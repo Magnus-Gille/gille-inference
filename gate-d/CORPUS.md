@@ -10,8 +10,16 @@ Gate D fixtures are deterministic, model-free graded, and append-only once used 
 The `gate-d-r1` task tree is pinned by Git tree object
 `5ab301a9cfd63debf37d9edd1823514f692dc872`. Tasks 01–10 must remain byte-identical so the
 June evidence stays reproducible. `verify-fixtures.sh` checks the pinned commit/tree and refuses
-any tracked or untracked drift below those ten task directories. Revision 2 only appends tasks
-11–14:
+any tracked or untracked drift below those ten task directories.
+
+The reachable commit anchor is the public-history root
+`9fbfddf6f1b6a46e4a39ad5f6df4ecfa4d5bf606`. It replaces the original private-history anchor
+`d2d2541dd01519ddf50a9bbba8903d02fcea5284`, which was intentionally omitted during the public
+history cutover. Both anchors resolve tasks 01–10 to the same content-addressed tree above; the
+tree hash remains the immutable corpus identity, while the public commit makes strict verification
+possible in a clean public clone.
+
+Revision 2 only appends tasks 11–14:
 
 - Cache-path containment and invalid-key rejection.
 - Cross-file CLI formatter export/import integration.
