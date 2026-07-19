@@ -1,0 +1,1465 @@
+[
+  {
+    "name": "unknown contract major",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/contract_version",
+        "value": "grimnir.learning-task/v2"
+      }
+    ],
+    "expected_error": "contract_version"
+  },
+  {
+    "name": "unknown schema revision fails closed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/schema_revision",
+        "value": 999
+      }
+    ],
+    "expected_error": "expected constant 1"
+  },
+  {
+    "name": "missing gateway canonical prompt identity",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "delete",
+        "path": "/execution/prompt_identity/gateway_canonical_envelope"
+      }
+    ],
+    "expected_error": "gateway_canonical_envelope"
+  },
+  {
+    "name": "legacy joint rendered prompt is rejected",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/prompt_identity/rendered",
+        "value": {
+          "algorithm": "sha256",
+          "version": "joint-v1",
+          "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ],
+    "expected_error": "additional property rendered"
+  },
+  {
+    "name": "capability evidence cannot be produced by Hugin",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/producer/component",
+        "value": "hugin"
+      }
+    ],
+    "expected_error": "producer.component"
+  },
+  {
+    "name": "direct origin must match source component",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/source/component",
+        "value": "hugin"
+      }
+    ],
+    "expected_error": "task origin_component must equal task.source.component"
+  },
+  {
+    "name": "task type vocabulary is closed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/task_type/id",
+        "value": "unregistered-task-kind"
+      }
+    ],
+    "expected_error": "task_type.id"
+  },
+  {
+    "name": "raw fingerprint canonicalization is fixed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/raw_fingerprint/version",
+        "value": "unicode-normalized-v2"
+      }
+    ],
+    "expected_error": "trim-utf8-sha256-v1"
+  },
+  {
+    "name": "invalid timestamp fails closed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/recorded_at",
+        "value": "2026-07-19 10:01"
+      }
+    ],
+    "expected_error": "invalid RFC 3339 UTC date-time"
+  },
+  {
+    "name": "invalid raw hash fails closed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/raw_fingerprint/digest",
+        "value": "not-a-sha256"
+      }
+    ],
+    "expected_error": "does not match ^[a-f0-9]{64}$"
+  },
+  {
+    "name": "repository commit ids are 40 to 64 lowercase hex",
+    "from_positive": 3,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/artifacts/repository/base_commit",
+        "value": "abc123"
+      }
+    ],
+    "expected_error": "^[a-f0-9]{40,64}$"
+  },
+  {
+    "name": "task outcome cannot contain late product quality scalar",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/outcomes/product_quality",
+        "value": "pass"
+      }
+    ],
+    "expected_error": "additional property product_quality"
+  },
+  {
+    "name": "experiment observation cannot contain late product outcome scalar",
+    "from_positive": 3,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/experiment/product_outcome",
+        "value": "accepted-unchanged"
+      }
+    ],
+    "expected_error": "additional property product_outcome"
+  },
+  {
+    "name": "policy unavailable projection cannot fabricate policies",
+    "from_positive": 5,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies",
+        "value": []
+      }
+    ],
+    "expected_error": "additional property policies"
+  },
+  {
+    "name": "policy manifest must predate task acceptance",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policy_manifest/approved_at",
+        "value": "2026-07-19T10:00:30Z"
+      }
+    ],
+    "expected_error": "policy manifest was approved after task acceptance"
+  },
+  {
+    "name": "governance must cover runtime prompt derivative",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "delete-array-item",
+        "path": "/governance/policies",
+        "index": 10
+      }
+    ],
+    "expected_error": "missing governance policy for source-doc:prompt/runtime-task-001"
+  },
+  {
+    "name": "governance subject kind is exact",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/0/subject_kind",
+        "value": "artifact"
+      }
+    ],
+    "expected_error": "governance subject fingerprint:raw must have kind raw-fingerprint"
+  },
+  {
+    "name": "governance subject retains direct owner",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/0/content_owner",
+        "value": "component:hugin"
+      }
+    ],
+    "expected_error": "governance subject fingerprint:raw must retain content owner principal:owner"
+  },
+  {
+    "name": "unexpected governance subjects fail",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/4/subject_ref",
+        "value": "fabricated:subject"
+      }
+    ],
+    "expected_error": "unexpected governance policy for fabricated:subject"
+  },
+  {
+    "name": "effective sensitivity cannot be weaker",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/0/sensitivity",
+        "value": "private"
+      }
+    ],
+    "expected_error": "effective sensitivity internal does not equal strictest private"
+  },
+  {
+    "name": "training export is closed in v1",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/0/allowed_uses/0",
+        "value": "training-export"
+      }
+    ],
+    "expected_error": "allowed_uses"
+  },
+  {
+    "name": "unknown expiry reason is fail closed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/0/retention/expires_at",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      }
+    ],
+    "expected_error": "impermissible unknown expiry"
+  },
+  {
+    "name": "expired retention cannot remain active",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policies/0/retention/expires_at",
+        "value": "2026-07-18T00:00:00Z"
+      }
+    ],
+    "expected_error": "expiry does not follow record creation"
+  },
+  {
+    "name": "effective evaluation eligibility is mechanically derived",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/effective/evaluation_eligible",
+        "value": false
+      }
+    ],
+    "expected_error": "evaluation_eligible is not derived fail-closed"
+  },
+  {
+    "name": "direct transport Hugin stamp must be not applicable",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      }
+    ],
+    "expected_error": "expected constant \"not-applicable\""
+  },
+  {
+    "name": "admitted M5 transport requires a known Hugin stamp",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      }
+    ],
+    "expected_error": "hugin_request_stamp.task_instance_id"
+  },
+  {
+    "name": "M5 macro route cannot use non-M5 transport state",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport",
+        "value": {
+          "state": "not-m5",
+          "hugin_request_stamp": {
+            "value": null,
+            "unknown_reason": "not-applicable"
+          },
+          "gateway_echo": {
+            "value": null,
+            "unknown_reason": "not-applicable"
+          }
+        }
+      }
+    ],
+    "expected_error": "M5 macro route must use an M5 transport state"
+  },
+  {
+    "name": "non-M5 macro route cannot claim admitted M5 transport",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/routing/macro/target",
+        "value": "local"
+      },
+      {
+        "op": "set",
+        "path": "/execution/routing/macro/service",
+        "value": "hugin-local"
+      }
+    ],
+    "expected_error": "non-M5 macro route must use not-m5 transport state"
+  },
+  {
+    "name": "M5 macro target names gateway service",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/routing/macro/service",
+        "value": "other-service"
+      },
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp/macro_decision/service",
+        "value": "other-service"
+      },
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/echoed_request/macro_decision/service",
+        "value": "other-service"
+      }
+    ],
+    "expected_error": "M5 macro target must name gille-inference service"
+  },
+  {
+    "name": "non-M5 route cannot retain gateway envelope",
+    "from_positive_derived": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/prompt_identity/gateway_canonical_envelope",
+        "value": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785-utf8-v1",
+          "source_ref": "source-doc:prompt/gateway-task-001",
+          "source_type": "prompt-stage",
+          "source_version": "prompt-stage-v1",
+          "digest": "fddff2461df95197b516540fffea742a230461bdd2efaebcc8ab07a8deac2c0a"
+        }
+      }
+    ],
+    "expected_error": "non-M5 route gateway envelope must be not-applicable"
+  },
+  {
+    "name": "M5 non-admission requires missing gateway provenance",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/state",
+        "value": "m5-not-admitted"
+      },
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-admitted"
+        }
+      }
+    ],
+    "expected_error": "M5 non-admission gateway envelope must carry the missing-echo reason"
+  },
+  {
+    "name": "M5 non-admission retains known request stamp",
+    "from_positive_derived": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-admitted"
+        }
+      }
+    ],
+    "expected_error": "hugin_request_stamp.task_instance_id"
+  },
+  {
+    "name": "M5 non-admission provenance reasons match echo",
+    "from_positive_derived": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/serving/unknown_reason",
+        "value": "producer-error"
+      }
+    ],
+    "expected_error": "M5 non-admission serving reason must match the missing echo"
+  },
+  {
+    "name": "direct origin Hugin envelope is not applicable",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/prompt_identity/hugin_envelope",
+        "value": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785-utf8-v1",
+          "source_ref": "source-doc:prompt/hugin-task-001",
+          "source_type": "prompt-stage",
+          "source_version": "prompt-stage-v1",
+          "digest": "9be437be615610b7326012e818d32d3963d08fd40a8cc13ef702645937009d3d"
+        }
+      }
+    ],
+    "expected_error": "direct origin Hugin envelope must be not-applicable"
+  },
+  {
+    "name": "direct origin macro route is not applicable",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/routing/macro",
+        "value": {
+          "policy_id": "hugin-macro",
+          "version": "v1",
+          "decision_id": "forged",
+          "target": "m5",
+          "service": "gille-inference"
+        }
+      }
+    ],
+    "expected_error": "direct origin macro routing must be not-applicable"
+  },
+  {
+    "name": "Hugin contract request matches record revision",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp/contract_request/schema_revision",
+        "value": 2
+      },
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/echoed_request/contract_request/schema_revision",
+        "value": 2
+      }
+    ],
+    "expected_error": "expected constant 1"
+  },
+  {
+    "name": "gateway capability echo matches requested feature set",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/capabilities/schema_revision",
+        "value": 2
+      }
+    ],
+    "expected_error": "expected constant 1"
+  },
+  {
+    "name": "gateway echo must exactly reproduce request stamp",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/echoed_request/request_id",
+        "value": "opaque:f2f2f2f2-f2f2-42f2-82f2-f2f2f2f2f2f2"
+      }
+    ],
+    "expected_error": "gateway echo does not exactly reproduce Hugin request stamp"
+  },
+  {
+    "name": "gateway principal substitution is rejected",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/authenticated_principal_id",
+        "value": "principal:attacker"
+      }
+    ],
+    "expected_error": "gateway authenticated principal does not match expected transport principal"
+  },
+  {
+    "name": "gateway principal binding digest is reproducible",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/principal_binding_digest/digest",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "expected_error": "gateway principal binding digest does not bind principal/request identity"
+  },
+  {
+    "name": "source acceptance cannot precede creation",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/source/accepted_at",
+        "value": "2026-07-19T09:58:00Z"
+      }
+    ],
+    "expected_error": "task source accepted_at precedes created_at"
+  },
+  {
+    "name": "unknown source principal requires policy unavailable",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/source/principal",
+        "value": {
+          "value": null,
+          "unknown_reason": "legacy"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp/source/principal",
+        "value": {
+          "value": null,
+          "unknown_reason": "legacy"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/echoed_request/source/principal",
+        "value": {
+          "value": null,
+          "unknown_reason": "legacy"
+        }
+      }
+    ],
+    "expected_error": "complete governance requires a known authenticated source principal"
+  },
+  {
+    "name": "execution cannot end before start",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/ended_at",
+        "value": "2026-07-19T10:00:00Z"
+      }
+    ],
+    "expected_error": "execution ended_at precedes started_at"
+  },
+  {
+    "name": "completed task has no failure mode",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/outcomes/execution_failure_mode",
+        "value": "infrastructure"
+      }
+    ],
+    "expected_error": "task execution outcome and failure mode are incoherent"
+  },
+  {
+    "name": "timeout task requires timeout failure mode",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/outcomes/execution",
+        "value": "timeout"
+      }
+    ],
+    "expected_error": "task execution outcome and failure mode are incoherent"
+  },
+  {
+    "name": "pre-admission M5 failure cannot report completed",
+    "from_positive_derived": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/outcomes/execution",
+        "value": "completed"
+      },
+      {
+        "op": "set",
+        "path": "/outcomes/execution_failure_mode",
+        "value": "not-applicable"
+      }
+    ],
+    "expected_error": "M5 non-admission requires a matching task failure mode"
+  },
+  {
+    "name": "observed exposure clocks are ordered",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/exposure/first_seen_at",
+        "value": "2026-07-19T11:00:03Z"
+      }
+    ],
+    "expected_error": "observed exposure clocks are not ordered"
+  },
+  {
+    "name": "observed exposure version matches raw canonicalization",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task/raw_fingerprint/version",
+        "value": "trim-utf8-sha256-v1"
+      },
+      {
+        "op": "set",
+        "path": "/exposure/fingerprint_version",
+        "value": "other-version"
+      }
+    ],
+    "expected_error": "trim-utf8-sha256-v1"
+  },
+  {
+    "name": "negative coverage fingerprint is exact",
+    "from_positive": 5,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/exposure/queried_fingerprint/digest",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "expected_error": "negative coverage query fingerprint differs from task fingerprint"
+  },
+  {
+    "name": "negative coverage contains exact six lanes",
+    "from_positive": 5,
+    "mutations": [
+      {
+        "op": "delete-array-item",
+        "path": "/exposure/coverage/lanes",
+        "index": 5
+      }
+    ],
+    "expected_error": "fewer than 6 items"
+  },
+  {
+    "name": "raw loopback is not an authenticated exposure lane",
+    "from_positive": 5,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/exposure/coverage/lanes/5",
+        "value": "raw-loopback"
+      }
+    ],
+    "expected_error": "chat|mcp-ask|delegate|delegate-disagreement|delegate-shadow|code-loop"
+  },
+  {
+    "name": "negative coverage clocks are ordered",
+    "from_positive": 5,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/exposure/coverage/relevant_task_at",
+        "value": "2026-07-18T23:00:00Z"
+      }
+    ],
+    "expected_error": "negative coverage clocks are not ordered"
+  },
+  {
+    "name": "advisory judge cannot affect routing",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/verifier/kind",
+        "value": "advisory-judge"
+      },
+      {
+        "op": "set",
+        "path": "/capability/admission_state",
+        "value": "inadmissible"
+      }
+    ],
+    "expected_error": "advisory judge cannot affect routing"
+  },
+  {
+    "name": "admission requires independent calibrated evidence",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/verifier/independence",
+        "value": "self"
+      }
+    ],
+    "expected_error": "capability admission requires independent calibrated policy-qualified evidence"
+  },
+  {
+    "name": "partial admission requires explicit policy basis",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/outcome",
+        "value": "partial"
+      }
+    ],
+    "expected_error": "capability admission requires independent calibrated policy-qualified evidence"
+  },
+  {
+    "name": "inadmissible evidence cannot admit",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/admission_state",
+        "value": "inadmissible"
+      }
+    ],
+    "expected_error": "inadmissible capability evidence cannot admit routing"
+  },
+  {
+    "name": "passing capability cannot carry failure",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/failure_mode",
+        "value": "model-capability"
+      }
+    ],
+    "expected_error": "passing or partial capability outcome requires not-applicable failure mode"
+  },
+  {
+    "name": "failed capability requires failure",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/outcome",
+        "value": "fail"
+      },
+      {
+        "op": "set",
+        "path": "/capability/admission_state",
+        "value": "inadmissible"
+      },
+      {
+        "op": "set",
+        "path": "/capability/admission_basis",
+        "value": "none"
+      },
+      {
+        "op": "set",
+        "path": "/capability/routing_effect",
+        "value": "reject"
+      }
+    ],
+    "expected_error": "non-passing capability outcome requires a failure mode"
+  },
+  {
+    "name": "unverified capability uses unverified failure",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/outcome",
+        "value": "unverified"
+      },
+      {
+        "op": "set",
+        "path": "/capability/failure_mode",
+        "value": "infrastructure"
+      },
+      {
+        "op": "set",
+        "path": "/capability/admission_state",
+        "value": "inadmissible"
+      },
+      {
+        "op": "set",
+        "path": "/capability/admission_basis",
+        "value": "none"
+      },
+      {
+        "op": "set",
+        "path": "/capability/routing_effect",
+        "value": "none-shadow"
+      }
+    ],
+    "expected_error": "unverified capability outcome requires unverified failure mode"
+  },
+  {
+    "name": "admissible capability must affect routing by admit",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/capability/routing_effect",
+        "value": "freeze"
+      }
+    ],
+    "expected_error": "admissible capability evidence must use routing effect admit"
+  },
+  {
+    "name": "passing experiment cannot carry failure",
+    "from_positive": 3,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/experiment/failure_mode",
+        "value": "infrastructure"
+      }
+    ],
+    "expected_error": "passing experiment observation requires not-applicable failure mode"
+  },
+  {
+    "name": "failed experiment requires failure",
+    "from_positive": 3,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/experiment/verification_outcome",
+        "value": "fail"
+      }
+    ],
+    "expected_error": "non-passing experiment observation requires a failure mode"
+  },
+  {
+    "name": "review identity and clock are paired",
+    "from_positive": 6,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/review/reviewer_principal_id",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      }
+    ],
+    "expected_error": "review principal and reviewed_at must be known or unknown together"
+  },
+  {
+    "name": "quality receipt native reviewer binds envelope",
+    "from_positive": 6,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/quality_receipt/reviewer/principal",
+        "value": "principal:other"
+      }
+    ],
+    "expected_error": "quality receipt native binding/reviewer does not match envelope"
+  },
+  {
+    "name": "quality receipt attempt binds task execution",
+    "from_positive": 6,
+    "mutations": [
+      {
+        "op": "set",
+      "path": "/quality_receipt/attempt_id",
+      "value": "attempt-missing"
+    },
+    {
+      "op": "set",
+      "path": "/quality_receipt/correction_group_key/digest",
+      "value": "d61c74799df04ff42d0f826c6573c588b7c002f3f7be0a7a7db214e28ed4779a"
+    }
+    ],
+    "second_from_positive": 0,
+    "second_record_mutations": [],
+    "expected_error": "quality receipt does not bind a known task execution attempt"
+  },
+  {
+    "name": "experiment rating binds immutable observation id",
+    "from_positive": 7,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/experiment_product_rating/observation_record_id",
+        "value": "experiment:mutable-name"
+      }
+    ],
+    "expected_error": "observation_record_id"
+  },
+  {
+    "name": "experiment rating binds referenced observation record",
+    "from_positive": 7,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/experiment_product_rating/observation_record_id",
+        "value": "opaque:17171717-1717-4717-8717-171717171717"
+      }
+    ],
+    "second_from_positive": 3,
+    "second_record_mutations": [],
+    "expected_error": "experiment product rating does not bind referenced observation"
+  },
+  {
+    "name": "correction reference binds correction artifact",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/lineage/correction_ref",
+        "value": "munin:missing-correction"
+      }
+    ],
+    "expected_error": "correction_ref must bind a correction artifact"
+  },
+  {
+    "name": "tombstone cannot retain task projection",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/task",
+        "value": {
+          "instance_id": "leaked"
+        }
+      }
+    ],
+    "expected_error": "additional property task"
+  },
+  {
+    "name": "pending store readback cannot produce tombstone",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/core_stores/2/status",
+        "value": "pending"
+      }
+    ],
+    "expected_error": "deleted|absent-confirmed"
+  },
+  {
+    "name": "erasure protocol covers all core stores",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/core_stores/6/store",
+        "value": "gille-exposure"
+      }
+    ],
+    "expected_error": "erasure protocol must cover every core store exactly once"
+  },
+  {
+    "name": "erasure protocol covers artifact inventory",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/expected_artifact_store_receipts",
+        "value": 3
+      }
+    ],
+    "expected_error": "artifact receipt count does not match pre-erasure inventory"
+  },
+  {
+    "name": "artifact receipts bind unique inventory entries",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/artifact_stores/1/inventory_entry_id",
+        "value": "opaque:74747474-7474-4474-8474-747474747474"
+      }
+    ],
+    "expected_error": "artifact erasure receipts must bind unique inventory entries"
+  },
+  {
+    "name": "backup expiry must be confirmed before erasure",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/backup_expiry/status",
+        "value": "exempt"
+      }
+    ],
+    "expected_error": "expected constant \"confirmed\""
+  },
+  {
+    "name": "backup deadline cannot precede erasure request",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/backup_expiry/deadline",
+        "value": "2026-07-31T23:59:59Z"
+      }
+    ],
+    "expected_error": "backup expiry clocks must satisfy requested <= deadline <= verified <= effective"
+  },
+  {
+    "name": "backup verification cannot precede deadline",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/backup_expiry/verified_at",
+        "value": "2026-08-01T00:00:07Z"
+      }
+    ],
+    "expected_error": "backup expiry clocks must satisfy requested <= deadline <= verified <= effective"
+  },
+  {
+    "name": "backup verification cannot follow effective erasure",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/erasure_protocol/backup_expiry/verified_at",
+        "value": "2026-08-01T00:00:10Z"
+      }
+    ],
+    "expected_error": "backup expiry clocks must satisfy requested <= deadline <= verified <= effective"
+  },
+  {
+    "name": "tombstone counter must be producer owned",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/counter_audit/0/membership_receipt/owner_component",
+        "value": "hugin"
+      }
+    ],
+    "expected_error": "does not own counter direct-m5-exposure-denominator"
+  },
+  {
+    "name": "tombstone cannot precede erasure",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/recorded_at",
+        "value": "2026-08-01T00:00:08Z"
+      }
+    ],
+    "expected_error": "tombstone recorded_at precedes effective_at"
+  },
+  {
+    "name": "erased dataset cannot retain superseded active projection",
+    "from_positive": 1,
+    "second_from_erased": true,
+    "second_record_mutations": [],
+    "expected_error": "tombstone supersedes content-bearing record still present"
+  },
+  {
+    "name": "duplicate producer-scoped tombstones fail",
+    "from_erased": true,
+    "second_from_erased": true,
+    "second_record_mutations": [
+      {
+        "op": "set",
+        "path": "/record_id",
+        "value": "opaque:78787878-7878-4878-8878-787878787878"
+      },
+      {
+        "op": "set",
+        "path": "/tombstone/receipt_id",
+        "value": "opaque:79797979-7979-4979-8979-797979797979"
+      }
+    ],
+    "expected_error": "duplicate producer-scoped tombstone"
+  },
+  {
+    "name": "active extensions are producer namespaced",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/extensions/gille-inference",
+        "value": {
+          "foreign": true
+        }
+      }
+    ],
+    "expected_error": "extension namespace gille-inference is not owned by producer hugin"
+  },
+  {
+    "name": "joined execution identity mismatch fails",
+    "from_positive": 0,
+    "second_from_positive": 4,
+    "second_record_mutations": [
+      {
+        "op": "set",
+      "path": "/execution/model_started_at",
+      "value": "2026-07-19T10:00:03.100Z"
+      }
+    ],
+    "expected_error": "joined identity mismatch at execution"
+  },
+  {
+    "name": "conflicting record replay fails",
+    "from_positive": 0,
+    "second_from_positive": 0,
+    "second_record_mutations": [
+      {
+        "op": "set",
+        "path": "/recorded_at",
+        "value": "2026-07-19T10:01:01Z"
+      }
+    ],
+    "expected_error": "conflicting record key"
+  },
+  {
+    "name": "conflicting task attempt fails",
+    "from_positive": 0,
+    "second_from_positive": 0,
+    "second_record_mutations": [
+      {
+        "op": "set",
+        "path": "/record_id",
+        "value": "opaque:15151515-1515-4515-8515-151515151515"
+      },
+      {
+        "op": "set",
+        "path": "/recorded_at",
+        "value": "2026-07-19T10:01:01Z"
+      }
+    ],
+    "expected_error": "correction supersession must have one effective leaf"
+  },
+  {
+    "name": "gateway admission cannot precede Hugin attempt start",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/gateway_echo/admitted_at",
+        "value": "2026-07-19T10:00:00.900Z"
+      }
+    ],
+    "expected_error": "gateway admission clock is outside stamp/model-start interval"
+  },
+  {
+    "name": "model start cannot precede gateway admission",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/model_started_at",
+        "value": "2026-07-19T10:00:01.500Z"
+      }
+    ],
+    "expected_error": "gateway admission clock is outside stamp/model-start interval"
+  },
+  {
+    "name": "non-admitted model clocks share missing reason",
+    "from_positive_derived": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/model_started_at/unknown_reason",
+        "value": "producer-error"
+      }
+    ],
+    "expected_error": "model clocks must be known together or share one qualified missing reason"
+  },
+  {
+    "name": "observed exposure binds full authoritative raw fingerprint",
+    "from_positive": 4,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/exposure/raw_fingerprint/digest",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "expected_error": "observed exposure raw fingerprint differs from authoritative task fingerprint"
+  },
+  {
+    "name": "preflight advertisement must be fresh at stamp time",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp/preflight/response/expires_at",
+        "value": "2026-07-19T10:00:00.500Z"
+      }
+    ],
+    "expected_error": "preflight freshness window does not cover request stamp"
+  },
+  {
+    "name": "partial preflight advertisement fails closed",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "delete-array-item",
+        "path": "/transport/hugin_request_stamp/preflight/response/capabilities/features",
+        "index": 3
+      }
+    ],
+    "expected_error": "fewer than 4 items"
+  },
+  {
+    "name": "service transport principal cannot manufacture owner authority",
+    "from_positive": 8,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/governance/policy_manifest/owner_attestations/0/authenticated_principal",
+        "value": "service:hugin-ingress"
+      }
+    ],
+    "expected_error": "authenticated owner attestation is invalid for principal:owner"
+  },
+  {
+    "name": "gille producer cannot claim repository authority",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/artifacts/repository",
+        "value": {
+          "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "diff_hash": {
+            "value": null,
+            "unknown_reason": "not-observed"
+          },
+          "changed_files_ref": {
+            "value": null,
+            "unknown_reason": "not-observed"
+          }
+        }
+      }
+    ],
+    "expected_error": "gille-inference records cannot assert repository bindings"
+  },
+  {
+    "name": "cross-owner correction cannot supersede another producer",
+    "from_positive": 1,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/lineage/correction_targets",
+        "value": [
+          {
+            "producer": "hugin",
+            "record_kind": "inference-exposure",
+            "fact_domain": "exposure",
+            "record_id": "opaque:11111111-1111-4111-8111-111111111111"
+          }
+        ]
+      }
+    ],
+    "expected_error": "correction target must retain the same producer, record kind, and fact domain"
+  },
+  {
+    "name": "denominator erasure cannot evade current occurrence month",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/counter_audit",
+        "value": []
+      }
+    ],
+    "expected_error": "denominator-bearing tombstone requires an idempotent membership receipt"
+  },
+  {
+    "name": "aggregate preservation must happen before effective removal",
+    "from_erased": true,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/tombstone/counter_audit/0/membership_receipt/confirmed_at",
+        "value": "2026-08-01T00:00:09.500Z"
+      }
+    ],
+    "expected_error": "membership was not confirmed before effective removal"
+  },
+  {
+    "name": "request retry telemetry is forbidden in immutable stamp",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/hugin_request_stamp/transport_attempt",
+        "value": 2
+      }
+    ],
+    "expected_error": "additional property transport_attempt"
+  },
+  {
+    "name": "delivery retry telemetry is forbidden in immutable evidence",
+    "from_positive": 0,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/transport/record_delivery_attempt",
+        "value": 2
+      }
+    ],
+    "expected_error": "additional property record_delivery_attempt"
+  },
+  {
+    "name": "pipeline counter owner is exact",
+    "from_positive": 9,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/pipeline_accounting/owner_component",
+        "value": "gille-inference"
+      }
+    ],
+    "expected_error": "pipeline accounting producer must equal counter/event owner"
+  },
+  {
+    "name": "successful emission binds record identity",
+    "from_positive": 10,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/pipeline_accounting/related_record",
+        "value": {
+          "value": null,
+          "unknown_reason": "producer-error"
+        }
+      }
+    ],
+    "expected_error": "successful emission must bind its immutable record identity"
+  },
+  {
+    "name": "capability admission requires an actual reproducible model run",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/serving",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/execution/model_started_at",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/execution/model_ended_at",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      }
+    ],
+    "expected_error": "capability admission requires complete nested serving provenance from a model-running transport"
+  },
+  {
+    "name": "attempt start is bounded even when completion clocks are unknown",
+    "from_positive": 2,
+    "mutations": [
+      {
+        "op": "set",
+        "path": "/execution/started_at",
+        "value": "2026-07-19T10:02:00Z"
+      },
+      {
+        "op": "set",
+        "path": "/execution/ended_at",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/execution/model_started_at",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/execution/model_ended_at",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      },
+      {
+        "op": "set",
+        "path": "/execution/serving",
+        "value": {
+          "value": null,
+          "unknown_reason": "not-observed"
+        }
+      }
+    ],
+    "expected_error": "execution started_at exceeds recorded_at"
+  }
+]
