@@ -22,6 +22,10 @@ import type {
   CodeLoopResult,
   CodeLoopUsage,
 } from "./code-loop-types.js";
+import {
+  parseLearningTaskGatewayEcho,
+  type LearningTaskGatewayEcho,
+} from "./learning-task-contract.js";
 
 /** Durable, content-minimal caller-idempotency record (#251). */
 export interface DurableCodeLoopRun {
@@ -33,6 +37,8 @@ export interface DurableCodeLoopRun {
   usage: CodeLoopUsage;
   result: CodeLoopResult | null;
   started_at_ms: number;
+  /** Content-blind exact admission echo retained for response-loss/idempotent recovery. */
+  learning_task_gateway_echo?: LearningTaskGatewayEcho;
   /** Per-process nonce: distinguishes pre-restart owners from starts racing the async sweep. */
   owner_instance_id?: string;
   /** OS process owner used to avoid orphaning a run owned by an overlapping live gateway. */
@@ -153,6 +159,9 @@ function readRecord(path: string): DurableCodeLoopRun | null {
       typeof parsed.usage.completion_tokens !== "number" ||
       (parsed.result !== null && typeof parsed.result !== "object")
     ) return null;
+    if (parsed.learning_task_gateway_echo !== undefined) {
+      parsed.learning_task_gateway_echo = parseLearningTaskGatewayEcho(parsed.learning_task_gateway_echo);
+    }
     return parsed;
   } catch {
     return null;
@@ -222,6 +231,11 @@ export function codeLoopRequestFingerprint(
           completion_tokens: req.caps.completion_tokens ?? null,
           edit_deadline_turn: req.caps.edit_deadline_turn ?? null,
         },
+    // Preserve the exact pre-LearningTaskContract serialization for unstamped callers. Adding a
+    // trailing null here would invalidate every durable client_run_id created before the rollout.
+    ...(req.learning_task_stamp === undefined
+      ? {}
+      : { learning_task_stamp: req.learning_task_stamp }),
   };
   return `sha256:${createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex")}`;
 }

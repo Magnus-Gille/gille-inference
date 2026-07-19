@@ -1,0 +1,163 @@
+{
+  "prompt": "## Task\n  Summarize the fixture incident report.\n",
+  "taskType": "summarize",
+  "huginTaskIdentity": {
+    "schemaVersion": 1,
+    "producer": "hugin",
+    "taskId": "task-001",
+    "rawTaskFingerprint": {
+      "algorithm": "sha256",
+      "version": "trim-utf8-sha256-v1",
+      "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+    },
+    "renderedPromptFingerprint": {
+      "algorithm": "sha256",
+      "version": "hugin-delegate-prompt-utf8-sha256-v1",
+      "digest": "d0846c9a9de32ee9708e8ed7dd039b0156465807252a65f68304822919264969",
+      "utf8Bytes": 49
+    }
+  },
+  "learningTaskStamp": {
+    "task_instance_id": "task-001",
+    "attempt_id": "hugin-attempt:11111111-1111-4111-8111-111111111111",
+    "client_id": "hugin",
+    "expected_transport_principal_id": "service:hugin",
+    "idempotency_key": "opaque:e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1",
+    "request_id": "opaque:e2e2e2e2-e2e2-4e2e-8e2e-e2e2e2e2e2e2",
+    "stamped_at": "2026-07-19T10:00:02.250Z",
+    "contract_request": {
+      "contract_version": "grimnir.learning-task/v1",
+      "schema_revision": 1,
+      "features": [
+        "hugin-request-stamp-v1",
+        "gateway-echo-v1",
+        "three-stage-prompt-provenance-v1",
+        "reproducible-serving-digests-v1"
+      ]
+    },
+    "preflight": {
+      "request": {
+        "request_id": "opaque:f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1",
+        "endpoint": "/v1/capabilities/learning-task",
+        "protocol_version": "learning-task-preflight/v1",
+        "requested_at": "2026-07-19T10:00:01.500Z",
+        "requested_capabilities": {
+          "contract_version": "grimnir.learning-task/v1",
+          "schema_revision": 1,
+          "features": [
+            "hugin-request-stamp-v1",
+            "gateway-echo-v1",
+            "three-stage-prompt-provenance-v1",
+            "reproducible-serving-digests-v1"
+          ]
+        }
+      },
+      "response": {
+        "advertisement_id": "opaque:f2f2f2f2-f2f2-4f2f-8f2f-f2f2f2f2f2f2",
+        "endpoint": "/v1/capabilities/learning-task",
+        "protocol_version": "learning-task-preflight/v1",
+        "advertised_at": "2026-07-19T10:00:02.000Z",
+        "expires_at": "2026-07-19T10:15:02.000Z",
+        "authenticated_principal_id": "service:gille-inference",
+        "authentication": "service-auth",
+        "capabilities": {
+          "contract_version": "grimnir.learning-task/v1",
+          "schema_revision": 1,
+          "features": [
+            "hugin-request-stamp-v1",
+            "gateway-echo-v1",
+            "three-stage-prompt-provenance-v1",
+            "reproducible-serving-digests-v1"
+          ]
+        }
+      }
+    },
+    "source": {
+      "component": "hugin",
+      "system": "broker",
+      "id": "broker-001",
+      "created_at": "2026-07-19T09:59:00.000Z",
+      "accepted_at": "2026-07-19T10:00:00.000Z",
+      "principal": {
+        "id": "principal:owner",
+        "authentication": "gateway-owner-auth",
+        "scope": "owner"
+      },
+      "content_owner": {
+        "id": "principal:owner",
+        "authority": "authenticated-owner"
+      }
+    },
+    "task_type": {
+      "id": "summarize",
+      "taxonomy_id": "gille-inference/task-types",
+      "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+    },
+    "raw_input": {
+      "algorithm": "sha256",
+      "canonicalization": "jcs-rfc8785-utf8-v1",
+      "source_ref": "source-doc:hugin/raw/b0b3576c00612d06363ea20fd22ea646b129720b4502f6d8c942098a0c7aa95e",
+      "source_type": "raw-input",
+      "source_version": "raw-input-v1",
+      "digest": "b0b3576c00612d06363ea20fd22ea646b129720b4502f6d8c942098a0c7aa95e"
+    },
+    "raw_fingerprint": {
+      "algorithm": "sha256",
+      "version": "trim-utf8-sha256-v1",
+      "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+    },
+    "hugin_envelope": {
+      "algorithm": "sha256",
+      "canonicalization": "jcs-rfc8785-utf8-v1",
+      "source_ref": "source-doc:hugin/prompt/11111111-1111-4111-8111-111111111111",
+      "source_type": "prompt-stage",
+      "source_version": "prompt-stage-v2",
+      "digest": "3792bf0a207fe200b314adf011b51de429a34c19c3846a8253353eaa5a04901d"
+    },
+    "origin_config": {
+      "prompt": {
+        "id": "hugin-direct-delegate-prompt",
+        "version": "v1",
+        "config_digest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785-utf8-v1",
+          "source_ref": "source-doc:hugin/config/direct-delegate-prompt-v1",
+          "source_type": "origin-prompt-config",
+          "source_version": "config-source-v1",
+          "digest": "dda8bada2f661ce23060250b0f54ff9822b690cc896d83bb60bd4a3cad1f5ef3"
+        }
+      },
+      "harness": {
+        "id": "homeserver-executor",
+        "version": "learning-task-v1",
+        "config_digest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785-utf8-v1",
+          "source_ref": "source-doc:hugin/config/homeserver-learning-task-v1",
+          "source_type": "origin-harness-config",
+          "source_version": "config-source-v1",
+          "digest": "b091a4a6bb10bebf79eb4d1612bb407713938aec7a44dcfb3f9878c1e172db6b"
+        }
+      },
+      "tool_policy": {
+        "id": "bounded-delegate",
+        "version": "learning-task-v1",
+        "config_digest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785-utf8-v1",
+          "source_ref": "source-doc:hugin/config/bounded-delegate-learning-task-v1",
+          "source_type": "origin-tool-policy-config",
+          "source_version": "config-source-v1",
+          "digest": "8eaa221e2d1b51314645d9130cb6fa6ca16650d562eae8cbcd8b36beaeb126a0"
+        }
+      }
+    },
+    "macro_decision": {
+      "policy_id": "hugin-runtime-selection",
+      "version": "homeserver-delegate-learning-task-v1",
+      "decision_id": "learning-task:11111111-1111-4111-8111-111111111111",
+      "target": "m5",
+      "service": "gille-inference"
+    }
+  }
+}

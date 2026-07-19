@@ -19,6 +19,7 @@ export type ErrorCode =
   | "not_found" // 404 (no such route / resource)
   | "alias_exists" // 409 (duplicate key alias on mint)
   | "invite_invalid" // 409 (unknown OR already-used invite code — uniform, no enumeration leak)
+  | "learning_task_conflict" // 409 (durable task/request/attempt identity is already admitted)
   | "rate_limit_exceeded" // 429
   | "credits_exhausted" // 402 (lifetime credit budget spent)
   | "server_busy" // 503
@@ -99,6 +100,12 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
     type: "invalid_request_error",
     param: null,
     message: "This invite code is invalid or has already been used.",
+  },
+  learning_task_conflict: {
+    status: 409,
+    type: "invalid_request_error",
+    param: "learningTaskStamp",
+    message: "This learning-task request, attempt, or idempotency identity is already admitted.",
   },
   rate_limit_exceeded: {
     status: 429,

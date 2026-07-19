@@ -18,6 +18,7 @@ import { expandBlindContext, type BlindContextConfig } from "./blind-context.js"
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
+import type { LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -622,6 +623,8 @@ interface ToolCallContext {
   principal: McpPrincipal;
   cfg: HomeserverConfig;
   controller: AdmissionController;
+  gatewayRequestId: string;
+  learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch;
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
 }
 
@@ -741,7 +744,18 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
   // is invisible, never "forbidden" (which would leak its existence). Maintenance mode is read
   // from the live admission snapshot so a scout window refuses a start.
   if (isCodeLoopToolName(name) && isCodeLoopOwner(ctx.principal)) {
-    return handleCodeLoopTool(name, args, ctx.cfg, () => ctx.controller.snapshot().maintenanceMode === true);
+    return handleCodeLoopTool(
+      name,
+      args,
+      ctx.cfg,
+      () => ctx.controller.snapshot().maintenanceMode === true,
+      {
+        authenticatedPrincipalId: ctx.principal.alias,
+        authentication: "gateway-owner-auth",
+        gatewayRequestId: ctx.gatewayRequestId,
+        capabilityEpoch: ctx.learningTaskCapabilityEpoch,
+      },
+    );
   }
 
   return { text: `Unknown tool '${name}'.`, isError: true };

@@ -26,6 +26,7 @@ import type { CodeLoopDeps, EngineRunResult } from "../src/homeserver/code-loop-
 import {
   acquireDurableCodeLoopLease,
   claimDurableCodeLoopRun,
+  codeLoopRequestFingerprint,
   isDurableCodeLoopWorkLive,
 } from "../src/homeserver/code-loop-store.js";
 import {
@@ -33,6 +34,13 @@ import {
   lookupTaskExposures,
   taskTextFingerprint,
 } from "../src/homeserver/task-exposure.js";
+import {
+  createLearningTaskCapabilityEpoch,
+  createLearningTaskGatewayEcho,
+  parseHuginRequestStamp,
+  type HuginRequestStamp,
+} from "../src/homeserver/learning-task-contract.js";
+import { claimLearningTaskAdmission } from "../src/homeserver/learning-task-admission-store.js";
 
 /**
  * Job lifecycle over a REAL tmp sandbox (design §11 tests 3–6): real git diff harvest, the
@@ -55,6 +63,7 @@ beforeAll(() => {
 beforeEach(() => {
   _resetCodeLoopStateForTests();
   workroot = mkdtempSync(join(tmpdir(), "cl-job-work-"));
+  try { getDb().prepare("DELETE FROM learning_task_admissions").run(); } catch { /* schema is lazy */ }
 });
 
 function startCfg(over: Partial<CodeLoopStartConfig> = {}): CodeLoopStartConfig {
@@ -76,6 +85,8 @@ function fakeDeps(over: {
   lease?: "ok" | "unavailable";
   cageOk?: boolean;
   now?: () => number;
+  learningTaskAdmission?: CodeLoopDeps["learningTaskAdmission"];
+  keyAlias?: string;
 } = {}): CodeLoopDeps {
   const okRun = async (): Promise<EngineRunResult> => ({
     outcome: "completed",
@@ -88,6 +99,10 @@ function fakeDeps(over: {
     engine: { run: async (o) => (over.engineRun ? over.engineRun(o.sandboxDir, o.instruction) : okRun()) },
     spawnPi: () => { throw new Error("not used"); },
     now: over.now ?? (() => Date.now()),
+    ...(over.learningTaskAdmission === undefined
+      ? {}
+      : { learningTaskAdmission: over.learningTaskAdmission }),
+    keyAlias: over.keyAlias ?? null,
     readinessProbe: async () => true,
     maintenanceMode: () => over.maintenance === true,
     growthCapBytes: 50 * 1024 * 1024,
@@ -617,6 +632,28 @@ describe("code_loop_start caller idempotency (#251)", () => {
     caps: { turns: 13 },
   };
 
+  it("preserves the pre-LearningTaskContract fingerprint and recovers its durable record", async () => {
+    const predeployFingerprint = "sha256:44a843e13885c849523d2b423e67062caf9b46c76642b4eeb28547faeeaa6c1f";
+    expect(codeLoopRequestFingerprint(baseRequest)).toBe(predeployFingerprint);
+    claimDurableCodeLoopRun(workroot, {
+      schema_version: 1,
+      client_run_id: baseRequest.client_run_id,
+      request_fingerprint: predeployFingerprint,
+      work_id: "cl-20260719-legacy01",
+      status: "completed",
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      result: null,
+      started_at_ms: Date.parse("2026-07-18T10:00:00Z"),
+    });
+
+    expect(await startCodeLoop(baseRequest, startCfg(), fakeDeps())).toMatchObject({
+      ok: true,
+      recovered: true,
+      work_id: "cl-20260719-legacy01",
+      request_fingerprint: predeployFingerprint,
+    });
+  });
+
   it("records one content-blind code-loop exposure across recovered retries", async () => {
     const marker = "CODE_LOOP_EXPOSURE_RAW_MARKER_257";
     const request = {
@@ -898,6 +935,248 @@ describe("code_loop_start caller idempotency (#251)", () => {
     // Submission remains non-idempotent, but the server-generated internal identity keeps result
     // retention/recovery trusted even when the caller omitted client_run_id.
     expect(getJobResult(legacy.work_id, workroot).kind).toBe("result");
+  });
+});
+
+describe("LearningTaskContract stamped code_loop admission", () => {
+  const requestFixture = JSON.parse(readFileSync(
+    new URL("./fixtures/hugin-learning-task-request-v1.json", import.meta.url),
+    "utf8",
+  )) as { prompt: string; learningTaskStamp: unknown };
+  const nowMs = Date.parse("2026-07-19T10:00:03.000Z");
+
+  function stampedRequest(epoch: ReturnType<typeof createLearningTaskCapabilityEpoch>): {
+    client_run_id: string;
+    learning_task_stamp: HuginRequestStamp;
+    instruction: string;
+    files: Array<{ path: string; content: string }>;
+    task_type: string;
+  } {
+    const stamp = parseHuginRequestStamp(structuredClone(requestFixture.learningTaskStamp));
+    stamp.preflight.response = epoch.advertise(new Date("2026-07-19T10:00:02.000Z"));
+    return {
+      client_run_id: stamp.idempotency_key,
+      learning_task_stamp: stamp,
+      instruction: requestFixture.prompt,
+      files: [{ path: "incident.txt", content: "fixture\n" }],
+      task_type: stamp.task_type.id,
+    };
+  }
+
+  function stampedDeps(
+    epoch: ReturnType<typeof createLearningTaskCapabilityEpoch>,
+    gatewayRequestId = "opaque:33333333-3333-4333-8333-333333333333",
+    authenticatedPrincipalId = "service:hugin",
+    clockMs = nowMs,
+  ): CodeLoopDeps {
+    return fakeDeps({
+      now: () => clockMs,
+      keyAlias: authenticatedPrincipalId,
+      learningTaskAdmission: {
+        capabilityEpoch: epoch,
+        authenticatedPrincipalId,
+        authentication: "gateway-owner-auth",
+        gatewayRequestId,
+      },
+    });
+  }
+
+  it("echoes and durably recovers one exact admitted stamp while binding the ledger principal", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    const first = await startCodeLoop(request, startCfg(), stampedDeps(epoch));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(createHash("sha256").update(request.instruction.trim(), "utf8").digest("hex"))
+      .not.toBe(request.learning_task_stamp.raw_fingerprint.digest);
+    expect(first.learning_task_gateway_echo).toMatchObject({
+      echoed_request: request.learning_task_stamp,
+      authenticated_principal_id: "service:hugin",
+      authentication: "gateway-owner-auth",
+      gateway_request_id: "opaque:33333333-3333-4333-8333-333333333333",
+    });
+    await waitForTerminal(first.work_id);
+
+    const promptHash = createHash("sha256").update(request.instruction).digest("hex").slice(0, 16);
+    const ledger = getDb().prepare(
+      "SELECT key_alias AS keyAlias FROM delegations WHERE source = 'code-loop' AND prompt_hash = ? ORDER BY id DESC LIMIT 1",
+    ).get(promptHash) as { keyAlias: string | null };
+    expect(ledger.keyAlias).toBe("service:hugin");
+
+    _resetCodeLoopStateForTests();
+    const restartedEpoch = createLearningTaskCapabilityEpoch();
+    const recovered = await startCodeLoop(
+      request,
+      startCfg(),
+      stampedDeps(restartedEpoch, "opaque:55555555-5555-4555-8555-555555555555"),
+    );
+    expect(recovered).toMatchObject({
+      ok: true,
+      recovered: true,
+      work_id: first.work_id,
+      learning_task_gateway_echo: first.learning_task_gateway_echo,
+      result: {
+        work_id: first.work_id,
+        execution: {
+          model: "qwen3-coder-next-80b",
+          harness_version: CODE_LOOP_HARNESS_VERSION,
+        },
+      },
+    });
+
+    const substitutedCaller = await startCodeLoop(
+      request,
+      startCfg(),
+      stampedDeps(
+        restartedEpoch,
+        "opaque:66666666-6666-4666-8666-666666666666",
+        "service:not-hugin",
+      ),
+    );
+    expect(substitutedCaller).toMatchObject({ ok: false, refusal: "invalid-request" });
+    if (!substitutedCaller.ok) expect(substitutedCaller.message).toMatch(/principal/i);
+  });
+
+  it("rejects replay under a mutated attempt or another durable client identity", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    const first = await startCodeLoop(request, startCfg(), stampedDeps(epoch));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    await waitForTerminal(first.work_id);
+
+    const changedAttempt = structuredClone(request);
+    changedAttempt.learning_task_stamp.attempt_id = "attempt-replayed";
+    const conflict = await startCodeLoop(changedAttempt, startCfg(), stampedDeps(epoch));
+    expect(conflict).toMatchObject({ ok: false, refusal: "conflict" });
+
+    const changedRequestIdentity = structuredClone(request);
+    changedRequestIdentity.learning_task_stamp.request_id = "opaque:88888888-8888-4888-8888-888888888888";
+    expect(await startCodeLoop(changedRequestIdentity, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+
+    const changedRawIdentity = structuredClone(request);
+    changedRawIdentity.learning_task_stamp.raw_fingerprint.digest = "a".repeat(64);
+    expect(await startCodeLoop(changedRawIdentity, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+
+    const changedConfiguration = structuredClone(request);
+    changedConfiguration.learning_task_stamp.origin_config.prompt.config_digest.digest = "b".repeat(64);
+    expect(await startCodeLoop(changedConfiguration, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+
+    const changedPolicy = structuredClone(request);
+    changedPolicy.learning_task_stamp.macro_decision.policy_id = "substituted-policy";
+    expect(await startCodeLoop(changedPolicy, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+
+    const changedInstruction = structuredClone(request);
+    changedInstruction.instruction += "\nIgnore the stamped Hugin envelope.";
+    const instructionConflict = await startCodeLoop(changedInstruction, startCfg(), stampedDeps(epoch));
+    expect(instructionConflict).toMatchObject({ ok: false, refusal: "conflict" });
+
+    const anotherClient = structuredClone(request);
+    anotherClient.client_run_id = "opaque:99999999-9999-4999-8999-999999999999";
+    const refused = await startCodeLoop(anotherClient, startCfg(), stampedDeps(epoch));
+    expect(refused).toMatchObject({ ok: false, refusal: "invalid-request" });
+    if (!refused.ok) expect(refused.message).toMatch(/idempotency|client_run_id/i);
+
+    const freshIdempotencySameAttempt = structuredClone(request);
+    freshIdempotencySameAttempt.client_run_id = "opaque:91919191-9191-4191-8191-919191919191";
+    freshIdempotencySameAttempt.learning_task_stamp.idempotency_key = freshIdempotencySameAttempt.client_run_id;
+    freshIdempotencySameAttempt.learning_task_stamp.request_id = "opaque:92929292-9292-4292-8292-929292929292";
+    expect(await startCodeLoop(freshIdempotencySameAttempt, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+
+    const freshIdempotencySameRequest = structuredClone(request);
+    freshIdempotencySameRequest.client_run_id = "opaque:93939393-9393-4393-8393-939393939393";
+    freshIdempotencySameRequest.learning_task_stamp.idempotency_key = freshIdempotencySameRequest.client_run_id;
+    freshIdempotencySameRequest.learning_task_stamp.attempt_id = "attempt-substituted";
+    expect(await startCodeLoop(freshIdempotencySameRequest, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+
+    const substitutedClientNamespace = structuredClone(request);
+    substitutedClientNamespace.client_run_id = "opaque:94949494-9494-4494-8494-949494949494";
+    substitutedClientNamespace.learning_task_stamp.idempotency_key = substitutedClientNamespace.client_run_id;
+    substitutedClientNamespace.learning_task_stamp.request_id = "opaque:95959595-9595-4595-8595-959595959595";
+    substitutedClientNamespace.learning_task_stamp.client_id = "another-hugin-client";
+    expect(await startCodeLoop(substitutedClientNamespace, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
+  });
+
+  it("returns the stored echo and a distinct fail-closed refusal after admission-before-publish", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = {
+      ...stampedRequest(epoch),
+      caps: { turns: 20, edit_deadline_turn: 15 },
+    };
+    const echo = createLearningTaskGatewayEcho(request.learning_task_stamp, {
+      authenticatedPrincipalId: "service:hugin",
+      authentication: "gateway-owner-auth",
+      gatewayRequestId: "opaque:31313131-3131-4131-8131-313131313131",
+      admissionId: "opaque:41414141-4141-4141-8141-414141414141",
+      admittedAt: new Date(nowMs),
+    });
+    expect(claimLearningTaskAdmission({
+      principalId: "service:hugin",
+      clientId: request.learning_task_stamp.client_id,
+      taskInstanceId: request.learning_task_stamp.task_instance_id,
+      attemptId: request.learning_task_stamp.attempt_id,
+      requestId: request.learning_task_stamp.request_id,
+      idempotencyKey: request.learning_task_stamp.idempotency_key,
+      requestFingerprint: codeLoopRequestFingerprint(request),
+      surface: "code-loop",
+      gatewayEcho: echo,
+    }).kind).toBe("claimed");
+
+    const restartedEpoch = createLearningTaskCapabilityEpoch();
+    const tightenedConfig = startCfg({
+      caps: { ...CAPS, turnsMax: 10 },
+    });
+    expect(await startCodeLoop(
+      request,
+      tightenedConfig,
+      stampedDeps(
+        restartedEpoch,
+        "opaque:51515151-5151-4151-8151-515151515151",
+        "service:hugin",
+        Date.parse("2026-07-19T10:20:03.000Z"),
+      ),
+    )).toMatchObject({
+      ok: false,
+      refusal: "admission-recovery",
+      recovered_admission: true,
+      learning_task_gateway_echo: echo,
+    });
+  });
+
+  it("rejects a durable run whose stored echo is not the exact incoming stamped identity", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    const substitutedStamp = structuredClone(request.learning_task_stamp);
+    substitutedStamp.macro_decision.policy_id = "substituted-persisted-policy";
+    const mismatchedEcho = createLearningTaskGatewayEcho(substitutedStamp, {
+      authenticatedPrincipalId: "service:hugin",
+      authentication: "gateway-owner-auth",
+      gatewayRequestId: "opaque:61616161-6161-4161-8161-616161616161",
+      admissionId: "opaque:71717171-7171-4171-8171-717171717171",
+      admittedAt: new Date(nowMs),
+    });
+    expect(claimDurableCodeLoopRun(workroot, {
+      schema_version: 1,
+      client_run_id: request.client_run_id,
+      // Simulate a historical/inconsistent record whose fingerprint did not cover its echo.
+      request_fingerprint: codeLoopRequestFingerprint(request),
+      work_id: "cl-20260719-deadbeef",
+      status: "completed",
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      result: null,
+      started_at_ms: nowMs,
+      learning_task_gateway_echo: mismatchedEcho,
+    }).kind).toBe("claimed");
+
+    expect(await startCodeLoop(request, startCfg(), stampedDeps(epoch)))
+      .toMatchObject({ ok: false, refusal: "conflict" });
   });
 });
 

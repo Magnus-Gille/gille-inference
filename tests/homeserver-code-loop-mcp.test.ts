@@ -75,6 +75,12 @@ function callBody(id: number, name: string, args: Record<string, unknown> = {}):
   return { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } };
 }
 
+async function learningTaskPreflight(key?: string): Promise<Response> {
+  return fetch(`http://127.0.0.1:${gatewayPort}/v1/capabilities/learning-task`, {
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+  });
+}
+
 async function listedToolNames(key: string): Promise<string[]> {
   const raw = await rpcRaw(toolsListBody(1), key);
   const parsed = JSON.parse(raw) as { result: { tools: Array<{ name: string }> } };
@@ -89,6 +95,35 @@ async function listedTools(key: string): Promise<Array<{ name: string; descripti
 
 const CODE_LOOP_TOOLS = ["code_loop_start", "code_loop_status", "code_loop_result"];
 
+describe("LearningTaskContract authenticated preflight", () => {
+  it("does not advertise the learning seam without authentication", async () => {
+    const response = await learningTaskPreflight();
+    expect(response.status).toBe(401);
+  });
+
+  it("advertises the exact accepted v1 contract to an authenticated Hugin-capable caller", async () => {
+    const response = await learningTaskPreflight(ownerKey);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("private, max-age=900");
+    expect(await response.json()).toMatchObject({
+      endpoint: "/v1/capabilities/learning-task",
+      protocol_version: "learning-task-preflight/v1",
+      authenticated_principal_id: "service:gille-inference",
+      authentication: "service-auth",
+      capabilities: {
+        contract_version: "grimnir.learning-task/v1",
+        schema_revision: 1,
+        features: [
+          "hugin-request-stamp-v1",
+          "gateway-echo-v1",
+          "three-stage-prompt-provenance-v1",
+          "reproducible-serving-digests-v1",
+        ],
+      },
+    });
+  });
+});
+
 describe("code_loop_* visibility in tools/list", () => {
   it("a minted OWNER key sees all three code_loop tools", async () => {
     const names = await listedToolNames(ownerKey);
@@ -102,6 +137,10 @@ describe("code_loop_* visibility in tools/list", () => {
     const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
     expect(start?.inputSchema?.properties).toHaveProperty("client_run_id");
     expect(JSON.stringify(start?.inputSchema?.properties?.["client_run_id"])).toContain("client-run-id-v1");
+    expect(start?.inputSchema?.properties).toHaveProperty("learning_task_stamp");
+    expect(JSON.stringify(start?.inputSchema?.properties?.["learning_task_stamp"])).toContain(
+      "LearningTaskContract v1",
+    );
   });
 
   it("advertises the exact harness and evidence contract before a paid start", async () => {
@@ -154,6 +193,20 @@ describe("code_loop_* calls by non-owners — byte-identical unknown-tool error"
 });
 
 describe("owner call with the feature flag OFF", () => {
+  it("rejects a malformed learning_task_stamp instead of silently entering the legacy path", async () => {
+    const raw = await rpcRaw(
+      callBody(7, "code_loop_start", {
+        learning_task_stamp: { contract_version: "grimnir.learning-task/v0" },
+        instruction: "x",
+        files: [{ path: "a.ts", content: "y" }],
+      }),
+      ownerKey,
+    );
+    const parsed = JSON.parse(raw) as { result: { content: Array<{ text: string }>; isError: boolean } };
+    expect(parsed.result.isError).toBe(true);
+    expect(JSON.parse(parsed.result.content[0]!.text)).toMatchObject({ refusal: "invalid-request" });
+  });
+
   it("rejects a supplied non-string client_run_id instead of silently entering legacy mode", async () => {
     const raw = await rpcRaw(
       callBody(8, "code_loop_start", {
