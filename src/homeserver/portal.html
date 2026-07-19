@@ -194,7 +194,8 @@
     <p>
       <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) serving each model via
       llama-server, hot-swapped by llama-swap, behind an authenticating &amp; metering gateway,
-      exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API.
+      exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
+      content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation.
     </p>
     <p style="margin-bottom:8px"><strong>Models</strong> (mostly Q4_K_M; VibeThinker uses Q8_0;
       gpt-oss uses MXFP4):</p>
@@ -376,6 +377,20 @@
         <p><strong>List models your key can use:</strong></p>
         <pre>curl https://inference.example.com/v1/models \
   -H "Authorization: Bearer $HS_KEY"</pre>
+
+        <p><strong>Learning-task capability preflight (automation clients):</strong></p>
+        <pre>curl https://inference.example.com/v1/capabilities/learning-task \
+  -H "Authorization: Bearer $HS_KEY"</pre>
+        <p>
+          Returns the content-blind <span class="badge mono">grimnir.learning-task/v1</span>
+          capability advertisement, service identity, and exact observation/expiry clocks.
+          Hugin carries the fresh response into stamped owner-only
+          <span class="badge mono">/delegate</span> or
+          <span class="badge mono">code_loop_start</span> traffic; the gateway rejects stale,
+          downgraded, cross-principal, replayed, or cross-restart stamps before model work begins.
+          Unstamped <span class="badge mono">/delegate</span> remains a legacy compatibility path
+          and is not eligible for joined learning-task evidence.
+        </p>
 
         <p><strong>Public usage stats (no key needed):</strong></p>
         <pre>curl https://inference.example.com/portal/stats</pre>

@@ -38,6 +38,18 @@ import {
   TASK_FINGERPRINT_VERSION,
   recordTaskExposureBestEffort,
 } from "./task-exposure.js";
+import {
+  LearningTaskContractError,
+  createLearningTaskGatewayEcho,
+  jcsCanonicalize,
+  validateHuginRequestStamp,
+  type LearningTaskGatewayEcho,
+} from "./learning-task-contract.js";
+import {
+  claimLearningTaskAdmission,
+  lookupLearningTaskAdmission,
+  releaseLearningTaskAdmission,
+} from "./learning-task-admission-store.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -103,6 +115,12 @@ export function codeLoopToolDefs(): unknown[] {
             type: "string",
             pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
             description: "optional durable caller idempotency key (client-run-id-v1)",
+          },
+          learning_task_stamp: {
+            type: "object",
+            description:
+              "optional Grimnir LearningTaskContract v1 Hugin request stamp; requires an exact " +
+              "fresh authenticated preflight and is echoed only after durable admission",
           },
           instruction: { type: "string", description: "the task prompt" },
           files: {
@@ -178,7 +196,12 @@ export type ValidateResult =
   | { ok: true; caps: CodeLoopCaps }
   | { ok: false; message: string };
 
-export function validateCodeLoopRequest(req: CodeLoopRequest, capsConfig: CodeLoopCapsConfig): ValidateResult {
+export type StructuralValidateResult =
+  | { ok: true }
+  | { ok: false; message: string };
+
+/** Immutable shape/size checks required before safely deriving the durable request identity. */
+export function validateCodeLoopRequestStructure(req: CodeLoopRequest): StructuralValidateResult {
   try {
     validateClientRunId(req.client_run_id);
   } catch (err) {
@@ -206,12 +229,23 @@ export function validateCodeLoopRequest(req: CodeLoopRequest, capsConfig: CodeLo
   if (total > MAX_TOTAL_BYTES) {
     return { ok: false, message: `Seed content too large (${total} bytes > ${MAX_TOTAL_BYTES}).` };
   }
-  const caps = clampCaps(req.caps, capsConfig);
   const rawDeadline = req.caps?.edit_deadline_turn;
   if (rawDeadline !== undefined) {
     if (typeof rawDeadline !== "number" || !Number.isInteger(rawDeadline) || rawDeadline < 1) {
       return { ok: false, message: "`caps.edit_deadline_turn` must be a positive integer." };
     }
+  }
+  return { ok: true };
+}
+
+/** Mutable deployment policy; exact durable recovery must be checked before consulting this. */
+export function validateCodeLoopCaps(
+  req: CodeLoopCapsRequest | undefined,
+  capsConfig: CodeLoopCapsConfig,
+): ValidateResult {
+  const caps = clampCaps(req, capsConfig);
+  const rawDeadline = req?.edit_deadline_turn;
+  if (rawDeadline !== undefined) {
     if (rawDeadline > caps.turns) {
       return {
         ok: false,
@@ -220,6 +254,13 @@ export function validateCodeLoopRequest(req: CodeLoopRequest, capsConfig: CodeLo
     }
   }
   return { ok: true, caps };
+}
+
+/** Public compatibility validator used by callers that need both structure and current policy. */
+export function validateCodeLoopRequest(req: CodeLoopRequest, capsConfig: CodeLoopCapsConfig): ValidateResult {
+  const structural = validateCodeLoopRequestStructure(req);
+  if (!structural.ok) return structural;
+  return validateCodeLoopCaps(req.caps, capsConfig);
 }
 
 const EDIT_DEADLINE_POLICY_VERSION = 1;
@@ -349,6 +390,7 @@ interface Job {
   /** Always present; omitted caller IDs receive an unreachable server-only durable identity. */
   durableClientRunId: string;
   durableRequestFingerprint: string;
+  learningTaskGatewayEcho: LearningTaskGatewayEcho | null;
 }
 
 const jobs = new Map<string, Job>();
@@ -454,8 +496,8 @@ export async function startCodeLoop(
   cfg: CodeLoopStartConfig,
   deps: CodeLoopDeps
 ): Promise<CodeLoopStartResult> {
-  const valid = validateCodeLoopRequest(req, cfg.caps);
-  if (!valid.ok) return { ok: false, refusal: "invalid-request", message: valid.message };
+  const structural = validateCodeLoopRequestStructure(req);
+  if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
   const clientRunId = validateClientRunId(req.client_run_id);
   const taskType = req.task_type && req.task_type.trim() !== "" ? req.task_type : classifyTask(req.instruction).taskType;
   const requestFingerprint = clientRunId === null
@@ -478,6 +520,32 @@ export async function startCodeLoop(
           message: "`client_run_id` is already bound to a different canonical request fingerprint.",
         };
       }
+      if (req.learning_task_stamp !== undefined) {
+        const admission = deps.learningTaskAdmission;
+        const persistedEcho = existing.learning_task_gateway_echo;
+        if (admission === undefined
+          || admission.authenticatedPrincipalId !== req.learning_task_stamp.expected_transport_principal_id
+          || persistedEcho?.authenticated_principal_id !== admission.authenticatedPrincipalId) {
+          return {
+            ok: false,
+            refusal: "invalid-request",
+            message: "Authenticated principal does not match the durable LearningTaskContract admission.",
+          };
+        }
+        if (jcsCanonicalize(persistedEcho.echoed_request) !== jcsCanonicalize(req.learning_task_stamp)) {
+          return {
+            ok: false,
+            refusal: "conflict",
+            message: "Durable LearningTaskContract echo does not match the exact incoming request stamp.",
+          };
+        }
+      } else if (existing.learning_task_gateway_echo !== undefined) {
+        return {
+          ok: false,
+          refusal: "conflict",
+          message: "Durable LearningTaskContract run cannot be recovered without its exact request stamp.",
+        };
+      }
       // A post-deploy retry normally hits the event written at original acceptance. For a
       // pre-feature recovered run, publish only metadata retained in its terminal result; never
       // relabel an older/running harness with today's configured model or contract version.
@@ -488,6 +556,107 @@ export async function startCodeLoop(
         existing.result?.execution.harness_version ?? null
       );
       return startResultFromRecord(failClosedIncompatibleResult(cfg.workroot, existing), true);
+    }
+  }
+
+  if (req.learning_task_stamp !== undefined) {
+    const stamp = req.learning_task_stamp;
+    const admission = deps.learningTaskAdmission;
+    if (admission === undefined) {
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: "LearningTaskContract stamp arrived without authenticated gateway admission context.",
+      };
+    }
+    // These bindings are independent of the rotating capability epoch and must still fail closed
+    // on recovery. In particular, client_run_id is excluded from the canonical request digest, so
+    // it must be checked explicitly before an exact durable admission can be returned.
+    if (admission.authenticatedPrincipalId !== stamp.expected_transport_principal_id) {
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: "Authenticated principal does not match expected transport principal.",
+      };
+    }
+    if (clientRunId === null || requestFingerprint === null || clientRunId !== stamp.idempotency_key) {
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: "Learning-task idempotency key must equal the durable transport idempotency key.",
+      };
+    }
+    if (taskType !== stamp.task_type.id) {
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: "Stamped task type does not match the effective gateway task type.",
+      };
+    }
+
+    // Admission can have been durably published immediately before a process crash. Recover that
+    // exact identity before consulting the now-rotated epoch or any transient execution gate.
+    const recovery = lookupLearningTaskAdmission({
+      principalId: admission.authenticatedPrincipalId,
+      clientId: stamp.client_id,
+      taskInstanceId: stamp.task_instance_id,
+      attemptId: stamp.attempt_id,
+      requestId: stamp.request_id,
+      idempotencyKey: stamp.idempotency_key,
+      requestFingerprint: requestFingerprint,
+      surface: "code-loop",
+    });
+    if (recovery.kind === "existing") {
+      return {
+        ok: false,
+        refusal: "admission-recovery",
+        message:
+          "Exact LearningTaskContract admission recovered, but its durable code-loop work record is unavailable; execution was not replayed.",
+        recovered_admission: true,
+        learning_task_gateway_echo: recovery.record.gatewayEcho,
+      };
+    }
+    if (recovery.kind === "conflict") {
+      return {
+        ok: false,
+        refusal: "conflict",
+        message: "LearningTaskContract request, attempt, or idempotency identity is already admitted.",
+      };
+    }
+  }
+
+  const capPolicy = validateCodeLoopCaps(req.caps, cfg.caps);
+  if (!capPolicy.ok) {
+    return { ok: false, refusal: "invalid-request", message: capPolicy.message };
+  }
+
+  let validatedLearningStamp = null;
+  if (req.learning_task_stamp !== undefined) {
+    const admission = deps.learningTaskAdmission;
+    if (admission === undefined) {
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: "LearningTaskContract stamp arrived without authenticated gateway admission context.",
+      };
+    }
+    try {
+      validatedLearningStamp = validateHuginRequestStamp(req.learning_task_stamp, {
+        capabilityEpoch: admission.capabilityEpoch,
+        authenticatedPrincipalId: admission.authenticatedPrincipalId,
+        authentication: admission.authentication,
+        transportIdempotencyKey: clientRunId,
+        effectiveTaskType: taskType,
+        now: new Date(deps.now()),
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: err instanceof LearningTaskContractError
+          ? err.message
+          : `LearningTaskContract validation failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -599,8 +768,76 @@ export async function startCodeLoop(
   // succeeded, but immediately before the job becomes observable/engine work begins. A retry
   // racing a failed admission sees only `busy`, never a recovered work_id that rollback erases.
   const acceptedAt = deps.now();
+  let learningTaskGatewayEcho: LearningTaskGatewayEcho | null = null;
+  if (validatedLearningStamp !== null) {
+    const admission = deps.learningTaskAdmission!;
+    try {
+      learningTaskGatewayEcho = createLearningTaskGatewayEcho(validatedLearningStamp, {
+        authenticatedPrincipalId: admission.authenticatedPrincipalId,
+        authentication: admission.authentication,
+        gatewayRequestId: admission.gatewayRequestId,
+        admissionId: `opaque:${randomUUID()}`,
+        admittedAt: new Date(acceptedAt),
+      });
+    } catch (err) {
+      try { await lease.release(); } catch { /* best effort */ }
+      rollbackAdmission();
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
   const durableClientRunId = clientRunId ?? `__internal__/${workId}`;
   const durableRequestFingerprint = requestFingerprint ?? codeLoopRequestFingerprint(req);
+  let learningAdmissionRecordId: string | null = null;
+  if (validatedLearningStamp !== null && learningTaskGatewayEcho !== null) {
+    const admission = deps.learningTaskAdmission!;
+    try {
+      const learningClaim = claimLearningTaskAdmission({
+        principalId: admission.authenticatedPrincipalId,
+        clientId: validatedLearningStamp.client_id,
+        taskInstanceId: validatedLearningStamp.task_instance_id,
+        attemptId: validatedLearningStamp.attempt_id,
+        requestId: validatedLearningStamp.request_id,
+        idempotencyKey: validatedLearningStamp.idempotency_key,
+        requestFingerprint: durableRequestFingerprint,
+        surface: "code-loop",
+        gatewayEcho: learningTaskGatewayEcho,
+      });
+      if (learningClaim.kind === "existing") {
+        try { await lease.release(); } catch { /* best effort */ }
+        rollbackAdmission();
+        return {
+          ok: false,
+          refusal: "admission-recovery",
+          message:
+            "Exact LearningTaskContract admission recovered, but its durable code-loop work record is unavailable; execution was not replayed.",
+          recovered_admission: true,
+          learning_task_gateway_echo: learningClaim.record.gatewayEcho,
+        };
+      }
+      if (learningClaim.kind === "conflict") {
+        try { await lease.release(); } catch { /* best effort */ }
+        rollbackAdmission();
+        return {
+          ok: false,
+          refusal: "conflict",
+          message: "LearningTaskContract request, attempt, or idempotency identity is already admitted.",
+        };
+      }
+      learningAdmissionRecordId = learningClaim.record.admissionRecordId;
+    } catch (err) {
+      try { await lease.release(); } catch { /* best effort */ }
+      rollbackAdmission();
+      return {
+        ok: false,
+        refusal: "invalid-request",
+        message: `Could not durably bind LearningTaskContract admission: ${(err as Error).message}`,
+      };
+    }
+  }
   {
     const candidate: DurableCodeLoopRun = {
       schema_version: 1,
@@ -611,10 +848,14 @@ export async function startCodeLoop(
       usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
       result: null,
       started_at_ms: acceptedAt,
+      ...(learningTaskGatewayEcho !== null ? { learning_task_gateway_echo: learningTaskGatewayEcho } : {}),
     };
     try {
       const claim = claimDurableCodeLoopRun(cfg.workroot, candidate);
       if (claim.kind === "conflict" || claim.kind === "existing") {
+        if (learningAdmissionRecordId !== null) {
+          try { releaseLearningTaskAdmission(learningAdmissionRecordId); } catch { /* preserve claim failure */ }
+        }
         try { await lease.release(); } catch { /* best effort */ }
         rollbackAdmission();
         if (claim.kind === "existing" && clientRunId !== null) {
@@ -635,6 +876,9 @@ export async function startCodeLoop(
       }
       durable = claim.record;
     } catch (err) {
+      if (learningAdmissionRecordId !== null) {
+        try { releaseLearningTaskAdmission(learningAdmissionRecordId); } catch { /* preserve durable publish failure */ }
+      }
       try { await lease.release(); } catch { /* best effort */ }
       rollbackAdmission();
       return { ok: false, refusal: "invalid-request", message: `Could not durably bind run identity: ${(err as Error).message}` };
@@ -650,7 +894,7 @@ export async function startCodeLoop(
     checkCmd: typeof req.check_cmd === "string" && req.check_cmd.trim() !== "" ? req.check_cmd : null,
     protectedGlobs: Array.isArray(req.protected) ? req.protected.filter((g) => typeof g === "string") : [],
     startedAtMs: acceptedAt,
-    effectiveCaps: valid.caps,
+    effectiveCaps: capPolicy.caps,
     usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
     engineTelemetry: null,
     result: null,
@@ -660,6 +904,7 @@ export async function startCodeLoop(
     requestFingerprint,
     durableClientRunId,
     durableRequestFingerprint,
+    learningTaskGatewayEcho,
   };
   jobs.set(workId, job);
   // The run is durably accepted and about to reach the model. A recovered retry uses the same
@@ -702,6 +947,7 @@ export async function startCodeLoop(
     client_run_id: clientRunId,
     request_fingerprint: requestFingerprint,
     recovered: false,
+    ...(learningTaskGatewayEcho !== null ? { learning_task_gateway_echo: learningTaskGatewayEcho } : {}),
     capabilities: CODE_LOOP_CAPABILITIES,
   };
 }
@@ -714,6 +960,9 @@ function startResultFromRecord(record: DurableCodeLoopRun, recovered: boolean): 
     client_run_id: record.client_run_id,
     request_fingerprint: record.request_fingerprint,
     recovered,
+    ...(record.learning_task_gateway_echo !== undefined
+      ? { learning_task_gateway_echo: record.learning_task_gateway_echo }
+      : {}),
     ...(record.result !== null && isCurrentCodeLoopResult(record.result) ? { result: record.result } : {}),
     capabilities: CODE_LOOP_CAPABILITIES,
   };
@@ -966,6 +1215,9 @@ function persistJobDurable(job: Job): void {
       usage: job.usage,
       result: job.result,
       started_at_ms: job.startedAtMs,
+      ...(job.learningTaskGatewayEcho !== null
+        ? { learning_task_gateway_echo: job.learningTaskGatewayEcho }
+        : {}),
     });
   } catch (err) {
     console.error("[code-loop] durable idempotency update failed:", err);
@@ -992,6 +1244,7 @@ function writeLedger(
       completionTokens: job.usage.completion_tokens || null,
       verifier: job.checkCmd !== null ? "check-cmd" : null,
       source: "code-loop",
+      keyAlias: deps.keyAlias ?? null,
     });
   } catch (err) {
     // Never let a telemetry write break the run.

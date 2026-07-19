@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { randomUUID } from "node:crypto";
+import { getDb, initDb } from "../src/db.js";
 
 // The gateway reads config from env at startGateway() time. We must set env BEFORE
 // importing config/gateway, and isolate the DB before any keystore call. Tests drive a
@@ -13,6 +14,7 @@ let upstream: Server;
 let upstreamPort = 0;
 let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "nonjson" | "reset" = "ok";
 let lastUpstreamBody = "";
+let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
 
 function startUpstream(): Promise<void> {
@@ -20,6 +22,7 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", async () => {
+      if (req.url?.endsWith("/chat/completions")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
       if (mockMode === "notfound") {
         res.writeHead(404, { "content-type": "application/json" });
@@ -79,6 +82,7 @@ function startUpstream(): Promise<void> {
 let startGateway: typeof import("../src/homeserver/gateway.js").startGateway;
 let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let lookupKey: typeof import("../src/homeserver/keystore.js").lookupKey;
+let recordCreditUsage: typeof import("../src/homeserver/keystore.js").recordUsage;
 let loadConfig: typeof import("../src/homeserver/config.js").loadConfig;
 let resetQuotaWindows: typeof import("../src/homeserver/quota.js").resetQuotaWindows;
 let taskTextFingerprint: typeof import("../src/homeserver/task-exposure.js").taskTextFingerprint;
@@ -112,6 +116,7 @@ beforeAll(async () => {
   startGateway = gw.startGateway;
   mintKey = ks.mintKey;
   lookupKey = ks.lookupKey;
+  recordCreditUsage = ks.recordUsage;
   loadConfig = cfgMod.loadConfig;
   resetQuotaWindows = q.resetQuotaWindows;
   taskTextFingerprint = exposure.taskTextFingerprint;
@@ -131,6 +136,7 @@ afterAll(async () => {
 beforeEach(() => {
   mockMode = "ok";
   releaseStall = null;
+  upstreamInferenceRequestCount = 0;
   resetQuotaWindows();
 });
 
@@ -149,7 +155,302 @@ async function chat(token: string, body: Record<string, unknown>): Promise<Respo
 const ADMIN = "admin-static-key";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
+async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Promise<{
+  principalId: string;
+  stamp: Record<string, any>;
+  requestBody: Record<string, any>;
+}> {
+  const principalId = lookupKey(owner.plaintextKey)!.alias;
+  const preflightResponse = await fetch(url("/v1/capabilities/learning-task"), {
+    headers: { authorization: `Bearer ${owner.plaintextKey}` },
+  });
+  expect(preflightResponse.status).toBe(200);
+  const advertisement = await preflightResponse.json() as Record<string, unknown> & {
+    advertised_at: string;
+    capabilities: unknown;
+  };
+  const requestFixture = JSON.parse(readFileSync(
+    new URL("./fixtures/hugin-learning-task-request-v1.json", import.meta.url),
+    "utf8",
+  )) as {
+    prompt: string;
+    taskType: string;
+    huginTaskIdentity: Record<string, any>;
+    learningTaskStamp: Record<string, any>;
+  };
+  const stamp = structuredClone(requestFixture.learningTaskStamp);
+  const advertisedMs = Date.parse(advertisement.advertised_at);
+  stamp.task_instance_id = `task-${randomUUID()}`;
+  stamp.attempt_id = "attempt-1";
+  stamp.idempotency_key = `opaque:${randomUUID()}`;
+  stamp.request_id = `opaque:${randomUUID()}`;
+  stamp.expected_transport_principal_id = principalId;
+  stamp.source.created_at = new Date(advertisedMs - 3_000).toISOString();
+  stamp.source.accepted_at = new Date(advertisedMs - 2_000).toISOString();
+  stamp.preflight.request.request_id = `opaque:${randomUUID()}`;
+  stamp.preflight.request.requested_at = new Date(advertisedMs - 1_000).toISOString();
+  stamp.preflight.response = advertisement;
+  stamp.stamped_at = advertisement.advertised_at;
+  return {
+    principalId,
+    stamp,
+    requestBody: {
+      ...structuredClone(requestFixture),
+      modelId: "m1",
+      maxTokens: 16,
+      learningTaskStamp: stamp,
+    },
+  };
+}
+
 describe("gateway spine — HTTP integration", () => {
+  it("recovers stamped /delegate before quota, busy admission, and a rotated gateway epoch", async () => {
+    const owner = mintKey({
+      alias: `service-hugin-${randomUUID()}`,
+      tier: "owner",
+      rpm: 1,
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const { principalId, stamp, requestBody } = await makeStampedDelegateRequest(owner);
+
+    const { taskType: _taskType, ...missingTaskTypeBody } = requestBody;
+    const missingTaskType = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(missingTaskTypeBody),
+    });
+    expect(missingTaskType.status).toBe(400);
+    expect(await missingTaskType.json()).toMatchObject({
+      error: { code: "invalid_request_error", param: "taskType" },
+    });
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const wrongPrincipalBody = structuredClone(requestBody);
+    wrongPrincipalBody.learningTaskStamp.expected_transport_principal_id = "service:not-this-caller";
+    const wrongPrincipal = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(wrongPrincipalBody),
+    });
+    expect(wrongPrincipal.status).toBe(400);
+    expect(await wrongPrincipal.json()).toMatchObject({
+      error: { code: "invalid_request_error", param: "learningTaskStamp" },
+    });
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const first = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json() as {
+      learningTaskGatewayEcho: Record<string, any>;
+    };
+    expect(firstBody.learningTaskGatewayEcho).toMatchObject({
+      echoed_request: stamp,
+      authenticated_principal_id: principalId,
+      authentication: "gateway-owner-auth",
+      capabilities: stamp.contract_request,
+    });
+    expect(firstBody.learningTaskGatewayEcho.gateway_request_id).toMatch(/^opaque:[0-9a-f-]{36}$/);
+    expect(firstBody.learningTaskGatewayEcho.admission_id).toMatch(/^opaque:[0-9a-f-]{36}$/);
+    const callsAfterFirstAdmission = upstreamInferenceRequestCount;
+    expect(callsAfterFirstAdmission).toBeGreaterThan(0);
+
+    const replay = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      outcome: "error",
+      learningTaskAdmission: {
+        recovered: true,
+        outcomeAvailable: false,
+      },
+      learningTaskGatewayEcho: firstBody.learningTaskGatewayEcho,
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsAfterFirstAdmission);
+
+    const freshIdempotency = structuredClone(requestBody);
+    freshIdempotency.learningTaskStamp.idempotency_key = `opaque:${randomUUID()}`;
+    freshIdempotency.learningTaskStamp.request_id = `opaque:${randomUUID()}`;
+    const naturalReplay = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(freshIdempotency),
+    });
+    expect(naturalReplay.status).toBe(409);
+    expect(upstreamInferenceRequestCount).toBe(callsAfterFirstAdmission);
+
+    const clientSubstitution = structuredClone(freshIdempotency);
+    clientSubstitution.learningTaskStamp.client_id = "substituted-client";
+    clientSubstitution.learningTaskStamp.idempotency_key = `opaque:${randomUUID()}`;
+    clientSubstitution.learningTaskStamp.request_id = `opaque:${randomUUID()}`;
+    const substituted = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(clientSubstitution),
+    });
+    expect(substituted.status).toBe(409);
+    expect(upstreamInferenceRequestCount).toBe(callsAfterFirstAdmission);
+
+    const requestReplay = structuredClone(requestBody);
+    requestReplay.learningTaskStamp.idempotency_key = `opaque:${randomUUID()}`;
+    requestReplay.learningTaskStamp.attempt_id = "attempt-2";
+    const repeatedRequest = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestReplay),
+    });
+    expect(repeatedRequest.status).toBe(409);
+    expect(upstreamInferenceRequestCount).toBe(callsAfterFirstAdmission);
+
+    // Recovery must not queue behind or acquire the scarce model slot. Hold that slot with a
+    // different authenticated owner, then require the stored response-loss echo immediately.
+    // Clear the quota window first so this assertion exercises the busy gate independently.
+    resetQuotaWindows();
+    mockMode = "stall";
+    const holder = mintKey({ alias: `delegate-holder-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const heldRequest = fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${holder.plaintextKey}` },
+      body: JSON.stringify({ prompt: "hold the model slot", taskType: "summarize", modelId: "m1" }),
+    });
+    for (let attempt = 0; attempt < 20 && releaseStall === null; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(releaseStall).not.toBeNull();
+
+    const busyRecoveryPromise = fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    const busyRecoveryWasImmediate = await Promise.race([
+      busyRecoveryPromise.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 150)),
+    ]);
+    releaseStall?.();
+    const [heldResponse, busyRecovery] = await Promise.all([heldRequest, busyRecoveryPromise]);
+    mockMode = "ok";
+    expect(heldResponse.status).toBe(200);
+    expect(busyRecoveryWasImmediate).toBe(true);
+    expect(busyRecovery.status).toBe(200);
+    expect(await busyRecovery.json()).toMatchObject({
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+      learningTaskGatewayEcho: firstBody.learningTaskGatewayEcho,
+    });
+
+    // Exhaust the non-resetting credit cap after the original execution. Recovery is a durable
+    // identity read, not a new paid request, so it must still return the stored echo.
+    const creditRecord = lookupKey(owner.plaintextKey)!;
+    recordCreditUsage(creditRecord.keyHash, creditRecord.creditLimit);
+    const creditRecovery = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(creditRecovery.status).toBe(200);
+    expect(await creditRecovery.json()).toMatchObject({
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+      learningTaskGatewayEcho: firstBody.learningTaskGatewayEcho,
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsAfterFirstAdmission + 1);
+
+    // A real restart rotates the private capability epoch. That invalidates new sends, but an
+    // already-admitted exact retry must still recover its original echo without inference.
+    await stopGateway?.();
+    const restarted = await startGateway();
+    gatewayPort = restarted.port;
+    stopGateway = restarted.stop;
+    const callsBeforeRestartRecovery = upstreamInferenceRequestCount;
+    const restartedRecovery = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(restartedRecovery.status).toBe(200);
+    expect(await restartedRecovery.json()).toMatchObject({
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+      learningTaskGatewayEcho: firstBody.learningTaskGatewayEcho,
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsBeforeRestartRecovery);
+
+    const changedTask = structuredClone(requestBody);
+    changedTask.taskType = "extract";
+    const changedTaskResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(changedTask),
+    });
+    expect(changedTaskResponse.status).toBe(409);
+
+    const changedFingerprint = structuredClone(requestBody);
+    changedFingerprint.prompt += " substituted";
+    const changedFingerprintResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(changedFingerprint),
+    });
+    expect(changedFingerprintResponse.status).toBe(409);
+
+    const otherOwner = mintKey({ alias: `delegate-recovery-other-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const changedPrincipalResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${otherOwner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(changedPrincipalResponse.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(callsBeforeRestartRecovery);
+  });
+
+  it("preserves stamped /delegate admission when ledger persistence throws after inference", async () => {
+    const owner = mintKey({ alias: `service-hugin-post-inference-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    const { recordDelegation } = await import("../src/homeserver/ledger.js");
+    // Initialize the ledger schema before installing a deterministic post-inference failure.
+    recordDelegation({ taskType: "test-setup", modelId: "m1", prompt: "setup", outcome: "unverified" });
+    getDb().exec(`
+      DROP TRIGGER IF EXISTS test_reject_delegate_ledger;
+      CREATE TRIGGER test_reject_delegate_ledger
+      BEFORE INSERT ON delegations
+      BEGIN
+        SELECT RAISE(FAIL, 'forced post-inference ledger failure');
+      END;
+    `);
+
+    const failed = await (async () => {
+      try {
+        return await fetch(url("/delegate"), {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+          body: JSON.stringify(requestBody),
+        });
+      } finally {
+        getDb().exec("DROP TRIGGER IF EXISTS test_reject_delegate_ledger");
+      }
+    })();
+    expect(failed.status).toBe(500);
+    const callsAfterPostInferenceFailure = upstreamInferenceRequestCount;
+    expect(callsAfterPostInferenceFailure).toBe(1);
+
+    const retry = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({
+      outcome: "error",
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+      learningTaskGatewayEcho: { echoed_request: requestBody.learningTaskStamp },
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsAfterPostInferenceFailure);
+  });
+
   it("key lifecycle E2E: mint guest → auth ok → revoke → 401", async () => {
     const minted = mintKey({ alias: "e2e-guest", tier: "guest" }, DEFAULTS);
     const ok = await chat(minted.plaintextKey, {});

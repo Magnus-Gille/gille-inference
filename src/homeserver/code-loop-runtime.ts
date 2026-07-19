@@ -15,6 +15,11 @@ import {
   type GatewayRelay,
 } from "./code-loop-cage.js";
 import { acquireGpuLease } from "./gpu-lease.js";
+import {
+  LearningTaskContractError,
+  parseHuginRequestStamp,
+  type LearningTaskCapabilityEpoch,
+} from "./learning-task-contract.js";
 
 /**
  * Composition root for code_loop's real dependencies (kept OUT of code-loop.ts so that module
@@ -94,7 +99,18 @@ export interface CodeLoopRuntime {
  * controller snapshot) so code_loop refuses during a model-scout window without importing the
  * controller.
  */
-export function buildCodeLoopRuntime(cfg: HomeserverConfig, maintenanceMode: () => boolean): CodeLoopRuntime {
+export interface CodeLoopGatewayContext {
+  authenticatedPrincipalId: string;
+  authentication: "gateway-owner-auth" | "service-auth";
+  gatewayRequestId: string;
+  capabilityEpoch: LearningTaskCapabilityEpoch;
+}
+
+export function buildCodeLoopRuntime(
+  cfg: HomeserverConfig,
+  maintenanceMode: () => boolean,
+  gatewayContext?: CodeLoopGatewayContext,
+): CodeLoopRuntime {
   const confinement = cfg.codeLoopConfinement;
   const home = homedir();
   const nm = nodeModulesDir();
@@ -162,6 +178,17 @@ export function buildCodeLoopRuntime(cfg: HomeserverConfig, maintenanceMode: () 
     engine,
     spawnPi: realSpawnPi,
     now: Date.now,
+    keyAlias: gatewayContext?.authenticatedPrincipalId ?? null,
+    ...(gatewayContext === undefined
+      ? {}
+      : {
+          learningTaskAdmission: {
+            capabilityEpoch: gatewayContext.capabilityEpoch,
+            authenticatedPrincipalId: gatewayContext.authenticatedPrincipalId,
+            authentication: gatewayContext.authentication,
+            gatewayRequestId: gatewayContext.gatewayRequestId,
+          },
+        }),
     readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
     maintenanceMode,
     growthCapBytes: GROWTH_CAP_BYTES,
@@ -268,9 +295,10 @@ export async function handleCodeLoopTool(
   name: string,
   args: Record<string, unknown>,
   cfg: HomeserverConfig,
-  maintenanceMode: () => boolean
+  maintenanceMode: () => boolean,
+  gatewayContext: CodeLoopGatewayContext,
 ): Promise<{ text: string; isError: boolean }> {
-  const { startConfig, deps } = buildCodeLoopRuntime(cfg, maintenanceMode);
+  const { startConfig, deps } = buildCodeLoopRuntime(cfg, maintenanceMode, gatewayContext);
 
   if (name === "code_loop_start") {
     if (Object.hasOwn(args, "client_run_id") && typeof args["client_run_id"] !== "string") {
@@ -279,8 +307,23 @@ export async function handleCodeLoopTool(
         isError: true,
       };
     }
+    let learningTaskStamp;
+    if (Object.hasOwn(args, "learning_task_stamp")) {
+      try {
+        learningTaskStamp = parseHuginRequestStamp(args["learning_task_stamp"]);
+      } catch (err) {
+        return {
+          text: JSON.stringify({
+            refusal: "invalid-request",
+            message: err instanceof LearningTaskContractError ? err.message : "invalid learning_task_stamp",
+          }),
+          isError: true,
+        };
+      }
+    }
     const req: CodeLoopRequest = {
       client_run_id: typeof args["client_run_id"] === "string" ? (args["client_run_id"] as string) : undefined,
+      ...(learningTaskStamp === undefined ? {} : { learning_task_stamp: learningTaskStamp }),
       instruction: typeof args["instruction"] === "string" ? (args["instruction"] as string) : "",
       files: Array.isArray(args["files"]) ? (args["files"] as CodeLoopRequest["files"]) : [],
       check_cmd: typeof args["check_cmd"] === "string" ? (args["check_cmd"] as string) : undefined,
@@ -297,13 +340,26 @@ export async function handleCodeLoopTool(
           client_run_id: r.client_run_id,
           request_fingerprint: r.request_fingerprint,
           recovered: r.recovered,
+          ...(r.learning_task_gateway_echo !== undefined
+            ? { learning_task_gateway_echo: r.learning_task_gateway_echo }
+            : {}),
           ...(r.result !== undefined ? { result: r.result } : {}),
           capabilities: r.capabilities,
         }),
         isError: false,
       };
     }
-    return { text: JSON.stringify({ refusal: r.refusal, message: r.message }), isError: true };
+    return {
+      text: JSON.stringify({
+        refusal: r.refusal,
+        message: r.message,
+        ...(r.recovered_admission === true ? { recovered_admission: true } : {}),
+        ...(r.learning_task_gateway_echo === undefined
+          ? {}
+          : { learning_task_gateway_echo: r.learning_task_gateway_echo }),
+      }),
+      isError: true,
+    };
   }
 
   if (name === "code_loop_status") {

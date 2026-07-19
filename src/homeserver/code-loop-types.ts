@@ -1,3 +1,9 @@
+import type {
+  HuginRequestStamp,
+  LearningTaskCapabilityEpoch,
+  LearningTaskGatewayEcho,
+} from "./learning-task-contract.js";
+
 /**
  * code_loop — frozen type contract (issue #116, docs/agentic-code-tool-design.md).
  *
@@ -47,6 +53,8 @@ export interface CodeLoopCapsConfig {
 export interface CodeLoopRequest {
   /** Optional durable idempotency key. Same id + same canonical request returns the same run. */
   client_run_id?: string;
+  /** Optional dual-read LearningTaskContract v1 stamp; validated before any new admission. */
+  learning_task_stamp?: HuginRequestStamp;
   /** The task prompt (required). */
   instruction: string;
   /** Phase-1 seeding: inline file subset (required, ≤64 files / ≤2 MB total, relative paths). */
@@ -70,7 +78,8 @@ export type CodeLoopRefusal =
   | "lease-unavailable"
   | "cage-unavailable"
   | "invalid-request"
-  | "conflict";
+  | "conflict"
+  | "admission-recovery";
 
 /** Terminal run statuses. `status` describes the RUN; verification lives in `check` —
  *  there is deliberately no "pass" status (design §4). */
@@ -188,13 +197,22 @@ export type CodeLoopStartResult =
       client_run_id: string | null;
       request_fingerprint: string | null;
       recovered: boolean;
+      /** Exact immutable echo for stamped starts; absent on the declared legacy path. */
+      learning_task_gateway_echo?: LearningTaskGatewayEcho;
       result?: CodeLoopResult;
       capabilities: {
         start_idempotency: "client-run-id-v1";
         agent_checks: "pi-bash-events-v3";
       };
     }
-  | { ok: false; refusal: CodeLoopRefusal; message: string };
+  | {
+      ok: false;
+      refusal: CodeLoopRefusal;
+      message: string;
+      /** Present only when an exact admission exists but its durable work record does not. */
+      recovered_admission?: true;
+      learning_task_gateway_echo?: LearningTaskGatewayEcho;
+    };
 
 // ─── Engine seam (pi is the only Phase-1 implementation; native A/B is Later) ───────────
 
@@ -268,6 +286,15 @@ export interface CodeLoopDeps {
   engine: AgentEngine;
   spawnPi: SpawnPiFn;
   now: () => number;
+  /** Authenticated transport facts injected by the gateway, never accepted from the JSON body. */
+  learningTaskAdmission?: {
+    capabilityEpoch: LearningTaskCapabilityEpoch;
+    authenticatedPrincipalId: string;
+    authentication: "gateway-owner-auth" | "service-auth";
+    gatewayRequestId: string;
+  };
+  /** Authenticated key alias persisted on the derived capability-ledger row. */
+  keyAlias?: string | null;
   /** Poll gateway/model readiness after a suspected degeneracy abort; resolves ready?. */
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */

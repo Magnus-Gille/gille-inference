@@ -2,7 +2,7 @@
 
 **Status:** stable reference for the BosGame M5 home-server gateway.
 **Audience:** Hugin's macro-router (the M5 runtime/executor), Heimdall's inference-observability collector, and any LAN client.
-**Source of truth:** `src/homeserver/gateway.ts` (routing), `src/homeserver/ledger.ts` (`/ledger`), `src/homeserver/model-admin.ts` (`/models`, `/admin/*` backend facade — routes to `llamaswap-admin.ts`, the default, or the deprecated `lmstudio-admin.ts` per `HOMESERVER_BACKEND`, #146), `src/homeserver/errors.ts` (envelopes). This doc is derived from those files — if they change, update this doc in the same PR.
+**Source of truth:** `src/homeserver/gateway.ts` (routing), `src/homeserver/learning-task-contract.ts` (LearningTaskContract preflight/stamp/echo), `src/homeserver/ledger.ts` (`/ledger`), `src/homeserver/model-admin.ts` (`/models`, `/admin/*` backend facade — routes to `llamaswap-admin.ts`, the default, or the deprecated `lmstudio-admin.ts` per `HOMESERVER_BACKEND`, #146), `src/homeserver/errors.ts` (envelopes). This doc is derived from those files — if they change, update this doc in the same PR.
 
 Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-routing (which node), the home-server gateway owns *micro*-routing + external admission, `ledger.ts` is the single capability KB (read via `/ledger`), and nightly local sub-tasks route through `/delegate`.
 
@@ -41,6 +41,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 401 | `invalid_api_key` | Missing/unknown Bearer key |
 | 403 | `route_not_allowed` (guest → `/delegate`, `/admin/*`, `/ledger`), `model_not_allowed` (a key's model allow-list on chat) | Tier/route or model not permitted |
 | 404 | `not_found` | Unknown route / no such resource |
+| 409 | `learning_task_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity |
 | 413 | `payload_too_large` | Request body exceeds the size cap |
 | 429 | quota codes | RPM/TPM/daily budget exceeded |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
@@ -58,6 +59,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 |--------|------|------|---------|
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
+| GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio) |
@@ -97,6 +99,101 @@ interface ModelInfo {
   "quantization": "Q4_K_M", "bitsPerWeight": 4.5, "sizeBytes": 4831838208, "paramsString": "7B",
   "maxContextLength": 131072, "vision": false, "toolUse": true, "loaded": true, "loadedContext": 32768 } ] }
 ```
+
+### GET `/v1/capabilities/learning-task`
+
+Authenticated, content-blind preflight for the accepted Grimnir LearningTaskContract v1. The
+closed response advertises contract version `grimnir.learning-task/v1`, schema revision `1`, the
+four required features, the fixed service identity `service:gille-inference`, and exact
+`advertised_at` / `expires_at` observation clocks. Responses are private-cacheable for at most
+15 minutes.
+
+`advertisement_id` is an opaque HMAC binding over the exact response and the running gateway's
+private capability epoch. A restart rotates that epoch, so a response cached from an older
+process/configuration is rejected even if its wall-clock expiry has not elapsed. The gateway
+accepts a **new** stamped task only when the response is from the current epoch, remains fresh,
+and its version, schema, and feature set match exactly. An exact authenticated recovery of an
+already-durable admission is the deliberate exception: it returns the original echo without
+creating or executing new work.
+
+```json
+{
+  "advertisement_id": "opaque:<uuid-v4>",
+  "endpoint": "/v1/capabilities/learning-task",
+  "protocol_version": "learning-task-preflight/v1",
+  "advertised_at": "<RFC3339 UTC>",
+  "expires_at": "<RFC3339 UTC, no more than 15 minutes later>",
+  "authenticated_principal_id": "service:gille-inference",
+  "authentication": "service-auth",
+  "capabilities": {
+    "contract_version": "grimnir.learning-task/v1",
+    "schema_revision": 1,
+    "features": [
+      "hugin-request-stamp-v1",
+      "gateway-echo-v1",
+      "three-stage-prompt-provenance-v1",
+      "reproducible-serving-digests-v1"
+    ]
+  }
+}
+```
+
+Hugin sends the exact preflight pair in either `code_loop_start.learning_task_stamp` or the actual
+one-shot inference lane, `POST /delegate`'s `learningTaskStamp`. Code-loop starts additionally bind
+`idempotency_key` to `client_run_id`; stamped `/delegate` requires an explicit `taskType`. Both bind
+the stamped task type to the effective gateway task type and `expected_transport_principal_id` to
+the authenticated minted-key alias. Stale advertisements, partial/unknown features, caller
+mismatches, malformed identity/config references, and replay under a changed durable request fail
+closed before model execution. After the surface's GPU admission, the
+start response contains `learning_task_gateway_echo`: the exact stamp, actual principal and
+authentication, admission/request IDs and clock, current capabilities, and the normative JCS
+principal-binding digest. That echo is durable and is returned unchanged on an exact idempotent
+recovery, including after restart. The recovered start co-returns the terminal `result.execution`
+when available, binding the same durable `work_id` to the effective model, harness, caps, and
+capabilities; unstamped legacy starts remain unchanged. The HTTP response spells the same field
+`learningTaskGatewayEcho` to match `/delegate`'s existing camel-case JSON API.
+
+Every stamped surface also claims one shared SQLite admission identity before model execution.
+The durable uniqueness boundaries are `(authenticated principal, idempotency_key)`,
+`(authenticated principal, task_instance_id, attempt_id)`, and `(authenticated principal,
+request_id)`. The natural attempt/request keys deliberately omit caller-supplied `client_id`, so
+changing that string cannot evade replay protection; `client_id` is nevertheless retained and must
+match on an exact identity. The table stores only the closed stamp/echo and request digest, never
+raw or rendered prompt content. An exact `/delegate` retry returns `200` with the stored echo,
+`outcome:"error"`, and `learningTaskAdmission:{recovered:true,outcomeAvailable:false}` without
+another model call: Hugin can preserve the admission join, but v1 does not pretend the unavailable
+original delegation result was recovered. The durable claim is the conservative "execution may
+have begun" boundary: once it exists, a later delegate/ledger exception never deletes it, because
+that exception can occur after inference. A mutated identity returns `409 learning_task_conflict`.
+`code_loop_start` normally recovers an exact previous durable result/echo before the shared guard.
+If a crash left the shared admission but not the work record, it instead returns the distinct
+`admission-recovery` refusal with the stored echo; changed identities remain `conflict`. This
+authenticated, fingerprint-exact lookup runs before current epoch/freshness validation and before
+current mutable code-loop cap policy, credit, quota, busy, cage, or GPU gates. Durable-run recovery
+also requires the persisted echo's complete request stamp to equal the incoming stamp. Only an
+identity absent from the durable guard proceeds as a new claim through current validation and
+transient gates.
+
+Clock validation deliberately allows **zero skew** in v1: request, advertisement, stamp, admission,
+and expiry timestamps must be monotonically ordered, and an advertisement is stale at its exact
+`expires_at`. Hugin and the gateway therefore require synchronized host clocks and should fetch a
+fresh preflight/retry after any clock-order refusal. No tolerance is applied because accepting
+future or expired stamps would weaken the durable evidence boundary.
+
+Admission records are currently retained durably without a local TTL so replay protection cannot
+silently expire. Delivery accounting, outcome retention, and the eventual explicit lifecycle /
+compaction policy belong to gille-inference #3; this contract does not pre-empt that policy.
+
+The actual `code_loop_start.instruction` is bound alongside the full stamp in the durable request
+fingerprint. It is not compared to `raw_fingerprint`: the contract intentionally defines that hash
+over Hugin's pre-orchestration logical input, while the transmitted instruction may be Hugin's
+post-context/system envelope. Hugin remains authoritative for resolving and validating those typed
+source documents; the gateway must not collapse the two prompt stages.
+
+The checked-in compatibility fixtures are emitted by Hugin #240's real `/delegate` serializer.
+The producer metadata fixture is byte-pinned by SHA-256 and the exact serialized request is parsed
+and exercised by gille-inference, so origin identities, the wrapper/raw distinction, and the
+accepted Grimnir schema fail tests on cross-repository drift.
 
 ### GET `/ledger`
 
@@ -204,7 +301,7 @@ Cancel + refund a job, **idempotent**. Scoped to the creator (`404` otherwise). 
 
 Ledger-gated one-shot delegation: classify task type → consult ledger → run a local model → record a ledger row. The handler accepts `modelId` (pin the local model), `frontierModelId` (run a frontier-fallback arm via OpenRouter), and a `verifier` **spec** that attaches a deterministic pass/fail grader — so a delegated run produces a real ledger verdict (`pass`/`fail`) instead of `unverified`, which is what lets the ledger actually *learn* from nightly traffic (#14, ADR-004).
 
-**Request:** `{ "prompt": string, "taskType"?: string, "systemPrompt"?: string, "maxTokens"?: number, "modelId"?: string, "temperature"?: number, "topP"?: number, "topK"?: number, "minP"?: number, "frontierModelId"?: string, "delegatorModelId"?: string, "premiumBaselineModelId"?: string, "verifier"?: VerifierSpec, "responseFormat"?: ResponseFormat }`. Sampling ranges are `temperature ∈ [0,2]`, `topP/minP ∈ [0,1]`, and integer `topK ≥ 0` (`0` disables llama.cpp's top-k cutoff).
+**Request:** `{ "prompt": string, "taskType"?: string, "systemPrompt"?: string, "maxTokens"?: number, "modelId"?: string, "temperature"?: number, "topP"?: number, "topK"?: number, "minP"?: number, "frontierModelId"?: string, "delegatorModelId"?: string, "premiumBaselineModelId"?: string, "verifier"?: VerifierSpec, "responseFormat"?: ResponseFormat, "learningTaskStamp"?: HuginRequestStamp }`. Sampling ranges are `temperature ∈ [0,2]`, `topP/minP ∈ [0,1]`, and integer `topK ≥ 0` (`0` disables llama.cpp's top-k cutoff).
 - On the M5 `/delegate` path, the established reasoning-model safety floor maps an accepted
   `temperature: 0` to `0.6`; raw OpenAI chat and MCP `ask` forward an explicit zero unchanged.
 - `prompt` required → else `400 invalid_request_error` (`param: "prompt"`).
@@ -250,8 +347,18 @@ interface DelegationOutcome {
     potentialSavingsPremiumUsd: number;
     notes: string[];
   };
+  learningTaskGatewayEcho?: LearningTaskGatewayEcho;
 }
 ```
+
+Supplying `learningTaskStamp` opts this real Hugin inference path into LearningTaskContract v1 and
+requires an explicit matching `taskType`. The gateway validates the fresh preflight and actual
+authenticated principal before admission, then claims the shared durable replay guard and returns
+the exact principal-bound `learningTaskGatewayEcho`. Once a stamped `/delegate` admission is
+durably claimed, it survives every downstream exception because inference may already have begun.
+An exact retry returns the retained echo and an explicit unavailable-outcome error without starting
+another model run. Omitting the stamp preserves the legacy API and response shape, but that call is
+explicitly ineligible for joined learning-task evidence.
 
 `costTrace.verifiedSavings*` is zero unless the local verifier returns `pass`; see
 `docs/delegation-cost-accounting.md` for the accounting rules and env knobs.
@@ -271,7 +378,7 @@ interface DelegationOutcome {
 1. **Liveness:** `GET /healthz` before routing to the M5 node.
 2. **Capability check:** `GET /ledger` (verdict per task_type) + `GET /models` (loaded/vision/tool-use) decide *whether* the M5 can take a sub-task. `delegate-local` → send it; `escalate-frontier` → keep it on a frontier model; `explore` → send a probe.
 3. **Dispatch:**
-   - **Ledger-gated sub-tasks** (nightly local work, verifiable one-shots) → `POST /delegate` (owner key). Attach a `verifier` spec (and optionally `modelId`/`frontierModelId`) so the run records a real `pass`/`fail` verdict and the ledger learns; pass `delegatorModelId` so savings are estimated against the actual cloud brain. Omit the verifier and the run records `unverified`; a later trusted grade becomes capability evidence only through the gateway/repo's defined evidence-import path. Hugin may retain its operational outcome, but must not create a competing capability ledger. Verified savings stays zero until trusted evidence lands.
+   - **Ledger-gated sub-tasks** (nightly local work, verifiable one-shots) → stamped `POST /delegate` (owner key). Attach the current preflight and stamp plus a `verifier` spec (and optionally `modelId`/`frontierModelId`) so the run is joinable and records a real `pass`/`fail` verdict; pass `delegatorModelId` so savings are estimated against the actual cloud brain. An unstamped call remains a legacy compatibility path and is not eligible for joined learning-task evidence. Omit the verifier and the run records `unverified`; a later trusted grade becomes capability evidence only through the gateway/repo's defined evidence-import path. Hugin may retain its operational outcome, but must not create a competing capability ledger. Verified savings stays zero until trusted evidence lands.
    - **Raw inference** (chat, streaming, agent inner loops) → `POST /v1/chat/completions`.
 4. **Backpressure:** honor `429` (quota) and `503` + `Retry-After` (owner preemption) — surface as a route-elsewhere or retry signal, never a hard error to the user.
 

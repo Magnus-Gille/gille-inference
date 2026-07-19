@@ -57,6 +57,23 @@ import {
   parseTaskExposureLookupRequest,
   recordMessageTaskExposuresBestEffort,
 } from "./task-exposure.js";
+import {
+  LEARNING_TASK_PREFLIGHT_ENDPOINT,
+  LEARNING_TASK_PREFLIGHT_TTL_MS,
+  LearningTaskContractError,
+  createLearningTaskGatewayEcho,
+  createLearningTaskCapabilityEpoch,
+  learningTaskObservedRequestFingerprint,
+  parseHuginRequestStamp,
+  validateHuginRequestStamp,
+  type HuginRequestStamp,
+  type LearningTaskGatewayEcho,
+  type LearningTaskCapabilityEpoch,
+} from "./learning-task-contract.js";
+import {
+  claimLearningTaskAdmission,
+  lookupLearningTaskAdmission,
+} from "./learning-task-admission-store.js";
 
 /**
  * Authenticated LAN gateway — the "endpoint with suitable auth" that sits in front of
@@ -782,6 +799,10 @@ const HANDLER_OWNED_OUTCOMES = new Set([
   "client_closed",
   // Fix #2: the degeneracy watchdog aborted a "?????" run + billed 0; the handler owns this 200.
   "degenerate",
+  // An exact stamped retry recovered its immutable admission echo, but v1 does not yet retain
+  // the original delegation outcome. The handler returns a truthful 200/error envelope so Hugin
+  // can preserve the join evidence without triggering another model call.
+  "learning_task_admission_recovered",
 ]);
 
 async function handleChatProxy(
@@ -1497,6 +1518,9 @@ interface DelegateParams {
   topP?: number;
   topK?: number;
   minP?: number;
+  /** Optional v1 handshake. Unstamped /delegate remains the legacy, learning-ineligible lane. */
+  learningTaskStamp?: HuginRequestStamp;
+  learningTaskObservedFingerprint?: string;
 }
 
 /**
@@ -1639,6 +1663,20 @@ function parseDelegateBody(rawBody: string): DelegateParse {
     }
     responseFormat = parsed.value;
   }
+  let learningTaskStamp: HuginRequestStamp | undefined;
+  let learningTaskObservedFingerprint: string | undefined;
+  if (body["learningTaskStamp"] !== undefined) {
+    try {
+      learningTaskStamp = parseHuginRequestStamp(body["learningTaskStamp"]);
+      learningTaskObservedFingerprint = learningTaskObservedRequestFingerprint(body);
+    } catch (err) {
+      return {
+        ok: false,
+        param: "learningTaskStamp",
+        message: err instanceof LearningTaskContractError ? err.message : "Invalid 'learningTaskStamp'.",
+      };
+    }
+  }
   return {
     ok: true,
     requestedMax: typeof body["maxTokens"] === "number" ? (body["maxTokens"] as number) : null,
@@ -1658,8 +1696,30 @@ function parseDelegateBody(rawBody: string): DelegateParse {
       topP: body["topP"] as number | undefined,
       topK: body["topK"] as number | undefined,
       minP: body["minP"] as number | undefined,
+      learningTaskStamp,
+      learningTaskObservedFingerprint,
     },
   };
+}
+
+function sendLearningTaskAdmissionRecovery(
+  res: ServerResponse,
+  lctx: LogCtx,
+  gatewayEcho: LearningTaskGatewayEcho,
+): void {
+  lctx.status = 200;
+  lctx.outcome = "learning_task_admission_recovered";
+  lctx.errorClass = "learning_task_outcome_unavailable";
+  sendJson(res, 200, {
+    outcome: "error",
+    decisionReason:
+      "Exact LearningTaskContract admission recovered; the original delegation outcome is unavailable and inference was not replayed.",
+    learningTaskAdmission: {
+      recovered: true,
+      outcomeAvailable: false,
+    },
+    learningTaskGatewayEcho: gatewayEcho,
+  });
 }
 
 async function handleDelegate(
@@ -1667,9 +1727,51 @@ async function handleDelegate(
   res: ServerResponse,
   effectiveMax: number,
   keyAlias: string,
-  lctx: LogCtx
+  lctx: LogCtx,
 ): Promise<MeteredResult> {
-  const result = await delegate({
+  let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
+  if (params.learningTaskStamp !== undefined) {
+    const stamp = params.learningTaskStamp;
+    if (params.learningTaskObservedFingerprint === undefined) {
+      throw new Error("stamped /delegate request is missing its observed request fingerprint");
+    }
+    learningTaskGatewayEcho = createLearningTaskGatewayEcho(stamp, {
+      authenticatedPrincipalId: keyAlias,
+      authentication: "gateway-owner-auth",
+      gatewayRequestId: `opaque:${lctx.requestId}`,
+      admissionId: `opaque:${randomUUID()}`,
+      admittedAt: new Date(),
+    });
+    const claim = claimLearningTaskAdmission({
+      principalId: keyAlias,
+      clientId: stamp.client_id,
+      taskInstanceId: stamp.task_instance_id,
+      attemptId: stamp.attempt_id,
+      requestId: stamp.request_id,
+      idempotencyKey: stamp.idempotency_key,
+      requestFingerprint: params.learningTaskObservedFingerprint,
+      surface: "delegate",
+      gatewayEcho: learningTaskGatewayEcho,
+    });
+    if (claim.kind === "existing") {
+      sendLearningTaskAdmissionRecovery(res, lctx, claim.record.gatewayEcho);
+      return ZERO_RESULT;
+    }
+    if (claim.kind === "conflict") {
+      lctx.status = 409;
+      lctx.outcome = "learning_task_conflict";
+      lctx.errorClass = "learning_task_conflict";
+      sendError(res, makeError("learning_task_conflict"));
+      return {
+        totalTokens: 0,
+        promptTokens: null,
+        completionTokens: null,
+        canonicalModel: null,
+        ttftMs: null,
+      };
+    }
+  }
+  const runDelegate = () => delegate({
     prompt: params.prompt,
     taskType: params.taskType,
     systemPrompt: params.systemPrompt,
@@ -1689,7 +1791,18 @@ async function handleDelegate(
     source: "gateway",
     keyAlias,
   });
-  sendJson(res, 200, result);
+  // A stamped claim is the durable "execution may have begun" boundary. delegate() can throw
+  // after the upstream model has already answered (for example while persisting its ledger row),
+  // so no exception from this point proves that replay is safe. Preserve the claim on every
+  // failure; an exact retry will recover its echo with outcomeUnavailable instead of inferring
+  // twice. All pre-model credit/quota/GPU refusals occur before handleDelegate and create no claim.
+  const result = await runDelegate();
+  sendJson(res, 200, {
+    ...result,
+    ...(learningTaskGatewayEcho === undefined
+      ? {}
+      : { learningTaskGatewayEcho }),
+  });
   lctx.node = result.nodeId;
   lctx.model = result.modelId;
   const m = result.metrics;
@@ -2612,6 +2725,9 @@ export function startGateway(): Promise<GatewayHandle> {
   // Freeze the implicit-admin posture once, here, from the actual bind host. Never
   // re-derived per request, so it cannot drift open as keys are revoked/expire.
   const implicitAdminAllowed = isImplicitAdminAllowed(cfg, loopback);
+  // Process/configuration epoch for LearningTaskContract advertisements. Its secret rotates on
+  // every gateway start, so cached preflight evidence from an earlier deployment fails closed.
+  const learningTaskCapabilityEpoch = createLearningTaskCapabilityEpoch();
 
   // Warm the trusted-catalogue cache in the background so empty-allow-list (owner/admin) requests
   // get a per-model label from the first request onward. Fire-and-forget — never blocks startup,
@@ -2644,7 +2760,14 @@ export function startGateway(): Promise<GatewayHandle> {
   }
 
   const server: Server = createServer((req, res) => {
-    void handleRequest(req, res, cfg, controller, implicitAdminAllowed).catch((err) => {
+    void handleRequest(
+      req,
+      res,
+      cfg,
+      controller,
+      implicitAdminAllowed,
+      learningTaskCapabilityEpoch,
+    ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
       console.error("[gateway] unhandled request error:", err);
@@ -2730,7 +2853,8 @@ async function handleRequest(
   res: ServerResponse,
   cfg: HomeserverConfig,
   controller: AdmissionController,
-  implicitAdminAllowed: boolean
+  implicitAdminAllowed: boolean,
+  learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -3100,6 +3224,18 @@ async function handleRequest(
     // keyHash is stored only in the owner-queryable request_log (never in the access log / metrics).
     lctx.keyHash = principal.keyHash;
 
+    // Authenticated, content-blind LearningTaskContract negotiation. The response shape is the
+    // accepted Grimnir v1 schema exactly; feature count is the closed four-item array, advertised_at
+    // is the observation clock, and advertisement_id binds this process/configuration epoch.
+    if (path === LEARNING_TASK_PREFLIGHT_ENDPOINT && method === "GET") {
+      res.setHeader("cache-control", `private, max-age=${LEARNING_TASK_PREFLIGHT_TTL_MS / 1_000}`);
+      sendJson(res, 200, learningTaskCapabilityEpoch.advertise());
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+
     const requireAdmin = (): boolean => {
       if (!principal.isAdmin) {
         lctx.status = 403;
@@ -3188,6 +3324,8 @@ async function handleRequest(
         principal,
         cfg,
         controller,
+        gatewayRequestId: `opaque:${lctx.requestId}`,
+        learningTaskCapabilityEpoch,
         inflight: {
           inc: incInflight,
           dec: decInflight,
@@ -3309,6 +3447,70 @@ async function handleRequest(
         lctx.admission = "n/a";
         sendError(res, makeError("invalid_request_error", { param: parsed.param, message: parsed.message }));
         return;
+      }
+      if (parsed.params.learningTaskStamp !== undefined) {
+        if (parsed.params.taskType === undefined || parsed.params.taskType.trim() === "") {
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "invalid_request_error";
+          lctx.admission = "n/a";
+          sendError(res, makeError("invalid_request_error", {
+            param: "taskType",
+            message: "Stamped /delegate requests must include an explicit 'taskType'.",
+          }));
+          return;
+        }
+        const stamp = parsed.params.learningTaskStamp;
+        const observedFingerprint = parsed.params.learningTaskObservedFingerprint;
+        if (observedFingerprint === undefined) {
+          throw new Error("stamped /delegate request is missing its observed request fingerprint");
+        }
+        // A verified principal may recover only the exact, content-blind identity already bound
+        // to it. This read must precede epoch/freshness and all metering/admission gates: after a
+        // restart, the original epoch is intentionally gone, and a retry must never execute again.
+        const recovery = lookupLearningTaskAdmission({
+          principalId: principal.alias,
+          clientId: stamp.client_id,
+          taskInstanceId: stamp.task_instance_id,
+          attemptId: stamp.attempt_id,
+          requestId: stamp.request_id,
+          idempotencyKey: stamp.idempotency_key,
+          requestFingerprint: observedFingerprint,
+          surface: "delegate",
+        });
+        if (recovery.kind === "existing") {
+          lctx.admission = "n/a";
+          sendLearningTaskAdmissionRecovery(res, lctx, recovery.record.gatewayEcho);
+          return;
+        }
+        if (recovery.kind === "conflict") {
+          lctx.status = 409;
+          lctx.outcome = "learning_task_conflict";
+          lctx.errorClass = "learning_task_conflict";
+          lctx.admission = "n/a";
+          sendError(res, makeError("learning_task_conflict"));
+          return;
+        }
+        try {
+          validateHuginRequestStamp(stamp, {
+            capabilityEpoch: learningTaskCapabilityEpoch,
+            authenticatedPrincipalId: principal.alias,
+            authentication: "gateway-owner-auth",
+            effectiveTaskType: parsed.params.taskType,
+          });
+        } catch (err) {
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "invalid_request_error";
+          lctx.admission = "n/a";
+          sendError(res, makeError("invalid_request_error", {
+            param: "learningTaskStamp",
+            message: err instanceof LearningTaskContractError
+              ? err.message
+              : "LearningTaskContract validation failed.",
+          }));
+          return;
+        }
       }
       const effectiveMax = clampMaxTokensForModel(
         cfg,
