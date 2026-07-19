@@ -1,0 +1,1 @@
+`src/cache-path.ts` is meant to build a cache-file path below a caller-provided root, but the seed uses the Node path API as though joining alone enforced containment: it accepts empty, absolute, and traversal keys that can escape that root. Fix the containment bug so normal nested keys resolve below the root and invalid keys throw. Do not add or modify tests.

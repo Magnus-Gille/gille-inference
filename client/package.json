@@ -1,0 +1,29 @@
+{
+  "name": "gille-inference",
+  "version": "1.0.0",
+  "description": "Dependency-free terminal client for a self-hosted Gille Inference gateway.",
+  "type": "module",
+  "bin": {
+    "hs": "./hs.mjs"
+  },
+  "files": [
+    "hs.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": [
+    "openai",
+    "inference",
+    "llm",
+    "cli",
+    "whisper",
+    "gille"
+  ],
+  "homepage": "https://github.com/Magnus-Gille/gille-inference",
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>Inference Portal</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d212b;
+    --border: #2a2f3a;
+    --text: #e7e9ee;
+    --muted: #9aa3b2;
+    --accent: #6ea8fe;
+    --ok: #5ad07a;
+    --warn: #e0a458;
+    --bad: #e06c6c;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f0f2f6; --border: #dfe3ea;
+      --text: #1b1f27; --muted: #5c6675; --accent: #2f6fe0;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh; display: flex; justify-content: center;
+    padding: 32px 16px 64px;
+  }
+  main { width: 100%; max-width: 560px; }
+  h1 { font-size: 20px; font-weight: 650; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 16px; font-weight: 650; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h3 { font-size: 14px; font-weight: 650; margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 24px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px;
+  }
+  .row {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 16px 0; border-bottom: 1px solid var(--border);
+  }
+  .row:first-child { padding-top: 0; }
+  .row:last-child { padding-bottom: 0; border-bottom: 0; }
+  .label {
+    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600;
+  }
+  .value { font-size: 15px; word-break: break-all; }
+  .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  .keyline { display: flex; gap: 8px; align-items: stretch; }
+  .keyline .value {
+    flex: 1; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; font-size: 13px;
+  }
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); padding: 10px 14px;
+    transition: border-color .15s, background .15s;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); width: 100%; padding: 12px; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.06); }
+  button.copy { white-space: nowrap; }
+  button.ghost { background: transparent; }
+  input[type="text"] {
+    font: inherit; width: 100%; padding: 12px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  }
+  input[type="text"]:focus { outline: none; border-color: var(--accent); }
+  .bar { height: 8px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--ok); transition: width .3s; }
+  .bar.warn > span { background: var(--warn); }
+  .bar.bad > span { background: var(--bad); }
+  .bartext { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); }
+  pre {
+    margin: 0; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 12.5px;
+  }
+  .err { color: var(--bad); font-size: 13px; margin: 12px 0 0; min-height: 1em; }
+  .stack { display: flex; flex-direction: column; gap: 14px; }
+  .hide { display: none !important; }
+  a { color: var(--accent); }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
+  /* Intro / hero */
+  .hero {
+    margin-bottom: 20px;
+  }
+  .hero p {
+    color: var(--muted); font-size: 14px; margin: 0 0 6px; line-height: 1.6;
+  }
+  /* Info cards (priority blurb, etc.) */
+  .info-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px 20px; margin-bottom: 16px;
+  }
+  .info-card p {
+    color: var(--muted); font-size: 13px; margin: 4px 0 0; line-height: 1.6;
+  }
+  /* "Served so far" stats card */
+  .stats-grid { display: flex; gap: 28px; margin-top: 6px; flex-wrap: wrap; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat-num {
+    font-size: 26px; font-weight: 700; letter-spacing: -0.02em; color: var(--text);
+    font-variant-numeric: tabular-nums; line-height: 1.1;
+  }
+  .stat-lbl {
+    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600;
+  }
+  .stat-since { color: var(--muted); font-size: 12px; margin: 12px 0 0; }
+  /* Docs section */
+  details {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--panel); margin-bottom: 16px; overflow: hidden;
+  }
+  details summary {
+    padding: 16px 20px; cursor: pointer; font-weight: 600; font-size: 14px;
+    list-style: none; display: flex; align-items: center; gap: 8px;
+    user-select: none;
+  }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before {
+    content: "›"; font-size: 18px; color: var(--accent);
+    transition: transform .2s; display: inline-block;
+  }
+  details[open] summary::before { transform: rotate(90deg); }
+  .docs-body {
+    padding: 0 20px 20px; display: flex; flex-direction: column; gap: 20px;
+  }
+  .docs-section { display: flex; flex-direction: column; gap: 10px; }
+  .docs-section p { font-size: 13px; color: var(--muted); margin: 0; line-height: 1.6; }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 12.5px;
+  }
+  th {
+    text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .badge {
+    display: inline-block; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11.5px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 5px;
+  }
+  .section-divider {
+    border: none; border-top: 1px solid var(--border); margin: 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <!-- INTRO / HERO -->
+  <div class="hero">
+    <h1>Inference Portal</h1>
+    <p style="color:var(--muted);font-size:14px;margin:6px 0 0;line-height:1.6">
+      A friend&#8217;s home machine running local AI models — no cloud, no data leaving the box —
+      speaking the standard OpenAI API so any OpenAI client works out of the box.
+      To get access, redeem the invite link below, or ask the owner for one.
+    </p>
+  </div>
+
+  <!-- HOW PRIORITY WORKS -->
+  <div class="info-card">
+    <h2>How priority works</h2>
+    <p>
+      This runs on one home machine with a single GPU. The owner&#8217;s work comes first — when
+      the box is busy your request may wait a moment or be briefly turned away (a <span class="badge">503</span>).
+      That&#8217;s normal — just retry in a few seconds.
+      Each key also has its own rate limit and credit budget; once the budget runs out you&#8217;ll
+      need to ask the owner for more credits or a new invite.
+    </p>
+  </div>
+
+  <!-- WHAT'S RUNNING -->
+  <!-- ⚠️ HAND-MAINTAINED. This page is the public face of inference.example.com and is NOT generated.
+       Whenever the served models, endpoints, quotas, or limits change, update this section AND the
+       "How to use it" docs below in the SAME change. portalHtml() caches the file at first request,
+       so a portal-only edit requires a gateway restart to take effect. See CLAUDE.md → "Keep the portal in sync". -->
+  <div class="info-card">
+    <h2>What&#8217;s running</h2>
+    <p>
+      <strong>Hardware:</strong> BosGame M5 &#8212; AMD Ryzen AI Max+ 395 &#8220;Strix Halo&#8221;,
+      128&nbsp;GB unified LPDDR5X memory shared between CPU and GPU,
+      Radeon 8060S integrated GPU. One home box, one GPU.
+    </p>
+    <p>
+      <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) serving each model via
+      llama-server, hot-swapped by llama-swap, behind an authenticating &amp; metering gateway,
+      exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API.
+    </p>
+    <p style="margin-bottom:8px"><strong>Models</strong> (mostly Q4_K_M; VibeThinker uses Q8_0;
+      gpt-oss uses MXFP4):</p>
+    <table>
+      <tr><th>Model</th><th>What it is</th><th>Best for</th><th>~tok/s</th></tr>
+      <tr>
+        <td><span class="badge mono">mellum</span></td>
+        <td>Mellum2-12B-A2.5B-Instruct — fast, no &#8220;thinking&#8221; overhead</td>
+        <td>Quick code edits, classification, extraction, short answers — the cheap default</td>
+        <td>~138</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">qwen3-30b-instruct</span></td>
+        <td>Qwen3-30B-A3B-Instruct-2507 — fast non-thinking MoE</td>
+        <td>General and multilingual work, source distillation and long-document extraction</td>
+        <td>~86</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">gemma4</span></td>
+        <td>Gemma-4-26B-A4B — thinking; multimodal (accepts images)</td>
+        <td>General questions and image understanding; balanced quality</td>
+        <td>~62</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">qwen36-a3b</span></td>
+        <td>Qwen3.6-35B-A3B — mid-sized MoE workhorse, non-thinking (answers directly)</td>
+        <td>Code and general tasks &#8212; the reliable mid-tier between mellum and the 80B coder</td>
+        <td>~62</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">vibethinker-3b</span></td>
+        <td>WeiboAI VibeThinker-3B — compact dense thinking model (Q8_0)</td>
+        <td>Verifiable math, coding and STEM reasoning; use a general model for broad knowledge/chat</td>
+        <td>~61</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">qwen3-coder-next-80b</span></td>
+        <td>Qwen3-Coder-Next — largest &amp; strongest; non-thinking</td>
+        <td>Complex coding and the hardest tasks &#8212; the heavy lifter</td>
+        <td>~60&#8211;69</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">gpt-oss-120b</span></td>
+        <td>OpenAI gpt-oss-120b — large MoE reasoning model (MXFP4)</td>
+        <td>Hard reasoning, verification and code review; expect internal reasoning before the answer</td>
+        <td>~30</td>
+      </tr>
+    </table>
+    <p style="margin-top:10px;font-size:12.5px">
+      Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
+      Models load on first use and unload after 30&nbsp;min idle. Cold loads are roughly 6&#8211;15s
+      for Mellum and 40&#8211;60s for the largest models, including gpt-oss.
+    </p>
+    <p style="margin-top:4px;font-size:12.5px">
+      Context window: 131,072 tokens for <span class="badge mono">mellum</span>,
+      <span class="badge mono">gemma4</span>, <span class="badge mono">qwen36-a3b</span>,
+      <span class="badge mono">qwen3-30b-instruct</span>, and
+      <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>
+      and <span class="badge mono">gpt-oss-120b</span> provide 65,536 per request. Prompt and completion
+      tokens share that window; the output limits documented below still apply. VibeThinker works best on
+      answer-verifiable reasoning with sampling enabled: <span class="badge mono">temperature: 1.0</span>,
+      <span class="badge mono">top_p: 0.95</span>, <span class="badge mono">top_k: 0</span>, and
+      <span class="badge mono">min_p: 0</span>. Explicit VibeThinker requests may ask for up to
+      32,768 completion tokens; omitted <span class="badge mono">max_tokens</span> keeps the safer fleet default.
+    </p>
+    <p style="margin-top:10px;font-size:12.5px">
+      <strong>Speech-to-text:</strong> <span class="badge mono">whisper-1</span>
+      (alias <span class="badge mono">kb-whisper-large</span>) &#8212; KB-Whisper-Large, an
+      OpenAI Whisper-compatible transcription model (strong on Swedish, still multilingual).
+      Upload an audio file to <span class="badge mono">POST /v1/audio/transcriptions</span>;
+      <strong>billed per second of audio</strong> (not per token), up to 30&nbsp;min / 32&nbsp;MB per file.
+    </p>
+    <p style="margin-top:4px;font-size:12.5px">
+      <strong>Sharing the box:</strong> one machine, one GPU &#8212; requests are handled roughly one at a time,
+      and only one model is loaded at a time, so if people use different models the box swaps them in and out
+      (a few-second pause). A handful of people at once is fine &#8212; you may just wait briefly in line. The
+      owner&#8217;s work takes priority (when it&#8217;s busy a guest request may get a quick 503 &#8212; just
+      retry), and each key has its own per-minute rate limits.
+    </p>
+  </div>
+
+  <!-- NEW MODEL EVALUATIONS — populated client-side from GET /portal/model-evals.json (the
+       weekly Model Scout's content-blind registry). Hidden until the fetch returns ≥1 row, so the
+       page degrades cleanly before the first scout run. Data-driven: NO gateway restart needed to
+       refresh (unlike the hand-maintained "What's running" table above). -->
+  <div id="evals-card" class="info-card hide">
+    <h2>New model evaluations</h2>
+    <p style="margin-bottom:8px">
+      Every week the box looks at trending new models on Hugging&nbsp;Face, downloads the ones that
+      fit, and benchmarks them against a fixed battery of tasks. Clear winners get auto-added to the
+      line-up above. Latest results (<span class="badge mono">pass%</span> = share of probe tasks
+      passed; higher is better):
+    </p>
+    <table>
+      <tr><th>Model</th><th>Quant</th><th>Size</th><th>pass%</th><th>~tok/s</th><th>Verdict</th></tr>
+      <tbody id="evals-rows"></tbody>
+    </table>
+    <p style="margin-top:10px;font-size:12.5px">
+      Each candidate is tested on a throwaway server, isolated from the live model line-up and run
+      off-peak. A &#8220;winner&#8221; beats or complements the current line-up and is promoted automatically.
+    </p>
+  </div>
+
+  <!-- SERVED SO FAR — public, content-blind grand totals from GET /portal/stats.
+       Coarse fleet-wide aggregates only (no per-user / per-key / per-model / content). Hidden
+       until the fetch succeeds so the page degrades cleanly when stats are unavailable. -->
+  <div id="stats-card" class="info-card hide">
+    <h2>Served so far</h2>
+    <div class="stats-grid">
+      <div class="stat">
+        <div class="stat-num" id="stat-tokens">—</div>
+        <div class="stat-lbl">tokens served</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num" id="stat-requests">—</div>
+        <div class="stat-lbl">requests served</div>
+      </div>
+    </div>
+    <p id="stat-since" class="stat-since"></p>
+  </div>
+
+  <!-- STATE A: no key yet → redeem an invite code -->
+  <section id="redeem-view" class="card hide">
+    <div class="stack">
+      <div>
+        <div class="label">Have an invite code?</div>
+        <p class="sub" style="margin:8px 0 0">Paste it below to create your personal API key.</p>
+      </div>
+      <input id="code" type="text" placeholder="inv_…" autocomplete="off" spellcheck="false" />
+      <button id="redeem-btn" class="primary">Create my key</button>
+      <p style="margin:4px 0 0;font-size:12px;color:var(--muted)">Keys are shown once and stored only in this browser. Lose it and you&#8217;ll need a new invite.</p>
+      <p id="redeem-err" class="err"></p>
+    </div>
+  </section>
+
+  <!-- STATE B: has key → dashboard -->
+  <section id="dash-view" class="card hide">
+    <div class="row">
+      <div class="label">Your API key</div>
+      <div class="keyline">
+        <div id="key-val" class="value mono"></div>
+        <button id="copy-key" class="copy">Copy</button>
+      </div>
+    </div>
+    <div class="row">
+      <div class="label">Model</div>
+      <div id="model-val" class="value mono">—</div>
+    </div>
+    <div class="row">
+      <div class="label">Credits</div>
+      <div class="bartext"><span id="credits-used">—</span><span id="credits-limit">—</span></div>
+      <div id="credits-bar" class="bar"><span style="width:0%"></span></div>
+    </div>
+    <div class="row">
+      <div class="label">Base URL</div>
+      <div id="endpoint-val" class="value mono"></div>
+      <div class="sub" style="margin:4px 0 0">OpenAI-compatible (chat completions). Point any OpenAI client/SDK — or a tool like Cursor, aider, or Continue — at this base URL with your key and the model above.</div>
+    </div>
+    <div class="row">
+      <button id="forget" class="ghost">Forget this key on this device</button>
+    </div>
+  </section>
+
+  <p id="dash-err" class="err"></p>
+
+  <!-- DOCS SECTION -->
+  <details id="docs-section">
+    <summary>How to use it</summary>
+    <div class="docs-body">
+
+      <!-- HTTP API -->
+      <div class="docs-section">
+        <h3>HTTP API</h3>
+        <p>
+          Base URL: <span class="badge mono">https://inference.example.com/v1</span><br />
+          Authentication: <span class="badge mono">Authorization: Bearer &lt;your-key&gt;</span>
+        </p>
+
+        <p><strong>List models your key can use:</strong></p>
+        <pre>curl https://inference.example.com/v1/models \
+  -H "Authorization: Bearer $HS_KEY"</pre>
+
+        <p><strong>Public usage stats (no key needed):</strong></p>
+        <pre>curl https://inference.example.com/portal/stats</pre>
+        <p>
+          Returns content-blind grand totals only —
+          <span class="badge mono">{total_tokens, total_requests, since}</span> — summed across
+          everything the box has ever served (survives restarts). No per-user, per-key, or
+          per-model detail is exposed. This powers the &#8220;Served so far&#8221; card above.
+        </p>
+
+        <p><strong>Chat completions (streaming — recommended):</strong></p>
+        <pre>curl https://inference.example.com/v1/chat/completions \
+  -H "Authorization: Bearer $HS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vibethinker-3b",
+    "messages": [{"role": "user", "content": "Solve this carefully: 17 * 19"}],
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 0,
+    "min_p": 0,
+    "max_tokens": 32768,
+    "stream": true
+  }'</pre>
+
+        <p>
+          <strong>Always use <span class="badge mono">stream: true</span></strong> for longer
+          completions — non-streaming requests are cut off after ~100 seconds by the network
+          layer. Streaming keeps the connection alive and tokens arrive as they are generated.
+        </p>
+
+        <p><strong>OpenAI Python SDK:</strong></p>
+        <pre>from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://inference.example.com/v1",
+    api_key="hs_guest_...",
+)
+stream = client.chat.completions.create(
+    model="vibethinker-3b",
+    messages=[{"role": "user", "content": "Solve this carefully: 17 * 19"}],
+    temperature=1.0,
+    top_p=0.95,
+    max_tokens=32768,
+    extra_body={"top_k": 0, "min_p": 0},
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="")</pre>
+
+        <p>
+          The server enforces a <strong>per-key rate limit and a lifetime credit budget.</strong>
+          Both are set when your invite is created and shown on your dashboard above.
+          Ordinary models cap <span class="badge mono">max_tokens</span> at 12,288.
+          Explicit <span class="badge mono">vibethinker-3b</span> requests may use up to 32,768;
+          omitting the field keeps the safer 12,288 default. Standard OpenAI clients understand
+          <span class="badge mono">temperature</span> and <span class="badge mono">top_p</span>.
+          Send llama.cpp extensions <span class="badge mono">top_k</span> and
+          <span class="badge mono">min_p</span> as extra request-body fields, as above.
+        </p>
+
+        <p><strong>Speech-to-text (transcription):</strong></p>
+        <pre>curl https://inference.example.com/v1/audio/transcriptions \
+  -H "Authorization: Bearer $HS_KEY" \
+  -F file=@meeting.m4a \
+  -F model=whisper-1</pre>
+        <p>
+          Send a multipart <span class="badge mono">file</span> (any common audio format).
+          Optional: <span class="badge mono">language</span> (default auto-detect),
+          <span class="badge mono">response_format</span>
+          (<span class="badge mono">json</span> → <span class="badge mono">{text}</span>,
+          <span class="badge mono">verbose_json</span> → full object with timings,
+          <span class="badge mono">text</span> → plain body), and
+          <span class="badge mono">temperature</span> (0&#8211;1). Unlike chat, this is
+          <strong>billed per second of audio</strong>, not per token — up to 30&nbsp;min / 32&nbsp;MB per request.
+          Any OpenAI Whisper client works unchanged.
+        </p>
+
+        <p><strong>Errors — what they mean and what to do:</strong></p>
+        <table>
+          <tr><th>HTTP</th><th>Code</th><th>Meaning</th><th>What to do</th></tr>
+          <tr><td><span class="badge">401</span></td><td><span class="badge mono">invalid_api_key</span></td><td>Missing, wrong, or revoked key</td><td>Check your key or ask the owner</td></tr>
+          <tr><td><span class="badge">402</span></td><td><span class="badge mono">credits_exhausted</span></td><td>Your credit budget is used up</td><td>Ask the owner for more credits</td></tr>
+          <tr><td><span class="badge">403</span></td><td><span class="badge mono">model_not_allowed</span></td><td>Your key is restricted to specific models and the requested model is not in its allow-list</td><td>Use a model from <span class="badge mono">GET /v1/models</span></td></tr>
+          <tr><td><span class="badge">429</span></td><td><span class="badge mono">rate_limit_exceeded</span></td><td>You hit your RPM, TPM, or daily budget</td><td>Retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
+          <tr><td><span class="badge">503</span></td><td><span class="badge mono">server_busy</span></td><td>Box is busy — owner&#8217;s work has priority</td><td>Normal — retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
+          <tr><td><span class="badge">502</span></td><td><span class="badge mono">upstream_unavailable</span></td><td>Model backend is not reachable</td><td>Retry shortly (no <span class="badge mono">Retry-After</span> is sent)</td></tr>
+          <tr><td><span class="badge">504</span></td><td><span class="badge mono">upstream_timeout</span></td><td>Model took too long to respond</td><td>Retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
+          <tr><td colspan="4" style="font-size:12px;color:var(--muted);padding-top:8px">Mid-stream failure: if a streaming response is cut short, a terminal error frame is sent so your client knows the stream was truncated — not cleanly finished. Retry the request.</td></tr>
+        </table>
+
+        <p>
+          All errors use the standard OpenAI error envelope
+          <span class="badge mono">{"error": {"message": "...", "type": "...", "code": "..."}}</span>
+          so any OpenAI SDK&#8217;s error handling works without changes.
+        </p>
+      </div>
+
+      <hr class="section-divider" />
+
+      <!-- MCP -->
+      <div class="docs-section">
+        <h3>MCP (Claude Code)</h3>
+        <p>
+          Add the box to Claude Code as an MCP server in one command. Once added, Claude can
+          offload self-contained sub-tasks — code generation, drafting, classification,
+          summarization — to the local models as tools, keeping data on the box and saving
+          frontier tokens.
+        </p>
+        <pre>claude mcp add --transport http local-llm \
+  https://inference.example.com/mcp \
+  --header "Authorization: Bearer hs_..."</pre>
+        <p>
+          The same key, credit budget, and model allow-list apply as for the HTTP API.
+          Two tools are exposed:
+        </p>
+        <table>
+          <tr><th>Tool</th><th>What it does</th></tr>
+          <tr>
+            <td><span class="badge mono">list_models</span></td>
+            <td>Returns the models your key may use (same as <span class="badge mono">GET /v1/models</span>), each with a one-line strength hint to help Claude pick the right one.</td>
+          </tr>
+          <tr>
+            <td><span class="badge mono">ask</span></td>
+            <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
+          </tr>
+        </table>
+      </div>
+
+      <hr class="section-divider" />
+
+      <!-- CLI -->
+      <div class="docs-section">
+        <h3>CLI (hs)</h3>
+        <p>
+          A zero-dependency command-line wrapper. Requires Node 18+.
+          Served directly from this gateway at
+          <span class="badge mono">/hs</span> — no GitHub account needed.
+        </p>
+        <pre># one-liner install
+curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bin/hs
+# or via npm: npm install -g gille-inference  (or: npx gille-inference ask "...")</pre>
+
+        <p><strong>Commands:</strong></p>
+        <table>
+          <tr><th>Command</th><th>What it does</th></tr>
+          <tr><td><span class="badge mono">hs redeem inv_…</span></td><td>Trade an invite code for a key and save credentials to <span class="badge mono">~/.config/hs/config.json</span></td></tr>
+          <tr><td><span class="badge mono">hs login --url &lt;base&gt; --key &lt;key&gt;</span></td><td>Save an existing key manually</td></tr>
+          <tr><td><span class="badge mono">hs models</span></td><td>List the models your key may use</td></tr>
+          <tr><td><span class="badge mono">hs ask [-m &lt;model&gt;] [--system &lt;s&gt;] &lt;prompt&gt;</span></td><td>Ask a question — streams tokens as they arrive</td></tr>
+          <tr><td><span class="badge mono">hs usage</span></td><td>Show your tier, allowed models, and credit usage (calls <span class="badge mono">GET /portal/me</span>)</td></tr>
+          <tr><td><span class="badge mono">hs whoami</span></td><td>Show stored base URL and masked key from <span class="badge mono">~/.config/hs/config.json</span></td></tr>
+        </table>
+
+        <p>
+          Under the hood <span class="badge mono">hs ask</span> calls
+          <span class="badge mono">POST /v1/chat/completions</span> with streaming,
+          and <span class="badge mono">hs models</span> calls
+          <span class="badge mono">GET /v1/models</span> —
+          so you can swap it for any OpenAI-compatible SDK at any time.
+        </p>
+      </div>
+
+    </div>
+  </details>
+
+  <!-- FEEDBACK CARD -->
+  <div id="feedback-card" class="card" style="margin-top:20px">
+    <h2 style="margin-bottom:8px">Something not working?</h2>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 12px;line-height:1.6">
+      Copy/paste an error, describe what went wrong, or leave any note. It gets saved for the owner to review.
+    </p>
+    <textarea
+      id="feedback-text"
+      rows="4"
+      style="
+        font:inherit;width:100%;padding:10px 12px;border-radius:8px;
+        border:1px solid var(--border);background:var(--panel-2);color:var(--text);
+        resize:vertical;box-sizing:border-box;
+      "
+      placeholder="Describe the issue…"
+      maxlength="4000"
+    ></textarea>
+    <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
+      <button id="feedback-btn" class="primary" style="width:auto;padding:10px 20px">Send report</button>
+      <span id="feedback-status" style="font-size:13px;color:var(--muted)"></span>
+    </div>
+  </div>
+
+
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var LS_KEY = "inference_portal_key";
+  var $ = function (id) { return document.getElementById(id); };
+  var origin = window.location.origin;
+
+  function show(view) {
+    $("redeem-view").classList.toggle("hide", view !== "redeem");
+    $("dash-view").classList.toggle("hide", view !== "dash");
+  }
+
+  function renderDash(key, me) {
+    var model = (me.models && me.models.length) ? me.models[0] : (me.model || null);
+    $("key-val").textContent = key;
+    $("model-val").textContent = model || "(any available model)";
+    $("endpoint-val").textContent = origin + "/v1";
+
+    var limit = me.creditLimit || 0;
+    var used = me.creditsUsed || 0;
+    var bar = $("credits-bar");
+    var fill = bar.firstElementChild;
+    bar.classList.remove("warn", "bad");
+    if (limit === 0) {
+      $("credits-used").textContent = used.toLocaleString() + " tokens used";
+      $("credits-limit").textContent = "unlimited";
+      fill.style.width = "8%";
+    } else {
+      var pct = Math.min(100, Math.round((used / limit) * 100));
+      $("credits-used").textContent = used.toLocaleString() + " used";
+      $("credits-limit").textContent = limit.toLocaleString() + " limit";
+      fill.style.width = pct + "%";
+      if (pct >= 100) bar.classList.add("bad");
+      else if (pct >= 80) bar.classList.add("warn");
+    }
+    show("dash");
+  }
+
+  function loadDashboard(key) {
+    show("dash");
+    $("dash-err").textContent = "";
+    fetch(origin + "/portal/me", { headers: { "Authorization": "Bearer " + key } })
+      .then(function (r) {
+        if (r.status === 401) {
+          // Stored key is no longer valid — drop it and return to redeem.
+          localStorage.removeItem(LS_KEY);
+          show("redeem");
+          throw new Error("handled");
+        }
+        return r.json();
+      })
+      .then(function (me) { renderDash(key, me); })
+      .catch(function (e) {
+        if (e && e.message === "handled") return;
+        $("dash-err").textContent = "Could not load your dashboard. Try again later.";
+      });
+  }
+
+  function redeem() {
+    var btn = $("redeem-btn");
+    var errEl = $("redeem-err");
+    var code = $("code").value.trim();
+    errEl.textContent = "";
+    if (!code) { errEl.textContent = "Enter your invite code."; return; }
+    btn.disabled = true; btn.textContent = "Creating…";
+    fetch(origin + "/portal/redeem", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: code })
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          var msg = (res.j && res.j.error && res.j.error.message) || "That code is invalid or already used.";
+          errEl.textContent = msg;
+          return;
+        }
+        localStorage.setItem(LS_KEY, res.j.key);
+        loadDashboard(res.j.key);
+      })
+      .catch(function () { errEl.textContent = "Network error. Try again."; })
+      .finally(function () { btn.disabled = false; btn.textContent = "Create my key"; });
+  }
+
+  function copyKey() {
+    var key = $("key-val").textContent;
+    var btn = $("copy-key");
+    var done = function () { btn.textContent = "Copied!"; setTimeout(function () { btn.textContent = "Copy"; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(key).then(done, done);
+    } else {
+      var r = document.createRange(); r.selectNode($("key-val"));
+      var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      try { document.execCommand("copy"); } catch (e) {}
+      s.removeAllRanges(); done();
+    }
+  }
+
+  $("redeem-btn").addEventListener("click", redeem);
+  $("code").addEventListener("keydown", function (e) { if (e.key === "Enter") redeem(); });
+  $("copy-key").addEventListener("click", copyKey);
+  $("forget").addEventListener("click", function () {
+    localStorage.removeItem(LS_KEY);
+    $("code").value = "";
+    show("redeem");
+  });
+
+  var stored = localStorage.getItem(LS_KEY);
+  if (stored) loadDashboard(stored);
+  else show("redeem");
+
+  // ── "Served so far" public stats (content-blind grand totals) ───────────────────────
+  // Fetches GET /portal/stats (no auth, coarse aggregates only) and renders the card. The card
+  // stays hidden if the request fails or the log is empty — never blocks the page. All values
+  // are written via textContent (never innerHTML), so a numeric/string payload cannot inject HTML.
+  function fmtCompact(n) {
+    if (typeof n !== "number" || !isFinite(n) || n < 0) return "—";
+    if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1).replace(/\.0$/, "") + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, "") + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, "") + "k";
+    return String(n);
+  }
+  function renderStats(s) {
+    var tokens = (s && typeof s.total_tokens === "number") ? s.total_tokens : null;
+    var reqs = (s && typeof s.total_requests === "number") ? s.total_requests : null;
+    if (tokens === null && reqs === null) return; // nothing to show
+    $("stat-tokens").textContent = tokens === null ? "—" : fmtCompact(tokens);
+    $("stat-tokens").title = tokens === null ? "" : tokens.toLocaleString() + " tokens";
+    $("stat-requests").textContent = reqs === null ? "—" : fmtCompact(reqs);
+    $("stat-requests").title = reqs === null ? "" : reqs.toLocaleString() + " requests";
+    if (s && typeof s.since === "number" && s.since > 0) {
+      var d = new Date(s.since);
+      // Date only (no time-of-day) — coarse, content-blind, locale-formatted.
+      $("stat-since").textContent = "Since " + d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    }
+    $("stats-card").classList.remove("hide");
+  }
+  fetch(origin + "/portal/stats")
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (s) { if (s) renderStats(s); })
+    .catch(function () { /* leave the card hidden on any error */ });
+
+  // ── New model evaluations (weekly scout) ───────────────────────────────────────────
+  function renderEvals(payload) {
+    var models = (payload && payload.models) || [];
+    if (!models.length) return; // keep the card hidden until there's something to show
+    var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]; }); };
+    var rows = models.map(function (m) {
+      var pct = Math.round((m.passRate || 0) * 1000) / 10;
+      var tok = (m.tokPerSec == null) ? "—" : Math.round(m.tokPerSec);
+      var verdict = m.served ? "served ✓" : esc(m.verdict || "");
+      var vcolor = m.served ? "var(--ok)" : (m.verdict === "winner" ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)"));
+      return "<tr><td><span class=\"badge mono\">" + esc(m.id) + "</span></td>"
+        + "<td>" + esc(m.quant || "—") + "</td>"
+        + "<td>" + (m.sizeGB || "—") + "&nbsp;GB</td>"
+        + "<td>" + pct + "</td>"
+        + "<td>" + tok + "</td>"
+        + "<td style=\"color:" + vcolor + "\">" + verdict + "</td></tr>";
+    }).join("");
+    $("evals-rows").innerHTML = rows;
+    $("evals-card").classList.remove("hide");
+  }
+  fetch(origin + "/portal/model-evals.json")
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (p) { if (p) renderEvals(p); })
+    .catch(function () { /* leave the card hidden on any error */ });
+
+  // ── Feedback card ──────────────────────────────────────────────────────────────────
+  $("feedback-btn").addEventListener("click", function () {
+    var btn = $("feedback-btn");
+    var statusEl = $("feedback-status");
+    var text = $("feedback-text").value;
+    statusEl.textContent = "";
+    if (!text.trim()) { statusEl.textContent = "Please write something first."; return; }
+    btn.disabled = true; btn.textContent = "Sending…";
+    fetch(origin + "/portal/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text, page: window.location.pathname })
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
+      .then(function (res) {
+        if (res.ok) {
+          $("feedback-text").value = "";
+          statusEl.style.color = "var(--ok)";
+          statusEl.textContent = "Thanks — sent ✓";
+        } else if (res.status === 429) {
+          statusEl.style.color = "var(--warn)";
+          statusEl.textContent = "Too many submissions — try again in a minute.";
+        } else {
+          var msg = (res.j && res.j.error && res.j.error.message) || "Something went wrong. Try again.";
+          statusEl.style.color = "var(--bad)";
+          statusEl.textContent = msg;
+        }
+      })
+      .catch(function () {
+        statusEl.style.color = "var(--bad)";
+        statusEl.textContent = "Network error. Try again.";
+      })
+      .finally(function () { btn.disabled = false; btn.textContent = "Send report"; });
+  });
+})();
+</script>
+</body>
+</html>

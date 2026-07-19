@@ -1,0 +1,45 @@
+name: CI
+
+# Typecheck + test gate. The suite is hermetic — no secrets, no network, no
+# pre-populated data/eval.db (tests use temp-dir / :memory: SQLite and mock the
+# OpenRouter client), so this runs without any repository secrets.
+
+on:
+  push:
+    branches: [main, aider-eval/base]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # npm ci builds better-sqlite3 (prebuilt for node 22 / linux x64, or
+      # compiled via node-gyp — ubuntu-latest has the toolchain).
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Gate D fixture verification
+        run: GATE_D_STRICT_PIN=1 bash gate-d/verify-fixtures.sh
+
+      - name: Test
+        run: npm test

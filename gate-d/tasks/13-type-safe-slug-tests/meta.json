@@ -1,0 +1,21 @@
+{
+  "id": "13-type-safe-slug-tests",
+  "difficulty": "M",
+  "kind": "tdd",
+  "edit": ["src/slugify.ts", "test/slugify.test.ts"],
+  "read": [],
+  "oracleFiles": ["tsconfig.json"],
+  "oracleCmd": "test/.hidden-oracle.ts",
+  "hiddenOracle": "oracle/slugify.oracle.ts",
+  "testAssertionGate": {
+    "file": "test/slugify.test.ts",
+    "subject": "slugify",
+    "minimum": 3
+  },
+  "structural": "npx --no-install tsx test/slugify.test.ts",
+  "seedOracleRed": true,
+  "corpusRevision": "gate-d-r2",
+  "holdout": true,
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

@@ -1,0 +1,11 @@
+{"type":"turn_start"}
+{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":500,"output":80},"stopReason":"stop"}}
+{"type":"turn_start"}
+{"type":"tool_execution_start","toolCallId":"synthetic-edit-1","toolName":"edit","args":{"path":"/tmp/gille-inference-fixture/hello.js","edits":[{"oldText":"i < n","newText":"i <= n"}]}}
+{"type":"tool_execution_end","toolCallId":"synthetic-edit-1","toolName":"edit","result":{"content":[{"type":"text","text":"Successfully replaced one synthetic fixture block."}]},"isError":false}
+{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":501,"output":100},"stopReason":"toolUse"}}
+{"type":"turn_start"}
+{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":500,"output":80},"stopReason":"toolUse"}}
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Fixed the synthetic example: i <= n now includes the final value."}],"stopReason":"stop"}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":500,"output":86},"stopReason":"stop"}}

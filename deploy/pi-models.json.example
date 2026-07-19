@@ -1,0 +1,21 @@
+{
+  "//": "code_loop (#116) — box-side pi provider config. Lives at $PI_CODING_AGENT_DIR/models.json",
+  "//baseUrl": "MUST be the in-cage loopback forward: http://127.0.0.1:<HOMESERVER_CODE_LOOP_FORWARD_PORT>/v1 (default 18080). The cage runs pi in a network namespace with NO general egress; pasta forwards ONLY this loopback port to a host relay that bridges to the real gateway (HOMESERVER_HOST:HOMESERVER_PORT). So pi reaches the gateway (owner_request_log / admission / poison-clear / degeneracy watchdog per turn) while all other egress is blocked. Do NOT put the tailnet IP or llama-swap :8091 here — the cage would block it.",
+  "//apiKey": "The $HS_API_KEY value is an ENV-VAR REFERENCE — pi resolves it at spawn. The harness injects a scoped service key. Never write the key value into this file.",
+  "//compat": "supportsDeveloperRole/supportsReasoningEffort false are required for the llama-swap backend.",
+  "providers": {
+    "inference-local": {
+      "baseUrl": "http://127.0.0.1:18080/v1",
+      "api": "openai-completions",
+      "apiKey": "$HS_API_KEY",
+      "authHeader": true,
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        { "id": "qwen3-coder-next-80b" }
+      ]
+    }
+  }
+}

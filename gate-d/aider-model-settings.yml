@@ -1,0 +1,17 @@
+# aider per-model settings for the box models (the research's two mandatory knobs:
+# diff edit-format + a long timeout so litellm's 600s default doesn't trip on slow local MoE).
+- name: openai/qwen3-coder-next-80b
+  edit_format: diff
+  use_repo_map: false
+  extra_params:
+    timeout: 1800
+- name: openai/gpt-oss-120b
+  edit_format: diff
+  use_repo_map: false
+  extra_params:
+    timeout: 1800
+- name: openai/mellum
+  edit_format: whole
+  use_repo_map: false
+  extra_params:
+    timeout: 1800

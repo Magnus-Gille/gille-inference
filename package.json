@@ -1,0 +1,35 @@
+{
+  "name": "gille-inference",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted inference serving, bounded delegation, and capability-evidence engine for Grimnir",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "run:eval": "tsx src/runner/index.ts",
+    "run:judge": "tsx src/judge/index.ts",
+    "run:analysis": "tsx src/analysis/index.ts",
+    "homeserver": "tsx src/homeserver/cli.ts",
+    "homeserver:serve": "tsx src/homeserver/cli.ts serve",
+    "homeserver:probe": "tsx src/homeserver/cli.ts probe --all",
+    "homeserver:ledger": "tsx src/homeserver/cli.ts ledger",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "openai": "^4.104.0",
+    "zod": "^3.23.0"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  }
+}

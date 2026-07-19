@@ -1,0 +1,12 @@
+{
+  "id": "02-fix-bug-test-catches",
+  "difficulty": "E",
+  "kind": "bugfix",
+  "edit": ["src/parse.ts"],
+  "read": ["test/parse.oracle.ts"],
+  "oracleFiles": ["test/parse.oracle.ts", "tsconfig.json"],
+  "oracleCmd": "test/parse.oracle.ts",
+  "structural": "true",
+  "turnsBudget": 6,
+  "costBudgetTok": 20000
+}

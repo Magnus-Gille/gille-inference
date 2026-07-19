@@ -1,0 +1,273 @@
+{
+  "_comment": "Evidence-based routing table AUTO-GENERATED from the capability ledger (delegations table, populated by cartography + nightly delegations) and the weekly Model Scout registry. 'escalate-frontier' = no reliable local model. A null model with attempts=0 is a pending hole awaiting fresh evidence, not a characterized gap.",
+  "_generator": "scripts/generate-routing-table.ts — DO NOT hand-edit; re-run the generator. Curated safety overrides live in src/homeserver/routing-table-generator.ts (MODEL_META.unsafeFor).",
+  "generatedAt": "2026-07-07T13:51:20.065Z",
+  "sources": [
+    {
+      "source": "capability-ledger (delegations table)",
+      "path": "/srv/gille-inference/data/eval.db",
+      "present": true,
+      "records": 1588,
+      "latest": "2026-07-07T13:37:13.430Z",
+      "note": "canonical evidence — per-(task_type,model) verdicts via ledgerReport(policy)"
+    },
+    {
+      "source": "cartography runs (JSONL)",
+      "path": "/srv/gille-inference/data/cartography-*.jsonl",
+      "present": true,
+      "records": 416,
+      "latest": "2026-06-17T23:03:02.713Z",
+      "note": "files: cartography-overnight.jsonl, cartography-smoke.jsonl"
+    },
+    {
+      "source": "extra-probes battery (JSONL)",
+      "path": "/srv/gille-inference/data/extra-probes-results.jsonl",
+      "present": true,
+      "records": 36,
+      "latest": "2026-07-07T13:37:13.430Z"
+    },
+    {
+      "source": "model-scout registry (JSONL)",
+      "path": "/srv/gille-inference/data/model-scout-registry.jsonl",
+      "present": true,
+      "records": 3,
+      "latest": "2026-07-05T04:39:19.908Z",
+      "note": "fills a model's overallPass when the ledger is too thin (consume, don't race the scout)"
+    }
+  ],
+  "globalRule": "Prefer NON-THINKING models, then higher pass-rate, then faster decode. Curated safety override: mellum is never selected for reason-math/reason-hard (documented math weakness) even on a passing probe. Escalate to a frontier model when no local model is viable or the evidence is still pending.",
+  "routing": {
+    "code-implement": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 110.6,
+      "verdict": "delegate-local",
+      "attempts": 22,
+      "note": "viable 22/22 (rate 1)"
+    },
+    "code-edit": {
+      "model": null,
+      "passRate": 1,
+      "tokPerSec": null,
+      "verdict": "escalate-frontier",
+      "attempts": 4,
+      "note": "insufficient evidence — best mellum has 1 < 3 attempts; escalating, pending more (Model Scout cron fills it)"
+    },
+    "code-review": {
+      "model": null,
+      "passRate": 0,
+      "tokPerSec": null,
+      "verdict": "escalate-frontier",
+      "attempts": 0,
+      "note": "insufficient evidence — best mellum has 0 < 3 attempts; escalating, pending more (Model Scout cron fills it)"
+    },
+    "unit-test-gen": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 102.1,
+      "verdict": "delegate-local",
+      "attempts": 5,
+      "note": "viable 5/5 (rate 1)"
+    },
+    "summarize": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 121.6,
+      "verdict": "delegate-local",
+      "attempts": 13,
+      "note": "viable 13/13 (rate 1)"
+    },
+    "extract": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 121.3,
+      "verdict": "delegate-local",
+      "attempts": 12,
+      "note": "viable 12/12 (rate 1)"
+    },
+    "classify": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 171.8,
+      "verdict": "delegate-local",
+      "attempts": 12,
+      "note": "viable 12/12 (rate 1)"
+    },
+    "data-transform": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 122,
+      "verdict": "delegate-local",
+      "attempts": 8,
+      "note": "viable 8/8 (rate 1)"
+    },
+    "regex": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 117.5,
+      "verdict": "delegate-local",
+      "attempts": 4,
+      "note": "viable 4/4 (rate 1)"
+    },
+    "sql": {
+      "model": "qwen3-coder-next-80b",
+      "passRate": 0.78,
+      "tokPerSec": 59.3,
+      "verdict": "delegate-local",
+      "attempts": 16,
+      "note": "viable 12/16 (rate 0.78)"
+    },
+    "reason-math": {
+      "model": "qwen3-coder-next-80b",
+      "passRate": 1,
+      "tokPerSec": 58.2,
+      "verdict": "delegate-local",
+      "attempts": 12,
+      "note": "viable 12/12 (rate 1) (safety-excluded: mellum) (unavailable: qwen35-a3b)"
+    },
+    "reason-hard": {
+      "model": "gpt-oss-120b",
+      "passRate": 0.97,
+      "tokPerSec": 56.3,
+      "verdict": "delegate-local",
+      "attempts": 36,
+      "note": "viable 35/36 (rate 0.97) (safety-excluded: mellum)"
+    },
+    "rewrite": {
+      "model": "qwen3-coder-next-80b",
+      "passRate": 0.95,
+      "tokPerSec": 63,
+      "verdict": "delegate-local",
+      "attempts": 32,
+      "note": "viable 30/32 (rate 0.95)"
+    },
+    "translate": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 130.9,
+      "verdict": "delegate-local",
+      "attempts": 4,
+      "note": "viable 4/4 (rate 1)"
+    },
+    "plan-decompose": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 117.3,
+      "verdict": "delegate-local",
+      "attempts": 4,
+      "note": "viable 4/4 (rate 1)"
+    },
+    "qa-factual": {
+      "model": "mellum",
+      "passRate": 1,
+      "tokPerSec": 120.6,
+      "verdict": "delegate-local",
+      "attempts": 5,
+      "note": "viable 5/5 (rate 1)"
+    },
+    "triage": {
+      "model": null,
+      "passRate": 0,
+      "tokPerSec": null,
+      "verdict": "escalate-frontier",
+      "attempts": 0,
+      "note": "no ledger evidence yet — escalating to frontier; pending cartography (Model Scout cron fills it)"
+    }
+  },
+  "escalateToFrontier": [
+    "code-edit",
+    "code-review",
+    "triage"
+  ],
+  "avoidForShortTasks": [
+    "gemma4"
+  ],
+  "modelProfiles": {
+    "Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf": {
+      "overallPass": 0.75,
+      "tokPerSec": 70.5,
+      "thinking": false,
+      "role": "",
+      "attempts": 430
+    },
+    "Qwen3-Coder-Next-Q4_K_M.gguf": {
+      "overallPass": 1,
+      "tokPerSec": 27.85,
+      "thinking": false,
+      "role": "",
+      "attempts": 48
+    },
+    "anthropic/claude-4.5-haiku-20251001": {
+      "overallPass": 1,
+      "tokPerSec": 90.33,
+      "thinking": false,
+      "role": "",
+      "attempts": 9
+    },
+    "anthropic/claude-4.6-sonnet-20260217": {
+      "overallPass": 1,
+      "tokPerSec": 45.7,
+      "thinking": false,
+      "role": "",
+      "attempts": 9
+    },
+    "gemma-4-12b-agentic-fable5-composer2-5-v2-3-5x-t": {
+      "overallPass": 0.95,
+      "tokPerSec": 26.5,
+      "thinking": false,
+      "role": "",
+      "attempts": 0,
+      "note": "overallPass from Model Scout registry (2026-07-05); ledger has 0 attempt(s)"
+    },
+    "gemma4": {
+      "overallPass": 0.88,
+      "tokPerSec": 60.87,
+      "thinking": true,
+      "role": "solid but slower; reasons efficiently. multimodal-capable.",
+      "attempts": 178
+    },
+    "gpt-oss-120b": {
+      "overallPass": 0.97,
+      "tokPerSec": 56.3,
+      "thinking": false,
+      "role": "",
+      "attempts": 36
+    },
+    "mellum": {
+      "overallPass": 0.94,
+      "tokPerSec": 123.62,
+      "thinking": false,
+      "role": "fast workhorse: code/extract/classify/summarize. WEAK at math & multi-constraint.",
+      "attempts": 276
+    },
+    "qwen3-30b-instruct": {
+      "overallPass": 1,
+      "tokPerSec": 89.52,
+      "thinking": false,
+      "role": "",
+      "attempts": 122
+    },
+    "qwen3-coder-next-80b": {
+      "overallPass": 0.93,
+      "tokPerSec": 62.4,
+      "thinking": false,
+      "role": "strongest generalist + escalation target (math, rewrite, hard instruction-following).",
+      "attempts": 165
+    },
+    "qwen35-a3b": {
+      "overallPass": 0.77,
+      "tokPerSec": 61.19,
+      "thinking": false,
+      "role": "",
+      "attempts": 93
+    },
+    "qwen36-a3b": {
+      "overallPass": null,
+      "tokPerSec": null,
+      "thinking": false,
+      "role": "Qwen3.6-35B-A3B non-thinking MoE workhorse (2026-07-02 upgrade of 3.5).",
+      "attempts": 0,
+      "note": "overallPass pending — no ledger evidence and no Model Scout eval yet"
+    }
+  }
+}

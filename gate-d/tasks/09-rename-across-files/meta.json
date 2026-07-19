@@ -1,0 +1,22 @@
+{
+  "id": "09-rename-across-files",
+  "difficulty": "H",
+  "kind": "refactor",
+  "edit": [
+    "src/core.ts",
+    "src/a.ts",
+    "src/b.ts",
+    "src/index.ts"
+  ],
+  "read": [
+    "test/rename.oracle.ts"
+  ],
+  "oracleFiles": [
+    "test/rename.oracle.ts",
+    "tsconfig.json"
+  ],
+  "oracleCmd": "test/rename.oracle.ts",
+  "structural": "! grep -rqw widget src && grep -rqw gadget src",
+  "turnsBudget": 16,
+  "costBudgetTok": 120000
+}

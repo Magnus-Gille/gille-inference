@@ -1,0 +1,20 @@
+{
+  "id": "03-impl-fn-across-2-files",
+  "difficulty": "M",
+  "kind": "feature",
+  "edit": [
+    "src/geo.ts",
+    "src/index.ts"
+  ],
+  "read": [
+    "test/nearest.oracle.ts"
+  ],
+  "oracleFiles": [
+    "test/nearest.oracle.ts",
+    "tsconfig.json"
+  ],
+  "oracleCmd": "test/nearest.oracle.ts",
+  "structural": "grep -qE 'import[^;]*\\bdistance\\b[^;]*from \"\\./geo' src/index.ts",
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

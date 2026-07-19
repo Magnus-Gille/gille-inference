@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+#
+# m5-auth — the canonical, secret-safe way for a harness to get the home-server (M5)
+# gateway bearer token. The token lives once in a configurable macOS Keychain item; nothing
+# reads it from a scratchpad file or scrapes it out of client configuration.
+#
+# Usage:
+#   M5_API_KEY=$(m5-auth)                 # print the token (for a harness env var)
+#   eval "$(m5-auth --env)"               # export M5_API_KEY + M5_BASE_URL (public gateway)
+#   eval "$(m5-auth --env --tailnet)"     # as --env, but M5_BASE_URL → m5 tailnet :8080 (#109)
+#   M5_AUTH_FILE=<(m5-auth) ./harness     # bridge for file-based harnesses (bash/zsh)
+#
+# The token is emitted for a bare call, `--env`, or `--env --tailnet` (the recognized
+# emit-flags, order-independent). `--help`/`-h` and ANY unrecognized argument — unknown
+# flags, trailing junk, or an empty-string arg — print usage to stderr WITHOUT touching the
+# token (gille-inference#97: a first-arg-only guard used to leak the raw owner token on e.g.
+# `m5-auth --help`, `m5-auth --env extra`, or `m5-auth ""`; the dispatch now allowlists every
+# arg). `--tailnet` only applies with `--env` (it rewrites M5_BASE_URL); alone it is rejected.
+#
+# NOTE: heavy/batch harnesses should run ON the box against llama-swap at
+# http://127.0.0.1:8091/v1 (UNAUTHENTICATED, loopback-only) — no token needed at all.
+# This helper is only for the case a harness must reach the authenticated gateway
+# (a configured public URL, or a private-network gateway URL).
+#
+# Set GILLE_KEYCHAIN_SERVICE and GILLE_KEYCHAIN_ACCOUNT to the item chosen during provisioning.
+# Mint and revoke keys with the homeserver CLI; never place the plaintext value in shell history.
+set -euo pipefail
+
+KEYCHAIN_SERVICE="${GILLE_KEYCHAIN_SERVICE:-gille-inference}"
+KEYCHAIN_ACCOUNT="${GILLE_KEYCHAIN_ACCOUNT:-gateway-owner}"
+TAILSCALE_HOST="${GILLE_TAILSCALE_HOST:-inference-node}"
+
+usage() {
+  cat >&2 <<'USAGE'
+m5-auth — emit the home-server (M5) gateway bearer token from the macOS Keychain.
+  m5-auth                      print the token   (for: M5_API_KEY=$(m5-auth))
+  m5-auth --env                print: export M5_API_KEY=… ; export M5_BASE_URL=…
+  m5-auth --env --tailnet      as --env, but M5_BASE_URL → m5 tailnet (:8080, bypasses Cloudflare)
+  M5_AUTH_FILE=<(m5-auth) …    bridge a file-based harness (no on-disk file)
+The token is NEVER printed for --help or any unrecognized argument.
+USAGE
+}
+
+# emit MODE(raw|env) — read the token from the Keychain and print it. Called DIRECTLY
+# (never inside $(…)) so a missing-token `exit 1` propagates and terminates the script.
+emit() {
+  local KEY
+  KEY=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null) || {
+    echo "m5-auth: no token in the configured Keychain item." >&2
+    echo "m5-auth: configure GILLE_KEYCHAIN_SERVICE and GILLE_KEYCHAIN_ACCOUNT." >&2
+    exit 1
+  }
+  if [ "$1" = "env" ]; then
+    printf 'export M5_API_KEY=%q\n' "$KEY"
+    printf 'export M5_BASE_URL=%q\n' "${M5_BASE_URL:-http://127.0.0.1:8080/v1}"
+  else
+    printf '%s' "$KEY"
+  fi
+}
+
+# resolve_m5_host — print the m5 tailnet host for the :8080 gateway. Prefer the live
+# tailscale IP; fall back to the MagicDNS name so this still works if the CLI is absent.
+resolve_m5_host() {
+  local ip
+  ip=$(tailscale ip -4 "$TAILSCALE_HOST" 2>/dev/null | head -n1) || true
+  if [ -n "${ip:-}" ]; then printf '%s' "$ip"; else printf '%s' "$TAILSCALE_HOST"; fi
+}
+
+# Dispatch via a per-arg ALLOWLIST (gille-inference#97): EVERY argument must be a
+# recognized flag, else we error WITHOUT reading the Keychain. The token is emitted only
+# for a bare call or a combination of recognized emit-flags (--env, --tailnet). Help wins
+# over emission; any unknown arg (including "") forces the no-token error path. The error
+# path never echoes the offending argument (it could itself be a token-shaped secret).
+want_env=0; want_tailnet=0; want_help=0; bad=0
+for arg in "$@"; do
+  case "$arg" in
+    --env) want_env=1 ;;
+    --tailnet) want_tailnet=1 ;;
+    -h|--help) want_help=1 ;;
+    *) bad=1 ;;
+  esac
+done
+
+if [ "$bad" -eq 1 ]; then
+  echo "m5-auth: unexpected argument(s); token is emitted only for a bare call, --env, or --env --tailnet." >&2
+  usage
+  exit 2
+elif [ "$want_help" -eq 1 ]; then
+  usage
+elif [ "$want_tailnet" -eq 1 ] && [ "$want_env" -eq 0 ]; then
+  echo "m5-auth: --tailnet only applies together with --env (it sets M5_BASE_URL)." >&2
+  usage
+  exit 2
+elif [ "$want_tailnet" -eq 1 ]; then
+  M5_BASE_URL="http://$(resolve_m5_host):8080/v1"
+  export M5_BASE_URL
+  emit env
+elif [ "$want_env" -eq 1 ]; then
+  emit env
+else
+  emit raw
+fi

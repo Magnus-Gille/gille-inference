@@ -1,0 +1,22 @@
+{
+  "id": "10-fix-shared-util-regression",
+  "difficulty": "H",
+  "kind": "bugfix",
+  "edit": [
+    "src/util.ts"
+  ],
+  "read": [
+    "test/util.oracle.ts"
+  ],
+  "oracleFiles": [
+    "test/util.oracle.ts",
+    "tsconfig.json",
+    "src/key.ts",
+    "src/format.ts",
+    "src/label.ts"
+  ],
+  "oracleCmd": "test/util.oracle.ts",
+  "structural": "true",
+  "turnsBudget": 16,
+  "costBudgetTok": 120000
+}

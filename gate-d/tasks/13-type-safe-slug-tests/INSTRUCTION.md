@@ -1,0 +1,1 @@
+Finish the TDD task: correct the type error and expected value in `test/slugify.test.ts`, add at least three meaningful assertions, and implement `slugify` in `src/slugify.ts`. It must lowercase text, replace runs of non-alphanumeric characters with one hyphen, and trim hyphens at both ends.

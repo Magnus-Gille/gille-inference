@@ -1,0 +1,16 @@
+{
+  "id": "11-node-path-containment",
+  "difficulty": "M",
+  "kind": "bugfix",
+  "edit": ["src/cache-path.ts"],
+  "read": [],
+  "oracleFiles": ["tsconfig.json"],
+  "oracleCmd": "test/.hidden-oracle.ts",
+  "hiddenOracle": "oracle/cache-path.oracle.ts",
+  "structural": "true",
+  "seedOracleRed": true,
+  "corpusRevision": "gate-d-r2",
+  "holdout": true,
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

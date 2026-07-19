@@ -1,0 +1,12 @@
+{
+  "id": "01-make-failing-test-pass",
+  "difficulty": "E",
+  "kind": "make-pass",
+  "edit": ["src/sum.ts"],
+  "read": ["test/sum.oracle.ts"],
+  "oracleFiles": ["test/sum.oracle.ts", "tsconfig.json"],
+  "oracleCmd": "test/sum.oracle.ts",
+  "structural": "true",
+  "turnsBudget": 6,
+  "costBudgetTok": 20000
+}

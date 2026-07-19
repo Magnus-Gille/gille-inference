@@ -1,0 +1,1 @@
+The shared handle pipeline accepts malformed values and normalizes too little. Strengthen `src/validate.ts` and wire it through `src/normalize.ts` so both existing callers accept trimmed mixed-case letters, digits, `_` and `-`, return lowercase handles, and reject empty, spaced, punctuated, or longer-than-20-character handles. Do not modify the callers or configuration.

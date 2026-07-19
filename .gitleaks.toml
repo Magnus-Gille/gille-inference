@@ -1,0 +1,49 @@
+title = "Gille Inference secret scanning"
+
+[extend]
+useDefault = true
+
+# The generic-api-key rule interprets the second '=' in this documented model
+# ceiling as a credential assignment. It is a numeric model limit.
+[[allowlists]]
+description = "documented model-token ceiling"
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^deploy/env\.example$''',
+  '''^src/homeserver/README\.md$''',
+]
+regexes = ['''HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768''']
+
+# These property names are multiplied into local cost estimates; no value is
+# present in source. The generic rule spans the preceding completionTokens arg.
+[[allowlists]]
+description = "local cost-estimator property names"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^src/homeserver/delegation-cost\.ts$''']
+regexes = ['''opts\.m5(?:Marginal|Amortized)UsdPerMTok''']
+
+# Explicit fake keys used to prove redaction and CLI request behavior. Keep the
+# exact literals and exact test paths narrow so a new token-shaped value fails.
+[[allowlists]]
+description = "code-loop redaction sentinel"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^tests/homeserver-code-loop-engine\.test\.ts$''']
+regexes = ['''hs_owner_sekret999abc''']
+
+[[allowlists]]
+description = "CLI fake gateway key"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^tests/hs-cli\.test\.ts$''']
+regexes = ['''hs_test123456789''']
+
+# This model identifier appears as a record key in synthetic harvest fixtures.
+[[allowlists]]
+description = "synthetic harvest model key"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^tests/post-harvest-decision-panel\.test\.ts$''']
+regexes = ['''qwen3-30b-instruct''']

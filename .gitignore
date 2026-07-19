@@ -1,0 +1,18 @@
+debate/
+STATUS.md
+node_modules/
+data/
+.env
+dist/
+*.db
+.claude/
+.playwright-mcp/
+coverage/
+__pycache__/
+*.py[cod]
+
+# Generated, time-sensitive research output
+deep-research.md
+
+# aider working artifacts (harness arm in gate-d)
+.aider*

@@ -1,0 +1,19 @@
+{
+  "id": "08-add-validation-guard",
+  "difficulty": "M",
+  "kind": "feature",
+  "edit": [
+    "src/account.ts"
+  ],
+  "read": [
+    "test/account.oracle.ts"
+  ],
+  "oracleFiles": [
+    "test/account.oracle.ts",
+    "tsconfig.json"
+  ],
+  "oracleCmd": "test/account.oracle.ts",
+  "structural": "true",
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

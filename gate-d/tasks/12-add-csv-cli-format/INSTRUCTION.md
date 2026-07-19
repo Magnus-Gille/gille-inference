@@ -1,0 +1,1 @@
+Add a `--csv` output mode to the small report CLI. Export a `formatCsv` helper from `src/format.ts`, import and use it from `src/cli.ts`, and preserve the existing text mode. Make the committed oracle pass without editing it.

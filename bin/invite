@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# invite — owner-only shortcut for minting invite codes on the M5 inference server.
+#
+# Usage:
+#   invite <friend-name> [credits] [model]
+#
+# Defaults:
+#   credits = 10000000   (10M tokens lifetime cap)
+#   model   = (none)     all models allowed
+#
+# This is a LOCAL CLI wrapper only. It writes directly to the keystore DB on this
+# box. There is NO network/HTTP endpoint that mints invites — friends can only redeem.
+#
+set -euo pipefail
+
+# ── Resolve repo root from script location (works from any CWD) ──────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+# ── Load .env if present (picks up EVAL_DB_PATH matching the running gateway) ─
+if [ -f ".env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+name="${1:-}"
+credits="${2:-10000000}"
+model="${3:-}"
+
+if [ -z "$name" ]; then
+  echo "usage: invite <friend-name> [credits] [model]" >&2
+  echo "  friend-name  — used as the invite alias-prefix (e.g. alice)" >&2
+  echo "  credits      — lifetime token cap (default: 10000000)" >&2
+  echo "  model        — restrict to a single model ID (default: all models)" >&2
+  exit 1
+fi
+
+# ── Build args for the CLI ────────────────────────────────────────────────────
+EXTRA_ARGS=()
+if [ -n "$model" ]; then
+  EXTRA_ARGS+=("--model" "$model")
+fi
+
+# ── Invoke the CLI (suppress the harmless Node punycode DeprecationWarning) ───
+NODE_OPTIONS="--no-deprecation" \
+  node_modules/.bin/tsx src/homeserver/cli.ts \
+    keys invite \
+    --credits "$credits" \
+    --tier guest \
+    --alias-prefix "$name" \
+    "${EXTRA_ARGS[@]}"

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# invites — list all invite codes and their redemption status.
+#
+# Usage:
+#   invites
+#
+# Prints a table of all invite codes: label, tier, credits, created date,
+# and status (unused / redeemed → <key-alias>).
+#
+# This is a LOCAL CLI wrapper only. It reads directly from the keystore DB on
+# this box. No args needed.
+#
+set -euo pipefail
+
+# ── Resolve repo root from script location (works from any CWD) ──────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+# ── Load .env if present (picks up EVAL_DB_PATH matching the running gateway) ─
+if [ -f ".env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+# ── Invoke the CLI (suppress the harmless Node punycode DeprecationWarning) ───
+NODE_OPTIONS="--no-deprecation" \
+  node_modules/.bin/tsx src/homeserver/cli.ts keys invites

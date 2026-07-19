@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "defaultRevision": "gate-d-r1",
+  "holdoutRevision": "gate-d-r2",
+  "revisions": {
+    "gate-d-r1": {
+      "tasks": [
+        "01-make-failing-test-pass",
+        "02-fix-bug-test-catches",
+        "03-impl-fn-across-2-files",
+        "04-add-cli-flag",
+        "05-tdd-write-test-then-impl",
+        "06-fix-off-by-one",
+        "07-refactor-extract-fn",
+        "08-add-validation-guard",
+        "09-rename-across-files",
+        "10-fix-shared-util-regression"
+      ],
+      "acceptance": { "minimumPass": 9, "denominator": 10 },
+      "pinnedCommit": "d2d2541dd01519ddf50a9bbba8903d02fcea5284",
+      "pinnedTaskTree": "5ab301a9cfd63debf37d9edd1823514f692dc872"
+    },
+    "gate-d-r2": {
+      "tasks": [
+        "01-make-failing-test-pass",
+        "02-fix-bug-test-catches",
+        "03-impl-fn-across-2-files",
+        "04-add-cli-flag",
+        "05-tdd-write-test-then-impl",
+        "06-fix-off-by-one",
+        "07-refactor-extract-fn",
+        "08-add-validation-guard",
+        "09-rename-across-files",
+        "10-fix-shared-util-regression",
+        "11-node-path-containment",
+        "12-add-csv-cli-format",
+        "13-type-safe-slug-tests",
+        "14-shared-handle-validation"
+      ],
+      "holdoutTasks": [
+        "11-node-path-containment",
+        "12-add-csv-cli-format",
+        "13-type-safe-slug-tests",
+        "14-shared-handle-validation"
+      ],
+      "acceptance": { "minimumPass": 13, "denominator": 14 }
+    }
+  }
+}

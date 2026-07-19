@@ -1,0 +1,19 @@
+{
+  "id": "05-tdd-write-test-then-impl",
+  "difficulty": "M",
+  "kind": "tdd",
+  "edit": [
+    "src/clamp.ts",
+    "test/clamp.test.ts"
+  ],
+  "read": [],
+  "oracleFiles": [
+    "tsconfig.json"
+  ],
+  "oracleCmd": "test/.hidden-oracle.ts",
+  "hiddenOracle": "oracle/clamp.oracle.ts",
+  "structural": "[ \"$(grep -cE 'assert\\.' test/clamp.test.ts)\" -ge 3 ]",
+  "seedOracleRed": true,
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

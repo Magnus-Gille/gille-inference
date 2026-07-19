@@ -1,0 +1,20 @@
+{
+  "id": "04-add-cli-flag",
+  "difficulty": "M",
+  "kind": "feature",
+  "edit": [
+    "src/cli.ts",
+    "src/format.ts"
+  ],
+  "read": [
+    "test/cli.oracle.ts"
+  ],
+  "oracleFiles": [
+    "test/cli.oracle.ts",
+    "tsconfig.json"
+  ],
+  "oracleCmd": "test/cli.oracle.ts",
+  "structural": "grep -qE 'export (function|const) formatJson' src/format.ts && grep -q formatJson src/cli.ts",
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

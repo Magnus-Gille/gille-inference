@@ -1,0 +1,16 @@
+{
+  "id": "14-shared-handle-validation",
+  "difficulty": "H",
+  "kind": "feature",
+  "edit": ["src/normalize.ts", "src/validate.ts"],
+  "read": ["src/member.ts", "src/lookup.ts"],
+  "oracleFiles": ["src/member.ts", "src/lookup.ts", "tsconfig.json"],
+  "oracleCmd": "test/.hidden-oracle.ts",
+  "hiddenOracle": "oracle/handle.oracle.ts",
+  "structural": "node \"$GATE_D_ROOT/check-ts-contract.mjs\" export-callable src/validate.ts assertValidHandle && node \"$GATE_D_ROOT/check-ts-contract.mjs\" import-validated-return src/normalize.ts assertValidHandle ./validate normalizeHandle",
+  "seedOracleRed": true,
+  "corpusRevision": "gate-d-r2",
+  "holdout": true,
+  "turnsBudget": 13,
+  "costBudgetTok": 60000
+}

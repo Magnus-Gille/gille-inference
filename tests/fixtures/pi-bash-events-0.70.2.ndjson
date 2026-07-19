@@ -1,0 +1,4 @@
+{"type":"tool_execution_start","toolCallId":"test-fail","toolName":"bash","args":{"command":"npm test"}}
+{"type":"tool_execution_end","toolCallId":"test-fail","toolName":"bash","result":{"content":[{"type":"text","text":"FAIL tests/example.test.ts\nCommand exited with code 1"}]},"isError":true}
+{"type":"tool_execution_start","toolCallId":"test-pass","toolName":"bash","args":{"command":"npm test"}}
+{"type":"tool_execution_end","toolCallId":"test-pass","toolName":"bash","result":{"content":[{"type":"text","text":"Tests: 3 passed\n"}]},"isError":false}

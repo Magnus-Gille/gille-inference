@@ -1,0 +1,14 @@
+{
+  "id": "12-add-csv-cli-format",
+  "difficulty": "M",
+  "kind": "feature",
+  "edit": ["src/cli.ts", "src/format.ts"],
+  "read": ["test/cli.oracle.ts"],
+  "oracleFiles": ["test/cli.oracle.ts", "tsconfig.json"],
+  "oracleCmd": "test/cli.oracle.ts",
+  "structural": "node \"$GATE_D_ROOT/check-ts-contract.mjs\" export-callable src/format.ts formatCsv && node \"$GATE_D_ROOT/check-ts-contract.mjs\" import-return-flow src/cli.ts formatCsv ./format run",
+  "corpusRevision": "gate-d-r2",
+  "holdout": true,
+  "turnsBudget": 10,
+  "costBudgetTok": 50000
+}

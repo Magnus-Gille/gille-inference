@@ -1,0 +1,103 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# TRACKED MIRROR — llama-swap serving config, manually synced from the box.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Source of truth: m5:/etc/llama-swap/config.yaml (a SEPARATE systemd
+# service, `llama-swap.service` — NOT part of this repo's automated rsync
+# deploy pipeline, which only covers /srv/gille-inference /
+# home-gateway.service). Nothing keeps this file and the live one in sync
+# automatically; a human copies it back here after every live change.
+#
+# Everything from the "BEGIN VERBATIM LIVE CONFIG" marker below is byte-identical to the live
+# file as of 2026-07-13. Last change: after switching the M5 from a fixed 64 GiB UMA carveout to
+# 512 MiB fixed UMA + 100 GiB dynamic TTM, expanded five models to 128K context and gpt-oss to
+# 64K; VibeThinker remains at its already-validated 64K. Backup on box:
+# config.yaml.bak.pre-context-20260713-*.
+# GGUF files retained on disk (removed from serving only). Prior context: gille-inference#160 gave
+# gemma4 --mmproj for images; #137 was the qwen3.5→3.6 non-thinking workhorse swap; #115 set
+# qwen3-coder-next-80b to -c 65536 -fa on (docs/m5-serving-optimization-2026-06-20.md).
+# THIS HEADER ITSELF is not part of the live file, so a naive whole-file diff always shows a
+# spurious header-only delta — see below.
+#
+# HOW TO DETECT DRIFT (strips this header before comparing, so only real config changes show):
+#   diff <(sed -n '/^# BEGIN VERBATIM LIVE CONFIG/,$p' deploy/llama-swap-config.yaml | tail -n +2) \
+#        /etc/llama-swap/config.yaml
+#   (run this ON the box, or after copying the live file over via scp/rsync
+#   if working from elsewhere). Any output means someone changed the live
+#   config out-of-band (as happened with #115) and this mirror is stale.
+#
+# HOW TO FIX DRIFT / APPLY A CHANGE (the live file is ALWAYS the source of truth — edits made
+# only in this repo file are never deployed and will NOT show up on the box):
+#   1. Edit /etc/llama-swap/config.yaml directly on the box (take a
+#      timestamped backup first, e.g. config.yaml.bak.pre-<change>).
+#   2. sudo systemctl restart llama-swap  (this file does NOT auto-apply —
+#      llama-swap only reads its live config path, never this repo).
+#   3. Verify coherence: a quick /v1/chat/completions round-trip against the
+#      changed model(s).
+#   4. Copy the new live file back over the content below this header and commit, so the repo
+#      stays the record of what's actually running.
+#
+# This file is DOCUMENTATION, not deployment — editing it and pushing a PR
+# changes nothing on the box. It exists purely so a config change (like the
+# #115 fix, which was made live and only discovered undocumented afterward)
+# is visible in git history and reviewable, instead of drifting silently.
+# ═══════════════════════════════════════════════════════════════════════════
+# BEGIN VERBATIM LIVE CONFIG — everything below this line must match the box exactly.
+# Optimized 2026-06-20: flash-attn pinned per model to the measured-best path.
+# See repo docs/m5-serving-optimization-2026-06-20.md. Backup: config.yaml.bak.20260620
+# Context expanded 2026-07-13 after UMA/TTM reconfiguration; one full request slot per model.
+healthCheckTimeout: 900
+logLevel: info
+models:
+  "vibethinker-3b":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/VibeThinker-3B.Q8_0.gguf
+      -ngl 99 -ub 512 -c 65536 -np 1 --jinja -fa on
+      --temp 1.0 --top-p 0.95 --top-k 0 --min-p 0.0
+    ttl: 1800
+  "qwen36-a3b":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/Qwen3.6-35B-A3B-Q4_K_M.gguf
+      -ngl 99 -ub 512 -c 131072 -np 1 --jinja -fa on
+      --chat-template-kwargs '{"enable_thinking":false}'
+    ttl: 1800
+  "qwen3-coder-next-80b":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/Qwen3-Coder-Next-Q4_K_M.gguf
+      -ngl 99 -ub 512 -c 131072 -np 1 --jinja -fa on
+    ttl: 1800
+  "mellum":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf
+      -ngl 99 -ub 512 -c 131072 -np 1 --jinja -fa on
+    ttl: 1800
+  "gemma4":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/gemma-4-26B-A4B-it-Q4_K_M.gguf
+      --mmproj /srv/models/mmproj-gemma-4-26B-A4B-it-bf16.gguf
+      -ngl 99 -ub 512 -c 131072 -np 1 --jinja -fa on
+    ttl: 1800
+  "qwen3-30b-instruct":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+      -ngl 99 -ub 512 -c 131072 -np 1 --jinja -fa on
+    ttl: 1800
+  "gpt-oss-120b":
+    cmd: |
+      /opt/llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /srv/models/gpt-oss-120b/gpt-oss-120b-mxfp4-00001-of-00003.gguf
+      -ngl 99 -ub 512 -c 65536 -np 1 --jinja -fa on
+    ttl: 1800

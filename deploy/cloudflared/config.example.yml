@@ -1,0 +1,45 @@
+# cloudflared Tunnel config — template. Copy to ~/.cloudflared/config.yml and edit.
+#
+# Setup (one-time):
+#   cloudflared tunnel login
+#   cloudflared tunnel create llm                  # prints a Tunnel UUID + creds file
+#   cloudflared tunnel route dns llm inference.example.com  # creates the CNAME at Cloudflare
+#   cloudflared tunnel run llm                      # or install as a service (below)
+#
+# Run as a service so it survives reboots:
+#   sudo cloudflared service install
+#   sudo systemctl enable --now cloudflared
+#
+# The tunnel connects OUTBOUND to Cloudflare — no inbound ports are opened on the
+# box or router. The gateway stays bound to 127.0.0.1.
+
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /home/REPLACE_USER/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  # Public hostname → the loopback-bound gateway.
+  - hostname: inference.example.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      # Long generations stream as SSE; do not let the origin connection idle-close
+      # mid-stream. Clients must use stream=true (see ONBOARDING.md) to beat
+      # Cloudflare's ~100s single-request limit.
+      noTLSVerify: false
+      connectTimeout: 10s
+      # keep the connection open for streaming responses
+      keepAliveTimeout: 90s
+
+  # Everything else is rejected.
+  - service: http_status:404
+
+# --- Cloudflare dashboard settings (configure in the UI, not here) ---
+# 1. REQUIRED — WAF → Rate limiting rules, BOTH paths:
+#      a. /v1/*           : e.g. >30 requests / 10s per IP → block (inference flood).
+#      b. /portal/redeem  : e.g. >10 requests / 10 min per IP → block. This is the
+#         unauthenticated invite-redemption surface; without a rule here an attacker can
+#         brute-force invite codes. The gateway ALSO enforces an in-app per-IP throttle
+#         (HOMESERVER_REDEEM_RPM, default 10 / 10 min) as defence-in-depth, but the WAF
+#         rule is the primary control and must be configured. Optionally also cover
+#         GET /portal and GET / .
+# 2. REQUIRED — Security → Bots → Bot Fight Mode: ON.
+# 3. Do not advertise the hostname publicly.

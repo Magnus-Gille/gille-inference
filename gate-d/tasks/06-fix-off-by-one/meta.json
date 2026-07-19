@@ -1,0 +1,12 @@
+{
+  "id": "06-fix-off-by-one",
+  "difficulty": "E",
+  "kind": "bugfix",
+  "edit": ["src/paginate.ts"],
+  "read": ["test/paginate.oracle.ts"],
+  "oracleFiles": ["test/paginate.oracle.ts", "tsconfig.json"],
+  "oracleCmd": "test/paginate.oracle.ts",
+  "structural": "true",
+  "turnsBudget": 6,
+  "costBudgetTok": 20000
+}
