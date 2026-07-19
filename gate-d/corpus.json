@@ -17,7 +17,7 @@
         "10-fix-shared-util-regression"
       ],
       "acceptance": { "minimumPass": 9, "denominator": 10 },
-      "pinnedCommit": "d2d2541dd01519ddf50a9bbba8903d02fcea5284",
+      "pinnedCommit": "9fbfddf6f1b6a46e4a39ad5f6df4ecfa4d5bf606",
       "pinnedTaskTree": "5ab301a9cfd63debf37d9edd1823514f692dc872"
     },
     "gate-d-r2": {
