@@ -209,28 +209,20 @@ benchmark reports under `docs/` for methodology and results.
 
 ## Deploying the M5 gateway
 
-The live directory `/srv/gille-inference` is not a Git checkout. Deploy only from a clean,
-reviewed `main` and follow `deploy/README.md` plus `src/homeserver/README.md`. The safe baseline is:
+`deploy/README.md`'s **"Live deployment (authoritative)"** section is the single source of truth
+for the live path, systemd unit, deploy/verify commands, rollback recipe, and the MCP-restart
+caveat — read it before touching production. In short: the unit is `home-gateway.service`
+(`WorkingDirectory=/home/magnus/home-server-eval`), the live tree is a plain rsync'd copy (not a
+git checkout), and `scripts/deploy-gateway.sh {deploy|verify|dry-run}` is the repo-owned deploy
+tool (issue #23) — it fails closed on a dirty source tree, a `WorkingDirectory` mismatch, or any
+failed health/capability probe, and stamps `.deployed-commit` only once every check has passed.
 
-```bash
-rsync -az --no-perms --omit-dir-times \
-  --exclude .git --exclude node_modules --exclude data --exclude .env \
-  --exclude '*.log' --exclude debate --exclude .claude --exclude .codex --exclude dist \
-  ./ m5:/srv/gille-inference/
-```
-
-Never sync `data/` or `.env`; they contain the live database, keystore/credits, logs, and secrets.
-Restart `home-gateway` only when gateway/server code or cached portal content changed, then verify
-the documented health endpoint. CLI/script-only changes may be zero-downtime. New `bin/invite`
-deployments may need their executable bit restored because `--no-perms` drops it.
-
-```bash
-ssh m5 'sudo systemctl restart home-gateway'
-curl http://<m5-tailnet-ip>:8080/healthz
-ssh m5 'chmod +x /srv/gille-inference/bin/invite'
-```
+`/srv/gille-inference` — this section's previously documented path — is **not** a Git checkout and
+does **not exist** on the box; do not target it. (`CONTRIBUTING.md`'s use of the same string as a
+reserved doc/test placeholder, alongside `example.com`, is intentional and unrelated.)
 
 `src/homeserver/portal.html` is hand-maintained and cached in memory. Whenever served models,
 endpoints, limits, credits/rate policy, or billing dimensions change, update the portal's "What's
 running" and "How to use it" sections in the same change and keep `src/homeserver/README.md`
-consistent. A portal-only deploy still requires a gateway restart.
+consistent. A portal-only deploy still requires a gateway restart (see `deploy/README.md`'s
+MCP-restart caveat).
