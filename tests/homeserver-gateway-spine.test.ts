@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getDb, initDb } from "../src/db.js";
+import {
+  EXPOSURE_RECEIPT_SCHEMA_VERSION,
+  EXPOSURE_RECEIPT_CONTRACT_VERSION,
+  SUBSCRIPTION_NOT_INDEPENDENT_NOTE,
+  type ExposureReceiptEnvelope,
+} from "../src/homeserver/exposure-receipt-schema.js";
 
 // The gateway reads config from env at startGateway() time. We must set env BEFORE
 // importing config/gateway, and isolate the DB before any keystore call. Tests drive a
@@ -838,6 +844,123 @@ describe("gateway spine — HTTP integration", () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { error: { code: string; param: string | null } };
     expect(body.error).toMatchObject({ code: "invalid_request_error", param: "fingerprint_version" });
+  });
+
+  function makeExposureReceipt(overrides: Partial<ExposureReceiptEnvelope> = {}): ExposureReceiptEnvelope {
+    const base: ExposureReceiptEnvelope = {
+      schemaVersion: EXPOSURE_RECEIPT_SCHEMA_VERSION,
+      contractVersion: EXPOSURE_RECEIPT_CONTRACT_VERSION,
+      kind: "observation",
+      receiptId: `receipt-${randomUUID()}`,
+      surface: "codex_app",
+      fingerprintVersion: taskFingerprintVersion,
+      canonicalFingerprintSha256: taskTextFingerprint(`http-exposure-receipt-${randomUUID()}`).sha256,
+      provider: "openai",
+      requestedModel: "gpt-5-codex",
+      effectiveModel: { status: "known", modelId: "gpt-5-codex" },
+      modelConfigEpoch: { kind: "label", label: "default-config" },
+      harness: { kind: "label", label: "codex-app@1.0.0" },
+      reasoningEffort: "medium",
+      instructionDigest: { kind: "unknown", reason: "not-observed" },
+      promptDigest: { kind: "unknown", reason: "not-observed" },
+      skillDigest: { kind: "unknown", reason: "not-observed" },
+      toolPolicyDigest: { kind: "unknown", reason: "not-observed" },
+      occurredAt: "2026-07-20T10:00:00.000Z",
+      producedAt: "2026-07-20T10:00:01.000Z",
+      subscriptionNotIndependentNote: SUBSCRIPTION_NOT_INDEPENDENT_NOTE,
+    };
+    return { ...base, ...overrides };
+  }
+
+  it("exposure-receipts intake denies guest and identity-less static admin keys (#10)", async () => {
+    const guest = mintKey({ alias: "exposure-receipt-guest", tier: "guest" }, DEFAULTS);
+    const body = JSON.stringify(makeExposureReceipt());
+    for (const token of [guest.plaintextKey, ADMIN]) {
+      const response = await fetch(url("/admin/exposure-receipts"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body,
+      });
+      expect(response.status).toBe(403);
+      const respBody = (await response.json()) as { error: { code: string } };
+      expect(respBody.error.code).toBe("route_not_allowed");
+    }
+  });
+
+  it("#10 AC1: a Codex App exposure receipt is later found seen (and cross-surface linked) via the shared #4 lookup", async () => {
+    const owner = mintKey({ alias: `codex-app-work-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const receipt = makeExposureReceipt();
+
+    const intake = await fetch(url("/admin/exposure-receipts"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(receipt),
+    });
+    expect(intake.status).toBe(200);
+    const intakeBody = await intake.json() as { status: string; admission: string; surface: string };
+    expect(intakeBody).toMatchObject({ status: "admitted", admission: "created", surface: "codex_app" });
+
+    const lookup = await fetch(url("/admin/task-exposures/lookup"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({
+        fingerprint_version: taskFingerprintVersion,
+        fingerprints: [],
+        canonical: [{ fingerprint_sha256: receipt.canonicalFingerprintSha256 }],
+      }),
+    });
+    expect(lookup.status).toBe(200);
+    const lookupBody = await lookup.json() as {
+      results: Array<{ seen: boolean; lanes: string[]; external_surfaces: string[]; model_ids: string[] }>;
+    };
+    expect(lookupBody.results[0]).toMatchObject({
+      seen: true,
+      lanes: ["external-producer"],
+      external_surfaces: ["codex_app"],
+      model_ids: ["gpt-5-codex"],
+    });
+
+    // Redelivering the exact same receipt is an idempotent no-op (duplicate).
+    const replay = await fetch(url("/admin/exposure-receipts"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(receipt),
+    });
+    expect(replay.status).toBe(200);
+    const replayBody = await replay.json() as { admission: string };
+    expect(replayBody.admission).toBe("exact-existing");
+  });
+
+  it("#10: exposure-receipts intake rejects an unsupported schema version with a specific reason", async () => {
+    const owner = mintKey({ alias: `codex-cli-reject-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const receipt = { ...makeExposureReceipt(), schemaVersion: 999 };
+    const response = await fetch(url("/admin/exposure-receipts"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(receipt),
+    });
+    expect(response.status).toBe(400);
+    const body = await response.json() as { status: string; reason: string };
+    expect(body).toMatchObject({ status: "rejected", reason: "unsupported-schema-version" });
+  });
+
+  it("#10: producer heartbeat endpoint accepts a registered surface and rejects an unknown one", async () => {
+    const owner = mintKey({ alias: `pi-heartbeat-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const ok = await fetch(url("/admin/exposure-receipts/heartbeat"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({ surface: "pi" }),
+    });
+    expect(ok.status).toBe(200);
+    const okBody = await ok.json() as { status: string; surface: string };
+    expect(okBody).toMatchObject({ status: "ok", surface: "pi" });
+
+    const bad = await fetch(url("/admin/exposure-receipts/heartbeat"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({ surface: "not-a-real-surface" }),
+    });
+    expect(bad.status).toBe(400);
   });
 
   it("duplicate alias mint → clean 409, no SQLite string in the body (Fix #10)", async () => {

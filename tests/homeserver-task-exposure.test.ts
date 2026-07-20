@@ -121,6 +121,7 @@ describe("task exposure storage and lookup", () => {
       harness_ids: ["code-loop-pi-v6", "delegate-local"],
       unseen_claim_supported: true,
       includes_legacy_inexact: false,
+      external_surfaces: [],
     });
     expect(response.results[1]).toMatchObject({
       fingerprint_sha256: unknown,
