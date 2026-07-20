@@ -58,7 +58,10 @@ import {
   lookupTaskExposures,
   parseTaskExposureLookupRequest,
   recordMessageTaskExposuresBestEffort,
+  recordExternalProducerHeartbeat,
 } from "./task-exposure.js";
+import { ingestExposureReceipt } from "./exposure-receipt-intake.js";
+import { exposureReceiptSurfaceSchema } from "./exposure-receipt-schema.js";
 import {
   LEARNING_TASK_PREFLIGHT_ENDPOINT,
   LEARNING_TASK_PREFLIGHT_TTL_MS,
@@ -3321,6 +3324,118 @@ async function handleRequest(
       }
       res.setHeader("cache-control", "no-store");
       sendJson(res, 200, lookupTaskExposures(parsed.value));
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      return;
+    }
+
+    // ─── External-surface exposure-receipt intake (#10) ───
+    // Authenticated, content-blind producer-receipt path for Codex App/Codex CLI/Pi exposure
+    // observations — gille's half of the pair with Magnus-Gille/hugin#237. Same boundary as
+    // /admin/task-exposures/lookup: a real minted owner key is required (every external producer/
+    // subscription is provisioned its own minted key); legacy static/implicit admins have no
+    // per-principal identity to bind a subscription alias to and are denied. The authenticated
+    // principal's OWN alias — never a body-supplied claim — becomes the receipt's subscription
+    // alias, so a receipt can never impersonate a different subscription.
+    if (path === "/admin/exposure-receipts" && method === "POST") {
+      lctx.admission = "n/a";
+      if (principal.tier !== "owner" || principal.keyHash === null) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner key." }));
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readBody(req, 16 * 1024);
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+        return;
+      }
+      let body: unknown;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
+        return;
+      }
+      const result = ingestExposureReceipt(body, principal.alias);
+      res.setHeader("cache-control", "no-store");
+      if (result.status === "rejected") {
+        sendJson(res, 400, result);
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = `exposure_receipt_${result.reason}`;
+        return;
+      }
+      sendJson(res, 200, result);
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      return;
+    }
+
+    // ─── External-surface producer heartbeat (#10) ───
+    // Lightweight liveness signal with nothing to expose (an idle Codex App/Codex CLI/Pi
+    // session) — same authenticated-owner-key boundary as the receipt endpoint above. A missing
+    // or stale heartbeat for a REGISTERED surface prevents an "unseen"-covered claim anywhere in
+    // /admin/task-exposures/lookup (see task-exposure.ts's externalProducerSurfaceHeartbeats).
+    if (path === "/admin/exposure-receipts/heartbeat" && method === "POST") {
+      lctx.admission = "n/a";
+      if (principal.tier !== "owner" || principal.keyHash === null) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner key." }));
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readBody(req, 4 * 1024);
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+        return;
+      }
+      let body: unknown;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
+        return;
+      }
+      const surfaceParsed = exposureReceiptSurfaceSchema.safeParse(
+        body !== null && typeof body === "object" ? (body as Record<string, unknown>)["surface"] : undefined
+      );
+      if (!surfaceParsed.success) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(
+          res,
+          makeError("invalid_request_error", {
+            param: "surface",
+            message: "surface must be one of codex_app, codex_cli, pi.",
+          })
+        );
+        return;
+      }
+      recordExternalProducerHeartbeat({ surface: surfaceParsed.data, principalAlias: principal.alias });
+      res.setHeader("cache-control", "no-store");
+      sendJson(res, 200, { status: "ok", surface: surfaceParsed.data, subscriptionAlias: principal.alias });
       lctx.status = 200;
       lctx.outcome = "ok";
       return;

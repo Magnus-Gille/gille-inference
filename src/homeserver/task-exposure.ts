@@ -45,14 +45,37 @@ export type TaskExposureIdentityKind = (typeof TASK_EXPOSURE_IDENTITY_KINDS)[num
 /** Identity kinds a lookup caller may query for; "legacy-inexact" is disclosure-only DB row data. */
 export type TaskExposureQueryIdentityKind = Extract<TaskExposureIdentityKind, "rendered-prompt" | "canonical-raw">;
 
+/**
+ * A single generic bucket for every authenticated EXTERNAL-SURFACE producer receipt (gille#10;
+ * exposure-receipt-intake.ts). Deliberately NOT added to `TASK_EXPOSURE_LANES`/`EvidenceLane`
+ * above: those are gille's own gateway-controlled execution lanes (what `coverage.lanes`
+ * documents as "declared gateway-controlled lanes"), and are also reused as-is by ledger.ts's
+ * capability-evidence identity — an external Codex App/Codex CLI/Pi observation is neither. The
+ * actual producer surface (codex_app / codex_cli / pi) is carried separately in the new
+ * `external_surface` column/field below, so per-surface cross-surface lineage stays visible
+ * without widening the shared gateway-lane vocabulary.
+ */
+export const TASK_EXPOSURE_EXTERNAL_LANE = "external-producer" as const;
+/** The widened row-level lane type accepted by `recordTaskExposure` — every gateway lane, plus
+ *  the one generic external-producer bucket. Never exported as part of `TaskExposureLane`/
+ *  `EvidenceLane` (see above). */
+export type TaskExposureRowLane = TaskExposureLane | typeof TASK_EXPOSURE_EXTERNAL_LANE;
+
 export interface TaskFingerprint {
   version: typeof TASK_FINGERPRINT_VERSION;
   sha256: string;
 }
 
 export interface TaskExposureRecord {
-  taskText: string;
-  lane: TaskExposureLane;
+  /**
+   * The rendered/gateway-observed task text. Optional (gille#10): an authenticated
+   * EXTERNAL-SURFACE producer receipt (Codex App/Codex CLI/Pi) never sends gille raw task
+   * bytes at all — content-blind throughout — so it supplies ONLY `canonicalFingerprintSha256`
+   * below and omits this field entirely. Every existing gateway-observed lane still supplies it
+   * exactly as before; this widening is purely additive.
+   */
+  taskText?: string;
+  lane: TaskExposureRowLane;
   modelId?: string | null;
   harnessId?: string | null;
   /** Stable for recovered/backfilled records; generated for an ordinary live event. */
@@ -60,12 +83,23 @@ export interface TaskExposureRecord {
   ts?: string;
   /**
    * Authoritative canonical logical-task identity (#4), taken directly from an admitted
-   * LearningTaskContract Hugin request stamp's `raw_fingerprint.digest`. Absent/null for every
-   * unstamped lane (chat, mcp-ask, plain delegate/code-loop) — those continue to record
-   * rendered-prompt identity only, exactly as before. When present, recorded as a SEPARATE
-   * "canonical-raw" row alongside (never replacing) the rendered-prompt row.
+   * LearningTaskContract Hugin request stamp's `raw_fingerprint.digest` OR (gille#10) an
+   * authenticated external-surface producer receipt's own pre-computed `trim-utf8-sha256-v1`
+   * digest over the same logical task text gille never sees. Absent/null for every unstamped
+   * lane (chat, mcp-ask, plain delegate/code-loop) — those continue to record rendered-prompt
+   * identity only, exactly as before. When present alongside `taskText`, recorded as a SEPARATE
+   * "canonical-raw" row alongside (never replacing) the rendered-prompt row; when `taskText` is
+   * absent (the external-producer case), this is the ONLY row recorded.
    */
   canonicalFingerprintSha256?: string | null;
+  /**
+   * The external producer surface this exposure was observed on (gille#10) — "codex_app",
+   * "codex_cli", or "pi". null/omitted for every gateway-observed lane. Stored alongside (never
+   * instead of) `lane`, which for every external-producer row is the generic
+   * `TASK_EXPOSURE_EXTERNAL_LANE` bucket — this field is what actually distinguishes Codex App
+   * from Codex CLI from Pi for cross-surface lineage.
+   */
+  externalSurface?: string | null;
 }
 
 /** One query item for the legacy `fingerprints` array — always "rendered-prompt", label-only. */
@@ -112,6 +146,14 @@ export interface TaskExposureLookupResult {
   unseen_claim_supported: boolean;
   /** True when at least one contributing row predates the identity-kind discriminator (#4 AC7). */
   includes_legacy_inexact: boolean;
+  /**
+   * Every distinct external-producer surface ("codex_app" / "codex_cli" / "pi") that reported
+   * this exact fingerprint (gille#10), sorted, deduplicated. Empty when every contributing row
+   * came from a gille-observed gateway lane. This is what makes cross-surface reuse — "seen on
+   * Codex AND Pi" — visible without ever storing raw task content: `lanes` already reports the
+   * gateway lane(s) alongside this, so a mixed native+external match shows both.
+   */
+  external_surfaces: string[];
 }
 
 /** One coverage-epoch's boundary record — a restart/gap is measurable, not just felt (#4 AC "restart"). */
@@ -184,6 +226,18 @@ export interface TaskExposureLookupResponse {
     canonical_identity_capture_started_at: string | null;
     direct_loopback_traffic: typeof DIRECT_LOOPBACK_TRAFFIC_DISCLOSURE;
     exact_match_semantics: typeof EXACT_MATCH_SEMANTICS_DISCLOSURE;
+    /**
+     * Queryable producer-heartbeat health per registered external surface (gille#10) — "a
+     * queryable field beats a dashboard", same house style as the coverage-epoch counters above.
+     * A surface only appears once some principal has ever reported a receipt/heartbeat for it;
+     * an unregistered surface never blocks anything (there is no expectation of coverage for a
+     * surface nobody has ever wired up). `healthy` is true when AT LEAST ONE principal for that
+     * surface has heartbeated within `EXTERNAL_EXPOSURE_HEARTBEAT_STALE_MS`.
+     */
+    external_producer_heartbeats: ExternalProducerSurfaceHeartbeatStatus[];
+    /** False whenever any REGISTERED external surface's heartbeat is missing/stale (gille#10 AC2)
+     *  — see `unseen_claim_supported` below, which is fail-closed gated on this too. */
+    external_producer_heartbeats_healthy: boolean;
   };
   results: TaskExposureLookupResult[];
 }
@@ -209,6 +263,28 @@ interface ExposureDbRow {
   model_id: string | null;
   harness_id: string | null;
   identity_kind: string;
+  external_surface: string | null;
+}
+
+/** Missing/stale threshold for an external producer's heartbeat (gille#10 AC2). Deliberately
+ *  generous — Codex App/Codex CLI/Pi sessions are bursty, not continuously polling — but still a
+ *  real fail-closed bound: past this, a registered surface can no longer support an "unseen"
+ *  claim anywhere in the registry, since the silent producer might have seen the task itself. */
+export const EXTERNAL_EXPOSURE_HEARTBEAT_STALE_MS = 24 * 60 * 60 * 1000;
+
+export interface ExternalProducerHeartbeatStatus {
+  surface: string;
+  principalAlias: string;
+  lastHeartbeatAt: string;
+  healthy: boolean;
+}
+
+export interface ExternalProducerSurfaceHeartbeatStatus {
+  surface: string;
+  healthy: boolean;
+  /** Most recent heartbeat across every principal reporting for this surface. */
+  last_heartbeat_at: string;
+  principals: Array<{ principal_alias: string; last_heartbeat_at: string; healthy: boolean }>;
 }
 
 interface OwnerRequestDbRow {
@@ -297,6 +373,15 @@ export function ensureTaskExposureSchema(
     );
     CREATE INDEX IF NOT EXISTS idx_task_exposure_epochs_started
       ON task_exposure_coverage_epochs(started_at);
+
+    -- External-surface producer heartbeats (gille#10). One row per (surface, principal) —
+    -- a surface is heartbeat-healthy when AT LEAST ONE of its principals is fresh.
+    CREATE TABLE IF NOT EXISTS task_exposure_external_heartbeats (
+      surface            TEXT NOT NULL,
+      principal_alias    TEXT NOT NULL,
+      last_heartbeat_at  TEXT NOT NULL,
+      PRIMARY KEY (surface, principal_alias)
+    );
   `);
   // Additive column migration (#4) for DBs created before the identity-kind/coverage-epoch
   // discriminators existed — same guarded ALTER TABLE idiom as ledger.ts's node_id/shadow columns.
@@ -310,6 +395,12 @@ export function ensureTaskExposureSchema(
     }
     if (!names.has("coverage_epoch_id")) {
       db.exec(`ALTER TABLE task_exposure_events ADD COLUMN coverage_epoch_id TEXT NOT NULL DEFAULT 'legacy-pre-epoch'`);
+    }
+    if (!names.has("external_surface")) {
+      // gille#10: nullable — only externally-sourced (identity_kind='canonical-raw', lane=
+      // TASK_EXPOSURE_EXTERNAL_LANE) rows ever populate this; every pre-existing and every
+      // gateway-observed row stays NULL.
+      db.exec(`ALTER TABLE task_exposure_events ADD COLUMN external_surface TEXT`);
     }
   })();
   db.exec(`
@@ -414,6 +505,83 @@ export function listTaskExposureCoverageEpochs(
   }));
 }
 
+/**
+ * Record (or refresh) an external producer's heartbeat for one surface (gille#10). Called both
+ * whenever a receipt is admitted (evidence of liveness) AND from an explicit lightweight
+ * heartbeat call with no exposure to report (an idle Codex App/Codex CLI/Pi session) — the two
+ * are the same primitive. A stamp older than the current row is ignored (`MAX`, not overwrite) so
+ * an out-of-order retry can never move a healthy heartbeat backwards into staleness.
+ */
+export function recordExternalProducerHeartbeat(
+  input: { surface: string; principalAlias: string; ts?: string },
+  db: Database.Database = getDb()
+): void {
+  ensureTaskExposureSchema(db);
+  const ts = input.ts ?? new Date().toISOString();
+  db.prepare(
+    `INSERT INTO task_exposure_external_heartbeats (surface, principal_alias, last_heartbeat_at)
+     VALUES (@surface, @principalAlias, @ts)
+     ON CONFLICT(surface, principal_alias) DO UPDATE SET
+       last_heartbeat_at = CASE
+         WHEN excluded.last_heartbeat_at > task_exposure_external_heartbeats.last_heartbeat_at
+         THEN excluded.last_heartbeat_at
+         ELSE task_exposure_external_heartbeats.last_heartbeat_at
+       END`
+  ).run({ surface: input.surface, principalAlias: input.principalAlias, ts });
+}
+
+/** Every registered (surface, principal) heartbeat with its computed health (gille#10). */
+export function listExternalProducerHeartbeats(
+  db: Database.Database = getDb(),
+  nowIso: string = new Date().toISOString(),
+  staleMs: number = EXTERNAL_EXPOSURE_HEARTBEAT_STALE_MS
+): ExternalProducerHeartbeatStatus[] {
+  ensureTaskExposureSchema(db);
+  const rows = db.prepare(
+    `SELECT surface, principal_alias, last_heartbeat_at
+       FROM task_exposure_external_heartbeats
+      ORDER BY surface, principal_alias`
+  ).all() as Array<{ surface: string; principal_alias: string; last_heartbeat_at: string }>;
+  const nowMs = Date.parse(nowIso);
+  return rows.map((row) => ({
+    surface: row.surface,
+    principalAlias: row.principal_alias,
+    lastHeartbeatAt: row.last_heartbeat_at,
+    healthy: nowMs - Date.parse(row.last_heartbeat_at) <= staleMs,
+  }));
+}
+
+/**
+ * Roll the per-principal heartbeat rows up to one status per surface (gille#10 AC2): a surface is
+ * healthy when AT LEAST ONE of its registered principals is currently fresh — a retired/replaced
+ * subscription that never reports again must not permanently poison a surface still actively
+ * covered by another principal.
+ */
+export function externalProducerSurfaceHeartbeats(
+  db: Database.Database = getDb(),
+  nowIso: string = new Date().toISOString(),
+  staleMs: number = EXTERNAL_EXPOSURE_HEARTBEAT_STALE_MS
+): ExternalProducerSurfaceHeartbeatStatus[] {
+  const statuses = listExternalProducerHeartbeats(db, nowIso, staleMs);
+  const bySurface = new Map<string, ExternalProducerHeartbeatStatus[]>();
+  for (const status of statuses) {
+    const list = bySurface.get(status.surface) ?? [];
+    list.push(status);
+    bySurface.set(status.surface, list);
+  }
+  return [...bySurface.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([surface, principals]) => {
+    const lastHeartbeatAt = principals.map((p) => p.lastHeartbeatAt).sort().at(-1)!;
+    return {
+      surface,
+      healthy: principals.some((p) => p.healthy),
+      last_heartbeat_at: lastHeartbeatAt,
+      principals: principals
+        .map((p) => ({ principal_alias: p.principalAlias, last_heartbeat_at: p.lastHeartbeatAt, healthy: p.healthy }))
+        .sort((a, b) => a.principal_alias.localeCompare(b.principal_alias)),
+    };
+  });
+}
+
 function cleanMetadataId(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   if (!trimmed || trimmed === "unknown" || trimmed === "none") return null;
@@ -422,11 +590,17 @@ function cleanMetadataId(value: string | null | undefined): string | null {
 }
 
 /**
- * Insert one exposure event. When `input.canonicalFingerprintSha256` is present, records BOTH
- * identities (#4): a "rendered-prompt" row (unchanged #257 behavior) AND a separate "canonical-raw"
- * row sharing the same lane/model/harness/ts/epoch metadata. `identityKindOverride` lets the
- * historical backfill importer (which has neither a live epoch nor a canonical identity) mark its
- * rows 'legacy-inexact' instead of 'rendered-prompt' — see the identity-kind doc comment above.
+ * Insert one exposure event. When `input.canonicalFingerprintSha256` is present ALONGSIDE
+ * `input.taskText`, records BOTH identities (#4): a "rendered-prompt" row (unchanged #257
+ * behavior) AND a separate "canonical-raw" row sharing the same lane/model/harness/ts/epoch
+ * metadata. `identityKindOverride` lets the historical backfill importer (which has neither a
+ * live epoch nor a canonical identity) mark its rows 'legacy-inexact' instead of 'rendered-prompt'
+ * — see the identity-kind doc comment above.
+ *
+ * gille#10: when `input.taskText` is ABSENT (the authenticated external-surface producer-receipt
+ * path — content-blind, gille never receives raw task bytes at all), the rendered-prompt row is
+ * skipped entirely and `canonicalFingerprintSha256` is REQUIRED — it is the only identity such a
+ * receipt can ever carry.
  */
 function insertExposure(
   db: Database.Database,
@@ -435,12 +609,13 @@ function insertExposure(
   ts: string,
   identityKindOverride: Extract<TaskExposureIdentityKind, "rendered-prompt" | "legacy-inexact"> = "rendered-prompt"
 ): boolean {
-  const canonical = canonicalTaskText(input.taskText);
-  if (canonical === "") return false;
-  const fingerprint = taskTextFingerprint(canonical);
+  if (input.taskText === undefined && !input.canonicalFingerprintSha256) {
+    throw new Error("recordTaskExposure requires taskText and/or canonicalFingerprintSha256");
+  }
   const epochId = identityKindOverride === "legacy-inexact" ? "legacy-pre-epoch" : currentCoverageEpochId(db);
   const modelId = cleanMetadataId(input.modelId);
   const harnessId = cleanMetadataId(input.harnessId);
+  const externalSurface = cleanMetadataId(input.externalSurface);
   const insertRow = (
     key: string,
     version: string,
@@ -448,9 +623,9 @@ function insertExposure(
     identityKind: TaskExposureIdentityKind
   ): boolean => db.prepare(
     `INSERT OR IGNORE INTO task_exposure_events
-       (event_key, ts, fingerprint_version, fingerprint_sha256, lane, model_id, harness_id, identity_kind, coverage_epoch_id)
+       (event_key, ts, fingerprint_version, fingerprint_sha256, lane, model_id, harness_id, identity_kind, coverage_epoch_id, external_surface)
      VALUES
-       (@eventKey, @ts, @version, @sha256, @lane, @modelId, @harnessId, @identityKind, @epochId)`
+       (@eventKey, @ts, @version, @sha256, @lane, @modelId, @harnessId, @identityKind, @epochId, @externalSurface)`
   ).run({
     eventKey: key,
     ts,
@@ -461,17 +636,29 @@ function insertExposure(
     harnessId,
     identityKind,
     epochId,
+    externalSurface,
   }).changes > 0;
 
-  let inserted = insertRow(`${eventKey}#${identityKindOverride}`, fingerprint.version, fingerprint.sha256, identityKindOverride);
+  let inserted = false;
+
+  if (input.taskText !== undefined) {
+    const canonical = canonicalTaskText(input.taskText);
+    if (canonical === "" && !input.canonicalFingerprintSha256) return false;
+    if (canonical !== "") {
+      const fingerprint = taskTextFingerprint(canonical);
+      inserted = insertRow(`${eventKey}#${identityKindOverride}`, fingerprint.version, fingerprint.sha256, identityKindOverride);
+    }
+  }
 
   if (input.canonicalFingerprintSha256) {
     if (!SHA256_RE.test(input.canonicalFingerprintSha256)) {
       throw new Error("canonical task fingerprint must be a lowercase 64-character SHA-256 hex string");
     }
-    // Trust boundary (#4): the WRITE side trusts an already-authenticated/admitted stamp's
-    // raw_fingerprint.digest (validated upstream by validateHuginRequestStamp + the admission
-    // claim). The READ side never extends that trust to an arbitrary lookup caller — see
+    // Trust boundary (#4/#10): the WRITE side trusts an already-authenticated/admitted stamp's
+    // raw_fingerprint.digest, or an authenticated external-surface producer receipt's own
+    // pre-computed digest (validated upstream — validateHuginRequestStamp + the admission claim
+    // for Hugin, ingestExposureReceipt's schema+auth checks for an external producer). The READ
+    // side never extends that trust to an arbitrary lookup caller — see
     // parseTaskExposureLookupRequest's exact_bytes recomputation below.
     const canonicalInserted = insertRow(
       `${eventKey}#canonical-raw`,
@@ -868,7 +1055,7 @@ function findExposureRows(
   const fpPlaceholders = fingerprints.map(() => "?").join(",");
   const kindPlaceholders = identityKinds.map(() => "?").join(",");
   const rows = db.prepare(
-    `SELECT fingerprint_sha256, ts, lane, model_id, harness_id, identity_kind
+    `SELECT fingerprint_sha256, ts, lane, model_id, harness_id, identity_kind, external_surface
        FROM task_exposure_events
       WHERE fingerprint_version = ? AND identity_kind IN (${kindPlaceholders}) AND fingerprint_sha256 IN (${fpPlaceholders})
       ORDER BY ts, event_key`
@@ -898,6 +1085,7 @@ function buildLookupResult(
     harness_ids: [...new Set(found.map((row) => row.harness_id).filter((v): v is string => v !== null))].sort(),
     unseen_claim_supported: unseenClaimSupported,
     includes_legacy_inexact: found.some((row) => row.identity_kind === "legacy-inexact"),
+    external_surfaces: [...new Set(found.map((row) => row.external_surface).filter((v): v is string => v !== null))].sort(),
   };
 }
 
@@ -923,11 +1111,23 @@ export function lookupTaskExposures(
   const captureHealthy = firstGap === null && !unhealthyDbs.has(db) && !unboundCaptureFailure;
   if (!captureHealthy) reasons.push("a live content-blind capture write failed");
 
+  // gille#10 AC2: a missing/stale external-producer heartbeat is a SEPARATE fail-closed gate from
+  // captureHealthy above (a healthy local DB write path says nothing about whether a registered
+  // Codex App/Codex CLI/Pi producer has gone silent and might be sitting on an unreported
+  // exposure). Only REGISTERED surfaces count — one nobody has ever wired up cannot block
+  // anything, since there is no expectation of coverage for it at all.
+  const externalSurfaceHeartbeats = externalProducerSurfaceHeartbeats(db, nowIso);
+  const externalHeartbeatsHealthy = externalSurfaceHeartbeats.every((s) => s.healthy);
+  if (!externalHeartbeatsHealthy) {
+    reasons.push("one or more registered external exposure producers have a missing or stale heartbeat");
+  }
+  const unseenClaimHealthy = captureHealthy && externalHeartbeatsHealthy;
+
   const canonicalIdentityCaptureStartedAt = metaGet(db, "canonical_identity_capture_started_at");
 
   const renderedFound = findExposureRows(db, request.fingerprint_version, "rendered-prompt", request.fingerprints);
   const renderedResults = request.fingerprints.map((fingerprint) =>
-    buildLookupResult(fingerprint, "rendered-prompt", renderedFound.get(fingerprint) ?? [], captureHealthy)
+    buildLookupResult(fingerprint, "rendered-prompt", renderedFound.get(fingerprint) ?? [], unseenClaimHealthy)
   );
 
   const canonicalQueries = request.canonical ?? [];
@@ -938,9 +1138,10 @@ export function lookupTaskExposures(
     canonicalQueries.map((q) => q.fingerprint_sha256)
   );
   const canonicalResults = canonicalQueries.map((query) => {
-    // Fail-closed disclosure (#4 AC2/AC3): a bare label (no verified exact_bytes) NEVER supports a
-    // negative claim, regardless of how healthy live capture otherwise is.
-    const unseenClaimSupported = captureHealthy
+    // Fail-closed disclosure (#4 AC2/AC3, gille#10 AC2): a bare label (no verified exact_bytes)
+    // NEVER supports a negative claim, regardless of how healthy live capture otherwise is; nor
+    // does a healthy bare-label-verified query when a registered external producer has gone dark.
+    const unseenClaimSupported = unseenClaimHealthy
       && query.exact_bytes !== undefined
       && canonicalIdentityCaptureStartedAt !== null;
     return buildLookupResult(
@@ -978,6 +1179,8 @@ export function lookupTaskExposures(
       canonical_identity_capture_started_at: canonicalIdentityCaptureStartedAt,
       direct_loopback_traffic: DIRECT_LOOPBACK_TRAFFIC_DISCLOSURE,
       exact_match_semantics: EXACT_MATCH_SEMANTICS_DISCLOSURE,
+      external_producer_heartbeats: externalSurfaceHeartbeats,
+      external_producer_heartbeats_healthy: externalHeartbeatsHealthy,
     },
     results: [...renderedResults, ...canonicalResults],
   };
