@@ -8,6 +8,7 @@ import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
 import { ledgerReport, recentDelegations, getDelegationById } from "./ledger.js";
+import { resetRoutingTable, loadRoutingTable } from "./routing-table.js";
 import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
   lookupKey,
@@ -3372,6 +3373,43 @@ async function handleRequest(
       sendJson(res, 200, result);
       lctx.status = 200;
       lctx.outcome = "ok";
+      return;
+    }
+
+    // ─── Reviewed routing-table reload (#7) ───
+    // The atomic-reload seam the reviewed lifecycle depends on: scripts/routing-lifecycle-cli.ts's
+    // `adopt` writes docs/m5-routing.json on disk, then calls THIS endpoint so the LIVE gateway
+    // process picks it up WITHOUT a restart (AC: "gateway adoption does not depend on an
+    // undocumented manual restart"). Same requireAdmin() idiom as the rest of /admin — no new auth
+    // scheme. Never writes the file itself; it only re-parses whatever is currently on disk, so a
+    // malformed write is reported as a 500 (and the caller rolls back) rather than crashing the
+    // gateway's already-loaded table.
+    if (path === "/admin/routing-table/reload" && method === "POST") {
+      lctx.admission = "n/a";
+      if (!requireAdmin()) return;
+      resetRoutingTable();
+      try {
+        const reloaded = loadRoutingTable();
+        sendJson(res, 200, {
+          reloaded: true,
+          routableTaskTypes: Object.keys(reloaded.routing).length,
+          escalateToFrontier: reloaded.escalateToFrontier.length,
+        });
+        lctx.status = 200;
+        lctx.outcome = "ok";
+      } catch (err) {
+        // A corrupt/missing table on disk must not crash the process — surface it as a failed
+        // reload so the caller (adoptRoutingTable) rolls back to the last-known-good snapshot.
+        sendError(
+          res,
+          makeError("internal_error", {
+            message: `routing-table reload failed: ${err instanceof Error ? err.message : String(err)}`,
+          })
+        );
+        lctx.status = 500;
+        lctx.outcome = "error";
+        lctx.errorClass = "internal_error";
+      }
       return;
     }
 

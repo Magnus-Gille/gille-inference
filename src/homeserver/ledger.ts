@@ -609,14 +609,29 @@ function evidenceWeight(taskType: string, verifierName: string | null, policy: P
  * #234: default-off evidence toggle. `includeShadow: true` re-admits shadow-lane candidate rows into
  * an evidence query — the ONLY way to see them, used by an explicit `?includeShadow=1` reader and by
  * a future promotion gate (#158). Every reader defaults to EXCLUDING shadow rows.
+ *
+ * `excludeOrganicJudge` (issue #7): additionally exclude rows graded by the harvest organic judge
+ * (verifier `llm-judge:<model>` or its shadow-mode counterpart `harvest-shadow:llm-judge:<model>` —
+ * see harvest.ts and calibration-sample.ts's `verifierClassOf`). Used ONLY by the reviewed routing
+ * lifecycle to compute what the evidence would say WITHOUT organic-judge rows, so it can detect a
+ * route change that is explained ONLY by that evidence (inadmissible to drive a route change unless
+ * the #6 calibration gate is GO with a recorded reviewed enablement — calibration-gate.ts). This is a
+ * READ-time filter for that one consumer; it does not change verdict computation for any other
+ * caller and does not touch routing-policy semantics itself.
  */
 export interface EvidenceReadOpts {
   includeShadow?: boolean;
+  excludeOrganicJudge?: boolean;
 }
 
 /** SQL fragment excluding shadow rows unless the caller opts in. Empty string re-admits them. */
 function shadowFilter(opts?: EvidenceReadOpts): string {
-  return opts?.includeShadow ? "" : " AND shadow = 0";
+  let clause = opts?.includeShadow ? "" : " AND shadow = 0";
+  if (opts?.excludeOrganicJudge) {
+    clause +=
+      " AND COALESCE(verifier, '') NOT LIKE 'llm-judge:%' AND COALESCE(verifier, '') NOT LIKE 'harvest-shadow:llm-judge:%'";
+  }
+  return clause;
 }
 
 interface AccumulatedOutcomeCounts {
