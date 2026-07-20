@@ -20,13 +20,13 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.13.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.2.7"
   },
   "dependencies": {
     "better-sqlite3": "^12.8.0",
     "openai": "^4.104.0",
+    "tsx": "^4.19.0",
     "zod": "^3.23.0"
   },
   "overrides": {

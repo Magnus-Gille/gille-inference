@@ -114,10 +114,12 @@ scripts/deploy-gateway.sh deploy
 
 The script (issue #23) is the repo-owned replacement for manual rsync + restart + hand-checked
 hashes. It fails closed: it refuses a dirty or non-addressable source tree, refuses when the live
-unit's `WorkingDirectory` doesn't match what it's about to sync into, restarts the unit only when
-the payload actually changed, probes local health, tailnet health, and an authenticated capability
-endpoint, and writes `.deployed-commit` with the exact 40-char SHA **only** after every check
-passes — any failure leaves the marker absent rather than certifying an ambiguous state.
+unit's `WorkingDirectory` doesn't match what it's about to sync into, seeds `docs/m5-routing.json`
+copy-if-absent without ever overwriting a live/adopted table (issue #44), preflights the ExecStart
+interpreter before restarting (issue #30 — see below), restarts the unit only when the payload
+actually changed, probes local health (best-effort) and tailnet health plus an authenticated
+capability endpoint, and writes `.deployed-commit` with the exact 40-char SHA **only** after every
+check passes — any failure leaves the marker absent rather than certifying an ambiguous state.
 
 A real deploy needs three env vars with no safe default (the script refuses to "certify" a
 deployment it did not actually probe):
@@ -128,12 +130,32 @@ deployment it did not actually probe):
 | `DEPLOY_CAPABILITY_URL` | `http://<tailnet-ip>:8080/v1/capabilities/learning-task` — cheap authenticated smoke test, no model call |
 | `HOMESERVER_OWNER_KEY` (or the var named by `DEPLOY_CAPABILITY_KEY_ENV`) | An owner-tier bearer key. Read from the environment; never printed, logged, or passed on the command line. |
 
+`DEPLOY_HEALTH_LOCAL_URL` has **no default** (issue #30 — the gateway binds only the tailnet
+interface, so a default loopback probe could never legitimately answer); set it explicitly only if
+something in your environment actually listens on loopback. `DEPLOY_HEALTH_TAILNET_URL` above is
+the mandatory probe of the box's real listener and is unaffected.
+
 `DEPLOY_REMOTE_HOST` defaults to the `m5` ssh alias and `DEPLOY_REMOTE_DIR` defaults to
 `/home/magnus/home-server-eval`; override either if the live topology ever changes. Run
 `scripts/deploy-gateway.sh --help`, or read the script's own header comment, for the full env var
 list, the exact rsync exclude list (and why each entry is there — native `node_modules` are never
 shipped from the operator's laptop; they're installed fresh on the box), and the fail-closed
 marker-invalidate/write ordering.
+
+**Routing-table adoption survives deploys (issue #44).** `docs/m5-routing.json` is excluded from
+the main rsync and only ever seeded with `rsync --ignore-existing` afterward: a fresh box with no
+table gets the committed copy; a box with any existing table — including one written by the #7
+routing-lifecycle CLI's `adopt` — is never touched. Before this fix, every deploy silently reverted
+an adopted table back to whatever happened to be committed (see "Adopting a routing-table change"
+below).
+
+**ExecStart interpreter preflight (issue #30).** The unit's `ExecStart` runs `tsx`
+(`node_modules/.bin/tsx`), which is production runtime, not a dev-only tool — `npm ci --omit=dev`
+used to strip it, so a restart crash-looped with `203/EXEC` until a manual full `npm ci`. `tsx` now
+lives in `package.json`'s `dependencies` (not `devDependencies`), so the default install keeps it;
+belt-and-braces, the script also refuses to restart the unit at all if the live `ExecStart`
+interpreter is missing or not executable right before every restart, leaving the box on its
+last-good build instead of crash-looping.
 
 Preview any deploy first:
 

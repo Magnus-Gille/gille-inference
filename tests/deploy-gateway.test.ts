@@ -121,9 +121,25 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     DEPLOY_WORKDIR_PROBE_CMD: `echo ${remoteDir}`,
     DEPLOY_INSTALL_CMD: "true",
     DEPLOY_RESTART_CMD: "true",
+    // Benign defaults for the issue #30 interpreter preflight: a fixture ExecStart line whose
+    // path is never actually stat'd because DEPLOY_INTERPRETER_CHECK_CMD is stubbed to "true".
+    // Tests that specifically exercise the preflight override both of these directly.
+    DEPLOY_EXECSTART_PROBE_CMD: `echo '{ path=${remoteDir}/node_modules/.bin/tsx ; argv[]=${remoteDir}/node_modules/.bin/tsx src/homeserver/cli.ts serve ; }'`,
+    DEPLOY_INTERPRETER_CHECK_CMD: "true",
     HOMESERVER_OWNER_KEY: OWNER_KEY,
     ...overrides,
   };
+}
+
+/** Writes docs/m5-routing.json into a source-repo fixture and commits it, so deploy-gateway.sh's
+ *  routing-table seed logic (issue #44) has a real "committed table" to sync from. `content`
+ *  defaults to a distinguishable fixture table so tests can assert exactly which bytes ended up
+ *  on the "remote". */
+function writeCommittedRoutingTable(srcDir: string, content = '{"routing":{},"escalateToFrontier":[],"_fixture":"committed"}\n'): void {
+  mkdirSync(join(srcDir, "docs"), { recursive: true });
+  writeFileSync(join(srcDir, "docs", "m5-routing.json"), content);
+  execFileSync("git", ["add", "-A"], { cwd: srcDir });
+  execFileSync("git", ["commit", "-q", "-m", "add fixture routing table"], { cwd: srcDir });
 }
 
 describe("scripts/deploy-gateway.sh", () => {
@@ -331,5 +347,184 @@ describe("scripts/deploy-gateway.sh", () => {
     const r = await runScript("verify", src, baseEnv(remote));
     expect(r.status).not.toBe(0);
     expect(r.stdout).toMatch(/no \.deployed-commit marker present/);
+  });
+
+  describe("routing-table copy-if-absent seeding (issue #44)", () => {
+    it("an already-adopted routing table SURVIVES a deploy (adopt -> deploy -> still adopted)", async () => {
+      const src = initSourceRepo();
+      writeCommittedRoutingTable(src, '{"routing":{},"escalateToFrontier":[],"_fixture":"committed-v2"}\n');
+      const remote = tmpDir("dg-remote-");
+      // Simulate the #7 routing-lifecycle CLI's `adopt` having already written a human-approved
+      // table directly onto the box, out of band from any deploy.
+      mkdirSync(join(remote, "docs"), { recursive: true });
+      const adoptedContent = '{"routing":{"code-implement":{"model":"mellum"}},"escalateToFrontier":[],"_fixture":"ADOPTED-BY-OPERATOR"}\n';
+      writeFileSync(join(remote, "docs", "m5-routing.json"), adoptedContent);
+
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+      expect(r.status).toBe(0);
+      // The whole point of #44: the deploy must NOT revert the box to the committed table.
+      expect(readFileSync(join(remote, "docs", "m5-routing.json"), "utf8")).toBe(adoptedContent);
+      expect(r.stdout).toMatch(/OK: docs\/m5-routing\.json already present on the remote -- left untouched/);
+    });
+
+    it("a fresh box with no routing table gets seeded with the committed copy", async () => {
+      const src = initSourceRepo();
+      const committedContent = '{"routing":{},"escalateToFrontier":[],"_fixture":"committed-v1"}\n';
+      writeCommittedRoutingTable(src, committedContent);
+      const remote = tmpDir("dg-remote-"); // no docs/m5-routing.json here at all
+
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+      expect(r.status).toBe(0);
+      expect(readFileSync(join(remote, "docs", "m5-routing.json"), "utf8")).toBe(committedContent);
+      expect(r.stdout).toMatch(/SEEDED: docs\/m5-routing\.json was absent on the remote/);
+    });
+
+    it("the main rsync excludes docs/m5-routing.json (never deletes or reverts it via --delete either)", async () => {
+      const src = initSourceRepo();
+      writeCommittedRoutingTable(src, '{"routing":{},"escalateToFrontier":[],"_fixture":"committed"}\n');
+      const remote = tmpDir("dg-remote-");
+      mkdirSync(join(remote, "docs"), { recursive: true });
+      const adoptedContent = '{"routing":{},"escalateToFrontier":[],"_fixture":"ADOPTED"}\n';
+      writeFileSync(join(remote, "docs", "m5-routing.json"), adoptedContent);
+      // An unrelated stale file that SHOULD be removed by --delete, to prove the exclude is
+      // scoped to the one path and doesn't accidentally disable --delete generally.
+      writeFileSync(join(remote, "docs", "stale-unrelated-file.md"), "should be deleted\n");
+
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+      expect(r.status).toBe(0);
+      expect(readFileSync(join(remote, "docs", "m5-routing.json"), "utf8")).toBe(adoptedContent);
+      expect(existsSync(join(remote, "docs", "stale-unrelated-file.md"))).toBe(false);
+    });
+  });
+
+  describe("ExecStart interpreter preflight before restart (issue #30)", () => {
+    it("refuses to restart (and never invokes the restart command) when the ExecStart interpreter is missing", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const missingTsxPath = join(remote, "node_modules", ".bin", "tsx"); // deliberately never created
+      const sentinel = join(remote, "RESTARTED_SENTINEL");
+
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_EXECSTART_PROBE_CMD: `echo '{ path=${missingTsxPath} ; argv[]=${missingTsxPath} src/homeserver/cli.ts serve ; }'`,
+          DEPLOY_INTERPRETER_CHECK_CMD: "", // empty falls back to the script's real default: test -x "$exec_path"
+          DEPLOY_RESTART_CMD: `touch '${sentinel}'`,
+        })
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/ExecStart interpreter .* is missing or not executable after/);
+      expect(r.stderr).toMatch(/issue #30/);
+      expect(existsSync(sentinel)).toBe(false); // restart must never have been attempted
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
+
+    it("proceeds with the restart when the ExecStart interpreter is present and executable", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const tsxPath = join(remote, "node_modules", ".bin", "tsx");
+      mkdirSync(join(remote, "node_modules", ".bin"), { recursive: true });
+      writeFileSync(tsxPath, "#!/bin/sh\n");
+      execFileSync("chmod", ["+x", tsxPath]);
+      const sentinel = join(remote, "RESTARTED_SENTINEL");
+
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_EXECSTART_PROBE_CMD: `echo '{ path=${tsxPath} ; argv[]=${tsxPath} src/homeserver/cli.ts serve ; }'`,
+          DEPLOY_INTERPRETER_CHECK_CMD: "", // real default: test -x "$exec_path"
+          DEPLOY_RESTART_CMD: `touch '${sentinel}'`,
+        })
+      );
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/OK: ExecStart interpreter present and executable/);
+      expect(existsSync(sentinel)).toBe(true);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+  });
+
+  describe("local health probe default (issue #30)", () => {
+    it("does not require DEPLOY_HEALTH_LOCAL_URL by default -- an unset local probe is skipped, not deploy-blocking", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          // DEPLOY_HEALTH_LOCAL_URL intentionally omitted -- must default to unset/best-effort.
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/SKIP: local health probe not configured/);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it("still refuses when the REQUIRED tailnet probe is unset -- only the local default became optional", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_CAPABILITY_URL: cap.url,
+          // DEPLOY_HEALTH_TAILNET_URL intentionally omitted -- still mandatory.
+        })
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/tailnet health URL is not set/);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
   });
 });

@@ -21,9 +21,11 @@ set -euo pipefail
 #
 # Modes (first positional arg):
 #   deploy    (default) Sync the clean reviewed source tree to the verified remote
-#             WorkingDirectory, restart the unit only if the payload actually changed, probe
-#             local + tailnet health plus an authenticated capability check, and stamp
-#             .deployed-commit with the exact 40-char SHA ONLY after every check passes.
+#             WorkingDirectory, seed docs/m5-routing.json copy-if-absent (never clobbering an
+#             adopted table — issue #44), restart the unit only if the payload actually changed
+#             (gated by an interpreter preflight — issue #30), probe local + tailnet health plus
+#             an authenticated capability check, and stamp .deployed-commit with the exact 40-char
+#             SHA ONLY after every check passes.
 #   verify    Read-only. Reports the marker commit plus a content spot-check against the local
 #             tree. Never touches rsync, the unit, or the marker.
 #   dry-run   Prints the exact plan (path check, rsync command, restart decision, probes) without
@@ -38,8 +40,16 @@ set -euo pipefail
 #     silently targets a stale or guessed path;
 #   - invalidates any existing .deployed-commit as the FIRST remote mutation, so every failure
 #     after that point leaves the marker ABSENT rather than stale-but-plausible;
-#   - writes the new marker as the LAST step, only once rsync, install, restart-if-needed, local
-#     health, tailnet health, and the authenticated capability probe have all succeeded.
+#   - never overwrites a live docs/m5-routing.json: it is excluded from the main rsync (like
+#     .env/data/) and only ever seeded with --ignore-existing, so an adopted routing table (the
+#     #7 routing-lifecycle CLI's runtime state) survives every deploy; a fresh box with no table
+#     still gets the committed one (issue #44);
+#   - refuses to restart the unit if the ExecStart interpreter is missing/non-executable after
+#     install — the exact failure mode of `npm ci --omit=dev` stripping the tsx runtime
+#     dependency (issue #30) — instead of restarting into a crash-loop;
+#   - writes the new marker as the LAST step, only once rsync, install, the interpreter preflight,
+#     restart-if-needed, local health (best-effort), tailnet health, and the authenticated
+#     capability probe have all succeeded.
 #
 # Test seam (see tests/deploy-gateway.test.ts): every "remote" step is issued through
 # remote_run(), which resolves an overridable env var to a command string and executes it via
@@ -53,7 +63,14 @@ set -euo pipefail
 DEPLOY_REMOTE_HOST="${DEPLOY_REMOTE_HOST-m5}"
 DEPLOY_REMOTE_DIR="${DEPLOY_REMOTE_DIR:-/home/magnus/home-server-eval}"
 DEPLOY_UNIT="${DEPLOY_UNIT:-home-gateway.service}"
-DEPLOY_HEALTH_LOCAL_URL="${DEPLOY_HEALTH_LOCAL_URL:-http://127.0.0.1:8080/healthz}"
+# issue #30: the gateway binds ONLY the tailnet interface (HOMESERVER_HOST), never loopback (that
+# is the whole reason DEPLOY_HEALTH_TAILNET_URL exists below and has no safe default). A default
+# of http://127.0.0.1:8080/healthz therefore probed a listener that was never going to answer,
+# blocking every deploy on an unfixable false negative. The local probe now defaults to UNSET and
+# is best-effort/non-blocking (see probe_health's `required` argument): set it explicitly only if
+# something legitimately listens on loopback in your environment (e.g. local dev). The mandatory,
+# always-required probe of the box's real listener is DEPLOY_HEALTH_TAILNET_URL, unchanged.
+DEPLOY_HEALTH_LOCAL_URL="${DEPLOY_HEALTH_LOCAL_URL:-}"
 DEPLOY_HEALTH_TAILNET_URL="${DEPLOY_HEALTH_TAILNET_URL:-}"
 DEPLOY_CAPABILITY_URL="${DEPLOY_CAPABILITY_URL:-}"
 DEPLOY_CAPABILITY_KEY_ENV="${DEPLOY_CAPABILITY_KEY_ENV:-HOMESERVER_OWNER_KEY}"
@@ -80,13 +97,23 @@ fi
 #   *.db / *.sqlite*  belt-and-braces in case a DB file ever lives outside data/.
 #   *.log             operational logs are box-local, not part of the reviewed payload.
 #   .deployed-commit* managed exclusively by this script's invalidate/write steps, never by rsync.
+#   docs/m5-routing.json  runtime state, NOT reviewed-payload content (issue #44): the #7
+#                     routing-lifecycle CLI's `adopt` command writes a human-approved routing
+#                     table into this exact path on the live box. It is still git-tracked (it also
+#                     doubles as the first-deploy SEED), so excluding it from the main sync is what
+#                     stops every later deploy from silently reverting an adoption back to whatever
+#                     happens to be committed. `seed_routing_table()` below (rsync --ignore-existing
+#                     on this one path, run AFTER the main sync) is the copy-if-absent half: a box
+#                     that has no table yet gets the committed one; a box with any existing table —
+#                     adopted or not — is never touched.
 #   .DS_Store         macOS noise from the operator's laptop.
 #   .claude/ .codex/  local agent-harness scratch, never shipped.
 #   dist/             no build step ships to the box today (tsx runs src/ directly); if that ever
 #                     changes, drop this exclude in the same change that adds a build step.
 # rsync's default --delete does NOT remove files matched by an --exclude (that needs the separate
-# --delete-excluded flag, which is deliberately never passed here), so data/.env/node_modules on
-# the box survive a delete pass even though the source tree here doesn't have matching content.
+# --delete-excluded flag, which is deliberately never passed here), so data/.env/node_modules/the
+# routing table on the box survive a delete pass even though the source tree here doesn't have
+# matching content.
 RSYNC_EXCLUDES=(
   --exclude .git --exclude .git/
   --exclude node_modules --exclude node_modules/
@@ -96,6 +123,7 @@ RSYNC_EXCLUDES=(
   --exclude '*.sqlite-wal' --exclude '*.sqlite-shm'
   --exclude '*.log'
   --exclude .deployed-commit --exclude .deployed-commit.tmp
+  --exclude docs/m5-routing.json
   --exclude .DS_Store
   --exclude .claude/ --exclude .codex/
   --exclude dist/
@@ -209,17 +237,89 @@ verify_path_match() {
   printf '%s\n' "${remote_dir%/}"
 }
 
+# probe_health URL LABEL [REQUIRED=1] — REQUIRED=0 (used for the "local" probe by default, issue
+# #30) means an unset URL is reported and skipped rather than refusing the deploy: the gateway
+# binds only the tailnet interface, so a default loopback probe can never legitimately answer, and
+# treating that as a hard failure blocked every deploy on an unfixable false negative. REQUIRED=1
+# (the default, and always used for "tailnet") keeps refusing when unset — that probe targets the
+# box's real listener and staying mandatory is exactly what issue #23 established.
 probe_health() {
-  local url="$1" label="$2"
+  local url="$1" label="$2" required="${3:-1}"
   if [ -z "$url" ]; then
-    echo "ERROR: $label health URL is not set — refusing to certify deployment without probing it." >&2
-    return 1
+    if [ "$required" = "1" ]; then
+      echo "ERROR: $label health URL is not set — refusing to certify deployment without probing it." >&2
+      return 1
+    fi
+    echo "  SKIP: $label health probe not configured (expected-per-config; not deploy-blocking, issue #30)"
+    return 0
   fi
   if ! curl -fsS --max-time 10 "$url" >/dev/null; then
     echo "ERROR: $label health probe failed: $url" >&2
     return 1
   fi
   echo "  OK: $label healthy ($url)"
+}
+
+# Copy-if-absent seed for the routing table (issue #44): a plain rsync of this ONE path with
+# --ignore-existing, run AFTER the main sync (which excludes it wholesale, see RSYNC_EXCLUDES).
+# rsync's own --ignore-existing does exactly the semantics this needs and nothing more: if the
+# destination file does not exist, it is created from the committed copy (the fresh-box SEED
+# case); if it already exists — freshly seeded on a prior deploy, or holding a human-adopted table
+# from the #7 routing-lifecycle CLI — rsync silently skips it. No existence-check-then-copy TOCTOU
+# window, no separate remote command, and it works identically in the ssh and local test-seam
+# modes because it goes through the exact same rsync_dest() the main sync already uses.
+seed_routing_table() {
+  local out
+  if [ ! -f docs/m5-routing.json ]; then
+    # Should not happen against a real checkout (it is always git-tracked) but fail SOFT here:
+    # a missing local seed file is a repo-consistency problem, not a reason to abort an otherwise
+    # good deploy of everything else.
+    echo "  WARN: no local docs/m5-routing.json to seed from -- skipping (nothing to install)."
+    return 0
+  fi
+  out="$(rsync -a --ignore-existing -i docs/m5-routing.json "$(rsync_dest)docs/m5-routing.json")"
+  if [ -n "$out" ]; then
+    echo "  SEEDED: docs/m5-routing.json was absent on the remote -- installed the committed table."
+  else
+    echo "  OK: docs/m5-routing.json already present on the remote -- left untouched (adopted tables are never overwritten)."
+  fi
+}
+
+# Resolve the live unit's ExecStart interpreter path (issue #30's pre-restart preflight). Parsed
+# from `systemctl show --property=ExecStart --value`, whose value looks like:
+#   { path=/abs/path/node_modules/.bin/tsx ; argv[]=/abs/path/.../tsx src/homeserver/cli.ts serve ; ... }
+# Parameter-expansion only (no grep -P / PCRE) so this runs identically under GNU and BSD toolchains.
+remote_execstart_path() {
+  local raw
+  raw="$(remote_run DEPLOY_EXECSTART_PROBE_CMD "systemctl show '$DEPLOY_UNIT' --property=ExecStart --value")" || return 1
+  raw="${raw#*path=}"
+  raw="${raw%%;*}"
+  raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  printf '%s\n' "$raw"
+}
+
+# Fail-closed guard (issue #30): refuse to restart the unit if the ExecStart interpreter is
+# missing or not executable after install. This is the exact failure mode of `npm ci --omit=dev`
+# stripping tsx (a devDependency that is also the production runtime) — the old default silently
+# restarted into a 203/EXEC crash-loop. Run this immediately before every restart, never before.
+preflight_interpreter() {
+  local exec_path
+  exec_path="$(remote_execstart_path)" || {
+    echo "ERROR: could not read $DEPLOY_UNIT's ExecStart -- refusing to restart without confirming its interpreter exists." >&2
+    return 1
+  }
+  if [ -z "$exec_path" ]; then
+    echo "ERROR: $DEPLOY_UNIT's ExecStart has no parseable interpreter path -- refusing to restart." >&2
+    return 1
+  fi
+  if ! remote_run DEPLOY_INTERPRETER_CHECK_CMD "test -x '$exec_path'"; then
+    echo "ERROR: $DEPLOY_UNIT's ExecStart interpreter ($exec_path) is missing or not executable after" >&2
+    echo "       install -- refusing to restart (issue #30: this is exactly what 'npm ci --omit=dev'" >&2
+    echo "       stripping the tsx runtime dependency looks like). Fix the install step and re-run;" >&2
+    echo "       the unit is left running its last-good build, not restarted into a crash-loop." >&2
+    return 1
+  fi
+  echo "  OK: ExecStart interpreter present and executable ($exec_path)"
 }
 
 # Authenticated capability smoke test. Reads the bearer key from an env var (name configurable
@@ -264,9 +364,11 @@ cmd_dry_run() {
     fi
   fi
   echo "PLAN: rsync -a --delete -i ${RSYNC_EXCLUDES[*]} ./ $(rsync_dest)"
+  echo "PLAN: seed docs/m5-routing.json copy-if-absent (rsync --ignore-existing; never overwrites an adopted table -- issue #44)"
   echo "PLAN: remote install: ${DEPLOY_INSTALL_CMD:-cd '<remote_dir>' && npm ci --omit=dev}"
+  echo "PLAN: if restarting: preflight the ExecStart interpreter first, refuse the restart if it is missing (issue #30)"
   echo "PLAN: restart $DEPLOY_UNIT only if rsync reports changes (or DEPLOY_FORCE_RESTART=1)"
-  echo "PLAN: probe local health at $DEPLOY_HEALTH_LOCAL_URL"
+  echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
   echo "PLAN: probe tailnet health at ${DEPLOY_HEALTH_TAILNET_URL:-<unset - required for a real deploy>}"
   echo "PLAN: authenticated capability probe at ${DEPLOY_CAPABILITY_URL:-<unset - required for a real deploy>}"
   echo "PLAN: write .deployed-commit=$sha only after every step above passes"
@@ -348,10 +450,15 @@ cmd_deploy() {
     return 1
   fi
 
+  echo "==> Seeding routing table (copy-if-absent; adopted tables are never overwritten -- issue #44)..."
+  seed_routing_table
+
   echo "==> Installing dependencies on the remote (native modules must build for its own platform)..."
   remote_run DEPLOY_INSTALL_CMD "cd '$remote_dir' && npm ci --omit=dev"
 
   if [ "$payload_changed" = 1 ] || [ "$DEPLOY_FORCE_RESTART" = 1 ]; then
+    echo "==> Preflighting ExecStart interpreter before restart (issue #30)..."
+    preflight_interpreter || return 1
     echo "==> Restarting $DEPLOY_UNIT (payload changed)..."
     echo "    NOTE: the gateway also serves /mcp -- this drops live MCP transports (clients"
     echo "    reconnect on next call); in-flight async code_loop jobs survive via the durable"
@@ -362,7 +469,7 @@ cmd_deploy() {
   fi
 
   echo "==> Probing local health..."
-  probe_health "$DEPLOY_HEALTH_LOCAL_URL" "local" || return 1
+  probe_health "$DEPLOY_HEALTH_LOCAL_URL" "local" 0 || return 1
   echo "==> Probing tailnet health..."
   probe_health "$DEPLOY_HEALTH_TAILNET_URL" "tailnet" || return 1
   echo "==> Probing authenticated capability endpoint..."
@@ -386,12 +493,18 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_REMOTE_HOST          ssh alias (default: m5). Never a raw IP in docs/commits.
   DEPLOY_REMOTE_DIR           Expected live WorkingDirectory (default: /home/magnus/home-server-eval)
   DEPLOY_UNIT                 systemd unit name (default: home-gateway.service)
-  DEPLOY_HEALTH_LOCAL_URL     (default: http://127.0.0.1:8080/healthz)
+  DEPLOY_HEALTH_LOCAL_URL     (default: unset -- best-effort/non-blocking; the gateway binds only
+                              the tailnet interface, so loopback has nothing to probe by default)
   DEPLOY_HEALTH_TAILNET_URL   Required for `deploy` (no safe default -- never hardcode the IP)
   DEPLOY_CAPABILITY_URL       Authenticated capability probe URL, required for `deploy`
   DEPLOY_CAPABILITY_KEY_ENV   Name of the env var holding the bearer key (default: HOMESERVER_OWNER_KEY)
   DEPLOY_FORCE_RESTART=1      Restart even if rsync reported no changes
   DEPLOY_DRY_RUN_OFFLINE=1    dry-run only: skip even the read-only WorkingDirectory check
+
+Routing-table seeding (issue #44) and the restart interpreter preflight (issue #30) have no
+operator-facing flags -- they always run as part of `deploy`. Their remote commands are
+overridable for tests the same way every other remote step is (DEPLOY_EXECSTART_PROBE_CMD,
+DEPLOY_INTERPRETER_CHECK_CMD; see tests/deploy-gateway.test.ts).
 EOF
 }
 
