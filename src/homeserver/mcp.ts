@@ -18,7 +18,10 @@ import { expandBlindContext, type BlindContextConfig } from "./blind-context.js"
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
-import type { LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
+import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
+// #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
+// deriveEvidenceIdentity doc comment for why this is lane-agnostic and safe to share.
+import { deriveEvidenceIdentity } from "./orchestrator.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -200,6 +203,19 @@ export interface RunChatArgs {
   topP?: number;
   topK?: number;
   minP?: number;
+  /**
+   * #33: an already-ADMITTED LearningTaskContract Hugin request stamp, when the caller has one —
+   * threaded straight through to the ledger write's evidence-identity derivation (lane "mcp-ask"),
+   * exactly like `DelegationTask.learningTaskStamp` on the delegate lane. NOT YET reachable from
+   * the public MCP `ask` tool (see mcp.ts's `ask` inputSchema / callTool "ask" branch, which have
+   * no stamp intake or LearningTaskContract admission of their own): the `ask` tool is a plain
+   * metered call with no pre-declared task type and no idempotent-admission surface today, so
+   * wiring in real stamp INTAKE (schema field, `validateHuginRequestStamp`, principal binding) is
+   * a distinct, larger follow-up — filed separately rather than bolted on here. This field exists
+   * so the write-site derivation is in place and directly unit-testable now, the same "ready but
+   * dormant until a real caller supplies one" shape the delegate lane had between #28 and #32.
+   */
+  learningTaskStamp?: HuginRequestStamp;
 }
 
 export type RunChatResult =
@@ -571,6 +587,12 @@ export async function runChatCompletion(
         });
         const tokPerSec =
           ok && metricCompletion !== null && totalMs > 0 ? metricCompletion / (totalMs / 1000) : null;
+        // #33: reuse PR #32's exact derivation (orchestrator.ts's deriveEvidenceIdentity), tagged
+        // with THIS lane's own identity ("mcp-ask") so an mcp-ask row can never be mistaken for (or
+        // copy) a delegate/delegate-shadow/code-loop row's config identity. `args.learningTaskStamp`
+        // is `undefined` for every real caller today (see the RunChatArgs field doc) — landing the
+        // same null/legacy identity unstamped callers have always landed, never a fabricated one.
+        const evidenceIdentity = await deriveEvidenceIdentity(args.learningTaskStamp, args.model, "mcp-ask");
         const ledgerId = recordDelegation({
           taskType,
           modelId: args.model,
@@ -584,6 +606,7 @@ export async function runChatCompletion(
           tokPerSec,
           source: "mcp-ask",
           keyAlias: principal.alias,
+          evidenceIdentity,
         });
         if (cfg.delegationCostLog === "on") {
           tryRecordDelegationCost(

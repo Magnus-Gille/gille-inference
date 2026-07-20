@@ -43,6 +43,7 @@ import {
   createLearningTaskGatewayEcho,
   jcsCanonicalize,
   validateHuginRequestStamp,
+  type HuginRequestStamp,
   type LearningTaskGatewayEcho,
 } from "./learning-task-contract.js";
 import {
@@ -50,6 +51,10 @@ import {
   lookupLearningTaskAdmission,
   releaseLearningTaskAdmission,
 } from "./learning-task-admission-store.js";
+// #33: reuse PR #32's exact derivation VERBATIM (never fork it) so the code_loop lane binds
+// evidence identity the same way the delegate lane does — same stamp-field join, same live
+// served-model observation, same fail-open-to-unknown discipline.
+import { deriveEvidenceIdentity } from "./orchestrator.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -391,6 +396,13 @@ interface Job {
   durableClientRunId: string;
   durableRequestFingerprint: string;
   learningTaskGatewayEcho: LearningTaskGatewayEcho | null;
+  /**
+   * The full ADMITTED stamp (#33), carried alongside the gateway echo above. The echo is what's
+   * persisted/returned to the caller; this is what `writeLedger` needs to derive evidence identity
+   * (`evidenceIdentityFromAdmittedStamp` reads the stamp's own mechanically-bound fields, not the
+   * echo). `null` for every unstamped/legacy run — never synthesized.
+   */
+  learningTaskStamp: HuginRequestStamp | null;
 }
 
 const jobs = new Map<string, Job>();
@@ -914,6 +926,7 @@ export async function startCodeLoop(
     durableClientRunId,
     durableRequestFingerprint,
     learningTaskGatewayEcho,
+    learningTaskStamp: validatedLearningStamp,
   };
   jobs.set(workId, job);
   // The run is durably accepted and about to reach the model. A recovered retry uses the same
@@ -1052,7 +1065,7 @@ async function runJob(
     // an arm-error with empty everything cost a manual sandbox dig (live smoke, 2026-07-02).
     detail: detail.slice(0, 400),
   };
-  finalizeJobWithResult(job, result, req, deps, unitName);
+  await finalizeJobWithResult(job, result, req, deps, unitName);
 }
 
 function codeLoopExecution(job: Job): CodeLoopResult["execution"] {
@@ -1167,13 +1180,19 @@ async function runCheck(
 
 // ─── Finalization + ledger ──────────────────────────────────────────────────────────────
 
-function finalizeJobWithResult(
+async function finalizeJobWithResult(
   job: Job,
   result: CodeLoopResult,
   req: CodeLoopRequest,
   deps: CodeLoopDeps,
   unitName: string
-): void {
+): Promise<void> {
+  // #33: derive evidence identity BEFORE flipping job.status/result to terminal — a caller polling
+  // code_loop_status/code_loop_result must never observe "terminal" while the ledger write (now
+  // async, since it joins a live served-model observation) is still in flight. This preserves the
+  // pre-#33 atomicity: everything from the status flip onward stays synchronous, exactly like
+  // before this change, with the one new async step ordered strictly earlier.
+  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
   job.status = result.status;
   job.result = result;
   job.usage = result.usage;
@@ -1186,18 +1205,20 @@ function finalizeJobWithResult(
   });
   persistJobDurable(job);
   recordCodeLoopRun(result.status);
-  writeLedger(job, result.status, req, deps, result.check);
+  writeLedger(job, result.status, req, deps, result.check, evidenceIdentity);
 }
 
 /** Used only for the pre-run lease/spawn refusal (no engine result yet). */
-function finalizeJob(
+async function finalizeJob(
   job: Job,
   status: CodeLoopTerminalStatus,
   detail: string,
   check: { ran: boolean; exit_code: number | null; output_tail: string },
   req: CodeLoopRequest,
   deps: CodeLoopDeps
-): void {
+): Promise<void> {
+  // #33: same ordering discipline as finalizeJobWithResult above.
+  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
   job.status = status;
   job.result = {
     status,
@@ -1216,7 +1237,7 @@ function finalizeJob(
   };
   persistJobDurable(job);
   recordCodeLoopRun(status);
-  writeLedger(job, status, req, deps, check);
+  writeLedger(job, status, req, deps, check, evidenceIdentity);
 }
 
 function persistJobDurable(job: Job): void {
@@ -1239,12 +1260,23 @@ function persistJobDurable(job: Job): void {
   }
 }
 
+/**
+ * `evidenceIdentity` is derived by the caller (deriveEvidenceIdentity, #33) BEFORE the job's
+ * status/result are flipped to terminal — see finalizeJobWithResult/finalizeJob — so this stays a
+ * plain synchronous write, exactly like it was before #33. Reuses PR #32's exact derivation (the
+ * same stamp-field join + live served-model observation as the delegate lane), tagged with THIS
+ * lane's own identity ("code-loop") so a code_loop row can never be mistaken for (or copy) a
+ * delegate/delegate-shadow/mcp-ask row's config identity. `undefined` for every unstamped/legacy
+ * run, exactly like the delegate lane — that keeps landing a null (legacy) identity, never a
+ * fabricated partial bundle.
+ */
 function writeLedger(
   job: Job,
   status: CodeLoopTerminalStatus,
   req: CodeLoopRequest,
   deps: CodeLoopDeps,
-  check: { ran: boolean; exit_code: number | null }
+  check: { ran: boolean; exit_code: number | null },
+  evidenceIdentity: Awaited<ReturnType<typeof deriveEvidenceIdentity>>
 ): void {
   const { outcome, errorClass } = ledgerOutcome(status, check);
   try {
@@ -1260,6 +1292,7 @@ function writeLedger(
       verifier: job.checkCmd !== null ? "check-cmd" : null,
       source: "code-loop",
       keyAlias: deps.keyAlias ?? null,
+      evidenceIdentity,
     });
   } catch (err) {
     // Never let a telemetry write break the run.
