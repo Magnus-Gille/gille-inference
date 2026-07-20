@@ -17,6 +17,7 @@ import {
   manualRollback,
   runCanary,
   buildCandidatePair,
+  gateAdmitsOrganicEvidence,
   ApprovalRefusedError,
   ApprovalMismatchError,
   PolicyEpochStaleError,
@@ -203,6 +204,25 @@ const HOLD_GATE: CalibrationGateDecision = {
   reasons: ["insufficient audited sample"],
   enabling: null,
 };
+
+describe("gateAdmitsOrganicEvidence — the single #6 admissibility predicate (issue #37)", () => {
+  it("is false for a null gate (none consulted) — most restrictive, never permissive", () => {
+    expect(gateAdmitsOrganicEvidence(null)).toBe(false);
+  });
+
+  it("is false for a HOLD gate, enabled or not", () => {
+    expect(gateAdmitsOrganicEvidence({ policyId: "p", generatedAt: NOW, verdict: "HOLD", enabled: false })).toBe(false);
+    expect(gateAdmitsOrganicEvidence({ policyId: "p", generatedAt: NOW, verdict: "HOLD", enabled: true })).toBe(false);
+  });
+
+  it("is false for a GO gate that was never explicitly enabled", () => {
+    expect(gateAdmitsOrganicEvidence({ policyId: "p", generatedAt: NOW, verdict: "GO", enabled: false })).toBe(false);
+  });
+
+  it("is true ONLY for a GO gate with a recorded reviewed enablement", () => {
+    expect(gateAdmitsOrganicEvidence({ policyId: "p", generatedAt: NOW, verdict: "GO", enabled: true })).toBe(true);
+  });
+});
 
 describe("#6 admissibility — organic-judge-only route changes require a GO+enabled gate", () => {
   it("blocks a route change explained ONLY by organic-judge (llm-judge) evidence when no gate is consulted", () => {

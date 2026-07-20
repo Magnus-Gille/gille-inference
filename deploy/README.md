@@ -197,6 +197,58 @@ curl -fsS -o /dev/null -w '%{http_code}\n' \
   "http://<tailnet-ip>:8080/v1/capabilities/learning-task"
 ```
 
+### Adopting a routing-table change (routing-lifecycle-cli.ts)
+
+`scripts/routing-lifecycle-cli.ts` (issue #7) is the reviewed GENERATE → VALIDATE → REVIEW →
+DEPLOY/RELOAD → CANARY → ROLLBACK lifecycle for `docs/m5-routing.json`. `review` never mutates
+anything; `adopt` is the only mutating command and requires a recorded human approval
+(`--approved-by`/`--reason`/`--decision-ref`) — there is no flag that skips it.
+
+**First live adoption (2026-07-20, grimnir#88) found two operability gaps, both caught safely by the
+fail-closed rollback with zero production impact** — issues #37 and #38 fixed both:
+
+1. **The live #6 calibration gate is now wired in.** `review` (and `adopt`'s re-validation) evaluate
+   the current calibration gate from ledger evidence instead of defaulting to `null`. A `null` or
+   `HOLD` gate is most restrictive and REFUSES any route change explained only by organic-judge
+   evidence — this was already true of the underlying `validateCandidate` logic; #37 was that the
+   CLI never sourced a live gate to check it against. Pass `--calibration-gate <path>` to use a
+   specific, previously human-reviewed decision (e.g. one with a recorded `enabling`) instead of the
+   live computation.
+2. **`adopt` now resolves the gateway URL and admin key without manual flags**, so a cron/no-flag
+   adoption on the box works once the environment below is set:
+   - **Gateway URL** — `--gateway-url` (explicit) > `GATEWAY_URL` env (explicit) > the gateway's OWN
+     configured listener (`HOMESERVER_HOST`/`HOMESERVER_PORT`, the exact host/port `gateway.ts`
+     binds — see `resolveGatewayUrl` in the script). In the live deployment `HOMESERVER_HOST` is
+     already set to the box's tailnet interface (issue #23), so this now resolves the REAL listener
+     automatically instead of defaulting to `http://127.0.0.1:8080` while the gateway binds only the
+     tailnet address.
+   - **Admin key** — `ROUTING_LIFECYCLE_ADMIN_KEY` is checked first; `HOMESERVER_OWNER_KEY` (the same
+     owner-tier bearer-key convention this runbook already uses for the capability smoke test above)
+     is the fallback. **Neither is guaranteed to be present in the deployed gateway `.env` today** —
+     confirm on the box and add whichever is missing:
+     ```bash
+     tsx src/homeserver/cli.ts keys mint --alias routing-lifecycle-cli --tier owner
+     # add the printed key to /home/magnus/home-server-eval/.env as ROUTING_LIFECYCLE_ADMIN_KEY=<key>
+     # (or reuse an existing HOMESERVER_OWNER_KEY value already exported for deploy-gateway.sh)
+     ```
+     A missing key produces an actionable `reload-failed` error naming both env vars — never a
+     hardcoded/fabricated key, and never a silent skip of authentication.
+
+**What the deployed `.env` must contain for a zero-flag/cron `adopt`:** `ROUTING_LIFECYCLE_ADMIN_KEY`
+(or `HOMESERVER_OWNER_KEY`) set to an owner-tier bearer key, and `HOMESERVER_HOST` set to the box's
+tailnet interface (already true per the "Access-control posture" note above this file). Nothing else
+is required — `--gateway-url` and `--calibration-gate` remain available as explicit overrides for a
+one-off or non-standard run.
+
+```bash
+# review (dry-run, safe to run any time — never mutates anything)
+tsx scripts/routing-lifecycle-cli.ts review --out /tmp/routing-review.json
+
+# adopt (the ONLY mutating command — requires a human-recorded approval)
+tsx scripts/routing-lifecycle-cli.ts adopt --artifact /tmp/routing-review.json \
+  --approved-by <name> --reason "<why>" --decision-ref <issue/PR>
+```
+
 ## Configuration
 
 All knobs are environment variables — see [`env.example`](./env.example).
