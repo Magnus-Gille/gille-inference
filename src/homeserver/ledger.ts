@@ -360,7 +360,13 @@ const VALID_OUTCOMES: ReadonlySet<string> = new Set([
  * absent from battery JSONL (cartography lines carry only an output preview), so without them
  * two distinct trials sharing a timestamp would silently merge and undercount attempts.
  */
-function importId(rec: ImportableDelegation): string {
+/**
+ * Exported (#8) so experiment-import.ts can resolve the exact id a given ImportableDelegation maps
+ * to WITHOUT importDelegations() changing its batch-oriented `{inserted,skipped}` return shape
+ * (issue #151's existing callers depend on that shape) — a single shared implementation instead of
+ * a second hand-maintained copy that could silently drift from this one.
+ */
+export function importId(rec: ImportableDelegation): string {
   const key = JSON.stringify([
     rec.ts,
     rec.taskType,
@@ -419,12 +425,12 @@ export function importDelegations(records: ImportableDelegation[]): {
        (id, ts, task_type, node_id, model_id, prompt_hash, prompt_excerpt, outcome, score,
         latency_ms, ttft_ms, prompt_tokens, completion_tokens, tok_per_s, verifier,
         error_class, escalated, source, notes, judge_policy,
-        evidence_identity_hash, evidence_lane)
+        evidence_identity_hash, evidence_lane, shadow)
      VALUES
        (@id, @ts, @taskType, @nodeId, @modelId, @promptHash, @promptExcerpt, @outcome, @score,
         @latencyMs, @ttftMs, @promptTokens, @completionTokens, @tokPerSec, @verifier,
         @errorClass, @escalated, @source, @notes, @judgePolicy,
-        @evidenceIdentityHash, @evidenceLane)`
+        @evidenceIdentityHash, @evidenceLane, @shadow)`
   );
 
   let inserted = 0;
@@ -457,6 +463,11 @@ export function importDelegations(records: ImportableDelegation[]): {
         judgePolicy: rec.judgePolicy ?? null,
         evidenceIdentityHash: identityHash,
         evidenceLane: evidenceLane,
+        // #8: previously silently dropped — a caller (e.g. experiment-import.ts) that imports a
+        // shadow-lane observation via importDelegations() must have that survive to the row, the
+        // same way recordDelegation() already does above. Not part of importId()'s content-hash key
+        // (same treatment as `escalated`): shadow is an admission-effect flag, not identity.
+        shadow: rec.shadow ? 1 : 0,
       });
       inserted += info.changes;
     }
@@ -506,6 +517,22 @@ export function supersedeHarvestVerdicts(p: {
     for (const pk of rowPks) changed += stmt.run({ now: p.nowIso, pk }).changes;
   })();
   return changed;
+}
+
+/**
+ * Id-addressable supersede (#8): mark exactly one delegations row as superseded by primary key,
+ * for the experiment-import correction path (experiment-import.ts) — a later Hugin run explicitly
+ * correcting an earlier one's row. Simpler counterpart to supersedeHarvestVerdicts above (which
+ * parses a `#<id>` token out of free-text notes for a bulk rejudge); this one is a direct id lookup
+ * because the caller already holds the exact delegation id from its own natural-key registry.
+ * Idempotent: superseding an already-superseded row is a safe no-op (returns false).
+ */
+export function supersedeDelegationById(id: string, nowIso: string): boolean {
+  const db = ledgerDb();
+  const info = db
+    .prepare(`UPDATE delegations SET superseded_at = @now WHERE id = @id AND superseded_at IS NULL`)
+    .run({ now: nowIso, id });
+  return info.changes > 0;
 }
 
 // ─── Verdict computation ───────────────────────────────────────────────────────

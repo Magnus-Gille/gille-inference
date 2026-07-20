@@ -8,6 +8,7 @@ import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
 import { ledgerReport, recentDelegations, getDelegationById } from "./ledger.js";
+import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
   lookupKey,
   mintKey,
@@ -3314,6 +3315,56 @@ async function handleRequest(
       }
       res.setHeader("cache-control", "no-store");
       sendJson(res, 200, lookupTaskExposures(parsed.value));
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      return;
+    }
+
+    // ─── Hugin experiment-outcome import (#8) ───
+    // Owner/admin authenticated service path, same idiom as the rest of the /admin surface
+    // (requireAdmin() — no new auth scheme). This bridges a completed Hugin champion/challenger
+    // experiment into the capability ledger as durable, content-addressed evidence; it never
+    // touches routing (see experiment-import.ts's module doc). A structurally malformed bundle is
+    // a 400; a structurally valid but business-inadmissible ARM is a 200 with that arm's specific
+    // rejection reason — one bad arm must not block the rest of the same bundle from being admitted.
+    if (path === "/admin/experiments/import" && method === "POST") {
+      lctx.admission = "n/a";
+      if (!requireAdmin()) return;
+      let raw: string;
+      try {
+        raw = await readBody(req, 1 * 1024 * 1024);
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+        return;
+      }
+      let body: unknown;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
+        return;
+      }
+      const parsed = parseHuginExperimentOutcomeBundle(body);
+      if (!parsed.ok) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(
+          res,
+          makeError("invalid_request_error", { param: parsed.param, message: parsed.message })
+        );
+        return;
+      }
+      const result = importHuginExperimentOutcome(parsed.value);
+      res.setHeader("cache-control", "no-store");
+      sendJson(res, 200, result);
       lctx.status = 200;
       lctx.outcome = "ok";
       return;

@@ -116,4 +116,22 @@ describe("importDelegations — durable probe-evidence import", () => {
     expect(res.inserted).toBe(2);
     expect(getVerdict("reason-probeid", "qwen3-coder-next-80b", DEFAULT_POLICY).attempts).toBe(2);
   });
+
+  // #8 regression: importDelegations previously built its INSERT column list without `shadow`,
+  // so an ImportableDelegation carrying `shadow: true` (a real, documented field on the type) was
+  // silently written as a NON-shadow row — recordDelegation() already persisted it correctly, only
+  // this second write path dropped it. Found while wiring the Hugin experiment-outcome importer,
+  // which relies on shadow rows to retain a failed/inconclusive experiment's evidence without it
+  // influencing routing (getVerdict/ledgerReport exclude shadow=1 by default).
+  it("propagates `shadow: true` through to the stored row (previously silently dropped)", () => {
+    const res = importDelegations([probeResult({ taskType: "reason-shadow-import", shadow: true })]);
+    expect(res.inserted).toBe(1);
+    const row = getDb()
+      .prepare(`SELECT shadow FROM delegations WHERE task_type = 'reason-shadow-import'`)
+      .get() as { shadow: number };
+    expect(row.shadow).toBe(1);
+    // Excluded from default evidence reads, same as a recordDelegation()-written shadow row.
+    expect(getVerdict("reason-shadow-import", "qwen3-coder-next-80b", DEFAULT_POLICY).attempts).toBe(0);
+    expect(getVerdict("reason-shadow-import", "qwen3-coder-next-80b", DEFAULT_POLICY, "m5", { includeShadow: true }).attempts).toBe(1);
+  });
 });
