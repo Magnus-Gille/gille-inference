@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseJudgeVerdict,
+  bandVerdictFromScore,
   canonicalModelId,
   isSelfGrade,
   judgeHintFor,
@@ -526,5 +527,37 @@ describe("hasRealHistory (codex retro: with-context must not count a bare system
   it("any prior user/assistant turn → true", () => {
     expect(hasRealHistory([{ role: "system", content: "s" }, { role: "assistant", content: "a" }])).toBe(true);
     expect(hasRealHistory([{ role: "user", content: "earlier ask" }])).toBe(true);
+  });
+});
+
+describe("bandVerdictFromScore (issue #6 calibration harness: content-blind recovery of a harvest-shadow row's intended verdict)", () => {
+  it("agrees with parseJudgeVerdict's own bands for a round-tripped score", () => {
+    for (const text of [
+      '{"verdict":"pass","score":0.95,"reason":"ok"}',
+      '{"verdict":"partial","score":0.5,"reason":"ok"}',
+      '{"verdict":"fail","score":0.05,"reason":"ok"}',
+    ]) {
+      const parsed = parseJudgeVerdict(text)!;
+      expect(bandVerdictFromScore(parsed.score)).toBe(parsed.verdict);
+    }
+  });
+
+  it("bands the full [0,1] range without gaps", () => {
+    expect(bandVerdictFromScore(1)).toBe("pass");
+    expect(bandVerdictFromScore(0.7)).toBe("pass");
+    expect(bandVerdictFromScore(0.69)).toBe("partial");
+    expect(bandVerdictFromScore(0.3)).toBe("partial");
+    expect(bandVerdictFromScore(0.29)).toBe("fail");
+    expect(bandVerdictFromScore(0)).toBe("fail");
+  });
+
+  it("returns null for a non-finite score rather than guessing a verdict", () => {
+    expect(bandVerdictFromScore(NaN)).toBeNull();
+    expect(bandVerdictFromScore(Infinity)).toBeNull();
+  });
+
+  it("clamps an out-of-range score before banding", () => {
+    expect(bandVerdictFromScore(1.5)).toBe("pass");
+    expect(bandVerdictFromScore(-0.5)).toBe("fail");
   });
 });
