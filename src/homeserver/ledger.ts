@@ -1146,6 +1146,109 @@ export function ledgerReport(policy: PolicyConfig, opts?: EvidenceReadOpts): Led
   });
 }
 
+// ─── Guard metrics window (issue #47 — post-adoption regression watchdog) ─────────
+
+export interface GuardMetricSnapshot {
+  taskType: string;
+  /**
+   * Verdict-eligible rows in this window (pass+partial+fail+error, excluding unverified) — the
+   * population size adoption-watchdog.ts uses BOTH as the T-task window-completion count and as the
+   * per-metric min-sample gate.
+   */
+  sampleSize: number;
+  errorRate: number;
+  escalationRate: number;
+  verifierFailRate: number;
+  /**
+   * Best-effort: share of rows whose free-text `notes` record an orchestrator-level retry (e.g. the
+   * #164 format-retry band-aid — see orchestrator.ts's `retryNote`). The ledger has no structured
+   * retry column today, so this is an approximation of "retry rate", not an exact count — documented
+   * here rather than silently presented as precise.
+   */
+  retryRate: number;
+  latencyP50Ms: number | null;
+}
+
+interface GuardMetricDbRow {
+  task_type: string;
+  outcome: string;
+  escalated: 0 | 1;
+  notes: string | null;
+  latency_ms: number | null;
+}
+
+/**
+ * #47 (adoption watchdog): production guard metrics for a set of task types over a raw wall-clock
+ * window `[sinceIso, untilIso)`. Deliberately NOT the capability-verdict machinery above
+ * (getVerdict/ledgerReport), which answers "is this model viable" over ALL history for one
+ * task-type/model pair — this answers "did production reliability on these ROUTES (task types,
+ * across whichever model served them) change in this specific window", which is what a
+ * post-adoption watchdog needs when comparing a pre-adoption baseline window against a
+ * post-adoption window on the exact same task types.
+ *
+ * `errorRate` counts every `outcome = 'error'` row (including infra errors) — unlike the capability
+ * verdict's exclusion of infra errors, a production reliability guard cares about total error
+ * exposure, not only model-capability failures. `verifierFailRate` is fails / (passes+partials+fails)
+ * — the share of VERIFIED attempts a verifier judged failing (unverified rows are excluded from the
+ * window entirely, matching getVerdict/getLaneEvidence). `retryRate` is approximate — see
+ * GuardMetricSnapshot's doc comment.
+ *
+ * Always returns exactly one row per requested task type, even when a type has zero matching rows
+ * in the window (`sampleSize: 0`, every rate `0`, `latencyP50Ms: null`) — callers (the watchdog's
+ * pure evaluator) rely on being able to look up every affected task type without a presence check.
+ */
+export function guardMetricsWindow(p: {
+  taskTypes: string[];
+  sinceIso: string;
+  untilIso: string;
+  nodeId?: "m5" | "orin";
+  opts?: EvidenceReadOpts;
+}): GuardMetricSnapshot[] {
+  const byType = new Map<string, GuardMetricDbRow[]>();
+  for (const t of p.taskTypes) byType.set(t, []);
+
+  if (p.taskTypes.length > 0) {
+    const db = ledgerDb();
+    const placeholders = p.taskTypes.map(() => "?").join(", ");
+    const rows = db
+      .prepare(
+        `SELECT task_type, outcome, escalated, notes, latency_ms
+         FROM delegations
+         WHERE task_type IN (${placeholders}) AND node_id = ? AND ts >= ? AND ts < ?
+           AND outcome != 'unverified' AND superseded_at IS NULL${shadowFilter(p.opts)}`
+      )
+      .all(...p.taskTypes, p.nodeId ?? "m5", p.sinceIso, p.untilIso) as GuardMetricDbRow[];
+    for (const r of rows) {
+      const bucket = byType.get(r.task_type);
+      if (bucket) bucket.push(r);
+      else byType.set(r.task_type, [r]);
+    }
+  }
+
+  return p.taskTypes.map((taskType) => {
+    const rows = byType.get(taskType) ?? [];
+    const sampleSize = rows.length;
+    const errors = rows.filter((r) => r.outcome === "error").length;
+    const escalated = rows.filter((r) => r.escalated === 1).length;
+    const passes = rows.filter((r) => r.outcome === "pass").length;
+    const partials = rows.filter((r) => r.outcome === "partial").length;
+    const fails = rows.filter((r) => r.outcome === "fail").length;
+    const verifiedTotal = passes + partials + fails;
+    const retried = rows.filter((r) => (r.notes ?? "").toLowerCase().includes("retry")).length;
+    const latencies = rows.map((r) => r.latency_ms).filter((v): v is number => v !== null && Number.isFinite(v));
+
+    return {
+      taskType,
+      sampleSize,
+      errorRate: sampleSize > 0 ? errors / sampleSize : 0,
+      escalationRate: sampleSize > 0 ? escalated / sampleSize : 0,
+      verifierFailRate: verifiedTotal > 0 ? fails / verifiedTotal : 0,
+      retryRate: sampleSize > 0 ? retried / sampleSize : 0,
+      latencyP50Ms: percentile(latencies, 0.5),
+    };
+  });
+}
+
 export interface RecentDelegation {
   id: string;
   ts: string;
