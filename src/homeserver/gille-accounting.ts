@@ -191,6 +191,14 @@ export const GILLE_EXCLUSION_REASONS = [
   "candidate-duplicate-lineage",
   "synthetic-test",
   "pre-v1-migration",
+  /** issue #9: an owner/operator explicitly requested this subject never be harvested again. Used
+   *  by retention-erasure.ts's `excludeSubjectFromHarvesting` — an ADDITIVE event, never a rewrite
+   *  of the subject's own prior direct-attempt/exposure rows. */
+  "retention-owner-opt-out",
+  /** issue #9: a subject was erased under the retention/erasure workflow; recorded here in addition
+   *  to (never instead of) the accompanying erasure-adjustment event, so a future admission/import
+   *  path can observe "excluded" from the same six-counter surface it already reads. */
+  "retention-erasure-requested",
 ] as const;
 export const gilleExclusionReasonSchema = z.enum(GILLE_EXCLUSION_REASONS);
 export type GilleExclusionReason = z.infer<typeof gilleExclusionReasonSchema>;
