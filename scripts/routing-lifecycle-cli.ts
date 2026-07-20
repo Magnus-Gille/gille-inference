@@ -41,19 +41,38 @@
  *       [--table docs/m5-routing.json] [--gateway-url http://...]
  *     The documented MANUAL rollback command: restores an exact snapshot file and reloads.
  *
+ *   tsx scripts/routing-lifecycle-cli.ts watch [--dry-run] [--data-dir ./data] \
+ *       [--table docs/m5-routing.json] [--gateway-url http://...] [--db ...]
+ *     The post-adoption regression watchdog (issue #47). Evaluates every `pending` adoption's watch
+ *     window: computes guard metrics (error/escalation/verifier-fail/retry rate, latency) on the
+ *     affected task types from the ledger, for a post-adoption window and an equal-length
+ *     pre-adoption baseline, and compares them (src/homeserver/adoption-watchdog.ts). A regression
+ *     beyond its bound (with sufficient sample) auto-reverts to the exact adoption snapshot via the
+ *     SAME #7 rollback primitives (`manualRollback` + `runCanary`) and QUARANTINEs the affected task
+ *     types (refused at `review`/`adopt` until a cooldown elapses AND a fresh candidate clears a
+ *     stronger margin). Suitable for cron. `--dry-run` reports what WOULD happen (verdicts, would-be
+ *     reverts) without mutating any durable state. Respects `AUTONOMY_KILL_SWITCH=on`: still
+ *     evaluates and records, but performs no auto-revert/quarantine write (reports what it would
+ *     have done). Durable watch state lives under `--data-dir` (default ./data,
+ *     `<data-dir>/adoption-watchdog/`) — a path deploy-gateway.sh's rsync NEVER touches (issue #44
+ *     discipline), so it survives restarts and redeploys.
+ *
  * ENV: EVAL_DB_PATH (ledger DB, default ./data/eval.db);
  *      GATEWAY_URL (explicit override; else derived from the gateway's OWN configured listener —
  *        HOMESERVER_HOST/HOMESERVER_PORT via loadConfig() — falling back to http://127.0.0.1:8080
  *        only when nothing configures a host at all; see resolveGatewayUrl, issue #38);
  *      ROUTING_LIFECYCLE_ADMIN_KEY, or HOMESERVER_OWNER_KEY as a fallback (owner/admin gateway key
- *        used ONLY to call the reload endpoint; see resolveAdminKey, issue #38).
+ *        used ONLY to call the reload endpoint; see resolveAdminKey, issue #38);
+ *      AUTONOMY_KILL_SWITCH=on (issue #47): the `watch` command still evaluates/records but performs
+ *        no auto-revert/quarantine write. Absent/anything else = acting ENABLED — fail-closed here
+ *        means REVERTING to the known-good snapshot, the safe direction, not refusing to.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { loadConfig, type HomeserverConfig } from "../src/homeserver/config.js";
-import { ledgerReport, listCalibrationSampleRows } from "../src/homeserver/ledger.js";
+import { ledgerReport, listCalibrationSampleRows, guardMetricsWindow } from "../src/homeserver/ledger.js";
 import { listModels } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
 import { contentDigest } from "../src/homeserver/evidence-identity.js";
@@ -73,9 +92,47 @@ import {
   type RoutingDecisionArtifact,
   type AdoptDeps,
 } from "../src/homeserver/routing-lifecycle.js";
+import {
+  evaluateQuarantineGate,
+  loadQuarantineState,
+  recordAdoptionForWatch,
+  runAdoptionWatch,
+  DEFAULT_WATCHDOG_POLICY,
+} from "../src/homeserver/adoption-watchdog.js";
 
 const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const DEFAULT_DATA_DIR = resolve("./data");
+
+function resolveDataDir(args: string[]): string {
+  return resolve(readFlag(args, "--data-dir") ?? DEFAULT_DATA_DIR);
+}
+
+/** Task types whose route actually CHANGED vs the adopted table — the axes both the watchdog and the
+ *  quarantine gate operate on. Same expression `adoptRoutingTable` uses internally for its own
+ *  changed-route canary scope (routing-lifecycle.ts) — kept identical here rather than re-derived. */
+function changedTaskTypesOf(diff: { changes: Array<{ kind: string; taskType: string }> }): string[] {
+  return diff.changes.filter((c) => c.kind !== "unchanged").map((c) => c.taskType);
+}
+
+/**
+ * Issue #47: refuse (fail closed) when any task type this candidate CHANGES is currently
+ * quarantined and has not cleared (cooldown elapsed AND a stronger margin δ′ satisfied — see
+ * adoption-watchdog.ts's `evaluateQuarantineGate`, the single definition both `review` and `adopt`
+ * consult here). Returns the gate result so callers can both print it and decide whether to refuse.
+ */
+function checkQuarantineGate(p: {
+  dataDir: string;
+  diff: { changes: Array<{ kind: string; taskType: string }> };
+  candidateRouting: Record<string, { passRate?: number } | undefined>;
+  nowIso: string;
+}): ReturnType<typeof evaluateQuarantineGate> {
+  const changedTaskTypes = changedTaskTypesOf(p.diff);
+  const quarantine = loadQuarantineState(p.dataDir);
+  const candidatePassRateByTaskType: Record<string, number | null | undefined> = {};
+  for (const t of changedTaskTypes) candidatePassRateByTaskType[t] = p.candidateRouting[t]?.passRate ?? null;
+  return evaluateQuarantineGate({ changedTaskTypes, quarantine, nowIso: p.nowIso, candidatePassRateByTaskType });
+}
 
 function readFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -256,13 +313,23 @@ async function cmdReview(args: string[]): Promise<void> {
     );
   }
 
+  // #47: report-time quarantine visibility — the hard refusal lives at `adopt` (fail closed, before
+  // any write); surfacing it here too means a reviewer sees the block BEFORE spending an approval on
+  // a candidate that would only be refused later.
+  const dataDir = resolveDataDir(args);
+  const quarantineGate = checkQuarantineGate({ dataDir, diff: artifact.diff, candidateRouting: artifact.candidate.routing, nowIso: generatedAt });
+  if (quarantineGate.blocked) {
+    process.stderr.write(`\nquarantine (#47): BLOCKED — ${quarantineGate.blockedAxes.length} axis(es) refused:\n`);
+    for (const b of quarantineGate.blockedAxes) process.stderr.write(`  [axis-quarantined] ${b.taskType}: ${b.reason}\n`);
+  }
+
   const json = JSON.stringify(artifact, null, 2) + "\n";
   if (outPath) {
     writeFileSync(resolve(outPath), json, "utf8");
     process.stderr.write(`wrote review artifact to ${outPath}\n`);
   }
   process.stdout.write(json);
-  process.exitCode = artifact.validation.ok ? 0 : 1;
+  process.exitCode = artifact.validation.ok && !quarantineGate.blocked ? 0 : 1;
 }
 
 // ─── adopt ──────────────────────────────────────────────────────────────────────
@@ -331,6 +398,22 @@ async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok:
   }
 }
 
+/** Composes the #7 `AdoptDeps` used by `adopt`, `rollback`, AND `watch` (issue #47) — one definition
+ *  so all three commands resolve the gateway URL/admin key/servable-catalogue probe identically. */
+function buildAdoptDeps(args: string[], config: HomeserverConfig, tablePath: string): AdoptDeps {
+  const base = resolveGatewayUrl(args, config);
+  const adminKey = resolveAdminKey();
+  return {
+    tablePath,
+    readTable: (p) => readFileSync(p, "utf8"),
+    writeTable: (p, d) => writeFileSync(p, d, "utf8"),
+    reload: () => callReloadEndpoint(base, adminKey),
+    servableModelIdsAfterReload: () => loadServableModelIds(),
+    nowIso: () => new Date().toISOString(),
+    currentPolicyEpochHash: policyEpochHash(config.policy),
+  };
+}
+
 async function cmdAdopt(args: string[]): Promise<void> {
   if (readFlag(args, "--db")) process.env["EVAL_DB_PATH"] = readFlag(args, "--db");
   const artifactPath = readFlag(args, "--artifact");
@@ -338,6 +421,7 @@ async function cmdAdopt(args: string[]): Promise<void> {
   const reason = readFlag(args, "--reason");
   const decisionRef = readFlag(args, "--decision-ref");
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
+  const dataDir = resolveDataDir(args);
   if (!artifactPath || !approvedBy || !reason || !decisionRef) {
     process.stderr.write(
       "adopt requires --artifact <path> --approved-by <name> --reason \"<why>\" --decision-ref <issue/PR>\n"
@@ -377,26 +461,59 @@ async function cmdAdopt(args: string[]): Promise<void> {
     );
   }
 
+  // #47: quarantine re-check — the SAME fail-closed, additional-CLI-refusal pattern as the #37
+  // organic-gate check just above (runs BEFORE approveArtifact/adoptRoutingTable; never trusts a
+  // stale review). A currently-quarantined axis this candidate touches is refused until the
+  // cooldown has elapsed AND the candidate's own passRate clears the stronger margin δ′ recorded at
+  // quarantine time — never overridden by approval.
+  const quarantineGate = checkQuarantineGate({
+    dataDir,
+    diff: artifact.diff,
+    candidateRouting: artifact.candidate.routing,
+    nowIso: new Date().toISOString(),
+  });
+  if (quarantineGate.blocked) {
+    process.stderr.write(`adopt refused: quarantined axis(es) not yet cleared:\n`);
+    for (const b of quarantineGate.blockedAxes) process.stderr.write(`  [axis-quarantined] ${b.taskType}: ${b.reason}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
   const approval = approveArtifact(artifact, { approvedBy, reason, decisionRef, approvedAt: new Date().toISOString() });
 
   const config = loadConfig();
-  const base = resolveGatewayUrl(args, config);
-  const adminKey = resolveAdminKey();
+  const deps = buildAdoptDeps(args, config, tablePath);
 
-  const deps: AdoptDeps = {
-    tablePath,
-    readTable: (p) => readFileSync(p, "utf8"),
-    writeTable: (p, d) => writeFileSync(p, d, "utf8"),
-    reload: () => callReloadEndpoint(base, adminKey),
-    servableModelIdsAfterReload: () => loadServableModelIds(),
-    nowIso: () => new Date().toISOString(),
-    currentPolicyEpochHash: policyEpochHash(config.policy),
-  };
+  // #47: capture the EXACT pre-adopt bytes (best-effort — absent on a first-ever adoption) so a
+  // successful adopt below can hand them to `recordAdoptionForWatch` as the watchdog's durable
+  // revert snapshot. Read BEFORE adoptRoutingTable's own write, mirroring its internal `priorRaw`
+  // read — duplicated here deliberately rather than threading a new return field through the
+  // reviewed #7 module, keeping that module's contract unchanged.
+  const priorRawForWatchdog = ((): string | null => {
+    try {
+      return readFileSync(tablePath, "utf8");
+    } catch {
+      return null;
+    }
+  })();
 
   const result = await adoptRoutingTable(artifact, approval, deps);
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   if (result.outcome === "adopted") {
     process.stderr.write(`ADOPTED — candidateHash=${result.record.candidateHash} approvedBy=${result.record.approvedBy}\n`);
+    const watchRecord = recordAdoptionForWatch({
+      dataDir,
+      adoptedAt: result.record.adoptedAt,
+      candidateHash: result.record.candidateHash,
+      decisionRef: result.record.decisionRef,
+      approvedBy: result.record.approvedBy,
+      changedTaskTypes: changedTaskTypesOf(artifact.diff),
+      priorRaw: priorRawForWatchdog,
+    });
+    process.stderr.write(
+      `watchdog (#47): queued adoption watch record ${watchRecord.id} for [${watchRecord.changedTaskTypes.join(", ")}] ` +
+        `(snapshot ${watchRecord.snapshotPath ? "captured" : "none — first-ever adoption"}); run 'watch' to evaluate.\n`
+    );
     process.exitCode = 0;
   } else if (result.outcome === "rolled-back") {
     process.stderr.write(`ROLLED BACK (canary failed) — ${result.rollback.reason}\n`);
@@ -431,23 +548,75 @@ async function cmdRollback(args: string[]): Promise<void> {
   }
   const snapshotRaw = readFileSync(resolve(snapshotPath), "utf8");
   const config = loadConfig();
-  const base = resolveGatewayUrl(args, config);
-  const adminKey = resolveAdminKey();
-
-  const deps: AdoptDeps = {
-    tablePath,
-    readTable: (p) => readFileSync(p, "utf8"),
-    writeTable: (p, d) => writeFileSync(p, d, "utf8"),
-    reload: () => callReloadEndpoint(base, adminKey),
-    servableModelIdsAfterReload: () => loadServableModelIds(),
-    nowIso: () => new Date().toISOString(),
-    currentPolicyEpochHash: "", // not consulted by manualRollback
-  };
+  const deps = buildAdoptDeps(args, config, tablePath);
 
   const record = await manualRollback({ deps, snapshotRaw, reason });
   process.stdout.write(JSON.stringify(record, null, 2) + "\n");
   process.stderr.write(`ROLLED BACK to ${snapshotPath} (reload ${record.reloadOk ? "ok" : "FAILED"})\n`);
   process.exitCode = record.reloadOk ? 0 : 1;
+}
+
+// ─── watch (issue #47 — post-adoption regression watchdog) ───────────────────────
+
+function killSwitchOn(): boolean {
+  return (process.env["AUTONOMY_KILL_SWITCH"] ?? "").trim().toLowerCase() === "on";
+}
+
+async function cmdWatch(args: string[]): Promise<void> {
+  if (readFlag(args, "--db")) process.env["EVAL_DB_PATH"] = readFlag(args, "--db");
+  const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
+  const dataDir = resolveDataDir(args);
+  const dryRun = args.includes("--dry-run");
+
+  const config = loadConfig();
+  const adoptDeps = buildAdoptDeps(args, config, tablePath);
+  const killActive = killSwitchOn();
+
+  const report = await runAdoptionWatch(
+    {
+      dataDir,
+      queryGuardMetrics: (taskTypes, sinceIso, untilIso) => guardMetricsWindow({ taskTypes, sinceIso, untilIso }),
+      nowIso: () => new Date().toISOString(),
+      killSwitchOn,
+      adoptDeps,
+    },
+    DEFAULT_WATCHDOG_POLICY,
+    { dryRun }
+  );
+
+  process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+
+  if (report.items.length === 0) {
+    process.stderr.write("watch: no pending adoption watch records (nothing to evaluate).\n");
+  }
+  let needsAttention = false;
+  for (const item of report.items) {
+    const { record, evaluation, action, revert, quarantined } = item;
+    process.stderr.write(
+      `[${record.candidateHash.slice(0, 12)}] ${record.changedTaskTypes.join(",")} -> verdict=${evaluation.verdict} action=${action}` +
+        (dryRun ? " (dry-run — no mutation)" : "") +
+        (killActive ? " (AUTONOMY_KILL_SWITCH=on — no mutation)" : "") +
+        "\n"
+    );
+    if (evaluation.verdict === "breach") {
+      for (const t of evaluation.perTaskType) {
+        if (t.status === "breach") {
+          for (const b of t.breaches) {
+            process.stderr.write(`  BREACH ${t.taskType}.${b.metric}: baseline=${b.baseline} current=${b.current} delta=${b.delta}\n`);
+          }
+        }
+      }
+      if (revert) process.stderr.write(`  revert: ${revert.status}\n`);
+      if (quarantined.length > 0) process.stderr.write(`  quarantined: ${quarantined.join(", ")}\n`);
+      if (revert?.status === "unknown") needsAttention = true;
+    }
+    if (evaluation.verdict === "inconclusive") {
+      process.stderr.write(`  window ended without sufficient sample on: ${evaluation.perTaskType.filter((t) => t.status === "insufficient-sample").map((t) => t.taskType).join(", ")} — surfaced for review, nothing mutated.\n`);
+      needsAttention = true;
+    }
+  }
+
+  process.exitCode = needsAttention ? 1 : 0;
 }
 
 // ─── main ───────────────────────────────────────────────────────────────────────
@@ -457,7 +626,8 @@ async function main(): Promise<void> {
   if (cmd === "review") return cmdReview(rest);
   if (cmd === "adopt") return cmdAdopt(rest);
   if (cmd === "rollback") return cmdRollback(rest);
-  process.stderr.write("usage: routing-lifecycle-cli.ts <review|adopt|rollback> [flags]\n");
+  if (cmd === "watch") return cmdWatch(rest);
+  process.stderr.write("usage: routing-lifecycle-cli.ts <review|adopt|rollback|watch> [flags]\n");
   process.exitCode = 2;
 }
 
