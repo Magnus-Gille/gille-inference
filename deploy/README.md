@@ -9,7 +9,7 @@ unified LPDDR5X** (single serial compute stream; ~215–256 GB/s; MoE-first).
 ## Topology
 
 ```
-friend ──HTTPS──▶ Cloudflare edge ──Tunnel (outbound-only)──▶ 127.0.0.1:8080
+friend ──HTTPS──▶ Cloudflare edge ──Tunnel (outbound-only)──▶ <gateway host>:8080
                   (TLS, DDoS, WAF)        cloudflared            gateway.ts
                                                                   │ auth (per-key bearer)
                                                                   │ admission (owner ≻ guest → 503)
@@ -19,10 +19,34 @@ friend ──HTTPS──▶ Cloudflare edge ──Tunnel (outbound-only)──�
                                                           (one iGPU, serial)
 ```
 
-**Security invariant:** the gateway and the model backend bind **loopback only**.
-The *only* inbound path is Cloudflare Tunnel → gateway. There are **no open
-ports** on the box or router. If you ever set `HOMESERVER_HOST=0.0.0.0`, the
-gateway refuses to start unless at least one API key (env or minted) exists.
+**Access-control posture (corrected 2026-07-20, issue #23 — read this before assuming the old
+"loopback only" claim below it in git history):** the gateway does **not** bind loopback-only in
+production. `HOMESERVER_HOST` (`src/homeserver/config.ts`) is configured to the box's Tailscale
+interface, so the process is reachable at both `127.0.0.1:8080` **and** `http://<tailnet-ip>:8080`
+— both were verified live on 2026-07-19/20. This document previously asserted a strict
+loopback-only invariant; that claim was wrong for the live box and is retracted here. What is
+actually true:
+
+- Every route that returns more than a coarse content-blind aggregate still requires
+  `Authorization: Bearer <key>` — see the Gateway API table in
+  [`../src/homeserver/README.md`](../src/homeserver/README.md). Reaching the tailnet listener does
+  not let a caller mint keys, read `/ledger`, or call `/v1/chat/completions` without one.
+- A small, deliberately unauthenticated set of routes is reachable on the tailnet listener exactly
+  as it already was on loopback: `GET /healthz`, `GET /` / `GET /portal`, `POST /portal/redeem`
+  (the one-time invite code is itself the credential), `GET /portal/stats`, and
+  `GET /portal/model-evals.json`. These were already unauthenticated on the loopback+Tunnel path;
+  the tailnet bind does not add a new unauthenticated surface, it changes who can reach the
+  existing one.
+- The startup safety net still holds: `startGateway()` refuses to bind any non-loopback host
+  (tailnet included) unless at least one API key is configured (env or minted) — see
+  `src/homeserver/gateway.ts`. An accidentally keyless box cannot silently expose the LAN/tailnet.
+- This document makes **no claim** about Tailscale ACL configuration on the box — that was not
+  verified as part of issue #23. Do not publish the box's tailnet address in docs, tickets, issues,
+  or commits; treat it as private operator infrastructure and reference it as `<tailnet-ip>` or via
+  the `m5` ssh alias instead.
+- The Cloudflare Tunnel path in the diagram above (for external friend access) is a separate,
+  additional inbound path and is unaffected by this correction; it was not re-verified as part of
+  issue #23 either, and this document makes no new claim about its current state.
 
 ## Build vs configure
 
@@ -55,6 +79,123 @@ gateway refuses to start unless at least one API key (env or minted) exists.
      is the primary control and is **not optional**. See `cloudflared/config.example.yml`.
 6. **Smoke-test** end-to-end with `stream=true` (see `ONBOARDING.md`).
 7. **Hand a friend** their key + `https://inference.example.com/v1` + `ONBOARDING.md`.
+
+## Live deployment (authoritative)
+
+This is the single authoritative description of how the M5 gateway is actually deployed and kept
+up to date. Every other document (`AGENTS.md`'s "Deploying the M5 gateway" section, runbooks under
+`docs/`) points here instead of repeating these facts — if you find a stale copy elsewhere, fix it
+to point here rather than re-describing the topology.
+
+**Live facts** (verified 2026-07-19/20, issue #23):
+
+- systemd unit: `home-gateway.service`
+- `WorkingDirectory`: `/home/magnus/home-server-eval`
+- `ExecStart`: `<WorkingDirectory>/node_modules/.bin/tsx src/homeserver/cli.ts serve`
+- The live tree at that path is a **plain rsync'd copy, not a git checkout** —
+  `git -C /home/magnus/home-server-eval rev-parse` fails with "not a git repository". There is no
+  local history to diff against on the box; `.deployed-commit` (below) is the only record of
+  deployed identity.
+- Current baseline: commit **`8caf400`** ("feat: add LearningTaskContract gateway handshake
+  (#20)"), content-verified against `canonical/main` by sha256-comparing
+  `src/homeserver/learning-task-contract.ts` and `src/homeserver/gateway.ts` on 2026-07-19.
+- `/srv/gille-inference` — previously documented in `AGENTS.md` as the live path — **does not
+  exist** on the box and is not this unit's `WorkingDirectory`. That claim was wrong; this section
+  is now the source of truth. (`CONTRIBUTING.md` also uses `/srv/gille-inference` as a *reserved
+  placeholder path* for docs/tests, the same way it uses `example.com` — that usage is intentional
+  and unrelated to this correction.)
+
+### Deploying
+
+```bash
+# from a clean checkout of canonical/main (or a worktree of the exact commit you intend to ship)
+scripts/deploy-gateway.sh deploy
+```
+
+The script (issue #23) is the repo-owned replacement for manual rsync + restart + hand-checked
+hashes. It fails closed: it refuses a dirty or non-addressable source tree, refuses when the live
+unit's `WorkingDirectory` doesn't match what it's about to sync into, restarts the unit only when
+the payload actually changed, probes local health, tailnet health, and an authenticated capability
+endpoint, and writes `.deployed-commit` with the exact 40-char SHA **only** after every check
+passes — any failure leaves the marker absent rather than certifying an ambiguous state.
+
+A real deploy needs three env vars with no safe default (the script refuses to "certify" a
+deployment it did not actually probe):
+
+| Var | Purpose |
+|---|---|
+| `DEPLOY_HEALTH_TAILNET_URL` | `http://<tailnet-ip>:8080/healthz` — export it locally; never commit the literal address |
+| `DEPLOY_CAPABILITY_URL` | `http://<tailnet-ip>:8080/v1/capabilities/learning-task` — cheap authenticated smoke test, no model call |
+| `HOMESERVER_OWNER_KEY` (or the var named by `DEPLOY_CAPABILITY_KEY_ENV`) | An owner-tier bearer key. Read from the environment; never printed, logged, or passed on the command line. |
+
+`DEPLOY_REMOTE_HOST` defaults to the `m5` ssh alias and `DEPLOY_REMOTE_DIR` defaults to
+`/home/magnus/home-server-eval`; override either if the live topology ever changes. Run
+`scripts/deploy-gateway.sh --help`, or read the script's own header comment, for the full env var
+list, the exact rsync exclude list (and why each entry is there — native `node_modules` are never
+shipped from the operator's laptop; they're installed fresh on the box), and the fail-closed
+marker-invalidate/write ordering.
+
+Preview any deploy first:
+
+```bash
+scripts/deploy-gateway.sh dry-run
+```
+
+`dry-run` prints the exact plan (including the literal rsync command) and still performs the
+read-only `WorkingDirectory` check, so a path mismatch is caught before a real deploy would hit it.
+Add `DEPLOY_DRY_RUN_OFFLINE=1` for a fully offline plan (no network at all).
+
+### Verifying what's actually deployed
+
+```bash
+scripts/deploy-gateway.sh verify
+```
+
+Read-only — never syncs, restarts, or writes anything. Reports the `.deployed-commit` marker plus a
+content spot-check (sha256 of `src/homeserver/learning-task-contract.ts` and
+`src/homeserver/gateway.ts` against that commit in your local checkout), so a stale marker or a
+hand-edited file on the box shows up as an explicit `MISMATCH` instead of a false green.
+
+### Rollback
+
+The unit is not a git checkout, so "rollback" means **redeploy a known-good commit**, not
+`git revert` on the box:
+
+```bash
+git worktree add /tmp/gille-rollback <known-good-sha>   # e.g. 8caf400, the current baseline
+cd /tmp/gille-rollback
+npm ci
+scripts/deploy-gateway.sh deploy
+```
+
+The current known-good baseline is **`8caf400`**. Update this line whenever a new deploy is
+accepted (i.e. whenever `.deployed-commit` changes on the box), so a future rollback always has a
+concrete target without needing to reconstruct one — the box itself keeps no deploy history.
+
+### MCP-restart caveat
+
+The gateway process also serves `/mcp` (`src/homeserver/mcp.ts`). A restart drops every live MCP
+transport — Claude Code / Codex sessions reconnect on their next call, but anything mid-flight over
+that specific connection is interrupted. **Async `code_loop` jobs are not affected**: they persist
+in the durable SQLite store (`src/homeserver/code-loop.ts`) and survive the restart; only the live
+transport, not the job, is dropped. `scripts/deploy-gateway.sh deploy` restarts only when rsync
+actually transferred a content change (or `DEPLOY_FORCE_RESTART=1`), specifically to avoid
+unnecessary MCP churn on a no-op deploy.
+
+### Credential-safe authenticated capability smoke test
+
+`scripts/deploy-gateway.sh deploy`'s capability probe calls
+`GET /v1/capabilities/learning-task` with `Authorization: Bearer $HOMESERVER_OWNER_KEY` (the env
+var name is configurable via `DEPLOY_CAPABILITY_KEY_ENV`) and checks only the HTTP status code. The
+key is read from the environment, never placed on the command line, and never appears in the
+script's stdout/stderr (covered by a regression test in `tests/deploy-gateway.test.ts`). Run the
+same check by hand for a one-off:
+
+```bash
+curl -fsS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer ${HOMESERVER_OWNER_KEY}" \
+  "http://<tailnet-ip>:8080/v1/capabilities/learning-task"
+```
 
 ## Configuration
 
