@@ -1193,7 +1193,7 @@
       {
         "op": "set",
         "path": "/transport/gateway_echo/admitted_at",
-        "value": "2026-07-19T10:00:00.900Z"
+        "value": "2026-07-19T09:59:58.900Z"
       }
     ],
     "expected_error": "gateway admission clock is outside stamp/model-start interval"
