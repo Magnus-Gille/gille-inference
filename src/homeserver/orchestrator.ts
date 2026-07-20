@@ -514,8 +514,11 @@ export async function currentModel(override?: string): Promise<string | null> {
  * backend, or an honest `unknown("not-observed")` pair when the backend has nothing to report or
  * the lookup itself fails. NEVER throws — a `/running` hiccup must degrade evidence quality, not
  * break serving, exactly like `currentModel`'s existing fail-open discipline above.
+ *
+ * Exported (#33) so the code_loop and MCP `ask` write paths can join their OWN served-model
+ * observation against their own admitted stamp, without forking this lookup.
  */
-async function resolveServedModelIdentity(
+export async function resolveServedModelIdentity(
   modelId: string
 ): Promise<Pick<EvidenceIdentityBundle, "modelArtifact" | "configEpoch">> {
   try {
@@ -542,8 +545,12 @@ async function resolveServedModelIdentity(
  * readers already disclose that honestly; synthesizing a mostly-unknown bundle here would only add
  * an untested partial-disclosure shape with no reconstructability benefit, since nothing about the
  * logical task/harness/tool-policy is mechanically known without a stamp).
+ *
+ * Exported (#33) — this derivation is lane-agnostic (the caller supplies its own `lane`), so the
+ * code_loop write path (code-loop.ts) and the MCP `ask` write path (mcp.ts) reuse it VERBATIM
+ * instead of forking the join logic PR #32 introduced for the delegate + delegate-shadow lanes.
  */
-async function deriveEvidenceIdentity(
+export async function deriveEvidenceIdentity(
   stamp: HuginRequestStamp | undefined,
   modelId: string,
   lane: EvidenceLane

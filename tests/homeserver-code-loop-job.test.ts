@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, beforeAll } from "vitest";
+import { describe, it, expect, beforeEach, beforeAll, vi } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,23 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import Database from "better-sqlite3";
 import { initDb, getDb } from "../src/db.js";
-import { ensureLedgerSchema } from "../src/homeserver/ledger.js";
+import { ensureLedgerSchema, reconstructEvidenceIdentity } from "../src/homeserver/ledger.js";
+import {
+  evidenceIdentityFromAdmittedStamp,
+  evidenceIdentityFromServedModelCmd,
+  buildEvidenceIdentityBundle,
+  evidenceIdentityHash,
+} from "../src/homeserver/evidence-identity.js";
+
+// #33: code-loop.ts now derives evidence identity via orchestrator.ts's deriveEvidenceIdentity,
+// which joins a LIVE served-model observation (model-admin.js's getRunningCmd). Mocked here —
+// same discipline as orchestrator-evidence-identity.test.ts — so the served-model half of a
+// stamped run's identity is deterministic instead of depending on a real llama-swap backend.
+const servedCmdByModel = new Map<string, string | null>();
+vi.mock("../src/homeserver/model-admin.js", () => ({
+  getLoaded: async () => [{ key: "qwen3-coder-next-80b" }],
+  getRunningCmd: async (modelId: string) => servedCmdByModel.get(modelId) ?? null,
+}));
 import {
   startCodeLoop,
   getJobStatus,
@@ -64,6 +80,7 @@ beforeEach(() => {
   _resetCodeLoopStateForTests();
   workroot = mkdtempSync(join(tmpdir(), "cl-job-work-"));
   try { getDb().prepare("DELETE FROM learning_task_admissions").run(); } catch { /* schema is lazy */ }
+  servedCmdByModel.clear();
 });
 
 function startCfg(over: Partial<CodeLoopStartConfig> = {}): CodeLoopStartConfig {
@@ -1225,6 +1242,129 @@ describe("LearningTaskContract stamped code_loop admission", () => {
 
     expect(await startCodeLoop(request, startCfg(), stampedDeps(epoch)))
       .toMatchObject({ ok: false, refusal: "conflict" });
+  });
+});
+
+describe("#33: code_loop lane binds evidence identity via orchestrator.ts's deriveEvidenceIdentity", () => {
+  const requestFixture = JSON.parse(readFileSync(
+    new URL("./fixtures/hugin-learning-task-request-v1.json", import.meta.url),
+    "utf8",
+  )) as { prompt: string; learningTaskStamp: unknown };
+  const nowMs = Date.parse("2026-07-19T10:00:03.000Z");
+
+  let uniqueCounter = 0;
+
+  function stampedRequest(epoch: ReturnType<typeof createLearningTaskCapabilityEpoch>): {
+    client_run_id: string;
+    learning_task_stamp: HuginRequestStamp;
+    instruction: string;
+    files: Array<{ path: string; content: string }>;
+    task_type: string;
+  } {
+    const stamp = parseHuginRequestStamp(structuredClone(requestFixture.learningTaskStamp));
+    stamp.preflight.response = epoch.advertise(new Date("2026-07-19T10:00:02.000Z"));
+    // recordDelegation() ids are random UUIDs (not insertion-ordered), and the older
+    // "LearningTaskContract stamped code_loop admission" describe block above ALSO writes
+    // code-loop ledger rows for this identical fixture prompt. A unique per-call suffix on the
+    // rendered instruction (never on the stamp — evidenceIdentityFromAdmittedStamp reads only
+    // stamp fields, never req.instruction) keeps this describe block's `ledgerRowFor` lookups
+    // unambiguous without depending on ledger row ordering.
+    const instruction = `${requestFixture.prompt}\n\n[#33 test marker ${uniqueCounter++}]`;
+    return {
+      client_run_id: stamp.idempotency_key,
+      learning_task_stamp: stamp,
+      instruction,
+      files: [{ path: "incident.txt", content: "fixture\n" }],
+      task_type: stamp.task_type.id,
+    };
+  }
+
+  function stampedDeps(epoch: ReturnType<typeof createLearningTaskCapabilityEpoch>): CodeLoopDeps {
+    return fakeDeps({
+      now: () => nowMs,
+      keyAlias: "service:hugin",
+      learningTaskAdmission: {
+        capabilityEpoch: epoch,
+        authenticatedPrincipalId: "service:hugin",
+        authentication: "gateway-owner-auth",
+        gatewayRequestId: "opaque:33333333-3333-4333-8333-333333333333",
+      },
+    });
+  }
+
+  function ledgerRowFor(prompt: string): { hash: string | null; lane: string | null } {
+    const promptHash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+    // `id` is a random UUID (recordDelegation), not insertion-ordered — order by `ts` (defense in
+    // depth on top of stampedRequest's unique-per-call instruction marker above).
+    return getDb()
+      .prepare(
+        "SELECT evidence_identity_hash AS hash, evidence_lane AS lane FROM delegations WHERE source = 'code-loop' AND prompt_hash = ? ORDER BY ts DESC LIMIT 1"
+      )
+      .get(promptHash) as { hash: string | null; lane: string | null };
+  }
+
+  it("a stamped code_loop run lands a reconstructable evidence identity tagged 'code-loop'", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    const servedCmd = "llama-server -m /models/qwen3-coder-next-80b-Q4_K_M.gguf -c 65536";
+    servedCmdByModel.set("qwen3-coder-next-80b", servedCmd);
+
+    const started = await startCodeLoop(request, startCfg(), stampedDeps(epoch));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const row = ledgerRowFor(request.instruction);
+    expect(row.hash).not.toBeNull();
+    // Per-lane correctness (#33 AC2): tagged code-loop, never a delegate/delegate-shadow/mcp-ask tag.
+    expect(row.lane).toBe("code-loop");
+
+    const expectedBundle = buildEvidenceIdentityBundle({
+      ...evidenceIdentityFromAdmittedStamp(request.learning_task_stamp),
+      ...evidenceIdentityFromServedModelCmd(servedCmd),
+      lane: "code-loop",
+    });
+    expect(row.hash).toBe(evidenceIdentityHash(expectedBundle));
+
+    const snapshot = reconstructEvidenceIdentity(row.hash!);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.bundle).toEqual(expectedBundle);
+    expect(snapshot!.bundle.lane).toBe("code-loop");
+    expect(snapshot!.bundle.harness.kind).toBe("digest");
+    expect(snapshot!.bundle.modelArtifact.kind).toBe("digest");
+  });
+
+  it("a served-model lookup failure fails OPEN to unknown('not-observed'), never fabricated", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    // No entry in servedCmdByModel for this model -> getRunningCmd resolves null (not-observed).
+    const started = await startCodeLoop(request, startCfg(), stampedDeps(epoch));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const row = ledgerRowFor(request.instruction);
+    expect(row.hash).not.toBeNull();
+    expect(row.lane).toBe("code-loop");
+    const snapshot = reconstructEvidenceIdentity(row.hash!);
+    expect(snapshot!.bundle.modelArtifact).toMatchObject({ kind: "unknown", reason: "not-observed" });
+    expect(snapshot!.bundle.configEpoch).toMatchObject({ kind: "unknown", reason: "not-observed" });
+  });
+
+  it("an unstamped code_loop run keeps a null (legacy) evidence identity, no crash", async () => {
+    const prompt = "plain legacy run, no stamp (#33)";
+    const started = await startCodeLoop(
+      { instruction: prompt, files: [{ path: "a.txt", content: "x\n" }] },
+      startCfg(),
+      fakeDeps()
+    );
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const row = ledgerRowFor(prompt);
+    expect(row.hash).toBeNull();
+    expect(row.lane).toBeNull();
   });
 });
 
