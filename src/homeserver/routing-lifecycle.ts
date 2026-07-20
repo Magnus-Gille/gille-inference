@@ -97,6 +97,22 @@ export function summarizeCalibrationGate(gate: CalibrationGateDecision | null): 
   return { policyId: gate.policyId, generatedAt: gate.generatedAt, verdict: gate.verdict, enabled: gate.enabling !== null };
 }
 
+/**
+ * The single #6 admissibility test: a route change explained only by organic-judge evidence may
+ * proceed iff the gate is a measured `GO` with a recorded reviewed enablement. A `null` gate (none
+ * consulted) or a `HOLD` gate is MOST RESTRICTIVE — never permissive — by construction: both fall
+ * through to `false` here, never `true`.
+ *
+ * Exported (rather than left as validateCandidate's private inline expression) so
+ * `scripts/routing-lifecycle-cli.ts`'s adopt-time re-validation (issue #37 — recomputing the LIVE
+ * gate immediately before a mutating adopt, as defense-in-depth alongside the policy-epoch staleness
+ * check) uses this EXACT same definition instead of a second, independently-maintained copy that
+ * could silently diverge from validateCandidate's own rule.
+ */
+export function gateAdmitsOrganicEvidence(gate: CalibrationGateSummary | null): boolean {
+  return gate !== null && gate.verdict === "GO" && gate.enabled;
+}
+
 export interface ValidateCandidateInputs {
   candidate: RoutingTableDoc;
   /** Semantic diff of `candidate` vs the currently-adopted table (see diffRoutingTables). */
@@ -200,7 +216,7 @@ export function validateCandidate(p: ValidateCandidateInputs): ValidateCandidate
   //    so comparing diff *kinds* would wrongly call an organic-only escalate-frontier "added" the
   //    same as a organic-driven delegate-local "added" — comparing the `after` SNAPSHOTS directly is
   //    the correct, kind-independent test.
-  const gateAdmits = p.calibrationGate !== null && p.calibrationGate.verdict === "GO" && p.calibrationGate.enabled;
+  const gateAdmits = gateAdmitsOrganicEvidence(p.calibrationGate);
   const changedEntries = p.diff.changes.filter((c) => c.kind !== "unchanged");
   const deterministicAfterByType = new Map(p.deterministicDiff.changes.map((c) => [c.taskType, c.after]));
   const organicDependent = new Set<string>();

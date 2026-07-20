@@ -13,45 +13,63 @@
  *
  * USAGE
  *   tsx scripts/routing-lifecycle-cli.ts review [--out artifact.json] [--table docs/m5-routing.json]
- *       [--calibration-gate gate.json] [--freshness-max-age-ms 604800000] [--db ...] [--data-dir ...]
+ *       [--calibration-gate gate.json] [--calibration-receipts receipts.json]
+ *       [--freshness-max-age-ms 604800000] [--db ...] [--data-dir ...]
  *     Prints the human-readable diff + validation summary to stderr, the machine-readable
  *     RoutingDecisionArtifact JSON to stdout (and --out, if given). Exit 0 iff validation passed —
- *     a non-zero exit means "do not approve this candidate", never "something crashed".
+ *     a non-zero exit means "do not approve this candidate", never "something crashed". The #6
+ *     calibration gate attached to the artifact is `--calibration-gate <path>` when given (e.g. a
+ *     human-reviewed GO+enabled decision); otherwise it is evaluated LIVE from current ledger
+ *     evidence (optionally joined to `--calibration-receipts <path>`) — never a bare `null` (issue
+ *     #37).
  *
  *   tsx scripts/routing-lifecycle-cli.ts adopt --artifact artifact.json \
  *       --approved-by <name> --reason "<why>" --decision-ref <issue/PR> \
- *       [--table docs/m5-routing.json] [--gateway-url http://127.0.0.1:8080] [--db ...]
+ *       [--table docs/m5-routing.json] [--gateway-url http://...] [--db ...] \
+ *       [--calibration-gate gate.json] [--calibration-receipts receipts.json]
  *     Adopts a PREVIOUSLY REVIEWED artifact (produced by `review`). Refuses (throws, no write) if
- *     the artifact failed validation, or if the routing policy changed since it was reviewed.
- *     Snapshots the current table, writes the candidate, reloads the live gateway (no restart via
- *     ROUTING_LIFECYCLE_ADMIN_KEY-authenticated POST /admin/routing-table/reload), runs a canary
- *     over changed routes, and rolls back to the exact prior bytes on any failure.
+ *     the artifact failed validation, or if the routing policy changed since it was reviewed. If any
+ *     lineage entry is organic-judge-dependent, ALSO recomputes the LIVE #6 gate right now and
+ *     refuses (no write) unless it still admits it (issue #37 — defense-in-depth against a stale
+ *     review). Snapshots the current table, writes the candidate, reloads the live gateway (no
+ *     restart via an owner-key-authenticated POST /admin/routing-table/reload — see resolveAdminKey),
+ *     runs a canary over changed routes, and rolls back to the exact prior bytes on any failure.
+ *     `--gateway-url` defaults to the gateway's OWN configured listener, not loopback (issue #38 —
+ *     see resolveGatewayUrl).
  *
  *   tsx scripts/routing-lifecycle-cli.ts rollback --snapshot prior-table.json --reason "<why>" \
- *       [--table docs/m5-routing.json] [--gateway-url http://127.0.0.1:8080]
+ *       [--table docs/m5-routing.json] [--gateway-url http://...]
  *     The documented MANUAL rollback command: restores an exact snapshot file and reloads.
  *
- * ENV: EVAL_DB_PATH (ledger DB, default ./data/eval.db); GATEWAY_URL (default http://127.0.0.1:8080);
- *      ROUTING_LIFECYCLE_ADMIN_KEY (owner/admin gateway key used ONLY to call the reload endpoint).
+ * ENV: EVAL_DB_PATH (ledger DB, default ./data/eval.db);
+ *      GATEWAY_URL (explicit override; else derived from the gateway's OWN configured listener —
+ *        HOMESERVER_HOST/HOMESERVER_PORT via loadConfig() — falling back to http://127.0.0.1:8080
+ *        only when nothing configures a host at all; see resolveGatewayUrl, issue #38);
+ *      ROUTING_LIFECYCLE_ADMIN_KEY, or HOMESERVER_OWNER_KEY as a fallback (owner/admin gateway key
+ *        used ONLY to call the reload endpoint; see resolveAdminKey, issue #38).
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { loadConfig } from "../src/homeserver/config.js";
-import { ledgerReport } from "../src/homeserver/ledger.js";
+import { loadConfig, type HomeserverConfig } from "../src/homeserver/config.js";
+import { ledgerReport, listCalibrationSampleRows } from "../src/homeserver/ledger.js";
 import { listModels } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
 import { contentDigest } from "../src/homeserver/evidence-identity.js";
 import { routableTaskTypes, type SourceManifestEntry } from "../src/homeserver/routing-table-generator.js";
 import type { DiffableRoutingTable } from "../src/homeserver/routing-table-diff.js";
 import type { CalibrationGateDecision } from "../src/homeserver/calibration-gate.js";
+import type { QualityReceiptRef } from "../src/homeserver/calibration-quality-receipts.js";
+import { computeLiveCalibrationGate } from "../src/homeserver/calibration-gate-live.js";
 import {
   buildCandidatePair,
   buildDecisionArtifact,
   approveArtifact,
   adoptRoutingTable,
   manualRollback,
+  summarizeCalibrationGate,
+  gateAdmitsOrganicEvidence,
   type RoutingDecisionArtifact,
   type AdoptDeps,
 } from "../src/homeserver/routing-lifecycle.js";
@@ -92,7 +110,11 @@ async function loadServableModelIds(): Promise<string[] | null> {
   }
 }
 
-function loadCalibrationGate(path: string | undefined): CalibrationGateDecision | null {
+/** Loads an EXPLICIT, previously-computed gate file (e.g. a human-reviewed GO with `enabling`
+ *  populated by calibration-gate.ts's `attachReviewedDecision`) — the only way `enabling` is ever
+ *  non-null, since `computeLiveCalibrationGate`/`evaluateCalibrationGate` always leave it null. This
+ *  stays the preferred, explicit path when given; see `resolveCalibrationGate` for the fallback. */
+export function loadCalibrationGate(path: string | undefined): CalibrationGateDecision | null {
   if (!path) return null;
   const raw = readFileSync(resolve(path), "utf8");
   const parsed = JSON.parse(raw) as CalibrationGateDecision;
@@ -100,6 +122,47 @@ function loadCalibrationGate(path: string | undefined): CalibrationGateDecision 
     throw new Error(`--calibration-gate ${path}: not a recognisable CalibrationGateDecision (bad "verdict")`);
   }
   return parsed;
+}
+
+/** Loads a `--calibration-receipts <path>` Quality Receipts export for the live-gate computation
+ *  (mirrors scripts/harvest-judge-calibration-gate.ts's own `--receipts` validation). Optional —
+ *  omitting it computes the live gate with zero receipts, which honestly evaluates to HOLD
+ *  ("insufficient audited sample") rather than skipping the gate. */
+export function loadCalibrationReceipts(path: string | undefined): QualityReceiptRef[] {
+  if (!path) return [];
+  const raw = readFileSync(resolve(path), "utf8");
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error(`--calibration-receipts ${path}: expected a JSON array of QualityReceiptRef objects`);
+  }
+  for (const [i, r] of parsed.entries()) {
+    const o = r as Record<string, unknown>;
+    const requiredStrings = ["receiptId", "receiptDigest", "bindingKey", "disposition", "rubricVersion", "reviewerId"];
+    for (const field of requiredStrings) {
+      if (typeof o[field] !== "string") {
+        throw new Error(`--calibration-receipts ${path}: row ${i} missing/invalid string field "${field}"`);
+      }
+    }
+    if (!["pass", "partial", "fail", "conflicted"].includes(o["rating"] as string)) {
+      throw new Error(`--calibration-receipts ${path}: row ${i} has invalid "rating" (expected pass|partial|fail|conflicted)`);
+    }
+  }
+  return parsed as QualityReceiptRef[];
+}
+
+/**
+ * Resolve the #6 calibration gate the CLI attaches to a decision artifact (issue #37): an explicit
+ * `--calibration-gate <path>` file (e.g. a human-reviewed GO+enabled decision) takes precedence when
+ * given; otherwise this evaluates the LIVE gate from current ledger evidence
+ * (`computeLiveCalibrationGate`) and an optional `--calibration-receipts <path>` export, so the
+ * artifact never defaults to a bare `null` merely because no file was piped in.
+ */
+export function resolveCalibrationGate(args: string[], generatedAt: string): CalibrationGateDecision | null {
+  const overridePath = readFlag(args, "--calibration-gate");
+  if (overridePath) return loadCalibrationGate(overridePath);
+  const rows = listCalibrationSampleRows({ includeShadow: true });
+  const receipts = loadCalibrationReceipts(readFlag(args, "--calibration-receipts"));
+  return computeLiveCalibrationGate({ rows, receipts, generatedAt });
 }
 
 function policyEpochHash(policy: unknown): string {
@@ -114,13 +177,14 @@ async function cmdReview(args: string[]): Promise<void> {
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
   const outPath = readFlag(args, "--out");
   const freshnessMaxAgeMs = Number(readFlag(args, "--freshness-max-age-ms") ?? DEFAULT_FRESHNESS_MAX_AGE_MS);
-  const calibrationGate = loadCalibrationGate(readFlag(args, "--calibration-gate"));
+  const generatedAt = new Date().toISOString();
+  // #37: the live #6 gate, not a hardcoded null — see resolveCalibrationGate's doc comment.
+  const calibrationGate = resolveCalibrationGate(args, generatedAt);
 
   const verdicts = ledgerReport(config.policy);
   const deterministicVerdicts = ledgerReport(config.policy, { excludeOrganicJudge: true });
   const registry = readRegistry(DEFAULT_REGISTRY_PATH);
   const servableModelIds = await loadServableModelIds();
-  const generatedAt = new Date().toISOString();
 
   const sources: SourceManifestEntry[] = [
     {
@@ -167,6 +231,17 @@ async function cmdReview(args: string[]): Promise<void> {
   });
 
   process.stderr.write(artifact.humanDiff);
+  // #37: always surface the gate verdict for the reviewer, not only when it happens to gate a
+  // change — an absent/HOLD gate is a decision-relevant fact even on a run with no organic-dependent
+  // routes this time.
+  process.stderr.write(
+    `calibration gate (#6): ${
+      artifact.calibrationGate
+        ? `${artifact.calibrationGate.verdict}${artifact.calibrationGate.enabled ? "+enabled" : ""} ` +
+          `(policy ${artifact.calibrationGate.policyId.slice(0, 12)}, generated ${artifact.calibrationGate.generatedAt})`
+        : "none consulted"
+    }\n`
+  );
   process.stderr.write(
     `\nvalidation: ${artifact.validation.ok ? "PASS" : "REFUSED"} (${artifact.validation.issues.length} issue(s))\n`
   );
@@ -192,13 +267,54 @@ async function cmdReview(args: string[]): Promise<void> {
 
 // ─── adopt ──────────────────────────────────────────────────────────────────────
 
-function gatewayUrl(args: string[]): string {
-  return (readFlag(args, "--gateway-url") ?? process.env["GATEWAY_URL"] ?? "http://127.0.0.1:8080").replace(/\/$/, "");
+/**
+ * Resolve the gateway base URL to call for `/admin/routing-table/reload` (issue #38). Precedence:
+ * `--gateway-url` (explicit) > `GATEWAY_URL` env (explicit) > the gateway's OWN configured listener
+ * — `config.gatewayHost`/`config.gatewayPort`, i.e. `HOMESERVER_HOST`/`HOMESERVER_PORT` via
+ * `loadConfig()`, the EXACT host/port `gateway.ts`'s `server.listen(cfg.gatewayPort, cfg.gatewayHost, ...)`
+ * binds (config.ts). In the live deployment `HOMESERVER_HOST` is already set to the box's tailnet
+ * interface (deploy/README.md's "Live deployment (authoritative)" section, issue #23) — deriving
+ * from config means a cron/no-flag `adopt` run ON the box resolves the real listener automatically,
+ * instead of defaulting to loopback while the gateway only binds the tailnet address. Only when
+ * NOTHING configures a host (bare local dev, no `.env`) does this still fall back to the historical
+ * `http://127.0.0.1:8080` default, because that is `loadConfig()`'s own default for `gatewayHost`.
+ */
+export function resolveGatewayUrl(args: string[], config: Pick<HomeserverConfig, "gatewayHost" | "gatewayPort">): string {
+  const explicit = readFlag(args, "--gateway-url") ?? process.env["GATEWAY_URL"];
+  if (explicit) return explicit.replace(/\/$/, "");
+  return `http://${config.gatewayHost}:${config.gatewayPort}`;
+}
+
+/** The env vars checked, in order, for the owner/admin bearer key that authenticates the reload
+ *  call (issue #38). `ROUTING_LIFECYCLE_ADMIN_KEY` is the dedicated var; `HOMESERVER_OWNER_KEY` is
+ *  the pre-existing owner-tier bearer-key convention this repo already uses for the same purpose
+ *  (`scripts/deploy-gateway.sh`'s `DEPLOY_CAPABILITY_KEY_ENV` default, deploy/README.md's
+ *  "Credential-safe authenticated capability smoke test") — falling back to it means a box that
+ *  already exports an owner key for deploy/capability checks does not need a second key minted and
+ *  wired just for `adopt`. As of this change NEITHER var is guaranteed to be present in the
+ *  deployed gateway `.env` (see deploy/README.md's "Adopting a routing-table change" section) —
+ *  `callReloadEndpoint`'s error names both when neither is set.
+ */
+export const ADMIN_KEY_ENV_VARS = ["ROUTING_LIFECYCLE_ADMIN_KEY", "HOMESERVER_OWNER_KEY"] as const;
+
+export function resolveAdminKey(): string {
+  for (const name of ADMIN_KEY_ENV_VARS) {
+    const v = process.env[name];
+    if (v && v.trim() !== "") return v;
+  }
+  return "";
 }
 
 async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok: boolean; error?: string }> {
   if (!adminKey) {
-    return { ok: false, error: "ROUTING_LIFECYCLE_ADMIN_KEY not set — cannot authenticate to the reload endpoint" };
+    return {
+      ok: false,
+      error:
+        `no admin key available — set ${ADMIN_KEY_ENV_VARS.join(" or ")} in the environment to an ` +
+        `owner-tier bearer key (mint one with 'tsx src/homeserver/cli.ts keys mint --alias <name> ` +
+        `--tier owner'). See deploy/README.md's "Adopting a routing-table change" section for what ` +
+        `the deployed .env must contain for a zero-flag/cron adopt.`,
+    };
   }
   try {
     const res = await fetch(`${base}/admin/routing-table/reload`, {
@@ -231,11 +347,41 @@ async function cmdAdopt(args: string[]): Promise<void> {
   }
 
   const artifact = JSON.parse(readFileSync(resolve(artifactPath), "utf8")) as RoutingDecisionArtifact;
+
+  // #37: adopt-time re-validation of the #6 admissibility rule, as defense-in-depth alongside
+  // adoptRoutingTable's own policy-epoch staleness check. `artifact.calibrationGate` is a
+  // review-time snapshot (frozen when `review` ran); if any lineage entry was flagged
+  // organic-judge-dependent, recompute the LIVE gate right now and refuse adoption unless it STILL
+  // admits it (gateAdmitsOrganicEvidence — the exact same predicate validateCandidate itself uses,
+  // never a second copy). This does not alter validateCandidate/adoptRoutingTable/approveArtifact —
+  // it is an additional CLI-level refusal that runs BEFORE approveArtifact/adoptRoutingTable are
+  // ever called, so a stale-good review can never coast an organic-dependent change through on a
+  // gate that has since gone HOLD.
+  const organicDependentTaskTypes = artifact.lineage.filter((l) => l.organicJudgeDependent).map((l) => l.taskType);
+  if (organicDependentTaskTypes.length > 0) {
+    const liveGate = resolveCalibrationGate(args, new Date().toISOString());
+    const liveGateSummary = summarizeCalibrationGate(liveGate);
+    if (!gateAdmitsOrganicEvidence(liveGateSummary)) {
+      process.stderr.write(
+        `adopt refused: organic-judge-dependent route change(s) [${organicDependentTaskTypes.join(", ")}] require ` +
+          `the LIVE #6 gate to be GO+enabled at adopt time (current: ${
+            liveGateSummary ? `${liveGateSummary.verdict}${liveGateSummary.enabled ? "+enabled" : ""}` : "none consulted"
+          }). Re-review and re-approve once the gate clears; approval is never overridden here.\n`
+      );
+      process.exitCode = 1;
+      return;
+    }
+    process.stderr.write(
+      `organic-judge-dependent route change(s) [${organicDependentTaskTypes.join(", ")}] confirmed admissible by the ` +
+        `LIVE #6 gate at adopt time (${liveGateSummary!.verdict}+enabled).\n`
+    );
+  }
+
   const approval = approveArtifact(artifact, { approvedBy, reason, decisionRef, approvedAt: new Date().toISOString() });
 
-  const base = gatewayUrl(args);
-  const adminKey = process.env["ROUTING_LIFECYCLE_ADMIN_KEY"] ?? "";
   const config = loadConfig();
+  const base = resolveGatewayUrl(args, config);
+  const adminKey = resolveAdminKey();
 
   const deps: AdoptDeps = {
     tablePath,
@@ -284,8 +430,9 @@ async function cmdRollback(args: string[]): Promise<void> {
     return;
   }
   const snapshotRaw = readFileSync(resolve(snapshotPath), "utf8");
-  const base = gatewayUrl(args);
-  const adminKey = process.env["ROUTING_LIFECYCLE_ADMIN_KEY"] ?? "";
+  const config = loadConfig();
+  const base = resolveGatewayUrl(args, config);
+  const adminKey = resolveAdminKey();
 
   const deps: AdoptDeps = {
     tablePath,
