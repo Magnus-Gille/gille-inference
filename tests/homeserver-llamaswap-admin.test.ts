@@ -207,6 +207,36 @@ describe("getLoaded", () => {
   });
 });
 
+// ─── getRunningCmd (#5: evidence-identity served-model observation) ────────────
+
+describe("getRunningCmd", () => {
+  it("returns the exact cmd string for a model in state:ready", async () => {
+    runningModels = [{ model: "llama3.2:8b", state: "ready", cmd: "llama-server -m /models/llama3.2-8b-Q4.gguf -c 8192" }];
+    const cmd = await llamaswap.getRunningCmd("llama3.2:8b");
+    expect(cmd).toBe("llama-server -m /models/llama3.2-8b-Q4.gguf -c 8192");
+  });
+
+  it("returns null for a model that is not running", async () => {
+    runningModels = [];
+    expect(await llamaswap.getRunningCmd("llama3.2:8b")).toBeNull();
+  });
+
+  it("returns null for a model present but not yet ready (e.g. still loading)", async () => {
+    runningModels = [{ model: "llama3.2:8b", state: "loading" }];
+    expect(await llamaswap.getRunningCmd("llama3.2:8b")).toBeNull();
+  });
+
+  it("model-admin's facade forwards to the llama-swap backend", async () => {
+    runningModels = [{ model: "qwen2.5:7b", state: "ready", cmd: "llama-server -m /models/qwen2.5-7b.gguf -c 16384" }];
+    setConfig({ backend: "llamaswap" });
+    expect(await modelAdmin.getRunningCmd("qwen2.5:7b")).toBe("llama-server -m /models/qwen2.5-7b.gguf -c 16384");
+  });
+
+  it("the deprecated lmstudio backend honestly reports null (#5) — no /running equivalent exists", async () => {
+    expect(await lmstudioAdmin.getRunningCmd("anything")).toBeNull();
+  });
+});
+
 // ─── unloadModel ──────────────────────────────────────────────────────────────
 
 describe("unloadModel", () => {

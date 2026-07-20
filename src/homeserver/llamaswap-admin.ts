@@ -116,6 +116,20 @@ export async function getLoaded(): Promise<Array<{ key: string; contextLength: n
     .map((r) => ({ key: r.model, contextLength: parseCtxFromCmd(r.cmd) }));
 }
 
+/**
+ * Return the exact `cmd` string llama-swap reports for the model currently serving `modelId`
+ * (state:"ready"), or null when that model is not running. This is genuinely observed local
+ * server state — the source evidence-identity.ts's `evidenceIdentityFromServedModelCmd` (#5)
+ * hashes into the model-artifact/config-epoch identity fields. Never fabricated: a fetch failure
+ * or an absent entry both surface as null, not a guessed value.
+ */
+export async function getRunningCmd(modelId: string): Promise<string | null> {
+  const origin = getOrigin();
+  const running = await fetchRunning(origin);
+  const entry = running.find((r) => r.model === modelId && r.state === "ready");
+  return entry?.cmd ?? null;
+}
+
 /** Unload a model by key (POST /api/models/unload/:id), or unload all (POST /api/models/unload). */
 export async function unloadModel(
   modelKey?: string
