@@ -1,0 +1,14 @@
+[
+  {
+    "name": "ASCII trim",
+    "input_text": "  Summarize the fixture incident report.\n",
+    "trimmed_utf8": "Summarize the fixture incident report.",
+    "expected_sha256": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+  },
+  {
+    "name": "Unicode trim without normalization",
+    "input_text": "\tÅngström \n",
+    "trimmed_utf8": "Ångström",
+    "expected_sha256": "d27607e4723af34d42f72e65d29314aa7ffa372d39a5440cce37e260c4a4138b"
+  }
+]

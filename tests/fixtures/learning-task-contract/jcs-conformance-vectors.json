@@ -1,0 +1,21 @@
+[
+  {
+    "name": "RFC 8785 section 3.2.2 sample",
+    "input": {
+      "numbers": [333333333.33333329, 1e30, 4.50, 2e-3, 1e-27],
+      "string": "€$\u000f\nA'B\"\\\"/",
+      "literals": [null, true, false]
+    },
+    "expected": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\"/\"}"
+  },
+  {
+    "name": "UTF-16 property order with non-ASCII keys",
+    "input": { "😀": 5, "ö": 4, "€": 3, "é": 2, "1": 1 },
+    "expected": "{\"1\":1,\"é\":2,\"ö\":4,\"€\":3,\"😀\":5}"
+  },
+  {
+    "name": "ECMAScript numeric rendering including negative zero",
+    "input": { "z": -0.0, "small": 0.000001, "exponent": 1e21, "fraction": 1.2345678901234567 },
+    "expected": "{\"exponent\":1e+21,\"fraction\":1.2345678901234567,\"small\":0.000001,\"z\":0}"
+  }
+]

@@ -476,7 +476,12 @@ function recordCodeLoopTaskExposure(
   req: CodeLoopRequest,
   workId: string,
   modelId: string | null,
-  harnessId: string | null
+  harnessId: string | null,
+  // #4: the caller passes stamp.raw_fingerprint.digest only once the stamp has been fully
+  // validated (validateHuginRequestStamp) or is byte-identical to a previously-validated durable
+  // echo (the recovery path — see the jcsCanonicalize(persistedEcho.echoed_request) equality check
+  // above). `req.instruction` remains the rendered/context-wrapped text; do not compare the two.
+  canonicalFingerprintSha256: string | null = null
 ): void {
   recordTaskExposureBestEffort({
     taskText: req.instruction,
@@ -484,6 +489,7 @@ function recordCodeLoopTaskExposure(
     modelId,
     harnessId,
     eventKey: `code-loop:${workId}:${TASK_FINGERPRINT_VERSION}`,
+    canonicalFingerprintSha256,
   });
 }
 
@@ -553,7 +559,10 @@ export async function startCodeLoop(
         req,
         existing.work_id,
         existing.result?.execution.model ?? null,
-        existing.result?.execution.harness_version ?? null
+        existing.result?.execution.harness_version ?? null,
+        // Safe here because either req.learning_task_stamp is undefined, or the jcsCanonicalize
+        // equality check just above proved it is byte-identical to the originally-validated echo.
+        req.learning_task_stamp?.raw_fingerprint.digest ?? null
       );
       return startResultFromRecord(failClosedIncompatibleResult(cfg.workroot, existing), true);
     }
@@ -909,7 +918,13 @@ export async function startCodeLoop(
   jobs.set(workId, job);
   // The run is durably accepted and about to reach the model. A recovered retry uses the same
   // work-id event key above, so caller ambiguity cannot double-count exposure.
-  recordCodeLoopTaskExposure(req, workId, cfg.model, CODE_LOOP_HARNESS_VERSION);
+  recordCodeLoopTaskExposure(
+    req,
+    workId,
+    cfg.model,
+    CODE_LOOP_HARNESS_VERSION,
+    validatedLearningStamp?.raw_fingerprint.digest ?? null
+  );
   // Metadata is an untrusted operational hint, never part of acceptance. A filesystem failure
   // here cannot reject the RPC after the durable commit or prevent the already-admitted engine
   // from being scheduled (the durable record drives recovery/retention).

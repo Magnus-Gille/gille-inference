@@ -1,0 +1,640 @@
+{
+  "schema_version": "learning-task-validation-context/v1",
+  "context_id": "fixture:learning-task-contract-v1",
+  "fixture_only": true,
+  "trusted_evidence": [
+    {
+      "evidence_id": "fixture-evidence-001",
+      "kind": "owner-authority",
+      "issuer": "principal:owner",
+      "payload_digest": {
+        "algorithm": "sha256",
+        "version": "trusted-evidence-payload-jcs-v1",
+        "digest": "b64e6c00ca17cc1aafc8ec372641baa92910f66e0fe31b1e62573753b5fbff9c"
+      },
+      "payload": {
+        "content_owner": "principal:owner",
+        "authenticated_principal": "principal:owner",
+        "authentication": "authenticated-owner",
+        "delegation": {
+          "value": null,
+          "unknown_reason": "not-applicable"
+        },
+        "approvals": [
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "gille-inference",
+              "record_kind": "inference-exposure",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "221ccd80641b0a76d5b738446ef00345090d5810bd199f175df3cb2f2b48d50a"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "hugin",
+              "record_kind": "task-outcome",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "3d8d03568d1e53971627bb7d17196fca92804395ae9333733972a39684f5b43b"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "hugin",
+              "record_kind": "task-outcome",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "4117d5e2a2fafa8b835ff9e99ed15a4d61bc80f0638c2c20906a7b3bb95f2dbd"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "hugin",
+              "record_kind": "experiment-observation",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "46c1132cea5a98fada99254ff74ddec0f4372f4252e0cec21ebac77ec9fc7ede"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "hugin",
+              "record_kind": "experiment-product-rating",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "56b83a772bcf2cfad45b9ddc8040e8d537ed8dd68c768dd135ad266ef8b5dbb7"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "hugin",
+              "record_kind": "task-outcome",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "5ac78bdc0d8bb68b3e45332c7893b962d918d0014f2da8ba84522c4bbfdf7c71"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "hugin",
+              "record_kind": "quality-receipt",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "8a07cc3e6478cf1cf5c5dffe8d7a0a30ceb9056992b7ebc08f7f2b129cc22681"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "gille-inference",
+              "record_kind": "capability-evidence",
+              "task": {
+                "origin_component": "hugin",
+                "instance_id": "task-001",
+                "source": {
+                  "component": "hugin",
+                  "system": "broker",
+                  "id": "broker-001",
+                  "created_at": "2026-07-19T09:59:00Z",
+                  "accepted_at": "2026-07-19T10:00:00Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "verified-signature",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "summarize",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "7b1c423b1792795a9442c6df25d5035af9daa83dbe43c48476f9bd8baa633152"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "96be47b1f5e2871ecba8730279b3e772e75ccf173738b4afb463e24a88007ba9"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "c53872e50788a1778a6cbdccbb0f95fce9fc6251ecef9af8abedacd5976a45d3"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "gille-inference",
+              "record_kind": "inference-exposure",
+              "task": {
+                "origin_component": "gille-inference",
+                "instance_id": "service-task-001",
+                "source": {
+                  "component": "gille-inference",
+                  "system": "openai-chat",
+                  "id": "service-request-001",
+                  "created_at": "2026-07-19T13:00:00Z",
+                  "accepted_at": "2026-07-19T13:00:01Z",
+                  "principal": {
+                    "id": "service:hugin-ingress",
+                    "authentication": "service-auth",
+                    "scope": "service"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "conversation",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "fd1f51675c8254360c0f871fd0a8509cc311df0ce892748d47bd07bbce45ecc6"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/service-task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "578e757bf6fae8d4a35001345c39b7042dde876d21033ae5063359922dbf517e"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "6654ff67cfecc3e27083c761978904227a763d1023262bc3957cfb4bd6d82750"
+            }
+          },
+          {
+            "manifest": {
+              "manifest_id": "opaque:d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1",
+              "version": "governance-policy-manifest-jcs-v1",
+              "approved_at": "2026-07-19T09:58:00Z"
+            },
+            "record_binding": {
+              "producer": "gille-inference",
+              "record_kind": "inference-exposure",
+              "task": {
+                "origin_component": "gille-inference",
+                "instance_id": "gateway-task-001",
+                "source": {
+                  "component": "gille-inference",
+                  "system": "openai-chat",
+                  "id": "request-001",
+                  "created_at": "2026-07-19T11:00:00Z",
+                  "accepted_at": "2026-07-19T11:00:01Z",
+                  "principal": {
+                    "id": "principal:owner",
+                    "authentication": "gateway-owner-auth",
+                    "scope": "owner"
+                  },
+                  "content_owner": {
+                    "id": "principal:owner",
+                    "authority": "authenticated-owner"
+                  }
+                },
+                "task_type": {
+                  "id": "conversation",
+                  "taxonomy_id": "gille-inference/task-types",
+                  "taxonomy_version": "gille-inference-task-types-2026-07-19-v1"
+                },
+                "raw_fingerprint": {
+                  "algorithm": "sha256",
+                  "version": "trim-utf8-sha256-v1",
+                  "digest": "63846616fc03843358aae14214d9475dd84ec29216c3ebcbda7eba078fe26f48"
+                },
+                "raw_input": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785-utf8-v1",
+                  "source_ref": "source-doc:raw/gateway-task-001",
+                  "source_type": "raw-input",
+                  "source_version": "raw-input-v1",
+                  "digest": "34c8cdb793eeaf55ee806bd54fb8627bd1049c250ff94ce3db43a4c21ad1abed"
+                }
+              }
+            },
+            "policy_subset_digest": {
+              "algorithm": "sha256",
+              "version": "owner-policy-subset-jcs-v1",
+              "digest": "7b08c2cc278360c1bd21057b7f8ee8c7b2b33566951d1f66d1b8ebde84f520a3"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "evidence_id": "fixture-evidence-002",
+      "kind": "hugin-task-attempt",
+      "issuer": "hugin",
+      "payload_digest": {
+        "algorithm": "sha256",
+        "version": "trusted-evidence-payload-jcs-v1",
+        "digest": "0fdb10eda0da42fb4690e8d94ea2c1b0513c1790d27d2b49e1b66b4af3c73311"
+      },
+      "payload": {
+        "outcome_ref": {
+          "producer": "hugin",
+          "record_kind": "task-outcome",
+          "record_id": "opaque:d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1"
+        },
+        "task_instance_id": "task-negative-001",
+        "attempt_id": "candidate-attempt-001",
+        "relevant_task_at": "2026-07-19T12:00:01Z",
+        "raw_fingerprint": {
+          "algorithm": "sha256",
+          "version": "trim-utf8-sha256-v1",
+          "digest": "b881fde015047ea1407096ce62b0385b243f0b93ea3ffa38bd92bcc0843d7deb"
+        },
+        "request_stamp_digest": {
+          "algorithm": "sha256",
+          "version": "request-stamp-jcs-v1",
+          "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      }
+    },
+    {
+      "evidence_id": "fixture-membership-direct-july",
+      "kind": "denominator-membership",
+      "issuer": "gille-inference",
+      "payload_digest": {
+        "algorithm": "sha256",
+        "version": "trusted-evidence-payload-jcs-v1",
+        "digest": "27b03127cc610c4b1278ed01c9c758cb50ead72811e798c1a7cfc2bb13c1fca3"
+      },
+      "payload": {
+        "owner_component": "gille-inference",
+        "counter": "direct-m5-exposure-denominator",
+        "period_utc": "2026-07",
+        "denominator_natural_key_digest": {
+          "algorithm": "sha256",
+          "version": "denominator-natural-key-jcs-v1",
+          "digest": "accee6ff97534ffa32e3b42f15059d2300080cf93496307acab3fd10980c9036"
+        },
+        "superseded_record_id": "opaque:22222222-2222-4222-8222-222222222222",
+        "issued_at": "2026-07-19T11:00:01Z"
+      }
+    },
+    {
+      "evidence_id": "fixture-denominator-basis-direct",
+      "kind": "denominator-basis",
+      "issuer": "gille-inference",
+      "payload_digest": {
+        "algorithm": "sha256",
+        "version": "trusted-evidence-payload-jcs-v1",
+        "digest": "2a2b0b6c566cf000e6eeb8746a1f7c86f9d2aeda91dbe5563dfebbe8c73fa90c"
+      },
+      "payload": {
+        "producer": "gille-inference",
+        "record_kind": "inference-exposure",
+        "superseded_record_id": "opaque:22222222-2222-4222-8222-222222222222",
+        "denominator_basis": "direct-exposure",
+        "counters": [
+          "direct-m5-exposure-denominator"
+        ],
+        "issued_at": "2026-07-19T11:00:01Z"
+      }
+    }
+  ]
+}

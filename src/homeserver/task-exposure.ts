@@ -23,6 +23,28 @@ export const TASK_EXPOSURE_LANES = [
 ] as const;
 export type TaskExposureLane = (typeof TASK_EXPOSURE_LANES)[number];
 
+/**
+ * Identity-kind discriminator (#4). Both kinds share the SAME fingerprint algorithm/version
+ * (`trim-utf8-sha256-v1`) but hash different byte domains — the discriminator, not the version
+ * string, is what tells two otherwise-identical-looking digests apart:
+ *
+ *  - "rendered-prompt": the exact gateway/runtime prompt text this process sent to a model
+ *    (`task.prompt` / `req.instruction`). Recorded for every lane, stamped or not. This is the
+ *    registry's original (#257) identity.
+ *  - "canonical-raw": the logical task's pre-context/system-wrapping identity, taken directly from
+ *    an admitted LearningTaskContract Hugin request stamp's `raw_fingerprint.digest`. Gille never
+ *    sees that raw text — only the already-hashed, already-authenticated digest Hugin stamped.
+ *    Recorded ADDITIONALLY (never instead of) rendered-prompt, only for stamped traffic.
+ *  - "legacy-inexact": rows written before this discriminator existed (in-place migrated rows) or
+ *    imported by the historical backfill importer. Real evidence, but deliberately never upgraded
+ *    to look like a first-class rendered-prompt/canonical-raw row (#4 AC7) — disclosed as inexact
+ *    on every read instead.
+ */
+export const TASK_EXPOSURE_IDENTITY_KINDS = ["rendered-prompt", "canonical-raw", "legacy-inexact"] as const;
+export type TaskExposureIdentityKind = (typeof TASK_EXPOSURE_IDENTITY_KINDS)[number];
+/** Identity kinds a lookup caller may query for; "legacy-inexact" is disclosure-only DB row data. */
+export type TaskExposureQueryIdentityKind = Extract<TaskExposureIdentityKind, "rendered-prompt" | "canonical-raw">;
+
 export interface TaskFingerprint {
   version: typeof TASK_FINGERPRINT_VERSION;
   sha256: string;
@@ -36,22 +58,103 @@ export interface TaskExposureRecord {
   /** Stable for recovered/backfilled records; generated for an ordinary live event. */
   eventKey?: string;
   ts?: string;
+  /**
+   * Authoritative canonical logical-task identity (#4), taken directly from an admitted
+   * LearningTaskContract Hugin request stamp's `raw_fingerprint.digest`. Absent/null for every
+   * unstamped lane (chat, mcp-ask, plain delegate/code-loop) — those continue to record
+   * rendered-prompt identity only, exactly as before. When present, recorded as a SEPARATE
+   * "canonical-raw" row alongside (never replacing) the rendered-prompt row.
+   */
+  canonicalFingerprintSha256?: string | null;
+}
+
+/** One query item for the legacy `fingerprints` array — always "rendered-prompt", label-only. */
+export interface TaskExposureCanonicalQuery {
+  /** Caller's claimed canonical-raw digest. Verified against `exact_bytes` when supplied. */
+  fingerprint_sha256: string;
+  /**
+   * Exact bytes the caller asserts hash to `fingerprint_sha256` under `trim-utf8-sha256-v1`.
+   * Required for a trustworthy negative ("unseen") freshness claim (#4 AC2) — a bare label can
+   * only ever support a positive `seen` result (see `unseen_claim_supported` on the result).
+   */
+  exact_bytes?: {
+    encoding: "utf-8";
+    /** Exact UTF-8 byte length of `text` as transmitted (pre-trim). Cross-checked server-side. */
+    byte_length: number;
+    text: string;
+  };
 }
 
 export interface TaskExposureLookupRequest {
   fingerprint_version: typeof TASK_FINGERPRINT_VERSION;
+  /** Rendered-prompt identity, label-only lookups. Unchanged wire shape/semantics from #257. */
   fingerprints: string[];
+  /** Canonical-raw identity lookups (#4). Optional and additive; absent = no canonical queries. */
+  canonical?: TaskExposureCanonicalQuery[];
 }
 
 export interface TaskExposureLookupResult {
   fingerprint_sha256: string;
+  identity_kind: TaskExposureQueryIdentityKind;
   seen: boolean;
   first_seen_at: string | null;
   last_seen_at: string | null;
   lanes: string[];
   model_ids: string[];
   harness_ids: string[];
+  /**
+   * Fail-closed disclosure (#4 AC3): true only when a `seen: false` result on THIS row is
+   * trustworthy evidence that the task was never previously exposed. False for every bare-label
+   * lookup (canonical-raw without `exact_bytes`) and whenever live capture itself is unhealthy —
+   * such a result may still report a real positive `seen: true` match, but callers MUST NOT treat
+   * `seen: false` here as a freshness guarantee.
+   */
+  unseen_claim_supported: boolean;
+  /** True when at least one contributing row predates the identity-kind discriminator (#4 AC7). */
+  includes_legacy_inexact: boolean;
 }
+
+/** One coverage-epoch's boundary record — a restart/gap is measurable, not just felt (#4 AC "restart"). */
+export interface TaskExposureCoverageEpoch {
+  epochId: string;
+  startedAt: string;
+  previousEpochId: string | null;
+  /** Last row timestamp observed in the previous epoch (or its own start, if it captured nothing). */
+  previousEpochLastSeenAt: string | null;
+  /** Wall-clock gap between the previous epoch's last known liveness and this epoch's start. */
+  gapMs: number | null;
+}
+
+/**
+ * Direct-loopback capture/exclusion contract (#4; grimnir docs/learning-task-contract.md "Exposure
+ * facts"). Raw inference traffic sent straight to the local runtime (llama-swap), bypassing this
+ * authenticated gateway entirely, never reaches recordTaskExposureBestEffort — every capture path
+ * in this file is only reachable from an authenticated gateway/MCP/code-loop request handler, so
+ * the gateway cannot retroactively observe traffic it never received.
+ *
+ * Decision: EXCLUDE, disclosed — not silently included. A holdout candidate must not be judged
+ * "unseen" against loopback traffic that was structurally never captured. Closing this gap means
+ * routing that traffic through one of the six declared lanes, never inventing a seventh implicit
+ * channel or quietly counting the gap as covered.
+ */
+export const DIRECT_LOOPBACK_TRAFFIC_DISCLOSURE = {
+  captured: false,
+  reason:
+    "raw loopback calls sent directly to the local runtime, bypassing the authenticated gateway, fall outside all six declared lanes and are structurally uncapturable here; treat any holdout window as EXCLUDING this traffic, never as covering it",
+} as const;
+
+/**
+ * Exact-match limits disclosure (#4; Non-goal: "Treating embedding similarity as definitive
+ * contamination proof"). Both identity kinds are exact post-trim UTF-8 byte-hash matches and
+ * nothing more: no Unicode normalization, no paraphrase/translation detection, no embeddings.
+ * A `seen: false` result proves only that this exact byte form was not recorded — never that the
+ * task is semantically fresh.
+ */
+export const EXACT_MATCH_SEMANTICS_DISCLOSURE = {
+  contamination_proof: false,
+  scope:
+    "exact post-trim UTF-8 byte-hash match only (rendered-prompt and canonical-raw alike); does not detect Unicode-normalized equivalents, paraphrase, translation, or other semantic exposure",
+} as const;
 
 export interface TaskExposureLookupResponse {
   schema_version: 1;
@@ -69,6 +172,18 @@ export interface TaskExposureLookupResponse {
     historical_rows_skipped_inexact: number;
     incomplete_before: string;
     incomplete_reasons: string[];
+    /** Current coverage epoch (#4). A restart mints a new id — see `restart_count`/`*_gap_ms`. */
+    coverage_epoch_id: string;
+    /** How many epoch transitions (restarts / recovered write gaps) this registry has ever had. */
+    restart_count: number;
+    /** Sum of every measured restart-boundary gap, in milliseconds — the queryable "candidate loss
+     *  at coverage boundaries" counter (#4). Zero means no restart has ever moved the boundary. */
+    total_restart_gap_ms: number;
+    /** When canonical-raw identity capture became possible on this deployment; null only if the
+     *  schema has genuinely never been initialized (should not occur past `ensureTaskExposureSchema`). */
+    canonical_identity_capture_started_at: string | null;
+    direct_loopback_traffic: typeof DIRECT_LOOPBACK_TRAFFIC_DISCLOSURE;
+    exact_match_semantics: typeof EXACT_MATCH_SEMANTICS_DISCLOSURE;
   };
   results: TaskExposureLookupResult[];
 }
@@ -93,6 +208,7 @@ interface ExposureDbRow {
   lane: string;
   model_id: string | null;
   harness_id: string | null;
+  identity_kind: string;
 }
 
 interface OwnerRequestDbRow {
@@ -160,7 +276,9 @@ export function ensureTaskExposureSchema(
       fingerprint_sha256 TEXT NOT NULL,
       lane               TEXT NOT NULL,
       model_id           TEXT,
-      harness_id         TEXT
+      harness_id         TEXT,
+      identity_kind       TEXT NOT NULL DEFAULT 'legacy-inexact',
+      coverage_epoch_id   TEXT NOT NULL DEFAULT 'legacy-pre-epoch'
     );
     CREATE INDEX IF NOT EXISTS idx_task_exposure_fingerprint
       ON task_exposure_events(fingerprint_version, fingerprint_sha256, ts);
@@ -169,11 +287,131 @@ export function ensureTaskExposureSchema(
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS task_exposure_coverage_epochs (
+      epoch_id                     TEXT PRIMARY KEY,
+      started_at                   TEXT NOT NULL,
+      previous_epoch_id            TEXT,
+      previous_epoch_last_seen_at  TEXT,
+      gap_ms                       INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_exposure_epochs_started
+      ON task_exposure_coverage_epochs(started_at);
+  `);
+  // Additive column migration (#4) for DBs created before the identity-kind/coverage-epoch
+  // discriminators existed — same guarded ALTER TABLE idiom as ledger.ts's node_id/shadow columns.
+  // A pre-existing row predates ANY discriminated identity and is disclosed as 'legacy-inexact'
+  // (#4 AC7): not silently upgraded to look like a first-class rendered-prompt/canonical-raw row.
+  const cols = db.prepare(`PRAGMA table_info(task_exposure_events)`).all() as Array<{ name: string }>;
+  const names = new Set(cols.map((c) => c.name));
+  db.transaction(() => {
+    if (!names.has("identity_kind")) {
+      db.exec(`ALTER TABLE task_exposure_events ADD COLUMN identity_kind TEXT NOT NULL DEFAULT 'legacy-inexact'`);
+    }
+    if (!names.has("coverage_epoch_id")) {
+      db.exec(`ALTER TABLE task_exposure_events ADD COLUMN coverage_epoch_id TEXT NOT NULL DEFAULT 'legacy-pre-epoch'`);
+    }
+  })();
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_exposure_identity
+      ON task_exposure_events(identity_kind, fingerprint_version, fingerprint_sha256, ts);
+    CREATE INDEX IF NOT EXISTS idx_task_exposure_epoch
+      ON task_exposure_events(coverage_epoch_id, ts);
   `);
   db.prepare(
     `INSERT OR IGNORE INTO task_exposure_meta (key, value) VALUES ('live_capture_started_at', ?)`
   ).run(nowIso);
+  // First moment canonical-raw identity capture became possible on this deployment (#4). Set once,
+  // ever, via INSERT OR IGNORE — unlike live_capture_started_at this does NOT reset on restart; it
+  // answers "since when could a canonical-raw row exist at all", not "since when is this epoch live".
+  db.prepare(
+    `INSERT OR IGNORE INTO task_exposure_meta (key, value) VALUES ('canonical_identity_capture_started_at', ?)`
+  ).run(nowIso);
   initialized.add(db);
+  bootstrapCoverageEpoch(db, nowIso);
+}
+
+/** Lazily mints coverage epoch #1 exactly once per DB (idempotent; a genuine restart never calls
+ *  this — it calls `rotateCoverageEpoch` instead, from `initializeTaskExposureRegistry`). */
+function bootstrapCoverageEpoch(db: Database.Database, nowIso: string): void {
+  if (metaGet(db, "current_coverage_epoch_id") !== null) return;
+  const epochId = `epoch:${randomUUID()}`;
+  db.transaction(() => {
+    db.prepare(
+      `INSERT OR IGNORE INTO task_exposure_coverage_epochs
+         (epoch_id, started_at, previous_epoch_id, previous_epoch_last_seen_at, gap_ms)
+       VALUES (@epochId, @startedAt, NULL, NULL, NULL)`
+    ).run({ epochId, startedAt: nowIso });
+    metaSet(db, "current_coverage_epoch_id", epochId);
+  })();
+}
+
+/**
+ * Mint a new coverage epoch on a genuine restart (#4). Measures the honest gap between the
+ * previous epoch's last known liveness (its last recorded row, or its own start if it captured
+ * nothing) and this epoch's start — the queryable "restart-induced boundary movement" the issue
+ * asks for. Only `initializeTaskExposureRegistry` calls this; plain `ensureTaskExposureSchema`
+ * calls (e.g. every `recordTaskExposure` in tests) never rotate an epoch on their own.
+ */
+function rotateCoverageEpoch(db: Database.Database, nowIso: string): void {
+  // The MAX(ts) read, the previous-epoch read, and the new-epoch insert+meta-write run inside ONE
+  // IMMEDIATE transaction (same idiom as learning-task-admission-store.ts's claimLearningTaskAdmission)
+  // so a concurrent writer on another gateway process cannot land a row between the read and the
+  // write and silently understate gap_ms — the SQLite writer lock is acquired before the read.
+  db.transaction(() => {
+    const previousEpochId = metaGet(db, "current_coverage_epoch_id");
+    if (previousEpochId === null) return; // defensive; ensureTaskExposureSchema always sets this first
+    const lastRow = db.prepare(
+      `SELECT MAX(ts) AS ts FROM task_exposure_events WHERE coverage_epoch_id = ?`
+    ).get(previousEpochId) as { ts: string | null };
+    const previousEpochMeta = db.prepare(
+      `SELECT started_at FROM task_exposure_coverage_epochs WHERE epoch_id = ?`
+    ).get(previousEpochId) as { started_at: string } | undefined;
+    const previousEpochLastSeenAt = lastRow.ts ?? previousEpochMeta?.started_at ?? null;
+    const gapMs = previousEpochLastSeenAt === null
+      ? null
+      : Math.max(0, Date.parse(nowIso) - Date.parse(previousEpochLastSeenAt));
+    const newEpochId = `epoch:${randomUUID()}`;
+    db.prepare(
+      `INSERT INTO task_exposure_coverage_epochs
+         (epoch_id, started_at, previous_epoch_id, previous_epoch_last_seen_at, gap_ms)
+       VALUES (@epochId, @startedAt, @previousEpochId, @previousEpochLastSeenAt, @gapMs)`
+    ).run({ epochId: newEpochId, startedAt: nowIso, previousEpochId, previousEpochLastSeenAt, gapMs });
+    metaSet(db, "current_coverage_epoch_id", newEpochId);
+  }).immediate();
+}
+
+function currentCoverageEpochId(db: Database.Database): string {
+  const id = metaGet(db, "current_coverage_epoch_id");
+  if (id === null) {
+    throw new Error("task exposure coverage epoch metadata is missing (schema not initialized)");
+  }
+  return id;
+}
+
+/** Queryable view over every coverage-epoch transition — "a queryable field beats a dashboard". */
+export function listTaskExposureCoverageEpochs(
+  db: Database.Database = getDb()
+): TaskExposureCoverageEpoch[] {
+  ensureTaskExposureSchema(db);
+  const rows = db.prepare(
+    `SELECT epoch_id, started_at, previous_epoch_id, previous_epoch_last_seen_at, gap_ms
+       FROM task_exposure_coverage_epochs
+      ORDER BY started_at, epoch_id`
+  ).all() as Array<{
+    epoch_id: string;
+    started_at: string;
+    previous_epoch_id: string | null;
+    previous_epoch_last_seen_at: string | null;
+    gap_ms: number | null;
+  }>;
+  return rows.map((row) => ({
+    epochId: row.epoch_id,
+    startedAt: row.started_at,
+    previousEpochId: row.previous_epoch_id,
+    previousEpochLastSeenAt: row.previous_epoch_last_seen_at,
+    gapMs: row.gap_ms,
+  }));
 }
 
 function cleanMetadataId(value: string | null | undefined): string | null {
@@ -183,30 +421,67 @@ function cleanMetadataId(value: string | null | undefined): string | null {
   return trimmed.slice(0, 160);
 }
 
+/**
+ * Insert one exposure event. When `input.canonicalFingerprintSha256` is present, records BOTH
+ * identities (#4): a "rendered-prompt" row (unchanged #257 behavior) AND a separate "canonical-raw"
+ * row sharing the same lane/model/harness/ts/epoch metadata. `identityKindOverride` lets the
+ * historical backfill importer (which has neither a live epoch nor a canonical identity) mark its
+ * rows 'legacy-inexact' instead of 'rendered-prompt' — see the identity-kind doc comment above.
+ */
 function insertExposure(
   db: Database.Database,
   input: TaskExposureRecord,
   eventKey: string,
-  ts: string
+  ts: string,
+  identityKindOverride: Extract<TaskExposureIdentityKind, "rendered-prompt" | "legacy-inexact"> = "rendered-prompt"
 ): boolean {
   const canonical = canonicalTaskText(input.taskText);
   if (canonical === "") return false;
   const fingerprint = taskTextFingerprint(canonical);
-  const info = db.prepare(
+  const epochId = identityKindOverride === "legacy-inexact" ? "legacy-pre-epoch" : currentCoverageEpochId(db);
+  const modelId = cleanMetadataId(input.modelId);
+  const harnessId = cleanMetadataId(input.harnessId);
+  const insertRow = (
+    key: string,
+    version: string,
+    sha256: string,
+    identityKind: TaskExposureIdentityKind
+  ): boolean => db.prepare(
     `INSERT OR IGNORE INTO task_exposure_events
-       (event_key, ts, fingerprint_version, fingerprint_sha256, lane, model_id, harness_id)
+       (event_key, ts, fingerprint_version, fingerprint_sha256, lane, model_id, harness_id, identity_kind, coverage_epoch_id)
      VALUES
-       (@eventKey, @ts, @version, @sha256, @lane, @modelId, @harnessId)`
+       (@eventKey, @ts, @version, @sha256, @lane, @modelId, @harnessId, @identityKind, @epochId)`
   ).run({
-    eventKey,
+    eventKey: key,
     ts,
-    version: fingerprint.version,
-    sha256: fingerprint.sha256,
+    version,
+    sha256,
     lane: input.lane,
-    modelId: cleanMetadataId(input.modelId),
-    harnessId: cleanMetadataId(input.harnessId),
-  });
-  return info.changes > 0;
+    modelId,
+    harnessId,
+    identityKind,
+    epochId,
+  }).changes > 0;
+
+  let inserted = insertRow(`${eventKey}#${identityKindOverride}`, fingerprint.version, fingerprint.sha256, identityKindOverride);
+
+  if (input.canonicalFingerprintSha256) {
+    if (!SHA256_RE.test(input.canonicalFingerprintSha256)) {
+      throw new Error("canonical task fingerprint must be a lowercase 64-character SHA-256 hex string");
+    }
+    // Trust boundary (#4): the WRITE side trusts an already-authenticated/admitted stamp's
+    // raw_fingerprint.digest (validated upstream by validateHuginRequestStamp + the admission
+    // claim). The READ side never extends that trust to an arbitrary lookup caller — see
+    // parseTaskExposureLookupRequest's exact_bytes recomputation below.
+    const canonicalInserted = insertRow(
+      `${eventKey}#canonical-raw`,
+      TASK_FINGERPRINT_VERSION,
+      input.canonicalFingerprintSha256,
+      "canonical-raw"
+    );
+    inserted = inserted || canonicalInserted;
+  }
+  return inserted;
 }
 
 /** Strict recorder for initialization/backfill/tests. Does not store the raw task. */
@@ -328,7 +603,7 @@ function backfillOwnerRequests(db: Database.Database): {
         // or invented id. Live capture uses the trusted canonical model label.
         modelId: null,
         harnessId: row.route === "mcp" ? "mcp-ask" : "openai-chat",
-      }, `backfill:owner-request:${row.id}:user:${i}:${TASK_FINGERPRINT_VERSION}`, row.ts)) imported++;
+      }, `backfill:owner-request:${row.id}:user:${i}:${TASK_FINGERPRINT_VERSION}`, row.ts, "legacy-inexact")) imported++;
     }
     if (from === null) from = row.ts;
     else if (row.ts.localeCompare(from) < 0) from = row.ts;
@@ -384,7 +659,7 @@ function backfillDelegations(db: Database.Database): {
       lane: mapped.lane,
       modelId: row.model_id,
       harnessId: mapped.harnessId,
-    }, `backfill:delegation:${row.id}:${TASK_FINGERPRINT_VERSION}`, row.ts)) imported++;
+    }, `backfill:delegation:${row.id}:${TASK_FINGERPRINT_VERSION}`, row.ts, "legacy-inexact")) imported++;
   }
   return { scanned: rows.length, imported, skippedInexact, from, through };
 }
@@ -431,7 +706,12 @@ export function initializeTaskExposureRegistry(
   db: Database.Database = getDb(),
   nowIso = new Date().toISOString()
 ): TaskExposureBackfillSummary {
+  // Detected BEFORE ensureTaskExposureSchema (which would otherwise lazily set this on a truly
+  // fresh DB): a value already present means this is a genuine restart, not the first-ever boot,
+  // and warrants a real coverage-epoch rotation (#4) rather than the bootstrap no-op.
+  const isRestart = tableExists(db, "task_exposure_meta") && metaGet(db, "live_capture_started_at") !== null;
   ensureTaskExposureSchema(db, nowIso);
+  if (isRestart) rotateCoverageEpoch(db, nowIso);
   // A successfully initialized process starts a new provably-contiguous live window. This both
   // recovers from a prior detected write gap and protects against the harder case where the gap
   // marker itself could not be persisted before a process restart. Older unseen candidates remain
@@ -459,11 +739,13 @@ export function parseTaskExposureLookupRequest(value: unknown):
       param: "fingerprint_version",
     };
   }
+  // `fingerprints` may be empty (a caller doing a canonical-only lookup) — but see the combined
+  // "at least one query total" check below, which preserves the original non-empty-request rule.
   const raw = obj["fingerprints"];
-  if (!Array.isArray(raw) || raw.length < 1 || raw.length > TASK_EXPOSURE_LOOKUP_MAX) {
+  if (!Array.isArray(raw) || raw.length > TASK_EXPOSURE_LOOKUP_MAX) {
     return {
       ok: false,
-      message: `fingerprints must contain 1-${TASK_EXPOSURE_LOOKUP_MAX} SHA-256 values.`,
+      message: `fingerprints must contain 0-${TASK_EXPOSURE_LOOKUP_MAX} SHA-256 values.`,
       param: "fingerprints",
     };
   }
@@ -478,9 +760,144 @@ export function parseTaskExposureLookupRequest(value: unknown):
   if (new Set(fingerprints).size !== fingerprints.length) {
     return { ok: false, message: "fingerprints must not contain duplicates.", param: "fingerprints" };
   }
+
+  let canonical: TaskExposureCanonicalQuery[] | undefined;
+  const rawCanonical = obj["canonical"];
+  if (rawCanonical !== undefined) {
+    if (!Array.isArray(rawCanonical) || rawCanonical.length < 1 || rawCanonical.length > TASK_EXPOSURE_LOOKUP_MAX) {
+      return {
+        ok: false,
+        message: `canonical must contain 1-${TASK_EXPOSURE_LOOKUP_MAX} queries.`,
+        param: "canonical",
+      };
+    }
+    const parsed: TaskExposureCanonicalQuery[] = [];
+    for (let i = 0; i < rawCanonical.length; i++) {
+      const item = rawCanonical[i];
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        return { ok: false, message: `canonical[${i}] must be an object.`, param: "canonical" };
+      }
+      const o = item as Record<string, unknown>;
+      const label = o["fingerprint_sha256"];
+      if (typeof label !== "string" || !SHA256_RE.test(label)) {
+        return {
+          ok: false,
+          message: `canonical[${i}].fingerprint_sha256 must be a lowercase 64-character SHA-256 hex string.`,
+          param: "canonical",
+        };
+      }
+      let exactBytes: TaskExposureCanonicalQuery["exact_bytes"];
+      if (o["exact_bytes"] !== undefined) {
+        const eb = o["exact_bytes"];
+        if (eb === null || typeof eb !== "object" || Array.isArray(eb)) {
+          return { ok: false, message: `canonical[${i}].exact_bytes must be an object.`, param: "canonical" };
+        }
+        const ebo = eb as Record<string, unknown>;
+        if (ebo["encoding"] !== "utf-8") {
+          return { ok: false, message: `canonical[${i}].exact_bytes.encoding must be 'utf-8'.`, param: "canonical" };
+        }
+        if (typeof ebo["text"] !== "string" || ebo["text"].length === 0) {
+          return { ok: false, message: `canonical[${i}].exact_bytes.text must be a non-empty string.`, param: "canonical" };
+        }
+        const text = ebo["text"];
+        const declaredLength = ebo["byte_length"];
+        const actualLength = Buffer.byteLength(text, "utf8");
+        // Byte-vector integrity (#4 AC2): the declared length must match the ACTUAL exact UTF-8
+        // byte length of the transmitted text — catches truncation/encoding mismatches up front.
+        if (typeof declaredLength !== "number" || !Number.isInteger(declaredLength) || declaredLength !== actualLength) {
+          return {
+            ok: false,
+            message: `canonical[${i}].exact_bytes.byte_length does not match the exact UTF-8 byte length of 'text'.`,
+            param: "canonical",
+          };
+        }
+        // Recomputation, not label trust (#4 AC2): the caller's claimed fingerprint_sha256 is
+        // ONLY accepted when it equals the digest gille independently recomputes from the exact
+        // bytes it was just given — never accepted as a bare assertion for a negative claim.
+        const recomputed = taskTextFingerprint(text);
+        if (recomputed.sha256 !== label) {
+          return {
+            ok: false,
+            message: `canonical[${i}].fingerprint_sha256 does not match the recomputed trim-utf8-sha256-v1 digest of the supplied exact bytes.`,
+            param: "canonical",
+          };
+        }
+        exactBytes = { encoding: "utf-8", byte_length: actualLength, text };
+      }
+      parsed.push({ fingerprint_sha256: label, ...(exactBytes ? { exact_bytes: exactBytes } : {}) });
+    }
+    if (new Set(parsed.map((q) => q.fingerprint_sha256)).size !== parsed.length) {
+      return { ok: false, message: "canonical fingerprints must not contain duplicates.", param: "canonical" };
+    }
+    canonical = parsed;
+  }
+
+  if (fingerprints.length + (canonical?.length ?? 0) < 1) {
+    return {
+      ok: false,
+      message: "At least one 'fingerprints' or 'canonical' query is required.",
+      param: null,
+    };
+  }
+
   return {
     ok: true,
-    value: { fingerprint_version: TASK_FINGERPRINT_VERSION, fingerprints },
+    value: {
+      fingerprint_version: TASK_FINGERPRINT_VERSION,
+      fingerprints,
+      ...(canonical ? { canonical } : {}),
+    },
+  };
+}
+
+/** Batched lookup of one identity-kind group, matching legacy rows into "rendered-prompt" queries. */
+function findExposureRows(
+  db: Database.Database,
+  version: string,
+  queryKind: TaskExposureQueryIdentityKind,
+  fingerprints: string[]
+): Map<string, ExposureDbRow[]> {
+  const map = new Map<string, ExposureDbRow[]>();
+  if (fingerprints.length === 0) return map;
+  // A rendered-prompt query also matches pre-discriminator legacy rows (#4 AC7): they ARE
+  // historical rendered-prompt-shaped evidence, just recorded before the discriminator existed.
+  // A canonical-raw query matches ONLY canonical-raw rows — legacy rows never had that identity.
+  const identityKinds: string[] = queryKind === "rendered-prompt"
+    ? ["rendered-prompt", "legacy-inexact"]
+    : ["canonical-raw"];
+  const fpPlaceholders = fingerprints.map(() => "?").join(",");
+  const kindPlaceholders = identityKinds.map(() => "?").join(",");
+  const rows = db.prepare(
+    `SELECT fingerprint_sha256, ts, lane, model_id, harness_id, identity_kind
+       FROM task_exposure_events
+      WHERE fingerprint_version = ? AND identity_kind IN (${kindPlaceholders}) AND fingerprint_sha256 IN (${fpPlaceholders})
+      ORDER BY ts, event_key`
+  ).all(version, ...identityKinds, ...fingerprints) as ExposureDbRow[];
+  for (const row of rows) {
+    const list = map.get(row.fingerprint_sha256) ?? [];
+    list.push(row);
+    map.set(row.fingerprint_sha256, list);
+  }
+  return map;
+}
+
+function buildLookupResult(
+  fingerprint: string,
+  identityKind: TaskExposureQueryIdentityKind,
+  found: ExposureDbRow[],
+  unseenClaimSupported: boolean
+): TaskExposureLookupResult {
+  return {
+    fingerprint_sha256: fingerprint,
+    identity_kind: identityKind,
+    seen: found.length > 0,
+    first_seen_at: found[0]?.ts ?? null,
+    last_seen_at: found.at(-1)?.ts ?? null,
+    lanes: [...new Set(found.map((row) => row.lane))].sort(),
+    model_ids: [...new Set(found.map((row) => row.model_id).filter((v): v is string => v !== null))].sort(),
+    harness_ids: [...new Set(found.map((row) => row.harness_id).filter((v): v is string => v !== null))].sort(),
+    unseen_claim_supported: unseenClaimSupported,
+    includes_legacy_inexact: found.some((row) => row.identity_kind === "legacy-inexact"),
   };
 }
 
@@ -494,32 +911,6 @@ export function lookupTaskExposures(
   if (!tableExists(db, "task_exposure_events") || !tableExists(db, "task_exposure_meta")) {
     throw new Error("task exposure registry is not initialized");
   }
-  const placeholders = request.fingerprints.map(() => "?").join(",");
-  const rows = db.prepare(
-    `SELECT fingerprint_sha256, ts, lane, model_id, harness_id
-     FROM task_exposure_events
-     WHERE fingerprint_version = ? AND fingerprint_sha256 IN (${placeholders})
-     ORDER BY ts, event_key`
-  ).all(request.fingerprint_version, ...request.fingerprints) as ExposureDbRow[];
-
-  const byFingerprint = new Map<string, ExposureDbRow[]>();
-  for (const row of rows) {
-    const list = byFingerprint.get(row.fingerprint_sha256) ?? [];
-    list.push(row);
-    byFingerprint.set(row.fingerprint_sha256, list);
-  }
-  const results = request.fingerprints.map((fingerprint): TaskExposureLookupResult => {
-    const found = byFingerprint.get(fingerprint) ?? [];
-    return {
-      fingerprint_sha256: fingerprint,
-      seen: found.length > 0,
-      first_seen_at: found[0]?.ts ?? null,
-      last_seen_at: found.at(-1)?.ts ?? null,
-      lanes: [...new Set(found.map((row) => row.lane))].sort(),
-      model_ids: [...new Set(found.map((row) => row.model_id).filter((v): v is string => v !== null))].sort(),
-      harness_ids: [...new Set(found.map((row) => row.harness_id).filter((v): v is string => v !== null))].sort(),
-    };
-  });
 
   const liveCaptureStartedAt = metaGet(db, "live_capture_started_at");
   if (liveCaptureStartedAt === null) throw new Error("task exposure coverage metadata is missing");
@@ -531,6 +922,40 @@ export function lookupTaskExposures(
   ];
   const captureHealthy = firstGap === null && !unhealthyDbs.has(db) && !unboundCaptureFailure;
   if (!captureHealthy) reasons.push("a live content-blind capture write failed");
+
+  const canonicalIdentityCaptureStartedAt = metaGet(db, "canonical_identity_capture_started_at");
+
+  const renderedFound = findExposureRows(db, request.fingerprint_version, "rendered-prompt", request.fingerprints);
+  const renderedResults = request.fingerprints.map((fingerprint) =>
+    buildLookupResult(fingerprint, "rendered-prompt", renderedFound.get(fingerprint) ?? [], captureHealthy)
+  );
+
+  const canonicalQueries = request.canonical ?? [];
+  const canonicalFound = findExposureRows(
+    db,
+    request.fingerprint_version,
+    "canonical-raw",
+    canonicalQueries.map((q) => q.fingerprint_sha256)
+  );
+  const canonicalResults = canonicalQueries.map((query) => {
+    // Fail-closed disclosure (#4 AC2/AC3): a bare label (no verified exact_bytes) NEVER supports a
+    // negative claim, regardless of how healthy live capture otherwise is.
+    const unseenClaimSupported = captureHealthy
+      && query.exact_bytes !== undefined
+      && canonicalIdentityCaptureStartedAt !== null;
+    return buildLookupResult(
+      query.fingerprint_sha256,
+      "canonical-raw",
+      canonicalFound.get(query.fingerprint_sha256) ?? [],
+      unseenClaimSupported
+    );
+  });
+
+  const currentEpochId = currentCoverageEpochId(db);
+  const epochStats = db.prepare(
+    `SELECT COUNT(*) AS restarts, COALESCE(SUM(gap_ms), 0) AS totalGapMs
+       FROM task_exposure_coverage_epochs WHERE previous_epoch_id IS NOT NULL`
+  ).get() as { restarts: number; totalGapMs: number };
 
   return {
     schema_version: 1,
@@ -547,7 +972,13 @@ export function lookupTaskExposures(
       historical_rows_skipped_inexact: Number(metaGet(db, "historical_rows_skipped_inexact") ?? 0),
       incomplete_before: liveCaptureStartedAt,
       incomplete_reasons: reasons,
+      coverage_epoch_id: currentEpochId,
+      restart_count: epochStats.restarts,
+      total_restart_gap_ms: epochStats.totalGapMs,
+      canonical_identity_capture_started_at: canonicalIdentityCaptureStartedAt,
+      direct_loopback_traffic: DIRECT_LOOPBACK_TRAFFIC_DISCLOSURE,
+      exact_match_semantics: EXACT_MATCH_SEMANTICS_DISCLOSURE,
     },
-    results,
+    results: [...renderedResults, ...canonicalResults],
   };
 }

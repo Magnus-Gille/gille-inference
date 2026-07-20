@@ -83,13 +83,18 @@ function validate(stamp: unknown, epoch: ReturnType<typeof createLearningTaskCap
 describe("LearningTaskContract v1 gateway contract", () => {
   it("pins and consumes the exact real Hugin serializer fixture without contract drift", () => {
     expect(createHash("sha256").update(serializerFixtureBytes).digest("hex")).toBe(
-      "c905050c9e8242353984a4ce2958ff955e29f003124ac6b6673cf05674c9e4b7",
+      "cae1637362ebfbc83f48e54bc22cd86fff7f7e4dd475bfb704bcd6ff8be69eae",
     );
     expect(createHash("sha256").update(requestFixtureBytes).digest("hex")).toBe(
       "a4fbd8930f5798c8e8671af80d79389fa1a2d9c7934d0e243bafae0445a765f6",
     );
     expect(fixture.fixture_status).toBe("real-hugin-serializer");
-    expect(fixture.contract_source).toContain("grimnir@032acc9");
+    // grimnir@032acc9 was the tip of the codex/86-learning-task-contract feature branch before
+    // squash-merge; that branch was deleted after PR #89 merged and the commit is GC-eligible
+    // (unreachable from grimnir origin/main). bc8cf09 is the squash-merge commit that IS
+    // origin/main's head and carries the identical tree (verified via `git diff 032acc9 bc8cf09`
+    // producing no output before this pin was repointed).
+    expect(fixture.contract_source).toContain("grimnir@bc8cf09");
     expect(fixture.producer_source).toBe("Magnus-Gille/hugin#240:buildHomeserverRequestBody");
     expect(requestFixture.prompt).toBe(fixture.observed_hugin_instruction);
     expect(requestFixture.learningTaskStamp).toEqual(fixture.stamp);
