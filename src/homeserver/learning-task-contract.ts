@@ -8,6 +8,15 @@ export const LEARNING_TASK_PREFLIGHT_ENDPOINT = "/v1/capabilities/learning-task"
 export const LEARNING_TASK_PREFLIGHT_PROTOCOL = "learning-task-preflight/v1" as const;
 export const LEARNING_TASK_SERVICE_PRINCIPAL = "service:gille-inference" as const;
 export const LEARNING_TASK_PREFLIGHT_TTL_MS = 15 * 60 * 1_000;
+/**
+ * Bounded allowance for clock disagreement between this gateway's host and the Hugin host when
+ * ordering timestamps stamped on DIFFERENT hosts (Hugin issue #253; mirrors Hugin's
+ * LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS — the two sides must tolerate at least the same skew or
+ * the stricter side rejects handshakes the other accepts). Applied ONLY to cross-host orderings;
+ * same-host orderings stay exact, and every expiry edge is TIGHTENED by the same amount so the
+ * tolerance can never extend an advertisement's validity window.
+ */
+export const LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS = 2_000;
 export const LEARNING_TASK_FEATURES = [
   "hugin-request-stamp-v1",
   "gateway-echo-v1",
@@ -430,7 +439,16 @@ export function validateHuginRequestStamp(
   if (!(created <= accepted && accepted <= stamped)) {
     throw new LearningTaskContractError("source creation/acceptance clocks are outside the request stamp ordering");
   }
-  if (!(requested <= advertised && advertised <= stamped && stamped < expires && stamped <= now.getTime())) {
+  // `requested`/`stamped` are Hugin-host clocks; `advertised`/`expires`/`now` are this host's.
+  // Cross-host orderings carry the bounded skew tolerance (mirrors Hugin #253/#254/#257); the
+  // expiry edge is tightened by the same amount so tolerance never extends the window. The
+  // same-host source ordering above stays exact.
+  if (!(
+    requested - LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS <= advertised
+    && advertised <= stamped + LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS
+    && stamped < expires - LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS
+    && stamped <= now.getTime() + LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS
+  )) {
     throw new LearningTaskContractError("preflight freshness does not cover the request stamp");
   }
   if (expires - advertised > LEARNING_TASK_PREFLIGHT_TTL_MS) {
@@ -461,7 +479,9 @@ export function createLearningTaskGatewayEcho(
     throw new LearningTaskContractError("cannot echo a request for another authenticated principal");
   }
   const admittedAt = context.admittedAt.toISOString();
-  if (Date.parse(admittedAt) < Date.parse(stamp.stamped_at)) {
+  // `admittedAt` is this host's clock; `stamped_at` is the Hugin host's — cross-host ordering,
+  // same bounded skew tolerance as validateHuginRequestStamp.
+  if (Date.parse(admittedAt) < Date.parse(stamp.stamped_at) - LEARNING_TASK_CLOCK_SKEW_TOLERANCE_MS) {
     throw new LearningTaskContractError("gateway admission precedes the Hugin request stamp");
   }
   const echoedRequest = structuredClone(stamp);

@@ -1,12 +1,15 @@
 # Provenance of Vendored Test Fixtures
 
 Source: `Magnus-Gille/grimnir` (GitHub)
-Source Commit: `bc8cf09` (full: `bc8cf09f7c5f2b42ac7baa895aead0cb0fc351c7`) — grimnir's `origin/main` head,
-the squash-merge commit for PR #89 "docs: define LearningTaskContract v1"
+Source Commit: `b8f85cf` (full: `b8f85cf015cb6766c89f71ffc9558bd9d949d3da`) — grimnir's `main` head,
+the squash-merge commit for PR #94 "docs(contract): bounded cross-host clock skew tolerance
+(v1 clarification)". Only `negative.json` changed relative to the previous pin `bc8cf09`
+(PR #89, "docs: define LearningTaskContract v1"): the admission-precedes vector's delta moved
+beyond the newly specified 2000ms cross-host tolerance.
 Source Path: `tests/fixtures/learning-task-contract/`
-Sync Date: 2026-07-20
+Sync Date: 2026-07-20 (re-synced same day for the tolerance clarification)
 
-Vendored files (copied byte-for-byte via `git show bc8cf09:tests/fixtures/learning-task-contract/<name>`,
+Vendored files (copied byte-for-byte via `git show b8f85cf:tests/fixtures/learning-task-contract/<name>`,
 verified with a sha256 comparison against the grimnir checkout at sync time):
 
 - `jcs-conformance-vectors.json`

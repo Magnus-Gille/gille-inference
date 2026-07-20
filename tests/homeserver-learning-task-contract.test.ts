@@ -207,4 +207,62 @@ describe("LearningTaskContract v1 gateway contract", () => {
     impossible.stamped_at = "2026-02-30T10:00:00Z";
     expect(() => parseHuginRequestStamp(impossible)).toThrow(/date|timestamp/i);
   });
+
+  describe("cross-host clock skew tolerance (Hugin #253 mirror)", () => {
+    // `stamped_at`/`requested_at` are Hugin-host clocks; `advertised_at`/`now`/`admittedAt` are
+    // this gateway's. Caught live by joint-smoke r7: the Hugin side gained tolerance
+    // (hugin #254/#257) while this gateway still rejected any advertisement stamped after the
+    // Hugin stamp clock — the two sides must tolerate at least the same skew.
+    const stampedMs = () => Date.parse((fixture.stamp as { stamped_at: string }).stamped_at);
+
+    it("accepts an advertisement clock ahead of the Hugin stamp within tolerance", () => {
+      const epoch = createLearningTaskCapabilityEpoch();
+      const stamp = parseHuginRequestStamp(clone(fixture.stamp));
+      stamp.preflight.response = epoch.advertise(new Date(stampedMs() + 1_500));
+      expect(() => validate(stamp, epoch, { now: new Date(stampedMs() + 1_600) })).not.toThrow();
+    });
+
+    it("rejects an advertisement clock beyond the tolerance", () => {
+      const epoch = createLearningTaskCapabilityEpoch();
+      const stamp = parseHuginRequestStamp(clone(fixture.stamp));
+      stamp.preflight.response = epoch.advertise(new Date(stampedMs() + 2_500));
+      expect(() => validate(stamp, epoch, { now: new Date(stampedMs() + 2_600) }))
+        .toThrow(/freshness does not cover the request stamp/);
+    });
+
+    it("accepts a Hugin stamp slightly ahead of this gateway's observation clock", () => {
+      const epoch = createLearningTaskCapabilityEpoch();
+      const stamp = parseHuginRequestStamp(clone(fixture.stamp));
+      // The gateway's own clock runs 1.5s behind the Hugin stamp clock: it advertised at its
+      // local "now minus 100ms" and observes the stamp at its local now — both gateway-local
+      // values self-consistent (advertised <= now), while the Hugin stamp sits 1.5s in the
+      // gateway's future, inside the tolerance.
+      stamp.preflight.response = epoch.advertise(new Date(stampedMs() - 1_600));
+      expect(() => validate(stamp, epoch, { now: new Date(stampedMs() - 1_500) })).not.toThrow();
+    });
+
+    it("echo creation tolerates admission slightly before the Hugin stamp clock", () => {
+      const { stamp, epoch } = liveStamp();
+      const accepted = validate(stamp, epoch);
+      expect(() => createLearningTaskGatewayEcho(accepted, {
+        authenticatedPrincipalId: "service:hugin",
+        authentication: "gateway-owner-auth",
+        gatewayRequestId: "opaque:33333333-3333-4333-8333-333333333333",
+        admissionId: "opaque:44444444-4444-4444-8444-444444444444",
+        admittedAt: new Date(stampedMs() - 1_500),
+      })).not.toThrow();
+    });
+
+    it("echo creation rejects admission beyond the tolerance before the stamp", () => {
+      const { stamp, epoch } = liveStamp();
+      const accepted = validate(stamp, epoch);
+      expect(() => createLearningTaskGatewayEcho(accepted, {
+        authenticatedPrincipalId: "service:hugin",
+        authentication: "gateway-owner-auth",
+        gatewayRequestId: "opaque:33333333-3333-4333-8333-333333333333",
+        admissionId: "opaque:44444444-4444-4444-8444-444444444444",
+        admittedAt: new Date(stampedMs() - 2_500),
+      })).toThrow(/admission precedes/);
+    });
+  });
 });
