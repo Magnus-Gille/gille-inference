@@ -67,6 +67,60 @@ export const MODEL_META: Record<string, ModelMeta> = {
   },
 };
 
+// ── Model family map (issue #48) ──────────────────────────────────────────────────
+//
+// Family-diversity is a no-self-grading rule for anchored-calibration.ts: an adjudicator/judge whose
+// model family matches the candidate it is grading is excluded from that candidate's anchored
+// agreement set (grading your own family is not independent evidence). This is a DOCUMENTED,
+// CURATED map — the same discipline as MODEL_META.unsafeFor above — never a blanket default, and it
+// lives alongside MODEL_META because both are hand-maintained judgment overlays on model identity.
+//
+// Known local/served ids get an explicit family; `gpt-oss-120b` is included even though it is not a
+// MODEL_META candidate because it is the default harvest judge (harvest.ts's HARVEST_JUDGE_DEFAULT)
+// and must still classify correctly when it is itself graded as a candidate on some lane. A small set
+// of FRONTIER vendor-prefix fallbacks is included for the design doc's "family-diverse frontier
+// adjudicator" direction (grimnir docs/autonomous-improvement-design.md §3) even though no frontier
+// adjudicator is wired into routing yet — so `modelFamilyOf` classifies them correctly the day one is.
+// GROW THIS ONLY with a reviewed, demonstrated family relationship — an unrecognised id conservatively
+// falls back to being its OWN singleton family (never silently grouped with something it might share
+// provenance with), which is the fail-closed direction for a no-self-grading rule.
+export const MODEL_FAMILY: Record<string, string> = {
+  mellum: "mellum",
+  "qwen3-coder-next-80b": "qwen",
+  "qwen36-a3b": "qwen",
+  gemma4: "gemma",
+  "gpt-oss-120b": "gpt-oss",
+};
+
+/** Prefix fallbacks for ids not (yet) in `MODEL_FAMILY` — same growth discipline as the map above. */
+const MODEL_FAMILY_PREFIXES: ReadonlyArray<[RegExp, string]> = [
+  [/^qwen/i, "qwen"],
+  [/^gemma/i, "gemma"],
+  [/^gemini/i, "google"],
+  [/^gpt-oss/i, "gpt-oss"],
+  [/^(gpt-|o[0-9])/i, "openai"],
+  [/^claude/i, "anthropic"],
+  [/^(llama|meta-llama)/i, "llama"],
+  [/^mellum/i, "mellum"],
+  [/^mistral/i, "mistral"],
+  [/^deepseek/i, "deepseek"],
+];
+
+/**
+ * Model family for the no-self-grading check. An id in `MODEL_FAMILY` wins; otherwise a known
+ * vendor-prefix pattern applies; otherwise the id is conservatively its OWN family (an unknown model
+ * is judged self-graded only against an EXACT id match, never grouped with anything else it might
+ * secretly share a family with — fail-closed for a safety exclusion means narrower matching, not
+ * wider). Never throws; a null/empty id maps to the literal string `"(unknown)"`, its own singleton.
+ */
+export function modelFamilyOf(modelId: string | null | undefined): string {
+  const id = (modelId ?? "").trim();
+  if (!id) return "(unknown)";
+  if (MODEL_FAMILY[id]) return MODEL_FAMILY[id];
+  for (const [re, family] of MODEL_FAMILY_PREFIXES) if (re.test(id)) return family;
+  return id;
+}
+
 // ── Task types excluded from the macro-routing table ─────────────────────────────
 
 /** Deep-research pipeline roles — routed by the deep-research harness itself, not the macro-router. */

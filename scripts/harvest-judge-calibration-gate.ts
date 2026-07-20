@@ -19,12 +19,22 @@
  * Usage:
  *   npx tsx scripts/harvest-judge-calibration-gate.ts [--receipts <path.json>] [--out <path.json>]
  *     [--target-per-stratum <int>] [--seed <int>] [--since <ISO>] [--include-shadow=false]
+ *     [--mode human|anchored|both] [--kappa <float>] [--window-days <int>] [--window-count <int>]
+ *     [--min-overlap-n <int>]
  *
  * `--receipts` points at a JSON array of QualityReceiptRef objects (calibration-quality-receipts.ts)
  * — content-blind by construction (opaque ids/digests, closed rating enum, never review text). No
  * such export exists in this repository; a real one is produced by whatever tool exports Hugin
  * Quality Receipts (out of gille-inference's ownership — see docs/learning-task-contract.md's
  * normative-ownership table: gille-inference does not own or fabricate Hugin's receipt store).
+ *
+ * `--mode` (issue #48, default `both`) selects the trusted-label FEED merged into the join:
+ * `human` is exactly the #37 behavior (only `--receipts`); `anchored` computes the verifier-anchored
+ * feed from ledger rows alone (anchored-calibration.ts) with ZERO human receipts required; `both`
+ * merges them (human stays fully optional/additive — never required, never silently overridden).
+ * `--kappa`/`--window-days`/`--window-count`/`--min-overlap-n` override the anchored feed's defaults
+ * (kappa=0.85, a 30-day rolling window, minOverlapN=30); `--window-count` switches the window to
+ * most-recent-N-items mode instead of time-based.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -35,6 +45,14 @@ import { joinSampleToReceipts, type QualityReceiptRef } from "../src/homeserver/
 import { computeCalibrationMetrics } from "../src/homeserver/calibration-metrics.js";
 import { evaluateCalibrationGate } from "../src/homeserver/calibration-gate.js";
 import { CURRENT_CALIBRATION_POLICY, calibrationPolicyId } from "../src/homeserver/calibration-policy.js";
+import {
+  computeAnchoredCalibration,
+  anchoredReceiptsFrom,
+  mergeCalibrationReceipts,
+  DEFAULT_ANCHORED_CALIBRATION_CONFIG,
+  type AnchoredCalibrationConfig,
+  type AnchoredWindow,
+} from "../src/homeserver/anchored-calibration.js";
 
 function readFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -66,6 +84,27 @@ function loadReceipts(path: string | undefined): QualityReceiptRef[] {
   return parsed as QualityReceiptRef[];
 }
 
+/** Validates and normalizes `--mode`; defaults to "both" (issue #48). */
+function readMode(args: string[]): "human" | "anchored" | "both" {
+  const raw = readFlag(args, "--mode") ?? "both";
+  if (raw !== "human" && raw !== "anchored" && raw !== "both") {
+    throw new Error(`--mode ${raw}: expected human|anchored|both`);
+  }
+  return raw;
+}
+
+/** Default window (days mode) — kept as a plain constant so `readWindow`'s fallback does not need
+ *  to narrow `DEFAULT_ANCHORED_CALIBRATION_CONFIG.window`'s discriminated union at every call site. */
+const DEFAULT_WINDOW_DAYS = DEFAULT_ANCHORED_CALIBRATION_CONFIG.window.mode === "days" ? DEFAULT_ANCHORED_CALIBRATION_CONFIG.window.days : 30;
+
+/** Builds the anchored feed's window from `--window-count` (takes precedence) or `--window-days`. */
+function readWindow(args: string[]): AnchoredWindow {
+  const count = readFlag(args, "--window-count");
+  if (count !== undefined) return { mode: "count", count: Number(count) };
+  const days = readFlag(args, "--window-days");
+  return { mode: "days", days: days !== undefined ? Number(days) : DEFAULT_WINDOW_DAYS };
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const receiptsPath = readFlag(args, "--receipts");
@@ -74,6 +113,12 @@ async function main(): Promise<void> {
   const seed = Number(readFlag(args, "--seed") ?? 0);
   const since = readFlag(args, "--since");
   const includeShadow = readFlag(args, "--include-shadow") !== "false";
+  const mode = readMode(args);
+  const anchoredConfig: Partial<AnchoredCalibrationConfig> = {
+    kappa: Number(readFlag(args, "--kappa") ?? DEFAULT_ANCHORED_CALIBRATION_CONFIG.kappa),
+    minOverlapN: Number(readFlag(args, "--min-overlap-n") ?? DEFAULT_ANCHORED_CALIBRATION_CONFIG.minOverlapN),
+    window: readWindow(args),
+  };
 
   const rows: CalibrationSampleRow[] = listCalibrationSampleRows({
     includeShadow,
@@ -85,7 +130,19 @@ async function main(): Promise<void> {
   const selectedRows = rows.filter((r) => selectedIds.has(r.id));
   const strataByRowId = new Map(selectedRows.map((r) => [r.id, stratumKeyOf(r)]));
 
-  const receipts = loadReceipts(receiptsPath);
+  const generatedAt = new Date().toISOString();
+  const humanReceipts = loadReceipts(receiptsPath);
+
+  // Anchored calibration runs over the FULL `rows` (not `selectedRows`) — see anchored-calibration.ts
+  // and calibration-gate-live.ts's matching comment for why: overlap evidence is comparatively
+  // scarce, and `joinSampleToReceipts` below only ever looks up receipts for the stratified sample
+  // anyway, so this cannot leak extra evidence past what the stratified draw already governs.
+  const anchoredReport =
+    mode === "human" ? null : computeAnchoredCalibration({ rows, asOf: generatedAt, config: anchoredConfig });
+  const anchoredReceipts = anchoredReport ? anchoredReceiptsFrom(anchoredReport) : [];
+  const receipts: QualityReceiptRef[] =
+    mode === "human" ? humanReceipts : mode === "anchored" ? anchoredReceipts : mergeCalibrationReceipts(humanReceipts, anchoredReceipts);
+
   const joined = joinSampleToReceipts(selectedRows, receipts);
 
   const policyId = calibrationPolicyId(CURRENT_CALIBRATION_POLICY);
@@ -96,7 +153,6 @@ async function main(): Promise<void> {
     thresholds: CURRENT_CALIBRATION_POLICY.thresholds,
   });
 
-  const generatedAt = new Date().toISOString();
   const gate = evaluateCalibrationGate({
     policyId,
     generatedAt,
@@ -107,6 +163,23 @@ async function main(): Promise<void> {
   const artifact = {
     schemaVersion: gate.schemaVersion,
     policyId: gate.policyId,
+    mode,
+    anchored: anchoredReport
+      ? {
+          config: anchoredReport.config,
+          judges: anchoredReport.judges.map((j) => ({
+            judgeIdentity: j.judgeIdentity,
+            totalOverlapN: j.totalOverlapN,
+            windowedN: j.windowedN,
+            agreement: j.agreement,
+            sufficient: j.sufficient,
+            admissible: j.admissible,
+            windowFrom: j.windowFrom,
+            windowTo: j.windowTo,
+            reasons: j.reasons,
+          })),
+        }
+      : null,
     policy: CURRENT_CALIBRATION_POLICY,
     generatedAt: gate.generatedAt,
     sampleSpec: { targetPerStratum: spec.targetPerStratum, totalPopulation: spec.totalPopulation, totalSelected: spec.totalSelected, strata: spec.strata },
