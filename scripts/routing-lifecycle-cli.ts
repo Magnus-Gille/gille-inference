@@ -399,8 +399,10 @@ async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok:
 }
 
 /** Composes the #7 `AdoptDeps` used by `adopt`, `rollback`, AND `watch` (issue #47) — one definition
- *  so all three commands resolve the gateway URL/admin key/servable-catalogue probe identically. */
-function buildAdoptDeps(args: string[], config: HomeserverConfig, tablePath: string): AdoptDeps {
+ *  so all three commands resolve the gateway URL/admin key/servable-catalogue probe identically.
+ *  Exported so `scripts/autonomy-tick-cli.ts` (issue #49) reuses the EXACT same gateway-reload
+ *  wiring for its own adopt/watch composition instead of a second, possibly-diverging copy. */
+export function buildAdoptDeps(args: string[], config: HomeserverConfig, tablePath: string): AdoptDeps {
   const base = resolveGatewayUrl(args, config);
   const adminKey = resolveAdminKey();
   return {
