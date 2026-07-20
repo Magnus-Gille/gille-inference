@@ -8,6 +8,27 @@ import {
   verifierBaseName,
   type VerifierKind,
 } from "./verifier-classification.js";
+import {
+  assertAdmissibleEvidenceIdentity,
+  evidenceIdentityDisclosure,
+  evidenceIdentityHash,
+  findPlaceholderIdentityFields,
+  type EvidenceIdentityBundle,
+  type EvidenceIdentityDisclosure,
+  type EvidenceLane,
+} from "./evidence-identity.js";
+import {
+  getEvidenceIdentitySnapshot,
+  upsertEvidenceIdentitySnapshot,
+  type EvidenceIdentitySnapshot,
+} from "./evidence-identity-store.js";
+
+export type {
+  EvidenceIdentityBundle,
+  EvidenceIdentityDisclosure,
+  EvidenceLane,
+} from "./evidence-identity.js";
+export type { EvidenceIdentitySnapshot } from "./evidence-identity-store.js";
 
 /**
  * Capability ledger.
@@ -74,6 +95,16 @@ export interface DelegationRecord {
    * with `includeShadow`. Defaults to false — an ordinary delegation is never shadow.
    */
   shadow?: boolean;
+  /**
+   * #5: content-addressed identity binding this row to the exact served model artifact/config
+   * epoch, logical task, rendered prompt, harness, taxonomy version, verifier/rubric, sampling,
+   * tool policy, and lane that produced it -- see evidence-identity.ts. Optional and additive: a
+   * call site that omits it still writes a valid row, but every identity-aware reader below
+   * discloses that row as "legacy" (evidenceIdentityDisclosure) rather than silently treating it
+   * as equivalent to an identity-complete one. A placeholder/fictional value anywhere in the
+   * bundle is rejected here at write time -- see assertAdmissibleEvidenceIdentity.
+   */
+  evidenceIdentity?: EvidenceIdentityBundle;
 }
 
 // ─── Verdict ───────────────────────────────────────────────────────────────────
@@ -164,6 +195,13 @@ function ensureSchema(db: Database.Database): void {
     // (non-shadow) delegation — the evidence readers only ever EXCLUDE shadow=1, never re-include a
     // legacy row by accident.
     if (!names.has("shadow")) db.exec(`ALTER TABLE delegations ADD COLUMN shadow INTEGER NOT NULL DEFAULT 0`);
+    // #5: content-addressed evidence identity. NULL on both columns is the honest legacy state —
+    // every identity-aware reader below treats NULL evidence_identity_hash as disclosure:"legacy",
+    // never as an implicit match against any real identity bucket. evidence_lane is a plain string
+    // mirror of the bundle's lane field (see evidence-identity.ts EvidenceLane) so a lane filter
+    // does not require joining out to evidence_identity_snapshots.
+    if (!names.has("evidence_identity_hash")) db.exec(`ALTER TABLE delegations ADD COLUMN evidence_identity_hash TEXT`);
+    if (!names.has("evidence_lane")) db.exec(`ALTER TABLE delegations ADD COLUMN evidence_lane TEXT`);
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -171,6 +209,8 @@ function ensureSchema(db: Database.Database): void {
   // only AFTER the additive migration. Creating it in the initial CREATE batch makes startup fail
   // before ALTER TABLE gets a chance to add node_id (#206 live-deploy regression).
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_node_type_model ON delegations(node_id, task_type, model_id)`);
+  // Same reasoning: evidence_identity_hash is added above, index it only after.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_identity ON delegations(task_type, model_id, node_id, evidence_identity_hash)`);
 
   _initialised = true;
 }
@@ -198,44 +238,72 @@ export function recordDelegation(rec: DelegationRecord): string {
   const ts = new Date().toISOString();
   const excerpt = rec.prompt.slice(0, 280);
 
-  db.prepare(
+  // #5: fail closed BEFORE the row (or its snapshot) ever touches the DB — a placeholder/fictional
+  // identity must never become admissible production evidence. See evidence-identity.ts's doc
+  // comment on why write-time rejection is the stronger of the two admissible points; ledger reads
+  // ALSO exclude a placeholder-tainted bucket defensively (listEvidenceIdentityBuckets below), but
+  // that is belt-and-suspenders — this is the primary gate. This check is pure (no DB access), so
+  // it runs before the transaction below rather than inside it.
+  if (rec.evidenceIdentity !== undefined) {
+    assertAdmissibleEvidenceIdentity(rec.evidenceIdentity);
+  }
+  const evidenceLane = rec.evidenceIdentity !== undefined && rec.evidenceIdentity.lane !== "unknown"
+    ? rec.evidenceIdentity.lane
+    : null;
+
+  const insertRow = db.prepare(
     `INSERT INTO delegations
        (id, ts, task_type, node_id, model_id, prompt_hash, prompt_excerpt, outcome, score,
         latency_ms, ttft_ms, prompt_tokens, completion_tokens, tok_per_s, verifier,
         error_class, escalated, source, notes,
-        gate_mode, gate_score, gate_would_escalate, gate_error, key_alias, shadow)
+        gate_mode, gate_score, gate_would_escalate, gate_error, key_alias, shadow,
+        evidence_identity_hash, evidence_lane)
      VALUES
        (@id, @ts, @taskType, @nodeId, @modelId, @promptHash, @promptExcerpt, @outcome, @score,
         @latencyMs, @ttftMs, @promptTokens, @completionTokens, @tokPerSec, @verifier,
         @errorClass, @escalated, @source, @notes,
-        @gateMode, @gateScore, @gateWouldEscalate, @gateError, @keyAlias, @shadow)`
-  ).run({
-    id,
-    ts,
-    taskType: rec.taskType,
-    nodeId: rec.nodeId ?? "m5",
-    modelId: rec.modelId,
-    promptHash: hashPrompt(rec.prompt),
-    promptExcerpt: excerpt,
-    outcome: rec.outcome,
-    score: rec.score ?? null,
-    latencyMs: rec.latencyMs ?? null,
-    ttftMs: rec.ttftMs ?? null,
-    promptTokens: rec.promptTokens ?? null,
-    completionTokens: rec.completionTokens ?? null,
-    tokPerSec: rec.tokPerSec ?? null,
-    verifier: rec.verifier ?? null,
-    errorClass: rec.errorClass ?? null,
-    escalated: rec.escalated ? 1 : 0,
-    source: rec.source ?? null,
-    notes: rec.notes ?? null,
-    gateMode: rec.gateMode ?? null,
-    gateScore: rec.gateScore ?? null,
-    gateWouldEscalate: rec.gateWouldEscalate === null || rec.gateWouldEscalate === undefined ? null : rec.gateWouldEscalate ? 1 : 0,
-    gateError: rec.gateError ?? null,
-    keyAlias: rec.keyAlias ?? null,
-    shadow: rec.shadow ? 1 : 0,
-  });
+        @gateMode, @gateScore, @gateWouldEscalate, @gateError, @keyAlias, @shadow,
+        @evidenceIdentityHash, @evidenceLane)`
+  );
+
+  // #5 (M5 dogfood review): the snapshot upsert and the row insert are two separate statements —
+  // grouping them in one transaction (matching importDelegations' existing pattern) means a killed
+  // process can never leave a delegations row whose evidence_identity_hash points at a snapshot
+  // that was never durably written. It cannot happen the other way around (an orphaned snapshot
+  // with no referencing row is harmless), so this is defense-in-depth, not a correctness fix.
+  db.transaction(() => {
+    const identityHash =
+      rec.evidenceIdentity !== undefined ? upsertEvidenceIdentitySnapshot(rec.evidenceIdentity, ts, db) : null;
+    insertRow.run({
+      id,
+      ts,
+      taskType: rec.taskType,
+      nodeId: rec.nodeId ?? "m5",
+      modelId: rec.modelId,
+      promptHash: hashPrompt(rec.prompt),
+      promptExcerpt: excerpt,
+      outcome: rec.outcome,
+      score: rec.score ?? null,
+      latencyMs: rec.latencyMs ?? null,
+      ttftMs: rec.ttftMs ?? null,
+      promptTokens: rec.promptTokens ?? null,
+      completionTokens: rec.completionTokens ?? null,
+      tokPerSec: rec.tokPerSec ?? null,
+      verifier: rec.verifier ?? null,
+      errorClass: rec.errorClass ?? null,
+      escalated: rec.escalated ? 1 : 0,
+      source: rec.source ?? null,
+      notes: rec.notes ?? null,
+      gateMode: rec.gateMode ?? null,
+      gateScore: rec.gateScore ?? null,
+      gateWouldEscalate: rec.gateWouldEscalate === null || rec.gateWouldEscalate === undefined ? null : rec.gateWouldEscalate ? 1 : 0,
+      gateError: rec.gateError ?? null,
+      keyAlias: rec.keyAlias ?? null,
+      shadow: rec.shadow ? 1 : 0,
+      evidenceIdentityHash: identityHash,
+      evidenceLane: evidenceLane,
+    });
+  })();
   return id;
 }
 
@@ -264,6 +332,18 @@ export interface ImportableDelegation extends DelegationRecord {
    * times; without this in the id, distinct trials would collapse into one "duplicate".
    */
   repeat?: number | null;
+}
+
+/** #5: import-path validation error, mirroring the shape of PlaceholderEvidenceIdentityError so a
+ *  caller can `instanceof Error` either writer's rejection the same way. */
+function assertImportEvidenceIdentityAdmissible(rec: ImportableDelegation, index: number): void {
+  if (rec.evidenceIdentity === undefined) return;
+  const offending = findPlaceholderIdentityFields(rec.evidenceIdentity);
+  if (offending.length > 0) {
+    throw new Error(
+      `importDelegations: record ${index} evidence identity contains placeholder/fictional value(s) in: ${offending.join(", ")} — inadmissible for production capability evidence`
+    );
+  }
 }
 
 const VALID_OUTCOMES: ReadonlySet<string> = new Set([
@@ -298,6 +378,10 @@ function importId(rec: ImportableDelegation): string {
     // JSONL (every legacy row would re-import under a new id). A policy-stamped rejudge is a
     // DISTINCT identity on purpose: it must insert alongside the (superseded) legacy row.
     ...(rec.judgePolicy != null ? [rec.judgePolicy] : []),
+    // #5: appended ONLY when present, same "additive, never reshapes a pre-existing id" rule as
+    // judgePolicy above — an identity-stamped re-harvest of the same probe is a DISTINCT identity
+    // on purpose (it must insert alongside, not collide with, the un-stamped historical row).
+    ...(rec.evidenceIdentity !== undefined ? [evidenceIdentityHash(rec.evidenceIdentity)] : []),
   ]);
   return "imp-" + createHash("sha256").update(key).digest("hex").slice(0, 32);
 }
@@ -324,6 +408,9 @@ export function importDelegations(records: ImportableDelegation[]): {
     if (!rec.taskType || !rec.modelId) {
       throw new Error(`importDelegations: record ${i} is missing taskType/modelId`);
     }
+    // #5: fail closed on placeholder/fictional identity in the harvest/import path too — the
+    // issue explicitly scopes "organic harvest evidence" alongside live capability observations.
+    assertImportEvidenceIdentityAdmissible(rec, i);
   }
 
   const db = ledgerDb();
@@ -331,16 +418,22 @@ export function importDelegations(records: ImportableDelegation[]): {
     `INSERT OR IGNORE INTO delegations
        (id, ts, task_type, node_id, model_id, prompt_hash, prompt_excerpt, outcome, score,
         latency_ms, ttft_ms, prompt_tokens, completion_tokens, tok_per_s, verifier,
-        error_class, escalated, source, notes, judge_policy)
+        error_class, escalated, source, notes, judge_policy,
+        evidence_identity_hash, evidence_lane)
      VALUES
        (@id, @ts, @taskType, @nodeId, @modelId, @promptHash, @promptExcerpt, @outcome, @score,
         @latencyMs, @ttftMs, @promptTokens, @completionTokens, @tokPerSec, @verifier,
-        @errorClass, @escalated, @source, @notes, @judgePolicy)`
+        @errorClass, @escalated, @source, @notes, @judgePolicy,
+        @evidenceIdentityHash, @evidenceLane)`
   );
 
   let inserted = 0;
   db.transaction(() => {
     for (const rec of records) {
+      const identityHash =
+        rec.evidenceIdentity !== undefined ? upsertEvidenceIdentitySnapshot(rec.evidenceIdentity, rec.ts, db) : null;
+      const evidenceLane =
+        rec.evidenceIdentity !== undefined && rec.evidenceIdentity.lane !== "unknown" ? rec.evidenceIdentity.lane : null;
       const info = stmt.run({
         id: importId(rec),
         ts: rec.ts,
@@ -362,6 +455,8 @@ export function importDelegations(records: ImportableDelegation[]): {
         source: rec.source ?? "probe-import",
         notes: rec.notes ?? null,
         judgePolicy: rec.judgePolicy ?? null,
+        evidenceIdentityHash: identityHash,
+        evidenceLane: evidenceLane,
       });
       inserted += info.changes;
     }
@@ -497,22 +592,25 @@ function shadowFilter(opts?: EvidenceReadOpts): string {
   return opts?.includeShadow ? "" : " AND shadow = 0";
 }
 
-export function getVerdict(
-  taskType: string,
-  modelId: string,
-  policy: PolicyConfig,
-  nodeId: "m5" | "orin" = "m5",
-  opts?: EvidenceReadOpts
-): VerdictResult {
-  const db = ledgerDb();
-  const rows = db
-    .prepare(
-      `SELECT outcome, error_class, verifier FROM delegations
-       WHERE task_type = ? AND model_id = ? AND node_id = ? AND outcome != 'unverified'
-         AND superseded_at IS NULL${shadowFilter(opts)}`
-    )
-    .all(taskType, modelId, nodeId) as OutcomeRow[];
+interface AccumulatedOutcomeCounts {
+  passes: number;
+  partials: number;
+  fails: number;
+  errors: number;
+  /** Weighted pass/partial sum — discounted for format-only evidence when enabled (#233). */
+  effective: number;
+  mechanicalFormatAttempts: number;
+}
 
+/**
+ * Shared verdict-admissibility and tallying rules, factored out of getVerdict() (#5) so the new
+ * identity-aware readers below (listEvidenceIdentityBuckets et al.) apply EXACTLY the same
+ * inclusion/weighting logic — judgment-type whitelist, infra-error exclusion, format-only
+ * discount — rather than a second hand-maintained copy that could silently drift from it. Pure
+ * extraction: getVerdict's observable behavior is unchanged (see the #5 parity test in
+ * homeserver-ledger-evidence-identity.test.ts).
+ */
+function accumulateOutcomeRows(rows: OutcomeRow[], taskType: string, policy: PolicyConfig): AccumulatedOutcomeCounts {
   // #168 verdict hygiene (WHITELIST, superseding #156's blacklist): for a JUDGMENT-QUALITY task type
   // (code-review at minimum) a row is admissible as evidence ONLY IF its verifier is one we
   // positively TRUST to grade that quality (policy.trustedVerifiersForJudgment). A whitelist is
@@ -533,7 +631,7 @@ export function getVerdict(
   let partials = 0;
   let fails = 0;
   let errors = 0;
-  let effective = 0; // #233: weighted pass/partial sum — discounted for format-only evidence when enabled
+  let effective = 0;
   let mechanicalFormatAttempts = 0;
   for (const r of rows) {
     if (isJudgmentType && !isTrustedJudgmentVerifier(r.verifier, trustedJudgmentVerifiers)) {
@@ -565,6 +663,30 @@ export function getVerdict(
         break;
     }
   }
+  return { passes, partials, fails, errors, effective, mechanicalFormatAttempts };
+}
+
+export function getVerdict(
+  taskType: string,
+  modelId: string,
+  policy: PolicyConfig,
+  nodeId: "m5" | "orin" = "m5",
+  opts?: EvidenceReadOpts
+): VerdictResult {
+  const db = ledgerDb();
+  const rows = db
+    .prepare(
+      `SELECT outcome, error_class, verifier FROM delegations
+       WHERE task_type = ? AND model_id = ? AND node_id = ? AND outcome != 'unverified'
+         AND superseded_at IS NULL${shadowFilter(opts)}`
+    )
+    .all(taskType, modelId, nodeId) as OutcomeRow[];
+
+  const { passes, partials, fails, errors, effective, mechanicalFormatAttempts } = accumulateOutcomeRows(
+    rows,
+    taskType,
+    policy
+  );
 
   const attempts = passes + partials + fails + errors;
   const successRate = attempts > 0 ? effective / attempts : 0;
@@ -699,6 +821,172 @@ export function getLaneEvidence(
     latestTs,
     sources,
   };
+}
+
+// ─── Identity-aware evidence (#5) ─────────────────────────────────────────────────
+//
+// getVerdict/getLaneEvidence/shouldDelegate above are UNCHANGED — they keep grouping by
+// (task_type, model_id[, verifier]) only, so routing behavior does not move (issue #5's Non-goal:
+// no routing-policy change). What follows is ADDITIVE: it groups the SAME underlying rows by their
+// evidence_identity_hash as well, so an operator (or a future routing-policy change, out of THIS
+// issue's scope) can see — and never silently merge — evidence from distinct served-model/config/
+// prompt/harness/lane identities that happen to share a (task_type, model_id) cell.
+
+interface IdentityOutcomeRow extends OutcomeRow {
+  evidence_identity_hash: string | null;
+  evidence_lane: string | null;
+  ts: string;
+}
+
+export interface EvidenceIdentityBucket {
+  nodeId: "m5" | "orin";
+  taskType: string;
+  modelId: string;
+  /** null = the pre-#5 legacy population: rows written with no evidenceIdentity bundle at all. */
+  evidenceIdentityHash: string | null;
+  lane: EvidenceLane | "unknown" | null;
+  /** "legacy" for the null-hash bucket; otherwise the disclosure of the reconstructed bundle —
+   *  see evidenceIdentityDisclosure(). Never upgraded by merely reading it. */
+  disclosure: EvidenceIdentityDisclosure;
+  attempts: number;
+  passes: number;
+  partials: number;
+  fails: number;
+  errors: number;
+  successRate: number;
+  latestTs: string | null;
+}
+
+/**
+ * Group one (task_type, model_id, node_id) cell's evidence by DISTINCT evidence identity —
+ * AC1 ("a model, prompt, harness, or configuration change creates a new evidence identity instead
+ * of inheriting the old verdict silently") made queryable: each returned bucket's pass/fail
+ * tally is computed independently, from only that bucket's own rows, via the identical
+ * accumulateOutcomeRows() rules getVerdict() uses. A row with no identity at all (evidenceIdentity
+ * omitted at write time) lands in the single `evidenceIdentityHash: null` "legacy" bucket rather
+ * than being distributed across, or silently merged with, any real identity bucket.
+ *
+ * Defense in depth (belt-and-suspenders on top of the write-time reject in recordDelegation/
+ * importDelegations): a bucket whose reconstructed snapshot still contains a placeholder/fictional
+ * field is dropped from the result entirely rather than surfaced as admissible evidence.
+ */
+export function listEvidenceIdentityBuckets(
+  taskType: string,
+  modelId: string,
+  policy: PolicyConfig,
+  nodeId: "m5" | "orin" = "m5",
+  opts?: EvidenceReadOpts
+): EvidenceIdentityBucket[] {
+  const db = ledgerDb();
+  const rows = db
+    .prepare(
+      `SELECT outcome, error_class, verifier, evidence_identity_hash, evidence_lane, ts
+       FROM delegations
+       WHERE task_type = ? AND model_id = ? AND node_id = ? AND outcome != 'unverified'
+         AND superseded_at IS NULL${shadowFilter(opts)}`
+    )
+    .all(taskType, modelId, nodeId) as IdentityOutcomeRow[];
+
+  const groups = new Map<string, IdentityOutcomeRow[]>();
+  for (const r of rows) {
+    const key = r.evidence_identity_hash ?? "";
+    const existing = groups.get(key);
+    if (existing) existing.push(r);
+    else groups.set(key, [r]);
+  }
+
+  const buckets: EvidenceIdentityBucket[] = [];
+  for (const [key, groupRows] of groups) {
+    const hash = key === "" ? null : key;
+    let snapshot: EvidenceIdentitySnapshot | null = null;
+    if (hash !== null) {
+      snapshot = getEvidenceIdentitySnapshot(hash, db);
+      if (snapshot && findPlaceholderIdentityFields(snapshot.bundle).length > 0) {
+        continue; // defense-in-depth — never surface a placeholder-tainted bucket as evidence
+      }
+    }
+    const counts = accumulateOutcomeRows(groupRows, taskType, policy);
+    const attempts = counts.passes + counts.partials + counts.fails + counts.errors;
+    const successRate = attempts > 0 ? counts.effective / attempts : 0;
+    let latestTs: string | null = null;
+    for (const r of groupRows) {
+      if (latestTs === null || r.ts > latestTs) latestTs = r.ts;
+    }
+    buckets.push({
+      nodeId,
+      taskType,
+      modelId,
+      evidenceIdentityHash: hash,
+      lane: hash === null ? null : snapshot?.bundle.lane ?? "unknown",
+      disclosure: evidenceIdentityDisclosure(snapshot?.bundle ?? null),
+      attempts,
+      passes: counts.passes,
+      partials: counts.partials,
+      fails: counts.fails,
+      errors: counts.errors,
+      successRate: Math.round(successRate * 100) / 100,
+      latestTs,
+    });
+  }
+  return buckets.sort((a, b) => (b.latestTs ?? "").localeCompare(a.latestTs ?? ""));
+}
+
+/** One named identity's bucket within a (task_type, model_id) cell, or null if that exact
+ *  identity has never been observed there. */
+export function getVerdictForIdentity(
+  taskType: string,
+  modelId: string,
+  evidenceIdentityHashValue: string,
+  policy: PolicyConfig,
+  nodeId: "m5" | "orin" = "m5",
+  opts?: EvidenceReadOpts
+): EvidenceIdentityBucket | null {
+  return (
+    listEvidenceIdentityBuckets(taskType, modelId, policy, nodeId, opts).find(
+      (b) => b.evidenceIdentityHash === evidenceIdentityHashValue
+    ) ?? null
+  );
+}
+
+export interface EvidenceIdentityComparison {
+  taskType: string;
+  modelId: string;
+  nodeId: "m5" | "orin";
+  left: EvidenceIdentityBucket | null;
+  right: EvidenceIdentityBucket | null;
+}
+
+/**
+ * AC5: "operators can compare two prompt or harness versions on matched tasks." `matched tasks`
+ * means the SAME (task_type, model_id, node_id) cell; `left`/`right` are two evidence-identity
+ * hashes within it (e.g. a harness-v1 bucket vs. a harness-v2 bucket) — a simple queryable
+ * side-by-side, not a UI. Either side is null when that identity has no rows in this cell yet.
+ */
+export function compareEvidenceIdentities(
+  taskType: string,
+  modelId: string,
+  leftHash: string,
+  rightHash: string,
+  policy: PolicyConfig,
+  nodeId: "m5" | "orin" = "m5",
+  opts?: EvidenceReadOpts
+): EvidenceIdentityComparison {
+  const buckets = listEvidenceIdentityBuckets(taskType, modelId, policy, nodeId, opts);
+  return {
+    taskType,
+    modelId,
+    nodeId,
+    left: buckets.find((b) => b.evidenceIdentityHash === leftHash) ?? null,
+    right: buckets.find((b) => b.evidenceIdentityHash === rightHash) ?? null,
+  };
+}
+
+/** Reconstructability (AC2): resolve a ledger row's evidence_identity_hash back to the exact
+ *  bundle — served model artifact/config epoch, prompt/harness/taxonomy/verifier/sampling/tool-
+ *  policy identity, and lane — that produced it. Thin re-export of the store's reader so a
+ *  consumer of ledger.ts does not need a second import for the common case. */
+export function reconstructEvidenceIdentity(evidenceIdentityHashValue: string): EvidenceIdentitySnapshot | null {
+  return getEvidenceIdentitySnapshot(evidenceIdentityHashValue);
 }
 
 // ─── Routing decision ────────────────────────────────────────────────────────────
