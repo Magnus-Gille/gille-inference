@@ -43,6 +43,29 @@ holds a winner for manual review when evidence is missing or any default thresho
 These lane-specific checks are separate from the aggregate scout pass rate: a model cannot make up
 for missing seeded bugs by passing unrelated probes.
 
+## Corpus/probe versioning + serving-config gate (#12)
+
+`src/homeserver/corpus-version.ts` exports `PROBE_BATTERY_VERSION` (a human-bumped label) and
+`computeCorpusFingerprint()` (a sha256 content hash over every probe's id/taskType/prompt/
+systemPrompt/verifierName/maxTokens/reviewExpectedFindings). `probes.ts` re-exports both alongside
+`CORPUS_FINGERPRINT`, computed from its OWN `PROBES` array so the two can never drift apart.
+`weekly-model-scout.ts` stamps `probeBatteryVersion` + `corpusFingerprint` on every registry row —
+so a row is traceable to the EXACT corpus that produced it, not just "some" battery.
+`tests/corpus-version.test.ts` pins the current fingerprint (mirroring `GATE_D_STRICT_PIN`):
+changing the corpus on purpose means updating `PROBE_BATTERY_VERSION` and the pinned test value in
+the same change.
+
+Each row that actually ran probes also carries an `evalServingConfig` (`ctx`, `repeats`, `ngl`,
+`flashAttn`) — the exact ephemeral serving parameters used to produce its evidence. A row missing
+this (a legacy row, a hand-written row, or any writer that skips the bookkeeping) is held for
+manual review by `scout-gate.ts`'s `servingConfigFlags` (`missing-serving-config`), the same
+fail-closed treatment as the missing-review-ground-truth fallback — "passed the battery" and "will
+behave the same way once served" are only the same claim when the tested configuration is known.
+
+`promote-model.ts` also validates that recomputed review recall/precision/clean-confabulation are
+finite numbers in `[0,1]` before trusting them (`invalid-review-ground-truth`) — a malformed or
+hand-written row can no longer slip past a `<`/`>` comparison that a `NaN` would silently fail.
+
 ## Memory budget (ground truth)
 
 Box = 128 GB unified = **64 GB GPU VRAM** carve-out + 61 GB system. With `-ngl 99` the whole model

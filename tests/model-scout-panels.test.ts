@@ -37,6 +37,10 @@ const strongReviewEvidence = {
   codeReviewRecall: 28 / 34,
   codeReviewPrecision: 28 / 30,
   codeReviewCleanConfabulationRate: 1 / 6,
+  // #12: an otherwise-clean row must also record the exact serving config it was tested under, or
+  // promote-model's servingConfigFlags gate holds it back regardless of how strong the review
+  // evidence is (see tests/promote-model.test.ts for the dedicated coverage of that gate).
+  evalServingConfig: { ctx: 8192, repeats: 1 },
 };
 
 describe("buildEvalsTablePanel", () => {

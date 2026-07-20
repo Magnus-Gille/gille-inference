@@ -262,6 +262,34 @@ export function reviewQualityFlags(
   return flags;
 }
 
+/**
+ * #12 promotion serving-config gate: a row must record the EXACT serving parameters (context
+ * length, repeats, and — when known — gpu-layers/flash-attention) used to produce its probe
+ * evidence, or the promoter cannot vouch that "passed the battery" and "will behave the same way
+ * once served" are the same claim. A legacy row, a hand-written row, or any writer that skips this
+ * bookkeeping is held for manual review — the same pattern as the #158 missing-review-ground-truth
+ * fallback in promote-model.ts's partitionServableWinners.
+ */
+export function servingConfigFlags(entry: {
+  evalServingConfig?: { ctx: number; repeats: number; ngl?: number; flashAttn?: string } | undefined;
+}): string[] {
+  const cfg = entry.evalServingConfig;
+  const valid =
+    cfg !== undefined &&
+    typeof cfg.ctx === "number" &&
+    Number.isFinite(cfg.ctx) &&
+    cfg.ctx > 0 &&
+    typeof cfg.repeats === "number" &&
+    Number.isFinite(cfg.repeats) &&
+    cfg.repeats > 0;
+  if (!valid) {
+    return [
+      "missing-serving-config: no exact eval serving configuration (ctx/repeats) recorded — cannot verify what configuration was actually tested, not auto-served",
+    ];
+  }
+  return [];
+}
+
 export interface GateResult {
   /** True when nothing tripped — safe to auto-serve. */
   autoServable: boolean;
