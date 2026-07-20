@@ -34,8 +34,12 @@ import { verifierBaseName, MECHANICAL_FORMAT_VERIFIERS } from "./verifier-classi
 
 /** Verifier base names calibration EXPLICITLY recognises as establishing truth by executing the
  *  candidate against real ground truth (mirrors verifier-classification.ts's own examples). Grow
- *  this only with a demonstrated, reviewed ground-truth verifier — never as a blanket default. */
-const KNOWN_TRUTH_ORIENTED_VERIFIERS: ReadonlySet<string> = new Set(["tsGate", "sqlExec"]);
+ *  this only with a demonstrated, reviewed ground-truth verifier — never as a blanket default.
+ *  `reviewGroundTruth` (issue #12's seeded-bug review corpus grader, verifier.ts) is deterministic
+ *  ground truth by the same construction as `tsGate`/`sqlExec` — it compares a reported finding set
+ *  against a closed-over seeded-bug manifest, not a format check — and is the second verifier-anchored
+ *  truth source issue #48's anchored-calibration harness draws on. */
+const KNOWN_TRUTH_ORIENTED_VERIFIERS: ReadonlySet<string> = new Set(["tsGate", "sqlExec", "reviewGroundTruth"]);
 
 /** Verifier base-name prefix for the harvest judge's real (non-shadow) verdict-writing verifier
  *  (`llm-judge:<model>`) and its shadow-mode counterpart (`harvest-shadow:llm-judge:<model>`). Both
