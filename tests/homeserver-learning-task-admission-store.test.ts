@@ -8,6 +8,7 @@ import {
 } from "../src/homeserver/learning-task-contract.js";
 import {
   claimLearningTaskAdmission,
+  getLearningTaskAdmissionByAttempt,
   lookupLearningTaskAdmission,
   releaseLearningTaskAdmission,
 } from "../src/homeserver/learning-task-admission-store.js";
@@ -116,6 +117,24 @@ describe("durable LearningTaskContract admission identity", () => {
       ...identity,
       principalId: "service:other-hugin",
     }, db)).toEqual({ kind: "none" });
+    db.close();
+  });
+
+  it("looks up an admitted request by (task_instance_id, attempt_id) alone — issue #3's authoritative-attempt-reference primitive", () => {
+    const db = new Database(":memory:");
+    const stamp = parseHuginRequestStamp(requestFixture.learningTaskStamp);
+    expect(getLearningTaskAdmissionByAttempt(stamp.task_instance_id, stamp.attempt_id, db)).toBeNull();
+
+    const claimed = claimLearningTaskAdmission(candidate(stamp), db);
+    expect(claimed.kind).toBe("claimed");
+
+    const found = getLearningTaskAdmissionByAttempt(stamp.task_instance_id, stamp.attempt_id, db);
+    expect(found?.gatewayEcho.echoed_request.task_instance_id).toBe(stamp.task_instance_id);
+    expect(found?.gatewayEcho.echoed_request.attempt_id).toBe(stamp.attempt_id);
+    expect(found?.gatewayEcho.echoed_request.source.component).toBe("hugin");
+
+    // A near-miss (right task, wrong attempt id) must not resolve to any row.
+    expect(getLearningTaskAdmissionByAttempt(stamp.task_instance_id, "some-other-attempt", db)).toBeNull();
     db.close();
   });
 

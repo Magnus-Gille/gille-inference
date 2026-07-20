@@ -200,6 +200,38 @@ export function claimLearningTaskAdmission(
 }
 
 /**
+ * Look up an admitted request purely by its (task_instance_id, attempt_id) pair, with no
+ * principal filter. Read-only; creates no claim.
+ *
+ * This is the authoritative-attempt-reference primitive issue #3 (gille accounting) builds on: a
+ * caller elsewhere in the codebase can claim "this negative-exposure decision / joined-exposure
+ * tombstone is backed by Hugin attempt X" — but that claim is only as good as this lookup, which
+ * can only ever return a row that already passed the full stamp/echo/principal-binding pipeline
+ * above (`assertCandidate`). A bare `(taskInstanceId, attemptId)` string pair supplied by an
+ * attacker can never manufacture a row here; it can only fail to find one. If more than one
+ * principal ever admits the identical (task_instance_id, attempt_id) pair (not possible under the
+ * current single-producer deployment, since `task_instance_id` is a Hugin-scoped identifier), the
+ * most recently admitted row wins — this lookup answers "does an authoritative admission exist",
+ * not "enumerate every admission".
+ */
+export function getLearningTaskAdmissionByAttempt(
+  taskInstanceId: string,
+  attemptId: string,
+  db: Database.Database = getDb(),
+): LearningTaskAdmission | null {
+  ensureSchema(db);
+  const row = db.prepare(`
+    SELECT admission_record_id, principal_id, client_id, task_instance_id, attempt_id,
+           request_id, idempotency_key, request_fingerprint, surface, gateway_echo_json
+      FROM learning_task_admissions
+     WHERE task_instance_id = ? AND attempt_id = ?
+     ORDER BY created_at DESC
+     LIMIT 1
+  `).get(taskInstanceId, attemptId) as AdmissionRow | undefined;
+  return row === undefined ? null : rowToAdmission(row);
+}
+
+/**
  * Roll back only the exact newly-created record while a surface can prove execution has not begun.
  * Never call this as a generic downstream exception handler: an error may occur after model work.
  */
