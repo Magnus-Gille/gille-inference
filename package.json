@@ -13,6 +13,7 @@
     "homeserver:serve": "tsx src/homeserver/cli.ts serve",
     "homeserver:probe": "tsx src/homeserver/cli.ts probe --all",
     "homeserver:ledger": "tsx src/homeserver/cli.ts ledger",
+    "autonomy:tick": "tsx scripts/autonomy-tick-cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
