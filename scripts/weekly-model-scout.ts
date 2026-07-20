@@ -58,12 +58,13 @@ import {
   readRegistry,
   servedIds,
 } from "../src/homeserver/model-registry.js";
-import { PROBES } from "../src/homeserver/probes.js";
+import { PROBES, PROBE_BATTERY_VERSION, CORPUS_FINGERPRINT } from "../src/homeserver/probes.js";
 import type { GgufFile, ProbeRunSummary, RegistryEntry, ScoutVerdict } from "../src/homeserver/scout-types.js";
 import {
   evaluateScoutGate,
   misconfigFlags,
   reviewQualityFlags,
+  servingConfigFlags,
   loadScoutGateConfig,
 } from "../src/homeserver/scout-gate.js";
 
@@ -206,7 +207,17 @@ function decideVerdict(s: ProbeRunSummary): ScoutVerdict {
   return "skip";
 }
 
-function toEntry(
+/**
+ * #12: the exact ephemeral serving parameters used whenever probes actually ran, so a durable
+ * row can be checked against what was promoted later (see scout-gate.ts servingConfigFlags). Kept
+ * as a function (not stamped once at module load) so tests can construct a comparable entry
+ * without depending on live CTX/REPEATS env resolution order.
+ */
+function currentEvalServingConfig(): { ctx: number; repeats: number; ngl: number; flashAttn: string } {
+  return { ctx: CTX, repeats: REPEATS, ngl: 99, flashAttn: "on" };
+}
+
+export function toEntry(
   c: Candidate,
   verdict: ScoutVerdict,
   s: ProbeRunSummary | null,
@@ -214,15 +225,19 @@ function toEntry(
 ): RegistryEntry {
   const scoresByTaskType: Record<string, number> = {};
   for (const t of s?.byTaskType ?? []) scoresByTaskType[t.taskType] = Math.round(t.passRate * 1000) / 1000;
-  // #176/#158: gate a would-be winner that looks benchmark-gamed (perfect on hard task types), whose
-  // name advertises a benchmark/marketing claim, or that errored on too many probes (misconfigured/
-  // broken serving, #158). Flags do NOT change the verdict — they block unattended auto-serve in
+  const evalServingConfig = s ? currentEvalServingConfig() : undefined;
+  // #176/#158/#12: gate a would-be winner that looks benchmark-gamed (perfect on hard task types),
+  // whose name advertises a benchmark/marketing claim, that errored on too many probes
+  // (misconfigured/broken serving, #158), or whose exact serving configuration wasn't recorded
+  // (#12 — "incompatible serving configuration" can't be ruled out without knowing what was
+  // actually tested). Flags do NOT change the verdict — they block unattended auto-serve in
   // promote-model; a human can still promote after review.
   const gate = evaluateScoutGate({ id: c.id, scoresByTaskType }, SCOUT_GATE_CONFIG);
   const gateFlags = [
     ...gate.flags,
     ...(s ? misconfigFlags(s, SCOUT_GATE_CONFIG) : []),
     ...(s?.reviewMetrics ? reviewQualityFlags(s.reviewMetrics, SCOUT_GATE_CONFIG) : []),
+    ...(s ? servingConfigFlags({ evalServingConfig }) : []),
   ];
   const probeTotalRuns = s?.totalRuns ?? 0;
   const probeErrors = s?.error ?? 0;
@@ -237,8 +252,13 @@ function toEntry(
     passRate: s ? Math.round(s.passRate * 1000) / 1000 : 0,
     avgTokPerSec: s?.avgTokPerSec ?? null,
     scoresByTaskType,
+    // #12: stamp which exact corpus produced this row regardless of verdict (even a load_failed
+    // row is useful evidence of "this corpus, at this time, could not evaluate this candidate").
+    probeBatteryVersion: PROBE_BATTERY_VERSION,
+    corpusFingerprint: CORPUS_FINGERPRINT,
     ...(s
       ? {
+          evalServingConfig,
           probeErrors,
           probeTotalRuns,
           probeErrorRate: probeTotalRuns > 0 ? Math.round((probeErrors / probeTotalRuns) * 1000) / 1000 : 0,

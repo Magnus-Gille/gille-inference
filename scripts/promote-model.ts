@@ -48,6 +48,7 @@ import {
   evaluateScoutGate,
   misconfigFlags,
   reviewQualityFlags,
+  servingConfigFlags,
   loadScoutGateConfig,
   DEFAULT_SCOUT_GATE_CONFIG,
   type ScoutGateConfig,
@@ -103,6 +104,7 @@ export function partitionServableWinners<
     codeReviewRecall?: number;
     codeReviewPrecision?: number;
     codeReviewCleanConfabulationRate?: number;
+    evalServingConfig?: { ctx: number; repeats: number; ngl?: number; flashAttn?: string };
   },
 >(
   winners: T[],
@@ -158,16 +160,40 @@ export function partitionServableWinners<
             cleanConfabulationRate: e.codeReviewCleanConfabulationRate,
           }
         : null;
-    const recomputedReview = reviewFromCounts ?? reviewFromRates;
+    const candidateReview = reviewFromCounts ?? reviewFromRates;
+    // #12 (M5-assisted review): a malformed or hand-written row could carry NaN/Infinity/out-of-
+    // range recall/precision/confabulation values (readRegistry's isRegistryEntry guard rejects
+    // these for rows read from the durable JSONL, but partitionServableWinners is also called
+    // directly — e.g. in tests, or by a future caller — so validate here too rather than trusting
+    // the shape alone). Treat invalid values as untrustworthy evidence, distinct from genuinely
+    // absent evidence, so an operator can tell "no review ran" apart from "review ran but produced
+    // garbage numbers".
+    const isValidRatio = (n: number): boolean => Number.isFinite(n) && n >= 0 && n <= 1;
+    const recomputedReview =
+      candidateReview &&
+      isValidRatio(candidateReview.recall) &&
+      isValidRatio(candidateReview.precision) &&
+      isValidRatio(candidateReview.cleanConfabulationRate)
+        ? candidateReview
+        : null;
     const recomputedReviewFlags = recomputedReview
       ? reviewQualityFlags(recomputedReview, cfg)
-      : ["missing-review-ground-truth: no #158 seeded-review evidence — not auto-served"];
+      : candidateReview
+        ? [
+            "invalid-review-ground-truth: recall/precision/clean-confabulation values are non-finite or out of [0,1] — not auto-served",
+          ]
+        : ["missing-review-ground-truth: no #158 seeded-review evidence — not auto-served"];
+    // #12: recompute the serving-config gate too — a row missing its exact eval serving
+    // parameters (ctx/repeats) cannot be vouched for as tested-under-a-known-configuration, same
+    // fail-closed treatment as the missing-review-ground-truth fallback above.
+    const recomputedServingConfigFlags = servingConfigFlags({ evalServingConfig: e.evalServingConfig });
     const flags = [
       ...new Set([
         ...persisted,
         ...evaluateScoutGate(e, cfg).flags,
         ...recomputedMisconfig,
         ...recomputedReviewFlags,
+        ...recomputedServingConfigFlags,
       ]),
     ];
     if (flags.length) gated.push({ entry: e, flags });

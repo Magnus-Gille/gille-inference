@@ -339,4 +339,42 @@ describe("isRegistryEntry", () => {
   it("rejects a gateFlags array with a non-string element", () => {
     expect(isRegistryEntry({ ...good, gateFlags: ["ok", 42] })).toBe(false);
   });
+
+  // #12: probeBatteryVersion / corpusFingerprint / evalServingConfig — optional, but shape-checked
+  // when present so a malformed writer can't poison the durable registry (fail closed).
+  it("accepts a row with no #12 versioning/serving-config fields (legacy row)", () => {
+    expect(isRegistryEntry(good)).toBe(true);
+  });
+  it("accepts a well-formed probeBatteryVersion + corpusFingerprint", () => {
+    expect(
+      isRegistryEntry({ ...good, probeBatteryVersion: "2026.07.20-1", corpusFingerprint: "abc123" })
+    ).toBe(true);
+  });
+  it("rejects a non-string probeBatteryVersion or corpusFingerprint", () => {
+    expect(isRegistryEntry({ ...good, probeBatteryVersion: 1 })).toBe(false);
+    expect(isRegistryEntry({ ...good, corpusFingerprint: {} })).toBe(false);
+  });
+  it("accepts a well-formed evalServingConfig", () => {
+    expect(isRegistryEntry({ ...good, evalServingConfig: { ctx: 8192, repeats: 1, ngl: 99, flashAttn: "on" } })).toBe(
+      true
+    );
+    // ngl/flashAttn are optional within the object
+    expect(isRegistryEntry({ ...good, evalServingConfig: { ctx: 8192, repeats: 1 } })).toBe(true);
+  });
+  it("rejects a malformed evalServingConfig (missing/invalid required sub-fields)", () => {
+    expect(isRegistryEntry({ ...good, evalServingConfig: { ctx: "8192", repeats: 1 } })).toBe(false);
+    expect(isRegistryEntry({ ...good, evalServingConfig: { repeats: 1 } })).toBe(false);
+    expect(isRegistryEntry({ ...good, evalServingConfig: "oops" })).toBe(false);
+    expect(isRegistryEntry({ ...good, evalServingConfig: null })).toBe(false);
+  });
+
+  it("round-trips the #12 versioning + serving-config fields through appendEntry/readRegistry", () => {
+    const e = makeEntry({
+      probeBatteryVersion: "2026.07.20-1",
+      corpusFingerprint: "deadbeef01234567",
+      evalServingConfig: { ctx: 8192, repeats: 1, ngl: 99, flashAttn: "on" },
+    });
+    appendEntry(e, TMP);
+    expect(readRegistry(TMP)[0]).toEqual(e);
+  });
 });

@@ -20,6 +20,20 @@ function isNonNegativeCountRecord(value: unknown): value is Record<string, numbe
   );
 }
 
+/** #12: shape-check for the persisted exact eval serving configuration. */
+function isEvalServingConfig(value: unknown): value is { ctx: number; repeats: number; ngl?: number; flashAttn?: string } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["ctx"] === "number" &&
+    Number.isFinite(v["ctx"]) &&
+    typeof v["repeats"] === "number" &&
+    Number.isFinite(v["repeats"]) &&
+    (v["ngl"] === undefined || typeof v["ngl"] === "number") &&
+    (v["flashAttn"] === undefined || typeof v["flashAttn"] === "string")
+  );
+}
+
 function hasConsistentReviewCounts(e: Record<string, unknown>): boolean {
   const seeded = e["codeReviewSeededBugs"];
   const truePositives = e["codeReviewTruePositives"];
@@ -86,6 +100,9 @@ export function isRegistryEntry(x: unknown): x is RegistryEntry {
     (e["codeReviewCleanConfabulationRate"] === undefined ||
       (typeof e["codeReviewCleanConfabulationRate"] === "number" && Number.isFinite(e["codeReviewCleanConfabulationRate"]) && e["codeReviewCleanConfabulationRate"] >= 0 && e["codeReviewCleanConfabulationRate"] <= 1)) &&
     hasConsistentReviewCounts(e) &&
+    (e["probeBatteryVersion"] === undefined || typeof e["probeBatteryVersion"] === "string") &&
+    (e["corpusFingerprint"] === undefined || typeof e["corpusFingerprint"] === "string") &&
+    (e["evalServingConfig"] === undefined || isEvalServingConfig(e["evalServingConfig"])) &&
     // #176 gateFlags is optional, but when present it must be a string[] — a malformed value would
     // otherwise reach promote-model and throw on `.join`. Reject the row (fail closed) instead.
     (e["gateFlags"] === undefined ||

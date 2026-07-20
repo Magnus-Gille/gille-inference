@@ -5,6 +5,7 @@ import {
   nameTellFlags,
   misconfigFlags,
   reviewQualityFlags,
+  servingConfigFlags,
   sanitizeModelName,
   loadScoutGateConfig,
   DEFAULT_SCOUT_GATE_CONFIG,
@@ -216,5 +217,28 @@ describe("loadScoutGateConfig — env overrides", () => {
     expect(loadScoutGateConfig({ SCOUT_SUSPICIOUS_MIN_HARD_TYPES: "5" }).minSuspiciousHardTypes).toBe(
       DEFAULT_SCOUT_GATE_CONFIG.minSuspiciousHardTypes
     );
+  });
+});
+
+describe("servingConfigFlags — a row must record what serving config actually produced it (#12)", () => {
+  it("flags a row with no evalServingConfig at all (legacy/hand-written row)", () => {
+    const f = servingConfigFlags({});
+    expect(f).toHaveLength(1);
+    expect(f[0]).toMatch(/missing-serving-config/);
+  });
+
+  it("does not flag a row with a well-formed evalServingConfig", () => {
+    expect(servingConfigFlags({ evalServingConfig: { ctx: 8192, repeats: 1, ngl: 99, flashAttn: "on" } })).toEqual(
+      []
+    );
+    // ngl/flashAttn are optional extras — ctx+repeats is the load-bearing pair.
+    expect(servingConfigFlags({ evalServingConfig: { ctx: 8192, repeats: 1 } })).toEqual([]);
+  });
+
+  it("flags a malformed evalServingConfig (non-finite/zero/negative ctx or repeats)", () => {
+    expect(servingConfigFlags({ evalServingConfig: { ctx: 0, repeats: 1 } }).length).toBe(1);
+    expect(servingConfigFlags({ evalServingConfig: { ctx: -8192, repeats: 1 } }).length).toBe(1);
+    expect(servingConfigFlags({ evalServingConfig: { ctx: Number.NaN, repeats: 1 } }).length).toBe(1);
+    expect(servingConfigFlags({ evalServingConfig: { ctx: 8192, repeats: 0 } }).length).toBe(1);
   });
 });

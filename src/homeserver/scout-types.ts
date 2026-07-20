@@ -133,6 +133,24 @@ export interface RegistryEntry {
   codeReviewRecall?: number;
   codeReviewPrecision?: number;
   codeReviewCleanConfabulationRate?: number;
+  /**
+   * #12: exact corpus/probe-battery identity used for THIS evaluation. Lets a durable row be
+   * matched back to the precise probe set (prompts, seeded-bug expectations, verifiers) that
+   * produced it, independent of code-comment references that can drift from what actually ran.
+   */
+  probeBatteryVersion?: string;
+  corpusFingerprint?: string;
+  /**
+   * #12: exact ephemeral serving configuration used to produce this row's probe evidence. A row
+   * missing this cannot be vouched for as "tested under a known configuration" — see
+   * scout-gate.ts servingConfigFlags.
+   */
+  evalServingConfig?: {
+    ctx: number;
+    repeats: number;
+    ngl?: number;
+    flashAttn?: string;
+  };
   served: boolean; // promoted into live llama-swap?
   configKey?: string; // llama-swap config entry id, if promoted
   ggufDir?: string; // absolute path to the per-model dir holding ALL local GGUF parts (scratch, then models dir)

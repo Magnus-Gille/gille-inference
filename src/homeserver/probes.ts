@@ -1,4 +1,5 @@
 import type { Verifier } from "./verifier.js";
+import { computeCorpusFingerprint, PROBE_BATTERY_VERSION } from "./corpus-version.js";
 import {
   answerIs,
   numeric,
@@ -817,3 +818,10 @@ export const PROBES: Probe[] = [
 export function getProbe(id: string): Probe | undefined {
   return PROBES.find((p) => p.id === id);
 }
+
+// ── Versioning + reproducibility (#12) ──────────────────────────────────────────────
+// A durable registry row must be traceable to the EXACT corpus that produced it. Re-exporting the
+// version alongside a fingerprint computed from THIS module's own PROBES array (rather than a
+// value hand-copied elsewhere) means the two can never drift apart.
+export { PROBE_BATTERY_VERSION };
+export const CORPUS_FINGERPRINT: string = computeCorpusFingerprint(PROBES);
