@@ -761,6 +761,55 @@ describe("gateway spine — HTTP integration", () => {
     });
   });
 
+  it("#5: a stamped /delegate call binds a real, reconstructable evidence identity to its ledger row", async () => {
+    // Production-wiring regression: gateway.ts's handleDelegate threads the SAME admitted stamp
+    // that already drives canonicalTaskFingerprintSha256 into orchestrator.delegate() as
+    // learningTaskStamp, which binds DelegationRecord.evidenceIdentity on the real write path
+    // (previously nothing populated it at all — PR #28 shipped only the pure derivation + storage).
+    const owner = mintKey({ alias: `evidence-identity-http-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    // A never-elsewhere-used-in-this-file taskType (still a valid taxonomy enum member — the stamp
+    // schema restricts task_type.id to the fixed taxonomy list). This file's shared real ledger DB
+    // accumulates evidence across its many "summarize"/"m1" delegate calls, and enough accrued
+    // failures freeze that cell to not_viable, which makes shouldDelegate skip the local attempt
+    // entirely (no ledgerId at all). A fresh cell keeps this test's verdict "unknown" (always
+    // delegate:true) regardless of what order it runs in relative to its siblings.
+    requestBody.taskType = "other";
+    requestBody.learningTaskStamp.task_type.id = "other";
+
+    const delegateResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(delegateResponse.status).toBe(200);
+    const delegateResult = await delegateResponse.json() as { ledgerId?: string };
+    expect(delegateResult.ledgerId).toBeDefined();
+
+    const { reconstructEvidenceIdentity } = await import("../src/homeserver/ledger.js");
+    const row = getDb()
+      .prepare(`SELECT evidence_identity_hash, evidence_lane FROM delegations WHERE id = ?`)
+      .get(delegateResult.ledgerId) as { evidence_identity_hash: string | null; evidence_lane: string | null };
+    expect(row.evidence_identity_hash).not.toBeNull();
+    expect(row.evidence_lane).toBe("delegate");
+
+    const snapshot = reconstructEvidenceIdentity(row.evidence_identity_hash!);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.bundle.lane).toBe("delegate");
+    // The stamp's own mechanically-bound fields (harness/tool-policy/logical-task/rendered-prompt)
+    // are real digests, sourced from the admitted LearningTaskContract stamp (AC2 reconstructability).
+    expect(snapshot!.bundle.harness).toMatchObject({ kind: "digest", id: "homeserver-executor" });
+    expect(snapshot!.bundle.toolPolicy.kind).toBe("digest");
+    expect(snapshot!.bundle.logicalTask.kind).toBe("digest");
+    expect(snapshot!.bundle.renderedPrompt.kind).toBe("digest");
+    expect(snapshot!.bundle.taxonomyVersion).toMatchObject({ kind: "label" });
+    // This mock upstream doesn't emulate llama-swap's /running shape, so the served-model fields
+    // honestly disclose "not-observed" rather than fabricating a model/config identity — the exact
+    // fail-safe behaviour resolveServedModelIdentity is built for.
+    expect(snapshot!.bundle.modelArtifact.kind).toBe("unknown");
+    expect(snapshot!.bundle.configEpoch.kind).toBe("unknown");
+  });
+
   it("task exposure lookup denies guest and identity-less static admin keys", async () => {
     const guest = mintKey({ alias: "task-exposure-guest", tier: "guest" }, DEFAULTS);
     const requestBody = JSON.stringify({

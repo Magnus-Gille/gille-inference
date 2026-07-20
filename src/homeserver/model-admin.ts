@@ -27,6 +27,15 @@ export function getLoaded(): Promise<Array<{ key: string; contextLength: number 
   return backend().getLoaded();
 }
 
+/**
+ * Genuinely observed served-model command string for `modelId` on the active backend, or null
+ * when not running / not observable (#5). Feeds `evidenceIdentityFromServedModelCmd` — never
+ * used to fabricate an identity, only to honestly report what was (or wasn't) observed.
+ */
+export function getRunningCmd(modelId: string): Promise<string | null> {
+  return backend().getRunningCmd(modelId);
+}
+
 export function loadModel(
   modelKey: string,
   opts?: import("./lmstudio-admin.js").LoadOptions

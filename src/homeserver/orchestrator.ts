@@ -2,7 +2,7 @@ import { loadConfig } from "./config.js";
 import { classifyTask, taskTypeEmitsJson } from "./taxonomy.js";
 import { shouldDelegate, recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import type { Verifier } from "./verifier.js";
-import { getLoaded } from "./model-admin.js";
+import { getLoaded, getRunningCmd } from "./model-admin.js";
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
@@ -28,6 +28,15 @@ import {
 } from "./shadow-lane.js";
 import type { HomeserverConfig } from "./config.js";
 import { recordTaskExposureBestEffort } from "./task-exposure.js";
+import type { HuginRequestStamp } from "./learning-task-contract.js";
+import {
+  buildEvidenceIdentityBundle,
+  evidenceIdentityFromAdmittedStamp,
+  evidenceIdentityFromServedModelCmd,
+  unknownIdentity,
+  type EvidenceIdentityBundle,
+  type EvidenceLane,
+} from "./evidence-identity.js";
 
 /**
  * The orchestrator: the decision point where a frontier brain (Opus) hands a task down
@@ -86,6 +95,15 @@ export interface DelegationTask {
    * Absent for every unstamped caller; those lanes continue to record rendered-prompt identity only.
    */
   canonicalTaskFingerprintSha256?: string | null;
+  /**
+   * #5: the SAME admitted LearningTaskContract Hugin request stamp `canonicalTaskFingerprintSha256`
+   * is drawn from — carried through in full so the delegate lane can bind ledger evidence to its
+   * mechanically-verified prompt/harness/tool-policy/taxonomy identity (see evidence-identity.ts's
+   * `evidenceIdentityFromAdmittedStamp`), joined with the served-model artifact/config epoch this
+   * lane actually used. Absent for every unstamped/legacy caller, exactly like the fingerprint above
+   * — those callers continue to record a null (legacy) evidence identity, never a fabricated one.
+   */
+  learningTaskStamp?: HuginRequestStamp;
   /**
    * The cloud "smart" model that delegated this task. Used only for cost accounting; callers should
    * pass the real delegator model id so savings can be measured against actual spend avoided.
@@ -181,6 +199,12 @@ function maybeScheduleEscalationShadow(
       : inheritedMaxTokens;
   const shadowConfig = { ...cfg.shadowLane, maxTokens: effectiveMaxTokens };
 
+  // #5: the shadow candidate is a DIFFERENT model (often a different served config epoch entirely)
+  // from whatever the primary lane would have used — resolved once here, alongside the model id, so
+  // `record` below can bind the shadow row's evidence identity to ITS OWN served-model observation,
+  // never the primary lane's. Undefined until resolveModelId has run.
+  let shadowServedFields: Pick<EvidenceIdentityBundle, "modelArtifact" | "configEpoch"> | undefined;
+
   scheduleShadowEvaluation(
     {
       taskType: outcome.taskType,
@@ -197,7 +221,14 @@ function maybeScheduleEscalationShadow(
     {
       config: shadowConfig,
       queueDepth: () => activeDelegations,
-      resolveModelId: async () => shadowConfig.model || (await currentModel()),
+      resolveModelId: async () => {
+        const modelId = shadowConfig.model || (await currentModel());
+        // Only pay for the served-model /running lookup when the original task was stamped — an
+        // unstamped task's shadow row stays a null/legacy identity anyway (see `record` below), so
+        // there is nothing to join the served fields against.
+        if (modelId && task.learningTaskStamp) shadowServedFields = await resolveServedModelIdentity(modelId);
+        return modelId;
+      },
       infer: async (modelId, job, laneCfg): Promise<ShadowInference> => {
         const controller = new AbortController();
         let timedOut = false;
@@ -253,7 +284,19 @@ function maybeScheduleEscalationShadow(
         }
       },
       record: (row: ShadowLedgerRow) => {
-        recordDelegation(row);
+        // #5: same principle as deriveEvidenceIdentity above — an unstamped task (or a served-model
+        // lookup that never resolved, e.g. resolveModelId returned null and the lane never ran)
+        // stays a null/"legacy" identity rather than a synthesized partial one. Lane is always
+        // "delegate-shadow": this row must never be mistaken for primary delegate-lane evidence.
+        const evidenceIdentity: EvidenceIdentityBundle | undefined =
+          task.learningTaskStamp && shadowServedFields
+            ? buildEvidenceIdentityBundle({
+                ...evidenceIdentityFromAdmittedStamp(task.learningTaskStamp),
+                ...shadowServedFields,
+                lane: "delegate-shadow",
+              })
+            : undefined;
+        recordDelegation({ ...row, evidenceIdentity });
       },
     }
   );
@@ -464,6 +507,51 @@ export async function currentModel(override?: string): Promise<string | null> {
     );
     return null;
   }
+}
+
+/**
+ * Genuinely observed model-artifact/config-epoch identity (#5) for `modelId` on the active
+ * backend, or an honest `unknown("not-observed")` pair when the backend has nothing to report or
+ * the lookup itself fails. NEVER throws — a `/running` hiccup must degrade evidence quality, not
+ * break serving, exactly like `currentModel`'s existing fail-open discipline above.
+ */
+async function resolveServedModelIdentity(
+  modelId: string
+): Promise<Pick<EvidenceIdentityBundle, "modelArtifact" | "configEpoch">> {
+  try {
+    const cmd = await getRunningCmd(modelId);
+    return evidenceIdentityFromServedModelCmd(cmd);
+  } catch (err) {
+    console.warn(
+      `[orchestrator] resolveServedModelIdentity: served-model lookup failed for ${modelId}: ${err instanceof Error ? err.message : String(err)}`
+    );
+    const reason = unknownIdentity("not-observed", "served-model /running lookup failed");
+    return { modelArtifact: reason, configEpoch: reason };
+  }
+}
+
+/**
+ * Build the #5 content-addressed evidence identity for one delegate-lane attempt: the admitted
+ * LearningTaskContract stamp's own mechanically-bound fields (prompt/harness/tool-policy/taxonomy),
+ * joined with the LIVE served-model artifact/config epoch THIS lane actually used, stamped with
+ * this lane's own identity so a shadow-lane candidate model can never be mistaken for the primary
+ * delegate lane's evidence (or vice versa).
+ *
+ * Returns `undefined` — never a bundle of all-unknown fields — for an unstamped caller, so an
+ * ordinary legacy request keeps landing in the null/"legacy" bucket exactly as before (#28's
+ * readers already disclose that honestly; synthesizing a mostly-unknown bundle here would only add
+ * an untested partial-disclosure shape with no reconstructability benefit, since nothing about the
+ * logical task/harness/tool-policy is mechanically known without a stamp).
+ */
+async function deriveEvidenceIdentity(
+  stamp: HuginRequestStamp | undefined,
+  modelId: string,
+  lane: EvidenceLane
+): Promise<EvidenceIdentityBundle | undefined> {
+  if (!stamp) return undefined;
+  const stampFields = evidenceIdentityFromAdmittedStamp(stamp);
+  const servedFields = await resolveServedModelIdentity(modelId);
+  return buildEvidenceIdentityBundle({ ...stampFields, ...servedFields, lane });
 }
 
 /**
@@ -742,6 +830,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
   if (!result.ok) {
     const errorClass = classifyError(result.error);
     const failNote = result.error === TIMEOUT_SENTINEL ? `timeout after ${cfg.callTimeoutMs}ms` : result.error;
+    const evidenceIdentity = await deriveEvidenceIdentity(task.learningTaskStamp, modelId, "delegate");
     const ledgerId = recordDelegation({
       taskType,
       nodeId,
@@ -754,6 +843,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       source: task.source,
       keyAlias: task.keyAlias,
       notes: [failNote, retryNote].filter(Boolean).join(" | "),
+      evidenceIdentity,
     });
     return attachCostTrace(task, await callFrontier(task, {
       delegated: true,
@@ -836,6 +926,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
   const verdictEscalate = outcome === "fail" || outcome === "error";
   const shouldEscalate = verdictEscalate || gateEscalate;
 
+  const evidenceIdentity = await deriveEvidenceIdentity(task.learningTaskStamp, modelId, "delegate");
   const ledgerId = recordDelegation({
     taskType,
     nodeId,
@@ -860,6 +951,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
     gateScore: gate?.score ?? null,
     gateWouldEscalate: gate?.wouldEscalate ?? null,
     gateError: gate?.secondaryError ?? null,
+    evidenceIdentity,
   });
 
   const decisionReason = gateEscalate
