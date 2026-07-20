@@ -152,6 +152,16 @@ export async function getLoaded(): Promise<Array<{ key: string; contextLength: n
     .map((m) => ({ key: m.key, contextLength: m.loadedContext ?? null }));
 }
 
+/**
+ * LM Studio has no llama-swap-style `/running` cmd string to observe (#5). This deprecated
+ * backend honestly reports null — an unobserved served-model identity — rather than fabricating
+ * one; evidence-identity.ts's `evidenceIdentityFromServedModelCmd(null)` turns this into an
+ * explicit `unknown("not-observed")`, never a guessed model/config identity.
+ */
+export async function getRunningCmd(_modelId: string): Promise<string | null> {
+  return null;
+}
+
 // ─── CLI management ────────────────────────────────────────────────────────────
 
 const SUCCESS_RE = /loaded successfully in ([\d.]+)s/i;
