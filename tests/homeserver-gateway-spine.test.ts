@@ -698,6 +698,69 @@ describe("gateway spine — HTTP integration", () => {
     });
   });
 
+  it("finds a stamped Hugin delegate task by its canonical identity, distinct from its rendered prompt (#4)", async () => {
+    const owner = mintKey({ alias: `task-exposure-canonical-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    // Grimnir's vendored bc8cf09 "ASCII trim" vector — the fixture's raw_fingerprint.digest was
+    // constructed to equal this exact vector (see tests/fixtures/learning-task-contract/PROVENANCE.md).
+    const vectors = JSON.parse(readFileSync(
+      new URL("./fixtures/learning-task-contract/raw-fingerprint-vectors.json", import.meta.url),
+      "utf8",
+    )) as Array<{ name: string; input_text: string; expected_sha256: string }>;
+    const asciiVector = vectors.find((v) => v.name === "ASCII trim")!;
+    expect(requestBody.learningTaskStamp.raw_fingerprint.digest).toBe(asciiVector.expected_sha256);
+    // The rendered prompt actually sent to the model is DIFFERENT bytes from the raw logical task
+    // the canonical fingerprint identifies — the whole point of AC1.
+    expect(requestBody.prompt).not.toBe(asciiVector.input_text);
+
+    const delegateResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(delegateResponse.status).toBe(200);
+
+    const renderedHash = taskTextFingerprint(requestBody.prompt as string).sha256;
+    const lookup = await fetch(url("/admin/task-exposures/lookup"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({
+        fingerprint_version: taskFingerprintVersion,
+        fingerprints: [renderedHash],
+        canonical: [{
+          fingerprint_sha256: asciiVector.expected_sha256,
+          exact_bytes: {
+            encoding: "utf-8",
+            byte_length: Buffer.byteLength(asciiVector.input_text, "utf8"),
+            text: asciiVector.input_text,
+          },
+        }],
+      }),
+    });
+    expect(lookup.status).toBe(200);
+    const body = await lookup.json() as {
+      results: Array<{
+        fingerprint_sha256: string;
+        identity_kind: string;
+        seen: boolean;
+        unseen_claim_supported: boolean;
+        lanes: string[];
+      }>;
+    };
+    expect(body.results.find((r) => r.fingerprint_sha256 === renderedHash)).toMatchObject({
+      identity_kind: "rendered-prompt",
+      seen: true,
+      lanes: ["delegate"],
+    });
+    // Found via its CANONICAL identity even though its rendered prompt never appeared in this query.
+    expect(body.results.find((r) => r.fingerprint_sha256 === asciiVector.expected_sha256)).toMatchObject({
+      identity_kind: "canonical-raw",
+      seen: true,
+      unseen_claim_supported: true,
+      lanes: ["delegate"],
+    });
+  });
+
   it("task exposure lookup denies guest and identity-less static admin keys", async () => {
     const guest = mintKey({ alias: "task-exposure-guest", tier: "guest" }, DEFAULTS);
     const requestBody = JSON.stringify({

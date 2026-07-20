@@ -1790,6 +1790,11 @@ async function handleDelegate(
     minP: params.minP,
     source: "gateway",
     keyAlias,
+    // #4: the stamp was structurally validated in parseDelegateBody and — on the live /delegate
+    // route — semantically validated by validateHuginRequestStamp before handleDelegate ever runs.
+    // raw_fingerprint.digest is the canonical logical-task identity; record it alongside (never
+    // instead of) the rendered `prompt` fingerprint the orchestrator already captures.
+    canonicalTaskFingerprintSha256: params.learningTaskStamp?.raw_fingerprint.digest ?? null,
   });
   // A stamped claim is the durable "execution may have begun" boundary. delegate() can throw
   // after the upstream model has already answered (for example while persisting its ledger row),

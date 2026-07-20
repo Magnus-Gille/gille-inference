@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, beforeAll } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import Database from "better-sqlite3";
@@ -1035,6 +1035,54 @@ describe("LearningTaskContract stamped code_loop admission", () => {
     );
     expect(substitutedCaller).toMatchObject({ ok: false, refusal: "invalid-request" });
     if (!substitutedCaller.ok) expect(substitutedCaller.message).toMatch(/principal/i);
+  });
+
+  it("records BOTH the rendered instruction and the stamp's canonical raw identity (#4)", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    // Fresh identity: the fixture's ids are fixed, and an earlier test in this describe block
+    // already durably admitted that exact task/attempt/idempotency/request tuple — reusing it here
+    // would hit the recovery path (same work_id, no new row) rather than exercise a live accept.
+    const freshOpaque = () => `opaque:${randomUUID()}`;
+    request.client_run_id = freshOpaque();
+    request.learning_task_stamp.idempotency_key = request.client_run_id;
+    request.learning_task_stamp.request_id = freshOpaque();
+    request.learning_task_stamp.task_instance_id = `task-${randomUUID()}`;
+    request.learning_task_stamp.attempt_id = `attempt-${randomUUID()}`;
+    // Also give this run its own canonical identity so its exposure row count is independent of
+    // the earlier "echoes and durably recovers" test, which admitted the fixture's default digest.
+    request.learning_task_stamp.raw_fingerprint.digest = createHash("sha256").update(randomUUID(), "utf8").digest("hex");
+    const started = await startCodeLoop(request, startCfg(), stampedDeps(epoch));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const renderedFingerprint = taskTextFingerprint(request.instruction).sha256;
+    const canonicalDigest = request.learning_task_stamp.raw_fingerprint.digest;
+    expect(renderedFingerprint).not.toBe(canonicalDigest); // genuinely distinct byte domains
+
+    const lookup = lookupTaskExposures({
+      fingerprint_version: TASK_FINGERPRINT_VERSION,
+      fingerprints: [renderedFingerprint],
+      canonical: [{ fingerprint_sha256: canonicalDigest }],
+    });
+    expect(lookup.results[0]).toMatchObject({
+      identity_kind: "rendered-prompt",
+      seen: true,
+      lanes: ["code-loop"],
+    });
+    expect(lookup.results[1]).toMatchObject({
+      identity_kind: "canonical-raw",
+      seen: true,
+      lanes: ["code-loop"],
+      model_ids: ["qwen3-coder-next-80b"],
+      harness_ids: [CODE_LOOP_HARNESS_VERSION],
+    });
+
+    const canonicalRowCount = (getDb().prepare(
+      `SELECT COUNT(*) AS n FROM task_exposure_events WHERE identity_kind = 'canonical-raw' AND fingerprint_sha256 = ?`
+    ).get(canonicalDigest) as { n: number }).n;
+    expect(canonicalRowCount).toBe(1);
   });
 
   it("rejects replay under a mutated attempt or another durable client identity", async () => {

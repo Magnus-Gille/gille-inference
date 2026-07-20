@@ -80,6 +80,13 @@ export interface DelegationTask {
   /** Authenticated gateway/MCP key alias when the caller has one. */
   keyAlias?: string | null;
   /**
+   * Authoritative canonical logical-task fingerprint (#4), taken directly from an admitted
+   * LearningTaskContract Hugin request stamp's `raw_fingerprint.digest` — the pre-context/system-
+   * wrapping identity, distinct from `prompt` (the rendered text actually sent to the model).
+   * Absent for every unstamped caller; those lanes continue to record rendered-prompt identity only.
+   */
+  canonicalTaskFingerprintSha256?: string | null;
+  /**
    * The cloud "smart" model that delegated this task. Used only for cost accounting; callers should
    * pass the real delegator model id so savings can be measured against actual spend avoided.
    */
@@ -205,6 +212,7 @@ function maybeScheduleEscalationShadow(
               lane: "delegate-shadow",
               modelId,
               harnessId: "delegate-shadow",
+              canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
             });
           }
           const sampling = resolveLocalSampling(modelId, task);
@@ -363,6 +371,7 @@ async function runSecondaryInference(
         lane: "delegate-disagreement",
         modelId: secondaryModelId,
         harnessId: "delegate-disagreement",
+        canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
       });
     }
     const sampling = resolveLocalSampling(secondaryModelId, task);
@@ -674,6 +683,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       lane: "delegate",
       modelId,
       harnessId: nodeId === "orin" ? "delegate-orin" : "delegate-local",
+      canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
     });
   }
   const runLocalOnce = async (): Promise<LocalInferenceResult> => {
