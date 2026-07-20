@@ -1,0 +1,23 @@
+[
+  {
+    "name": "post-clamp sampling mutation invalidates digest",
+    "source_ref": "source-doc:sampling/fixture-model-v1",
+    "path": "/document/final/temperature",
+    "value": 0.7,
+    "expected_error": "source document digest mismatch"
+  },
+  {
+    "name": "prompt-stage mutation invalidates digest",
+    "source_ref": "source-doc:prompt/hugin-task-001",
+    "path": "/document/task_binding",
+    "value": "task-substituted",
+    "expected_error": "source document digest mismatch"
+  },
+  {
+    "name": "artifact-manifest mutation invalidates digest",
+    "source_ref": "source-doc:artifact/fixture-model-v1",
+    "path": "/document/files/0/bytes",
+    "value": 4294967297,
+    "expected_error": "source document digest mismatch"
+  }
+]

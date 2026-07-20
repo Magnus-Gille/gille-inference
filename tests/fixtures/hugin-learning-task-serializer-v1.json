@@ -1,6 +1,6 @@
 {
   "fixture_status": "real-hugin-serializer",
-  "contract_source": "Magnus-Gille/grimnir@032acc9:docs/learning-task-contract-v1.schema.json",
+  "contract_source": "Magnus-Gille/grimnir@bc8cf09:docs/learning-task-contract-v1.schema.json",
   "producer_source": "Magnus-Gille/hugin#240:buildHomeserverRequestBody",
   "consumer_target": "Magnus-Gille/gille-inference#2:/delegate.learningTaskStamp",
   "raw_logical_task": "  Summarize the fixture incident report.\n",
