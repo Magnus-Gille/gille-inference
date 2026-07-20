@@ -473,6 +473,17 @@ function clamp01(n: number): number {
 }
 
 /**
+ * The verdict↔score band boundaries. Single source of truth so parseJudgeVerdict's clamp and
+ * bandVerdictFromScore's inverse can never drift apart (#6 calibration harness needs the inverse:
+ * see below). `pass` >= 0.7, `partial` in [0.3, 0.7), `fail` < 0.3.
+ */
+const VERDICT_SCORE_BANDS: ReadonlyArray<[JudgeVerdict["verdict"], number, number]> = [
+  ["pass", 0.7, 1],
+  ["partial", 0.3, 0.7],
+  ["fail", 0, 0.3],
+];
+
+/**
  * Parse the judge's JSON verdict. Robust to surrounding prose/fences. Returns null when the output
  * has no usable verdict — the caller then SKIPS the row rather than recording a spurious `fail`
  * (a judge that couldn't answer is a judge error, not model evidence). `score` is derived from the
@@ -497,9 +508,28 @@ export function parseJudgeVerdict(text: string): JudgeVerdict | null {
   // "pass" can't be stored with score 0.1 (or a "fail" with 0.9). Default from the verdict.
   const defaultScore = v === "pass" ? 1 : v === "partial" ? 0.5 : 0;
   const rawScore = typeof o["score"] === "number" ? clamp01(o["score"]) : defaultScore;
-  const band: [number, number] = v === "pass" ? [0.7, 1] : v === "partial" ? [0.3, 0.7] : [0, 0.3];
-  const score = Math.max(band[0], Math.min(band[1], rawScore));
+  const band = VERDICT_SCORE_BANDS.find(([name]) => name === v)!;
+  const score = Math.max(band[1], Math.min(band[2], rawScore));
   return { verdict: v, score, reason };
+}
+
+/**
+ * Inverse of the verdict→score clamp above: recover the verdict BAND a stored `score` belongs to.
+ * Exists for the calibration harness (#6): a `harvest-shadow` ledger row's outcome is always
+ * `unverified` (zero routing impact by design — see this module's doc comment), so the judge's
+ * INTENDED verdict is not directly queryable from `outcome`. It IS queryable content-blind from the
+ * numeric `score` column (written for both shadow and on-mode rows — see harvestRecord's `base`),
+ * without parsing the free-text `notes` field (which the calibration harness must never read — see
+ * calibration-sample.ts's content-blindness rule). Boundaries are shared with parseJudgeVerdict via
+ * VERDICT_SCORE_BANDS, so this can never disagree with what was actually written.
+ */
+export function bandVerdictFromScore(score: number): JudgeVerdict["verdict"] | null {
+  if (!Number.isFinite(score)) return null;
+  const clamped = clamp01(score);
+  for (const [name, lo, hi] of VERDICT_SCORE_BANDS) {
+    if (clamped >= lo && clamped <= hi) return name;
+  }
+  return null;
 }
 
 // ─── Judge response classification (pure) ────────────────────────────────────────────

@@ -1255,3 +1255,109 @@ export function gateFireRate(mode?: "off" | "shadow" | "on"): GateFireRateResult
     .get(mode !== undefined ? { mode } : {}) as { gated: number; wouldEscalate: number; secondaryErrors: number };
   return { ...row, rate: row.gated > 0 ? row.wouldEscalate / row.gated : 0 };
 }
+
+// ─── Content-blind calibration sample rows (#6) ──────────────────────────────────
+//
+// The harvest-judge calibration harness (src/homeserver/calibration-*.ts) needs to draw a
+// stratified sample of REAL ledger evidence — but the calibration artifacts it produces (sample
+// specs, joined metrics, the HOLD/GO gate decision) must never carry raw task text, so this reader
+// deliberately selects a NARROW, structured, already-content-blind column set: no `prompt_hash`
+// (a hash is still a correlatable content fingerprint an operator should not need for calibration),
+// no `prompt_excerpt`, no `notes` (free text — harvest.ts's shadow rows encode the judge's intended
+// verdict there as prose). The judge's intended verdict on a `harvest-shadow` row (outcome is always
+// `unverified` by design — zero routing impact) is instead recovered content-blind from the numeric
+// `score` column via harvest.ts's bandVerdictFromScore, which the calibration metrics module uses.
+
+export interface CalibrationSampleRow {
+  /** Ledger row id — an opaque identifier, not content. Lets a joined Quality Receipt bind here. */
+  id: string;
+  ts: string;
+  nodeId: "m5" | "orin";
+  taskType: string;
+  modelId: string;
+  outcome: string;
+  verifier: string | null;
+  verifierKind: VerifierKind;
+  /** Structured size signal for the prompt-size stratum — never the text itself. */
+  promptTokens: number | null;
+  /** Delegation source ("harvest" | "harvest-shadow" | "probe" | "gateway" | ...) — the closest
+   *  content-blind proxy this ledger has for "harness surface" until #5's harness identity field
+   *  is populated on every row (today mostly `unknown` on legacy rows). */
+  source: string | null;
+  /** #4/#257 exposure lane mirror, or null when the row predates evidence-identity (#5). */
+  lane: EvidenceLane | "unknown" | null;
+  /** #5 content-addressed identity hash — the immutable key calibration strata are keyed by. */
+  evidenceIdentityHash: string | null;
+  /** #217 judge grading-policy epoch stamp, or null for pre-epoch/non-judge evidence. */
+  judgePolicy: string | null;
+  shadow: boolean;
+  /** Judge score in [0,1] when this row is judge-graded evidence (harvest or harvest-shadow); null
+   *  otherwise. Content-blind — a number, not text. */
+  score: number | null;
+}
+
+interface CalibrationSampleDbRow {
+  id: string;
+  ts: string;
+  nodeId: "m5" | "orin";
+  taskType: string;
+  modelId: string;
+  outcome: string;
+  verifier: string | null;
+  promptTokens: number | null;
+  source: string | null;
+  lane: string | null;
+  evidenceIdentityHash: string | null;
+  judgePolicy: string | null;
+  shadow: 0 | 1;
+  score: number | null;
+}
+
+/**
+ * Read-only, content-blind evidence rows for the calibration harness. Includes `unverified` rows
+ * (unlike getVerdict/getLaneEvidence) because `harvest-shadow` evidence — the exact population the
+ * harness exists to calibrate BEFORE it can affect routing — is always written as `unverified`.
+ * Superseded rows (#217 rejudge) are excluded: a superseded verdict is not current evidence.
+ */
+export function listCalibrationSampleRows(
+  opts?: EvidenceReadOpts & { since?: string; limit?: number }
+): CalibrationSampleRow[] {
+  const db = ledgerDb();
+  const clauses = ["superseded_at IS NULL"];
+  const params: Record<string, string | number> = {};
+  if (!opts?.includeShadow) clauses.push("shadow = 0");
+  if (opts?.since) {
+    clauses.push("ts >= @since");
+    params["since"] = opts.since;
+  }
+  const limitClause = opts?.limit ? " LIMIT @limit" : "";
+  if (opts?.limit) params["limit"] = opts.limit;
+  const rows = db
+    .prepare(
+      `SELECT id, ts, node_id AS nodeId, task_type AS taskType, model_id AS modelId, outcome,
+              verifier, prompt_tokens AS promptTokens, source, evidence_lane AS lane,
+              evidence_identity_hash AS evidenceIdentityHash, judge_policy AS judgePolicy, shadow,
+              score
+       FROM delegations
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY ts ASC${limitClause}`
+    )
+    .all(params) as CalibrationSampleDbRow[];
+  return rows.map((r) => ({
+    id: r.id,
+    ts: r.ts,
+    nodeId: r.nodeId,
+    taskType: r.taskType,
+    modelId: r.modelId,
+    outcome: r.outcome,
+    verifier: r.verifier,
+    verifierKind: classifyVerifierKind(r.verifier),
+    promptTokens: r.promptTokens,
+    source: r.source,
+    lane: (r.lane as EvidenceLane | null) ?? (r.evidenceIdentityHash ? "unknown" : null),
+    evidenceIdentityHash: r.evidenceIdentityHash,
+    judgePolicy: r.judgePolicy,
+    shadow: r.shadow === 1,
+    score: r.score,
+  }));
+}
