@@ -43,7 +43,7 @@ import { manualRollback, deleteTableAndReload, adoptRoutingTable, approveArtifac
 import type { RoutingTableDoc } from "../src/homeserver/routing-table-generator.js";
 import type { AdoptDeps, ReloadOutcome } from "../src/homeserver/routing-lifecycle.js";
 import type { CalibrationGateDecision } from "../src/homeserver/calibration-gate.js";
-import { contentDigest } from "../src/homeserver/evidence-identity.js";
+import { contentDigest, tableContentHash } from "../src/homeserver/evidence-identity.js";
 
 const NOW = "2026-07-21T00:00:00.000Z";
 
@@ -254,7 +254,12 @@ describe("Finding 2 — the watchdog claims (CAS) a record for reverting BEFORE 
     record = recordAdoptionForWatch({
       dataDir,
       adoptedAt: "2026-07-20T00:00:00.000Z",
-      candidateHash: "h-breach",
+      // Round 7 finding 1: `candidateHash` must be the REAL content hash of the live table
+      // (`badRaw`) — `classifyLiveTable` now compares it against the live table before any revert
+      // is attempted, and a placeholder string here would misclassify this record as "superseded"
+      // (matches neither candidate nor snapshot), short-circuiting the very claim-before-act
+      // behavior this test exists to prove.
+      candidateHash: tableContentHash(badRaw),
       decisionRef: "r",
       approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
       changedTaskTypes: ["classify"],

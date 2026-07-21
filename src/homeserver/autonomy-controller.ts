@@ -730,6 +730,14 @@ export async function reconcileAdoptionIntent(
         // ("aborted"); keep the intent "pending" so the next tick retries the restore rather than
         // certifying a recovery that never actually happened. "Failure-marked" (never silently
         // dropped): the attempt itself is now visible on the durable record.
+        //
+        // Round 7 follow-up (b): fence/revalidate THIS save too, exactly like every terminal save
+        // below — without this check, a reconciler whose lease went stale mid-rollback-attempt could
+        // still overwrite a NEWER terminal resolution (e.g. a fresh-lease reconciler that already
+        // finalized/aborted this same intent while this call's rollback was in flight) with a stale
+        // "still retrying" failure mark.
+        const stillCurrent = assertStillCurrentOrDefer();
+        if (stillCurrent !== true) return stillCurrent;
         saveAdoptionIntent(dataDir, {
           ...intent,
           restoreAttempts: (intent.restoreAttempts ?? 0) + 1,
@@ -1507,6 +1515,10 @@ export async function runAutonomyTick(
     const checked = loadAnchoredEnablementChecked(deps.dataDir);
     if (checked.warning) warnings.push(checked.warning);
   }
+  // Round 7 finding 1: surface the watchdog's own non-fatal warnings (e.g. a record resolved
+  // "superseded" — a newer legitimate adoption was found live, so no rollback was attempted) on
+  // this same tick-level observability surface, never gating any in-tick decision on their own.
+  warnings.push(...watch.warnings);
 
   // 1.5 ACKNOWLEDGE + DEMOTE (finding 5, round 1): reconcile every breach not yet acknowledged by
   // the tier ladder, from BOTH signals — not just the DURABLE "breach" status, and not just THIS

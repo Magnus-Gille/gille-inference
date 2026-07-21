@@ -173,7 +173,12 @@ describe("Finding 1 (CRITICAL) — stale snapshot across WATCH", () => {
     recordAdoptionForWatch({
       dataDir,
       adoptedAt: "2026-07-17T00:00:00.000Z", // well before NOW — window (1h) completes
-      candidateHash: "h-prior-extract",
+      // Round 7 finding 1: `candidateHash` must be the REAL content hash of the live table at the
+      // time WATCH evaluates this record (`initialTable`, unchanged for "extract" since this
+      // record's adoption) — `classifyLiveTable` now compares it against the live table before any
+      // revert is attempted, and a placeholder string here would misclassify this record as
+      // "superseded", skipping the very revert this test exists to prove happens.
+      candidateHash: tableContentHash(initialTable),
       decisionRef: "r",
       approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
       changedTaskTypes: ["extract"],

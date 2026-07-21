@@ -475,7 +475,15 @@ export interface ReloadOutcome {
   error?: string;
 }
 
-export type ReloadFn = () => Promise<ReloadOutcome> | ReloadOutcome;
+/**
+ * Round 7 follow-up (a): accepts an optional `AbortSignal` so `reloadAndRenew`'s timeout branch can
+ * actually CANCEL the losing reload attempt, not just stop waiting on it. A bare `Promise.race`
+ * (the pre-round-7 shape) never cancels its loser — an unbounded/slow `fetch` kept running in the
+ * background even after the timeout branch "won", wasting a connection and risking a late,
+ * unobserved side effect. Implementations that ignore the signal (e.g. test fakes) remain valid;
+ * the parameter is additive.
+ */
+export type ReloadFn = (signal?: AbortSignal) => Promise<ReloadOutcome> | ReloadOutcome;
 
 export interface AdoptDeps {
   tablePath: string;
@@ -599,14 +607,26 @@ const DEFAULT_RELOAD_TIMEOUT_MS = 30_000;
  * in THIS SAME call (e.g. a canary-failure rollback). Renewal is best-effort and never throws: if
  * the token has already been superseded, the renewal is simply a no-op — the NEXT `fencedWrite` in
  * this call correctly refuses with `MutationLockStaleError` regardless of whether renewal ran.
+ *
+ * Exported (round 7 follow-up (a)) so its `AbortController`-on-timeout behavior is directly unit
+ * testable with a short `timeoutMs`, rather than only reachable through `manualRollback`/
+ * `adoptRoutingTable`'s fixed 30s default.
  */
-async function reloadAndRenew(deps: AdoptDeps, timeoutMs = DEFAULT_RELOAD_TIMEOUT_MS): Promise<ReloadOutcome> {
+export async function reloadAndRenew(deps: AdoptDeps, timeoutMs = DEFAULT_RELOAD_TIMEOUT_MS): Promise<ReloadOutcome> {
+  // Round 7 follow-up (a): a real `AbortController` wired to the timeout, not just `Promise.race` —
+  // `Promise.race` alone never cancels its loser; the losing `deps.reload()` call would keep running
+  // (and could still "land late", e.g. writing something or holding a socket open) even after this
+  // function had already returned a timeout failure to its caller.
+  const controller = new AbortController();
   let result: ReloadOutcome;
   try {
     result = await Promise.race([
-      Promise.resolve(deps.reload()),
+      Promise.resolve(deps.reload(controller.signal)),
       new Promise<ReloadOutcome>((resolve) => {
-        setTimeout(() => resolve({ ok: false, error: `gateway reload timed out after ${timeoutMs}ms` }), timeoutMs).unref?.();
+        setTimeout(() => {
+          controller.abort();
+          resolve({ ok: false, error: `gateway reload timed out after ${timeoutMs}ms` });
+        }, timeoutMs).unref?.();
       }),
     ]);
   } catch (err) {

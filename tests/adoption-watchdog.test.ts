@@ -28,6 +28,7 @@ import {
   type WatchdogRunnerDeps,
 } from "../src/homeserver/adoption-watchdog.js";
 import type { AdoptDeps, ReloadOutcome } from "../src/homeserver/routing-lifecycle.js";
+import { tableContentHash } from "../src/homeserver/evidence-identity.js";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────────
 
@@ -328,7 +329,13 @@ function seedPendingRecord(dataDir: string) {
   return recordAdoptionForWatch({
     dataDir,
     adoptedAt: ADOPTED_AT,
-    candidateHash: "sha256:candidate1",
+    // Round 7 finding 1: `candidateHash` is now load-bearing — `classifyLiveTable` compares it
+    // against the LIVE table's actual content hash to distinguish "still the candidate that
+    // regressed" from "superseded by a newer adoption". Every breach-path test in this file seeds
+    // `fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE })` as the live table, so this must be the
+    // REAL hash of that exact content (a placeholder string here would misclassify every one of
+    // those runs as "superseded" and silently skip the revert this suite exists to exercise).
+    candidateHash: tableContentHash(BAD_CANDIDATE_TABLE),
     decisionRef: "grimnir#88",
     approvedBy: "magnus",
     changedTaskTypes: ["classify"],

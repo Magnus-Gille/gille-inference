@@ -333,8 +333,15 @@ export interface AdoptionWatchRecord {
    * and only record the outcome afterward, so a crash mid-revert left the record `"pending"` with
    * no trace that a revert was ever attempted, and the NEXT watch run would blindly attempt it
    * AGAIN (a double revert / double gateway-reload call). See `revertingToken`/`revertingAt`.
+   *
+   * Round 7 finding 1: `"superseded"` is a SECOND new terminal state — a revert (or its recovery)
+   * that finds the live table matches NEITHER this record's candidate NOR its snapshot means a
+   * NEWER legitimate adoption is live; rolling back over it would clobber that newer work. This
+   * record's breach evidence is resolved as `"superseded"` (never `"breach"`) with ZERO table
+   * mutation — the axis is still quarantined (the OLD candidate genuinely regressed), but nothing
+   * is written to the routing table.
    */
-  status: "pending" | "reverting" | "healthy" | "breach" | "inconclusive";
+  status: "pending" | "reverting" | "healthy" | "breach" | "inconclusive" | "superseded";
   lastEvaluatedAt: string | null;
   /** Structured provenance — see `AdoptionProvenance`'s doc comment. Absent on legacy records
    *  (treat as `"manual"`). */
@@ -359,6 +366,17 @@ export interface AdoptionWatchRecord {
    */
   revertingToken?: number;
   revertingAt?: string;
+  /**
+   * Round 7 finding 2: "incomplete revert must not finalize" — a restore-write, reload, or
+   * confirmation (canary) failure keeps the record `"reverting"` (retriable) rather than the prior
+   * behavior of finalizing to `"breach"` unconditionally. These three fields are the watchdog's
+   * counterpart of `AdoptionIntent.restoreAttempts`/`lastRestoreAttemptAt`/`lastRestoreError` — a
+   * failed attempt is "failure-marked" (visible on the durable record) rather than silently retried
+   * with no trace, or worse, silently certified as resolved.
+   */
+  revertAttempts?: number;
+  lastRevertAttemptAt?: string;
+  lastRevertError?: string;
 }
 
 export interface WatchdogState {
@@ -428,6 +446,9 @@ interface WatchRecordRow {
   intent_id: string | null;
   reverting_token: number | null;
   reverting_at: string | null;
+  revert_attempts: number | null;
+  last_revert_attempt_at: string | null;
+  last_revert_error: string | null;
 }
 
 interface QuarantineRow {
@@ -455,6 +476,9 @@ function rowToRecord(row: WatchRecordRow): AdoptionWatchRecord {
     ...(row.intent_id ? { intentId: row.intent_id } : {}),
     ...(row.reverting_token !== null ? { revertingToken: row.reverting_token } : {}),
     ...(row.reverting_at !== null ? { revertingAt: row.reverting_at } : {}),
+    ...(row.revert_attempts !== null ? { revertAttempts: row.revert_attempts } : {}),
+    ...(row.last_revert_attempt_at !== null ? { lastRevertAttemptAt: row.last_revert_attempt_at } : {}),
+    ...(row.last_revert_error !== null ? { lastRevertError: row.last_revert_error } : {}),
   };
 }
 
@@ -473,6 +497,9 @@ function recordToRowParams(r: AdoptionWatchRecord) {
     intent_id: r.intentId ?? null,
     reverting_token: r.revertingToken ?? null,
     reverting_at: r.revertingAt ?? null,
+    revert_attempts: r.revertAttempts ?? null,
+    last_revert_attempt_at: r.lastRevertAttemptAt ?? null,
+    last_revert_error: r.lastRevertError ?? null,
   };
 }
 
@@ -502,14 +529,15 @@ function quarantineToRowParams(r: QuarantineRecord) {
 
 const UPSERT_RECORD_SQL = `
   INSERT INTO adoption_watch_records
-    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id, reverting_token, reverting_at)
+    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id, reverting_token, reverting_at, revert_attempts, last_revert_attempt_at, last_revert_error)
   VALUES
-    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id, @reverting_token, @reverting_at)
+    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id, @reverting_token, @reverting_at, @revert_attempts, @last_revert_attempt_at, @last_revert_error)
   ON CONFLICT(id) DO UPDATE SET
     adopted_at = excluded.adopted_at, candidate_hash = excluded.candidate_hash, decision_ref = excluded.decision_ref,
     approved_by = excluded.approved_by, changed_task_types = excluded.changed_task_types, snapshot_path = excluded.snapshot_path,
     status = excluded.status, last_evaluated_at = excluded.last_evaluated_at, provenance = excluded.provenance, intent_id = excluded.intent_id,
-    reverting_token = excluded.reverting_token, reverting_at = excluded.reverting_at
+    reverting_token = excluded.reverting_token, reverting_at = excluded.reverting_at,
+    revert_attempts = excluded.revert_attempts, last_revert_attempt_at = excluded.last_revert_attempt_at, last_revert_error = excluded.last_revert_error
 `;
 
 const UPSERT_QUARANTINE_SQL = `
@@ -556,12 +584,15 @@ const adoptionWatchRecordSchema = z.object({
   approvedBy: z.string().min(1),
   changedTaskTypes: z.array(z.string().min(1)),
   snapshotPath: z.string().min(1).nullable(),
-  status: z.enum(["pending", "reverting", "healthy", "breach", "inconclusive"]),
+  status: z.enum(["pending", "reverting", "healthy", "breach", "inconclusive", "superseded"]),
   lastEvaluatedAt: z.string().min(1).nullable(),
   provenance: adoptionProvenanceSchema.optional(),
   intentId: z.string().min(1).optional(),
   revertingToken: z.number().optional(),
   revertingAt: z.string().min(1).optional(),
+  revertAttempts: z.number().optional(),
+  lastRevertAttemptAt: z.string().min(1).optional(),
+  lastRevertError: z.string().min(1).optional(),
 }) satisfies z.ZodType<AdoptionWatchRecord>;
 
 const watchdogStateSchema = z.object({
@@ -665,6 +696,10 @@ function ensureRevertingColumns(db: Database.Database): void {
   const names = new Set(cols.map((c) => c.name));
   if (!names.has("reverting_token")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN reverting_token INTEGER`);
   if (!names.has("reverting_at")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN reverting_at TEXT`);
+  // Round 7 finding 2.
+  if (!names.has("revert_attempts")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN revert_attempts INTEGER`);
+  if (!names.has("last_revert_attempt_at")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN last_revert_attempt_at TEXT`);
+  if (!names.has("last_revert_error")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN last_revert_error TEXT`);
 }
 
 function openWatchdogDb(dataDir: string): Database.Database {
@@ -687,7 +722,10 @@ function openWatchdogDb(dataDir: string): Database.Database {
         provenance         TEXT,
         intent_id          TEXT,
         reverting_token    INTEGER,
-        reverting_at       TEXT
+        reverting_at       TEXT,
+        revert_attempts        INTEGER,
+        last_revert_attempt_at TEXT,
+        last_revert_error      TEXT
       );
       CREATE TABLE IF NOT EXISTS quarantine_entries (
         task_type                        TEXT PRIMARY KEY,
@@ -865,7 +903,9 @@ export function recordAdoptionForWatch(p: {
 
 // ─── Durable watchdog events (audit trail) ────────────────────────────────────────
 
-export type WatchdogAction = "none" | "would-revert" | "reverted";
+/** Round 7 finding 1: `"superseded"` — resolved without any table mutation because a newer
+ *  legitimate adoption was found live; see `AdoptionWatchRecord.status`'s doc comment. */
+export type WatchdogAction = "none" | "would-revert" | "reverted" | "superseded";
 
 export interface WatchdogRevertResult {
   status:
@@ -877,7 +917,16 @@ export interface WatchdogRevertResult {
      *  held the mutation lease at the moment this breach was detected (round 4 finding 3) — the
      *  revert was deliberately NOT attempted rather than racing it. The record is left `"pending"`
      *  (never resolved to `"breach"`) so the NEXT watch run re-detects and reverts it for real. */
-    | "skipped-lock-busy";
+    | "skipped-lock-busy"
+    /** Round 7 finding 1: the live table matched NEITHER this record's candidate NOR its snapshot —
+     *  a newer legitimate adoption is live. NO table mutation was attempted; the record resolves to
+     *  the terminal `"superseded"` status instead (quarantine still applies to the axis). */
+    | "superseded"
+    /** Round 7 finding 2: the restore write and reload both succeeded, but the canary could not
+     *  CONFIRM the revert took effect (or did not run at all) — "incomplete revert must not
+     *  finalize": the record stays `"reverting"` (retriable), never terminal `"breach"`, until
+     *  write AND reload AND confirmation all succeed. */
+    | "restored-unconfirmed";
   rollback?: RollbackRecord;
   canary?: CanaryOutcome;
 }
@@ -935,6 +984,10 @@ export interface WatchRunReport {
   dryRun: boolean;
   killSwitchActive: boolean;
   items: WatchRunReportItem[];
+  /** Round 7 finding 1: non-fatal observability warnings — e.g. a record resolved as `"superseded"`
+   *  (a newer legitimate adoption was found live, so no rollback was attempted). Never gates any
+   *  in-tick decision; merged into `AutonomyTickReport.warnings` by the caller. */
+  warnings: string[];
 }
 
 function readPassRateForTaskType(snapshotPath: string | null, taskType: string): number | null {
@@ -1106,12 +1159,95 @@ function quarantineEntriesFor(
 }
 
 /**
+ * Round 7 finding 1: before ANY restore (a fresh breach revert OR a stuck-row recovery retry),
+ * classify what the LIVE table currently holds relative to THIS record:
+ *   - `"matches-candidate"` — the live table still holds what this record's own adoption wrote —
+ *     the ordinary case; a revert is exactly the intended, safe corrective action.
+ *   - `"matches-snapshot"` — the live table already holds the PRE-adoption snapshot — a revert
+ *     write already landed (e.g. a crashed prior attempt), but reload/confirmation may not have.
+ *   - `"superseded"` — the live table matches NEITHER: a NEWER legitimate adoption is live. A full-
+ *     table rollback here would clobber that newer, unrelated work. NEVER roll back in this case.
+ */
+function classifyLiveTable(liveRaw: string | null, candidateHash: string, snapshotRaw: string): "matches-candidate" | "matches-snapshot" | "superseded" {
+  const liveHash = tableContentHash(liveRaw);
+  if (liveHash === candidateHash) return "matches-candidate";
+  if (liveHash === tableContentHash(snapshotRaw)) return "matches-snapshot";
+  return "superseded";
+}
+
+/**
+ * Round 7 finding 2: "incomplete revert must not finalize" — records a failed/unconfirmed revert
+ * ATTEMPT (attempt count, timestamp, error) WITHOUT transitioning status away from `"reverting"`.
+ * Guarded by the SAME claim token, so a since-superseded claim cannot mark an attempt against a row
+ * some OTHER holder now owns. Mirrors `AdoptionIntent.restoreAttempts`'s failure-marking pattern.
+ */
+function markRevertAttemptFailed(p: {
+  dataDir: string;
+  recordId: string;
+  claimToken: number;
+  attemptAt: string;
+  error: string;
+  /** Round 6's "quarantine every breaching axis regardless of revert quality — the breach itself
+   *  is the trigger; a failed restore-write does not make the axis any MORE trustworthy" applies
+   *  here too: an incomplete/failed revert attempt still quarantines, it just does not FINALIZE the
+   *  record. Upserted by task_type (`UPSERT_QUARANTINE_SQL`), so retried attempts across multiple
+   *  ticks safely re-write the SAME rows rather than duplicating them. */
+  quarantineEntries?: QuarantineRecord[];
+}): boolean {
+  const db = openWatchdogDb(p.dataDir);
+  try {
+    const insertQuarantine = p.quarantineEntries && p.quarantineEntries.length > 0 ? db.prepare(UPSERT_QUARANTINE_SQL) : null;
+    const commit = db.transaction((): boolean => {
+      const result = db
+        .prepare(
+          `UPDATE adoption_watch_records SET revert_attempts = COALESCE(revert_attempts, 0) + 1, last_revert_attempt_at = ?, last_revert_error = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ?`
+        )
+        .run(p.attemptAt, p.error, p.recordId, p.claimToken);
+      if (result.changes > 0 && insertQuarantine) {
+        for (const q of p.quarantineEntries!) insertQuarantine.run(quarantineToRowParams(q));
+      }
+      return result.changes > 0;
+    });
+    return commit.immediate();
+  } finally {
+    db.close();
+  }
+}
+
+function describeIncompleteRevert(rollback: RollbackRecord, canary: CanaryOutcome | undefined): string {
+  if (!rollback.restoreWriteOk) return `restore write failed: ${rollback.reason}`;
+  if (!rollback.reloadOk) return `reload failed after restore write: ${rollback.reason}`;
+  if (!canary) return "restore write + reload succeeded but the canary could not run to confirm";
+  if (!canary.ok) {
+    return `restore write + reload succeeded but canary did NOT confirm: ${canary.checks
+      .filter((c) => !c.ok)
+      .map((c) => `${c.taskType}: ${c.detail}`)
+      .join("; ")}`;
+  }
+  return "unknown incomplete state"; // unreachable in practice — confirmed cases never reach this describer
+}
+
+/**
  * Round 6 finding 2: performs the external rollback action for ONE breaching record, but ONLY after
  * winning the CAS claim (`fromStatus -> "reverting"`) — "watchdog acts before claiming" is exactly
- * the bug this closes: the CAS now happens BEFORE `manualRollback`, not after. A stale-lease refusal
- * inside the fenced write (round 6 finding 1: "a stale holder must never roll back") leaves the
- * record claimed-but-unresolved (`"reverting"`, never finalized) for the NEXT run's recovery path to
- * pick up — never finalized as if the revert had actually happened.
+ * the bug this closes: the CAS now happens BEFORE `manualRollback`, not after.
+ *
+ * Round 7 finding 1: immediately after claiming (and BEFORE any restore action), the live table is
+ * classified against this record's candidate/snapshot (`classifyLiveTable`). A `"superseded"`
+ * result means a NEWER legitimate adoption is live — this function NEVER rolls back in that case;
+ * it resolves the record to the terminal `"superseded"` status with ZERO table mutation (quarantine
+ * still applies to the axis) and surfaces a warning. Otherwise (still matches the candidate, OR
+ * already matches the snapshot from an earlier crashed attempt) it proceeds with the SAME
+ * `manualRollback` call either way — re-writing bytes that are already present is a safe no-op, and
+ * critically this means reload+canary ALWAYS run regardless of whether the write itself was a
+ * no-op (round 7 finding 2: "the gateway caches the table; disk state alone proves nothing about
+ * what's being served").
+ *
+ * Round 7 finding 2: finalizes to terminal `"breach"` ONLY when the restore write AND reload AND
+ * canary confirmation ALL succeeded. Anything less (a stale-lease refusal, a failed write, a failed
+ * reload, or a reload that succeeded without canary confirmation) leaves the record `"reverting"`
+ * (retriable) and records the attempt via `markRevertAttemptFailed` — never finalized as if the
+ * revert had actually, confirmedly happened.
  */
 async function performRevertAndFinalize(p: {
   deps: WatchdogRunnerDeps;
@@ -1128,6 +1264,7 @@ async function performRevertAndFinalize(p: {
   revert?: WatchdogRevertResult;
   newStatus: AdoptionWatchRecord["status"];
   quarantined: string[];
+  warning?: string;
 }> {
   const { deps, policy, record, breachingTaskTypes, now, lockToken, fromStatus, dryRun } = p;
 
@@ -1144,8 +1281,55 @@ async function performRevertAndFinalize(p: {
     return { claimed: false, action: "none", newStatus: record.status, quarantined: [] };
   }
 
-  const snapshotRaw = readFileSync(record.snapshotPath as string, "utf8");
-  // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token.
+  if (record.snapshotPath === null) {
+    // No snapshot to compare against or restore from (first-ever adoption) — nothing to verify or
+    // write; resolve directly, matching the ordinary `snapshotPath === null` path's own handling.
+    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
+    if (!dryRun) {
+      finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "breach", lastEvaluatedAt: now, quarantineEntries });
+    }
+    return { claimed: true, action: "reverted", revert: { status: "skipped-no-snapshot" }, newStatus: "breach", quarantined: breachingTaskTypes };
+  }
+
+  const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
+  const liveRawBeforeAction = (() => {
+    try {
+      return deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
+    } catch {
+      return null;
+    }
+  })();
+  const classification = classifyLiveTable(liveRawBeforeAction, record.candidateHash, snapshotRaw);
+
+  if (classification === "superseded") {
+    // Round 7 finding 1: a NEWER legitimate adoption is live — NEVER roll back over it. Resolve as
+    // a terminal "superseded" state with ZERO table mutation; quarantine still applies (the OLD
+    // candidate's breach evidence remains valid even though the table has since moved on).
+    const warning = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was SUPERSEDED by a newer adoption before its breach revert could run — the live table matches neither this record's candidate nor its snapshot. No rollback was attempted; quarantine still applied to [${breachingTaskTypes.join(", ")}].`;
+    const quarantineEntries = quarantineEntriesFor(
+      breachingTaskTypes,
+      now,
+      policy,
+      record,
+      " — table was superseded by a newer adoption before this revert could run; quarantine still applied, no rollback attempted"
+    );
+    if (!dryRun) {
+      finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "superseded", lastEvaluatedAt: now, quarantineEntries });
+    }
+    return {
+      claimed: true,
+      action: "superseded",
+      revert: { status: "superseded" },
+      newStatus: "superseded",
+      quarantined: breachingTaskTypes,
+      warning,
+    };
+  }
+
+  // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token. Safe to call
+  // regardless of whether the live table already matches the snapshot (classification ===
+  // "matches-snapshot") — re-writing identical bytes is a no-op, and this guarantees reload+canary
+  // ALWAYS run (round 7 finding 2), never skipped just because disk content already looked right.
   const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
   const rollback = await manualRollback({
     deps: fencedDeps,
@@ -1159,13 +1343,19 @@ async function performRevertAndFinalize(p: {
     // Round 6 finding 1: "a stale holder must never roll back" — the write was correctly refused,
     // never attempted. Do NOT finalize: leave this record claimed ("reverting") with its now-stale
     // token, an honest unresolved state + warning (the rollback record's own `reason` says so) —
-    // the NEXT watch run's recovery path detects the stale claim and re-examines it.
+    // the NEXT watch run's recovery path detects the stale claim and re-examines it. Quarantine
+    // STILL applies — the breach itself (not the revert's success) is the trigger (round 6's
+    // "quarantine regardless of revert quality", carried forward to every incomplete-revert path).
+    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — revert attempt refused (stale lease); retrying next tick");
+    if (!dryRun) {
+      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+    }
     return {
       claimed: true,
       action: "would-revert",
       revert: { status: "unknown", rollback },
       newStatus: "reverting",
-      quarantined: [],
+      quarantined: breachingTaskTypes,
     };
   }
 
@@ -1187,12 +1377,40 @@ async function performRevertAndFinalize(p: {
     }
   }
 
+  // Round 7 finding 2: terminal "breach" requires write AND reload AND CONFIRMATION (canary) — an
+  // unconfirmed (or outright failed) revert is never finalized as if it had actually happened.
   const status: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
     ? "unknown" // mirrors performRollback's own "UNKNOWN state, manual recovery required"
     : !rollback.reloadOk
       ? "restored-reload-failed"
-      : "restored";
+      : canary?.ok === true
+        ? "restored"
+        : "restored-unconfirmed";
   const revert: WatchdogRevertResult = { status, rollback, canary };
+  const confirmed = status === "restored";
+
+  if (!confirmed) {
+    // Failure-marked (never silently dropped) — status stays "reverting". Once this call's own
+    // lease is released (by the caller's `finally`), the claim naturally goes stale, and the NEXT
+    // run's recovery path re-examines this record from scratch (re-classifying superseded/
+    // matches-snapshot/matches-candidate, never assuming the prior attempt's classification still
+    // holds). Quarantine STILL applies (round 6: "the breach itself is the trigger; a failed
+    // restore-write does not make the axis any MORE trustworthy") — an incomplete revert is not a
+    // reason to leave the regressed axis eligible for further traffic while it retries.
+    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt incomplete (${describeIncompleteRevert(rollback, canary)}); retrying next tick`);
+    if (!dryRun) {
+      markRevertAttemptFailed({
+        dataDir: deps.dataDir,
+        recordId: record.id,
+        claimToken: lockToken,
+        attemptAt: now,
+        error: describeIncompleteRevert(rollback, canary),
+        quarantineEntries,
+      });
+    }
+    return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes };
+  }
+
   const newStatus: AdoptionWatchRecord["status"] = "breach";
 
   // Quarantine every breaching axis regardless of revert quality — the breach itself is the
@@ -1231,7 +1449,7 @@ async function recoverStuckReverting(
   record: AdoptionWatchRecord,
   now: string,
   dryRun: boolean
-): Promise<{ item: WatchRunReportItem; event: WatchdogEvent } | null> {
+): Promise<{ item: WatchRunReportItem; event: WatchdogEvent; warning?: string } | null> {
   let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
   try {
     lockHandle = acquireMutationLock(deps.dataDir);
@@ -1242,20 +1460,13 @@ async function recoverStuckReverting(
 
   try {
     const snapshotRaw = record.snapshotPath ? readFileSync(record.snapshotPath, "utf8") : null;
-    const liveRaw = (() => {
-      try {
-        return deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
-      } catch {
-        return null;
-      }
-    })();
-    const alreadyReverted = snapshotRaw !== null && tableContentHash(liveRaw) === tableContentHash(snapshotRaw);
     const breachingTaskTypes = record.changedTaskTypes;
 
     let action: WatchdogAction;
     let revert: WatchdogRevertResult;
     let newStatus: AdoptionWatchRecord["status"];
     let quarantined: string[] = [];
+    let warning: string | undefined;
 
     if (snapshotRaw === null) {
       // No snapshot to compare against (first-ever adoption) — nothing to verify or retry; resolve
@@ -1281,30 +1492,13 @@ async function recoverStuckReverting(
         );
         finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockHandle.token, newStatus, lastEvaluatedAt: now, quarantineEntries });
       }
-    } else if (alreadyReverted) {
-      const claimed = claimForReverting({
-        dataDir: deps.dataDir,
-        recordId: record.id,
-        fromStatus: "reverting",
-        expectedRevertingToken: record.revertingToken,
-        leaseToken: lockHandle.token,
-        nowIso: now,
-      });
-      action = "reverted";
-      revert = { status: "restored" };
-      newStatus = "breach";
-      if (claimed && !dryRun) {
-        const quarantineEntries = quarantineEntriesFor(
-          breachingTaskTypes,
-          now,
-          policy,
-          record,
-          " — recovered after a crashed revert attempt; the live table already matched the pre-breach snapshot"
-        );
-        finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockHandle.token, newStatus, lastEvaluatedAt: now, quarantineEntries });
-      }
     } else {
-      // Not yet reverted — retry the revert from scratch, re-claiming from "reverting".
+      // Round 7 findings 1+2: delegate entirely to `performRevertAndFinalize` — it now performs the
+      // SAME three-way classification (matches-candidate / matches-snapshot / superseded) and the
+      // SAME write-AND-reload-AND-confirm gate uniformly for both a first attempt and a recovery
+      // retry. This replaces the old "already reverted -> finalize without reload/confirm" shortcut
+      // (round 7 finding 2's bug: disk state alone was treated as proof, when the gateway caches the
+      // table) and the old missing supersession check (round 7 finding 1's bug) in the recovery path.
       const outcome = await performRevertAndFinalize({
         deps,
         policy,
@@ -1319,6 +1513,7 @@ async function recoverStuckReverting(
       revert = outcome.revert ?? { status: "unknown" };
       newStatus = outcome.newStatus;
       quarantined = outcome.quarantined;
+      warning = outcome.warning;
     }
 
     const event: WatchdogEvent = {
@@ -1357,6 +1552,7 @@ async function recoverStuckReverting(
         quarantined,
       },
       event,
+      warning,
     };
   } finally {
     lockHandle.release();
@@ -1373,6 +1569,10 @@ export async function runAdoptionWatch(
   const killSwitchActive = deps.killSwitchOn();
   const state = loadWatchdogState(deps.dataDir);
   const items: WatchRunReportItem[] = [];
+  // Round 7 finding 1: non-fatal observability warnings (e.g. a "superseded" resolution) collected
+  // across the whole run and surfaced on the report — merged into `AutonomyTickReport.warnings` by
+  // `runAutonomyTick`, never gating any in-tick decision on their own.
+  const warnings: string[] = [];
 
   for (const record of state.records) {
     if (record.status === "reverting") {
@@ -1382,7 +1582,10 @@ export async function runAdoptionWatch(
       }
       if (dryRun) continue; // recovery is itself a mutation; dry-run never performs it
       const recovered = await recoverStuckReverting(deps, policy, record, now, dryRun);
-      if (recovered) items.push(recovered.item);
+      if (recovered) {
+        items.push(recovered.item);
+        if (recovered.warning) warnings.push(recovered.warning);
+      }
       continue;
     }
     if (record.status !== "pending") continue; // already resolved — nothing further to do
@@ -1486,6 +1689,7 @@ export async function runAdoptionWatch(
             revert = outcome.revert;
             newStatus = outcome.newStatus;
             quarantined = outcome.quarantined;
+            if (outcome.warning) warnings.push(outcome.warning);
             // Finalize already committed (fenced, WHILE holding this lease) inside
             // performRevertAndFinalize — never re-commit via the generic path below.
             committedUnderLock = true;
@@ -1541,5 +1745,5 @@ export async function runAdoptionWatch(
     items.push({ record, evaluation, action, revert, quarantined });
   }
 
-  return { evaluatedAt: now, dryRun, killSwitchActive, items };
+  return { evaluatedAt: now, dryRun, killSwitchActive, items, warnings };
 }

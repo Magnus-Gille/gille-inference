@@ -92,6 +92,7 @@ import {
   gateAdmitsOrganicEvidence,
   type RoutingDecisionArtifact,
   type AdoptDeps,
+  type RollbackRecord,
 } from "../src/homeserver/routing-lifecycle.js";
 import {
   evaluateQuarantineGate,
@@ -374,7 +375,13 @@ export function resolveAdminKey(): string {
   return "";
 }
 
-async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok: boolean; error?: string }> {
+/**
+ * Round 7 follow-up (a): accepts the caller's `AbortSignal` (from `reloadAndRenew`'s
+ * `AbortController`, wired to its 30s timeout) and threads it into `fetch` so a losing reload
+ * attempt is actually cancelled at the network layer, not left running in the background after
+ * `reloadAndRenew` has already returned a timeout failure to its own caller.
+ */
+async function callReloadEndpoint(base: string, adminKey: string, signal?: AbortSignal): Promise<{ ok: boolean; error?: string }> {
   if (!adminKey) {
     return {
       ok: false,
@@ -389,6 +396,7 @@ async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok:
     const res = await fetch(`${base}/admin/routing-table/reload`, {
       method: "POST",
       headers: { authorization: `Bearer ${adminKey}` },
+      signal,
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -411,7 +419,7 @@ export function buildAdoptDeps(args: string[], config: HomeserverConfig, tablePa
     tablePath,
     readTable: (p) => readFileSync(p, "utf8"),
     writeTable: (p, d) => writeFileSync(p, d, "utf8"),
-    reload: () => callReloadEndpoint(base, adminKey),
+    reload: (signal) => callReloadEndpoint(base, adminKey, signal),
     servableModelIdsAfterReload: () => loadServableModelIds(),
     nowIso: () => new Date().toISOString(),
     currentPolicyEpochHash: policyEpochHash(config.policy),
@@ -631,6 +639,39 @@ export async function acquireMutationLockWithBriefRetry(
   throw lastErr;
 }
 
+/**
+ * Round 7 finding 3: "manual rollback CLI truthfulness" — the SINGLE source of truth for whether a
+ * `rollback` invocation is reported as a genuine success, extracted as a pure function so it is
+ * directly unit-testable (following the same "test the underlying function, not the CLI's `main()`
+ * entrypoint" pattern already used elsewhere in this file, e.g. `evaluateQuarantineGate`). Success
+ * (`ok: true`, exit 0, "ROLLED BACK") requires `restoreWriteOk && reloadOk` — reporting success off
+ * `reloadOk` alone (the pre-round-7 bug) could print "ROLLED BACK" when the restore write itself was
+ * refused (a stale lease) or failed outright, as long as the UNCHANGED live table happened to still
+ * reload fine.
+ */
+export function describeRollbackOutcome(record: RollbackRecord): { ok: boolean; label: "ROLLED BACK" | "REFUSED" | "INCOMPLETE"; message: string } {
+  if (record.staleLeaseRefused) {
+    return {
+      ok: false,
+      label: "REFUSED",
+      message:
+        `REFUSED — UNRESOLVED state: the restore write was refused because this command's lease was ` +
+        `no longer current (${record.reason}). The table was NOT rolled back. Re-run once you hold a ` +
+        `current lease.`,
+    };
+  }
+  if (!record.restoreWriteOk || !record.reloadOk) {
+    return {
+      ok: false,
+      label: "INCOMPLETE",
+      message:
+        `INCOMPLETE — UNRESOLVED state: ${!record.restoreWriteOk ? "restore write failed" : "reload failed after restore write"} ` +
+        `(${record.reason}). Do not treat this as a completed rollback — investigate and retry.`,
+    };
+  }
+  return { ok: true, label: "ROLLED BACK", message: `ROLLED BACK (reload ok)` };
+}
+
 async function cmdRollback(args: string[]): Promise<void> {
   const snapshotPath = readFlag(args, "--snapshot");
   const reason = readFlag(args, "--reason") ?? "manual rollback (scripts/routing-lifecycle-cli.ts rollback)";
@@ -673,8 +714,11 @@ async function cmdRollback(args: string[]): Promise<void> {
     lockHandle.release();
   }
   process.stdout.write(JSON.stringify(record, null, 2) + "\n");
-  process.stderr.write(`ROLLED BACK to ${snapshotPath} (reload ${record.reloadOk ? "ok" : "FAILED"})\n`);
-  process.exitCode = record.reloadOk ? 0 : 1;
+  // Round 7 finding 3: "manual rollback CLI truthfulness" — the exit code and message are driven
+  // ENTIRELY by `describeRollbackOutcome` (the single source of truth), never by `reloadOk` alone.
+  const outcome = describeRollbackOutcome(record);
+  process.stderr.write(`${outcome.message}${outcome.ok ? ` (snapshot: ${snapshotPath})` : ""}\n`);
+  process.exitCode = outcome.ok ? 0 : 1;
 }
 
 // ─── watch (issue #47 — post-adoption regression watchdog) ───────────────────────
@@ -729,12 +773,25 @@ async function cmdWatch(args: string[]): Promise<void> {
       }
       if (revert) process.stderr.write(`  revert: ${revert.status}\n`);
       if (quarantined.length > 0) process.stderr.write(`  quarantined: ${quarantined.join(", ")}\n`);
-      if (revert?.status === "unknown") needsAttention = true;
+      // Round 7 findings 1+2: "unknown" (a genuinely failed/refused restore) and
+      // "restored-unconfirmed" (write+reload succeeded but the canary did not confirm — record
+      // stays "reverting", retriable) both need an operator's eyes just as much as "unknown" did
+      // before. "superseded" is an honest terminal state (a newer legitimate adoption is live, no
+      // rollback was attempted) — also attention-worthy, but distinct from a failure.
+      if (revert?.status === "unknown" || revert?.status === "restored-unconfirmed" || revert?.status === "superseded") {
+        needsAttention = true;
+      }
     }
     if (evaluation.verdict === "inconclusive") {
       process.stderr.write(`  window ended without sufficient sample on: ${evaluation.perTaskType.filter((t) => t.status === "insufficient-sample").map((t) => t.taskType).join(", ")} — surfaced for review, nothing mutated.\n`);
       needsAttention = true;
     }
+  }
+
+  // Round 7 finding 1: surface the watchdog's own non-fatal warnings (e.g. a "superseded"
+  // resolution) — never gates the exit code beyond what the per-item logic above already decided.
+  for (const w of report.warnings) {
+    process.stderr.write(`  WARNING: ${w}\n`);
   }
 
   process.exitCode = needsAttention ? 1 : 0;
