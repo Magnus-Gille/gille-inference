@@ -191,6 +191,9 @@ function baseTickDeps(p: {
     review: p.review ?? baseReview(),
     queryGuardMetrics: p.queryGuardMetrics ?? (() => []),
     adoptDeps: adoptFixture.deps,
+    // None of these tests exercise an organic-dependent Tier-2 adopt attempt, so this is never
+    // actually invoked — provided anyway so a future addition doesn't hit a silent gap.
+    recomputeCalibrationGate: () => (p.review ?? baseReview()).calibrationGate,
   };
   return { deps, fs: adoptFixture.fs, tablePath: adoptFixture.tablePath };
 }
@@ -238,14 +241,17 @@ describe("evaluateStatisticalSufficiency", () => {
 });
 
 describe("computeRiskBudgetStatus / routeCooldownActive", () => {
-  it("counts only autonomous adoptions within the trailing window", () => {
+  it("counts only autonomous adoptions (structured provenance, never approvedBy text) within the trailing window", () => {
     const records = [
-      { id: "1", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h1", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["a"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null },
+      { id: "1", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h1", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["a"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null, provenance: { kind: "autonomy" as const, tier: 1 as const } },
       { id: "2", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h2", decisionRef: "r", approvedBy: "magnus", changedTaskTypes: ["b"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null },
-      { id: "3", adoptedAt: "2020-01-01T00:00:00.000Z", candidateHash: "h3", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["c"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null },
+      { id: "3", adoptedAt: "2020-01-01T00:00:00.000Z", candidateHash: "h3", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["c"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null, provenance: { kind: "autonomy" as const, tier: 1 as const } },
+      // A MANUAL record whose approvedBy happens to match the autonomy display-string convention
+      // (a human could type this via `adopt --approved-by`) — must NOT be counted (finding 7).
+      { id: "4", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h4", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["d"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null },
     ];
     const status = computeRiskBudgetStatus(records, NOW, TEST_POLICY);
-    expect(status.used).toBe(1); // only record "1" is autonomous AND within the window
+    expect(status.used).toBe(1); // only record "1" has autonomy provenance AND is within the window
     expect(status.remaining).toBe(2);
   });
 
@@ -259,6 +265,7 @@ describe("computeRiskBudgetStatus / routeCooldownActive", () => {
         approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
         changedTaskTypes: ["classify"],
         priorRaw: null,
+        provenance: { kind: "autonomy", tier: 1 },
       }),
     ];
     expect(routeCooldownActive(records, "classify", NOW, TEST_POLICY).active).toBe(true); // 24h cooldown, only 12h elapsed
@@ -417,6 +424,7 @@ describe("runAutonomyTick — each predicate failure individually blocks adoptio
         approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
         changedTaskTypes: [t],
         priorRaw: null,
+        provenance: { kind: "autonomy", tier: 1 },
       });
     }
     const report = await tierOneTick({ dataDir });
@@ -458,6 +466,7 @@ describe("runAutonomyTick — each predicate failure individually blocks adoptio
       approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
       changedTaskTypes: ["classify"],
       priorRaw: null,
+      provenance: { kind: "autonomy", tier: 1 },
     });
     const report = await tierOneTick({ dataDir });
     expect(report.adopted).toHaveLength(0);
@@ -504,6 +513,7 @@ describe("runAutonomyTick — kill switch", () => {
       approvedBy: `${AUTONOMY_APPROVER_PREFIX}2`,
       changedTaskTypes: ["extract"],
       priorRaw: ADOPTED_TABLE_JSON,
+      provenance: { kind: "autonomy", tier: 2 },
     });
 
     const { deps } = baseTickDeps({
@@ -553,6 +563,7 @@ describe("runAutonomyTick — a watchdog breach-revert demotes the tier and rese
       approvedBy: `${AUTONOMY_APPROVER_PREFIX}2`,
       changedTaskTypes: ["extract"],
       priorRaw: ADOPTED_TABLE_JSON,
+      provenance: { kind: "autonomy", tier: 2 },
     });
 
     const { deps } = baseTickDeps({
@@ -662,7 +673,7 @@ describe("runAutonomyTick — dry run", () => {
 
 describe("emptyTierState / DEFAULT_AUTONOMY_POLICY sanity", () => {
   it("starts at Tier 0 with zero healthy cycles", () => {
-    expect(emptyTierState()).toEqual({ schemaVersion: 1, tier: 0, consecutiveHealthyCycles: 0, lastCycleAt: null, lastEvent: null });
+    expect(emptyTierState()).toEqual({ schemaVersion: 1, tier: 0, consecutiveHealthyCycles: 0, lastCycleAt: null, lastEvent: null, ackedBreachIds: [] });
   });
 
   it("matches the design doc's proposed defaults (grimnir docs/autonomous-improvement-design.md §6)", () => {

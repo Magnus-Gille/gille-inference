@@ -1,17 +1,22 @@
 #!/usr/bin/env tsx
 /**
  * autonomy-tick-cli.ts — the IO composition root for the autonomy controller (issue #49). One
- * idempotent cron entrypoint: WATCH (#47) → REVIEW (#7 + live #48 gate) → PREDICATES → DECIDE BY
- * TIER → ADOPT eligible axes (one at a time) → TIER LADDER → NOTIFY. All decision logic lives in
- * src/homeserver/autonomy-controller.ts (pure/DI); this script only wires it to the ledger, the
- * served-model catalogue, the filesystem, and the live gateway's reload endpoint — the exact same
- * IO surface scripts/routing-lifecycle-cli.ts already composes for the human-driven `review`/
- * `adopt`/`watch` commands (`buildAdoptDeps` is imported from there rather than re-wired here).
+ * idempotent cron entrypoint: RECONCILE any crashed prior tick's adoption intent → WATCH (#47) →
+ * ACKNOWLEDGE/DEMOTE → REVIEW (#7, live-table baseline read AFTER watch + live #48 gate) →
+ * PREDICATES → DECIDE BY TIER → ADOPT at most ONE axis → TIER LADDER → NOTIFY. All decision logic
+ * lives in src/homeserver/autonomy-controller.ts (pure/DI); this script only wires it to the
+ * ledger, the served-model catalogue, the filesystem, and the live gateway's reload endpoint — the
+ * exact same IO surface scripts/routing-lifecycle-cli.ts already composes for the human-driven
+ * `review`/`adopt`/`watch` commands (`buildAdoptDeps` is imported from there rather than re-wired
+ * here).
  *
  * Unlike `routing-lifecycle-cli.ts review`, this script NEVER accepts a `--calibration-gate
  * <path>` override — an unattended cron tick always computes the LIVE #6/#48 gate from current
  * evidence (`computeLiveCalibrationGate`, default mode "both": human receipts merged additively
- * with #48's verifier-anchored feed, exactly like the human `review` command's own default).
+ * with #48's verifier-anchored feed, exactly like the human `review` command's own default). This
+ * script also supplies `recomputeCalibrationGate` — a FRESH ledger read + gate computation invoked
+ * again by the controller immediately before any organic-dependent adopt attempt (Sol-xhigh review
+ * finding 6), never the single review-time snapshot reused stale.
  *
  * USAGE
  *   tsx scripts/autonomy-tick-cli.ts [--dry-run] [--table docs/m5-routing.json] [--data-dir ./data]
@@ -29,7 +34,7 @@
  *        after any adopt/revert/tier-change (issue #49 item 8). Never an HTTP call — the box wires
  *        Ratatoskr or anything else behind this command itself.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -40,7 +45,6 @@ import { listModels } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
 import { contentDigest } from "../src/homeserver/evidence-identity.js";
 import { routableTaskTypes } from "../src/homeserver/routing-table-generator.js";
-import type { DiffableRoutingTable } from "../src/homeserver/routing-table-diff.js";
 import { computeLiveCalibrationGate } from "../src/homeserver/calibration-gate-live.js";
 import { buildCandidatePair } from "../src/homeserver/routing-lifecycle.js";
 import { DEFAULT_WATCHDOG_POLICY } from "../src/homeserver/adoption-watchdog.js";
@@ -49,7 +53,6 @@ import {
   runAutonomyTick,
   DEFAULT_AUTONOMY_POLICY,
   type AutonomyTickDeps,
-  type AdoptedRawEntry,
 } from "../src/homeserver/autonomy-controller.js";
 
 const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
@@ -79,36 +82,6 @@ async function loadServableModelIds(): Promise<string[] | null> {
     );
     return null;
   }
-}
-
-/** Loads the currently-adopted table BOTH as the type-narrow `DiffableRoutingTable` (for the real
- *  review diff) and as a `passRate`-preserving raw map (for per-axis revert fidelity — see
- *  autonomy-controller.ts's `buildAxisArtifactInputs`). Machine-generated tables (the only kind
- *  this pipeline ever writes) carry both; a hand-edited legacy table simply yields `passRate:
- *  undefined` per entry, which `buildAxisArtifactInputs` already treats as "no fidelity info,
- *  cosmetic-only default". */
-function loadAdoptedTable(path: string): { diffable: DiffableRoutingTable | null; raw: Record<string, AdoptedRawEntry | undefined> } {
-  if (!existsSync(path)) return { diffable: null, raw: {} };
-  const raw = readFileSync(path, "utf8");
-  let parsed: { routing?: Record<string, Record<string, unknown>> };
-  try {
-    parsed = JSON.parse(raw) as typeof parsed;
-  } catch (err) {
-    throw new Error(
-      `adopted table at ${path} is corrupt (${err instanceof Error ? err.message : String(err)}) — refusing to diff against an unreadable table.`
-    );
-  }
-  const rawEntries: Record<string, AdoptedRawEntry | undefined> = {};
-  for (const [taskType, entry] of Object.entries(parsed.routing ?? {})) {
-    rawEntries[taskType] = {
-      model: typeof entry["model"] === "string" ? (entry["model"] as string) : null,
-      verdict: typeof entry["verdict"] === "string" ? (entry["verdict"] as string) : "escalate-frontier",
-      attempts: typeof entry["attempts"] === "number" ? (entry["attempts"] as number) : 0,
-      passRate: typeof entry["passRate"] === "number" ? (entry["passRate"] as number) : undefined,
-      tokPerSec: typeof entry["tokPerSec"] === "number" ? (entry["tokPerSec"] as number) : null,
-    };
-  }
-  return { diffable: parsed as DiffableRoutingTable, raw: rawEntries };
 }
 
 function policyEpochHash(policy: unknown): string {
@@ -154,7 +127,12 @@ async function main(): Promise<void> {
     servableModelIds: servableModelIds ?? undefined,
   });
 
-  const { diffable: adopted, raw: adoptedRaw } = loadAdoptedTable(tablePath);
+  // NOTE (Sol-xhigh review finding 1): the adopted routing table is deliberately NOT read here.
+  // `runAutonomyTick` re-reads the LIVE table itself, AFTER its own WATCH phase runs — reading it
+  // here (before WATCH) would hand the controller a baseline WATCH might revert/quarantine out
+  // from under, exactly the staleness bug the fix addresses. This CLI's only job for REVIEW is to
+  // supply the ledger-derived CANDIDATE (which does not depend on the adopted table at all) and the
+  // review-time #6/#48 gate snapshot.
 
   // Always the LIVE #6/#48 gate — see module header on why this CLI never accepts an override file.
   const rows = listCalibrationSampleRows({ includeShadow: true });
@@ -162,6 +140,13 @@ async function main(): Promise<void> {
 
   const epochHash = policyEpochHash(config.policy);
   const adoptDeps = buildAdoptDeps(args, config, tablePath);
+
+  // Finding 6: recompute the LIVE gate again, FRESH, at the exact moment of an organic-dependent
+  // adopt attempt — a fresh ledger read each call, never the `calibrationGate` snapshot above.
+  const recomputeCalibrationGate = () => {
+    const freshRows = listCalibrationSampleRows({ includeShadow: true });
+    return computeLiveCalibrationGate({ rows: freshRows, receipts: [], generatedAt: new Date().toISOString() });
+  };
 
   const deps: AutonomyTickDeps = {
     dataDir,
@@ -173,8 +158,6 @@ async function main(): Promise<void> {
     review: {
       candidate,
       deterministicCandidate,
-      adopted,
-      adoptedRaw,
       servableModelIds,
       requiredTaskTypes: routableTaskTypes(),
       freshnessMaxAgeMs: DEFAULT_FRESHNESS_MAX_AGE_MS,
@@ -184,6 +167,7 @@ async function main(): Promise<void> {
     },
     queryGuardMetrics: (taskTypes, sinceIso, untilIso) => guardMetricsWindow({ taskTypes, sinceIso, untilIso }),
     adoptDeps,
+    recomputeCalibrationGate,
     notify: (json) => notifyIfConfigured(json),
   };
 

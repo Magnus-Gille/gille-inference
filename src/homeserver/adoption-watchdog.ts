@@ -291,11 +291,23 @@ export function evaluateQuarantineGate(p: {
 
 // ─── Durable adoption-watch state (issue #44 discipline: lives under data/, deploy never touches it) ──
 
+/**
+ * Structured provenance (gille-inference#49, Sol-xhigh review finding 7): WHO/WHAT initiated an
+ * adoption, set ONLY by the actual caller of `recordAdoptionForWatch` — never inferred from
+ * `approvedBy` (free text a human `adopt --approved-by` invocation could type identically to the
+ * autonomy controller's own convention, e.g. `autonomy-controller:tier1`, spoofing risk-budget/
+ * revert-rate accounting). Any accounting that needs to know "was this autonomous" MUST read this
+ * field, never parse `approvedBy`. Optional/absent on records written before this field existed —
+ * treat a missing field as `"manual"` (the least-privileged classification), never upgrade it.
+ */
+export type AdoptionProvenance = { kind: "manual" } | { kind: "autonomy"; tier: 0 | 1 | 2 | 3 };
+
 export interface AdoptionWatchRecord {
   id: string;
   adoptedAt: string;
   candidateHash: string;
   decisionRef: string;
+  /** Free-text approver identity — DISPLAY ONLY. Never parsed for accounting; see `provenance`. */
   approvedBy: string;
   /** Task types whose route changed in this adoption — the affected axes the watchdog monitors. */
   changedTaskTypes: string[];
@@ -305,6 +317,9 @@ export interface AdoptionWatchRecord {
   snapshotPath: string | null;
   status: "pending" | "healthy" | "breach" | "inconclusive";
   lastEvaluatedAt: string | null;
+  /** Structured provenance — see `AdoptionProvenance`'s doc comment. Absent on legacy records
+   *  (treat as `"manual"`). */
+  provenance?: AdoptionProvenance;
 }
 
 export interface WatchdogState {
@@ -396,6 +411,10 @@ export function recordAdoptionForWatch(p: {
   /** Exact prior live-table bytes (read BEFORE the candidate write), or null when no prior table
    *  existed (first-ever adoption — nothing to snapshot). */
   priorRaw: string | null;
+  /** Structured provenance (issue #49 finding 7) — omit for a human/manual adoption (the
+   *  routing-lifecycle CLI's own `adopt` command never passes this, so its records correctly read
+   *  as `undefined`/"manual"); the autonomy controller ALWAYS passes `{kind:"autonomy", tier}`. */
+  provenance?: AdoptionProvenance;
 }): AdoptionWatchRecord {
   const { snapshotsDir } = watchdogPaths(p.dataDir);
   const id = randomUUID();
@@ -416,6 +435,7 @@ export function recordAdoptionForWatch(p: {
     snapshotPath,
     status: "pending",
     lastEvaluatedAt: null,
+    ...(p.provenance ? { provenance: p.provenance } : {}),
   };
   const state = loadWatchdogState(p.dataDir);
   state.records.push(record);
