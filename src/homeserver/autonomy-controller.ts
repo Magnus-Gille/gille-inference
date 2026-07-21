@@ -1436,6 +1436,21 @@ export interface AutonomyTickReport {
   /** Round 4 finding 10: non-fatal observability warnings (e.g. a corrupt anchored-enablement
    *  record, or a stale one that failed to revoke) — never gates any in-tick decision. */
   warnings: string[];
+  /**
+   * Round 9 finding 3: every watchdog record still durably `"reverting"` at the end of THIS tick —
+   * an unresolved revert, surfaced on EVERY tick it remains so (not just the tick it was first
+   * detected) so the suppression it triggers (`anyUnresolvedRevert`, above) is never a SILENT
+   * operational deadlock. Also included in the AUTONOMY_NOTIFY_CMD payload; the CLI exits with a
+   * distinct attention-bearing nonzero code whenever this is non-empty.
+   */
+  unresolvedReverts: Array<{
+    recordId: string;
+    candidateHash: string;
+    changedTaskTypes: string[];
+    revertAttempts: number;
+    lastRevertAttemptAt: string | null;
+    lastRevertError: string | null;
+  }>;
 }
 
 /**
@@ -1460,6 +1475,36 @@ export interface AutonomyTickReport {
  * finding 4) → NOTIFY. `AUTONOMY_KILL_SWITCH=on` suppresses adopt + promotion only (demotion/
  * reconciliation still apply); `opts.dryRun` suppresses every durable write (including the lock).
  */
+
+/**
+ * Round 8 finding 4 + round 9 follow-up (d): PURE — "is the routing table's true post-breach state
+ * NOT YET CONFIRMED", the signal that suppresses the WHOLE adopt phase this tick and forces
+ * `cycleOutcome: "unhealthy"`. True when EITHER:
+ *   - this tick's own `watch.items` surfaced a revert that did not fully confirm — `"unknown"`
+ *     (failed/refused), `"restored-unconfirmed"` (canary didn't confirm), `"restored-reload-failed"`
+ *     (reload didn't confirm), or `"skipped-lock-busy"` (round 9 follow-up (d): couldn't even be
+ *     ATTEMPTED this tick because the mutation lease was busy — exactly as unresolved as one that
+ *     WAS attempted and came back incomplete: the table's true post-breach state is unknown either
+ *     way, and an adopt on a DIFFERENT axis this same cycle would race ahead of a revert that has
+ *     not even started); OR
+ *   - ANY watchdog record is still durably `"reverting"` (genuinely in-flight elsewhere, or a stuck
+ *     claim this same tick's kill-switch path left untouched) — covers a record that isn't even in
+ *     `watch.items` this tick at all (e.g. skipped because its claim is still genuinely current).
+ * Extracted as its own exported function (rather than an inline tick-local const) so it is directly
+ * unit-testable without needing to reproduce real mutation-lease contention end-to-end.
+ */
+export function watchRunHasUnresolvedRevert(watch: Pick<WatchRunReport, "items">, watchdogRecords: readonly AdoptionWatchRecord[]): boolean {
+  return (
+    watch.items.some(
+      (i) =>
+        i.revert?.status === "unknown" ||
+        i.revert?.status === "restored-unconfirmed" ||
+        i.revert?.status === "restored-reload-failed" ||
+        i.revert?.status === "skipped-lock-busy"
+    ) || watchdogRecords.some((r) => r.status === "reverting")
+  );
+}
+
 export async function runAutonomyTick(
   deps: AutonomyTickDeps,
   opts: { dryRun?: boolean } = {}
@@ -1507,18 +1552,27 @@ export async function runAutonomyTick(
   // between here and either usage mutates `adoption_watch_records`, so one read is both cheaper and
   // more internally consistent than two separate reads of the same conceptual state.
   const watchdogRecordsSnapshot = loadWatchdogState(deps.dataDir).records;
-  // Round 8 finding 4: "unresolved reverts don't suppress" — ANY revert this tick's watch pass
-  // surfaced as still-incomplete (`"unknown"`, `"restored-unconfirmed"`, `"restored-reload-failed"`
-  // — write/reload/canary did not ALL confirm), OR any watchdog record still durably `"reverting"`
-  // (e.g. genuinely in-flight elsewhere, or a stuck claim this same tick's kill-switch/lock-busy path
-  // left untouched), means the routing table's true state is NOT YET CONFIRMED — attempting a NEW
-  // adopt on top of that is exactly the kind of "mutate before the last mutation resolved" hazard
-  // `reconcileNonterminal` already guards against; this is the SAME category, just sourced from the
-  // watchdog's revert path instead of the controller's own adopt-intent journal.
-  const anyUnresolvedRevert =
-    watch.items.some(
-      (i) => i.revert?.status === "unknown" || i.revert?.status === "restored-unconfirmed" || i.revert?.status === "restored-reload-failed"
-    ) || watchdogRecordsSnapshot.some((r) => r.status === "reverting");
+  // Round 8 finding 4 (+ round 9 follow-up (d)): "unresolved reverts don't suppress" — see
+  // `watchRunHasUnresolvedRevert`'s own doc comment for the exact signal.
+  const anyUnresolvedRevert = watchRunHasUnresolvedRevert(watch, watchdogRecordsSnapshot);
+  // Round 9 finding 3: "silent operational deadlock" — the suppression above is correct but was
+  // otherwise INVISIBLE past the first acknowledgement (no unique per-tick signal once the initial
+  // breach event had already fired once). Every durably-`"reverting"` record's own attempt-tracking
+  // fields (round 7/8's `revertAttempts`/`lastRevertAttemptAt`/`lastRevertError`) are surfaced here,
+  // on EVERY tick the record remains unresolved — in the tick report (`unresolvedReverts`, below)
+  // and in the AUTONOMY_NOTIFY_CMD payload, so an operator (or an alerting rule watching the report
+  // JSON) can see "this has been stuck for N attempts" rather than the demotion/suppression
+  // happening silently, tick after tick, with no growing signal that anything needs attention.
+  const unresolvedReverts: AutonomyTickReport["unresolvedReverts"] = watchdogRecordsSnapshot
+    .filter((r) => r.status === "reverting")
+    .map((r) => ({
+      recordId: r.id,
+      candidateHash: r.candidateHash,
+      changedTaskTypes: r.changedTaskTypes,
+      revertAttempts: r.revertAttempts ?? 0,
+      lastRevertAttemptAt: r.lastRevertAttemptAt ?? null,
+      lastRevertError: r.lastRevertError ?? null,
+    }));
 
   let tierState = loadTierState(deps.dataDir);
   // Round 6 follow-up: a LEGACY state file (pre-round-5, before `tier1EnteredAt` was tracked) that
@@ -2153,8 +2207,11 @@ export async function runAutonomyTick(
   }
 
   // 8. NOTIFICATION — content-blind summary, after any adopt/revert/tier-change/failed attempt.
+  // Round 9 finding 3: ALSO fires on every tick with an unresolved revert, even one with no other
+  // trigger this tick (no fresh breach/adopt/tier-change) — otherwise a revert stuck for many ticks
+  // in a row, past the tick it was first detected, would never notify again.
   const anyAdopted = adopted.some((a) => a.outcome.outcome === "adopted");
-  if (!dryRun && deps.notify && (anyAdopted || anyBreach || tierEvent !== null || mutationAttemptFailed)) {
+  if (!dryRun && deps.notify && (anyAdopted || anyBreach || tierEvent !== null || mutationAttemptFailed || unresolvedReverts.length > 0)) {
     const summary = {
       at: now,
       tier: { before: tierBefore, after: tierState.tier, event: tierEvent },
@@ -2164,6 +2221,8 @@ export async function runAutonomyTick(
         .filter((i) => i.evaluation.verdict === "breach")
         .flatMap((i) => i.record.changedTaskTypes),
       killSwitchActive,
+      // Round 9 finding 3: status/attempt-count/last-error for every unresolved revert, every tick.
+      unresolvedReverts,
     };
     await deps.notify(JSON.stringify(summary));
   }
@@ -2183,5 +2242,6 @@ export async function runAutonomyTick(
     healthyCycle,
     cycleOutcome,
     warnings,
+    unresolvedReverts,
   };
 }

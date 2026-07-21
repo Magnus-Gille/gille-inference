@@ -58,7 +58,7 @@ import {
   ensureLeaseTables,
   isLeaseCurrent,
 } from "./mutation-lock.js";
-import { tableContentHash } from "./evidence-identity.js";
+import { tableContentHash, isVerifiedEnoentError } from "./evidence-identity.js";
 import type { RoutingTableDoc } from "./routing-table-generator.js";
 import type { GuardMetricSnapshot } from "./ledger.js";
 
@@ -391,6 +391,32 @@ export interface AdoptionWatchRecord {
    * record can ever support; per-axis refinement is a strict enhancement, not a requirement.
    */
   candidateSnapshotPath?: string | null;
+  /**
+   * Round 9 finding 1: while a PARTIAL (per-axis) restore's WRITE has landed but reload/canary has
+   * not yet CONFIRMED it, this is `tableContentHash` of the exact merged bytes that write produced.
+   * Recovery must NOT reclassify a live table that still matches this hash — whole-table
+   * classification would read "matches neither candidate nor snapshot" and wrongly conclude
+   * "superseded", abandoning an axis that is, in fact, THIS record's own in-flight attempted merge
+   * (Sol's exact reproduction: run1 restored-reload-failed/reverting, run2 wrongly resolved
+   * superseded, reload count never advanced past 1). Set by the partial-restore attempt that produced
+   * these bytes; cleared once finalized (`finalizeReverting` always clears both fields) OR once the
+   * live table no longer matches it (someone else changed the table since — re-enter classification
+   * fresh, per the whole-table/generic-error failure-mark paths, which explicitly clear it too).
+   */
+  pendingMergeHash?: string;
+  /** The exact axes `pendingMergeHash`'s attempted merge covers — reused verbatim to retry
+   *  reload+canary confirmation of THAT exact state, never re-planned from scratch while it matches. */
+  pendingMergeAxes?: string[];
+  /**
+   * Round 9 follow-up (b): the axes that ACTUALLY breached at the moment this record was FIRST
+   * claimed for reverting — a SUBSET of `changedTaskTypes` on a "mixed axis" adoption where only some
+   * of the adopted axes regressed. Persisted (once, at the first "pending -> reverting" CAS claim) so
+   * recovery restores/quarantines exactly the axes that actually breached, never broadening to every
+   * `changedTaskTypes` the way a legacy record's conservative fallback must (absent on records
+   * predating this field, and on the manual/non-watchdog-detected paths that never go through the
+   * breach-detection loop at all).
+   */
+  breachedTaskTypes?: string[];
 }
 
 export interface WatchdogState {
@@ -468,6 +494,9 @@ interface WatchRecordRow {
   last_revert_attempt_at: string | null;
   last_revert_error: string | null;
   candidate_snapshot_path: string | null;
+  pending_merge_hash: string | null;
+  pending_merge_axes: string | null;
+  breached_task_types: string | null;
 }
 
 interface QuarantineRow {
@@ -499,6 +528,9 @@ function rowToRecord(row: WatchRecordRow): AdoptionWatchRecord {
     ...(row.last_revert_attempt_at !== null ? { lastRevertAttemptAt: row.last_revert_attempt_at } : {}),
     ...(row.last_revert_error !== null ? { lastRevertError: row.last_revert_error } : {}),
     ...(row.candidate_snapshot_path !== null ? { candidateSnapshotPath: row.candidate_snapshot_path } : {}),
+    ...(row.pending_merge_hash !== null ? { pendingMergeHash: row.pending_merge_hash } : {}),
+    ...(row.pending_merge_axes !== null ? { pendingMergeAxes: JSON.parse(row.pending_merge_axes) as string[] } : {}),
+    ...(row.breached_task_types !== null ? { breachedTaskTypes: JSON.parse(row.breached_task_types) as string[] } : {}),
   };
 }
 
@@ -521,6 +553,9 @@ function recordToRowParams(r: AdoptionWatchRecord) {
     last_revert_attempt_at: r.lastRevertAttemptAt ?? null,
     last_revert_error: r.lastRevertError ?? null,
     candidate_snapshot_path: r.candidateSnapshotPath ?? null,
+    pending_merge_hash: r.pendingMergeHash ?? null,
+    pending_merge_axes: r.pendingMergeAxes ? JSON.stringify(r.pendingMergeAxes) : null,
+    breached_task_types: r.breachedTaskTypes ? JSON.stringify(r.breachedTaskTypes) : null,
   };
 }
 
@@ -550,16 +585,18 @@ function quarantineToRowParams(r: QuarantineRecord) {
 
 const UPSERT_RECORD_SQL = `
   INSERT INTO adoption_watch_records
-    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id, reverting_token, reverting_at, revert_attempts, last_revert_attempt_at, last_revert_error, candidate_snapshot_path)
+    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id, reverting_token, reverting_at, revert_attempts, last_revert_attempt_at, last_revert_error, candidate_snapshot_path, pending_merge_hash, pending_merge_axes, breached_task_types)
   VALUES
-    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id, @reverting_token, @reverting_at, @revert_attempts, @last_revert_attempt_at, @last_revert_error, @candidate_snapshot_path)
+    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id, @reverting_token, @reverting_at, @revert_attempts, @last_revert_attempt_at, @last_revert_error, @candidate_snapshot_path, @pending_merge_hash, @pending_merge_axes, @breached_task_types)
   ON CONFLICT(id) DO UPDATE SET
     adopted_at = excluded.adopted_at, candidate_hash = excluded.candidate_hash, decision_ref = excluded.decision_ref,
     approved_by = excluded.approved_by, changed_task_types = excluded.changed_task_types, snapshot_path = excluded.snapshot_path,
     status = excluded.status, last_evaluated_at = excluded.last_evaluated_at, provenance = excluded.provenance, intent_id = excluded.intent_id,
     reverting_token = excluded.reverting_token, reverting_at = excluded.reverting_at,
     revert_attempts = excluded.revert_attempts, last_revert_attempt_at = excluded.last_revert_attempt_at, last_revert_error = excluded.last_revert_error,
-    candidate_snapshot_path = excluded.candidate_snapshot_path
+    candidate_snapshot_path = excluded.candidate_snapshot_path,
+    pending_merge_hash = excluded.pending_merge_hash, pending_merge_axes = excluded.pending_merge_axes,
+    breached_task_types = excluded.breached_task_types
 `;
 
 const UPSERT_QUARANTINE_SQL = `
@@ -616,6 +653,9 @@ const adoptionWatchRecordSchema = z.object({
   lastRevertAttemptAt: z.string().min(1).optional(),
   lastRevertError: z.string().min(1).optional(),
   candidateSnapshotPath: z.string().min(1).nullable().optional(),
+  pendingMergeHash: z.string().min(1).optional(),
+  pendingMergeAxes: z.array(z.string().min(1)).optional(),
+  breachedTaskTypes: z.array(z.string().min(1)).optional(),
 }) satisfies z.ZodType<AdoptionWatchRecord>;
 
 const watchdogStateSchema = z.object({
@@ -725,6 +765,10 @@ function ensureRevertingColumns(db: Database.Database): void {
   if (!names.has("last_revert_error")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN last_revert_error TEXT`);
   // Round 8 finding 1.
   if (!names.has("candidate_snapshot_path")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN candidate_snapshot_path TEXT`);
+  // Round 9 finding 1 + follow-up (b).
+  if (!names.has("pending_merge_hash")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN pending_merge_hash TEXT`);
+  if (!names.has("pending_merge_axes")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN pending_merge_axes TEXT`);
+  if (!names.has("breached_task_types")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN breached_task_types TEXT`);
 }
 
 function openWatchdogDb(dataDir: string): Database.Database {
@@ -751,7 +795,10 @@ function openWatchdogDb(dataDir: string): Database.Database {
         revert_attempts        INTEGER,
         last_revert_attempt_at TEXT,
         last_revert_error      TEXT,
-        candidate_snapshot_path TEXT
+        candidate_snapshot_path TEXT,
+        pending_merge_hash TEXT,
+        pending_merge_axes TEXT,
+        breached_task_types TEXT
       );
       CREATE TABLE IF NOT EXISTS quarantine_entries (
         task_type                        TEXT PRIMARY KEY,
@@ -1118,6 +1165,16 @@ function claimForReverting(p: {
   expectedRevertingToken?: number;
   leaseToken: number;
   nowIso: string;
+  /**
+   * Round 9 follow-up (b): only meaningful when `fromStatus === "pending"` (the FIRST-ever claim) —
+   * the axes that ACTUALLY breached this evaluation (a subset of `changedTaskTypes` on a "mixed
+   * axis" adoption), stamped once so recovery never has to guess/widen to the full
+   * `changedTaskTypes`. Omitted leaves the column NULL — recovery's own fallback
+   * (`breachedTaskTypes ?? changedTaskTypes`) handles a legacy record the same conservative way it
+   * always has. Never touched on a `fromStatus: "reverting"` re-claim (the value from the ORIGINAL
+   * "pending -> reverting" claim persists across recovery re-claims of the same stuck row).
+   */
+  breachedTaskTypes?: string[];
 }): boolean {
   const db = openWatchdogDb(p.dataDir);
   try {
@@ -1125,8 +1182,10 @@ function claimForReverting(p: {
       const result =
         p.fromStatus === "pending"
           ? db
-              .prepare(`UPDATE adoption_watch_records SET status = 'reverting', reverting_token = ?, reverting_at = ? WHERE id = ? AND status = 'pending'`)
-              .run(p.leaseToken, p.nowIso, p.recordId)
+              .prepare(
+                `UPDATE adoption_watch_records SET status = 'reverting', reverting_token = ?, reverting_at = ?, breached_task_types = ? WHERE id = ? AND status = 'pending'`
+              )
+              .run(p.leaseToken, p.nowIso, p.breachedTaskTypes ? JSON.stringify(p.breachedTaskTypes) : null, p.recordId)
           : db
               .prepare(
                 `UPDATE adoption_watch_records SET reverting_token = ?, reverting_at = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ?`
@@ -1159,9 +1218,13 @@ function finalizeReverting(p: {
   try {
     const insertQuarantine = p.quarantineEntries && p.quarantineEntries.length > 0 ? db.prepare(UPSERT_QUARANTINE_SQL) : null;
     const commit = db.transaction((): boolean => {
+      // Round 9 finding 1: a terminal resolution ALWAYS clears any pending-merge marker — a
+      // confirmed finalize means either there was nothing to retry, or the retry just succeeded;
+      // either way, nothing should be left for a LATER, unrelated evaluation of this (now-terminal)
+      // record to misread.
       const result = db
         .prepare(
-          `UPDATE adoption_watch_records SET status = ?, reverting_token = NULL, reverting_at = NULL, last_evaluated_at = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ?`
+          `UPDATE adoption_watch_records SET status = ?, reverting_token = NULL, reverting_at = NULL, last_evaluated_at = ?, pending_merge_hash = NULL, pending_merge_axes = NULL WHERE id = ? AND status = 'reverting' AND reverting_token = ?`
         )
         .run(p.newStatus, p.lastEvaluatedAt, p.recordId, p.claimToken);
       if (result.changes > 0 && insertQuarantine) {
@@ -1239,6 +1302,16 @@ function markRevertAttemptFailed(p: {
    *  record. Upserted by task_type (`UPSERT_QUARANTINE_SQL`), so retried attempts across multiple
    *  ticks safely re-write the SAME rows rather than duplicating them. */
   quarantineEntries?: QuarantineRecord[];
+  /**
+   * Round 9 finding 1: REQUIRED (never silently defaulted) so every call site makes an explicit
+   * choice. `{ hash, axes }` SETS the pending-merge marker — this failed/incomplete attempt's own
+   * merged bytes, to be retried (without reclassifying) next time the live table still matches
+   * `hash`. `null` CLEARS it — this failure is NOT a partial-restore attempt (the whole-table path,
+   * a fully-superseded resolution, or the generic per-record error handler), so any marker a
+   * DIFFERENT, earlier attempt might have left behind must not linger and be misread by a later,
+   * unrelated evaluation of this same record.
+   */
+  pendingMerge: { hash: string; axes: string[] } | null;
 }): boolean {
   const db = openWatchdogDb(p.dataDir);
   try {
@@ -1246,9 +1319,16 @@ function markRevertAttemptFailed(p: {
     const commit = db.transaction((): boolean => {
       const result = db
         .prepare(
-          `UPDATE adoption_watch_records SET revert_attempts = COALESCE(revert_attempts, 0) + 1, last_revert_attempt_at = ?, last_revert_error = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ?`
+          `UPDATE adoption_watch_records SET revert_attempts = COALESCE(revert_attempts, 0) + 1, last_revert_attempt_at = ?, last_revert_error = ?, pending_merge_hash = ?, pending_merge_axes = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ?`
         )
-        .run(p.attemptAt, p.error, p.recordId, p.claimToken);
+        .run(
+          p.attemptAt,
+          p.error,
+          p.pendingMerge ? p.pendingMerge.hash : null,
+          p.pendingMerge ? JSON.stringify(p.pendingMerge.axes) : null,
+          p.recordId,
+          p.claimToken
+        );
       if (result.changes > 0 && insertQuarantine) {
         for (const q of p.quarantineEntries!) insertQuarantine.run(quarantineToRowParams(q));
       }
@@ -1341,6 +1421,214 @@ function buildPartialAxisRestoreRaw(liveRaw: string, snapshotRaw: string, axes: 
 }
 
 /**
+ * Round 9 follow-up (a): lazily captures the missing `candidateSnapshotPath` for a LEGACY record
+ * (one that predates round 8's per-axis machinery, or whose candidate bytes were never captured for
+ * some other reason) — but ONLY while it is still safe to do so: the live table right now must still
+ * hash-match this record's own `candidateHash`. Once that stops being true (a newer adoption has
+ * superseded it), backfilling would capture the WRONG bytes under this record's name — the
+ * no-candidate-bytes fallback (whole-table "superseded") is the correct, safe answer at that point,
+ * not a backfill. Runs "at first access under the lease" — called from `performRevertAndFinalize`,
+ * which only ever runs while this record is durably claimed `"reverting"` under `p.claimToken`; the
+ * DB update is fenced by that same claim (and guarded against a concurrent double-backfill) so a
+ * since-superseded claim cannot attribute a backfill to a record another holder now owns — the FILE
+ * itself is still written either way (an orphaned file on a lost race is harmless, just unreferenced).
+ */
+function backfillCandidateSnapshotIfPossible(p: {
+  dataDir: string;
+  recordId: string;
+  claimToken: number;
+  liveRaw: string | null;
+  candidateHash: string;
+}): string | null {
+  if (p.liveRaw === null) return null;
+  if (tableContentHash(p.liveRaw) !== p.candidateHash) return null;
+  const { candidateSnapshotsDir } = watchdogPaths(p.dataDir);
+  mkdirSync(candidateSnapshotsDir, { recursive: true });
+  const abs = join(candidateSnapshotsDir, `${p.recordId}.json`);
+  writeFileSync(abs, p.liveRaw, "utf8");
+  const db = openWatchdogDb(p.dataDir);
+  try {
+    const commit = db.transaction((): boolean => {
+      const result = db
+        .prepare(
+          `UPDATE adoption_watch_records SET candidate_snapshot_path = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ? AND candidate_snapshot_path IS NULL`
+        )
+        .run(abs, p.recordId, p.claimToken);
+      return result.changes > 0;
+    });
+    return commit.immediate() ? abs : null;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Round 9 follow-up (c): a defensive, pre-write structural check on a constructed partial-restore
+ * table — "trust but verify" before a production mutation. Confirms the merged bytes actually parse
+ * as a routing table, and that EVERY task type NOT in `axes` (both its routing entry and its
+ * `escalateToFrontier` membership) is byte/value-IDENTICAL between the live table and the merged
+ * table — i.e. the merge touched ONLY the intended axes. Throws (never returns a boolean) on any
+ * violation; the caller never catches this locally — it is meant to propagate to
+ * `performRevertAndFinalize`'s own outer per-record error handler (round 8 finding 5), which
+ * fail-marks the record and retries later rather than writing a merge that touched more than
+ * intended. This should never actually fire given correct construction; it exists as a last-resort
+ * guard against a future regression in `buildPartialAxisRestoreRaw` reaching production.
+ */
+export function validatePartialRestoreRaw(liveRaw: string, mergedRaw: string, axes: string[]): void {
+  const live = JSON.parse(liveRaw) as RoutingTableDoc;
+  const merged = JSON.parse(mergedRaw) as RoutingTableDoc;
+  if (!merged || typeof merged !== "object" || !merged.routing || typeof merged.routing !== "object") {
+    throw new Error("partial-restore validation failed: merged table does not parse as a routing table (missing/invalid 'routing' object)");
+  }
+  const axisSet = new Set(axes);
+  const allTaskTypes = new Set([...Object.keys(live.routing ?? {}), ...Object.keys(merged.routing ?? {})]);
+  for (const taskType of allTaskTypes) {
+    if (axisSet.has(taskType)) continue; // an intended axis — expected (allowed) to differ
+    const liveEntry = JSON.stringify((live.routing ?? {})[taskType] ?? null);
+    const mergedEntry = JSON.stringify((merged.routing ?? {})[taskType] ?? null);
+    if (liveEntry !== mergedEntry) {
+      throw new Error(
+        `partial-restore validation failed: unrelated axis '${taskType}' changed in the merged table but was never one of the intended restore axes [${axes.join(", ")}] — refusing to write a merge that touches more than intended`
+      );
+    }
+  }
+  const liveEscalate = new Set(live.escalateToFrontier ?? []);
+  const mergedEscalate = new Set(merged.escalateToFrontier ?? []);
+  for (const taskType of new Set([...liveEscalate, ...mergedEscalate])) {
+    if (axisSet.has(taskType)) continue;
+    if (liveEscalate.has(taskType) !== mergedEscalate.has(taskType)) {
+      throw new Error(
+        `partial-restore validation failed: unrelated axis '${taskType}'s escalateToFrontier membership changed in the merged table but it was never one of the intended restore axes [${axes.join(", ")}]`
+      );
+    }
+  }
+}
+
+/**
+ * Round 9 finding 1: the shared write+reload+canary+confirm+finalize/fail-mark core for a PARTIAL
+ * (per-axis) restore — used for BOTH a fresh attempt (freshly planned via `planPartialAxisRestore`/
+ * `buildPartialAxisRestoreRaw`) and a RETRY of an already-in-flight attempted merge (the live table
+ * already matches `record.pendingMergeHash` — re-confirming, never re-planning). `restorationRaw` is
+ * already the exact bytes to write (identical content is a safe no-op, per round 7's own "re-writing
+ * bytes that are already present is a safe no-op" pattern) — this function's ONLY job is write ->
+ * reload -> canary (scoped to `restoreAxes`) -> confirm -> finalize `"breach"` (clearing the merge
+ * marker, via `finalizeReverting`'s own unconditional clear) OR fail-mark, PERSISTING
+ * `pendingMergeHash`/`pendingMergeAxes` on any non-confirmed outcome so a LATER run retries
+ * confirmation of THIS EXACT state without reclassifying (Sol's exact reproduction: run1
+ * restored-reload-failed/reverting, run2 wrongly resolved superseded, reload count never advanced).
+ */
+async function attemptPartialRestore(p: {
+  deps: WatchdogRunnerDeps;
+  policy: WatchdogPolicyConfig;
+  record: AdoptionWatchRecord;
+  breachingTaskTypes: string[];
+  restoreAxes: string[];
+  supersededAxes: string[];
+  restorationRaw: string;
+  snapshotRaw: string;
+  now: string;
+  lockToken: number;
+  dryRun: boolean;
+}): Promise<{
+  claimed: true;
+  action: WatchdogAction;
+  revert: WatchdogRevertResult;
+  newStatus: AdoptionWatchRecord["status"];
+  quarantined: string[];
+  warning?: string;
+}> {
+  const { deps, policy, record, breachingTaskTypes, restoreAxes, supersededAxes, restorationRaw, snapshotRaw, now, lockToken, dryRun } = p;
+  const mergeHash = tableContentHash(restorationRaw);
+  const warningPrefix = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was PARTIALLY superseded — axes [${restoreAxes.join(", ")}] still carried this record's own regressed candidate value and were restored to snapshot${supersededAxes.length > 0 ? `; axes [${supersededAxes.join(", ")}] were left untouched (already superseded by a newer, unrelated adoption)` : ""}.`;
+
+  // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token.
+  const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
+  const rollback = await manualRollback({
+    deps: fencedDeps,
+    snapshotRaw: restorationRaw,
+    reason:
+      `adoption-watchdog: guard-metric breach on [${restoreAxes.join(", ")}] within the post-adoption watch ` +
+      `window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef}) — PARTIAL (per-axis) ` +
+      `restore${supersededAxes.length > 0 ? `; axes [${supersededAxes.join(", ")}] preserved as superseded` : ""}`,
+  });
+
+  if (rollback.staleLeaseRefused) {
+    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — partial revert attempt refused (stale lease); retrying next tick");
+    if (!dryRun) {
+      markRevertAttemptFailed({
+        dataDir: deps.dataDir,
+        recordId: record.id,
+        claimToken: lockToken,
+        attemptAt: now,
+        error: rollback.reason,
+        quarantineEntries,
+        pendingMerge: { hash: mergeHash, axes: restoreAxes },
+      });
+    }
+    return { claimed: true, action: "would-revert", revert: { status: "unknown", rollback }, newStatus: "reverting", quarantined: breachingTaskTypes, warning: warningPrefix };
+  }
+
+  let canary: CanaryOutcome | undefined;
+  if (rollback.restoreWriteOk && rollback.reloadOk) {
+    try {
+      const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
+      const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
+      const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
+      const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
+      canary = runCanary({
+        changedTaskTypes: restoreAxes,
+        reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
+        candidate: priorParsed,
+        servableModelIds,
+      });
+    } catch {
+      canary = undefined;
+    }
+  }
+
+  const status: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
+    ? "unknown"
+    : !rollback.reloadOk
+      ? "restored-reload-failed"
+      : canary?.ok === true
+        ? "restored"
+        : "restored-unconfirmed";
+  const revert: WatchdogRevertResult = { status, rollback, canary };
+  const confirmed = status === "restored";
+
+  if (!confirmed) {
+    const quarantineEntries = quarantineEntriesFor(
+      breachingTaskTypes,
+      now,
+      policy,
+      record,
+      ` — partial revert attempt incomplete (${describeIncompleteRevert(rollback, canary)}); retrying next tick`
+    );
+    if (!dryRun) {
+      markRevertAttemptFailed({
+        dataDir: deps.dataDir,
+        recordId: record.id,
+        claimToken: lockToken,
+        attemptAt: now,
+        error: describeIncompleteRevert(rollback, canary),
+        quarantineEntries,
+        pendingMerge: { hash: mergeHash, axes: restoreAxes },
+      });
+    }
+    return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes, warning: warningPrefix };
+  }
+
+  // Quarantine the FULL breaching set (both restored and superseded axes) — the OLD candidate's
+  // breach evidence remains valid for every axis it originally touched, regardless of whether THIS
+  // revert action mutated it (same rule as the whole-table superseded/incomplete paths).
+  const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
+  if (!dryRun) {
+    finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "breach", lastEvaluatedAt: now, quarantineEntries });
+  }
+  return { claimed: true, action: "reverted-partial", revert, newStatus: "breach", quarantined: breachingTaskTypes, warning: warningPrefix };
+}
+
+/**
  * Round 6 finding 2: performs the external rollback action for ONE breaching record, but ONLY after
  * winning the CAS claim (`fromStatus -> "reverting"`) — "watchdog acts before claiming" is exactly
  * the bug this closes: the CAS now happens BEFORE `manualRollback`, not after.
@@ -1398,6 +1686,10 @@ async function performRevertAndFinalize(p: {
     expectedRevertingToken: record.revertingToken,
     leaseToken: lockToken,
     nowIso: now,
+    // Round 9 follow-up (b): only meaningful (and only ever applied) on the FIRST "pending ->
+    // reverting" claim — `claimForReverting` itself ignores this on a `fromStatus: "reverting"`
+    // re-claim, so this is safe to pass unconditionally on every call.
+    breachedTaskTypes: breachingTaskTypes,
   });
   if (!claimed) {
     // Someone else (another process, or this same record having already moved on) beat us to it.
@@ -1439,7 +1731,9 @@ async function performRevertAndFinalize(p: {
           ` — revert attempt incomplete (delete-and-reload did not fully succeed: ${rollback.reason}); retrying next tick`
         );
         if (!dryRun) {
-          markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+          // Round 9 finding 1: not a partial-restore attempt (no snapshot even exists) — clear any
+          // stale merge marker (defensive; none should ever be set for a no-snapshot record).
+          markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries, pendingMerge: null });
         }
         return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes };
       }
@@ -1451,13 +1745,57 @@ async function performRevertAndFinalize(p: {
     }
 
     const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
+    // Round 9 finding 2: null ONLY on a VERIFIED "no table at all" (ENOENT) — any OTHER read error
+    // (EACCES, EIO, a transient I/O fault) must PROPAGATE to the outer per-record catch (round 8
+    // finding 5), never be silently folded into `null`. `tableContentHash(null)` reads as the
+    // sentinel "(none)", which matches neither a real candidateHash nor a real snapshot hash —
+    // treating a permission error as "the table is absent" wrongly resolved this record terminal
+    // "superseded" (Sol reproduced this with EACCES) instead of a retriable failure-mark.
     const liveRawBeforeAction = (() => {
       try {
         return deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
-      } catch {
-        return null;
+      } catch (err) {
+        if (isVerifiedEnoentError(err)) return null;
+        throw err;
       }
     })();
+
+    // Round 9 follow-up (a): opportunistically backfill a LEGACY record's missing
+    // `candidateSnapshotPath` while it is still safe (live currently matches candidateHash) — never
+    // changes this run's own classification/outcome, just enriches the record for a LATER run that
+    // might need per-axis refinement after all.
+    const candidateSnapshotPathForThisRun =
+      record.candidateSnapshotPath ??
+      backfillCandidateSnapshotIfPossible({
+        dataDir: deps.dataDir,
+        recordId: record.id,
+        claimToken: lockToken,
+        liveRaw: liveRawBeforeAction,
+        candidateHash: record.candidateHash,
+      });
+
+    // Round 9 finding 1: a PENDING attempted merge from a prior incomplete partial-restore attempt —
+    // retry ITS confirmation, NEVER reclassify, as long as the live table still matches it. Matching
+    // means write+reload+canary against THIS EXACT state (a safe no-op write, since the bytes are
+    // already there); NOT matching means someone else changed the table since — fall through to
+    // fresh classification below (the stale marker is explicitly cleared by every path that follows,
+    // so it can never linger and be misread by a later, unrelated evaluation of this same record).
+    if (record.pendingMergeHash && liveRawBeforeAction !== null && tableContentHash(liveRawBeforeAction) === record.pendingMergeHash) {
+      return await attemptPartialRestore({
+        deps,
+        policy,
+        record,
+        breachingTaskTypes,
+        restoreAxes: record.pendingMergeAxes ?? breachingTaskTypes,
+        supersededAxes: [],
+        restorationRaw: liveRawBeforeAction,
+        snapshotRaw,
+        now,
+        lockToken,
+        dryRun,
+      });
+    }
+
     const classification = classifyLiveTable(liveRawBeforeAction, record.candidateHash, snapshotRaw);
 
     if (classification === "superseded") {
@@ -1465,7 +1803,7 @@ async function performRevertAndFinalize(p: {
       // actually superseded — a later, unrelated adoption to a DIFFERENT axis produces the exact
       // same whole-table hash mismatch while leaving this record's own bad axis untouched and still
       // live. Refine per axis before giving up.
-      const candidateRawForPlan = record.candidateSnapshotPath ? readFileSync(record.candidateSnapshotPath, "utf8") : null;
+      const candidateRawForPlan = candidateSnapshotPathForThisRun ? readFileSync(candidateSnapshotPathForThisRun, "utf8") : null;
       const { restoreAxes, supersededAxes } = planPartialAxisRestore({
         liveRaw: liveRawBeforeAction,
         candidateRaw: candidateRawForPlan,
@@ -1501,83 +1839,25 @@ async function performRevertAndFinalize(p: {
       // still live for it. Build a restoration table: the CURRENT live table with ONLY the
       // still-live axes reset to their snapshot values — every other axis (superseded axes, and any
       // entirely unrelated axis a newer adoption touched) is preserved exactly as-is.
-      const partialWarningPrefix = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was PARTIALLY superseded — axes [${restoreAxes.join(", ")}] still carried this record's own regressed candidate value and were restored to snapshot; axes [${supersededAxes.join(", ")}] were left untouched (already superseded by a newer, unrelated adoption).`;
       const restorationRaw = buildPartialAxisRestoreRaw(liveRawBeforeAction as string, snapshotRaw, restoreAxes);
-      const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
-      const rollback = await manualRollback({
-        deps: fencedDeps,
-        snapshotRaw: restorationRaw,
-        reason:
-          `adoption-watchdog: guard-metric breach on [${restoreAxes.join(", ")}] within the post-adoption watch ` +
-          `window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef}) — PARTIAL (per-axis) ` +
-          `restore; axes [${supersededAxes.join(", ")}] preserved as superseded`,
+      // Round 9 follow-up (c): a defensive structural check BEFORE this ever reaches a write —
+      // throws (caught by the outer per-record handler, round 8 finding 5) if the merge somehow
+      // touched more than the intended axes; never writes a merge it cannot verify is scoped
+      // correctly.
+      validatePartialRestoreRaw(liveRawBeforeAction as string, restorationRaw, restoreAxes);
+      return await attemptPartialRestore({
+        deps,
+        policy,
+        record,
+        breachingTaskTypes,
+        restoreAxes,
+        supersededAxes,
+        restorationRaw,
+        snapshotRaw,
+        now,
+        lockToken,
+        dryRun,
       });
-
-      if (rollback.staleLeaseRefused) {
-        const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — partial revert attempt refused (stale lease); retrying next tick");
-        if (!dryRun) {
-          markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
-        }
-        return { claimed: true, action: "would-revert", revert: { status: "unknown", rollback }, newStatus: "reverting", quarantined: breachingTaskTypes, warning: partialWarningPrefix };
-      }
-
-      let partialCanary: CanaryOutcome | undefined;
-      if (rollback.restoreWriteOk && rollback.reloadOk) {
-        try {
-          const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
-          const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
-          const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
-          const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
-          partialCanary = runCanary({
-            changedTaskTypes: restoreAxes,
-            reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
-            candidate: priorParsed,
-            servableModelIds,
-          });
-        } catch {
-          partialCanary = undefined;
-        }
-      }
-
-      const partialStatus: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
-        ? "unknown"
-        : !rollback.reloadOk
-          ? "restored-reload-failed"
-          : partialCanary?.ok === true
-            ? "restored"
-            : "restored-unconfirmed";
-      const partialRevert: WatchdogRevertResult = { status: partialStatus, rollback, canary: partialCanary };
-      const partialConfirmed = partialStatus === "restored";
-
-      if (!partialConfirmed) {
-        const quarantineEntries = quarantineEntriesFor(
-          breachingTaskTypes,
-          now,
-          policy,
-          record,
-          ` — partial revert attempt incomplete (${describeIncompleteRevert(rollback, partialCanary)}); retrying next tick`
-        );
-        if (!dryRun) {
-          markRevertAttemptFailed({
-            dataDir: deps.dataDir,
-            recordId: record.id,
-            claimToken: lockToken,
-            attemptAt: now,
-            error: describeIncompleteRevert(rollback, partialCanary),
-            quarantineEntries,
-          });
-        }
-        return { claimed: true, action: "would-revert", revert: partialRevert, newStatus: "reverting", quarantined: breachingTaskTypes, warning: partialWarningPrefix };
-      }
-
-      // Quarantine the FULL breaching set (both restored and superseded axes) — the OLD candidate's
-      // breach evidence remains valid for every axis it originally touched, regardless of whether
-      // THIS revert action mutated it (same rule as the whole-table superseded/incomplete paths).
-      const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
-      if (!dryRun) {
-        finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "breach", lastEvaluatedAt: now, quarantineEntries });
-      }
-      return { claimed: true, action: "reverted-partial", revert: partialRevert, newStatus: "breach", quarantined: breachingTaskTypes, warning: partialWarningPrefix };
     }
 
     // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token. Safe to call
@@ -1602,7 +1882,9 @@ async function performRevertAndFinalize(p: {
       // "quarantine regardless of revert quality", carried forward to every incomplete-revert path).
       const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — revert attempt refused (stale lease); retrying next tick");
       if (!dryRun) {
-        markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+        // Round 9 finding 1: NOT a partial-restore attempt — clear any stale merge marker an
+        // EARLIER, different attempt might have left behind so a later evaluation never misreads it.
+        markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries, pendingMerge: null });
       }
       return {
         claimed: true,
@@ -1653,6 +1935,7 @@ async function performRevertAndFinalize(p: {
       // reason to leave the regressed axis eligible for further traffic while it retries.
       const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt incomplete (${describeIncompleteRevert(rollback, canary)}); retrying next tick`);
       if (!dryRun) {
+        // Round 9 finding 1: NOT a partial-restore attempt — clear any stale merge marker.
         markRevertAttemptFailed({
           dataDir: deps.dataDir,
           recordId: record.id,
@@ -1660,6 +1943,7 @@ async function performRevertAndFinalize(p: {
           attemptAt: now,
           error: describeIncompleteRevert(rollback, canary),
           quarantineEntries,
+          pendingMerge: null,
         });
       }
       return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes };
@@ -1691,10 +1975,13 @@ async function performRevertAndFinalize(p: {
     // OTHER record this same run would otherwise have evaluated. Mirrors the ordinary
     // "incomplete revert" failure-mark path: status stays "reverting", never "superseded" (a
     // classification error is not evidence of anything, safe or otherwise) and never terminal.
+    // Round 9 finding 1: clears any pending-merge marker — an unexpected error means we can no
+    // longer vouch for what state was actually intended; the next run re-derives everything fresh
+    // (always a safe, correct fallback) rather than retrying a merge this call could not verify.
     const message = err instanceof Error ? err.message : String(err);
     const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt failed with an unexpected error (${message}); retrying next tick`);
     if (!dryRun) {
-      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: message, quarantineEntries });
+      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: message, quarantineEntries, pendingMerge: null });
     }
     return {
       claimed: true,
@@ -1734,7 +2021,11 @@ async function recoverStuckReverting(
   if (lockHandle === null) return null; // busy — leave the stuck row exactly as-is; try again next run
 
   try {
-    const breachingTaskTypes = record.changedTaskTypes;
+    // Round 9 follow-up (b): use the axes that ACTUALLY breached (persisted once, at the FIRST
+    // "pending -> reverting" claim) — never broaden to the full `changedTaskTypes` on a "mixed axis"
+    // adoption where only some of the adopted axes regressed. Falls back to the full set for a
+    // legacy record that predates this field (the same conservative default this code always used).
+    const breachingTaskTypes = record.breachedTaskTypes ?? record.changedTaskTypes;
 
     // Round 7 findings 1+2 + round 8 finding 5: delegate ENTIRELY to `performRevertAndFinalize` —
     // it performs the SAME three-way classification (matches-candidate / matches-snapshot /

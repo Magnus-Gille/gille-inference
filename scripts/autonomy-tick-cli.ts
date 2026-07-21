@@ -22,8 +22,17 @@
  *   tsx scripts/autonomy-tick-cli.ts [--dry-run] [--table docs/m5-routing.json] [--data-dir ./data]
  *       [--decision-ref gille-inference#49] [--gateway-url http://...] [--db ...]
  *     Prints the machine-readable AutonomyTickReport JSON to stdout and a human-readable summary
- *     to stderr. Exit 0 always (a refused/ineligible axis is a normal, honest outcome, not a
- *     script failure) unless an unexpected exception propagates.
+ *     to stderr. Exit 0 for an ordinary tick (a refused/ineligible axis is a normal, honest
+ *     outcome, not a script failure); exit 2 on an unexpected exception (unchanged); exit 3
+ *     (round 9 finding 3 — "silent operational deadlock") when `report.unresolvedReverts` is
+ *     non-empty — a watchdog revert that has NOT yet been confirmed (write/reload/canary all
+ *     succeeding) for one or more ticks in a row. This is deliberately a DISTINCT, attention-bearing
+ *     nonzero code so `systemctl status` on the oneshot service surfaces "failed" — visible to
+ *     anyone/anything watching the unit, not just to something that parses the JSON report body.
+ *     A Persistent systemd timer is UNAFFECTED by any one run's exit code — it still fires the next
+ *     scheduled tick regardless, which is exactly what keeps retrying the stuck revert; only the
+ *     oneshot SERVICE's own last-run state reflects the failure, which is exactly the visibility
+ *     this exit code is for.
  *
  * ENV: EVAL_DB_PATH (ledger DB, default ./data/eval.db);
  *      GATEWAY_URL / ROUTING_LIFECYCLE_ADMIN_KEY / HOMESERVER_OWNER_KEY — see
@@ -53,12 +62,28 @@ import {
   runAutonomyTick,
   DEFAULT_AUTONOMY_POLICY,
   type AutonomyTickDeps,
+  type AutonomyTickReport,
 } from "../src/homeserver/autonomy-controller.js";
 
 const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const DEFAULT_DATA_DIR = resolve("./data");
 const DEFAULT_DECISION_REF = "gille-inference#49";
+
+/**
+ * Round 9 finding 3: the SINGLE source of truth for this CLI's exit code, extracted as a pure
+ * function so it is directly unit-testable (the same "test the underlying function, not the CLI's
+ * `main()` entrypoint" pattern as `describeRollbackOutcome`/`revertNeedsOperatorAttention` in
+ * routing-lifecycle-cli.ts). Exit 3 — distinct from the generic exit 2 unexpected-exception path —
+ * whenever ANY watchdog record is still durably "reverting" at the end of this tick: a
+ * distinct, attention-bearing nonzero code so `systemctl status` on the oneshot service surfaces
+ * "failed" (visible to monitoring), while a Persistent systemd timer is UNAFFECTED by any one run's
+ * exit code and still fires the next scheduled tick regardless — this is a visibility signal, not a
+ * retry mechanism; retrying is the timer's own job, unconditionally.
+ */
+export function autonomyTickExitCode(report: Pick<AutonomyTickReport, "unresolvedReverts">): number {
+  return report.unresolvedReverts.length > 0 ? 3 : 0;
+}
 
 function readFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -200,7 +225,13 @@ async function main(): Promise<void> {
       );
     }
   }
-  process.exitCode = 0;
+
+  for (const r of report.unresolvedReverts) {
+    process.stderr.write(
+      `  UNRESOLVED REVERT: record ${r.recordId} [${r.changedTaskTypes.join(", ")}] — ${r.revertAttempts} attempt(s), last at ${r.lastRevertAttemptAt ?? "(never)"}: ${r.lastRevertError ?? "(no error recorded)"}\n`
+    );
+  }
+  process.exitCode = autonomyTickExitCode(report);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
