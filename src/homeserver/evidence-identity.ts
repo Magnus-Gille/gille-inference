@@ -117,6 +117,25 @@ export function tableContentHash(raw: string | null): string {
   return contentDigest(JSON.stringify(JSON.parse(raw)));
 }
 
+// gille-inference#49 round 8 follow-up (deferred, NOT implemented): this hash is NOT canonical-JSON
+// — it normalizes pretty-printing/whitespace (via the parse/re-stringify round-trip above) but does
+// NOT sort object keys, so two documents that are semantically identical but were SERIALIZED with a
+// different key order would still hash differently. A recursive key-sorting normalization would make
+// every comparison in this codebase (classifyLiveTable's superseded/matches-candidate/matches-
+// snapshot check, the round-8 per-axis "did a newer adoption touch this axis" check, adopt-time
+// baseline/candidate-hash comparisons, etc.) robust to that case. Deliberately NOT done here: this
+// hash's exact current bytes-in/hash-out behavior is already load-bearing in PRODUCTION —
+// `AdoptionWatchRecord.candidateHash` values already durably stored on disk, and every writer in this
+// codebase (routing-table-generator.ts, adoptRoutingTable, the manual CLI) already serializes
+// deterministically (a fixed field order, always freshly generated or round-tripped through this same
+// function) — so key-order divergence has never been an OBSERVED problem, only a theoretical one.
+// Changing the hash function now would silently invalidate every already-computed candidateHash
+// comparison against freshly-recomputed content, which is a far more dangerous failure mode (a
+// SILENT hash-compat break across a deploy boundary) than the theoretical gap it would close. If this
+// ever needs closing for real, it must ship as an explicit, versioned migration (e.g. a
+// `tableContentHashV2` used only for NEW records, with old records still compared via this function),
+// never a silent in-place change to `tableContentHash` itself.
+
 /**
  * True iff `err` represents a VERIFIED "file does not exist" condition — either a real Node
  * `NodeJS.ErrnoException` with `code === "ENOENT"` (what `readFileSync` throws in production) or,

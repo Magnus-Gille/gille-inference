@@ -286,6 +286,7 @@ function fakeAdoptDeps(p: {
   initialTable: string;
   writeTable?: (path: string, data: string) => void;
   reload?: () => ReloadOutcome;
+  deleteTable?: (path: string) => void;
 }): { deps: AdoptDeps; fs: Map<string, string>; tablePath: string } {
   const fs = new Map<string, string>([["/virtual/m5-routing.json", p.initialTable]]);
   const tablePath = "/virtual/m5-routing.json";
@@ -300,6 +301,10 @@ function fakeAdoptDeps(p: {
     servableModelIdsAfterReload: () => ["mellum"],
     nowIso: () => "2026-07-20T02:00:00.000Z",
     currentPolicyEpochHash: "epoch-1",
+    // Round 8 follow-up (b): a first-ever-adoption breach now genuinely deletes the bad table
+    // (never just "skips" the revert) — default fake supports it, matching every other test file's
+    // `fakeAdoptDeps` convention.
+    deleteTable: p.deleteTable ?? ((path) => fs.delete(path)),
   };
   return { deps, fs, tablePath };
 }
@@ -566,7 +571,7 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
     expect(loadQuarantineState(dataDir).byTaskType["classify"]).toBeDefined();
   });
 
-  it("a first-ever adoption (no snapshot) that breaches skips the revert honestly instead of crashing", async () => {
+  it("a first-ever adoption (no snapshot) that breaches genuinely DELETES the bad table instead of just calling itself reverted (round 8 follow-up b)", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "watchdog-run-"));
     recordAdoptionForWatch({
       dataDir,
@@ -577,7 +582,7 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
       changedTaskTypes: ["classify"],
       priorRaw: null, // nothing to snapshot
     });
-    const { deps } = fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE });
+    const { deps, fs, tablePath } = fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE });
 
     const report = await runAdoptionWatch(
       {
@@ -594,8 +599,14 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
       TEST_POLICY
     );
 
-    expect(report.items[0]?.revert?.status).toBe("skipped-no-snapshot");
-    // Quarantine still applies even though nothing could be reverted.
+    // Round 8 follow-up (b): the OLD "skipped-no-snapshot" behavior never actually deleted the bad
+    // table — it stayed live forever while the record called itself "reverted". Confirmed
+    // delete+reload now reports "restored", and the table is genuinely gone.
+    expect(report.items[0]?.action).toBe("reverted");
+    expect(report.items[0]?.revert?.status).toBe("restored");
+    expect(fs.has(tablePath)).toBe(false);
+    expect(loadWatchdogState(dataDir).records[0]?.status).toBe("breach");
+    // Quarantine still applies even though nothing could be RESTORED TO (deleted, not rolled back).
     expect(loadQuarantineState(dataDir).byTaskType["classify"]).toBeDefined();
     expect(loadQuarantineState(dataDir).byTaskType["classify"]?.baselinePassRateAtQuarantine).toBeNull();
   });

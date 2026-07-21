@@ -605,7 +605,7 @@ export interface ReconcileAdoptionIntentResult {
  * candidate write, and any rollback-on-failure restore write — is routed through
  * `fencedWrite`/`withFencing` (routing-lifecycle.ts), never a separate check-then-write.
  */
-function instrumentAdoptDepsForIntent(
+export function instrumentAdoptDepsForIntent(
   base: AdoptDeps,
   dataDir: string,
   intentId: string,
@@ -628,8 +628,13 @@ function instrumentAdoptDepsForIntent(
         markPhase("table-written");
       }
     },
-    reload: async () => {
-      const result = await base.reload();
+    // Round 8 follow-up (a): thread the caller's `AbortSignal` through to `base.reload` — without
+    // this, `reloadAndRenew`'s own `AbortController` (wired to its 30s timeout) would abort a signal
+    // NOBODY downstream was ever listening to: this wrapper used to accept no signal at all and call
+    // `base.reload()` bare, silently dropping it, so an autonomous adopt's losing reload attempt kept
+    // running in the background exactly like the pre-round-7 bug the AbortController was built to fix.
+    reload: async (signal) => {
+      const result = await base.reload(signal);
       if (result.ok) markPhase("reloaded");
       return result;
     },
@@ -759,7 +764,8 @@ export async function reconcileAdoptionIntent(
       return { action: "aborted", detail: intent.phase };
     }
 
-    const liveHash = tableContentHash(tryReadLiveTable(adoptDeps));
+    const liveRawAtCanaryPassed = tryReadLiveTable(adoptDeps);
+    const liveHash = tableContentHash(liveRawAtCanaryPassed);
     if (liveHash !== intent.candidateHash) {
       const stillCurrent = assertStillCurrentOrDefer();
       if (stillCurrent !== true) return stillCurrent;
@@ -791,6 +797,10 @@ export async function reconcileAdoptionIntent(
       approvedBy: intent.approvedBy,
       changedTaskTypes: [intent.taskType],
       priorRaw: intent.priorRaw,
+      // Round 8 finding 1: the live table's content was JUST confirmed (above) to hash-match
+      // `intent.candidateHash` — the exact bytes read for that check ARE the candidate bytes this
+      // record's own adoption produced, captured here for later per-axis supersession refinement.
+      candidateRaw: liveRawAtCanaryPassed,
       provenance: { kind: "autonomy", tier: intent.tier },
       intentId: intent.id,
       leaseToken: lockHandle.token,
@@ -1118,14 +1128,18 @@ export function applyLadderEnablement(
  *     yet promoted — see `TierState.tier1EnteredAt`'s own doc comment).
  */
 export function computeAutonomousRevertRate(records: readonly AdoptionWatchRecord[], tenureStartIso: string | null = null): number {
+  // Round 8 finding 6: `"superseded"` joins durable breach accounting — it IS a resolved outcome
+  // (the watch window genuinely detected a breach; the ONLY thing "superseded" changes is whether a
+  // table rollback was safe to attempt) and belongs in both the denominator (resolved evidence) and
+  // the numerator (a breach-equivalent, not a healthy one) exactly like `"breach"` does.
   const resolvedInTenure = records.filter(
     (r) =>
       countsTowardAutonomousHealthStats(r) &&
-      (r.status === "healthy" || r.status === "breach") &&
+      (r.status === "healthy" || r.status === "breach" || r.status === "superseded") &&
       (tenureStartIso === null || Date.parse(r.adoptedAt) >= Date.parse(tenureStartIso))
   );
   if (resolvedInTenure.length === 0) return 0;
-  return resolvedInTenure.filter((r) => r.status === "breach").length / resolvedInTenure.length;
+  return resolvedInTenure.filter((r) => r.status === "breach" || r.status === "superseded").length / resolvedInTenure.length;
 }
 
 /**
@@ -1487,6 +1501,24 @@ export async function runAutonomyTick(
     adoptDeps: deps.adoptDeps,
   };
   const watch = await runAdoptionWatch(watchDeps, deps.watchdogPolicy, { dryRun });
+  // Round 8 findings 4+6: ONE snapshot of the durable watchdog records, read right after WATCH runs
+  // and reused below for (a) the unresolved-revert adopt-phase suppression signal (finding 4) and
+  // (b) the demotion-ack durable-status signal (finding 6, extended to "superseded"). Nothing
+  // between here and either usage mutates `adoption_watch_records`, so one read is both cheaper and
+  // more internally consistent than two separate reads of the same conceptual state.
+  const watchdogRecordsSnapshot = loadWatchdogState(deps.dataDir).records;
+  // Round 8 finding 4: "unresolved reverts don't suppress" — ANY revert this tick's watch pass
+  // surfaced as still-incomplete (`"unknown"`, `"restored-unconfirmed"`, `"restored-reload-failed"`
+  // — write/reload/canary did not ALL confirm), OR any watchdog record still durably `"reverting"`
+  // (e.g. genuinely in-flight elsewhere, or a stuck claim this same tick's kill-switch/lock-busy path
+  // left untouched), means the routing table's true state is NOT YET CONFIRMED — attempting a NEW
+  // adopt on top of that is exactly the kind of "mutate before the last mutation resolved" hazard
+  // `reconcileNonterminal` already guards against; this is the SAME category, just sourced from the
+  // watchdog's revert path instead of the controller's own adopt-intent journal.
+  const anyUnresolvedRevert =
+    watch.items.some(
+      (i) => i.revert?.status === "unknown" || i.revert?.status === "restored-unconfirmed" || i.revert?.status === "restored-reload-failed"
+    ) || watchdogRecordsSnapshot.some((r) => r.status === "reverting");
 
   let tierState = loadTierState(deps.dataDir);
   // Round 6 follow-up: a LEGACY state file (pre-round-5, before `tier1EnteredAt` was tracked) that
@@ -1536,9 +1568,11 @@ export async function runAutonomyTick(
   // kill-switch-blocked (signal a) is acked immediately, so its LATER durable resolution to
   // "breach" (once the switch clears, signal b) is not treated as a second, new event.
   const freshBreachIds = watch.items.filter((i) => i.evaluation.verdict === "breach").map((i) => i.record.id);
-  const durableBreachIds = loadWatchdogState(deps.dataDir)
-    .records.filter((r) => r.status === "breach")
-    .map((r) => r.id);
+  // Round 8 finding 6: "superseded" joins durable breach accounting here too — a record that
+  // crashed between WATCH's own resolve-to-"superseded" save and THIS module's demotion save would
+  // otherwise never be caught by a later tick at all (it is no longer "pending"/"reverting", so it
+  // never reappears in `watch.items`; this durable-status scan is the ONLY remaining signal).
+  const durableBreachIds = watchdogRecordsSnapshot.filter((r) => r.status === "breach" || r.status === "superseded").map((r) => r.id);
   const allBreachIds = [...new Set([...freshBreachIds, ...durableBreachIds])];
   const unackedBreachIdSet = new Set(tierState.ackedBreachIds);
   const unackedBreachIds = allBreachIds.filter((id) => !unackedBreachIdSet.has(id));
@@ -1768,7 +1802,9 @@ export async function runAutonomyTick(
 
   // Round 6 finding 3: reconcile being nonterminal suppresses ANY adopt attempt this tick,
   // regardless of how many axes would otherwise be eligible — see step 0's own comment.
-  if (!noop && eligibleTaskTypes.length > 0 && reconcileNonterminal === null) {
+  // Round 8 finding 4: an unresolved watchdog revert suppresses the SAME way — see
+  // `anyUnresolvedRevert`'s own comment above.
+  if (!noop && eligibleTaskTypes.length > 0 && reconcileNonterminal === null && !anyUnresolvedRevert) {
     const rotationState = loadRotationState(deps.dataDir);
     const rotationOrder = rotateEligibleAxes(eligibleTaskTypes, rotationState.lastAttemptedTaskType);
     // Captured ONCE, right after the post-watch read above — the optimistic-concurrency baseline
@@ -1919,6 +1955,10 @@ export async function runAutonomyTick(
             approvedBy: outcome.record.approvedBy,
             changedTaskTypes: [taskType],
             priorRaw: liveRawNow,
+            // Round 8 finding 1: `axisArtifact.candidate` is exactly what `adoptRoutingTable` just
+            // wrote to disk — persisted so a later whole-table "superseded" classification can be
+            // refined per axis.
+            candidateRaw: JSON.stringify(axisArtifact.candidate, null, 2) + "\n",
             provenance: { kind: "autonomy", tier: tierState.tier },
             intentId,
             leaseToken: lockHandle.token,
@@ -1942,18 +1982,39 @@ export async function runAutonomyTick(
           }
         } else {
           // Finding 4 (round 1): a write/reload/rollback/canary failure is NOT a healthy cycle.
-          // `adoptRoutingTable` already restored the prior bytes internally on this path.
+          // `adoptRoutingTable` already attempted its own internal rollback on this path.
           mutationAttemptFailed = true;
           const current = loadAdoptionIntent(deps.dataDir);
           if (current && current.id === intentId) {
+            // Round 8 finding 2: "intent terminalized without confirmed rollback" — the prior code
+            // marked this intent terminal ("aborted") the instant `outcome.outcome !== "adopted"`,
+            // regardless of whether `adoptRoutingTable`'s OWN internal rollback actually confirmed
+            // the table was restored. Every non-adopted outcome ("rolled-back"/"reload-failed"/
+            // "write-failed") carries a `rollback: RollbackRecord` — only `restoreWriteOk &&
+            // reloadOk` means the table is genuinely back to a known-good state; anything less may
+            // leave it in the bad, uncanaried state, and certifying that as "aborted" (a resolved,
+            // CLOSED intent) would stop the next tick's `reconcileAdoptionIntent` from ever
+            // retrying the restore. Mirrors the watchdog's own round 7 finding 2 rule ("incomplete
+            // revert must not finalize") and reuses the SAME failure-marking fields
+            // `reconcileAdoptionIntent` itself already uses for the identical situation.
+            const rollbackConfirmed = outcome.rollback.restoreWriteOk && outcome.rollback.reloadOk;
             try {
               assertLeaseCurrent(deps.dataDir, lockHandle.token);
-              saveAdoptionIntent(deps.dataDir, {
-                ...current,
-                status: "aborted",
-                abortedAt: deps.nowIso(),
-                abortReason: `adoptRoutingTable outcome: ${outcome.outcome}`,
-              });
+              if (rollbackConfirmed) {
+                saveAdoptionIntent(deps.dataDir, {
+                  ...current,
+                  status: "aborted",
+                  abortedAt: deps.nowIso(),
+                  abortReason: `adoptRoutingTable outcome: ${outcome.outcome}`,
+                });
+              } else {
+                saveAdoptionIntent(deps.dataDir, {
+                  ...current,
+                  restoreAttempts: (current.restoreAttempts ?? 0) + 1,
+                  lastRestoreAttemptAt: deps.nowIso(),
+                  lastRestoreError: `adoptRoutingTable outcome: ${outcome.outcome} — internal rollback did not fully confirm (${outcome.rollback.reason})`,
+                });
+              }
             } catch (fencingErr) {
               if (!(fencingErr instanceof MutationLockStaleError)) throw fencingErr;
               // Leave "pending" — reconcileAdoptionIntent's next-tick call handles the restore
@@ -1982,9 +2043,10 @@ export async function runAutonomyTick(
   // didn't fail — yet it was silently counted as "healthy", letting a permanently lock-contended or
   // gate-flapping system march toward promotion on ticks that never actually did anything. Three-way
   // split:
-  //   - UNHEALTHY: an unacknowledged breach, an invalid review artifact, an "unknown" infra failure
-  //     from the watchdog's own revert, or a real (attempted) mutation that failed. Resets streaks —
-  //     identical to the old `healthyCycle: false` behavior.
+  //   - UNHEALTHY: an unacknowledged breach, an invalid review artifact, an unresolved watchdog
+  //     revert (round 8 finding 4: "unknown"/"restored-unconfirmed"/"restored-reload-failed", or a
+  //     durably-`"reverting"` record — see `anyUnresolvedRevert`), or a real (attempted) mutation
+  //     that failed. Resets streaks — identical to the old `healthyCycle: false` behavior.
   //   - NEUTRAL: there were eligible axes this tick, but the rotation was exhausted by pre-write
   //     refusals alone (`adopted.length === 0` despite `eligibleTaskTypes.length > 0`) — advances
   //     NOTHING, resets NOTHING; this tick is neither evidence of health nor of failure.
@@ -1997,11 +2059,10 @@ export async function runAutonomyTick(
   // "restore-failed" joins the OTHER unhealthy triggers (a genuine failure signal takes priority over
   // "neutral" even if reconcile was ALSO merely lock-busy this same tick), "lock-busy" joins the
   // OTHER neutral triggers (advances/resets nothing, absent a stronger unhealthy signal).
-  const anyInfraFailure = watch.items.some((i) => i.revert?.status === "unknown");
   const anyAxisActuallyAttempted = adopted.length > 0;
   const preWriteRefusalExhausted = eligibleTaskTypes.length > 0 && !anyAxisActuallyAttempted;
   const cycleOutcome: "advancing" | "neutral" | "unhealthy" =
-    !fullArtifact.validation.ok || anyBreach || anyInfraFailure || mutationAttemptFailed || reconcileNonterminal === "restore-failed"
+    !fullArtifact.validation.ok || anyBreach || anyUnresolvedRevert || mutationAttemptFailed || reconcileNonterminal === "restore-failed"
       ? "unhealthy"
       : preWriteRefusalExhausted || reconcileNonterminal === "lock-busy"
         ? "neutral"

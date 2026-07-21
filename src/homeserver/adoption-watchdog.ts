@@ -43,11 +43,13 @@ import { z } from "zod";
 
 import {
   manualRollback,
+  deleteTableAndReload,
   runCanary,
   type AdoptDeps,
   type RollbackRecord,
   type CanaryOutcome,
 } from "./routing-lifecycle.js";
+import { routingTarget, type RoutingTable } from "./routing-table.js";
 import {
   acquireMutationLock,
   MutationLockBusyError,
@@ -377,6 +379,18 @@ export interface AdoptionWatchRecord {
   revertAttempts?: number;
   lastRevertAttemptAt?: string;
   lastRevertError?: string;
+  /**
+   * Round 8 finding 1: absolute path to the EXACT candidate table bytes this record's own adoption
+   * wrote (mirrors `snapshotPath`'s persistence pattern, one directory over) — persisted so a later
+   * "superseded" classification (the whole table matches neither this record's candidate nor its
+   * snapshot) can be refined PER AXIS: for each of `changedTaskTypes`, compare the LIVE table's
+   * routing target against THIS candidate's own target for that axis, rather than only ever being
+   * able to answer the whole-table question. Absent on legacy records (predating this field) and on
+   * a first-ever adoption's crash-recovery retroactive record (no candidate bytes were captured at
+   * the time) — a missing path means the whole-table "superseded" classification is the most this
+   * record can ever support; per-axis refinement is a strict enhancement, not a requirement.
+   */
+  candidateSnapshotPath?: string | null;
 }
 
 export interface WatchdogState {
@@ -398,6 +412,9 @@ export interface WatchdogPaths {
   quarantinePath: string;
   eventsPath: string;
   snapshotsDir: string;
+  /** Round 8 finding 1: mirrors `snapshotsDir` for the POST-adoption candidate bytes — see
+   *  `AdoptionWatchRecord.candidateSnapshotPath`'s doc comment. */
+  candidateSnapshotsDir: string;
 }
 
 export function watchdogPaths(dataDir: string): WatchdogPaths {
@@ -408,6 +425,7 @@ export function watchdogPaths(dataDir: string): WatchdogPaths {
     quarantinePath: join(root, "quarantine.json"),
     eventsPath: join(root, "events.jsonl"),
     snapshotsDir: join(root, "snapshots"),
+    candidateSnapshotsDir: join(root, "candidate-snapshots"),
   };
 }
 
@@ -449,6 +467,7 @@ interface WatchRecordRow {
   revert_attempts: number | null;
   last_revert_attempt_at: string | null;
   last_revert_error: string | null;
+  candidate_snapshot_path: string | null;
 }
 
 interface QuarantineRow {
@@ -479,6 +498,7 @@ function rowToRecord(row: WatchRecordRow): AdoptionWatchRecord {
     ...(row.revert_attempts !== null ? { revertAttempts: row.revert_attempts } : {}),
     ...(row.last_revert_attempt_at !== null ? { lastRevertAttemptAt: row.last_revert_attempt_at } : {}),
     ...(row.last_revert_error !== null ? { lastRevertError: row.last_revert_error } : {}),
+    ...(row.candidate_snapshot_path !== null ? { candidateSnapshotPath: row.candidate_snapshot_path } : {}),
   };
 }
 
@@ -500,6 +520,7 @@ function recordToRowParams(r: AdoptionWatchRecord) {
     revert_attempts: r.revertAttempts ?? null,
     last_revert_attempt_at: r.lastRevertAttemptAt ?? null,
     last_revert_error: r.lastRevertError ?? null,
+    candidate_snapshot_path: r.candidateSnapshotPath ?? null,
   };
 }
 
@@ -529,15 +550,16 @@ function quarantineToRowParams(r: QuarantineRecord) {
 
 const UPSERT_RECORD_SQL = `
   INSERT INTO adoption_watch_records
-    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id, reverting_token, reverting_at, revert_attempts, last_revert_attempt_at, last_revert_error)
+    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id, reverting_token, reverting_at, revert_attempts, last_revert_attempt_at, last_revert_error, candidate_snapshot_path)
   VALUES
-    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id, @reverting_token, @reverting_at, @revert_attempts, @last_revert_attempt_at, @last_revert_error)
+    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id, @reverting_token, @reverting_at, @revert_attempts, @last_revert_attempt_at, @last_revert_error, @candidate_snapshot_path)
   ON CONFLICT(id) DO UPDATE SET
     adopted_at = excluded.adopted_at, candidate_hash = excluded.candidate_hash, decision_ref = excluded.decision_ref,
     approved_by = excluded.approved_by, changed_task_types = excluded.changed_task_types, snapshot_path = excluded.snapshot_path,
     status = excluded.status, last_evaluated_at = excluded.last_evaluated_at, provenance = excluded.provenance, intent_id = excluded.intent_id,
     reverting_token = excluded.reverting_token, reverting_at = excluded.reverting_at,
-    revert_attempts = excluded.revert_attempts, last_revert_attempt_at = excluded.last_revert_attempt_at, last_revert_error = excluded.last_revert_error
+    revert_attempts = excluded.revert_attempts, last_revert_attempt_at = excluded.last_revert_attempt_at, last_revert_error = excluded.last_revert_error,
+    candidate_snapshot_path = excluded.candidate_snapshot_path
 `;
 
 const UPSERT_QUARANTINE_SQL = `
@@ -593,6 +615,7 @@ const adoptionWatchRecordSchema = z.object({
   revertAttempts: z.number().optional(),
   lastRevertAttemptAt: z.string().min(1).optional(),
   lastRevertError: z.string().min(1).optional(),
+  candidateSnapshotPath: z.string().min(1).nullable().optional(),
 }) satisfies z.ZodType<AdoptionWatchRecord>;
 
 const watchdogStateSchema = z.object({
@@ -700,6 +723,8 @@ function ensureRevertingColumns(db: Database.Database): void {
   if (!names.has("revert_attempts")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN revert_attempts INTEGER`);
   if (!names.has("last_revert_attempt_at")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN last_revert_attempt_at TEXT`);
   if (!names.has("last_revert_error")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN last_revert_error TEXT`);
+  // Round 8 finding 1.
+  if (!names.has("candidate_snapshot_path")) db.exec(`ALTER TABLE adoption_watch_records ADD COLUMN candidate_snapshot_path TEXT`);
 }
 
 function openWatchdogDb(dataDir: string): Database.Database {
@@ -725,7 +750,8 @@ function openWatchdogDb(dataDir: string): Database.Database {
         reverting_at       TEXT,
         revert_attempts        INTEGER,
         last_revert_attempt_at TEXT,
-        last_revert_error      TEXT
+        last_revert_error      TEXT,
+        candidate_snapshot_path TEXT
       );
       CREATE TABLE IF NOT EXISTS quarantine_entries (
         task_type                        TEXT PRIMARY KEY,
@@ -843,6 +869,14 @@ export function recordAdoptionForWatch(p: {
   /** Exact prior live-table bytes (read BEFORE the candidate write), or null when no prior table
    *  existed (first-ever adoption — nothing to snapshot). */
   priorRaw: string | null;
+  /**
+   * Round 8 finding 1: exact POST-adoption candidate bytes — i.e. exactly what was just written to
+   * the live table. Persisted alongside `priorRaw` so a later whole-table "superseded" breach-revert
+   * classification can be refined PER AXIS (see `AdoptionWatchRecord.candidateSnapshotPath`). Optional
+   * and omittable (a caller with no candidate bytes handy — e.g. a crash-recovery retroactive record —
+   * simply gets a record that can only ever answer the whole-table question, never the per-axis one).
+   */
+  candidateRaw?: string | null;
   /** Structured provenance (issue #49 finding 7) — omit for a human/manual adoption (the
    *  routing-lifecycle CLI's own `adopt` command never passes this, so its records correctly read
    *  as `undefined`/"manual"); the autonomy controller ALWAYS passes `{kind:"autonomy", tier}`. */
@@ -861,7 +895,7 @@ export function recordAdoptionForWatch(p: {
    */
   leaseToken?: number;
 }): AdoptionWatchRecord {
-  const { snapshotsDir } = watchdogPaths(p.dataDir);
+  const { snapshotsDir, candidateSnapshotsDir } = watchdogPaths(p.dataDir);
   const id = randomUUID();
   let snapshotPath: string | null = null;
   if (p.priorRaw !== null) {
@@ -869,6 +903,13 @@ export function recordAdoptionForWatch(p: {
     const abs = join(snapshotsDir, `${id}.json`);
     writeFileSync(abs, p.priorRaw, "utf8");
     snapshotPath = abs;
+  }
+  let candidateSnapshotPath: string | null = null;
+  if (p.candidateRaw != null) {
+    mkdirSync(candidateSnapshotsDir, { recursive: true });
+    const abs = join(candidateSnapshotsDir, `${id}.json`);
+    writeFileSync(abs, p.candidateRaw, "utf8");
+    candidateSnapshotPath = abs;
   }
   const record: AdoptionWatchRecord = {
     id,
@@ -882,6 +923,7 @@ export function recordAdoptionForWatch(p: {
     lastEvaluatedAt: null,
     ...(p.provenance ? { provenance: p.provenance } : {}),
     ...(p.intentId ? { intentId: p.intentId } : {}),
+    ...(candidateSnapshotPath !== null ? { candidateSnapshotPath } : {}),
   };
   const db = openWatchdogDb(p.dataDir);
   try {
@@ -904,8 +946,12 @@ export function recordAdoptionForWatch(p: {
 // ─── Durable watchdog events (audit trail) ────────────────────────────────────────
 
 /** Round 7 finding 1: `"superseded"` — resolved without any table mutation because a newer
- *  legitimate adoption was found live; see `AdoptionWatchRecord.status`'s doc comment. */
-export type WatchdogAction = "none" | "would-revert" | "reverted" | "superseded";
+ *  legitimate adoption was found live; see `AdoptionWatchRecord.status`'s doc comment.
+ *  Round 8 finding 1: `"reverted-partial"` — a whole-table "superseded" classification was refined
+ *  PER AXIS: at least one of this record's own breaching axes still carried its own bad candidate
+ *  value (reverted to snapshot) while at least one other was left untouched (genuinely superseded
+ *  by a newer, unrelated adoption to that specific axis). */
+export type WatchdogAction = "none" | "would-revert" | "reverted" | "reverted-partial" | "superseded";
 
 export interface WatchdogRevertResult {
   status:
@@ -1228,6 +1274,73 @@ function describeIncompleteRevert(rollback: RollbackRecord, canary: CanaryOutcom
 }
 
 /**
+ * Round 8 finding 1: refines a whole-table "superseded" classification PER AXIS. `p.axes` is
+ * normally `record.changedTaskTypes` (the axes THIS record's own adoption touched). For each axis,
+ * compares the LIVE table's routing TARGET (`routingTarget` — the same content-blind "what would a
+ * request for this task type actually resolve to" unit the canary itself uses) against what THIS
+ * record's own persisted candidate bytes say that axis should be:
+ *   - target UNCHANGED since this record's adoption (`restoreAxes`) — the breach is STILL LIVE for
+ *     this axis; it needs reverting to the snapshot value.
+ *   - target DIFFERS from this record's candidate (`supersededAxes`) — a newer, unrelated adoption
+ *     re-routed THIS SPECIFIC axis since; rolling it back would clobber that newer work.
+ * `p.candidateRaw === null` (no persisted candidate bytes — a legacy record, or a crash-recovery
+ * retroactive record that never captured them) means per-axis refinement is IMPOSSIBLE: every axis
+ * is conservatively treated as `supersededAxes` (the safe direction — falls back to round 7's
+ * whole-table "superseded, zero mutation" behavior via an empty `restoreAxes`).
+ */
+function planPartialAxisRestore(p: { liveRaw: string | null; candidateRaw: string | null; axes: string[] }): {
+  restoreAxes: string[];
+  supersededAxes: string[];
+} {
+  if (p.candidateRaw === null) {
+    return { restoreAxes: [], supersededAxes: [...p.axes] };
+  }
+  const liveParsed = p.liveRaw !== null ? (JSON.parse(p.liveRaw) as RoutingTableDoc) : null;
+  const candidateParsed = JSON.parse(p.candidateRaw) as RoutingTableDoc;
+  const liveTable: RoutingTable = { routing: liveParsed?.routing ?? {}, escalateToFrontier: liveParsed?.escalateToFrontier ?? [] };
+  const candidateTable: RoutingTable = { routing: candidateParsed.routing ?? {}, escalateToFrontier: candidateParsed.escalateToFrontier ?? [] };
+  const restoreAxes: string[] = [];
+  const supersededAxes: string[] = [];
+  for (const axis of p.axes) {
+    if (routingTarget(axis, liveTable) === routingTarget(axis, candidateTable)) {
+      restoreAxes.push(axis);
+    } else {
+      supersededAxes.push(axis);
+    }
+  }
+  return { restoreAxes, supersededAxes };
+}
+
+/**
+ * Round 8 finding 1: builds the restoration table for a PARTIAL (per-axis) revert — the CURRENT
+ * live table with ONLY `axes` reset to their snapshot values (routing entry AND `escalateToFrontier`
+ * membership, both taken from the snapshot); every OTHER axis (superseded axes this record chose not
+ * to touch, and any entirely unrelated axis a newer adoption introduced) is preserved byte-for-byte
+ * as the live table currently has it. Mirrors `autonomy-controller.ts`'s `buildAxisArtifactInputs` —
+ * the SAME "isolate to just these axes, leave everything else exactly as it is" approach, reused here
+ * for the watchdog's own revert direction instead of the controller's adopt direction.
+ */
+function buildPartialAxisRestoreRaw(liveRaw: string, snapshotRaw: string, axes: string[]): string {
+  const live = JSON.parse(liveRaw) as RoutingTableDoc;
+  const snapshot = JSON.parse(snapshotRaw) as RoutingTableDoc;
+  const routing = { ...live.routing };
+  const escalateSet = new Set(live.escalateToFrontier ?? []);
+  for (const axis of axes) {
+    if (Object.prototype.hasOwnProperty.call(snapshot.routing, axis)) {
+      routing[axis] = snapshot.routing[axis];
+    } else {
+      delete routing[axis];
+    }
+    if ((snapshot.escalateToFrontier ?? []).includes(axis)) {
+      escalateSet.add(axis);
+    } else {
+      escalateSet.delete(axis);
+    }
+  }
+  return JSON.stringify({ ...live, routing, escalateToFrontier: [...escalateSet] }, null, 2) + "\n";
+}
+
+/**
  * Round 6 finding 2: performs the external rollback action for ONE breaching record, but ONLY after
  * winning the CAS claim (`fromStatus -> "reverting"`) — "watchdog acts before claiming" is exactly
  * the bug this closes: the CAS now happens BEFORE `manualRollback`, not after.
@@ -1242,6 +1355,16 @@ function describeIncompleteRevert(rollback: RollbackRecord, canary: CanaryOutcom
  * critically this means reload+canary ALWAYS run regardless of whether the write itself was a
  * no-op (round 7 finding 2: "the gateway caches the table; disk state alone proves nothing about
  * what's being served").
+ *
+ * Round 8 finding 1: a "superseded" whole-table classification is refined PER AXIS
+ * (`planPartialAxisRestore`) before giving up — a later adoption that only touched an UNRELATED axis
+ * must never strand THIS record's own still-live bad axis served forever. See the `"superseded"`
+ * branch below.
+ *
+ * Round 8 finding 5: everything from the snapshot read onward is wrapped in a try/catch — a read
+ * error (EIO/EACCES) or malformed JSON anywhere in this record's own files must fail-mark THIS
+ * record and retry later, never throw past this function (which would abort the ENTIRE watch run,
+ * starving every OTHER record this same run would otherwise have evaluated).
  *
  * Round 7 finding 2: finalizes to terminal `"breach"` ONLY when the restore write AND reload AND
  * canary confirmation ALL succeeded. Anything less (a stale-lease refusal, a failed write, a failed
@@ -1281,155 +1404,307 @@ async function performRevertAndFinalize(p: {
     return { claimed: false, action: "none", newStatus: record.status, quarantined: [] };
   }
 
-  if (record.snapshotPath === null) {
-    // No snapshot to compare against or restore from (first-ever adoption) — nothing to verify or
-    // write; resolve directly, matching the ordinary `snapshotPath === null` path's own handling.
+  try {
+    if (record.snapshotPath === null) {
+      // Round 8 follow-up (b): no snapshot to restore TO (first-ever adoption) does NOT mean
+      // "nothing can be done" — the correct undo is DELETING the bad, unconfirmed table outright
+      // (mirrors `reconcileAdoptionIntent`'s own first-ever-adoption undo), never leaving it live
+      // forever while calling the record "reverted". Confirmation-gated exactly like the
+      // whole-table path below (round 7 finding 2): terminal "breach" only once the delete AND the
+      // reload both genuinely succeed — there is no table content left to canary-check against, so
+      // "confirmed" here is `restoreWriteOk && reloadOk`.
+      const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
+      const rollback = await deleteTableAndReload({
+        deps: fencedDeps,
+        reason:
+          `adoption-watchdog: guard-metric breach on [${breachingTaskTypes.join(", ")}] within the post-adoption ` +
+          `watch window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef}) — no prior ` +
+          `snapshot existed (first-ever adoption); deleting the unconfirmed table`,
+      });
+      const confirmed = rollback.restoreWriteOk && rollback.reloadOk;
+      const status: WatchdogRevertResult["status"] = rollback.staleLeaseRefused
+        ? "unknown"
+        : !rollback.restoreWriteOk
+          ? "unknown"
+          : !rollback.reloadOk
+            ? "restored-reload-failed"
+            : "restored";
+      const revert: WatchdogRevertResult = { status, rollback };
+      if (!confirmed) {
+        const quarantineEntries = quarantineEntriesFor(
+          breachingTaskTypes,
+          now,
+          policy,
+          record,
+          ` — revert attempt incomplete (delete-and-reload did not fully succeed: ${rollback.reason}); retrying next tick`
+        );
+        if (!dryRun) {
+          markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+        }
+        return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes };
+      }
+      const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
+      if (!dryRun) {
+        finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "breach", lastEvaluatedAt: now, quarantineEntries });
+      }
+      return { claimed: true, action: "reverted", revert, newStatus: "breach", quarantined: breachingTaskTypes };
+    }
+
+    const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
+    const liveRawBeforeAction = (() => {
+      try {
+        return deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
+      } catch {
+        return null;
+      }
+    })();
+    const classification = classifyLiveTable(liveRawBeforeAction, record.candidateHash, snapshotRaw);
+
+    if (classification === "superseded") {
+      // Round 8 finding 1: a whole-table mismatch does NOT mean every axis THIS record touched is
+      // actually superseded — a later, unrelated adoption to a DIFFERENT axis produces the exact
+      // same whole-table hash mismatch while leaving this record's own bad axis untouched and still
+      // live. Refine per axis before giving up.
+      const candidateRawForPlan = record.candidateSnapshotPath ? readFileSync(record.candidateSnapshotPath, "utf8") : null;
+      const { restoreAxes, supersededAxes } = planPartialAxisRestore({
+        liveRaw: liveRawBeforeAction,
+        candidateRaw: candidateRawForPlan,
+        axes: breachingTaskTypes,
+      });
+
+      if (restoreAxes.length === 0) {
+        // Every one of this record's own axes has moved on to something other than what THIS
+        // record's own candidate wrote (or per-axis refinement was unavailable) — genuinely
+        // superseded on every axis; zero mutation (unchanged from round 7's whole-table behavior).
+        const warning = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was SUPERSEDED by a newer adoption before its breach revert could run — the live table matches neither this record's candidate nor its snapshot${candidateRawForPlan ? " (per-axis check confirmed every breaching axis has since moved on)" : " (no persisted candidate bytes to refine this per axis)"}. No rollback was attempted; quarantine still applied to [${breachingTaskTypes.join(", ")}].`;
+        const quarantineEntries = quarantineEntriesFor(
+          breachingTaskTypes,
+          now,
+          policy,
+          record,
+          " — table was superseded by a newer adoption before this revert could run; quarantine still applied, no rollback attempted"
+        );
+        if (!dryRun) {
+          finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "superseded", lastEvaluatedAt: now, quarantineEntries });
+        }
+        return {
+          claimed: true,
+          action: "superseded",
+          revert: { status: "superseded" },
+          newStatus: "superseded",
+          quarantined: breachingTaskTypes,
+          warning,
+        };
+      }
+
+      // At least one axis still carries THIS record's own (bad) candidate value — the breach is
+      // still live for it. Build a restoration table: the CURRENT live table with ONLY the
+      // still-live axes reset to their snapshot values — every other axis (superseded axes, and any
+      // entirely unrelated axis a newer adoption touched) is preserved exactly as-is.
+      const partialWarningPrefix = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was PARTIALLY superseded — axes [${restoreAxes.join(", ")}] still carried this record's own regressed candidate value and were restored to snapshot; axes [${supersededAxes.join(", ")}] were left untouched (already superseded by a newer, unrelated adoption).`;
+      const restorationRaw = buildPartialAxisRestoreRaw(liveRawBeforeAction as string, snapshotRaw, restoreAxes);
+      const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
+      const rollback = await manualRollback({
+        deps: fencedDeps,
+        snapshotRaw: restorationRaw,
+        reason:
+          `adoption-watchdog: guard-metric breach on [${restoreAxes.join(", ")}] within the post-adoption watch ` +
+          `window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef}) — PARTIAL (per-axis) ` +
+          `restore; axes [${supersededAxes.join(", ")}] preserved as superseded`,
+      });
+
+      if (rollback.staleLeaseRefused) {
+        const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — partial revert attempt refused (stale lease); retrying next tick");
+        if (!dryRun) {
+          markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+        }
+        return { claimed: true, action: "would-revert", revert: { status: "unknown", rollback }, newStatus: "reverting", quarantined: breachingTaskTypes, warning: partialWarningPrefix };
+      }
+
+      let partialCanary: CanaryOutcome | undefined;
+      if (rollback.restoreWriteOk && rollback.reloadOk) {
+        try {
+          const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
+          const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
+          const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
+          const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
+          partialCanary = runCanary({
+            changedTaskTypes: restoreAxes,
+            reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
+            candidate: priorParsed,
+            servableModelIds,
+          });
+        } catch {
+          partialCanary = undefined;
+        }
+      }
+
+      const partialStatus: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
+        ? "unknown"
+        : !rollback.reloadOk
+          ? "restored-reload-failed"
+          : partialCanary?.ok === true
+            ? "restored"
+            : "restored-unconfirmed";
+      const partialRevert: WatchdogRevertResult = { status: partialStatus, rollback, canary: partialCanary };
+      const partialConfirmed = partialStatus === "restored";
+
+      if (!partialConfirmed) {
+        const quarantineEntries = quarantineEntriesFor(
+          breachingTaskTypes,
+          now,
+          policy,
+          record,
+          ` — partial revert attempt incomplete (${describeIncompleteRevert(rollback, partialCanary)}); retrying next tick`
+        );
+        if (!dryRun) {
+          markRevertAttemptFailed({
+            dataDir: deps.dataDir,
+            recordId: record.id,
+            claimToken: lockToken,
+            attemptAt: now,
+            error: describeIncompleteRevert(rollback, partialCanary),
+            quarantineEntries,
+          });
+        }
+        return { claimed: true, action: "would-revert", revert: partialRevert, newStatus: "reverting", quarantined: breachingTaskTypes, warning: partialWarningPrefix };
+      }
+
+      // Quarantine the FULL breaching set (both restored and superseded axes) — the OLD candidate's
+      // breach evidence remains valid for every axis it originally touched, regardless of whether
+      // THIS revert action mutated it (same rule as the whole-table superseded/incomplete paths).
+      const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
+      if (!dryRun) {
+        finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "breach", lastEvaluatedAt: now, quarantineEntries });
+      }
+      return { claimed: true, action: "reverted-partial", revert: partialRevert, newStatus: "breach", quarantined: breachingTaskTypes, warning: partialWarningPrefix };
+    }
+
+    // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token. Safe to call
+    // regardless of whether the live table already matches the snapshot (classification ===
+    // "matches-snapshot") — re-writing identical bytes is a no-op, and this guarantees reload+canary
+    // ALWAYS run (round 7 finding 2), never skipped just because disk content already looked right.
+    const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
+    const rollback = await manualRollback({
+      deps: fencedDeps,
+      snapshotRaw,
+      reason:
+        `adoption-watchdog: guard-metric breach on [${breachingTaskTypes.join(", ")}] within the ` +
+        `post-adoption watch window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef})`,
+    });
+
+    if (rollback.staleLeaseRefused) {
+      // Round 6 finding 1: "a stale holder must never roll back" — the write was correctly refused,
+      // never attempted. Do NOT finalize: leave this record claimed ("reverting") with its now-stale
+      // token, an honest unresolved state + warning (the rollback record's own `reason` says so) —
+      // the NEXT watch run's recovery path detects the stale claim and re-examines it. Quarantine
+      // STILL applies — the breach itself (not the revert's success) is the trigger (round 6's
+      // "quarantine regardless of revert quality", carried forward to every incomplete-revert path).
+      const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — revert attempt refused (stale lease); retrying next tick");
+      if (!dryRun) {
+        markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+      }
+      return {
+        claimed: true,
+        action: "would-revert",
+        revert: { status: "unknown", rollback },
+        newStatus: "reverting",
+        quarantined: breachingTaskTypes,
+      };
+    }
+
+    let canary: CanaryOutcome | undefined;
+    if (rollback.restoreWriteOk && rollback.reloadOk) {
+      try {
+        const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
+        const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
+        const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
+        const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
+        canary = runCanary({
+          changedTaskTypes: breachingTaskTypes,
+          reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
+          candidate: priorParsed,
+          servableModelIds,
+        });
+      } catch {
+        canary = undefined; // best-effort confirmation; the rollback record is authoritative
+      }
+    }
+
+    // Round 7 finding 2: terminal "breach" requires write AND reload AND CONFIRMATION (canary) — an
+    // unconfirmed (or outright failed) revert is never finalized as if it had actually happened.
+    const status: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
+      ? "unknown" // mirrors performRollback's own "UNKNOWN state, manual recovery required"
+      : !rollback.reloadOk
+        ? "restored-reload-failed"
+        : canary?.ok === true
+          ? "restored"
+          : "restored-unconfirmed";
+    const revert: WatchdogRevertResult = { status, rollback, canary };
+    const confirmed = status === "restored";
+
+    if (!confirmed) {
+      // Failure-marked (never silently dropped) — status stays "reverting". Once this call's own
+      // lease is released (by the caller's `finally`), the claim naturally goes stale, and the NEXT
+      // run's recovery path re-examines this record from scratch (re-classifying superseded/
+      // matches-snapshot/matches-candidate, never assuming the prior attempt's classification still
+      // holds). Quarantine STILL applies (round 6: "the breach itself is the trigger; a failed
+      // restore-write does not make the axis any MORE trustworthy") — an incomplete revert is not a
+      // reason to leave the regressed axis eligible for further traffic while it retries.
+      const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt incomplete (${describeIncompleteRevert(rollback, canary)}); retrying next tick`);
+      if (!dryRun) {
+        markRevertAttemptFailed({
+          dataDir: deps.dataDir,
+          recordId: record.id,
+          claimToken: lockToken,
+          attemptAt: now,
+          error: describeIncompleteRevert(rollback, canary),
+          quarantineEntries,
+        });
+      }
+      return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes };
+    }
+
+    const newStatus: AdoptionWatchRecord["status"] = "breach";
+
+    // Quarantine every breaching axis regardless of revert quality — the breach itself is the
+    // trigger; a failed restore-write does not make the axis any MORE trustworthy. Written ONLY as
+    // part of THIS finalize commit — "quarantine row written only on CAS win" (round 6 finding 2).
     const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
+
     if (!dryRun) {
-      finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "breach", lastEvaluatedAt: now, quarantineEntries });
+      finalizeReverting({
+        dataDir: deps.dataDir,
+        recordId: record.id,
+        claimToken: lockToken,
+        newStatus,
+        lastEvaluatedAt: now,
+        quarantineEntries,
+      });
     }
-    return { claimed: true, action: "reverted", revert: { status: "skipped-no-snapshot" }, newStatus: "breach", quarantined: breachingTaskTypes };
-  }
 
-  const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
-  const liveRawBeforeAction = (() => {
-    try {
-      return deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
-    } catch {
-      return null;
-    }
-  })();
-  const classification = classifyLiveTable(liveRawBeforeAction, record.candidateHash, snapshotRaw);
-
-  if (classification === "superseded") {
-    // Round 7 finding 1: a NEWER legitimate adoption is live — NEVER roll back over it. Resolve as
-    // a terminal "superseded" state with ZERO table mutation; quarantine still applies (the OLD
-    // candidate's breach evidence remains valid even though the table has since moved on).
-    const warning = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was SUPERSEDED by a newer adoption before its breach revert could run — the live table matches neither this record's candidate nor its snapshot. No rollback was attempted; quarantine still applied to [${breachingTaskTypes.join(", ")}].`;
-    const quarantineEntries = quarantineEntriesFor(
-      breachingTaskTypes,
-      now,
-      policy,
-      record,
-      " — table was superseded by a newer adoption before this revert could run; quarantine still applied, no rollback attempted"
-    );
+    return { claimed: true, action: "reverted", revert, newStatus, quarantined: breachingTaskTypes };
+  } catch (err) {
+    // Round 8 finding 5: a read error (EIO/EACCES) or malformed JSON anywhere above (the snapshot
+    // file, the candidate-snapshot file, the live table) must fail-mark THIS record and retry later
+    // — never throw past this function, which would abort the ENTIRE watch run and starve every
+    // OTHER record this same run would otherwise have evaluated. Mirrors the ordinary
+    // "incomplete revert" failure-mark path: status stays "reverting", never "superseded" (a
+    // classification error is not evidence of anything, safe or otherwise) and never terminal.
+    const message = err instanceof Error ? err.message : String(err);
+    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt failed with an unexpected error (${message}); retrying next tick`);
     if (!dryRun) {
-      finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, newStatus: "superseded", lastEvaluatedAt: now, quarantineEntries });
-    }
-    return {
-      claimed: true,
-      action: "superseded",
-      revert: { status: "superseded" },
-      newStatus: "superseded",
-      quarantined: breachingTaskTypes,
-      warning,
-    };
-  }
-
-  // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token. Safe to call
-  // regardless of whether the live table already matches the snapshot (classification ===
-  // "matches-snapshot") — re-writing identical bytes is a no-op, and this guarantees reload+canary
-  // ALWAYS run (round 7 finding 2), never skipped just because disk content already looked right.
-  const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
-  const rollback = await manualRollback({
-    deps: fencedDeps,
-    snapshotRaw,
-    reason:
-      `adoption-watchdog: guard-metric breach on [${breachingTaskTypes.join(", ")}] within the ` +
-      `post-adoption watch window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef})`,
-  });
-
-  if (rollback.staleLeaseRefused) {
-    // Round 6 finding 1: "a stale holder must never roll back" — the write was correctly refused,
-    // never attempted. Do NOT finalize: leave this record claimed ("reverting") with its now-stale
-    // token, an honest unresolved state + warning (the rollback record's own `reason` says so) —
-    // the NEXT watch run's recovery path detects the stale claim and re-examines it. Quarantine
-    // STILL applies — the breach itself (not the revert's success) is the trigger (round 6's
-    // "quarantine regardless of revert quality", carried forward to every incomplete-revert path).
-    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, " — revert attempt refused (stale lease); retrying next tick");
-    if (!dryRun) {
-      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: rollback.reason, quarantineEntries });
+      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: message, quarantineEntries });
     }
     return {
       claimed: true,
       action: "would-revert",
-      revert: { status: "unknown", rollback },
+      revert: { status: "unknown" },
       newStatus: "reverting",
       quarantined: breachingTaskTypes,
+      warning: `adoption-watchdog: record ${record.id} hit an unexpected error while classifying/restoring (${message}) — failure-marked and left retriable, not silently dropped.`,
     };
   }
-
-  let canary: CanaryOutcome | undefined;
-  if (rollback.restoreWriteOk && rollback.reloadOk) {
-    try {
-      const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
-      const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
-      const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
-      const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
-      canary = runCanary({
-        changedTaskTypes: breachingTaskTypes,
-        reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
-        candidate: priorParsed,
-        servableModelIds,
-      });
-    } catch {
-      canary = undefined; // best-effort confirmation; the rollback record is authoritative
-    }
-  }
-
-  // Round 7 finding 2: terminal "breach" requires write AND reload AND CONFIRMATION (canary) — an
-  // unconfirmed (or outright failed) revert is never finalized as if it had actually happened.
-  const status: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
-    ? "unknown" // mirrors performRollback's own "UNKNOWN state, manual recovery required"
-    : !rollback.reloadOk
-      ? "restored-reload-failed"
-      : canary?.ok === true
-        ? "restored"
-        : "restored-unconfirmed";
-  const revert: WatchdogRevertResult = { status, rollback, canary };
-  const confirmed = status === "restored";
-
-  if (!confirmed) {
-    // Failure-marked (never silently dropped) — status stays "reverting". Once this call's own
-    // lease is released (by the caller's `finally`), the claim naturally goes stale, and the NEXT
-    // run's recovery path re-examines this record from scratch (re-classifying superseded/
-    // matches-snapshot/matches-candidate, never assuming the prior attempt's classification still
-    // holds). Quarantine STILL applies (round 6: "the breach itself is the trigger; a failed
-    // restore-write does not make the axis any MORE trustworthy") — an incomplete revert is not a
-    // reason to leave the regressed axis eligible for further traffic while it retries.
-    const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt incomplete (${describeIncompleteRevert(rollback, canary)}); retrying next tick`);
-    if (!dryRun) {
-      markRevertAttemptFailed({
-        dataDir: deps.dataDir,
-        recordId: record.id,
-        claimToken: lockToken,
-        attemptAt: now,
-        error: describeIncompleteRevert(rollback, canary),
-        quarantineEntries,
-      });
-    }
-    return { claimed: true, action: "would-revert", revert, newStatus: "reverting", quarantined: breachingTaskTypes };
-  }
-
-  const newStatus: AdoptionWatchRecord["status"] = "breach";
-
-  // Quarantine every breaching axis regardless of revert quality — the breach itself is the
-  // trigger; a failed restore-write does not make the axis any MORE trustworthy. Written ONLY as
-  // part of THIS finalize commit — "quarantine row written only on CAS win" (round 6 finding 2).
-  const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record);
-
-  if (!dryRun) {
-    finalizeReverting({
-      dataDir: deps.dataDir,
-      recordId: record.id,
-      claimToken: lockToken,
-      newStatus,
-      lastEvaluatedAt: now,
-      quarantineEntries,
-    });
-  }
-
-  return { claimed: true, action: "reverted", revert, newStatus, quarantined: breachingTaskTypes };
 }
 
 /**
@@ -1459,62 +1734,30 @@ async function recoverStuckReverting(
   if (lockHandle === null) return null; // busy — leave the stuck row exactly as-is; try again next run
 
   try {
-    const snapshotRaw = record.snapshotPath ? readFileSync(record.snapshotPath, "utf8") : null;
     const breachingTaskTypes = record.changedTaskTypes;
 
-    let action: WatchdogAction;
-    let revert: WatchdogRevertResult;
-    let newStatus: AdoptionWatchRecord["status"];
-    let quarantined: string[] = [];
-    let warning: string | undefined;
-
-    if (snapshotRaw === null) {
-      // No snapshot to compare against (first-ever adoption) — nothing to verify or retry; resolve
-      // directly, matching the ordinary `snapshotPath === null` path's own handling.
-      const claimed = claimForReverting({
-        dataDir: deps.dataDir,
-        recordId: record.id,
-        fromStatus: "reverting",
-        expectedRevertingToken: record.revertingToken,
-        leaseToken: lockHandle.token,
-        nowIso: now,
-      });
-      action = "reverted";
-      revert = { status: "skipped-no-snapshot" };
-      newStatus = "breach";
-      if (claimed && !dryRun) {
-        const quarantineEntries = quarantineEntriesFor(
-          breachingTaskTypes,
-          now,
-          policy,
-          record,
-          " — recovered after a crashed revert attempt"
-        );
-        finalizeReverting({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockHandle.token, newStatus, lastEvaluatedAt: now, quarantineEntries });
-      }
-    } else {
-      // Round 7 findings 1+2: delegate entirely to `performRevertAndFinalize` — it now performs the
-      // SAME three-way classification (matches-candidate / matches-snapshot / superseded) and the
-      // SAME write-AND-reload-AND-confirm gate uniformly for both a first attempt and a recovery
-      // retry. This replaces the old "already reverted -> finalize without reload/confirm" shortcut
-      // (round 7 finding 2's bug: disk state alone was treated as proof, when the gateway caches the
-      // table) and the old missing supersession check (round 7 finding 1's bug) in the recovery path.
-      const outcome = await performRevertAndFinalize({
-        deps,
-        policy,
-        record,
-        breachingTaskTypes,
-        now,
-        lockToken: lockHandle.token,
-        fromStatus: "reverting",
-        dryRun,
-      });
-      action = outcome.action;
-      revert = outcome.revert ?? { status: "unknown" };
-      newStatus = outcome.newStatus;
-      quarantined = outcome.quarantined;
-      warning = outcome.warning;
-    }
+    // Round 7 findings 1+2 + round 8 finding 5: delegate ENTIRELY to `performRevertAndFinalize` —
+    // it performs the SAME three-way classification (matches-candidate / matches-snapshot /
+    // superseded, refined per axis per round 8 finding 1), the SAME write-AND-reload-AND-confirm
+    // gate, the SAME `record.snapshotPath === null` delete-and-reload handling (round 8 follow-up
+    // b), and the SAME per-record error safety (round 8 finding 5) uniformly for both a first
+    // attempt and a recovery retry — no separate read-and-branch needed here at all, and no
+    // separate "no snapshot" shortcut that used to skip verification entirely.
+    const outcome = await performRevertAndFinalize({
+      deps,
+      policy,
+      record,
+      breachingTaskTypes,
+      now,
+      lockToken: lockHandle.token,
+      fromStatus: "reverting",
+      dryRun,
+    });
+    const action = outcome.action;
+    const revert = outcome.revert ?? { status: "unknown" };
+    const newStatus = outcome.newStatus;
+    const quarantined = outcome.quarantined;
+    const warning = outcome.warning;
 
     const event: WatchdogEvent = {
       schemaVersion: 1,
@@ -1581,6 +1824,46 @@ export async function runAdoptionWatch(
         continue; // genuinely in-flight elsewhere right now — do not race it
       }
       if (dryRun) continue; // recovery is itself a mutation; dry-run never performs it
+      if (killSwitchActive) {
+        // Round 8 finding 3: a stuck "reverting" row's claiming lease has gone stale — ordinarily
+        // this triggers reclaim-and-execute recovery, but that IS a mutation (a re-claim, a
+        // possible table write, a possible quarantine write), exactly what the kill switch exists to
+        // suppress. Mirrors the fresh-breach path's own kill-switch contract exactly: evaluate and
+        // RECORD (an event, a report item) but perform NO reclaim, NO table mutation, NO quarantine
+        // write. The record stays "reverting" untouched — it resumes once the switch clears.
+        const event: WatchdogEvent = {
+          schemaVersion: 1,
+          emittedAt: now,
+          recordId: record.id,
+          adoptedAt: record.adoptedAt,
+          candidateHash: record.candidateHash,
+          decisionRef: record.decisionRef,
+          verdict: "breach",
+          changedTaskTypes: record.changedTaskTypes,
+          metricsBefore: [],
+          metricsAfter: [],
+          breaches: [],
+          killSwitchActive: true,
+          dryRun,
+          action: "would-revert",
+          quarantined: [],
+        };
+        appendWatchdogEvent(deps.dataDir, event);
+        items.push({
+          record,
+          evaluation: {
+            verdict: "breach",
+            windowComplete: true,
+            elapsedHours: (Date.parse(now) - Date.parse(record.adoptedAt)) / (60 * 60 * 1000),
+            totalPostAdoptionTasks: 0,
+            perTaskType: [],
+            evaluatedAt: now,
+          },
+          action: "would-revert",
+          quarantined: [],
+        });
+        continue;
+      }
       const recovered = await recoverStuckReverting(deps, policy, record, now, dryRun);
       if (recovered) {
         items.push(recovered.item);
@@ -1633,24 +1916,6 @@ export async function runAdoptionWatch(
         // Report-only: detected and (outside dry-run) recorded, but no mutation — see the module
         // header on why the record stays `pending` under a kill switch rather than resolving.
         action = "would-revert";
-      } else if (record.snapshotPath === null) {
-        // No table mutation is involved in this branch (nothing to restore) — no mutation LEASE is
-        // needed either (fixed round 5: the round-4 comment here claimed the lock was taken but the
-        // code never actually acquired one). The record-status + quarantine-row commit is still
-        // atomic: both land in ONE SQLite transaction via `commitRecordResolution`.
-        newStatus = "breach";
-        revert = { status: "skipped-no-snapshot" };
-        action = "reverted";
-        quarantineEntriesToCommit = breachingTaskTypes.map((t) => ({
-          taskType: t,
-          quarantinedAt: now,
-          reason: `guard-metric breach on adoption ${record.candidateHash} (${record.decisionRef})`,
-          cooldownUntil: new Date(Date.parse(now) + policy.cooldownHours * 60 * 60 * 1000).toISOString(),
-          requiredMarginDelta: policy.requiredMarginDelta,
-          baselinePassRateAtQuarantine: readPassRateForTaskType(record.snapshotPath, t),
-          clearedAt: null,
-        }));
-        quarantined = breachingTaskTypes;
       } else {
         // Round 4 finding 3 (+ round 5 finding 1's fencing, + round 6 finding 2's CAS-before-act):
         // the revert WRITE must run under the SAME exclusive mutation lease every other table
@@ -1660,6 +1925,12 @@ export async function runAdoptionWatch(
         // `manualRollback` action — never the reverse — so a crash mid-revert leaves an honest
         // `"reverting"` trace for the NEXT run's recovery path, rather than silently looking
         // untouched and inviting a double revert.
+        //
+        // Round 8 follow-up (b): this now ALSO covers `record.snapshotPath === null` (first-ever
+        // adoption) — the old separate "no snapshot, no lease needed" branch never actually undid
+        // the bad table at all (it just called itself "reverted"). `performRevertAndFinalize`'s own
+        // `snapshotPath === null` handling now genuinely deletes+reloads+confirms, which DOES need
+        // the lease like every other table mutation.
         let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
         try {
           lockHandle = acquireMutationLock(deps.dataDir);

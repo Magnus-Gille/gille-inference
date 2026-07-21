@@ -101,6 +101,7 @@ import {
   runAdoptionWatch,
   DEFAULT_WATCHDOG_POLICY,
   type AdoptionWatchRecord,
+  type WatchdogRevertResult,
 } from "../src/homeserver/adoption-watchdog.js";
 
 const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
@@ -574,6 +575,9 @@ async function cmdAdopt(args: string[]): Promise<void> {
         approvedBy: result.record.approvedBy,
         changedTaskTypes: changedTaskTypesOf(artifact.diff),
         priorRaw: priorRawForWatchdog,
+        // Round 8 finding 1: `artifact.candidate` is exactly what `adoptRoutingTable` just wrote —
+        // persisted so a later whole-table "superseded" classification can be refined per axis.
+        candidateRaw: JSON.stringify(artifact.candidate, null, 2) + "\n",
         leaseToken: lockHandle.token,
       });
     }
@@ -727,6 +731,23 @@ function killSwitchOn(): boolean {
   return (process.env["AUTONOMY_KILL_SWITCH"] ?? "").trim().toLowerCase() === "on";
 }
 
+/**
+ * Round 7 findings 1+2 + round 8 follow-up (c): the SINGLE source of truth for which revert
+ * statuses need an operator's eyes, extracted as a pure function so it is directly unit-testable
+ * (the same "test the underlying function, not the CLI's `main()` entrypoint" pattern as
+ * `describeRollbackOutcome`). "unknown" (a genuinely failed/refused restore) and
+ * "restored-unconfirmed" (write+reload succeeded but the canary did not confirm) both need
+ * attention, same as "restored-reload-failed" (the restore WRITE succeeded but the reload never
+ * confirmed it took effect — round 8 follow-up (c) added this; it was missing before, so the table
+ * could be silently un-reloaded and nobody would ever be told). "superseded" is an honest terminal
+ * state (a newer legitimate adoption is live, no rollback was attempted) — also attention-worthy,
+ * but distinct from a failure. "restored" and "reverted-partial"'s own confirmed "restored" canary
+ * outcome, plus "skipped-lock-busy"/"skipped-no-snapshot", need no attention.
+ */
+export function revertNeedsOperatorAttention(status: WatchdogRevertResult["status"] | undefined): boolean {
+  return status === "unknown" || status === "restored-unconfirmed" || status === "restored-reload-failed" || status === "superseded";
+}
+
 async function cmdWatch(args: string[]): Promise<void> {
   if (readFlag(args, "--db")) process.env["EVAL_DB_PATH"] = readFlag(args, "--db");
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
@@ -773,14 +794,7 @@ async function cmdWatch(args: string[]): Promise<void> {
       }
       if (revert) process.stderr.write(`  revert: ${revert.status}\n`);
       if (quarantined.length > 0) process.stderr.write(`  quarantined: ${quarantined.join(", ")}\n`);
-      // Round 7 findings 1+2: "unknown" (a genuinely failed/refused restore) and
-      // "restored-unconfirmed" (write+reload succeeded but the canary did not confirm — record
-      // stays "reverting", retriable) both need an operator's eyes just as much as "unknown" did
-      // before. "superseded" is an honest terminal state (a newer legitimate adoption is live, no
-      // rollback was attempted) — also attention-worthy, but distinct from a failure.
-      if (revert?.status === "unknown" || revert?.status === "restored-unconfirmed" || revert?.status === "superseded") {
-        needsAttention = true;
-      }
+      if (revertNeedsOperatorAttention(revert?.status)) needsAttention = true;
     }
     if (evaluation.verdict === "inconclusive") {
       process.stderr.write(`  window ended without sufficient sample on: ${evaluation.perTaskType.filter((t) => t.status === "insufficient-sample").map((t) => t.taskType).join(", ")} — surfaced for review, nothing mutated.\n`);
