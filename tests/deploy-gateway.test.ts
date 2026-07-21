@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -51,10 +51,15 @@ function headSha(dir: string): string {
   return execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
 }
 
-/** A real local HTTP server that always answers 200 — stands in for a healthy /healthz. */
-function startOkServer(): Promise<{ url: string; close: () => Promise<void> }> {
+/** A real local HTTP server that always answers 200 — stands in for a healthy /healthz.
+ *  `onHit`, when given, runs synchronously before the response is sent — used by the gi#49
+ *  ordering test to record exactly when each probe was actually reached relative to other steps. */
+function startOkServer(onHit?: () => void): Promise<{ url: string; close: () => Promise<void> }> {
   return new Promise((resolvePromise) => {
-    const server = createServer((_req, res) => res.end("ok"));
+    const server = createServer((_req, res) => {
+      onHit?.();
+      res.end("ok");
+    });
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
       const close = () => new Promise<void>((r) => server.close(() => r()));
@@ -64,12 +69,17 @@ function startOkServer(): Promise<{ url: string; close: () => Promise<void> }> {
   });
 }
 
-/** Stands in for /v1/capabilities/learning-task: 200 only for the expected bearer key. */
-function startCapabilityServer(expectedKey: string): Promise<{ url: string; close: () => Promise<void> }> {
+/** Stands in for /v1/capabilities/learning-task: 200 only for the expected bearer key.
+ *  `onHit` (see startOkServer) fires only on the accepted (200) request. */
+function startCapabilityServer(
+  expectedKey: string,
+  onHit?: () => void
+): Promise<{ url: string; close: () => Promise<void> }> {
   return new Promise((resolvePromise) => {
     const server = createServer((req, res) => {
       const auth = req.headers.authorization ?? "";
       if (auth === `Bearer ${expectedKey}`) {
+        onHit?.();
         res.writeHead(200);
         res.end("{}");
       } else {
@@ -126,10 +136,15 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     // Tests that specifically exercise the preflight override both of these directly.
     DEPLOY_EXECSTART_PROBE_CMD: `echo '{ path=${remoteDir}/node_modules/.bin/tsx ; argv[]=${remoteDir}/node_modules/.bin/tsx src/homeserver/cli.ts serve ; }'`,
     DEPLOY_INTERPRETER_CHECK_CMD: "true",
-    // Benign no-op stub for the gi#49 autonomy-tick unit install/enable step: like every other
-    // remote-mutating step, tests that don't specifically exercise it must never touch a real
-    // user systemd session or $HOME/.config/systemd/user. Tests that care override this directly.
-    DEPLOY_UNITS_INSTALL_CMD: "true",
+    // Benign no-op stubs for the gi#49 autonomy-tick unit render/lingering-check/enable steps:
+    // like every other remote-mutating step, tests that don't specifically exercise them must
+    // never touch a real user systemd session, $HOME/.config/systemd/user, or loginctl. Tests
+    // that care override the relevant one(s) directly. (DEPLOY_INTERPRETER_CHECK_CMD above is
+    // reused verbatim for the timer's own interpreter check -- same override var, same idiom.)
+    DEPLOY_UNITS_RENDER_CMD: "true",
+    DEPLOY_UNITS_RELOAD_CMD: "true",
+    DEPLOY_LINGER_CHECK_CMD: "true",
+    DEPLOY_UNITS_ENABLE_CMD: "true",
     HOMESERVER_OWNER_KEY: OWNER_KEY,
     ...overrides,
   };
@@ -144,6 +159,24 @@ function writeCommittedRoutingTable(srcDir: string, content = '{"routing":{},"es
   writeFileSync(join(srcDir, "docs", "m5-routing.json"), content);
   execFileSync("git", ["add", "-A"], { cwd: srcDir });
   execFileSync("git", ["commit", "-q", "-m", "add fixture routing table"], { cwd: srcDir });
+}
+
+/** Writes the real (placeholder-bearing) deploy/systemd/gille-autonomy-tick.{service,timer}
+ *  templates into a source-repo fixture and commits them, so a real deploy's main rsync ships
+ *  them to the "remote" fixture dir exactly like a real checkout would -- letting a test exercise
+ *  the REAL (unstubbed) DEPLOY_UNITS_RENDER_CMD default and assert on the rendered output. */
+function writeAutonomyTickUnitTemplate(srcDir: string): void {
+  mkdirSync(join(srcDir, "deploy", "systemd"), { recursive: true });
+  writeFileSync(
+    join(srcDir, "deploy", "systemd", "gille-autonomy-tick.service"),
+    "[Unit]\nDescription=gille autonomy controller tick (gi#49)\n\n[Service]\nType=oneshot\nWorkingDirectory=@@REMOTE_DIR@@\nExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/autonomy-tick-cli.ts\n"
+  );
+  writeFileSync(
+    join(srcDir, "deploy", "systemd", "gille-autonomy-tick.timer"),
+    "[Unit]\nDescription=Daily gille autonomy tick\n\n[Timer]\nOnCalendar=*-*-* 05:30:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+  );
+  execFileSync("git", ["add", "-A"], { cwd: srcDir });
+  execFileSync("git", ["commit", "-q", "-m", "add fixture autonomy-tick unit templates"], { cwd: srcDir });
 }
 
 describe("scripts/deploy-gateway.sh", () => {
@@ -270,8 +303,8 @@ describe("scripts/deploy-gateway.sh", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/PLAN: would deploy commit [0-9a-f]{40}/);
     expect(r.stdout).toMatch(/PLAN: remote WorkingDirectory verified/);
-    // gi#49: the autonomy-tick systemd unit install/enable step must appear in the plan too.
-    expect(r.stdout).toMatch(/PLAN: install\/enable user-scope systemd units \(gille-autonomy-tick/);
+    // gi#49: the autonomy-tick systemd unit render/enable step must appear in the plan too.
+    expect(r.stdout).toMatch(/PLAN: LAST, only after every check above passes: render gille-autonomy-tick\.service/);
     expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
   });
 
@@ -534,11 +567,12 @@ describe("scripts/deploy-gateway.sh", () => {
     });
   });
 
-  describe("gi#49 autonomy-tick systemd unit install/enable", () => {
-    it("invokes the unit-install step after the remote install and before the restart, as part of a normal deploy", async () => {
+  describe("gi#49 autonomy-tick systemd unit render/interpreter-check/lingering-check/enable", () => {
+    it("renders the installed unit with the actual remote dir + absolute tsx path -- no placeholder, no npx/env", async () => {
       const src = initSourceRepo();
+      writeAutonomyTickUnitTemplate(src); // real templates, so the REAL render command has something to substitute
       const remote = tmpDir("dg-remote-");
-      const orderLog = join(remote, "ORDER_LOG");
+      const fakeHome = tmpDir("dg-home-");
       const local = await startOkServer();
       const tailnet = await startOkServer();
       const cap = await startCapabilityServer(OWNER_KEY);
@@ -546,26 +580,30 @@ describe("scripts/deploy-gateway.sh", () => {
         "deploy",
         src,
         baseEnv(remote, {
+          HOME: fakeHome, // the render step's `$HOME` must expand to THIS fixture dir, not the real one
+          DEPLOY_UNITS_RENDER_CMD: "", // empty falls back to the script's real default (sed render + cp; daemon-reload is a separate, still-stubbed step)
           DEPLOY_HEALTH_LOCAL_URL: local.url,
           DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
           DEPLOY_CAPABILITY_URL: cap.url,
-          DEPLOY_INSTALL_CMD: `echo install >> '${orderLog}'`,
-          DEPLOY_UNITS_INSTALL_CMD: `echo units >> '${orderLog}'`,
-          DEPLOY_RESTART_CMD: `echo restart >> '${orderLog}'`,
         })
       );
       expect(r.status).toBe(0);
-      expect(r.stdout).toMatch(/Installing\/enabling the gi#49 autonomy-tick user-scope systemd timer/);
-      // Order matters: npm install -> unit install/enable -> restart (never the reverse).
-      const order = readFileSync(orderLog, "utf8").trim().split("\n");
-      expect(order).toEqual(["install", "units", "restart"]);
+      const renderedPath = join(fakeHome, ".config", "systemd", "user", "gille-autonomy-tick.service");
+      expect(existsSync(renderedPath)).toBe(true);
+      const rendered = readFileSync(renderedPath, "utf8");
+      expect(rendered).toContain(`WorkingDirectory=${remote}`);
+      expect(rendered).toContain(`ExecStart=${remote}/node_modules/.bin/tsx scripts/autonomy-tick-cli.ts`);
+      expect(rendered).not.toContain("@@REMOTE_DIR@@"); // placeholder must be fully substituted
+      expect(rendered).not.toContain("npx");
+      expect(rendered).not.toContain("/usr/bin/env");
+      // The .timer has no path to substitute -- copied as-is alongside the rendered .service.
+      expect(existsSync(join(fakeHome, ".config", "systemd", "user", "gille-autonomy-tick.timer"))).toBe(true);
       expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
     });
 
-    it("fails the whole deploy (nonzero, no marker, restart never reached) when the unit install/enable fails", async () => {
+    it("fails the deploy (no marker) when the unit render/copy/daemon-reload step fails", async () => {
       const src = initSourceRepo();
       const remote = tmpDir("dg-remote-");
-      const restartSentinel = join(remote, "RESTARTED_SENTINEL");
       const local = await startOkServer();
       const tailnet = await startOkServer();
       const cap = await startCapabilityServer(OWNER_KEY);
@@ -576,14 +614,84 @@ describe("scripts/deploy-gateway.sh", () => {
           DEPLOY_HEALTH_LOCAL_URL: local.url,
           DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
           DEPLOY_CAPABILITY_URL: cap.url,
-          DEPLOY_UNITS_INSTALL_CMD: "false", // simulates a failed cp/daemon-reload/enable --now
-          DEPLOY_RESTART_CMD: `touch '${restartSentinel}'`,
+          DEPLOY_UNITS_RENDER_CMD: "false",
         })
       );
       expect(r.status).not.toBe(0);
-      expect(r.stderr).toMatch(/failed to install\/enable gille-autonomy-tick\.timer \(gi#49\)/);
-      expect(existsSync(restartSentinel)).toBe(false); // restart must never have been attempted
+      expect(r.stderr).toMatch(/failed to render\/install gille-autonomy-tick unit files \(gi#49\)/);
       expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
+
+    it("fails the deploy (no marker) when user lingering cannot be confirmed, even after attempting enable-linger, and names the remediation command", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_LINGER_CHECK_CMD: "false", // simulates a persistently-refused enable-linger
+        })
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/user lingering is not enabled for this account/);
+      expect(r.stderr).toMatch(/loginctl enable-linger/); // exact remediation command must be named
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
+
+    it("fails the deploy (no marker) when enabling gille-autonomy-tick.timer itself fails", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_UNITS_ENABLE_CMD: "false",
+        })
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/failed to enable gille-autonomy-tick\.timer \(gi#49\)/);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
+
+    it("arms the timer (enable --now) only after restart + every health/capability probe pass, immediately before the marker write", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const orderLog = join(remote, "ORDER_LOG");
+      const record = (label: string) => appendFileSync(orderLog, `${label}\n`);
+      // onHit fires synchronously inside each real HTTP server's request handler, so the log
+      // reflects the actual chronological order the deploy script reached each step in --
+      // the deploy script itself runs strictly sequentially (each remote/curl call blocks the
+      // next line), so this is a reliable ordering signal, not a race.
+      const local = await startOkServer(() => record("local-health"));
+      const tailnet = await startOkServer(() => record("tailnet-health"));
+      const cap = await startCapabilityServer(OWNER_KEY, () => record("capability"));
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_RESTART_CMD: `echo restart >> '${orderLog}'`,
+          DEPLOY_UNITS_ENABLE_CMD: `echo enable >> '${orderLog}'`,
+        })
+      );
+      expect(r.status).toBe(0);
+      const order = readFileSync(orderLog, "utf8").trim().split("\n");
+      expect(order).toEqual(["restart", "local-health", "tailnet-health", "capability", "enable"]);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
     });
   });
 });

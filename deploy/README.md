@@ -159,21 +159,45 @@ last-good build instead of crash-looping.
 
 **Autonomy-tick timer (gi#49).** `deploy/systemd/gille-autonomy-tick.{service,timer}` are
 repo-managed IaC — committed unit files, not hand-authored on the box — mirroring hugin's
-convention of keeping unit definitions in-repo. `scripts/deploy-gateway.sh deploy` installs and
-enables them on every deploy: after the main rsync (which ships `deploy/systemd/*` like any other
-tracked file) and the remote `npm ci`, it copies both units into
-`$HOME/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then
-`systemctl --user enable --now gille-autonomy-tick.timer`. This is idempotent — re-running it on an
-already-enabled, already-running timer is a no-op — so it runs unconditionally on every deploy, not
-just the first. **Fail-closed:** a failed copy/reload/enable is a hard deploy `ERROR` (nonzero
-exit, `.deployed-commit` left unwritten), never a silent skip, because an un-enabled timer means the
-autonomy controller silently stops ticking.
+convention of keeping unit definitions in-repo. `scripts/deploy-gateway.sh deploy` renders and
+enables them on every deploy, but only as the very LAST step, strictly after restart-if-needed and
+every health/capability probe below have already passed (a review finding: a `Persistent=true`
+catch-up tick armed any earlier could fire against a gateway that is still mid-restart):
+
+1. **Render, not copy verbatim.** The committed `.service` file is a *template* —
+   `WorkingDirectory`/`ExecStart` hold the placeholder `@@REMOTE_DIR@@`, never a real path (a
+   hardcoded path would bypass this very script's own `verify_path_match` guard the moment the
+   live path ever changes). The main rsync ships the template to
+   `$REMOTE_DIR/deploy/systemd/*.{service,timer}` like any other tracked file; this step
+   `sed`-substitutes the actual, just-verified remote dir into the installed copy at
+   `$HOME/.config/systemd/user/gille-autonomy-tick.service` (the `.timer` has no path to
+   substitute and is copied as-is), then runs `systemctl --user daemon-reload`.
+2. **Interpreter existence check**, reusing the exact issue #30 preflight idiom above against
+   `$REMOTE_DIR/node_modules/.bin/tsx` — the same absolute binary `home-gateway.service` itself
+   runs. `ExecStart` deliberately does **not** go through `/usr/bin/env npx`: `npx`'s resolution
+   depends on the invoking shell's `PATH` (nvm/asdf/login-shell shims), which the `systemd --user`
+   manager does not necessarily share.
+3. **Lingering check.** `systemctl --user enable --now` succeeding over the deploy's own SSH
+   session proves nothing once that session ends — without lingering enabled for the account, the
+   user manager (and every unit in it) is torn down at logout, and the timer would silently never
+   fire unattended even though the deploy already stamped success. This step attempts the (usually
+   unprivileged) `loginctl enable-linger $(id -un)` first; if the account still isn't lingering
+   afterward, it fails the whole deploy closed with the exact remediation command instead of
+   certifying a timer that will never actually run.
+4. **Enable + start**, only once 1–3 have all succeeded: `systemctl --user enable --now
+   gille-autonomy-tick.timer` — idempotent, so it runs unconditionally on every deploy, not just
+   the first.
+
+**Fail-closed:** a failure at any of steps 1–4 is a hard deploy `ERROR` (nonzero exit,
+`.deployed-commit` left unwritten), never a silent skip — an un-rendered, un-enabled, or
+non-lingering timer means the autonomy controller silently stops ticking.
 
 - **Cadence:** `OnCalendar=*-*-* 05:30:00` (daily, 05:30 local time on the box), `Persistent=true`
   (a missed run, e.g. the box was off, fires once at the next boot/wake instead of being dropped).
-- **What it runs:** `npx tsx scripts/autonomy-tick-cli.ts` (the Phase 4 autonomy controller's one
-  idempotent cron entrypoint — issue #49) as a `Type=oneshot` unit with
-  `WorkingDirectory=/home/magnus/home-server-eval`, the same directory that holds `.env`.
+- **What it runs:** `$REMOTE_DIR/node_modules/.bin/tsx scripts/autonomy-tick-cli.ts` (the Phase 4
+  autonomy controller's one idempotent cron entrypoint — issue #49) as a `Type=oneshot` unit with
+  `WorkingDirectory=$REMOTE_DIR` (currently `/home/magnus/home-server-eval`, the same directory
+  that holds `.env`), rendered at install time — see step 1 above.
 - **Pause, not stop:** set `AUTONOMY_KILL_SWITCH=on` in that `.env`. The tick still runs, still
   evaluates and records everything (demotions still apply), but performs no adopt/promote — the
   same semantics `routing-lifecycle-cli.ts watch` and the adoption watchdog already use. This is
@@ -185,6 +209,10 @@ autonomy controller silently stops ticking.
   survive the next deploy needs to stay disabled deliberately (e.g. re-run the disable command
   again after any deploy, or gate the timer install by other means if a longer-lived stop is ever
   needed).
+- **Lingering:** `loginctl show-user $(id -un) --property=Linger` should report `Linger=yes` — the
+  deploy script now enforces this itself (step 3 above), attempting
+  `loginctl enable-linger $(id -un)` automatically; only a persistently-refused linger request
+  (e.g. missing polkit authorization) requires manual intervention.
 
 Preview any deploy first:
 
