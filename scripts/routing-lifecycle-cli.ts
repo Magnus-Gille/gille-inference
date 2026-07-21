@@ -75,7 +75,8 @@ import { loadConfig, type HomeserverConfig } from "../src/homeserver/config.js";
 import { ledgerReport, listCalibrationSampleRows, guardMetricsWindow } from "../src/homeserver/ledger.js";
 import { listModels } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
-import { contentDigest } from "../src/homeserver/evidence-identity.js";
+import { contentDigest, tableContentHash } from "../src/homeserver/evidence-identity.js";
+import { acquireMutationLock, MutationLockBusyError } from "../src/homeserver/mutation-lock.js";
 import { routableTaskTypes, type SourceManifestEntry } from "../src/homeserver/routing-table-generator.js";
 import type { DiffableRoutingTable } from "../src/homeserver/routing-table-diff.js";
 import type { CalibrationGateDecision } from "../src/homeserver/calibration-gate.js";
@@ -499,7 +500,51 @@ async function cmdAdopt(args: string[]): Promise<void> {
     }
   })();
 
-  const result = await adoptRoutingTable(artifact, approval, deps);
+  // Round 3 finding 2 (Sol-xhigh review of gille-inference#49): acquire the SAME exclusive
+  // mutation lock the autonomy controller's own adopt attempt takes (mutation-lock.ts), so a
+  // concurrent autonomous tick and this manual `adopt` invocation can never interleave a
+  // hash-check-then-write race against each other.
+  let lockHandle: { release: () => void };
+  try {
+    lockHandle = acquireMutationLock(dataDir);
+  } catch (err) {
+    if (err instanceof MutationLockBusyError) {
+      process.stderr.write(`adopt refused: ${err.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+
+  let result: Awaited<ReturnType<typeof adoptRoutingTable>>;
+  try {
+    // Re-verify, UNDER THE LOCK, that the live table still matches what THIS artifact's diff was
+    // built against — the same optimistic-concurrency discipline the autonomy controller's own
+    // adopt path applies (`tableContentHash`), closing the gap where `review` and `adopt` are two
+    // separate invocations with an arbitrary delay (and possibly another writer) between them.
+    const liveNow = ((): string | null => {
+      try {
+        return readFileSync(tablePath, "utf8");
+      } catch {
+        return null;
+      }
+    })();
+    const expectedHash = artifact.adoptedHash ?? "(none)";
+    const liveHash = tableContentHash(liveNow);
+    if (liveHash !== expectedHash) {
+      process.stderr.write(
+        `adopt refused: the live routing table has changed since this artifact was reviewed ` +
+          `(expected ${expectedHash}, found ${liveHash}) — re-review and re-approve against the current table; ` +
+          `approval is never overridden here.\n`
+      );
+      process.exitCode = 1;
+      return;
+    }
+    result = await adoptRoutingTable(artifact, approval, deps);
+  } finally {
+    lockHandle.release();
+  }
+
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   if (result.outcome === "adopted") {
     process.stderr.write(`ADOPTED — candidateHash=${result.record.candidateHash} approvedBy=${result.record.approvedBy}\n`);

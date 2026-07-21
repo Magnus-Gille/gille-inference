@@ -241,18 +241,23 @@ describe("evaluateStatisticalSufficiency", () => {
 });
 
 describe("computeRiskBudgetStatus / routeCooldownActive", () => {
-  it("counts only autonomous adoptions (structured provenance, never approvedBy text) within the trailing window", () => {
+  it("counts autonomous adoptions (structured provenance OR a matching-but-unset approvedBy, round 3 finding 6) within the trailing window", () => {
     const records = [
       { id: "1", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h1", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["a"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null, provenance: { kind: "autonomy" as const, tier: 1 as const } },
       { id: "2", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h2", decisionRef: "r", approvedBy: "magnus", changedTaskTypes: ["b"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null },
       { id: "3", adoptedAt: "2020-01-01T00:00:00.000Z", candidateHash: "h3", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["c"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null, provenance: { kind: "autonomy" as const, tier: 1 as const } },
-      // A MANUAL record whose approvedBy happens to match the autonomy display-string convention
-      // (a human could type this via `adopt --approved-by`) — must NOT be counted (finding 7).
+      // A record with NO structured provenance whose approvedBy happens to match the autonomy
+      // display-string convention (a legacy record, or a human who typed it via `adopt
+      // --approved-by`) — round 3 finding 6: COUNTS toward the budget (the restrictive direction
+      // for a mutation ceiling), unlike the STRICT health-stats predicate (see
+      // `computeAutonomousRevertRate`'s own tests).
       { id: "4", adoptedAt: "2026-07-20T00:00:00.000Z", candidateHash: "h4", decisionRef: "r", approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`, changedTaskTypes: ["d"], snapshotPath: null, status: "pending" as const, lastEvaluatedAt: null },
     ];
     const status = computeRiskBudgetStatus(records, NOW, TEST_POLICY);
-    expect(status.used).toBe(1); // only record "1" has autonomy provenance AND is within the window
-    expect(status.remaining).toBe(2);
+    // "1" (explicit provenance, in window) and "4" (ambiguous-but-matching, in window) count;
+    // "2" has no signal at all; "3" is outside the trailing window despite its provenance.
+    expect(status.used).toBe(2);
+    expect(status.remaining).toBe(1);
   });
 
   it("route cooldown is active only for the specific taskType, until perRouteCooldownHours after its last autonomous adoption", () => {
@@ -673,7 +678,15 @@ describe("runAutonomyTick — dry run", () => {
 
 describe("emptyTierState / DEFAULT_AUTONOMY_POLICY sanity", () => {
   it("starts at Tier 0 with zero healthy cycles", () => {
-    expect(emptyTierState()).toEqual({ schemaVersion: 1, tier: 0, consecutiveHealthyCycles: 0, lastCycleAt: null, lastEvent: null, ackedBreachIds: [] });
+    expect(emptyTierState()).toEqual({
+      schemaVersion: 1,
+      tier: 0,
+      consecutiveHealthyCycles: 0,
+      consecutiveGoCycles: 0,
+      lastCycleAt: null,
+      lastEvent: null,
+      ackedBreachIds: [],
+    });
   });
 
   it("matches the design doc's proposed defaults (grimnir docs/autonomous-improvement-design.md §6)", () => {

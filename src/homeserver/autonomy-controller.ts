@@ -39,43 +39,86 @@
  * ─── Fix-forward: the Sol (xhigh) cross-model review findings ────────────────────────────────
  *
  * The first version of this module (gille-inference#53) shipped with several defects an
- * adversarial cross-model review reproduced before any timer was ever installed against it. Fixed
- * here, in `runAutonomyTick` unless noted:
+ * adversarial cross-model review reproduced before any timer was ever installed against it, and a
+ * SECOND review round found 3 partial fixes + 5 new defects in the round-1 fixes themselves. Fixed
+ * here, in `runAutonomyTick` unless noted (round 1 numbering preserved; round-3 items marked):
  *
- *   1. STALE SNAPSHOT ACROSS WATCH — the adopted-table baseline is now read AFTER WATCH runs
+ *   1. STALE SNAPSHOT ACROSS WATCH — the adopted-table baseline is read AFTER WATCH runs
  *      (`tryReadLiveTable`/`parseAdoptedTable`), never handed in pre-built by the caller (removed
  *      from `AutonomyReviewInputs` entirely), so a WATCH-triggered revert this same tick is never
- *      diffed against — and silently undone by — a stale pre-watch snapshot. A second,
- *      optimistic-concurrency check (`tableContentHash`) re-verifies the live table immediately
- *      before the one attempted axis actually writes.
+ *      diffed against — and silently undone by — a stale pre-watch snapshot. An optimistic-
+ *      concurrency check (`tableContentHash`) re-verifies the live table immediately before the one
+ *      attempted axis actually writes — round 3: now taken UNDER the mutation lock (finding 2,
+ *      below), since the round-1 check alone still left a window for a concurrent writer.
  *   2. ADOPT-THEN-WATCH CRASH GAP — every attempted adoption is journalled durably (`AdoptionIntent`
  *      / `saveAdoptionIntent`) BEFORE the mutating `adoptRoutingTable` call and finalized only after
  *      `recordAdoptionForWatch` succeeds. `reconcileAdoptionIntent`, called at the very start of
  *      every tick (step 0, before WATCH), recovers a `"pending"` intent left by a crashed prior
- *      tick: if the live table matches the intent's candidate, it retroactively opens the missing
- *      watch window (and consumes the risk budget) instead of leaving that adoption permanently
- *      unwatched.
+ *      tick. Round 3 finding 1 ("journal commit ambiguity"): the round-1 version treated "live table
+ *      content matches the candidate" as proof of a completed adoption, but the #7 adopt sequence is
+ *      write -> reload -> canary -> (rollback on failure) — a crash after the WRITE but before
+ *      reload/canary confirms would have been falsely certified. The intent now tracks its PHASE
+ *      (`AdoptionIntentPhase`; `instrumentAdoptDepsForIntent` persists each transition the instant
+ *      it happens) and `reconcileAdoptionIntent` RESTORES the prior snapshot (`manualRollback`) for
+ *      anything short of `"canary-passed"`, only ever finalizing a truly canary-confirmed adoption.
  *   3. MULTI-AXIS SAME-TICK OVERWRITE — `runAutonomyTick` attempts AT MOST ONE axis per tick;
- *      every OTHER changed axis is left as a deferred standing-proposal entry, never adopted in the
- *      same pass that could see (and silently revert) an axis this tick already wrote.
+ *      every OTHER changed axis is left as a standing-proposal entry for the next tick, never
+ *      adopted in the same pass that could see (and silently revert) an axis this tick already
+ *      wrote. Round 3 finding 5: round 1 achieved this by giving every axis AFTER the first a
+ *      FABRICATED placeholder evaluation, which both lied in the standing proposal and let the
+ *      lexically-first eligible axis starve every other one forever. Every changed axis now gets an
+ *      HONEST, full predicate evaluation every tick; WHICH eligible axis is attempted is decided by
+ *      a persisted round-robin cursor (`RotationState`/`rotateEligibleAxes`), and a pre-write
+ *      refusal (gate recheck, lock, hash recheck) tries the NEXT eligible axis in rotation without
+ *      consuming the tick's one mutation slot.
  *   4. FAILED ADOPTION COUNTED HEALTHY — the healthy-cycle computation runs AFTER any mutation
  *      attempt; a write/reload/rollback/canary failure, a stale-gate refusal, or a stale-baseline
  *      abort all set `mutationAttemptFailed`, which forces `healthyCycle: false` regardless of the
  *      review artifact's own validation.
- *   5. CRASH LOSES A REQUIRED DEMOTION — `TierState.ackedBreachIds` durably tracks which watchdog
- *      breach records have already triggered a demotion. Every tick reconciles BOTH this tick's
- *      fresh watch verdicts (needed because a kill-switch-blocked breach never reaches durable
- *      `"breach"` status at all — see `runAdoptionWatch`'s own semantics) and any already-durable
- *      `"breach"` record left unacknowledged by a crashed prior tick, and persists the resulting
- *      demotion IMMEDIATELY (step 1.5), before REVIEW/ADOPT even run.
+ *   5. CRASH LOSES A REQUIRED DEMOTION — `TierState.ackedBreachIds` (bounded — round 3 finding 7,
+ *      below) durably tracks which watchdog breach records have already triggered a demotion. Every
+ *      tick reconciles BOTH this tick's fresh watch verdicts (needed because a kill-switch-blocked
+ *      breach never reaches durable `"breach"` status at all — see `runAdoptionWatch`'s own
+ *      semantics) and any already-durable `"breach"` record left unacknowledged by a crashed prior
+ *      tick, and persists the resulting demotion IMMEDIATELY (step 1.5), before REVIEW/ADOPT even
+ *      run — also revoking the Tier-2 ladder enablement (finding 4, round 3) if the demotion drops
+ *      below Tier 2.
  *   6. STALE GATE AT ORGANIC ADOPTION — `AutonomyTickDeps.recomputeCalibrationGate` is invoked
  *      immediately before adopting an organic-judge-dependent axis; a live gate that has decayed
- *      off GO+enabled since REVIEW time refuses the adoption, mirroring
- *      `routing-lifecycle-cli.ts`'s own adopt-time recheck (issue #37).
- *   7. APPROVER-STRING SPOOFING — risk-budget/cooldown/revert-rate accounting reads
- *      `AdoptionWatchRecord.provenance` (a structured field only this controller ever sets), never
- *      `approvedBy` (free text a human `adopt --approved-by` invocation could type identically).
- *      See `isAutonomousRecord` and `adoption-watchdog.ts`'s `AdoptionProvenance` type.
+ *      off GO+enabled since REVIEW time refuses the adoption (without consuming the mutation slot —
+ *      finding 5, round 3), mirroring `routing-lifecycle-cli.ts`'s own adopt-time recheck (#37).
+ *   7. APPROVER-STRING SPOOFING — risk-budget/cooldown accounting (`countsTowardRiskBudget`) and
+ *      health/revert-rate accounting (`countsTowardAutonomousHealthStats`) each read the STRUCTURED
+ *      `AdoptionWatchRecord.provenance` field (only this controller ever sets `{kind:"autonomy"}`),
+ *      never `approvedBy` text ALONE (free text a human `adopt --approved-by` invocation could type
+ *      identically) — round 3 finding 6 refined the direction: an ambiguous legacy record (no
+ *      `provenance`, `approvedBy` matching the display convention) COUNTS toward the risk budget
+ *      (restrictive — never manufactures extra mutation headroom) but is EXCLUDED from the health/
+ *      revert-rate stat (restrictive the other way — never manufactures a false-healthy track
+ *      record). See both functions' own doc comments. `adoption-watchdog.ts`'s `AdoptionProvenance`
+ *      type carries the structured signal.
+ *
+ * ─── Round-3-only findings ─────────────────────────────────────────────────────────────────────
+ *
+ *   R3-2. CONCURRENT WRITERS — an exclusive, file-based mutation lock (`mutation-lock.ts`,
+ *      `acquireMutationLock`) is taken by BOTH this module's own adopt attempt and
+ *      `routing-lifecycle-cli.ts`'s human `adopt` command immediately before their respective
+ *      table-hash recheck + `adoptRoutingTable` call, so the tick and a concurrent manual adopt can
+ *      never interleave a check-then-write race. A busy lock is a pre-write refusal (does not
+ *      consume the mutation slot — finding 5).
+ *   R3-3. tryReadLiveTable SWALLOWED ALL READ ERRORS — `isVerifiedEnoent` now distinguishes a
+ *      genuine "file does not exist" (a real errno `ENOENT`, or a test fake's equivalent message)
+ *      from any OTHER read failure (permission denied, disk fault, transient I/O error), which now
+ *      PROPAGATES instead of being silently treated as "no table exists yet".
+ *   R3-4. TIER-2 ORGANIC PATH VACUOUS IN PRODUCTION — `computeLiveCalibrationGate` NEVER populates
+ *      `CalibrationGateDecision.enabling` (only a human-authored `attachReviewedDecision` does,
+ *      which this unattended cron path never invokes), making Tier 2 permanently unreachable
+ *      outside a test's hand-injected gate. `AnchoredEnablementRecord`/`applyLadderEnablement`: the
+ *      tier ladder itself durably GRANTS enablement the moment its own Tier-2 unlock condition is
+ *      met (`TierState.consecutiveGoCycles` sustained + Tier-1 revert rate; see `maybePromote`),
+ *      and REVOKES it on any demotion below Tier 2 — gate PARAMETERS (κ, windows) stay owner-side/
+ *      code-configured while the enablement STATE is ladder-computed, consistent with the
+ *      protected-lanes rule.
  *
  * ─── Protected lanes ───────────────────────────────────────────────────────────────────────────
  *
@@ -99,7 +142,7 @@
  * dry-run contract.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -107,6 +150,7 @@ import {
   buildDecisionArtifact,
   approveArtifact,
   adoptRoutingTable,
+  manualRollback,
   gateAdmitsOrganicEvidence,
   summarizeCalibrationGate,
   type RoutingDecisionArtifact,
@@ -129,7 +173,8 @@ import {
 } from "./adoption-watchdog.js";
 import { wilsonInterval } from "./calibration-metrics.js";
 import type { CalibrationGateDecision } from "./calibration-gate.js";
-import { contentDigest } from "./evidence-identity.js";
+import { tableContentHash } from "./evidence-identity.js";
+import { acquireMutationLock, MutationLockBusyError } from "./mutation-lock.js";
 
 // ─── Tiers and policy ─────────────────────────────────────────────────────────────
 
@@ -195,14 +240,32 @@ export const DEFAULT_AUTONOMY_POLICY: AutonomyPolicyConfig = {
 };
 
 /**
- * The SOLE admissibility test for "was this adoption autonomous" (Sol-xhigh review finding 7).
- * Reads the STRUCTURED `record.provenance` field ONLY — never `approvedBy` (free text a human
- * `adopt --approved-by` invocation could type identically to the autonomy controller's own
- * convention, e.g. `autonomy-controller:tier1`, silently corrupting risk-budget/revert-rate
- * accounting). A record with no `provenance` (legacy, or genuinely manual) is NOT autonomous —
- * the fail-safe direction for something that gates a MUTATION budget, never inferred upward.
+ * Two DIFFERENT admissibility tests for "was this adoption autonomous" (Sol-xhigh review findings
+ * 7 and 6-round-3), because the SAFE fail-direction is opposite for the two things this question
+ * gates:
+ *
+ *   - `countsTowardRiskBudget` — RESTRICTIVE: a record with NO `provenance` at all (legacy, written
+ *     before this field existed) whose `approvedBy` text nonetheless matches the autonomy display
+ *     convention (`autonomy-controller:tier<N>`) COUNTS toward the risk budget/cooldown. Erring
+ *     toward "counted" never lets ambiguity manufacture MORE mutation headroom than intended — the
+ *     restrictive direction for a ceiling. A record EXPLICITLY marked `{kind:"manual"}` never
+ *     counts, regardless of its `approvedBy` text (explicit provenance always wins over a
+ *     free-text guess).
+ *   - `countsTowardAutonomousHealthStats` — STRICT: ONLY an explicit `{kind:"autonomy"}` record
+ *     counts toward the revert-rate/health signal the tier ladder reads to decide PROMOTION.
+ *     Erring toward "excluded" never lets an ambiguous legacy record inflate (or deflate) the
+ *     evidence that unlocks MORE autonomy — the restrictive direction for a promotion gate.
+ *
+ * `approvedBy` itself is NEVER the sole signal for either — a record with STRUCTURED provenance
+ * (either kind) is always classified by that field alone, never by its display text.
  */
-function isAutonomousRecord(record: Pick<AdoptionWatchRecord, "provenance">): boolean {
+function countsTowardRiskBudget(record: Pick<AdoptionWatchRecord, "provenance" | "approvedBy">): boolean {
+  if (record.provenance?.kind === "autonomy") return true;
+  if (record.provenance?.kind === "manual") return false;
+  return record.approvedBy.startsWith(AUTONOMY_APPROVER_PREFIX);
+}
+
+function countsTowardAutonomousHealthStats(record: Pick<AdoptionWatchRecord, "provenance">): boolean {
   return record.provenance?.kind === "autonomy";
 }
 
@@ -221,6 +284,14 @@ export interface TierState {
   schemaVersion: 1;
   tier: AutonomyTier;
   consecutiveHealthyCycles: number;
+  /**
+   * Consecutive ticks whose live #6/#48 gate verdict was `"GO"` (round 3 finding 4) — the
+   * "sustained anchored GO ≥ κ over the required window" condition the design doc (§6) names for
+   * unlocking Tier 2, tracked SEPARATELY from `consecutiveHealthyCycles` because a tick can be
+   * healthy without the anchored feed being GO (most of the time, before Tier 2 is even relevant).
+   * Resets to 0 on any non-GO tick or any demotion, exactly like the healthy-cycle streak.
+   */
+  consecutiveGoCycles: number;
   lastCycleAt: string | null;
   lastEvent: TierEvent | null;
   /**
@@ -232,12 +303,25 @@ export interface TierState {
    * permanently lose the demotion: the next tick's `watch.items` would simply never mention that
    * record again. Reconciled at the START of every tick against ALL breach-status records in
    * `adoption-watchdog.ts`'s durable state, not just the ones this specific tick's watch pass
-   * freshly resolved. */
+   * freshly resolved. Bounded (round 3 finding 7) — capped at `MAX_ACKED_BREACH_IDS`, oldest
+   * evicted first, so this list cannot grow without limit over the system's lifetime. */
   ackedBreachIds: string[];
 }
 
+/** Cap for `TierState.ackedBreachIds` (round 3 finding 7) — breach events are rare, so this is far
+ *  more headroom than any realistic operating history needs while still bounding growth. */
+export const MAX_ACKED_BREACH_IDS = 500;
+
 export function emptyTierState(): TierState {
-  return { schemaVersion: 1, tier: 0, consecutiveHealthyCycles: 0, lastCycleAt: null, lastEvent: null, ackedBreachIds: [] };
+  return {
+    schemaVersion: 1,
+    tier: 0,
+    consecutiveHealthyCycles: 0,
+    consecutiveGoCycles: 0,
+    lastCycleAt: null,
+    lastEvent: null,
+    ackedBreachIds: [],
+  };
 }
 
 export interface AutonomyPaths {
@@ -246,6 +330,8 @@ export interface AutonomyPaths {
   tierEventsPath: string;
   standingProposalPath: string;
   adoptionIntentPath: string;
+  anchoredEnablementPath: string;
+  rotationStatePath: string;
 }
 
 export function autonomyPaths(dataDir: string): AutonomyPaths {
@@ -256,6 +342,8 @@ export function autonomyPaths(dataDir: string): AutonomyPaths {
     tierEventsPath: join(root, "tier-events.jsonl"),
     standingProposalPath: join(root, "standing-proposal.json"),
     adoptionIntentPath: join(root, "adoption-intent.json"),
+    anchoredEnablementPath: join(root, "anchored-enablement.json"),
+    rotationStatePath: join(root, "rotation-state.json"),
   };
 }
 
@@ -278,6 +366,8 @@ export function loadTierState(dataDir: string): TierState {
     // `ackedBreachIds` is new (finding 5) — a state file saved before this field existed simply
     // has no acknowledged breaches yet, never a corruption.
     if (!Array.isArray(parsed.ackedBreachIds)) parsed.ackedBreachIds = [];
+    // `consecutiveGoCycles` is new (round 3 finding 4) — same "legacy file, not corruption" story.
+    if (typeof parsed.consecutiveGoCycles !== "number") parsed.consecutiveGoCycles = 0;
     return parsed;
   } catch (err) {
     throw new Error(
@@ -367,6 +457,23 @@ export function saveStandingProposal(dataDir: string, record: StandingProposalRe
  * `tableContentHash`'s doc comment for why this is safely comparable against the live file's bytes
  * even though `adoptRoutingTable` pretty-prints when it writes).
  */
+/**
+ * Phase transitions of an in-flight adoption (round 3 finding 1 — "journal commit ambiguity").
+ * The #7 `adoptRoutingTable` sequence is write -> reload -> canary -> (rollback on failure); a
+ * crash can land the process at ANY of these steps, and "the live table matches the candidate" by
+ * itself only proves the WRITE happened — NOT that reload confirmed it or canary passed. Each
+ * phase is persisted THE INSTANT it happens (via an instrumented `AdoptDeps` wrapper — see
+ * `instrumentAdoptDepsForIntent` — never inferred after the fact from table content alone):
+ *   - `"planned"` — the intent was written, `adoptRoutingTable` has not been called yet.
+ *   - `"table-written"` — the candidate WRITE succeeded (reload/canary not yet attempted/confirmed).
+ *   - `"reloaded"` — the RELOAD succeeded (canary not yet confirmed).
+ *   - `"canary-passed"` — `adoptRoutingTable` returned `"adopted"` — canary DID pass; only
+ *     `recordAdoptionForWatch`/finalizing may still be pending.
+ * `reconcileAdoptionIntent` treats anything short of `"canary-passed"` as UNCONFIRMED and restores
+ * the prior snapshot rather than certifying an uncanaried table as an adoption.
+ */
+export type AdoptionIntentPhase = "planned" | "table-written" | "reloaded" | "canary-passed";
+
 export interface AdoptionIntent {
   schemaVersion: 1;
   id: string;
@@ -378,8 +485,10 @@ export interface AdoptionIntent {
   tier: AutonomyTier;
   /** Exact prior live-table bytes read BEFORE the write this intent describes — carried here (not
    *  just handed to `recordAdoptionForWatch` in the happy path) so a CRASH-RECOVERY reconciliation
-   *  can still open the exact same watch-window snapshot the normal path would have. */
+   *  can still open the exact same watch-window snapshot the normal path would have, OR restore it
+   *  directly if the crash happened before canary confirmation. */
   priorRaw: string | null;
+  phase: AdoptionIntentPhase;
   status: "pending" | "finalized" | "aborted";
   finalizedAt?: string;
   abortedAt?: string;
@@ -403,22 +512,11 @@ export function saveAdoptionIntent(dataDir: string, intent: AdoptionIntent): voi
   atomicWriteFile(autonomyPaths(dataDir).adoptionIntentPath, JSON.stringify(intent, null, 2) + "\n");
 }
 
-/**
- * Content hash of a routing table's SEMANTIC bytes — safely comparable against
- * `RoutingDecisionArtifact.candidateHash` (`contentDigest(JSON.stringify(candidate))`, computed
- * directly on the in-memory object, no pretty-printing) even though `adoptRoutingTable` writes
- * `JSON.stringify(artifact.candidate, null, 2) + "\n"` to disk: parsing the live bytes back into an
- * object and re-stringifying compactly undoes the pretty-print/trailing-newline formatting and
- * reproduces byte-identical compact JSON for any plain JSON-safe value (no `undefined`/`NaN`/
- * `Date` — which a `RoutingTableDoc` never contains), because `JSON.parse` reconstructs object keys
- * in the same order they appear in the source text and `JSON.stringify` is deterministic over that
- * order. Locked in by a dedicated round-trip unit test (never assume this silently). Returns the
- * sentinel `"(none)"` for a null/absent table (never a fabricated hash of nothing).
- */
-export function tableContentHash(raw: string | null): string {
-  if (raw === null) return "(none)";
-  return contentDigest(JSON.stringify(JSON.parse(raw)));
-}
+// `tableContentHash` now lives in evidence-identity.ts (round 3 finding 2) so
+// scripts/routing-lifecycle-cli.ts's human `adopt` path can share the EXACT same hash semantics
+// without importing this module — re-exported here (of the binding imported above) for existing
+// call sites/tests that still import it from here.
+export { tableContentHash };
 
 export interface ReconcileAdoptionIntentResult {
   action: "none" | "finalized-existing-watch-record" | "finalized-new-watch-record" | "aborted";
@@ -426,39 +524,96 @@ export interface ReconcileAdoptionIntentResult {
 }
 
 /**
+ * Wraps a REAL `AdoptDeps` so `writeTable`/`reload` ALSO persist the intent's phase (round 3
+ * finding 1) the INSTANT each underlying call succeeds, before `adoptRoutingTable`'s own internal
+ * sequence proceeds to the next step — composing the injected DI surface, never reimplementing
+ * `adoptRoutingTable` itself. `writeTable` only marks `"table-written"` on its FIRST call within one
+ * attempt (the candidate write); a SECOND call (the write half of `adoptRoutingTable`'s own internal
+ * rollback-on-failure) is deliberately left unmarked, since by then this is no longer the phase
+ * "table-written" describes — the candidate write already happened and failed downstream. Callers
+ * MUST construct a FRESH wrapper per adopt attempt (the `written` flag is attempt-scoped).
+ */
+function instrumentAdoptDepsForIntent(base: AdoptDeps, dataDir: string, intentId: string): AdoptDeps {
+  let candidateWriteMarked = false;
+  const markPhase = (phase: AdoptionIntentPhase): void => {
+    const current = loadAdoptionIntent(dataDir);
+    if (current && current.id === intentId && current.status === "pending") {
+      saveAdoptionIntent(dataDir, { ...current, phase });
+    }
+  };
+  return {
+    ...base,
+    writeTable: (path, data) => {
+      base.writeTable(path, data);
+      if (!candidateWriteMarked) {
+        candidateWriteMarked = true;
+        markPhase("table-written");
+      }
+    },
+    reload: async () => {
+      const result = await base.reload();
+      if (result.ok) markPhase("reloaded");
+      return result;
+    },
+  };
+}
+
+/**
  * Called at the START of every tick, before WATCH even runs (so a just-recovered watch record is
  * visible to THIS tick's own watch pass too). A `"pending"` intent left over from a crashed prior
- * tick is resolved deterministically from the live table's CURRENT content — never from wall-clock
- * timing or a retry counter:
- *   - live table hash != intent.candidateHash → the write never completed (or something else
- *     reverted it since) → mark `"aborted"`, nothing to finalize.
- *   - live table hash == intent.candidateHash AND a watchdog record for this candidateHash already
- *     exists → the crash happened AFTER `recordAdoptionForWatch` but before this intent was marked
- *     finalized → just finalize it (no duplicate watch record).
- *   - live table hash == intent.candidateHash AND NO watchdog record exists yet → the crash
- *     happened in the exact gap finding 2 names → recreate the missing watch record NOW (retroactively
- *     opening the parachute + consuming the risk budget for this adoption, exactly as the normal
- *     path would have), using the intent's own `adoptedAt`/`priorRaw`/`approvedBy`/`tier` so the
- *     recovered record is indistinguishable from one written by the uninterrupted path.
+ * tick is resolved from its PERSISTED PHASE, never from table content alone (round 3 finding 1 —
+ * "the intent record treats live-table-matches-candidate as adoption-committed, but a crash after
+ * the WRITE and before reload/canary completes would falsely finalize an uncanaried table"):
+ *   - phase is anything SHORT OF `"canary-passed"` — the write may have landed but reload/canary
+ *     never confirmed it — RESTORE the intent's own snapshot (`manualRollback`, the SAME #7
+ *     rollback primitive every other revert in this codebase uses) and mark `"aborted"`. No prior
+ *     snapshot (first-ever adoption) means there is nothing to restore TO; the table is left as-is
+ *     and the abort reason says so explicitly.
+ *   - phase is `"canary-passed"` — the adopt fully succeeded through canary; only
+ *     `recordAdoptionForWatch`/finalizing may still be pending. A final live-table-hash check
+ *     guards against something ELSE changing the table since (refuses to fabricate a watch record
+ *     for content that is no longer live); otherwise this is the original finding-2 gap: finalize
+ *     an EXISTING watch record if one already exists (crash between recording and finalizing), or
+ *     retroactively create the missing one (crash between canary passing and recording).
  */
-export function reconcileAdoptionIntent(
+export async function reconcileAdoptionIntent(
   dataDir: string,
   now: string,
-  readLiveTable: () => string | null
-): ReconcileAdoptionIntentResult {
+  adoptDeps: AdoptDeps
+): Promise<ReconcileAdoptionIntentResult> {
   const intent = loadAdoptionIntent(dataDir);
   if (!intent || intent.status !== "pending") return { action: "none" };
 
-  const liveHash = tableContentHash(readLiveTable());
+  if (intent.phase !== "canary-passed") {
+    let restoreNote: string;
+    if (intent.priorRaw !== null) {
+      await manualRollback({
+        deps: adoptDeps,
+        snapshotRaw: intent.priorRaw,
+        reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase})`,
+      });
+      restoreNote = "restored to the pre-adoption snapshot";
+    } else {
+      restoreNote = "no prior snapshot existed (first-ever adoption) — table left as-is";
+    }
+    saveAdoptionIntent(dataDir, {
+      ...intent,
+      status: "aborted",
+      abortedAt: now,
+      abortReason: `crashed before canary confirmation (phase: ${intent.phase}) — ${restoreNote}`,
+    });
+    return { action: "aborted", detail: intent.phase };
+  }
 
+  const liveHash = tableContentHash(tryReadLiveTable(adoptDeps));
   if (liveHash !== intent.candidateHash) {
     saveAdoptionIntent(dataDir, {
       ...intent,
       status: "aborted",
       abortedAt: now,
-      abortReason: `live table hash ${liveHash} does not match the intent's candidate hash ${intent.candidateHash} — the write likely never completed`,
+      abortReason: `canary had passed but the live table (${liveHash}) no longer matches the intent's candidate (${intent.candidateHash}) — refusing to register a watch record for content that is no longer live`,
     });
-    return { action: "aborted", detail: "live table does not match the intended candidate" };
+    return { action: "aborted", detail: "table-changed-after-canary" };
   }
 
   const existing = loadWatchdogState(dataDir).records.find((r) => r.candidateHash === intent.candidateHash);
@@ -548,10 +703,11 @@ export interface RiskBudgetStatus {
 }
 
 /**
- * PURE. Counts prior AUTONOMOUS adoptions (structured `provenance.kind === "autonomy"` — see
- * `isAutonomousRecord`, NEVER `approvedBy` string parsing, finding 7) within the trailing
- * risk-budget window from the SAME durable `AdoptionWatchRecord[]` issue #47 already persists for
- * every adoption — no second risk-budget ledger is invented.
+ * PURE. Counts prior AUTONOMOUS adoptions — the RESTRICTIVE `countsTowardRiskBudget` predicate
+ * (round 3 finding 6: a legacy/ambiguous record still counts here, never `approvedBy` string
+ * parsing ALONE, finding 7) — within the trailing risk-budget window from the SAME durable
+ * `AdoptionWatchRecord[]` issue #47 already persists for every adoption — no second risk-budget
+ * ledger is invented.
  */
 export function computeRiskBudgetStatus(
   records: readonly AdoptionWatchRecord[],
@@ -561,7 +717,7 @@ export function computeRiskBudgetStatus(
   const nowMs = Date.parse(nowIso);
   const windowStartMs = nowMs - policy.riskBudgetWindowHours * 60 * 60 * 1000;
   const used = records.filter((r) => {
-    if (!isAutonomousRecord(r)) return false;
+    if (!countsTowardRiskBudget(r)) return false;
     const t = Date.parse(r.adoptedAt);
     return t >= windowStartMs && t <= nowMs;
   }).length;
@@ -574,14 +730,15 @@ export interface RouteCooldownStatus {
 }
 
 /** PURE. An axis is on cooldown until `perRouteCooldownHours` after its MOST RECENT autonomous
- *  adoption — same durable records as the risk budget, no separate cooldown store. */
+ *  adoption (RESTRICTIVE `countsTowardRiskBudget` predicate — same direction as the risk budget) —
+ *  same durable records, no separate cooldown store. */
 export function routeCooldownActive(
   records: readonly AdoptionWatchRecord[],
   taskType: string,
   nowIso: string,
   policy: Pick<AutonomyPolicyConfig, "perRouteCooldownHours">
 ): RouteCooldownStatus {
-  const relevant = records.filter((r) => isAutonomousRecord(r) && r.changedTaskTypes.includes(taskType));
+  const relevant = records.filter((r) => countsTowardRiskBudget(r) && r.changedTaskTypes.includes(taskType));
   if (relevant.length === 0) return { active: false };
   const latest = relevant.reduce((a, b) => (Date.parse(a.adoptedAt) > Date.parse(b.adoptedAt) ? a : b));
   const untilMs = Date.parse(latest.adoptedAt) + policy.perRouteCooldownHours * 60 * 60 * 1000;
@@ -645,19 +802,112 @@ export function buildAxisArtifactInputs(
 
 // ─── Tier ladder (§6) ─────────────────────────────────────────────────────────────
 
+/**
+ * The tier ladder's OWN durable enablement record (round 3 finding 4). `computeLiveCalibrationGate`
+ * (calibration-gate-live.ts) NEVER populates `CalibrationGateDecision.enabling` — that field is
+ * only ever set by `calibration-gate.ts`'s `attachReviewedDecision`, a HUMAN-authored action this
+ * unattended cron path deliberately never invokes (see autonomy-tick-cli.ts's own header on why it
+ * never accepts a `--calibration-gate` override). Left as-is, this makes Tier 2 (which REQUIRES
+ * `gateAdmitsOrganicEvidence`, i.e. `enabling !== null`) permanently unreachable in production —
+ * the exact gap this record closes.
+ *
+ * Written ONLY by `maybePromote` the moment the Tier 1 -> Tier 2 unlock condition is met (sustained
+ * anchored GO — `TierState.consecutiveGoCycles` — over the required window, plus the Tier-1 track
+ * record); REVOKED the instant a demotion drops the tier below 2. `applyLadderEnablement` is the
+ * ONLY place this record is ever consulted, and only to synthesize `enabling` onto an ALREADY-`GO`
+ * gate — a `HOLD` verdict is untouched (still fails closed) regardless of this record's presence.
+ * This keeps gate PARAMETERS (κ, windows) owner-side/code-configured while the enablement STATE
+ * itself is ladder-computed — consistent with the protected-lanes rule that promotion policy
+ * parameters are never something the loop can rewrite, while the loop's OWN measured operating
+ * record is exactly what is allowed to move it up the ladder.
+ */
+export interface AnchoredEnablementRecord {
+  schemaVersion: 1;
+  reviewerId: string;
+  reason: string;
+  decisionRef: string;
+  reviewedAt: string;
+  /** The tier this enablement was granted at — audit/debugging only. */
+  grantedAtTier: AutonomyTier;
+}
+
+export function loadAnchoredEnablement(dataDir: string): AnchoredEnablementRecord | null {
+  const path = autonomyPaths(dataDir).anchoredEnablementPath;
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as AnchoredEnablementRecord;
+  } catch (err) {
+    throw new Error(
+      `autonomy-controller: anchored enablement record at ${path} is corrupt (${err instanceof Error ? err.message : String(err)}) — refusing to operate on unreadable durable state.`
+    );
+  }
+}
+
+export function saveAnchoredEnablement(dataDir: string, record: AnchoredEnablementRecord): void {
+  atomicWriteFile(autonomyPaths(dataDir).anchoredEnablementPath, JSON.stringify(record, null, 2) + "\n");
+}
+
+/** Revokes the ladder's own enablement — called the instant a demotion drops the tier below 2.
+ *  Idempotent (a missing file is not an error). */
+export function revokeAnchoredEnablement(dataDir: string): void {
+  const path = autonomyPaths(dataDir).anchoredEnablementPath;
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already absent — nothing to revoke.
+  }
+}
+
+/**
+ * Applies the tier ladder's OWN durable enablement to a freshly-computed live gate: a
+ * `verdict: "GO"` gate gains `enabling` FROM the ladder's own record (written only when Tier 2 was
+ * unlocked, revoked immediately on any demotion below Tier 2) — never from a human
+ * `attachReviewedDecision` file this unattended cron path does not accept. A `"HOLD"` gate, or the
+ * absence of a ladder record, is returned UNCHANGED (`enabling` stays `null` — fail closed).
+ */
+export function applyLadderEnablement(
+  gate: CalibrationGateDecision | null,
+  dataDir: string
+): CalibrationGateDecision | null {
+  if (gate === null || gate.verdict !== "GO") return gate;
+  const record = loadAnchoredEnablement(dataDir);
+  if (!record) return gate;
+  return {
+    ...gate,
+    enabling: {
+      reviewerId: record.reviewerId,
+      reason: record.reason,
+      decisionRef: record.decisionRef,
+      reviewedAt: record.reviewedAt,
+    },
+  };
+}
+
 /** Tier-1 revert rate (breaches / autonomous adoptions) from the SAME durable watchdog records —
- *  no new accounting. Zero adoptions so far reads as 0 (no evidence of failure), not a refusal. */
+ *  no new accounting. Uses the STRICT `countsTowardAutonomousHealthStats` predicate (round 3
+ *  finding 6: an ambiguous legacy record must never inflate OR deflate this health signal). Zero
+ *  adoptions so far reads as 0 (no evidence of failure), not a refusal. */
 export function computeAutonomousRevertRate(records: readonly AdoptionWatchRecord[]): number {
-  const auto = records.filter((r) => isAutonomousRecord(r));
+  const auto = records.filter((r) => countsTowardAutonomousHealthStats(r));
   if (auto.length === 0) return 0;
   return auto.filter((r) => r.status === "breach").length / auto.length;
 }
 
+/**
+ * Tier 1 -> Tier 2's unlock condition is "sustained anchored GO ... AND Tier-1 revert rate <= r"
+ * (design doc §6) — NOT "the gate already admits organic evidence" (`gateAdmitsOrganicEvidence`
+ * requires `enabling !== null`, which is EXACTLY what promotion is supposed to grant; checking it
+ * as a PRECONDITION of the promotion that creates it is circular and makes Tier 2 unreachable —
+ * round 3 finding 4). `state.consecutiveGoCycles` tracks the RAW verdict being `"GO"` (the anchored
+ * feed clearing kappa) sustained over `tier1UnlockCycles` ticks; reaching the threshold is what
+ * lets `maybePromote` itself durably GRANT `enabling`, via `saveAnchoredEnablement`, dataDir-side.
+ */
 function maybePromote(
   state: TierState,
   now: string,
   policy: AutonomyPolicyConfig,
-  calibrationGate: CalibrationGateDecision | null,
+  dataDir: string,
+  decisionRef: string,
   tier1RevertRate: number
 ): { state: TierState; event: TierEvent } | null {
   if (state.tier >= 3) return null; // Tier 3 (roster/serving promotion) is out of scope — see PR notes.
@@ -672,12 +922,11 @@ function maybePromote(
       toTier: 1,
       reason: `${policy.tier1UnlockCycles} consecutive healthy cycles reached — unlocking Tier 1 (verifier-backed auto-adopt)`,
     };
-    return { state: { ...state, tier: 1, consecutiveHealthyCycles: 0, lastEvent: event }, event };
+    return { state: { ...state, tier: 1, consecutiveHealthyCycles: 0, consecutiveGoCycles: 0, lastEvent: event }, event };
   }
 
   if (state.tier === 1) {
-    const gateGo = gateAdmitsOrganicEvidence(summarizeCalibrationGate(calibrationGate));
-    if (!gateGo || tier1RevertRate > policy.tier2RevertRateMax) return null;
+    if (state.consecutiveGoCycles < policy.tier1UnlockCycles || tier1RevertRate > policy.tier2RevertRateMax) return null;
     const event: TierEvent = {
       schemaVersion: 1,
       at: now,
@@ -685,13 +934,76 @@ function maybePromote(
       fromTier: 1,
       toTier: 2,
       reason:
-        `${policy.tier1UnlockCycles} consecutive healthy cycles + anchored calibration GO+enabled + Tier-1 revert rate ` +
-        `${tier1RevertRate.toFixed(3)} <= r=${policy.tier2RevertRateMax} — unlocking Tier 2 (organic-gated auto-adopt)`,
+        `${policy.tier1UnlockCycles} consecutive healthy cycles + ${state.consecutiveGoCycles} consecutive anchored-GO cycles + ` +
+        `Tier-1 revert rate ${tier1RevertRate.toFixed(3)} <= r=${policy.tier2RevertRateMax} — unlocking Tier 2 (organic-gated auto-adopt); ` +
+        `ladder-granted anchored enablement recorded`,
     };
-    return { state: { ...state, tier: 2, consecutiveHealthyCycles: 0, lastEvent: event }, event };
+    // The ladder ITSELF is the reviewer here — this is the one and only place `enabling` is ever
+    // durably granted for the anchored gate (round 3 finding 4).
+    saveAnchoredEnablement(dataDir, {
+      schemaVersion: 1,
+      reviewerId: "autonomy-controller:tier-ladder",
+      reason: event.reason,
+      decisionRef,
+      reviewedAt: now,
+      grantedAtTier: 2,
+    });
+    return { state: { ...state, tier: 2, consecutiveHealthyCycles: 0, consecutiveGoCycles: 0, lastEvent: event }, event };
   }
 
   return null; // tier === 2: Tier 3 (roster/serving promotion) is out of scope for this ticket.
+}
+
+// ─── Axis rotation (round 3 finding 5) ────────────────────────────────────────────
+
+export interface RotationState {
+  schemaVersion: 1;
+  /** The task type actually ATTEMPTED (mutation-wise) on the last tick that attempted one, or
+   *  `null` before any attempt has ever happened. */
+  lastAttemptedTaskType: string | null;
+}
+
+export function emptyRotationState(): RotationState {
+  return { schemaVersion: 1, lastAttemptedTaskType: null };
+}
+
+export function loadRotationState(dataDir: string): RotationState {
+  const path = autonomyPaths(dataDir).rotationStatePath;
+  if (!existsSync(path)) return emptyRotationState();
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as RotationState;
+    if (parsed.lastAttemptedTaskType !== null && typeof parsed.lastAttemptedTaskType !== "string") {
+      throw new Error("invalid lastAttemptedTaskType");
+    }
+    return parsed;
+  } catch (err) {
+    throw new Error(
+      `autonomy-controller: rotation state at ${path} is corrupt (${err instanceof Error ? err.message : String(err)}) — refusing to operate on unreadable durable state.`
+    );
+  }
+}
+
+export function saveRotationState(dataDir: string, state: RotationState): void {
+  atomicWriteFile(autonomyPaths(dataDir).rotationStatePath, JSON.stringify(state, null, 2) + "\n");
+}
+
+/**
+ * PURE. Orders a set of ELIGIBLE task types so the rotation starts right after whichever one was
+ * last actually attempted (round 3 finding 5 — "the lexically-first axis owns every tick"
+ * starvation fix). Every eligible axis still gets a full, honest predicate evaluation each tick
+ * (this function only decides ATTEMPT ORDER, never which axes are eligible); a pre-write refusal on
+ * one candidate simply moves to the next entry in this list within the SAME tick, still capped at
+ * one actual mutation. Deterministic (alphabetical) when there is no prior attempt, or when the
+ * previously-attempted axis is no longer in the eligible set (it just starts from the top again).
+ */
+export function rotateEligibleAxes(eligibleTaskTypes: readonly string[], lastAttempted: string | null): string[] {
+  const sorted = [...eligibleTaskTypes].sort();
+  if (sorted.length === 0 || lastAttempted === null) return sorted;
+  const idx = sorted.indexOf(lastAttempted);
+  if (idx === -1) return sorted;
+  // Start with the NEXT axis after lastAttempted, wrapping around — lastAttempted itself comes
+  // last, so it still gets tried again if it is the ONLY eligible axis, but never hogs first place.
+  return [...sorted.slice(idx + 1), ...sorted.slice(0, idx + 1)];
 }
 
 // ─── The tick ─────────────────────────────────────────────────────────────────────
@@ -710,17 +1022,38 @@ export interface AutonomyReviewInputs {
 }
 
 /**
+ * True iff `err` represents a VERIFIED "file does not exist" condition (round 3 finding 3) —
+ * either a real Node `NodeJS.ErrnoException` with `code === "ENOENT"` (what `readFileSync` throws
+ * in production) or, for test fakes that throw a plain `Error` without an errno code, a message
+ * that says so explicitly. Anything else (permission denied, disk error, a transient I/O fault) is
+ * NOT this — see `tryReadLiveTable`'s doc comment for why that distinction matters.
+ */
+function isVerifiedEnoent(err: unknown): boolean {
+  const code = err && typeof err === "object" ? (err as NodeJS.ErrnoException).code : undefined;
+  if (code === "ENOENT") return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /\bENOENT\b/.test(message);
+}
+
+/**
  * Reads the LIVE routing table via the SAME `AdoptDeps.readTable` every other consumer uses.
  * Deliberately NOT part of `AutonomyReviewInputs` (Sol-xhigh review finding 1) — the caller building
  * `deps.review` runs BEFORE `runAutonomyTick` is even called, which is exactly the staleness bug:
  * WATCH can revert/quarantine an axis, and only a read taken AFTER that point is a valid diff
  * baseline. This module reads it itself, at the correct point in the tick, every time.
+ *
+ * Returns `null` ONLY on a verified ENOENT (round 3 finding 3: the original version swallowed
+ * EVERY read error — a permission error, a disk fault, any transient I/O failure — as "no table
+ * exists yet", which could make REVIEW silently assume an empty baseline and write a synthetic
+ * full table with no real rollback snapshot behind it). Any other error PROPAGATES, so the tick
+ * fails loudly (an honest infra failure, not a wrong assumption).
  */
 function tryReadLiveTable(adoptDeps: AdoptDeps): string | null {
   try {
     return adoptDeps.readTable(adoptDeps.tablePath);
-  } catch {
-    return null;
+  } catch (err) {
+    if (isVerifiedEnoent(err)) return null;
+    throw err;
   }
 }
 
@@ -815,16 +1148,21 @@ export interface AutonomyTickReport {
  * adopted, so an axis this function already adopted no longer appears as "changed" on the next
  * call — idempotency falls out of the design rather than being special-cased).
  *
- * Sequence (exactly the numbered steps in the ticket, with the Sol-xhigh review's fixes folded
- * in): RECONCILE any crashed prior tick's adoption intent (finding 2) → WATCH (#47) → ACKNOWLEDGE
- * every resolved-but-unacknowledged breach and persist any demotion IMMEDIATELY (finding 5) →
- * REVIEW (#7 artifact, adopted-table baseline re-read AFTER watch — finding 1) → per-axis
- * PREDICATES → DECIDE by TIER → ADOPT at most ONE axis this tick (finding 3), guarded by a
- * live-gate recheck for organic-dependent axes (finding 6) and an optimistic-concurrency table-hash
- * check (finding 1), journalled via a durable intent record BEFORE the mutating call (finding 2) →
- * healthy-cycle computed AFTER any mutation attempt (finding 4) → TIER LADDER promotion → NOTIFY.
- * `AUTONOMY_KILL_SWITCH=on` suppresses adopt + promotion only (demotion/reconciliation still
- * apply); `opts.dryRun` suppresses every durable write.
+ * Sequence (exactly the numbered steps in the ticket, with the Sol-xhigh review's round 1-3 fixes
+ * folded in): RECONCILE any crashed prior tick's adoption intent (findings 2/1: phase-aware, never
+ * certifies an uncanaried write) → WATCH (#47) → ACKNOWLEDGE every resolved-but-unacknowledged
+ * breach and persist any demotion IMMEDIATELY, revoking Tier-2 ladder enablement if it drops below
+ * Tier 2 (findings 5/4) → REVIEW (#7 artifact, adopted-table baseline re-read AFTER watch — finding
+ * 1; the live #6/#48 gate augmented with the ladder's OWN durable enablement — finding 4) →
+ * HONEST per-axis PREDICATES for every changed axis (finding 5 — never a fabricated placeholder) →
+ * DECIDE by TIER → ADOPT: rotate over the ELIGIBLE axes (persisted cursor, finding 5) attempting
+ * the first one whose pre-write rechecks (organic-gate recheck, finding 6; exclusive mutation lock
+ * + table-hash recheck, findings 2/1) also pass — a pre-write refusal tries the NEXT eligible axis
+ * without consuming the tick's one mutation slot — journalled via a durable, PHASE-TRACKED intent
+ * record (finding 1) BEFORE the mutating call → healthy-cycle computed AFTER any mutation attempt
+ * (finding 4) → TIER LADDER promotion (writes the ladder enablement record on Tier 2 unlock,
+ * finding 4) → NOTIFY. `AUTONOMY_KILL_SWITCH=on` suppresses adopt + promotion only (demotion/
+ * reconciliation still apply); `opts.dryRun` suppresses every durable write (including the lock).
  */
 export async function runAutonomyTick(
   deps: AutonomyTickDeps,
@@ -835,13 +1173,13 @@ export async function runAutonomyTick(
   const killSwitchActive = deps.killSwitchOn();
   const policy = deps.policy;
 
-  // 0. RECONCILE (finding 2): a "pending" adoption intent left over from a crashed prior tick is
+  // 0. RECONCILE (findings 2/1): a "pending" adoption intent left over from a crashed prior tick is
   // resolved BEFORE anything else — including before WATCH runs, so a just-recovered watch record
   // is visible to THIS tick's own watch pass too. Skipped under --dry-run (zero mutation); NOT
   // skipped under the kill switch (this is honest bookkeeping for a write that already happened,
   // not a new autonomous mutation).
   if (!dryRun) {
-    reconcileAdoptionIntent(deps.dataDir, now, () => tryReadLiveTable(deps.adoptDeps));
+    await reconcileAdoptionIntent(deps.dataDir, now, deps.adoptDeps);
   }
 
   // 1. WATCH (#47) — reused verbatim, including its own kill-switch/dry-run semantics.
@@ -857,10 +1195,13 @@ export async function runAutonomyTick(
   let tierState = loadTierState(deps.dataDir);
   const tierBefore = tierState.tier;
   let tierEvent: TierEvent | null = null;
+  // Finding 7 (round 3): the demotion event below is persisted IMMEDIATELY (before REVIEW/ADOPT) —
+  // this flag stops the end-of-tick save block from appending the SAME event a second time.
+  let tierEventAlreadyPersisted = false;
 
-  // 1.5 ACKNOWLEDGE + DEMOTE (finding 5): reconcile every breach not yet acknowledged by the tier
-  // ladder, from BOTH signals — not just the DURABLE "breach" status, and not just THIS tick's
-  // fresh verdict alone:
+  // 1.5 ACKNOWLEDGE + DEMOTE (finding 5, round 1): reconcile every breach not yet acknowledged by
+  // the tier ladder, from BOTH signals — not just the DURABLE "breach" status, and not just THIS
+  // tick's fresh verdict alone:
   //   (a) `watch.items` whose EVALUATION verdict is "breach" this tick — this is the ONLY signal
   //       available while `AUTONOMY_KILL_SWITCH=on`, because `runAdoptionWatch` itself deliberately
   //       leaves a kill-switch-blocked record's durable `status` at `"pending"` (never "breach") —
@@ -881,7 +1222,11 @@ export async function runAutonomyTick(
   const unackedBreachIds = allBreachIds.filter((id) => !tierState.ackedBreachIds.includes(id));
   const anyBreach = unackedBreachIds.length > 0;
   if (anyBreach) {
-    const nextAcked = [...tierState.ackedBreachIds, ...unackedBreachIds];
+    // Finding 7 (round 3): bound `ackedBreachIds` — evict the OLDEST entries once the cap is
+    // exceeded rather than growing this list without limit over the system's lifetime.
+    const rawNextAcked = [...tierState.ackedBreachIds, ...unackedBreachIds];
+    const nextAcked =
+      rawNextAcked.length > MAX_ACKED_BREACH_IDS ? rawNextAcked.slice(rawNextAcked.length - MAX_ACKED_BREACH_IDS) : rawNextAcked;
     if (tierState.tier > 0) {
       const toTier = (tierState.tier - 1) as AutonomyTier;
       const event: TierEvent = {
@@ -892,22 +1237,39 @@ export async function runAutonomyTick(
         toTier,
         reason: `watchdog breach record id(s) [${unackedBreachIds.join(", ")}] resolved and not yet acknowledged — demoting and resetting progress`,
       };
-      tierState = { ...tierState, tier: toTier, consecutiveHealthyCycles: 0, lastCycleAt: now, lastEvent: event, ackedBreachIds: nextAcked };
+      tierState = {
+        ...tierState,
+        tier: toTier,
+        consecutiveHealthyCycles: 0,
+        consecutiveGoCycles: 0,
+        lastCycleAt: now,
+        lastEvent: event,
+        ackedBreachIds: nextAcked,
+      };
       tierEvent = event;
+      if (!dryRun && toTier < 2) revokeAnchoredEnablement(deps.dataDir); // finding 4: revoke on drop below Tier 2
     } else {
-      tierState = { ...tierState, consecutiveHealthyCycles: 0, lastCycleAt: now, ackedBreachIds: nextAcked };
+      tierState = { ...tierState, consecutiveHealthyCycles: 0, consecutiveGoCycles: 0, lastCycleAt: now, ackedBreachIds: nextAcked };
     }
     if (!dryRun) {
       saveTierState(deps.dataDir, tierState);
-      if (tierEvent) appendTierEvent(deps.dataDir, tierEvent);
+      if (tierEvent) {
+        appendTierEvent(deps.dataDir, tierEvent);
+        tierEventAlreadyPersisted = true;
+      }
     }
   }
 
   // 2. REVIEW (#7 + live #48 gate) — the adopted-table baseline is read HERE, AFTER watch, so a
   // breach's revert earlier THIS SAME tick is never diffed against a stale pre-watch snapshot
-  // (finding 1). buildDecisionArtifact itself remains pure; this is the only IO REVIEW performs.
+  // (finding 1, round 1). buildDecisionArtifact itself remains pure; this is the only IO REVIEW
+  // performs. The gate is augmented with the tier ladder's OWN durable enablement (finding 4,
+  // round 3) BEFORE it is used anywhere — including inside `buildDecisionArtifact`'s own
+  // admissibility check — so an organic-dependent axis at Tier 2 is never wrongly flagged
+  // inadmissible by a raw production gate that (by construction) never carries `enabling` itself.
   const liveRawForReview = tryReadLiveTable(deps.adoptDeps);
   const { diffable: adoptedTable, raw: adoptedRaw } = parseAdoptedTable(liveRawForReview);
+  const effectiveReviewGate = applyLadderEnablement(deps.review.calibrationGate, deps.dataDir);
 
   const fullArtifact = buildDecisionArtifact({
     candidate: deps.review.candidate,
@@ -917,7 +1279,7 @@ export async function runAutonomyTick(
     requiredTaskTypes: deps.review.requiredTaskTypes,
     freshnessMaxAgeMs: deps.review.freshnessMaxAgeMs,
     nowIso: now,
-    calibrationGate: deps.review.calibrationGate,
+    calibrationGate: effectiveReviewGate,
     policyEpochHash: deps.review.policyEpochHash,
     expectedPolicyEpochHash: deps.review.expectedPolicyEpochHash,
   });
@@ -925,14 +1287,15 @@ export async function runAutonomyTick(
   const changedTaskTypes = fullArtifact.diff.changes.filter((c) => c.kind !== "unchanged").map((c) => c.taskType);
   const noop = changedTaskTypes.length === 0;
 
-  // 3+4. PREDICATES + DECIDE BY TIER, per changed axis. AT MOST ONE axis is ever ATTEMPTED this
-  // tick (finding 3 — "one axis per change" is a risk-budget invariant, not merely a preference:
-  // every axis artifact is isolated against the SAME post-watch baseline, so a second attempt in
-  // the same tick could only ever see — and silently revert — the first attempt's own write).
-  const axisEvaluations: AxisEvaluation[] = [];
-  const adopted: AutonomyAdoptionOutcome[] = [];
-  let mutationAttemptFailed = false;
-  let attemptedThisTick = false;
+  // 3. PREDICATES — an HONEST, full evaluation for EVERY changed axis, every tick (round 3 finding
+  // 5: the round-1 fix hard-coded a placeholder for any axis after the first attempted one, both
+  // fabricating its predicate results AND letting the lexically-first eligible axis starve every
+  // other one forever). `eligibleTaskTypes` collects the subset whose predicates+tier genuinely
+  // pass (kill switch/dry run aside — those never attempt anything, but still evaluate honestly).
+  const axisEvalByType = new Map<string, AxisEvaluation>();
+  const axisArtifactByType = new Map<string, RoutingDecisionArtifact>();
+  const statDetailByType = new Map<string, string>();
+  const eligibleTaskTypes: string[] = [];
 
   if (!noop) {
     const recordsAtStart = loadWatchdogState(deps.dataDir).records;
@@ -946,30 +1309,8 @@ export async function runAutonomyTick(
       ),
     });
     const quarantineReasonByAxis = new Map(quarantineGate.blockedAxes.map((b) => [b.taskType, b.reason]));
-    // Captured ONCE, right after the post-watch read above — the optimistic-concurrency baseline
-    // every attempted axis's write is checked against immediately before it mutates (finding 1).
-    const baselineHash = tableContentHash(liveRawForReview);
 
     for (const taskType of changedTaskTypes) {
-      if (attemptedThisTick) {
-        axisEvaluations.push({
-          taskType,
-          verifierBacked: !(fullArtifact.lineage.find((l) => l.taskType === taskType)?.organicJudgeDependent ?? false),
-          validationOk: true,
-          validationIssues: [],
-          statisticallySufficient: false,
-          ciLower: null,
-          protectedRoute: false,
-          quarantined: false,
-          cooldownActive: false,
-          riskBudgetAvailable: false,
-          eligible: false,
-          attempted: false,
-          reasons: ["single-axis-per-tick: deferred — another axis was already attempted this tick; re-evaluated next tick"],
-        });
-        continue;
-      }
-
       const lineageEntry = fullArtifact.lineage.find((l) => l.taskType === taskType);
       const verifierBacked = !(lineageEntry?.organicJudgeDependent ?? false);
 
@@ -988,10 +1329,11 @@ export async function runAutonomyTick(
         requiredTaskTypes: deps.review.requiredTaskTypes,
         freshnessMaxAgeMs: deps.review.freshnessMaxAgeMs,
         nowIso: now,
-        calibrationGate: deps.review.calibrationGate,
+        calibrationGate: effectiveReviewGate,
         policyEpochHash: deps.review.policyEpochHash,
         expectedPolicyEpochHash: deps.review.expectedPolicyEpochHash,
       });
+      axisArtifactByType.set(taskType, axisArtifact);
 
       const challengerEntry = deps.review.candidate.routing[taskType];
       const incumbentEntry = adoptedRaw[taskType];
@@ -1003,6 +1345,7 @@ export async function runAutonomyTick(
         },
         policy
       );
+      statDetailByType.set(taskType, stat.detail);
 
       const protectedRoute = policy.protectedRoutes.has(taskType);
       const quarantineReason = quarantineReasonByAxis.get(taskType);
@@ -1037,7 +1380,7 @@ export async function runAutonomyTick(
         riskBudget.remaining > 0 &&
         tierAllows;
 
-      const baseFields = {
+      axisEvalByType.set(taskType, {
         taskType,
         verifierBacked,
         validationOk: axisArtifact.validation.ok,
@@ -1052,103 +1395,170 @@ export async function runAutonomyTick(
         cooldownActive: cooldown.active,
         cooldownUntil: cooldown.until,
         riskBudgetAvailable: riskBudget.remaining > 0,
-      };
+        eligible: predicatesPass,
+        attempted: false,
+        reasons,
+      });
 
-      // 5a. Not eligible by the ordinary predicates/tier rule, OR suppressed by kill switch/dry
-      // run — no attempt is made, and (kill switch/dry run aside) every OTHER axis still gets a
-      // full, independent evaluation this tick (only an ACTUAL attempt below limits it to one).
-      if (!predicatesPass || killSwitchActive || dryRun) {
-        axisEvaluations.push({ ...baseFields, eligible: predicatesPass, attempted: false, reasons });
-        continue;
-      }
+      if (predicatesPass && !killSwitchActive && !dryRun) eligibleTaskTypes.push(taskType);
+    }
+  }
 
-      // This IS the one axis this tick will attempt — no further axis is even considered below.
-      attemptedThisTick = true;
+  // 4. DECIDE BY TIER + ADOPT — rotate over the ELIGIBLE axes (persisted cursor, finding 5) and
+  // attempt the FIRST one whose pre-write rechecks also pass; at most ONE actual mutation per tick
+  // (finding 3, round 1) — a pre-write refusal tries the next axis in rotation WITHOUT consuming
+  // that one slot (finding 5, round 3).
+  const adopted: AutonomyAdoptionOutcome[] = [];
+  let mutationAttemptFailed = false;
 
-      // 5b. Finding 6: recheck the LIVE gate immediately before an organic-dependent adopt — the
-      // review-time snapshot (`deps.review.calibrationGate`) may have decayed to HOLD (or lost its
-      // `enabling`) by now.
-      if (!verifierBacked) {
-        const freshGateSummary = summarizeCalibrationGate(deps.recomputeCalibrationGate());
+  if (!noop && eligibleTaskTypes.length > 0) {
+    const rotationState = loadRotationState(deps.dataDir);
+    const rotationOrder = rotateEligibleAxes(eligibleTaskTypes, rotationState.lastAttemptedTaskType);
+    // Captured ONCE, right after the post-watch read above — the optimistic-concurrency baseline
+    // every attempted axis's write is checked against immediately before it mutates (finding 1).
+    const baselineHash = tableContentHash(liveRawForReview);
+
+    for (const taskType of rotationOrder) {
+      const axisArtifact = axisArtifactByType.get(taskType)!;
+      const evalRecord = axisEvalByType.get(taskType)!;
+
+      // 4a. Finding 6 (round 1): recheck the LIVE gate immediately before an organic-dependent
+      // adopt, also augmented with the ladder's own enablement (finding 4, round 3) — a pre-write
+      // refusal here does NOT consume this tick's mutation slot; the rotation just tries the next
+      // eligible axis.
+      if (!evalRecord.verifierBacked) {
+        const freshGateSummary = summarizeCalibrationGate(applyLadderEnablement(deps.recomputeCalibrationGate(), deps.dataDir));
         if (!gateAdmitsOrganicEvidence(freshGateSummary)) {
-          reasons.push(
-            `organic-gate-recheck-failed: the live #6/#48 gate is no longer GO+enabled at adopt time (review-time snapshot was ${
-              summarizeCalibrationGate(deps.review.calibrationGate)?.verdict ?? "none consulted"
-            })`
-          );
-          axisEvaluations.push({ ...baseFields, eligible: false, attempted: true, reasons });
-          mutationAttemptFailed = true;
+          axisEvalByType.set(taskType, {
+            ...evalRecord,
+            eligible: false,
+            reasons: [
+              ...evalRecord.reasons,
+              `organic-gate-recheck-failed: the live #6/#48 gate is no longer GO+enabled at adopt time (review-time snapshot was ${
+                summarizeCalibrationGate(effectiveReviewGate)?.verdict ?? "none consulted"
+              })`,
+            ],
+          });
           continue;
         }
       }
 
-      // 5c. Finding 1 (optimistic concurrency): refuse if the live table changed since this
-      // tick's REVIEW baseline was read, rather than trusting a possibly-stale artifact.
-      const liveRawNow = tryReadLiveTable(deps.adoptDeps);
-      if (tableContentHash(liveRawNow) !== baselineHash) {
-        reasons.push(
-          "table-changed-since-baseline: the live routing table was mutated after this tick's REVIEW baseline was read — refusing to adopt against a stale artifact"
-        );
-        axisEvaluations.push({ ...baseFields, eligible: false, attempted: true, reasons });
-        mutationAttemptFailed = true;
-        continue;
+      // 4b. Finding 2 (round 3): the exclusive mutation lock, shared with the human
+      // `routing-lifecycle-cli.ts adopt` path — refuses (does not consume the slot) rather than
+      // racing a concurrent writer between this recheck and the write below.
+      let lockHandle: { release: () => void };
+      try {
+        lockHandle = acquireMutationLock(deps.dataDir);
+      } catch (err) {
+        if (err instanceof MutationLockBusyError) {
+          axisEvalByType.set(taskType, { ...evalRecord, eligible: false, reasons: [...evalRecord.reasons, err.message] });
+          continue;
+        }
+        throw err;
       }
 
-      const approval = approveArtifact(axisArtifact, {
-        approvedBy: `${AUTONOMY_APPROVER_PREFIX}${tierState.tier}`,
-        reason: `autonomy-controller tick ${now}: ${stat.detail}`,
-        decisionRef: deps.decisionRef,
-        approvedAt: now,
-      });
+      try {
+        // 4c. Finding 1 (round 1, re-verified UNDER the lock per round 3 finding 2): refuse if the
+        // live table changed since this tick's REVIEW baseline was read.
+        const liveRawNow = tryReadLiveTable(deps.adoptDeps);
+        if (tableContentHash(liveRawNow) !== baselineHash) {
+          axisEvalByType.set(taskType, {
+            ...evalRecord,
+            eligible: false,
+            reasons: [
+              ...evalRecord.reasons,
+              "table-changed-since-baseline: the live routing table was mutated after this tick's REVIEW baseline was read — refusing to adopt against a stale artifact",
+            ],
+          });
+          continue;
+        }
 
-      // 5d. Finding 2: journal the INTENT durably BEFORE the mutating adopt call, so a crash
-      // between the table write landing and `recordAdoptionForWatch` running is recoverable by the
-      // NEXT tick's reconciliation (step 0).
-      const intent: AdoptionIntent = {
-        schemaVersion: 1,
-        id: randomUUID(),
-        createdAt: now,
-        taskType,
-        candidateHash: axisArtifact.candidateHash,
-        decisionRef: deps.decisionRef,
-        approvedBy: approval.approvedBy,
-        tier: tierState.tier,
-        priorRaw: liveRawNow,
-        status: "pending",
-      };
-      saveAdoptionIntent(deps.dataDir, intent);
+        // This IS the one axis this tick attempts — the rotation loop stops after this iteration
+        // regardless of the eventual outcome (success or failure both consume the slot).
+        const approval = approveArtifact(axisArtifact, {
+          approvedBy: `${AUTONOMY_APPROVER_PREFIX}${tierState.tier}`,
+          reason: `autonomy-controller tick ${now}: ${statDetailByType.get(taskType) ?? ""}`,
+          decisionRef: deps.decisionRef,
+          approvedAt: now,
+        });
 
-      const outcome = await adoptRoutingTable(axisArtifact, approval, deps.adoptDeps);
-      let watchRecord: AdoptionWatchRecord | undefined;
-      if (outcome.outcome === "adopted") {
-        watchRecord = recordAdoptionForWatch({
-          dataDir: deps.dataDir,
-          adoptedAt: outcome.record.adoptedAt,
-          candidateHash: outcome.record.candidateHash,
-          decisionRef: outcome.record.decisionRef,
-          approvedBy: outcome.record.approvedBy,
-          changedTaskTypes: [taskType],
+        // 4d. Finding 2 (round 1) + finding 1 (round 3 phase tracking): journal the INTENT durably
+        // BEFORE the mutating call, then wrap `adoptDeps` so each phase (table-written, reloaded)
+        // is ALSO persisted the instant it happens inside `adoptRoutingTable`'s own sequence.
+        const intentId = randomUUID();
+        const intent: AdoptionIntent = {
+          schemaVersion: 1,
+          id: intentId,
+          createdAt: now,
+          taskType,
+          candidateHash: axisArtifact.candidateHash,
+          decisionRef: deps.decisionRef,
+          approvedBy: approval.approvedBy,
+          tier: tierState.tier,
           priorRaw: liveRawNow,
-          provenance: { kind: "autonomy", tier: tierState.tier },
-        });
-        saveAdoptionIntent(deps.dataDir, { ...intent, status: "finalized", finalizedAt: deps.nowIso(), watchRecordId: watchRecord.id });
-      } else {
-        // Finding 4: a write/reload/rollback/canary failure is NOT a healthy cycle.
-        mutationAttemptFailed = true;
-        saveAdoptionIntent(deps.dataDir, {
-          ...intent,
-          status: "aborted",
-          abortedAt: deps.nowIso(),
-          abortReason: `adoptRoutingTable outcome: ${outcome.outcome}`,
-        });
+          phase: "planned",
+          status: "pending",
+        };
+        saveAdoptionIntent(deps.dataDir, intent);
+        const instrumentedDeps = instrumentAdoptDepsForIntent(deps.adoptDeps, deps.dataDir, intentId);
+
+        const outcome = await adoptRoutingTable(axisArtifact, approval, instrumentedDeps);
+        let watchRecord: AdoptionWatchRecord | undefined;
+        if (outcome.outcome === "adopted") {
+          // Canary DID pass by construction of this outcome — mark it BEFORE recordAdoptionForWatch
+          // so a crash in the remaining gap still reconciles as "finalize", never "restore".
+          const afterAdopt = loadAdoptionIntent(deps.dataDir);
+          if (afterAdopt && afterAdopt.id === intentId && afterAdopt.status === "pending") {
+            saveAdoptionIntent(deps.dataDir, { ...afterAdopt, phase: "canary-passed" });
+          }
+          watchRecord = recordAdoptionForWatch({
+            dataDir: deps.dataDir,
+            adoptedAt: outcome.record.adoptedAt,
+            candidateHash: outcome.record.candidateHash,
+            decisionRef: outcome.record.decisionRef,
+            approvedBy: outcome.record.approvedBy,
+            changedTaskTypes: [taskType],
+            priorRaw: liveRawNow,
+            provenance: { kind: "autonomy", tier: tierState.tier },
+          });
+          const finalIntent = loadAdoptionIntent(deps.dataDir);
+          if (finalIntent && finalIntent.id === intentId) {
+            saveAdoptionIntent(deps.dataDir, {
+              ...finalIntent,
+              status: "finalized",
+              finalizedAt: deps.nowIso(),
+              watchRecordId: watchRecord.id,
+            });
+          }
+        } else {
+          // Finding 4 (round 1): a write/reload/rollback/canary failure is NOT a healthy cycle.
+          // `adoptRoutingTable` already restored the prior bytes internally on this path.
+          mutationAttemptFailed = true;
+          const current = loadAdoptionIntent(deps.dataDir);
+          if (current && current.id === intentId) {
+            saveAdoptionIntent(deps.dataDir, {
+              ...current,
+              status: "aborted",
+              abortedAt: deps.nowIso(),
+              abortReason: `adoptRoutingTable outcome: ${outcome.outcome}`,
+            });
+          }
+        }
+        adopted.push({ taskType, outcome, watchRecord });
+        axisEvalByType.set(taskType, { ...evalRecord, eligible: outcome.outcome === "adopted", attempted: true });
+        if (!dryRun) saveRotationState(deps.dataDir, { schemaVersion: 1, lastAttemptedTaskType: taskType });
+      } finally {
+        lockHandle.release();
       }
-      adopted.push({ taskType, outcome, watchRecord });
-      axisEvaluations.push({ ...baseFields, eligible: outcome.outcome === "adopted", attempted: true, reasons });
+
+      break; // exactly one attempt this tick, whatever its outcome
     }
   }
 
-  // Healthy-cycle bookkeeping (§6, finding 4): computed AFTER any mutation attempt — a failed
-  // write/reload/rollback/canary, a stale-baseline abort, or a stale-gate refusal is NEVER a
+  const axisEvaluations = changedTaskTypes.map((t) => axisEvalByType.get(t)!);
+
+  // Healthy-cycle bookkeeping (§6, finding 4, round 1): computed AFTER any mutation attempt — a
+  // failed write/reload/rollback/canary, a stale-baseline abort, or a stale-gate refusal is NEVER a
   // healthy cycle, regardless of what the review artifact's own validation said.
   const anyInfraFailure = watch.items.some((i) => i.revert?.status === "unknown");
   const healthyCycle = fullArtifact.validation.ok && !anyBreach && !anyInfraFailure && !mutationAttemptFailed;
@@ -1160,12 +1570,23 @@ export async function runAutonomyTick(
     // streak (not "consecutive" anymore) without itself being a demotion trigger.
     tierState = { ...tierState, consecutiveHealthyCycles: 0, lastCycleAt: now };
   }
+  // Finding 4 (round 3): the SUSTAINED anchored-GO streak the Tier-2 unlock condition reads —
+  // tracked independently of `consecutiveHealthyCycles` (a tick can be healthy without being GO,
+  // which is the common case before Tier 2 is even relevant). The breach path already reset this
+  // to 0 above when applicable.
+  const isGoTick = deps.review.calibrationGate?.verdict === "GO";
+  if (isGoTick) {
+    tierState = { ...tierState, consecutiveGoCycles: tierState.consecutiveGoCycles + 1 };
+  } else if (!anyBreach) {
+    tierState = { ...tierState, consecutiveGoCycles: 0 };
+  }
 
   // 6. TIER LADDER — promotion only (demotion already applied + durably persisted in step 1.5;
-  // never evaluated under the kill switch).
+  // never evaluated under the kill switch). May itself write the Tier-2 ladder-enablement record
+  // (finding 4, round 3) — see `maybePromote`'s own doc comment.
   if (!killSwitchActive && !tierEvent) {
     const revertRate = computeAutonomousRevertRate(loadWatchdogState(deps.dataDir).records);
-    const promotion = maybePromote(tierState, now, policy, deps.review.calibrationGate, revertRate);
+    const promotion = maybePromote(tierState, now, policy, deps.dataDir, deps.decisionRef, revertRate);
     if (promotion) {
       tierEvent = promotion.event;
       tierState = promotion.state;
@@ -1204,7 +1625,9 @@ export async function runAutonomyTick(
 
   if (!dryRun) {
     saveTierState(deps.dataDir, tierState);
-    if (tierEvent) appendTierEvent(deps.dataDir, tierEvent);
+    // Finding 7 (round 3): never append the SAME demotion event a second time — only a genuinely
+    // new (promotion) event reaches this point unpersisted.
+    if (tierEvent && !tierEventAlreadyPersisted) appendTierEvent(deps.dataDir, tierEvent);
     saveStandingProposal(deps.dataDir, standingProposal);
   }
 

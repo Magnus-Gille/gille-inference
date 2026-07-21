@@ -97,6 +97,26 @@ export function contentDigest(bytes: string): string {
   return `sha256:${createHash("sha256").update(bytes, "utf8").digest("hex")}`;
 }
 
+/**
+ * Content hash of a routing table's SEMANTIC bytes (gille-inference#49) — safely comparable
+ * against `RoutingDecisionArtifact.candidateHash` (`contentDigest(JSON.stringify(candidate))`,
+ * computed directly on the in-memory object, no pretty-printing) even though `adoptRoutingTable`
+ * (routing-lifecycle.ts) writes `JSON.stringify(artifact.candidate, null, 2) + "\n"` to disk:
+ * parsing the live bytes back into an object and re-stringifying compactly undoes the pretty-print/
+ * trailing-newline formatting and reproduces byte-identical compact JSON for any plain JSON-safe
+ * value (no `undefined`/`NaN`/`Date` — which a `RoutingTableDoc` never contains), because
+ * `JSON.parse` reconstructs object keys in the same order they appear in the source text and
+ * `JSON.stringify` is deterministic over that order. Locked in by a dedicated round-trip unit test
+ * (never assume this silently). Returns the sentinel `"(none)"` for a null/absent table (never a
+ * fabricated hash of nothing). Shared by `autonomy-controller.ts` (the autonomous adopt path) and
+ * `scripts/routing-lifecycle-cli.ts` (the human `adopt` path, finding 2's concurrent-writer fix) so
+ * both surfaces compare against the live table identically.
+ */
+export function tableContentHash(raw: string | null): string {
+  if (raw === null) return "(none)";
+  return contentDigest(JSON.stringify(JSON.parse(raw)));
+}
+
 function normalizeDigest(digest: string): string {
   return digest.startsWith("sha256:") ? digest : `sha256:${digest}`;
 }

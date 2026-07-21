@@ -270,6 +270,9 @@ describe("Finding 2 (CRITICAL) — crash between the table write and recordAdopt
       approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
       tier: 1,
       priorRaw: tableJson({ classify: { model: "mellum", verdict: "delegate-local", attempts: 50, passRate: 0.5 } }),
+      // round 3: the crash this scenario simulates happened AFTER canary passed (the live table
+      // already reflects it) — reconcile must finalize, never restore-and-abort.
+      phase: "canary-passed",
       status: "pending",
     };
     saveAdoptionIntent(dataDir, intent);
@@ -316,7 +319,7 @@ describe("Finding 2 (CRITICAL) — crash between the table write and recordAdopt
     expect(loadAdoptionIntent(dataDir)?.status).toBe("finalized");
   });
 
-  it("reconcileAdoptionIntent itself: aborts when the live table does NOT match the intent (write never completed)", () => {
+  it("reconcileAdoptionIntent itself: aborts when the live table does NOT match the intent (write never completed)", async () => {
     const dataDir = tmp();
     const intent: AdoptionIntent = {
       schemaVersion: 1,
@@ -328,10 +331,16 @@ describe("Finding 2 (CRITICAL) — crash between the table write and recordAdopt
       approvedBy: "x",
       tier: 1,
       priorRaw: null,
+      // round 3: reconcile now keys off the PHASE, not table content alone — "canary-passed"
+      // means the write DID complete, so a mismatch here means something else changed it since.
+      phase: "canary-passed",
       status: "pending",
     };
     saveAdoptionIntent(dataDir, intent);
-    const result = reconcileAdoptionIntent(dataDir, NOW, () => tableJson({ classify: { model: "mellum", verdict: "delegate-local", attempts: 1 } }));
+    const { deps: adoptDeps } = fakeAdoptDeps({
+      initialTable: tableJson({ classify: { model: "mellum", verdict: "delegate-local", attempts: 1 } }),
+    });
+    const result = await reconcileAdoptionIntent(dataDir, NOW, adoptDeps);
     expect(result.action).toBe("aborted");
     expect(loadAdoptionIntent(dataDir)?.status).toBe("aborted");
   });
@@ -590,12 +599,17 @@ describe("Finding 6 (MAJOR) — organic-dependent adoption must recheck the live
 // ── Finding 7 (MINOR): approver-prefix spoofing ───────────────────────────────────
 
 describe("Finding 7 (MINOR) — approver-prefix string is never accounting evidence", () => {
-  it("a MANUAL record whose approvedBy happens to start with the autonomy prefix is NOT counted as autonomous", () => {
+  it("a record with NO structured provenance and an approvedBy matching the autonomy prefix: counted toward budget/cooldown (restrictive), excluded from health stats (round 3 finding 6 refinement)", () => {
     const dataDir = tmp();
-    // A human ran `routing-lifecycle-cli.ts adopt --approved-by "autonomy-controller:tier1"` —
-    // nothing stops an operator from typing this exact string. `provenance` is correctly omitted
-    // (this call site never sets it) since it is a genuinely manual adoption.
-    const spoofed = recordAdoptionForWatch({
+    // A human ran `routing-lifecycle-cli.ts adopt --approved-by "autonomy-controller:tier1"` (or
+    // this is simply a legacy record written before `provenance` existed) — `provenance` is
+    // correctly absent either way. Round 3's re-review refined the ORIGINAL round-1 rule (which
+    // excluded this from everything): the safe fail-direction differs by CONSUMER — a risk BUDGET
+    // must never let ambiguity manufacture MORE mutation headroom than intended (so this counts),
+    // while a HEALTH/promotion stat must never let ambiguity manufacture a false-healthy track
+    // record (so this is excluded there) — see `countsTowardRiskBudget` vs
+    // `countsTowardAutonomousHealthStats`'s doc comments.
+    const ambiguous = recordAdoptionForWatch({
       dataDir,
       adoptedAt: NOW,
       candidateHash: "h-manual-spoofed",
@@ -605,13 +619,28 @@ describe("Finding 7 (MINOR) — approver-prefix string is never accounting evide
       priorRaw: null,
     });
 
-    const budget = computeRiskBudgetStatus([spoofed], NOW, TEST_POLICY);
-    expect(budget.used).toBe(0);
+    const budget = computeRiskBudgetStatus([ambiguous], NOW, TEST_POLICY);
+    expect(budget.used).toBe(1); // restrictive direction for a budget ceiling
 
-    const cooldown = routeCooldownActive([spoofed], "classify", NOW, TEST_POLICY);
-    expect(cooldown.active).toBe(false);
+    const cooldown = routeCooldownActive([ambiguous], "classify", NOW, TEST_POLICY);
+    expect(cooldown.active).toBe(true); // same restrictive direction
 
-    expect(computeAutonomousRevertRate([spoofed])).toBe(0);
+    expect(computeAutonomousRevertRate([ambiguous])).toBe(0); // excluded from the strict health signal
+  });
+
+  it("a record EXPLICITLY marked manual provenance is NEVER counted toward budget, even with a matching approvedBy text", () => {
+    const dataDir = tmp();
+    const explicitlyManual = recordAdoptionForWatch({
+      dataDir,
+      adoptedAt: NOW,
+      candidateHash: "h-explicit-manual",
+      decisionRef: "r",
+      approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
+      changedTaskTypes: ["classify"],
+      priorRaw: null,
+      provenance: { kind: "manual" },
+    });
+    expect(computeRiskBudgetStatus([explicitlyManual], NOW, TEST_POLICY).used).toBe(0);
   });
 
   it("a genuine autonomous record (structured provenance) IS counted, regardless of its approvedBy text", () => {
