@@ -511,7 +511,7 @@ async function cmdAdopt(args: string[]): Promise<void> {
   // mutation lock the autonomy controller's own adopt attempt takes (mutation-lock.ts), so a
   // concurrent autonomous tick and this manual `adopt` invocation can never interleave a
   // hash-check-then-write race against each other.
-  let lockHandle: { release: () => void };
+  let lockHandle: ReturnType<typeof acquireMutationLock>;
   try {
     lockHandle = acquireMutationLock(dataDir);
   } catch (err) {
@@ -548,7 +548,11 @@ async function cmdAdopt(args: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    result = await adoptRoutingTable(artifact, approval, deps);
+    // Round 6 finding 1: stamp the real lease token onto the deps used for the write — the candidate
+    // write inside adoptRoutingTable is now fenced (check-AND-write in one SQLite transaction), not
+    // just guarded by holding this lock throughout the call.
+    const fencedDeps: AdoptDeps = { ...deps, leaseContext: { dataDir, token: lockHandle.token } };
+    result = await adoptRoutingTable(artifact, approval, fencedDeps);
     if (result.outcome === "adopted") {
       // Round 4 finding 3: `recordAdoptionForWatch` stays UNDER THE SAME LEASE as the write itself —
       // releasing the lock between the write and opening the watch window would let a concurrent
@@ -562,6 +566,7 @@ async function cmdAdopt(args: string[]): Promise<void> {
         approvedBy: result.record.approvedBy,
         changedTaskTypes: changedTaskTypesOf(artifact.diff),
         priorRaw: priorRawForWatchdog,
+        leaseToken: lockHandle.token,
       });
     }
   } finally {
@@ -640,7 +645,7 @@ async function cmdRollback(args: string[]): Promise<void> {
   const config = loadConfig();
   const deps = buildAdoptDeps(args, config, tablePath);
 
-  let lockHandle: { release: () => void };
+  let lockHandle: ReturnType<typeof acquireMutationLock>;
   try {
     lockHandle = await acquireMutationLockWithBriefRetry(dataDir);
   } catch (err) {
@@ -660,7 +665,10 @@ async function cmdRollback(args: string[]): Promise<void> {
 
   let record: Awaited<ReturnType<typeof manualRollback>>;
   try {
-    record = await manualRollback({ deps, snapshotRaw, reason });
+    // Round 6 finding 1: fence the restore write with the real lease token this command acquired —
+    // check-AND-write in one SQLite transaction, never a separate check-then-write.
+    const fencedDeps: AdoptDeps = { ...deps, leaseContext: { dataDir, token: lockHandle.token } };
+    record = await manualRollback({ deps: fencedDeps, snapshotRaw, reason });
   } finally {
     lockHandle.release();
   }

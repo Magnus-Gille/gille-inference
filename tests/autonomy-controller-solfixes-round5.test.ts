@@ -207,9 +207,12 @@ describe("Finding 1 — fencing checked at the resource, not only at acquire", (
     db.close();
     const reclaimer = acquireMutationLock(dataDir);
 
-    await expect(
-      adoptRoutingTable(artifact, approval, adoptDeps, { verifiedPriorRaw: adopted, leaseContext: { dataDir, token: holder.token } })
-    ).rejects.toThrow(MutationLockStaleError);
+    // Round 6 finding 1: leaseContext now lives on `deps` itself (so EVERY filesystem mutation
+    // routed through these deps is fenced, not just the one call that used to accept an opt).
+    const leasedDeps = { ...adoptDeps, leaseContext: { dataDir, token: holder.token } };
+    await expect(adoptRoutingTable(artifact, approval, leasedDeps, { verifiedPriorRaw: adopted })).rejects.toThrow(
+      MutationLockStaleError
+    );
     expect(fs.get(tablePath)).toBe(adopted); // NOTHING was written
     reclaimer.release();
   });

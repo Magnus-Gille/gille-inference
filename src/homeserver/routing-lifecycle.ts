@@ -39,7 +39,7 @@
  */
 
 import { contentDigest, isVerifiedEnoentError, tableContentHash } from "./evidence-identity.js";
-import { assertLeaseCurrent } from "./mutation-lock.js";
+import { fencedWrite, renewMutationLock, MutationLockStaleError } from "./mutation-lock.js";
 import { generateRoutingTable, type RoutingTableDoc } from "./routing-table-generator.js";
 import {
   diffRoutingTables,
@@ -511,6 +511,21 @@ export interface AdoptDeps {
    * a caller bug, not a silent no-op — `deleteTableAndReload` below reports it as a failed restore.
    */
   deleteTable?: (path: string) => void;
+  /**
+   * Round 6 finding 1: when present, EVERY filesystem mutation this module performs through these
+   * deps (`writeTable`/`deleteTable`, in `adoptRoutingTable`'s candidate write, `performRollback`'s
+   * restore write, and `deleteTableAndReload`'s delete) is routed through `fencedWrite` — the token
+   * check and the write commit inside ONE SQLite transaction, never a separate check-then-write.
+   * Set this on the deps object itself (not passed as a call-by-call opt) so it automatically
+   * covers every write path a caller's `deps` flows through, including ones this module calls
+   * internally (`manualRollback`/`deleteTableAndReload` reached via `performRollback`) — the manual
+   * CLI `adopt`/`rollback` commands set this via `buildAdoptDeps`'s lease-aware construction, and
+   * the autonomy controller sets it on its own instrumented deps, both AFTER acquiring the lease
+   * (the token is not known before that). Omitted entirely (no lease context at all) means NO
+   * fencing — reserved for call sites that are not lease-protected at all (there are none left in
+   * production; kept optional so this is additive, not a breaking signature change).
+   */
+  leaseContext?: { dataDir: string; token: number };
 }
 
 export interface AdoptionRecord {
@@ -537,6 +552,15 @@ export interface RollbackRecord {
    */
   restoreWriteOk: boolean;
   restoreWriteError?: string;
+  /**
+   * Round 6 finding 1: true iff the restore write was REFUSED (never even attempted) because
+   * `fencedWrite` found the caller's lease token was no longer current. This is NOT an ordinary
+   * write failure — `restoreWriteOk` is `false`, but the correct response is "the table is in an
+   * UNRESOLVED state, requiring reconciliation under a FRESH lease", never a blind retry with this
+   * same (superseded) token and never any other recovery attempt: "a stale holder must never roll
+   * back" — this holder can no longer be sure it is not clobbering a newer holder's legitimate work.
+   */
+  staleLeaseRefused?: boolean;
   reloadOk: boolean;
   reloadError?: string;
 }
@@ -551,11 +575,66 @@ export type AdoptOutcome =
   | { outcome: "write-failed"; rollback: RollbackRecord };
 
 /**
+ * Round 6 finding 1: routes a filesystem mutation through `fencedWrite` when `deps.leaseContext` is
+ * present (check-AND-write, one SQLite transaction), or runs it unfenced otherwise (no lease context
+ * at all — never partially fenced). ALL of this module's filesystem writes go through this, so
+ * `adoptRoutingTable`'s candidate write, `performRollback`'s restore write, and
+ * `deleteTableAndReload`'s delete are uniformly protected whenever the caller's deps carry a lease.
+ */
+function withFencing<T>(deps: AdoptDeps, fn: () => T): T {
+  if (deps.leaseContext) {
+    return fencedWrite(deps.leaseContext.dataDir, deps.leaseContext.token, fn);
+  }
+  return fn();
+}
+
+const DEFAULT_RELOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * Round 6 finding 1 (defense in depth): bounds `deps.reload()` with a timeout (the live gateway
+ * reload is a network call; an unbounded hang here would hold the mutation lease open indefinitely,
+ * denying every other caller) and, when `deps.leaseContext` is present, re-asserts/renews the lease
+ * immediately after reload returns — a slow-but-successful reload can eat meaningfully into the
+ * lease's staleness clock, and renewing here keeps it fresh for whatever fenced write happens next
+ * in THIS SAME call (e.g. a canary-failure rollback). Renewal is best-effort and never throws: if
+ * the token has already been superseded, the renewal is simply a no-op — the NEXT `fencedWrite` in
+ * this call correctly refuses with `MutationLockStaleError` regardless of whether renewal ran.
+ */
+async function reloadAndRenew(deps: AdoptDeps, timeoutMs = DEFAULT_RELOAD_TIMEOUT_MS): Promise<ReloadOutcome> {
+  let result: ReloadOutcome;
+  try {
+    result = await Promise.race([
+      Promise.resolve(deps.reload()),
+      new Promise<ReloadOutcome>((resolve) => {
+        setTimeout(() => resolve({ ok: false, error: `gateway reload timed out after ${timeoutMs}ms` }), timeoutMs).unref?.();
+      }),
+    ]);
+  } catch (err) {
+    result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (deps.leaseContext) {
+    try {
+      renewMutationLock(deps.leaseContext.dataDir, deps.leaseContext.token);
+    } catch {
+      // Best-effort keep-alive only — never let a renewal hiccup mask the reload's own result.
+    }
+  }
+  return result;
+}
+
+/**
  * Restores `priorRaw` (exact bytes) and reloads. NEVER throws — every IO step is caught and folded
  * into the returned `RollbackRecord`, because this is the function everything else calls when
  * something has ALREADY gone wrong; if it can also throw, a caller has no safe way to react (an
  * uncaught rejection here would surface as a crash with no structured "what is the table's state
  * now" answer, which is the worst possible outcome on the PRODUCTION-ROUTING-MUTATION seam).
+ *
+ * Round 6 finding 1: the restore write is fenced (`withFencing`/`fencedWrite`) — and a REFUSED write
+ * (`MutationLockStaleError`, this holder's lease is no longer current) is NEVER treated as an
+ * ordinary write failure to retry or paper over. "A stale holder must never roll back": the record
+ * comes back with `restoreWriteOk: false` AND `staleLeaseRefused: true`, and the reason says plainly
+ * that the table is in an UNRESOLVED state requiring reconciliation under a fresh lease — never a
+ * blind retry with this same (superseded) token.
  */
 async function performRollback(p: {
   deps: AdoptDeps;
@@ -564,11 +643,15 @@ async function performRollback(p: {
 }): Promise<RollbackRecord> {
   let restoreWriteOk = true;
   let restoreWriteError: string | undefined;
+  let staleLeaseRefused = false;
   if (p.priorRaw !== null) {
     try {
-      p.deps.writeTable(p.deps.tablePath, p.priorRaw);
+      withFencing(p.deps, () => p.deps.writeTable(p.deps.tablePath, p.priorRaw as string));
     } catch (err) {
       restoreWriteOk = false;
+      if (err instanceof MutationLockStaleError) {
+        staleLeaseRefused = true;
+      }
       restoreWriteError = err instanceof Error ? err.message : String(err);
     }
   }
@@ -576,7 +659,7 @@ async function performRollback(p: {
   let reloadOk = true;
   let reloadError: string | undefined;
   try {
-    const r = await p.deps.reload();
+    const r = await reloadAndRenew(p.deps);
     reloadOk = r.ok;
     reloadError = r.error;
   } catch (err) {
@@ -586,9 +669,11 @@ async function performRollback(p: {
 
   const record: RollbackRecord = {
     rolledBackAt: p.deps.nowIso(),
-    reason: restoreWriteOk
-      ? p.reason
-      : `${p.reason} — AND the rollback restore write itself failed (${restoreWriteError}); table is in an UNKNOWN state, manual recovery required`,
+    reason: staleLeaseRefused
+      ? `${p.reason} — REFUSED: the mutation lease was no longer current when this rollback write was about to commit; a stale holder must never roll back. Table state is UNRESOLVED — requires reconciliation under a FRESH lease, never a retry with this same (superseded) token.`
+      : restoreWriteOk
+        ? p.reason
+        : `${p.reason} — AND the rollback restore write itself failed (${restoreWriteError}); table is in an UNKNOWN state, manual recovery required`,
     restoredHash: p.priorRaw !== null ? contentDigest(p.priorRaw) : "(none — no prior table existed)",
     restoreWriteOk,
     // `reloadOk` reports what reload() actually returned (best-effort, attempted regardless of
@@ -598,6 +683,7 @@ async function performRollback(p: {
   };
   return {
     ...record,
+    ...(staleLeaseRefused ? { staleLeaseRefused: true } : {}),
     ...(restoreWriteError ? { restoreWriteError } : {}),
     ...(reloadError ? { reloadError } : {}),
   };
@@ -621,26 +707,13 @@ export async function adoptRoutingTable(
   deps: AdoptDeps,
   opts: {
     verifiedPriorRaw?: string | null;
-    /** Round 5 follow-up (defense in depth alongside item 1's fencing): the caller's OWN
-     *  content hash of `verifiedPriorRaw` at the moment it was captured (e.g.
+    /** Round 5 follow-up (defense in depth alongside `deps.leaseContext`'s fencing): the caller's
+     *  OWN content hash of `verifiedPriorRaw` at the moment it was captured (e.g.
      *  `tableContentHash(liveRawNow)`, already computed for the caller's own staleness recheck) —
      *  a pure, no-IO cross-check that the value threaded through as `verifiedPriorRaw` is really
      *  what the caller believes it is (catches a caller-side wiring bug, e.g. the wrong variable
-     *  threaded through), never a substitute for `leaseContext`'s concurrency guarantee. */
+     *  threaded through), never a substitute for the lease's own concurrency guarantee. */
     verifiedPriorRawHash?: string;
-    /**
-     * Round 5 finding 1 — "fencing enforced at the resource": when supplied, this function
-     * re-verifies (transactionally, against the live lease db) that `token` is STILL the current
-     * mutation lease immediately before the candidate write commits. A caller that already holds
-     * the lease throughout its own call (the normal case) passes this so a lease that went stale
-     * mid-operation (reclaimed by another holder while this call was in flight) is caught HERE,
-     * at the resource, not just at the caller's own acquire — closing the gap where a stale holder
-     * could otherwise still perform its write and silently clobber a newer holder's legitimate one.
-     * Throws `MutationLockStaleError` (propagated, never swallowed) if the token is no longer
-     * current; nothing has been written yet at that point, so the caller's correct response is a
-     * clean abort (no rollback needed) rather than any recovery attempt.
-     */
-    leaseContext?: { dataDir: string; token: number };
   } = {}
 ): Promise<AdoptOutcome> {
   assertApprovalBindsArtifact(artifact, approval);
@@ -678,7 +751,7 @@ export async function adoptRoutingTable(
 
   // Round 5 follow-up: defensive, no-IO integrity check on a caller-supplied verifiedPriorRaw —
   // catches a caller-side wiring bug (e.g. the wrong variable threaded through), independent of
-  // (and no substitute for) the fencing check just below.
+  // (and no substitute for) the fencing check inside `withFencing`/`fencedWrite` below.
   if ("verifiedPriorRaw" in opts && opts.verifiedPriorRawHash !== undefined) {
     const actualHash = tableContentHash(priorRaw);
     if (actualHash !== opts.verifiedPriorRawHash) {
@@ -688,16 +761,15 @@ export async function adoptRoutingTable(
     }
   }
 
-  // Round 5 finding 1 — fencing enforced AT THE RESOURCE: re-verify the lease token immediately
-  // before the write commits, not only at the caller's own acquire. Throws MutationLockStaleError
-  // (propagated) if this token has since been superseded — nothing below has written anything yet.
-  if (opts.leaseContext) {
-    assertLeaseCurrent(opts.leaseContext.dataDir, opts.leaseContext.token);
-  }
-
   try {
-    deps.writeTable(deps.tablePath, candidateJson);
+    // Round 6 finding 1: the check (is `deps.leaseContext`'s token still current?) and the write
+    // commit in ONE SQLite transaction via `withFencing`/`fencedWrite` — not a separate
+    // `assertLeaseCurrent` call followed by an unfenced write. Throws `MutationLockStaleError`
+    // (propagated) if the token was superseded; nothing has been written at that point, so the
+    // caller's correct response is a clean abort (no rollback needed), never a recovery attempt.
+    withFencing(deps, () => deps.writeTable(deps.tablePath, candidateJson));
   } catch (err) {
+    if (err instanceof MutationLockStaleError) throw err;
     // The candidate write itself threw (e.g. disk full) — reload was never attempted. Route
     // through the SAME rollback primitive as every other failure so this is never an uncaught
     // rejection: best-effort restore of the prior bytes (which very likely never left disk, since
@@ -709,7 +781,8 @@ export async function adoptRoutingTable(
     });
     return { outcome: "write-failed", rollback };
   }
-  const reloadResult = await deps.reload();
+  // Round 6 finding 1: bounded (timeout) + lease-renewing — see `reloadAndRenew`'s doc comment.
+  const reloadResult = await reloadAndRenew(deps);
 
   if (!reloadResult.ok) {
     const rollback = await performRollback({
@@ -790,16 +863,32 @@ export async function manualRollback(p: { deps: AdoptDeps; snapshotRaw: string; 
  * `restoreWriteOk` is `false` (with a `restoreWriteError` explaining why) both when the delete
  * itself throws AND when `deps.deleteTable` was never supplied at all — a caller MUST check
  * `restoreWriteOk` before treating this as a completed restore.
+ *
+ * Round 6: the delete is fenced the same way `performRollback`'s restore write is (a stale lease
+ * refuses, never silently deletes on a superseded token — `staleLeaseRefused`). Round 6 follow-up:
+ * a verified ENOENT (the table is ALREADY gone — e.g. a previous call's delete succeeded but the
+ * process crashed before this function could record that) is treated as idempotent SUCCESS, not a
+ * failure — deleting something that does not exist achieves the exact same end state the caller
+ * wants ("no table"), so failing here would only make an already-correct outcome retry forever.
  */
 export async function deleteTableAndReload(p: { deps: AdoptDeps; reason: string }): Promise<RollbackRecord> {
   let restoreWriteOk = true;
   let restoreWriteError: string | undefined;
+  let staleLeaseRefused = false;
   if (p.deps.deleteTable) {
     try {
-      p.deps.deleteTable(p.deps.tablePath);
+      withFencing(p.deps, () => p.deps.deleteTable!(p.deps.tablePath));
     } catch (err) {
-      restoreWriteOk = false;
-      restoreWriteError = err instanceof Error ? err.message : String(err);
+      if (isVerifiedEnoentError(err)) {
+        // Already gone — idempotent success, not a failure (round 6 follow-up).
+      } else if (err instanceof MutationLockStaleError) {
+        restoreWriteOk = false;
+        staleLeaseRefused = true;
+        restoreWriteError = err.message;
+      } else {
+        restoreWriteOk = false;
+        restoreWriteError = err instanceof Error ? err.message : String(err);
+      }
     }
   } else {
     restoreWriteOk = false;
@@ -809,7 +898,7 @@ export async function deleteTableAndReload(p: { deps: AdoptDeps; reason: string 
   let reloadOk = true;
   let reloadError: string | undefined;
   try {
-    const r = await p.deps.reload();
+    const r = await reloadAndRenew(p.deps);
     reloadOk = r.ok;
     reloadError = r.error;
   } catch (err) {
@@ -819,15 +908,18 @@ export async function deleteTableAndReload(p: { deps: AdoptDeps; reason: string 
 
   const record: RollbackRecord = {
     rolledBackAt: p.deps.nowIso(),
-    reason: restoreWriteOk
-      ? p.reason
-      : `${p.reason} — AND deleting the table failed (${restoreWriteError}); table is in an UNKNOWN state, manual recovery required`,
+    reason: staleLeaseRefused
+      ? `${p.reason} — REFUSED: the mutation lease was no longer current when this delete was about to commit; a stale holder must never roll back. Table state is UNRESOLVED — requires reconciliation under a FRESH lease, never a retry with this same (superseded) token.`
+      : restoreWriteOk
+        ? p.reason
+        : `${p.reason} — AND deleting the table failed (${restoreWriteError}); table is in an UNKNOWN state, manual recovery required`,
     restoredHash: "(deleted — first-ever adoption had no prior snapshot)",
     restoreWriteOk,
     reloadOk,
   };
   return {
     ...record,
+    ...(staleLeaseRefused ? { staleLeaseRefused: true } : {}),
     ...(restoreWriteError ? { restoreWriteError } : {}),
     ...(reloadError ? { reloadError } : {}),
   };

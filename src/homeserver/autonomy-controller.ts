@@ -540,7 +540,23 @@ export function loadAdoptionIntent(dataDir: string): AdoptionIntent | null {
   }
 }
 
+/**
+ * Round 6 finding 3: the journal is structurally SINGLE-SLOT. Refuses (throws) to overwrite an
+ * on-disk intent that is still `"pending"` with a DIFFERENT intent (a different `id`) — this makes
+ * "at most one adoption intent in flight at a time" a hard invariant rather than a convention that a
+ * future bug (e.g. a control-flow path that skips reconcile, or misses the round-6 finding-3 gate on
+ * the rotation loop) could silently violate by clobbering an unresolved intent with a new one.
+ * Updating the SAME intent (identical `id` — a phase transition, a finalize, an abort) is always
+ * allowed; this only blocks a genuinely DIFFERENT intent from being created on top of an unresolved
+ * one.
+ */
 export function saveAdoptionIntent(dataDir: string, intent: AdoptionIntent): void {
+  const existing = loadAdoptionIntent(dataDir);
+  if (existing && existing.status === "pending" && existing.id !== intent.id) {
+    throw new Error(
+      `autonomy-controller: refusing to overwrite a PENDING adoption intent (id=${existing.id}, phase=${existing.phase}) with a different intent (id=${intent.id}) — the journal is single-slot; reconcile the existing intent first.`
+    );
+  }
   atomicWriteFile(autonomyPaths(dataDir).adoptionIntentPath, JSON.stringify(intent, null, 2) + "\n");
 }
 
@@ -583,8 +599,18 @@ export interface ReconcileAdoptionIntentResult {
  * rollback-on-failure) is deliberately left unmarked, since by then this is no longer the phase
  * "table-written" describes — the candidate write already happened and failed downstream. Callers
  * MUST construct a FRESH wrapper per adopt attempt (the `written` flag is attempt-scoped).
+ *
+ * Round 6 finding 1: also stamps `leaseContext` onto the returned deps (when supplied) so EVERY
+ * filesystem mutation `adoptRoutingTable`/`performRollback` perform through these deps — the
+ * candidate write, and any rollback-on-failure restore write — is routed through
+ * `fencedWrite`/`withFencing` (routing-lifecycle.ts), never a separate check-then-write.
  */
-function instrumentAdoptDepsForIntent(base: AdoptDeps, dataDir: string, intentId: string): AdoptDeps {
+function instrumentAdoptDepsForIntent(
+  base: AdoptDeps,
+  dataDir: string,
+  intentId: string,
+  leaseContext?: { dataDir: string; token: number }
+): AdoptDeps {
   let candidateWriteMarked = false;
   const markPhase = (phase: AdoptionIntentPhase): void => {
     const current = loadAdoptionIntent(dataDir);
@@ -594,6 +620,7 @@ function instrumentAdoptDepsForIntent(base: AdoptDeps, dataDir: string, intentId
   };
   return {
     ...base,
+    ...(leaseContext ? { leaseContext } : {}),
     writeTable: (path, data) => {
       base.writeTable(path, data);
       if (!candidateWriteMarked) {
@@ -636,14 +663,11 @@ export async function reconcileAdoptionIntent(
   now: string,
   adoptDeps: AdoptDeps
 ): Promise<ReconcileAdoptionIntentResult> {
-  const intent = loadAdoptionIntent(dataDir);
-  if (!intent || intent.status !== "pending") return { action: "none" };
-
-  // Round 5 finding 2: hold ONE lease through the ENTIRE reconcile sequence for a pending intent —
-  // round 4 only covered the restore-write branch; the canary-passed branch's live-hash check +
-  // watch-record dedupe/creation + intent finalization must be equally atomic against a concurrent
-  // mutation (a manual adopt, or this same tick's own later rotation-loop adopt attempt), not left
-  // to run lock-free.
+  // Round 6 finding 4: acquire the lease FIRST, THEN load (and revalidate) the intent — reading it
+  // before acquiring risked acting on a snapshot another holder could already have resolved between
+  // the read and the acquire (a genuine, if narrow, TOCTOU: reconcile decides its ENTIRE course of
+  // action from the intent it read, so that read must happen under the SAME lease everything else
+  // in this function is protected by, not before it).
   let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
   try {
     lockHandle = acquireMutationLock(dataDir);
@@ -651,12 +675,20 @@ export async function reconcileAdoptionIntent(
     if (!(err instanceof MutationLockBusyError)) throw err;
   }
   if (lockHandle === null) {
-    // Busy: do not proceed concurrently. The intent stays "pending" — the next tick's reconcile
-    // call retries the whole sequence from scratch under a fresh lease.
+    // Busy: do not proceed concurrently. Whatever intent may exist stays exactly as-is — the next
+    // tick's reconcile call retries the whole sequence from scratch under a fresh lease.
     return { action: "restore-deferred-lock-busy" };
   }
 
   try {
+    const intent = loadAdoptionIntent(dataDir);
+    if (!intent || intent.status !== "pending") return { action: "none" };
+
+    // Round 6 finding 1: stamp the lease context onto the deps used for the restore write below —
+    // `manualRollback`/`deleteTableAndReload` route their filesystem mutation through
+    // `fencedWrite`/`withFencing` whenever `deps.leaseContext` is set (routing-lifecycle.ts).
+    const fencedAdoptDeps: AdoptDeps = { ...adoptDeps, leaseContext: { dataDir, token: lockHandle.token } };
+
     // Round 5 finding 1: fencing enforced at the resource — verified immediately before EVERY
     // terminal (finalize/abort) write below, using the SAME token this call acquired. A stale token
     // means another holder reclaimed the lease sometime during this call; the correct response is
@@ -678,7 +710,7 @@ export async function reconcileAdoptionIntent(
       let rollback: RollbackRecord;
       if (intent.priorRaw !== null) {
         rollback = await manualRollback({
-          deps: adoptDeps,
+          deps: fencedAdoptDeps,
           snapshotRaw: intent.priorRaw,
           reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase})`,
         });
@@ -687,7 +719,7 @@ export async function reconcileAdoptionIntent(
         // correct undo is deleting the unconfirmed table outright, never "leave it in place and
         // abort" (which would leave a possibly-uncanaried table live and call that "recovered").
         rollback = await deleteTableAndReload({
-          deps: adoptDeps,
+          deps: fencedAdoptDeps,
           reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase}) — no prior snapshot existed (first-ever adoption); deleting the unconfirmed table`,
         });
       }
@@ -1420,8 +1452,22 @@ export async function runAutonomyTick(
   // is visible to THIS tick's own watch pass too. Skipped under --dry-run (zero mutation); NOT
   // skipped under the kill switch (this is honest bookkeeping for a write that already happened,
   // not a new autonomous mutation).
+  //
+  // Round 6 finding 3: the round-5 code discarded this result entirely — a NONTERMINAL outcome
+  // (the restore failed and will retry, the lease was busy, or it went stale mid-reconcile) means
+  // the routing table's true state is NOT YET CONFIRMED this tick. Attempting a NEW mutation on top
+  // of an unresolved prior one is exactly the "journal overwrite" this round's finding 3 also closes
+  // structurally (see `saveAdoptionIntent`'s single-slot guard) — so this tick MUST NOT attempt any
+  // adopt at all while reconcile is nonterminal. REVIEW/PREDICATES still run (read-only) so the
+  // standing proposal stays current; only the ADOPT phase (the rotation loop below) is suppressed.
+  let reconcileNonterminal: "lock-busy" | "restore-failed" | null = null;
   if (!dryRun) {
-    await reconcileAdoptionIntent(deps.dataDir, now, deps.adoptDeps);
+    const reconcileResult = await reconcileAdoptionIntent(deps.dataDir, now, deps.adoptDeps);
+    if (reconcileResult.action === "restore-deferred-lock-busy" || reconcileResult.action === "deferred-lease-went-stale") {
+      reconcileNonterminal = "lock-busy";
+    } else if (reconcileResult.action === "restore-failed-will-retry") {
+      reconcileNonterminal = "restore-failed";
+    }
   }
 
   // 1. WATCH (#47) — reused verbatim, including its own kill-switch/dry-run semantics.
@@ -1435,6 +1481,18 @@ export async function runAutonomyTick(
   const watch = await runAdoptionWatch(watchDeps, deps.watchdogPolicy, { dryRun });
 
   let tierState = loadTierState(deps.dataDir);
+  // Round 6 follow-up: a LEGACY state file (pre-round-5, before `tier1EnteredAt` was tracked) that
+  // is ALREADY at Tier 1+ has no recorded tenure start. Round 5 defaulted this to `null` ("no
+  // cutoff" — every watchdog record counts as current-tenure evidence), which is the UNSAFE
+  // direction: it could silently admit evidence from a tenure a demotion should have invalidated,
+  // but that demotion predates this field and was never recorded as an epoch reset. Derive the
+  // epoch CONSERVATIVELY as NOW instead — no pre-migration record counts as current-tenure evidence
+  // at all, so Tier 2 (re-)promotion must be earned fresh from this point forward. One-time
+  // backfill: once written, a genuine promotion/demotion event sets the real epoch going forward.
+  if (tierState.tier1EnteredAt === null && tierState.tier >= 1) {
+    tierState = { ...tierState, tier1EnteredAt: now };
+    if (!dryRun) saveTierState(deps.dataDir, tierState);
+  }
   const tierBefore = tierState.tier;
   let tierEvent: TierEvent | null = null;
   // Finding 7 (round 3): the demotion event below is persisted IMMEDIATELY (before REVIEW/ADOPT) —
@@ -1696,7 +1754,9 @@ export async function runAutonomyTick(
   const adopted: AutonomyAdoptionOutcome[] = [];
   let mutationAttemptFailed = false;
 
-  if (!noop && eligibleTaskTypes.length > 0) {
+  // Round 6 finding 3: reconcile being nonterminal suppresses ANY adopt attempt this tick,
+  // regardless of how many axes would otherwise be eligible — see step 0's own comment.
+  if (!noop && eligibleTaskTypes.length > 0 && reconcileNonterminal === null) {
     const rotationState = loadRotationState(deps.dataDir);
     const rotationOrder = rotateEligibleAxes(eligibleTaskTypes, rotationState.lastAttemptedTaskType);
     // Captured ONCE, right after the post-watch read above — the optimistic-concurrency baseline
@@ -1785,7 +1845,13 @@ export async function runAutonomyTick(
           status: "pending",
         };
         saveAdoptionIntent(deps.dataDir, intent);
-        const instrumentedDeps = instrumentAdoptDepsForIntent(deps.adoptDeps, deps.dataDir, intentId);
+        // Round 6 finding 1: leaseContext is stamped onto the deps object itself (not a call-by-call
+        // opt) so EVERY filesystem mutation adoptRoutingTable/performRollback perform through it —
+        // the candidate write, and any rollback-on-failure restore write — is fenced.
+        const instrumentedDeps = instrumentAdoptDepsForIntent(deps.adoptDeps, deps.dataDir, intentId, {
+          dataDir: deps.dataDir,
+          token: lockHandle.token,
+        });
 
         let outcome: Awaited<ReturnType<typeof adoptRoutingTable>>;
         try {
@@ -1795,7 +1861,6 @@ export async function runAutonomyTick(
           outcome = await adoptRoutingTable(axisArtifact, approval, instrumentedDeps, {
             verifiedPriorRaw: liveRawNow,
             verifiedPriorRawHash: baselineHash,
-            leaseContext: { dataDir: deps.dataDir, token: lockHandle.token },
           });
         } catch (err) {
           if (!(err instanceof MutationLockStaleError)) throw err;
@@ -1915,13 +1980,18 @@ export async function runAutonomyTick(
   //     (Tier 0 propose-only always lands here: `tierAllows` is baked into `predicatesPass`, so
   //     `eligibleTaskTypes` is ALWAYS empty at Tier 0 — never "neutral"), or a completed adoption.
   //     Advances the streaks — identical to the old `healthyCycle: true` behavior.
+  //
+  // Round 6 finding 3: `reconcileNonterminal` is folded in at the SAME priority as its own category —
+  // "restore-failed" joins the OTHER unhealthy triggers (a genuine failure signal takes priority over
+  // "neutral" even if reconcile was ALSO merely lock-busy this same tick), "lock-busy" joins the
+  // OTHER neutral triggers (advances/resets nothing, absent a stronger unhealthy signal).
   const anyInfraFailure = watch.items.some((i) => i.revert?.status === "unknown");
   const anyAxisActuallyAttempted = adopted.length > 0;
   const preWriteRefusalExhausted = eligibleTaskTypes.length > 0 && !anyAxisActuallyAttempted;
   const cycleOutcome: "advancing" | "neutral" | "unhealthy" =
-    !fullArtifact.validation.ok || anyBreach || anyInfraFailure || mutationAttemptFailed
+    !fullArtifact.validation.ok || anyBreach || anyInfraFailure || mutationAttemptFailed || reconcileNonterminal === "restore-failed"
       ? "unhealthy"
-      : preWriteRefusalExhausted
+      : preWriteRefusalExhausted || reconcileNonterminal === "lock-busy"
         ? "neutral"
         : "advancing";
   // Back-compat display field (scripts/autonomy-tick-cli.ts, existing tests) — `true` for BOTH

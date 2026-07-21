@@ -300,7 +300,13 @@ describe("Finding 2 (round 3) — exclusive mutation lock shared by the tick and
       const report = await runAutonomyTick(baseDeps({ dataDir, review, adoptDeps }));
       // The tick must NOT have mutated the table while the lock was held externally.
       expect(report.adopted.filter((a) => a.outcome.outcome === "adopted")).toHaveLength(0);
-      expect(report.axisEvaluations[0]?.reasons.some((r) => r.includes("mutation-lock"))).toBe(true);
+      // Round 6 finding 4: reconcile now acquires the SAME lease FIRST, before even checking
+      // whether a pending intent exists — so an externally-held lock is detected THERE, before the
+      // rotation loop's own per-axis lock probe ever runs this tick (round 6 finding 3: a
+      // nonterminal reconcile outcome suppresses the whole adopt phase). The tick-level signal is
+      // now `cycleOutcome: "neutral"` (reconcile's own lock-busy classification) rather than a
+      // per-axis "mutation-lock" reason, which never gets a chance to run.
+      expect(report.cycleOutcome).toBe("neutral");
     } finally {
       externalHolder.release();
     }
@@ -371,6 +377,13 @@ describe("Finding 4 (round 3) — ladder-computed anchored enablement (productio
 
   it("Tier 1 -> Tier 2 promotion writes a durable ladder-enablement record; the raw gate's `enabling` stays null throughout", async () => {
     const dataDir = tmp();
+    // Round 6 follow-up: a state file with NO recorded `tier1EnteredAt` is treated as a LEGACY file
+    // and conservatively backfilled to "the tenure starts NOW" — which would exclude the
+    // 2026-07-10 healthy record seeded below (adopted BEFORE "now") from counting as current-tenure
+    // evidence. This test's OWN intent is the positive promotion path for a system that has ALREADY
+    // been tracking tenure correctly (not a legacy file), so it explicitly seeds `tier1EnteredAt`
+    // before the healthy record's `adoptedAt` — a genuinely legacy-file scenario is covered
+    // separately (see the round-6 test file).
     saveTierState(dataDir, {
       schemaVersion: 1,
       tier: 1,
@@ -379,6 +392,7 @@ describe("Finding 4 (round 3) — ladder-computed anchored enablement (productio
       lastEvent: null,
       ackedBreachIds: [],
       consecutiveGoCycles: TEST_POLICY.tier1UnlockCycles - 1,
+      tier1EnteredAt: "2026-07-01T00:00:00.000Z",
     } as TierState);
     // Round 4 finding 7: promotion ALSO requires at least one resolved-healthy autonomous Tier-1
     // adoption on record (a revert rate of 0 is otherwise indistinguishable from "Tier 1 has never
@@ -635,11 +649,13 @@ describe("Finding 5 (round 3) — every changed axis gets an HONEST evaluation; 
     busyHandle.release();
 
     expect(report.adopted.filter((a) => a.outcome.outcome === "adopted")).toHaveLength(0);
-    // BOTH axes must show the lock-busy refusal reason (neither was skipped as "deferred" due to
-    // the other consuming a slot that was never actually used).
-    for (const axis of report.axisEvaluations) {
-      expect(axis.reasons.some((r) => r.includes("mutation-lock"))).toBe(true);
-    }
+    // Round 6 finding 4: reconcile now acquires the SAME lease FIRST, before checking for a
+    // pending intent — with the lease held externally for the WHOLE tick, reconcile itself is
+    // refused before the rotation loop's own per-axis lock probe ever runs (round 6 finding 3
+    // suppresses the whole adopt phase on a nonterminal reconcile outcome). Neither axis gets a
+    // chance to show a per-axis "mutation-lock" reason; the tick-level `cycleOutcome: "neutral"` is
+    // the equivalent, tick-scoped signal that the mutation slot was never consumed by this refusal.
+    expect(report.cycleOutcome).toBe("neutral");
   });
 });
 

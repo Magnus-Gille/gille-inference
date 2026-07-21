@@ -139,6 +139,13 @@ export function isLeaseCurrent(db: Database.Database, token: number): boolean {
  * transactionally against the live db. Call immediately before a protected mutation actually
  * commits — this is the "fencing enforced at the resource" completion (round 5 finding 1), not a
  * substitute for holding the lease throughout the operation.
+ *
+ * Round 6 finding 1: this function ALONE is check-then-write, not check-AND-write — there is a
+ * (tiny, but real) window between this function returning and the caller's OWN subsequent
+ * filesystem write during which another holder could reclaim the lease. `fencedWrite` (below)
+ * closes that window; this standalone assertion remains useful only for a caller with NO
+ * synchronous write to fence (there is none left in this codebase after round 6 — kept exported for
+ * diagnostics/tests and any future non-write protected action).
  */
 export function assertLeaseCurrent(dataDir: string, token: number): void {
   const db = openLeaseDb(dataDir);
@@ -149,6 +156,42 @@ export function assertLeaseCurrent(dataDir: string, token: number): void {
         `mutation-lock: fencing token ${token} is no longer the current lease (it was reclaimed by another holder) — refusing to commit a protected mutation with a stale token.`
       );
     }
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Round 6 finding 1: the PROPER fencing completion. `assertLeaseCurrent` followed by a separate,
+ * un-transactioned filesystem write is check-then-write — there is a window between the two in
+ * which another caller's OWN `acquireMutationLock`/`fencedWrite`/`renewMutationLock`/
+ * `releaseMutationLock` transaction could reclaim the lease and even complete its OWN write before
+ * this caller's write ever happens. `fencedWrite` closes that window by running `fn` (the actual
+ * filesystem mutation — MUST be synchronous; better-sqlite3 transactions cannot await) INSIDE the
+ * SAME `db.transaction(...).immediate()` critical section as the token check: `.immediate()`
+ * acquires SQLite's RESERVED writer lock on this db file before the callback runs, and every OTHER
+ * lease operation on this SAME file (acquire/renew/release/another fencedWrite) also goes through
+ * `.immediate()` — so a competing writer cannot even BEGIN its own transaction (let alone reclaim
+ * the lease) until this one commits. The check and the write are therefore atomic with respect to
+ * every other lease operation, not just "checked, then hopefully still true a moment later."
+ *
+ * Throws `MutationLockStaleError` (nothing written) if `token` is not the current lease at the
+ * instant the transaction begins. Propagates whatever `fn` itself throws (e.g. a real disk error)
+ * after the transaction implicitly rolls back the SQLite side (the lease row itself is unaffected
+ * either way — this transaction never mutates it, only reads it to check).
+ */
+export function fencedWrite<T>(dataDir: string, token: number, fn: () => T): T {
+  const db = openLeaseDb(dataDir);
+  try {
+    const run = db.transaction((): T => {
+      if (!isLeaseCurrent(db, token)) {
+        throw new MutationLockStaleError(
+          `mutation-lock: fencing token ${token} is no longer the current lease (it was reclaimed by another holder) — refusing to commit a protected mutation with a stale token.`
+        );
+      }
+      return fn();
+    });
+    return run.immediate();
   } finally {
     db.close();
   }
@@ -216,8 +259,11 @@ export function acquireMutationLock(
 /** Extends a held lease's `acquired_at_ms` to "now", guarded by the SAME fencing token — a
  *  transactional `UPDATE ... WHERE token = ?`, so this can never touch a lease some OTHER,
  *  subsequently-reclaimed acquisition now holds. Returns `{renewed: false}` (never throws) if this
- *  token has since been superseded. */
-function renewMutationLock(dataDir: string, token: number, nowMs: number = Date.now()): { renewed: boolean } {
+ *  token has since been superseded. Exported (round 6 finding 1) so a caller holding only
+ *  `{dataDir, token}` (not the original `MutationLockHandle`) — e.g. `routing-lifecycle.ts`,
+ *  re-asserting/renewing immediately after a potentially-slow gateway reload — can keep the lease
+ *  fresh without needing the handle itself. */
+export function renewMutationLock(dataDir: string, token: number, nowMs: number = Date.now()): { renewed: boolean } {
   const db = openLeaseDb(dataDir);
   try {
     return db.transaction((): { renewed: boolean } => {
