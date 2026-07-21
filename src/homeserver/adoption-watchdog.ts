@@ -1505,17 +1505,55 @@ export function validatePartialRestoreRaw(liveRaw: string, mergedRaw: string, ax
 }
 
 /**
- * Round 9 finding 1: the shared write+reload+canary+confirm+finalize/fail-mark core for a PARTIAL
- * (per-axis) restore — used for BOTH a fresh attempt (freshly planned via `planPartialAxisRestore`/
- * `buildPartialAxisRestoreRaw`) and a RETRY of an already-in-flight attempted merge (the live table
- * already matches `record.pendingMergeHash` — re-confirming, never re-planning). `restorationRaw` is
- * already the exact bytes to write (identical content is a safe no-op, per round 7's own "re-writing
- * bytes that are already present is a safe no-op" pattern) — this function's ONLY job is write ->
- * reload -> canary (scoped to `restoreAxes`) -> confirm -> finalize `"breach"` (clearing the merge
- * marker, via `finalizeReverting`'s own unconditional clear) OR fail-mark, PERSISTING
- * `pendingMergeHash`/`pendingMergeAxes` on any non-confirmed outcome so a LATER run retries
- * confirmation of THIS EXACT state without reclassifying (Sol's exact reproduction: run1
- * restored-reload-failed/reverting, run2 wrongly resolved superseded, reload count never advanced).
+ * Round 10 finding 1: persists the pending-merge marker (hash + axes), fenced under the caller's
+ * claim token, WITHOUT touching `revert_attempts`/`last_revert_error`/quarantine — a deliberately
+ * separate, narrower write than `markRevertAttemptFailed`'s. Called BEFORE `manualRollback` ever
+ * attempts the write (see `attemptPartialRestore`'s own doc comment for why the ORDERING is the
+ * fix): a crash between this call and the write leaves an HONEST "intended to reach this merged
+ * state, but did I?" marker; recovery's own hash-mismatch check (the live table still shows the
+ * PRE-write content) correctly clears it and reclassifies fresh — "a pre-write crash is safe."
+ */
+function markPendingMergeAttempt(p: { dataDir: string; recordId: string; claimToken: number; hash: string; axes: string[] }): boolean {
+  const db = openWatchdogDb(p.dataDir);
+  try {
+    const commit = db.transaction((): boolean => {
+      const result = db
+        .prepare(`UPDATE adoption_watch_records SET pending_merge_hash = ?, pending_merge_axes = ? WHERE id = ? AND status = 'reverting' AND reverting_token = ?`)
+        .run(p.hash, JSON.stringify(p.axes), p.recordId, p.claimToken);
+      return result.changes > 0;
+    });
+    return commit.immediate();
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Round 9 finding 1 (+ round 10 finding 1's ordering fix): the shared write+reload+canary+confirm+
+ * finalize/fail-mark core for a PARTIAL (per-axis) restore — used for BOTH a fresh attempt (freshly
+ * planned via `planPartialAxisRestore`/`buildPartialAxisRestoreRaw`) and a RETRY of an already-
+ * in-flight attempted merge (the live table already matches `record.pendingMergeHash` —
+ * re-confirming, never re-planning). `restorationRaw` is already the exact bytes to write (identical
+ * content is a safe no-op, per round 7's own "re-writing bytes that are already present is a safe
+ * no-op" pattern).
+ *
+ * Round 10 finding 1: the pending-merge marker is now persisted (`markPendingMergeAttempt`) BEFORE
+ * `manualRollback` is even attempted — round 9's version persisted it only in the FAILURE branches,
+ * AFTER the write+reload had already run, leaving a real gap: a crash between a SUCCESSFUL write and
+ * a successful reload (i.e. exactly mid-reload) left NO marker at all, so recovery's classification
+ * saw the merged (now-live) table matching neither candidateHash nor snapshotHash, read it as
+ * "superseded", and finalized WITHOUT ever confirming the reload actually happened. Persisting the
+ * marker first closes this: even a crash before the write ever runs is safe (the live table still
+ * shows the OLD, pre-write content, which does not match the marker's hash — recovery's own
+ * hash-mismatch check clears the now-stale marker and reclassifies fresh, exactly as intended).
+ *
+ * This function's job is: mark the intended merge -> write -> reload -> canary (scoped to
+ * `restoreAxes`) -> confirm -> finalize `"breach"` (clearing the merge marker, via
+ * `finalizeReverting`'s own unconditional clear) OR fail-mark, RE-PERSISTING
+ * `pendingMergeHash`/`pendingMergeAxes` (same values — a harmless re-affirm) on any non-confirmed
+ * outcome so a LATER run retries confirmation of THIS EXACT state without reclassifying (Sol's
+ * exact round-9 reproduction: run1 restored-reload-failed/reverting, run2 wrongly resolved
+ * superseded, reload count never advanced).
  */
 async function attemptPartialRestore(p: {
   deps: WatchdogRunnerDeps;
@@ -1540,6 +1578,15 @@ async function attemptPartialRestore(p: {
   const { deps, policy, record, breachingTaskTypes, restoreAxes, supersededAxes, restorationRaw, snapshotRaw, now, lockToken, dryRun } = p;
   const mergeHash = tableContentHash(restorationRaw);
   const warningPrefix = `adoption-watchdog: record ${record.id} (candidateHash=${record.candidateHash}) was PARTIALLY superseded — axes [${restoreAxes.join(", ")}] still carried this record's own regressed candidate value and were restored to snapshot${supersededAxes.length > 0 ? `; axes [${supersededAxes.join(", ")}] were left untouched (already superseded by a newer, unrelated adoption)` : ""}.`;
+
+  // Round 10 finding 1: persist the pending-merge marker BEFORE the write is even attempted — see
+  // this function's own doc comment for why the ordering closes the "crash mid-reload leaves no
+  // marker" gap. Best-effort: if this itself is refused (e.g. the claim token has already gone
+  // stale by this point), the write below will independently discover the same staleness via
+  // `manualRollback`'s own fencing and refuse too — never a silent divergence.
+  if (!dryRun) {
+    markPendingMergeAttempt({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, hash: mergeHash, axes: restoreAxes });
+  }
 
   // Round 6 finding 1: fence the actual rollback write with THIS SAME lease token.
   const fencedDeps: AdoptDeps = { ...deps.adoptDeps, leaseContext: { dataDir: deps.dataDir, token: lockToken } };
@@ -1695,6 +1742,14 @@ async function performRevertAndFinalize(p: {
     // Someone else (another process, or this same record having already moved on) beat us to it.
     return { claimed: false, action: "none", newStatus: record.status, quarantined: [] };
   }
+
+  // Round 10 finding 2: "check/carry the marker first" — captured ONCE, before any of the reads
+  // below that could throw, so the generic per-record catch (finding 5) can PRESERVE it rather than
+  // guessing. `record` itself never mutates during this call, so this is exactly the marker state
+  // this record entered the call with.
+  const enteringPendingMerge: { hash: string; axes: string[] } | null = record.pendingMergeHash
+    ? { hash: record.pendingMergeHash, axes: record.pendingMergeAxes ?? [] }
+    : null;
 
   try {
     if (record.snapshotPath === null) {
@@ -1975,13 +2030,17 @@ async function performRevertAndFinalize(p: {
     // OTHER record this same run would otherwise have evaluated. Mirrors the ordinary
     // "incomplete revert" failure-mark path: status stays "reverting", never "superseded" (a
     // classification error is not evidence of anything, safe or otherwise) and never terminal.
-    // Round 9 finding 1: clears any pending-merge marker — an unexpected error means we can no
-    // longer vouch for what state was actually intended; the next run re-derives everything fresh
-    // (always a safe, correct fallback) rather than retrying a merge this call could not verify.
+    // Round 10 finding 2: PRESERVE whatever pending-merge marker this record entered the call with
+    // (`enteringPendingMerge`) — round 9's version hard-cleared it here, which wiped a GENUINELY
+    // still-valid "this is my own in-flight attempted merge" marker on nothing more than a
+    // TRANSIENT read/parse error (e.g. a momentary EIO reading the snapshot file), losing the
+    // retry-without-reclassifying guarantee item 1 exists to provide. The marker is cleared ONLY at
+    // the specific point that PROVES (via a successful live-table read) the table no longer matches
+    // it — never merely because this call happened to hit an unrelated, possibly-transient error.
     const message = err instanceof Error ? err.message : String(err);
     const quarantineEntries = quarantineEntriesFor(breachingTaskTypes, now, policy, record, ` — revert attempt failed with an unexpected error (${message}); retrying next tick`);
     if (!dryRun) {
-      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: message, quarantineEntries, pendingMerge: null });
+      markRevertAttemptFailed({ dataDir: deps.dataDir, recordId: record.id, claimToken: lockToken, attemptAt: now, error: message, quarantineEntries, pendingMerge: enteringPendingMerge });
     }
     return {
       claimed: true,

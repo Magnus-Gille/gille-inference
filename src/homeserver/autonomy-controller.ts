@@ -1563,16 +1563,33 @@ export async function runAutonomyTick(
   // and in the AUTONOMY_NOTIFY_CMD payload, so an operator (or an alerting rule watching the report
   // JSON) can see "this has been stuck for N attempts" rather than the demotion/suppression
   // happening silently, tick after tick, with no growing signal that anything needs attention.
-  const unresolvedReverts: AutonomyTickReport["unresolvedReverts"] = watchdogRecordsSnapshot
-    .filter((r) => r.status === "reverting")
-    .map((r) => ({
+  // Round 10 follow-up (a): a FRESH "skipped-lock-busy" breach this same tick — the mutation lease
+  // was busy, so the record was never even CLAIMED into "reverting" (it stays "pending") — is just
+  // as unresolved as a durably-"reverting" record for VISIBILITY purposes too, not only for the
+  // adopt-suppression signal above. Deduped by record id against the durable scan (a record could in
+  // principle appear in both if it raced from "reverting" back toward "pending" — defensive, not
+  // expected in practice).
+  const durablyReverting = watchdogRecordsSnapshot.filter((r) => r.status === "reverting");
+  const durablyRevertingIds = new Set(durablyReverting.map((r) => r.id));
+  const freshLockBusyOnly = watch.items.filter((i) => i.revert?.status === "skipped-lock-busy" && !durablyRevertingIds.has(i.record.id));
+  const unresolvedReverts: AutonomyTickReport["unresolvedReverts"] = [
+    ...durablyReverting.map((r) => ({
       recordId: r.id,
       candidateHash: r.candidateHash,
       changedTaskTypes: r.changedTaskTypes,
       revertAttempts: r.revertAttempts ?? 0,
       lastRevertAttemptAt: r.lastRevertAttemptAt ?? null,
       lastRevertError: r.lastRevertError ?? null,
-    }));
+    })),
+    ...freshLockBusyOnly.map((i) => ({
+      recordId: i.record.id,
+      candidateHash: i.record.candidateHash,
+      changedTaskTypes: i.record.changedTaskTypes,
+      revertAttempts: i.record.revertAttempts ?? 0,
+      lastRevertAttemptAt: i.record.lastRevertAttemptAt ?? null,
+      lastRevertError: i.record.lastRevertError ?? "mutation lease busy this tick — revert not yet attempted",
+    })),
+  ];
 
   let tierState = loadTierState(deps.dataDir);
   // Round 6 follow-up: a LEGACY state file (pre-round-5, before `tier1EnteredAt` was tracked) that
