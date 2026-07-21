@@ -126,6 +126,10 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     // Tests that specifically exercise the preflight override both of these directly.
     DEPLOY_EXECSTART_PROBE_CMD: `echo '{ path=${remoteDir}/node_modules/.bin/tsx ; argv[]=${remoteDir}/node_modules/.bin/tsx src/homeserver/cli.ts serve ; }'`,
     DEPLOY_INTERPRETER_CHECK_CMD: "true",
+    // Benign no-op stub for the gi#49 autonomy-tick unit install/enable step: like every other
+    // remote-mutating step, tests that don't specifically exercise it must never touch a real
+    // user systemd session or $HOME/.config/systemd/user. Tests that care override this directly.
+    DEPLOY_UNITS_INSTALL_CMD: "true",
     HOMESERVER_OWNER_KEY: OWNER_KEY,
     ...overrides,
   };
@@ -266,6 +270,8 @@ describe("scripts/deploy-gateway.sh", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/PLAN: would deploy commit [0-9a-f]{40}/);
     expect(r.stdout).toMatch(/PLAN: remote WorkingDirectory verified/);
+    // gi#49: the autonomy-tick systemd unit install/enable step must appear in the plan too.
+    expect(r.stdout).toMatch(/PLAN: install\/enable user-scope systemd units \(gille-autonomy-tick/);
     expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
   });
 
@@ -524,6 +530,59 @@ describe("scripts/deploy-gateway.sh", () => {
       );
       expect(r.status).not.toBe(0);
       expect(r.stderr).toMatch(/tailnet health URL is not set/);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
+  });
+
+  describe("gi#49 autonomy-tick systemd unit install/enable", () => {
+    it("invokes the unit-install step after the remote install and before the restart, as part of a normal deploy", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const orderLog = join(remote, "ORDER_LOG");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_INSTALL_CMD: `echo install >> '${orderLog}'`,
+          DEPLOY_UNITS_INSTALL_CMD: `echo units >> '${orderLog}'`,
+          DEPLOY_RESTART_CMD: `echo restart >> '${orderLog}'`,
+        })
+      );
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Installing\/enabling the gi#49 autonomy-tick user-scope systemd timer/);
+      // Order matters: npm install -> unit install/enable -> restart (never the reverse).
+      const order = readFileSync(orderLog, "utf8").trim().split("\n");
+      expect(order).toEqual(["install", "units", "restart"]);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it("fails the whole deploy (nonzero, no marker, restart never reached) when the unit install/enable fails", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const restartSentinel = join(remote, "RESTARTED_SENTINEL");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_UNITS_INSTALL_CMD: "false", // simulates a failed cp/daemon-reload/enable --now
+          DEPLOY_RESTART_CMD: `touch '${restartSentinel}'`,
+        })
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/failed to install\/enable gille-autonomy-tick\.timer \(gi#49\)/);
+      expect(existsSync(restartSentinel)).toBe(false); // restart must never have been attempted
       expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
     });
   });

@@ -1,0 +1,7 @@
+[Unit]
+Description=gille autonomy controller tick (gi#49)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/magnus/home-server-eval
+ExecStart=/usr/bin/env npx tsx scripts/autonomy-tick-cli.ts

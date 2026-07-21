@@ -157,6 +157,35 @@ belt-and-braces, the script also refuses to restart the unit at all if the live 
 interpreter is missing or not executable right before every restart, leaving the box on its
 last-good build instead of crash-looping.
 
+**Autonomy-tick timer (gi#49).** `deploy/systemd/gille-autonomy-tick.{service,timer}` are
+repo-managed IaC — committed unit files, not hand-authored on the box — mirroring hugin's
+convention of keeping unit definitions in-repo. `scripts/deploy-gateway.sh deploy` installs and
+enables them on every deploy: after the main rsync (which ships `deploy/systemd/*` like any other
+tracked file) and the remote `npm ci`, it copies both units into
+`$HOME/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then
+`systemctl --user enable --now gille-autonomy-tick.timer`. This is idempotent — re-running it on an
+already-enabled, already-running timer is a no-op — so it runs unconditionally on every deploy, not
+just the first. **Fail-closed:** a failed copy/reload/enable is a hard deploy `ERROR` (nonzero
+exit, `.deployed-commit` left unwritten), never a silent skip, because an un-enabled timer means the
+autonomy controller silently stops ticking.
+
+- **Cadence:** `OnCalendar=*-*-* 05:30:00` (daily, 05:30 local time on the box), `Persistent=true`
+  (a missed run, e.g. the box was off, fires once at the next boot/wake instead of being dropped).
+- **What it runs:** `npx tsx scripts/autonomy-tick-cli.ts` (the Phase 4 autonomy controller's one
+  idempotent cron entrypoint — issue #49) as a `Type=oneshot` unit with
+  `WorkingDirectory=/home/magnus/home-server-eval`, the same directory that holds `.env`.
+- **Pause, not stop:** set `AUTONOMY_KILL_SWITCH=on` in that `.env`. The tick still runs, still
+  evaluates and records everything (demotions still apply), but performs no adopt/promote — the
+  same semantics `routing-lifecycle-cli.ts watch` and the adoption watchdog already use. This is
+  the reversible pause lever; no systemd changes needed, and no restart of `home-gateway.service`
+  either (the tick is a separate process, not the gateway).
+- **Full stop:** `systemctl --user disable --now gille-autonomy-tick.timer` on the box. This
+  unschedules future ticks entirely (unlike the kill switch, it also stops the evaluate/record
+  side); a later `scripts/deploy-gateway.sh deploy` re-enables it, so a full stop that should
+  survive the next deploy needs to stay disabled deliberately (e.g. re-run the disable command
+  again after any deploy, or gate the timer install by other means if a longer-lived stop is ever
+  needed).
+
 Preview any deploy first:
 
 ```bash

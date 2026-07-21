@@ -22,7 +22,9 @@ set -euo pipefail
 # Modes (first positional arg):
 #   deploy    (default) Sync the clean reviewed source tree to the verified remote
 #             WorkingDirectory, seed docs/m5-routing.json copy-if-absent (never clobbering an
-#             adopted table — issue #44), restart the unit only if the payload actually changed
+#             adopted table — issue #44), install/enable the repo-managed user-scope
+#             gille-autonomy-tick.timer (gi#49; deploy/systemd/*.{service,timer}, mirrors hugin's
+#             in-repo-units convention), restart the unit only if the payload actually changed
 #             (gated by an interpreter preflight — issue #30), probe local + tailnet health plus
 #             an authenticated capability check, and stamp .deployed-commit with the exact 40-char
 #             SHA ONLY after every check passes.
@@ -47,9 +49,11 @@ set -euo pipefail
 #   - refuses to restart the unit if the ExecStart interpreter is missing/non-executable after
 #     install — the exact failure mode of `npm ci --omit=dev` stripping the tsx runtime
 #     dependency (issue #30) — instead of restarting into a crash-loop;
-#   - writes the new marker as the LAST step, only once rsync, install, the interpreter preflight,
-#     restart-if-needed, local health (best-effort), tailnet health, and the authenticated
-#     capability probe have all succeeded.
+#   - a failed gille-autonomy-tick.timer install/enable (gi#49) is a hard deploy ERROR, not a
+#     silent skip — an un-enabled timer means the autonomy controller silently stops ticking;
+#   - writes the new marker as the LAST step, only once rsync, install, the unit install/enable,
+#     the interpreter preflight, restart-if-needed, local health (best-effort), tailnet health, and
+#     the authenticated capability probe have all succeeded.
 #
 # Test seam (see tests/deploy-gateway.test.ts): every "remote" step is issued through
 # remote_run(), which resolves an overridable env var to a command string and executes it via
@@ -322,6 +326,33 @@ preflight_interpreter() {
   echo "  OK: ExecStart interpreter present and executable ($exec_path)"
 }
 
+# Install/enable the repo-managed user-scope systemd units (gi#49: the daily autonomy-controller
+# tick, docs: deploy/systemd/gille-autonomy-tick.{service,timer}) — mirrors hugin's convention of
+# keeping unit files in-repo as IaC rather than hand-authored on the box. The main rsync already
+# shipped deploy/systemd/*.{service,timer} into "$remote_dir/deploy/systemd/" (that path is not in
+# RSYNC_EXCLUDES); this step copies them onward to the user systemd unit search path, reloads the
+# user daemon, and enables+starts the timer. `systemctl --user enable --now` is idempotent — running
+# it again on an already-enabled, already-running timer is a no-op, not an error — so this is safe
+# to run on every deploy. Routed through remote_run (like every other remote step) so tests can stub
+# it without touching a real user session or systemd. Fail-closed: install/enable failing is a hard
+# deploy ERROR, never a silent skip — an un-enabled timer means the autonomy controller silently
+# stops ticking, which is exactly the failure mode this must not hide.
+install_user_units() {
+  # The `\$HOME` below is deliberate: within THIS double-quoted string, backslash-dollar collapses
+  # to a literal, unescaped `$HOME` in the assembled command -- which must be expanded by the
+  # remote/local shell that actually EXECUTES the command (where $HOME is meaningful), never by
+  # this script's own shell substituting a path resolved against the wrong box/session. Do not
+  # single-quote it: single quotes would ship a literal, never-expanded "$HOME" string instead.
+  local remote_dir="$1"
+  if ! remote_run DEPLOY_UNITS_INSTALL_CMD \
+    "mkdir -p \$HOME/.config/systemd/user && cp '$remote_dir/deploy/systemd/gille-autonomy-tick.service' '$remote_dir/deploy/systemd/gille-autonomy-tick.timer' \$HOME/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now gille-autonomy-tick.timer"; then
+    echo "ERROR: failed to install/enable gille-autonomy-tick.timer (gi#49) -- refusing to certify" >&2
+    echo "       deployment with the autonomy tick possibly un-enabled or unreloaded." >&2
+    return 1
+  fi
+  echo "  OK: gille-autonomy-tick.timer installed and enabled (user scope)"
+}
+
 # Authenticated capability smoke test. Reads the bearer key from an env var (name configurable
 # via DEPLOY_CAPABILITY_KEY_ENV) and NEVER echoes, logs, or includes it in any printed command —
 # only the resulting HTTP status code is reported. This is the credential-safe authenticated
@@ -366,6 +397,7 @@ cmd_dry_run() {
   echo "PLAN: rsync -a --delete -i ${RSYNC_EXCLUDES[*]} ./ $(rsync_dest)"
   echo "PLAN: seed docs/m5-routing.json copy-if-absent (rsync --ignore-existing; never overwrites an adopted table -- issue #44)"
   echo "PLAN: remote install: ${DEPLOY_INSTALL_CMD:-cd '<remote_dir>' && npm ci --omit=dev}"
+  echo "PLAN: install/enable user-scope systemd units (gille-autonomy-tick.service+.timer, gi#49) -- copy deploy/systemd/*.{service,timer} to \$HOME/.config/systemd/user/, daemon-reload, enable --now (idempotent; failure is a deploy ERROR)"
   echo "PLAN: if restarting: preflight the ExecStart interpreter first, refuse the restart if it is missing (issue #30)"
   echo "PLAN: restart $DEPLOY_UNIT only if rsync reports changes (or DEPLOY_FORCE_RESTART=1)"
   echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
@@ -456,6 +488,9 @@ cmd_deploy() {
   echo "==> Installing dependencies on the remote (native modules must build for its own platform)..."
   remote_run DEPLOY_INSTALL_CMD "cd '$remote_dir' && npm ci --omit=dev"
 
+  echo "==> Installing/enabling the gi#49 autonomy-tick user-scope systemd timer..."
+  install_user_units "$remote_dir" || return 1
+
   if [ "$payload_changed" = 1 ] || [ "$DEPLOY_FORCE_RESTART" = 1 ]; then
     echo "==> Preflighting ExecStart interpreter before restart (issue #30)..."
     preflight_interpreter || return 1
@@ -501,10 +536,11 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_FORCE_RESTART=1      Restart even if rsync reported no changes
   DEPLOY_DRY_RUN_OFFLINE=1    dry-run only: skip even the read-only WorkingDirectory check
 
-Routing-table seeding (issue #44) and the restart interpreter preflight (issue #30) have no
-operator-facing flags -- they always run as part of `deploy`. Their remote commands are
-overridable for tests the same way every other remote step is (DEPLOY_EXECSTART_PROBE_CMD,
-DEPLOY_INTERPRETER_CHECK_CMD; see tests/deploy-gateway.test.ts).
+Routing-table seeding (issue #44), the restart interpreter preflight (issue #30), and the gi#49
+autonomy-tick user-scope systemd unit install/enable have no operator-facing flags -- they always
+run as part of `deploy`. Their remote commands are overridable for tests the same way every other
+remote step is (DEPLOY_EXECSTART_PROBE_CMD, DEPLOY_INTERPRETER_CHECK_CMD, DEPLOY_UNITS_INSTALL_CMD;
+see tests/deploy-gateway.test.ts).
 EOF
 }
 
