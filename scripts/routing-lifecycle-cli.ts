@@ -67,7 +67,7 @@
  *        no auto-revert/quarantine write. Absent/anything else = acting ENABLED — fail-closed here
  *        means REVERTING to the known-good snapshot, the safe direction, not refusing to.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -75,7 +75,8 @@ import { loadConfig, type HomeserverConfig } from "../src/homeserver/config.js";
 import { ledgerReport, listCalibrationSampleRows, guardMetricsWindow } from "../src/homeserver/ledger.js";
 import { listModels } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
-import { contentDigest } from "../src/homeserver/evidence-identity.js";
+import { contentDigest, tableContentHash } from "../src/homeserver/evidence-identity.js";
+import { acquireMutationLock, MutationLockBusyError } from "../src/homeserver/mutation-lock.js";
 import { routableTaskTypes, type SourceManifestEntry } from "../src/homeserver/routing-table-generator.js";
 import type { DiffableRoutingTable } from "../src/homeserver/routing-table-diff.js";
 import type { CalibrationGateDecision } from "../src/homeserver/calibration-gate.js";
@@ -91,6 +92,7 @@ import {
   gateAdmitsOrganicEvidence,
   type RoutingDecisionArtifact,
   type AdoptDeps,
+  type RollbackRecord,
 } from "../src/homeserver/routing-lifecycle.js";
 import {
   evaluateQuarantineGate,
@@ -98,6 +100,8 @@ import {
   recordAdoptionForWatch,
   runAdoptionWatch,
   DEFAULT_WATCHDOG_POLICY,
+  type AdoptionWatchRecord,
+  type WatchdogRevertResult,
 } from "../src/homeserver/adoption-watchdog.js";
 
 const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
@@ -372,7 +376,13 @@ export function resolveAdminKey(): string {
   return "";
 }
 
-async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok: boolean; error?: string }> {
+/**
+ * Round 7 follow-up (a): accepts the caller's `AbortSignal` (from `reloadAndRenew`'s
+ * `AbortController`, wired to its 30s timeout) and threads it into `fetch` so a losing reload
+ * attempt is actually cancelled at the network layer, not left running in the background after
+ * `reloadAndRenew` has already returned a timeout failure to its own caller.
+ */
+async function callReloadEndpoint(base: string, adminKey: string, signal?: AbortSignal): Promise<{ ok: boolean; error?: string }> {
   if (!adminKey) {
     return {
       ok: false,
@@ -387,6 +397,7 @@ async function callReloadEndpoint(base: string, adminKey: string): Promise<{ ok:
     const res = await fetch(`${base}/admin/routing-table/reload`, {
       method: "POST",
       headers: { authorization: `Bearer ${adminKey}` },
+      signal,
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -409,10 +420,16 @@ export function buildAdoptDeps(args: string[], config: HomeserverConfig, tablePa
     tablePath,
     readTable: (p) => readFileSync(p, "utf8"),
     writeTable: (p, d) => writeFileSync(p, d, "utf8"),
-    reload: () => callReloadEndpoint(base, adminKey),
+    reload: (signal) => callReloadEndpoint(base, adminKey, signal),
     servableModelIdsAfterReload: () => loadServableModelIds(),
     nowIso: () => new Date().toISOString(),
     currentPolicyEpochHash: policyEpochHash(config.policy),
+    // Round 5 finding 6a: without this, `deleteTableAndReload` (autonomy-controller.ts's
+    // reconcileAdoptionIntent, undoing a first-ever adoption that crashed before canary
+    // confirmation) always reported `restoreWriteOk: false` in PRODUCTION — the restore path was
+    // wired end-to-end but never actually able to complete, looping "restore-failed-will-retry"
+    // forever instead of ever resolving.
+    deleteTable: (p) => unlinkSync(p),
   };
 }
 
@@ -499,22 +516,81 @@ async function cmdAdopt(args: string[]): Promise<void> {
     }
   })();
 
-  const result = await adoptRoutingTable(artifact, approval, deps);
+  // Round 3 finding 2 (Sol-xhigh review of gille-inference#49): acquire the SAME exclusive
+  // mutation lock the autonomy controller's own adopt attempt takes (mutation-lock.ts), so a
+  // concurrent autonomous tick and this manual `adopt` invocation can never interleave a
+  // hash-check-then-write race against each other.
+  let lockHandle: ReturnType<typeof acquireMutationLock>;
+  try {
+    lockHandle = acquireMutationLock(dataDir);
+  } catch (err) {
+    if (err instanceof MutationLockBusyError) {
+      process.stderr.write(`adopt refused: ${err.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+
+  let result: Awaited<ReturnType<typeof adoptRoutingTable>>;
+  let watchRecord: AdoptionWatchRecord | undefined;
+  try {
+    // Re-verify, UNDER THE LOCK, that the live table still matches what THIS artifact's diff was
+    // built against — the same optimistic-concurrency discipline the autonomy controller's own
+    // adopt path applies (`tableContentHash`), closing the gap where `review` and `adopt` are two
+    // separate invocations with an arbitrary delay (and possibly another writer) between them.
+    const liveNow = ((): string | null => {
+      try {
+        return readFileSync(tablePath, "utf8");
+      } catch {
+        return null;
+      }
+    })();
+    const expectedHash = artifact.adoptedHash ?? "(none)";
+    const liveHash = tableContentHash(liveNow);
+    if (liveHash !== expectedHash) {
+      process.stderr.write(
+        `adopt refused: the live routing table has changed since this artifact was reviewed ` +
+          `(expected ${expectedHash}, found ${liveHash}) — re-review and re-approve against the current table; ` +
+          `approval is never overridden here.\n`
+      );
+      process.exitCode = 1;
+      return;
+    }
+    // Round 6 finding 1: stamp the real lease token onto the deps used for the write — the candidate
+    // write inside adoptRoutingTable is now fenced (check-AND-write in one SQLite transaction), not
+    // just guarded by holding this lock throughout the call.
+    const fencedDeps: AdoptDeps = { ...deps, leaseContext: { dataDir, token: lockHandle.token } };
+    result = await adoptRoutingTable(artifact, approval, fencedDeps);
+    if (result.outcome === "adopted") {
+      // Round 4 finding 3: `recordAdoptionForWatch` stays UNDER THE SAME LEASE as the write itself —
+      // releasing the lock between the write and opening the watch window would let a concurrent
+      // tick or another manual `adopt` slip in and mutate the table before this adoption's watch
+      // record (and its revert-snapshot linkage) is durably committed.
+      watchRecord = recordAdoptionForWatch({
+        dataDir,
+        adoptedAt: result.record.adoptedAt,
+        candidateHash: result.record.candidateHash,
+        decisionRef: result.record.decisionRef,
+        approvedBy: result.record.approvedBy,
+        changedTaskTypes: changedTaskTypesOf(artifact.diff),
+        priorRaw: priorRawForWatchdog,
+        // Round 8 finding 1: `artifact.candidate` is exactly what `adoptRoutingTable` just wrote —
+        // persisted so a later whole-table "superseded" classification can be refined per axis.
+        candidateRaw: JSON.stringify(artifact.candidate, null, 2) + "\n",
+        leaseToken: lockHandle.token,
+      });
+    }
+  } finally {
+    lockHandle.release();
+  }
+
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   if (result.outcome === "adopted") {
     process.stderr.write(`ADOPTED — candidateHash=${result.record.candidateHash} approvedBy=${result.record.approvedBy}\n`);
-    const watchRecord = recordAdoptionForWatch({
-      dataDir,
-      adoptedAt: result.record.adoptedAt,
-      candidateHash: result.record.candidateHash,
-      decisionRef: result.record.decisionRef,
-      approvedBy: result.record.approvedBy,
-      changedTaskTypes: changedTaskTypesOf(artifact.diff),
-      priorRaw: priorRawForWatchdog,
-    });
     process.stderr.write(
-      `watchdog (#47): queued adoption watch record ${watchRecord.id} for [${watchRecord.changedTaskTypes.join(", ")}] ` +
-        `(snapshot ${watchRecord.snapshotPath ? "captured" : "none — first-ever adoption"}); run 'watch' to evaluate.\n`
+      `watchdog (#47): queued adoption watch record ${watchRecord!.id} for [${watchRecord!.changedTaskTypes.join(", ")}] ` +
+        `(snapshot ${watchRecord!.snapshotPath ? "captured" : "none — first-ever adoption"}); run 'watch' to evaluate.\n`
     );
     process.exitCode = 0;
   } else if (result.outcome === "rolled-back") {
@@ -539,10 +615,72 @@ async function cmdAdopt(args: string[]): Promise<void> {
 
 // ─── rollback (documented manual command) ────────────────────────────────────────
 
+/**
+ * Round 5 finding 5: `rollback` mutates the SAME production routing table `adopt`/the autonomy
+ * controller do — it MUST take the same exclusive mutation lease, never bypass it (this command's
+ * whole purpose is emergency recovery, but racing a concurrent `adopt`/autonomous tick would make
+ * things worse, not better). Since this is the one command an operator invokes BY HAND in an actual
+ * emergency, a bare immediate refusal on transient contention is poor ergonomics — retry briefly
+ * (a few short attempts) before giving up with a clear, actionable message. Never proceeds without
+ * holding the lease.
+ */
+export async function acquireMutationLockWithBriefRetry(
+  dataDir: string,
+  opts: { attempts?: number; delayMs?: number } = {}
+): Promise<ReturnType<typeof acquireMutationLock>> {
+  const attempts = opts.attempts ?? 3;
+  const delayMs = opts.delayMs ?? 500;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return acquireMutationLock(dataDir);
+    } catch (err) {
+      if (!(err instanceof MutationLockBusyError)) throw err;
+      lastErr = err;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Round 7 finding 3: "manual rollback CLI truthfulness" — the SINGLE source of truth for whether a
+ * `rollback` invocation is reported as a genuine success, extracted as a pure function so it is
+ * directly unit-testable (following the same "test the underlying function, not the CLI's `main()`
+ * entrypoint" pattern already used elsewhere in this file, e.g. `evaluateQuarantineGate`). Success
+ * (`ok: true`, exit 0, "ROLLED BACK") requires `restoreWriteOk && reloadOk` — reporting success off
+ * `reloadOk` alone (the pre-round-7 bug) could print "ROLLED BACK" when the restore write itself was
+ * refused (a stale lease) or failed outright, as long as the UNCHANGED live table happened to still
+ * reload fine.
+ */
+export function describeRollbackOutcome(record: RollbackRecord): { ok: boolean; label: "ROLLED BACK" | "REFUSED" | "INCOMPLETE"; message: string } {
+  if (record.staleLeaseRefused) {
+    return {
+      ok: false,
+      label: "REFUSED",
+      message:
+        `REFUSED — UNRESOLVED state: the restore write was refused because this command's lease was ` +
+        `no longer current (${record.reason}). The table was NOT rolled back. Re-run once you hold a ` +
+        `current lease.`,
+    };
+  }
+  if (!record.restoreWriteOk || !record.reloadOk) {
+    return {
+      ok: false,
+      label: "INCOMPLETE",
+      message:
+        `INCOMPLETE — UNRESOLVED state: ${!record.restoreWriteOk ? "restore write failed" : "reload failed after restore write"} ` +
+        `(${record.reason}). Do not treat this as a completed rollback — investigate and retry.`,
+    };
+  }
+  return { ok: true, label: "ROLLED BACK", message: `ROLLED BACK (reload ok)` };
+}
+
 async function cmdRollback(args: string[]): Promise<void> {
   const snapshotPath = readFlag(args, "--snapshot");
   const reason = readFlag(args, "--reason") ?? "manual rollback (scripts/routing-lifecycle-cli.ts rollback)";
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
+  const dataDir = resolveDataDir(args);
   if (!snapshotPath) {
     process.stderr.write("rollback requires --snapshot <path-to-exact-prior-table.json>\n");
     process.exitCode = 2;
@@ -552,16 +690,62 @@ async function cmdRollback(args: string[]): Promise<void> {
   const config = loadConfig();
   const deps = buildAdoptDeps(args, config, tablePath);
 
-  const record = await manualRollback({ deps, snapshotRaw, reason });
+  let lockHandle: ReturnType<typeof acquireMutationLock>;
+  try {
+    lockHandle = await acquireMutationLockWithBriefRetry(dataDir);
+  } catch (err) {
+    if (err instanceof MutationLockBusyError) {
+      process.stderr.write(
+        `rollback refused: ${err.message}\n` +
+          `The mutation lease is still held after retrying — this command NEVER bypasses it (racing a\n` +
+          `concurrent adopt/autonomous tick would make an emergency worse, not better). Wait for the\n` +
+          `current holder to finish (or, if it is genuinely stuck, let it go stale — see\n` +
+          `DEFAULT_MUTATION_LOCK_STALE_AFTER_MS) and re-run.\n`
+      );
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+
+  let record: Awaited<ReturnType<typeof manualRollback>>;
+  try {
+    // Round 6 finding 1: fence the restore write with the real lease token this command acquired —
+    // check-AND-write in one SQLite transaction, never a separate check-then-write.
+    const fencedDeps: AdoptDeps = { ...deps, leaseContext: { dataDir, token: lockHandle.token } };
+    record = await manualRollback({ deps: fencedDeps, snapshotRaw, reason });
+  } finally {
+    lockHandle.release();
+  }
   process.stdout.write(JSON.stringify(record, null, 2) + "\n");
-  process.stderr.write(`ROLLED BACK to ${snapshotPath} (reload ${record.reloadOk ? "ok" : "FAILED"})\n`);
-  process.exitCode = record.reloadOk ? 0 : 1;
+  // Round 7 finding 3: "manual rollback CLI truthfulness" — the exit code and message are driven
+  // ENTIRELY by `describeRollbackOutcome` (the single source of truth), never by `reloadOk` alone.
+  const outcome = describeRollbackOutcome(record);
+  process.stderr.write(`${outcome.message}${outcome.ok ? ` (snapshot: ${snapshotPath})` : ""}\n`);
+  process.exitCode = outcome.ok ? 0 : 1;
 }
 
 // ─── watch (issue #47 — post-adoption regression watchdog) ───────────────────────
 
 function killSwitchOn(): boolean {
   return (process.env["AUTONOMY_KILL_SWITCH"] ?? "").trim().toLowerCase() === "on";
+}
+
+/**
+ * Round 7 findings 1+2 + round 8 follow-up (c): the SINGLE source of truth for which revert
+ * statuses need an operator's eyes, extracted as a pure function so it is directly unit-testable
+ * (the same "test the underlying function, not the CLI's `main()` entrypoint" pattern as
+ * `describeRollbackOutcome`). "unknown" (a genuinely failed/refused restore) and
+ * "restored-unconfirmed" (write+reload succeeded but the canary did not confirm) both need
+ * attention, same as "restored-reload-failed" (the restore WRITE succeeded but the reload never
+ * confirmed it took effect — round 8 follow-up (c) added this; it was missing before, so the table
+ * could be silently un-reloaded and nobody would ever be told). "superseded" is an honest terminal
+ * state (a newer legitimate adoption is live, no rollback was attempted) — also attention-worthy,
+ * but distinct from a failure. "restored" and "reverted-partial"'s own confirmed "restored" canary
+ * outcome, plus "skipped-lock-busy"/"skipped-no-snapshot", need no attention.
+ */
+export function revertNeedsOperatorAttention(status: WatchdogRevertResult["status"] | undefined): boolean {
+  return status === "unknown" || status === "restored-unconfirmed" || status === "restored-reload-failed" || status === "superseded";
 }
 
 async function cmdWatch(args: string[]): Promise<void> {
@@ -610,12 +794,18 @@ async function cmdWatch(args: string[]): Promise<void> {
       }
       if (revert) process.stderr.write(`  revert: ${revert.status}\n`);
       if (quarantined.length > 0) process.stderr.write(`  quarantined: ${quarantined.join(", ")}\n`);
-      if (revert?.status === "unknown") needsAttention = true;
+      if (revertNeedsOperatorAttention(revert?.status)) needsAttention = true;
     }
     if (evaluation.verdict === "inconclusive") {
       process.stderr.write(`  window ended without sufficient sample on: ${evaluation.perTaskType.filter((t) => t.status === "insufficient-sample").map((t) => t.taskType).join(", ")} — surfaced for review, nothing mutated.\n`);
       needsAttention = true;
     }
+  }
+
+  // Round 7 finding 1: surface the watchdog's own non-fatal warnings (e.g. a "superseded"
+  // resolution) — never gates the exit code beyond what the per-item logic above already decided.
+  for (const w of report.warnings) {
+    process.stderr.write(`  WARNING: ${w}\n`);
   }
 
   process.exitCode = needsAttention ? 1 : 0;

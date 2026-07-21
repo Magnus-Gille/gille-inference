@@ -28,6 +28,7 @@ import {
   type WatchdogRunnerDeps,
 } from "../src/homeserver/adoption-watchdog.js";
 import type { AdoptDeps, ReloadOutcome } from "../src/homeserver/routing-lifecycle.js";
+import { tableContentHash } from "../src/homeserver/evidence-identity.js";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────────
 
@@ -285,6 +286,7 @@ function fakeAdoptDeps(p: {
   initialTable: string;
   writeTable?: (path: string, data: string) => void;
   reload?: () => ReloadOutcome;
+  deleteTable?: (path: string) => void;
 }): { deps: AdoptDeps; fs: Map<string, string>; tablePath: string } {
   const fs = new Map<string, string>([["/virtual/m5-routing.json", p.initialTable]]);
   const tablePath = "/virtual/m5-routing.json";
@@ -299,6 +301,10 @@ function fakeAdoptDeps(p: {
     servableModelIdsAfterReload: () => ["mellum"],
     nowIso: () => "2026-07-20T02:00:00.000Z",
     currentPolicyEpochHash: "epoch-1",
+    // Round 8 follow-up (b): a first-ever-adoption breach now genuinely deletes the bad table
+    // (never just "skips" the revert) — default fake supports it, matching every other test file's
+    // `fakeAdoptDeps` convention.
+    deleteTable: p.deleteTable ?? ((path) => fs.delete(path)),
   };
   return { deps, fs, tablePath };
 }
@@ -328,7 +334,13 @@ function seedPendingRecord(dataDir: string) {
   return recordAdoptionForWatch({
     dataDir,
     adoptedAt: ADOPTED_AT,
-    candidateHash: "sha256:candidate1",
+    // Round 7 finding 1: `candidateHash` is now load-bearing — `classifyLiveTable` compares it
+    // against the LIVE table's actual content hash to distinguish "still the candidate that
+    // regressed" from "superseded by a newer adoption". Every breach-path test in this file seeds
+    // `fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE })` as the live table, so this must be the
+    // REAL hash of that exact content (a placeholder string here would misclassify every one of
+    // those runs as "superseded" and silently skip the revert this suite exists to exercise).
+    candidateHash: tableContentHash(BAD_CANDIDATE_TABLE),
     decisionRef: "grimnir#88",
     approvedBy: "magnus",
     changedTaskTypes: ["classify"],
@@ -489,10 +501,11 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
   it("dry-run reports what would happen without mutating ANY durable state", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "watchdog-run-"));
     seedPendingRecord(dataDir);
-    // Seeding itself writes state.json (recordAdoptionForWatch persists the queued record) — capture
-    // its content here so the assertion below proves dry-run leaves it byte-for-byte untouched,
-    // rather than mis-testing for its absence.
-    const stateBefore = readFileSync(watchdogPaths(dataDir).statePath, "utf8");
+    // Round 5 finding 3: state now lives in SQLite, not a JSON file — capture the STRUCTURED
+    // snapshot (not raw file bytes) so the assertion below proves dry-run leaves it untouched,
+    // rather than mis-testing a file that is no longer written at all.
+    const stateBefore = loadWatchdogState(dataDir);
+    const quarantineBefore = loadQuarantineState(dataDir);
     const { deps, fs, tablePath } = fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE });
     const before = fs.get(tablePath);
 
@@ -516,11 +529,11 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
     expect(report.items[0]?.evaluation.verdict).toBe("breach");
     expect(report.items[0]?.action).toBe("would-revert");
     expect(fs.get(tablePath)).toBe(before);
-    // The pre-existing state.json is byte-for-byte unchanged (still "pending"); events/quarantine —
-    // which only a REAL run would create — were never written at all.
-    expect(readFileSync(watchdogPaths(dataDir).statePath, "utf8")).toBe(stateBefore);
+    // The pre-existing watchdog/quarantine state is unchanged (still "pending"); events — which
+    // only a REAL run would create — were never written at all.
+    expect(loadWatchdogState(dataDir)).toEqual(stateBefore);
+    expect(loadQuarantineState(dataDir)).toEqual(quarantineBefore);
     expect(existsSync(watchdogPaths(dataDir).eventsPath)).toBe(false);
-    expect(existsSync(watchdogPaths(dataDir).quarantinePath)).toBe(false);
   });
 
   it("a revert whose restore WRITE fails is recorded honestly as UNKNOWN (mirrors performRollback), and the axis is still quarantined", async () => {
@@ -558,7 +571,7 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
     expect(loadQuarantineState(dataDir).byTaskType["classify"]).toBeDefined();
   });
 
-  it("a first-ever adoption (no snapshot) that breaches skips the revert honestly instead of crashing", async () => {
+  it("a first-ever adoption (no snapshot) that breaches genuinely DELETES the bad table instead of just calling itself reverted (round 8 follow-up b)", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "watchdog-run-"));
     recordAdoptionForWatch({
       dataDir,
@@ -569,7 +582,7 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
       changedTaskTypes: ["classify"],
       priorRaw: null, // nothing to snapshot
     });
-    const { deps } = fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE });
+    const { deps, fs, tablePath } = fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE });
 
     const report = await runAdoptionWatch(
       {
@@ -586,8 +599,14 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
       TEST_POLICY
     );
 
-    expect(report.items[0]?.revert?.status).toBe("skipped-no-snapshot");
-    // Quarantine still applies even though nothing could be reverted.
+    // Round 8 follow-up (b): the OLD "skipped-no-snapshot" behavior never actually deleted the bad
+    // table — it stayed live forever while the record called itself "reverted". Confirmed
+    // delete+reload now reports "restored", and the table is genuinely gone.
+    expect(report.items[0]?.action).toBe("reverted");
+    expect(report.items[0]?.revert?.status).toBe("restored");
+    expect(fs.has(tablePath)).toBe(false);
+    expect(loadWatchdogState(dataDir).records[0]?.status).toBe("breach");
+    // Quarantine still applies even though nothing could be RESTORED TO (deleted, not rolled back).
     expect(loadQuarantineState(dataDir).byTaskType["classify"]).toBeDefined();
     expect(loadQuarantineState(dataDir).byTaskType["classify"]?.baselinePassRateAtQuarantine).toBeNull();
   });

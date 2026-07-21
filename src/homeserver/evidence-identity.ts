@@ -97,6 +97,64 @@ export function contentDigest(bytes: string): string {
   return `sha256:${createHash("sha256").update(bytes, "utf8").digest("hex")}`;
 }
 
+/**
+ * Content hash of a routing table's SEMANTIC bytes (gille-inference#49) — safely comparable
+ * against `RoutingDecisionArtifact.candidateHash` (`contentDigest(JSON.stringify(candidate))`,
+ * computed directly on the in-memory object, no pretty-printing) even though `adoptRoutingTable`
+ * (routing-lifecycle.ts) writes `JSON.stringify(artifact.candidate, null, 2) + "\n"` to disk:
+ * parsing the live bytes back into an object and re-stringifying compactly undoes the pretty-print/
+ * trailing-newline formatting and reproduces byte-identical compact JSON for any plain JSON-safe
+ * value (no `undefined`/`NaN`/`Date` — which a `RoutingTableDoc` never contains), because
+ * `JSON.parse` reconstructs object keys in the same order they appear in the source text and
+ * `JSON.stringify` is deterministic over that order. Locked in by a dedicated round-trip unit test
+ * (never assume this silently). Returns the sentinel `"(none)"` for a null/absent table (never a
+ * fabricated hash of nothing). Shared by `autonomy-controller.ts` (the autonomous adopt path) and
+ * `scripts/routing-lifecycle-cli.ts` (the human `adopt` path, finding 2's concurrent-writer fix) so
+ * both surfaces compare against the live table identically.
+ */
+export function tableContentHash(raw: string | null): string {
+  if (raw === null) return "(none)";
+  return contentDigest(JSON.stringify(JSON.parse(raw)));
+}
+
+// gille-inference#49 round 8 follow-up (deferred, NOT implemented): this hash is NOT canonical-JSON
+// — it normalizes pretty-printing/whitespace (via the parse/re-stringify round-trip above) but does
+// NOT sort object keys, so two documents that are semantically identical but were SERIALIZED with a
+// different key order would still hash differently. A recursive key-sorting normalization would make
+// every comparison in this codebase (classifyLiveTable's superseded/matches-candidate/matches-
+// snapshot check, the round-8 per-axis "did a newer adoption touch this axis" check, adopt-time
+// baseline/candidate-hash comparisons, etc.) robust to that case. Deliberately NOT done here: this
+// hash's exact current bytes-in/hash-out behavior is already load-bearing in PRODUCTION —
+// `AdoptionWatchRecord.candidateHash` values already durably stored on disk, and every writer in this
+// codebase (routing-table-generator.ts, adoptRoutingTable, the manual CLI) already serializes
+// deterministically (a fixed field order, always freshly generated or round-tripped through this same
+// function) — so key-order divergence has never been an OBSERVED problem, only a theoretical one.
+// Changing the hash function now would silently invalidate every already-computed candidateHash
+// comparison against freshly-recomputed content, which is a far more dangerous failure mode (a
+// SILENT hash-compat break across a deploy boundary) than the theoretical gap it would close. If this
+// ever needs closing for real, it must ship as an explicit, versioned migration (e.g. a
+// `tableContentHashV2` used only for NEW records, with old records still compared via this function),
+// never a silent in-place change to `tableContentHash` itself.
+
+/**
+ * True iff `err` represents a VERIFIED "file does not exist" condition — either a real Node
+ * `NodeJS.ErrnoException` with `code === "ENOENT"` (what `readFileSync` throws in production) or,
+ * for test fakes that throw a plain `Error` without an errno code, a message that says so
+ * explicitly. Anything else (permission denied, disk error, a transient I/O fault) is NOT this.
+ *
+ * Round 3 finding 3 introduced this distinction in `autonomy-controller.ts`'s `tryReadLiveTable`
+ * (an unverified swallow-everything read there could make REVIEW silently assume an empty
+ * baseline). Round 4 finding 4 shares the EXACT same check with `routing-lifecycle.ts`'s
+ * `adoptRoutingTable`, whose own prior-snapshot read had the identical unverified-swallow bug on
+ * its manual-adopt path — one implementation, two call sites, so the two surfaces cannot drift.
+ */
+export function isVerifiedEnoentError(err: unknown): boolean {
+  const code = err && typeof err === "object" ? (err as NodeJS.ErrnoException).code : undefined;
+  if (code === "ENOENT") return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /\bENOENT\b/.test(message);
+}
+
 function normalizeDigest(digest: string): string {
   return digest.startsWith("sha256:") ? digest : `sha256:${digest}`;
 }
