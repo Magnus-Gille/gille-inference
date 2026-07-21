@@ -75,7 +75,8 @@
  *      attempt; a write/reload/rollback/canary failure, a stale-gate refusal, or a stale-baseline
  *      abort all set `mutationAttemptFailed`, which forces `healthyCycle: false` regardless of the
  *      review artifact's own validation.
- *   5. CRASH LOSES A REQUIRED DEMOTION — `TierState.ackedBreachIds` (bounded — round 3 finding 7,
+ *   5. CRASH LOSES A REQUIRED DEMOTION — `TierState.ackedBreachIds` (unbounded — round 3 finding 7
+ *      added a 500-entry eviction cap, round 4 finding 5 removed it as unsound; see its doc comment
  *      below) durably tracks which watchdog breach records have already triggered a demotion. Every
  *      tick reconciles BOTH this tick's fresh watch verdicts (needed because a kill-switch-blocked
  *      breach never reaches durable `"breach"` status at all — see `runAdoptionWatch`'s own
@@ -145,17 +146,20 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 
 import {
   buildDecisionArtifact,
   approveArtifact,
   adoptRoutingTable,
   manualRollback,
+  deleteTableAndReload,
   gateAdmitsOrganicEvidence,
   summarizeCalibrationGate,
   type RoutingDecisionArtifact,
   type AdoptDeps,
   type AdoptOutcome,
+  type RollbackRecord,
 } from "./routing-lifecycle.js";
 import type { RoutingTableDoc, GeneratedRoutingEntry } from "./routing-table-generator.js";
 import type { DiffableRoutingTable, DiffableRoutingEntry } from "./routing-table-diff.js";
@@ -173,7 +177,7 @@ import {
 } from "./adoption-watchdog.js";
 import { wilsonInterval } from "./calibration-metrics.js";
 import type { CalibrationGateDecision } from "./calibration-gate.js";
-import { tableContentHash } from "./evidence-identity.js";
+import { tableContentHash, isVerifiedEnoentError } from "./evidence-identity.js";
 import { acquireMutationLock, MutationLockBusyError } from "./mutation-lock.js";
 
 // ─── Tiers and policy ─────────────────────────────────────────────────────────────
@@ -303,14 +307,16 @@ export interface TierState {
    * permanently lose the demotion: the next tick's `watch.items` would simply never mention that
    * record again. Reconciled at the START of every tick against ALL breach-status records in
    * `adoption-watchdog.ts`'s durable state, not just the ones this specific tick's watch pass
-   * freshly resolved. Bounded (round 3 finding 7) — capped at `MAX_ACKED_BREACH_IDS`, oldest
-   * evicted first, so this list cannot grow without limit over the system's lifetime. */
+   * freshly resolved.
+   *
+   * Round 3 finding 7 added a `MAX_ACKED_BREACH_IDS` (500) eviction cap here; round 4 finding 5
+   * REMOVED it — evicting the oldest ack made an evicted breach id look "unacknowledged" again on
+   * the very next tick, re-triggering its demotion forever (breach RECORDS are never evicted
+   * either, so evicting only the ack was asymmetric and unsound). This list is retained in full,
+   * one entry per ever-resolved breach; store compaction (if this and the watchdog's own breach
+   * records ever need joint pruning) is a follow-up ticket note, not a cap here. */
   ackedBreachIds: string[];
 }
-
-/** Cap for `TierState.ackedBreachIds` (round 3 finding 7) — breach events are rare, so this is far
- *  more headroom than any realistic operating history needs while still bounding growth. */
-export const MAX_ACKED_BREACH_IDS = 500;
 
 export function emptyTierState(): TierState {
   return {
@@ -519,7 +525,19 @@ export function saveAdoptionIntent(dataDir: string, intent: AdoptionIntent): voi
 export { tableContentHash };
 
 export interface ReconcileAdoptionIntentResult {
-  action: "none" | "finalized-existing-watch-record" | "finalized-new-watch-record" | "aborted";
+  action:
+    | "none"
+    | "finalized-existing-watch-record"
+    | "finalized-new-watch-record"
+    | "aborted"
+    /** Round 4 finding 2: restoration was ATTEMPTED but did not fully succeed (the restore write
+     *  itself failed, or it succeeded but reload did not) — the intent is deliberately left
+     *  `"pending"` (never marked terminal `"aborted"`) so the NEXT tick retries the restore, rather
+     *  than certifying a recovery that never actually happened. */
+    | "restore-failed-will-retry"
+    /** Round 4 finding 3: a concurrent mutation held the lease at reconcile time — the restore was
+     *  deliberately NOT attempted rather than racing it. Left `"pending"` for the next tick. */
+    | "restore-deferred-lock-busy";
   detail?: string;
 }
 
@@ -555,6 +573,10 @@ function instrumentAdoptDepsForIntent(base: AdoptDeps, dataDir: string, intentId
       if (result.ok) markPhase("reloaded");
       return result;
     },
+    // Round 4 finding 11: mark "canary-passed" from INSIDE `adoptRoutingTable`'s own call, the
+    // instant canary success is known — see `AdoptDeps.onCanaryPassed`'s doc comment for the crash
+    // window this closes relative to marking it only after `adoptRoutingTable` returns.
+    onCanaryPassed: () => markPhase("canary-passed"),
   };
 }
 
@@ -585,22 +607,55 @@ export async function reconcileAdoptionIntent(
   if (!intent || intent.status !== "pending") return { action: "none" };
 
   if (intent.phase !== "canary-passed") {
-    let restoreNote: string;
-    if (intent.priorRaw !== null) {
-      await manualRollback({
-        deps: adoptDeps,
-        snapshotRaw: intent.priorRaw,
-        reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase})`,
-      });
-      restoreNote = "restored to the pre-adoption snapshot";
-    } else {
-      restoreNote = "no prior snapshot existed (first-ever adoption) — table left as-is";
+    // Round 4 finding 3: the restore write is a table mutation like any other — it must take the
+    // SAME exclusive lease a concurrent manual adopt or this tick's own later adopt attempt would
+    // take, never race it.
+    let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
+    try {
+      lockHandle = acquireMutationLock(dataDir);
+    } catch (err) {
+      if (!(err instanceof MutationLockBusyError)) throw err;
     }
+    if (lockHandle === null) {
+      // Busy: do not attempt the restore concurrently. The intent stays "pending" — the next
+      // tick's reconcile call retries from scratch.
+      return { action: "restore-deferred-lock-busy" };
+    }
+
+    let rollback: RollbackRecord;
+    try {
+      if (intent.priorRaw !== null) {
+        rollback = await manualRollback({
+          deps: adoptDeps,
+          snapshotRaw: intent.priorRaw,
+          reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase})`,
+        });
+      } else {
+        // Round 4 finding 2: a first-ever adoption has no prior snapshot to restore TO — the
+        // correct undo is deleting the unconfirmed table outright, never "leave it in place and
+        // abort" (which would leave a possibly-uncanaried table live and call that "recovered").
+        rollback = await deleteTableAndReload({
+          deps: adoptDeps,
+          reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase}) — no prior snapshot existed (first-ever adoption); deleting the unconfirmed table`,
+        });
+      }
+    } finally {
+      lockHandle.release();
+    }
+
+    if (!rollback.restoreWriteOk || !rollback.reloadOk) {
+      // Round 4 finding 2: restoration was attempted but did NOT fully succeed — the table may
+      // still be in the bad, uncanaried state. Do NOT mark this terminal ("aborted"); keep the
+      // intent "pending" so the next tick retries the restore rather than certifying a recovery
+      // that never actually happened.
+      return { action: "restore-failed-will-retry", detail: rollback.reason };
+    }
+
     saveAdoptionIntent(dataDir, {
       ...intent,
       status: "aborted",
       abortedAt: now,
-      abortReason: `crashed before canary confirmation (phase: ${intent.phase}) — ${restoreNote}`,
+      abortReason: `crashed before canary confirmation (phase: ${intent.phase}) — restored (${rollback.restoredHash})`,
     });
     return { action: "aborted", detail: intent.phase };
   }
@@ -616,7 +671,10 @@ export async function reconcileAdoptionIntent(
     return { action: "aborted", detail: "table-changed-after-canary" };
   }
 
-  const existing = loadWatchdogState(dataDir).records.find((r) => r.candidateHash === intent.candidateHash);
+  // Round 4 finding 8: dedupe by THIS intent's id, never by candidateHash alone — two different
+  // intents can legitimately share a candidate hash (e.g. two ticks that each adopt identical bytes
+  // for the axis), and conflating them would wrongly skip opening a genuine new watch window.
+  const existing = loadWatchdogState(dataDir).records.find((r) => r.intentId === intent.id);
   if (existing) {
     saveAdoptionIntent(dataDir, { ...intent, status: "finalized", finalizedAt: now, watchRecordId: existing.id });
     return { action: "finalized-existing-watch-record", detail: existing.id };
@@ -631,6 +689,7 @@ export async function reconcileAdoptionIntent(
     changedTaskTypes: [intent.taskType],
     priorRaw: intent.priorRaw,
     provenance: { kind: "autonomy", tier: intent.tier },
+    intentId: intent.id,
   });
   saveAdoptionIntent(dataDir, { ...intent, status: "finalized", finalizedAt: now, watchRecordId: record.id });
   return { action: "finalized-new-watch-record", detail: record.id };
@@ -831,30 +890,81 @@ export interface AnchoredEnablementRecord {
   grantedAtTier: AutonomyTier;
 }
 
-export function loadAnchoredEnablement(dataDir: string): AnchoredEnablementRecord | null {
+/**
+ * Round 4 finding 10: this is a live AUTHORIZATION record (its presence is what makes Tier 2's
+ * organic-evidence admissibility gate reachable at all) — deserializing it with a bare
+ * `JSON.parse(...) as AnchoredEnablementRecord` cast (the pre-fix version) trusted the SHAPE of
+ * whatever bytes happened to be on disk with zero verification, and THREW on any parse error,
+ * crashing the entire tick rather than degrading safely. Validated here so a corrupt/malformed/
+ * truncated file is treated as "not enabled" (fail closed — the strictly SAFER direction for an
+ * authorization record) rather than either crashing or, worse, silently trusting a malformed shape.
+ */
+const anchoredEnablementRecordSchema = z.object({
+  schemaVersion: z.literal(1),
+  reviewerId: z.string().min(1),
+  reason: z.string().min(1),
+  decisionRef: z.string().min(1),
+  reviewedAt: z.string().min(1),
+  grantedAtTier: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]),
+}) satisfies z.ZodType<AnchoredEnablementRecord>;
+
+interface AnchoredEnablementLoadResult {
+  record: AnchoredEnablementRecord | null;
+  /** Set iff a file existed but failed to parse/validate — the record is treated as NOT enabled
+   *  (fail closed) either way; this is purely for surfacing to `AutonomyTickReport.warnings`. */
+  warning?: string;
+}
+
+function loadAnchoredEnablementChecked(dataDir: string): AnchoredEnablementLoadResult {
   const path = autonomyPaths(dataDir).anchoredEnablementPath;
-  if (!existsSync(path)) return null;
+  if (!existsSync(path)) return { record: null };
+  let raw: unknown;
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as AnchoredEnablementRecord;
+    raw = JSON.parse(readFileSync(path, "utf8"));
   } catch (err) {
-    throw new Error(
-      `autonomy-controller: anchored enablement record at ${path} is corrupt (${err instanceof Error ? err.message : String(err)}) — refusing to operate on unreadable durable state.`
-    );
+    return {
+      record: null,
+      warning: `anchored-enablement record at ${path} is corrupt JSON (${err instanceof Error ? err.message : String(err)}) — treating as NOT enabled (fail closed)`,
+    };
   }
+  const parsed = anchoredEnablementRecordSchema.safeParse(raw);
+  if (!parsed.success) {
+    return {
+      record: null,
+      warning: `anchored-enablement record at ${path} failed schema validation (${parsed.error.message}) — treating as NOT enabled (fail closed)`,
+    };
+  }
+  return { record: parsed.data };
+}
+
+/** Fail-closed load: any corruption/shape mismatch reads as "no enablement" (never throws — round
+ *  4 finding 10). Callers that need the WARNING text (for `AutonomyTickReport.warnings`) use
+ *  `loadAnchoredEnablementChecked` directly; this is the plain accessor `applyLadderEnablement` and
+ *  every other consumer uses. */
+export function loadAnchoredEnablement(dataDir: string): AnchoredEnablementRecord | null {
+  return loadAnchoredEnablementChecked(dataDir).record;
 }
 
 export function saveAnchoredEnablement(dataDir: string, record: AnchoredEnablementRecord): void {
   atomicWriteFile(autonomyPaths(dataDir).anchoredEnablementPath, JSON.stringify(record, null, 2) + "\n");
 }
 
-/** Revokes the ladder's own enablement — called the instant a demotion drops the tier below 2.
- *  Idempotent (a missing file is not an error). */
+/**
+ * Revokes the ladder's own enablement. Round 4 finding 10: only a VERIFIED ENOENT is swallowed
+ * (idempotent — already-absent is not an error); anything else (EPERM, EIO, a transient filesystem
+ * fault) now PROPAGATES rather than being silently treated as "nothing to revoke" — the pre-fix
+ * bare `catch {}` could leave a stale enablement record on disk indefinitely with no signal that
+ * revocation never actually happened. Callers must catch this (the demotion itself stays durably
+ * recorded regardless) and should retry on a later tick — see `runAutonomyTick`'s self-healing
+ * revoke check.
+ */
 export function revokeAnchoredEnablement(dataDir: string): void {
   const path = autonomyPaths(dataDir).anchoredEnablementPath;
   try {
     unlinkSync(path);
-  } catch {
-    // Already absent — nothing to revoke.
+  } catch (err) {
+    if (isVerifiedEnoentError(err)) return; // already absent — nothing to revoke
+    throw err;
   }
 }
 
@@ -894,13 +1004,30 @@ export function computeAutonomousRevertRate(records: readonly AdoptionWatchRecor
 }
 
 /**
- * Tier 1 -> Tier 2's unlock condition is "sustained anchored GO ... AND Tier-1 revert rate <= r"
- * (design doc §6) — NOT "the gate already admits organic evidence" (`gateAdmitsOrganicEvidence`
- * requires `enabling !== null`, which is EXACTLY what promotion is supposed to grant; checking it
- * as a PRECONDITION of the promotion that creates it is circular and makes Tier 2 unreachable —
- * round 3 finding 4). `state.consecutiveGoCycles` tracks the RAW verdict being `"GO"` (the anchored
- * feed clearing kappa) sustained over `tier1UnlockCycles` ticks; reaching the threshold is what
- * lets `maybePromote` itself durably GRANT `enabling`, via `saveAnchoredEnablement`, dataDir-side.
+ * Round 4 finding 7: Tier-2's revert-rate check has a degenerate zero case —
+ * `computeAutonomousRevertRate` returns `0` both when Tier-1 autonomous adoptions have genuinely
+ * all stayed healthy AND when there have been NONE at all (or none has finished its watch window
+ * yet) — "zero evidence of failure" and "zero evidence, period" collapse to the identical number.
+ * A revert-rate ceiling alone therefore cannot distinguish "Tier 1 has actually been exercised and
+ * proven safe" from "Tier 1 has never mutated anything yet, so of course nothing reverted." This
+ * checks for real, resolved, POSITIVE evidence: at least one autonomous Tier-1 adoption whose watch
+ * window actually completed healthy (`status === "healthy"`, not still `"pending"`).
+ */
+function hasResolvedHealthyAutonomousTier1Adoption(records: readonly AdoptionWatchRecord[]): boolean {
+  return records.some(
+    (r) => r.provenance?.kind === "autonomy" && r.provenance.tier === 1 && r.status === "healthy"
+  );
+}
+
+/**
+ * Tier 1 -> Tier 2's unlock condition is "sustained anchored GO ... AND Tier-1 revert rate <= r ...
+ * AND at least one Tier-1 adoption has actually proven itself (round 4 finding 7)" (design doc §6)
+ * — NOT "the gate already admits organic evidence" (`gateAdmitsOrganicEvidence` requires
+ * `enabling !== null`, which is EXACTLY what promotion is supposed to grant; checking it as a
+ * PRECONDITION of the promotion that creates it is circular and makes Tier 2 unreachable — round 3
+ * finding 4). `state.consecutiveGoCycles` tracks the RAW verdict being `"GO"` (the anchored feed
+ * clearing kappa) sustained over `tier1UnlockCycles` ticks; reaching the threshold is what lets
+ * `maybePromote` itself durably GRANT `enabling`, via `saveAnchoredEnablement`, dataDir-side.
  */
 function maybePromote(
   state: TierState,
@@ -908,7 +1035,8 @@ function maybePromote(
   policy: AutonomyPolicyConfig,
   dataDir: string,
   decisionRef: string,
-  tier1RevertRate: number
+  tier1RevertRate: number,
+  watchdogRecords: readonly AdoptionWatchRecord[]
 ): { state: TierState; event: TierEvent } | null {
   if (state.tier >= 3) return null; // Tier 3 (roster/serving promotion) is out of scope — see PR notes.
   if (state.consecutiveHealthyCycles < policy.tier1UnlockCycles) return null;
@@ -927,6 +1055,7 @@ function maybePromote(
 
   if (state.tier === 1) {
     if (state.consecutiveGoCycles < policy.tier1UnlockCycles || tier1RevertRate > policy.tier2RevertRateMax) return null;
+    if (!hasResolvedHealthyAutonomousTier1Adoption(watchdogRecords)) return null; // round 4 finding 7
     const event: TierEvent = {
       schemaVersion: 1,
       at: now,
@@ -935,8 +1064,8 @@ function maybePromote(
       toTier: 2,
       reason:
         `${policy.tier1UnlockCycles} consecutive healthy cycles + ${state.consecutiveGoCycles} consecutive anchored-GO cycles + ` +
-        `Tier-1 revert rate ${tier1RevertRate.toFixed(3)} <= r=${policy.tier2RevertRateMax} — unlocking Tier 2 (organic-gated auto-adopt); ` +
-        `ladder-granted anchored enablement recorded`,
+        `Tier-1 revert rate ${tier1RevertRate.toFixed(3)} <= r=${policy.tier2RevertRateMax}, with at least one resolved-healthy ` +
+        `autonomous Tier-1 adoption on record — unlocking Tier 2 (organic-gated auto-adopt); ladder-granted anchored enablement recorded`,
     };
     // The ladder ITSELF is the reviewer here — this is the one and only place `enabling` is ever
     // durably granted for the anchored gate (round 3 finding 4).
@@ -993,17 +1122,32 @@ export function saveRotationState(dataDir: string, state: RotationState): void {
  * starvation fix). Every eligible axis still gets a full, honest predicate evaluation each tick
  * (this function only decides ATTEMPT ORDER, never which axes are eligible); a pre-write refusal on
  * one candidate simply moves to the next entry in this list within the SAME tick, still capped at
- * one actual mutation. Deterministic (alphabetical) when there is no prior attempt, or when the
- * previously-attempted axis is no longer in the eligible set (it just starts from the top again).
+ * one actual mutation. Deterministic (alphabetical) when there is no prior attempt.
+ *
+ * Round 4 finding 9: when `lastAttempted` is no longer IN the eligible set (its eligibility
+ * fluctuated away this tick — e.g. it hit a cooldown or a risk-budget ceiling), the round-3 version
+ * reset to the START of the sorted list — which means whichever axis sorts lexically first
+ * effectively wins the rotation again on every tick the cursor axis is transiently ineligible,
+ * reproducing the exact starvation bug round 3 meant to fix. Fixed: resume from `lastAttempted`'s
+ * LEXICAL INSERTION POINT among the CURRENTLY eligible axes (the first eligible axis that would
+ * sort after it), wrapping — so an axis that alphabetically follows the cursor is tried BEFORE one
+ * that precedes it, exactly preserving the "resume after last position" intent even though the
+ * cursor's own axis is momentarily absent from the set.
  */
 export function rotateEligibleAxes(eligibleTaskTypes: readonly string[], lastAttempted: string | null): string[] {
   const sorted = [...eligibleTaskTypes].sort();
   if (sorted.length === 0 || lastAttempted === null) return sorted;
   const idx = sorted.indexOf(lastAttempted);
-  if (idx === -1) return sorted;
-  // Start with the NEXT axis after lastAttempted, wrapping around — lastAttempted itself comes
-  // last, so it still gets tried again if it is the ONLY eligible axis, but never hogs first place.
-  return [...sorted.slice(idx + 1), ...sorted.slice(0, idx + 1)];
+  if (idx !== -1) {
+    // Start with the NEXT axis after lastAttempted, wrapping around — lastAttempted itself comes
+    // last, so it still gets tried again if it is the ONLY eligible axis, but never hogs first place.
+    return [...sorted.slice(idx + 1), ...sorted.slice(0, idx + 1)];
+  }
+  // lastAttempted is not currently eligible — resume from its lexical insertion point (the first
+  // CURRENTLY eligible axis that sorts after it), wrapping to the start if none does.
+  let insertionPoint = sorted.findIndex((t) => t > lastAttempted);
+  if (insertionPoint === -1) insertionPoint = 0;
+  return [...sorted.slice(insertionPoint), ...sorted.slice(0, insertionPoint)];
 }
 
 // ─── The tick ─────────────────────────────────────────────────────────────────────
@@ -1021,19 +1165,10 @@ export interface AutonomyReviewInputs {
   expectedPolicyEpochHash: string;
 }
 
-/**
- * True iff `err` represents a VERIFIED "file does not exist" condition (round 3 finding 3) —
- * either a real Node `NodeJS.ErrnoException` with `code === "ENOENT"` (what `readFileSync` throws
- * in production) or, for test fakes that throw a plain `Error` without an errno code, a message
- * that says so explicitly. Anything else (permission denied, disk error, a transient I/O fault) is
- * NOT this — see `tryReadLiveTable`'s doc comment for why that distinction matters.
- */
-function isVerifiedEnoent(err: unknown): boolean {
-  const code = err && typeof err === "object" ? (err as NodeJS.ErrnoException).code : undefined;
-  if (code === "ENOENT") return true;
-  const message = err instanceof Error ? err.message : String(err);
-  return /\bENOENT\b/.test(message);
-}
+// `isVerifiedEnoent` (round 3 finding 3) now lives in evidence-identity.ts as `isVerifiedEnoentError`
+// (round 4 finding 4) so `routing-lifecycle.ts`'s `adoptRoutingTable` can share the EXACT same
+// verified-ENOENT check on its own prior-snapshot read — one implementation, not two that can drift.
+const isVerifiedEnoent = isVerifiedEnoentError;
 
 /**
  * Reads the LIVE routing table via the SAME `AdoptDeps.readTable` every other consumer uses.
@@ -1140,6 +1275,9 @@ export interface AutonomyTickReport {
   adopted: AutonomyAdoptionOutcome[];
   standingProposal: StandingProposalRecord | null;
   healthyCycle: boolean;
+  /** Round 4 finding 10: non-fatal observability warnings (e.g. a corrupt anchored-enablement
+   *  record, or a stale one that failed to revoke) — never gates any in-tick decision. */
+  warnings: string[];
 }
 
 /**
@@ -1198,6 +1336,15 @@ export async function runAutonomyTick(
   // Finding 7 (round 3): the demotion event below is persisted IMMEDIATELY (before REVIEW/ADOPT) —
   // this flag stops the end-of-tick save block from appending the SAME event a second time.
   let tierEventAlreadyPersisted = false;
+  // Round 4 finding 10: non-fatal, surfaced-to-the-caller warnings — e.g. a corrupt anchored-
+  // enablement record (fail-closed: treated as NOT enabled, never a thrown crash) or a stale
+  // enablement record that failed to revoke. Never used to gate any decision in-tick; purely an
+  // observability surface on `AutonomyTickReport`.
+  const warnings: string[] = [];
+  {
+    const checked = loadAnchoredEnablementChecked(deps.dataDir);
+    if (checked.warning) warnings.push(checked.warning);
+  }
 
   // 1.5 ACKNOWLEDGE + DEMOTE (finding 5, round 1): reconcile every breach not yet acknowledged by
   // the tier ladder, from BOTH signals — not just the DURABLE "breach" status, and not just THIS
@@ -1219,14 +1366,20 @@ export async function runAutonomyTick(
     .records.filter((r) => r.status === "breach")
     .map((r) => r.id);
   const allBreachIds = [...new Set([...freshBreachIds, ...durableBreachIds])];
-  const unackedBreachIds = allBreachIds.filter((id) => !tierState.ackedBreachIds.includes(id));
+  const unackedBreachIdSet = new Set(tierState.ackedBreachIds);
+  const unackedBreachIds = allBreachIds.filter((id) => !unackedBreachIdSet.has(id));
   const anyBreach = unackedBreachIds.length > 0;
   if (anyBreach) {
-    // Finding 7 (round 3): bound `ackedBreachIds` — evict the OLDEST entries once the cap is
-    // exceeded rather than growing this list without limit over the system's lifetime.
-    const rawNextAcked = [...tierState.ackedBreachIds, ...unackedBreachIds];
-    const nextAcked =
-      rawNextAcked.length > MAX_ACKED_BREACH_IDS ? rawNextAcked.slice(rawNextAcked.length - MAX_ACKED_BREACH_IDS) : rawNextAcked;
+    // Round 4 finding 5: the round-3 cap (`MAX_ACKED_BREACH_IDS`) evicted the OLDEST acked ids once
+    // exceeded — but breach RECORDS themselves are never evicted, so an evicted ack would look
+    // "unacknowledged" again on the very next tick and re-trigger a demotion for an already-handled
+    // breach forever (the "501st breach evicts, the evicted one looks new forever" replay wedge).
+    // Fix: retain an ack for EVERY retained breach record — symmetric with breach-record retention,
+    // and small in practice (bounded by how many breaches this system has ever recorded). Store
+    // compaction (if ackedBreachIds and the watchdog's own breach records ever need pruning
+    // together) is a follow-up ticket note, not a silent cap here. Still Set-based for O(1)
+    // membership above; storage remains a plain string[] for simple JSON durability.
+    const nextAcked = [...tierState.ackedBreachIds, ...unackedBreachIds];
     if (tierState.tier > 0) {
       const toTier = (tierState.tier - 1) as AutonomyTier;
       const event: TierEvent = {
@@ -1247,16 +1400,39 @@ export async function runAutonomyTick(
         ackedBreachIds: nextAcked,
       };
       tierEvent = event;
-      if (!dryRun && toTier < 2) revokeAnchoredEnablement(deps.dataDir); // finding 4: revoke on drop below Tier 2
     } else {
       tierState = { ...tierState, consecutiveHealthyCycles: 0, consecutiveGoCycles: 0, lastCycleAt: now, ackedBreachIds: nextAcked };
     }
     if (!dryRun) {
-      saveTierState(deps.dataDir, tierState);
+      // Round 4 finding 11 (event-then-ack ordering): append the JSONL audit event BEFORE saving
+      // tier state. A crash between the two now loses at most a REPLAYED ack next tick (the same
+      // breach id(s) get re-acknowledged — cheap and idempotent, since acking an already-acked id
+      // via the Set-deduped `nextAcked` above is a no-op), rather than the previous ordering, which
+      // could persist the demotion durably and then crash before the event was ever written — a
+      // demotion the audit trail can never account for.
       if (tierEvent) {
         appendTierEvent(deps.dataDir, tierEvent);
         tierEventAlreadyPersisted = true;
       }
+      saveTierState(deps.dataDir, tierState);
+    }
+  }
+
+  // Round 4 finding 10: revoke the ladder's own enablement whenever the CURRENT tier is below 2 —
+  // not gated on "did THIS tick freshly demote" (the round-3 version's condition), so a prior tick's
+  // failed revoke (EPERM/EIO — `revokeAnchoredEnablement` now propagates anything but a verified
+  // ENOENT) is retried every subsequent tick until it actually succeeds, rather than leaving a stale
+  // enablement record on disk forever. The demotion itself is ALREADY durably recorded above
+  // regardless of whether this revoke succeeds — `applyLadderEnablement`'s in-memory `tierAllows`
+  // gating is independently correct either way, so a stale file is harmless (never re-grants
+  // anything) for the one extra tick it might take to clean up.
+  if (!dryRun && tierState.tier < 2 && loadAnchoredEnablement(deps.dataDir) !== null) {
+    try {
+      revokeAnchoredEnablement(deps.dataDir);
+    } catch (err) {
+      warnings.push(
+        `failed to revoke stale anchored-enablement record (current tier ${tierState.tier} < 2): ${err instanceof Error ? err.message : String(err)} — will retry next tick`
+      );
     }
   }
 
@@ -1502,15 +1678,12 @@ export async function runAutonomyTick(
         saveAdoptionIntent(deps.dataDir, intent);
         const instrumentedDeps = instrumentAdoptDepsForIntent(deps.adoptDeps, deps.dataDir, intentId);
 
-        const outcome = await adoptRoutingTable(axisArtifact, approval, instrumentedDeps);
+        const outcome = await adoptRoutingTable(axisArtifact, approval, instrumentedDeps, { verifiedPriorRaw: liveRawNow });
         let watchRecord: AdoptionWatchRecord | undefined;
         if (outcome.outcome === "adopted") {
-          // Canary DID pass by construction of this outcome — mark it BEFORE recordAdoptionForWatch
-          // so a crash in the remaining gap still reconciles as "finalize", never "restore".
-          const afterAdopt = loadAdoptionIntent(deps.dataDir);
-          if (afterAdopt && afterAdopt.id === intentId && afterAdopt.status === "pending") {
-            saveAdoptionIntent(deps.dataDir, { ...afterAdopt, phase: "canary-passed" });
-          }
+          // Round 4 finding 11: phase "canary-passed" was ALREADY persisted synchronously via
+          // `instrumentedDeps.onCanaryPassed`, from inside `adoptRoutingTable` itself, before this
+          // await even resolved — no redundant load-and-mark round trip needed here.
           watchRecord = recordAdoptionForWatch({
             dataDir: deps.dataDir,
             adoptedAt: outcome.record.adoptedAt,
@@ -1520,6 +1693,7 @@ export async function runAutonomyTick(
             changedTaskTypes: [taskType],
             priorRaw: liveRawNow,
             provenance: { kind: "autonomy", tier: tierState.tier },
+            intentId,
           });
           const finalIntent = loadAdoptionIntent(deps.dataDir);
           if (finalIntent && finalIntent.id === intentId) {
@@ -1557,27 +1731,61 @@ export async function runAutonomyTick(
 
   const axisEvaluations = changedTaskTypes.map((t) => axisEvalByType.get(t)!);
 
-  // Healthy-cycle bookkeeping (§6, finding 4, round 1): computed AFTER any mutation attempt — a
-  // failed write/reload/rollback/canary, a stale-baseline abort, or a stale-gate refusal is NEVER a
-  // healthy cycle, regardless of what the review artifact's own validation said.
+  // Round 4 finding 6: a binary healthyCycle conflated two very different ticks — a genuinely
+  // healthy/no-op cycle, and a cycle where EVERY eligible axis was refused before any real write
+  // was even attempted (mutation lock busy, table hash changed since baseline, organic gate decayed
+  // since REVIEW). The latter is NOT evidence of anything — it proves nothing succeeded, but it also
+  // didn't fail — yet it was silently counted as "healthy", letting a permanently lock-contended or
+  // gate-flapping system march toward promotion on ticks that never actually did anything. Three-way
+  // split:
+  //   - UNHEALTHY: an unacknowledged breach, an invalid review artifact, an "unknown" infra failure
+  //     from the watchdog's own revert, or a real (attempted) mutation that failed. Resets streaks —
+  //     identical to the old `healthyCycle: false` behavior.
+  //   - NEUTRAL: there were eligible axes this tick, but the rotation was exhausted by pre-write
+  //     refusals alone (`adopted.length === 0` despite `eligibleTaskTypes.length > 0`) — advances
+  //     NOTHING, resets NOTHING; this tick is neither evidence of health nor of failure.
+  //   - ADVANCING: everything else — a genuine no-op review, ordinary predicate/tier ineligibility
+  //     (Tier 0 propose-only always lands here: `tierAllows` is baked into `predicatesPass`, so
+  //     `eligibleTaskTypes` is ALWAYS empty at Tier 0 — never "neutral"), or a completed adoption.
+  //     Advances the streaks — identical to the old `healthyCycle: true` behavior.
   const anyInfraFailure = watch.items.some((i) => i.revert?.status === "unknown");
-  const healthyCycle = fullArtifact.validation.ok && !anyBreach && !anyInfraFailure && !mutationAttemptFailed;
-  if (healthyCycle) {
+  const anyAxisActuallyAttempted = adopted.length > 0;
+  const preWriteRefusalExhausted = eligibleTaskTypes.length > 0 && !anyAxisActuallyAttempted;
+  const cycleOutcome: "advancing" | "neutral" | "unhealthy" =
+    !fullArtifact.validation.ok || anyBreach || anyInfraFailure || mutationAttemptFailed
+      ? "unhealthy"
+      : preWriteRefusalExhausted
+        ? "neutral"
+        : "advancing";
+  // Back-compat display field (scripts/autonomy-tick-cli.ts, existing tests) — `true` for BOTH
+  // "advancing" and "neutral" (neither is a failure signal); `cycleOutcome` is the real gating
+  // signal for the promotion streaks below.
+  const healthyCycle = cycleOutcome !== "unhealthy";
+
+  if (cycleOutcome === "advancing") {
     tierState = { ...tierState, consecutiveHealthyCycles: tierState.consecutiveHealthyCycles + 1, lastCycleAt: now };
-  } else if (!anyBreach) {
+  } else if (cycleOutcome === "unhealthy" && !anyBreach) {
     // The breach path (1.5, above) already reset the streak when applicable; this covers every
     // OTHER unhealthy cause (invalid review, infra failure, failed mutation attempt) — breaks the
     // streak (not "consecutive" anymore) without itself being a demotion trigger.
     tierState = { ...tierState, consecutiveHealthyCycles: 0, lastCycleAt: now };
   }
+  // NEUTRAL: consecutiveHealthyCycles is left exactly as-is — advances nothing, resets nothing.
+
   // Finding 4 (round 3): the SUSTAINED anchored-GO streak the Tier-2 unlock condition reads —
   // tracked independently of `consecutiveHealthyCycles` (a tick can be healthy without being GO,
   // which is the common case before Tier 2 is even relevant). The breach path already reset this
-  // to 0 above when applicable.
+  // to 0 above when applicable. Round 4 finding 6: gated the SAME way as `consecutiveHealthyCycles` —
+  // an "advancing" tick still increments only on an actual GO verdict (unchanged: an advancing-but-
+  // HOLD tick still breaks the GO streak, since it is not evidence of anchored-calibration health);
+  // an "unhealthy" tick resets it (matching consecutiveHealthyCycles); a "neutral" tick touches
+  // neither.
   const isGoTick = deps.review.calibrationGate?.verdict === "GO";
-  if (isGoTick) {
-    tierState = { ...tierState, consecutiveGoCycles: tierState.consecutiveGoCycles + 1 };
-  } else if (!anyBreach) {
+  if (cycleOutcome === "advancing") {
+    tierState = isGoTick
+      ? { ...tierState, consecutiveGoCycles: tierState.consecutiveGoCycles + 1 }
+      : { ...tierState, consecutiveGoCycles: 0 };
+  } else if (cycleOutcome === "unhealthy" && !anyBreach) {
     tierState = { ...tierState, consecutiveGoCycles: 0 };
   }
 
@@ -1585,8 +1793,9 @@ export async function runAutonomyTick(
   // never evaluated under the kill switch). May itself write the Tier-2 ladder-enablement record
   // (finding 4, round 3) — see `maybePromote`'s own doc comment.
   if (!killSwitchActive && !tierEvent) {
-    const revertRate = computeAutonomousRevertRate(loadWatchdogState(deps.dataDir).records);
-    const promotion = maybePromote(tierState, now, policy, deps.dataDir, deps.decisionRef, revertRate);
+    const watchdogRecordsForPromotion = loadWatchdogState(deps.dataDir).records;
+    const revertRate = computeAutonomousRevertRate(watchdogRecordsForPromotion);
+    const promotion = maybePromote(tierState, now, policy, deps.dataDir, deps.decisionRef, revertRate, watchdogRecordsForPromotion);
     if (promotion) {
       tierEvent = promotion.event;
       tierState = promotion.state;
@@ -1660,5 +1869,6 @@ export async function runAutonomyTick(
     adopted,
     standingProposal,
     healthyCycle,
+    warnings,
   };
 }

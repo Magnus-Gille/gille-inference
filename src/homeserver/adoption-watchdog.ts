@@ -46,6 +46,7 @@ import {
   type RollbackRecord,
   type CanaryOutcome,
 } from "./routing-lifecycle.js";
+import { acquireMutationLock, MutationLockBusyError } from "./mutation-lock.js";
 import type { RoutingTableDoc } from "./routing-table-generator.js";
 import type { GuardMetricSnapshot } from "./ledger.js";
 
@@ -320,6 +321,16 @@ export interface AdoptionWatchRecord {
   /** Structured provenance — see `AdoptionProvenance`'s doc comment. Absent on legacy records
    *  (treat as `"manual"`). */
   provenance?: AdoptionProvenance;
+  /**
+   * The autonomy controller's own `AdoptionIntent.id` this record finalizes (gille-inference#49
+   * round 4 finding 8). Present ONLY for autonomously-adopted records (the manual CLI adopt path
+   * has no intent journal). `reconcileAdoptionIntent`'s crash-recovery dedup check matches on THIS,
+   * never on `candidateHash` alone: two DIFFERENT intents (e.g. two separate ticks that each
+   * legitimately adopted the identical candidate bytes for the same axis, or a candidate hash that
+   * happens to collide with an unrelated axis's prior watch record) must never be conflated into
+   * "this intent's watch record already exists" just because the content hash matches.
+   */
+  intentId?: string;
 }
 
 export interface WatchdogState {
@@ -415,6 +426,9 @@ export function recordAdoptionForWatch(p: {
    *  routing-lifecycle CLI's own `adopt` command never passes this, so its records correctly read
    *  as `undefined`/"manual"); the autonomy controller ALWAYS passes `{kind:"autonomy", tier}`. */
   provenance?: AdoptionProvenance;
+  /** The autonomy controller's `AdoptionIntent.id` this record finalizes (round 4 finding 8) —
+   *  omitted for a manual CLI adopt, which has no intent journal. */
+  intentId?: string;
 }): AdoptionWatchRecord {
   const { snapshotsDir } = watchdogPaths(p.dataDir);
   const id = randomUUID();
@@ -436,6 +450,7 @@ export function recordAdoptionForWatch(p: {
     status: "pending",
     lastEvaluatedAt: null,
     ...(p.provenance ? { provenance: p.provenance } : {}),
+    ...(p.intentId ? { intentId: p.intentId } : {}),
   };
   const state = loadWatchdogState(p.dataDir);
   state.records.push(record);
@@ -448,7 +463,16 @@ export function recordAdoptionForWatch(p: {
 export type WatchdogAction = "none" | "would-revert" | "reverted";
 
 export interface WatchdogRevertResult {
-  status: "restored" | "restored-reload-failed" | "unknown" | "skipped-no-snapshot";
+  status:
+    | "restored"
+    | "restored-reload-failed"
+    | "unknown"
+    | "skipped-no-snapshot"
+    /** A concurrent table mutation (a manual adopt, or the autonomy controller's own adopt attempt)
+     *  held the mutation lease at the moment this breach was detected (round 4 finding 3) — the
+     *  revert was deliberately NOT attempted rather than racing it. The record is left `"pending"`
+     *  (never resolved to `"breach"`) so the NEXT watch run re-detects and reverts it for real. */
+    | "skipped-lock-busy";
   rollback?: RollbackRecord;
   canary?: CanaryOutcome;
 }
@@ -575,49 +599,13 @@ export async function runAdoptionWatch(
         // Report-only: detected and (outside dry-run) recorded, but no mutation — see the module
         // header on why the record stays `pending` under a kill switch rather than resolving.
         action = "would-revert";
-      } else {
+      } else if (record.snapshotPath === null) {
+        // No table mutation is involved in this branch (nothing to restore) — quarantine still
+        // needs the lock (round 4 finding 3: it is durable state paired with the breach
+        // resolution), but there is no revert-write race to guard here.
         record.status = "breach";
-        if (record.snapshotPath === null) {
-          revert = { status: "skipped-no-snapshot" };
-        } else {
-          const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
-          const rollback = await manualRollback({
-            deps: deps.adoptDeps,
-            snapshotRaw,
-            reason:
-              `adoption-watchdog: guard-metric breach on [${breachingTaskTypes.join(", ")}] within the ` +
-              `post-adoption watch window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef})`,
-          });
-
-          let canary: CanaryOutcome | undefined;
-          if (rollback.restoreWriteOk && rollback.reloadOk) {
-            try {
-              const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
-              const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
-              const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
-              const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
-              canary = runCanary({
-                changedTaskTypes: breachingTaskTypes,
-                reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
-                candidate: priorParsed,
-                servableModelIds,
-              });
-            } catch {
-              canary = undefined; // best-effort confirmation; the rollback record is authoritative
-            }
-          }
-
-          const status: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
-            ? "unknown" // mirrors performRollback's own "UNKNOWN state, manual recovery required"
-            : !rollback.reloadOk
-              ? "restored-reload-failed"
-              : "restored";
-          revert = { status, rollback, canary };
-        }
+        revert = { status: "skipped-no-snapshot" };
         action = "reverted";
-
-        // Quarantine every breaching axis regardless of revert quality — the breach itself is the
-        // trigger; a failed restore-write does not make the axis any MORE trustworthy.
         const quarantine = loadQuarantineState(deps.dataDir);
         for (const t of breachingTaskTypes) {
           quarantine.byTaskType[t] = {
@@ -632,6 +620,83 @@ export async function runAdoptionWatch(
         }
         if (!dryRun) saveQuarantineState(deps.dataDir, quarantine);
         quarantined = breachingTaskTypes;
+      } else {
+        // Round 4 finding 3: the revert WRITE + its paired quarantine-state commit must run under
+        // the SAME exclusive mutation lease every other table mutation takes (a manual `adopt`, or
+        // this same tick's own autonomous adopt attempt) — otherwise a breach revert here could race
+        // a concurrent write exactly like the pre-round-4 file-CAS bugs did.
+        let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
+        try {
+          lockHandle = acquireMutationLock(deps.dataDir);
+        } catch (err) {
+          if (!(err instanceof MutationLockBusyError)) throw err;
+        }
+
+        if (lockHandle === null) {
+          // Busy: do NOT race the concurrent mutation. Leave the record "pending" (never resolve it
+          // to "breach") — a genuine breach's underlying metrics do not self-heal, so the very next
+          // watch run re-evaluates this record from scratch and reverts it then.
+          revert = { status: "skipped-lock-busy" };
+          action = "would-revert";
+        } else {
+          try {
+            record.status = "breach";
+            const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
+            const rollback = await manualRollback({
+              deps: deps.adoptDeps,
+              snapshotRaw,
+              reason:
+                `adoption-watchdog: guard-metric breach on [${breachingTaskTypes.join(", ")}] within the ` +
+                `post-adoption watch window (candidateHash=${record.candidateHash}, decisionRef=${record.decisionRef})`,
+            });
+
+            let canary: CanaryOutcome | undefined;
+            if (rollback.restoreWriteOk && rollback.reloadOk) {
+              try {
+                const reloadedRaw = deps.adoptDeps.readTable(deps.adoptDeps.tablePath);
+                const reloadedParsed = JSON.parse(reloadedRaw) as { routing?: RoutingTableDoc["routing"]; escalateToFrontier?: string[] };
+                const priorParsed = JSON.parse(snapshotRaw) as RoutingTableDoc;
+                const servableModelIds = await deps.adoptDeps.servableModelIdsAfterReload();
+                canary = runCanary({
+                  changedTaskTypes: breachingTaskTypes,
+                  reloadedTable: { routing: reloadedParsed.routing ?? {}, escalateToFrontier: reloadedParsed.escalateToFrontier ?? [] },
+                  candidate: priorParsed,
+                  servableModelIds,
+                });
+              } catch {
+                canary = undefined; // best-effort confirmation; the rollback record is authoritative
+              }
+            }
+
+            const status: WatchdogRevertResult["status"] = !rollback.restoreWriteOk
+              ? "unknown" // mirrors performRollback's own "UNKNOWN state, manual recovery required"
+              : !rollback.reloadOk
+                ? "restored-reload-failed"
+                : "restored";
+            revert = { status, rollback, canary };
+            action = "reverted";
+
+            // Quarantine every breaching axis regardless of revert quality — the breach itself is
+            // the trigger; a failed restore-write does not make the axis any MORE trustworthy.
+            // Committed under the SAME lock as the revert write (round 4 finding 3).
+            const quarantine = loadQuarantineState(deps.dataDir);
+            for (const t of breachingTaskTypes) {
+              quarantine.byTaskType[t] = {
+                taskType: t,
+                quarantinedAt: now,
+                reason: `guard-metric breach on adoption ${record.candidateHash} (${record.decisionRef})`,
+                cooldownUntil: new Date(Date.parse(now) + policy.cooldownHours * 60 * 60 * 1000).toISOString(),
+                requiredMarginDelta: policy.requiredMarginDelta,
+                baselinePassRateAtQuarantine: readPassRateForTaskType(record.snapshotPath, t),
+                clearedAt: null,
+              };
+            }
+            if (!dryRun) saveQuarantineState(deps.dataDir, quarantine);
+            quarantined = breachingTaskTypes;
+          } finally {
+            lockHandle.release();
+          }
+        }
       }
     }
     // evaluation.verdict === "pending": no state transition, no action — keep watching.

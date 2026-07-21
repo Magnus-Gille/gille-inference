@@ -38,7 +38,7 @@
  * `scripts/routing-lifecycle-cli.ts` and the gateway's `/admin/routing-table/reload` endpoint.
  */
 
-import { contentDigest } from "./evidence-identity.js";
+import { contentDigest, isVerifiedEnoentError } from "./evidence-identity.js";
 import { generateRoutingTable, type RoutingTableDoc } from "./routing-table-generator.js";
 import {
   diffRoutingTables,
@@ -489,6 +489,27 @@ export interface AdoptDeps {
   nowIso: () => string;
   /** Current routing-policy epoch hash, recomputed at adopt time (see PolicyEpochStaleError). */
   currentPolicyEpochHash: string;
+  /**
+   * Optional (gille-inference#49 round 4 finding 11): called synchronously immediately after the
+   * post-reload canary passes, BEFORE `adoptRoutingTable` returns its `"adopted"` outcome to the
+   * caller. Exists so a caller journaling adoption phases (`autonomy-controller.ts`'s
+   * `instrumentAdoptDepsForIntent`) can persist "canary-passed" AT THE INSTANT it becomes true,
+   * closing the crash window between canary success and the awaited call unwinding back to the
+   * caller — marking the phase only AFTER `adoptRoutingTable` returns would leave the journal at
+   * "reloaded" if the process died in that window, and crash-recovery would then roll back a table
+   * that had already been canary-confirmed.
+   */
+  onCanaryPassed?: () => void;
+  /**
+   * Optional (gille-inference#49 round 4 finding 2): deletes the table file outright. Only ever
+   * needed to restore a "first-ever adoption" (no prior snapshot existed) that must be undone —
+   * `performRollback`'s own internal rollback intentionally leaves such a table live-as-is
+   * (out of scope for this change; see its doc comment), but `autonomy-controller.ts`'s crash-
+   * recovery reconciliation (`reconcileAdoptionIntent`) must actually remove a bad first-ever
+   * write rather than abort-in-place. Omitted by production deps that never exercise that path is
+   * a caller bug, not a silent no-op — `deleteTableAndReload` below reports it as a failed restore.
+   */
+  deleteTable?: (path: string) => void;
 }
 
 export interface AdoptionRecord {
@@ -596,7 +617,8 @@ async function performRollback(p: {
 export async function adoptRoutingTable(
   artifact: RoutingDecisionArtifact,
   approval: ApprovalToken,
-  deps: AdoptDeps
+  deps: AdoptDeps,
+  opts: { verifiedPriorRaw?: string | null } = {}
 ): Promise<AdoptOutcome> {
   assertApprovalBindsArtifact(artifact, approval);
   if (!artifact.validation.ok) {
@@ -611,13 +633,25 @@ export async function adoptRoutingTable(
   }
 
   const candidateJson = JSON.stringify(artifact.candidate, null, 2) + "\n";
-  const priorRaw = (() => {
-    try {
-      return deps.readTable(deps.tablePath);
-    } catch {
-      return null; // no prior table on disk yet — first-ever adoption
-    }
-  })();
+  // Round 4 finding 4: a caller that has ALREADY captured a verified snapshot of the live table
+  // this same tick (autonomy-controller.ts's journal, taken under the mutation lock immediately
+  // before this call) passes it via `opts.verifiedPriorRaw` so this function does NOT re-read —
+  // avoiding a second, independent read whose own error-handling could silently disagree with the
+  // caller's. Absent that, this reads for itself — and, unlike the pre-fix version, only treats a
+  // VERIFIED ENOENT as "no prior table" (first-ever adoption); any other read error (permission
+  // denied, disk fault, transient I/O) now PROPAGATES rather than being silently swallowed as
+  // "no prior table", which could otherwise make a manual `adopt` skip a real rollback snapshot.
+  const priorRaw =
+    "verifiedPriorRaw" in opts
+      ? (opts.verifiedPriorRaw ?? null)
+      : (() => {
+          try {
+            return deps.readTable(deps.tablePath);
+          } catch (err) {
+            if (isVerifiedEnoentError(err)) return null; // no prior table on disk yet — first-ever adoption
+            throw err;
+          }
+        })();
 
   try {
     deps.writeTable(deps.tablePath, candidateJson);
@@ -686,6 +720,9 @@ export async function adoptRoutingTable(
     return { outcome: "rolled-back", record, rollback, canary };
   }
 
+  // Round 4 finding 11: fire BEFORE returning — see `AdoptDeps.onCanaryPassed`'s doc comment.
+  deps.onCanaryPassed?.();
+
   return { outcome: "adopted", record };
 }
 
@@ -698,6 +735,60 @@ export async function adoptRoutingTable(
  */
 export async function manualRollback(p: { deps: AdoptDeps; snapshotRaw: string; reason: string }): Promise<RollbackRecord> {
   return performRollback({ deps: p.deps, priorRaw: p.snapshotRaw, reason: p.reason });
+}
+
+/**
+ * Round 4 finding 2: the restore counterpart of `manualRollback` for the ONE case
+ * `manualRollback`'s signature cannot represent — undoing a "first-ever adoption" (no prior
+ * snapshot ever existed, so there is nothing to restore TO; the correct undo is deleting the
+ * table entirely, then reloading so the live gateway state reflects "no table"). Used by
+ * `autonomy-controller.ts`'s `reconcileAdoptionIntent` when recovering a crashed intent whose
+ * `priorRaw` was `null`. Mirrors `performRollback`'s own never-throws, always-structured-record
+ * contract: every IO step is caught and folded into the returned `RollbackRecord`, and
+ * `restoreWriteOk` is `false` (with a `restoreWriteError` explaining why) both when the delete
+ * itself throws AND when `deps.deleteTable` was never supplied at all — a caller MUST check
+ * `restoreWriteOk` before treating this as a completed restore.
+ */
+export async function deleteTableAndReload(p: { deps: AdoptDeps; reason: string }): Promise<RollbackRecord> {
+  let restoreWriteOk = true;
+  let restoreWriteError: string | undefined;
+  if (p.deps.deleteTable) {
+    try {
+      p.deps.deleteTable(p.deps.tablePath);
+    } catch (err) {
+      restoreWriteOk = false;
+      restoreWriteError = err instanceof Error ? err.message : String(err);
+    }
+  } else {
+    restoreWriteOk = false;
+    restoreWriteError = "AdoptDeps.deleteTable was not provided — cannot delete a first-ever-adoption table to restore it";
+  }
+
+  let reloadOk = true;
+  let reloadError: string | undefined;
+  try {
+    const r = await p.deps.reload();
+    reloadOk = r.ok;
+    reloadError = r.error;
+  } catch (err) {
+    reloadOk = false;
+    reloadError = err instanceof Error ? err.message : String(err);
+  }
+
+  const record: RollbackRecord = {
+    rolledBackAt: p.deps.nowIso(),
+    reason: restoreWriteOk
+      ? p.reason
+      : `${p.reason} — AND deleting the table failed (${restoreWriteError}); table is in an UNKNOWN state, manual recovery required`,
+    restoredHash: "(deleted — first-ever adoption had no prior snapshot)",
+    restoreWriteOk,
+    reloadOk,
+  };
+  return {
+    ...record,
+    ...(restoreWriteError ? { restoreWriteError } : {}),
+    ...(reloadError ? { reloadError } : {}),
+  };
 }
 
 // ─── GENERATE helper (thin, still pure) ──────────────────────────────────────────

@@ -36,7 +36,21 @@ import {
   recordAdoptionForWatch,
   type GuardMetricSnapshot,
 } from "../src/homeserver/adoption-watchdog.js";
-import { acquireMutationLock, mutationLockPath } from "../src/homeserver/mutation-lock.js";
+import { acquireMutationLock, mutationLockDbPath } from "../src/homeserver/mutation-lock.js";
+import Database from "better-sqlite3";
+
+// Round 4 finding 1: the mutation lock is now a SQLite lease, not a bare lock file. This helper
+// reads the lease row directly (equivalent verification strength to the old `existsSync(lockPath)`
+// check: "is a lease currently held", not merely "did some file get created").
+function hasActiveLease(dataDir: string): boolean {
+  const db = new Database(mutationLockDbPath(dataDir));
+  try {
+    const row = db.prepare(`SELECT token FROM mutation_lease WHERE id = 1`).get();
+    return row !== undefined;
+  } finally {
+    db.close();
+  }
+}
 import type { RoutingTableDoc } from "../src/homeserver/routing-table-generator.js";
 import type { AdoptDeps, ReloadOutcome } from "../src/homeserver/routing-lifecycle.js";
 import type { CalibrationGateDecision } from "../src/homeserver/calibration-gate.js";
@@ -247,10 +261,10 @@ describe("Finding 2 (round 3) — exclusive mutation lock shared by the tick and
   it("a second lock acquisition attempt is refused while the first is fresh", () => {
     const dataDir = tmp();
     const handle = acquireMutationLock(dataDir);
-    expect(existsSync(mutationLockPath(dataDir))).toBe(true);
+    expect(hasActiveLease(dataDir)).toBe(true);
     expect(() => acquireMutationLock(dataDir)).toThrow(/mutation-lock/i);
     handle.release();
-    expect(existsSync(mutationLockPath(dataDir))).toBe(false);
+    expect(hasActiveLease(dataDir)).toBe(false);
   });
 
   it("a stale lock (older than the threshold) is force-taken-over rather than blocking forever", () => {
@@ -366,6 +380,24 @@ describe("Finding 4 (round 3) — ladder-computed anchored enablement (productio
       ackedBreachIds: [],
       consecutiveGoCycles: TEST_POLICY.tier1UnlockCycles - 1,
     } as TierState);
+    // Round 4 finding 7: promotion ALSO requires at least one resolved-healthy autonomous Tier-1
+    // adoption on record (a revert rate of 0 is otherwise indistinguishable from "Tier 1 has never
+    // mutated anything at all") — seed one directly into watchdog state.
+    const priorAdoption = recordAdoptionForWatch({
+      dataDir,
+      adoptedAt: "2026-07-10T00:00:00.000Z",
+      candidateHash: "h-prior-tier1-adoption",
+      decisionRef: "r",
+      approvedBy: `${AUTONOMY_APPROVER_PREFIX}1`,
+      changedTaskTypes: ["extract"],
+      priorRaw: null,
+      provenance: { kind: "autonomy", tier: 1 },
+    });
+    const seededWatchState = loadWatchdogState(dataDir);
+    const seededIdx = seededWatchState.records.findIndex((r) => r.id === priorAdoption.id);
+    seededWatchState.records[seededIdx] = { ...seededWatchState.records[seededIdx]!, status: "healthy" };
+    const { saveWatchdogState } = await import("../src/homeserver/adoption-watchdog.js");
+    saveWatchdogState(dataDir, seededWatchState);
 
     const noopDoc = makeDoc({ classify: { model: "mellum", verdict: "delegate-local", attempts: 50, passRate: 0.5 } });
     const { deps: adoptDeps } = fakeAdoptDeps({ initialTable: tableJson({ classify: { model: "mellum", verdict: "delegate-local", attempts: 50, passRate: 0.5 } }) });
@@ -482,7 +514,15 @@ describe("Finding 5 (round 3) — every changed axis gets an HONEST evaluation; 
     expect(rotateEligibleAxes(["a", "b", "c"], null)).toEqual(["a", "b", "c"]);
     expect(rotateEligibleAxes(["a", "b", "c"], "a")).toEqual(["b", "c", "a"]);
     expect(rotateEligibleAxes(["a", "b", "c"], "c")).toEqual(["a", "b", "c"]);
-    expect(rotateEligibleAxes(["a", "c"], "b")).toEqual(["a", "c"]); // last-attempted no longer eligible
+    // Round 4 finding 9 DELIBERATELY REVERSED this case's expectation: round 3 reset to the START
+    // of the sorted list whenever `lastAttempted` ("b") was no longer eligible, which means the
+    // lexically-first eligible axis ("a") wins the rotation again on every tick "b" is transiently
+    // ineligible — reproducing the exact starvation the round-3 fix was meant to close. The fix
+    // resumes from "b"'s LEXICAL INSERTION POINT among the eligible set ("c", the first eligible
+    // axis sorting after "b"), wrapping — so "c" is tried before "a" here, not after.
+    expect(rotateEligibleAxes(["a", "c"], "b")).toEqual(["c", "a"]);
+    // Insertion point wraps to the start when nothing eligible sorts after lastAttempted.
+    expect(rotateEligibleAxes(["a", "b"], "z")).toEqual(["a", "b"]);
   });
 
   it("a second, later-alphabetical axis is NOT given fabricated placeholder predicate results", async () => {
@@ -704,7 +744,12 @@ describe("Finding 7 (round 3) — demotion event appended exactly once; ackedBre
     expect(demotionEvents).toHaveLength(1);
   });
 
-  it("ackedBreachIds is bounded — does not grow without limit across many breach cycles", async () => {
+  // Round 4 finding 5 DELIBERATELY REVERSED this rule's direction: round 3's 500-entry eviction cap
+  // was itself a bug (an evicted ack made an old, already-handled breach id look "unacknowledged"
+  // again forever, re-triggering its demotion on every subsequent tick — the "501st breach evicts,
+  // the evicted one looks new forever" replay wedge). The fix keeps an ack for EVERY retained breach
+  // record, unbounded — this test now asserts the OPPOSITE of its round-3 name: nothing is evicted.
+  it("ackedBreachIds retains every id — round 4 removed the round-3 eviction cap as unsound (replay-wedge risk)", async () => {
     const dataDir = tmp();
     const manyIds = Array.from({ length: 600 }, (_, i) => `breach-${i}`);
     saveTierState(dataDir, {
@@ -751,7 +796,9 @@ describe("Finding 7 (round 3) — demotion event appended exactly once; ackedBre
     await runAutonomyTick(baseDeps({ dataDir, review, adoptDeps }));
 
     const after = loadTierState(dataDir);
-    expect(after.ackedBreachIds.length).toBeLessThan(601);
-    expect(after.ackedBreachIds).toContain(newRecord.id); // the fresh one is never evicted immediately
+    // Round 4 finding 5: no cap — all 600 pre-seeded ids PLUS the fresh one are retained.
+    expect(after.ackedBreachIds.length).toBe(601);
+    expect(after.ackedBreachIds).toContain(newRecord.id);
+    expect(after.ackedBreachIds).toContain("breach-0"); // the OLDEST id is no longer evicted
   });
 });

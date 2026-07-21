@@ -186,6 +186,9 @@ async function main(): Promise<void> {
     `  kill-switch: ${report.killSwitchActive ? "ON (no adopt/promote)" : "off"}${dryRun ? " | DRY-RUN (zero mutation)" : ""} | healthy-cycle: ${report.healthyCycle}\n`
   );
   process.stderr.write(`  watch: ${report.watch.items.length} window(s) evaluated\n`);
+  for (const warning of report.warnings) {
+    process.stderr.write(`  WARNING: ${warning}\n`);
+  }
   if (report.noop) {
     process.stderr.write("  review: no semantic routing changes — healthy no-op cycle\n");
   } else {

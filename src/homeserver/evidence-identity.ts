@@ -117,6 +117,25 @@ export function tableContentHash(raw: string | null): string {
   return contentDigest(JSON.stringify(JSON.parse(raw)));
 }
 
+/**
+ * True iff `err` represents a VERIFIED "file does not exist" condition — either a real Node
+ * `NodeJS.ErrnoException` with `code === "ENOENT"` (what `readFileSync` throws in production) or,
+ * for test fakes that throw a plain `Error` without an errno code, a message that says so
+ * explicitly. Anything else (permission denied, disk error, a transient I/O fault) is NOT this.
+ *
+ * Round 3 finding 3 introduced this distinction in `autonomy-controller.ts`'s `tryReadLiveTable`
+ * (an unverified swallow-everything read there could make REVIEW silently assume an empty
+ * baseline). Round 4 finding 4 shares the EXACT same check with `routing-lifecycle.ts`'s
+ * `adoptRoutingTable`, whose own prior-snapshot read had the identical unverified-swallow bug on
+ * its manual-adopt path — one implementation, two call sites, so the two surfaces cannot drift.
+ */
+export function isVerifiedEnoentError(err: unknown): boolean {
+  const code = err && typeof err === "object" ? (err as NodeJS.ErrnoException).code : undefined;
+  if (code === "ENOENT") return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /\bENOENT\b/.test(message);
+}
+
 function normalizeDigest(digest: string): string {
   return digest.startsWith("sha256:") ? digest : `sha256:${digest}`;
 }

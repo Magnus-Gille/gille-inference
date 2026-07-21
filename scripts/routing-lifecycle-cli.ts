@@ -99,6 +99,7 @@ import {
   recordAdoptionForWatch,
   runAdoptionWatch,
   DEFAULT_WATCHDOG_POLICY,
+  type AdoptionWatchRecord,
 } from "../src/homeserver/adoption-watchdog.js";
 
 const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
@@ -517,6 +518,7 @@ async function cmdAdopt(args: string[]): Promise<void> {
   }
 
   let result: Awaited<ReturnType<typeof adoptRoutingTable>>;
+  let watchRecord: AdoptionWatchRecord | undefined;
   try {
     // Re-verify, UNDER THE LOCK, that the live table still matches what THIS artifact's diff was
     // built against — the same optimistic-concurrency discipline the autonomy controller's own
@@ -541,6 +543,21 @@ async function cmdAdopt(args: string[]): Promise<void> {
       return;
     }
     result = await adoptRoutingTable(artifact, approval, deps);
+    if (result.outcome === "adopted") {
+      // Round 4 finding 3: `recordAdoptionForWatch` stays UNDER THE SAME LEASE as the write itself —
+      // releasing the lock between the write and opening the watch window would let a concurrent
+      // tick or another manual `adopt` slip in and mutate the table before this adoption's watch
+      // record (and its revert-snapshot linkage) is durably committed.
+      watchRecord = recordAdoptionForWatch({
+        dataDir,
+        adoptedAt: result.record.adoptedAt,
+        candidateHash: result.record.candidateHash,
+        decisionRef: result.record.decisionRef,
+        approvedBy: result.record.approvedBy,
+        changedTaskTypes: changedTaskTypesOf(artifact.diff),
+        priorRaw: priorRawForWatchdog,
+      });
+    }
   } finally {
     lockHandle.release();
   }
@@ -548,18 +565,9 @@ async function cmdAdopt(args: string[]): Promise<void> {
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   if (result.outcome === "adopted") {
     process.stderr.write(`ADOPTED — candidateHash=${result.record.candidateHash} approvedBy=${result.record.approvedBy}\n`);
-    const watchRecord = recordAdoptionForWatch({
-      dataDir,
-      adoptedAt: result.record.adoptedAt,
-      candidateHash: result.record.candidateHash,
-      decisionRef: result.record.decisionRef,
-      approvedBy: result.record.approvedBy,
-      changedTaskTypes: changedTaskTypesOf(artifact.diff),
-      priorRaw: priorRawForWatchdog,
-    });
     process.stderr.write(
-      `watchdog (#47): queued adoption watch record ${watchRecord.id} for [${watchRecord.changedTaskTypes.join(", ")}] ` +
-        `(snapshot ${watchRecord.snapshotPath ? "captured" : "none — first-ever adoption"}); run 'watch' to evaluate.\n`
+      `watchdog (#47): queued adoption watch record ${watchRecord!.id} for [${watchRecord!.changedTaskTypes.join(", ")}] ` +
+        `(snapshot ${watchRecord!.snapshotPath ? "captured" : "none — first-ever adoption"}); run 'watch' to evaluate.\n`
     );
     process.exitCode = 0;
   } else if (result.outcome === "rolled-back") {
