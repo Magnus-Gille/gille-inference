@@ -686,6 +686,7 @@ describe("emptyTierState / DEFAULT_AUTONOMY_POLICY sanity", () => {
       lastCycleAt: null,
       lastEvent: null,
       ackedBreachIds: [],
+      tier1EnteredAt: null, // round 5 finding 4: no Tier-1 tenure has started yet
     });
   });
 

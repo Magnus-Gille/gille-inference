@@ -51,6 +51,23 @@ export class MutationLockBusyError extends Error {
   }
 }
 
+/**
+ * Round 5 finding 1: acquiring the lease at the START of an operation is only HALF of fencing — the
+ * classic completion is verifying the token again AT THE RESOURCE, immediately before the protected
+ * mutation actually commits. Without this, a holder whose lease goes stale MID-OPERATION (reclaimed
+ * by someone else while this holder was still, say, mid-`adoptRoutingTable`) could still perform its
+ * write — silently clobbering the new holder's legitimate work. `MutationLockStaleError` is thrown
+ * by `assertLeaseCurrent`/`isLeaseCurrent`'s callers when that has happened; the caller MUST treat
+ * this as "nothing was written by me — abort cleanly, no rollback needed, retry (if applicable) next
+ * tick" rather than attempting any recovery of its own.
+ */
+export class MutationLockStaleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MutationLockStaleError";
+  }
+}
+
 /** Generous for a single adopt call's write+reload+canary (seconds, not minutes, in practice) —
  *  tunable via `acquireMutationLock`'s own `staleAfterMs` option. */
 export const DEFAULT_MUTATION_LOCK_STALE_AFTER_MS = 5 * 60 * 1000;
@@ -69,10 +86,15 @@ interface SeqRow {
   next_token: number;
 }
 
-function openLeaseDb(dataDir: string): Database.Database {
-  const path = mutationLockDbPath(dataDir);
-  mkdirSync(dirname(path), { recursive: true });
-  const db = new Database(path);
+/**
+ * Round 5 finding 3: the watchdog's adoption records + quarantine state move into SQLite, sharing
+ * THIS SAME db file (`mutationLockDbPath`) — so a fencing check and the protected write it guards
+ * can commit inside ONE transaction on one connection, never two. Exported so
+ * `adoption-watchdog.ts` can open its OWN connection to the identical file and call this to ensure
+ * the lease tables exist there too (idempotent — `CREATE TABLE IF NOT EXISTS`), before adding its
+ * own tables in the same `db.exec` call.
+ */
+export function ensureLeaseTables(db: Database.Database): void {
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 2000");
   db.exec(`
@@ -87,7 +109,49 @@ function openLeaseDb(dataDir: string): Database.Database {
       next_token INTEGER NOT NULL
     );
   `);
+}
+
+function openLeaseDb(dataDir: string): Database.Database {
+  const path = mutationLockDbPath(dataDir);
+  mkdirSync(dirname(path), { recursive: true });
+  const db = new Database(path);
+  ensureLeaseTables(db);
   return db;
+}
+
+/**
+ * Round 5 finding 1 — the fencing check itself, usable two ways:
+ *   - Standalone (`assertLeaseCurrent`, below) for a protected mutation that is NOT already sharing
+ *     a SQLite transaction with the lease table (e.g. the adoption-intent journal, still a plain
+ *     file) — opens its own connection, checks, closes.
+ *   - Inline (`isLeaseCurrent`) for a caller (adoption-watchdog.ts's SQLite-backed state) that wants
+ *     the token check and its own protected write to commit in the SAME transaction, on the SAME
+ *     already-open connection to this db file — true same-transaction atomicity, not a check
+ *     followed by a separate write with its own tiny race window.
+ */
+export function isLeaseCurrent(db: Database.Database, token: number): boolean {
+  const row = db.prepare(`SELECT token FROM mutation_lease WHERE id = 1`).get() as { token: number } | undefined;
+  return row !== undefined && row.token === token;
+}
+
+/**
+ * Throws `MutationLockStaleError` unless `token` is still the CURRENT lease's token, checked
+ * transactionally against the live db. Call immediately before a protected mutation actually
+ * commits — this is the "fencing enforced at the resource" completion (round 5 finding 1), not a
+ * substitute for holding the lease throughout the operation.
+ */
+export function assertLeaseCurrent(dataDir: string, token: number): void {
+  const db = openLeaseDb(dataDir);
+  try {
+    const current = db.transaction((): boolean => isLeaseCurrent(db, token)).immediate();
+    if (!current) {
+      throw new MutationLockStaleError(
+        `mutation-lock: fencing token ${token} is no longer the current lease (it was reclaimed by another holder) — refusing to commit a protected mutation with a stale token.`
+      );
+    }
+  } finally {
+    db.close();
+  }
 }
 
 type AcquireResult = { ok: true; token: number } | { ok: false; ageMs: number };

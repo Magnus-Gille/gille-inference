@@ -35,9 +35,10 @@
  * fail-closed means REFUSING a mutation; here it means PERFORMING the corrective one).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import Database from "better-sqlite3";
 
 import {
   manualRollback,
@@ -46,7 +47,14 @@ import {
   type RollbackRecord,
   type CanaryOutcome,
 } from "./routing-lifecycle.js";
-import { acquireMutationLock, MutationLockBusyError } from "./mutation-lock.js";
+import {
+  acquireMutationLock,
+  MutationLockBusyError,
+  MutationLockStaleError,
+  mutationLockDbPath,
+  ensureLeaseTables,
+  isLeaseCurrent,
+} from "./mutation-lock.js";
 import type { RoutingTableDoc } from "./routing-table-generator.js";
 import type { GuardMetricSnapshot } from "./ledger.js";
 
@@ -344,7 +352,11 @@ export function emptyWatchdogState(): WatchdogState {
 
 export interface WatchdogPaths {
   root: string;
+  /** Legacy JSON state path — no longer written (round 5 finding 3 moved records into SQLite), kept
+   *  ONLY as the one-time migration source and for any external tooling that still expects the path
+   *  to resolve. */
   statePath: string;
+  /** Legacy JSON quarantine path — same status as `statePath` above. */
   quarantinePath: string;
   eventsPath: string;
   snapshotsDir: string;
@@ -361,56 +373,273 @@ export function watchdogPaths(dataDir: string): WatchdogPaths {
   };
 }
 
-/** write-to-temp then rename — same atomicity discipline as code-loop-store.ts's atomicReplace, so a
- *  crash mid-write can never leave a half-written state/quarantine file on disk. */
-function atomicWriteFile(path: string, contents: string): void {
+// ─── SQLite-backed watch-record + quarantine storage (round 5 finding 3) ─────────
+//
+// Round 4's file-based storage had a lost-update class of bug: `runAdoptionWatch`'s
+// load-whole-state → evaluate → save-whole-state and `recordAdoptionForWatch`'s
+// load-whole-state → append → save-whole-state could interleave across two process invocations
+// (a cron watch tick overlapping a manual `adopt`, say) — whichever finishes its "save the WHOLE
+// array I loaded" LAST silently wins, discarding whatever the other call added or changed. This
+// class of bug cannot be patched away by locking harder around a whole-file overwrite; it requires
+// each COMMIT to be scoped to exactly the row(s) it actually changed, transactionally, so two
+// concurrent commits to DIFFERENT rows can never clobber each other, and two commits to the SAME
+// row are serialized by SQLite's own write lock (never a silent last-writer-wins).
+//
+// Records + quarantine entries now live in the SAME db file the mutation lease itself uses
+// (`mutationLockDbPath`) — round 5's fencing (finding 1) can then verify the caller's lease token
+// and commit the protected row change in ONE transaction, not a check followed by a separate write.
+// `loadWatchdogState`/`saveWatchdogState`/`loadQuarantineState`/`saveQuarantineState` keep their
+// EXACT exported signatures (`saveWatchdogState`/`saveQuarantineState` are now bulk upsert-alls, used
+// by tests and any caller that legitimately wants to set the whole state at once); the PRODUCTION
+// hot paths (`recordAdoptionForWatch`, `runAdoptionWatch`'s own per-record resolution) never call
+// them — each commits only the row(s) it actually owns.
+
+interface WatchRecordRow {
+  id: string;
+  adopted_at: string;
+  candidate_hash: string;
+  decision_ref: string;
+  approved_by: string;
+  changed_task_types: string;
+  snapshot_path: string | null;
+  status: string;
+  last_evaluated_at: string | null;
+  provenance: string | null;
+  intent_id: string | null;
+}
+
+interface QuarantineRow {
+  task_type: string;
+  quarantined_at: string;
+  reason: string;
+  cooldown_until: string;
+  required_margin_delta: number;
+  baseline_pass_rate_at_quarantine: number | null;
+  cleared_at: string | null;
+}
+
+function rowToRecord(row: WatchRecordRow): AdoptionWatchRecord {
+  return {
+    id: row.id,
+    adoptedAt: row.adopted_at,
+    candidateHash: row.candidate_hash,
+    decisionRef: row.decision_ref,
+    approvedBy: row.approved_by,
+    changedTaskTypes: JSON.parse(row.changed_task_types) as string[],
+    snapshotPath: row.snapshot_path,
+    status: row.status as AdoptionWatchRecord["status"],
+    lastEvaluatedAt: row.last_evaluated_at,
+    ...(row.provenance ? { provenance: JSON.parse(row.provenance) as AdoptionProvenance } : {}),
+    ...(row.intent_id ? { intentId: row.intent_id } : {}),
+  };
+}
+
+function recordToRowParams(r: AdoptionWatchRecord) {
+  return {
+    id: r.id,
+    adopted_at: r.adoptedAt,
+    candidate_hash: r.candidateHash,
+    decision_ref: r.decisionRef,
+    approved_by: r.approvedBy,
+    changed_task_types: JSON.stringify(r.changedTaskTypes),
+    snapshot_path: r.snapshotPath,
+    status: r.status,
+    last_evaluated_at: r.lastEvaluatedAt,
+    provenance: r.provenance ? JSON.stringify(r.provenance) : null,
+    intent_id: r.intentId ?? null,
+  };
+}
+
+function rowToQuarantineRecord(row: QuarantineRow): QuarantineRecord {
+  return {
+    taskType: row.task_type,
+    quarantinedAt: row.quarantined_at,
+    reason: row.reason,
+    cooldownUntil: row.cooldown_until,
+    requiredMarginDelta: row.required_margin_delta,
+    baselinePassRateAtQuarantine: row.baseline_pass_rate_at_quarantine,
+    clearedAt: row.cleared_at,
+  };
+}
+
+function quarantineToRowParams(r: QuarantineRecord) {
+  return {
+    task_type: r.taskType,
+    quarantined_at: r.quarantinedAt,
+    reason: r.reason,
+    cooldown_until: r.cooldownUntil,
+    required_margin_delta: r.requiredMarginDelta,
+    baseline_pass_rate_at_quarantine: r.baselinePassRateAtQuarantine,
+    cleared_at: r.clearedAt,
+  };
+}
+
+const UPSERT_RECORD_SQL = `
+  INSERT INTO adoption_watch_records
+    (id, adopted_at, candidate_hash, decision_ref, approved_by, changed_task_types, snapshot_path, status, last_evaluated_at, provenance, intent_id)
+  VALUES
+    (@id, @adopted_at, @candidate_hash, @decision_ref, @approved_by, @changed_task_types, @snapshot_path, @status, @last_evaluated_at, @provenance, @intent_id)
+  ON CONFLICT(id) DO UPDATE SET
+    adopted_at = excluded.adopted_at, candidate_hash = excluded.candidate_hash, decision_ref = excluded.decision_ref,
+    approved_by = excluded.approved_by, changed_task_types = excluded.changed_task_types, snapshot_path = excluded.snapshot_path,
+    status = excluded.status, last_evaluated_at = excluded.last_evaluated_at, provenance = excluded.provenance, intent_id = excluded.intent_id
+`;
+
+const UPSERT_QUARANTINE_SQL = `
+  INSERT INTO quarantine_entries
+    (task_type, quarantined_at, reason, cooldown_until, required_margin_delta, baseline_pass_rate_at_quarantine, cleared_at)
+  VALUES
+    (@task_type, @quarantined_at, @reason, @cooldown_until, @required_margin_delta, @baseline_pass_rate_at_quarantine, @cleared_at)
+  ON CONFLICT(task_type) DO UPDATE SET
+    quarantined_at = excluded.quarantined_at, reason = excluded.reason, cooldown_until = excluded.cooldown_until,
+    required_margin_delta = excluded.required_margin_delta,
+    baseline_pass_rate_at_quarantine = excluded.baseline_pass_rate_at_quarantine, cleared_at = excluded.cleared_at
+`;
+
+/**
+ * One-time, idempotent migration of the legacy JSON state/quarantine files into SQLite, run the
+ * first time this db file is opened for THIS dataDir (checked via "table is empty" — a real
+ * production install has exactly the records it has ever recorded, so an empty table unambiguously
+ * means "never migrated yet", and every subsequent open is a fast no-op COUNT query). Best-effort:
+ * a corrupt/unreadable legacy file is logged-and-skipped here (this is a migration convenience, not
+ * the authoritative read path — `loadWatchdogState`'s CALLERS have never depended on the legacy
+ * JSON file directly once this module owns storage), never allowed to block startup.
+ */
+function migrateLegacyJsonIfNeeded(db: Database.Database, dataDir: string): void {
+  const { statePath, quarantinePath } = watchdogPaths(dataDir);
+
+  const recordCount = (db.prepare(`SELECT COUNT(*) AS n FROM adoption_watch_records`).get() as { n: number }).n;
+  if (recordCount === 0 && existsSync(statePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(statePath, "utf8")) as WatchdogState;
+      if (Array.isArray(parsed.records) && parsed.records.length > 0) {
+        const insert = db.prepare(UPSERT_RECORD_SQL);
+        const importAll = db.transaction((records: AdoptionWatchRecord[]) => {
+          for (const r of records) insert.run(recordToRowParams(r));
+        });
+        importAll.immediate(parsed.records);
+      }
+    } catch {
+      // Best-effort: an unreadable legacy file is not migrated, but does not block operation either.
+    }
+  }
+
+  const quarantineCount = (db.prepare(`SELECT COUNT(*) AS n FROM quarantine_entries`).get() as { n: number }).n;
+  if (quarantineCount === 0 && existsSync(quarantinePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(quarantinePath, "utf8")) as QuarantineState;
+      if (parsed.byTaskType && typeof parsed.byTaskType === "object") {
+        const entries = Object.values(parsed.byTaskType);
+        if (entries.length > 0) {
+          const insert = db.prepare(UPSERT_QUARANTINE_SQL);
+          const importAll = db.transaction((rows: QuarantineRecord[]) => {
+            for (const r of rows) insert.run(quarantineToRowParams(r));
+          });
+          importAll.immediate(entries);
+        }
+      }
+    } catch {
+      // Best-effort, same rationale as above.
+    }
+  }
+}
+
+function openWatchdogDb(dataDir: string): Database.Database {
+  const path = mutationLockDbPath(dataDir);
   mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(temp, contents, "utf8");
-  renameSync(temp, path);
+  const db = new Database(path);
+  ensureLeaseTables(db); // same db file as the mutation lease — see the module note above
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS adoption_watch_records (
+      id                 TEXT PRIMARY KEY,
+      adopted_at         TEXT NOT NULL,
+      candidate_hash     TEXT NOT NULL,
+      decision_ref       TEXT NOT NULL,
+      approved_by        TEXT NOT NULL,
+      changed_task_types TEXT NOT NULL,
+      snapshot_path      TEXT,
+      status             TEXT NOT NULL,
+      last_evaluated_at  TEXT,
+      provenance         TEXT,
+      intent_id          TEXT
+    );
+    CREATE TABLE IF NOT EXISTS quarantine_entries (
+      task_type                        TEXT PRIMARY KEY,
+      quarantined_at                   TEXT NOT NULL,
+      reason                           TEXT NOT NULL,
+      cooldown_until                   TEXT NOT NULL,
+      required_margin_delta            REAL NOT NULL,
+      baseline_pass_rate_at_quarantine REAL,
+      cleared_at                       TEXT
+    );
+  `);
+  migrateLegacyJsonIfNeeded(db, dataDir);
+  return db;
 }
 
 export function loadWatchdogState(dataDir: string): WatchdogState {
-  const { statePath } = watchdogPaths(dataDir);
-  if (!existsSync(statePath)) return emptyWatchdogState();
+  const db = openWatchdogDb(dataDir);
   try {
-    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as WatchdogState;
-    if (!Array.isArray(parsed.records)) throw new Error("no records array");
-    return parsed;
-  } catch (err) {
-    throw new Error(
-      `adoption-watchdog: state file at ${statePath} is corrupt (${err instanceof Error ? err.message : String(err)}) — refusing to operate on unreadable durable state.`
-    );
+    const rows = db.prepare(`SELECT * FROM adoption_watch_records ORDER BY rowid`).all() as WatchRecordRow[];
+    return { schemaVersion: 1, records: rows.map(rowToRecord) };
+  } finally {
+    db.close();
   }
 }
 
+/**
+ * Bulk upsert-all of `state.records` — a convenience setter for tests and any caller that
+ * legitimately wants to set the whole state at once (e.g. seeding a fixture). NOT used by this
+ * module's own production hot paths (`recordAdoptionForWatch`, `runAdoptionWatch`) — those commit
+ * only the ONE row they actually own, which is what closes the lost-update race this migration
+ * fixes (round 5 finding 3). Still transactional, so a single call is atomic across every record.
+ */
 export function saveWatchdogState(dataDir: string, state: WatchdogState): void {
-  atomicWriteFile(watchdogPaths(dataDir).statePath, JSON.stringify(state, null, 2) + "\n");
+  const db = openWatchdogDb(dataDir);
+  try {
+    const insert = db.prepare(UPSERT_RECORD_SQL);
+    const upsertAll = db.transaction((records: AdoptionWatchRecord[]) => {
+      for (const r of records) insert.run(recordToRowParams(r));
+    });
+    upsertAll.immediate(state.records);
+  } finally {
+    db.close();
+  }
 }
 
 export function loadQuarantineState(dataDir: string): QuarantineState {
-  const { quarantinePath } = watchdogPaths(dataDir);
-  if (!existsSync(quarantinePath)) return emptyQuarantineState();
+  const db = openWatchdogDb(dataDir);
   try {
-    const parsed = JSON.parse(readFileSync(quarantinePath, "utf8")) as QuarantineState;
-    if (!parsed.byTaskType || typeof parsed.byTaskType !== "object") throw new Error("no byTaskType map");
-    return parsed;
-  } catch (err) {
-    throw new Error(
-      `adoption-watchdog: quarantine file at ${quarantinePath} is corrupt (${err instanceof Error ? err.message : String(err)}) — refusing to operate on unreadable durable state.`
-    );
+    const rows = db.prepare(`SELECT * FROM quarantine_entries ORDER BY rowid`).all() as QuarantineRow[];
+    const byTaskType: Record<string, QuarantineRecord> = {};
+    for (const row of rows) byTaskType[row.task_type] = rowToQuarantineRecord(row);
+    return { schemaVersion: 1, byTaskType };
+  } finally {
+    db.close();
   }
 }
 
+/** Bulk upsert-all — same convenience-setter role as `saveWatchdogState` above. */
 export function saveQuarantineState(dataDir: string, state: QuarantineState): void {
-  atomicWriteFile(watchdogPaths(dataDir).quarantinePath, JSON.stringify(state, null, 2) + "\n");
+  const db = openWatchdogDb(dataDir);
+  try {
+    const insert = db.prepare(UPSERT_QUARANTINE_SQL);
+    const upsertAll = db.transaction((rows: QuarantineRecord[]) => {
+      for (const r of rows) insert.run(quarantineToRowParams(r));
+    });
+    upsertAll.immediate(Object.values(state.byTaskType));
+  } finally {
+    db.close();
+  }
 }
 
 /**
  * Called by the CLI immediately after a successful `adoptRoutingTable` outcome (never before —
  * this records what WAS adopted, it does not gate whether adoption happens). Persists the exact
  * prior table bytes as a durable snapshot (when one existed) and queues a `pending`
- * AdoptionWatchRecord for future `watch` runs to evaluate.
+ * AdoptionWatchRecord for future `watch` runs to evaluate. Round 5 finding 3: this is now a SCOPED
+ * single-row INSERT (never a load-whole-state/append/save-whole-state round trip), so it can never
+ * clobber a concurrent `runAdoptionWatch` run's OWN scoped updates to other rows.
  */
 export function recordAdoptionForWatch(p: {
   dataDir: string;
@@ -429,6 +658,16 @@ export function recordAdoptionForWatch(p: {
   /** The autonomy controller's `AdoptionIntent.id` this record finalizes (round 4 finding 8) —
    *  omitted for a manual CLI adopt, which has no intent journal. */
   intentId?: string;
+  /**
+   * Round 5 finding 1: when the caller already holds the mutation lease (both production call
+   * sites do — the autonomy controller's own adopt path, and the manual CLI `adopt` command), pass
+   * its token so this insert's fencing check and the row commit happen in ONE transaction on this
+   * db file, never a check followed by a separate write. Throws `MutationLockStaleError` (nothing
+   * was written) if the token is no longer current. Omitted by a caller with no lease context
+   * (e.g. `reconcileAdoptionIntent`'s canary-passed finalize, which the CALLER wraps in its own
+   * lease-held scope instead — see round 5 finding 2).
+   */
+  leaseToken?: number;
 }): AdoptionWatchRecord {
   const { snapshotsDir } = watchdogPaths(p.dataDir);
   const id = randomUUID();
@@ -452,9 +691,21 @@ export function recordAdoptionForWatch(p: {
     ...(p.provenance ? { provenance: p.provenance } : {}),
     ...(p.intentId ? { intentId: p.intentId } : {}),
   };
-  const state = loadWatchdogState(p.dataDir);
-  state.records.push(record);
-  saveWatchdogState(p.dataDir, state);
+  const db = openWatchdogDb(p.dataDir);
+  try {
+    const insert = db.prepare(UPSERT_RECORD_SQL);
+    const commit = db.transaction((): void => {
+      if (p.leaseToken !== undefined && !isLeaseCurrent(db, p.leaseToken)) {
+        throw new MutationLockStaleError(
+          `adoption-watchdog: fencing token ${p.leaseToken} is no longer the current mutation lease — refusing to commit a new watch record with a stale token.`
+        );
+      }
+      insert.run(recordToRowParams(record));
+    });
+    commit.immediate();
+  } finally {
+    db.close();
+  }
   return record;
 }
 
@@ -553,6 +804,49 @@ function readPassRateForTaskType(snapshotPath: string | null, taskType: string):
  * durable event append — it only returns the report so a caller (the CLI) can print what WOULD
  * happen.
  */
+/**
+ * Round 5 finding 3: commits ONE record's resolution (status + lastEvaluatedAt), optionally
+ * alongside quarantine rows, in a SINGLE SQLite transaction guarded by `WHERE status = 'pending'` —
+ * never a whole-state overwrite. Two concurrent `runAdoptionWatch` invocations resolving DIFFERENT
+ * records can never clobber each other (different rows); resolving the SAME record has one commit
+ * win (rows affected = 1) and the other affect zero rows (reported via the return value, never
+ * silently overwritten). `leaseToken`, when supplied, is verified in the SAME transaction (round 5
+ * finding 1) — used only by the branch that already holds the mutation lease because it just
+ * performed a real table write (`manualRollback`); the no-table-write paths (healthy/inconclusive/
+ * no-snapshot-breach) never need the lease at all, since SQLite's own transaction already serializes
+ * concurrent commits to this db file.
+ */
+function commitRecordResolution(p: {
+  dataDir: string;
+  recordId: string;
+  newStatus: AdoptionWatchRecord["status"];
+  lastEvaluatedAt: string;
+  quarantineEntries?: QuarantineRecord[];
+  leaseToken?: number;
+}): boolean {
+  const db = openWatchdogDb(p.dataDir);
+  try {
+    const insertQuarantine = p.quarantineEntries && p.quarantineEntries.length > 0 ? db.prepare(UPSERT_QUARANTINE_SQL) : null;
+    const commit = db.transaction((): boolean => {
+      if (p.leaseToken !== undefined && !isLeaseCurrent(db, p.leaseToken)) {
+        throw new MutationLockStaleError(
+          `adoption-watchdog: fencing token ${p.leaseToken} is no longer the current mutation lease — refusing to commit this record's resolution with a stale token.`
+        );
+      }
+      const result = db
+        .prepare(`UPDATE adoption_watch_records SET status = ?, last_evaluated_at = ? WHERE id = ? AND status = 'pending'`)
+        .run(p.newStatus, p.lastEvaluatedAt, p.recordId);
+      if (insertQuarantine) {
+        for (const q of p.quarantineEntries!) insertQuarantine.run(quarantineToRowParams(q));
+      }
+      return result.changes > 0;
+    });
+    return commit.immediate();
+  } finally {
+    db.close();
+  }
+}
+
 export async function runAdoptionWatch(
   deps: WatchdogRunnerDeps,
   policy: WatchdogPolicyConfig = DEFAULT_WATCHDOG_POLICY,
@@ -585,11 +879,22 @@ export async function runAdoptionWatch(
     let action: WatchdogAction = "none";
     let revert: WatchdogRevertResult | undefined;
     let quarantined: string[] = [];
+    // Round 5 finding 3: the in-memory `record.status` mutations below still drive the RETURNED
+    // report/items (unchanged shape) and the `WatchdogEvent` written below, but the DURABLE
+    // resolution is committed via `commitRecordResolution` (scoped, guarded) — never a bulk
+    // `saveWatchdogState` of the whole array at the end of this loop.
+    let newStatus: AdoptionWatchRecord["status"] = record.status;
+    let quarantineEntriesToCommit: QuarantineRecord[] | undefined;
+    // Set true only by the branch that commits WHILE STILL HOLDING the mutation lease (below) — the
+    // fencing check (round 5 finding 1) is meaningless once the lease has already been released, so
+    // that branch's commit must happen BEFORE its own `lockHandle.release()`, not after this loop
+    // iteration's generic post-decision commit further down.
+    let committedUnderLock = false;
 
     if (evaluation.verdict === "healthy") {
-      record.status = "healthy";
+      newStatus = "healthy";
     } else if (evaluation.verdict === "inconclusive") {
-      record.status = "inconclusive";
+      newStatus = "inconclusive";
     } else if (evaluation.verdict === "breach") {
       const breachingTaskTypes = evaluation.perTaskType
         .filter((t): t is Extract<TaskTypeVerdict, { status: "breach" }> => t.status === "breach")
@@ -600,31 +905,30 @@ export async function runAdoptionWatch(
         // header on why the record stays `pending` under a kill switch rather than resolving.
         action = "would-revert";
       } else if (record.snapshotPath === null) {
-        // No table mutation is involved in this branch (nothing to restore) — quarantine still
-        // needs the lock (round 4 finding 3: it is durable state paired with the breach
-        // resolution), but there is no revert-write race to guard here.
-        record.status = "breach";
+        // No table mutation is involved in this branch (nothing to restore) — no mutation LEASE is
+        // needed either (fixed round 5: the round-4 comment here claimed the lock was taken but the
+        // code never actually acquired one). The record-status + quarantine-row commit is still
+        // atomic: both land in ONE SQLite transaction via `commitRecordResolution`.
+        newStatus = "breach";
         revert = { status: "skipped-no-snapshot" };
         action = "reverted";
-        const quarantine = loadQuarantineState(deps.dataDir);
-        for (const t of breachingTaskTypes) {
-          quarantine.byTaskType[t] = {
-            taskType: t,
-            quarantinedAt: now,
-            reason: `guard-metric breach on adoption ${record.candidateHash} (${record.decisionRef})`,
-            cooldownUntil: new Date(Date.parse(now) + policy.cooldownHours * 60 * 60 * 1000).toISOString(),
-            requiredMarginDelta: policy.requiredMarginDelta,
-            baselinePassRateAtQuarantine: readPassRateForTaskType(record.snapshotPath, t),
-            clearedAt: null,
-          };
-        }
-        if (!dryRun) saveQuarantineState(deps.dataDir, quarantine);
+        quarantineEntriesToCommit = breachingTaskTypes.map((t) => ({
+          taskType: t,
+          quarantinedAt: now,
+          reason: `guard-metric breach on adoption ${record.candidateHash} (${record.decisionRef})`,
+          cooldownUntil: new Date(Date.parse(now) + policy.cooldownHours * 60 * 60 * 1000).toISOString(),
+          requiredMarginDelta: policy.requiredMarginDelta,
+          baselinePassRateAtQuarantine: readPassRateForTaskType(record.snapshotPath, t),
+          clearedAt: null,
+        }));
         quarantined = breachingTaskTypes;
       } else {
-        // Round 4 finding 3: the revert WRITE + its paired quarantine-state commit must run under
-        // the SAME exclusive mutation lease every other table mutation takes (a manual `adopt`, or
-        // this same tick's own autonomous adopt attempt) — otherwise a breach revert here could race
-        // a concurrent write exactly like the pre-round-4 file-CAS bugs did.
+        // Round 4 finding 3 (+ round 5 finding 1's fencing): the revert WRITE must run under the
+        // SAME exclusive mutation lease every other table mutation takes (a manual `adopt`, or this
+        // same tick's own autonomous adopt attempt) — otherwise a breach revert here could race a
+        // concurrent write exactly like the pre-round-4 file-CAS bugs did. The record-status +
+        // quarantine commit below is fenced by THIS SAME token, verified again immediately before it
+        // lands (finding 1's "enforced at the resource", not only at acquire).
         let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
         try {
           lockHandle = acquireMutationLock(deps.dataDir);
@@ -640,7 +944,6 @@ export async function runAdoptionWatch(
           action = "would-revert";
         } else {
           try {
-            record.status = "breach";
             const snapshotRaw = readFileSync(record.snapshotPath, "utf8");
             const rollback = await manualRollback({
               deps: deps.adoptDeps,
@@ -675,24 +978,35 @@ export async function runAdoptionWatch(
                 : "restored";
             revert = { status, rollback, canary };
             action = "reverted";
+            newStatus = "breach";
 
             // Quarantine every breaching axis regardless of revert quality — the breach itself is
             // the trigger; a failed restore-write does not make the axis any MORE trustworthy.
-            // Committed under the SAME lock as the revert write (round 4 finding 3).
-            const quarantine = loadQuarantineState(deps.dataDir);
-            for (const t of breachingTaskTypes) {
-              quarantine.byTaskType[t] = {
-                taskType: t,
-                quarantinedAt: now,
-                reason: `guard-metric breach on adoption ${record.candidateHash} (${record.decisionRef})`,
-                cooldownUntil: new Date(Date.parse(now) + policy.cooldownHours * 60 * 60 * 1000).toISOString(),
-                requiredMarginDelta: policy.requiredMarginDelta,
-                baselinePassRateAtQuarantine: readPassRateForTaskType(record.snapshotPath, t),
-                clearedAt: null,
-              };
-            }
-            if (!dryRun) saveQuarantineState(deps.dataDir, quarantine);
+            // Committed in the SAME transaction as the record-status update, fenced by this token.
+            quarantineEntriesToCommit = breachingTaskTypes.map((t) => ({
+              taskType: t,
+              quarantinedAt: now,
+              reason: `guard-metric breach on adoption ${record.candidateHash} (${record.decisionRef})`,
+              cooldownUntil: new Date(Date.parse(now) + policy.cooldownHours * 60 * 60 * 1000).toISOString(),
+              requiredMarginDelta: policy.requiredMarginDelta,
+              baselinePassRateAtQuarantine: readPassRateForTaskType(record.snapshotPath, t),
+              clearedAt: null,
+            }));
             quarantined = breachingTaskTypes;
+
+            // Round 5 finding 1: commit WHILE STILL HOLDING the lease — fencing the token against
+            // this SAME lease that is about to be released would be meaningless if checked after.
+            if (!dryRun) {
+              commitRecordResolution({
+                dataDir: deps.dataDir,
+                recordId: record.id,
+                newStatus,
+                lastEvaluatedAt: now,
+                quarantineEntries: quarantineEntriesToCommit,
+                leaseToken: lockHandle.token,
+              });
+            }
+            committedUnderLock = true;
           } finally {
             lockHandle.release();
           }
@@ -700,6 +1014,25 @@ export async function runAdoptionWatch(
       }
     }
     // evaluation.verdict === "pending": no state transition, no action — keep watching.
+
+    record.status = newStatus; // keep the in-memory copy consistent with what was (or is about to be) committed
+    if (!dryRun && !committedUnderLock) {
+      // The locked branch above already committed (WHILE holding its lease) before releasing it —
+      // every other path (healthy/inconclusive/no-snapshot-breach/pending) never took a lease at
+      // all, so it commits here, unfenced (no table write to protect; SQLite's own transaction is
+      // the only serialization this path needs).
+      commitRecordResolution({
+        dataDir: deps.dataDir,
+        recordId: record.id,
+        newStatus,
+        lastEvaluatedAt: now,
+        quarantineEntries: quarantineEntriesToCommit,
+      });
+      // A `false` return means another process resolved this exact record first (extremely rare —
+      // watch runs are typically single-flight via cron); we do not retry or crash — if we performed
+      // a real revert action above, that action itself is idempotent-safe (a redundant rollback to
+      // the same snapshot), and the WINNING commit is the authoritative durable resolution either way.
+    }
 
     const event: WatchdogEvent = {
       schemaVersion: 1,
@@ -725,8 +1058,6 @@ export async function runAdoptionWatch(
 
     items.push({ record, evaluation, action, revert, quarantined });
   }
-
-  if (!dryRun) saveWatchdogState(deps.dataDir, state);
 
   return { evaluatedAt: now, dryRun, killSwitchActive, items };
 }

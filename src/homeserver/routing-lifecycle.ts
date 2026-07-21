@@ -38,7 +38,8 @@
  * `scripts/routing-lifecycle-cli.ts` and the gateway's `/admin/routing-table/reload` endpoint.
  */
 
-import { contentDigest, isVerifiedEnoentError } from "./evidence-identity.js";
+import { contentDigest, isVerifiedEnoentError, tableContentHash } from "./evidence-identity.js";
+import { assertLeaseCurrent } from "./mutation-lock.js";
 import { generateRoutingTable, type RoutingTableDoc } from "./routing-table-generator.js";
 import {
   diffRoutingTables,
@@ -618,7 +619,29 @@ export async function adoptRoutingTable(
   artifact: RoutingDecisionArtifact,
   approval: ApprovalToken,
   deps: AdoptDeps,
-  opts: { verifiedPriorRaw?: string | null } = {}
+  opts: {
+    verifiedPriorRaw?: string | null;
+    /** Round 5 follow-up (defense in depth alongside item 1's fencing): the caller's OWN
+     *  content hash of `verifiedPriorRaw` at the moment it was captured (e.g.
+     *  `tableContentHash(liveRawNow)`, already computed for the caller's own staleness recheck) —
+     *  a pure, no-IO cross-check that the value threaded through as `verifiedPriorRaw` is really
+     *  what the caller believes it is (catches a caller-side wiring bug, e.g. the wrong variable
+     *  threaded through), never a substitute for `leaseContext`'s concurrency guarantee. */
+    verifiedPriorRawHash?: string;
+    /**
+     * Round 5 finding 1 — "fencing enforced at the resource": when supplied, this function
+     * re-verifies (transactionally, against the live lease db) that `token` is STILL the current
+     * mutation lease immediately before the candidate write commits. A caller that already holds
+     * the lease throughout its own call (the normal case) passes this so a lease that went stale
+     * mid-operation (reclaimed by another holder while this call was in flight) is caught HERE,
+     * at the resource, not just at the caller's own acquire — closing the gap where a stale holder
+     * could otherwise still perform its write and silently clobber a newer holder's legitimate one.
+     * Throws `MutationLockStaleError` (propagated, never swallowed) if the token is no longer
+     * current; nothing has been written yet at that point, so the caller's correct response is a
+     * clean abort (no rollback needed) rather than any recovery attempt.
+     */
+    leaseContext?: { dataDir: string; token: number };
+  } = {}
 ): Promise<AdoptOutcome> {
   assertApprovalBindsArtifact(artifact, approval);
   if (!artifact.validation.ok) {
@@ -652,6 +675,25 @@ export async function adoptRoutingTable(
             throw err;
           }
         })();
+
+  // Round 5 follow-up: defensive, no-IO integrity check on a caller-supplied verifiedPriorRaw —
+  // catches a caller-side wiring bug (e.g. the wrong variable threaded through), independent of
+  // (and no substitute for) the fencing check just below.
+  if ("verifiedPriorRaw" in opts && opts.verifiedPriorRawHash !== undefined) {
+    const actualHash = tableContentHash(priorRaw);
+    if (actualHash !== opts.verifiedPriorRawHash) {
+      throw new Error(
+        `routing-lifecycle: verifiedPriorRaw does not match its own claimed hash (expected ${opts.verifiedPriorRawHash}, got ${actualHash}) — refusing to trust a caller-supplied prior-table snapshot that fails its own integrity check.`
+      );
+    }
+  }
+
+  // Round 5 finding 1 — fencing enforced AT THE RESOURCE: re-verify the lease token immediately
+  // before the write commits, not only at the caller's own acquire. Throws MutationLockStaleError
+  // (propagated) if this token has since been superseded — nothing below has written anything yet.
+  if (opts.leaseContext) {
+    assertLeaseCurrent(opts.leaseContext.dataDir, opts.leaseContext.token);
+  }
 
   try {
     deps.writeTable(deps.tablePath, candidateJson);

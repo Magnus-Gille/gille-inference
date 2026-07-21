@@ -489,10 +489,11 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
   it("dry-run reports what would happen without mutating ANY durable state", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "watchdog-run-"));
     seedPendingRecord(dataDir);
-    // Seeding itself writes state.json (recordAdoptionForWatch persists the queued record) — capture
-    // its content here so the assertion below proves dry-run leaves it byte-for-byte untouched,
-    // rather than mis-testing for its absence.
-    const stateBefore = readFileSync(watchdogPaths(dataDir).statePath, "utf8");
+    // Round 5 finding 3: state now lives in SQLite, not a JSON file — capture the STRUCTURED
+    // snapshot (not raw file bytes) so the assertion below proves dry-run leaves it untouched,
+    // rather than mis-testing a file that is no longer written at all.
+    const stateBefore = loadWatchdogState(dataDir);
+    const quarantineBefore = loadQuarantineState(dataDir);
     const { deps, fs, tablePath } = fakeAdoptDeps({ initialTable: BAD_CANDIDATE_TABLE });
     const before = fs.get(tablePath);
 
@@ -516,11 +517,11 @@ describe("runAdoptionWatch — breach detection triggers auto-revert + quarantin
     expect(report.items[0]?.evaluation.verdict).toBe("breach");
     expect(report.items[0]?.action).toBe("would-revert");
     expect(fs.get(tablePath)).toBe(before);
-    // The pre-existing state.json is byte-for-byte unchanged (still "pending"); events/quarantine —
-    // which only a REAL run would create — were never written at all.
-    expect(readFileSync(watchdogPaths(dataDir).statePath, "utf8")).toBe(stateBefore);
+    // The pre-existing watchdog/quarantine state is unchanged (still "pending"); events — which
+    // only a REAL run would create — were never written at all.
+    expect(loadWatchdogState(dataDir)).toEqual(stateBefore);
+    expect(loadQuarantineState(dataDir)).toEqual(quarantineBefore);
     expect(existsSync(watchdogPaths(dataDir).eventsPath)).toBe(false);
-    expect(existsSync(watchdogPaths(dataDir).quarantinePath)).toBe(false);
   });
 
   it("a revert whose restore WRITE fails is recorded honestly as UNKNOWN (mirrors performRollback), and the axis is still quarantined", async () => {

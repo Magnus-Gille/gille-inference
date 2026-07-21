@@ -178,7 +178,7 @@ import {
 import { wilsonInterval } from "./calibration-metrics.js";
 import type { CalibrationGateDecision } from "./calibration-gate.js";
 import { tableContentHash, isVerifiedEnoentError } from "./evidence-identity.js";
-import { acquireMutationLock, MutationLockBusyError } from "./mutation-lock.js";
+import { acquireMutationLock, MutationLockBusyError, MutationLockStaleError, assertLeaseCurrent } from "./mutation-lock.js";
 
 // ─── Tiers and policy ─────────────────────────────────────────────────────────────
 
@@ -316,6 +316,18 @@ export interface TierState {
    * one entry per ever-resolved breach; store compaction (if this and the watchdog's own breach
    * records ever need joint pruning) is a follow-up ticket note, not a cap here. */
   ackedBreachIds: string[];
+  /**
+   * Round 5 finding 4: the timestamp of the most recent transition INTO Tier 1 — either the
+   * original 0->1 promotion, or a later 2->1 demotion (which resets this epoch, same as it resets
+   * the promotion streaks). Tier-2 unlock's revert-rate evidence (`computeAutonomousRevertRate`)
+   * and its "at least one resolved-healthy adoption" gate are BOTH scoped to records adopted AT OR
+   * AFTER this timestamp — evidence from a PRIOR Tier-1 tenure (before a demotion sent the system
+   * back down) must never count toward re-earning Tier 2 again; only what has happened since the
+   * CURRENT tenure began is admissible. `null` on a legacy state file that predates this field, or
+   * on a system that has never yet reached Tier 1 — treated as "no cutoff" (every record is
+   * in-tenure) rather than a fabricated timestamp; the first real transition into Tier 1 sets it.
+   */
+  tier1EnteredAt: string | null;
 }
 
 export function emptyTierState(): TierState {
@@ -327,6 +339,7 @@ export function emptyTierState(): TierState {
     lastCycleAt: null,
     lastEvent: null,
     ackedBreachIds: [],
+    tier1EnteredAt: null,
   };
 }
 
@@ -374,6 +387,9 @@ export function loadTierState(dataDir: string): TierState {
     if (!Array.isArray(parsed.ackedBreachIds)) parsed.ackedBreachIds = [];
     // `consecutiveGoCycles` is new (round 3 finding 4) — same "legacy file, not corruption" story.
     if (typeof parsed.consecutiveGoCycles !== "number") parsed.consecutiveGoCycles = 0;
+    // `tier1EnteredAt` is new (round 5 finding 4) — a legacy file simply has no recorded tenure
+    // start; treated as "no cutoff" (see the field's own doc comment), never a corruption.
+    if (typeof parsed.tier1EnteredAt !== "string") parsed.tier1EnteredAt = null;
     return parsed;
   } catch (err) {
     throw new Error(
@@ -500,6 +516,16 @@ export interface AdoptionIntent {
   abortedAt?: string;
   abortReason?: string;
   watchRecordId?: string;
+  /**
+   * Round 5 finding 6b: a restore attempt that reports neither full success (terminal `"aborted"`)
+   * nor a hard failure worth crashing on is NOT silently ignored — it is "failure-marked" here
+   * (status stays `"pending"` for the next tick's retry) so the durable record itself shows a
+   * restore was attempted and did not fully land, rather than looking identical to an intent no
+   * restore has ever been tried against yet.
+   */
+  restoreAttempts?: number;
+  lastRestoreAttemptAt?: string;
+  lastRestoreError?: string;
 }
 
 export function loadAdoptionIntent(dataDir: string): AdoptionIntent | null {
@@ -537,7 +563,14 @@ export interface ReconcileAdoptionIntentResult {
     | "restore-failed-will-retry"
     /** Round 4 finding 3: a concurrent mutation held the lease at reconcile time — the restore was
      *  deliberately NOT attempted rather than racing it. Left `"pending"` for the next tick. */
-    | "restore-deferred-lock-busy";
+    | "restore-deferred-lock-busy"
+    /** Round 5 finding 1: the lease this reconcile call was holding went stale (reclaimed by
+     *  another holder) sometime DURING this call, before the intent could be finalized/aborted
+     *  terminally — caught by `assertLeaseCurrent` immediately before the terminal
+     *  `saveAdoptionIntent`. Left `"pending"` for the next tick's reconcile to re-examine from
+     *  scratch under a fresh lease, rather than certifying a terminal outcome this call can no
+     *  longer be sure is safe. */
+    | "deferred-lease-went-stale";
   detail?: string;
 }
 
@@ -606,24 +639,43 @@ export async function reconcileAdoptionIntent(
   const intent = loadAdoptionIntent(dataDir);
   if (!intent || intent.status !== "pending") return { action: "none" };
 
-  if (intent.phase !== "canary-passed") {
-    // Round 4 finding 3: the restore write is a table mutation like any other — it must take the
-    // SAME exclusive lease a concurrent manual adopt or this tick's own later adopt attempt would
-    // take, never race it.
-    let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
-    try {
-      lockHandle = acquireMutationLock(dataDir);
-    } catch (err) {
-      if (!(err instanceof MutationLockBusyError)) throw err;
-    }
-    if (lockHandle === null) {
-      // Busy: do not attempt the restore concurrently. The intent stays "pending" — the next
-      // tick's reconcile call retries from scratch.
-      return { action: "restore-deferred-lock-busy" };
-    }
+  // Round 5 finding 2: hold ONE lease through the ENTIRE reconcile sequence for a pending intent —
+  // round 4 only covered the restore-write branch; the canary-passed branch's live-hash check +
+  // watch-record dedupe/creation + intent finalization must be equally atomic against a concurrent
+  // mutation (a manual adopt, or this same tick's own later rotation-loop adopt attempt), not left
+  // to run lock-free.
+  let lockHandle: ReturnType<typeof acquireMutationLock> | null = null;
+  try {
+    lockHandle = acquireMutationLock(dataDir);
+  } catch (err) {
+    if (!(err instanceof MutationLockBusyError)) throw err;
+  }
+  if (lockHandle === null) {
+    // Busy: do not proceed concurrently. The intent stays "pending" — the next tick's reconcile
+    // call retries the whole sequence from scratch under a fresh lease.
+    return { action: "restore-deferred-lock-busy" };
+  }
 
-    let rollback: RollbackRecord;
-    try {
+  try {
+    // Round 5 finding 1: fencing enforced at the resource — verified immediately before EVERY
+    // terminal (finalize/abort) write below, using the SAME token this call acquired. A stale token
+    // means another holder reclaimed the lease sometime during this call; the correct response is
+    // to leave the intent exactly as-is (still "pending") for the next tick to re-examine under a
+    // fresh lease, never to certify a terminal outcome this call can no longer vouch for.
+    const assertStillCurrentOrDefer = (): true | ReconcileAdoptionIntentResult => {
+      try {
+        assertLeaseCurrent(dataDir, lockHandle!.token);
+        return true;
+      } catch (err) {
+        if (err instanceof MutationLockStaleError) {
+          return { action: "deferred-lease-went-stale", detail: err.message };
+        }
+        throw err;
+      }
+    };
+
+    if (intent.phase !== "canary-passed") {
+      let rollback: RollbackRecord;
       if (intent.priorRaw !== null) {
         rollback = await manualRollback({
           deps: adoptDeps,
@@ -639,60 +691,77 @@ export async function reconcileAdoptionIntent(
           reason: `autonomy-controller: reconciling an adoption intent that crashed before canary confirmation (phase: ${intent.phase}) — no prior snapshot existed (first-ever adoption); deleting the unconfirmed table`,
         });
       }
-    } finally {
-      lockHandle.release();
+
+      if (!rollback.restoreWriteOk || !rollback.reloadOk) {
+        // Round 4 finding 2 + round 5 finding 6b: restoration was attempted but did NOT fully
+        // succeed — the table may still be in the bad, uncanaried state. Do NOT mark this terminal
+        // ("aborted"); keep the intent "pending" so the next tick retries the restore rather than
+        // certifying a recovery that never actually happened. "Failure-marked" (never silently
+        // dropped): the attempt itself is now visible on the durable record.
+        saveAdoptionIntent(dataDir, {
+          ...intent,
+          restoreAttempts: (intent.restoreAttempts ?? 0) + 1,
+          lastRestoreAttemptAt: now,
+          lastRestoreError: rollback.reason,
+        });
+        return { action: "restore-failed-will-retry", detail: rollback.reason };
+      }
+
+      const stillCurrent = assertStillCurrentOrDefer();
+      if (stillCurrent !== true) return stillCurrent;
+
+      saveAdoptionIntent(dataDir, {
+        ...intent,
+        status: "aborted",
+        abortedAt: now,
+        abortReason: `crashed before canary confirmation (phase: ${intent.phase}) — restored (${rollback.restoredHash})`,
+      });
+      return { action: "aborted", detail: intent.phase };
     }
 
-    if (!rollback.restoreWriteOk || !rollback.reloadOk) {
-      // Round 4 finding 2: restoration was attempted but did NOT fully succeed — the table may
-      // still be in the bad, uncanaried state. Do NOT mark this terminal ("aborted"); keep the
-      // intent "pending" so the next tick retries the restore rather than certifying a recovery
-      // that never actually happened.
-      return { action: "restore-failed-will-retry", detail: rollback.reason };
+    const liveHash = tableContentHash(tryReadLiveTable(adoptDeps));
+    if (liveHash !== intent.candidateHash) {
+      const stillCurrent = assertStillCurrentOrDefer();
+      if (stillCurrent !== true) return stillCurrent;
+      saveAdoptionIntent(dataDir, {
+        ...intent,
+        status: "aborted",
+        abortedAt: now,
+        abortReason: `canary had passed but the live table (${liveHash}) no longer matches the intent's candidate (${intent.candidateHash}) — refusing to register a watch record for content that is no longer live`,
+      });
+      return { action: "aborted", detail: "table-changed-after-canary" };
     }
 
-    saveAdoptionIntent(dataDir, {
-      ...intent,
-      status: "aborted",
-      abortedAt: now,
-      abortReason: `crashed before canary confirmation (phase: ${intent.phase}) — restored (${rollback.restoredHash})`,
+    // Round 4 finding 8: dedupe by THIS intent's id, never by candidateHash alone — two different
+    // intents can legitimately share a candidate hash (e.g. two ticks that each adopt identical bytes
+    // for the axis), and conflating them would wrongly skip opening a genuine new watch window.
+    const existing = loadWatchdogState(dataDir).records.find((r) => r.intentId === intent.id);
+    if (existing) {
+      const stillCurrent = assertStillCurrentOrDefer();
+      if (stillCurrent !== true) return stillCurrent;
+      saveAdoptionIntent(dataDir, { ...intent, status: "finalized", finalizedAt: now, watchRecordId: existing.id });
+      return { action: "finalized-existing-watch-record", detail: existing.id };
+    }
+
+    const record = recordAdoptionForWatch({
+      dataDir,
+      adoptedAt: intent.createdAt,
+      candidateHash: intent.candidateHash,
+      decisionRef: intent.decisionRef,
+      approvedBy: intent.approvedBy,
+      changedTaskTypes: [intent.taskType],
+      priorRaw: intent.priorRaw,
+      provenance: { kind: "autonomy", tier: intent.tier },
+      intentId: intent.id,
+      leaseToken: lockHandle.token,
     });
-    return { action: "aborted", detail: intent.phase };
+    const stillCurrent = assertStillCurrentOrDefer();
+    if (stillCurrent !== true) return stillCurrent;
+    saveAdoptionIntent(dataDir, { ...intent, status: "finalized", finalizedAt: now, watchRecordId: record.id });
+    return { action: "finalized-new-watch-record", detail: record.id };
+  } finally {
+    lockHandle.release();
   }
-
-  const liveHash = tableContentHash(tryReadLiveTable(adoptDeps));
-  if (liveHash !== intent.candidateHash) {
-    saveAdoptionIntent(dataDir, {
-      ...intent,
-      status: "aborted",
-      abortedAt: now,
-      abortReason: `canary had passed but the live table (${liveHash}) no longer matches the intent's candidate (${intent.candidateHash}) — refusing to register a watch record for content that is no longer live`,
-    });
-    return { action: "aborted", detail: "table-changed-after-canary" };
-  }
-
-  // Round 4 finding 8: dedupe by THIS intent's id, never by candidateHash alone — two different
-  // intents can legitimately share a candidate hash (e.g. two ticks that each adopt identical bytes
-  // for the axis), and conflating them would wrongly skip opening a genuine new watch window.
-  const existing = loadWatchdogState(dataDir).records.find((r) => r.intentId === intent.id);
-  if (existing) {
-    saveAdoptionIntent(dataDir, { ...intent, status: "finalized", finalizedAt: now, watchRecordId: existing.id });
-    return { action: "finalized-existing-watch-record", detail: existing.id };
-  }
-
-  const record = recordAdoptionForWatch({
-    dataDir,
-    adoptedAt: intent.createdAt,
-    candidateHash: intent.candidateHash,
-    decisionRef: intent.decisionRef,
-    approvedBy: intent.approvedBy,
-    changedTaskTypes: [intent.taskType],
-    priorRaw: intent.priorRaw,
-    provenance: { kind: "autonomy", tier: intent.tier },
-    intentId: intent.id,
-  });
-  saveAdoptionIntent(dataDir, { ...intent, status: "finalized", finalizedAt: now, watchRecordId: record.id });
-  return { action: "finalized-new-watch-record", detail: record.id };
 }
 
 // ─── Statistical sufficiency (§2: conservative CI lower bound beats incumbent by δ at n>=N) ──────
@@ -993,14 +1062,30 @@ export function applyLadderEnablement(
   };
 }
 
-/** Tier-1 revert rate (breaches / autonomous adoptions) from the SAME durable watchdog records —
- *  no new accounting. Uses the STRICT `countsTowardAutonomousHealthStats` predicate (round 3
- *  finding 6: an ambiguous legacy record must never inflate OR deflate this health signal). Zero
- *  adoptions so far reads as 0 (no evidence of failure), not a refusal. */
-export function computeAutonomousRevertRate(records: readonly AdoptionWatchRecord[]): number {
-  const auto = records.filter((r) => countsTowardAutonomousHealthStats(r));
-  if (auto.length === 0) return 0;
-  return auto.filter((r) => r.status === "breach").length / auto.length;
+/**
+ * Tier-1 revert rate (breaches / RESOLVED autonomous adoptions) from the SAME durable watchdog
+ * records — no new accounting. Uses the STRICT `countsTowardAutonomousHealthStats` predicate
+ * (round 3 finding 6: an ambiguous legacy record must never inflate OR deflate this health signal).
+ * Zero (resolved, in-tenure) adoptions so far reads as 0 (no evidence of failure), not a refusal.
+ *
+ * Round 5 finding 4, two refinements over the round-4 version:
+ *   - The denominator (and numerator) now excludes `"pending"`/`"inconclusive"` records — a watch
+ *     window that has not finished yet (or ended without a clean verdict) is NOT evidence of health,
+ *     and counting it in the denominator diluted a genuine breach rate with unresolved noise.
+ *   - `tenureStartIso` scopes both to the CURRENT Tier-1 tenure (`TierState.tier1EnteredAt`) — a
+ *     record adopted during a PRIOR tenure (before a demotion sent the system back to Tier 1) must
+ *     never count toward re-earning Tier 2 again. `null` means "no cutoff" (legacy state / never
+ *     yet promoted — see `TierState.tier1EnteredAt`'s own doc comment).
+ */
+export function computeAutonomousRevertRate(records: readonly AdoptionWatchRecord[], tenureStartIso: string | null = null): number {
+  const resolvedInTenure = records.filter(
+    (r) =>
+      countsTowardAutonomousHealthStats(r) &&
+      (r.status === "healthy" || r.status === "breach") &&
+      (tenureStartIso === null || Date.parse(r.adoptedAt) >= Date.parse(tenureStartIso))
+  );
+  if (resolvedInTenure.length === 0) return 0;
+  return resolvedInTenure.filter((r) => r.status === "breach").length / resolvedInTenure.length;
 }
 
 /**
@@ -1011,11 +1096,17 @@ export function computeAutonomousRevertRate(records: readonly AdoptionWatchRecor
  * A revert-rate ceiling alone therefore cannot distinguish "Tier 1 has actually been exercised and
  * proven safe" from "Tier 1 has never mutated anything yet, so of course nothing reverted." This
  * checks for real, resolved, POSITIVE evidence: at least one autonomous Tier-1 adoption whose watch
- * window actually completed healthy (`status === "healthy"`, not still `"pending"`).
+ * window actually completed healthy (`status === "healthy"`, not still `"pending"`), scoped to the
+ * CURRENT Tier-1 tenure (round 5 finding 4 — same `tenureStartIso` rationale as the revert rate
+ * above: evidence from a tenure a demotion already ended must not count toward re-earning Tier 2).
  */
-function hasResolvedHealthyAutonomousTier1Adoption(records: readonly AdoptionWatchRecord[]): boolean {
+function hasResolvedHealthyAutonomousTier1Adoption(records: readonly AdoptionWatchRecord[], tenureStartIso: string | null): boolean {
   return records.some(
-    (r) => r.provenance?.kind === "autonomy" && r.provenance.tier === 1 && r.status === "healthy"
+    (r) =>
+      r.provenance?.kind === "autonomy" &&
+      r.provenance.tier === 1 &&
+      r.status === "healthy" &&
+      (tenureStartIso === null || Date.parse(r.adoptedAt) >= Date.parse(tenureStartIso))
   );
 }
 
@@ -1050,12 +1141,16 @@ function maybePromote(
       toTier: 1,
       reason: `${policy.tier1UnlockCycles} consecutive healthy cycles reached — unlocking Tier 1 (verifier-backed auto-adopt)`,
     };
-    return { state: { ...state, tier: 1, consecutiveHealthyCycles: 0, consecutiveGoCycles: 0, lastEvent: event }, event };
+    // Round 5 finding 4: this is the start of a NEW Tier-1 tenure — its evidence epoch begins now.
+    return {
+      state: { ...state, tier: 1, consecutiveHealthyCycles: 0, consecutiveGoCycles: 0, lastEvent: event, tier1EnteredAt: now },
+      event,
+    };
   }
 
   if (state.tier === 1) {
     if (state.consecutiveGoCycles < policy.tier1UnlockCycles || tier1RevertRate > policy.tier2RevertRateMax) return null;
-    if (!hasResolvedHealthyAutonomousTier1Adoption(watchdogRecords)) return null; // round 4 finding 7
+    if (!hasResolvedHealthyAutonomousTier1Adoption(watchdogRecords, state.tier1EnteredAt)) return null; // round 4 finding 7, tenure-scoped (round 5 finding 4)
     const event: TierEvent = {
       schemaVersion: 1,
       at: now,
@@ -1274,7 +1369,16 @@ export interface AutonomyTickReport {
   axisEvaluations: AxisEvaluation[];
   adopted: AutonomyAdoptionOutcome[];
   standingProposal: StandingProposalRecord | null;
+  /** DERIVED display/back-compat field: `cycleOutcome !== "unhealthy"` — see `cycleOutcome` for the
+   *  real three-way signal (round 5 follow-up: this used to be the ONLY signal, which meant a
+   *  "neutral" tick — every eligible axis refused pre-write — read identically to a genuinely
+   *  healthy one; round 4 finding 6 fixed the STREAK gating, this follow-up fixes the REPORT). */
   healthyCycle: boolean;
+  /** Round 4 finding 6: the three-way cycle outcome that actually gates the promotion streaks —
+   *  `"advancing"` (genuine no-op/ineligible-tier/completed-adoption cycle — advances the streaks),
+   *  `"neutral"` (eligible axes existed but every one was refused pre-write — advances/resets
+   *  nothing), or `"unhealthy"` (a real failure signal — resets the streaks). */
+  cycleOutcome: "advancing" | "neutral" | "unhealthy";
   /** Round 4 finding 10: non-fatal observability warnings (e.g. a corrupt anchored-enablement
    *  record, or a stale one that failed to revoke) — never gates any in-tick decision. */
   warnings: string[];
@@ -1398,6 +1502,11 @@ export async function runAutonomyTick(
         lastCycleAt: now,
         lastEvent: event,
         ackedBreachIds: nextAcked,
+        // Round 5 finding 4: landing BACK on Tier 1 (from Tier 2) starts a NEW tenure — its own
+        // evidence epoch, discarding any prior tenure's revert-rate/healthy-adoption evidence.
+        // Demoting further, to Tier 0, leaves tier1EnteredAt untouched (irrelevant there; the next
+        // 0->1 promotion sets a fresh one).
+        ...(toTier === 1 ? { tier1EnteredAt: now } : {}),
       };
       tierEvent = event;
     } else {
@@ -1622,7 +1731,7 @@ export async function runAutonomyTick(
       // 4b. Finding 2 (round 3): the exclusive mutation lock, shared with the human
       // `routing-lifecycle-cli.ts adopt` path — refuses (does not consume the slot) rather than
       // racing a concurrent writer between this recheck and the write below.
-      let lockHandle: { release: () => void };
+      let lockHandle: ReturnType<typeof acquireMutationLock>;
       try {
         lockHandle = acquireMutationLock(deps.dataDir);
       } catch (err) {
@@ -1678,7 +1787,48 @@ export async function runAutonomyTick(
         saveAdoptionIntent(deps.dataDir, intent);
         const instrumentedDeps = instrumentAdoptDepsForIntent(deps.adoptDeps, deps.dataDir, intentId);
 
-        const outcome = await adoptRoutingTable(axisArtifact, approval, instrumentedDeps, { verifiedPriorRaw: liveRawNow });
+        let outcome: Awaited<ReturnType<typeof adoptRoutingTable>>;
+        try {
+          // Round 5 finding 1 (+ follow-up): fencing enforced AT THE RESOURCE (re-verified inside
+          // adoptRoutingTable immediately before the write, not only here at acquire) and a
+          // defensive no-IO hash cross-check on the verifiedPriorRaw this call threads through.
+          outcome = await adoptRoutingTable(axisArtifact, approval, instrumentedDeps, {
+            verifiedPriorRaw: liveRawNow,
+            verifiedPriorRawHash: baselineHash,
+            leaseContext: { dataDir: deps.dataDir, token: lockHandle.token },
+          });
+        } catch (err) {
+          if (!(err instanceof MutationLockStaleError)) throw err;
+          // The fencing check fired BEFORE any write — nothing was written, so this is a clean
+          // pre-write refusal (like the lock-busy/table-changed-since-baseline refusals above),
+          // NOT an attempted-and-failed mutation: never consumes the tick's mutation slot, and the
+          // rotation tries the next eligible axis. Best-effort mark the (never-written) intent
+          // aborted so it does not linger as "planned"/pending forever.
+          const current = loadAdoptionIntent(deps.dataDir);
+          if (current && current.id === intentId) {
+            try {
+              assertLeaseCurrent(deps.dataDir, lockHandle.token);
+              saveAdoptionIntent(deps.dataDir, {
+                ...current,
+                status: "aborted",
+                abortedAt: deps.nowIso(),
+                abortReason: `mutation lease went stale mid-operation before any write occurred (fencing check failed) — no rollback needed, nothing was written: ${err.message}`,
+              });
+            } catch (fencingErr) {
+              if (!(fencingErr instanceof MutationLockStaleError)) throw fencingErr;
+              // Still stale for this save too — leave it "planned"/pending; the NEXT tick's
+              // reconcileAdoptionIntent picks it up under a fresh lease (a no-op restore, since
+              // nothing was ever written for this intent).
+            }
+          }
+          axisEvalByType.set(taskType, {
+            ...evalRecord,
+            eligible: false,
+            reasons: [...evalRecord.reasons, `mutation-lease-went-stale-mid-operation: ${err.message}`],
+          });
+          continue;
+        }
+
         let watchRecord: AdoptionWatchRecord | undefined;
         if (outcome.outcome === "adopted") {
           // Round 4 finding 11: phase "canary-passed" was ALREADY persisted synchronously via
@@ -1694,15 +1844,24 @@ export async function runAutonomyTick(
             priorRaw: liveRawNow,
             provenance: { kind: "autonomy", tier: tierState.tier },
             intentId,
+            leaseToken: lockHandle.token,
           });
           const finalIntent = loadAdoptionIntent(deps.dataDir);
           if (finalIntent && finalIntent.id === intentId) {
-            saveAdoptionIntent(deps.dataDir, {
-              ...finalIntent,
-              status: "finalized",
-              finalizedAt: deps.nowIso(),
-              watchRecordId: watchRecord.id,
-            });
+            try {
+              // Round 5 finding 1: fencing check before the intent-journal finalize write.
+              assertLeaseCurrent(deps.dataDir, lockHandle.token);
+              saveAdoptionIntent(deps.dataDir, {
+                ...finalIntent,
+                status: "finalized",
+                finalizedAt: deps.nowIso(),
+                watchRecordId: watchRecord.id,
+              });
+            } catch (fencingErr) {
+              if (!(fencingErr instanceof MutationLockStaleError)) throw fencingErr;
+              // Leave "pending" at phase "canary-passed" — reconcileAdoptionIntent's next-tick call
+              // matches the EXISTING watch record by intentId and finalizes it then.
+            }
           }
         } else {
           // Finding 4 (round 1): a write/reload/rollback/canary failure is NOT a healthy cycle.
@@ -1710,12 +1869,20 @@ export async function runAutonomyTick(
           mutationAttemptFailed = true;
           const current = loadAdoptionIntent(deps.dataDir);
           if (current && current.id === intentId) {
-            saveAdoptionIntent(deps.dataDir, {
-              ...current,
-              status: "aborted",
-              abortedAt: deps.nowIso(),
-              abortReason: `adoptRoutingTable outcome: ${outcome.outcome}`,
-            });
+            try {
+              assertLeaseCurrent(deps.dataDir, lockHandle.token);
+              saveAdoptionIntent(deps.dataDir, {
+                ...current,
+                status: "aborted",
+                abortedAt: deps.nowIso(),
+                abortReason: `adoptRoutingTable outcome: ${outcome.outcome}`,
+              });
+            } catch (fencingErr) {
+              if (!(fencingErr instanceof MutationLockStaleError)) throw fencingErr;
+              // Leave "pending" — reconcileAdoptionIntent's next-tick call handles the restore
+              // under a fresh lease (adoptRoutingTable's own internal rollback already ran, so this
+              // is a redundant-but-harmless re-check, never a second real divergent write).
+            }
           }
         }
         adopted.push({ taskType, outcome, watchRecord });
@@ -1794,7 +1961,9 @@ export async function runAutonomyTick(
   // (finding 4, round 3) — see `maybePromote`'s own doc comment.
   if (!killSwitchActive && !tierEvent) {
     const watchdogRecordsForPromotion = loadWatchdogState(deps.dataDir).records;
-    const revertRate = computeAutonomousRevertRate(watchdogRecordsForPromotion);
+    // Round 5 finding 4: both scoped to the CURRENT Tier-1 tenure (tierState.tier1EnteredAt) — see
+    // computeAutonomousRevertRate's and hasResolvedHealthyAutonomousTier1Adoption's own doc comments.
+    const revertRate = computeAutonomousRevertRate(watchdogRecordsForPromotion, tierState.tier1EnteredAt);
     const promotion = maybePromote(tierState, now, policy, deps.dataDir, deps.decisionRef, revertRate, watchdogRecordsForPromotion);
     if (promotion) {
       tierEvent = promotion.event;
@@ -1869,6 +2038,7 @@ export async function runAutonomyTick(
     adopted,
     standingProposal,
     healthyCycle,
+    cycleOutcome,
     warnings,
   };
 }

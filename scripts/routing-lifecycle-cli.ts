@@ -67,7 +67,7 @@
  *        no auto-revert/quarantine write. Absent/anything else = acting ENABLED — fail-closed here
  *        means REVERTING to the known-good snapshot, the safe direction, not refusing to.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -415,6 +415,12 @@ export function buildAdoptDeps(args: string[], config: HomeserverConfig, tablePa
     servableModelIdsAfterReload: () => loadServableModelIds(),
     nowIso: () => new Date().toISOString(),
     currentPolicyEpochHash: policyEpochHash(config.policy),
+    // Round 5 finding 6a: without this, `deleteTableAndReload` (autonomy-controller.ts's
+    // reconcileAdoptionIntent, undoing a first-ever adoption that crashed before canary
+    // confirmation) always reported `restoreWriteOk: false` in PRODUCTION — the restore path was
+    // wired end-to-end but never actually able to complete, looping "restore-failed-will-retry"
+    // forever instead of ever resolving.
+    deleteTable: (p) => unlinkSync(p),
   };
 }
 
@@ -592,10 +598,39 @@ async function cmdAdopt(args: string[]): Promise<void> {
 
 // ─── rollback (documented manual command) ────────────────────────────────────────
 
+/**
+ * Round 5 finding 5: `rollback` mutates the SAME production routing table `adopt`/the autonomy
+ * controller do — it MUST take the same exclusive mutation lease, never bypass it (this command's
+ * whole purpose is emergency recovery, but racing a concurrent `adopt`/autonomous tick would make
+ * things worse, not better). Since this is the one command an operator invokes BY HAND in an actual
+ * emergency, a bare immediate refusal on transient contention is poor ergonomics — retry briefly
+ * (a few short attempts) before giving up with a clear, actionable message. Never proceeds without
+ * holding the lease.
+ */
+export async function acquireMutationLockWithBriefRetry(
+  dataDir: string,
+  opts: { attempts?: number; delayMs?: number } = {}
+): Promise<ReturnType<typeof acquireMutationLock>> {
+  const attempts = opts.attempts ?? 3;
+  const delayMs = opts.delayMs ?? 500;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return acquireMutationLock(dataDir);
+    } catch (err) {
+      if (!(err instanceof MutationLockBusyError)) throw err;
+      lastErr = err;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
 async function cmdRollback(args: string[]): Promise<void> {
   const snapshotPath = readFlag(args, "--snapshot");
   const reason = readFlag(args, "--reason") ?? "manual rollback (scripts/routing-lifecycle-cli.ts rollback)";
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
+  const dataDir = resolveDataDir(args);
   if (!snapshotPath) {
     process.stderr.write("rollback requires --snapshot <path-to-exact-prior-table.json>\n");
     process.exitCode = 2;
@@ -605,7 +640,30 @@ async function cmdRollback(args: string[]): Promise<void> {
   const config = loadConfig();
   const deps = buildAdoptDeps(args, config, tablePath);
 
-  const record = await manualRollback({ deps, snapshotRaw, reason });
+  let lockHandle: { release: () => void };
+  try {
+    lockHandle = await acquireMutationLockWithBriefRetry(dataDir);
+  } catch (err) {
+    if (err instanceof MutationLockBusyError) {
+      process.stderr.write(
+        `rollback refused: ${err.message}\n` +
+          `The mutation lease is still held after retrying — this command NEVER bypasses it (racing a\n` +
+          `concurrent adopt/autonomous tick would make an emergency worse, not better). Wait for the\n` +
+          `current holder to finish (or, if it is genuinely stuck, let it go stale — see\n` +
+          `DEFAULT_MUTATION_LOCK_STALE_AFTER_MS) and re-run.\n`
+      );
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+
+  let record: Awaited<ReturnType<typeof manualRollback>>;
+  try {
+    record = await manualRollback({ deps, snapshotRaw, reason });
+  } finally {
+    lockHandle.release();
+  }
   process.stdout.write(JSON.stringify(record, null, 2) + "\n");
   process.stderr.write(`ROLLED BACK to ${snapshotPath} (reload ${record.reloadOk ? "ok" : "FAILED"})\n`);
   process.exitCode = record.reloadOk ? 0 : 1;

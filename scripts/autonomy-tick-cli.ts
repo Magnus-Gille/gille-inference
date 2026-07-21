@@ -183,7 +183,7 @@ async function main(): Promise<void> {
       `${report.tierEvent ? ` (${report.tierEvent.kind}: ${report.tierEvent.reason})` : ""}\n`
   );
   process.stderr.write(
-    `  kill-switch: ${report.killSwitchActive ? "ON (no adopt/promote)" : "off"}${dryRun ? " | DRY-RUN (zero mutation)" : ""} | healthy-cycle: ${report.healthyCycle}\n`
+    `  kill-switch: ${report.killSwitchActive ? "ON (no adopt/promote)" : "off"}${dryRun ? " | DRY-RUN (zero mutation)" : ""} | cycle: ${report.cycleOutcome} (healthy-cycle: ${report.healthyCycle})\n`
   );
   process.stderr.write(`  watch: ${report.watch.items.length} window(s) evaluated\n`);
   for (const warning of report.warnings) {
