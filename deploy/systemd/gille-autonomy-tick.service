@@ -1,0 +1,19 @@
+# TEMPLATE, not a live unit file: @@REMOTE_DIR@@ is substituted with the actual, just-verified
+# deploy path by scripts/deploy-gateway.sh's install_user_units() at install time (sed, run on the
+# remote). This file, as committed, is never installed or loaded verbatim -- the rendered copy
+# lives at $HOME/.config/systemd/user/gille-autonomy-tick.service on the box. Hardcoding a real
+# path here would bypass the deploy script's own WorkingDirectory guard (verify_path_match) the
+# moment the live path ever changes (review finding, gi#49).
+[Unit]
+Description=gille autonomy controller tick (gi#49)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@@REMOTE_DIR@@
+# Absolute interpreter path, not `/usr/bin/env npx` -- npx's resolution depends on the invoking
+# shell's PATH (nvm/asdf/SSH-login-shell shims), which the systemd --user manager does not
+# necessarily share (it does not run as, or inherit the PATH of, an interactive login shell).
+# This is the exact same tsx binary home-gateway.service's own ExecStart already runs from the
+# same WorkingDirectory -- install_user_units() checks it is present and executable (reusing the
+# issue #30 preflight idiom) before ever enabling this timer.
+ExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/autonomy-tick-cli.ts

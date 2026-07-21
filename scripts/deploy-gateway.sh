@@ -24,8 +24,12 @@ set -euo pipefail
 #             WorkingDirectory, seed docs/m5-routing.json copy-if-absent (never clobbering an
 #             adopted table — issue #44), restart the unit only if the payload actually changed
 #             (gated by an interpreter preflight — issue #30), probe local + tailnet health plus
-#             an authenticated capability check, and stamp .deployed-commit with the exact 40-char
-#             SHA ONLY after every check passes.
+#             an authenticated capability check, and — only once ALL of that has passed — render
+#             and enable the repo-managed user-scope gille-autonomy-tick.timer (gi#49;
+#             deploy/systemd/*.{service,timer}, mirrors hugin's in-repo-units convention; armed
+#             LAST, immediately before the marker write, so a Persistent=true catch-up tick can
+#             never fire against a gateway that is still mid-restart), then stamp
+#             .deployed-commit with the exact 40-char SHA ONLY after every check passes.
 #   verify    Read-only. Reports the marker commit plus a content spot-check against the local
 #             tree. Never touches rsync, the unit, or the marker.
 #   dry-run   Prints the exact plan (path check, rsync command, restart decision, probes) without
@@ -47,9 +51,17 @@ set -euo pipefail
 #   - refuses to restart the unit if the ExecStart interpreter is missing/non-executable after
 #     install — the exact failure mode of `npm ci --omit=dev` stripping the tsx runtime
 #     dependency (issue #30) — instead of restarting into a crash-loop;
-#   - writes the new marker as the LAST step, only once rsync, install, the interpreter preflight,
-#     restart-if-needed, local health (best-effort), tailnet health, and the authenticated
-#     capability probe have all succeeded.
+#   - renders gille-autonomy-tick.timer's WorkingDirectory/ExecStart against the ACTUAL verified
+#     $remote_dir (never a hardcoded path), refuses to arm it if its tsx interpreter is missing,
+#     and refuses to arm it if the account isn't (and can't be made) lingering — a failure at any
+#     of those gates is a hard deploy ERROR (gi#49), not a silent skip, because an un-enabled or
+#     non-lingering timer means the autonomy controller silently stops ticking;
+#   - arms that timer LAST, strictly after restart-if-needed and every health/capability probe
+#     have already succeeded, so a Persistent=true catch-up tick can never fire against a gateway
+#     that is still mid-restart;
+#   - writes the new marker as the truly final step, only once rsync, install, the interpreter
+#     preflight, restart-if-needed, local health (best-effort), tailnet health, the authenticated
+#     capability probe, and the autonomy-tick timer render/enable have all succeeded.
 #
 # Test seam (see tests/deploy-gateway.test.ts): every "remote" step is issued through
 # remote_run(), which resolves an overridable env var to a command string and executes it via
@@ -322,6 +334,96 @@ preflight_interpreter() {
   echo "  OK: ExecStart interpreter present and executable ($exec_path)"
 }
 
+# Install/enable the repo-managed user-scope systemd units (gi#49: the daily autonomy-controller
+# tick, docs: deploy/systemd/gille-autonomy-tick.{service,timer}) — mirrors hugin's convention of
+# keeping unit files in-repo as IaC rather than hand-authored on the box. Called from cmd_deploy
+# ONLY after rsync, install, restart-if-needed, local/tailnet health, and the capability probe have
+# ALL already succeeded (see the call site) — arming the timer any earlier risks a Persistent=true
+# catch-up tick firing against a gateway that is mid-restart. Five sub-steps, each fail-closed:
+#
+#   1. Render + copy: deploy/systemd/gille-autonomy-tick.service is a TEMPLATE (placeholder
+#      @@REMOTE_DIR@@, never a real path) — a hardcoded WorkingDirectory/ExecStart in the
+#      committed file would bypass this very script's own path guard (verify_path_match) the
+#      moment the live WorkingDirectory ever changes. This step substitutes the ACTUAL, just-
+#      verified $remote_dir via sed into the installed copy under $HOME/.config/systemd/user/, so
+#      the running unit always points at the tree this deploy just verified and shipped. The main
+#      rsync already put the template at "$remote_dir/deploy/systemd/*.{service,timer}" (that path
+#      is not in RSYNC_EXCLUDES); the .timer has no path to substitute and is copied verbatim.
+#      Deliberately kept separate from step 2's daemon-reload (its own override var) so tests can
+#      exercise the real file-substitution logic without depending on a real `systemctl` being
+#      present at all (e.g. under macOS or a container with no systemd --user session).
+#   2. Daemon-reload, now that the (possibly new/changed) unit files are in place.
+#   3. Interpreter existence check: reuses the EXACT same idiom (and override var,
+#      DEPLOY_INTERPRETER_CHECK_CMD) as preflight_interpreter's issue #30 check above, against the
+#      identical binary ("$remote_dir/node_modules/.bin/tsx" — the ExecStart no longer goes through
+#      `/usr/bin/env npx`, which can silently resolve differently, or not at all, under the
+#      systemd --user manager's PATH vs. an interactive SSH PATH/nvm/asdf shim).
+#   4. Lingering check: `systemctl --user enable --now` succeeding over THIS ssh/local session
+#      proves nothing once the session ends — without lingering enabled for the account, the user
+#      manager (and every unit in it, including this timer) is torn down at logout, and the 05:30
+#      tick silently never fires even though the deploy already stamped success. Attempts the
+#      (usually unprivileged) `loginctl enable-linger` first; if the account still isn't lingering
+#      afterward, fails closed with the exact remediation command rather than certifying a timer
+#      that will never actually run unattended.
+#   5. Enable + start: only once 1-4 have all succeeded.
+#
+# Every sub-step is routed through remote_run (its own override var) so tests can stub each
+# independently, exactly like every other remote step in this script.
+install_user_units() {
+  local remote_dir="$1"
+  local tsx_path="$remote_dir/node_modules/.bin/tsx"
+
+  # 1. Render (substitute @@REMOTE_DIR@@ -> $remote_dir) + copy. `\$HOME` below is deliberate:
+  # within this double-quoted string, backslash-dollar collapses to a literal, unescaped `$HOME`
+  # in the assembled command, which must be expanded by the remote/local shell that actually
+  # EXECUTES it (where $HOME is meaningful) — never by this script's own shell substituting a
+  # path resolved against the wrong box/session. Do not single-quote it.
+  if ! remote_run DEPLOY_UNITS_RENDER_CMD \
+    "mkdir -p \$HOME/.config/systemd/user && sed 's|@@REMOTE_DIR@@|$remote_dir|g' '$remote_dir/deploy/systemd/gille-autonomy-tick.service' > \$HOME/.config/systemd/user/gille-autonomy-tick.service && cp '$remote_dir/deploy/systemd/gille-autonomy-tick.timer' \$HOME/.config/systemd/user/gille-autonomy-tick.timer"; then
+    echo "ERROR: failed to render/install gille-autonomy-tick unit files (gi#49) -- refusing to" >&2
+    echo "       certify deployment with the autonomy-tick units possibly missing/stale." >&2
+    return 1
+  fi
+
+  # 2. Daemon-reload, now that the (possibly new/changed) unit files are in place.
+  if ! remote_run DEPLOY_UNITS_RELOAD_CMD "systemctl --user daemon-reload"; then
+    echo "ERROR: 'systemctl --user daemon-reload' failed after installing gille-autonomy-tick" >&2
+    echo "       unit files (gi#49) -- refusing to certify deployment with a stale user manager." >&2
+    return 1
+  fi
+
+  # 3. Interpreter existence check (issue #30 idiom reused verbatim).
+  if ! remote_run DEPLOY_INTERPRETER_CHECK_CMD "test -x '$tsx_path'"; then
+    echo "ERROR: gille-autonomy-tick.timer's tsx interpreter ($tsx_path) is missing or not" >&2
+    echo "       executable -- refusing to enable the timer (gi#49)." >&2
+    return 1
+  fi
+
+  # 4. Lingering check. The whole pipeline's exit status is the final `loginctl show-user` check,
+  # so this is TRUE iff the account ends up lingering, regardless of whether enable-linger itself
+  # was needed/succeeded. No local variables to substitute -- entirely remote-side, hence the
+  # single-quoted literal (verbatim $ signs, no local expansion).
+  # shellcheck disable=SC2016 # intentional: expands on the REMOTE/local-test-seam shell that runs
+  # this string via remote_exec, not this script's own shell -- same idiom as \$HOME above.
+  if ! remote_run DEPLOY_LINGER_CHECK_CMD \
+    'u="$(id -un)"; loginctl show-user "$u" --property=Linger 2>/dev/null | grep -q "^Linger=yes$" || loginctl enable-linger "$u" >/dev/null 2>&1; loginctl show-user "$u" --property=Linger 2>/dev/null | grep -q "^Linger=yes$"'; then
+    echo "ERROR: user lingering is not enabled for this account -- gille-autonomy-tick.timer would" >&2
+    echo "       be torn down at SSH/session logout and the 05:30 tick would never fire unattended." >&2
+    echo "       Run on the box, then re-run this deploy:" >&2
+    echo "         loginctl enable-linger \$(id -un)" >&2
+    return 1
+  fi
+
+  # 5. Arm the timer. `enable --now` is idempotent -- a no-op on an already-enabled, already-
+  # running timer -- so this is safe to run unconditionally on every deploy.
+  if ! remote_run DEPLOY_UNITS_ENABLE_CMD "systemctl --user enable --now gille-autonomy-tick.timer"; then
+    echo "ERROR: failed to enable gille-autonomy-tick.timer (gi#49) -- refusing to certify" >&2
+    echo "       deployment with the autonomy tick un-enabled." >&2
+    return 1
+  fi
+  echo "  OK: gille-autonomy-tick.timer rendered, interpreter verified, lingering confirmed, and enabled"
+}
+
 # Authenticated capability smoke test. Reads the bearer key from an env var (name configurable
 # via DEPLOY_CAPABILITY_KEY_ENV) and NEVER echoes, logs, or includes it in any printed command —
 # only the resulting HTTP status code is reported. This is the credential-safe authenticated
@@ -371,6 +473,7 @@ cmd_dry_run() {
   echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
   echo "PLAN: probe tailnet health at ${DEPLOY_HEALTH_TAILNET_URL:-<unset - required for a real deploy>}"
   echo "PLAN: authenticated capability probe at ${DEPLOY_CAPABILITY_URL:-<unset - required for a real deploy>}"
+  echo "PLAN: LAST, only after every check above passes: render gille-autonomy-tick.service (gi#49) against the verified remote dir, verify its tsx interpreter, confirm/enable user lingering, then 'systemctl --user enable --now gille-autonomy-tick.timer' (idempotent; any failure is a deploy ERROR, no marker)"
   echo "PLAN: write .deployed-commit=$sha only after every step above passes"
 }
 
@@ -475,6 +578,12 @@ cmd_deploy() {
   echo "==> Probing authenticated capability endpoint..."
   probe_capability || return 1
 
+  # Armed LAST, only once restart-if-needed + every health/capability probe above has already
+  # succeeded (review finding: Persistent=true's catch-up semantics mean arming any earlier risks
+  # a missed tick firing against a gateway that is still mid-restart).
+  echo "==> Installing/enabling the gi#49 autonomy-tick user-scope systemd timer..."
+  install_user_units "$remote_dir" || return 1
+
   echo "==> All checks passed -- recording accepted deployment $sha..."
   remote_run DEPLOY_WRITE_MARKER_CMD "printf '%s\n' '$sha' > '$remote_dir/.deployed-commit.tmp' && mv '$remote_dir/.deployed-commit.tmp' '$remote_dir/.deployed-commit'"
   echo "Deployed $sha to $remote_dir."
@@ -501,10 +610,13 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_FORCE_RESTART=1      Restart even if rsync reported no changes
   DEPLOY_DRY_RUN_OFFLINE=1    dry-run only: skip even the read-only WorkingDirectory check
 
-Routing-table seeding (issue #44) and the restart interpreter preflight (issue #30) have no
-operator-facing flags -- they always run as part of `deploy`. Their remote commands are
-overridable for tests the same way every other remote step is (DEPLOY_EXECSTART_PROBE_CMD,
-DEPLOY_INTERPRETER_CHECK_CMD; see tests/deploy-gateway.test.ts).
+Routing-table seeding (issue #44), the restart interpreter preflight (issue #30), and the gi#49
+autonomy-tick user-scope systemd unit render/interpreter-check/lingering-check/enable (armed LAST,
+after every health/capability probe) have no operator-facing flags -- they always run as part of
+`deploy`. Their remote commands are overridable for tests the same way every other remote step is
+(DEPLOY_EXECSTART_PROBE_CMD, DEPLOY_INTERPRETER_CHECK_CMD, DEPLOY_UNITS_RENDER_CMD,
+DEPLOY_UNITS_RELOAD_CMD, DEPLOY_LINGER_CHECK_CMD, DEPLOY_UNITS_ENABLE_CMD; see
+tests/deploy-gateway.test.ts).
 EOF
 }
 
