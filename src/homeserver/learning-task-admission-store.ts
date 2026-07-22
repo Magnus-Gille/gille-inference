@@ -101,6 +101,11 @@ function ensureSchema(db: Database.Database): void {
   initialized.add(db);
 }
 
+/** Eagerly create the durable admission schema (idempotent), before composing larger transactions. */
+export function ensureLearningTaskAdmissionSchema(db: Database.Database = getDb()): void {
+  ensureSchema(db);
+}
+
 function rowToAdmission(row: AdmissionRow): LearningTaskAdmission {
   return {
     admissionRecordId: row.admission_record_id,
@@ -228,6 +233,26 @@ export function getLearningTaskAdmissionByAttempt(
      ORDER BY created_at DESC
      LIMIT 1
   `).get(taskInstanceId, attemptId) as AdmissionRow | undefined;
+  return row === undefined ? null : rowToAdmission(row);
+}
+
+/**
+ * Resolve the exact durable admission row by its server-generated primary key. This is the
+ * authoritative join primitive for other rows that persist an admission reference: callers do
+ * not supply task/attempt fields independently and therefore cannot substitute a compatible-looking
+ * pair from another admitted request.
+ */
+export function getLearningTaskAdmissionById(
+  admissionRecordId: string,
+  db: Database.Database = getDb(),
+): LearningTaskAdmission | null {
+  ensureSchema(db);
+  const row = db.prepare(`
+    SELECT admission_record_id, principal_id, client_id, task_instance_id, attempt_id,
+           request_id, idempotency_key, request_fingerprint, surface, gateway_echo_json
+      FROM learning_task_admissions
+     WHERE admission_record_id = ?
+  `).get(admissionRecordId) as AdmissionRow | undefined;
   return row === undefined ? null : rowToAdmission(row);
 }
 

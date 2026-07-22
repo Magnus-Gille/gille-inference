@@ -8,6 +8,7 @@ import {
 } from "../src/homeserver/learning-task-contract.js";
 import {
   claimLearningTaskAdmission,
+  getLearningTaskAdmissionById,
   getLearningTaskAdmissionByAttempt,
   lookupLearningTaskAdmission,
   releaseLearningTaskAdmission,
@@ -135,6 +136,23 @@ describe("durable LearningTaskContract admission identity", () => {
 
     // A near-miss (right task, wrong attempt id) must not resolve to any row.
     expect(getLearningTaskAdmissionByAttempt(stamp.task_instance_id, "some-other-attempt", db)).toBeNull();
+    db.close();
+  });
+
+  it("resolves only the exact server-generated admission id for ledger binding (#61)", () => {
+    const db = new Database(":memory:");
+    const stamp = parseHuginRequestStamp(requestFixture.learningTaskStamp);
+    const claimed = claimLearningTaskAdmission(candidate(stamp), db);
+    expect(claimed.kind).toBe("claimed");
+    if (claimed.kind !== "claimed") return;
+
+    expect(getLearningTaskAdmissionById(claimed.record.admissionRecordId, db)).toMatchObject({
+      admissionRecordId: claimed.record.admissionRecordId,
+      taskInstanceId: stamp.task_instance_id,
+      attemptId: stamp.attempt_id,
+      surface: "delegate",
+    });
+    expect(getLearningTaskAdmissionById("no-such-admission", db)).toBeNull();
     db.close();
   });
 

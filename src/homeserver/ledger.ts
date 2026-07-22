@@ -12,11 +12,17 @@ import {
   assertAdmissibleEvidenceIdentity,
   evidenceIdentityDisclosure,
   evidenceIdentityHash,
+  evidenceIdentityFromAdmittedStamp,
   findPlaceholderIdentityFields,
   type EvidenceIdentityBundle,
   type EvidenceIdentityDisclosure,
   type EvidenceLane,
 } from "./evidence-identity.js";
+import {
+  ensureLearningTaskAdmissionSchema,
+  getLearningTaskAdmissionById,
+} from "./learning-task-admission-store.js";
+import { jcsCanonicalize, type HuginRequestStamp } from "./learning-task-contract.js";
 import {
   getEvidenceIdentitySnapshot,
   upsertEvidenceIdentitySnapshot,
@@ -105,6 +111,15 @@ export interface DelegationRecord {
    * bundle is rejected here at write time -- see assertAdmissibleEvidenceIdentity.
    */
   evidenceIdentity?: EvidenceIdentityBundle;
+  /**
+   * #61: server-generated id of the authoritative LearningTask admission that owns this row.
+   * `recordDelegation` resolves it inside the ledger transaction, verifies principal + admitted
+   * stamp provenance, and copies the immutable task/attempt pair from that record. Callers cannot
+   * supply those pair fields independently.
+   */
+  learningTaskAdmissionId?: string;
+  /** The exact validated stamp paired with learningTaskAdmissionId; validated but never stored here. */
+  learningTaskStamp?: HuginRequestStamp;
 }
 
 // ─── Verdict ───────────────────────────────────────────────────────────────────
@@ -165,7 +180,10 @@ function ensureSchema(db: Database.Database): void {
       error_class       TEXT,
       escalated         INTEGER NOT NULL DEFAULT 0,
       source            TEXT,
-      notes             TEXT
+      notes             TEXT,
+      learning_task_admission_id TEXT,
+      learning_task_instance_id TEXT,
+      learning_task_attempt_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_deleg_type_model ON delegations(task_type, model_id);
     CREATE INDEX IF NOT EXISTS idx_deleg_ts         ON delegations(ts);
@@ -202,6 +220,13 @@ function ensureSchema(db: Database.Database): void {
     // does not require joining out to evidence_identity_snapshots.
     if (!names.has("evidence_identity_hash")) db.exec(`ALTER TABLE delegations ADD COLUMN evidence_identity_hash TEXT`);
     if (!names.has("evidence_lane")) db.exec(`ALTER TABLE delegations ADD COLUMN evidence_lane TEXT`);
+    // #61: exact content-blind binding from a returned ledgerId to the admitted Hugin attempt.
+    // All three stay NULL on legacy/unstamped rows. New bound writes resolve these values from the
+    // authoritative admission row inside recordDelegation's transaction; callers never provide
+    // the task/attempt strings separately.
+    if (!names.has("learning_task_admission_id")) db.exec(`ALTER TABLE delegations ADD COLUMN learning_task_admission_id TEXT`);
+    if (!names.has("learning_task_instance_id")) db.exec(`ALTER TABLE delegations ADD COLUMN learning_task_instance_id TEXT`);
+    if (!names.has("learning_task_attempt_id")) db.exec(`ALTER TABLE delegations ADD COLUMN learning_task_attempt_id TEXT`);
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -257,13 +282,15 @@ export function recordDelegation(rec: DelegationRecord): string {
         latency_ms, ttft_ms, prompt_tokens, completion_tokens, tok_per_s, verifier,
         error_class, escalated, source, notes,
         gate_mode, gate_score, gate_would_escalate, gate_error, key_alias, shadow,
-        evidence_identity_hash, evidence_lane)
+        evidence_identity_hash, evidence_lane, learning_task_admission_id,
+        learning_task_instance_id, learning_task_attempt_id)
      VALUES
        (@id, @ts, @taskType, @nodeId, @modelId, @promptHash, @promptExcerpt, @outcome, @score,
         @latencyMs, @ttftMs, @promptTokens, @completionTokens, @tokPerSec, @verifier,
         @errorClass, @escalated, @source, @notes,
         @gateMode, @gateScore, @gateWouldEscalate, @gateError, @keyAlias, @shadow,
-        @evidenceIdentityHash, @evidenceLane)`
+        @evidenceIdentityHash, @evidenceLane, @learningTaskAdmissionId,
+        @learningTaskInstanceId, @learningTaskAttemptId)`
   );
 
   // #5 (M5 dogfood review): the snapshot upsert and the row insert are two separate statements —
@@ -271,7 +298,35 @@ export function recordDelegation(rec: DelegationRecord): string {
   // process can never leave a delegations row whose evidence_identity_hash points at a snapshot
   // that was never durably written. It cannot happen the other way around (an orphaned snapshot
   // with no referencing row is harmless), so this is defense-in-depth, not a correctness fix.
-  db.transaction(() => {
+  if (rec.learningTaskAdmissionId !== undefined) ensureLearningTaskAdmissionSchema(db);
+  const writeDelegation = db.transaction(() => {
+    const admission = rec.learningTaskAdmissionId === undefined
+      ? null
+      : getLearningTaskAdmissionById(rec.learningTaskAdmissionId, db);
+    if (rec.learningTaskAdmissionId !== undefined) {
+      if (admission === null) {
+        throw new Error(`delegation references unknown LearningTask admission ${rec.learningTaskAdmissionId}`);
+      }
+      if (admission.surface !== "delegate") {
+        throw new Error("delegation LearningTask binding must reference a delegate admission");
+      }
+      if (rec.keyAlias !== admission.principalId) {
+        throw new Error("delegation LearningTask binding does not match the authenticated principal");
+      }
+      if (rec.evidenceIdentity === undefined) {
+        throw new Error("delegation LearningTask binding requires a non-legacy evidence identity");
+      }
+      if (rec.learningTaskStamp === undefined
+        || jcsCanonicalize(rec.learningTaskStamp) !== jcsCanonicalize(admission.gatewayEcho.echoed_request)) {
+        throw new Error("delegation LearningTask stamp does not match the authoritative admission");
+      }
+      const admittedIdentity = evidenceIdentityFromAdmittedStamp(admission.gatewayEcho.echoed_request);
+      for (const field of Object.keys(admittedIdentity) as Array<keyof typeof admittedIdentity>) {
+        if (jcsCanonicalize(rec.evidenceIdentity[field]) !== jcsCanonicalize(admittedIdentity[field])) {
+          throw new Error(`delegation LearningTask evidence does not match admitted stamp field ${field}`);
+        }
+      }
+    }
     const identityHash =
       rec.evidenceIdentity !== undefined ? upsertEvidenceIdentitySnapshot(rec.evidenceIdentity, ts, db) : null;
     insertRow.run({
@@ -302,8 +357,14 @@ export function recordDelegation(rec: DelegationRecord): string {
       shadow: rec.shadow ? 1 : 0,
       evidenceIdentityHash: identityHash,
       evidenceLane: evidenceLane,
+      learningTaskAdmissionId: admission?.admissionRecordId ?? null,
+      learningTaskInstanceId: admission?.taskInstanceId ?? null,
+      learningTaskAttemptId: admission?.attemptId ?? null,
     });
-  })();
+  });
+  // Acquire the writer lock before resolving the admission so another process cannot remove or
+  // replace authoritative state between validation and the ledger insert (#61).
+  writeDelegation.immediate();
   return id;
 }
 
@@ -1273,6 +1334,23 @@ export interface RecentDelegation {
   shadow: boolean;
 }
 
+export interface DelegationById extends RecentDelegation {
+  /** #5 immutable evidence identity for this exact row; NULL means legacy. */
+  evidenceIdentityHash: string | null;
+  /** #61 explicit binding state. Consumers must accept only "bound" for LearningTask evidence. */
+  learningTaskBinding: "bound" | "legacy" | "invalid";
+  learningTaskAdmissionId: string | null;
+  taskInstanceId: string | null;
+  attemptId: string | null;
+}
+
+interface DelegationByIdRow extends RecentDelegationRow {
+  evidenceIdentityHash: string | null;
+  learningTaskAdmissionId: string | null;
+  taskInstanceId: string | null;
+  attemptId: string | null;
+}
+
 interface RecentDelegationRow {
   id: string;
   ts: string;
@@ -1323,7 +1401,7 @@ export function recentDelegations(limit = 50): RecentDelegation[] {
  * (#217 rejudge) are still resolvable by id — the audit trail stays addressable even after a
  * newer verdict replaces it in evidence-reading queries.
  */
-export function getDelegationById(id: string): RecentDelegation | null {
+export function getDelegationById(id: string): DelegationById | null {
   const db = ledgerDb();
   const row = db
     .prepare(
@@ -1331,13 +1409,24 @@ export function getDelegationById(id: string): RecentDelegation | null {
               latency_ms AS latencyMs, verifier, source, key_alias AS keyAlias,
               gate_mode AS gateMode, gate_score AS gateScore,
               gate_would_escalate AS gateWouldEscalate, gate_error AS gateError,
-              superseded_at AS supersededAt, shadow
+              superseded_at AS supersededAt, shadow,
+              evidence_identity_hash AS evidenceIdentityHash,
+              learning_task_admission_id AS learningTaskAdmissionId,
+              learning_task_instance_id AS taskInstanceId,
+              learning_task_attempt_id AS attemptId
        FROM delegations WHERE id = ?`
     )
-    .get(id) as RecentDelegationRow | undefined;
+    .get(id) as DelegationByIdRow | undefined;
   if (!row) return null;
+  const bindingValues = [row.learningTaskAdmissionId, row.taskInstanceId, row.attemptId];
+  const learningTaskBinding = bindingValues.every((value) => value === null)
+    ? "legacy"
+    : bindingValues.every((value) => value !== null)
+      ? "bound"
+      : "invalid";
   return {
     ...row,
+    learningTaskBinding,
     gateWouldEscalate: row.gateWouldEscalate === null ? null : row.gateWouldEscalate === 1,
     verifierKind: classifyVerifierKind(row.verifier),
     shadow: row.shadow === 1,

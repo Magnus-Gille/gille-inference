@@ -1735,6 +1735,7 @@ async function handleDelegate(
   lctx: LogCtx,
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
+  let learningTaskAdmissionId: string | undefined;
   if (params.learningTaskStamp !== undefined) {
     const stamp = params.learningTaskStamp;
     if (params.learningTaskObservedFingerprint === undefined) {
@@ -1775,6 +1776,7 @@ async function handleDelegate(
         ttftMs: null,
       };
     }
+    learningTaskAdmissionId = claim.record.admissionRecordId;
   }
   const runDelegate = () => delegate({
     prompt: params.prompt,
@@ -1805,6 +1807,7 @@ async function handleDelegate(
     // evidence-identity.ts's evidenceIdentityFromAdmittedStamp and orchestrator.ts's
     // deriveEvidenceIdentity. Undefined for every unstamped request, exactly like the fingerprint.
     learningTaskStamp: params.learningTaskStamp,
+    learningTaskAdmissionId,
   });
   // A stamped claim is the durable "execution may have begun" boundary. delegate() can throw
   // after the upstream model has already answered (for example while persisting its ledger row),

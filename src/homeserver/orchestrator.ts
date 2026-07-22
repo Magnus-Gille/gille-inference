@@ -104,6 +104,8 @@ export interface DelegationTask {
    * — those callers continue to record a null (legacy) evidence identity, never a fabricated one.
    */
   learningTaskStamp?: HuginRequestStamp;
+  /** Server-generated authoritative admission id for the same validated stamp (#61). */
+  learningTaskAdmissionId?: string;
   /**
    * The cloud "smart" model that delegated this task. Used only for cost accounting; callers should
    * pass the real delegator model id so savings can be measured against actual spend avoided.
@@ -851,6 +853,8 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       keyAlias: task.keyAlias,
       notes: [failNote, retryNote].filter(Boolean).join(" | "),
       evidenceIdentity,
+      learningTaskAdmissionId: task.learningTaskAdmissionId,
+      learningTaskStamp: task.learningTaskStamp,
     });
     return attachCostTrace(task, await callFrontier(task, {
       delegated: true,
@@ -959,6 +963,8 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
     gateWouldEscalate: gate?.wouldEscalate ?? null,
     gateError: gate?.secondaryError ?? null,
     evidenceIdentity,
+    learningTaskAdmissionId: task.learningTaskAdmissionId,
+    learningTaskStamp: task.learningTaskStamp,
   });
 
   const decisionReason = gateEscalate

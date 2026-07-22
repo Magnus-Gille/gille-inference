@@ -230,7 +230,8 @@ export const HARVEST_STORE_REGISTRY: readonly HarvestStoreDescriptor[] = [
     policyEpoch: POLICY_EPOCH_2026_07_20,
     purpose:
       "Capability verdict/routing evidence (task_type, model_id, outcome, score, latencies, " +
-      "evidence_identity_hash) — content-blind once prompt_excerpt is redacted. Six-month window.",
+      "evidence_identity_hash, and immutable LearningTask admission/task/attempt ids) — " +
+      "content-blind once prompt_excerpt is redacted. Six-month window.",
   },
 
   // ── task-exposure.ts — task_exposure_events: content-blind fingerprint dedup registry (#257).
