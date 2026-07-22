@@ -1222,6 +1222,146 @@ describe("gateway spine — HTTP integration", () => {
     expect(body.verifier).toBe("tsGate");
   });
 
+  it("#61: a stamped /delegate ledger row resolves to its exact admitted attempt and evidence identity", async () => {
+    const owner = mintKey({
+      alias: `service-hugin-ledger-binding-${randomUUID()}`,
+      tier: "owner",
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const first = await makeStampedDelegateRequest(owner);
+    first.stamp.task_type.id = "memory-decision";
+    first.requestBody.taskType = "memory-decision";
+    const firstDelegate = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(first.requestBody),
+    });
+    expect(firstDelegate.status).toBe(200);
+    const firstResult = await firstDelegate.json() as { ledgerId?: string };
+    expect(firstResult.ledgerId).toBeDefined();
+
+    const second = await makeStampedDelegateRequest(owner);
+    second.stamp.attempt_id = "attempt-2";
+
+    const resolved = await fetch(url(`/ledger/${firstResult.ledgerId}`), {
+      headers: { authorization: `Bearer ${ADMIN}` },
+    });
+    expect(resolved.status).toBe(200);
+    const row = await resolved.json() as Record<string, unknown>;
+    expect(row).toMatchObject({
+      id: firstResult.ledgerId,
+      taskType: first.requestBody.taskType,
+      modelId: "m1",
+      learningTaskBinding: "bound",
+      taskInstanceId: first.stamp.task_instance_id,
+      attemptId: first.stamp.attempt_id,
+    });
+    expect(row.learningTaskAdmissionId).toEqual(expect.any(String));
+    expect(row.evidenceIdentityHash).toMatch(/^sha256:[a-f0-9]{64}$/);
+    // Holding the first ledger id can never silently resolve to the newer task/attempt. Hugin can
+    // fail closed by comparing these exact immutable fields before writing registry evidence.
+    expect(row.taskInstanceId).not.toBe(second.stamp.task_instance_id);
+    expect(row.attemptId).not.toBe(second.stamp.attempt_id);
+    expect(row).not.toHaveProperty("prompt");
+    expect(row).not.toHaveProperty("output");
+
+    const { recordDelegation, reconstructEvidenceIdentity } = await import("../src/homeserver/ledger.js");
+    const snapshot = reconstructEvidenceIdentity(row.evidenceIdentityHash as string);
+    expect(snapshot).not.toBeNull();
+    const rowCountBefore = (getDb().prepare("SELECT COUNT(*) AS count FROM delegations").get() as { count: number }).count;
+    const baseRecord = {
+      taskType: first.requestBody.taskType as string,
+      modelId: "m1",
+      prompt: "not persisted when the binding is invalid",
+      outcome: "unverified" as const,
+      keyAlias: first.principalId,
+      evidenceIdentity: snapshot!.bundle,
+    };
+    expect(() => recordDelegation({
+      ...baseRecord,
+      learningTaskAdmissionId: "no-such-admission",
+      learningTaskStamp: first.stamp as any,
+    })).toThrow(/unknown LearningTask admission/);
+    expect(() => recordDelegation({
+      ...baseRecord,
+      learningTaskAdmissionId: row.learningTaskAdmissionId as string,
+      learningTaskStamp: second.stamp as any,
+    })).toThrow(/stamp does not match/);
+    expect(() => recordDelegation({
+      ...baseRecord,
+      keyAlias: "service:substituted-principal",
+      learningTaskAdmissionId: row.learningTaskAdmissionId as string,
+      learningTaskStamp: first.stamp as any,
+    })).toThrow(/authenticated principal/);
+    const rowCountAfter = (getDb().prepare("SELECT COUNT(*) AS count FROM delegations").get() as { count: number }).count;
+    expect(rowCountAfter).toBe(rowCountBefore);
+  });
+
+  it("#61: an unstamped legacy row exposes an explicit legacy/null binding", async () => {
+    const { recordDelegation } = await import("../src/homeserver/ledger.js");
+    const id = recordDelegation({
+      taskType: "ledger-id-legacy-binding-test",
+      modelId: "m1",
+      prompt: "must remain content-blind",
+      outcome: "unverified",
+    });
+    const res = await fetch(url(`/ledger/${id}`), { headers: { authorization: `Bearer ${ADMIN}` } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      id,
+      evidenceIdentityHash: null,
+      learningTaskBinding: "legacy",
+      learningTaskAdmissionId: null,
+      taskInstanceId: null,
+      attemptId: null,
+    });
+  });
+
+  it("#61: a partially populated binding is explicit invalid and cannot look eligible", async () => {
+    const { recordDelegation } = await import("../src/homeserver/ledger.js");
+    const id = recordDelegation({
+      taskType: "ledger-id-invalid-binding-test",
+      modelId: "m1",
+      prompt: "content stays outside the response",
+      outcome: "unverified",
+    });
+    getDb().prepare(`
+      UPDATE delegations
+         SET learning_task_admission_id = 'dangling-admission'
+       WHERE id = ?
+    `).run(id);
+
+    const res = await fetch(url(`/ledger/${id}`), { headers: { authorization: `Bearer ${ADMIN}` } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      id,
+      evidenceIdentityHash: null,
+      learningTaskBinding: "invalid",
+      learningTaskAdmissionId: "dangling-admission",
+      taskInstanceId: null,
+      attemptId: null,
+    });
+
+    getDb().prepare(`
+      UPDATE delegations
+         SET learning_task_instance_id = 'task-without-evidence',
+             learning_task_attempt_id = 'attempt-without-evidence'
+       WHERE id = ?
+    `).run(id);
+    const missingEvidence = await fetch(url(`/ledger/${id}`), {
+      headers: { authorization: `Bearer ${ADMIN}` },
+    });
+    expect(missingEvidence.status).toBe(200);
+    expect(await missingEvidence.json()).toMatchObject({
+      id,
+      evidenceIdentityHash: null,
+      learningTaskBinding: "invalid",
+      learningTaskAdmissionId: "dangling-admission",
+      taskInstanceId: "task-without-evidence",
+      attemptId: "attempt-without-evidence",
+    });
+  });
+
   it("#227: GET /ledger/:id 404s on an unknown id", async () => {
     const res = await fetch(url("/ledger/no-such-ledger-id"), { headers: { authorization: `Bearer ${ADMIN}` } });
     expect(res.status).toBe(404);

@@ -226,6 +226,14 @@ interface RecentDelegation {
   source: string | null;
   keyAlias: string | null; // authenticated gateway/MCP alias; never a token or key hash
 }
+
+interface DelegationById extends RecentDelegation {
+  evidenceIdentityHash: string | null;
+  learningTaskBinding: "bound" | "legacy" | "invalid";
+  learningTaskAdmissionId: string | null;
+  taskInstanceId: string | null;
+  attemptId: string | null;
+}
 ```
 
 **#233 — format-verified vs truth-verified evidence.** `verifier-classification.ts`'s
@@ -256,7 +264,22 @@ Resolves a single `ledgerId` — `recordDelegation()`'s return value, echoed by 
 has to fall back to timestamp matching against `recent[]`. Same auth gate as `GET /ledger`
 (admin or monitor).
 
-**Response 200:** a single `RecentDelegation` (see above), including `id`.
+**Response 200:** a single `DelegationById` (see above), including `id`. For a stamped
+`POST /delegate` row, `learningTaskBinding:"bound"` means the ledger write resolved the exact
+server-generated admission id inside the same SQLite transaction, verified the authenticated
+principal and complete admitted stamp, and copied the authoritative `taskInstanceId` / `attemptId`
+pair into the row. `evidenceIdentityHash` is the exact non-null evidence identity for that row.
+Consumers must compare all four identities (`taskInstanceId`, `attemptId`, `modelId`, `taskType`)
+plus `evidenceIdentityHash` before treating the result as eligible joined evidence.
+
+Unstamped and pre-migration rows return `learningTaskBinding:"legacy"` with all three binding
+fields explicitly `null`; they cannot be mistaken for eligible stamped evidence. A mechanically
+inconsistent partially-populated historical/corrupt row returns `learningTaskBinding:"invalid"`
+and must also fail closed. New bound writes reject an unknown admission id, a non-delegate
+admission, a different authenticated principal, a cross-task/cross-attempt stamp, a missing
+evidence identity, or evidence fields inconsistent with the admitted stamp before inserting any
+ledger row. The response remains content-blind: it adds no prompt, output, credential, or private
+payload bytes.
 
 **Errors:** unknown `id` → bare `404 not_found` (no enumeration oracle); non-admin/non-monitor key
 → `403 route_not_allowed`; malformed percent-encoding in `{id}` (e.g. a bare `%`) →
