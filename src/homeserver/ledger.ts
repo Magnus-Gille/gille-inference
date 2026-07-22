@@ -1421,7 +1421,7 @@ export function getDelegationById(id: string): DelegationById | null {
   const bindingValues = [row.learningTaskAdmissionId, row.taskInstanceId, row.attemptId];
   const learningTaskBinding = bindingValues.every((value) => value === null)
     ? "legacy"
-    : bindingValues.every((value) => value !== null)
+    : bindingValues.every((value) => value !== null) && row.evidenceIdentityHash !== null
       ? "bound"
       : "invalid";
   return {

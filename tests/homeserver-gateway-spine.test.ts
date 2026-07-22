@@ -1341,6 +1341,25 @@ describe("gateway spine — HTTP integration", () => {
       taskInstanceId: null,
       attemptId: null,
     });
+
+    getDb().prepare(`
+      UPDATE delegations
+         SET learning_task_instance_id = 'task-without-evidence',
+             learning_task_attempt_id = 'attempt-without-evidence'
+       WHERE id = ?
+    `).run(id);
+    const missingEvidence = await fetch(url(`/ledger/${id}`), {
+      headers: { authorization: `Bearer ${ADMIN}` },
+    });
+    expect(missingEvidence.status).toBe(200);
+    expect(await missingEvidence.json()).toMatchObject({
+      id,
+      evidenceIdentityHash: null,
+      learningTaskBinding: "invalid",
+      learningTaskAdmissionId: "dangling-admission",
+      taskInstanceId: "task-without-evidence",
+      attemptId: "attempt-without-evidence",
+    });
   });
 
   it("#227: GET /ledger/:id 404s on an unknown id", async () => {
