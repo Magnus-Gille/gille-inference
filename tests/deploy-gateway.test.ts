@@ -8,6 +8,7 @@ import {
   writeFileSync,
   mkdirSync,
   appendFileSync,
+  chmodSync,
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -490,6 +491,61 @@ describe("scripts/deploy-gateway.sh", () => {
       expect(r.status).toBe(0);
       expect(readFileSync(join(remote, "docs", "m5-routing.json"), "utf8")).toBe(adoptedContent);
       expect(existsSync(join(remote, "docs", "stale-unrelated-file.md"))).toBe(false);
+    });
+  });
+
+  describe("mutable agent-cache residues (issue #65)", () => {
+    it("preserves the approved disposable Aider tag cache without treating it as reviewed payload", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const cacheDir = join(remote, ".aider.tags.cache.v4");
+      mkdirSync(cacheDir, { recursive: true });
+      const cacheMarker = join(cacheDir, "agent-generated-index");
+      writeFileSync(cacheMarker, "");
+
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+
+      expect(r.status).toBe(0);
+      expect(statSync(cacheMarker).isFile()).toBe(true);
+    });
+
+    it("fails closed and leaves no marker when an unexpected residue cannot be deleted", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const fakeBin = tmpDir("dg-bin-");
+      const fakeRsync = join(fakeBin, "rsync");
+      // GNU rsync may temporarily make an owned read-only directory writable during deletion,
+      // so chmod-based fault injection is not portable. This PATH-local stub reproduces rsync's
+      // standard undeletable-residue failure (exit 23) without sudo, chattr, or platform features.
+      writeFileSync(
+        fakeRsync,
+        "#!/bin/sh\n" +
+          "printf '%s\\n' 'rsync: [generator] delete_file: unlink(.unexpected-agent-residue): Permission denied (13)' >&2\n" +
+          "exit 23\n"
+      );
+      chmodSync(fakeRsync, 0o755);
+
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        })
+      );
+
+      expect(r.status).not.toBe(0);
+      expect(r.stdout + r.stderr).toMatch(/unexpected-agent-residue/);
+      expect(r.stdout + r.stderr).toMatch(/could not reconcile the live tree with the reviewed payload/);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
     });
   });
 

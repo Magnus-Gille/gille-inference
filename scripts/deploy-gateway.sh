@@ -124,6 +124,12 @@ fi
 #                     adopted or not — is never touched.
 #   .DS_Store         macOS noise from the operator's laptop.
 #   .claude/ .codex/  local agent-harness scratch, never shipped.
+#   .aider.tags.cache.v4/  approved mutable Aider repo-map/tag cache (issue #65). It is
+#                     disposable agent-cache residue, not gateway runtime state or reviewed
+#                     payload: never copy, inspect, or log it. Preserve exactly this known
+#                     versioned directory to avoid a deploy deleting agent activity mid-run.
+#                     Any other undeletable residue remains unexcluded and makes rsync fail
+#                     before a deployment marker can be written.
 #   dist/             no build step ships to the box today (tsx runs src/ directly); if that ever
 #                     changes, drop this exclude in the same change that adds a build step.
 # rsync's default --delete does NOT remove files matched by an --exclude (that needs the separate
@@ -142,6 +148,7 @@ RSYNC_EXCLUDES=(
   --exclude docs/m5-routing.json
   --exclude .DS_Store
   --exclude .claude/ --exclude .codex/
+  --exclude .aider.tags.cache.v4 --exclude .aider.tags.cache.v4/
   --exclude dist/
 )
 
@@ -557,7 +564,12 @@ cmd_deploy() {
   remote_run DEPLOY_INVALIDATE_MARKER_CMD "rm -f '$remote_dir/.deployed-commit' '$remote_dir/.deployed-commit.tmp'"
 
   echo "==> Syncing to $(rsync_dest)..."
-  rsync_out="$(rsync -a --delete -i "${RSYNC_EXCLUDES[@]}" ./ "$(rsync_dest)")"
+  if ! rsync_out="$(rsync -a --delete -i "${RSYNC_EXCLUDES[@]}" ./ "$(rsync_dest)")"; then
+    echo "ERROR: rsync could not reconcile the live tree with the reviewed payload; refusing to" >&2
+    echo "       install, restart, or certify an ambiguous deployment. Only documented mutable" >&2
+    echo "       state/cache paths may be excluded; inspect unexpected residue out of band." >&2
+    return 1
+  fi
   printf '%s\n' "$rsync_out"
   # rsync -i always itemizes the destination ROOT directory (typically ".d..t.... ./", an
   # attribute/timestamp-only line) even when nothing inside changed, so a naive "output
