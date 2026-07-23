@@ -1,6 +1,15 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  existsSync,
+  writeFileSync,
+  mkdirSync,
+  appendFileSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -145,6 +154,7 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     DEPLOY_UNITS_RELOAD_CMD: "true",
     DEPLOY_LINGER_CHECK_CMD: "true",
     DEPLOY_UNITS_ENABLE_CMD: "true",
+    DEPLOY_NOTIFY_INSTALL_CMD: "true",
     HOMESERVER_OWNER_KEY: OWNER_KEY,
     ...overrides,
   };
@@ -177,6 +187,19 @@ function writeAutonomyTickUnitTemplate(srcDir: string): void {
   );
   execFileSync("git", ["add", "-A"], { cwd: srcDir });
   execFileSync("git", ["commit", "-q", "-m", "add fixture autonomy-tick unit templates"], { cwd: srcDir });
+}
+
+/** Copies the repository's real autonomy notification hook template into a disposable source
+ *  fixture. The deploy test then exercises the real render/install command without ever invoking
+ *  the hook or contacting Ratatoskr. */
+function writeAutonomyNotifyTemplate(srcDir: string): void {
+  mkdirSync(join(srcDir, "deploy"), { recursive: true });
+  writeFileSync(
+    join(srcDir, "deploy", "autonomy-notify.sh"),
+    readFileSync(join(__dirname, "..", "deploy", "autonomy-notify.sh"), "utf8")
+  );
+  execFileSync("git", ["add", "-A"], { cwd: srcDir });
+  execFileSync("git", ["commit", "-q", "-m", "add fixture autonomy notify template"], { cwd: srcDir });
 }
 
 describe("scripts/deploy-gateway.sh", () => {
@@ -303,6 +326,7 @@ describe("scripts/deploy-gateway.sh", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/PLAN: would deploy commit [0-9a-f]{40}/);
     expect(r.stdout).toMatch(/PLAN: remote WorkingDirectory verified/);
+    expect(r.stdout).toMatch(/PLAN: LAST, only after every check above passes: render\/install deploy\/autonomy-notify\.sh/);
     // gi#49: the autonomy-tick systemd unit render/enable step must appear in the plan too.
     expect(r.stdout).toMatch(/PLAN: LAST, only after every check above passes: render gille-autonomy-tick\.service/);
     expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
@@ -568,6 +592,74 @@ describe("scripts/deploy-gateway.sh", () => {
   });
 
   describe("gi#49 autonomy-tick systemd unit render/interpreter-check/lingering-check/enable", () => {
+    it("renders, installs, and updates the autonomy notification hook at mode 0755 without leaking secrets", async () => {
+      const src = initSourceRepo();
+      writeAutonomyNotifyTemplate(src);
+      const remote = tmpDir("dg-remote-");
+      const fakeHome = tmpDir("dg-home-");
+      const notifySecret = "ratatoskr-test-secret-never-print";
+      const ownerChatId = "123456789";
+      writeFileSync(
+        join(remote, ".env"),
+        `RATATOSKR_SEND_API_KEY=${notifySecret}\nRATATOSKR_OWNER_CHAT_ID=${ownerChatId}\n`
+      );
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const env = baseEnv(remote, {
+        HOME: fakeHome,
+        DEPLOY_NOTIFY_INSTALL_CMD: "", // exercise the real render + atomic install command
+        DEPLOY_HEALTH_LOCAL_URL: local.url,
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+      });
+
+      const first = await runScript("deploy", src, env);
+      expect(first.status).toBe(0);
+      const installedPath = join(fakeHome, "bin", "autonomy-notify.sh");
+      expect(existsSync(installedPath)).toBe(true);
+      const installed = readFileSync(installedPath, "utf8");
+      expect(installed).toContain(`ENV_FILE="${remote}/.env"`);
+      expect(installed).toContain("http://huginmunin:3034/api/send");
+      expect(installed).not.toContain("@@REMOTE_DIR@@");
+      expect(installed).not.toMatch(/http:\/\/\d{1,3}(?:\.\d{1,3}){3}/);
+      expect(statSync(installedPath).mode & 0o777).toBe(0o755);
+      expect(first.stdout + first.stderr + installed).not.toContain(notifySecret);
+      expect(first.stdout + first.stderr + installed).not.toContain(ownerChatId);
+
+      appendFileSync(join(src, "deploy", "autonomy-notify.sh"), "# managed-update-sentinel\n");
+      execFileSync("git", ["add", "deploy/autonomy-notify.sh"], { cwd: src });
+      execFileSync("git", ["commit", "-q", "-m", "update fixture autonomy notify template"], { cwd: src });
+
+      const second = await runScript("deploy", src, env);
+      expect(second.status).toBe(0);
+      expect(readFileSync(installedPath, "utf8")).toContain("# managed-update-sentinel");
+      expect(statSync(installedPath).mode & 0o777).toBe(0o755);
+      expect(second.stdout + second.stderr).not.toContain(notifySecret);
+      expect(second.stdout + second.stderr).not.toContain(ownerChatId);
+    });
+
+    it("fails closed without a deployment marker when the notification hook cannot be installed", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_NOTIFY_INSTALL_CMD: "false",
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/failed to render\/install autonomy notification hook \(gi#58\)/);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    });
+
     it("renders the installed unit with the actual remote dir + absolute tsx path -- no placeholder, no npx/env", async () => {
       const src = initSourceRepo();
       writeAutonomyTickUnitTemplate(src); // real templates, so the REAL render command has something to substitute

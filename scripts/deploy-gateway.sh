@@ -25,7 +25,8 @@ set -euo pipefail
 #             adopted table — issue #44), restart the unit only if the payload actually changed
 #             (gated by an interpreter preflight — issue #30), probe local + tailnet health plus
 #             an authenticated capability check, and — only once ALL of that has passed — render
-#             and enable the repo-managed user-scope gille-autonomy-tick.timer (gi#49;
+#             install the repo-managed autonomy notification hook (gi#58), and enable the
+#             repo-managed user-scope gille-autonomy-tick.timer (gi#49;
 #             deploy/systemd/*.{service,timer}, mirrors hugin's in-repo-units convention; armed
 #             LAST, immediately before the marker write, so a Persistent=true catch-up tick can
 #             never fire against a gateway that is still mid-restart), then stamp
@@ -56,6 +57,9 @@ set -euo pipefail
 #     and refuses to arm it if the account isn't (and can't be made) lingering — a failure at any
 #     of those gates is a hard deploy ERROR (gi#49), not a silent skip, because an un-enabled or
 #     non-lingering timer means the autonomy controller silently stops ticking;
+#   - renders deploy/autonomy-notify.sh against the same verified $remote_dir and atomically
+#     installs it at $HOME/bin/autonomy-notify.sh with mode 0755 (gi#58), without reading or
+#     copying the Ratatoskr credentials from the box-local .env;
 #   - arms that timer LAST, strictly after restart-if-needed and every health/capability probe
 #     have already succeeded, so a Persistent=true catch-up tick can never fire against a gateway
 #     that is still mid-restart;
@@ -424,6 +428,24 @@ install_user_units() {
   echo "  OK: gille-autonomy-tick.timer rendered, interpreter verified, lingering confirmed, and enabled"
 }
 
+# Render/install the repo-managed AUTONOMY_NOTIFY_CMD hook (gi#58). The source template contains
+# no credentials: it references the verified live tree's box-local .env at runtime. Rendering is
+# atomic within $HOME/bin (temporary file + chmod + rename), so a failed deploy cannot leave a
+# partially-written executable in the path already configured by the live .env.
+install_autonomy_notify_hook() {
+  local remote_dir="$1"
+
+  # All $HOME/$tmp expansion is deliberately remote-side. See install_user_units() for the same
+  # quoting convention. The template is shipped by the main rsync before this final IaC step.
+  if ! remote_run DEPLOY_NOTIFY_INSTALL_CMD \
+    "mkdir -p \"\$HOME/bin\" && tmp=\$(mktemp \"\$HOME/bin/.autonomy-notify.sh.XXXXXX\") && trap 'rm -f \"\$tmp\"' EXIT && sed 's|@@REMOTE_DIR@@|$remote_dir|g' '$remote_dir/deploy/autonomy-notify.sh' > \"\$tmp\" && chmod 0755 \"\$tmp\" && mv -f \"\$tmp\" \"\$HOME/bin/autonomy-notify.sh\" && trap - EXIT"; then
+    echo "ERROR: failed to render/install autonomy notification hook (gi#58) -- refusing to" >&2
+    echo "       certify deployment with AUTONOMY_NOTIFY_CMD possibly missing or stale." >&2
+    return 1
+  fi
+  echo "  OK: autonomy notification hook rendered and installed at \$HOME/bin/autonomy-notify.sh (mode 0755)"
+}
+
 # Authenticated capability smoke test. Reads the bearer key from an env var (name configurable
 # via DEPLOY_CAPABILITY_KEY_ENV) and NEVER echoes, logs, or includes it in any printed command —
 # only the resulting HTTP status code is reported. This is the credential-safe authenticated
@@ -473,6 +495,7 @@ cmd_dry_run() {
   echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
   echo "PLAN: probe tailnet health at ${DEPLOY_HEALTH_TAILNET_URL:-<unset - required for a real deploy>}"
   echo "PLAN: authenticated capability probe at ${DEPLOY_CAPABILITY_URL:-<unset - required for a real deploy>}"
+  echo "PLAN: LAST, only after every check above passes: render/install deploy/autonomy-notify.sh (gi#58) against the verified remote dir at \$HOME/bin/autonomy-notify.sh with mode 0755"
   echo "PLAN: LAST, only after every check above passes: render gille-autonomy-tick.service (gi#49) against the verified remote dir, verify its tsx interpreter, confirm/enable user lingering, then 'systemctl --user enable --now gille-autonomy-tick.timer' (idempotent; any failure is a deploy ERROR, no marker)"
   echo "PLAN: write .deployed-commit=$sha only after every step above passes"
 }
@@ -581,6 +604,8 @@ cmd_deploy() {
   # Armed LAST, only once restart-if-needed + every health/capability probe above has already
   # succeeded (review finding: Persistent=true's catch-up semantics mean arming any earlier risks
   # a missed tick firing against a gateway that is still mid-restart).
+  echo "==> Installing the gi#58 autonomy notification hook..."
+  install_autonomy_notify_hook "$remote_dir" || return 1
   echo "==> Installing/enabling the gi#49 autonomy-tick user-scope systemd timer..."
   install_user_units "$remote_dir" || return 1
 
@@ -610,11 +635,12 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_FORCE_RESTART=1      Restart even if rsync reported no changes
   DEPLOY_DRY_RUN_OFFLINE=1    dry-run only: skip even the read-only WorkingDirectory check
 
-Routing-table seeding (issue #44), the restart interpreter preflight (issue #30), and the gi#49
-autonomy-tick user-scope systemd unit render/interpreter-check/lingering-check/enable (armed LAST,
-after every health/capability probe) have no operator-facing flags -- they always run as part of
-`deploy`. Their remote commands are overridable for tests the same way every other remote step is
-(DEPLOY_EXECSTART_PROBE_CMD, DEPLOY_INTERPRETER_CHECK_CMD, DEPLOY_UNITS_RENDER_CMD,
+Routing-table seeding (issue #44), the restart interpreter preflight (issue #30), the gi#58
+autonomy notification hook install, and the gi#49 autonomy-tick user-scope systemd unit
+render/interpreter-check/lingering-check/enable (armed LAST, after every health/capability probe)
+have no operator-facing flags -- they always run as part of `deploy`. Their remote commands are
+overridable for tests the same way every other remote step is (DEPLOY_EXECSTART_PROBE_CMD,
+DEPLOY_INTERPRETER_CHECK_CMD, DEPLOY_NOTIFY_INSTALL_CMD, DEPLOY_UNITS_RENDER_CMD,
 DEPLOY_UNITS_RELOAD_CMD, DEPLOY_LINGER_CHECK_CMD, DEPLOY_UNITS_ENABLE_CMD; see
 tests/deploy-gateway.test.ts).
 EOF
