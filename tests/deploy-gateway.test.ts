@@ -521,39 +521,26 @@ describe("scripts/deploy-gateway.sh", () => {
     it("fails closed and leaves no marker when an unexpected residue cannot be deleted", async () => {
       const src = initSourceRepo();
       const remote = tmpDir("dg-remote-");
-      // Start from an already-synced payload so the only reconciliation work is deleting the
-      // unexpected residue below. The production command requires rsync too, so this adds no
-      // test-only platform dependency.
-      execFileSync(
-        "rsync",
-        ["-a", "--exclude", ".git", "--exclude", ".git/", `${src}/`, `${remote}/`],
-        { cwd: src }
+      const fakeBin = tmpDir("dg-bin-");
+      const fakeRsync = join(fakeBin, "rsync");
+      // GNU rsync may temporarily make an owned read-only directory writable during deletion,
+      // so chmod-based fault injection is not portable. This PATH-local stub reproduces rsync's
+      // standard undeletable-residue failure (exit 23) without sudo, chattr, or platform features.
+      writeFileSync(
+        fakeRsync,
+        "#!/bin/sh\n" +
+          "printf '%s\\n' 'rsync: [generator] delete_file: unlink(.unexpected-agent-residue): Permission denied (13)' >&2\n" +
+          "exit 23\n"
       );
-      const residueDir = join(remote, ".unexpected-agent-residue");
-      mkdirSync(residueDir, { recursive: true });
-      writeFileSync(join(residueDir, "locked-entry"), "");
+      chmodSync(fakeRsync, 0o755);
 
-      const tailnet = await startOkServer();
-      const cap = await startCapabilityServer(OWNER_KEY);
-      let r!: Awaited<ReturnType<typeof runScript>>;
-      // Deleting residueDir is controlled by its parent. Make the destination root non-writable
-      // and match the source-root mode so `rsync -a` cannot normalize it back to writable before
-      // its delete pass. Restore both roots even if spawning/assertion setup unexpectedly throws.
-      chmodSync(src, 0o555);
-      chmodSync(remote, 0o555);
-      try {
-        r = await runScript(
-          "deploy",
-          src,
-          baseEnv(remote, {
-            DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
-            DEPLOY_CAPABILITY_URL: cap.url,
-          })
-        );
-      } finally {
-        chmodSync(remote, 0o755);
-        chmodSync(src, 0o755);
-      }
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        })
+      );
 
       expect(r.status).not.toBe(0);
       expect(r.stdout + r.stderr).toMatch(/unexpected-agent-residue/);
