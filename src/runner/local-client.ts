@@ -18,8 +18,24 @@ export type LocalInferenceResult =
       ttftMs: number;        // time to first token
       tokensPerSecond: number; // completion_tokens / generation_time
       provider: 'local-ollama';
+      /** Terminal provider reason when the backend exposes one. */
+      finishReason?: string | null;
+      /** Explicit false on a clean terminal response; omitted by backends without this signal. */
+      truncated?: false;
     }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      /** Terminal provider reason when failure classification came from the completion itself. */
+      finishReason?: string | null;
+      /** True only when the provider explicitly reported a token-limit finish. */
+      truncated?: true;
+      /** Best-effort diagnostics retained without exposing or verifying the partial answer. */
+      promptTokens?: number;
+      completionTokens?: number;
+      durationMs?: number;
+      ttftMs?: number;
+    };
 
 const DEFAULT_BASE_URL = 'http://localhost:11434';
 

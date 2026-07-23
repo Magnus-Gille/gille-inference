@@ -92,9 +92,11 @@ export async function runLmStudioInference(
     let promptTokens = 0;
     let completionTokens = 0;
     let reasoningChars = 0;
+    let finishReason: string | null = null;
 
     for await (const chunk of stream) {
-      const choiceDelta = chunk.choices[0]?.delta as
+      const choice = chunk.choices[0];
+      const choiceDelta = choice?.delta as
         | (OpenAI.Chat.ChatCompletionChunk.Choice.Delta & {
             reasoning_content?: string | null;
             reasoning?: string | null;
@@ -116,12 +118,34 @@ export async function runLmStudioInference(
         promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
         completionTokens = chunk.usage.completion_tokens ?? completionTokens;
       }
+      if (typeof choice?.finish_reason === 'string') {
+        finishReason = choice.finish_reason;
+      }
     }
     void reasoningChars; // (available for diagnostics; not persisted)
 
     const end = performance.now();
     const durationMs = Math.round(end - start);
     const ttftMs = firstTokenAt !== null ? Math.round(firstTokenAt - start) : durationMs;
+
+    // A token-limit terminal reason means the visible content is not a complete answer. This is
+    // true both when reasoning consumed the whole budget (empty content) and when the answer was
+    // cut mid-token. Never pass the stump to a verifier: surface the provider signal explicitly so
+    // /delegate records capability-relevant `truncated` evidence and can escalate/retry upstream.
+    if (finishReason === 'length') {
+      return {
+        ok: false,
+        error:
+          `LM Studio completion truncated: finish_reason=length, max_tokens=${maxTokens}, ` +
+          `completion_tokens=${completionTokens}, visible_content_chars=${content.length}`,
+        finishReason,
+        truncated: true,
+        promptTokens,
+        completionTokens,
+        durationMs,
+        ttftMs,
+      };
+    }
 
     if (!content || content.trim() === '') {
       return { ok: false, error: 'Empty response from LM Studio model' };
@@ -143,6 +167,8 @@ export async function runLmStudioInference(
       ttftMs,
       tokensPerSecond,
       provider: 'local-ollama', // reuse the local result tag so analysis treats it as local hardware
+      finishReason,
+      truncated: false,
     };
   } catch (err) {
     if (err instanceof Error) return { ok: false, error: `LM Studio error: ${err.message}` };
