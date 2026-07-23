@@ -355,6 +355,8 @@ interface DelegationOutcome {
   output?: string;
   metrics?: { latencyMs: number; ttftMs: number; promptTokens: number; completionTokens: number; tokPerSec: number };
   verifierNotes?: string; ledgerId?: string;
+  finishReason?: string | null;
+  truncated?: boolean;
   frontierOutput?: string; frontierModelId?: string; frontierError?: string;
   costTrace?: {
     costStatus: "verified" | "unverified" | "failed" | "escalated" | "not_applicable";
@@ -373,6 +375,13 @@ interface DelegationOutcome {
   learningTaskGatewayEcho?: LearningTaskGatewayEcho;
 }
 ```
+
+When the local backend terminates with `finish_reason: "length"`, `/delegate` fails closed:
+`outcome` is `error`, `truncated` is `true`, `finishReason` is `"length"`, and no partial output is
+passed to the verifier or returned as `output`. The ledger row records
+`error_class = "truncated"` plus best-effort token/timing diagnostics, and normal frontier
+escalation remains available. A clean backend finish may expose its terminal reason with
+`truncated: false`; backends without a terminal-reason signal omit both fields.
 
 Supplying `learningTaskStamp` opts this real Hugin inference path into LearningTaskContract v1 and
 requires an explicit matching `taskType`. The gateway validates the fresh preflight and actual

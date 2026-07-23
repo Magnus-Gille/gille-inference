@@ -186,6 +186,60 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
     expect(rec.notes ?? "").not.toContain("format-retry");
   });
 
+  it("a token-limited local result is explicit, recorded as truncated, and never verified", async () => {
+    lmInferenceMock.mockResolvedValue({
+      ok: false as const,
+      error:
+        "LM Studio completion truncated (finish_reason=length, completion_tokens=64, visible_content_chars=3)",
+      finishReason: "length",
+      truncated: true,
+      promptTokens: 20,
+      completionTokens: 64,
+      durationMs: 900,
+      ttftMs: 250,
+    });
+
+    const verifier = vi.fn(async () => ({ outcome: "pass" as const, score: 1 }));
+    const out = await delegate({
+      prompt: "answer exactly F-20",
+      verifier,
+      verifierName: "exact",
+      frontierModelId: "anthropic/claude-sonnet-4-6",
+    });
+
+    expect(lmInferenceMock).toHaveBeenCalledTimes(1);
+    expect(verifier).not.toHaveBeenCalled();
+    expect(out).toMatchObject({
+      delegated: true,
+      escalate: true,
+      outcome: "error",
+      finishReason: "length",
+      truncated: true,
+      frontierOutput: "FRONTIER ANSWER",
+    });
+    expect(out.output).toBeUndefined();
+    const rec = recordDelegationMock.mock.calls[0]![0] as {
+      outcome: string;
+      escalated: boolean;
+      errorClass: string;
+      notes: string | null;
+      latencyMs: number | null;
+      ttftMs: number | null;
+      promptTokens: number | null;
+      completionTokens: number | null;
+    };
+    expect(rec).toMatchObject({
+      outcome: "error",
+      escalated: true,
+      errorClass: "truncated",
+      latencyMs: 900,
+      ttftMs: 250,
+      promptTokens: 20,
+      completionTokens: 64,
+    });
+    expect(rec.notes ?? "").toContain("finish_reason=length");
+  });
+
   it("a real per-attempt timeout aborts and never reaches the format-retry branch (single call)", async () => {
     // The per-attempt timer aborts the in-flight call; the late-resolving (over-budget) result is
     // normalized to the timeout sentinel, which is NOT a format error → no retry. This pins that the

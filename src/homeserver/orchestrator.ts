@@ -145,6 +145,10 @@ export interface DelegationOutcome {
   metrics?: DelegationMetrics;
   verifierNotes?: string;
   ledgerId?: string;
+  /** Terminal provider reason, surfaced so callers never have to infer token-cap failures. */
+  finishReason?: string | null;
+  /** True means the local answer was incomplete and was not passed to a verifier or consumer. */
+  truncated?: boolean;
   /** Frontier fallback output, set when frontierModelId was given and the call succeeded. */
   frontierOutput?: string;
   /** The OpenRouter model that handled the frontier fallback. */
@@ -837,7 +841,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
 
   // ── Infra / empty / timeout / (twice-failed) parse failures ──
   if (!result.ok) {
-    const errorClass = classifyError(result.error);
+    const errorClass = result.truncated === true ? "truncated" : classifyError(result.error);
     const failNote = result.error === TIMEOUT_SENTINEL ? `timeout after ${cfg.callTimeoutMs}ms` : result.error;
     const evidenceIdentity = await deriveEvidenceIdentity(task.learningTaskStamp, modelId, "delegate");
     const ledgerId = recordDelegation({
@@ -847,6 +851,10 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       prompt: task.prompt,
       outcome: "error",
       errorClass,
+      latencyMs: result.durationMs ?? null,
+      ttftMs: result.ttftMs ?? null,
+      promptTokens: result.promptTokens ?? null,
+      completionTokens: result.completionTokens ?? null,
       verifier: task.verifierName ?? (task.verifier ? "custom" : "none"),
       escalated: true,
       source: task.source,
@@ -868,6 +876,8 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       outcome: "error",
       ledgerId,
       verifierNotes: result.error,
+      finishReason: result.finishReason,
+      truncated: result.truncated === true,
       formatRetried,
       delegatePolicy,
     }), cfg);
@@ -986,6 +996,8 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
     metrics,
     verifierNotes: notes,
     ledgerId,
+    finishReason: result.finishReason,
+    truncated: result.truncated === false ? false : undefined,
     gate,
     formatRetried,
     delegatePolicy,
