@@ -160,9 +160,10 @@ last-good build instead of crash-looping.
 **Autonomy-tick timer (gi#49).** `deploy/systemd/gille-autonomy-tick.{service,timer}` are
 repo-managed IaC — committed unit files, not hand-authored on the box — mirroring hugin's
 convention of keeping unit definitions in-repo. `scripts/deploy-gateway.sh deploy` renders and
-enables them on every deploy, but only as the very LAST step, strictly after restart-if-needed and
-every health/capability probe below have already passed (a review finding: a `Persistent=true`
-catch-up tick armed any earlier could fire against a gateway that is still mid-restart):
+enables them on every deploy. The same final IaC phase also installs the autonomy notification hook
+described below. It runs only as the very LAST phase, strictly after restart-if-needed and every
+health/capability probe below have already passed (a review finding: a `Persistent=true` catch-up
+tick armed any earlier could fire against a gateway that is still mid-restart):
 
 1. **Render, not copy verbatim.** The committed `.service` file is a *template* —
    `WorkingDirectory`/`ExecStart` hold the placeholder `@@REMOTE_DIR@@`, never a real path (a
@@ -191,6 +192,27 @@ catch-up tick armed any earlier could fire against a gateway that is still mid-r
 **Fail-closed:** a failure at any of steps 1–4 is a hard deploy `ERROR` (nonzero exit,
 `.deployed-commit` left unwritten), never a silent skip — an un-rendered, un-enabled, or
 non-lingering timer means the autonomy controller silently stops ticking.
+
+**Autonomy notification hook (gi#58).** `deploy/autonomy-notify.sh` is the repo-managed template
+for the already-live `AUTONOMY_NOTIFY_CMD` behavior. During the final IaC phase,
+`scripts/deploy-gateway.sh deploy` renders its `@@REMOTE_DIR@@` placeholder against the same
+verified WorkingDirectory used by the timer, then atomically installs/updates it at
+`$HOME/bin/autonomy-notify.sh` with mode `0755`. The template contains no credentials and deploy
+never reads credential values; the installed hook reads them from the box-local `.env` only when a
+notification actually fires. It preserves the live behavior: read at most 3000 bytes of
+content-blind summary JSON from stdin, prefix it with `AUTONOMY[gille]:`, and POST the owner message
+to Ratatoskr's authenticated tailnet-only `/api/send` endpoint via the resolvable `huginmunin`
+hostname.
+
+The box-local `.env` must set `AUTONOMY_NOTIFY_CMD` to the installed
+`$HOME/bin/autonomy-notify.sh` path so the tick invokes the managed hook. It must also contain the
+following two Ratatoskr settings. Values remain box-local and must never be placed in this
+repository, deploy output, issues, or PRs:
+
+| Var | Purpose |
+|---|---|
+| `RATATOSKR_SEND_API_KEY` | Bearer credential accepted by Ratatoskr's owner-only send endpoint. |
+| `RATATOSKR_OWNER_CHAT_ID` | Numeric owner chat identifier used as the `chat_id` in the send request. |
 
 - **Cadence:** `OnCalendar=*-*-* 05:30:00` (daily, 05:30 local time on the box), `Persistent=true`
   (a missed run, e.g. the box was off, fires once at the next boot/wake instead of being dropped).
