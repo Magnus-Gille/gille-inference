@@ -521,29 +521,42 @@ describe("scripts/deploy-gateway.sh", () => {
     it("fails closed and leaves no marker when an unexpected residue cannot be deleted", async () => {
       const src = initSourceRepo();
       const remote = tmpDir("dg-remote-");
+      // Start from an already-synced payload so the only reconciliation work is deleting the
+      // unexpected residue below. The production command requires rsync too, so this adds no
+      // test-only platform dependency.
+      execFileSync(
+        "rsync",
+        ["-a", "--exclude", ".git", "--exclude", ".git/", `${src}/`, `${remote}/`],
+        { cwd: src }
+      );
       const residueDir = join(remote, ".unexpected-agent-residue");
       mkdirSync(residueDir, { recursive: true });
       writeFileSync(join(residueDir, "locked-entry"), "");
-      // A non-writable directory prevents rsync from deleting its child. This simulates an
-      // unapproved cache/residue that cannot be reconciled with the reviewed source payload.
-      chmodSync(residueDir, 0o555);
 
       const tailnet = await startOkServer();
       const cap = await startCapabilityServer(OWNER_KEY);
-      const r = await runScript(
-        "deploy",
-        src,
-        baseEnv(remote, {
-          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
-          DEPLOY_CAPABILITY_URL: cap.url,
-        })
-      );
-
-      // Restore cleanup permissions after the child has exercised the failure path. Cache
-      // contents are intentionally never read or surfaced by this test.
-      chmodSync(residueDir, 0o755);
+      let r!: Awaited<ReturnType<typeof runScript>>;
+      // Deleting residueDir is controlled by its parent. Make the destination root non-writable
+      // and match the source-root mode so `rsync -a` cannot normalize it back to writable before
+      // its delete pass. Restore both roots even if spawning/assertion setup unexpectedly throws.
+      chmodSync(src, 0o555);
+      chmodSync(remote, 0o555);
+      try {
+        r = await runScript(
+          "deploy",
+          src,
+          baseEnv(remote, {
+            DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+            DEPLOY_CAPABILITY_URL: cap.url,
+          })
+        );
+      } finally {
+        chmodSync(remote, 0o755);
+        chmodSync(src, 0o755);
+      }
 
       expect(r.status).not.toBe(0);
+      expect(r.stdout + r.stderr).toMatch(/unexpected-agent-residue/);
       expect(r.stdout + r.stderr).toMatch(/could not reconcile the live tree with the reviewed payload/);
       expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
     });
