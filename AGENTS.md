@@ -213,9 +213,10 @@ benchmark reports under `docs/` for methodology and results.
 for the live path, systemd unit, deploy/verify commands, rollback recipe, and the MCP-restart
 caveat — read it before touching production. In short: the unit is `home-gateway.service`
 (`WorkingDirectory=/home/magnus/home-server-eval`), the live tree is a plain rsync'd copy (not a
-git checkout), and `scripts/deploy-gateway.sh {deploy|verify|dry-run}` is the repo-owned deploy
-tool (issue #23) — it fails closed on a dirty source tree, a `WorkingDirectory` mismatch, or any
-failed health/capability probe, and stamps `.deployed-commit` only once every check has passed.
+git checkout), and `scripts/deploy-gateway.sh {deploy <full-sha>|verify|dry-run <full-sha>}` is the
+repo-owned deploy tool (issue #23) — it fails closed on a dirty source tree, a source-identity or
+`WorkingDirectory` mismatch, or any failed health/capability probe, and stamps `.deployed-commit`
+only once every check has passed.
 
 `/srv/gille-inference` — this section's previously documented path — is **not** a Git checkout and
 does **not exist** on the box; do not target it. (`CONTRIBUTING.md`'s use of the same string as a
@@ -226,3 +227,9 @@ endpoints, limits, credits/rate policy, or billing dimensions change, update the
 running" and "How to use it" sections in the same change and keep `src/homeserver/README.md`
 consistent. A portal-only deploy still requires a gateway restart (see `deploy/README.md`'s
 MCP-restart caveat).
+
+Invoke deployments as `scripts/deploy-gateway.sh deploy <accepted-full-sha>`. The entry point binds
+the invoked script's physical checkout and the caller's physical cwd/worktree/HEAD to that explicit
+release revision before any remote check or mutation, then rsyncs a temporary `git archive` of that
+commit rather than mutable worktree bytes; `dry-run` requires the same binding. Preserve this outer
+source-identity gate and immutable-payload boundary in addition to every existing deployment check.

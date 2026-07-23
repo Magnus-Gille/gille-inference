@@ -20,7 +20,8 @@ set -euo pipefail
 #     durable SQLite store (see docs/agentic-code-tool-design.md).
 #
 # Modes (first positional arg):
-#   deploy    (default) Sync the clean reviewed source tree to the verified remote
+#   deploy <full-expected-sha>
+#             Sync the clean reviewed source tree to the verified remote
 #             WorkingDirectory, seed docs/m5-routing.json copy-if-absent (never clobbering an
 #             adopted table — issue #44), restart the unit only if the payload actually changed
 #             (gated by an interpreter preflight — issue #30), probe local + tailnet health plus
@@ -33,13 +34,19 @@ set -euo pipefail
 #             .deployed-commit with the exact 40-char SHA ONLY after every check passes.
 #   verify    Read-only. Reports the marker commit plus a content spot-check against the local
 #             tree. Never touches rsync, the unit, or the marker.
-#   dry-run   Prints the exact plan (path check, rsync command, restart decision, probes) without
+#   dry-run <full-expected-sha>
+#             Prints the exact plan (path check, rsync command, restart decision, probes) without
 #             running rsync, restarting the unit, or writing the marker. Still performs the
 #             READ-ONLY remote WorkingDirectory check by default, so a path mismatch is caught
 #             before a real deploy would hit it; set DEPLOY_DRY_RUN_OFFLINE=1 to skip even that
 #             (fully offline plan, e.g. to review the rsync command with no network at all).
 #
 # Fail-closed safety contract (mirrors hugin/scripts/deploy-pi.sh's marker discipline):
+#   - requires the caller's accepted full commit SHA and binds it to this script's physical
+#     repository root, the caller's physical cwd, Git's resolved worktree root, and actual HEAD
+#     before any remote probe or mutation;
+#   - materializes the deploy payload from that accepted commit with `git archive`, so ignored
+#     files and concurrent working-tree edits can never enter the bytes rsync reads;
 #   - refuses a dirty or non-addressable source tree before any network access;
 #   - refuses when the remote unit's WorkingDirectory does not match DEPLOY_REMOTE_DIR — never
 #     silently targets a stale or guessed path;
@@ -91,6 +98,7 @@ DEPLOY_HEALTH_TAILNET_URL="${DEPLOY_HEALTH_TAILNET_URL:-}"
 DEPLOY_CAPABILITY_URL="${DEPLOY_CAPABILITY_URL:-}"
 DEPLOY_CAPABILITY_KEY_ENV="${DEPLOY_CAPABILITY_KEY_ENV:-HOMESERVER_OWNER_KEY}"
 DEPLOY_FORCE_RESTART="${DEPLOY_FORCE_RESTART:-0}"
+DEPLOY_SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 # Default spot-check set for `verify`: files whose content on the box was hash-compared against
 # canonical/main during the #20 deploy that established the 8caf400 baseline. Override with a
@@ -200,6 +208,48 @@ refuse_symlinked_node_modules() {
   fi
 }
 
+# Verify that the caller-selected immutable revision belongs to the physical checkout containing
+# this invoked script. A clean checkout alone is insufficient: another worktree can be clean at a
+# stale or unintended commit. This guard deliberately runs before verify_path_match(), the first
+# remote call in deploy/dry-run, so a rejection cannot invalidate a marker, rsync/copy content,
+# install dependencies, restart a unit, or perform any other remote mutation.
+verify_deploy_source_binding() {
+  local expected_sha="${1:-}" actual_cwd actual_root_raw actual_root actual_sha
+  actual_cwd="$(pwd -P)"
+  actual_root="<not-a-worktree>"
+  actual_sha="<unavailable>"
+
+  if actual_root_raw="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+    actual_root="$(cd "$actual_root_raw" 2>/dev/null && pwd -P)"; then
+    :
+  else
+    actual_root="<not-a-worktree>"
+  fi
+  if ! actual_sha="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    [[ ! "$actual_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    actual_sha="<unavailable>"
+  fi
+
+  printf 'Expected source: %s @ %s\n' "$DEPLOY_SOURCE_ROOT" "${expected_sha:-<missing>}"
+  printf 'Actual source: %s @ %s\n' "$actual_cwd" "$actual_sha"
+  printf 'Actual worktree root: %s\n' "$actual_root"
+
+  if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: deploy requires an explicit full 40-character commit SHA." >&2
+    return 1
+  fi
+  if [ "$actual_root" = "<not-a-worktree>" ] || [ "$actual_sha" = "<unavailable>" ]; then
+    echo "ERROR: deploy source is not an addressable Git checkout." >&2
+    return 1
+  fi
+  if [ "$actual_cwd" != "$DEPLOY_SOURCE_ROOT" ] ||
+    [ "$actual_root" != "$DEPLOY_SOURCE_ROOT" ] ||
+    [ "$actual_sha" != "$expected_sha" ]; then
+    echo "ERROR: deploy source does not match the explicitly expected path and revision." >&2
+    return 1
+  fi
+}
+
 # Print the exact 40-char HEAD commit SHA iff the source tree is an addressable, clean git
 # checkout rooted at the current directory. Fails closed (dirty-source / detached-blob / wrong-cwd
 # refusal) — verbatim in spirit to hugin/scripts/deploy-pi.sh's read_clean_deploy_sha.
@@ -228,6 +278,22 @@ read_clean_deploy_sha() {
     return 1
   fi
   printf '%s\n' "$source_sha"
+}
+
+# Export only bytes committed at the accepted revision into a fresh local snapshot. The caller
+# owns cleanup. This is intentionally separate from the physical worktree: ignored/untracked files
+# are never archived, and a concurrent writer cannot change Git object bytes while rsync reads the
+# materialized payload.
+materialize_deploy_payload() {
+  local expected_sha="$1" payload_root="$2"
+  if ! mkdir -m 0755 "$payload_root"; then
+    echo "ERROR: could not create the immutable deploy payload root." >&2
+    return 1
+  fi
+  if ! git archive --format=tar "$expected_sha" | tar -xf - -C "$payload_root"; then
+    echo "ERROR: could not materialize immutable deploy payload for $expected_sha." >&2
+    return 1
+  fi
 }
 
 # ── remote probes ───────────────────────────────────────────────────────────────────────────
@@ -292,15 +358,16 @@ probe_health() {
 # window, no separate remote command, and it works identically in the ssh and local test-seam
 # modes because it goes through the exact same rsync_dest() the main sync already uses.
 seed_routing_table() {
-  local out
-  if [ ! -f docs/m5-routing.json ]; then
+  local source_root="${1:-.}" source_file out
+  source_file="${source_root%/}/docs/m5-routing.json"
+  if [ ! -f "$source_file" ]; then
     # Should not happen against a real checkout (it is always git-tracked) but fail SOFT here:
     # a missing local seed file is a repo-consistency problem, not a reason to abort an otherwise
     # good deploy of everything else.
     echo "  WARN: no local docs/m5-routing.json to seed from -- skipping (nothing to install)."
     return 0
   fi
-  out="$(rsync -a --ignore-existing -i docs/m5-routing.json "$(rsync_dest)docs/m5-routing.json")"
+  out="$(rsync -a --ignore-existing -i "$source_file" "$(rsync_dest)docs/m5-routing.json")"
   if [ -n "$out" ]; then
     echo "  SEEDED: docs/m5-routing.json was absent on the remote -- installed the committed table."
   else
@@ -481,8 +548,17 @@ probe_capability() {
 # ── modes ────────────────────────────────────────────────────────────────────────────────────
 
 cmd_dry_run() {
-  local sha remote_dir
+  local expected_sha="${1:-}" sha remote_dir
+  if [ "$#" -ne 1 ]; then
+    echo "ERROR: dry-run requires exactly one explicit full 40-character commit SHA." >&2
+    return 2
+  fi
+  verify_deploy_source_binding "$expected_sha" || return 1
   sha="$(read_clean_deploy_sha)" || return 1
+  if [ "$sha" != "$expected_sha" ]; then
+    echo "ERROR: deploy source HEAD changed after source binding; refusing to plan another revision." >&2
+    return 1
+  fi
   echo "PLAN: would deploy commit $sha"
   if [ "${DEPLOY_DRY_RUN_OFFLINE:-0}" = 1 ]; then
     echo "PLAN: DEPLOY_DRY_RUN_OFFLINE=1 -- skipping the (read-only) remote WorkingDirectory check."
@@ -494,7 +570,8 @@ cmd_dry_run() {
       return 1
     fi
   fi
-  echo "PLAN: rsync -a --delete -i ${RSYNC_EXCLUDES[*]} ./ $(rsync_dest)"
+  echo "PLAN: materialize an immutable local payload with git archive $sha"
+  echo "PLAN: rsync -a --delete -i ${RSYNC_EXCLUDES[*]} <immutable-payload>/ $(rsync_dest)"
   echo "PLAN: seed docs/m5-routing.json copy-if-absent (rsync --ignore-existing; never overwrites an adopted table -- issue #44)"
   echo "PLAN: remote install: ${DEPLOY_INSTALL_CMD:-cd '<remote_dir>' && npm ci --omit=dev}"
   echo "PLAN: if restarting: preflight the ExecStart interpreter first, refuse the restart if it is missing (issue #30)"
@@ -549,12 +626,41 @@ cmd_verify() {
   return "$status"
 }
 
-cmd_deploy() {
-  local sha remote_dir rsync_out post_sha payload_changed=0
+cmd_deploy() (
+  local expected_sha="${1:-}" sha remote_dir rsync_out post_sha
+  local payload_parent="" payload_root="" payload_changed=0
 
+  # shellcheck disable=SC2329 # invoked indirectly by the EXIT trap below
+  cleanup_deploy_payload() {
+    if [ -n "$payload_parent" ] && [ -d "$payload_parent" ]; then
+      rm -rf -- "$payload_parent"
+    fi
+  }
+  trap cleanup_deploy_payload EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if [ "$#" -ne 1 ]; then
+    echo "ERROR: deploy requires exactly one explicit full 40-character commit SHA." >&2
+    return 2
+  fi
+  verify_deploy_source_binding "$expected_sha" || return 1
   refuse_symlinked_node_modules || return 1
   sha="$(read_clean_deploy_sha)" || return 1
+  if [ "$sha" != "$expected_sha" ]; then
+    echo "ERROR: deploy source HEAD changed after source binding; refusing remote access." >&2
+    return 1
+  fi
   echo "==> Deploy source clean at $sha"
+
+  echo "==> Materializing immutable payload from accepted commit $sha..."
+  if ! payload_parent="$(mktemp -d "${TMPDIR:-/tmp}/gille-deploy-payload.XXXXXX")"; then
+    echo "ERROR: could not create a private temporary deploy-payload directory." >&2
+    return 1
+  fi
+  payload_root="$payload_parent/archive-root"
+  materialize_deploy_payload "$expected_sha" "$payload_root" || return 1
 
   echo "==> Verifying remote WorkingDirectory for $DEPLOY_UNIT..."
   remote_dir="$(verify_path_match)" || return 1
@@ -564,7 +670,7 @@ cmd_deploy() {
   remote_run DEPLOY_INVALIDATE_MARKER_CMD "rm -f '$remote_dir/.deployed-commit' '$remote_dir/.deployed-commit.tmp'"
 
   echo "==> Syncing to $(rsync_dest)..."
-  if ! rsync_out="$(rsync -a --delete -i "${RSYNC_EXCLUDES[@]}" ./ "$(rsync_dest)")"; then
+  if ! rsync_out="$(rsync -a --delete -i "${RSYNC_EXCLUDES[@]}" "$payload_root/" "$(rsync_dest)")"; then
     echo "ERROR: rsync could not reconcile the live tree with the reviewed payload; refusing to" >&2
     echo "       install, restart, or certify an ambiguous deployment. Only documented mutable" >&2
     echo "       state/cache paths may be excluded; inspect unexpected residue out of band." >&2
@@ -583,13 +689,13 @@ cmd_deploy() {
   # hugin/scripts/deploy-pi.sh's post-sync re-check): if source changed mid-sync, the payload no
   # longer represents the single commit we're about to stamp, so refuse to go further. The marker
   # was already invalidated above, so this leaves the box markerless rather than misrepresented.
-  if ! post_sha="$(read_clean_deploy_sha)" || [ "$post_sha" != "$sha" ]; then
+  if ! post_sha="$(read_clean_deploy_sha)" || [ "$post_sha" != "$expected_sha" ]; then
     echo "ERROR: deploy source changed during sync; refusing to install/restart/certify." >&2
     return 1
   fi
 
   echo "==> Seeding routing table (copy-if-absent; adopted tables are never overwritten -- issue #44)..."
-  seed_routing_table
+  seed_routing_table "$payload_root"
 
   echo "==> Installing dependencies on the remote (native modules must build for its own platform)..."
   remote_run DEPLOY_INSTALL_CMD "cd '$remote_dir' && npm ci --omit=dev"
@@ -624,16 +730,24 @@ cmd_deploy() {
   echo "==> All checks passed -- recording accepted deployment $sha..."
   remote_run DEPLOY_WRITE_MARKER_CMD "printf '%s\n' '$sha' > '$remote_dir/.deployed-commit.tmp' && mv '$remote_dir/.deployed-commit.tmp' '$remote_dir/.deployed-commit'"
   echo "Deployed $sha to $remote_dir."
-}
+)
 
 usage() {
   cat <<'EOF'
-Usage: scripts/deploy-gateway.sh [deploy|verify|dry-run]
+Usage:
+  scripts/deploy-gateway.sh deploy <full-expected-sha>
+  scripts/deploy-gateway.sh dry-run <full-expected-sha>
+  scripts/deploy-gateway.sh verify
 
 Modes:
-  deploy    Sync + install + restart-if-needed + probe + stamp .deployed-commit (default).
+  deploy    Bind this physical checkout to the explicit accepted revision, then sync + install +
+            restart-if-needed + probe + stamp .deployed-commit.
   verify    Read-only: report the currently deployed commit plus a content spot-check.
-  dry-run   Print the plan without syncing, restarting, or writing the marker.
+  dry-run   Bind this physical checkout to the explicit accepted revision, then print the plan
+            without syncing, restarting, or writing the marker.
+
+The deploy/dry-run SHA must be the immutable full 40-character revision selected by the release
+decision. Do not derive it from whichever checkout happens to be current at deploy time.
 
 Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_REMOTE_HOST          ssh alias (default: m5). Never a raw IP in docs/commits.

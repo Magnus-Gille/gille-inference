@@ -10,6 +10,7 @@ import {
   appendFileSync,
   chmodSync,
   statSync,
+  realpathSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,6 +52,9 @@ function initSourceRepo(): string {
   execFileSync("git", ["init", "-q"], { cwd: dir });
   execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
   execFileSync("git", ["config", "user.name", "Deploy Test"], { cwd: dir });
+  mkdirSync(join(dir, "scripts"), { recursive: true });
+  writeFileSync(join(dir, "scripts", "deploy-gateway.sh"), readFileSync(SCRIPT));
+  chmodSync(join(dir, "scripts", "deploy-gateway.sh"), 0o755);
   writeFileSync(join(dir, "README.md"), "fixture repo for deploy-gateway.sh tests\n");
   execFileSync("git", ["add", "-A"], { cwd: dir });
   execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: dir });
@@ -122,10 +126,31 @@ async function closedPortUrl(): Promise<string> {
 function runScript(
   mode: string,
   cwd: string,
-  env: Record<string, string>
+  env: Record<string, string>,
+  options: { expectedRevision?: string | null; script?: string } = {}
 ): Promise<{ status: number; stdout: string; stderr: string }> {
+  let expectedRevision = options.expectedRevision;
+  if (expectedRevision === undefined && (mode === "deploy" || mode === "dry-run")) {
+    try {
+      expectedRevision = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      // A syntactically valid placeholder lets non-Git fixture tests reach the source guard.
+      expectedRevision = "0".repeat(40);
+    }
+  }
+  const script =
+    options.script ??
+    (existsSync(join(cwd, "scripts", "deploy-gateway.sh"))
+      ? join(cwd, "scripts", "deploy-gateway.sh")
+      : SCRIPT);
+  const args = [script, mode];
+  if (expectedRevision !== null && expectedRevision !== undefined) args.push(expectedRevision);
   return new Promise((resolvePromise) => {
-    const child = spawn("bash", [SCRIPT, mode], { cwd, env: { ...process.env, ...env } });
+    const child = spawn("bash", args, { cwd, env: { ...process.env, ...env } });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -204,6 +229,276 @@ function writeAutonomyNotifyTemplate(srcDir: string): void {
 }
 
 describe("scripts/deploy-gateway.sh", () => {
+  describe("explicit deployment source binding (issue #69)", () => {
+    function sourceBindingFixture(): {
+      current: string;
+      currentOther: string;
+      stale: string;
+      currentSha: string;
+      staleSha: string;
+    } {
+      const repo = initSourceRepo();
+      const staleSha = headSha(repo);
+      writeFileSync(join(repo, "current.txt"), "current\n");
+      execFileSync("git", ["add", "current.txt"], { cwd: repo });
+      execFileSync("git", ["commit", "-q", "-m", "current"], { cwd: repo });
+      const currentSha = headSha(repo);
+      const worktrees = tmpDir("dg-source-binding-");
+      const currentPath = join(worktrees, "current-detached");
+      const currentOtherPath = join(worktrees, "current-other-detached");
+      const stalePath = join(worktrees, "stale-detached");
+      execFileSync("git", ["worktree", "add", "-q", "--detach", currentPath, currentSha], {
+        cwd: repo,
+      });
+      execFileSync(
+        "git",
+        ["worktree", "add", "-q", "--detach", currentOtherPath, currentSha],
+        { cwd: repo }
+      );
+      execFileSync("git", ["worktree", "add", "-q", "--detach", stalePath, staleSha], {
+        cwd: repo,
+      });
+      const current = realpathSync(currentPath);
+      const currentOther = realpathSync(currentOtherPath);
+      const stale = realpathSync(stalePath);
+      return { current, currentOther, stale, currentSha, staleSha };
+    }
+
+    function expectRejectedBeforeRemote(
+      r: { status: number; stdout: string; stderr: string },
+      remote: string,
+      remoteCalled: string
+    ): void {
+      expect(r.status).not.toBe(0);
+      expect(existsSync(remoteCalled)).toBe(false);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8")).toBe("prior-marker\n");
+    }
+
+    it("rejects a missing expected revision before any remote call or deploy mutation", async () => {
+      const { current } = sourceBindingFixture();
+      const remote = tmpDir("dg-remote-");
+      const remoteCalled = join(remote, "REMOTE_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+
+      const r = await runScript(
+        "deploy",
+        current,
+        baseEnv(remote, {
+          DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteCalled}'; echo '${remote}'`,
+        }),
+        { expectedRevision: null }
+      );
+
+      expectRejectedBeforeRemote(r, remote, remoteCalled);
+      expect(r.stderr).toMatch(/explicit full 40-character commit SHA/);
+    });
+
+    it("rejects the correct script invoked from the wrong physical cwd before mutation", async () => {
+      const { current, currentOther, currentSha } = sourceBindingFixture();
+      const remote = tmpDir("dg-remote-");
+      const remoteCalled = join(remote, "REMOTE_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+
+      const r = await runScript(
+        "deploy",
+        currentOther,
+        baseEnv(remote, {
+          DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteCalled}'; echo '${remote}'`,
+        }),
+        {
+          expectedRevision: currentSha,
+          script: join(current, "scripts", "deploy-gateway.sh"),
+        }
+      );
+
+      expectRejectedBeforeRemote(r, remote, remoteCalled);
+      expect(r.stdout).toContain(`Expected source: ${current} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual source: ${currentOther} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual worktree root: ${currentOther}`);
+    });
+
+    it("rejects a subdirectory of the correct worktree before mutation", async () => {
+      const { current, currentSha } = sourceBindingFixture();
+      const subdir = join(current, "scripts");
+      const remote = tmpDir("dg-remote-");
+      const remoteCalled = join(remote, "REMOTE_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+
+      const r = await runScript(
+        "deploy",
+        subdir,
+        baseEnv(remote, {
+          DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteCalled}'; echo '${remote}'`,
+        }),
+        {
+          expectedRevision: currentSha,
+          script: join(current, "scripts", "deploy-gateway.sh"),
+        }
+      );
+
+      expectRejectedBeforeRemote(r, remote, remoteCalled);
+      expect(r.stdout).toContain(`Expected source: ${current} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual source: ${subdir} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual worktree root: ${current}`);
+    });
+
+    it("applies the same source binding to dry-run before its first remote probe", async () => {
+      const { current, currentOther, currentSha } = sourceBindingFixture();
+      const remote = tmpDir("dg-remote-");
+      const remoteCalled = join(remote, "REMOTE_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+
+      const r = await runScript(
+        "dry-run",
+        currentOther,
+        baseEnv(remote, {
+          DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteCalled}'; echo '${remote}'`,
+        }),
+        {
+          expectedRevision: currentSha,
+          script: join(current, "scripts", "deploy-gateway.sh"),
+        }
+      );
+
+      expectRejectedBeforeRemote(r, remote, remoteCalled);
+      expect(r.stdout).toContain(`Expected source: ${current} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual source: ${currentOther} @ ${currentSha}`);
+    });
+
+    it("rejects a stale clean detached worktree before mutation", async () => {
+      const { stale, currentSha, staleSha } = sourceBindingFixture();
+      const remote = tmpDir("dg-remote-");
+      const remoteCalled = join(remote, "REMOTE_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+      expect(execFileSync("git", ["status", "--porcelain"], { cwd: stale, encoding: "utf8" })).toBe("");
+
+      const r = await runScript(
+        "deploy",
+        stale,
+        baseEnv(remote, {
+          DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteCalled}'; echo '${remote}'`,
+        }),
+        { expectedRevision: currentSha }
+      );
+
+      expectRejectedBeforeRemote(r, remote, remoteCalled);
+      expect(r.stdout).toContain(`Expected source: ${stale} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual source: ${stale} @ ${staleSha}`);
+    });
+
+    it("allows the correct clean detached worktree to reach the existing deploy gates", async () => {
+      const { current, currentSha } = sourceBindingFixture();
+      const remote = tmpDir("dg-remote-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      expect(
+        execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+          cwd: current,
+          encoding: "utf8",
+        }).trim()
+      ).toBe("HEAD");
+
+      const r = await runScript(
+        "deploy",
+        current,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        }),
+        { expectedRevision: currentSha }
+      );
+
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(r.stdout).toContain(`Expected source: ${current} @ ${currentSha}`);
+      expect(r.stdout).toContain(`Actual source: ${current} @ ${currentSha}`);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(currentSha);
+    });
+  });
+
+  describe("immutable commit payload (issue #69)", () => {
+    it("does not ship an ignored STATUS.md from an otherwise clean accepted checkout", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      chmodSync(remote, 0o755);
+      writeFileSync(join(src, ".gitignore"), "STATUS.md\n");
+      execFileSync("git", ["add", ".gitignore"], { cwd: src });
+      execFileSync("git", ["commit", "-q", "-m", "ignore local status"], { cwd: src });
+      writeFileSync(join(src, "STATUS.md"), "private local handoff\n");
+      expect(execFileSync("git", ["status", "--porcelain"], { cwd: src, encoding: "utf8" })).toBe("");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+
+      expect(r.status).toBe(0);
+      expect(existsSync(join(remote, "STATUS.md"))).toBe(false);
+      expect(statSync(remote).mode & 0o777).toBe(0o755);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it("rsyncs committed bytes when a tracked worktree file changes and is restored during sync", async () => {
+      const src = initSourceRepo();
+      const committedReadme = readFileSync(join(src, "README.md"), "utf8");
+      const remote = tmpDir("dg-remote-");
+      const fakeBin = tmpDir("dg-rsync-race-bin-");
+      const fakeRsync = join(fakeBin, "rsync");
+      const backup = join(tmpDir("dg-rsync-race-backup-"), "README.md");
+      const realRsync = execFileSync("sh", ["-c", "command -v rsync"], {
+        encoding: "utf8",
+      }).trim();
+      const realGit = execFileSync("sh", ["-c", "command -v git"], {
+        encoding: "utf8",
+      }).trim();
+      writeFileSync(
+        fakeRsync,
+        "#!/usr/bin/env bash\n" +
+          "set -u\n" +
+          "restore_source() {\n" +
+          "  \"$REAL_GIT\" -C \"$MUTABLE_SOURCE\" show HEAD:README.md > \"$SOURCE_BACKUP\"\n" +
+          "  /bin/mv -f \"$SOURCE_BACKUP\" \"$MUTABLE_SOURCE/README.md\"\n" +
+          "}\n" +
+          "trap restore_source EXIT HUP INT TERM\n" +
+          "printf '%s\\n' 'transient unreviewed bytes' > \"$MUTABLE_SOURCE/README.md\"\n" +
+          "\"$REAL_RSYNC\" \"$@\"\n"
+      );
+      chmodSync(fakeRsync, 0o755);
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          REAL_RSYNC: realRsync,
+          REAL_GIT: realGit,
+          MUTABLE_SOURCE: src,
+          SOURCE_BACKUP: backup,
+          DEPLOY_HEALTH_LOCAL_URL: local.url,
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(readFileSync(join(remote, "README.md"), "utf8")).toBe(committedReadme);
+      expect(readFileSync(join(src, "README.md"), "utf8")).toBe(committedReadme);
+      expect(execFileSync("git", ["status", "--porcelain"], { cwd: src, encoding: "utf8" })).toBe("");
+    });
+  });
+
   it("refuses a dirty source tree before touching the remote at all", async () => {
     const src = initSourceRepo();
     const remote = tmpDir("dg-remote-");

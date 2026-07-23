@@ -109,17 +109,28 @@ to point here rather than re-describing the topology.
 
 ```bash
 # from a clean checkout of canonical/main (or a worktree of the exact commit you intend to ship)
-scripts/deploy-gateway.sh deploy
+scripts/deploy-gateway.sh deploy <accepted-full-sha>
 ```
 
 The script (issue #23) is the repo-owned replacement for manual rsync + restart + hand-checked
-hashes. It fails closed: it refuses a dirty or non-addressable source tree, refuses when the live
-unit's `WorkingDirectory` doesn't match what it's about to sync into, seeds `docs/m5-routing.json`
-copy-if-absent without ever overwriting a live/adopted table (issue #44), preflights the ExecStart
-interpreter before restarting (issue #30 — see below), restarts the unit only when the payload
-actually changed, probes local health (best-effort) and tailnet health plus an authenticated
-capability endpoint, and writes `.deployed-commit` with the exact 40-char SHA **only** after every
-check passes — any failure leaves the marker absent rather than certifying an ambiguous state.
+hashes. It fails closed: the caller must supply the immutable full commit SHA selected by the
+accepted release decision, and before any remote check or mutation the script requires its own
+physical repository root, the caller's physical current directory, Git's resolved worktree root,
+and actual `HEAD` to match that source identity. It reports the expected/actual paths and revisions
+without printing remote credentials or private transport URLs. The expected SHA must not be
+derived from `git rev-parse HEAD` in whichever checkout happens to be current at deploy time. Once
+those gates pass, the script creates a temporary `git archive` snapshot of the accepted SHA and
+rsyncs that immutable payload—not the mutable worktree—so ignored/untracked files and concurrent
+worktree edits cannot enter the deployed bytes. The temporary snapshot is removed on every exit.
+
+The source-binding check is an additional outer gate. All existing checks remain: the script
+refuses a dirty or non-addressable source tree, refuses when the live unit's `WorkingDirectory`
+doesn't match what it's about to sync into, seeds `docs/m5-routing.json` copy-if-absent without ever
+overwriting a live/adopted table (issue #44), preflights the ExecStart interpreter before
+restarting (issue #30 — see below), restarts the unit only when the payload actually changed,
+probes local health (best-effort) and tailnet health plus an authenticated capability endpoint,
+and writes `.deployed-commit` with the exact 40-char SHA **only** after every check passes — any
+failure leaves the marker absent rather than certifying an ambiguous state.
 
 A real deploy needs three env vars with no safe default (the script refuses to "certify" a
 deployment it did not actually probe):
@@ -179,7 +190,7 @@ last-good build instead of crash-looping.
 
 **Autonomy-tick timer (gi#49).** `deploy/systemd/gille-autonomy-tick.{service,timer}` are
 repo-managed IaC — committed unit files, not hand-authored on the box — mirroring hugin's
-convention of keeping unit definitions in-repo. `scripts/deploy-gateway.sh deploy` renders and
+convention of keeping unit definitions in-repo. The `deploy <accepted-full-sha>` mode renders and
 enables them on every deploy. The same final IaC phase also installs the autonomy notification hook
 described below. It runs only as the very LAST phase, strictly after restart-if-needed and every
 health/capability probe below have already passed (a review finding: a `Persistent=true` catch-up
@@ -214,8 +225,8 @@ tick armed any earlier could fire against a gateway that is still mid-restart):
 non-lingering timer means the autonomy controller silently stops ticking.
 
 **Autonomy notification hook (gi#58).** `deploy/autonomy-notify.sh` is the repo-managed template
-for the already-live `AUTONOMY_NOTIFY_CMD` behavior. During the final IaC phase,
-`scripts/deploy-gateway.sh deploy` renders its `@@REMOTE_DIR@@` placeholder against the same
+for the already-live `AUTONOMY_NOTIFY_CMD` behavior. During the final IaC phase, the bound
+`deploy <accepted-full-sha>` mode renders its `@@REMOTE_DIR@@` placeholder against the same
 verified WorkingDirectory used by the timer, then atomically installs/updates it at
 `$HOME/bin/autonomy-notify.sh` with mode `0755`. The template contains no credentials and deploy
 never reads credential values; the installed hook reads them from the box-local `.env` only when a
@@ -247,7 +258,7 @@ repository, deploy output, issues, or PRs:
   either (the tick is a separate process, not the gateway).
 - **Full stop:** `systemctl --user disable --now gille-autonomy-tick.timer` on the box. This
   unschedules future ticks entirely (unlike the kill switch, it also stops the evaluate/record
-  side); a later `scripts/deploy-gateway.sh deploy` re-enables it, so a full stop that should
+  side); a later bound deploy re-enables it, so a full stop that should
   survive the next deploy needs to stay disabled deliberately (e.g. re-run the disable command
   again after any deploy, or gate the timer install by other means if a longer-lived stop is ever
   needed).
@@ -259,7 +270,7 @@ repository, deploy output, issues, or PRs:
 Preview any deploy first:
 
 ```bash
-scripts/deploy-gateway.sh dry-run
+scripts/deploy-gateway.sh dry-run <accepted-full-sha>
 ```
 
 `dry-run` prints the exact plan (including the literal rsync command) and still performs the
@@ -286,7 +297,7 @@ The unit is not a git checkout, so "rollback" means **redeploy a known-good comm
 git worktree add /tmp/gille-rollback <known-good-sha>   # e.g. 8caf400, the current baseline
 cd /tmp/gille-rollback
 npm ci
-scripts/deploy-gateway.sh deploy
+scripts/deploy-gateway.sh deploy <known-good-full-sha>
 ```
 
 The current known-good baseline is **`8caf400`**. Update this line whenever a new deploy is
@@ -299,13 +310,13 @@ The gateway process also serves `/mcp` (`src/homeserver/mcp.ts`). A restart drop
 transport — Claude Code / Codex sessions reconnect on their next call, but anything mid-flight over
 that specific connection is interrupted. **Async `code_loop` jobs are not affected**: they persist
 in the durable SQLite store (`src/homeserver/code-loop.ts`) and survive the restart; only the live
-transport, not the job, is dropped. `scripts/deploy-gateway.sh deploy` restarts only when rsync
+transport, not the job, is dropped. The bound deploy mode restarts only when rsync
 actually transferred a content change (or `DEPLOY_FORCE_RESTART=1`), specifically to avoid
 unnecessary MCP churn on a no-op deploy.
 
 ### Credential-safe authenticated capability smoke test
 
-`scripts/deploy-gateway.sh deploy`'s capability probe calls
+The bound deploy mode's capability probe calls
 `GET /v1/capabilities/learning-task` with `Authorization: Bearer $HOMESERVER_OWNER_KEY` (the env
 var name is configurable via `DEPLOY_CAPABILITY_KEY_ENV`) and checks only the HTTP status code. The
 key is read from the environment, never placed on the command line, and never appears in the
