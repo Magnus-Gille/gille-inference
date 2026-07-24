@@ -1,3 +1,5 @@
+import { REVIEW_BOUNDED_TASK_TYPE, REVIEW_BOUNDED_TAXONOMY_KEYWORDS } from "./review-bounded.js";
+
 /**
  * Task taxonomy.
  *
@@ -97,6 +99,26 @@ export const TASK_TYPES: TaskType[] = [
       "review this",
       "review the",
     ],
+  },
+  {
+    id: REVIEW_BOUNDED_TASK_TYPE,
+    label: "Bounded code-review subtask (local-eligible, advisory)",
+    description:
+      "A NARROW, contract-shaped review subtask — classify already-identified findings, detect a " +
+      "fixed anti-pattern, or verify output shape — distinct from `code-review` (open-ended, " +
+      "whole-patch review, which remains frontier-only and unaffected by this type; #74). Only " +
+      "matches the FIXED prompt-contract markers in review-bounded.ts, never ordinary review prose, " +
+      "so a near-miss open-ended review ask cannot silently route here — see " +
+      "taxonomy-review-bounded-classification.test.ts's route-stability coverage. Local output for " +
+      "this type is advisory evidence only until promoted (see delegate-policy.ts " +
+      "isAdvisoryOnlyTaskType) — grimnir session 2026-07-24 evidence on gille-inference#25.",
+    // Deliberately imported from review-bounded.ts rather than inlined (unlike every other entry in
+    // this file) — the prompt contract builders there emit these EXACT literals, and #74 requires
+    // that prompt wording cannot silently change the intended route. A single shared constant makes
+    // that structurally true instead of relying on two copies staying in sync by hand.
+    keywords: [...REVIEW_BOUNDED_TAXONOMY_KEYWORDS],
+    // The contract's response is always the structured review-bounded JSON object (#166 pattern).
+    jsonOutput: true,
   },
   {
     id: "unit-test-gen",

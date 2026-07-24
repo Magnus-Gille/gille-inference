@@ -173,6 +173,13 @@ export interface DelegatePolicyConfig {
   maxErrorRate: number;
   /** Maximum p90 latency for automatic production delegation. */
   maxP90LatencyMs: number;
+  /**
+   * #74: task types normally treated as advisory-only (delegate-policy.ts's
+   * ADVISORY_ONLY_TASK_TYPES, e.g. `review-bounded`) that an operator has explicitly promoted past
+   * that guardrail after a measured pass rate. DEFAULT EMPTY — promotion is a deliberate operator
+   * action, never an automatic consequence of accumulating passing ledger rows.
+   */
+  promotedAdvisoryTaskTypes: string[];
 }
 
 /**
@@ -207,6 +214,7 @@ export const DEFAULT_DELEGATE_POLICY: DelegatePolicyConfig = {
   lowRiskSuccessRate: 0.9,
   maxErrorRate: 0.05,
   maxP90LatencyMs: 30_000,
+  promotedAdvisoryTaskTypes: [],
 };
 
 // ─── Top-level config ────────────────────────────────────────────────────────────
@@ -708,6 +716,10 @@ export function loadConfig(): HomeserverConfig {
         "HOMESERVER_DELEGATE_POLICY_MAX_P90_LATENCY_MS",
         DEFAULT_DELEGATE_POLICY.maxP90LatencyMs
       ),
+      // #74: empty by default — see DelegatePolicyConfig.promotedAdvisoryTaskTypes. Promoting
+      // review-bounded (or a future advisory-only type) past advisory-only is a deliberate,
+      // per-box operator action driven by measured pass rate, never a merge-time default change.
+      promotedAdvisoryTaskTypes: envList("HOMESERVER_DELEGATE_POLICY_PROMOTED_ADVISORY_TASK_TYPES"),
     },
     shadowLane: {
       // Default OFF: the lane spends GPU on work nobody asked for. Only "on" enables it.

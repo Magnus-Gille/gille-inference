@@ -35,6 +35,23 @@ export interface DecideDelegatePolicyInput extends DelegatePolicyInput {
 
 const BROAD_TASK_TYPES: ReadonlySet<string> = new Set(["other", "unknown"]);
 const LOW_RISK_TASK_TYPES: ReadonlySet<string> = new Set(["rewrite", "summarize", "translate"]);
+
+/**
+ * Task types whose local output must never become an automatic production merge/decision gate,
+ * EVEN AFTER satisfying every other evidence threshold below — issue #74. `review-bounded`'s
+ * verifier is a deterministic structural check (see review-bounded.ts), so it can accumulate
+ * certified-lane evidence exactly like any other task type; this set is the extra, independent
+ * guardrail that keeps that evidence advisory-only until an operator explicitly promotes it via
+ * `delegatePolicy.promotedAdvisoryTaskTypes` (a measured-pass-rate decision, not a code change).
+ * The promoted list defaults to empty, so a fresh checkout can never silently start treating
+ * review-bounded output as authoritative merely by accumulating passing rows.
+ */
+const ADVISORY_ONLY_TASK_TYPES: ReadonlySet<string> = new Set(["review-bounded"]);
+
+/** True when `taskType`'s local output is advisory-only-by-construction (see the set above). */
+export function isAdvisoryOnlyTaskType(taskType: string): boolean {
+  return ADVISORY_ONLY_TASK_TYPES.has(taskType);
+}
 const LEARNING_SOURCE_PREFIXES = ["probe", "cartography", "harvest", "backfill", "model-scout", "gate-"];
 const LEARNING_SOURCES: ReadonlySet<string> = new Set([
   "extra-probes",
@@ -170,6 +187,22 @@ export function decideDelegatePolicy(input: DecideDelegatePolicyInput): Delegate
       ...base,
       action: "deny",
       reason: `lane p90 latency ${input.evidence.p90LatencyMs}ms > ${cfg.maxP90LatencyMs}ms`,
+    };
+  }
+
+  // #74: the lane just cleared every evidence gate above (samples, success rate, error rate,
+  // latency) — but an advisory-only task type still cannot become an automatic production
+  // decision gate until an operator explicitly promotes it. This check runs LAST, deliberately
+  // after every other deny/shadow diagnostic, so a genuinely broken lane still reports its real
+  // blocking reason instead of always saying "advisory-only".
+  if (isAdvisoryOnlyTaskType(input.taskType) && !cfg.promotedAdvisoryTaskTypes.includes(input.taskType)) {
+    return {
+      ...base,
+      action: "shadow",
+      reason:
+        `${input.taskType} cleared certified-lane evidence (${input.evidence.attempts} samples, ` +
+        `success ${input.evidence.successRate.toFixed(3)}) but is advisory-only until promoted via ` +
+        "delegatePolicy.promotedAdvisoryTaskTypes (#74)",
     };
   }
 
