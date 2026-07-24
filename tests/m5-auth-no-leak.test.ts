@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 
 // m5-auth contract under test:
 //   • bare call           → emit the raw owner token (for M5_API_KEY=$(m5-auth))
-//   • --env               → export M5_API_KEY + M5_BASE_URL (public gateway)
-//   • --env --tailnet     → as --env, but M5_BASE_URL → m5 tailnet :8080 (#109)
+//   • --env               → export M5_API_KEY + explicit OpenAI/gateway-root URLs
+//   • --env --tailnet     → as --env, but URLs → m5 tailnet :8080 (#109)
 //   • --help / -h         → usage only, NEVER the token
 //   • anything else        → no token, non-zero exit (gille-inference#97 leak guard)
 // gille-inference#97: the raw owner token must NEVER reach stdout OR stderr for --help/-h
@@ -73,8 +73,19 @@ describe("m5-auth — documented token-emitting paths still work", () => {
     const { code, stdout } = run(["--env"]);
     expect(code).toBe(0);
     expect(stdout).toContain("export M5_API_KEY=");
+    expect(stdout).toContain("export M5_OPENAI_BASE_URL=");
+    expect(stdout).toContain("export M5_GATEWAY_URL=");
     expect(stdout).toContain("export M5_BASE_URL=");
     expect(stdout).toContain(SENTINEL);
+  });
+
+  it("--env keeps M5_BASE_URL as the OpenAI-base compatibility alias and emits a gateway-root URL", () => {
+    const { code, stdout } = run(["--env"]);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*:8080\/v1/);
+    expect(stdout).toMatch(/export M5_BASE_URL=.*:8080\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*:8080(?:['"])?\n/);
+    expect(stdout).not.toMatch(/export M5_GATEWAY_URL=.*\/v1/);
   });
 });
 
@@ -91,7 +102,11 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
       expect(stdout).toContain("export M5_API_KEY=");
       expect(stdout).toContain(SENTINEL);
       // tailnet endpoint, NOT the Cloudflare-fronted public host.
+      expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*192\.0\.2\.10:8080\/v1/);
       expect(stdout).toMatch(/export M5_BASE_URL=.*192\.0\.2\.10:8080\/v1/);
+      expect(stdout).toMatch(/export M5_GATEWAY_URL=.*192\.0\.2\.10:8080(?:['"])?\n/);
+      // Canonical gateway-root composition can never create the non-route /v1/delegate.
+      expect(`${stdout.match(/export M5_GATEWAY_URL=.*$/m)?.[0] ?? ""}/delegate`).not.toContain("/v1/delegate");
       expect(stdout).not.toContain("inference.example.com");
     });
   }
@@ -101,7 +116,9 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     const { code, stdout } = run(["--env", "--tailnet"], binDirNoTs);
     expect(code).toBe(0);
     expect(stdout).toContain(SENTINEL);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*\bhttp:\/\/inference-node:8080\/v1/);
     expect(stdout).toMatch(/export M5_BASE_URL=.*\bhttp:\/\/inference-node:8080\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*\bhttp:\/\/inference-node:8080(?:['"])?\n/);
     expect(stdout).not.toContain("inference.example.com");
   });
 

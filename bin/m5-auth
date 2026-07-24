@@ -6,8 +6,8 @@
 #
 # Usage:
 #   M5_API_KEY=$(m5-auth)                 # print the token (for a harness env var)
-#   eval "$(m5-auth --env)"               # export M5_API_KEY + M5_BASE_URL (public gateway)
-#   eval "$(m5-auth --env --tailnet)"     # as --env, but M5_BASE_URL → m5 tailnet :8080 (#109)
+#   eval "$(m5-auth --env)"               # export token + OpenAI and gateway-root bases
+#   eval "$(m5-auth --env --tailnet)"     # as --env, but bases → m5 tailnet :8080 (#109)
 #   M5_AUTH_FILE=<(m5-auth) ./harness     # bridge for file-based harnesses (bash/zsh)
 #
 # The token is emitted for a bare call, `--env`, or `--env --tailnet` (the recognized
@@ -15,7 +15,7 @@
 # flags, trailing junk, or an empty-string arg — print usage to stderr WITHOUT touching the
 # token (gille-inference#97: a first-arg-only guard used to leak the raw owner token on e.g.
 # `m5-auth --help`, `m5-auth --env extra`, or `m5-auth ""`; the dispatch now allowlists every
-# arg). `--tailnet` only applies with `--env` (it rewrites M5_BASE_URL); alone it is rejected.
+# arg). `--tailnet` only applies with `--env` (it rewrites both bases); alone it is rejected.
 #
 # NOTE: heavy/batch harnesses should run ON the box against llama-swap at
 # http://127.0.0.1:8091/v1 (UNAUTHENTICATED, loopback-only) — no token needed at all.
@@ -34,9 +34,11 @@ usage() {
   cat >&2 <<'USAGE'
 m5-auth — emit the home-server (M5) gateway bearer token from the macOS Keychain.
   m5-auth                      print the token   (for: M5_API_KEY=$(m5-auth))
-  m5-auth --env                print: export M5_API_KEY=… ; export M5_BASE_URL=…
-  m5-auth --env --tailnet      as --env, but M5_BASE_URL → m5 tailnet (:8080, bypasses Cloudflare)
+  m5-auth --env                print: export M5_API_KEY + M5_OPENAI_BASE_URL + M5_GATEWAY_URL
+  m5-auth --env --tailnet      as --env, but bases → m5 tailnet (:8080, bypasses Cloudflare)
   M5_AUTH_FILE=<(m5-auth) …    bridge a file-based harness (no on-disk file)
+M5_OPENAI_BASE_URL ends in /v1 (for /chat/completions); M5_GATEWAY_URL has no /v1
+(for /delegate and /ledger). M5_BASE_URL remains the M5_OPENAI_BASE_URL compatibility alias.
 The token is NEVER printed for --help or any unrecognized argument.
 USAGE
 }
@@ -51,8 +53,19 @@ emit() {
     exit 1
   }
   if [ "$1" = "env" ]; then
+    # These two distinct bases make route composition mechanically unambiguous:
+    #   "$M5_OPENAI_BASE_URL/chat/completions" → /v1/chat/completions
+    #   "$M5_GATEWAY_URL/delegate"             → /delegate
+    # Preserve M5_BASE_URL for existing OpenAI-compatible callers (#71).
+    local OPENAI_BASE_URL GATEWAY_URL
+    OPENAI_BASE_URL="${M5_OPENAI_BASE_URL:-${M5_BASE_URL:-http://127.0.0.1:8080/v1}}"
+    OPENAI_BASE_URL="${OPENAI_BASE_URL%/}"
+    GATEWAY_URL="${M5_GATEWAY_URL:-${OPENAI_BASE_URL%/v1}}"
+    GATEWAY_URL="${GATEWAY_URL%/}"
     printf 'export M5_API_KEY=%q\n' "$KEY"
-    printf 'export M5_BASE_URL=%q\n' "${M5_BASE_URL:-http://127.0.0.1:8080/v1}"
+    printf 'export M5_OPENAI_BASE_URL=%q\n' "$OPENAI_BASE_URL"
+    printf 'export M5_GATEWAY_URL=%q\n' "$GATEWAY_URL"
+    printf 'export M5_BASE_URL=%q\n' "$OPENAI_BASE_URL"
   else
     printf '%s' "$KEY"
   fi
@@ -88,12 +101,14 @@ if [ "$bad" -eq 1 ]; then
 elif [ "$want_help" -eq 1 ]; then
   usage
 elif [ "$want_tailnet" -eq 1 ] && [ "$want_env" -eq 0 ]; then
-  echo "m5-auth: --tailnet only applies together with --env (it sets M5_BASE_URL)." >&2
+  echo "m5-auth: --tailnet only applies together with --env (it sets the gateway base URLs)." >&2
   usage
   exit 2
 elif [ "$want_tailnet" -eq 1 ]; then
-  M5_BASE_URL="http://$(resolve_m5_host):8080/v1"
-  export M5_BASE_URL
+  M5_GATEWAY_URL="http://$(resolve_m5_host):8080"
+  M5_OPENAI_BASE_URL="$M5_GATEWAY_URL/v1"
+  M5_BASE_URL="$M5_OPENAI_BASE_URL"
+  export M5_GATEWAY_URL M5_OPENAI_BASE_URL M5_BASE_URL
   emit env
 elif [ "$want_env" -eq 1 ]; then
   emit env
