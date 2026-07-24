@@ -62,6 +62,16 @@ function run(args: string[], dir: string = binDir, extraEnv: NodeJS.ProcessEnv =
   return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
+function loadEnvAndCompose(dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
+  const env = { ...process.env, ...extraEnv, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  const script = [
+    'eval "$("$1" --env)"',
+    'printf "%s\\n" "$M5_GATEWAY_URL/delegate" "$M5_GATEWAY_URL/ledger" "$M5_OPENAI_BASE_URL/chat/completions"',
+  ].join("\n");
+  const r = spawnSync("bash", ["-c", script, "bash", SCRIPT], { env, encoding: "utf8" });
+  return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
 describe("m5-auth — documented token-emitting paths still work", () => {
   it("bare call prints the token on stdout, exit 0", () => {
     const { code, stdout } = run([]);
@@ -159,6 +169,49 @@ describe("m5-auth — authenticated base URL contract (#71)", () => {
     expect(code).toBe(0);
     expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=https:\/\/legacy\.example\/v1/);
     expect(stdout).toMatch(/export M5_GATEWAY_URL=https:\/\/legacy\.example\n/);
+  });
+
+  // Explicit M5_GATEWAY_URL / M5_OPENAI_BASE_URL override legacy M5_BASE_URL. A sole
+  // first-class value derives its counterpart; an explicit pair must already agree.
+  const validOverrideMatrix: Array<[string, NodeJS.ProcessEnv, string]> = [
+    ["gateway only", { M5_GATEWAY_URL: "https://gateway.example/" }, "https://gateway.example"],
+    ["OpenAI only", { M5_OPENAI_BASE_URL: "https://openai.example/v1/" }, "https://openai.example"],
+    ["legacy only", { M5_BASE_URL: "https://legacy.example/v1/" }, "https://legacy.example"],
+    [
+      "matching first-class pair",
+      { M5_GATEWAY_URL: "https://both.example", M5_OPENAI_BASE_URL: "https://both.example/v1" },
+      "https://both.example",
+    ],
+  ];
+
+  it.each(validOverrideMatrix)("loads valid %s overrides and composes the three route families", (_label, env, root) => {
+    const result = loadEnvAndCompose(binDir, env);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.trim().split("\n")).toEqual([
+      `${root}/delegate`,
+      `${root}/ledger`,
+      `${root}/v1/chat/completions`,
+    ]);
+  });
+
+  const invalidOverrideMatrix: Array<[string, NodeJS.ProcessEnv]> = [
+    ["a path-only OpenAI base", { M5_OPENAI_BASE_URL: "/v1" }],
+    ["a gateway with a path", { M5_GATEWAY_URL: "https://gateway.example/path" }],
+    ["a gateway with a query", { M5_GATEWAY_URL: "https://gateway.example?private=1" }],
+    ["a gateway with a fragment", { M5_GATEWAY_URL: "https://gateway.example#private" }],
+    ["a non-HTTP(S) gateway", { M5_GATEWAY_URL: "ftp://gateway.example" }],
+    ["an empty gateway override", { M5_GATEWAY_URL: "" }],
+    ["an empty OpenAI override", { M5_OPENAI_BASE_URL: "" }],
+    ["an empty legacy override", { M5_BASE_URL: "" }],
+  ];
+
+  it.each(invalidOverrideMatrix)("rejects %s before emitting the Keychain token", (_label, env) => {
+    const { code, stdout, stderr } = run(["--env"], binDir, env);
+    expect(code).not.toBe(0);
+    expect(stdout).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stderr).toMatch(/base URL/i);
   });
 });
 

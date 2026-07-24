@@ -46,14 +46,40 @@ USAGE
 # prepare_env_bases — normalize and validate the two public route bases BEFORE touching
 # the Keychain. Do not echo configured values: callers may have supplied private locators.
 prepare_env_bases() {
-  M5_AUTH_OPENAI_BASE_URL="${M5_OPENAI_BASE_URL:-${M5_BASE_URL:-http://127.0.0.1:8080/v1}}"
+  local has_gateway=0 has_openai=0 has_legacy=0
+  [ "${M5_GATEWAY_URL+x}" = x ] && has_gateway=1
+  [ "${M5_OPENAI_BASE_URL+x}" = x ] && has_openai=1
+  [ "${M5_BASE_URL+x}" = x ] && has_legacy=1
+
+  # Explicit empty values are configuration errors, never fall-through defaults.
+  if { [ "$has_gateway" -eq 1 ] && [ -z "$M5_GATEWAY_URL" ]; } || \
+     { [ "$has_openai" -eq 1 ] && [ -z "$M5_OPENAI_BASE_URL" ]; } || \
+     { [ "$has_legacy" -eq 1 ] && [ -z "$M5_BASE_URL" ]; }; then
+    echo "m5-auth: invalid authenticated base URL configuration." >&2
+    exit 2
+  fi
+
+  # First-class bases take precedence over the legacy M5_BASE_URL alias. A sole
+  # first-class base derives its counterpart; an explicit pair must match below.
+  if [ "$has_gateway" -eq 1 ]; then
+    M5_AUTH_GATEWAY_URL="${M5_GATEWAY_URL%/}"
+    M5_AUTH_OPENAI_BASE_URL="${M5_OPENAI_BASE_URL:-$M5_AUTH_GATEWAY_URL/v1}"
+  elif [ "$has_openai" -eq 1 ]; then
+    M5_AUTH_OPENAI_BASE_URL="${M5_OPENAI_BASE_URL%/}"
+    M5_AUTH_GATEWAY_URL="${M5_AUTH_OPENAI_BASE_URL%/v1}"
+  else
+    M5_AUTH_OPENAI_BASE_URL="${M5_BASE_URL:-http://127.0.0.1:8080/v1}"
+    M5_AUTH_OPENAI_BASE_URL="${M5_AUTH_OPENAI_BASE_URL%/}"
+    M5_AUTH_GATEWAY_URL="${M5_AUTH_OPENAI_BASE_URL%/v1}"
+  fi
   M5_AUTH_OPENAI_BASE_URL="${M5_AUTH_OPENAI_BASE_URL%/}"
-  M5_AUTH_GATEWAY_URL="${M5_GATEWAY_URL:-${M5_AUTH_OPENAI_BASE_URL%/v1}}"
   M5_AUTH_GATEWAY_URL="${M5_AUTH_GATEWAY_URL%/}"
 
-  if [[ "$M5_AUTH_GATEWAY_URL" == */v1 ]] || [ "$M5_AUTH_OPENAI_BASE_URL" != "$M5_AUTH_GATEWAY_URL/v1" ]; then
-    echo "m5-auth: inconsistent authenticated base URL configuration." >&2
-    echo "m5-auth: M5_OPENAI_BASE_URL must equal M5_GATEWAY_URL plus /v1." >&2
+  if ! [[ "$M5_AUTH_GATEWAY_URL" =~ ^https?://[^/?#]+$ ]] || \
+     [[ "$M5_AUTH_GATEWAY_URL" == */v1 ]] || \
+     [ "$M5_AUTH_OPENAI_BASE_URL" != "$M5_AUTH_GATEWAY_URL/v1" ]; then
+    echo "m5-auth: invalid authenticated base URL configuration." >&2
+    echo "m5-auth: M5_OPENAI_BASE_URL must equal an absolute M5_GATEWAY_URL plus /v1." >&2
     exit 2
   fi
 }

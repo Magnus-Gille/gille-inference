@@ -12,6 +12,14 @@ Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-rou
 
 - **Base URL:** `http://<m5-host>:8080`. The gateway binds via `HOMESERVER_HOST` (default `127.0.0.1`) and `HOMESERVER_PORT` (default `8080`). On the M5 this is the single runtime entry Hugin macro-routes to. (Clients such as Hugin's executor point at it via their own `HOMESERVER_GATEWAY_URL` — that is a client-side var, *not* read by the gateway.)
 - **Authenticated harness bases:** `eval "$(m5-auth --env)"` exports `M5_GATEWAY_URL` at the gateway root and `M5_OPENAI_BASE_URL` at that root plus `/v1`; it also retains `M5_BASE_URL` as an OpenAI-base compatibility alias. The helper refuses inconsistent overrides before reading the token: after trailing-slash normalization, the OpenAI base must equal the gateway root plus `/v1`. Compose routes exactly as `"$M5_GATEWAY_URL/delegate"`, `"$M5_GATEWAY_URL/ledger"`, and `"$M5_OPENAI_BASE_URL/chat/completions"`. Do not append `/delegate` or `/ledger` to either OpenAI-base variable: that produces the non-route `/v1/delegate` or `/v1/ledger`. `--tailnet` changes both bases to the authenticated tailnet gateway, never to loopback.
+
+| Supplied environment | Result |
+|---|---|
+| `M5_GATEWAY_URL` only | Derives `M5_OPENAI_BASE_URL=$M5_GATEWAY_URL/v1`. |
+| `M5_OPENAI_BASE_URL` only | Derives the gateway root by removing its final `/v1`. |
+| Legacy `M5_BASE_URL` only | Treats it as the OpenAI base and derives the gateway root. |
+| Both first-class variables | Requires `M5_OPENAI_BASE_URL=$M5_GATEWAY_URL/v1`. |
+| Empty, path/query/fragment gateway, non-HTTP(S) gateway, or an inconsistent pair | Fails closed before reading or emitting the bearer token. |
 - **Bind / implicit-admin:** the gateway freezes its implicit-admin posture once at startup from the actual bind host (`isImplicitAdminAllowed`). Implicit admin (no-token bootstrap) requires **all** of: a loopback bind, zero `HOMESERVER_API_KEYS`, zero `HOMESERVER_ADMIN_API_KEYS`, and zero active keystore keys at startup. If any key exists, every request must authenticate. For LAN/external use, configure keys.
 - **Content type:** `application/json` for all bodies and responses (except `/v1/chat/completions` streaming, which is `text/event-stream`).
 
