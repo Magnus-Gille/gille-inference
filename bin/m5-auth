@@ -43,9 +43,28 @@ The token is NEVER printed for --help or any unrecognized argument.
 USAGE
 }
 
-# emit MODE(raw|env) — read the token from the Keychain and print it. Called DIRECTLY
+# prepare_env_bases — normalize and validate the two public route bases BEFORE touching
+# the Keychain. Do not echo configured values: callers may have supplied private locators.
+prepare_env_bases() {
+  M5_AUTH_OPENAI_BASE_URL="${M5_OPENAI_BASE_URL:-${M5_BASE_URL:-http://127.0.0.1:8080/v1}}"
+  M5_AUTH_OPENAI_BASE_URL="${M5_AUTH_OPENAI_BASE_URL%/}"
+  M5_AUTH_GATEWAY_URL="${M5_GATEWAY_URL:-${M5_AUTH_OPENAI_BASE_URL%/v1}}"
+  M5_AUTH_GATEWAY_URL="${M5_AUTH_GATEWAY_URL%/}"
+
+  if [[ "$M5_AUTH_GATEWAY_URL" == */v1 ]] || [ "$M5_AUTH_OPENAI_BASE_URL" != "$M5_AUTH_GATEWAY_URL/v1" ]; then
+    echo "m5-auth: inconsistent authenticated base URL configuration." >&2
+    echo "m5-auth: M5_OPENAI_BASE_URL must equal M5_GATEWAY_URL plus /v1." >&2
+    exit 2
+  fi
+}
+
+# emit MODE(raw|env) — validate bases before reading the token, then print it. Called DIRECTLY
 # (never inside $(…)) so a missing-token `exit 1` propagates and terminates the script.
 emit() {
+  if [ "$1" = "env" ]; then
+    prepare_env_bases
+  fi
+
   local KEY
   KEY=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null) || {
     echo "m5-auth: no token in the configured Keychain item." >&2
@@ -57,15 +76,10 @@ emit() {
     #   "$M5_OPENAI_BASE_URL/chat/completions" → /v1/chat/completions
     #   "$M5_GATEWAY_URL/delegate"             → /delegate
     # Preserve M5_BASE_URL for existing OpenAI-compatible callers (#71).
-    local OPENAI_BASE_URL GATEWAY_URL
-    OPENAI_BASE_URL="${M5_OPENAI_BASE_URL:-${M5_BASE_URL:-http://127.0.0.1:8080/v1}}"
-    OPENAI_BASE_URL="${OPENAI_BASE_URL%/}"
-    GATEWAY_URL="${M5_GATEWAY_URL:-${OPENAI_BASE_URL%/v1}}"
-    GATEWAY_URL="${GATEWAY_URL%/}"
     printf 'export M5_API_KEY=%q\n' "$KEY"
-    printf 'export M5_OPENAI_BASE_URL=%q\n' "$OPENAI_BASE_URL"
-    printf 'export M5_GATEWAY_URL=%q\n' "$GATEWAY_URL"
-    printf 'export M5_BASE_URL=%q\n' "$OPENAI_BASE_URL"
+    printf 'export M5_OPENAI_BASE_URL=%q\n' "$M5_AUTH_OPENAI_BASE_URL"
+    printf 'export M5_GATEWAY_URL=%q\n' "$M5_AUTH_GATEWAY_URL"
+    printf 'export M5_BASE_URL=%q\n' "$M5_AUTH_OPENAI_BASE_URL"
   else
     printf '%s' "$KEY"
   fi

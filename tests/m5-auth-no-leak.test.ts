@@ -54,10 +54,10 @@ beforeAll(() => {
   writeMock(binDirNoTs, "tailscale", `#!/usr/bin/env bash\nexit 1\n`);
 });
 
-function run(args: string[], dir: string = binDir) {
+function run(args: string[], dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
   // Prepend the mock dir so our fake `security`/`tailscale` shadow the system ones, making
   // --tailnet resolution deterministic and independent of whether the host is on the tailnet.
-  const env = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  const env = { ...process.env, ...extraEnv, PATH: `${dir}:${process.env.PATH ?? ""}` };
   const r = spawnSync("bash", [SCRIPT, ...args], { env, encoding: "utf8" });
   return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -129,6 +129,36 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     expect(stdout).not.toContain("hs_owner_");
     expect(stderr).not.toContain(SENTINEL);
     expect(stderr).toMatch(/tailnet/i);
+  });
+});
+
+describe("m5-auth — authenticated base URL contract (#71)", () => {
+  const badOverrides: Array<[string, NodeJS.ProcessEnv]> = [
+    ["a gateway URL ending in /v1", { M5_GATEWAY_URL: "https://private.example/v1" }],
+    ["an OpenAI base URL without /v1", { M5_OPENAI_BASE_URL: "https://private.example/api" }],
+    [
+      "a mismatched OpenAI/gateway pair",
+      { M5_GATEWAY_URL: "https://gateway.example", M5_OPENAI_BASE_URL: "https://other.example/v1" },
+    ],
+  ];
+
+  it.each(badOverrides)("rejects %s without reading or echoing sensitive values", (_label, extraEnv) => {
+    const { code, stdout, stderr } = run(["--env"], binDir, extraEnv);
+    expect(code).not.toBe(0);
+    expect(stdout).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stdout).not.toContain("private.example");
+    expect(stderr).not.toContain("private.example");
+    expect(stdout).not.toContain("gateway.example");
+    expect(stderr).not.toContain("gateway.example");
+    expect(stderr).toMatch(/base URL/i);
+  });
+
+  it("derives a gateway root from the legacy M5_BASE_URL-only input", () => {
+    const { code, stdout } = run(["--env"], binDir, { M5_BASE_URL: "https://legacy.example/v1/" });
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=https:\/\/legacy\.example\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=https:\/\/legacy\.example\n/);
   });
 });
 
