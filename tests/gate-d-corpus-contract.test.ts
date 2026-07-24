@@ -54,6 +54,14 @@ describe("Gate D corpus revision contract (#250)", () => {
     expect(workflow).not.toContain("GATE_D_CONTRACT_ONLY=1");
   });
 
+  it("uses immutable Node 24-native GitHub Action pins in CI (#73)", () => {
+    const workflow = readFileSync(CI, "utf8");
+    expect(workflow).toContain("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1");
+    expect(workflow).toContain("actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0");
+    expect(workflow).toContain("node-version: '22'");
+    expect(workflow).not.toMatch(/actions\/(checkout|setup-node)@v\d/);
+  });
+
   it("shell runners use the manifest helper instead of filesystem task globs", () => {
     for (const path of [RUN, SWEEP]) {
       const source = readFileSync(path, "utf8");
