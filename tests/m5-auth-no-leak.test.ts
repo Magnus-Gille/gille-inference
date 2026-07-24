@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 
 // m5-auth contract under test:
 //   • bare call           → emit the raw owner token (for M5_API_KEY=$(m5-auth))
-//   • --env               → export M5_API_KEY + M5_BASE_URL (public gateway)
-//   • --env --tailnet     → as --env, but M5_BASE_URL → m5 tailnet :8080 (#109)
+//   • --env               → export M5_API_KEY + explicit OpenAI/gateway-root URLs
+//   • --env --tailnet     → as --env, but URLs → m5 tailnet :8080 (#109)
 //   • --help / -h         → usage only, NEVER the token
 //   • anything else        → no token, non-zero exit (gille-inference#97 leak guard)
 // gille-inference#97: the raw owner token must NEVER reach stdout OR stderr for --help/-h
@@ -54,11 +54,21 @@ beforeAll(() => {
   writeMock(binDirNoTs, "tailscale", `#!/usr/bin/env bash\nexit 1\n`);
 });
 
-function run(args: string[], dir: string = binDir) {
+function run(args: string[], dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
   // Prepend the mock dir so our fake `security`/`tailscale` shadow the system ones, making
   // --tailnet resolution deterministic and independent of whether the host is on the tailnet.
-  const env = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  const env = { ...process.env, ...extraEnv, PATH: `${dir}:${process.env.PATH ?? ""}` };
   const r = spawnSync("bash", [SCRIPT, ...args], { env, encoding: "utf8" });
+  return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+function loadEnvAndCompose(dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
+  const env = { ...process.env, ...extraEnv, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  const script = [
+    'eval "$("$1" --env)"',
+    'printf "%s\\n" "$M5_GATEWAY_URL/delegate" "$M5_GATEWAY_URL/ledger" "$M5_OPENAI_BASE_URL/chat/completions"',
+  ].join("\n");
+  const r = spawnSync("bash", ["-c", script, "bash", SCRIPT], { env, encoding: "utf8" });
   return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
@@ -73,8 +83,19 @@ describe("m5-auth — documented token-emitting paths still work", () => {
     const { code, stdout } = run(["--env"]);
     expect(code).toBe(0);
     expect(stdout).toContain("export M5_API_KEY=");
+    expect(stdout).toContain("export M5_OPENAI_BASE_URL=");
+    expect(stdout).toContain("export M5_GATEWAY_URL=");
     expect(stdout).toContain("export M5_BASE_URL=");
     expect(stdout).toContain(SENTINEL);
+  });
+
+  it("--env keeps M5_BASE_URL as the OpenAI-base compatibility alias and emits a gateway-root URL", () => {
+    const { code, stdout } = run(["--env"]);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*:8080\/v1/);
+    expect(stdout).toMatch(/export M5_BASE_URL=.*:8080\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*:8080(?:['"])?\n/);
+    expect(stdout).not.toMatch(/export M5_GATEWAY_URL=.*\/v1/);
   });
 });
 
@@ -91,7 +112,11 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
       expect(stdout).toContain("export M5_API_KEY=");
       expect(stdout).toContain(SENTINEL);
       // tailnet endpoint, NOT the Cloudflare-fronted public host.
+      expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*192\.0\.2\.10:8080\/v1/);
       expect(stdout).toMatch(/export M5_BASE_URL=.*192\.0\.2\.10:8080\/v1/);
+      expect(stdout).toMatch(/export M5_GATEWAY_URL=.*192\.0\.2\.10:8080(?:['"])?\n/);
+      // Canonical gateway-root composition can never create the non-route /v1/delegate.
+      expect(`${stdout.match(/export M5_GATEWAY_URL=.*$/m)?.[0] ?? ""}/delegate`).not.toContain("/v1/delegate");
       expect(stdout).not.toContain("inference.example.com");
     });
   }
@@ -101,7 +126,9 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     const { code, stdout } = run(["--env", "--tailnet"], binDirNoTs);
     expect(code).toBe(0);
     expect(stdout).toContain(SENTINEL);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*\bhttp:\/\/inference-node:8080\/v1/);
     expect(stdout).toMatch(/export M5_BASE_URL=.*\bhttp:\/\/inference-node:8080\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*\bhttp:\/\/inference-node:8080(?:['"])?\n/);
     expect(stdout).not.toContain("inference.example.com");
   });
 
@@ -112,6 +139,79 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     expect(stdout).not.toContain("hs_owner_");
     expect(stderr).not.toContain(SENTINEL);
     expect(stderr).toMatch(/tailnet/i);
+  });
+});
+
+describe("m5-auth — authenticated base URL contract (#71)", () => {
+  const badOverrides: Array<[string, NodeJS.ProcessEnv]> = [
+    ["a gateway URL ending in /v1", { M5_GATEWAY_URL: "https://private.example/v1" }],
+    ["an OpenAI base URL without /v1", { M5_OPENAI_BASE_URL: "https://private.example/api" }],
+    [
+      "a mismatched OpenAI/gateway pair",
+      { M5_GATEWAY_URL: "https://gateway.example", M5_OPENAI_BASE_URL: "https://other.example/v1" },
+    ],
+  ];
+
+  it.each(badOverrides)("rejects %s without reading or echoing sensitive values", (_label, extraEnv) => {
+    const { code, stdout, stderr } = run(["--env"], binDir, extraEnv);
+    expect(code).not.toBe(0);
+    expect(stdout).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stdout).not.toContain("private.example");
+    expect(stderr).not.toContain("private.example");
+    expect(stdout).not.toContain("gateway.example");
+    expect(stderr).not.toContain("gateway.example");
+    expect(stderr).toMatch(/base URL/i);
+  });
+
+  it("derives a gateway root from the legacy M5_BASE_URL-only input", () => {
+    const { code, stdout } = run(["--env"], binDir, { M5_BASE_URL: "https://legacy.example/v1/" });
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=https:\/\/legacy\.example\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=https:\/\/legacy\.example\n/);
+  });
+
+  // Explicit M5_GATEWAY_URL / M5_OPENAI_BASE_URL override legacy M5_BASE_URL. A sole
+  // first-class value derives its counterpart; an explicit pair must already agree.
+  const validOverrideMatrix: Array<[string, NodeJS.ProcessEnv, string]> = [
+    ["gateway only", { M5_GATEWAY_URL: "https://gateway.example/" }, "https://gateway.example"],
+    ["OpenAI only", { M5_OPENAI_BASE_URL: "https://openai.example/v1/" }, "https://openai.example"],
+    ["legacy only", { M5_BASE_URL: "https://legacy.example/v1/" }, "https://legacy.example"],
+    [
+      "matching first-class pair",
+      { M5_GATEWAY_URL: "https://both.example", M5_OPENAI_BASE_URL: "https://both.example/v1" },
+      "https://both.example",
+    ],
+  ];
+
+  it.each(validOverrideMatrix)("loads valid %s overrides and composes the three route families", (_label, env, root) => {
+    const result = loadEnvAndCompose(binDir, env);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.trim().split("\n")).toEqual([
+      `${root}/delegate`,
+      `${root}/ledger`,
+      `${root}/v1/chat/completions`,
+    ]);
+  });
+
+  const invalidOverrideMatrix: Array<[string, NodeJS.ProcessEnv]> = [
+    ["a path-only OpenAI base", { M5_OPENAI_BASE_URL: "/v1" }],
+    ["a gateway with a path", { M5_GATEWAY_URL: "https://gateway.example/path" }],
+    ["a gateway with a query", { M5_GATEWAY_URL: "https://gateway.example?private=1" }],
+    ["a gateway with a fragment", { M5_GATEWAY_URL: "https://gateway.example#private" }],
+    ["a non-HTTP(S) gateway", { M5_GATEWAY_URL: "ftp://gateway.example" }],
+    ["an empty gateway override", { M5_GATEWAY_URL: "" }],
+    ["an empty OpenAI override", { M5_OPENAI_BASE_URL: "" }],
+    ["an empty legacy override", { M5_BASE_URL: "" }],
+  ];
+
+  it.each(invalidOverrideMatrix)("rejects %s before emitting the Keychain token", (_label, env) => {
+    const { code, stdout, stderr } = run(["--env"], binDir, env);
+    expect(code).not.toBe(0);
+    expect(stdout).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stderr).toMatch(/base URL/i);
   });
 });
 
