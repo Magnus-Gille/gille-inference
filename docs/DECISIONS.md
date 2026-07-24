@@ -46,6 +46,30 @@ Canonical architecture: [`architecture.md`](./architecture.md); evidence:
 [`migration-go-no-go-verdict.md`](./migration-go-no-go-verdict.md); full decision:
 [`adr-005-hybrid-steady-state.md`](./adr-005-hybrid-steady-state.md).
 
+## ADR-006: bounded local-review lane, distinct from `code-review` (#74)
+
+**Decision:** A new, narrow `review-bounded` task type MAY route locally for three bounded review
+subtasks — classify already-identified findings, detect a fixed anti-pattern, verify output shape —
+each with a fixed prompt contract and an exact, machine-checkable structured output schema.
+`code-review` (open-ended, whole-patch PR review) remains a frontier-escalation gap type,
+unchanged. Local `review-bounded` output is advisory evidence only, never an authoritative
+merge/decision gate, until an operator explicitly promotes it
+(`delegatePolicy.promotedAdvisoryTaskTypes`) after a measured pass rate.
+
+**Rationale:** grimnir session 2026-07-24 (recorded on gille-inference#25): 4/4 BOUNDED
+single-question M5 review calls on real merged PRs were useful and correct, versus a whole-patch
+adversarial review of a ~160-line safety-relevant diff (gille-inference#78) whose 4 findings were
+ALL refuted on validation, one of which would have removed safety-relevant claim-token fencing. The
+boundary that data supports is bounded-vs-open-ended, not general model review capability.
+
+**Consequence:** `taxonomy.ts` gains a `review-bounded` type keyed on fixed contract markers (never
+ordinary review prose, so wording cannot silently change the route);
+`delegate-policy.ts`'s `decideDelegatePolicy` gains an advisory-only guardrail that runs after every
+other evidence check; the ledger gains a `reviewer_usefulness` overlay
+(`pass`\|`partial`\|`redo`\|`wrong`) distinct from the deterministic verifier `outcome`; and
+`GET /v1/capabilities/review-lane` lets an orchestrator ask which lane it will get before sending a
+prompt. Full design: [`review-bounded-lane.md`](./review-bounded-lane.md).
+
 ## Hugin timed deprecation trial
 
 **Decision:** Freeze expansion and validate Hugin's narrow durable-supervisor role from 2026-07-11

@@ -63,6 +63,12 @@ import {
 import { ingestExposureReceipt } from "./exposure-receipt-intake.js";
 import { exposureReceiptSurfaceSchema } from "./exposure-receipt-schema.js";
 import {
+  REVIEW_LANE_KNOWN_TASK_TYPES,
+  REVIEW_LANE_CAPABILITY_ENDPOINT,
+  REVIEW_BOUNDED_CONTRACT_VERSION,
+  reviewLaneCapability,
+} from "./review-bounded.js";
+import {
   LEARNING_TASK_PREFLIGHT_ENDPOINT,
   LEARNING_TASK_PREFLIGHT_TTL_MS,
   LearningTaskContractError,
@@ -3248,6 +3254,31 @@ async function handleRequest(
     if (path === LEARNING_TASK_PREFLIGHT_ENDPOINT && method === "GET") {
       res.setHeader("cache-control", `private, max-age=${LEARNING_TASK_PREFLIGHT_TTL_MS / 1_000}`);
       sendJson(res, 200, learningTaskCapabilityEpoch.advertise());
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+
+    // #74: content-blind, no-I/O preflight — an orchestrator can ask which lane a task TYPE will
+    // get (frontier-only vs local-advisory) before spending a `/delegate` round trip, and never
+    // waits on a local review result for a task type that always escalates. Always includes both
+    // known review lanes (code-review, review-bounded); an explicit `?taskType=` is echoed too
+    // (falls back to the generic "no local-eligible lane" reason for anything unrecognized).
+    if (path === REVIEW_LANE_CAPABILITY_ENDPOINT && method === "GET") {
+      const requestedTaskType = parsedUrl.searchParams.get("taskType");
+      const lanes: Record<string, ReturnType<typeof reviewLaneCapability>> = {};
+      for (const t of REVIEW_LANE_KNOWN_TASK_TYPES) lanes[t] = reviewLaneCapability(t, cfg.delegatePolicy.promotedAdvisoryTaskTypes);
+      if (requestedTaskType && !(requestedTaskType in lanes)) {
+        lanes[requestedTaskType] = reviewLaneCapability(requestedTaskType, cfg.delegatePolicy.promotedAdvisoryTaskTypes);
+      }
+      res.setHeader("cache-control", "private, max-age=60");
+      sendJson(res, 200, {
+        endpoint: REVIEW_LANE_CAPABILITY_ENDPOINT,
+        contract_version: REVIEW_BOUNDED_CONTRACT_VERSION,
+        generated_at: new Date().toISOString(),
+        lanes,
+      });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";

@@ -60,6 +60,15 @@ export type Outcome = "pass" | "partial" | "fail" | "error" | "unverified";
  */
 export type ErrorClass = "empty" | "truncated" | "timeout" | "parse" | "infra";
 
+/**
+ * #74: a reviewer's (human, or a delegator session — e.g. "grimnir-session-2026-07-24") after-the-
+ * fact judgment of whether a delegation's local output was actually USEFUL, distinct from the
+ * deterministic verifier `Outcome` above. `pass` = used as-is; `partial` = useful but incomplete/
+ * needed editing; `redo` = not useful, had to redo the work another way; `wrong` = actively
+ * incorrect (e.g. the four gille-inference#78 whole-patch findings that were all refuted).
+ */
+export type ReviewerUsefulness = "pass" | "partial" | "redo" | "wrong";
+
 const INFRA_ERROR_CLASSES: ReadonlySet<string> = new Set(["infra"]);
 
 export interface DelegationRecord {
@@ -227,6 +236,16 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("learning_task_admission_id")) db.exec(`ALTER TABLE delegations ADD COLUMN learning_task_admission_id TEXT`);
     if (!names.has("learning_task_instance_id")) db.exec(`ALTER TABLE delegations ADD COLUMN learning_task_instance_id TEXT`);
     if (!names.has("learning_task_attempt_id")) db.exec(`ALTER TABLE delegations ADD COLUMN learning_task_attempt_id TEXT`);
+    // #74: reviewer-usefulness overlay. This is a HUMAN/reviewer-session judgment of whether the
+    // local output was actually useful (pass|partial|redo|wrong) — distinct from `outcome`, which is
+    // the deterministic verifier's grading. Both can legitimately disagree (e.g. a schema-valid
+    // output the reviewer still judged not worth using). Written AFTER the row exists (a bounded
+    // review call's real-world usefulness is only knowable once someone checks it), via
+    // `recordReviewerUsefulness`, never at insert time. All four columns stay NULL until judged.
+    if (!names.has("reviewer_usefulness")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness TEXT`);
+    if (!names.has("reviewer_usefulness_notes")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_notes TEXT`);
+    if (!names.has("reviewer_usefulness_by")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_by TEXT`);
+    if (!names.has("reviewer_usefulness_ts")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_ts TEXT`);
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -593,6 +612,46 @@ export function supersedeDelegationById(id: string, nowIso: string): boolean {
   const info = db
     .prepare(`UPDATE delegations SET superseded_at = @now WHERE id = @id AND superseded_at IS NULL`)
     .run({ now: nowIso, id });
+  return info.changes > 0;
+}
+
+export interface ReviewerUsefulnessInput {
+  /** The `recordDelegation` return value (or POST /delegate's echoed `costTrace.delegationId`). */
+  ledgerId: string;
+  usefulness: ReviewerUsefulness;
+  /** Free-text rationale, e.g. "refuted on validation — see gille-inference#78". */
+  notes?: string | null;
+  /** Who judged it — e.g. "magnus" or a delegator session id. Never raw task content. */
+  judgedBy?: string | null;
+  now?: string;
+}
+
+/**
+ * Record (or overwrite) a reviewer's usefulness verdict on an existing delegation row (#74).
+ * Idempotent-by-id: a later call simply replaces the earlier judgment, matching the mutable-
+ * status-vs-immutable-log convention used elsewhere in this codebase (a usefulness verdict is a
+ * current-status field, not an append-only event log). Returns false — never throws — when
+ * `ledgerId` does not exist, mirroring `supersedeDelegationById`'s "safe no-op" discipline.
+ */
+export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): boolean {
+  const db = ledgerDb();
+  const now = input.now ?? new Date().toISOString();
+  const info = db
+    .prepare(
+      `UPDATE delegations
+         SET reviewer_usefulness = @usefulness,
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = @judgedBy,
+             reviewer_usefulness_ts = @ts
+       WHERE id = @id`
+    )
+    .run({
+      usefulness: input.usefulness,
+      notes: input.notes ?? null,
+      judgedBy: input.judgedBy ?? null,
+      ts: now,
+      id: input.ledgerId,
+    });
   return info.changes > 0;
 }
 
@@ -1342,6 +1401,11 @@ export interface DelegationById extends RecentDelegation {
   learningTaskAdmissionId: string | null;
   taskInstanceId: string | null;
   attemptId: string | null;
+  /** #74: NULL until a reviewer judges this row (see recordReviewerUsefulness). */
+  reviewerUsefulness: ReviewerUsefulness | null;
+  reviewerUsefulnessNotes: string | null;
+  reviewerUsefulnessBy: string | null;
+  reviewerUsefulnessTs: string | null;
 }
 
 interface DelegationByIdRow extends RecentDelegationRow {
@@ -1349,6 +1413,10 @@ interface DelegationByIdRow extends RecentDelegationRow {
   learningTaskAdmissionId: string | null;
   taskInstanceId: string | null;
   attemptId: string | null;
+  reviewerUsefulness: ReviewerUsefulness | null;
+  reviewerUsefulnessNotes: string | null;
+  reviewerUsefulnessBy: string | null;
+  reviewerUsefulnessTs: string | null;
 }
 
 interface RecentDelegationRow {
@@ -1413,7 +1481,11 @@ export function getDelegationById(id: string): DelegationById | null {
               evidence_identity_hash AS evidenceIdentityHash,
               learning_task_admission_id AS learningTaskAdmissionId,
               learning_task_instance_id AS taskInstanceId,
-              learning_task_attempt_id AS attemptId
+              learning_task_attempt_id AS attemptId,
+              reviewer_usefulness AS reviewerUsefulness,
+              reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+              reviewer_usefulness_by AS reviewerUsefulnessBy,
+              reviewer_usefulness_ts AS reviewerUsefulnessTs
        FROM delegations WHERE id = ?`
     )
     .get(id) as DelegationByIdRow | undefined;

@@ -2,7 +2,7 @@
 
 **Status:** stable reference for the BosGame M5 home-server gateway.
 **Audience:** Hugin's macro-router (the M5 runtime/executor), Heimdall's inference-observability collector, and any LAN client.
-**Source of truth:** `src/homeserver/gateway.ts` (routing), `src/homeserver/learning-task-contract.ts` (LearningTaskContract preflight/stamp/echo), `src/homeserver/ledger.ts` (`/ledger`), `src/homeserver/model-admin.ts` (`/models`, `/admin/*` backend facade — routes to `llamaswap-admin.ts`, the default, or the deprecated `lmstudio-admin.ts` per `HOMESERVER_BACKEND`, #146), `src/homeserver/errors.ts` (envelopes). This doc is derived from those files — if they change, update this doc in the same PR.
+**Source of truth:** `src/homeserver/gateway.ts` (routing), `src/homeserver/learning-task-contract.ts` (LearningTaskContract preflight/stamp/echo), `src/homeserver/review-bounded.ts` (review-lane capability preflight, #74), `src/homeserver/ledger.ts` (`/ledger`), `src/homeserver/model-admin.ts` (`/models`, `/admin/*` backend facade — routes to `llamaswap-admin.ts`, the default, or the deprecated `lmstudio-admin.ts` per `HOMESERVER_BACKEND`, #146), `src/homeserver/errors.ts` (envelopes). This doc is derived from those files — if they change, update this doc in the same PR.
 
 Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-routing (which node), the home-server gateway owns *micro*-routing + external admission, `ledger.ts` is the single capability KB (read via `/ledger`), and nightly local sub-tasks route through `/delegate`.
 
@@ -69,6 +69,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
+| GET | `/v1/capabilities/review-lane` | owner or guest | Review-lane preflight (#74) — which task types are local-eligible (`review-bounded`) vs frontier-only (`code-review`), and whether local output has been promoted past advisory-only |
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio) |
@@ -203,6 +204,51 @@ The checked-in compatibility fixtures are emitted by Hugin #240's real `/delegat
 The producer metadata fixture is byte-pinned by SHA-256 and the exact serialized request is parsed
 and exercised by gille-inference, so origin identities, the wrapper/raw distinction, and the
 accepted Grimnir schema fail tests on cross-repository drift.
+
+### GET `/v1/capabilities/review-lane` (#74)
+
+Content-blind, no-I/O preflight — an orchestrator can ask which lane a review **task type** will
+get *before* sending a `/delegate` prompt, and never waits on a local review result for a task type
+that always escalates. Always returns both known review lanes; an explicit `?taskType=` is echoed
+too (any unrecognized value falls back to the generic "no local-eligible lane" reason).
+
+```
+GET /v1/capabilities/review-lane
+GET /v1/capabilities/review-lane?taskType=review-bounded
+```
+
+```json
+{
+  "endpoint": "/v1/capabilities/review-lane",
+  "contract_version": "gille-inference.review-bounded/v1",
+  "generated_at": "<RFC3339 UTC>",
+  "lanes": {
+    "code-review": {
+      "taskType": "code-review",
+      "eligible": "frontier-only",
+      "advisoryOnly": false,
+      "promoted": false,
+      "reason": "open-ended / whole-patch PR review remains frontier-only, unchanged by #74"
+    },
+    "review-bounded": {
+      "taskType": "review-bounded",
+      "eligible": "local-advisory",
+      "advisoryOnly": true,
+      "promoted": false,
+      "subtaskKinds": ["classify-findings", "detect-anti-pattern", "verify-output-shape"],
+      "contractVersion": "gille-inference.review-bounded/v1",
+      "reason": "bounded review subtasks ... may route locally; output is advisory evidence only until promoted (#74)"
+    }
+  }
+}
+```
+
+`code-review` (open-ended, whole-patch PR review) is unaffected by this ticket and always reports
+`frontier-only`. `review-bounded` (the three bounded subtasks — see `docs/review-bounded-lane.md`)
+reports `advisoryOnly:true` until an operator sets `HOMESERVER_DELEGATE_POLICY_PROMOTED_ADVISORY_TASK_TYPES`
+(comma-separated task types) after a measured pass rate; `decideDelegatePolicy` (`delegate-policy.ts`)
+enforces this identically regardless of what this endpoint reports — the endpoint is advisory
+discovery, not the enforcement point.
 
 ### GET `/ledger`
 

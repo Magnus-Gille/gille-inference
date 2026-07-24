@@ -1,0 +1,139 @@
+{
+  "contract_version": "gille-inference.review-bounded/v1",
+  "note": "Issue #74 evaluation set: exact expected structured outputs for the three bounded review-lane subtasks. Consumed by tests/homeserver-review-bounded.test.ts, which grades a PERFECT candidate output (must pass) and a deliberately-wrong candidate (must not pass) against each entry, proving the verifier's grading is automatic and machine-checkable.",
+  "entries": [
+    {
+      "id": "cf-action-pin-sha",
+      "subtask": "classify-findings",
+      "payload": {
+        "diffExcerpt": "- uses: actions/checkout@v4\n+ uses: actions/checkout@1d96c772d19495a3b5c517cd2bc0cb401ea0e420",
+        "findings": [
+          { "id": "f1", "claim": "the action is now pinned to a full commit SHA, not a mutable tag" },
+          { "id": "f2", "claim": "the pinned SHA does not correspond to any release of actions/checkout" }
+        ]
+      },
+      "expected": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "classify-findings",
+        "classifications": [
+          { "id": "f1", "verdict": "confirmed" },
+          { "id": "f2", "verdict": "refuted" }
+        ]
+      },
+      "wrong_candidate": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "classify-findings",
+        "classifications": [
+          { "id": "f1", "verdict": "refuted" },
+          { "id": "f2", "verdict": "confirmed" }
+        ]
+      }
+    },
+    {
+      "id": "cf-docs-secret-substring",
+      "subtask": "classify-findings",
+      "payload": {
+        "diffExcerpt": "- Set the HS_API_KEY environment variable.\n+ Set $HS_API_KEY before running the script.",
+        "findings": [
+          { "id": "f1", "claim": "the doc now shows a shell variable reference, not a literal env var name, which is a meaning change readers could miscopy" }
+        ]
+      },
+      "expected": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "classify-findings",
+        "classifications": [{ "id": "f1", "verdict": "confirmed" }]
+      },
+      "wrong_candidate": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "classify-findings",
+        "classifications": [{ "id": "f1", "verdict": "needs-info" }]
+      }
+    },
+    {
+      "id": "dap-bare-catch",
+      "subtask": "detect-anti-pattern",
+      "payload": {
+        "patternId": "bare-catch-swallow",
+        "patternDescription": "a catch block that swallows the error with no logging, rethrow, or diagnostic context",
+        "codeExcerpt": "function load() {\n  try {\n    return JSON.parse(readFileSync(p, \"utf8\"));\n  } catch (e) {}\n  return null;\n}"
+      },
+      "expected": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "detect-anti-pattern",
+        "pattern_id": "bare-catch-swallow",
+        "detected": true,
+        "locations": ["catch (e) {}"]
+      },
+      "wrong_candidate": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "detect-anti-pattern",
+        "pattern_id": "bare-catch-swallow",
+        "detected": false,
+        "locations": []
+      }
+    },
+    {
+      "id": "dap-clean-control",
+      "subtask": "detect-anti-pattern",
+      "payload": {
+        "patternId": "bare-catch-swallow",
+        "patternDescription": "a catch block that swallows the error with no logging, rethrow, or diagnostic context",
+        "codeExcerpt": "function load() {\n  try {\n    return JSON.parse(readFileSync(p, \"utf8\"));\n  } catch (e) {\n    console.error(\"[load] failed:\", e);\n    return null;\n  }\n}"
+      },
+      "expected": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "detect-anti-pattern",
+        "pattern_id": "bare-catch-swallow",
+        "detected": false,
+        "locations": []
+      },
+      "wrong_candidate": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "detect-anti-pattern",
+        "pattern_id": "bare-catch-swallow",
+        "detected": true,
+        "locations": ["catch (e)"]
+      }
+    },
+    {
+      "id": "vos-missing-field",
+      "subtask": "verify-output-shape",
+      "payload": {
+        "schemaDescription": "{\"ok\": boolean, \"id\": string}",
+        "candidateOutput": "{\"ok\": true}"
+      },
+      "expected": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "verify-output-shape",
+        "matches_schema": false,
+        "violations": ["missing field: id"]
+      },
+      "wrong_candidate": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "verify-output-shape",
+        "matches_schema": true,
+        "violations": []
+      }
+    },
+    {
+      "id": "vos-exact-match",
+      "subtask": "verify-output-shape",
+      "payload": {
+        "schemaDescription": "{\"ok\": boolean, \"id\": string}",
+        "candidateOutput": "{\"ok\": true, \"id\": \"abc123\"}"
+      },
+      "expected": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "verify-output-shape",
+        "matches_schema": true,
+        "violations": []
+      },
+      "wrong_candidate": {
+        "contract": "gille-inference.review-bounded/v1",
+        "subtask": "verify-output-shape",
+        "matches_schema": false,
+        "violations": ["missing field: id"]
+      }
+    }
+  ]
+}
