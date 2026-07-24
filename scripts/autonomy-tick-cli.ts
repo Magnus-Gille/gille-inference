@@ -26,7 +26,8 @@
  *     outcome, not a script failure); exit 2 on an unexpected exception (unchanged); exit 3
  *     (round 9 finding 3 — "silent operational deadlock") when `report.unresolvedReverts` is
  *     non-empty — a watchdog revert that has NOT yet been confirmed (write/reload/canary all
- *     succeeding) for one or more ticks in a row. This is deliberately a DISTINCT, attention-bearing
+ *     succeeding), whether the record is durably "reverting" OR (round 10 follow-up) a fresh
+ *     breach was skipped lock-busy this tick while the record itself is still "pending". This is deliberately a DISTINCT, attention-bearing
  *     nonzero code so `systemctl status` on the oneshot service surfaces "failed" — visible to
  *     anyone/anything watching the unit, not just to something that parses the JSON report body.
  *     A Persistent systemd timer is UNAFFECTED by any one run's exit code — it still fires the next
@@ -75,7 +76,9 @@ const DEFAULT_DECISION_REF = "gille-inference#49";
  * function so it is directly unit-testable (the same "test the underlying function, not the CLI's
  * `main()` entrypoint" pattern as `describeRollbackOutcome`/`revertNeedsOperatorAttention` in
  * routing-lifecycle-cli.ts). Exit 3 — distinct from the generic exit 2 unexpected-exception path —
- * whenever ANY watchdog record is still durably "reverting" at the end of this tick: a
+ * whenever `report.unresolvedReverts` is non-empty at the end of this tick: durably "reverting"
+ * records AND (round 10 follow-up, #57 item 3) fresh skipped-lock-busy breaches whose record never
+ * left "pending" this tick. A
  * distinct, attention-bearing nonzero code so `systemctl status` on the oneshot service surfaces
  * "failed" (visible to monitoring), while a Persistent systemd timer is UNAFFECTED by any one run's
  * exit code and still fires the next scheduled tick regardless — this is a visibility signal, not a
