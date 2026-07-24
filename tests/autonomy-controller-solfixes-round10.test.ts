@@ -36,6 +36,7 @@ import {
   type WatchdogRunnerDeps,
 } from "../src/homeserver/adoption-watchdog.js";
 import { acquireMutationLock } from "../src/homeserver/mutation-lock.js";
+import { autonomyTickExitCode } from "../scripts/autonomy-tick-cli.js";
 import type { AdoptDeps, ReloadOutcome } from "../src/homeserver/routing-lifecycle.js";
 import type { RoutingTableDoc } from "../src/homeserver/routing-table-generator.js";
 import { tableContentHash } from "../src/homeserver/evidence-identity.js";
@@ -376,6 +377,10 @@ describe("Follow-up — a fresh 'skipped-lock-busy' breach appears in unresolved
       const entry = report.unresolvedReverts.find((r) => r.recordId === record.id);
       expect(entry).toBeDefined();
       expect(entry?.lastRevertError).toBeTruthy();
+      // #57 item 3: the widened round-10 scope, asserted DIRECTLY against the CLI's exit-code
+      // contract — a fresh skipped-lock-busy breach alone (record still "pending") must produce
+      // exit 3, not just an unresolvedReverts entry something else has to interpret.
+      expect(autonomyTickExitCode(report)).toBe(3);
       // The record itself never left "pending" — proving this entry comes from the FRESH
       // watch.items scan (skipped-lock-busy), not the durable "reverting"-status scan.
       expect(loadWatchdogState(dataDir).records.find((r) => r.id === record.id)?.status).toBe("pending");
