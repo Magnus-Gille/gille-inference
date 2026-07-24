@@ -421,8 +421,11 @@ failing probe refuses the job with `cage-unavailable`.
    `deploy/pi-models.json.example`. `baseUrl` **MUST be the in-cage loopback forward**
    `http://127.0.0.1:<HOMESERVER_CODE_LOOP_FORWARD_PORT>/v1` (default `http://127.0.0.1:18080/v1`),
    NOT the tailnet IP (the cage blocks it) — pasta forwards that loopback port to the host relay
-   that bridges to the real gateway. `apiKey:"HS_API_KEY"` is an env-var reference the harness
-   fills at spawn. Set `HOMESERVER_CODE_LOOP_PI_AGENT_DIR` to that dir.
+   that bridges to the real gateway. `apiKey:"$HS_API_KEY"` is an env-var reference — the leading
+   `$` is load-bearing; pi resolves that token against its own process env at spawn, it is not a
+   literal key value. The harness sets `HS_API_KEY` in pi's spawn env (`buildPiEnv` in
+   `pi-engine.ts`) from `HOMESERVER_CODE_LOOP_API_KEY`. Never write the literal key value into
+   `models.json`. Set `HOMESERVER_CODE_LOOP_PI_AGENT_DIR` to that dir.
 3. Mint the service key with a **fresh timestamped alias**:
    `keys mint --alias code-loop-$(date +%Y%m%d-%H%M%S) --tier owner` allow-listed to
    `qwen3-coder-next-80b` with TPM/daily quotas → `.env` as `HOMESERVER_CODE_LOOP_API_KEY`.
