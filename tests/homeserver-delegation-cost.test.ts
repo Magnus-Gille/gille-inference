@@ -86,7 +86,135 @@ describe("delegation cost trace", () => {
 
     expect(trace.actualBaselineCostUsd).toBeNull();
     expect(trace.verifiedSavingsActualUsd).toBe(0);
+    expect(trace.delegatorModelSource).toBeNull();
     expect(trace.notes).toContain("missing-delegator-model");
+  });
+
+  // #83: regression coverage for the root cause — delegator_model was mostly unpopulated in
+  // production, and even where it WAS populated the row never distinguished a caller's own stamp
+  // from the configured HOMESERVER_DEFAULT_DELEGATOR_MODEL_ID fallback. These four cases pin the
+  // required behavior: caller stamp wins, is labelled "stamped", and is the only source ever
+  // allowed to book verifiedSavingsActualUsd — a defaulted attribution is weaker evidence and must
+  // never be reported as a measured displacement.
+  it("labels a caller-supplied delegatorModelId as 'stamped' and books it as measured savings", () => {
+    const trace = buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 1_000_000, completionTokens: 1_000_000 },
+      delegatorModelId: "claude-sonnet-5",
+    });
+
+    expect(trace.delegatorModel).toBe("claude-sonnet-5");
+    expect(trace.delegatorModelSource).toBe("stamped");
+    expect(trace.actualBaselineCostUsd).toBeGreaterThan(0);
+    expect(trace.verifiedSavingsActualUsd).toBeGreaterThan(0);
+    expect(trace.notes).not.toContain(expect.stringContaining("delegator-model-defaulted"));
+  });
+
+  it("falls back to defaultDelegatorModelId, labels it 'default', and never books it as measured savings", () => {
+    const trace = buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 1_000_000, completionTokens: 1_000_000 },
+      defaultDelegatorModelId: "claude-sonnet-5",
+    });
+
+    expect(trace.costStatus).toBe("verified");
+    expect(trace.delegatorModel).toBe("claude-sonnet-5");
+    expect(trace.delegatorModelSource).toBe("default");
+    // The estimate is still computed (it's useful, honest information)...
+    expect(trace.actualBaselineCostUsd).toBeGreaterThan(0);
+    expect(trace.potentialSavingsActualUsd).toBeGreaterThan(0);
+    // ...but MUST NOT be reported as a measured/verified displacement.
+    expect(trace.verifiedSavingsActualUsd).toBe(0);
+    expect(trace.notes).toContain("delegator-model-defaulted:claude-sonnet-5");
+    expect(trace.notes).toContain("actual-savings-not-measured-default-attribution");
+  });
+
+  it("prefers a caller stamp over the configured default when both are present", () => {
+    const trace = buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 1_000_000, completionTokens: 1_000_000 },
+      delegatorModelId: "claude-sonnet-5",
+      defaultDelegatorModelId: "claude-fable-5",
+    });
+
+    expect(trace.delegatorModel).toBe("claude-sonnet-5");
+    expect(trace.delegatorModelSource).toBe("stamped");
+    expect(trace.verifiedSavingsActualUsd).toBeGreaterThan(0);
+  });
+
+  it("persists delegator_model_source so it survives a round trip through the ledger", () => {
+    ensureDelegationCostSchema();
+    const trace = buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 10, completionTokens: 20 },
+      defaultDelegatorModelId: "claude-fable-5",
+    });
+    recordDelegationCost(trace);
+
+    const db = getDb();
+    const row = db.prepare(`SELECT * FROM delegation_costs WHERE id = ?`).get(trace.id) as Record<string, unknown>;
+    expect(row["delegator_model"]).toBe("claude-fable-5");
+    expect(row["delegator_model_source"]).toBe("default");
+    expect(row["verified_savings_actual_usd"]).toBe(0);
+  });
+
+  it("migrates an existing delegation_costs table to include delegator_model_source", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hs-deleg-cost-migration-source-test-"));
+    initDb(join(dir, "test.db"));
+    const db = getDb();
+    db.exec(`
+      CREATE TABLE delegation_costs (
+        id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        delegation_id TEXT,
+        task_type TEXT NOT NULL,
+        key_alias TEXT,
+        source TEXT,
+        local_model TEXT NOT NULL,
+        delegator_model TEXT,
+        premium_baseline_model TEXT NOT NULL,
+        fallback_model TEXT,
+        delegate_policy_mode TEXT,
+        delegate_policy_action TEXT,
+        cost_status TEXT NOT NULL,
+        outcome TEXT,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        actual_baseline_cost_usd REAL,
+        premium_baseline_cost_usd REAL,
+        m5_marginal_cost_usd REAL NOT NULL,
+        m5_amortized_cost_usd REAL NOT NULL,
+        m5_total_cost_usd REAL NOT NULL,
+        verified_savings_actual_usd REAL NOT NULL,
+        verified_savings_premium_usd REAL NOT NULL,
+        potential_savings_actual_usd REAL NOT NULL,
+        potential_savings_premium_usd REAL NOT NULL,
+        price_catalog_version TEXT NOT NULL,
+        notes TEXT
+      )
+    `);
+
+    ensureDelegationCostSchema();
+
+    const cols = new Set((db.prepare(`PRAGMA table_info(delegation_costs)`).all() as Array<{ name: string }>).map((r) => r.name));
+    expect(cols.has("delegator_model_source")).toBe(true);
   });
 
   it("persists a content-blind savings row", () => {

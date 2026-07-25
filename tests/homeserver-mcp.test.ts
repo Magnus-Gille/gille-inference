@@ -596,18 +596,25 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
 
     const row = getDb()
       .prepare(
-        "SELECT source, delegator_model, cost_status, potential_savings_actual_usd, delegate_policy_mode, delegate_policy_action FROM delegation_costs WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1"
+        "SELECT source, delegator_model, delegator_model_source, cost_status, actual_baseline_cost_usd, potential_savings_actual_usd, delegate_policy_mode, delegate_policy_action FROM delegation_costs WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1"
       )
       .get() as {
         source: string;
         delegator_model: string | null;
+        delegator_model_source: string | null;
         cost_status: string;
+        actual_baseline_cost_usd: number | null;
         potential_savings_actual_usd: number;
         delegate_policy_mode: string | null;
         delegate_policy_action: string | null;
       };
     expect(row.source).toBe("mcp-ask");
     expect(row.delegator_model).toBe("openai/gpt-5.5");
+    // #83 regression: the MCP `ask` surface must persist the STAMPED delegator model, distinguish
+    // it from a merely-defaulted attribution, and book a real non-zero actual-baseline cost — the
+    // exact scenario ($0.00 actual savings reported across all 432 rows) that motivated this fix.
+    expect(row.delegator_model_source).toBe("stamped");
+    expect(row.actual_baseline_cost_usd).toBeGreaterThan(0);
     expect(row.cost_status).toBe("unverified");
     expect(row.potential_savings_actual_usd).toBeGreaterThan(0);
     // #202: the primary real offload channel is policy-evaluated for evidence, but this trace
