@@ -54,13 +54,28 @@ Two identity forms exist, and the split is deliberate:
 
 - **`normalizeTaskType` (trim + case-fold) — for a guardrail.** Its failure direction is "treat more
   input as restricted", so over-matching is safe.
-- **`ingressTaskType` (trim only) — for anything that PREDICTS behavior**, because it is exactly what
-  `orchestrator.resolveTaskType` records (#155: an explicit caller bucket is preserved verbatim apart
-  from trimming). Routing (`routeViaTable`), the judgment-verifier guard, and the evidence bucket all
-  key off the recorded spelling, so `"Code-Review"` genuinely *is* a different bucket from
-  `"code-review"`. The `/v1/capabilities/review-lane` preflight therefore trims but does not
-  case-fold: a case variant is reported as frontier-only with the generic "no local-eligible lane"
-  reason rather than advertised as a canonical lane it would not actually get.
+- **`ingressTaskType` (trim only) — for anything that must PREDICT the recorded spelling**, because
+  it is exactly what `orchestrator.resolveTaskType` records (#155: an explicit caller bucket is
+  preserved verbatim apart from trimming). The `/v1/capabilities/review-lane` preflight
+  (`reviewLaneCapability`) uses this form: it trims but does not case-fold, so a case variant is
+  reported as frontier-only with the generic "no local-eligible lane" reason rather than advertised
+  as a canonical lane — the review-bounded lane's eligibility depends on the prompt's fixed contract
+  markers, not on task-type spelling, so advertising a spelling-only match would over-promise.
+
+**Update (#91):** routing (`routeViaTable`), the judgment-verifier guard, `BROAD_TASK_TYPES` /
+`LOW_RISK_TASK_TYPES`, and `taskTypeEmitsJson` no longer key off the raw recorded spelling by exact
+match. They compare a third identity, `policyTaskTypeIdentity` (`task-type-identity.ts`): canonicalize
+a spelling ONLY when its normalized (trim + case-fold) form is a KNOWN taxonomy id, otherwise keep the
+#155 ingress spelling verbatim. So `"Code-Review"` now *is* treated as the same lane as `"code-review"`
+for those specific gates — closing a real authority-gate bypass (a case variant used to dodge the
+judgment-verifier deny) — while a genuinely unrecognized spelling (not a known id under any casing)
+still falls through to the unknown-lane policy exactly as before, and the recorded ledger row itself
+is still whatever `resolveTaskType` produced, untouched. The authoritative rationale lives as the doc
+comment on `policyTaskTypeIdentity` in `task-type-identity.ts`.
+`reviewLaneCapability`'s advertisement above is intentionally NOT part of this canonicalization: it is
+describing what a caller's spelling will get *advertised as*, not what the authority gates will do
+with it, and the two are allowed to differ in the safe direction (never advertise more than the gates
+will actually grant).
 
 Both halves fail safe: the guardrail never under-catches, and the advertisement never over-promises.
 Neither rewrites the recorded ledger bucket.

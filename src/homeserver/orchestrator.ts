@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
-import { classifyTask, taskTypeEmitsJson } from "./taxonomy.js";
+import { classifyTask, isKnownTaskType, taskTypeEmitsJson } from "./taxonomy.js";
+import { policyTaskTypeIdentity } from "./task-type-identity.js";
 import { shouldDelegate, recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import type { Verifier } from "./verifier.js";
 import { getLoaded, getRunningCmd } from "./model-admin.js";
@@ -466,13 +467,19 @@ export type RouteDecision =
  * `enabled` (HOMESERVER_USE_ROUTING_TABLE=on). An explicit caller-supplied model id ALWAYS wins
  * over the table (the table is the default policy, not a hard constraint), so it returns
  * "fallthrough" in that case — including for gap types, since the override is a deliberate choice.
+ *
+ * #91: the table lookup itself uses the canonical policy identity (`policyTaskTypeIdentity`), not
+ * the raw `taskType` — a case/whitespace variant of a known taxonomy id (e.g. "Code-Review") routes
+ * exactly like its canonical id instead of silently missing the table and falling through to
+ * "UNKNOWN". `taskType` as recorded on the outcome (the ledger bucket) is unaffected — only this
+ * lookup's argument is canonicalized (#155's verbatim-ingress policy is otherwise untouched).
  */
 export function routeViaTable(
   taskType: string,
   opts: { enabled: boolean; explicitModelId?: string }
 ): RouteDecision {
   if (!opts.enabled || opts.explicitModelId) return { kind: "fallthrough" };
-  const target = routingTarget(taskType);
+  const target = routingTarget(policyTaskTypeIdentity(taskType, isKnownTaskType));
   if (target === FRONTIER) return { kind: "escalate" };
   if (target === UNKNOWN_ROUTE) return { kind: "fallthrough" };
   return { kind: "local", modelId: target };

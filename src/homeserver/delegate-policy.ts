@@ -5,7 +5,8 @@ import {
 } from "./config.js";
 import { getLaneEvidence, type LaneEvidence } from "./ledger.js";
 import { isTrustedJudgmentVerifier, verifierBaseName } from "./verifier-classification.js";
-import { isPromotedAdvisoryTaskType, normalizeTaskType } from "./task-type-identity.js";
+import { isPromotedAdvisoryTaskType, normalizeTaskType, policyTaskTypeIdentity } from "./task-type-identity.js";
+import { isKnownTaskType } from "./taxonomy.js";
 
 export type DelegatePolicyAction = "allow" | "shadow" | "deny";
 
@@ -34,6 +35,10 @@ export interface DecideDelegatePolicyInput extends DelegatePolicyInput {
   evidence: LaneEvidence;
 }
 
+// #91: these sets are compared against the CANONICAL policy identity (see `policyTaskTypeIdentity`
+// in task-type-identity.ts), not the raw caller-supplied spelling — a case/whitespace variant of a
+// known taxonomy id (e.g. "Other") must land in the same bucket as its canonical id for this lookup,
+// or a caller could dodge the broad/low-risk classification purely by spelling.
 const BROAD_TASK_TYPES: ReadonlySet<string> = new Set(["other", "unknown"]);
 const LOW_RISK_TASK_TYPES: ReadonlySet<string> = new Set(["rewrite", "summarize", "translate"]);
 
@@ -97,6 +102,11 @@ export function isLearningSource(source: string | null | undefined): boolean {
   return LEARNING_SOURCES.has(source) || LEARNING_SOURCE_PREFIXES.some((prefix) => source.startsWith(prefix));
 }
 
+/**
+ * `taskType` here is expected to already be a resolved policy identity (see
+ * `policyTaskTypeIdentity` in task-type-identity.ts) — `decideDelegatePolicy` below is the only
+ * caller and resolves it before calling in.
+ */
 export function requiredSuccessRateForTask(
   taskType: string,
   cfg: DelegatePolicyConfig
@@ -107,7 +117,13 @@ export function requiredSuccessRateForTask(
 export function decideDelegatePolicy(input: DecideDelegatePolicyInput): DelegatePolicyDecision {
   const cfg = input.delegatePolicy;
   const verifierName = normalizeVerifierName(input.verifierName);
-  const requiredSuccessRate = requiredSuccessRateForTask(input.taskType, cfg);
+  // #91: resolve ONCE to the canonical policy identity — a case/whitespace variant of a known
+  // taxonomy id (e.g. "Code-Review") is treated as that id for every gate below, so it cannot dodge
+  // the judgment-verifier deny, the broad/low-risk classification, or the required success rate
+  // purely by spelling. A spelling that does not normalize to a known id is left at its #155 ingress
+  // identity and falls through to the unknown-lane policy exactly as before.
+  const policyTaskType = policyTaskTypeIdentity(input.taskType, isKnownTaskType);
+  const requiredSuccessRate = requiredSuccessRateForTask(policyTaskType, cfg);
   const productionSource = !isLearningSource(input.source);
 
   const base = {
@@ -129,7 +145,7 @@ export function decideDelegatePolicy(input: DecideDelegatePolicyInput): Delegate
     };
   }
 
-  if (BROAD_TASK_TYPES.has(input.taskType)) {
+  if (BROAD_TASK_TYPES.has(policyTaskType)) {
     return {
       ...base,
       action: "deny",
@@ -147,7 +163,7 @@ export function decideDelegatePolicy(input: DecideDelegatePolicyInput): Delegate
 
   const judgmentTypes = input.policy.judgmentQualityTaskTypes ?? DEFAULT_JUDGMENT_QUALITY_TASK_TYPES;
   if (
-    judgmentTypes.includes(input.taskType) &&
+    judgmentTypes.includes(policyTaskType) &&
     !isTrustedJudgmentVerifier(verifierName, new Set(input.policy.trustedVerifiersForJudgment ?? []))
   ) {
     return {
@@ -225,9 +241,16 @@ export function decideDelegatePolicy(input: DecideDelegatePolicyInput): Delegate
 
 export function evaluateDelegatePolicy(input: DelegatePolicyInput): DelegatePolicyDecision {
   const verifierName = normalizeVerifierName(input.verifierName);
+  // #91: read evidence from the same canonical policy identity `decideDelegatePolicy` gates
+  // against below — a lane's evidence key is (taskType, modelId, nodeId, verifier), so a case
+  // variant of a known task type must read the REAL lane's evidence, not accumulate its own
+  // parallel bucket that a caller could grow independently of the canonical lane's track record.
+  // (Recorded ledger rows themselves are unaffected — `recordDelegation` still writes whatever
+  // spelling `orchestrator.resolveTaskType` produced, per #155.)
+  const policyTaskType = policyTaskTypeIdentity(input.taskType, isKnownTaskType);
   const evidence =
     input.delegatePolicy.mode === "off" || isLearningSource(input.source)
-      ? emptyEvidence(input.taskType, input.modelId, verifierName)
-      : getLaneEvidence(input.taskType, input.modelId, verifierName, input.policy, input.nodeId ?? "m5");
+      ? emptyEvidence(policyTaskType, input.modelId, verifierName)
+      : getLaneEvidence(policyTaskType, input.modelId, verifierName, input.policy, input.nodeId ?? "m5");
   return decideDelegatePolicy({ ...input, evidence });
 }

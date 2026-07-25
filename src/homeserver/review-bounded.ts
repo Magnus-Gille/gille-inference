@@ -378,10 +378,11 @@ export function reviewLaneCapability(
 ): ReviewLaneCapability {
   // #80: resolve the caller's spelling exactly the way INGRESS will (trim, otherwise verbatim —
   // orchestrator.resolveTaskType, #155), so `?taskType=review-bounded%20` reports its real lane.
-  // Deliberately NOT case-folded: routing, the judgment-verifier guard, and the evidence bucket all
-  // key off the recorded spelling, so advertising `Code-Review` as the canonical `code-review` lane
-  // would promise behavior the pipeline does not deliver. A case variant therefore falls through to
-  // the generic frontier-only answer below — the conservative answer, and the true one.
+  // Deliberately NOT case-folded: this advertisement must describe the lane a caller actually gets.
+  // `review-bounded` is not a taxonomy id, so #91's `policyTaskTypeIdentity` never canonicalizes it
+  // and a case variant genuinely does fall through to the generic frontier-only answer below.
+  // (For `code-review` both branches answer frontier-only anyway.) The conservative answer, and the
+  // true one.
   const taskType = ingressTaskType(rawTaskType);
   if (taskType === REVIEW_BOUNDED_TASK_TYPE) {
     const promoted = isPromotedAdvisoryTaskType(taskType, promotedAdvisoryTaskTypes);
