@@ -1,4 +1,5 @@
 import { REVIEW_BOUNDED_TASK_TYPE, REVIEW_BOUNDED_TAXONOMY_KEYWORDS } from "./review-bounded.js";
+import { policyTaskTypeIdentity } from "./task-type-identity.js";
 
 /**
  * Task taxonomy.
@@ -380,9 +381,14 @@ const JSON_OUTPUT_TASK_TYPES = new Set(TASK_TYPES.filter((t) => t.jsonOutput).ma
  * True when the task type's contract is a structured JSON payload (TaskType.jsonOutput) — the signal
  * the delegate path uses to default a json_object response_format so gpt-oss-120b can't drift into a
  * harmony/PEG 500 (#166). Unknown ids are treated as non-JSON.
+ *
+ * #91: canonicalizes `id` to a known taxonomy id first (case/whitespace variant of a real type,
+ * e.g. `"Triage"` → `"triage"`) so a caller-supplied spelling gets the same response-format contract
+ * as the canonical id — an unrecognized spelling is left as-is and correctly reports false, exactly
+ * as before.
  */
 export function taskTypeEmitsJson(id: string): boolean {
-  return JSON_OUTPUT_TASK_TYPES.has(id);
+  return JSON_OUTPUT_TASK_TYPES.has(policyTaskTypeIdentity(id, isKnownTaskType));
 }
 
 export interface Classification {

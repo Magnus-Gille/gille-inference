@@ -66,3 +66,37 @@ export function isPromotedAdvisoryTaskType(
   const canonical = normalizeTaskType(taskType);
   return promotedAdvisoryTaskTypes.some((promoted) => normalizeTaskType(promoted) === canonical);
 }
+
+/**
+ * The single policy/lookup identity of a task type — issue #91.
+ *
+ * #80/#90 left a real gap: `isAdvisoryOnlyTaskType` case-folds its own input (a guardrail, so
+ * over-catching is fail-safe), but every OTHER policy comparison — the judgment-verifier deny in
+ * `decideDelegatePolicy`, `BROAD_TASK_TYPES`/`LOW_RISK_TASK_TYPES`, `taskTypeEmitsJson`, and the
+ * routing-table lookup — still compared the #155 verbatim-ingress spelling by exact string match.
+ * `"Code-Review"` is therefore a different bucket from `"code-review"` for those gates, including
+ * the judgment-verifier deny, which is an AUTHORITY gate: with enough evidence accumulated on that
+ * variant bucket, enforce-mode `decideDelegatePolicy` could return `allow` where canonical
+ * `code-review` returns `deny`.
+ *
+ * The rule (decided on the orchestrator side, #155/#91): canonicalize a spelling ONLY when its
+ * normalized (trim + case-fold) form is a KNOWN taxonomy id. That canonical identity is then used
+ * for routing, the judgment/broad/low-risk lookups, the JSON response contract, and evidence-bucket
+ * reads — so a real task type cannot dodge those gates by spelling. A spelling whose normalized form
+ * is NOT a known id keeps its #155 ingress identity (trimmed, otherwise verbatim) and still falls
+ * through to the existing unknown-lane policy unchanged — canonicalizing an unrecognized spelling
+ * would fold arbitrary caller buckets together (e.g. two different ratatoskr domain buckets that
+ * happen to differ only by case) and risk silently re-bucketing evidence already recorded under a
+ * caller's own asserted type, which is exactly the kind of undocumented migration #91 rules out.
+ *
+ * `isKnownTaskType` is injected rather than imported directly: `taxonomy.ts` imports
+ * `review-bounded.ts`, which imports this leaf module, so importing `taxonomy.ts` here would close
+ * that cycle (see the file header). Every call site already has `isKnownTaskType` in scope.
+ */
+export function policyTaskTypeIdentity(
+  taskType: string,
+  isKnownTaskType: (id: string) => boolean
+): string {
+  const canonical = normalizeTaskType(taskType);
+  return isKnownTaskType(canonical) ? canonical : ingressTaskType(taskType);
+}
