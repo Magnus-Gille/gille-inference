@@ -38,9 +38,15 @@ export function normalizeTaskType(raw: string): string {
  * `orchestrator.resolveTaskType` produces for a non-blank explicit task type (#155).
  *
  * Use this whenever the answer must PREDICT real behavior rather than restrict it. Case-folding
- * here would be a lie: routing (`routeViaTable`), the judgment-verifier guard, and the evidence
- * bucket all key off the recorded spelling, so `"Code-Review"` is a different bucket from
+ * here would be a lie about RECORDED IDENTITY: the orchestrator writes `taskType` to the ledger
+ * verbatim (#155), so `"Code-Review"` remains a different recorded evidence bucket from
  * `"code-review"` no matter what a capability advertisement claims.
+ *
+ * #91 NOTE — policy DECISIONS no longer key off the raw spelling. `policyTaskTypeIdentity`
+ * canonicalizes a spelling whose normalized form is a known taxonomy id, and routing
+ * (`routeViaTable`), the judgment-verifier guard, the broad/low-risk lookups and the policy-side
+ * evidence read all use that canonical identity. A case variant is therefore no longer a policy
+ * bypass; it is only still a distinct RECORDED bucket.
  *
  * The asymmetry with `normalizeTaskType` is deliberate and both halves fail safe:
  * - the advisory-only guardrail case-folds, so a spelling variant can only ever be caught by it;
