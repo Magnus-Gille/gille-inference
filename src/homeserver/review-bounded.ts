@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { extractCodeBlock, stripThink, type Verifier, type VerifyResult } from "./verifier.js";
+import { ingressTaskType, isPromotedAdvisoryTaskType } from "./task-type-identity.js";
 
 /**
  * Bounded local-review lane (issue #74).
@@ -372,11 +373,18 @@ export interface ReviewLaneCapability {
  * review result for a task type that will always escalate (#74 acceptance criterion 4/5).
  */
 export function reviewLaneCapability(
-  taskType: string,
+  rawTaskType: string,
   promotedAdvisoryTaskTypes: readonly string[]
 ): ReviewLaneCapability {
+  // #80: resolve the caller's spelling exactly the way INGRESS will (trim, otherwise verbatim —
+  // orchestrator.resolveTaskType, #155), so `?taskType=review-bounded%20` reports its real lane.
+  // Deliberately NOT case-folded: routing, the judgment-verifier guard, and the evidence bucket all
+  // key off the recorded spelling, so advertising `Code-Review` as the canonical `code-review` lane
+  // would promise behavior the pipeline does not deliver. A case variant therefore falls through to
+  // the generic frontier-only answer below — the conservative answer, and the true one.
+  const taskType = ingressTaskType(rawTaskType);
   if (taskType === REVIEW_BOUNDED_TASK_TYPE) {
-    const promoted = promotedAdvisoryTaskTypes.includes(REVIEW_BOUNDED_TASK_TYPE);
+    const promoted = isPromotedAdvisoryTaskType(taskType, promotedAdvisoryTaskTypes);
     return {
       taskType,
       eligible: "local-advisory",

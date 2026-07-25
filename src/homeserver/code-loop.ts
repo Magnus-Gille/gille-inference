@@ -32,7 +32,6 @@ import {
   type DurableCodeLoopRun,
 } from "./code-loop-store.js";
 import { recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
-import { classifyTask } from "./taxonomy.js";
 import { recordCodeLoopRun, setCodeLoopActive } from "./metrics.js";
 import {
   TASK_FINGERPRINT_VERSION,
@@ -54,7 +53,7 @@ import {
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) so the code_loop lane binds
 // evidence identity the same way the delegate lane does — same stamp-field join, same live
 // served-model observation, same fail-open-to-unknown discipline.
-import { deriveEvidenceIdentity } from "./orchestrator.js";
+import { deriveEvidenceIdentity, resolveTaskType } from "./orchestrator.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -517,7 +516,11 @@ export async function startCodeLoop(
   const structural = validateCodeLoopRequestStructure(req);
   if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
   const clientRunId = validateClientRunId(req.client_run_id);
-  const taskType = req.task_type && req.task_type.trim() !== "" ? req.task_type : classifyTask(req.instruction).taskType;
+  // #80: resolve through the SAME boundary /delegate uses (orchestrator.resolveTaskType) instead of
+  // re-implementing it. The old inline guard trimmed only to test for emptiness and then passed the
+  // RAW value on, so `"review-bounded "` recorded a whitespace-variant ledger bucket and missed the
+  // #74 advisory-only guardrail's exact match.
+  const taskType = resolveTaskType({ taskType: req.task_type, prompt: req.instruction });
   const requestFingerprint = clientRunId === null
     ? null
     : codeLoopRequestFingerprint(req);

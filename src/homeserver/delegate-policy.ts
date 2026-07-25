@@ -5,6 +5,7 @@ import {
 } from "./config.js";
 import { getLaneEvidence, type LaneEvidence } from "./ledger.js";
 import { isTrustedJudgmentVerifier, verifierBaseName } from "./verifier-classification.js";
+import { isPromotedAdvisoryTaskType, normalizeTaskType } from "./task-type-identity.js";
 
 export type DelegatePolicyAction = "allow" | "shadow" | "deny";
 
@@ -48,9 +49,15 @@ const LOW_RISK_TASK_TYPES: ReadonlySet<string> = new Set(["rewrite", "summarize"
  */
 const ADVISORY_ONLY_TASK_TYPES: ReadonlySet<string> = new Set(["review-bounded"]);
 
-/** True when `taskType`'s local output is advisory-only-by-construction (see the set above). */
+/**
+ * True when `taskType`'s local output is advisory-only-by-construction (see the set above).
+ *
+ * #80: normalizes its OWN input (trim + case-fold) rather than trusting every caller to have
+ * canonicalized first. This guardrail is the independent last line of defense, so it must hold
+ * even when an ingress path forgets — and normalizing can only ever catch MORE input here.
+ */
 export function isAdvisoryOnlyTaskType(taskType: string): boolean {
-  return ADVISORY_ONLY_TASK_TYPES.has(taskType);
+  return ADVISORY_ONLY_TASK_TYPES.has(normalizeTaskType(taskType));
 }
 const LEARNING_SOURCE_PREFIXES = ["probe", "cartography", "harvest", "backfill", "model-scout", "gate-"];
 const LEARNING_SOURCES: ReadonlySet<string> = new Set([
@@ -195,7 +202,10 @@ export function decideDelegatePolicy(input: DecideDelegatePolicyInput): Delegate
   // decision gate until an operator explicitly promotes it. This check runs LAST, deliberately
   // after every other deny/shadow diagnostic, so a genuinely broken lane still reports its real
   // blocking reason instead of always saying "advisory-only".
-  if (isAdvisoryOnlyTaskType(input.taskType) && !cfg.promotedAdvisoryTaskTypes.includes(input.taskType)) {
+  if (
+    isAdvisoryOnlyTaskType(input.taskType) &&
+    !isPromotedAdvisoryTaskType(input.taskType, cfg.promotedAdvisoryTaskTypes)
+  ) {
     return {
       ...base,
       action: "shadow",

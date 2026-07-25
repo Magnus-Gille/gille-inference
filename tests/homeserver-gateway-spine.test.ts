@@ -413,6 +413,54 @@ describe("gateway spine — HTTP integration", () => {
     expect(upstreamInferenceRequestCount).toBe(callsBeforeRestartRecovery);
   });
 
+  // #80: the stamp is validated against the RESOLVED task type — the same value the delegation
+  // will record (resolveTaskType trims) — not the raw param. A padded taskType against a canonical
+  // stamp must therefore be admitted rather than rejected with a confusing "stamped task type does
+  // not match", while a genuinely different type must still fail closed.
+  it("stamped /delegate compares the stamp against the resolved (trimmed) task type", async () => {
+    const owner = mintKey({ alias: `service-hugin-padded-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const { stamp, requestBody } = await makeStampedDelegateRequest(owner);
+    expect(requestBody.taskType).toBe(stamp.task_type.id);
+    // Use a taskType cell no other test in this file writes to (same reasoning as the evidence
+    // identity test below): this file shares one real ledger DB, and accrued failures on the
+    // popular "summarize"/"m1" cell freeze it to not_viable, which would both change this test's
+    // route and leak into siblings. "classify" is a valid taxonomy id the stamp schema accepts.
+    const padded = structuredClone(requestBody);
+    padded.learningTaskStamp.task_type.id = "classify";
+    padded.taskType = "  classify  ";
+    const paddedResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(padded),
+    });
+    expect(paddedResponse.status).toBe(200);
+    expect(await paddedResponse.json()).toMatchObject({
+      taskType: "classify", // recorded trimmed, exactly what the stamp was compared against
+      learningTaskGatewayEcho: { echoed_request: padded.learningTaskStamp },
+    });
+
+    // A genuinely different task type still fails closed, and does so BEFORE any inference.
+    const { requestBody: otherBody } = await makeStampedDelegateRequest(owner);
+    const mismatched = structuredClone(otherBody);
+    mismatched.learningTaskStamp.task_type.id = "classify";
+    mismatched.taskType = "extract";
+    const callsBeforeMismatch = upstreamInferenceRequestCount;
+    const mismatchedResponse = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(mismatched),
+    });
+    expect(mismatchedResponse.status).toBe(400);
+    expect(await mismatchedResponse.json()).toMatchObject({
+      error: {
+        code: "invalid_request_error",
+        param: "learningTaskStamp",
+        message: "stamped task type does not match the effective gateway task type",
+      },
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsBeforeMismatch);
+  });
+
   it("preserves stamped /delegate admission when ledger persistence throws after inference", async () => {
     const owner = mintKey({ alias: `service-hugin-post-inference-${randomUUID()}`, tier: "owner" }, DEFAULTS);
     const { requestBody } = await makeStampedDelegateRequest(owner);
