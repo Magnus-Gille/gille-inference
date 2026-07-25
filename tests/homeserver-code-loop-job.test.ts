@@ -1125,6 +1125,54 @@ describe("LearningTaskContract stamped code_loop admission", () => {
     expect(canonicalRowCount).toBe(1);
   });
 
+  // #80: the stamp equality check now compares the RESOLVED task type (resolveTaskType trims), so a
+  // padded request task_type against a canonical stamp is admitted and records the trimmed ledger
+  // bucket — while a genuinely different type still fails closed.
+  it("compares the stamp against the resolved (trimmed) task type, and still rejects a different one (#80)", async () => {
+    const epoch = createLearningTaskCapabilityEpoch();
+    const request = stampedRequest(epoch);
+    const freshOpaque = () => `opaque:${randomUUID()}`;
+    request.client_run_id = freshOpaque();
+    request.learning_task_stamp.idempotency_key = request.client_run_id;
+    request.learning_task_stamp.request_id = freshOpaque();
+    request.learning_task_stamp.task_instance_id = `task-${randomUUID()}`;
+    request.learning_task_stamp.attempt_id = `attempt-${randomUUID()}`;
+    request.learning_task_stamp.raw_fingerprint.digest = createHash("sha256").update(randomUUID(), "utf8").digest("hex");
+    const canonicalTaskType = request.learning_task_stamp.task_type.id;
+
+    const started = await startCodeLoop(
+      { ...request, task_type: `  ${canonicalTaskType}  ` },
+      startCfg(),
+      stampedDeps(epoch)
+    );
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    // This describe block reuses one fixture prompt across tests and recordDelegation ids are
+    // random UUIDs, so assert over ALL rows for this prompt rather than depending on row order.
+    const promptHash = createHash("sha256").update(request.instruction).digest("hex").slice(0, 16);
+    const rows = getDb().prepare(
+      "SELECT task_type AS taskType FROM delegations WHERE source = 'code-loop' AND prompt_hash = ?"
+    ).all(promptHash) as Array<{ taskType: string }>;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.some((r) => r.taskType === canonicalTaskType)).toBe(true);
+    expect(rows.every((r) => r.taskType === r.taskType.trim())).toBe(true);
+
+    // A genuinely different task type still fails closed. Its own workroot, so the durable
+    // client_run_id binding (checked before the stamp comparison) cannot mask the refusal.
+    const mismatched = await startCodeLoop(
+      { ...request, task_type: `not-${canonicalTaskType}` },
+      startCfg({ workroot: mkdtempSync(join(tmpdir(), "cl-job-work-mismatch-")) }),
+      stampedDeps(epoch)
+    );
+    expect(mismatched.ok).toBe(false);
+    if (!mismatched.ok) {
+      expect(mismatched.refusal).toBe("invalid-request");
+      expect(mismatched.message).toMatch(/task type/i);
+    }
+  });
+
   it("rejects replay under a mutated attempt or another durable client identity", async () => {
     const epoch = createLearningTaskCapabilityEpoch();
     const request = stampedRequest(epoch);

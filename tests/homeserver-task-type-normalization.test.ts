@@ -20,6 +20,7 @@ import {
   type DecideDelegatePolicyInput,
 } from "../src/homeserver/delegate-policy.js";
 import {
+  ingressTaskType,
   isPromotedAdvisoryTaskType,
   normalizeTaskType,
 } from "../src/homeserver/task-type-identity.js";
@@ -82,6 +83,20 @@ describe("normalizeTaskType (#80)", () => {
     expect(normalizeTaskType("ratatoskr triage")).toBe("ratatoskr triage");
     expect(normalizeTaskType("")).toBe("");
     expect(normalizeTaskType("   ")).toBe("");
+  });
+});
+
+describe("ingressTaskType — the form that PREDICTS behavior (#80)", () => {
+  it("trims but never case-folds, matching what resolveTaskType records", () => {
+    expect(ingressTaskType(" review-bounded ")).toBe("review-bounded");
+    expect(ingressTaskType("Review-Bounded")).toBe("Review-Bounded");
+    expect(ingressTaskType(" Triage ")).toBe("Triage");
+  });
+
+  it("agrees exactly with resolveTaskType for any non-blank explicit task type", () => {
+    for (const raw of [" review-bounded ", "Review-Bounded", "Triage", "some-other-type"]) {
+      expect(ingressTaskType(raw), raw).toBe(resolveTaskType({ taskType: raw, prompt: "anything" }));
+    }
   });
 });
 
@@ -152,9 +167,17 @@ describe("isPromotedAdvisoryTaskType — one shared promotion test (#80)", () =>
   });
 });
 
-describe("reviewLaneCapability preflight agrees with the policy guardrail (#80)", () => {
-  it("resolves a variant to the canonical local-advisory lane and echoes the canonical id", () => {
-    for (const variant of VARIANTS) {
+/**
+ * The preflight PREDICTS behavior, so it resolves a spelling the way ingress does (trim only) —
+ * it must not case-fold. Routing (`routeViaTable`), the judgment-verifier guard, and the evidence
+ * bucket all key off the recorded spelling, so `"Code-Review"` genuinely IS a different bucket
+ * from `"code-review"`; advertising it as the canonical lane would be a false promise. The
+ * asymmetry with the case-folding guardrail is deliberate: the guardrail over-catches (safe), the
+ * advertisement never over-promises (also safe).
+ */
+describe("reviewLaneCapability mirrors ingress rather than the guardrail (#80)", () => {
+  it("trims a whitespace variant to its real lane — the #80 motivating case", () => {
+    for (const variant of ["review-bounded ", " review-bounded", "\treview-bounded\n"]) {
       const cap = reviewLaneCapability(variant, []);
       expect(cap.taskType, `variant ${JSON.stringify(variant)}`).toBe("review-bounded");
       expect(cap.eligible).toBe("local-advisory");
@@ -169,13 +192,25 @@ describe("reviewLaneCapability preflight agrees with the policy guardrail (#80)"
     expect(cap.advisoryOnly).toBe(false);
   });
 
-  it("a code-review variant stays frontier-only", () => {
-    const cap = reviewLaneCapability(" Code-Review ", []);
-    expect(cap.taskType).toBe("code-review");
-    expect(cap.eligible).toBe("frontier-only");
+  it("does NOT advertise a case variant as the canonical lane — that bucket routes differently", () => {
+    const caseVariant = reviewLaneCapability("Review-Bounded", []);
+    expect(caseVariant.taskType).toBe("Review-Bounded");
+    expect(caseVariant.eligible).toBe("frontier-only");
+    expect(caseVariant.reason).toMatch(/no local-eligible review lane/i);
+
+    // ...while the guardrail still catches that same spelling, so the two directions agree on the
+    // only thing that matters for authority: the variant can never be an authoritative local gate.
+    expect(isAdvisoryOnlyTaskType("Review-Bounded")).toBe(true);
   });
 
-  it("an unrecognized task type is still echoed as given (canonicalized) and stays frontier-only", () => {
+  it("code-review stays frontier-only, and a code-review variant is not advertised as it either", () => {
+    expect(reviewLaneCapability(" code-review ", []).eligible).toBe("frontier-only");
+    const caseVariant = reviewLaneCapability("Code-Review", []);
+    expect(caseVariant.taskType).toBe("Code-Review");
+    expect(caseVariant.eligible).toBe("frontier-only");
+  });
+
+  it("an unrecognized task type is echoed trimmed-but-verbatim and stays frontier-only", () => {
     const cap = reviewLaneCapability(" some-other-type ", []);
     expect(cap.taskType).toBe("some-other-type");
     expect(cap.eligible).toBe("frontier-only");

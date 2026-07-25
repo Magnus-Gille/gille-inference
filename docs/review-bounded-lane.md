@@ -44,14 +44,26 @@ authoritative merely by accumulating passing ledger rows.
 
 **Task-type spelling does not weaken that guardrail (#80).** `isAdvisoryOnlyTaskType` and the
 promotion test canonicalize their own input (`normalizeTaskType` in `task-type-identity.ts`: trim +
-case-fold), so `"review-bounded "` or `"Review-Bounded"` resolves to the same advisory-only lane
-regardless of how a caller spelled it — and an operator promotion written with stray whitespace or
-different case still promotes the canonical lane. Case-folding is safe because every task-type id in
+case-fold), so `"review-bounded "` or `"Review-Bounded"` is caught by the guardrail regardless of
+how a caller spelled it — and an operator promotion written with stray whitespace or different case
+still promotes the canonical lane. Case-folding is safe there because every task-type id in
 `taxonomy.ts` is a lowercase kebab literal, so it can only map a variant onto a canonical id, never
-invent one. Ingress itself (`orchestrator.resolveTaskType`, used by both `/delegate` and
-`code-loop.ts`) trims but otherwise preserves an explicit caller-supplied bucket verbatim, keeping
-the #155 policy intact; canonicalization applies to the policy/lookup comparisons, not to the
-recorded ledger bucket.
+invent one.
+
+Two identity forms exist, and the split is deliberate:
+
+- **`normalizeTaskType` (trim + case-fold) — for a guardrail.** Its failure direction is "treat more
+  input as restricted", so over-matching is safe.
+- **`ingressTaskType` (trim only) — for anything that PREDICTS behavior**, because it is exactly what
+  `orchestrator.resolveTaskType` records (#155: an explicit caller bucket is preserved verbatim apart
+  from trimming). Routing (`routeViaTable`), the judgment-verifier guard, and the evidence bucket all
+  key off the recorded spelling, so `"Code-Review"` genuinely *is* a different bucket from
+  `"code-review"`. The `/v1/capabilities/review-lane` preflight therefore trims but does not
+  case-fold: a case variant is reported as frontier-only with the generic "no local-eligible lane"
+  reason rather than advertised as a canonical lane it would not actually get.
+
+Both halves fail safe: the guardrail never under-catches, and the advertisement never over-promises.
+Neither rewrites the recorded ledger bucket.
 
 ## The evidence (grimnir session 2026-07-24, recorded on gille-inference#25)
 

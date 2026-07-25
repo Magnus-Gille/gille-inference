@@ -23,9 +23,31 @@
  * a shared helper living in either of those would close an import cycle.
  */
 
-/** Canonical comparison form of a task-type string: trimmed and case-folded. */
+/**
+ * Canonical comparison form of a task-type string: trimmed and case-folded.
+ *
+ * Use this for a GUARDRAIL — a check whose failure direction is "treat more input as restricted".
+ * Do NOT use it to advertise what a task type will actually do (see `ingressTaskType`).
+ */
 export function normalizeTaskType(raw: string): string {
   return raw.trim().toLowerCase();
+}
+
+/**
+ * The form ingress actually records: trimmed, otherwise verbatim — exactly what
+ * `orchestrator.resolveTaskType` produces for a non-blank explicit task type (#155).
+ *
+ * Use this whenever the answer must PREDICT real behavior rather than restrict it. Case-folding
+ * here would be a lie: routing (`routeViaTable`), the judgment-verifier guard, and the evidence
+ * bucket all key off the recorded spelling, so `"Code-Review"` is a different bucket from
+ * `"code-review"` no matter what a capability advertisement claims.
+ *
+ * The asymmetry with `normalizeTaskType` is deliberate and both halves fail safe:
+ * - the advisory-only guardrail case-folds, so a spelling variant can only ever be caught by it;
+ * - a capability advertisement only trims, so it never promises a lane the pipeline won't take.
+ */
+export function ingressTaskType(raw: string): string {
+  return raw.trim();
 }
 
 /**

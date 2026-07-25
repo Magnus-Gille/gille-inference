@@ -68,7 +68,7 @@ import {
   REVIEW_BOUNDED_CONTRACT_VERSION,
   reviewLaneCapability,
 } from "./review-bounded.js";
-import { normalizeTaskType } from "./task-type-identity.js";
+import { ingressTaskType } from "./task-type-identity.js";
 import {
   LEARNING_TASK_PREFLIGHT_ENDPOINT,
   LEARNING_TASK_PREFLIGHT_TTL_MS,
@@ -3267,9 +3267,11 @@ async function handleRequest(
     // known review lanes (code-review, review-bounded); an explicit `?taskType=` is echoed too
     // (falls back to the generic "no local-eligible lane" reason for anything unrecognized).
     if (path === REVIEW_LANE_CAPABILITY_ENDPOINT && method === "GET") {
-      // #80: canonicalize the caller's `?taskType=` before the lookup and key the response by the
-      // canonical id, so `?taskType=review-bounded%20` is not mislabelled "no local-eligible lane".
-      const requestedTaskType = normalizeTaskType(parsedUrl.searchParams.get("taskType") ?? "");
+      // #80: resolve the caller's `?taskType=` the way ingress will (trim only) and key the
+      // response by that, so `?taskType=review-bounded%20` is not mislabelled "no local-eligible
+      // lane" — and so a case variant, which really is a different bucket downstream, is not
+      // advertised as a lane it will not get.
+      const requestedTaskType = ingressTaskType(parsedUrl.searchParams.get("taskType") ?? "");
       const lanes: Record<string, ReturnType<typeof reviewLaneCapability>> = {};
       for (const t of REVIEW_LANE_KNOWN_TASK_TYPES) lanes[t] = reviewLaneCapability(t, cfg.delegatePolicy.promotedAdvisoryTaskTypes);
       if (requestedTaskType && !(requestedTaskType in lanes)) {
