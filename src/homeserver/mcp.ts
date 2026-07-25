@@ -623,7 +623,11 @@ export async function runChatCompletion(
               ledgerId,
               keyAlias: principal.alias,
               source: "mcp-ask",
-              delegatorModelId: args.delegatorModelId ?? cfg.defaultDelegatorModelId,
+              // #83: keep caller-stamped and configured-default separate (see the matching
+              // orchestrator.ts attachCostTrace comment) so the cost row records provenance
+              // instead of merging them before buildDelegationCostTrace ever sees them.
+              delegatorModelId: args.delegatorModelId ?? null,
+              defaultDelegatorModelId: cfg.defaultDelegatorModelId,
               premiumBaselineModelId: cfg.premiumBaselineModelId,
               m5MarginalUsdPerMTok: cfg.m5MarginalUsdPerMTok,
               m5AmortizedUsdPerMTok: cfg.m5AmortizedUsdPerMTok,

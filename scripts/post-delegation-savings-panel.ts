@@ -36,6 +36,9 @@ export interface DailySavings {
   unverifiedCalls: number;
   failedCalls: number;
   escalatedCalls: number;
+  /** #83: how many rows' delegator_model came from the caller vs the configured default. */
+  stampedDelegatorCalls: number;
+  defaultDelegatorCalls: number;
   verifiedSavingsActualSek: number;
   verifiedSavingsPremiumSek: number;
   potentialSavingsActualSek: number;
@@ -60,6 +63,8 @@ interface DailySavingsDbRow {
   unverified_calls: number;
   failed_calls: number;
   escalated_calls: number;
+  stamped_delegator_calls: number;
+  default_delegator_calls: number;
   verified_actual_usd: number;
   verified_premium_usd: number;
   potential_actual_usd: number;
@@ -124,6 +129,8 @@ export function queryDailySavings(
         unverifiedCalls: 0,
         failedCalls: 0,
         escalatedCalls: 0,
+        stampedDelegatorCalls: 0,
+        defaultDelegatorCalls: 0,
         verifiedSavingsActualSek: 0,
         verifiedSavingsPremiumSek: 0,
         potentialSavingsActualSek: 0,
@@ -142,6 +149,8 @@ export function queryDailySavings(
          SUM(CASE WHEN cost_status = 'unverified' THEN 1 ELSE 0 END) AS unverified_calls,
          SUM(CASE WHEN cost_status = 'failed' THEN 1 ELSE 0 END) AS failed_calls,
          SUM(CASE WHEN cost_status = 'escalated' THEN 1 ELSE 0 END) AS escalated_calls,
+         SUM(CASE WHEN delegator_model_source = 'stamped' THEN 1 ELSE 0 END) AS stamped_delegator_calls,
+         SUM(CASE WHEN delegator_model_source = 'default' THEN 1 ELSE 0 END) AS default_delegator_calls,
          COALESCE(SUM(verified_savings_actual_usd), 0) AS verified_actual_usd,
          COALESCE(SUM(verified_savings_premium_usd), 0) AS verified_premium_usd,
          COALESCE(SUM(potential_savings_actual_usd), 0) AS potential_actual_usd,
@@ -165,6 +174,8 @@ export function queryDailySavings(
       unverifiedCalls: r?.unverified_calls ?? 0,
       failedCalls: r?.failed_calls ?? 0,
       escalatedCalls: r?.escalated_calls ?? 0,
+      stampedDelegatorCalls: r?.stamped_delegator_calls ?? 0,
+      defaultDelegatorCalls: r?.default_delegator_calls ?? 0,
       verifiedSavingsActualSek: usdToSek(r?.verified_actual_usd ?? 0, sekRate),
       verifiedSavingsPremiumSek: usdToSek(r?.verified_premium_usd ?? 0, sekRate),
       potentialSavingsActualSek: usdToSek(r?.potential_actual_usd ?? 0, sekRate),
@@ -212,44 +223,92 @@ export function querySavingsByTaskType(
   }));
 }
 
-export function buildSavingsTimeseriesPanel(rows: DailySavings[], days: number): TimeseriesPanel {
+export interface SavingsTimeseriesPanels {
+  /**
+   * Verified savings vs the ACTUAL delegating cloud model (stamped delegator_model only — see
+   * delegation-cost.ts's delegatorModelSource). This is the honest, "measured displacement"
+   * baseline; it reads zero until callers actually stamp who delegated.
+   */
+  actual: TimeseriesPanel;
+  /**
+   * Verified savings vs the fixed premium baseline (claude-fable-5 by default). This is a
+   * deliberately optimistic upper bound — see docs/delegation-cost-accounting.md.
+   */
+  premium: TimeseriesPanel;
+}
+
+const ACTUAL_SAVINGS_PANEL = "delegation-savings-actual";
+
+/**
+ * #83: build BOTH the actual-baseline and premium-baseline timeseries panels together, as one
+ * call. Returning them as a pair (never a single panel) is a structural guarantee that a caller
+ * of this module can't push the flattering premium number without the honest actual number
+ * sitting right next to it — the exact failure mode this ticket exists to close. Each panel's
+ * own detail table also carries BOTH SEK figures side by side for the same reason.
+ */
+export function buildSavingsTimeseriesPanels(rows: DailySavings[], days: number): SavingsTimeseriesPanels {
   const latest = rows[rows.length - 1];
-  return {
+  const n = rows.reduce((sum, r) => sum + r.calls, 0);
+  const detailCols = [
+    "date",
+    "calls",
+    "verified",
+    "unverified",
+    "failed",
+    "escalated",
+    "stamped delegator",
+    "default delegator",
+    "verified actual SEK",
+    "potential actual SEK",
+    "verified premium SEK",
+    "potential premium SEK",
+  ];
+  const detailRows = rows.map((r) => ({
+    date: r.date,
+    calls: r.calls,
+    verified: r.verifiedCalls,
+    unverified: r.unverifiedCalls,
+    failed: r.failedCalls,
+    escalated: r.escalatedCalls,
+    "stamped delegator": r.stampedDelegatorCalls,
+    "default delegator": r.defaultDelegatorCalls,
+    "verified actual SEK": r.verifiedSavingsActualSek,
+    "potential actual SEK": r.potentialSavingsActualSek,
+    "verified premium SEK": r.verifiedSavingsPremiumSek,
+    "potential premium SEK": r.potentialSavingsPremiumSek,
+  }));
+
+  const actual: TimeseriesPanel = {
+    service: SERVICE,
+    panel: ACTUAL_SAVINGS_PANEL,
+    kind: "timeseries",
+    label: "Verified M5 delegation savings vs ACTUAL delegator baseline (caller-stamped only)",
+    unit: "SEK",
+    points: rows.map((r) => ({ t: r.date, y: r.verifiedSavingsActualSek })),
+    summary: {
+      latest: latest?.verifiedSavingsActualSek ?? 0,
+      window: `${days}d`,
+      n,
+    },
+    detail: { kind: "table", cols: detailCols, rows: detailRows },
+  };
+
+  const premium: TimeseriesPanel = {
     service: SERVICE,
     panel: SAVINGS_PANEL,
     kind: "timeseries",
-    label: "Verified M5 delegation savings vs premium baseline",
+    label: "Verified M5 delegation savings vs premium baseline (optimistic upper bound)",
     unit: "SEK",
     points: rows.map((r) => ({ t: r.date, y: r.verifiedSavingsPremiumSek })),
     summary: {
       latest: latest?.verifiedSavingsPremiumSek ?? 0,
       window: `${days}d`,
-      n: rows.reduce((sum, r) => sum + r.calls, 0),
+      n,
     },
-    detail: {
-      kind: "table",
-      cols: [
-        "date",
-        "calls",
-        "verified",
-        "unverified",
-        "failed",
-        "escalated",
-        "verified premium SEK",
-        "potential premium SEK",
-      ],
-      rows: rows.map((r) => ({
-        date: r.date,
-        calls: r.calls,
-        verified: r.verifiedCalls,
-        unverified: r.unverifiedCalls,
-        failed: r.failedCalls,
-        escalated: r.escalatedCalls,
-        "verified premium SEK": r.verifiedSavingsPremiumSek,
-        "potential premium SEK": r.potentialSavingsPremiumSek,
-      })),
-    },
+    detail: { kind: "table", cols: detailCols, rows: detailRows },
   };
+
+  return { actual, premium };
 }
 
 export function buildSavingsByTaskPanel(rows: SavingsByTaskType[], days: number): TablePanel {
@@ -305,12 +364,13 @@ async function main(): Promise<void> {
   const days = Number(flag("--days") ?? DEFAULT_DAYS);
   const sekRate = Number(process.env["HOMESERVER_USD_TO_SEK"] ?? 10.5);
   const db = openReadOnlySavingsDb(dbPath);
-  const daily = queryDailySavings(db, Number.isFinite(days) && days > 0 ? days : DEFAULT_DAYS, Date.now(), sekRate);
-  const byTask = querySavingsByTaskType(db, Number.isFinite(days) && days > 0 ? days : DEFAULT_DAYS, Date.now(), sekRate);
-  const panels = [
-    buildSavingsTimeseriesPanel(daily, Number.isFinite(days) && days > 0 ? days : DEFAULT_DAYS),
-    buildSavingsByTaskPanel(byTask, Number.isFinite(days) && days > 0 ? days : DEFAULT_DAYS),
-  ];
+  const effectiveDays = Number.isFinite(days) && days > 0 ? days : DEFAULT_DAYS;
+  const daily = queryDailySavings(db, effectiveDays, Date.now(), sekRate);
+  const byTask = querySavingsByTaskType(db, effectiveDays, Date.now(), sekRate);
+  // #83: buildSavingsTimeseriesPanels always returns actual+premium TOGETHER — there is no call
+  // shape here that pushes the premium panel without its actual-baseline counterpart.
+  const timeseries = buildSavingsTimeseriesPanels(daily, effectiveDays);
+  const panels = [timeseries.actual, timeseries.premium, buildSavingsByTaskPanel(byTask, effectiveDays)];
 
   if (dryRun) {
     console.log(JSON.stringify(panels, null, 2));

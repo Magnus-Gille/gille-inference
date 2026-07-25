@@ -285,7 +285,37 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
 
     expect(out.outcome).toBe("pass");
     expect(out.costTrace?.costStatus).toBe("verified");
+    // #83 regression: the /delegate surface must persist the STAMPED delegator model and book it
+    // as a real, non-zero actual-baseline cost — this is the exact scenario that read $0.00 in
+    // production because delegator_model was mostly unpopulated.
+    expect(out.costTrace?.delegatorModel).toBe("claude-fable-5");
+    expect(out.costTrace?.delegatorModelSource).toBe("stamped");
+    expect(out.costTrace?.actualBaselineCostUsd).toBeGreaterThan(0);
     expect(out.costTrace?.verifiedSavingsActualUsd).toBeGreaterThan(0);
+    expect(out.costTrace?.verifiedSavingsPremiumUsd).toBeGreaterThan(0);
+  });
+
+  it("#83: attributes the configured default delegator model when the caller doesn't stamp one, but never books it as measured actual savings", async () => {
+    setConfig({ delegationCostLog: "on", defaultDelegatorModelId: "claude-fable-5" });
+    lmInferenceMock.mockResolvedValue(lmOk("VERIFIED ANSWER"));
+
+    const out = await delegate({
+      prompt: "bounded task",
+      // No delegatorModelId — the caller (the /delegate skill, Hugin) didn't stamp one, exactly
+      // the dominant production case (only 72/267 gateway-source rows were stamped).
+      premiumBaselineModelId: "claude-fable-5",
+      verifierName: "test-pass",
+      verifier: async () => ({ outcome: "pass", score: 1 }),
+    });
+
+    expect(out.outcome).toBe("pass");
+    expect(out.costTrace?.costStatus).toBe("verified");
+    expect(out.costTrace?.delegatorModel).toBe("claude-fable-5");
+    expect(out.costTrace?.delegatorModelSource).toBe("default");
+    // The row still records an honest actual-baseline cost estimate...
+    expect(out.costTrace?.actualBaselineCostUsd).toBeGreaterThan(0);
+    // ...but a defaulted attribution must NEVER be reported as a measured displacement.
+    expect(out.costTrace?.verifiedSavingsActualUsd).toBe(0);
     expect(out.costTrace?.verifiedSavingsPremiumUsd).toBeGreaterThan(0);
   });
 });
