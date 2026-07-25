@@ -21,6 +21,15 @@ import {
 export type DelegationCostStatus = "verified" | "unverified" | "failed" | "escalated" | "not_applicable";
 export type DelegationPolicyMode = "off" | "shadow" | "enforce";
 export type DelegationPolicyAction = "allow" | "shadow" | "deny";
+/**
+ * Provenance of `delegatorModel` (#83). "stamped" means the caller (the /delegate request body
+ * or the MCP `ask` delegator_model_id/delegatorModelId argument) supplied it directly — the
+ * strongest evidence. "default" means it came only from HOMESERVER_DEFAULT_DELEGATOR_MODEL_ID —
+ * a labelled fallback, not a caller confirmation. null means neither supplied one. This distinction
+ * exists so a defaulted attribution can never silently masquerade as a measured displacement — see
+ * verifiedSavingsActualUsd below.
+ */
+export type DelegatorModelSource = "stamped" | "default" | null;
 
 export interface CostMetrics {
   promptTokens: number;
@@ -37,7 +46,15 @@ export interface BuildDelegationCostTraceOptions {
   ledgerId?: string | null;
   keyAlias?: string | null;
   source?: string | null;
+  /** Caller-supplied delegator model id (the /delegate request field, or MCP ask's argument). */
   delegatorModelId?: string | null;
+  /**
+   * The configured HOMESERVER_DEFAULT_DELEGATOR_MODEL_ID fallback, passed SEPARATELY from
+   * delegatorModelId (#83) — never pre-merged with `??` by the caller — so this function is the
+   * single place that decides, and records, whether the resolved delegator model was stamped or
+   * defaulted.
+   */
+  defaultDelegatorModelId?: string | null;
   premiumBaselineModelId?: string | null;
   fallbackModelId?: string | null;
   delegatePolicyMode?: DelegationPolicyMode | null;
@@ -56,6 +73,7 @@ export interface DelegationCostTrace {
   source: string | null;
   localModel: string;
   delegatorModel: string | null;
+  delegatorModelSource: DelegatorModelSource;
   premiumBaselineModel: string;
   fallbackModel: string | null;
   delegatePolicyMode: DelegationPolicyMode | null;
@@ -87,6 +105,7 @@ const COST_COLUMNS = [
   "source",
   "local_model",
   "delegator_model",
+  "delegator_model_source",
   "premium_baseline_model",
   "fallback_model",
   "delegate_policy_mode",
@@ -128,6 +147,7 @@ function ensureSchema(db: Database.Database): void {
       source                        TEXT,
       local_model                   TEXT NOT NULL,
       delegator_model               TEXT,
+      delegator_model_source        TEXT,
       premium_baseline_model        TEXT NOT NULL,
       fallback_model                TEXT,
       delegate_policy_mode          TEXT,
@@ -156,6 +176,9 @@ function ensureSchema(db: Database.Database): void {
   }
   if (!cols.has("delegate_policy_action")) {
     db.exec(`ALTER TABLE delegation_costs ADD COLUMN delegate_policy_action TEXT`);
+  }
+  if (!cols.has("delegator_model_source")) {
+    db.exec(`ALTER TABLE delegation_costs ADD COLUMN delegator_model_source TEXT`);
   }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_delegation_costs_ts      ON delegation_costs(ts);
@@ -203,7 +226,17 @@ export function buildDelegationCostTrace(opts: BuildDelegationCostTraceOptions):
   const promptTokens = opts.metrics?.promptTokens ?? null;
   const completionTokens = opts.metrics?.completionTokens ?? null;
   const totalTokens = promptTokens == null || completionTokens == null ? null : promptTokens + completionTokens;
-  const delegatorModel = cleanModelId(opts.delegatorModelId);
+  // #83: resolve caller-stamped vs default-attributed SEPARATELY (never pre-merged with `??` by
+  // the caller) so the row can honestly record which one supplied the id. A caller stamp always
+  // wins over the configured default when both are present.
+  const stampedDelegatorModel = cleanModelId(opts.delegatorModelId);
+  const defaultDelegatorModel = cleanModelId(opts.defaultDelegatorModelId);
+  const delegatorModel = stampedDelegatorModel ?? defaultDelegatorModel;
+  const delegatorModelSource: DelegatorModelSource = stampedDelegatorModel
+    ? "stamped"
+    : defaultDelegatorModel
+      ? "default"
+      : null;
   const premiumBaselineModel = cleanModelId(opts.premiumBaselineModelId) ?? DEFAULT_PREMIUM_BASELINE_MODEL_ID;
   const fallbackModel = cleanModelId(opts.fallbackModelId);
   const costStatus = deriveCostStatus(opts);
@@ -224,14 +257,27 @@ export function buildDelegationCostTrace(opts: BuildDelegationCostTraceOptions):
 
   const notes: string[] = [];
   if (promptTokens == null || completionTokens == null) notes.push("missing-token-usage");
-  if (delegatorModel === null) notes.push("missing-delegator-model");
-  else if (!lookupModelTokenPrice(delegatorModel)) notes.push(`missing-price:${delegatorModel}`);
+  if (delegatorModel === null) {
+    notes.push("missing-delegator-model");
+  } else {
+    if (delegatorModelSource === "default") notes.push(`delegator-model-defaulted:${delegatorModel}`);
+    if (!lookupModelTokenPrice(delegatorModel)) notes.push(`missing-price:${delegatorModel}`);
+  }
   if (!lookupModelTokenPrice(premiumBaselineModel)) notes.push(`missing-price:${premiumBaselineModel}`);
   if (costStatus !== "verified") notes.push("verified-savings-zero-until-pass");
+  // #83: a defaulted attribution is weaker evidence than a caller stamp and must never be reported
+  // as a MEASURED displacement — even when the local attempt verified pass. Booking it into
+  // verifiedSavingsActualUsd here (fail-closed, at the source) means every downstream consumer
+  // (dashboards, ad-hoc SUM() queries) inherits the guarantee for free instead of having to
+  // remember to filter by delegator_model_source themselves.
+  if (costStatus === "verified" && delegatorModelSource === "default") {
+    notes.push("actual-savings-not-measured-default-attribution");
+  }
 
   const actualDelta = savingsAgainst(actualBaselineCostUsd, m5TotalCostUsd);
   const premiumDelta = savingsAgainst(premiumBaselineCostUsd, m5TotalCostUsd);
   const potentialAllowed = costStatus === "verified" || costStatus === "unverified";
+  const actualIsMeasured = delegatorModelSource === "stamped";
 
   return {
     id: randomUUID(),
@@ -242,6 +288,7 @@ export function buildDelegationCostTrace(opts: BuildDelegationCostTraceOptions):
     source: opts.source ?? null,
     localModel: opts.localModelId,
     delegatorModel,
+    delegatorModelSource,
     premiumBaselineModel,
     fallbackModel,
     delegatePolicyMode: opts.delegatePolicyMode ?? null,
@@ -256,7 +303,7 @@ export function buildDelegationCostTrace(opts: BuildDelegationCostTraceOptions):
     m5MarginalCostUsd,
     m5AmortizedCostUsd,
     m5TotalCostUsd,
-    verifiedSavingsActualUsd: costStatus === "verified" ? actualDelta : 0,
+    verifiedSavingsActualUsd: costStatus === "verified" && actualIsMeasured ? actualDelta : 0,
     verifiedSavingsPremiumUsd: costStatus === "verified" ? premiumDelta : 0,
     potentialSavingsActualUsd: potentialAllowed ? actualDelta : 0,
     potentialSavingsPremiumUsd: potentialAllowed ? premiumDelta : 0,
@@ -270,6 +317,7 @@ export function recordDelegationCost(trace: DelegationCostTrace): string {
     .prepare(
       `INSERT INTO delegation_costs
          (id, ts, delegation_id, task_type, key_alias, source, local_model, delegator_model,
+          delegator_model_source,
           premium_baseline_model, fallback_model, delegate_policy_mode, delegate_policy_action,
           cost_status, outcome,
           prompt_tokens, completion_tokens, total_tokens,
@@ -280,6 +328,7 @@ export function recordDelegationCost(trace: DelegationCostTrace): string {
           price_catalog_version, notes)
        VALUES
          (@id, @ts, @delegationId, @taskType, @keyAlias, @source, @localModel, @delegatorModel,
+          @delegatorModelSource,
           @premiumBaselineModel, @fallbackModel, @delegatePolicyMode, @delegatePolicyAction,
           @costStatus, @outcome,
           @promptTokens, @completionTokens, @totalTokens,

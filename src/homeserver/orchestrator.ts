@@ -384,7 +384,11 @@ function attachCostTrace(
     ledgerId: outcome.ledgerId ?? null,
     keyAlias: task.keyAlias ?? null,
     source: task.source ?? null,
-    delegatorModelId: task.delegatorModelId ?? cfg.defaultDelegatorModelId,
+    // #83: pass caller-stamped and configured-default delegator ids SEPARATELY — never pre-merged
+    // with `??` here — so buildDelegationCostTrace can record which one actually supplied the id
+    // instead of a defaulted attribution silently masquerading as a caller stamp.
+    delegatorModelId: task.delegatorModelId ?? null,
+    defaultDelegatorModelId: cfg.defaultDelegatorModelId,
     premiumBaselineModelId: task.premiumBaselineModelId ?? cfg.premiumBaselineModelId,
     fallbackModelId: outcome.frontierModelId ?? task.frontierModelId ?? null,
     delegatePolicyMode: outcome.delegatePolicy?.mode ?? null,

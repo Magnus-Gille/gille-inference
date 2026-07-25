@@ -11,7 +11,7 @@ import {
 } from "../src/homeserver/delegation-cost.js";
 import {
   buildSavingsByTaskPanel,
-  buildSavingsTimeseriesPanel,
+  buildSavingsTimeseriesPanels,
   hasDelegationCostsTable,
   openReadOnlySavingsDb,
   queryDailySavings,
@@ -34,6 +34,8 @@ function insertTrace(over: {
   outcome: "pass" | "unverified" | "error";
   promptTokens?: number;
   completionTokens?: number;
+  delegatorModelId?: string | null;
+  defaultDelegatorModelId?: string | null;
 }): void {
   recordDelegationCost(
     buildDelegationCostTrace({
@@ -46,7 +48,8 @@ function insertTrace(over: {
         promptTokens: over.promptTokens ?? 100_000,
         completionTokens: over.completionTokens ?? 100_000,
       },
-      delegatorModelId: "claude-fable-5",
+      delegatorModelId: over.delegatorModelId === undefined ? "claude-fable-5" : over.delegatorModelId,
+      defaultDelegatorModelId: over.defaultDelegatorModelId,
       premiumBaselineModelId: "claude-fable-5",
     })
   );
@@ -88,13 +91,50 @@ describe("post-delegation-savings-panel", () => {
   it("builds valid Heimdall panel ids", () => {
     const daily = queryDailySavings(getDb(), 1, Date.now(), 10);
     const byTask = querySavingsByTaskType(getDb(), 1, Date.now(), 10);
-    const ts = buildSavingsTimeseriesPanel(daily, 1);
+    const ts = buildSavingsTimeseriesPanels(daily, 1);
     const table = buildSavingsByTaskPanel(byTask, 1);
-    expect(ts.kind).toBe("timeseries");
+    expect(ts.actual.kind).toBe("timeseries");
+    expect(ts.premium.kind).toBe("timeseries");
     expect(table.kind).toBe("table");
-    expect(PANEL_ID_RE.test(ts.service)).toBe(true);
-    expect(PANEL_ID_RE.test(ts.panel)).toBe(true);
+    expect(PANEL_ID_RE.test(ts.actual.service)).toBe(true);
+    expect(PANEL_ID_RE.test(ts.actual.panel)).toBe(true);
+    expect(PANEL_ID_RE.test(ts.premium.panel)).toBe(true);
     expect(PANEL_ID_RE.test(table.panel)).toBe(true);
+  });
+
+  // #83: the panel that reported $0.00 actual savings across all 432 production rows, because the
+  // top-level timeseries panel only ever plotted the premium-baseline number — the actual-baseline
+  // series didn't exist at all. buildSavingsTimeseriesPanels must always return BOTH, as distinct
+  // panels with distinct ids/labels, and never let the premium figure stand alone.
+  it("returns the actual-baseline and premium-baseline savings as two distinct panels, never one alone", () => {
+    insertTrace({ outcome: "pass" }); // stamped delegator, verified — feeds BOTH actual and premium
+    const daily = queryDailySavings(getDb(), 1, Date.now(), 10);
+    const panels = buildSavingsTimeseriesPanels(daily, 1);
+
+    expect(panels.actual.panel).not.toBe(panels.premium.panel);
+    expect(panels.actual.label.toLowerCase()).toContain("actual");
+    expect(panels.premium.label.toLowerCase()).toContain("premium");
+    // Fable 100k+100k = $6 → 60 SEK at rate 10, and this row is caller-stamped, so BOTH series
+    // carry the same non-zero figure for a fully-stamped, fully-priced, verified row.
+    expect(panels.actual.points[0]!.y).toBe(60);
+    expect(panels.premium.points[0]!.y).toBe(60);
+    // Every panel's own detail table also carries both figures side by side — auditable even in
+    // isolation, not just when both panels happen to be viewed together.
+    expect(panels.actual.detail?.cols).toEqual(expect.arrayContaining(["verified actual SEK", "verified premium SEK"]));
+    expect(panels.premium.detail?.cols).toEqual(expect.arrayContaining(["verified actual SEK", "verified premium SEK"]));
+  });
+
+  it("keeps the actual-baseline series at zero for a default-attributed row while premium stays real", () => {
+    insertTrace({ outcome: "pass", delegatorModelId: null, defaultDelegatorModelId: "claude-fable-5" });
+    const daily = queryDailySavings(getDb(), 1, Date.now(), 10);
+    expect(daily[0]!.defaultDelegatorCalls).toBe(1);
+    expect(daily[0]!.stampedDelegatorCalls).toBe(0);
+
+    const panels = buildSavingsTimeseriesPanels(daily, 1);
+    // A defaulted attribution must never show up as measured actual savings...
+    expect(panels.actual.points[0]!.y).toBe(0);
+    // ...but the premium baseline (unaffected by delegator attribution) is unchanged.
+    expect(panels.premium.points[0]!.y).toBe(60);
   });
 
   it("zero-fills the daily series when the table is absent", () => {
