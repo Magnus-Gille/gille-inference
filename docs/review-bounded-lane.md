@@ -42,6 +42,17 @@ every one of those thresholds still returns `shadow`, never `allow`, while unpro
 promoted list is empty, so a fresh checkout cannot silently start treating review-bounded output as
 authoritative merely by accumulating passing ledger rows.
 
+**Task-type spelling does not weaken that guardrail (#80).** `isAdvisoryOnlyTaskType` and the
+promotion test canonicalize their own input (`normalizeTaskType` in `task-type-identity.ts`: trim +
+case-fold), so `"review-bounded "` or `"Review-Bounded"` resolves to the same advisory-only lane
+regardless of how a caller spelled it — and an operator promotion written with stray whitespace or
+different case still promotes the canonical lane. Case-folding is safe because every task-type id in
+`taxonomy.ts` is a lowercase kebab literal, so it can only map a variant onto a canonical id, never
+invent one. Ingress itself (`orchestrator.resolveTaskType`, used by both `/delegate` and
+`code-loop.ts`) trims but otherwise preserves an explicit caller-supplied bucket verbatim, keeping
+the #155 policy intact; canonicalization applies to the policy/lookup comparisons, not to the
+recorded ledger bucket.
+
 ## The evidence (grimnir session 2026-07-24, recorded on gille-inference#25)
 
 Five M5 review calls on real merged PRs, all on `qwen3-coder-next-80b`:

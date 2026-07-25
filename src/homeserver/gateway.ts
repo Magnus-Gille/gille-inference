@@ -3,7 +3,7 @@ import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import { listModels, loadModel, unloadModel, downloadModel } from "./model-admin.js";
-import { delegate } from "./orchestrator.js";
+import { delegate, resolveTaskType } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
@@ -68,6 +68,7 @@ import {
   REVIEW_BOUNDED_CONTRACT_VERSION,
   reviewLaneCapability,
 } from "./review-bounded.js";
+import { normalizeTaskType } from "./task-type-identity.js";
 import {
   LEARNING_TASK_PREFLIGHT_ENDPOINT,
   LEARNING_TASK_PREFLIGHT_TTL_MS,
@@ -3266,7 +3267,9 @@ async function handleRequest(
     // known review lanes (code-review, review-bounded); an explicit `?taskType=` is echoed too
     // (falls back to the generic "no local-eligible lane" reason for anything unrecognized).
     if (path === REVIEW_LANE_CAPABILITY_ENDPOINT && method === "GET") {
-      const requestedTaskType = parsedUrl.searchParams.get("taskType");
+      // #80: canonicalize the caller's `?taskType=` before the lookup and key the response by the
+      // canonical id, so `?taskType=review-bounded%20` is not mislabelled "no local-eligible lane".
+      const requestedTaskType = normalizeTaskType(parsedUrl.searchParams.get("taskType") ?? "");
       const lanes: Record<string, ReturnType<typeof reviewLaneCapability>> = {};
       for (const t of REVIEW_LANE_KNOWN_TASK_TYPES) lanes[t] = reviewLaneCapability(t, cfg.delegatePolicy.promotedAdvisoryTaskTypes);
       if (requestedTaskType && !(requestedTaskType in lanes)) {
@@ -3744,7 +3747,14 @@ async function handleRequest(
             capabilityEpoch: learningTaskCapabilityEpoch,
             authenticatedPrincipalId: principal.alias,
             authentication: "gateway-owner-auth",
-            effectiveTaskType: parsed.params.taskType,
+            // #80: compare the stamp against the SAME value the delegation will record. The
+            // orchestrator resolves the caller's taskType through resolveTaskType (trimmed), so
+            // passing the raw param here could reject " review-bounded" with a confusing
+            // "stamped task type does not match" while the ledger bucket is the trimmed one.
+            effectiveTaskType: resolveTaskType({
+              taskType: parsed.params.taskType,
+              prompt: parsed.params.prompt,
+            }),
           });
         } catch (err) {
           lctx.status = 400;

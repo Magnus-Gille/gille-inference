@@ -38,6 +38,7 @@ import {
   CODE_LOOP_HARNESS_VERSION,
 } from "../src/homeserver/code-loop.js";
 import { execCageCommand } from "../src/homeserver/code-loop-cage.js";
+import { isAdvisoryOnlyTaskType } from "../src/homeserver/delegate-policy.js";
 import type { CodeLoopDeps, EngineRunResult } from "../src/homeserver/code-loop-types.js";
 import {
   acquireDurableCodeLoopLease,
@@ -301,6 +302,28 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     const row = getDb().prepare("SELECT outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC LIMIT 1").get() as { outcome: string; verifier: string };
     expect(row.outcome).toBe("pass");
     expect(row.verifier).toBe("check-cmd");
+  });
+
+  // #80: a caller-supplied `task_type` used to enter the pipeline UNTRIMMED (the old guard trimmed
+  // only to test for emptiness, then passed the raw value on), so `"review-bounded "` recorded a
+  // whitespace-variant ledger bucket and missed the #74 advisory-only guardrail's exact match.
+  // Ingress now resolves it through the same `resolveTaskType` boundary `/delegate` uses.
+  it("resolves a caller-supplied task_type at ingress so the advisory-only guardrail sees it (#80)", async () => {
+    const instruction = `advisory-lane ingress ${randomUUID()}`;
+    const start = await startCodeLoop(
+      { instruction, files: [{ path: "a.ts", content: "export {};\n" }], task_type: "review-bounded " },
+      startCfg(),
+      fakeDeps()
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+    const promptHash = createHash("sha256").update(instruction).digest("hex").slice(0, 16);
+    const row = getDb().prepare(
+      "SELECT task_type AS taskType FROM delegations WHERE source = 'code-loop' AND prompt_hash = ? ORDER BY id DESC LIMIT 1"
+    ).get(promptHash) as { taskType: string };
+    expect(row.taskType).toBe("review-bounded");
+    expect(isAdvisoryOnlyTaskType(row.taskType)).toBe(true);
   });
 
   it("reports trusted first-edit timing and passes the stable deadline wrapper to the engine", async () => {

@@ -103,4 +103,19 @@ describe("GET /v1/capabilities/review-lane", () => {
     const j = (await r.json()) as CapabilityResponse;
     expect(j.lanes["code-implement"]!.eligible).toBe("frontier-only");
   });
+
+  // #80: the preflight must resolve a spelling variant to the SAME lane the policy guardrail will
+  // apply — otherwise an orchestrator is told "no local-eligible lane" for a task type that is in
+  // fact the advisory-only review-bounded lane.
+  it("canonicalizes an untrimmed / case-variant ?taskType= instead of reporting the generic fallback", async () => {
+    const r = await fetch(url("/v1/capabilities/review-lane?taskType=%20Review-Bounded%20"), {
+      headers: { Authorization: `Bearer ${ownerKey}` },
+    });
+    expect(r.status).toBe(200);
+    const j = (await r.json()) as CapabilityResponse;
+    expect(Object.keys(j.lanes)).not.toContain(" Review-Bounded ");
+    expect(j.lanes["review-bounded"]!.eligible).toBe("local-advisory");
+    expect(j.lanes["review-bounded"]!.advisoryOnly).toBe(true);
+    expect(j.lanes["review-bounded"]!.promoted).toBe(false);
+  });
 });

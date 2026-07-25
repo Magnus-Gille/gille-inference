@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { extractCodeBlock, stripThink, type Verifier, type VerifyResult } from "./verifier.js";
+import { isPromotedAdvisoryTaskType, normalizeTaskType } from "./task-type-identity.js";
 
 /**
  * Bounded local-review lane (issue #74).
@@ -372,11 +373,15 @@ export interface ReviewLaneCapability {
  * review result for a task type that will always escalate (#74 acceptance criterion 4/5).
  */
 export function reviewLaneCapability(
-  taskType: string,
+  rawTaskType: string,
   promotedAdvisoryTaskTypes: readonly string[]
 ): ReviewLaneCapability {
+  // #80: canonicalize before the exact-match lookups below and echo the canonical id, so this
+  // preflight and decideDelegatePolicy's advisory-only guardrail can never disagree about the
+  // lane a given spelling resolves to.
+  const taskType = normalizeTaskType(rawTaskType);
   if (taskType === REVIEW_BOUNDED_TASK_TYPE) {
-    const promoted = promotedAdvisoryTaskTypes.includes(REVIEW_BOUNDED_TASK_TYPE);
+    const promoted = isPromotedAdvisoryTaskType(taskType, promotedAdvisoryTaskTypes);
     return {
       taskType,
       eligible: "local-advisory",

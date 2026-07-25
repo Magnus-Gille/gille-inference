@@ -210,7 +210,10 @@ accepted Grimnir schema fail tests on cross-repository drift.
 Content-blind, no-I/O preflight — an orchestrator can ask which lane a review **task type** will
 get *before* sending a `/delegate` prompt, and never waits on a local review result for a task type
 that always escalates. Always returns both known review lanes; an explicit `?taskType=` is echoed
-too (any unrecognized value falls back to the generic "no local-eligible lane" reason).
+too (any unrecognized value falls back to the generic "no local-eligible lane" reason). The
+requested value is canonicalized before lookup and keyed/echoed canonically (trim + case-fold,
+#80), so `?taskType=review-bounded%20` reports the real `review-bounded` lane instead of the
+generic fallback.
 
 ```
 GET /v1/capabilities/review-lane
