@@ -21,7 +21,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 import { DEFAULT_DELEGATE_POLICY, DEFAULT_POLICY, type DelegatePolicyConfig } from "../src/homeserver/config.js";
 import {
   decideDelegatePolicy,
@@ -267,5 +267,64 @@ describe("evaluateDelegatePolicy — evidence keys merge onto the canonical buck
     });
     expect(decision.evidence.taskType).toBe(raw);
     expect(decision.evidence.attempts).toBeGreaterThanOrEqual(1);
+  });
+
+  it("records a known-id spelling variant into the canonical lane, so its failures demote the lane the gate reads (#95)", () => {
+    const promptPrefix = `known-variant-demotion-${Date.now()}`;
+    const trustedPolicy = { ...DEFAULT_POLICY, trustedVerifiersForJudgment: ["predicate"] };
+    const canonicalInput: DelegatePolicyInput = {
+      taskType: "summarize",
+      modelId: MODEL,
+      verifierName: "predicate",
+      hasVerifier: true,
+      source: "gateway",
+      explicitModelOverride: false,
+      policy: trustedPolicy,
+      delegatePolicy: cfg(),
+    };
+
+    // Establish an enforce-mode-certified canonical lane first.
+    for (let i = 0; i < 10; i++) {
+      recordDelegation({
+        taskType: "summarize",
+        modelId: MODEL,
+        prompt: `${promptPrefix}-pass-${i}`,
+        outcome: "pass",
+        latencyMs: 900,
+        verifier: "predicate",
+        source: "gateway",
+      });
+    }
+    expect(evaluateDelegatePolicy(canonicalInput).action).toBe("allow");
+
+    // This is the former orphaned-evidence path: policy reads "summarize" while a caller
+    // supplied "Summarize". These failures must land in the policy's canonical bucket.
+    for (let i = 0; i < 3; i++) {
+      recordDelegation({
+        taskType: "Summarize",
+        modelId: MODEL,
+        prompt: `${promptPrefix}-variant-fail-${i}`,
+        outcome: "fail",
+        latencyMs: 900,
+        verifier: "predicate",
+        source: "gateway",
+      });
+    }
+
+    const demoted = evaluateDelegatePolicy(canonicalInput);
+    expect(demoted.evidence.taskType).toBe("summarize");
+    expect(demoted.evidence.attempts).toBe(13);
+    expect(demoted.evidence.fails).toBe(3);
+    expect(demoted.action).toBe("deny");
+  });
+
+  it("keeps a genuine caller-domain bucket verbatim in the ledger (#95 migration guard)", () => {
+    const taskType = `Ratatoskr-Domain-Bucket-${Date.now()}`;
+    recordDelegation({ taskType, modelId: MODEL, prompt: "domain bucket", outcome: "pass" });
+
+    const row = getDb()
+      .prepare("SELECT task_type AS taskType FROM delegations WHERE prompt_excerpt = ?")
+      .get("domain bucket") as { taskType: string };
+    expect(row.taskType).toBe(taskType);
   });
 });

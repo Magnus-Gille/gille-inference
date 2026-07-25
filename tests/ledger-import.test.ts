@@ -17,6 +17,7 @@ import { getDb, initDb } from "../src/db.js";
 import { DEFAULT_POLICY } from "../src/homeserver/config.js";
 import {
   importDelegations,
+  importId,
   getVerdict,
   ledgerReport,
   type ImportableDelegation,
@@ -93,6 +94,44 @@ describe("importDelegations — durable probe-evidence import", () => {
 
   it("rejects a record without a timestamp (undated evidence is not durable evidence)", () => {
     expect(() => importDelegations([probeResult({ ts: "" })])).toThrow(/ts/i);
+  });
+
+  it("canonicalizes a known taxonomy spelling but preserves an unknown caller-domain spelling (#95)", () => {
+    const domainType = `Ratatoskr-Domain-Bucket-${Date.now()}`;
+    importDelegations([
+      probeResult({ taskType: "Summarize", prompt: "known-variant-import" }),
+      probeResult({ taskType: domainType, prompt: "domain-bucket-import" }),
+    ]);
+
+    const rows = getDb()
+      .prepare("SELECT task_type AS taskType FROM delegations WHERE prompt_excerpt IN (?, ?) ORDER BY prompt_excerpt")
+      .all("domain-bucket-import", "known-variant-import") as Array<{ taskType: string }>;
+    expect(rows).toEqual([{ taskType: domainType }, { taskType: "summarize" }]);
+  });
+
+  it("deduplicates canonical and variant spellings of the same known taxonomy evidence (#95)", () => {
+    const prompt = `known-identity-dedupe-${Date.now()}`;
+    const canonical = probeResult({ taskType: "summarize", prompt });
+    const variant = { ...canonical, taskType: "Summarize" };
+
+    // The two spellings write the same canonical lane, so their import identity must match too.
+    expect(importId(variant)).toBe(importId(canonical));
+    expect(importDelegations([canonical]).inserted).toBe(1);
+    expect(importDelegations([variant])).toEqual({ inserted: 0, skipped: 1 });
+    const rows = getDb()
+      .prepare("SELECT id, task_type AS taskType FROM delegations WHERE prompt_excerpt = ?")
+      .all(prompt) as Array<{ id: string; taskType: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.taskType).toBe("summarize");
+  });
+
+  it("keeps case-variant unknown caller-domain import identities distinct (#95)", () => {
+    const prompt = `unknown-identity-distinct-${Date.now()}`;
+    const domain = probeResult({ taskType: "ratatoskr-domain-bucket", prompt });
+    const variant = { ...domain, taskType: "Ratatoskr-Domain-Bucket" };
+
+    expect(importId(variant)).not.toBe(importId(domain));
+    expect(importDelegations([domain, variant])).toEqual({ inserted: 2, skipped: 0 });
   });
 
   // Self-review finding (PR #153): batteries can stamp a run-level ts on every line and repeat
