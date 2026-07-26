@@ -673,6 +673,29 @@ describe("gateway spine — HTTP integration", () => {
     expect(res.status).toBe(400);
   });
 
+  it("#87: an explicit classify delegate request has a non-empty JSON outcome", async () => {
+    const owner = mintKey({ alias: `delegate-classify-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const res = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({
+        prompt: "Classify this short request.",
+        taskType: "classify",
+        modelId: "m1",
+        maxTokens: 16,
+      }),
+    });
+
+    const raw = await res.text();
+    expect(raw).not.toBe("");
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.status).toBe(200);
+    expect(JSON.parse(raw)).toMatchObject({
+      taskType: "classify",
+      delegated: true,
+    });
+  });
+
   it("a minted owner can look up chat and direct-delegate exposure without raw task text", async () => {
     const chatOwner = mintKey(
       { alias: "task-exposure-chat-owner", tier: "owner", modelAllowList: ["m1"] },
