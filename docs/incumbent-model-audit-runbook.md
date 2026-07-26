@@ -4,8 +4,9 @@ This is a separate, advisory lane for models that are already served. Weekly Mod
 candidate discovery only. An incumbent audit never loads, unloads, adopts, culls, or edits a route.
 
 Run it when the probe corpus/version, a route role, observed artifact/configuration, or the
-evidence-age policy changes. The operator owns the decision and must review the append-only JSONL
-record before proposing keep/standby/cull through the existing reviewed routing lifecycle.
+evidence-age policy changes. The M5 inference operator owns the weekly Sunday 02:00 UTC cadence
+and its exceptions; the routing reviewer owns keep/standby/cull proposals. Both must review the
+append-only JSONL record before proposing anything through the existing reviewed routing lifecycle.
 
 On M5, use the shared GPU lease and a bounded audit of a model that is already `ready`; it will
 refuse to invent evidence for an unloaded/unobservable model:
@@ -13,6 +14,12 @@ refuse to invent evidence for an unloaded/unobservable model:
 ```bash
 npx tsx src/homeserver/cli.ts gpu run --model <served-model> --eta 30m --purpose incumbent-audit -- \
   npx tsx scripts/incumbent-model-audit.ts --model <served-model> --trigger evidence-age
+```
+
+Before allocating the lease, this is an operator-safe no-network/no-write fixture check:
+
+```bash
+npx tsx scripts/incumbent-model-audit.ts --model <served-model> --trigger evidence-age --dry-run
 ```
 
 The runner appends `data/incumbent-audits.jsonl`. Each row is source-attributed as
@@ -28,6 +35,8 @@ not replace the gateway's production admission controls. Run off-peak and use ma
 when local contention needs to be declared to guests.
 
 Stale or configuration-mismatched evidence is not inherited: the record's observed identity is a
-new evidence boundary. Route generation must treat a missing, unavailable, or mismatched current
-identity as a reason to escalate/hold rather than silently reuse the old bucket. A human-reviewed
+new evidence boundary. `generate-routing-table.ts` reads this registry and filters a served model
+out of local route selection unless its current `/running` command matches a completed audit within
+`INCUMBENT_AUDIT_MAX_AGE_MS` (default seven days); its source manifest names every stale/unavailable
+reason. A human-reviewed
 proposal may subsequently use the routing lifecycle; this lane itself cannot mutate it.

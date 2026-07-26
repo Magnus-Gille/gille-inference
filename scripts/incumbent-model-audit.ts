@@ -11,6 +11,10 @@ function value(flag: string): string | undefined {
 }
 const model = value("--model");
 if (!model) throw new Error("usage: incumbent-model-audit --model <served-model> [--trigger <reason>]");
+if (process.argv.includes("--dry-run")) {
+  console.log(JSON.stringify({ dryRun: true, model, trigger: value("--trigger") ?? "manual", mutation: "none", requires: ["ready /running observation", "external gpu run lease"] }));
+  process.exit(0);
+}
 const endpoint = (process.env["INCUMBENT_AUDIT_ENDPOINT"] ?? "http://127.0.0.1:8080/v1").replace(/\/$/, "");
 const output = resolve(process.env["INCUMBENT_AUDIT_REGISTRY"] ?? "./data/incumbent-audits.jsonl");
 const record = await auditIncumbent({
