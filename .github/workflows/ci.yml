@@ -18,6 +18,51 @@ permissions:
   contents: read
 
 jobs:
+  secret-scan:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      # Full history is required for both the initial scan and any later
+      # force-push-safe revalidation. The action derives a PR's precise
+      # first-PR-commit^..head range itself; only push needs BASE_REF.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Select full first-parent push history
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          first_commit="$(git rev-list --reverse --first-parent HEAD | sed -n '2p')"
+          if [[ -z "$first_commit" ]]; then
+            first_commit="${GITHUB_SHA}"
+          fi
+          printf 'BASE_REF=%s\n' "$first_commit" >> "$GITHUB_ENV"
+
+      # gitleaks/gitleaks-action v2.3.9, pinned to its immutable release
+      # commit. It fails the job when gitleaks reports a leak.
+      - name: Scan committed history
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_VERSION: '8.24.3'
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
+
+      # The action's push mode scans the event range. Re-run its pinned
+      # Gitleaks binary over every reachable ref so an older or merged commit
+      # cannot escape the initial/revalidation push gate.
+      - name: Scan all reachable push history
+        if: github.event_name == 'push'
+        shell: bash
+        run: gitleaks detect --config .gitleaks.toml --source . --log-opts='--all' --redact
+
+      - name: Verify the gitleaks configuration rejects a synthetic secret
+        shell: bash
+        run: scripts/verify-gitleaks-config.sh
+
   test:
     runs-on: ubuntu-latest
     steps:

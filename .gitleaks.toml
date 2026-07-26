@@ -3,6 +3,16 @@ title = "Gille Inference secret scanning"
 [extend]
 useDefault = true
 
+# A hermetic CI configuration test assembles this invented marker in a
+# temporary untracked file. It guards against silently disabling scanning or
+# replacing this config with an empty allowlist-only file; it cannot match a
+# production credential format.
+[[rules]]
+id = "synthetic-config-test-secret"
+description = "invented gitleaks configuration test marker"
+regex = '''gitleaks-test-secret-[0-9a-f]{32}'''
+secretGroup = 0
+
 # The generic-api-key rule interprets the second '=' in this documented model
 # ceiling as a credential assignment. It is a numeric model limit.
 [[allowlists]]
@@ -39,6 +49,13 @@ condition = "AND"
 regexTarget = "match"
 paths = ['''^tests/hs-cli\.test\.ts$''']
 regexes = ['''hs_test123456789''']
+
+[[allowlists]]
+description = "deploy script test-only owner key"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^tests/deploy-gateway\.test\.ts$''']
+regexes = ['''test-owner-key-0123456789''']
 
 # This model identifier appears as a record key in synthetic harvest fixtures.
 [[allowlists]]
