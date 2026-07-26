@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { auditIncumbent } from "../src/homeserver/incumbent-audit.js";
+import { evidenceIdentityFromServedModelCmd } from "../src/homeserver/evidence-identity.js";
 import type { Probe } from "../src/homeserver/probes.js";
 
 const probe: Probe = { id: "p", taskType: "triage", verifierName: "exact", prompt: "say ok", verifier: async () => ({ outcome: "pass", score: 1 }) };
@@ -23,10 +24,15 @@ describe("auditIncumbent", () => {
   });
 
   it("refuses completed evidence when the served command changes during probes", async () => {
-    const getRunningCmd = vi.fn().mockResolvedValueOnce("llama-server -m /models/mellum-Q4.gguf -c 8192").mockResolvedValueOnce("llama-server -m /models/mellum-Q4.gguf -c 16384");
+    const initial = "llama-server -m /models/mellum-Q4.gguf -c 8192";
+    const final = "llama-server -m /models/mellum-Q4.gguf -c 16384";
+    const getRunningCmd = vi.fn().mockResolvedValueOnce(initial).mockResolvedValueOnce(final);
     const record = await auditIncumbent({ ...common, getRunningCmd, chat: async () => ({ output: "ok", latencyMs: 12, tokPerSec: 2, promptTokens: 1, completionTokens: 1, reasoningChars: null, finishReason: "stop" }) });
     expect(record).toMatchObject({ status: "unavailable", unavailableReason: "served artifact/configuration changed during audit" });
-    expect(record.summary).toBeUndefined();
+    expect(record.servedCommand).toBe(initial);
+    expect(record.postAuditServedCommand).toBe(final);
+    expect(record.evidenceIdentity.configEpoch).toEqual(evidenceIdentityFromServedModelCmd(initial).configEpoch);
+    expect(record.summary).toMatchObject({ totalRuns: 1, pass: 1 });
     expect(getRunningCmd).toHaveBeenCalledTimes(2);
   });
 });

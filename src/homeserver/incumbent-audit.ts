@@ -18,7 +18,10 @@ export interface IncumbentAuditRecord {
   trigger: string;
   probeBatteryVersion: string;
   corpusFingerprint: string;
+  /** Command observed before probes; this is always the exact artifact/configuration tested. */
   servedCommand: string | null;
+  /** A second observation after probes, retained when it differs or post-observation fails. */
+  postAuditServedCommand?: string | null;
   evidenceIdentity: Pick<EvidenceIdentityBundle, "modelArtifact" | "configEpoch">;
   status: "completed" | "unavailable";
   unavailableReason?: string;
@@ -62,10 +65,10 @@ export async function auditIncumbent(opts: AuditIncumbentOptions): Promise<Incum
   try {
     finalCommand = await opts.getRunningCmd(opts.model);
   } catch (err) {
-    return unavailable(opts, auditedAt, servedCommand, `served-model post-audit observation failed: ${String(err)}`);
+    return unavailable(opts, auditedAt, servedCommand, `served-model post-audit observation failed: ${String(err)}`, { summary });
   }
   if (finalCommand !== servedCommand) {
-    return unavailable(opts, auditedAt, finalCommand, "served artifact/configuration changed during audit");
+    return unavailable(opts, auditedAt, servedCommand, "served artifact/configuration changed during audit", { postAuditServedCommand: finalCommand, summary });
   }
   return {
     schemaVersion: 1, source: "live-served-model", auditedAt, model: opts.model, trigger: opts.trigger,
@@ -74,11 +77,14 @@ export async function auditIncumbent(opts: AuditIncumbentOptions): Promise<Incum
   };
 }
 
-function unavailable(opts: AuditIncumbentOptions, auditedAt: string, servedCommand: string | null, unavailableReason: string): IncumbentAuditRecord {
+function unavailable(
+  opts: AuditIncumbentOptions, auditedAt: string, servedCommand: string | null, unavailableReason: string,
+  diagnostic: Pick<IncumbentAuditRecord, "postAuditServedCommand" | "summary"> = {}
+): IncumbentAuditRecord {
   return {
     schemaVersion: 1, source: "live-served-model", auditedAt, model: opts.model, trigger: opts.trigger,
     probeBatteryVersion: opts.probeBatteryVersion, corpusFingerprint: opts.corpusFingerprint,
     servedCommand, evidenceIdentity: evidenceIdentityFromServedModelCmd(servedCommand),
-    status: "unavailable", unavailableReason,
+    status: "unavailable", unavailableReason, ...diagnostic,
   };
 }

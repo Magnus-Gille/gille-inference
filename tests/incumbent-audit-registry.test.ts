@@ -18,4 +18,10 @@ describe("incumbent audit eligibility", () => {
     for (const raw of ["0", "-1", "NaN", "Infinity"]) expect(() => parseIncumbentAuditMaxAgeMs(raw)).toThrow(/finite positive/);
     expect(() => eligibleIncumbents(new Map([["mellum", cmd]]), [record], Date.now(), Number.NaN)).toThrow(/finite and positive/);
   });
+  it("never admits an invalidated diagnostic run even when its retained probe summary passed", () => {
+    const invalidated = { ...record, status: "unavailable" as const, unavailableReason: "served artifact/configuration changed during audit", postAuditServedCommand: "llama-server -m /models/mellum-Q4.gguf -c 16384" };
+    const result = eligibleIncumbents(new Map([["mellum", cmd]]), [invalidated], Date.parse("2026-07-26T01:00:00Z"), 86_400_000);
+    expect(result.eligibleModelIds).toEqual([]);
+    expect(result.reasons.mellum).toContain("changed during audit");
+  });
 });
