@@ -52,6 +52,14 @@ describe("homeserver cost catalog", () => {
     expect(lookupModelTokenPrice("openai/gpt-5", new Date("2026-08-26T00:00:00.000Z"))).toBeNull();
   });
 
+  it("does not book the scheduled Sonnet standard tariff before its effective date", () => {
+    expect(inspectModelTokenPrice("claude-sonnet-5-standard", { now: new Date("2026-08-31T23:59:59.999Z") }).kind)
+      .toBe("not-yet-effective");
+    // The catalog itself expires before the future tariff takes effect, forcing a fresh check.
+    expect(inspectModelTokenPrice("claude-sonnet-5-standard", { now: new Date("2026-09-01T00:00:00.000Z") }).kind)
+      .toBe("stale");
+  });
+
   it("returns null for unknown or local-only models", () => {
     expect(lookupModelTokenPrice("does-not-exist")).toBeNull();
     expect(estimateTokenCostUsd("does-not-exist", 10, 10)).toBeNull();

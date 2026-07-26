@@ -99,7 +99,7 @@ export interface DelegationCostTrace {
 
 export interface UnpricedDelegatorModel {
   modelId: string;
-  reason: "missing" | "stale" | "unavailable";
+  reason: "missing" | "stale" | "unavailable" | "not-yet-effective";
   rows: number;
   firstSeenAt: string;
   lastSeenAt: string;

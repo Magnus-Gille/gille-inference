@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import {
   findUnpricedDelegatorModels,
   recordDelegationCost,
 } from "../src/homeserver/delegation-cost.js";
+import { cmdLedger } from "../src/homeserver/cli.js";
 
 beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), "hs-deleg-cost-test-"));
@@ -170,6 +171,27 @@ describe("delegation cost trace", () => {
       expect.objectContaining({ modelId: "qwen3-30b-instruct", reason: "unavailable", rows: 1 }),
       expect.objectContaining({ modelId: "unlisted-model", reason: "missing", rows: 1 }),
     ]);
+  });
+
+  it("shows an operator-visible ledger warning when a newly recorded delegator has no price", () => {
+    ensureDelegationCostSchema();
+    recordDelegationCost(buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 1, completionTokens: 1 },
+      delegatorModelId: "new-unpriced-delegator",
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      cmdLedger(); // The production `homeserver ledger` command calls this exact path.
+      expect(log.mock.calls.flat().join("\n")).toContain("PRICING WARNINGS");
+      expect(log.mock.calls.flat().join("\n")).toContain("new-unpriced-delegator: missing");
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it("falls back to defaultDelegatorModelId, labels it 'default', and never books it as measured savings", () => {

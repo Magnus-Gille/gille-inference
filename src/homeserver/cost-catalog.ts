@@ -20,6 +20,8 @@ export interface ModelTokenPrice {
   checkedAt: string;
   /** Do not book savings after this date without a deliberate catalog refresh. */
   validUntil: string;
+  /** Optional future effective date; prices never book before it. */
+  availableFrom?: string;
   note?: string;
 }
 
@@ -36,6 +38,7 @@ export type CatalogEntry = ModelTokenPrice | UnavailableModelTokenPrice;
 export type ModelTokenPriceStatus =
   | { kind: "priced"; price: ModelTokenPrice }
   | { kind: "stale"; price: ModelTokenPrice }
+  | { kind: "not-yet-effective"; price: ModelTokenPrice }
   | { kind: "unavailable"; entry: UnavailableModelTokenPrice }
   | { kind: "missing" };
 
@@ -55,9 +58,10 @@ function priced(
   inputUsdPerMTok: number,
   outputUsdPerMTok: number,
   sourceUrl: string,
-  note?: string
+  note?: string,
+  availableFrom?: string
 ): ModelTokenPrice {
-  return { modelId, provider, inputUsdPerMTok, outputUsdPerMTok, sourceUrl, checkedAt: CATALOG_CHECKED_AT, validUntil: CATALOG_VALID_UNTIL, note };
+  return { modelId, provider, inputUsdPerMTok, outputUsdPerMTok, sourceUrl, checkedAt: CATALOG_CHECKED_AT, validUntil: CATALOG_VALID_UNTIL, note, availableFrom };
 }
 
 export const DEFAULT_MODEL_TOKEN_PRICES: readonly ModelTokenPrice[] = [
@@ -83,7 +87,7 @@ export const DEFAULT_MODEL_TOKEN_PRICES: readonly ModelTokenPrice[] = [
     ...priced("claude-sonnet-5", "anthropic", 2, 10, ANTHROPIC_PRICING_URL, "Introductory price through 2026-08-31; catalog expires before that change."),
   },
   {
-    ...priced("claude-sonnet-5-standard", "anthropic", 3, 15, ANTHROPIC_PRICING_URL, "Scheduled standard price from 2026-09-01; never selected before catalog expiry."),
+    ...priced("claude-sonnet-5-standard", "anthropic", 3, 15, ANTHROPIC_PRICING_URL, "Scheduled standard price from 2026-09-01; catalog expires before that change.", "2026-09-01"),
   },
   {
     ...priced("claude-sonnet-4.6", "anthropic", 3, 15, ANTHROPIC_PRICING_URL),
@@ -95,7 +99,7 @@ export const DEFAULT_MODEL_TOKEN_PRICES: readonly ModelTokenPrice[] = [
     ...priced("gpt-5", "openai", 1.25, 10, "https://developers.openai.com/api/docs/models/gpt-5"),
   },
   {
-    ...priced("gpt-5.6-sol", "openai", 5, 30, OPENAI_PRICING_URL),
+    ...priced("gpt-5.6-sol", "openai", 5, 30, OPENAI_PRICING_URL, "OpenAI Standard processing, short-context (<270K) input/output tariff."),
   },
   { ...priced("gpt-5.5", "openai", 5, 30, OPENAI_PRICING_URL) },
   { ...priced("gpt-5.4", "openai", 2.5, 15, OPENAI_PRICING_URL) },
@@ -139,6 +143,10 @@ function isExpired(price: ModelTokenPrice, now: Date): boolean {
   return Number.isNaN(Date.parse(price.validUntil)) || now.getTime() > Date.parse(`${price.validUntil}T23:59:59.999Z`);
 }
 
+function isNotYetEffective(price: ModelTokenPrice, now: Date): boolean {
+  return price.availableFrom !== undefined && now.getTime() < Date.parse(`${price.availableFrom}T00:00:00.000Z`);
+}
+
 export function inspectModelTokenPrice(
   modelId: string | null | undefined,
   options: { now?: Date; catalog?: readonly ModelTokenPrice[]; unavailable?: readonly UnavailableModelTokenPrice[] } = {}
@@ -147,7 +155,10 @@ export function inspectModelTokenPrice(
   const normalized = normalizeModelId(modelId);
   const now = options.now ?? new Date();
   const direct = (options.catalog ?? DEFAULT_MODEL_TOKEN_PRICES).find((p) => normalizeModelId(p.modelId) === normalized);
-  if (direct) return isExpired(direct, now) ? { kind: "stale", price: direct } : { kind: "priced", price: direct };
+  if (direct) {
+    if (isNotYetEffective(direct, now)) return { kind: "not-yet-effective", price: direct };
+    return isExpired(direct, now) ? { kind: "stale", price: direct } : { kind: "priced", price: direct };
+  }
   const unavailable = (options.unavailable ?? DEFAULT_UNAVAILABLE_MODEL_TOKEN_PRICES)
     .find((entry) => normalizeModelId(entry.modelId) === normalized);
   if (unavailable) return { kind: "unavailable", entry: unavailable };
