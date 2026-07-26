@@ -21,4 +21,12 @@ describe("auditIncumbent", () => {
     expect(chat).not.toHaveBeenCalled();
     expect(record.evidenceIdentity.modelArtifact).toMatchObject({ kind: "unknown", reason: "not-observed" });
   });
+
+  it("refuses completed evidence when the served command changes during probes", async () => {
+    const getRunningCmd = vi.fn().mockResolvedValueOnce("llama-server -m /models/mellum-Q4.gguf -c 8192").mockResolvedValueOnce("llama-server -m /models/mellum-Q4.gguf -c 16384");
+    const record = await auditIncumbent({ ...common, getRunningCmd, chat: async () => ({ output: "ok", latencyMs: 12, tokPerSec: 2, promptTokens: 1, completionTokens: 1, reasoningChars: null, finishReason: "stop" }) });
+    expect(record).toMatchObject({ status: "unavailable", unavailableReason: "served artifact/configuration changed during audit" });
+    expect(record.summary).toBeUndefined();
+    expect(getRunningCmd).toHaveBeenCalledTimes(2);
+  });
 });

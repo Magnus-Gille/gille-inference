@@ -5,8 +5,8 @@ candidate discovery only. An incumbent audit never loads, unloads, adopts, culls
 
 Run it when the probe corpus/version, a route role, observed artifact/configuration, or the
 evidence-age policy changes. The M5 inference operator owns the weekly Sunday 02:00 UTC cadence
-and its exceptions; the routing reviewer owns keep/standby/cull proposals. Both must review the
-append-only JSONL record before proposing anything through the existing reviewed routing lifecycle.
+and its exceptions. The existing autonomous-improvement controller and routing lifecycle own any
+promotion decision under their mechanical predicates; this audit only supplies non-mutating evidence.
 
 On M5, use the shared GPU lease and a bounded audit of a model that is already `ready`; it will
 refuse to invent evidence for an unloaded/unobservable model:
@@ -32,11 +32,12 @@ Use gateway authentication through the configured environment only (for example,
 least-privilege audit key); never put a key in the command, registry, or Git. Schedule only after
 an owner chooses an evidence-age cadence. The GPU lease serializes cooperating heavy jobs; it does
 not replace the gateway's production admission controls. Run off-peak and use maintenance mode
-when local contention needs to be declared to guests.
+when local contention needs to be declared to guests. `INCUMBENT_AUDIT_MAX_AGE_MS` must be a finite,
+strictly positive millisecond value; invalid policy fails route generation closed.
 
 Stale or configuration-mismatched evidence is not inherited: the record's observed identity is a
 new evidence boundary. `generate-routing-table.ts` reads this registry and filters a served model
 out of local route selection unless its current `/running` command matches a completed audit within
 `INCUMBENT_AUDIT_MAX_AGE_MS` (default seven days); its source manifest names every stale/unavailable
-reason. A human-reviewed
-proposal may subsequently use the routing lifecycle; this lane itself cannot mutate it.
+reason. The existing controller/routing lifecycle may subsequently promote under its established
+mechanical gates; this lane itself cannot mutate it.

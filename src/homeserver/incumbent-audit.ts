@@ -56,6 +56,17 @@ export async function auditIncumbent(opts: AuditIncumbentOptions): Promise<Incum
     model: opts.model, endpoint: opts.endpoint, probes: opts.probes, repeats: opts.repeats,
     apiKey: opts.apiKey, timeoutMs: opts.timeoutMs, chat: opts.chat,
   });
+  // The pre-probe observation identifies the thing tested only if it still names the same
+  // artifact/configuration after the serial battery. Never emit completed evidence across a swap.
+  let finalCommand: string | null;
+  try {
+    finalCommand = await opts.getRunningCmd(opts.model);
+  } catch (err) {
+    return unavailable(opts, auditedAt, servedCommand, `served-model post-audit observation failed: ${String(err)}`);
+  }
+  if (finalCommand !== servedCommand) {
+    return unavailable(opts, auditedAt, finalCommand, "served artifact/configuration changed during audit");
+  }
   return {
     schemaVersion: 1, source: "live-served-model", auditedAt, model: opts.model, trigger: opts.trigger,
     probeBatteryVersion: opts.probeBatteryVersion, corpusFingerprint: opts.corpusFingerprint,

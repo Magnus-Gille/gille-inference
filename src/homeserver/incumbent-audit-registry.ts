@@ -17,10 +17,18 @@ export function readIncumbentAudits(path: string): IncumbentAuditRecord[] {
 
 export interface IncumbentEligibility { eligibleModelIds: string[]; reasons: Record<string, string>; }
 
+/** Parse a policy duration once; invalid policy must never widen routing eligibility. */
+export function parseIncumbentAuditMaxAgeMs(raw: string | undefined, fallbackMs = 7 * 24 * 60 * 60 * 1000): number {
+  const value = raw === undefined ? fallbackMs : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) throw new Error("INCUMBENT_AUDIT_MAX_AGE_MS must be a finite positive number of milliseconds");
+  return value;
+}
+
 /** A model needs a recent completed audit whose observed command exactly matches now. */
 export function eligibleIncumbents(
   servedCommands: ReadonlyMap<string, string | null>, records: readonly IncumbentAuditRecord[], nowMs: number, maxAgeMs: number
 ): IncumbentEligibility {
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) throw new Error("incumbent audit maximum age must be finite and positive");
   const eligibleModelIds: string[] = [];
   const reasons: Record<string, string> = Object.create(null);
   for (const [model, cmd] of servedCommands) {

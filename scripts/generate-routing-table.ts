@@ -55,7 +55,7 @@ import { ledgerReport } from "../src/homeserver/ledger.js";
 import { getDb } from "../src/db.js";
 import { listModels, getRunningCmd } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
-import { eligibleIncumbents, readIncumbentAudits } from "../src/homeserver/incumbent-audit-registry.js";
+import { eligibleIncumbents, parseIncumbentAuditMaxAgeMs, readIncumbentAudits } from "../src/homeserver/incumbent-audit-registry.js";
 import {
   generateRoutingTable,
   summarizeEvidence,
@@ -93,7 +93,7 @@ function parseArgs(argv: string[]): {
     out: flag("--out") ?? join(repoRoot, "docs", "m5-routing.json"),
     db: flag("--db"),
     dataDir: flag("--data-dir") ?? resolve("./data"),
-    incumbentAuditMaxAgeMs: Number(flag("--incumbent-audit-max-age-ms") ?? process.env["INCUMBENT_AUDIT_MAX_AGE_MS"] ?? 7 * 24 * 60 * 60 * 1000),
+    incumbentAuditMaxAgeMs: parseIncumbentAuditMaxAgeMs(flag("--incumbent-audit-max-age-ms") ?? process.env["INCUMBENT_AUDIT_MAX_AGE_MS"]),
   };
 }
 
@@ -269,7 +269,9 @@ async function main(): Promise<void> {
   const auditPath = join(args.dataDir, "incumbent-audits.jsonl");
   const servedCommands = new Map<string, string | null>();
   if (catalogueIds) await Promise.all(catalogueIds.map(async id => servedCommands.set(id, await getRunningCmd(id).catch(() => null))));
-  const incumbent = eligibleIncumbents(servedCommands, readIncumbentAudits(auditPath), Date.now(), args.incumbentAuditMaxAgeMs);
+  const audits = readIncumbentAudits(auditPath);
+  const auditLatest = audits.reduce<string | null>((latest, audit) => latest === null || audit.auditedAt > latest ? audit.auditedAt : latest, null);
+  const incumbent = eligibleIncumbents(servedCommands, audits, Date.now(), args.incumbentAuditMaxAgeMs);
   const servableModelIds = catalogueIds ? catalogueIds.filter(id => incumbent.eligibleModelIds.includes(id)) : undefined;
 
   const sources: SourceManifestEntry[] = [
@@ -306,7 +308,7 @@ async function main(): Promise<void> {
     },
     {
       source: "incumbent served-model audits (JSONL)", path: auditPath, present: existsSync(auditPath),
-      records: readIncumbentAudits(auditPath).length, latest: null,
+      records: audits.length, latest: auditLatest,
       note: catalogueIds ? `${incumbent.eligibleModelIds.length}/${catalogueIds.length} served models eligible; ${Object.entries(incumbent.reasons).map(([id, reason]) => `${id}: ${reason}`).join("; ") || "none stale"}` : "catalogue unavailable",
     },
   ];
