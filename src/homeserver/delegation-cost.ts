@@ -6,6 +6,7 @@ import {
   DEFAULT_PREMIUM_BASELINE_MODEL_ID,
   estimateLocalTokenCostUsd,
   estimateTokenCostUsd,
+  inspectModelTokenPrice,
   lookupModelTokenPrice,
   roundUsd,
 } from "./cost-catalog.js";
@@ -94,6 +95,14 @@ export interface DelegationCostTrace {
   potentialSavingsPremiumUsd: number;
   priceCatalogVersion: string;
   notes: string[];
+}
+
+export interface UnpricedDelegatorModel {
+  modelId: string;
+  reason: "missing" | "stale" | "unavailable";
+  rows: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
 }
 
 const COST_COLUMNS = [
@@ -202,6 +211,26 @@ export function ensureDelegationCostSchema(): void {
 
 export function delegationCostColumns(): string[] {
   return [...COST_COLUMNS];
+}
+
+/**
+ * Content-blind catalog drift detector for operations and the savings dashboard.
+ * It intentionally queries only model ids and timestamps: an unpriced model must
+ * surface without reading a prompt, output, alias, or task identity.
+ */
+export function findUnpricedDelegatorModels(now = new Date()): UnpricedDelegatorModel[] {
+  const rows = costDb().prepare(`
+    SELECT delegator_model AS modelId, COUNT(*) AS rows, MIN(ts) AS firstSeenAt, MAX(ts) AS lastSeenAt
+    FROM delegation_costs
+    WHERE delegator_model IS NOT NULL AND TRIM(delegator_model) <> ''
+    GROUP BY delegator_model
+    ORDER BY delegator_model COLLATE NOCASE ASC
+  `).all() as Array<{ modelId: string; rows: number; firstSeenAt: string; lastSeenAt: string }>;
+  return rows.flatMap((row) => {
+    const status = inspectModelTokenPrice(row.modelId, { now });
+    if (status.kind === "priced") return [];
+    return [{ ...row, reason: status.kind }];
+  });
 }
 
 function cleanModelId(value: string | null | undefined): string | null {

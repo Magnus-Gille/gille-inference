@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_PREMIUM_BASELINE_MODEL_ID,
   estimateTokenCostUsd,
+  inspectModelTokenPrice,
   lookupModelTokenPrice,
 } from "../src/homeserver/cost-catalog.js";
 
@@ -33,10 +34,22 @@ describe("homeserver cost catalog", () => {
     expect(estimateTokenCostUsd("claude-fable-5", 1_000_000, 1_000_000)).toBe(60);
   });
 
-  it("falls back to the repo's OpenRouter benchmark registry for non-frontier models", () => {
-    const price = lookupModelTokenPrice("qwen/qwen3-coder-next");
-    expect(price?.provider).toBe("openrouter");
-    expect(price?.inputUsdPerMTok).toBeGreaterThan(0);
+  it("prices each newly evidenced paid delegator from a first-party tariff", () => {
+    expect(lookupModelTokenPrice("anthropic/claude-opus-5")?.outputUsdPerMTok).toBe(25);
+    expect(lookupModelTokenPrice("openai/gpt-5")?.inputUsdPerMTok).toBe(1.25);
+    expect(lookupModelTokenPrice("openai/gpt-5.6-sol")?.outputUsdPerMTok).toBe(30);
+  });
+
+  it("does not substitute a reseller or local-model rate for an official vendor tariff", () => {
+    expect(inspectModelTokenPrice("openai/gpt-5.6").kind).toBe("unavailable");
+    expect(inspectModelTokenPrice("qwen3-30b-instruct").kind).toBe("unavailable");
+    expect(lookupModelTokenPrice("qwen/qwen3-coder-next")).toBeNull();
+  });
+
+  it("fails closed after a catalog entry expires", () => {
+    const status = inspectModelTokenPrice("openai/gpt-5", { now: new Date("2026-08-26T00:00:00.000Z") });
+    expect(status.kind).toBe("stale");
+    expect(lookupModelTokenPrice("openai/gpt-5", new Date("2026-08-26T00:00:00.000Z"))).toBeNull();
   });
 
   it("returns null for unknown or local-only models", () => {

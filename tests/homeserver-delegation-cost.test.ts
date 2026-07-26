@@ -7,6 +7,7 @@ import {
   buildDelegationCostTrace,
   delegationCostColumns,
   ensureDelegationCostSchema,
+  findUnpricedDelegatorModels,
   recordDelegationCost,
 } from "../src/homeserver/delegation-cost.js";
 
@@ -112,6 +113,63 @@ describe("delegation cost trace", () => {
     expect(trace.actualBaselineCostUsd).toBeGreaterThan(0);
     expect(trace.verifiedSavingsActualUsd).toBeGreaterThan(0);
     expect(trace.notes).not.toContain(expect.stringContaining("delegator-model-defaulted"));
+  });
+
+  it("books a non-zero actual baseline for a stamped, officially priced frontier delegator", () => {
+    const trace = buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 1_000_000, completionTokens: 1_000_000 },
+      delegatorModelId: "anthropic/claude-opus-5",
+    });
+
+    expect(trace.delegatorModelSource).toBe("stamped");
+    expect(trace.actualBaselineCostUsd).toBe(30);
+    expect(trace.verifiedSavingsActualUsd).toBe(30);
+  });
+
+  it("keeps an unavailable or missing stamped model at zero with the existing missing-price note", () => {
+    const trace = buildDelegationCostTrace({
+      taskType: "summarize",
+      localModelId: "mellum",
+      delegated: true,
+      escalated: false,
+      outcome: "pass",
+      metrics: { promptTokens: 1_000_000, completionTokens: 1_000_000 },
+      delegatorModelId: "qwen3-30b-instruct",
+    });
+
+    expect(trace.actualBaselineCostUsd).toBeNull();
+    expect(trace.verifiedSavingsActualUsd).toBe(0);
+    expect(trace.notes).toContain("missing-price:qwen3-30b-instruct");
+  });
+
+  it("reports ledger delegator ids whose prices are missing, unavailable, or stale without exposing content", () => {
+    ensureDelegationCostSchema();
+    for (const delegatorModelId of ["anthropic/claude-opus-5", "qwen3-30b-instruct", "unlisted-model"]) {
+      recordDelegationCost(buildDelegationCostTrace({
+        taskType: "summarize",
+        localModelId: "mellum",
+        delegated: true,
+        escalated: false,
+        outcome: "pass",
+        metrics: { promptTokens: 1, completionTokens: 1 },
+        delegatorModelId,
+      }));
+    }
+
+    expect(findUnpricedDelegatorModels()).toEqual([
+      expect.objectContaining({ modelId: "qwen3-30b-instruct", reason: "unavailable", rows: 1 }),
+      expect.objectContaining({ modelId: "unlisted-model", reason: "missing", rows: 1 }),
+    ]);
+    expect(findUnpricedDelegatorModels(new Date("2026-08-26T00:00:00.000Z"))).toEqual([
+      expect.objectContaining({ modelId: "anthropic/claude-opus-5", reason: "stale", rows: 1 }),
+      expect.objectContaining({ modelId: "qwen3-30b-instruct", reason: "unavailable", rows: 1 }),
+      expect.objectContaining({ modelId: "unlisted-model", reason: "missing", rows: 1 }),
+    ]);
   });
 
   it("falls back to defaultDelegatorModelId, labels it 'default', and never books it as measured savings", () => {
