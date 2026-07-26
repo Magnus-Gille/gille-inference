@@ -65,6 +65,11 @@ describe("shadowEligible — the lowest-priority admission policy", () => {
     expect(r.reason).toContain("summarize");
   });
 
+  it("matches known taxonomy spelling variants against the shadow allow-list", () => {
+    const scoped: ShadowLaneConfig = { ...CFG, taskTypes: ["code-review"] };
+    expect(shadowEligible({ ...BASE, config: scoped, taskType: "Code-Review" }).eligible).toBe(true);
+  });
+
   it("checks the queue BEFORE the allow-list is irrelevant — busy box always loses, whatever the type", () => {
     const scoped: ShadowLaneConfig = { ...CFG, taskTypes: ["code-review"] };
     expect(shadowEligible({ ...BASE, config: scoped, queueDepth: 2 }).eligible).toBe(false);

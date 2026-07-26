@@ -58,6 +58,18 @@ describe("capability ledger verdicts", () => {
     expect(shouldDelegate(t, MODEL, DEFAULT_POLICY, always(1)).delegate).toBe(false);
   });
 
+  it("uses a known taxonomy spelling variant for the live verdict and learning gate", () => {
+    // The policy lane is canonical, while the stored record remains its raw attribution.
+    // A caller must not escape a frozen code-review bucket by writing "Code-Review".
+    for (let i = 0; i < 3; i++) record("code-review", "fail");
+    const policy = { ...DEFAULT_POLICY, judgmentQualityTaskTypes: [] };
+
+    const verdict = getVerdict("Code-Review", MODEL, policy);
+    expect(verdict.verdict).toBe("not_viable");
+    expect(verdict.taskType).toBe("Code-Review"); // returned attribution remains caller-facing
+    expect(shouldDelegate("Code-Review", MODEL, policy, always(1)).delegate).toBe(false);
+  });
+
   it("re-probes a frozen not_viable when exploration fires", () => {
     const t = uniqueType();
     record(t, "fail");

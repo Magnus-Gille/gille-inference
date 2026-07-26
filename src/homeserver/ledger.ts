@@ -849,6 +849,9 @@ export function getVerdict(
   nodeId: "m5" | "orin" = "m5",
   opts?: EvidenceReadOpts
 ): VerdictResult {
+  // Policy/evidence lookups share the #91 identity rule. Keep `taskType` itself for the returned
+  // audit attribution; only the decision key is canonicalized when this is a known taxonomy lane.
+  const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
   const db = ledgerDb();
   const rows = db
     .prepare(
@@ -856,11 +859,11 @@ export function getVerdict(
        WHERE task_type = ? AND model_id = ? AND node_id = ? AND outcome != 'unverified'
          AND superseded_at IS NULL${shadowFilter(opts)}`
     )
-    .all(taskType, modelId, nodeId) as OutcomeRow[];
+    .all(policyTaskType, modelId, nodeId) as OutcomeRow[];
 
   const { passes, partials, fails, errors, effective, mechanicalFormatAttempts } = accumulateOutcomeRows(
     rows,
-    taskType,
+    policyTaskType,
     policy
   );
 

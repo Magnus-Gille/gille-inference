@@ -51,6 +51,10 @@ describe("Orin backend contract", () => {
     await expect(runOrinInference("too-large:4b", "reply", { maxTokens: 16, temperature: 0 })).resolves.toEqual({ ok: false, error: "orin unavailable or model not allowed" });
   });
 
+  it("treats known taxonomy spelling variants as the same configured eligibility lane", () => {
+    expect(orinAllowsTask("Extract")).toBe(true);
+  });
+
   it("forwards the complete sampler profile to Ollama", async () => {
     await runOrinInference("qwen2.5-coder:3b", "reply", {
       maxTokens: 16,

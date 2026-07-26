@@ -1,6 +1,8 @@
 import { loadConfig, type HomeserverConfig } from "./config.js";
 import type { LocalInferenceResult } from "../runner/local-client.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
+import { isKnownTaskType } from "./taxonomy.js";
+import { policyTaskTypeIdentity } from "./task-type-identity.js";
 
 /** Stable identities used in logs, metrics and ledger evidence. */
 export type ComputeNodeId = "m5" | "orin";
@@ -18,7 +20,13 @@ export function orinEnabled(cfg: HomeserverConfig = loadConfig()): boolean {
 }
 
 export function orinAllowsTask(taskType: string, cfg: HomeserverConfig = loadConfig()): boolean {
-  return orinEnabled(cfg) && cfg.orin.eligibleTaskTypes.includes(taskType);
+  const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
+  return (
+    orinEnabled(cfg) &&
+    cfg.orin.eligibleTaskTypes.some(
+      (eligible) => policyTaskTypeIdentity(eligible, isKnownTaskType) === policyTaskType
+    )
+  );
 }
 
 /** A content-blind availability/inventory probe for /healthz and deployment checks. */
