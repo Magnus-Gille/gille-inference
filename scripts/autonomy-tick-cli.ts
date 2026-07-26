@@ -59,6 +59,7 @@ import { computeLiveCalibrationGate } from "../src/homeserver/calibration-gate-l
 import { buildCandidatePair } from "../src/homeserver/routing-lifecycle.js";
 import { DEFAULT_WATCHDOG_POLICY } from "../src/homeserver/adoption-watchdog.js";
 import { buildAdoptDeps } from "./routing-lifecycle-cli.js";
+import { microRoutingAdmission } from "../src/homeserver/autonomy-constitution.js";
 import {
   runAutonomyTick,
   DEFAULT_AUTONOMY_POLICY,
@@ -70,6 +71,8 @@ const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const DEFAULT_DATA_DIR = resolve("./data");
 const DEFAULT_DECISION_REF = "gille-inference#49";
+const DEFAULT_CONSTITUTION_PATH = resolve("./contracts/grimnir-autonomy-v1/constitution.json");
+const DEFAULT_COVERAGE_PATH = resolve("./contracts/grimnir-autonomy-v1/coverage.json");
 
 /**
  * Round 9 finding 3: the SINGLE source of truth for this CLI's exit code, extracted as a pure
@@ -136,6 +139,13 @@ async function main(): Promise<void> {
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
   const dataDir = resolve(readFlag(args, "--data-dir") ?? DEFAULT_DATA_DIR);
   const decisionRef = readFlag(args, "--decision-ref") ?? DEFAULT_DECISION_REF;
+  // ADR-008 is an admission floor, not an observer. A missing, altered, or
+  // disarmed owner registry leaves the existing controller useful for shadow
+  // review but mechanically unable to write a route.
+  const constitutionalAdmission = microRoutingAdmission(
+    resolve(readFlag(args, "--constitution") ?? DEFAULT_CONSTITUTION_PATH),
+    resolve(readFlag(args, "--coverage") ?? DEFAULT_COVERAGE_PATH)
+  );
 
   const config = loadConfig();
   const generatedAt = new Date().toISOString();
@@ -179,7 +189,7 @@ async function main(): Promise<void> {
   const deps: AutonomyTickDeps = {
     dataDir,
     nowIso: () => new Date().toISOString(),
-    killSwitchOn,
+    killSwitchOn: () => killSwitchOn() || !constitutionalAdmission.allowed,
     decisionRef,
     policy: DEFAULT_AUTONOMY_POLICY,
     watchdogPolicy: DEFAULT_WATCHDOG_POLICY,
@@ -210,6 +220,9 @@ async function main(): Promise<void> {
     `autonomy tick @ ${report.evaluatedAt} — tier ${report.tierBefore}->${report.tierAfter}` +
       `${report.tierEvent ? ` (${report.tierEvent.kind}: ${report.tierEvent.reason})` : ""}\n`
   );
+  if (!constitutionalAdmission.allowed) {
+    process.stderr.write(`  ADR-008: shadow-only (${constitutionalAdmission.reason})\n`);
+  }
   process.stderr.write(
     `  kill-switch: ${report.killSwitchActive ? "ON (no adopt/promote)" : "off"}${dryRun ? " | DRY-RUN (zero mutation)" : ""} | cycle: ${report.cycleOutcome} (healthy-cycle: ${report.healthyCycle})\n`
   );
