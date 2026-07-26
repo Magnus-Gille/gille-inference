@@ -342,6 +342,21 @@ export function selectRoutingEntry(
     };
   }
 
+  // A thin lucky pass must not hide independently measured negative evidence. This makes a
+  // null route a characterized capability gap instead of promising that the scout will fill it.
+  const measuredGap = safe.filter((r) => r.recommendation === "escalate-frontier" && r.attempts >= minSamples);
+  if (measuredGap.length > 0) {
+    const best = rankCandidates(measuredGap, meta)[0]!;
+    return {
+      model: null,
+      passRate: round2(best.successRate),
+      tokPerSec: null,
+      verdict: "escalate-frontier",
+      attempts: forType.reduce((s, r) => s + r.attempts, 0),
+      note: `characterized gap — ${best.modelId} ${best.passes}/${best.attempts} (rate ${round2(best.successRate)}); escalating${excludedNote}`,
+    };
+  }
+
   // No local model is viable, or the only signal is too thin → escalate. Summarise for context,
   // distinguishing "insufficient evidence" (thin) from "measured not-viable".
   const bestSeen = rankCandidates(forType, meta)[0]!;

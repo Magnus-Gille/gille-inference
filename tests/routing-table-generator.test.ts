@@ -251,6 +251,14 @@ describe("generateRoutingTable — missing evidence is surfaced, never guessed",
 // local route — the same "insufficient evidence → null+reason" rule the model profiles already use.
 
 describe("generateRoutingTable — thin evidence never becomes a local route", () => {
+  it("labels a measured failure as a characterized gap even when another model has a thin pass", () => {
+    const doc = generateRoutingTable(baseInputs([
+      row("code-edit", "mellum", { successRate: 1, attempts: 1, recommendation: "explore", verdict: "unknown" }),
+      row("code-edit", "qwen3-coder-next-80b", { successRate: 0.07, attempts: 15, passes: 1, recommendation: "escalate-frontier", verdict: "not_viable" }),
+    ]));
+    expect(doc.routing["code-edit"]?.note).toMatch(/characterized gap.*qwen3-coder-next-80b/i);
+  });
+
   it("escalates a below-minSamples 'explore' (unknown) row to frontier instead of routing local", () => {
     const doc = generateRoutingTable(
       baseInputs([
