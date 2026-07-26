@@ -73,6 +73,7 @@ const DEFAULT_DATA_DIR = resolve("./data");
 const DEFAULT_DECISION_REF = "gille-inference#49";
 const DEFAULT_CONSTITUTION_PATH = resolve("./contracts/grimnir-autonomy-v1/constitution.json");
 const DEFAULT_COVERAGE_PATH = resolve("./contracts/grimnir-autonomy-v1/coverage.json");
+const DEFAULT_OWNER_ATTESTATIONS_PATH = resolve("./contracts/grimnir-autonomy-v1/owner-attestations.json");
 
 /**
  * Round 9 finding 3: the SINGLE source of truth for this CLI's exit code, extracted as a pure
@@ -144,7 +145,8 @@ async function main(): Promise<void> {
   // review but mechanically unable to write a route.
   const constitutionalAdmission = microRoutingAdmission(
     resolve(readFlag(args, "--constitution") ?? DEFAULT_CONSTITUTION_PATH),
-    resolve(readFlag(args, "--coverage") ?? DEFAULT_COVERAGE_PATH)
+    resolve(readFlag(args, "--coverage") ?? DEFAULT_COVERAGE_PATH),
+    resolve(readFlag(args, "--owner-attestations") ?? DEFAULT_OWNER_ATTESTATIONS_PATH)
   );
 
   const config = loadConfig();

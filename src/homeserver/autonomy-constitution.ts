@@ -29,12 +29,14 @@ export interface ConstitutionalAdmission {
 }
 
 /** Validates the pinned W0 artifact and one owner-controlled registry snapshot. */
-export function microRoutingAdmission(constitutionPath: string, coveragePath: string): ConstitutionalAdmission {
+export function microRoutingAdmission(constitutionPath: string, coveragePath: string, ownerAttestationPath: string): ConstitutionalAdmission {
   let constitution: UnknownRecord;
   let coverage: UnknownRecord;
+  let attestations: UnknownRecord;
   try {
     constitution = JSON.parse(readFileSync(constitutionPath, "utf8")) as UnknownRecord;
     coverage = JSON.parse(readFileSync(coveragePath, "utf8")) as UnknownRecord;
+    attestations = JSON.parse(readFileSync(ownerAttestationPath, "utf8")) as UnknownRecord;
   } catch (error) {
     return { allowed: false, reason: `constitution-unavailable:${error instanceof Error ? error.message : String(error)}` };
   }
@@ -47,5 +49,9 @@ export function microRoutingAdmission(constitutionPath: string, coveragePath: st
   if (coverage.global_state !== "armed") return { allowed: false, reason: "coverage-disarmed" };
   const domain = Array.isArray(coverage.domains) ? coverage.domains.find((entry) => isRecord(entry) && entry.domain === "micro-routing") : undefined;
   if (!isRecord(domain) || domain.owner !== "gille-inference" || domain.recovery_class !== "R-exact" || domain.coverage !== "armed-canary") return { allowed: false, reason: "micro-routing-not-armed-canary" };
+  const binding = Array.isArray(domain.bindings) ? domain.bindings.find(isRecord) : undefined;
+  if (!isRecord(binding) || !Array.isArray(attestations.attestations) || attestations.kind !== "autonomy-owner-attestation-registry" || typeof attestations.registry_digest !== "string" || digestWithout(attestations, "registry_digest") !== attestations.registry_digest) return { allowed: false, reason: "owner-attestation-unavailable-or-tampered" };
+  const attestation = attestations.attestations.find((entry) => isRecord(entry) && entry.domain === "micro-routing" && entry.target_scope_digest === binding.target_scope_digest && entry.configuration_owner === binding.configuration_owner && entry.attestation_digest === binding.configuration_owner_authority_digest);
+  if (!attestation) return { allowed: false, reason: "owner-attestation-mismatch" };
   return { allowed: true, reason: "admitted" };
 }
