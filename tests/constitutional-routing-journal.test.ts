@@ -32,6 +32,13 @@ describe("constitutional micro-routing journal", () => {
     expect(journal.commit("2026-07-26T00:30:00.000Z")).toMatchObject({ outcome: "committed", disarmed: false });
   });
 
+  it("resumes a completed watch before deadline without invoking a legacy watchdog", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-journal-")); const s = store(mutation.baseline);
+    const journal = new ConstitutionalRoutingJournal(root, s.store, () => "2026-07-26T00:00:00.000Z");
+    journal.prepare(mutation); journal.apply(); journal.verify(); journal.watch();
+    expect(journal.resume("2026-07-26T00:30:00.000Z")).toMatchObject({ outcome: "committed", disarmed: false });
+  });
+
   it("fails closed and terminally disarms when exact restore cannot be proven", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-journal-"));
     let value = mutation.baseline;

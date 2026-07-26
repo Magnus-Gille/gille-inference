@@ -32,6 +32,16 @@ export class ConstitutionalRoutingJournal {
   constructor(private readonly dataDir: string, private readonly table: RouteTableStore, private readonly nowIso: () => string) {
     this.path = join(dataDir, "autonomy-constitution", "micro-routing-journal.json");
   }
+  exists(): boolean { return existsSync(this.path); }
+  /** Startup/timer entrypoint: commit a completed watch before its absolute deadline, otherwise recover. */
+  resume(at = this.nowIso()): JournalResult | null {
+    if (!this.exists()) return null;
+    const state = this.load();
+    if (state.entries.at(-1)?.outcome === "committed" || state.disarmed) return null;
+    if (parseIso(at) >= parseIso(state.mutation.deadline)) return this.recover("deadline-expired");
+    if (state.entries.at(-1)?.phase === "watch" && parseIso(at) >= parseIso(state.mutation.watchDeadline)) return this.commit(at);
+    return null;
+  }
   prepare(mutation: RouteMutation): JournalResult {
     if (existsSync(this.path)) throw new Error("an autonomous micro-routing journal already exists; recover or clear it through owner procedure");
     if (parseIso(mutation.watchDeadline) > parseIso(mutation.deadline)) throw new Error("watch deadline exceeds operation deadline");
