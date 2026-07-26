@@ -87,9 +87,13 @@ async function listedToolNames(key: string): Promise<string[]> {
   return parsed.result.tools.map((t) => t.name);
 }
 
-async function listedTools(key: string): Promise<Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> } }>> {
+async function initialized(key: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await rpcRaw({ jsonrpc: "2.0", id: 99, method: "initialize" }, key)).result as Record<string, unknown>;
+}
+
+async function listedTools(key: string): Promise<Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> }; outputSchema?: Record<string, unknown> }>> {
   const raw = await rpcRaw(toolsListBody(2), key);
-  const parsed = JSON.parse(raw) as { result: { tools: Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> } }> } };
+  const parsed = JSON.parse(raw) as { result: { tools: Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> }; outputSchema?: Record<string, unknown> }> } };
   return parsed.result.tools;
 }
 
@@ -133,6 +137,18 @@ describe("code_loop_* visibility in tools/list", () => {
     expect(names).toContain("ask");
   });
 
+  it("puts owner-only delegation instructions in initialize and never leaks them to guests", async () => {
+    expect(String((await initialized(ownerKey))["instructions"])).toMatch(/self-contained.*seed-file/i);
+    expect((await initialized(guestKey))["instructions"]).toBeUndefined();
+  });
+
+  it("keeps structuredContent scoped to code_loop tools", async () => {
+    const raw = await rpcRaw(callBody(98, "ask", {}), ownerKey);
+    const parsed = JSON.parse(raw) as { result: { content: Array<{ text: string }>; structuredContent?: unknown } };
+    expect(parsed.result.content[0]?.text).toContain("required");
+    expect(parsed.result.structuredContent).toBeUndefined();
+  });
+
   it("advertises the versioned caller-idempotency input only on the owner start tool", async () => {
     const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
     expect(start?.inputSchema?.properties).toHaveProperty("client_run_id");
@@ -148,6 +164,29 @@ describe("code_loop_* visibility in tools/list", () => {
     expect(start?.description).toContain(
       "contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]"
     );
+  });
+
+  it("makes the delegate-or-not contract discoverable without starting a job", async () => {
+    const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
+    expect(start?.inputSchema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["instruction", "files"],
+    });
+    const files = (start?.inputSchema?.properties?.["files"] ?? {}) as Record<string, unknown>;
+    expect(files).toMatchObject({ type: "array", minItems: 1, maxItems: 64 });
+    expect(start?.outputSchema).toBeDefined();
+  });
+
+  it("advertises a well-formed start lifecycle with closed state and refusal variants", async () => {
+    const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
+    const schemaText = JSON.stringify(start?.outputSchema);
+    for (const value of ["running", "completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]) {
+      expect(schemaText).toContain(value);
+    }
+    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
+      expect(schemaText).toContain(refusal);
+    }
   });
 
   it("a GUEST key sees none of them", async () => {
@@ -230,11 +269,13 @@ describe("owner call with the feature flag OFF", () => {
     expect(parsed.result.isError).toBe(true);
     const payload = JSON.parse(parsed.result.content[0]!.text) as { refusal: string };
     expect(payload.refusal).toBe("disabled");
+    expect(parsed.result.structuredContent).toEqual(payload);
   });
 
   it("code_loop_status for an unknown work_id is a tool error, not a crash", async () => {
     const raw = await rpcRaw(callBody(10, "code_loop_status", { work_id: "cl-nope" }), ownerKey);
     const parsed = JSON.parse(raw) as { result: { isError: boolean } };
     expect(parsed.result.isError).toBe(true);
+    expect(JSON.parse(raw).result.structuredContent).toEqual({ error: "unknown work_id", work_id: "cl-nope" });
   });
 });

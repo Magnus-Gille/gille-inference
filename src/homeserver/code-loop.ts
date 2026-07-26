@@ -54,6 +54,7 @@ import {
 // evidence identity the same way the delegate lane does — same stamp-field join, same live
 // served-model observation, same fail-open-to-unknown discipline.
 import { deriveEvidenceIdentity, resolveTaskType } from "./orchestrator.js";
+import { TASK_TYPES } from "./taxonomy.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -77,6 +78,32 @@ export const CODE_LOOP_CAPABILITIES = {
 export const CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT =
   `contract[harness=${CODE_LOOP_HARNESS_VERSION};agent_checks=${CODE_LOOP_CAPABILITIES.agent_checks};` +
   `schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
+
+const CODE_LOOP_TERMINAL_STATUS_ENUM = ["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"] as const;
+const CODE_LOOP_JOB_STATUS_ENUM = ["running", ...CODE_LOOP_TERMINAL_STATUS_ENUM] as const;
+const CODE_LOOP_REFUSAL_ENUM = [
+  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery",
+] as const;
+
+const CODE_LOOP_START_OUTPUT_SCHEMA = {
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        work_id: { type: "string", pattern: "^cl-" },
+        status: { enum: CODE_LOOP_JOB_STATUS_ENUM },
+      },
+      required: ["work_id", "status"],
+    },
+    {
+      type: "object",
+      properties: {
+        refusal: { enum: CODE_LOOP_REFUSAL_ENUM },
+      },
+      required: ["refusal"],
+    },
+  ],
+} as const;
 
 function isCurrentCodeLoopResult(result: CodeLoopResult): boolean {
   return result.execution?.schema_version === 1 &&
@@ -114,6 +141,7 @@ export function codeLoopToolDefs(): unknown[] {
         `an owner-authored check_cmd + protected globs. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
       inputSchema: {
         type: "object",
+        additionalProperties: false,
         properties: {
           client_run_id: {
             type: "string",
@@ -126,21 +154,25 @@ export function codeLoopToolDefs(): unknown[] {
               "optional Grimnir LearningTaskContract v1 Hugin request stamp; requires an exact " +
               "fresh authenticated preflight and is echoed only after durable admission",
           },
-          instruction: { type: "string", description: "the task prompt" },
+          instruction: { type: "string", minLength: 1, description: "the complete self-contained task prompt" },
           files: {
             type: "array",
             description: "seed files (relative paths); required in Phase 1",
+            minItems: 1,
+            maxItems: 64,
             items: {
               type: "object",
+              additionalProperties: false,
               properties: { path: { type: "string" }, content: { type: "string" } },
               required: ["path", "content"],
             },
           },
           check_cmd: { type: "string", description: "owner-authored verification command run in the sandbox post-loop (120s cap)" },
           protected: { type: "array", items: { type: "string" }, description: "globs whose modification is reported at exit" },
-          task_type: { type: "string", description: "ledger task type (defaults to the classifier)" },
+          task_type: { type: "string", enum: TASK_TYPES.map((task) => task.id), description: "optional canonical task vocabulary; omit to classify from instruction" },
           caps: {
             type: "object",
+            additionalProperties: false,
             properties: {
               wall_s: { type: "number" },
               turns: { type: "number" },
@@ -155,18 +187,28 @@ export function codeLoopToolDefs(): unknown[] {
         },
         required: ["instruction", "files"],
       },
+      outputSchema: CODE_LOOP_START_OUTPUT_SCHEMA,
     },
     {
       name: "code_loop_status",
-      description: "OWNER-ONLY. Poll a code_loop run: returns {status, usage}. work_id from code_loop_start.",
-      inputSchema: { type: "object", properties: { work_id: { type: "string" } }, required: ["work_id"] },
+      description: "OWNER-ONLY. Poll async code_loop state.",
+      inputSchema: { type: "object", additionalProperties: false, properties: { work_id: { type: "string", minLength: 1 } }, required: ["work_id"] },
+      outputSchema: { oneOf: [
+        { type: "object", properties: { status: { enum: CODE_LOOP_JOB_STATUS_ENUM } }, required: ["status"] },
+        { type: "object", properties: { error: { const: "unknown work_id" } }, required: ["error"] },
+      ] },
     },
     {
       name: "code_loop_result",
       description:
-        "OWNER-ONLY. Fetch a finished code_loop run: the git diff, changed files, protected violations, " +
-        "pi's summary, the check result, and usage. Re-fetchable until the 24h TTL sweep.",
-      inputSchema: { type: "object", properties: { work_id: { type: "string" } }, required: ["work_id"] },
+        "OWNER-ONLY. Fetch async code_loop result.",
+      inputSchema: { type: "object", additionalProperties: false, properties: { work_id: { type: "string", minLength: 1 } }, required: ["work_id"] },
+      outputSchema: { oneOf: [
+        { type: "object", properties: { status: { const: "running" } }, required: ["status"] },
+        { type: "object", properties: { status: { enum: CODE_LOOP_TERMINAL_STATUS_ENUM }, error: { const: "terminal result unavailable after restart" } }, required: ["status", "error"] },
+        { type: "object", not: { required: ["error"] }, properties: { status: { enum: CODE_LOOP_TERMINAL_STATUS_ENUM } }, required: ["status"] },
+        { type: "object", properties: { error: { const: "unknown work_id" } }, required: ["error"] },
+      ] },
     },
   ];
 }

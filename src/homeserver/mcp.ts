@@ -99,6 +99,9 @@ const ASK_DESCRIPTION =
   "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); a guest key supplying " +
   "`files` is always rejected, never silently ignored.";
 
+const CODE_LOOP_OWNER_INSTRUCTIONS =
+  "code_loop is OWNER-ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
+
 /**
  * The code_loop owner gate — the EXACT owner_request_log guard (owner-log.ts:13 /
  * gateway.ts): a real minted OWNER key. EXCLUDES implicit-admin and legacy static admins
@@ -140,8 +143,7 @@ function toolDefs(principal: McpPrincipal): unknown[] {
           delegator_model_id: {
             type: "string",
             description:
-              "optional cloud model id that delegated this task, used only for savings accounting " +
-              "(for example openai/gpt-5.5 or anthropic/claude-sonnet-4-6)",
+              "optional actual known cloud delegator model id for savings accounting; omit when unknown, never guess",
           },
           files: {
             type: "array",
@@ -656,7 +658,7 @@ interface ToolCallContext {
 }
 
 /** A tools/call result: a text content block + isError flag. Never throws for a tool error. */
-async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<{ text: string; isError: boolean }> {
+async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<{ text: string; isError: boolean; structuredContent?: unknown }> {
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal);
     if (models.length === 0) {
@@ -771,7 +773,7 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
   // is invisible, never "forbidden" (which would leak its existence). Maintenance mode is read
   // from the live admission snapshot so a scout window refuses a start.
   if (isCodeLoopToolName(name) && isCodeLoopOwner(ctx.principal)) {
-    return handleCodeLoopTool(
+    const out = await handleCodeLoopTool(
       name,
       args,
       ctx.cfg,
@@ -783,6 +785,7 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
         capabilityEpoch: ctx.learningTaskCapabilityEpoch,
       },
     );
+    return { ...out, structuredContent: JSON.parse(out.text) };
   }
 
   return { text: `Unknown tool '${name}'.`, isError: true };
@@ -839,6 +842,7 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: "m5-local-models", version: "1.0.0" },
+        ...(isCodeLoopOwner(ctx.principal) ? { instructions: CODE_LOOP_OWNER_INSTRUCTIONS } : {}),
       })
     );
     return;
@@ -862,7 +866,7 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     const toolArgs = (typeof params.arguments === "object" && params.arguments !== null ? params.arguments : {}) as Record<string, unknown>;
     const out = await callTool(name, toolArgs, ctx);
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError }));
+    res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }) }));
     return;
   }
 
