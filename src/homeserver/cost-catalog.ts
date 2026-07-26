@@ -1,4 +1,3 @@
-import { getModelById } from "../runner/models.js";
 
 /**
  * Token price catalog for delegation savings accounting.
@@ -6,6 +5,8 @@ import { getModelById } from "../runner/models.js";
  * Values are USD per 1M tokens. The catalog is deliberately versioned and
  * snapshot-like: historical savings rows should be reproducible even after a
  * vendor changes prices. Refresh this file intentionally when pricing changes.
+ * Only first-party vendor tariffs may book a savings figure; benchmark registry
+ * or reseller rates are deliberately not aliases for a delegator's own bill.
  */
 
 export interface ModelTokenPrice {
@@ -13,100 +14,112 @@ export interface ModelTokenPrice {
   provider: "anthropic" | "openai" | "openrouter" | "local" | "unknown";
   inputUsdPerMTok: number;
   outputUsdPerMTok: number;
-  source: string;
+  /** First-party vendor source for these standard, uncached token rates. */
+  sourceUrl: string;
+  /** Date the source was verified, in YYYY-MM-DD form. */
+  checkedAt: string;
+  /** Do not book savings after this date without a deliberate catalog refresh. */
+  validUntil: string;
+  /** Optional future effective date; prices never book before it. */
+  availableFrom?: string;
   note?: string;
 }
 
-export const DEFAULT_COST_CATALOG_VERSION = "2026-07-08";
+/** A deliberately non-priceable id which still needs an auditable answer in the catalog. */
+export interface UnavailableModelTokenPrice {
+  modelId: string;
+  provider: "anthropic" | "openai" | "openrouter" | "local" | "unknown";
+  sourceUrl: string;
+  checkedAt: string;
+  reason: string;
+}
+
+export type CatalogEntry = ModelTokenPrice | UnavailableModelTokenPrice;
+export type ModelTokenPriceStatus =
+  | { kind: "priced"; price: ModelTokenPrice }
+  | { kind: "stale"; price: ModelTokenPrice }
+  | { kind: "not-yet-effective"; price: ModelTokenPrice }
+  | { kind: "unavailable"; entry: UnavailableModelTokenPrice }
+  | { kind: "missing" };
+
+export const DEFAULT_COST_CATALOG_VERSION = "2026-07-26";
 
 export const DEFAULT_PREMIUM_BASELINE_MODEL_ID = "claude-fable-5";
 
+const ANTHROPIC_PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing";
+const OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing";
+const QWEN3_30B_MODEL_CARD_URL = "https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507";
+const CATALOG_CHECKED_AT = "2026-07-26";
+const CATALOG_VALID_UNTIL = "2026-08-25";
+
+function priced(
+  modelId: string,
+  provider: ModelTokenPrice["provider"],
+  inputUsdPerMTok: number,
+  outputUsdPerMTok: number,
+  sourceUrl: string,
+  note?: string,
+  availableFrom?: string
+): ModelTokenPrice {
+  return { modelId, provider, inputUsdPerMTok, outputUsdPerMTok, sourceUrl, checkedAt: CATALOG_CHECKED_AT, validUntil: CATALOG_VALID_UNTIL, note, availableFrom };
+}
+
 export const DEFAULT_MODEL_TOKEN_PRICES: readonly ModelTokenPrice[] = [
   {
-    modelId: "claude-fable-5",
-    provider: "anthropic",
-    inputUsdPerMTok: 10,
-    outputUsdPerMTok: 50,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-fable-5", "anthropic", 10, 50, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "claude-opus-4.8",
-    provider: "anthropic",
-    inputUsdPerMTok: 5,
-    outputUsdPerMTok: 25,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-opus-5", "anthropic", 5, 25, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "claude-opus-4.7",
-    provider: "anthropic",
-    inputUsdPerMTok: 5,
-    outputUsdPerMTok: 25,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-opus-4.8", "anthropic", 5, 25, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "claude-opus-4.6",
-    provider: "anthropic",
-    inputUsdPerMTok: 5,
-    outputUsdPerMTok: 25,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-opus-4.7", "anthropic", 5, 25, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "claude-opus-4.5",
-    provider: "anthropic",
-    inputUsdPerMTok: 5,
-    outputUsdPerMTok: 25,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-opus-4.6", "anthropic", 5, 25, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "claude-sonnet-5",
-    provider: "anthropic",
-    inputUsdPerMTok: 2,
-    outputUsdPerMTok: 10,
-    source: "Anthropic pricing, checked 2026-07-08",
-    note: "Introductory price through 2026-08-31; standard price is $3/$15 from 2026-09-01.",
+    ...priced("claude-opus-4.5", "anthropic", 5, 25, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "claude-sonnet-5-standard",
-    provider: "anthropic",
-    inputUsdPerMTok: 3,
-    outputUsdPerMTok: 15,
-    source: "Anthropic pricing, checked 2026-07-08",
-    note: "Standard price starting 2026-09-01.",
+    ...priced("claude-sonnet-5", "anthropic", 2, 10, ANTHROPIC_PRICING_URL, "Introductory price through 2026-08-31; catalog expires before that change."),
   },
   {
-    modelId: "claude-sonnet-4.6",
-    provider: "anthropic",
-    inputUsdPerMTok: 3,
-    outputUsdPerMTok: 15,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-sonnet-5-standard", "anthropic", 3, 15, ANTHROPIC_PRICING_URL, "Scheduled standard price from 2026-09-01; catalog expires before that change.", "2026-09-01"),
   },
   {
-    modelId: "claude-haiku-4.5",
-    provider: "anthropic",
-    inputUsdPerMTok: 1,
-    outputUsdPerMTok: 5,
-    source: "Anthropic pricing, checked 2026-07-08",
+    ...priced("claude-sonnet-4.6", "anthropic", 3, 15, ANTHROPIC_PRICING_URL),
   },
   {
-    modelId: "gpt-5.5",
+    ...priced("claude-haiku-4.5", "anthropic", 1, 5, ANTHROPIC_PRICING_URL),
+  },
+  {
+    ...priced("gpt-5", "openai", 1.25, 10, "https://developers.openai.com/api/docs/models/gpt-5"),
+  },
+  {
+    ...priced("gpt-5.6-sol", "openai", 5, 30, OPENAI_PRICING_URL, "OpenAI Standard processing, short-context (<270K) input/output tariff."),
+  },
+  { ...priced("gpt-5.5", "openai", 5, 30, OPENAI_PRICING_URL) },
+  { ...priced("gpt-5.4", "openai", 2.5, 15, OPENAI_PRICING_URL) },
+  { ...priced("gpt-5.4-mini", "openai", 0.75, 4.5, OPENAI_PRICING_URL) },
+];
+
+export const DEFAULT_UNAVAILABLE_MODEL_TOKEN_PRICES: readonly UnavailableModelTokenPrice[] = [
+  {
+    modelId: "gpt-5.6",
     provider: "openai",
-    inputUsdPerMTok: 5,
-    outputUsdPerMTok: 30,
-    source: "OpenAI model docs, checked 2026-07-08",
+    sourceUrl: OPENAI_PRICING_URL,
+    checkedAt: CATALOG_CHECKED_AT,
+    reason: "OpenAI publishes distinct gpt-5.6-sol/terra/luna rates, not a base gpt-5.6 model rate.",
   },
   {
-    modelId: "gpt-5.4",
-    provider: "openai",
-    inputUsdPerMTok: 2.5,
-    outputUsdPerMTok: 15,
-    source: "OpenAI model docs, checked 2026-07-08",
-  },
-  {
-    modelId: "gpt-5.4-mini",
-    provider: "openai",
-    inputUsdPerMTok: 0.75,
-    outputUsdPerMTok: 4.5,
-    source: "OpenAI model docs, checked 2026-07-08",
+    modelId: "qwen3-30b-instruct",
+    provider: "local",
+    sourceUrl: QWEN3_30B_MODEL_CARD_URL,
+    checkedAt: CATALOG_CHECKED_AT,
+    reason: "Open-weight local model; its model card does not establish a provider token tariff.",
   },
 ];
 
@@ -123,30 +136,39 @@ function normalizeModelId(id: string): string {
 }
 
 /**
- * Look up a cloud token price. First checks the pinned frontier catalog, then falls back to the
- * benchmark model registry's OpenRouter price fields for evaluated non-frontier models.
+ * Look up a cloud token price from the pinned, first-party catalog only. A benchmark or reseller
+ * rate is not evidence of what the delegator actually paid.
  */
-export function lookupModelTokenPrice(modelId: string | null | undefined): ModelTokenPrice | null {
-  if (!modelId || modelId.trim() === "") return null;
+function isExpired(price: ModelTokenPrice, now: Date): boolean {
+  return Number.isNaN(Date.parse(price.validUntil)) || now.getTime() > Date.parse(`${price.validUntil}T23:59:59.999Z`);
+}
+
+function isNotYetEffective(price: ModelTokenPrice, now: Date): boolean {
+  return price.availableFrom !== undefined && now.getTime() < Date.parse(`${price.availableFrom}T00:00:00.000Z`);
+}
+
+export function inspectModelTokenPrice(
+  modelId: string | null | undefined,
+  options: { now?: Date; catalog?: readonly ModelTokenPrice[]; unavailable?: readonly UnavailableModelTokenPrice[] } = {}
+): ModelTokenPriceStatus {
+  if (!modelId || modelId.trim() === "") return { kind: "missing" };
   const normalized = normalizeModelId(modelId);
-  const direct = DEFAULT_MODEL_TOKEN_PRICES.find((p) => normalizeModelId(p.modelId) === normalized);
-  if (direct) return direct;
-
-  const registry = getModelById(modelId) ?? getModelById(normalized);
-  if (
-    registry &&
-    (registry.openRouterPricePerMInputToken > 0 || registry.openRouterPricePerMOutputToken > 0)
-  ) {
-    return {
-      modelId: registry.id,
-      provider: "openrouter",
-      inputUsdPerMTok: registry.openRouterPricePerMInputToken,
-      outputUsdPerMTok: registry.openRouterPricePerMOutputToken,
-      source: "src/runner/models.ts OpenRouter registry",
-    };
+  const now = options.now ?? new Date();
+  const direct = (options.catalog ?? DEFAULT_MODEL_TOKEN_PRICES).find((p) => normalizeModelId(p.modelId) === normalized);
+  if (direct) {
+    if (isNotYetEffective(direct, now)) return { kind: "not-yet-effective", price: direct };
+    return isExpired(direct, now) ? { kind: "stale", price: direct } : { kind: "priced", price: direct };
   }
+  const unavailable = (options.unavailable ?? DEFAULT_UNAVAILABLE_MODEL_TOKEN_PRICES)
+    .find((entry) => normalizeModelId(entry.modelId) === normalized);
+  if (unavailable) return { kind: "unavailable", entry: unavailable };
 
-  return null;
+  return { kind: "missing" };
+}
+
+export function lookupModelTokenPrice(modelId: string | null | undefined, now = new Date()): ModelTokenPrice | null {
+  const status = inspectModelTokenPrice(modelId, { now });
+  return status.kind === "priced" ? status.price : null;
 }
 
 export function estimateTokenCostUsd(
