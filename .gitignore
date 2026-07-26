@@ -16,3 +16,11 @@ deep-research.md
 
 # aider working artifacts (harness arm in gate-d)
 .aider*
+
+# Owner-private working documents. The clean-history publication deliberately dropped
+# these; they carry host addressing, private-domain references, and unredacted
+# operational detail. STATUS.md and deep-research.md are listed above; these two were
+# dropped without an ignore rule, so a routine `git add docs/` could republish them.
+# Enforced by tests/public-host-identifiers.test.ts.
+docs/m5-build-journal.md
+docs/holistic-infra-analysis-2026-06-16.md
