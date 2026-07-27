@@ -12,10 +12,14 @@ The exact wire schema and durable validator live in
 ## Authority and identity
 
 - The stable logical owner is `service:hugin`.
-- POST requires a real minted owner key with that alias.
+- POST requires a real minted key in that logical rotation family.
 - The durable row separately binds the actual authenticated key hash. Key rotation does not change
-  logical ownership, but a retry using a different key is a conflict rather than an exact retry.
+  logical ownership. An exact byte-identical retry after rotation returns the original immutable
+  record and its original credential audit binding; a new proposal binds the new credential.
 - GET is scoped to the authenticated logical principal and never provides a list operation.
+- This service credential is route-scoped before generic dispatch. Even though the keystore tier is
+  `owner`, it receives `403` on inference, model administration, routing reload, maintenance, key
+  administration, public routes, and every surface except proposal POST and exact own-GET.
 
 ## Server-owned admission inputs
 
@@ -40,6 +44,11 @@ Restore descriptors are content-addressed opaque references resolved through a s
 registry. Canary requests similarly name a server-owned registry entry/version whose digest binds
 route, configuration, verifier, and postconditions. Caller-chosen route or verifier material is not
 accepted.
+
+Admission verifies the evidence store as content-addressed data: the returned identity must equal
+the requested hash and a fresh recomputation over the bundle, and its first/last observation
+metadata must be canonical and monotone. Every prior desired entry must still be resident and have
+an exactly resolvable restore descriptor before a reload or removal can arm.
 
 ## Deliberately unavailable by default
 
@@ -67,10 +76,19 @@ Rows move transactionally through:
 `submitted → rejected`, or `submitted → accepted → armed → expired`.
 
 Only one proposal may be armed for the axis. Expiration uses integer epoch milliseconds; canonical
-UTC strings remain signed/display fields. Every insert, retry, scoped read, and expiry validates the
+UTC strings remain signed/display fields. Admission re-samples the protected clock after all async
+providers and stamps the baseline, decision, and events with that final coherent time. Every insert,
+retry, scoped read, and expiry validates the
 closed record: proposal/candidate/baseline/admission digests, mirrored columns, credential binding,
 normalized delta, state/reason legality, and lifecycle-event tail. Any mismatch is treated as
 durable corruption and fails closed.
 
 An `armed` record is authorization data for a future actuator, not an applied change. This version
 contains no actuator route.
+
+## Cross-repository sequencing
+
+`tests/fixtures/gille-roster-proposal-v1-seed.json` is a gille-owned seed/interchange example. It is
+not output from a real Hugin serializer and is not cross-repository compatibility evidence. Grimnir
+issue #108 remains open until this schema merges, Hugin implements the producer, and
+gille-inference consumes Hugin's byte-pinned positive and adversarial fixtures.

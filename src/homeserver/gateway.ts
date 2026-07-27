@@ -116,7 +116,10 @@ import {
 // ─── Principal resolution ──────────────────────────────────────────────────────────
 
 interface PrincipalContext {
+  /** Concrete credential alias; rotates with the key. */
   alias: string;
+  /** Stable owner identity shared by a key-rotation family. */
+  logicalAlias: string;
   tier: Tier;
   isAdmin: boolean;
   /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models. */
@@ -179,6 +182,7 @@ function resolvePrincipal(
     if (implicitAdminAllowed) {
       return {
         alias: "static:admin",
+        logicalAlias: "static:admin",
         tier: "owner",
         isAdmin: true,
         modelAllowList: [],
@@ -197,6 +201,7 @@ function resolvePrincipal(
   if (rec) {
     return {
       alias: rec.alias,
+      logicalAlias: rec.logicalAlias ?? rec.alias,
       tier: rec.tier,
       isAdmin: rec.tier === "owner",
       modelAllowList: rec.modelAllowList,
@@ -212,6 +217,7 @@ function resolvePrincipal(
   if (keyMatches(token, cfg.adminApiKeys)) {
     return {
       alias: "static:admin",
+      logicalAlias: "static:admin",
       tier: "owner",
       isAdmin: true,
       modelAllowList: [],
@@ -227,6 +233,7 @@ function resolvePrincipal(
   if (keyMatches(token, cfg.apiKeys)) {
     return {
       alias: "static:user",
+      logicalAlias: "static:user",
       tier: "guest",
       isAdmin: false,
       modelAllowList: [],
@@ -244,6 +251,7 @@ function resolvePrincipal(
   if (keyMatches(token, cfg.monitorApiKeys)) {
     return {
       alias: "static:monitor",
+      logicalAlias: "static:monitor",
       tier: "guest",
       isAdmin: false,
       isMonitor: true,
@@ -2993,6 +3001,29 @@ async function handleRequest(
       }
     }
 
+    // The Hugin roster credential is a route-scoped service principal, not a
+    // general owner/admin key. Enforce its closed allowlist before public,
+    // inference, or generic admin dispatch so tier=owner cannot widen it.
+    if (principal?.logicalAlias === ROSTER_PROPOSAL_PRINCIPAL) {
+      const rosterPost = method === "POST" && path === "/v1/roster-proposals";
+      const rosterOwnGet =
+        method === "GET"
+        && /^\/v1\/roster-proposals\/[^/]+$/.test(path);
+      if (!rosterPost && !rosterOwnGet) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "The Hugin roster service principal is limited to proposal submit and own-read.",
+          }),
+        );
+        return;
+      }
+    }
+
     // Health is unauthenticated (for router/uptime checks) — minimal liveness only.
     // Gate healthz logging behind the config toggle (default: off, to avoid noise).
     if (path === "/healthz" && method === "GET") {
@@ -3307,7 +3338,7 @@ async function handleRequest(
     // route, load, unload, download, restart, or alter configuration.
     if (path === "/v1/roster-proposals" && method === "POST") {
       if (
-        principal.alias !== ROSTER_PROPOSAL_PRINCIPAL
+        principal.logicalAlias !== ROSTER_PROPOSAL_PRINCIPAL
         || principal.tier !== "owner"
         || principal.keyHash === null
       ) {
@@ -3340,7 +3371,7 @@ async function handleRequest(
         return;
       }
       try {
-        const result = await admitRosterProposal(body, principal.alias, {
+        const result = await admitRosterProposal(body, principal.logicalAlias, {
           credentialBindingDigest: `sha256:${principal.keyHash}`,
           dependencies: rosterAdmissionDependencies,
         });
@@ -3393,7 +3424,7 @@ async function handleRequest(
       );
       if (proposalId === null) return;
       const record = getRosterProposalForPrincipal(
-        principal.alias,
+        principal.logicalAlias,
         proposalId,
       );
       if (!record) {

@@ -5,6 +5,7 @@ import {
   buildEvidenceIdentityBundle,
   contentDigest,
   digestIdentity,
+  evidenceIdentityHash,
   labelIdentity,
   type EvidenceIdentityBundle,
 } from "../src/homeserver/evidence-identity.js";
@@ -91,7 +92,7 @@ function snapshot(
   lastSeenAt = "2026-07-27T14:59:00Z",
 ): EvidenceIdentitySnapshot {
   return {
-    identityHash: contentDigest("evidence-snapshot"),
+    identityHash: evidenceIdentityHash(bundle),
     bundle,
     firstSeenAt: "2026-07-27T14:00:00Z",
     lastSeenAt,
@@ -303,13 +304,31 @@ beforeEach(() => {
 });
 
 describe("gille roster-proposal v1 contract", () => {
-  it("accepts the canonical cross-repository Hugin fixture", async () => {
+  it("materializes and accepts the gille-owned seed/interchange fixture", async () => {
     const fixture = JSON.parse(readFileSync(
-      new URL("./fixtures/hugin-roster-proposal-v1.json", import.meta.url),
+      new URL("./fixtures/gille-roster-proposal-v1-seed.json", import.meta.url),
       "utf8",
-    )) as unknown;
+    )) as {
+      seed_owner: string;
+      seed_version: string;
+      proposal: Omit<RosterProposal, "producer" | "proposal_digest">;
+    };
+    expect(fixture.seed_owner).toBe("gille-inference");
+    expect(fixture.seed_version).toBe("gille-roster-proposal-v1-seed");
+    const unsigned: Omit<RosterProposal, "proposal_digest"> = {
+      ...fixture.proposal,
+      producer: {
+        component: "hugin",
+        instance_id: "hugin:gille-test-seed",
+        serializer_version: "hugin-roster-proposal-v1",
+      },
+    };
+    const materialized: RosterProposal = {
+      ...unsigned,
+      proposal_digest: canonicalRosterProposalDigest(unsigned),
+    };
     const result = await admitRosterProposal(
-      fixture,
+      materialized,
       ROSTER_PROPOSAL_PRINCIPAL,
       {
         db,
@@ -339,7 +358,7 @@ describe("gille roster-proposal v1 contract", () => {
       serving_config_digest: contentDigest("candidate-config"),
       template_digest: contentDigest("template"),
       quantization: "q4-k-m",
-      evidence_identity_hash: contentDigest("evidence-snapshot"),
+      evidence_identity_hash: evidenceIdentityHash(evidenceBundle),
       restore_descriptor_ref: contentDigest("restore-ref:qwen-main:8192"),
       restore_descriptor_digest: candidate({ context_length: 8_192 }).restore_descriptor_digest,
     }]);
@@ -466,7 +485,9 @@ describe("fail-closed admission and durable lifecycle", () => {
     const customDeps = reason === "NON_RESIDENT_MODEL"
       ? { ...observationDeps(deps, models), readEvidence: () => snapshot(incompleteArtifact) }
       : observationDeps(deps, models);
-    expect(await reasonFor(custom, customDeps)).toBe(reason);
+    expect(await reasonFor(custom, customDeps)).toBe(
+      reason === "NON_RESIDENT_MODEL" ? "EVIDENCE_SNAPSHOT_INVALID" : reason,
+    );
   });
 
   it("admits one known unloaded catalogue addition with fresh exact artifact evidence", async () => {
@@ -563,6 +584,135 @@ describe("fail-closed admission and durable lifecycle", () => {
     expect(result.kind).toBe("armed");
   });
 
+  it("rejects a reload when its prior desired entry is no longer resolvable", async () => {
+    const baselineRef = candidate({ context_length: 8_192 }).restore_descriptor_ref;
+    expect(await reasonFor(proposal(), {
+      ...deps,
+      resolveRestoreDescriptor: (ref) =>
+        ref === baselineRef ? null : deps.resolveRestoreDescriptor(ref),
+    })).toBe("BASELINE_RESTORE_UNAVAILABLE");
+  });
+
+  it("rejects stale or nonresident prior state before admitting an unload", async () => {
+    const fallback: ModelInfo = {
+      key: "fallback",
+      type: "llm",
+      displayName: "Fallback",
+      loaded: true,
+      loadedContext: 4_096,
+      quantization: "q4-k-m",
+    };
+    const models = [fallback, ...liveModels];
+    const baseline = liveCatalogueIdentity(models);
+    const remaining = candidate({
+      model_id: "fallback",
+      alias: "fallback",
+      context_length: 4_096,
+    });
+    const registry = canaryDefinition("unload", "qwen-main");
+    const input = proposal({
+      proposal_id: "proposal:w5:baseline-unload",
+      idempotency_key: "idem:w5:baseline-unload",
+      baseline: {
+        catalogue_digest: baseline.catalogueDigest,
+        roster_digest: candidateRosterDigest([
+          remaining,
+          candidate({ context_length: 8_192 }),
+        ]),
+      },
+      candidate: {
+        entries: [remaining],
+        roster_digest: candidateRosterDigest([remaining]),
+      },
+      delta: {
+        operation: "unload",
+        model_id: "qwen-main",
+        backend: "lmstudio",
+        backend_capability_digest: backendCapabilityIdentity("lmstudio").capabilityDigest,
+      },
+      canary: {
+        ...proposal().canary,
+        operation: "unload",
+        model_id: "qwen-main",
+        expected_state: "absent",
+        fallback_model_id: "fallback",
+        registry_id: registry.registryId,
+        registry_version: registry.registryVersion,
+        registry_digest: registry.registryDigest,
+      },
+    });
+    const observed = observationDeps(deps, models);
+    const baselineRef = candidate({ context_length: 8_192 }).restore_descriptor_ref;
+    expect(await reasonFor(input, {
+      ...observed,
+      resolveRestoreDescriptor: (ref) => {
+        const descriptor = observed.resolveRestoreDescriptor(ref);
+        if (!descriptor || ref !== baselineRef) return descriptor;
+        const stale = { ...descriptor, alias: "stale-alias" };
+        return {
+          ...stale,
+          digest: restoreDescriptorDigest(stale),
+        };
+      },
+    })).toBe("BASELINE_RESTORE_MISMATCH");
+
+    db = new Database(":memory:");
+    expect(await reasonFor(input, {
+      ...observed,
+      readResidentModelIds: async () => ["fallback"],
+    })).toBe("BASELINE_NON_RESIDENT");
+  });
+
+  it.each(["model id", "alias"])(
+    "rejects duplicate desired-roster %s identities",
+    async (duplicateKind) => {
+      const second: ModelInfo = {
+        key: "second",
+        type: "llm",
+        displayName: "Second",
+        loaded: false,
+        loadedContext: null,
+        quantization: "q4-k-m",
+      };
+      const models = [...liveModels, second];
+      const firstEntry = candidate({ context_length: 8_192 });
+      const secondEntry = duplicateKind === "model id"
+        ? firstEntry
+        : candidate({
+          model_id: "second",
+          alias: "qwen-main",
+          context_length: 4_096,
+        });
+      const desired = [firstEntry, secondEntry].map((entry) => ({
+        modelId: entry.model_id,
+        alias: entry.alias,
+        contextLength: entry.context_length,
+        artifactDigest: entry.artifact_digest,
+        servingConfigDigest: entry.serving_config_digest,
+        templateDigest: entry.template_digest,
+        quantization: entry.quantization,
+        evidenceIdentityHash: entry.evidence_identity_hash,
+        restoreDescriptorRef: entry.restore_descriptor_ref,
+        restoreDescriptorDigest: entry.restore_descriptor_digest,
+      }));
+      const baseline = liveCatalogueIdentity(models);
+      const input = proposal({
+        proposal_id: `proposal:w5:duplicate-${duplicateKind.replace(" ", "-")}`,
+        idempotency_key: `idem:w5:duplicate-${duplicateKind.replace(" ", "-")}`,
+        baseline: {
+          catalogue_digest: baseline.catalogueDigest,
+          roster_digest: candidateRosterDigest([firstEntry, secondEntry]),
+        },
+      });
+      expect(await reasonFor(input, {
+        ...deps,
+        readCatalogue: async () => models,
+        readDesiredRoster: async () => desired,
+        readResidentModelIds: async () => ["qwen-main", "second"],
+      })).toBe("BASELINE_DUPLICATE");
+    },
+  );
+
   it("rejects a backend-unsupported reload/config mutation", async () => {
     const capability = backendCapabilityIdentity("llamaswap");
     const input = proposal({
@@ -588,10 +738,17 @@ describe("fail-closed admission and durable lifecycle", () => {
 
     db = new Database(":memory:");
     const incomplete = snapshot(buildEvidenceIdentityBundle({ modelArtifact: evidenceBundle.modelArtifact }));
-    expect(await reasonFor(proposal(), { ...deps, readEvidence: () => incomplete })).toBe("EVIDENCE_INCOMPLETE");
+    expect(await reasonFor(proposal(), { ...deps, readEvidence: () => incomplete }))
+      .toBe("EVIDENCE_SNAPSHOT_INVALID");
 
     db = new Database(":memory:");
-    expect(await reasonFor(proposal(), { ...deps, readEvidence: () => snapshot(evidenceBundle, "2026-07-27T12:00:00Z") }))
+    expect(await reasonFor(proposal(), {
+      ...deps,
+      readEvidence: () => ({
+        ...snapshot(evidenceBundle, "2026-07-27T12:00:00Z"),
+        firstSeenAt: "2026-07-27T11:00:00Z",
+      }),
+    }))
       .toBe("EVIDENCE_STALE");
 
     db = new Database(":memory:");
@@ -602,6 +759,97 @@ describe("fail-closed admission and durable lifecycle", () => {
       },
     });
     expect(await reasonFor(mismatched)).toBe("EVIDENCE_IDENTITY_MISMATCH");
+  });
+
+  it.each([
+    ["returned hash", {
+      ...snapshot(),
+      identityHash: contentDigest("wrong-returned-hash"),
+    }],
+    ["bundle hash", {
+      ...snapshot(),
+      bundle: buildEvidenceIdentityBundle({
+        ...evidenceBundle,
+        configEpoch: digestIdentity({
+          id: "llama-swap-config",
+          version: "v2",
+          digest: contentDigest("different-bundle"),
+          origin: "server-observed",
+        }),
+      }),
+    }],
+    ["noncanonical metadata", {
+      ...snapshot(),
+      firstSeenAt: "2026-07-27T14:00:00.000Z",
+    }],
+    ["regressed metadata", {
+      ...snapshot(),
+      firstSeenAt: "2026-07-27T15:00:00Z",
+      lastSeenAt: "2026-07-27T14:59:00Z",
+    }],
+    ["invalid count", {
+      ...snapshot(),
+      observationCount: 0,
+    }],
+  ])("rejects an invalid evidence snapshot: %s", async (_label, evidence) => {
+    expect(await reasonFor(proposal(), {
+      ...deps,
+      readEvidence: () => evidence,
+    })).toBe("EVIDENCE_SNAPSHOT_INVALID");
+  });
+
+  it("re-samples the protected clock after providers and rejects crossing expiry", async () => {
+    const clock = [
+      new Date("2026-07-27T14:59:59Z"),
+      new Date("2026-07-27T15:00:01Z"),
+    ];
+    const input = proposal({
+      proposal_id: "proposal:w5:provider-expiry",
+      idempotency_key: "idem:w5:provider-expiry",
+      expires_at: "2026-07-27T15:00:00Z",
+    });
+    const result = await admitRosterProposal(input, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: {
+        ...deps,
+        readCatalogue: async () => {
+          await Promise.resolve();
+          return structuredClone(liveModels);
+        },
+        now: () => clock.shift() ?? new Date("2026-07-27T15:00:01Z"),
+      },
+    });
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode).toBe("PROPOSAL_EXPIRED");
+      expect(result.record.updatedAt).toBe("2026-07-27T15:00:01Z");
+      expect(result.record.baselineSnapshot?.observed_at)
+        .toBe("2026-07-27T15:00:01Z");
+    }
+  });
+
+  it("rejects an incoherent protected clock before any decision write", async () => {
+    const clock = [
+      new Date("2026-07-27T15:00:00Z"),
+      new Date("2026-07-27T14:59:59Z"),
+    ];
+    await expect(
+      admitRosterProposal(proposal(), ROSTER_PROPOSAL_PRINCIPAL, {
+        db,
+        dependencies: {
+          ...deps,
+          now: () => clock.shift() ?? new Date("2026-07-27T14:59:59Z"),
+        },
+      }),
+    ).rejects.toThrow("protected admission clock became incoherent");
+    expect(
+      getRosterProposalForPrincipal(
+        ROSTER_PROPOSAL_PRINCIPAL,
+        proposal().proposal_id,
+        db,
+        new Date(now),
+      ),
+    ).toBeNull();
   });
 
   it("rejects excessive candidate delta and a canary outside the changed entry", async () => {
@@ -682,9 +930,11 @@ describe("fail-closed admission and durable lifecycle", () => {
     })).toBe("ROSTER_OBSERVER_UNAVAILABLE");
 
     db = new Database(":memory:");
+    const baselineRef = candidate({ context_length: 8_192 }).restore_descriptor_ref;
     expect(await reasonFor(proposal(), {
       ...deps,
-      resolveRestoreDescriptor: () => null,
+      resolveRestoreDescriptor: (ref) =>
+        ref === baselineRef ? deps.resolveRestoreDescriptor(ref) : null,
     })).toBe("RESTORE_DESCRIPTOR_UNAVAILABLE");
 
     db = new Database(":memory:");
@@ -694,7 +944,7 @@ describe("fail-closed admission and durable lifecycle", () => {
     })).toBe("CANARY_REGISTRY_UNAVAILABLE");
   });
 
-  it("binds exact retries to the authenticated credential while retaining logical ownership", async () => {
+  it("recovers an exact retry across credential rotation while retaining the original audit binding", async () => {
     const first = await admitRosterProposal(
       proposal(),
       ROSTER_PROPOSAL_PRINCIPAL,
@@ -713,7 +963,11 @@ describe("fail-closed admission and durable lifecycle", () => {
         credentialBindingDigest: contentDigest("credential:hugin:rotated"),
       },
     );
-    expect(rotated).toEqual({ kind: "conflict" });
+    expect(rotated.kind).toBe("existing");
+    if (rotated.kind === "existing") {
+      expect(rotated.record.recordId).toBe(first.record.recordId);
+      expect(rotated.record.credentialBindingDigest).toBe(credentialBindingDigest);
+    }
   });
 
   it("detects durable row corruption and expires by numeric epoch", async () => {

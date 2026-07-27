@@ -12,6 +12,7 @@ import { z } from "zod";
 import { getDb } from "../db.js";
 import { jcsCanonicalize } from "./learning-task-contract.js";
 import {
+  evidenceIdentityHash,
   evidenceIdentityDisclosure,
   type EvidenceIdentityBundle,
 } from "./evidence-identity.js";
@@ -348,9 +349,14 @@ export const ROSTER_REJECTION_REASONS = [
   "EVIDENCE_STALE",
   "EVIDENCE_INCOMPLETE",
   "EVIDENCE_IDENTITY_MISMATCH",
+  "EVIDENCE_SNAPSHOT_INVALID",
   "TEMPLATE_IDENTITY_UNAVAILABLE",
   "TEMPLATE_IDENTITY_MISMATCH",
   "BASELINE_IDENTITY_UNAVAILABLE",
+  "BASELINE_DUPLICATE",
+  "BASELINE_NON_RESIDENT",
+  "BASELINE_RESTORE_UNAVAILABLE",
+  "BASELINE_RESTORE_MISMATCH",
   "BACKEND_CAPABILITY_MISMATCH",
   "BACKEND_CONFIG_MISMATCH",
   "UNSUPPORTED_OPERATION",
@@ -642,11 +648,9 @@ function findCollision(
 function isExactRetry(
   record: DurableRosterProposal,
   principalId: string,
-  credentialBindingDigest: string,
   proposal: RosterProposal,
 ): boolean {
   return record.principalId === principalId
-    && record.credentialBindingDigest === credentialBindingDigest
     && record.proposalId === proposal.proposal_id
     && record.idempotencyKey === proposal.idempotency_key
     && record.proposalDigest === proposal.proposal_digest
@@ -873,6 +877,22 @@ async function buildServerBaselineSnapshot(
   };
 }
 
+function restampBaselineSnapshot(
+  snapshot: DurableRosterBaselineSnapshot | null,
+  now: Date,
+): DurableRosterBaselineSnapshot | null {
+  if (snapshot === null) return null;
+  const { snapshot_digest: _oldDigest, observed_at: _oldObservedAt, ...stable } = snapshot;
+  const withoutDigest: Omit<DurableRosterBaselineSnapshot, "snapshot_digest"> = {
+    ...stable,
+    observed_at: now.toISOString().replace(".000Z", "Z"),
+  };
+  return {
+    ...withoutDigest,
+    snapshot_digest: rosterDigest(withoutDigest),
+  };
+}
+
 function semanticDecision(
   proposal: RosterProposal,
   models: ModelInfo[] | null,
@@ -891,6 +911,12 @@ function semanticDecision(
   if (baselineSnapshot.roster_digest !== proposal.baseline.roster_digest) {
     return "BASELINE_MISMATCH";
   }
+  const baselineModelIds = baselineSnapshot.entries.map((entry) => entry.model_id);
+  const baselineAliases = baselineSnapshot.entries.map((entry) => entry.alias);
+  if (
+    new Set(baselineModelIds).size !== baselineModelIds.length
+    || new Set(baselineAliases).size !== baselineAliases.length
+  ) return "BASELINE_DUPLICATE";
   if (
     backendCapability === null
     || proposal.delta.backend !== backendCapability.backend
@@ -906,30 +932,70 @@ function semanticDecision(
     && proposal.candidate.entries.some((entry) => entry.alias !== entry.model_id)
   ) return "BACKEND_CONFIG_MISMATCH";
 
+  const resident = new Set(baselineSnapshot.resident_model_ids);
+  for (const entry of baselineSnapshot.entries) {
+    if (!resident.has(entry.model_id)) return "BASELINE_NON_RESIDENT";
+    const descriptor = deps.resolveRestoreDescriptor(entry.restore_descriptor_ref);
+    if (!descriptor) return "BASELINE_RESTORE_UNAVAILABLE";
+    if (
+      descriptor.digest !== restoreDescriptorDigest({
+        modelId: descriptor.modelId,
+        alias: descriptor.alias,
+        artifactDigest: descriptor.artifactDigest,
+        quantization: descriptor.quantization,
+        templateDigest: descriptor.templateDigest,
+        contextLength: descriptor.contextLength,
+        servingConfigDigest: descriptor.servingConfigDigest,
+        evidenceIdentityHash: descriptor.evidenceIdentityHash,
+        ref: descriptor.ref,
+      })
+      || descriptor.ref !== entry.restore_descriptor_ref
+      || descriptor.digest !== entry.restore_descriptor_digest
+      || descriptor.modelId !== entry.model_id
+      || descriptor.alias !== entry.alias
+      || descriptor.artifactDigest !== entry.artifact_digest
+      || descriptor.quantization !== entry.quantization
+      || descriptor.templateDigest !== entry.template_digest
+      || descriptor.contextLength !== entry.context_length
+      || descriptor.servingConfigDigest !== entry.serving_config_digest
+      || descriptor.evidenceIdentityHash !== entry.evidence_identity_hash
+    ) return "BASELINE_RESTORE_MISMATCH";
+  }
+
   const modelIds = proposal.candidate.entries.map((entry) => entry.model_id);
   if (new Set(modelIds).size !== modelIds.length) return "DUPLICATE_MODEL";
   const aliases = proposal.candidate.entries.map((entry) => entry.alias);
   if (new Set(aliases).size !== aliases.length) return "DUPLICATE_ALIAS";
 
   const byId = new Map(models.map((model) => [model.key, model]));
-  const resident = new Set(baselineSnapshot.resident_model_ids);
   for (const entry of proposal.candidate.entries) {
     const model = byId.get(entry.model_id);
     if (!model) return "UNKNOWN_MODEL";
     if (!resident.has(entry.model_id)) return "NON_RESIDENT_MODEL";
     const evidence = deps.readEvidence(entry.evidence_identity_hash);
     if (!evidence) return "EVIDENCE_MISSING";
+    const firstSeenAt = Date.parse(evidence.firstSeenAt);
+    const lastSeenAt = Date.parse(evidence.lastSeenAt);
+    if (
+      evidence.identityHash !== entry.evidence_identity_hash
+      || evidenceIdentityHash(evidence.bundle) !== entry.evidence_identity_hash
+      || !isCanonicalRosterUtc(evidence.firstSeenAt)
+      || !isCanonicalRosterUtc(evidence.lastSeenAt)
+      || !Number.isFinite(firstSeenAt)
+      || !Number.isFinite(lastSeenAt)
+      || firstSeenAt > lastSeenAt
+      || !Number.isSafeInteger(evidence.observationCount)
+      || evidence.observationCount <= 0
+    ) return "EVIDENCE_SNAPSHOT_INVALID";
     const artifactIdentity = evidence.bundle.modelArtifact;
     if (
       artifactIdentity.kind !== "digest"
       || artifactIdentity.origin !== "server-observed"
     ) return "NON_RESIDENT_MODEL";
     if (evidenceIdentityDisclosure(evidence.bundle) !== "complete") return "EVIDENCE_INCOMPLETE";
-    const observedAt = Date.parse(evidence.lastSeenAt);
     if (
-      !isCanonicalRosterUtc(evidence.lastSeenAt)
-      || observedAt > now.getTime() + CLOCK_SKEW_MS
-      || now.getTime() - observedAt > proposal.evidence.freshness_seconds * 1_000
+      lastSeenAt > now.getTime() + CLOCK_SKEW_MS
+      || now.getTime() - lastSeenAt > proposal.evidence.freshness_seconds * 1_000
     ) return "EVIDENCE_STALE";
     const artifact = digestIdentity(evidence.bundle, "modelArtifact");
     const config = digestIdentity(evidence.bundle, "configEpoch");
@@ -1075,7 +1141,7 @@ function insertDecision(
     expireRosterProposals(now, db);
     const collision = findCollision(db, proposal);
     if (collision) {
-      return isExactRetry(collision, principalId, credentialBindingDigest, proposal)
+      return isExactRetry(collision, principalId, proposal)
         ? { kind: "existing" as const, record: collision }
         : { kind: "conflict" as const };
     }
@@ -1190,26 +1256,25 @@ export async function admitRosterProposal(
   ) {
     throw new RosterProposalContractError("authenticated transport principal mismatch");
   }
-  const now = deps.now();
-  if (!Number.isFinite(now.getTime())) {
+  const startedAt = deps.now();
+  if (!Number.isFinite(startedAt.getTime())) {
     throw new RosterProposalContractError("protected admission clock unavailable");
   }
   const created = Date.parse(proposal.created_at);
   const expires = Date.parse(proposal.expires_at);
   if (
-    created > now.getTime() + CLOCK_SKEW_MS
+    created > startedAt.getTime() + CLOCK_SKEW_MS
     || expires <= created
     || expires - created > MAX_PROPOSAL_LIFETIME_MS
   ) {
     throw new RosterProposalContractError("invalid proposal lifetime");
   }
-  expireRosterProposals(now, db);
+  expireRosterProposals(startedAt, db);
   const existing = findCollision(db, proposal);
   if (existing) {
     return isExactRetry(
       existing,
       authenticatedPrincipalId,
-      credentialBindingDigest,
       proposal,
     )
       ? { kind: "existing", record: existing }
@@ -1225,18 +1290,28 @@ export async function admitRosterProposal(
       models,
       deps,
       backendCapability,
-      now,
+      startedAt,
     );
   } catch {
     models = null;
   }
+  const finalNow = deps.now();
+  if (
+    !Number.isFinite(finalNow.getTime())
+    || finalNow.getTime() < startedAt.getTime()
+  ) {
+    throw new RosterProposalContractError(
+      "protected admission clock became incoherent",
+    );
+  }
+  baselineSnapshot = restampBaselineSnapshot(baselineSnapshot, finalNow);
   const reason = semanticDecision(
     proposal,
     models,
     baselineSnapshot,
     backendCapability,
     deps,
-    now,
+    finalNow,
   );
   return insertDecision(
     proposal,
@@ -1244,7 +1319,7 @@ export async function admitRosterProposal(
     credentialBindingDigest,
     reason,
     baselineSnapshot,
-    now,
+    finalNow,
     db,
   );
 }

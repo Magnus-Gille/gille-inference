@@ -31,6 +31,7 @@ import {
   type ServerCanaryDefinition,
   type ServerRestoreDescriptor,
 } from "../src/homeserver/roster-proposal.js";
+import { listKeys, rotateKey } from "../src/homeserver/keystore.js";
 
 let upstream: Server;
 let upstreamPort = 0;
@@ -42,6 +43,12 @@ let guestKey = "";
 let proposalBody: RosterProposal;
 let rosterDependencies: RosterAdmissionDependencies;
 let upstreamMutations = 0;
+const keyDefaults = {
+  rpm: 1000,
+  tpm: 1_000_000,
+  dailyTokenBudget: 0,
+  maxParallel: 1,
+};
 
 const models = [
   {
@@ -109,10 +116,9 @@ beforeAll(async () => {
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
 
   const { mintKey } = await import("../src/homeserver/keystore.js");
-  const limits = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
-  serviceKey = mintKey({ alias: ROSTER_PROPOSAL_PRINCIPAL, tier: "owner" }, limits).plaintextKey;
-  otherOwnerKey = mintKey({ alias: "service:other-owner", tier: "owner" }, limits).plaintextKey;
-  guestKey = mintKey({ alias: "service:hugin-guest", tier: "guest" }, limits).plaintextKey;
+  serviceKey = mintKey({ alias: ROSTER_PROPOSAL_PRINCIPAL, tier: "owner" }, keyDefaults).plaintextKey;
+  otherOwnerKey = mintKey({ alias: "service:other-owner", tier: "owner" }, keyDefaults).plaintextKey;
+  guestKey = mintKey({ alias: "service:hugin-guest", tier: "guest" }, keyDefaults).plaintextKey;
 
   const bundle = buildEvidenceIdentityBundle({
     modelArtifact: digestIdentity({
@@ -323,7 +329,11 @@ describe("authenticated zero-mutation roster-proposal HTTP boundary", () => {
       body: JSON.stringify(proposalBody),
     });
     expect(accepted.status).toBe(201);
-    const body = await accepted.json() as { state: string; proposalId: string };
+    const body = await accepted.json() as {
+      state: string;
+      proposalId: string;
+      credentialBindingDigest: string;
+    };
     expect(body.state).toBe("armed");
     expect(body.proposalId).toBe(proposalBody.proposal_id);
 
@@ -334,10 +344,57 @@ describe("authenticated zero-mutation roster-proposal HTTP boundary", () => {
     });
     expect(retry.status).toBe(200);
 
+    const rotated = rotateKey(ROSTER_PROPOSAL_PRINCIPAL, {}, keyDefaults);
+    serviceKey = rotated.plaintextKey;
+
     const own = await fetch(url(`/v1/roster-proposals/${encodeURIComponent(proposalBody.proposal_id)}`), {
       headers: auth(serviceKey),
     });
     expect(own.status).toBe(200);
+    const ownAfterRotation = await own.json() as {
+      principalId: string;
+      credentialBindingDigest: string;
+    };
+    expect(ownAfterRotation.principalId).toBe(ROSTER_PROPOSAL_PRINCIPAL);
+    expect(ownAfterRotation.credentialBindingDigest).toBe(body.credentialBindingDigest);
+
+    const rotatedRetry = await fetch(url("/v1/roster-proposals"), {
+      method: "POST",
+      headers: auth(serviceKey),
+      body: JSON.stringify(proposalBody),
+    });
+    expect(rotatedRetry.status).toBe(200);
+    const recovered = await rotatedRetry.json() as { credentialBindingDigest: string };
+    expect(recovered.credentialBindingDigest).toBe(body.credentialBindingDigest);
+
+    const {
+      proposal_digest: _oldDigest,
+      ...newUnsigned
+    } = proposalBody;
+    const nextUnsigned: Omit<RosterProposal, "proposal_digest"> = {
+      ...newUnsigned,
+      proposal_id: "proposal:w5:http:rotated",
+      idempotency_key: "idem:w5:http:rotated",
+    };
+    const nextProposal: RosterProposal = {
+      ...nextUnsigned,
+      proposal_digest: canonicalRosterProposalDigest(nextUnsigned),
+    };
+    const next = await fetch(url("/v1/roster-proposals"), {
+      method: "POST",
+      headers: auth(serviceKey),
+      body: JSON.stringify(nextProposal),
+    });
+    expect(next.status).toBe(422);
+    const nextRecord = await next.json() as {
+      principalId: string;
+      credentialBindingDigest: string;
+      reasonCode: string;
+    };
+    expect(nextRecord.principalId).toBe(ROSTER_PROPOSAL_PRINCIPAL);
+    expect(nextRecord.credentialBindingDigest).not.toBe(body.credentialBindingDigest);
+    expect(nextRecord.reasonCode).toBe("ACTIVE_PROPOSAL_EXISTS");
+
     const crossPrincipal = await fetch(url(`/v1/roster-proposals/${encodeURIComponent(proposalBody.proposal_id)}`), {
       headers: auth(otherOwnerKey),
     });
@@ -348,8 +405,49 @@ describe("authenticated zero-mutation roster-proposal HTTP boundary", () => {
         url(`/v1/roster-proposals/${encodeURIComponent(proposalBody.proposal_id)}/${suffix}`),
         { method: "POST", headers: auth(serviceKey), body: "{}" },
       );
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(403);
     }
     expect(upstreamMutations).toBe(0);
+  });
+
+  it("confines the Hugin service key to submit and own-read while preserving normal owners", async () => {
+    const keyCount = listKeys().length;
+    const blocked: Array<[string, string, string | undefined]> = [
+      ["GET", "/healthz", undefined],
+      ["POST", "/v1/chat/completions", JSON.stringify({
+        model: "qwen-main",
+        messages: [{ role: "user", content: "do not run" }],
+      })],
+      ["POST", "/admin/models/load", JSON.stringify({ modelKey: "second" })],
+      ["POST", "/admin/models/unload", JSON.stringify({ modelKey: "qwen-main" })],
+      ["POST", "/admin/models/download", JSON.stringify({ modelKey: "second" })],
+      ["POST", "/admin/routing-table/reload", "{}"],
+      ["GET", "/admin/keys", undefined],
+      ["POST", "/admin/keys", JSON.stringify({ alias: "must-not-exist", tier: "owner" })],
+      ["GET", "/admin/maintenance", undefined],
+      ["POST", "/admin/maintenance", JSON.stringify({ on: true })],
+    ];
+    for (const [method, path, body] of blocked) {
+      const response = await fetch(url(path), {
+        method,
+        headers: auth(serviceKey),
+        body,
+      });
+      expect(response.status, `${method} ${path}`).toBe(403);
+    }
+    expect(upstreamMutations).toBe(0);
+    expect(listKeys()).toHaveLength(keyCount);
+    expect(listKeys().some((key) => key.alias === "must-not-exist")).toBe(false);
+
+    const ordinaryOwner = await fetch(url("/admin/keys"), {
+      headers: auth(otherOwnerKey),
+    });
+    expect(ordinaryOwner.status).toBe(200);
+    const maintenance = await fetch(url("/admin/maintenance"), {
+      headers: auth(otherOwnerKey),
+    });
+    expect(maintenance.status).toBe(200);
+    expect((await maintenance.json() as { maintenance: boolean }).maintenance)
+      .toBe(false);
   });
 });
