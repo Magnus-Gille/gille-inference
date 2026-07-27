@@ -50,6 +50,13 @@ const CANONICAL_GRIMNIR_SCHEMA_IDS = new Map<string, string>([
   ["contracts/grimnir-autonomy-v1/schemas/owner-authorization.schema.json", "https://grimnir.gille.ai/contracts/autonomy-owner-authorization/v1/schema.json"],
   ["contracts/grimnir-autonomy-v1/schemas/journal.schema.json", "https://grimnir.gille.ai/contracts/autonomous-mutation-journal/v1/schema.json"],
   ["contracts/grimnir-autonomy-v1/schemas/recovery-workers.schema.json", "https://grimnir.gille.ai/contracts/autonomy-recovery-worker-registry/v1/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/constitution.schema.json", "https://grimnir.gille.ai/contracts/autonomy-constitution/v2/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/runtime-narrowing.schema.json", "https://grimnir.gille.ai/contracts/autonomy-runtime-narrowing/v1/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/coverage.schema.json", "https://grimnir.gille.ai/contracts/autonomy-coverage-registry/v2/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/owner-attestations.schema.json", "https://grimnir.gille.ai/contracts/autonomy-owner-attestation-registry/v1/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/owner-authorization.schema.json", "https://grimnir.gille.ai/contracts/autonomy-owner-authorization/v1/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/journal.schema.json", "https://grimnir.gille.ai/contracts/autonomous-mutation-journal/v2/schema.json"],
+  ["contracts/grimnir-autonomy-v2/schemas/recovery-workers.schema.json", "https://grimnir.gille.ai/contracts/autonomy-recovery-worker-registry/v1/schema.json"],
 ]);
 
 function contentWithoutCanonicalSchemaId(path: string, content: string): string {
@@ -102,6 +109,13 @@ describe("public repository host identifiers", () => {
     expect(contentWithoutCanonicalSchemaId(path, `{\n  "$id": "https://grimnir.gille.ai/other",\n}`)).toMatch(PRIVATE_DOMAIN);
     PRIVATE_DOMAIN.lastIndex = 0;
     expect(contentWithoutCanonicalSchemaId("docs/example.md", allowed)).toMatch(PRIVATE_DOMAIN);
+    PRIVATE_DOMAIN.lastIndex = 0;
+
+    const v2Path = "contracts/grimnir-autonomy-v2/schemas/journal.schema.json";
+    const allowedV2 = CANONICAL_GRIMNIR_SCHEMA_IDS.get(v2Path)!;
+    expect(contentWithoutCanonicalSchemaId(v2Path, `{\n  "$id": ${JSON.stringify(allowedV2)},\n}`)).not.toMatch(PRIVATE_DOMAIN);
+    PRIVATE_DOMAIN.lastIndex = 0;
+    expect(contentWithoutCanonicalSchemaId(v2Path, `{\n  "$id": "https://grimnir.gille.ai/other",\n}`)).toMatch(PRIVATE_DOMAIN);
     PRIVATE_DOMAIN.lastIndex = 0;
   });
 
