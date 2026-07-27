@@ -1670,14 +1670,24 @@ export async function admitRosterProposal(
             error,
           );
         }
-        if (
-          providerResult !== null
-          && (
-            typeof providerResult === "object"
-            || typeof providerResult === "function"
-          )
-          && typeof (providerResult as { then?: unknown }).then === "function"
-        ) {
+        let providerThen: unknown;
+        try {
+          if (
+            providerResult !== null
+            && (
+              typeof providerResult === "object"
+              || typeof providerResult === "function"
+            )
+          ) {
+            providerThen = (providerResult as { then?: unknown }).then;
+          }
+        } catch (error) {
+          throw new ServerObservationFenceProviderError(
+            "server observation fence provider result inspection failed",
+            error,
+          );
+        }
+        if (typeof providerThen === "function") {
           throw new ServerObservationFenceProtocolError(
             "server observation fence returned a thenable",
           );

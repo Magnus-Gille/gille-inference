@@ -1206,6 +1206,11 @@ describe("fail-closed admission and durable lifecycle", () => {
       () => undefined,
       { then: () => undefined },
     )],
+    ["throwing-getter", () => Object.defineProperty({}, "then", {
+      get: () => {
+        throw new Error("provider then getter failed");
+      },
+    })],
   ])("rolls back an armed callback when a provider returns a %s thenable", async (
     shape,
     makeThenable,
