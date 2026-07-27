@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -19,20 +20,31 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, uptime } from "node:os";
 import { isAbsolute, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   ConstitutionalRoutingController,
   ConstitutionalRoutingWatchdog,
+  constitutionalPaths,
   type AuthoritySnapshot,
   type ProtectedAuthorityReader,
+  type RecoveryRegistrar,
   type RestoreOnlyCapability,
   type RouteMutationPlan,
 } from "../src/homeserver/constitutional-routing-controller.js";
-import { acquireMutationLock, fencedWrite } from "../src/homeserver/mutation-lock.js";
+import {
+  composeImmutablePlan,
+  parseRouteMutationProposal,
+  persistImmutablePlan,
+} from "../src/homeserver/constitutional-routing-scheduler.js";
+import { ConstitutionalRouteDatabase } from "../src/homeserver/constitutional-route-database.js";
+import {
+  constitutionalResourceExists,
+  readConstitutionalResource,
+} from "../src/homeserver/constitutional-fenced-lease.js";
 
-interface AuthorityConfig {
+export interface AuthorityConfig {
   schema_version: 1;
   authorization_path: string;
   constitution_path: string;
@@ -48,8 +60,17 @@ interface AuthorityConfig {
   current_digests_path: string;
   clock_health_path: string;
   verifier_bin: string;
-  recovery_signer_bin: string;
+  canonical_state_dir: string;
+  canonical_route_table_path: string;
+  canonical_plan_path: string;
 }
+export const PRODUCTION_AUTHORITY_CONFIG = "/etc/gille-inference/autonomy/authority-config.json";
+export const PRODUCTION_STATE_DIR = "/var/lib/gille-inference/autonomy";
+export const PRODUCTION_ROUTE_TABLE = "/var/lib/gille-inference/routing/m5-routing.db";
+export const PRODUCTION_PLAN = "/var/lib/gille-inference/autonomy/immutable-plan.json";
+export const PRODUCTION_PROPOSAL = "/var/lib/gille-inference/proposals/micro-routing.json";
+export const RECOVERY_REGISTRATION_SOCKET = "/run/gille-inference/autonomy/recovery-register.sock";
+export const RECOVERY_ACTION_SOCKET = "/run/gille-inference/autonomy/recovery-action.sock";
 
 function readFlag(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
@@ -75,12 +96,14 @@ export function sameOpenedInode(before: { dev: number | bigint; ino: number | bi
   return before.dev === opened.dev && before.ino === opened.ino;
 }
 
-export function protectedPath(path: string): string {
+export function protectedPath(path: string, requiredUid?: number): string {
   if (!isAbsolute(path)) throw new Error(`protected path must be absolute: ${path}`);
   const stat = lstatSync(path);
   if (stat.isSymbolicLink()) throw new Error(`protected path must not be a symlink: ${path}`);
   if ((stat.mode & 0o022) !== 0) throw new Error(`protected path is group/world writable: ${path}`);
-  const allowedUids = new Set([0, ...(typeof process.getuid === "function" ? [process.getuid()] : [])]);
+  const allowedUids = requiredUid === undefined
+    ? new Set([0, ...(typeof process.getuid === "function" ? [process.getuid()] : [])])
+    : new Set([requiredUid]);
   if (!allowedUids.has(stat.uid)) throw new Error(`protected path has an unexpected owner: ${path}`);
   let parent = dirname(path);
   while (parent !== dirname(parent)) {
@@ -101,8 +124,8 @@ function exactKeys(value: unknown, keys: string[]): value is Record<string, unkn
     && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
 }
 
-function loadConfig(path: string): AuthorityConfig {
-  const config = JSON.parse(boundedProtectedRead(protectedPath(resolve(path)), 64_000)) as unknown;
+export function loadAuthorityConfig(path: string): AuthorityConfig {
+  const config = JSON.parse(boundedProtectedRead(protectedPath(resolve(path), 0), 64_000)) as unknown;
   const keys = [
     "schema_version",
     "authorization_path",
@@ -119,19 +142,76 @@ function loadConfig(path: string): AuthorityConfig {
     "current_digests_path",
     "clock_health_path",
     "verifier_bin",
-    "recovery_signer_bin",
+    "canonical_state_dir",
+    "canonical_route_table_path",
+    "canonical_plan_path",
   ];
   if (!exactKeys(config, keys) || config.schema_version !== 1) throw new Error("invalid closed authority config");
-  for (const key of keys.slice(1)) {
+  for (const key of keys.slice(1).filter((key) => !key.startsWith("canonical_"))) {
     const value = config[key];
     if (typeof value !== "string") throw new Error(`authority config ${key} must be a path`);
-    protectedPath(value);
+    if (!resolve(value).startsWith("/etc/gille-inference/autonomy/")) {
+      throw new Error(`authority config ${key} must stay below the protected root`);
+    }
+    protectedPath(value, 0);
   }
+  if (
+    config.canonical_state_dir !== PRODUCTION_STATE_DIR
+    || config.canonical_route_table_path !== PRODUCTION_ROUTE_TABLE
+    || config.canonical_plan_path !== PRODUCTION_PLAN
+  ) throw new Error("authority config canonical target paths do not match the compiled production roots");
   return config as unknown as AuthorityConfig;
 }
 
 function json(path: string): unknown {
   return JSON.parse(boundedProtectedRead(protectedPath(path))) as unknown;
+}
+
+interface ProtectedFreshnessRecord {
+  observed_at: string;
+  boot_id: string;
+  monotonic_ns: string;
+  digest: string;
+}
+
+function currentBootId(): string {
+  return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+}
+
+function currentMonotonicNs(): bigint {
+  return BigInt(Math.floor(uptime() * 1_000_000_000));
+}
+
+export function verifiedFreshness(
+  value: unknown,
+  extraKeys: string[],
+  unsigned: Record<string, unknown>,
+  nowMs = Date.now(),
+  bootId = currentBootId(),
+  monotonicNs = currentMonotonicNs(),
+): asserts value is ProtectedFreshnessRecord {
+  const keys = ["observed_at", "boot_id", "monotonic_ns", "digest", ...extraKeys];
+  if (!exactKeys(value, keys)) throw new Error("invalid closed protected freshness record");
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.observed_at !== "string"
+    || typeof record.boot_id !== "string"
+    || typeof record.monotonic_ns !== "string"
+    || typeof record.digest !== "string"
+    || !/^\d+$/.test(record.monotonic_ns)
+  ) throw new Error("invalid protected freshness fields");
+  const observedMs = Date.parse(record.observed_at);
+  const observedMonotonic = BigInt(record.monotonic_ns);
+  const expected = `sha256:${createHash("sha256").update(JSON.stringify(unsigned)).digest("hex")}`;
+  if (
+    !Number.isFinite(observedMs)
+    || observedMs > nowMs + 1_000
+    || nowMs - observedMs > 900_000
+    || record.boot_id !== bootId
+    || observedMonotonic > monotonicNs
+    || monotonicNs - observedMonotonic > 900_000_000_000n
+    || record.digest !== expected
+  ) throw new Error("protected freshness record is replayed, future-dated, cross-boot, or stale");
 }
 
 function authorityReader(config: AuthorityConfig): ProtectedAuthorityReader {
@@ -157,29 +237,39 @@ function authorityReader(config: AuthorityConfig): ProtectedAuthorityReader {
     },
     trustedNowIso: () => {
       const value = json(config.clock_health_path);
+      const record = value as Record<string, unknown>;
       if (
-        !exactKeys(value, ["now", "observed_at", "synchronized", "max_error_ms", "digest"])
-        || typeof value.now !== "string"
-        || typeof value.observed_at !== "string"
-        || value.synchronized !== true
-        || typeof value.max_error_ms !== "number"
-        || value.max_error_ms < 0
-        || value.max_error_ms > 1_000
-        || typeof value.digest !== "string"
+        record.synchronized !== true
+        || typeof record.max_error_ms !== "number"
+        || record.max_error_ms < 0
+        || record.max_error_ms > 1_000
       ) {
         throw new Error("invalid or unsynchronized protected clock-health record");
       }
-      const unsigned = { now: value.now, observed_at: value.observed_at, synchronized: value.synchronized, max_error_ms: value.max_error_ms };
-      const expected = `sha256:${createHash("sha256").update(JSON.stringify(unsigned)).digest("hex")}`;
-      if (value.digest !== expected || value.now !== value.observed_at) throw new Error("protected clock-health digest or observation mismatch");
-      return value.now;
+      verifiedFreshness(value, ["synchronized", "max_error_ms"], {
+        observed_at: record.observed_at,
+        boot_id: record.boot_id,
+        monotonic_ns: record.monotonic_ns,
+        synchronized: record.synchronized,
+        max_error_ms: record.max_error_ms,
+      });
+      // Time advances independently of controller-writable files. ProtectClock
+      // on every consumer unit prevents those identities from setting it.
+      return new Date(Math.floor(Date.now() / 1000) * 1000).toISOString().replace(".000Z", "Z");
     },
     liveness: () => {
       const value = json(config.liveness_path);
-      if (!exactKeys(value, ["healthy", "observed_at", "digest"]) || typeof value.healthy !== "boolean" || typeof value.observed_at !== "string" || typeof value.digest !== "string") {
+      const record = value as Record<string, unknown>;
+      if (typeof record.healthy !== "boolean") {
         throw new Error("invalid closed protected liveness record");
       }
-      return { healthy: value.healthy, observedAt: value.observed_at, digest: value.digest };
+      verifiedFreshness(value, ["healthy"], {
+        healthy: record.healthy,
+        observed_at: record.observed_at,
+        boot_id: record.boot_id,
+        monotonic_ns: record.monotonic_ns,
+      });
+      return { healthy: record.healthy, observedAt: String(record.observed_at), digest: String(record.digest) };
     },
     currentDigests: () => {
       const value = json(config.current_digests_path);
@@ -193,7 +283,7 @@ function authorityReader(config: AuthorityConfig): ProtectedAuthorityReader {
 
 function atomicWrite(path: string, value: string): void {
   const temporary = `${path}.${process.pid}.tmp`;
-  const fd = openSync(temporary, "wx", 0o600);
+  const fd = openSync(temporary, "wx", 0o660);
   try {
     writeFileSync(fd, value, "utf8");
     fsyncSync(fd);
@@ -209,7 +299,22 @@ function atomicWrite(path: string, value: string): void {
   }
 }
 
-function runJsonBin(path: string, input: unknown): any {
+function boundedTargetRead(path: string, maxBytes = 1_000_000): string {
+  const before = lstatSync(path);
+  if (before.isSymbolicLink() || !before.isFile() || before.size > maxBytes) {
+    throw new Error(`target is not a bounded regular file: ${path}`);
+  }
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(fd);
+    if (!sameOpenedInode(before, opened)) throw new Error(`target changed during open: ${path}`);
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function runJsonBin(path: string, input: unknown): any {
   const checked = protectedPath(path);
   const before = lstatSync(checked);
   const fd = openSync(checked, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -231,34 +336,40 @@ function runJsonBin(path: string, input: unknown): any {
   }
 }
 
+function runUnixJson(
+  socket: string,
+  endpoint: "/register" | "/actuate" | "/demote" | "/fence/acquire" | "/fence/release",
+  input: unknown,
+): any {
+  const stdout = execFileSync("/usr/bin/curl", [
+    "--fail-with-body",
+    "--silent",
+    "--show-error",
+    "--max-time", "30",
+    "--unix-socket", socket,
+    "-H", "content-type: application/json",
+    "--data-binary", JSON.stringify(input),
+    `http://localhost${endpoint}`,
+  ], { encoding: "utf8", timeout: 35_000, maxBuffer: 1_000_000 });
+  return JSON.parse(stdout) as unknown;
+}
+
 export async function run(args: string[]): Promise<number> {
   const command = args[0];
-  if (!["begin", "commit", "watchdog"].includes(command ?? "")) {
-    process.stderr.write("usage: constitutional-routing-cli.ts begin|commit|watchdog --authority-config ABS --data-dir DIR --table FILE [--plan FILE]\n");
+  if (!["controller", "begin", "commit", "watchdog"].includes(command ?? "")) {
+    process.stderr.write("usage: constitutional-routing-cli.ts controller|begin|commit|watchdog\n");
     return 2;
   }
   const configPath = resolveAuthorityConfigPath(args, process.env["GILLE_AUTONOMY_AUTHORITY_CONFIG"]);
-  const dataDirFlag = readFlag(args, "--data-dir") ?? process.env["GILLE_AUTONOMY_DATA_DIR"];
-  const tableFlag = readFlag(args, "--table") ?? process.env["GILLE_AUTONOMY_TABLE_PATH"];
-  if (!configPath || !dataDirFlag || !tableFlag) throw new Error("authority config, data dir, and route table are required");
-  const config = loadConfig(configPath);
-  const dataDir = resolve(dataDirFlag);
-  const tablePath = resolve(tableFlag);
+  if (readFlag(args, "--data-dir") || readFlag(args, "--table") || readFlag(args, "--plan")) {
+    throw new Error("production target/state/plan paths are fixed; arbitrary path flags are refused");
+  }
+  const config = loadAuthorityConfig(configPath);
+  const dataDir = PRODUCTION_STATE_DIR;
+  const tablePath = PRODUCTION_ROUTE_TABLE;
   const authority = authorityReader(config);
-  const lease = acquireMutationLock(dataDir);
-  try {
-    const store = {
-      read: () => boundedProtectedRead(tablePath),
-      compareAndSwap: (expected: string, next: string) => fencedWrite(dataDir, lease.token, () => {
-        if (boundedProtectedRead(tablePath) !== expected) return false;
-        atomicWrite(tablePath, next);
-        return true;
-      }),
-    };
-    if (command === "begin" || command === "commit") {
-      const planPath = readFlag(args, "--plan");
-      if (command === "begin" && !planPath) throw new Error("begin requires --plan");
-      const plan = planPath ? JSON.parse(boundedProtectedRead(resolve(planPath))) as RouteMutationPlan : undefined;
+  const store = new ConstitutionalRouteDatabase(tablePath);
+    if (command === "controller" || command === "begin" || command === "commit") {
       const verifier = { verify: (verificationInput: {
         configDigest: string;
         evidenceDigest: string;
@@ -284,38 +395,89 @@ export async function run(args: string[]): Promise<number> {
           proofDigest: String(result.proof_digest),
         };
       } };
-      const controller = new ConstitutionalRoutingController(dataDir, store, authority, verifier);
-      const result = command === "begin" ? controller.begin(plan!) : controller.commit();
+      const recoveryRegistrar: RecoveryRegistrar = {
+        registerPreRecovery: (input) => {
+          const { baseline: _baseline, ...closedRequest } = input;
+          const result = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/register", closedRequest);
+          if (!exactKeys(result, ["handle", "registrationDigest"])) {
+            throw new Error("recovery registration service returned an invalid closed receipt");
+          }
+          return { handle: String(result.handle), registrationDigest: String(result.registrationDigest) };
+        },
+      };
+      const controller = new ConstitutionalRoutingController(dataDir, store, authority, verifier, recoveryRegistrar);
+      let operation: "begin" | "commit" = command === "commit" ? "commit" : "begin";
+      let plan: RouteMutationPlan | undefined;
+      if (command === "controller") {
+        const paths = constitutionalPaths(dataDir);
+        if (constitutionalResourceExists(paths.lock, paths.journal)) {
+          const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!) as { binding?: { canary?: { watch_deadline?: string } }; entries?: Array<{ phase?: string }> };
+          const phase = journal.entries?.at(-1)?.phase;
+          if (phase !== "watch") {
+            process.stdout.write(`${JSON.stringify({ outcome: "noop", reason: `journal-${phase ?? "invalid"}-awaits-watchdog-or-owner` })}\n`);
+            return 0;
+          }
+          if (Date.parse(authority.trustedNowIso()) < Date.parse(String(journal.binding?.canary?.watch_deadline))) {
+            process.stdout.write(`${JSON.stringify({ outcome: "waiting", reason: "watch-window-active" })}\n`);
+            return 0;
+          }
+          operation = "commit";
+        } else {
+          operation = "begin";
+          if (!existsSync(PRODUCTION_PLAN)) {
+            const proposal = parseRouteMutationProposal(JSON.parse(boundedProtectedRead(PRODUCTION_PROPOSAL)));
+            persistImmutablePlan(PRODUCTION_PLAN, composeImmutablePlan(
+              proposal,
+              store.read(),
+              authority.read(),
+              authority.trustedNowIso(),
+            ));
+          }
+        }
+      }
+      if (operation === "begin") plan = JSON.parse(boundedTargetRead(PRODUCTION_PLAN)) as RouteMutationPlan;
+      const result = operation === "begin" ? controller.begin(plan!) : controller.commit();
       process.stdout.write(`${JSON.stringify(result)}\n`);
       return result.outcome === "unknown" ? 3 : 0;
-    }
+  }
 
-    const recovery: RestoreOnlyCapability = {
+  const recovery: RestoreOnlyCapability = {
       recoveryWorkerIdentity: "micro-route-revert-worker",
-      restorePreRegisteredBaseline: ({ baseline, baselineDigest }) => fencedWrite(dataDir, lease.token, () => {
-        const current = boundedProtectedRead(tablePath);
-        if (`sha256:${contentSha(current)}` === baselineDigest) return "already-baseline";
-        atomicWrite(tablePath, baseline);
-        return `sha256:${contentSha(boundedProtectedRead(tablePath))}` === baselineDigest ? "restored" : "failed";
-      }),
+      acquireRouteFence: () => {
+        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/fence/acquire", {});
+        if (!exactKeys(result, ["epoch", "token"])) throw new Error("recovery service returned an invalid route fence");
+        return { epoch: Number(result.epoch), token: String(result.token) };
+      },
+      releaseRouteFence: (fence) => {
+        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/fence/release", fence);
+        if (!exactKeys(result, ["released"]) || result.released !== true) {
+          throw new Error("recovery service refused the route-fence release");
+        }
+      },
+      actuatePreRegisteredRecovery: (input) => {
+        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/actuate", input);
+        if (!exactKeys(result, ["classification", "registrationDigest"])) {
+          throw new Error("recovery action service returned an invalid closed result");
+        }
+        return ["restored", "already-baseline", "superseded", "failed"].includes(String(result.classification))
+          ? result.classification
+          : "failed";
+      },
       signAndPersistDemotion: (input) => {
-        const result = runJsonBin(config.recovery_signer_bin, input);
+        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/demote", input);
         if (!exactKeys(result, ["ledger", "registry", "checkpoint"])) throw new Error("recovery signer returned an invalid closed response");
         return result as unknown as { ledger: unknown; registry: unknown; checkpoint: unknown };
       },
-    };
-    const watchdog = new ConstitutionalRoutingWatchdog(dataDir, authority, recovery);
-    const result = watchdog.tick();
-    process.stdout.write(`${JSON.stringify(result)}\n`);
-    return result.outcome === "terminally-blocked" ? 3 : 0;
-  } finally {
-    lease.release();
-  }
+  };
+  const watchdog = new ConstitutionalRoutingWatchdog(dataDir, authority, recovery);
+  const result = watchdog.tick();
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result.outcome === "terminally-blocked" ? 3 : 0;
 }
 
-export function resolveAuthorityConfigPath(args: string[], configuredPath?: string, home = homedir()): string {
+export function resolveAuthorityConfigPath(args: string[], configuredPath?: string, _home = homedir()): string {
   if (readFlag(args, "--authority-config")) throw new Error("production authority config path is fixed; arbitrary --authority-config is refused");
-  const fixed = resolve(home, ".config", "gille-inference", "authority-config.json");
+  const fixed = PRODUCTION_AUTHORITY_CONFIG;
   if (configuredPath && resolve(configuredPath) !== fixed) throw new Error("authority config substitution is refused");
   return fixed;
 }

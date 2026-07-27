@@ -5,7 +5,7 @@ import {
   type KeyObject,
 } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import {
   type AuthoritySnapshot,
   type ConstitutionalRouteStore,
   type ProtectedAuthorityReader,
+  type RecoveryRegistrar,
   type RestoreOnlyCapability,
   type RouteMutationPlan,
 } from "../src/homeserver/constitutional-routing-controller.js";
@@ -25,6 +26,14 @@ import {
   validateJournalV1,
   validateJournalV1Prefix,
 } from "../src/homeserver/autonomy-contract-v1.js";
+import {
+  ConstitutionalRouteDatabase,
+  initializeConstitutionalRouteDatabase,
+} from "../src/homeserver/constitutional-route-database.js";
+import {
+  ConstitutionalFencedLease,
+  readConstitutionalResource,
+} from "../src/homeserver/constitutional-fenced-lease.js";
 
 const contractRoot = new URL("../contracts/grimnir-autonomy-v1/", import.meta.url).pathname;
 const artifact = (name: string): any => JSON.parse(readFileSync(join(contractRoot, name), "utf8"));
@@ -150,9 +159,18 @@ function fakeAuthority(snapshot: AuthoritySnapshot) {
 function fakeStore(initial = '{"route":"mellum"}\n') {
   let value = initial;
   let throwAfterWrite = false;
+  let fence = { epoch: 0, token: "owner-init" };
   const store: ConstitutionalRouteStore = {
     read: () => value,
-    compareAndSwap: (expected, next) => {
+    acquireWriterLease: () => {
+      fence = {
+        epoch: fence.epoch + 1,
+        token: `${String(fence.epoch + 1).padStart(8, "0")}-0000-4000-8000-000000000000`,
+      };
+      return { ...fence, release: () => undefined };
+    },
+    compareAndSwap: (expected, next, suppliedFence) => {
+      if (suppliedFence.epoch !== fence.epoch || suppliedFence.token !== fence.token) return false;
       if (value !== expected) return false;
       value = next;
       if (throwAfterWrite) throw new Error("simulated kill -9 after route write");
@@ -163,6 +181,12 @@ function fakeStore(initial = '{"route":"mellum"}\n') {
     store,
     read: () => value,
     write: (next: string) => { value = next; },
+    restore: (expectedDigest: string, next: string, nextFence: { epoch: number; token: string }) => {
+      if (`sha256:${createHash("sha256").update(value).digest("hex")}` !== expectedDigest) return false;
+      if (nextFence.epoch !== fence.epoch || nextFence.token !== fence.token) return false;
+      value = next;
+      return true;
+    },
     crashAfterWrite: () => { throwAfterWrite = true; },
   };
 }
@@ -195,12 +219,27 @@ function recoveryCapability(
   snapshot: AuthoritySnapshot,
   opts: { restoreFails?: boolean } = {},
 ): RestoreOnlyCapability {
+  let activeRouteLease: { epoch: number; token: string; release(): void } | undefined;
   return {
     recoveryWorkerIdentity: "micro-route-revert-worker",
-    restorePreRegisteredBaseline: ({ baseline, baselineDigest }) => {
+    acquireRouteFence: () => {
+      activeRouteLease = store.store.acquireWriterLease();
+      return { epoch: activeRouteLease.epoch, token: activeRouteLease.token };
+    },
+    releaseRouteFence: (fence) => {
+      if (activeRouteLease?.epoch === fence.epoch && activeRouteLease.token === fence.token) {
+        activeRouteLease.release();
+        activeRouteLease = undefined;
+      }
+    },
+    actuatePreRegisteredRecovery: ({ candidateDigest, fenceEpoch, fenceToken }) => {
       if (opts.restoreFails) return "failed";
-      if (`sha256:${createHash("sha256").update(store.read()).digest("hex")}` === baselineDigest) return "already-baseline";
-      store.write(baseline);
+      const current = `sha256:${createHash("sha256").update(store.read()).digest("hex")}`;
+      const baseline = '{"route":"mellum"}\n';
+      const baselineDigest = `sha256:${createHash("sha256").update(baseline).digest("hex")}`;
+      if (current === baselineDigest) return "already-baseline";
+      if (current !== candidateDigest) return "superseded";
+      if (!store.restore(candidateDigest, baseline, { epoch: fenceEpoch, token: fenceToken })) return "failed";
       return `sha256:${createHash("sha256").update(store.read()).digest("hex")}` === baselineDigest ? "restored" : "failed";
     },
     signAndPersistDemotion: ({ targetScopeDigest, journalReceiptDigest }) => {
@@ -243,6 +282,13 @@ function recoveryCapability(
   };
 }
 
+const recoveryRegistrar: RecoveryRegistrar = {
+  registerPreRecovery: () => ({
+    handle: "recovery-00000000-0000-4000-8000-000000000000",
+    registrationDigest: `sha256:${"6".repeat(64)}`,
+  }),
+};
+
 const proofVerifier = {
   verify: (input: { candidateDigest: string; postconditionsDigest: string }) => ({
     ok: true,
@@ -255,7 +301,7 @@ const proofVerifier = {
 describe("constitutional micro-routing controller", () => {
   it.each(["kill9", "stop"] as const)("recovers through the real child-process %s fault harness", async (mode) => {
     const root = mkdtempSync(join(tmpdir(), `constitutional-real-${mode}-`));
-    const tablePath = join(root, "routing.json");
+    const tablePath = join(root, "routing.db");
     const snapshotPath = join(root, "snapshot.json");
     const planPath = join(root, "plan.json");
     const synthetic = syntheticAuthority();
@@ -263,7 +309,7 @@ describe("constitutional micro-routing controller", () => {
     const table = fakeStore();
     const baseline = table.read();
     const mutation = plan(table, synthetic.snapshot);
-    writeFileSync(tablePath, baseline);
+    initializeConstitutionalRouteDatabase(tablePath, baseline);
     writeFileSync(snapshotPath, JSON.stringify(synthetic.snapshot));
     writeFileSync(planPath, JSON.stringify(mutation));
     const child = spawn(process.execPath, [
@@ -283,27 +329,49 @@ describe("constitutional micro-routing controller", () => {
       });
     } else {
       await new Promise<void>((resolve, reject) => {
-        child.stdout!.once("data", (chunk) => String(chunk).includes("WATCHING") ? resolve() : reject(new Error("child did not enter watch")));
+        child.stdout!.once("data", (chunk) => String(chunk).includes("AFTER-CLIENT-CHECK-BEFORE-RESOURCE-MUTATION")
+          ? resolve()
+          : reject(new Error("child did not stop after its client check")));
         child.once("error", reject);
       });
-      process.kill(child.pid!, "SIGSTOP");
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
+    const routeDb = new ConstitutionalRouteDatabase(tablePath);
     const parentTable = {
-      read: () => readFileSync(tablePath, "utf8"),
-      write: (next: string) => writeFileSync(tablePath, next),
+      store: routeDb,
+      read: () => routeDb.read(),
+      write: (next: string) => {
+        const lease = routeDb.acquireWriterLease();
+        const fence = { epoch: lease.epoch, token: lease.token };
+        if (!routeDb.compareAndSwap(routeDb.read(), next, fence)) throw new Error("test route write failed");
+        lease.release();
+      },
+      restore: (expected: string, next: string, fence: { epoch: number; token: string }) => {
+        return routeDb.restoreExact(expected, next, fence);
+      },
     };
     authority.setNow("2026-07-26T01:00:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
       authority.reader,
       recoveryCapability(parentTable as ReturnType<typeof fakeStore>, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+      () => undefined,
+      undefined,
+      { durationMs: 150 },
     );
     expect(watchdog.tick().outcome).toBe("reverted");
-    expect(readFileSync(tablePath, "utf8")).toBe(baseline);
+    expect(routeDb.read()).toBe(baseline);
     if (mode === "stop") {
-      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-      process.kill(child.pid!, "SIGKILL");
-      await exited;
+      const exited = new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        let stderr = "";
+        child.stderr!.on("data", (chunk) => { stderr += String(chunk); });
+        child.once("exit", (code) => resolve({ code, stderr }));
+      });
+      process.kill(child.pid!, "SIGCONT");
+      const resumed = await exited;
+      expect(resumed.code).not.toBe(0);
+      expect(resumed.stderr).toMatch(/expired or superseded/);
+      expect(routeDb.read()).toBe(baseline);
     }
   }, 15_000);
 
@@ -313,10 +381,14 @@ describe("constitutional micro-routing controller", () => {
     const authority = fakeAuthority(synthetic.snapshot);
     const table = fakeStore();
     const mutation = plan(table, synthetic.snapshot);
-    const controller = new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier);
+    const controller = new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar);
     expect(controller.begin(mutation).outcome).toBe("watching");
     const paths = constitutionalPaths(root);
-    const journal = JSON.parse(readFileSync(paths.journal, "utf8"));
+    const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!);
+    const recoveryMaterial = JSON.parse(readConstitutionalResource(paths.lock, paths.recoveryMaterial)!);
+    expect(recoveryMaterial).not.toHaveProperty("baseline");
+    expect(recoveryMaterial.plan).not.toHaveProperty("baseline");
+    expect(recoveryMaterial.recovery_handle).toMatch(/^recovery-/);
     expect(validateJournalV1Prefix(
       journal,
       synthetic.snapshot.constitution,
@@ -342,7 +414,7 @@ describe("constitutional micro-routing controller", () => {
     const baseline = table.read();
     const mutation = plan(table, synthetic.snapshot);
     table.crashAfterWrite();
-    const controller = new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier);
+    const controller = new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar);
     expect(() => controller.begin(mutation)).toThrow(/simulated kill -9/);
     expect(table.read()).toBe(mutation.candidate);
     authority.setNow("2026-07-26T01:00:01Z");
@@ -364,7 +436,7 @@ describe("constitutional micro-routing controller", () => {
     const table = fakeStore();
     const baseline = table.read();
     const mutation = plan(table, synthetic.snapshot);
-    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier).begin(mutation);
+    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
     authority.setNow("2026-07-26T01:00:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
@@ -382,7 +454,7 @@ describe("constitutional micro-routing controller", () => {
     const authority = fakeAuthority(synthetic.snapshot);
     const table = fakeStore();
     const mutation = plan(table, synthetic.snapshot);
-    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier).begin(mutation);
+    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
     authority.setNow("2026-07-26T01:00:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
@@ -393,6 +465,26 @@ describe("constitutional micro-routing controller", () => {
     expect(watchdog.tick()).toMatchObject({ outcome: "noop", reason: "terminal-signed-demotion-reconciled" });
   });
 
+  it("durably blocks the target before parsing corrupt recovery material", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-corrupt-material-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar)
+      .begin(plan(table, synthetic.snapshot));
+    const paths = constitutionalPaths(root);
+    const corruptor = ConstitutionalFencedLease.acquire(paths.lock);
+    corruptor.writeResource(paths.recoveryMaterial, "{broken");
+    corruptor.release();
+    const result = new ConstitutionalRoutingWatchdog(
+      root,
+      authority.reader,
+      recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+    ).tick();
+    expect(result).toMatchObject({ outcome: "terminally-blocked", reason: expect.stringMatching(/^recovery-input-unreadable:/) });
+    expect(readConstitutionalResource(paths.lock, paths.targetBlock)).toBeDefined();
+  });
+
   it("rejects a kill switch, stale liveness, concurrent journal, and second attempt without mutating", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-refusals-"));
     const synthetic = syntheticAuthority();
@@ -400,12 +492,12 @@ describe("constitutional micro-routing controller", () => {
     const table = fakeStore();
     const mutation = plan(table, synthetic.snapshot);
     authority.setKilled(true);
-    expect(() => new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier).begin(mutation)).toThrow(/kill switch/);
+    expect(() => new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation)).toThrow(/kill switch/);
     authority.setKilled(false);
     authority.setHealthy(false);
-    expect(() => new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier).begin(mutation)).toThrow(/liveness/);
+    expect(() => new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation)).toThrow(/liveness/);
     authority.setHealthy(true);
-    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier).begin(mutation);
-    expect(() => new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier).begin({ ...mutation, attemptId: "second-route-attempt" })).toThrow(/prior constitutional attempt|in flight/);
+    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
+    expect(() => new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin({ ...mutation, attemptId: "second-route-attempt" })).toThrow(/prior constitutional attempt|in flight/);
   });
 });

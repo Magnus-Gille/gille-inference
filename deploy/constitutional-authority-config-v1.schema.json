@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/gille-inference/constitutional-authority-config-v1.schema.json",
+  "title": "Gille constitutional micro-routing authority config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authorization_path",
+    "constitution_path",
+    "coverage_path",
+    "owner_attestations_path",
+    "recovery_registry_path",
+    "pinned_owner_public_key_path",
+    "authorization_checkpoint_path",
+    "runtime_narrowing_path",
+    "runtime_narrowing_checkpoint_path",
+    "kill_switch_path",
+    "liveness_path",
+    "current_digests_path",
+    "clock_health_path",
+    "verifier_bin",
+    "canonical_state_dir",
+    "canonical_route_table_path",
+    "canonical_plan_path"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "authorization_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "constitution_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "coverage_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "owner_attestations_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "recovery_registry_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "pinned_owner_public_key_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "authorization_checkpoint_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "runtime_narrowing_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "runtime_narrowing_checkpoint_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "kill_switch_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "liveness_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "current_digests_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "clock_health_path": { "$ref": "#/$defs/rootOwnedPath" },
+    "verifier_bin": { "$ref": "#/$defs/rootOwnedPath" },
+    "canonical_state_dir": { "const": "/var/lib/gille-inference/autonomy" },
+    "canonical_route_table_path": { "const": "/var/lib/gille-inference/routing/m5-routing.db" },
+    "canonical_plan_path": { "const": "/var/lib/gille-inference/autonomy/immutable-plan.json" }
+  },
+  "$defs": {
+    "rootOwnedPath": {
+      "type": "string",
+      "pattern": "^/etc/gille-inference/autonomy/[A-Za-z0-9._/-]+$"
+    }
+  }
+}

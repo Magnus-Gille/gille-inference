@@ -17,20 +17,8 @@
  *   Raw baseline/candidate bytes live in a mode-0600 recovery sidecar bound by
  *   the journal digests and cannot affect authorization.
  */
-import { createHash, randomUUID } from "node:crypto";
-import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
-import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import {
   canonicalJson,
   digestJson,
@@ -42,14 +30,31 @@ import {
   type OwnerAuthorizationInputs,
   type VerifiedAuthorization,
 } from "./autonomy-contract-v1.js";
+import {
+  ConstitutionalFencedLease,
+  constitutionalResourceExists,
+  readConstitutionalResource,
+  type ConstitutionalLeaseOptions,
+} from "./constitutional-fenced-lease.js";
+import type { RouteFence } from "./constitutional-route-database.js";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
 
 export interface ConstitutionalRouteStore {
   read(): string;
-  /** Atomic with respect to every autonomous writer for this route table. */
-  compareAndSwap(expected: string, next: string): boolean;
+  /** Acquires the lease stored beside the authoritative route value. */
+  acquireWriterLease(options?: ConstitutionalLeaseOptions): RouteWriterLease;
+  /**
+   * Atomic with respect to every autonomous writer for this route table.
+   * The authoritative resource MUST compare and persist this fence atomically
+   * with the value mutation.
+   */
+  compareAndSwap(expected: string, next: string, fence: RouteFence): boolean;
+}
+
+export interface RouteWriterLease extends RouteFence {
+  release(): void;
 }
 
 export interface AuthoritySnapshot extends OwnerAuthorizationInputs {
@@ -225,11 +230,12 @@ interface RecoveryMaterial {
   schema_version: 1;
   journal_id: string;
   binding_digest: string;
-  baseline: string;
   candidate: string;
   baseline_digest: string;
   candidate_digest: string;
-  plan: RouteMutationPlan;
+  recovery_handle: string;
+  recovery_registration_digest: string;
+  plan: Omit<RouteMutationPlan, "baseline">;
   authority_epoch_digest: string;
   prepared_authority: AuthoritySnapshot;
   material_digest: string;
@@ -253,11 +259,11 @@ export function constitutionalPaths(dataDir: string): ConstitutionalPaths {
   const root = join(dataDir, "autonomy-constitution", "micro-routing");
   return {
     root,
-    journal: join(root, "journal-v1.json"),
-    recoveryMaterial: join(root, "recovery-material.json"),
-    attemptIndex: join(root, "attempt-index.json"),
-    lock: join(root, "writer-lock.db"),
-    targetBlock: join(root, "target-block.json"),
+    journal: "journal-v1.json",
+    recoveryMaterial: "recovery-material.json",
+    attemptIndex: "attempt-index.json",
+    lock: join(root, "constitutional-state.db"),
+    targetBlock: "target-block.json",
   };
 }
 
@@ -276,34 +282,16 @@ function strictUtc(value: string): number {
   return parsed;
 }
 
-function atomicJson(path: string, value: unknown, mode = 0o600): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const fd = openSync(temporary, "wx", mode);
-  try {
-    writeFileSync(fd, `${canonicalJson(value)}\n`, "utf8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temporary, path);
-  const directory = openSync(dirname(path), "r");
-  try {
-    fsyncSync(directory);
-  } finally {
-    closeSync(directory);
-  }
-}
-
-function readJson(path: string): unknown {
-  const bytes = readFileSync(path);
-  if (bytes.byteLength > 1_000_000) throw new Error(`constitutional JSON exceeds 1 MiB: ${path}`);
-  const parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+function readJson(dbPath: string, resource: string): unknown {
+  const bytes = readConstitutionalResource(dbPath, resource);
+  if (bytes === undefined) throw new Error(`constitutional resource is missing: ${resource}`);
+  if (Buffer.byteLength(bytes) > 1_000_000) throw new Error(`constitutional JSON exceeds 1 MiB: ${resource}`);
+  const parsed = JSON.parse(bytes) as unknown;
   let nodes = 0;
   const walk = (value: unknown, depth: number): void => {
-    if (++nodes > 10_000 || depth > 64) throw new Error(`constitutional JSON exceeds structural limits: ${path}`);
+    if (++nodes > 10_000 || depth > 64) throw new Error(`constitutional JSON exceeds structural limits: ${resource}`);
     if (Array.isArray(value)) {
-      if (value.length > 4096) throw new Error(`constitutional JSON array exceeds entry limit: ${path}`);
+      if (value.length > 4096) throw new Error(`constitutional JSON array exceeds entry limit: ${resource}`);
       for (const entry of value) walk(entry, depth + 1);
     } else if (value !== null && typeof value === "object") {
       for (const entry of Object.values(value)) walk(entry, depth + 1);
@@ -313,40 +301,38 @@ function readJson(path: string): unknown {
   return parsed;
 }
 
-function processIsAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+function withLease<T>(
+  path: string,
+  options: ConstitutionalLeaseOptions,
+  operation: (lease: ConstitutionalFencedLease) => T,
+): T {
+  const lease = ConstitutionalFencedLease.acquire(path, options);
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    return operation(lease);
+  } finally {
+    lease.release();
   }
 }
 
-/** Transactional ownership avoids file-lock stale-reclaim TOCTOU entirely. */
-function withLock<T>(path: string, operation: () => T): T {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const token = randomUUID();
-  const db = new Database(path);
-  db.pragma("journal_mode = WAL");
-  db.pragma("busy_timeout = 2000");
-  db.exec("CREATE TABLE IF NOT EXISTS constitutional_writer_lock (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL)");
-  db.transaction(() => {
-    const existing = db.prepare("SELECT pid, token FROM constitutional_writer_lock WHERE id=1").get() as { pid: number; token: string } | undefined;
-    if (existing && processIsAlive(existing.pid)) throw new Error("constitutional route writer is already active");
-    db.prepare("INSERT INTO constitutional_writer_lock(id,pid,token) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid,token=excluded.token").run(process.pid, token);
-  }).immediate();
+function withRouteAndStateLease<T>(
+  path: string,
+  table: ConstitutionalRouteStore,
+  options: ConstitutionalLeaseOptions,
+  operation: (stateLease: ConstitutionalFencedLease, routeFence: RouteFence) => T,
+): T {
+  // Never invalidate a demonstrably current state writer merely because a
+  // second timer invocation arrived. Once the state lease is takeable, fence
+  // the effect-owning route database FIRST. A predecessor resumed after this
+  // point cannot mutate the route, even before the new state lease advances.
+  ConstitutionalFencedLease.assertAcquirable(path, options);
+  const routeLease = table.acquireWriterLease(options);
   try {
-    return operation();
+    return withLease(path, options, (stateLease) => operation(stateLease, {
+      epoch: routeLease.epoch,
+      token: routeLease.token,
+    }));
   } finally {
-    try {
-      db.transaction(() => {
-        db.prepare("DELETE FROM constitutional_writer_lock WHERE id=1 AND token=?").run(token);
-      }).immediate();
-    } catch {
-      // Never mask the operation result or delete another holder.
-    }
-    db.close();
+    routeLease.release();
   }
 }
 
@@ -391,7 +377,7 @@ interface FreshGate {
 
 function freshGate(
   authority: ProtectedAuthorityReader,
-  plan: RouteMutationPlan,
+  plan: Omit<RouteMutationPlan, "baseline">,
   policy: ConstitutionalPolicy,
 ): FreshGate {
   if (authority.killSwitchActive()) throw new Error("constitutional kill switch is active");
@@ -533,9 +519,9 @@ function append(
   journal.entries.push(entry);
 }
 
-function loadAttemptIndex(path: string): AttemptIndex {
-  if (!existsSync(path)) return { schema_version: 1, attempts: [] };
-  const parsed = readJson(path) as AttemptIndex;
+function loadAttemptIndex(paths: ConstitutionalPaths): AttemptIndex {
+  if (!constitutionalResourceExists(paths.lock, paths.attemptIndex)) return { schema_version: 1, attempts: [] };
+  const parsed = readJson(paths.lock, paths.attemptIndex) as AttemptIndex;
   if (
     parsed.schema_version !== 1
     || !Array.isArray(parsed.attempts)
@@ -562,12 +548,12 @@ function enforceAttemptBounds(index: AttemptIndex, plan: RouteMutationPlan, now:
 }
 
 function loadJournal(paths: ConstitutionalPaths): JournalV1 {
-  if (!existsSync(paths.journal)) throw new Error("no constitutional journal");
-  return readJson(paths.journal) as JournalV1;
+  if (!constitutionalResourceExists(paths.lock, paths.journal)) throw new Error("no constitutional journal");
+  return readJson(paths.lock, paths.journal) as JournalV1;
 }
 
 function loadMaterial(paths: ConstitutionalPaths, journal: JournalV1): RecoveryMaterial {
-  const material = readJson(paths.recoveryMaterial) as RecoveryMaterial;
+  const material = readJson(paths.lock, paths.recoveryMaterial) as RecoveryMaterial;
   const claimed = material.material_digest;
   const computed = digestJson(material, "material_digest");
   if (
@@ -576,10 +562,11 @@ function loadMaterial(paths: ConstitutionalPaths, journal: JournalV1): RecoveryM
     || material.binding_digest !== journal.binding_digest
     || material.baseline_digest !== journal.binding.baseline_digest
     || material.candidate_digest !== journal.binding.candidate_digest
+    || !/^recovery-[a-f0-9-]{36}$/.test(material.recovery_handle)
+    || !DIGEST.test(material.recovery_registration_digest)
     || material.authority_epoch_digest.length === 0
     || material.plan.attemptId !== journal.binding.attempt_id
     || !journal.entries.every((entry) => entry.content_refs.length === 1 && entry.content_refs[0] === material.plan.contentRef)
-    || sha(material.baseline) !== material.baseline_digest
     || sha(material.candidate) !== material.candidate_digest
     || claimed !== computed
   ) {
@@ -588,18 +575,36 @@ function loadMaterial(paths: ConstitutionalPaths, journal: JournalV1): RecoveryM
   return material;
 }
 
-function saveAndValidate(paths: ConstitutionalPaths, journal: JournalV1, gate: FreshGate, terminal: boolean): void {
+function saveAndValidate(
+  paths: ConstitutionalPaths,
+  journal: JournalV1,
+  gate: FreshGate,
+  terminal: boolean,
+  lease: ConstitutionalFencedLease,
+): void {
   if (terminal) {
     validateJournalV1(journal, gate.snapshot.constitution, gate.snapshot.coverage, gate.snapshot.attestations);
   } else {
     validateJournalV1Prefix(journal, gate.snapshot.constitution, gate.snapshot.coverage, gate.snapshot.attestations);
   }
-  atomicJson(paths.journal, journal);
+  lease.writeResource(paths.journal, `${canonicalJson(journal)}\n`);
 }
 
 export type BeginResult =
   | { outcome: "watching"; journal: JournalV1 }
   | { outcome: "unknown"; journal: JournalV1; reason: string };
+
+export interface RecoveryRegistrar {
+  registerPreRecovery(input: {
+    journalId: string;
+    bindingDigest: string;
+    targetScopeDigest: string;
+    baseline: string;
+    baselineDigest: string;
+    candidateDigest: string;
+    descriptorDigest: string;
+  }): { handle: string; registrationDigest: string };
+}
 
 export class ConstitutionalRoutingController {
   private readonly paths: ConstitutionalPaths;
@@ -609,20 +614,22 @@ export class ConstitutionalRoutingController {
     private readonly table: ConstitutionalRouteStore,
     private readonly authority: ProtectedAuthorityReader,
     private readonly verifier: CandidateVerifier,
+    private readonly recoveryRegistrar: RecoveryRegistrar,
     private readonly policy: ConstitutionalPolicy = MICRO_ROUTING_CONSTITUTIONAL_POLICY,
+    private readonly leaseOptions: ConstitutionalLeaseOptions = {},
   ) {
     this.paths = constitutionalPaths(dataDir);
   }
 
   begin(plan: RouteMutationPlan): BeginResult {
-    return withLock(this.paths.lock, () => {
-      if (existsSync(this.paths.targetBlock)) throw new Error("micro-routing target is persistently blocked pending signed demotion reconciliation");
+    return withRouteAndStateLease(this.paths.lock, this.table, this.leaseOptions, (lease, routeFence) => {
+      if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) throw new Error("micro-routing target is persistently blocked pending signed demotion reconciliation");
       const initial = freshGate(this.authority, plan, this.policy);
       requirePlan(plan, this.policy, initial.now);
       if (plan.recoveryDescriptorDigest !== digestJson(initial.snapshot)) {
         throw new Error("recovery descriptor does not bind the exact prepared authority snapshot");
       }
-      if (existsSync(this.paths.journal)) {
+      if (constitutionalResourceExists(this.paths.lock, this.paths.journal)) {
         const prior = loadJournal(this.paths);
         const last = prior.entries.at(-1)?.phase;
         throw new Error(
@@ -633,7 +640,7 @@ export class ConstitutionalRoutingController {
       }
       if (this.table.read() !== plan.baseline) throw new Error("live route table does not match the proposed baseline");
 
-      const index = loadAttemptIndex(this.paths.attemptIndex);
+      const index = loadAttemptIndex(this.paths);
       enforceAttemptBounds(index, plan, initial.now, this.policy);
       const binding = makeBinding(plan, initial);
       const journal: JournalV1 = {
@@ -648,31 +655,48 @@ export class ConstitutionalRoutingController {
         extensions: [],
       };
       append(journal, "prepare", "prepared", binding.controller_identity, initial.now, "prepared-durable-before-write", plan.contentRef);
+      // The recovery service authenticates this prepared journal and reads
+      // the canonical live baseline itself. It never trusts controller bytes
+      // as recovery authority.
+      saveAndValidate(this.paths, journal, initial, false, lease);
+      const registration = this.recoveryRegistrar.registerPreRecovery({
+        journalId: journal.journal_id,
+        bindingDigest: journal.binding_digest,
+        targetScopeDigest: journal.binding.target_scope_digest,
+        baseline: plan.baseline,
+        baselineDigest: binding.baseline_digest,
+        candidateDigest: binding.candidate_digest,
+        descriptorDigest: binding.recovery.descriptor_digest,
+      });
+      if (!/^recovery-[a-f0-9-]{36}$/.test(registration.handle) || !DIGEST.test(registration.registrationDigest)) {
+        throw new Error("recovery service returned an invalid opaque preregistration receipt");
+      }
+      const { baseline: _baseline, ...persistedPlan } = plan;
       const materialBase = {
         schema_version: 1 as const,
         journal_id: journal.journal_id,
         binding_digest: journal.binding_digest,
-        baseline: plan.baseline,
         candidate: plan.candidate,
         baseline_digest: binding.baseline_digest,
         candidate_digest: binding.candidate_digest,
-        plan: structuredClone(plan),
+        recovery_handle: registration.handle,
+        recovery_registration_digest: registration.registrationDigest,
+        plan: structuredClone(persistedPlan),
         authority_epoch_digest: authorityEpochDigest(initial),
         prepared_authority: structuredClone(initial.snapshot),
       };
       const material: RecoveryMaterial = { ...materialBase, material_digest: digestJson(materialBase) };
 
-      // Recovery bytes and consumed attempt are durable before the public
-      // prepare receipt; a crash at any later instruction is recoverable.
-      atomicJson(this.paths.recoveryMaterial, material);
-      saveAndValidate(this.paths, journal, initial, false);
+      // Only the candidate and opaque recovery handle return to the
+      // controller-owned state directory; baseline bytes remain recovery-owned.
+      lease.writeResource(this.paths.recoveryMaterial, `${canonicalJson(material)}\n`);
       // The attempt index follows the recoverable journal. A crash before
       // this write leaves an in-flight journal that blocks/reconciles; it
       // never consumes an attempt without a journal.
-      atomicJson(this.paths.attemptIndex, {
+      lease.writeResource(this.paths.attemptIndex, `${canonicalJson({
         ...index,
         attempts: [...index.attempts, { attempt_id: plan.attemptId, started_at: initial.now, binding_digest: journal.binding_digest }],
-      } satisfies AttemptIndex);
+      } satisfies AttemptIndex)}\n`);
 
       try {
         // No stale admission window: independently re-read all protected
@@ -680,32 +704,35 @@ export class ConstitutionalRoutingController {
         // liveness inputs immediately before the CAS.
         requirePreparedEpoch(freshGate(this.authority, plan, this.policy), material);
       } catch (error) {
-        return this.unknown(journal, plan, `pre-apply-gate:${error instanceof Error ? error.message : String(error)}`);
+        return this.unknown(journal, plan, `pre-apply-gate:${error instanceof Error ? error.message : String(error)}`, lease);
       }
 
-      if (!this.table.compareAndSwap(plan.baseline, plan.candidate) || sha(this.table.read()) !== binding.candidate_digest) {
-        return this.unknown(journal, plan, "apply-or-candidate-readback-failed");
+      if (
+        !this.table.compareAndSwap(plan.baseline, plan.candidate, routeFence)
+        || sha(this.table.read()) !== binding.candidate_digest
+      ) {
+        return this.unknown(journal, plan, "apply-or-candidate-readback-failed", lease);
       }
       const appliedAt = this.authority.trustedNowIso();
       append(journal, "apply", "applied", binding.controller_identity, appliedAt, "candidate-readback-matches", plan.contentRef);
-      saveAndValidate(this.paths, journal, initial, false);
+      saveAndValidate(this.paths, journal, initial, false, lease);
 
       try {
         requirePreparedEpoch(freshGate(this.authority, plan, this.policy), material);
         this.requireProof(material);
       } catch (error) {
-        return this.unknown(journal, plan, `verify-gate:${error instanceof Error ? error.message : String(error)}`);
+        return this.unknown(journal, plan, `verify-gate:${error instanceof Error ? error.message : String(error)}`, lease);
       }
       const verifiedAt = this.authority.trustedNowIso();
       append(journal, "verify", "verified", binding.controller_identity, verifiedAt, "verifier-passes", plan.contentRef);
       append(journal, "watch", "watching", binding.controller_identity, verifiedAt, "canary-watch-started", plan.contentRef);
-      saveAndValidate(this.paths, journal, initial, false);
+      saveAndValidate(this.paths, journal, initial, false, lease);
       return { outcome: "watching", journal };
     });
   }
 
   commit(): { outcome: "committed" | "unknown"; journal: JournalV1; reason?: string } {
-    return withLock(this.paths.lock, () => {
+    return withRouteAndStateLease(this.paths.lock, this.table, this.leaseOptions, (lease, _routeFence) => {
       const journal = loadJournal(this.paths);
       const material = loadMaterial(this.paths, journal);
       const plan = material.plan;
@@ -722,11 +749,11 @@ export class ConstitutionalRoutingController {
         if (sha(this.table.read()) !== journal.binding.candidate_digest) throw new Error("candidate readback changed during watch");
         this.requireProof(material);
       } catch (error) {
-        const result = this.unknown(journal, plan, `pre-commit-gate:${error instanceof Error ? error.message : String(error)}`);
+        const result = this.unknown(journal, plan, `pre-commit-gate:${error instanceof Error ? error.message : String(error)}`, lease);
         return { outcome: "unknown", journal: result.journal, reason: result.reason };
       }
       append(journal, "commit", "committed", journal.binding.controller_identity, gate.now, "canary-watch-complete", plan.contentRef);
-      saveAndValidate(this.paths, journal, gate, true);
+      saveAndValidate(this.paths, journal, gate, true, lease);
       return { outcome: "committed", journal };
     });
   }
@@ -751,7 +778,12 @@ export class ConstitutionalRoutingController {
     return proof;
   }
 
-  private unknown(journal: JournalV1, plan: RouteMutationPlan, reason: string): BeginResult & { outcome: "unknown" } {
+  private unknown(
+    journal: JournalV1,
+    plan: Omit<RouteMutationPlan, "baseline">,
+    reason: string,
+    lease: ConstitutionalFencedLease,
+  ): BeginResult & { outcome: "unknown" } {
     const now = this.authority.trustedNowIso();
     append(journal, "unknown", "unknown", journal.binding.controller_identity, now, reason, plan.contentRef);
     // Prefix validation is performed against a fresh protected read when
@@ -759,9 +791,9 @@ export class ConstitutionalRoutingController {
     // receipt anyway; the watchdog validates it against its protected copy.
     try {
       const gate = freshGate(this.authority, plan, this.policy);
-      saveAndValidate(this.paths, journal, gate, false);
+      saveAndValidate(this.paths, journal, gate, false, lease);
     } catch {
-      atomicJson(this.paths.journal, journal);
+      lease.writeResource(this.paths.journal, `${canonicalJson(journal)}\n`);
     }
     return { outcome: "unknown", journal, reason };
   }
@@ -769,26 +801,35 @@ export class ConstitutionalRoutingController {
 
 export interface RestoreOnlyCapability {
   readonly recoveryWorkerIdentity: string;
+  /** Recovery service acquires the lease stored beside the route value. */
+  acquireRouteFence(): RouteFence;
+  releaseRouteFence(fence: RouteFence): void;
   /**
    * Implemented by a separately privileged worker. It can write only the
    * pre-registered baseline bound to this journal, never arbitrary bytes.
    */
-  restorePreRegisteredBaseline(input: {
+  actuatePreRegisteredRecovery(input: {
+    handle: string;
     journalId: string;
     bindingDigest: string;
-    baseline: string;
-    baselineDigest: string;
+    targetScopeDigest: string;
+    journalReceiptDigest: string;
     candidateDigest: string;
-  }): "restored" | "already-baseline" | "failed";
+    fenceEpoch: number;
+    fenceToken: string;
+  }): "restored" | "already-baseline" | "superseded" | "failed";
   /**
    * Appends a recovery-worker-signed armed-* -> shadow narrowing and returns
    * the independently readable resulting ledger and protected tail.
    */
   signAndPersistDemotion(input: {
+    journalId: string;
     ownerAuthorizationDigest: string;
     domain: "micro-routing";
     targetScopeDigest: string;
     journalReceiptDigest: string;
+    fenceEpoch: number;
+    fenceToken: string;
   }): { ledger: unknown; registry: unknown; checkpoint: unknown };
 }
 
@@ -807,28 +848,58 @@ export class ConstitutionalRoutingWatchdog {
     private readonly recovery: RestoreOnlyCapability,
     private readonly notifyBestEffort: (summary: string) => void = () => undefined,
     private readonly policy: ConstitutionalPolicy = MICRO_ROUTING_CONSTITUTIONAL_POLICY,
+    private readonly leaseOptions: ConstitutionalLeaseOptions = {},
   ) {
     this.paths = constitutionalPaths(dataDir);
   }
 
   tick(): WatchdogTickResult {
-    return withLock(this.paths.lock, () => {
-      if (!existsSync(this.paths.journal)) return { outcome: "noop", reason: "no-journal" };
-      const journal = loadJournal(this.paths);
+    // Fence the effect-owning route resource before advancing state. This
+    // ordering closes the cross-database window where an expired predecessor
+    // could resume after state takeover but before route invalidation.
+    ConstitutionalFencedLease.assertAcquirable(this.paths.lock, this.leaseOptions);
+    const routeFence = this.recovery.acquireRouteFence();
+    try {
+      return withLease(this.paths.lock, this.leaseOptions, (lease) => {
+      if (!constitutionalResourceExists(this.paths.lock, this.paths.journal)) return { outcome: "noop", reason: "no-journal" };
+      // Establish the fail-closed target block before parsing any controller-
+      // writable recovery state or consulting clock/liveness. Corruption can
+      // therefore strand the target blocked, never active with an exception
+      // loop. A healthy waiting watch removes this evaluation block below.
+      const evaluationBlockCreated = !constitutionalResourceExists(this.paths.lock, this.paths.targetBlock);
+      if (evaluationBlockCreated) {
+        lease.writeResource(this.paths.targetBlock, `${canonicalJson({
+          schema_version: 1,
+          target_scope_digest: "unknown-until-journal-validated",
+          binding_digest: "unknown-until-journal-validated",
+          reason_digest: reasonDigest("watchdog-evaluation-in-progress"),
+          blocked_at: "unknown-until-protected-clock-validated",
+          signed_demotion_pending: true,
+        })}\n`);
+      }
+      let journal: JournalV1;
+      try {
+        journal = loadJournal(this.paths);
+      } catch (error) {
+        return { outcome: "terminally-blocked", reason: `journal-unreadable:${error instanceof Error ? error.message : String(error)}` };
+      }
       const last = journal.entries.at(-1);
       if (!last) return { outcome: "terminally-blocked", reason: "empty-journal" };
       if (["commit", "disarm", "terminally-blocked"].includes(last.phase)) {
-        if (last.phase === "terminally-blocked" && existsSync(this.paths.targetBlock)) {
+        if (last.phase === "terminally-blocked" && constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
           try {
             const material = loadMaterial(this.paths, journal);
             const snapshot = material.prepared_authority;
             const verified = verifyOwnerAuthorization(snapshot);
-            const demotion = this.recovery.signAndPersistDemotion({
+            const demotion = lease.transition(() => this.recovery.signAndPersistDemotion({
+              journalId: journal.journal_id,
               ownerAuthorizationDigest: verified.authorizationDigest,
               domain: "micro-routing",
               targetScopeDigest: journal.binding.target_scope_digest,
               journalReceiptDigest: last.receipt_digest,
-            });
+              fenceEpoch: routeFence.epoch,
+              fenceToken: routeFence.token,
+            }));
             const narrowed = verifyRuntimeNarrowing(demotion.ledger, demotion.registry, verified, demotion.checkpoint);
             const entries = (demotion.ledger as { entries?: Array<{ journal_receipt_digest?: unknown }> }).entries;
             if (
@@ -837,7 +908,7 @@ export class ConstitutionalRoutingWatchdog {
             ) {
               throw new Error("reconciled demotion is not bound to the terminal receipt and target");
             }
-            unlinkSync(this.paths.targetBlock);
+            lease.removeResource(this.paths.targetBlock);
             return { outcome: "noop", reason: "terminal-signed-demotion-reconciled", journal };
           } catch (error) {
             return {
@@ -847,14 +918,31 @@ export class ConstitutionalRoutingWatchdog {
             };
           }
         }
+        if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
         return { outcome: "noop", reason: `terminal-${last.phase}`, journal };
       }
-      const material = loadMaterial(this.paths, journal);
-      const now = this.authority.trustedNowIso();
+      let material: RecoveryMaterial;
+      let now: string;
+      try {
+        material = loadMaterial(this.paths, journal);
+        now = this.authority.trustedNowIso();
+        strictUtc(now);
+      } catch (error) {
+        // The target block was already fsync'd above. Never throw back into a
+        // timer loop while a possibly-active candidate remains unblocked.
+        return {
+          outcome: "terminally-blocked",
+          reason: `recovery-input-unreadable:${error instanceof Error ? error.message : String(error)}`,
+          journal,
+        };
+      }
       const expired = strictUtc(now) >= strictUtc(journal.binding.deadline);
-      const silence = strictUtc(now) - strictUtc(last.recorded_at) >= this.policy.maxSilenceSeconds * 1000;
       const kill = this.authority.killSwitchActive();
-      if (!expired && !silence && !kill && last.phase !== "unknown") {
+      // maxSilenceSeconds constrains the independently advancing protected
+      // liveness proof in freshGate; it is not a journal-receipt cadence. A
+      // one-hour canary is intentionally quiet between watch and commit.
+      if (!expired && !kill && last.phase !== "unknown") {
+        if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
         return { outcome: "waiting", reason: "watch-active", journal };
       }
 
@@ -903,46 +991,54 @@ export class ConstitutionalRoutingWatchdog {
           material,
           `authority-or-journal-invalid:${error instanceof Error ? error.message : String(error)}`,
           now,
+          undefined,
+          lease,
         );
       }
       if (this.recovery.recoveryWorkerIdentity !== journal.binding.recovery_worker_identity) {
-        return this.terminalBlock(journal, material, "recovery-worker-identity-mismatch", now);
+        return this.terminalBlock(journal, material, "recovery-worker-identity-mismatch", now, undefined, lease);
       }
 
       if (last.phase !== "unknown") {
-        append(journal, "unknown", "unknown", journal.binding.watchdog_identity, now, expired ? "deadline-expired" : kill ? "kill-switch-active" : "watchdog-silence-bound-exceeded", material.plan.contentRef);
-        saveAndValidate(this.paths, journal, gate, false);
+        append(journal, "unknown", "unknown", journal.binding.watchdog_identity, now, expired ? "deadline-expired" : "kill-switch-active", material.plan.contentRef);
+        saveAndValidate(this.paths, journal, gate, false, lease);
       }
-      atomicJson(this.paths.targetBlock, {
+      lease.writeResource(this.paths.targetBlock, `${canonicalJson({
         schema_version: 1,
         target_scope_digest: journal.binding.target_scope_digest,
         binding_digest: journal.binding_digest,
         reason_digest: reasonDigest("recovery-in-progress"),
         blocked_at: now,
         signed_demotion_pending: true,
-      });
+      })}\n`);
 
-      const restored = this.recovery.restorePreRegisteredBaseline({
+      const restored = lease.transition(() => this.recovery.actuatePreRegisteredRecovery({
+        handle: material.recovery_handle,
         journalId: journal.journal_id,
         bindingDigest: journal.binding_digest,
-        baseline: material.baseline,
-        baselineDigest: material.baseline_digest,
+        targetScopeDigest: journal.binding.target_scope_digest,
+        journalReceiptDigest: journal.entries.at(-1)!.receipt_digest,
         candidateDigest: material.candidate_digest,
-      });
+        fenceEpoch: routeFence.epoch,
+        fenceToken: routeFence.token,
+      }));
       if (!["restored", "already-baseline"].includes(restored)) {
-        return this.terminalBlock(journal, material, "exact-baseline-restore-failed", now, gate);
+        return this.terminalBlock(journal, material, "exact-baseline-restore-failed", now, gate, lease);
       }
       append(journal, "revert", "reverted", journal.binding.recovery_worker_identity, now, "baseline-digest-restored", material.plan.contentRef);
-      saveAndValidate(this.paths, journal, gate, false);
+      saveAndValidate(this.paths, journal, gate, false, lease);
 
       let demotion: ReturnType<RestoreOnlyCapability["signAndPersistDemotion"]>;
       try {
-        demotion = this.recovery.signAndPersistDemotion({
+        demotion = lease.transition(() => this.recovery.signAndPersistDemotion({
+          journalId: journal.journal_id,
           ownerAuthorizationDigest: gate.verified.authorizationDigest,
           domain: "micro-routing",
           targetScopeDigest: journal.binding.target_scope_digest,
           journalReceiptDigest: journal.entries.at(-1)!.receipt_digest,
-        });
+          fenceEpoch: routeFence.epoch,
+          fenceToken: routeFence.token,
+        }));
         const narrowed = verifyRuntimeNarrowing(
           demotion.ledger,
           demotion.registry,
@@ -963,18 +1059,22 @@ export class ConstitutionalRoutingWatchdog {
           `signed-demotion-failed:${error instanceof Error ? error.message : String(error)}`,
           now,
           gate,
+          lease,
         );
       }
       append(journal, "disarm", "disarmed", journal.binding.recovery_worker_identity, now, "recovery-worker-disarm-confirmed", material.plan.contentRef);
-      saveAndValidate(this.paths, journal, gate, true);
-      unlinkSync(this.paths.targetBlock);
+      saveAndValidate(this.paths, journal, gate, true, lease);
+      lease.removeResource(this.paths.targetBlock);
       try {
         this.notifyBestEffort(canonicalJson({ kind: "constitutional-route-reverted", journal_id: journal.journal_id }));
       } catch {
         // Observers and notification transport never gate recovery.
       }
       return { outcome: "reverted", reason: "baseline-restored-and-target-demoted", journal };
-    });
+      });
+    } finally {
+      this.recovery.releaseRouteFence(routeFence);
+    }
   }
 
   private terminalBlock(
@@ -983,27 +1083,29 @@ export class ConstitutionalRoutingWatchdog {
     reason: string,
     now: string,
     gate?: FreshGate,
+    lease?: ConstitutionalFencedLease,
   ): WatchdogTickResult {
+    if (!lease) throw new Error("terminal block requires a current fenced lease");
     if (journal.entries.at(-1)?.phase !== "unknown") {
       append(journal, "unknown", "unknown", journal.binding.watchdog_identity, now, reason, material.plan.contentRef);
     }
     append(journal, "terminally-blocked", "terminally-blocked", journal.binding.recovery_worker_identity, now, reason, material.plan.contentRef);
-    atomicJson(this.paths.targetBlock, {
+    lease.writeResource(this.paths.targetBlock, `${canonicalJson({
       schema_version: 1,
       target_scope_digest: journal.binding.target_scope_digest,
       binding_digest: journal.binding_digest,
       reason_digest: reasonDigest(reason),
       blocked_at: now,
       signed_demotion_pending: true,
-    });
+    })}\n`);
     if (gate) {
       try {
-        saveAndValidate(this.paths, journal, gate, true);
+        saveAndValidate(this.paths, journal, gate, true, lease);
       } catch {
-        atomicJson(this.paths.journal, journal);
+        lease.writeResource(this.paths.journal, `${canonicalJson(journal)}\n`);
       }
     } else {
-      atomicJson(this.paths.journal, journal);
+      lease.writeResource(this.paths.journal, `${canonicalJson(journal)}\n`);
     }
     try {
       this.notifyBestEffort(canonicalJson({ kind: "constitutional-route-terminally-blocked", journal_id: journal.journal_id, reason_digest: reasonDigest(reason) }));

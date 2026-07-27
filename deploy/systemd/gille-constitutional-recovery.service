@@ -1,0 +1,29 @@
+# The recovery key and registry are visible only to this UID.
+[Unit]
+Description=Grimnir constitutional restore-only recovery service
+Requires=gille-constitutional-recovery-register.socket gille-constitutional-recovery-action.socket
+After=gille-constitutional-recovery-register.socket gille-constitutional-recovery-action.socket
+ConditionPathExists=/etc/gille-inference/autonomy/recovery-config.json
+
+[Service]
+Type=simple
+User=gille-autonomy-recovery
+Group=gille-autonomy-recovery
+SupplementaryGroups=gille-autonomy-state gille-routing-writers
+WorkingDirectory=@@REMOTE_DIR@@
+ExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/constitutional-recovery-service.ts
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+PrivateTmp=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=@@REMOTE_DIR@@
+ReadOnlyPaths=/etc/gille-inference/autonomy
+ReadOnlyPaths=/var/lib/gille-inference/autonomy
+ReadWritePaths=/var/lib/gille-inference/autonomy-recovery
+# SQLite requires sibling -wal/-shm files. This dedicated directory contains
+# only the constitutional route database and is group-owned by route writers.
+ReadWritePaths=/var/lib/gille-inference/routing
+UMask=0007

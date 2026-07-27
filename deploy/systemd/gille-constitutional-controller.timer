@@ -1,0 +1,11 @@
+[Unit]
+Description=Grimnir constitutional micro-routing scheduler
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

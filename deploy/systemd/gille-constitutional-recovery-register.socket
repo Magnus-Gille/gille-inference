@@ -1,0 +1,14 @@
+[Unit]
+Description=Controller-only constitutional recovery registration capability
+
+[Socket]
+ListenStream=/run/gille-inference/autonomy/recovery-register.sock
+FileDescriptorName=registration
+SocketUser=gille-autonomy-recovery
+SocketGroup=gille-autonomy-controller
+SocketMode=0660
+DirectoryMode=0755
+Service=gille-constitutional-recovery.service
+
+[Install]
+WantedBy=sockets.target

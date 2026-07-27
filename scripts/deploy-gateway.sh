@@ -457,7 +457,7 @@ install_user_units() {
   # EXECUTES it (where $HOME is meaningful) — never by this script's own shell substituting a
   # path resolved against the wrong box/session. Do not single-quote it.
   if ! remote_run DEPLOY_UNITS_RENDER_CMD \
-    "mkdir -p \$HOME/.config/systemd/user && sed 's|@@REMOTE_DIR@@|$remote_dir|g' '$remote_dir/deploy/systemd/gille-autonomy-tick.service' > \$HOME/.config/systemd/user/gille-autonomy-tick.service && cp '$remote_dir/deploy/systemd/gille-autonomy-tick.timer' \$HOME/.config/systemd/user/gille-autonomy-tick.timer && sed 's|@@REMOTE_DIR@@|$remote_dir|g' '$remote_dir/deploy/systemd/gille-constitutional-watchdog.service' > \$HOME/.config/systemd/user/gille-constitutional-watchdog.service && cp '$remote_dir/deploy/systemd/gille-constitutional-watchdog.timer' \$HOME/.config/systemd/user/gille-constitutional-watchdog.timer"; then
+    "mkdir -p \$HOME/.config/systemd/user && sed 's|@@REMOTE_DIR@@|$remote_dir|g' '$remote_dir/deploy/systemd/gille-autonomy-tick.service' > \$HOME/.config/systemd/user/gille-autonomy-tick.service && cp '$remote_dir/deploy/systemd/gille-autonomy-tick.timer' \$HOME/.config/systemd/user/gille-autonomy-tick.timer"; then
     echo "ERROR: failed to render/install gille-autonomy-tick unit files (gi#49) -- refusing to" >&2
     echo "       certify deployment with the autonomy-tick units possibly missing/stale." >&2
     return 1
@@ -494,7 +494,7 @@ install_user_units() {
 
   # 5. Arm the timer. `enable --now` is idempotent -- a no-op on an already-enabled, already-
   # running timer -- so this is safe to run unconditionally on every deploy.
-  if ! remote_run DEPLOY_UNITS_ENABLE_CMD "systemctl --user enable --now gille-autonomy-tick.timer gille-constitutional-watchdog.timer"; then
+  if ! remote_run DEPLOY_UNITS_ENABLE_CMD "systemctl --user enable --now gille-autonomy-tick.timer"; then
     echo "ERROR: failed to enable gille-autonomy-tick.timer (gi#49) -- refusing to certify" >&2
     echo "       deployment with the autonomy tick un-enabled." >&2
     return 1

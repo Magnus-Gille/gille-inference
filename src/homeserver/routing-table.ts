@@ -22,6 +22,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readConstitutionalRouteDatabase } from "./constitutional-route-database.js";
 
 /** A single per-task-type routing verdict from the cartography. */
 export interface RoutingEntry {
@@ -48,6 +49,14 @@ export const UNKNOWN_ROUTE = "UNKNOWN";
 
 /** Default location of the routing JSON, resolved relative to this module (src/homeserver → repo/docs). */
 function defaultRoutingPath(): string {
+  const configured = process.env["HOMESERVER_ROUTING_TABLE_PATH"];
+  if (configured !== undefined) {
+    const production = "/var/lib/gille-inference/routing/m5-routing.db";
+    if (configured !== production) {
+      throw new Error(`routing-table: HOMESERVER_ROUTING_TABLE_PATH must equal ${production}`);
+    }
+    return configured;
+  }
   const here = dirname(fileURLToPath(import.meta.url));
   return join(here, "..", "..", "docs", "m5-routing.json");
 }
@@ -59,7 +68,10 @@ function defaultRoutingPath(): string {
  */
 export function loadRoutingTable(filePath?: string): RoutingTable {
   const path = filePath ?? defaultRoutingPath();
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RoutingTable>;
+  const bytes = path.endsWith(".db")
+    ? readConstitutionalRouteDatabase(path)
+    : readFileSync(path, "utf8");
+  const parsed = JSON.parse(bytes) as Partial<RoutingTable>;
   if (!parsed.routing || typeof parsed.routing !== "object") {
     throw new Error(`routing-table: ${path} has no "routing" object`);
   }
@@ -71,8 +83,15 @@ export function loadRoutingTable(filePath?: string): RoutingTable {
 
 let cached: RoutingTable | null = null;
 
-/** Memoized default table (the real docs/m5-routing.json). */
-function defaultTable(): RoutingTable {
+/**
+ * Read the current authoritative table. The constitutional production
+ * database is live state and must never be retained across a fenced CAS.
+ * Repository JSON is immutable per deployed revision and may stay memoized.
+ */
+export function currentRoutingTable(filePath?: string): RoutingTable {
+  const path = filePath ?? defaultRoutingPath();
+  if (path.endsWith(".db")) return loadRoutingTable(path);
+  if (filePath !== undefined) return loadRoutingTable(path);
   if (cached === null) cached = loadRoutingTable();
   return cached;
 }
@@ -94,7 +113,7 @@ export function resetRoutingTable(): void {
  * @param table Optional injected table (defaults to the memoized real routing JSON).
  */
 export function routingTarget(taskType: string, table?: RoutingTable): string {
-  const t = table ?? defaultTable();
+  const t = table ?? currentRoutingTable();
   if (t.escalateToFrontier.includes(taskType)) return FRONTIER;
   // Own-property lookup only: task types are now caller-supplied verbatim (#155), so a prototype-
   // named key ("__proto__"/"constructor"/"toString"/…) must NOT resolve to an inherited property

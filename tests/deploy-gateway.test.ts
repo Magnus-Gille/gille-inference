@@ -211,14 +211,6 @@ function writeAutonomyTickUnitTemplate(srcDir: string): void {
     join(srcDir, "deploy", "systemd", "gille-autonomy-tick.timer"),
     "[Unit]\nDescription=Daily gille autonomy tick\n\n[Timer]\nOnCalendar=*-*-* 05:30:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
   );
-  writeFileSync(
-    join(srcDir, "deploy", "systemd", "gille-constitutional-watchdog.service"),
-    "[Unit]\nDescription=constitutional watchdog\nConditionPathExists=%h/.config/gille-inference/autonomy.env\nConditionPathExists=%h/.config/gille-inference/authority-config.json\n\n[Service]\nType=oneshot\nWorkingDirectory=@@REMOTE_DIR@@\nExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/constitutional-routing-cli.ts watchdog\n"
-  );
-  writeFileSync(
-    join(srcDir, "deploy", "systemd", "gille-constitutional-watchdog.timer"),
-    "[Unit]\nDescription=constitutional watchdog timer\n\n[Timer]\nOnUnitActiveSec=60s\n\n[Install]\nWantedBy=timers.target\n"
-  );
   execFileSync("git", ["add", "-A"], { cwd: srcDir });
   execFileSync("git", ["commit", "-q", "-m", "add fixture autonomy-tick unit templates"], { cwd: srcDir });
 }
@@ -1049,12 +1041,6 @@ describe("scripts/deploy-gateway.sh", () => {
       expect(rendered).not.toContain("/usr/bin/env");
       // The .timer has no path to substitute -- copied as-is alongside the rendered .service.
       expect(existsSync(join(fakeHome, ".config", "systemd", "user", "gille-autonomy-tick.timer"))).toBe(true);
-      const watchdogService = join(fakeHome, ".config", "systemd", "user", "gille-constitutional-watchdog.service");
-      expect(existsSync(watchdogService)).toBe(true);
-      expect(readFileSync(watchdogService, "utf8")).toContain(`WorkingDirectory=${remote}`);
-      expect(readFileSync(watchdogService, "utf8")).toContain("constitutional-routing-cli.ts watchdog");
-      expect(readFileSync(watchdogService, "utf8")).toContain("ConditionPathExists=%h/.config/gille-inference/authority-config.json");
-      expect(existsSync(join(fakeHome, ".config", "systemd", "user", "gille-constitutional-watchdog.timer"))).toBe(true);
       expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
     });
 

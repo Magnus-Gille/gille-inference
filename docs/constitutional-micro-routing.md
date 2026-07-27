@@ -1,105 +1,130 @@
 # Constitutional micro-routing (ADR-008 / W1)
 
 The legacy autonomy timer remains useful for review, evidence evaluation, and standing proposals,
-but is structurally shadow-only: its composition always supplies an active kill switch before the
-legacy actuation loop. Autonomous route writes use only
+but is structurally shadow-only. Autonomous route writes use only the production composition in
 `scripts/constitutional-routing-cli.ts`.
 
-- The legacy autonomy timer evaluates in shadow mode and cannot actuate an autonomous route.
-- The independent constitutional watchdog checks in-flight work every 60 seconds.
-- Production remains inert until the owner installs protected authority configuration, a recovery
-  signing helper, and separately arms the exact micro-routing target.
-
-The repository intentionally contains no live authorization, owner key, recovery private key,
-protected checkpoint, kill-switch state, or arming configuration.
+Production remains inert. The repository ships no live authorization, owner key, recovery private
+key, protected checkpoint, kill-switch state, arming configuration, or enabled system-scope unit.
+The ordinary gateway deploy does not install or enable the constitutional units.
 
 ## Authority and process split
 
-`begin` and `commit` run as the controller identity. They can compare-and-swap the route table from
-the journaled baseline to the exact candidate, but they do not receive a recovery signing
-capability. Before both apply and commit they re-read:
+`controller` runs under `gille-autonomy-controller`; the deadline watchdog runs under
+`gille-autonomy-watchdog`; restore and demotion run under `gille-autonomy-recovery`. The three
+accounts share only the narrowly required state or route-writer groups. Registration and action
+use distinct systemd-owned AF_UNIX sockets, so the controller cannot invoke restore/demotion and
+the watchdog cannot register arbitrary baselines.
 
-- the owner-signed authorization and independently pinned public key;
-- the protected authorization and runtime-narrowing checkpoints;
+All authority inputs, including the owner public-key pin and both anti-rollback checkpoints, are
+root-owned, non-writable regular files below `/etc/gille-inference/autonomy`. `ProtectSystem`,
+`ReadOnlyPaths`, distinct UIDs, and explicit root-ownership checks keep them outside controller,
+watchdog, and recovery write authority.
+
+Before apply and commit, the controller re-reads:
+
+- owner-signed authorization and the independently pinned public key;
+- authorization and runtime-narrowing checkpoints;
 - the exact owner-controlled coverage binding and five distinct identities;
-- kill-switch state, current config/evidence/policy/postcondition digests, trusted time, and
-  liveness.
+- kill-switch state, config/evidence/policy/postcondition digests, trusted time, and liveness.
 
-The prepared authority epoch is bound into the recovery descriptor. Rotation after prepare cannot
-silently turn an old proposal into a cross-epoch write, while a recovery worker can still validate
-the immutable prepared epoch and restore its baseline.
+The prepared authority epoch is bound into recovery state. Rotation after prepare cannot turn an
+old proposal into a cross-epoch write. Recovery authenticates the prepared signed records with its
+root-owned pin and checkpoints, so later rotation cannot strand an already-written candidate.
 
-The watchdog is a separate oneshot process driven by
-`gille-constitutional-watchdog.timer`. It receives only:
+The watchdog receives only an opaque recovery handle and two exact-receipt-bound operations:
+candidate-to-preregistered-baseline restore, followed by `armed-* -> shadow` narrowing. The
+recovery service accepts only the exact eligible `prepare`, `unknown`, or `revert` receipt. A live
+third revision is classified as superseding state and is never overwritten. Notification is best
+effort and cannot suppress restore or disarm.
 
-1. the pre-registered baseline bound by the journal;
-2. a restore operation constrained to that baseline; and
-3. an owner-installed helper that signs an `armed-* -> shadow` runtime-narrowing entry.
+## Durable state and fencing
 
-Notification is best effort and runs only after recovery state is durable. It cannot suppress
-restore or disarm.
+The `journal-v1` resource is the ADR-008 journal envelope with a monotone digest-linked receipt chain. It
+distinguishes prepared, applied, verified, watching, committed, unknown, reverted, disarmed, and
+terminally blocked states. Controller state holds the candidate, opaque recovery handle, digests,
+and prepared signed authority snapshot, but never baseline bytes. The recovery service captures
+the exact baseline directly from the canonical route database and stores it only in its private
+registry.
 
-## Durable state
+Recovery registration and the prepared journal are durable before route-table CAS. The attempt
+index follows the recoverable journal, so a crash cannot consume an attempt without durable state
+that the watchdog can reconcile. Missing or corrupt recovery material creates a durable target
+block before parsing or clock access; no exception loop can leave a possibly active candidate
+optimistically eligible.
 
-The authoritative `journal-v1.json` is an exact ADR-008 journal envelope with a monotone,
-digest-linked receipt chain. It distinguishes prepared, applied, verified, watching, committed,
-unknown, reverted, disarmed, and terminally-blocked state. A mode-0600 sidecar holds the exact
-baseline and candidate bytes needed for R-exact recovery; its digests and prepared authority
-snapshot are checked against the journal before use.
+The writer mutex is an expiring monotonic fenced lease. Each acquisition advances a durable epoch,
+mints an unguessable token, and records the boot ID. Journal/state writes compare the state lease
+in the same SQLite transaction that mutates the authoritative state resource. The route database
+holds its own effect-authoritative lease beside the route value, and route CAS compares that lease
+inside the same `BEGIN IMMEDIATE` transaction as the value mutation. Controller takeover acquires
+the route lease before the state lease. Watchdog takeover asks the restore-only recovery service to
+acquire and hold that route-local lease before the watchdog advances state; the watchdog never
+gains route filesystem access. Thus there is no state-acquisition-to-route-claim gap. No database
+transaction is held around caller code, so a `SIGSTOP`ed process cannot pin recovery. A resumed
+stale controller is rejected by the resource transaction even when it was stopped after its final
+client-side check. If a watchdog dies without releasing its recovery-service session, a new
+acquisition is refused while the lease is current and advances to a new epoch after expiry.
 
-Recovery bytes and the prepared journal are durable before the route-table CAS. The attempt index
-is written only after the recoverable journal, so a crash cannot consume an attempt without leaving
-state the watchdog can reconcile.
-
-Any unknown state, deadline, silence bound, kill switch, invariant failure, or restore failure
-causes recovery or terminal blocking. A local target block is persisted before recovery. If signed
-demotion cannot be completed, that block remains authoritative for future admission; no optimistic
-retry or re-arm occurs.
+The one-hour whole-operation deadline is independent of receipt cadence. The watch deadline is
+five minutes earlier, leaving deterministic timer/restart jitter margin. Fresh protected liveness
+is still bounded to fifteen minutes.
 
 ## Owner-installed configuration
 
-The watchdog service reads `%h/.config/gille-inference/autonomy.env`. A future arming ceremony must
-install both that file and the independently fixed
-`%h/.config/gille-inference/authority-config.json`, then set:
+A separate explicit root ceremony must create the service accounts/groups, state directories,
+socket units, services, and timers, then install:
+
+- `/etc/gille-inference/autonomy/autonomy.env`;
+- `/etc/gille-inference/autonomy/authority-config.json`, conforming to
+  `deploy/constitutional-authority-config-v1.schema.json`;
+- `/etc/gille-inference/autonomy/recovery-config.json`, conforming to
+  `deploy/constitutional-recovery-config-v1.schema.json`; and
+- every referenced authority record, public pin, checkpoint, freshness record, verifier, and
+  recovery signer below the protected root.
+
+Targets are compiled and schema-fixed. Flags and environment variables cannot substitute them:
 
 ```text
-GILLE_AUTONOMY_DATA_DIR=/absolute/persistent/data
-GILLE_AUTONOMY_TABLE_PATH=/absolute/live/m5-routing.json
+state:      /var/lib/gille-inference/autonomy
+proposal:   /var/lib/gille-inference/proposals/micro-routing.json
+plan:       /var/lib/gille-inference/autonomy/immutable-plan.json
+route:      /var/lib/gille-inference/routing/m5-routing.db
+recovery:   /var/lib/gille-inference/autonomy-recovery
 ```
 
-The closed authority config names absolute, service-account-owned, non-group/world-writable files
-for authorization, constitution, coverage, owner attestations, recovery registry, pinned owner
-public key, both protected checkpoints, kill switch, liveness, current digests, verifier binary,
-recovery-signer binary, and protected clock-health record. Missing, malformed, writable, oversized, stale, disarmed, or
-cryptographically invalid inputs fail closed.
+The owner ceremony must provision the shared state directory for `gille-autonomy-state`, the
+dedicated route directory for `gille-routing-writers`, initialize `m5-routing.db` from the current
+reviewed JSON route bytes, and set the live gateway's
+`HOMESERVER_ROUTING_TABLE_PATH=/var/lib/gille-inference/routing/m5-routing.db`. The gateway opens
+that database read-only. The recovery registry remains accessible only to
+`gille-autonomy-recovery`. Missing unit conditions cleanly skip execution. Wrong-owner, writable,
+malformed, oversized, stale, disarmed, or cryptographically invalid inputs fail closed.
 
-Deploy installs and enables the timer, but both owner-installed files are systemd conditions. A
-disarmed installation is therefore cleanly skipped rather than failing every minute. Arming is an
-owner ceremony: install the fixed config and environment atomically with restrictive ownership and
-modes, run one manual `watchdog` status check, then `systemctl --user start
-gille-constitutional-watchdog.service`. Removing either file cleanly disarms subsequent timer runs.
-
-Commands:
+Commands, after that ceremony, are deliberately pathless:
 
 ```bash
-npm run autonomy:constitutional -- begin --data-dir /absolute/path --table /absolute/path --plan /absolute/plan.json
-npm run autonomy:constitutional -- commit --data-dir /absolute/path --table /absolute/path
-npm run autonomy:constitutional -- watchdog --data-dir /absolute/path --table /absolute/path
+npm run autonomy:constitutional -- controller
+npm run autonomy:constitutional -- watchdog
 ```
 
-`begin` requires a content-blind, exact-digest-bound verifier proof and leaves the operation in
-`watch`. `commit` consumes the persisted plan and recovery material rather than accepting new
-candidate decisions from its caller.
+`controller` composes one immutable plan from the fixed proposal when none exists, begins it, and
+on later timer activations commits only after the watch deadline. The independent watchdog
+recovers at the absolute deadline.
 
 ## Fault evidence
 
-The test harness uses real child processes:
+The regression harness covers:
 
-- `SIGKILL` immediately after the external route write and before the apply receipt;
-- `SIGSTOP` after entering the watch phase while a separate watchdog passes the absolute deadline;
-- notification failure during recovery;
+- real `SIGKILL` immediately after route write and before the apply receipt;
+- real `SIGSTOP` after the controller's final client-side check but before its authoritative route
+  transaction, route-local lease expiry and successor acquisition (with no separate claim step),
+  then `SIGCONT`, with the stale controller rejected by the resource-local fence;
+- observer failure during recovery;
 - failed exact restore, which terminally blocks and is not retried;
-- concurrent attempts, stale liveness, kill switch, and invalid authority refusal.
+- corrupt material before clock access;
+- third-revision preservation;
+- signer-oracle, target substitution, stale freshness, and wrong-identity refusal.
 
-Both process faults end in exact baseline readback, signed target demotion, and terminal disarm in
-the successful recovery case.
+The successful process-fault cases end with exact baseline readback, signed target demotion, and
+terminal disarm.
