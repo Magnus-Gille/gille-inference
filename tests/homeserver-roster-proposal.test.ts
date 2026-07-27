@@ -358,6 +358,21 @@ function resignProvenance(input: RosterProposal): RosterProposal {
   };
 }
 
+function withProposalDigest(input: RosterProposal): RosterProposal {
+  const proposal = structuredClone(input);
+  const { proposal_digest: _digest, ...unsignedProposal } = proposal;
+  return {
+    ...unsignedProposal,
+    proposal_digest: canonicalRosterProposalDigest(unsignedProposal),
+  };
+}
+
+function withForgedEnvelope(input: RosterProposal): RosterProposal {
+  const proposal = structuredClone(input);
+  proposal.provenance.signature.value_base64 = "0".repeat(88);
+  return withProposalDigest(proposal);
+}
+
 let db: Database.Database;
 let deps: RosterAdmissionDependencies;
 
@@ -566,7 +581,7 @@ describe("gille roster-proposal v2 contract", () => {
   it("byte-verifies and arms the exact Hugin v2 producer fixture", async () => {
     const sourceBytes = readFileSync(huginFixturePositive, "utf8");
     expect(createHash("sha256").update(sourceBytes, "utf8").digest("hex"))
-      .toBe("d03d263b5f9cf6606d98fe9f1cfd85ec390eec0706dffffd80675538150dc963");
+      .toBe("f92f9226f6cc85c905b90d4cce4fa8dd4f150c0a534242aa5e6bdb4b96501d62");
 
     const result = await admitRosterProposal(
       JSON.parse(sourceBytes),
@@ -591,11 +606,12 @@ describe("gille roster-proposal v2 contract", () => {
     expect(createHash("sha256").update(
       readFileSync(huginFixtureAdversarial, "utf8"),
       "utf8",
-    ).digest("hex")).toBe("5e4470e771c80f7ad03f13c9a8ed6cf3ca18c1c2d5e65e63bd72f173fc01fa78");
+    ).digest("hex")).toBe("5d179375d528de198aad44b7612fdb29456851535b8f6d1818c8874f792868d2");
     expect(createHash("sha256").update(sourceBytes, "utf8").digest("hex"))
       .toBe(manifest.source_bytes_sha256);
     expect(manifest.cases.map((fixtureCase) => fixtureCase.name)).toEqual([
       "source-receipt-digest-tamper",
+      "source-receipt-signature-tamper",
       "source-base-tamper",
       "candidate-digest-tamper",
       "evidence-set-tamper",
@@ -621,6 +637,124 @@ describe("gille roster-proposal v2 contract", () => {
       db,
       dependencies: unconfigured,
     })).rejects.toThrow("hugin provenance trust root unavailable");
+  });
+
+  it("authenticates before default observer handling or any durable side effect", async () => {
+    await expect(admitRosterProposal(proposal(), ROSTER_PROPOSAL_PRINCIPAL, { db }))
+      .rejects.toThrow("hugin provenance trust root unavailable");
+    expect(getRosterProposalForPrincipal(
+      ROSTER_PROPOSAL_PRINCIPAL,
+      proposal().proposal_id,
+      db,
+    )).toBeNull();
+  });
+
+  it("does not durably reject an unavailable-observer proposal with a forged envelope", async () => {
+    const forged = withForgedEnvelope(proposal({
+      proposal_id: "proposal:w5:unavailable-forged",
+      idempotency_key: "idem:w5:unavailable-forged",
+    }));
+    await expect(admitRosterProposal(forged, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, readServerObservation: async () => null },
+    })).rejects.toThrow("hugin provenance binding invalid");
+    expect(getRosterProposalForPrincipal(ROSTER_PROPOSAL_PRINCIPAL, forged.proposal_id, db)).toBeNull();
+  });
+
+  it("does not let an unverified proposal or idempotency key squat on a later authentic admission", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:unsquatted",
+      idempotency_key: "idem:w5:unsquatted",
+    });
+    await expect(admitRosterProposal(withForgedEnvelope(valid), ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, readServerObservation: async () => null },
+    })).rejects.toThrow("hugin provenance binding invalid");
+
+    const result = await admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    });
+    expect(result.kind).toBe("armed");
+  });
+
+  it("authenticates an exact retry before returning its existing durable row", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:retry-authentication",
+      idempotency_key: "idem:w5:retry-authentication",
+    });
+    await expect(admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, { db, dependencies: deps }))
+      .resolves.toMatchObject({ kind: "armed" });
+    await expect(admitRosterProposal(withForgedEnvelope(valid), ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    })).rejects.toThrow("hugin provenance binding invalid");
+  });
+
+  it("preserves a signed exact retry after TTL while expiring its prior durable row", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:retry-after-ttl",
+      idempotency_key: "idem:w5:retry-after-ttl",
+      created_at: "2026-07-27T14:00:00Z",
+      expires_at: "2026-07-27T15:00:00Z",
+    });
+    const beforeExpiry = { ...deps, now: () => new Date("2026-07-27T14:59:35Z") };
+    await expect(admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: beforeExpiry,
+    })).resolves.toMatchObject({ kind: "armed" });
+
+    const retry = await admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, now: () => new Date("2026-07-27T15:00:00Z") },
+    });
+    expect(retry).toMatchObject({ kind: "existing", record: { state: "expired" } });
+  });
+
+  it("only durably rejects an observer-unavailable proposal after authenticating its envelope", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:unavailable-authentic",
+      idempotency_key: "idem:w5:unavailable-authentic",
+    });
+    const result = await admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, readServerObservation: async () => null },
+    });
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode).toBe("ROSTER_OBSERVER_UNAVAILABLE");
+    }
+  });
+
+  it("does not sweep an expired row while rejecting an unauthenticated proposal", async () => {
+    const expiring = proposal({
+      proposal_id: "proposal:w5:expiry-authentication",
+      idempotency_key: "idem:w5:expiry-authentication",
+      created_at: "2026-07-27T14:00:00Z",
+      expires_at: "2026-07-27T15:00:00Z",
+    });
+    const earlyDeps = { ...deps, now: () => new Date("2026-07-27T14:59:35Z") };
+    const armed = await admitRosterProposal(expiring, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: earlyDeps,
+    });
+    expect(armed).toMatchObject({ kind: "armed" });
+
+    const forged = withForgedEnvelope(proposal({
+      proposal_id: "proposal:w5:expiry-forged",
+      idempotency_key: "idem:w5:expiry-forged",
+    }));
+    await expect(admitRosterProposal(forged, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, now: () => new Date("2026-07-27T15:00:00Z") },
+    })).rejects.toThrow("hugin provenance binding invalid");
+
+    expect(getRosterProposalForPrincipal(
+      ROSTER_PROPOSAL_PRINCIPAL,
+      expiring.proposal_id,
+      db,
+      new Date("2026-07-27T14:59:35Z"),
+    )?.state).toBe("armed");
   });
 
   it("rejects absent and unrecognized provenance before making a durable decision", async () => {

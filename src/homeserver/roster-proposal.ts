@@ -1002,12 +1002,14 @@ function validateContract(raw: unknown): RosterProposal {
   return proposal;
 }
 
-function validateHuginProvenance(
+/**
+ * Authenticate the closed Hugin envelope before this request may observe or
+ * mutate durable admission state.  In particular, an unavailable server
+ * observer is not authority to retain an otherwise unauthenticated request.
+ */
+function validateHuginProvenanceAuthentication(
   proposal: RosterProposal,
-  observation: ServerRosterObservation,
-  now: Date,
   trust: RosterAdmissionDependencies["huginProvenanceTrust"],
-  enforceSourceExpiry = true,
 ): void {
   if (!trust || trust.keyId !== "hugin-roster-provenance") {
     throw new RosterProposalContractError("hugin provenance trust root unavailable");
@@ -1029,18 +1031,12 @@ function validateHuginProvenance(
   } catch { /* invalid deployment key is a fail-closed contract error */ }
   const evidence = [...provenance.evidence_fingerprints].sort();
   const candidateEvidence = [...new Set(proposal.candidate.entries.map((entry) => entry.evidence_identity_hash))].sort();
-  const expectedBase = {
-    revision: observation.observation_epoch,
-    digest: combinedRosterBaselineDigest(proposal.baseline),
-  };
   if (
     canonicalReceiptDigest !== canonicalProposalDigest
     || !envelopeVerified
     || provenance.source_receipt_digest !== rosterDigest(receipt)
     || provenance.source_base.revision !== receipt.base.revision
     || provenance.source_base.digest !== receipt.base.digest
-    || provenance.source_base.revision !== expectedBase.revision
-    || provenance.source_base.digest !== expectedBase.digest
     || provenance.proposal_content_digest !== rosterDigest(proposalContent)
     || provenance.candidate_digest !== proposal.candidate.roster_digest
     || receipt.candidateContentDigest !== proposal.candidate.roster_digest
@@ -1055,7 +1051,26 @@ function validateHuginProvenance(
     || provenance.principal_id !== proposal.expected_transport_principal_id
     || receipt.proposalId !== proposal.proposal_id
     || receipt.expiresAt !== proposal.expires_at
-    || (enforceSourceExpiry && Date.parse(receipt.expiresAt) <= now.getTime())
+  ) throw new RosterProposalContractError("hugin provenance binding invalid");
+}
+
+/**
+ * This is deliberately separate from envelope authentication: only the
+ * server's current observation can establish whether Hugin's authenticated
+ * source base is still current.  It is checked once after the initial read
+ * and again while the provider's observation fence is held.
+ */
+function validateHuginProvenanceCurrentBase(
+  proposal: RosterProposal,
+  observation: ServerRosterObservation,
+): void {
+  const expectedBase = {
+    revision: observation.observation_epoch,
+    digest: combinedRosterBaselineDigest(proposal.baseline),
+  };
+  if (
+    proposal.provenance.source_base.revision !== expectedBase.revision
+    || proposal.provenance.source_base.digest !== expectedBase.digest
   ) throw new RosterProposalContractError("hugin provenance binding invalid");
 }
 
@@ -1617,6 +1632,15 @@ export async function admitRosterProposal(
   ) {
     throw new RosterProposalContractError("invalid proposal lifetime");
   }
+  // The envelope binds the proposal to the Gille-owned Hugin trust root. It
+  // must be authenticated before expiry sweeping, collision/idempotency
+  // handling, or an observer-unavailable durable rejection. Its TTL fields
+  // are bound here, while current-time expiry remains a durable lifecycle
+  // decision so a signed exact retry can recover its expired row.
+  validateHuginProvenanceAuthentication(
+    proposal,
+    deps.huginProvenanceTrust,
+  );
   expireRosterProposals(startedAt, db);
   const existing = findCollision(db, proposal);
   if (existing) {
@@ -1665,11 +1689,9 @@ export async function admitRosterProposal(
 
   const expectedObservationEpoch = observation.observation.observation_epoch;
   const expectedObservationDigest = observation.observation.observation_digest;
-  validateHuginProvenance(
+  validateHuginProvenanceCurrentBase(
     proposal,
     observation.observation,
-    startedAt,
-    deps.huginProvenanceTrust,
   );
   const expectedToken: ServerRosterObservationToken = Object.freeze({
     schema_version: "gille-roster-server-observation-token-v1",
@@ -1736,19 +1758,12 @@ export async function admitRosterProposal(
                 ) {
                   reason = "OBSERVATION_CHANGED";
                 } else {
-                  // Recheck the signed source/base binding at the protected
-                  // clock sample while the provider's current-observation
-                  // fence is held. A caller cannot provide this trust root.
-                  validateHuginProvenance(
+                  // Recheck the authenticated source/base binding while the
+                  // provider's current-observation fence is held. The
+                  // current base itself cannot be supplied by the caller.
+                  validateHuginProvenanceCurrentBase(
                     proposal,
                     observation.observation,
-                    decisionNow,
-                    deps.huginProvenanceTrust,
-                    // Expiry is classified by the protected final-time
-                    // decision below, so an otherwise authentic proposal
-                    // crossing its TTL becomes a durable rejection rather
-                    // than an exception that escapes the fence.
-                    false,
                   );
                   reason = semanticDecision(
                     proposal,

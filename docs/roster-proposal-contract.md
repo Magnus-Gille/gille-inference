@@ -162,7 +162,7 @@ observation epoch+digest plus content-addressed identities before any mutation.
 seed example and must fail closed under v2. It is not output from a real Hugin
 serializer and is not cross-repository compatibility evidence. The checked-in
 Hugin-produced v2 positive and adversarial artifacts are imported byte-for-byte
-from `Magnus-Gille/hugin@b85e5dd`; their provenance note records the exact
+from `Magnus-Gille/hugin@4ff72db`; their provenance note records the exact
 paths and source-byte SHA-256. The Gille consumer test verifies that SHA,
 accepts the positive artifact under the fixture-only issuer key and matching
 observation, and mechanically applies then rejects every adversarial case.
