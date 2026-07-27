@@ -622,6 +622,17 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
         if (!changed) throw new Error("route guard fence is stale");
         return respond(response, 200, { changed: true });
       }
+      if (request.url === "/route/digest") {
+        const fence = body as RouteFence;
+        if (
+          typeof body !== "object"
+          || body === null
+          || Array.isArray(body)
+          || Object.keys(body).sort().join(",") !== "epoch,token"
+        ) throw new Error("route digest request does not match the held recovery fence");
+        requireRecoveryFence(fence);
+        return respond(response, 200, { digest: sha(options.route.read()) });
+      }
       if (request.url === "/demote") {
         const input = body as Parameters<RecoveryServiceOptions["demote"]>[0];
         if (

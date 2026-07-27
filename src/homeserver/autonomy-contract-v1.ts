@@ -9,6 +9,19 @@ const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
 const UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/;
 const DOMAINS = new Set(["micro-routing", "macro-routing", "prompt", "harness", "tool-policy", "served-model-roster", "no-reboot-security-bugfix-maintenance"]);
+const COVERAGE_DOMAINS_V2 = new Set([
+  ...DOMAINS,
+  "credentials-and-auth", "owner-policy", "constitution-and-safety-gates",
+  "deployments-and-code", "privacy-retention-and-erasure", "firmware",
+  "remote-recovery", "model-weight-training", "irreversible-external-actions",
+  "package-downgrade",
+]);
+const PROTECTED_LANES_V2 = new Set([
+  "credentials-and-auth", "owner-policy", "constitution-and-safety-gates",
+  "deployments-and-code", "privacy-retention-and-erasure", "firmware",
+  "remote-recovery", "model-weight-training", "irreversible-external-actions",
+  "package-downgrade",
+]);
 const CONSTITUTION_EPOCHS = new Map([
   ["v1", {
     id: "grimnir-autonomy-v1",
@@ -139,6 +152,16 @@ function verifyMicroRoutingTargetStateVersion(i: TargetStateVerificationInputs, 
   const authorizationBindings = i.verified.authorization["bindings"] as Record<string, unknown>;
   if (authorizationBindings["coverage_intent_digest"] !== digestJson(coverage, "registry_digest") || authorizationBindings["owner_attestation_registry_digest"] !== digestJson(attestations, "registry_digest")) fail("current state is not owner-authorized");
   if (!exact(coverage, ["kind", "schema_version", "registry_id", "issued_at", "constitution_digest", "mutation_policy", "global_state", "domains", "registry_digest", "extensions"]) || coverage.kind !== "autonomy-coverage-registry" || coverage.schema_version !== version || coverage.global_state !== "armed" || coverage.registry_digest !== digestJson(coverage, "registry_digest") || !Array.isArray(coverage.domains) || !Array.isArray(coverage.extensions) || coverage.extensions.length) fail("invalid or disarmed current coverage");
+  if (version === "v2") {
+    const v2 = CONSTITUTION_EPOCHS.get("v2")!;
+    if (coverage.constitution_digest !== v2.digest || coverage.mutation_policy !== "owner-widen-recovery-worker-narrow") fail("coverage does not bind the canonical v2 constitution or mutation policy");
+    const domains = new Set(coverage.domains.map((row: any) => row?.domain));
+    if (domains.size !== COVERAGE_DOMAINS_V2.size || [...COVERAGE_DOMAINS_V2].some((domain) => !domains.has(domain))) fail("coverage does not contain the canonical v2 domain registry");
+    for (const domain of PROTECTED_LANES_V2) {
+      const row = coverage.domains.find((candidate: any) => candidate?.domain === domain);
+      if (row?.coverage !== "protected" || row.target_state !== "never-mechanical" || !Array.isArray(row.bindings) || row.bindings.length !== 0) fail("coverage violates a canonical protected lane");
+    }
+  }
   if (!exact(attestations, ["kind", "schema_version", "registry_id", "issued_at", "issuer_identity", "mutation_policy", "attestations", "registry_digest", "extensions"]) || attestations.kind !== "autonomy-owner-attestation-registry" || attestations.schema_version !== "v1" || attestations.mutation_policy !== "owner-controlled-protected-lane" || attestations.registry_digest !== digestJson(attestations, "registry_digest") || !Array.isArray(attestations.attestations) || !Array.isArray(attestations.extensions) || attestations.extensions.length) fail("invalid owner attestation registry");
   for (const row of coverage.domains) {
     if (!exact(row, COVERAGE_ROW_KEYS) || !Array.isArray(row.bindings)) fail("invalid closed coverage row");

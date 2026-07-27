@@ -529,6 +529,13 @@ export function createWatchdogRecoverySocketClient(
         throw new Error("recovery service refused the route unblock");
       }
     },
+    readRouteDigest: (fence) => {
+      const result = transport(socket, "/route/digest", fence);
+      if (!exactKeys(result, ["digest"]) || !/^sha256:[a-f0-9]{64}$/.test(String(result.digest))) {
+        throw new Error("recovery service returned an invalid route digest");
+      }
+      return String(result.digest);
+    },
     actuatePreRegisteredRecovery: (input) => {
       const result = transport(socket, "/actuate", input);
       if (!exactKeys(result, ["classification", "registrationDigest"])) {

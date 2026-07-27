@@ -28,7 +28,9 @@ import {
 } from "../src/homeserver/autonomy-contract-v1.js";
 import {
   ConstitutionalRouteDatabase,
+  ConstitutionalRouteBlockedError,
   initializeConstitutionalRouteDatabase,
+  readConstitutionalRouteDatabase,
 } from "../src/homeserver/constitutional-route-database.js";
 import {
   ConstitutionalFencedLease,
@@ -134,7 +136,32 @@ function syntheticAuthority() {
     runtimeNarrowing: emptyNarrowing,
     runtimeNarrowingCheckpoint: emptyTail,
   };
-  return { snapshot, recoveryPrivateKey: recovery.privateKey, authorizationDigest };
+  return {
+    snapshot,
+    ownerPrivateKey: owner.privateKey,
+    recoveryPrivateKey: recovery.privateKey,
+    authorizationDigest,
+  };
+}
+
+function resignSnapshot(snapshot: AuthoritySnapshot, ownerPrivateKey: KeyObject): void {
+  const authorization = structuredClone(snapshot.authorization) as any;
+  authorization.bindings.constitution_digest = digestJson(snapshot.constitution, "constitution_digest");
+  authorization.bindings.coverage_intent_digest = digestJson(snapshot.coverage, "registry_digest");
+  authorization.bindings.owner_attestation_registry_digest = digestJson(snapshot.attestations, "registry_digest");
+  authorization.bindings.recovery_worker_registry_digest = digestJson(snapshot.recoveryRegistry, "registry_digest");
+  const { signature: _signature, ...unsigned } = authorization;
+  authorization.signature = {
+    algorithm: "Ed25519",
+    value_base64: signObject(unsigned, ownerPrivateKey),
+  };
+  snapshot.authorization = authorization;
+  snapshot.checkpoint = {
+    ...(snapshot.checkpoint as Record<string, unknown>),
+    authorization_digest: digestJson(authorization),
+  };
+  (snapshot.runtimeNarrowing as any).owner_authorization_digest = digestJson(authorization);
+  (snapshot.runtimeNarrowingCheckpoint as any).owner_authorization_digest = digestJson(authorization);
 }
 
 function fakeAuthority(snapshot: AuthoritySnapshot) {
@@ -233,6 +260,7 @@ function recoveryCapability(
     },
     blockRoute: () => undefined,
     clearRouteBlock: () => undefined,
+    readRouteDigest: () => `sha256:${createHash("sha256").update(store.read()).digest("hex")}`,
     actuatePreRegisteredRecovery: ({ fenceEpoch, fenceToken }) => {
       if (opts.restoreFails) return "failed";
       const candidateDigest = `sha256:${createHash("sha256").update('{"route":"qwen"}\n').digest("hex")}`;
@@ -683,7 +711,112 @@ describe("constitutional micro-routing controller", () => {
       recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot, { restoreFails: true }),
     );
     expect(watchdog.tick()).toMatchObject({ outcome: "terminally-blocked", reason: "exact-baseline-restore-failed" });
-    expect(watchdog.tick()).toMatchObject({ outcome: "noop", reason: "terminal-signed-demotion-reconciled" });
+    expect(watchdog.tick()).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: "terminal-demoted-baseline-not-restored",
+    });
+    expect(readConstitutionalResource(
+      constitutionalPaths(root).lock,
+      constitutionalPaths(root).targetBlock,
+    )).toBeDefined();
+  });
+
+  it("keeps the real route database fail-closed after failed restore and no-journal reconciliation", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-real-restore-fail-"));
+    const routePath = join(root, "routing.db");
+    const baseline = '{"route":"mellum"}\n';
+    initializeConstitutionalRouteDatabase(routePath, baseline);
+    const routeDb = new ConstitutionalRouteDatabase(routePath);
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const adapter = {
+      store: routeDb,
+      read: () => routeDb.read(),
+      restore: (expected: string, next: string, fence: { epoch: number; token: string }) =>
+        routeDb.restoreExact(expected, next, fence),
+    } as ReturnType<typeof fakeStore>;
+    const mutation = plan(adapter, synthetic.snapshot);
+    new ConstitutionalRoutingController(
+      root,
+      routeDb,
+      authority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    ).begin(mutation);
+    authority.setNow("2026-07-26T01:10:01Z");
+    const recovery = recoveryCapability(
+      adapter,
+      synthetic.recoveryPrivateKey,
+      synthetic.authorizationDigest,
+      synthetic.snapshot,
+      { restoreFails: true },
+    );
+    recovery.blockRoute = (fence) => {
+      if (!routeDb.block(fence)) throw new Error("failed to block real route database");
+    };
+    recovery.clearRouteBlock = (fence) => {
+      if (!routeDb.clearBlock(fence)) throw new Error("failed to clear real route database");
+    };
+    const watchdog = new ConstitutionalRoutingWatchdog(root, authority.reader, recovery);
+
+    expect(watchdog.tick()).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: "exact-baseline-restore-failed",
+    });
+    expect(routeDb.isBlocked()).toBe(true);
+    expect(() => readConstitutionalRouteDatabase(routePath)).toThrow(ConstitutionalRouteBlockedError);
+
+    expect(watchdog.tick()).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: "terminal-demoted-baseline-not-restored",
+    });
+    expect(routeDb.isBlocked()).toBe(true);
+    expect(() => readConstitutionalRouteDatabase(routePath)).toThrow(ConstitutionalRouteBlockedError);
+
+    const paths = constitutionalPaths(root);
+    const lease = ConstitutionalFencedLease.acquire(paths.lock);
+    lease.removeResource(paths.journal);
+    lease.release();
+    expect(watchdog.tick()).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: "durable-target-block-without-journal",
+    });
+    expect(routeDb.isBlocked()).toBe(true);
+    expect(() => readConstitutionalRouteDatabase(routePath)).toThrow(ConstitutionalRouteBlockedError);
+  });
+
+  it.each([
+    ["coverage constitution binding", (coverage: any) => {
+      coverage.constitution_digest = `sha256:${"0".repeat(64)}`;
+    }],
+    ["canonical domain registry", (coverage: any) => {
+      coverage.domains.pop();
+    }],
+    ["protected lane", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
+      row.coverage = "shadow";
+      row.target_state = "armed-canary";
+    }],
+    ["mutation policy", (coverage: any) => {
+      coverage.mutation_policy = "recovery-worker-may-widen";
+    }],
+  ])("rejects owner-resigned v2 coverage that violates the %s", (_label, mutate) => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-invalid-v2-coverage-"));
+    const synthetic = syntheticAuthority();
+    const coverage = structuredClone(synthetic.snapshot.coverage) as any;
+    mutate(coverage);
+    coverage.registry_digest = digestJson(coverage, "registry_digest");
+    synthetic.snapshot.coverage = coverage;
+    resignSnapshot(synthetic.snapshot, synthetic.ownerPrivateKey);
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    expect(() => new ConstitutionalRoutingController(
+      root,
+      table.store,
+      authority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    ).begin(plan(table, synthetic.snapshot))).toThrow(/coverage|constitution|protected|mutation|domain/i);
   });
 
   it("durably blocks the target before parsing corrupt recovery material", () => {

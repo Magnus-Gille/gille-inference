@@ -819,6 +819,8 @@ export interface RestoreOnlyCapability {
   releaseRouteFence(fence: RouteFence): void;
   blockRoute(fence: RouteFence): void;
   clearRouteBlock(fence: RouteFence): void;
+  /** Independently reads the serving route digest under the held recovery fence. */
+  readRouteDigest(fence: RouteFence): string;
   /**
    * Implemented by a separately privileged worker. It can write only the
    * pre-registered baseline bound to this journal, never arbitrary bytes.
@@ -878,6 +880,9 @@ export class ConstitutionalRoutingWatchdog {
       this.recovery.blockRoute(routeFence);
       return withLease(this.paths.lock, this.leaseOptions, (lease) => {
       if (!constitutionalResourceExists(this.paths.lock, this.paths.journal)) {
+        if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
+          return { outcome: "terminally-blocked", reason: "durable-target-block-without-journal" };
+        }
         this.recovery.clearRouteBlock(routeFence);
         return { outcome: "noop", reason: "no-journal" };
       }
@@ -907,6 +912,9 @@ export class ConstitutionalRoutingWatchdog {
       if (["commit", "disarm", "terminally-blocked"].includes(last.phase)) {
         if (last.phase === "terminally-blocked" && constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
           try {
+            if (this.recovery.readRouteDigest(routeFence) !== journal.binding.baseline_digest) {
+              return { outcome: "terminally-blocked", reason: "terminal-demoted-baseline-not-restored", journal };
+            }
             const material = loadMaterial(this.paths, journal);
             const snapshot = material.prepared_authority;
             const verified = verifyOwnerAuthorization(snapshot);
