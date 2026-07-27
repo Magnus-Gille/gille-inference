@@ -2764,13 +2764,19 @@ export function initializeGatewayRegistries(
   try {
     initializers.initializeTaskExposureRegistry();
   } catch (err) {
-    throw new Error(`Could not initialize task exposure registry: ${(err as Error).message}`);
+    throw new Error(
+      `Could not initialize task exposure registry: ${(err as Error).message}`,
+      { cause: err },
+    );
   }
   try {
     initializers.ensureRosterProposalSchema();
     initializers.expireRosterProposals();
   } catch (err) {
-    throw new Error(`Could not initialize roster proposal registry: ${(err as Error).message}`);
+    throw new Error(
+      `Could not initialize roster proposal registry: ${(err as Error).message}`,
+      { cause: err },
+    );
   }
 }
 
@@ -2779,8 +2785,8 @@ export function startGateway(
 ): Promise<GatewayHandle> {
   const cfg = loadConfig();
   try {
-    // #257: install the content-blind exposure schema and finish the idempotent retained-log
-    // backfill before the port accepts traffic. The lookup route itself remains strictly read-only.
+    // Install independent task-exposure and roster-proposal registries before
+    // the port accepts traffic; each preserves its own diagnostic cause.
     initializeGatewayRegistries();
   } catch (err) {
     return Promise.reject(err);
