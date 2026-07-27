@@ -80,8 +80,8 @@ function readFlag(args: string[], name: string): string | undefined {
   return value && !value.startsWith("--") ? value : undefined;
 }
 
-export function boundedProtectedRead(path: string, maxBytes = 1_000_000): string {
-  const checked = protectedPath(path);
+export function boundedProtectedRead(path: string, maxBytes = 1_000_000, requiredUid?: number): string {
+  const checked = protectedPath(path, requiredUid);
   const before = lstatSync(checked);
   const fd = openSync(checked, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -127,7 +127,7 @@ function exactKeys(value: unknown, keys: string[]): value is Record<string, unkn
 }
 
 export function loadAuthorityConfig(path: string): AuthorityConfig {
-  const config = JSON.parse(boundedProtectedRead(protectedPath(resolve(path), 0), 64_000)) as unknown;
+  const config = JSON.parse(boundedProtectedRead(protectedPath(resolve(path), 0), 64_000, 0)) as unknown;
   const keys = [
     "schema_version",
     "authorization_path",
@@ -166,7 +166,7 @@ export function loadAuthorityConfig(path: string): AuthorityConfig {
 }
 
 function json(path: string): unknown {
-  return JSON.parse(boundedProtectedRead(protectedPath(path))) as unknown;
+  return JSON.parse(boundedProtectedRead(protectedPath(path, 0), 1_000_000, 0)) as unknown;
 }
 
 interface ProtectedFreshnessRecord {
@@ -224,7 +224,7 @@ function authorityReader(config: AuthorityConfig): ProtectedAuthorityReader {
       coverage: json(config.coverage_path),
       attestations: json(config.owner_attestations_path),
       recoveryRegistry: json(config.recovery_registry_path),
-      pinnedOwnerPublicKeyPem: boundedProtectedRead(protectedPath(config.pinned_owner_public_key_path), 64_000),
+      pinnedOwnerPublicKeyPem: boundedProtectedRead(protectedPath(config.pinned_owner_public_key_path, 0), 64_000, 0),
       checkpoint: json(config.authorization_checkpoint_path),
       runtimeNarrowing: json(config.runtime_narrowing_path),
       runtimeNarrowingCheckpoint: json(config.runtime_narrowing_checkpoint_path),
@@ -476,6 +476,13 @@ export function createControllerRecoverySocketClient(
       }
       return result.applied;
     },
+    clearCandidateDeadline: (candidate, fence): boolean => {
+      const result = transport(socket, "/route/promote", { ...candidate, ...fence });
+      if (!exactKeys(result, ["promoted"]) || typeof result.promoted !== "boolean") {
+        throw new Error("route service returned an invalid closed promotion result");
+      }
+      return result.promoted;
+    },
   };
   const recoveryRegistrar: RecoveryRegistrar = {
     registerPreRecovery: (input) => {
@@ -529,6 +536,12 @@ export function createWatchdogRecoverySocketClient(
       const result = transport(socket, "/route/unblock", fence);
       if (!exactKeys(result, ["changed"]) || result.changed !== true) {
         throw new Error("recovery service refused the route unblock");
+      }
+    },
+    clearCandidateDeadline: (candidate, fence) => {
+      const result = transport(socket, "/route/promote", { ...candidate, ...fence });
+      if (!exactKeys(result, ["promoted"]) || result.promoted !== true) {
+        throw new Error("recovery service refused committed deadline reconciliation");
       }
     },
     readRouteDigest: (fence) => {

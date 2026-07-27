@@ -70,6 +70,14 @@ record and a resource-local serving block before parsing or clock access. The ga
 blocked route database as FRONTIER, so no exception loop can leave a possibly active candidate
 optimistically eligible.
 
+The candidate CAS also persists its exact journal, attempt, binding, target, candidate digest,
+and absolute `not_after` deadline in that same fenced route-database transaction. The serving
+reader independently returns FRONTIER at the deadline even if the watchdog, recovery service, or
+their socket is unavailable; a reboot without a continuous monotonic anchor also fails closed
+rather than trusting a rolled-back RTC. Exact revert clears this record atomically with baseline
+restore. Exact commit first persists its terminal receipt, then clears it through a fenced,
+idempotent reconciliation that the watchdog can repeat after a crash.
+
 The writer mutex is an expiring monotonic fenced lease. Each acquisition advances a durable epoch,
 mints an unguessable token, and records the boot ID. Journal/state writes compare the state lease
 in the same SQLite transaction that mutates the authoritative state resource. The route database
@@ -92,6 +100,8 @@ within the attempt deadline. Only `watch` may wait between timer activations; in
 recovery. The 900-second maximum silence is an independently advancing liveness heartbeat, not a
 synthetic journal phase or receipt cadence. Every watchdog pass rechecks protected liveness,
 current digests, the prepared authority epoch, and the independently bound candidate proof.
+`maxAttempts` is the durable lifetime allowance in the attempt index; `maxAttemptsPerWindow` is a
+separate rolling rate limit. Neither resets the other.
 
 ## Owner-installed configuration
 

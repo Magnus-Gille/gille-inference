@@ -21,7 +21,7 @@ import {
   verifyOwnerAuthorization,
 } from "./autonomy-contract-v1.js";
 import Database from "better-sqlite3";
-import type { RouteFence } from "./constitutional-route-database.js";
+import type { CandidateRouteDeadline, RouteFence } from "./constitutional-route-database.js";
 import type { ConstitutionalLeaseOptions } from "./constitutional-fenced-lease.js";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -78,6 +78,8 @@ export interface RecoveryJournalView {
   targetScopeDigest: string;
   baselineDigest: string;
   candidateDigest: string;
+  attemptId: string;
+  deadline: string;
   descriptorDigest: string;
   ownerAuthorizationDigest: string;
   phase: "prepare" | "unknown" | "revert" | "terminally-blocked" | "disarm" | "commit";
@@ -130,6 +132,8 @@ export function authenticateRecoveryJournal(input: {
     targetScopeDigest: journal.binding.target_scope_digest,
     baselineDigest: journal.binding.baseline_digest,
     candidateDigest: journal.binding.candidate_digest,
+    attemptId: journal.binding.attempt_id,
+    deadline: journal.binding.deadline,
     descriptorDigest: journal.binding.recovery.descriptor_digest,
     ownerAuthorizationDigest: verified.authorizationDigest,
     phase: last.phase,
@@ -141,6 +145,7 @@ export interface RecoveryRoute {
   read(): string;
   acquireWriterLease(options?: ConstitutionalLeaseOptions): RouteLease;
   restoreExact(expectedCandidateDigest: string, baseline: string, fence: RouteFence): boolean;
+  clearCandidateDeadline(candidate: CandidateRouteDeadline, fence: RouteFence): boolean;
 }
 
 interface RouteLease extends RouteFence {
@@ -361,7 +366,7 @@ export class RecoveryRegistry {
 
   applyCandidate(
     request: RouteApplicationRequest,
-    route: RecoveryRoute & { compareAndSwap(expected: string, next: string, fence: RouteFence): boolean },
+    route: RecoveryRoute & { compareAndSwap(expected: string, next: string, fence: RouteFence, candidateDeadline?: CandidateRouteDeadline): boolean },
     authority: RecoveryJournalAuthority,
   ): boolean {
     if (
@@ -392,7 +397,42 @@ export class RecoveryRegistry {
       return route.compareAndSwap(stored.baseline, request.candidate, {
         epoch: request.fenceEpoch,
         token: request.fenceToken,
+      }, {
+        journalId: journal.journalId,
+        attemptId: journal.attemptId,
+        bindingDigest: journal.bindingDigest,
+        targetScopeDigest: journal.targetScopeDigest,
+        candidateDigest: journal.candidateDigest,
+        notAfter: journal.deadline,
       });
+    } finally {
+      db.close();
+    }
+  }
+
+  promoteCandidate(
+    candidate: CandidateRouteDeadline,
+    fence: RouteFence,
+    route: RecoveryRoute,
+    authority: RecoveryJournalAuthority,
+  ): boolean {
+    const db = this.open();
+    try {
+      const row = db.prepare("SELECT record_json FROM recovery_registration WHERE json_extract(record_json, '$.journalId')=?")
+        .get(candidate.journalId) as { record_json: string } | undefined;
+      if (!row) throw new Error("unknown recovery preregistration journal");
+      const stored = JSON.parse(row.record_json) as StoredRegistration;
+      const journal = authority.read(candidate.journalId, stored.protectedAuthority);
+      if (
+        journal.phase !== "commit"
+        || stored.journalId !== candidate.journalId
+        || journal.bindingDigest !== candidate.bindingDigest
+        || journal.targetScopeDigest !== candidate.targetScopeDigest
+        || journal.candidateDigest !== candidate.candidateDigest
+        || journal.attemptId !== candidate.attemptId
+        || journal.deadline !== candidate.notAfter
+      ) throw new Error("candidate promotion is not the exact committed journal");
+      return route.clearCandidateDeadline(candidate, fence);
     } finally {
       db.close();
     }
@@ -419,7 +459,7 @@ export interface RecoveryServiceOptions {
   actionFd?: number;
   registry: RecoveryRegistry;
   route: RecoveryRoute & {
-    compareAndSwap(expected: string, next: string, fence: RouteFence): boolean;
+    compareAndSwap(expected: string, next: string, fence: RouteFence, candidateDeadline?: CandidateRouteDeadline): boolean;
     block(fence: RouteFence): boolean;
     clearBlock(fence: RouteFence): boolean;
   };
@@ -563,6 +603,17 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
           ),
         });
       }
+      if (request.url === "/route/promote") {
+        const candidate = body as CandidateRouteDeadline & RouteFence;
+        requireControllerFence(body);
+        if (
+          typeof body !== "object" || body === null || Array.isArray(body)
+          || Object.keys(body).sort().join(",") !== "attemptId,bindingDigest,candidateDigest,epoch,journalId,notAfter,targetScopeDigest,token"
+        ) throw new Error("invalid closed candidate promotion request");
+        return respond(response, 200, {
+          promoted: options.registry.promoteCandidate(candidate, candidate, options.route, options.journalAuthority),
+        });
+      }
       return respond(response, 404, { error: "not-found" });
     } catch (error) {
       respond(response, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -606,6 +657,17 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
           options.route,
           options.journalAuthority,
         ));
+      }
+      if (request.url === "/route/promote") {
+        const candidate = body as CandidateRouteDeadline & RouteFence;
+        requireRecoveryFence(body);
+        if (
+          typeof body !== "object" || body === null || Array.isArray(body)
+          || Object.keys(body).sort().join(",") !== "attemptId,bindingDigest,candidateDigest,epoch,journalId,notAfter,targetScopeDigest,token"
+        ) throw new Error("invalid closed recovery deadline reconciliation request");
+        return respond(response, 200, {
+          promoted: options.registry.promoteCandidate(candidate, candidate, options.route, options.journalAuthority),
+        });
       }
       if (request.url === "/route/block" || request.url === "/route/unblock") {
         const fence = body as RouteFence;

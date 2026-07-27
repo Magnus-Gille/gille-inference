@@ -36,7 +36,7 @@ import {
   readConstitutionalResource,
   type ConstitutionalLeaseOptions,
 } from "./constitutional-fenced-lease.js";
-import type { RouteFence } from "./constitutional-route-database.js";
+import type { CandidateRouteDeadline, RouteFence } from "./constitutional-route-database.js";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
@@ -50,7 +50,14 @@ export interface ConstitutionalRouteStore {
    * The authoritative resource MUST compare and persist this fence atomically
    * with the value mutation.
    */
-  compareAndSwap(expected: string, next: string, fence: RouteFence): boolean;
+  compareAndSwap(
+    expected: string,
+    next: string,
+    fence: RouteFence,
+    candidateDeadline?: CandidateRouteDeadline,
+  ): boolean;
+  /** Removes the serving deadline only after a durable exact commit. */
+  clearCandidateDeadline(candidateDeadline: CandidateRouteDeadline, fence: RouteFence): boolean;
 }
 
 export interface RouteWriterLease extends RouteFence {
@@ -536,8 +543,14 @@ function enforceAttemptBounds(index: AttemptIndex, plan: RouteMutationPlan, now:
   if (index.attempts.some((attempt) => attempt.attempt_id === plan.attemptId)) {
     throw new Error("constitutional attempt id was already consumed");
   }
+  // maxAttempts is the lifetime budget retained in the durable attempt index;
+  // maxAttemptsPerWindow is an additional rate limit, not an accidental alias
+  // that resets the total budget whenever the time window rolls over.
+  if (index.attempts.length >= policy.maxAttempts) {
+    throw new Error("constitutional attempt budget exhausted");
+  }
   const inWindow = index.attempts.filter((attempt) => nowMs - strictUtc(attempt.started_at) < policy.attemptWindowSeconds * 1000);
-  if (inWindow.length >= policy.maxAttemptsPerWindow || inWindow.length >= policy.maxAttempts) {
+  if (inWindow.length >= policy.maxAttemptsPerWindow) {
     throw new Error("constitutional attempt budget exhausted");
   }
   const latest = index.attempts.at(-1);
@@ -711,7 +724,14 @@ export class ConstitutionalRoutingController {
       }
 
       if (
-        !this.table.compareAndSwap(plan.baseline, plan.candidate, routeFence)
+        !this.table.compareAndSwap(plan.baseline, plan.candidate, routeFence, {
+          journalId: journal.journal_id,
+          attemptId: plan.attemptId,
+          bindingDigest: journal.binding_digest,
+          targetScopeDigest: journal.binding.target_scope_digest,
+          candidateDigest: journal.binding.candidate_digest,
+          notAfter: journal.binding.deadline,
+        })
         || sha(this.table.read()) !== binding.candidate_digest
       ) {
         return this.unknown(journal, plan, "apply-or-candidate-readback-failed", lease);
@@ -741,10 +761,26 @@ export class ConstitutionalRoutingController {
   }
 
   commit(): { outcome: "committed" | "unknown"; journal: JournalV2; reason?: string } {
-    return withRouteAndStateLease(this.paths.lock, this.table, this.leaseOptions, (lease, _routeFence) => {
+    return withRouteAndStateLease(this.paths.lock, this.table, this.leaseOptions, (lease, routeFence) => {
       const journal = loadJournal(this.paths);
       const material = loadMaterial(this.paths, journal);
       const plan = material.plan;
+      const candidateDeadline: CandidateRouteDeadline = {
+        journalId: journal.journal_id,
+        attemptId: plan.attemptId,
+        bindingDigest: journal.binding_digest,
+        targetScopeDigest: journal.binding.target_scope_digest,
+        candidateDigest: journal.binding.candidate_digest,
+        notAfter: journal.binding.deadline,
+      };
+      // Commit is durable before it makes the candidate non-expiring. A retry
+      // after a crash in that narrow post-receipt window is exact and safe.
+      if (journal.entries.at(-1)?.phase === "commit") {
+        if (!this.table.clearCandidateDeadline(candidateDeadline, routeFence)) {
+          throw new Error("committed candidate deadline could not be cleared at the serving resource");
+        }
+        return { outcome: "committed", journal };
+      }
       if (journal.entries.at(-1)?.phase !== "watch") {
         throw new Error("constitutional commit does not match an in-flight watch");
       }
@@ -767,6 +803,9 @@ export class ConstitutionalRoutingController {
       }
       append(journal, "commit", "committed", journal.binding.controller_identity, gate.now, "canary-watch-complete", plan.contentRef);
       saveAndValidate(this.paths, journal, gate, true, lease);
+      if (!this.table.clearCandidateDeadline(candidateDeadline, routeFence)) {
+        throw new Error("committed candidate deadline could not be cleared at the serving resource");
+      }
       return { outcome: "committed", journal };
     });
   }
@@ -819,6 +858,8 @@ export interface RestoreOnlyCapability {
   releaseRouteFence(fence: RouteFence): void;
   blockRoute(fence: RouteFence): void;
   clearRouteBlock(fence: RouteFence): void;
+  /** Clears an exact committed candidate's serving deadline. */
+  clearCandidateDeadline(candidateDeadline: CandidateRouteDeadline, fence: RouteFence): void;
   /** Independently reads the serving route digest under the held recovery fence. */
   readRouteDigest(fence: RouteFence): string;
   /**
@@ -900,38 +941,32 @@ export class ConstitutionalRoutingWatchdog {
       const last = journal.entries.at(-1);
       if (!last) return { outcome: "terminally-blocked", reason: "empty-journal" };
       if (["commit", "disarm", "terminally-blocked"].includes(last.phase)) {
-        if (last.phase === "terminally-blocked" && constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
+        if (last.phase === "commit") {
           try {
-            if (this.recovery.readRouteDigest(routeFence) !== journal.binding.baseline_digest) {
-              return { outcome: "terminally-blocked", reason: "terminal-demoted-baseline-not-restored", journal };
-            }
-            const material = loadMaterial(this.paths, journal);
-            const snapshot = material.prepared_authority;
-            const verified = verifyOwnerAuthorization(snapshot);
-            const demotion = lease.transition(() => this.recovery.signAndPersistDemotion({
+            this.recovery.clearCandidateDeadline({
               journalId: journal.journal_id,
-              ownerAuthorizationDigest: verified.authorizationDigest,
-              domain: "micro-routing",
+              attemptId: journal.binding.attempt_id,
+              bindingDigest: journal.binding_digest,
               targetScopeDigest: journal.binding.target_scope_digest,
-              journalReceiptDigest: last.receipt_digest,
-              fenceEpoch: routeFence.epoch,
-              fenceToken: routeFence.token,
-            }));
-            this.requirePersistedDemotion(
-              demotion,
-              journal.binding.target_scope_digest,
-              last.receipt_digest,
-            );
-            lease.removeResource(this.paths.targetBlock);
-            this.recovery.clearRouteBlock(routeFence);
-            return { outcome: "noop", reason: "terminal-signed-demotion-reconciled", journal };
+              candidateDigest: journal.binding.candidate_digest,
+              notAfter: journal.binding.deadline,
+            }, routeFence);
           } catch (error) {
+            this.recovery.blockRoute(routeFence);
             return {
               outcome: "terminally-blocked",
-              reason: `terminal-signed-demotion-pending:${error instanceof Error ? error.message : String(error)}`,
+              reason: `committed-deadline-reconciliation-pending:${error instanceof Error ? error.message : String(error)}`,
               journal,
             };
           }
+        }
+        if (last.phase === "terminally-blocked" && constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
+          // Terminal means terminal. In particular, a signer failure after a
+          // successful exact restore must not become an unbounded signer retry
+          // loop. The durable terminal receipt plus resource-local block leaves
+          // an explicit owner reconciliation ceremony as the only next action.
+          this.recovery.blockRoute(routeFence);
+          return { outcome: "terminally-blocked", reason: "terminal-owner-reconciliation-required", journal };
         }
         if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
         if (last.phase !== "terminally-blocked") this.recovery.clearRouteBlock(routeFence);

@@ -34,7 +34,7 @@ const registration = (): RecoveryRegistrationRequest => ({
   descriptorDigest: `sha256:${"3".repeat(64)}`,
 });
 
-function journalAuthority(phase: "prepare" | "unknown" | "revert" = "prepare") {
+function journalAuthority(phase: "prepare" | "unknown" | "revert" | "commit" = "prepare") {
   let currentPhase = phase;
   let currentProtectedAuthority = { epoch: "prepared-authority" };
   const preparedProtectedAuthority = structuredClone(currentProtectedAuthority);
@@ -54,6 +54,8 @@ function journalAuthority(phase: "prepare" | "unknown" | "revert" = "prepare") {
         targetScopeDigest: `sha256:${"2".repeat(64)}`,
         baselineDigest: digest(baseline),
         candidateDigest: digest(candidate),
+        attemptId: "micro-route-attempt",
+        deadline: "2030-07-26T01:10:00Z",
         descriptorDigest: `sha256:${"3".repeat(64)}`,
         ownerAuthorizationDigest: `sha256:${"5".repeat(64)}`,
         phase: currentPhase,
@@ -62,7 +64,7 @@ function journalAuthority(phase: "prepare" | "unknown" | "revert" = "prepare") {
       },
       protectedAuthority: () => structuredClone(currentProtectedAuthority),
     },
-    setPhase: (next: "prepare" | "unknown" | "revert") => { currentPhase = next; },
+    setPhase: (next: "prepare" | "unknown" | "revert" | "commit") => { currentPhase = next; },
     rotateAuthority: () => { currentProtectedAuthority = { epoch: "rotated-authority" }; },
   };
 }
@@ -99,6 +101,9 @@ function route(initial: string) {
       current = next;
       return true;
     },
+    clearCandidateDeadline: (_candidate: unknown, suppliedFence: { epoch: number; token: string }) => (
+      suppliedFence.epoch === currentFence.epoch && suppliedFence.token === currentFence.token
+    ),
     compareAndSwap: (expected: string, next: string, suppliedFence: { epoch: number; token: string }) => {
       if (suppliedFence.epoch !== currentFence.epoch || suppliedFence.token !== currentFence.token) return false;
       if (current !== expected) return false;
@@ -233,6 +238,32 @@ describe("recovery-owned preregistration", () => {
       ...fence,
     }, live, journal.authority)).toThrow(/exact eligible unknown journal receipt/);
     expect(live.read()).toBe(candidate);
+  });
+
+  it("clears a candidate serving deadline only for the exact durable commit", () => {
+    const registry = new RecoveryRegistry(mkdtempSync(join(tmpdir(), "constitutional-recovery-")));
+    const live = route(baseline);
+    const journal = journalAuthority();
+    registry.register(registration(), live, journal.authority);
+    const lease = live.acquireWriterLease();
+    journal.setPhase("commit");
+    expect(registry.promoteCandidate({
+      journalId: "micro-route-journal",
+      attemptId: "micro-route-attempt",
+      bindingDigest: `sha256:${"1".repeat(64)}`,
+      targetScopeDigest: `sha256:${"2".repeat(64)}`,
+      candidateDigest: digest(candidate),
+      notAfter: "2030-07-26T01:10:00Z",
+    }, { epoch: lease.epoch, token: lease.token }, live, journal.authority)).toBe(true);
+    expect(() => registry.promoteCandidate({
+      journalId: "micro-route-journal",
+      attemptId: "forged-attempt",
+      bindingDigest: `sha256:${"1".repeat(64)}`,
+      targetScopeDigest: `sha256:${"2".repeat(64)}`,
+      candidateDigest: digest(candidate),
+      notAfter: "2030-07-26T01:10:00Z",
+    }, { epoch: lease.epoch, token: lease.token }, live, journal.authority)).toThrow(/exact committed journal/);
+    lease.release();
   });
 
   it("replays safely after a crash between exact restore and consumed-state commit", () => {
