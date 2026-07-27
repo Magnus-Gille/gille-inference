@@ -25,16 +25,19 @@ import {
   getRosterProposalForPrincipal,
   isCanonicalRosterUtc,
   liveCatalogueIdentity,
+  rosterDigest,
   rosterProposalEvents,
+  serverRosterObservationDigest,
+  templateIdentityDigest,
   restoreDescriptorDigest,
   canaryRegistryDigest,
   type RosterAdmissionDependencies,
   type RosterCandidateEntry,
   type RosterProposal,
-  type ServerBaselineEntryIdentity,
-  type ServerRosterBackendCapability,
   type ServerCanaryDefinition,
   type ServerRestoreDescriptor,
+  type ServerRosterObservation,
+  type ServerRosterObservationToken,
 } from "../src/homeserver/roster-proposal.js";
 
 const now = "2026-07-27T15:00:00Z";
@@ -164,19 +167,86 @@ function canaryDefinition(
 function desiredIdentity(
   modelId: string,
   contextLength: number,
-): ServerBaselineEntryIdentity {
+): ServerRosterObservation["desired_roster"][number] {
   const entry = candidate({ model_id: modelId, alias: modelId, context_length: contextLength });
   return {
-    modelId,
+    model_id: modelId,
     alias: modelId,
-    contextLength,
-    artifactDigest: entry.artifact_digest,
-    servingConfigDigest: entry.serving_config_digest,
-    templateDigest: entry.template_digest,
+    context_length: contextLength,
+    artifact_digest: entry.artifact_digest,
+    serving_config_digest: entry.serving_config_digest,
+    template_digest: entry.template_digest,
     quantization: entry.quantization,
-    evidenceIdentityHash: entry.evidence_identity_hash,
-    restoreDescriptorRef: entry.restore_descriptor_ref,
-    restoreDescriptorDigest: entry.restore_descriptor_digest,
+    evidence_identity_hash: entry.evidence_identity_hash,
+    restore_descriptor_ref: entry.restore_descriptor_ref,
+    restore_descriptor_digest: entry.restore_descriptor_digest,
+  };
+}
+
+function serverObservation(
+  models: ModelInfo[] = liveModels,
+  overrides: Partial<Omit<ServerRosterObservation, "observation_digest">> = {},
+): ServerRosterObservation {
+  const backend = overrides.backend_capability?.backend ?? "lmstudio";
+  const capability = backendCapabilityIdentity(backend);
+  const unsigned: Omit<ServerRosterObservation, "observation_digest"> = {
+    schema_version: "gille-roster-server-observation-v1",
+    observed_at: "2026-07-27T14:59:30Z",
+    observation_epoch: "epoch:test:v1",
+    catalogue: models.map((model) => ({
+      model_id: model.key,
+      type: model.type,
+      quantization: model.quantization ?? null,
+    })).sort((left, right) => left.model_id.localeCompare(right.model_id)),
+    backend_capability: {
+      backend: capability.backend,
+      supported_operations: [...capability.supportedOperations],
+      alias_control: capability.aliasControl,
+      context_control: capability.contextControl,
+      capability_digest: capability.capabilityDigest,
+    },
+    desired_roster: models
+      .filter((model) => model.loaded)
+      .map((model) => desiredIdentity(model.key, model.loadedContext ?? 1))
+      .sort((left, right) => left.model_id.localeCompare(right.model_id)),
+    resident_model_ids: models.map((model) => model.key).sort(),
+    running_model_ids: models
+      .filter((model) => model.loaded)
+      .map((model) => model.key)
+      .sort(),
+    ...overrides,
+  };
+  return {
+    ...unsigned,
+    observation_digest: serverRosterObservationDigest(unsigned),
+  };
+}
+
+function tokenFor(observation: ServerRosterObservation): ServerRosterObservationToken {
+  return {
+    schema_version: "gille-roster-server-observation-token-v1",
+    observation_epoch: observation.observation_epoch,
+    observation_digest: observation.observation_digest,
+  };
+}
+
+function fenceFor(
+  observation: ServerRosterObservation,
+): RosterAdmissionDependencies["withServerObservationFence"] {
+  return <T>(
+    _expected: ServerRosterObservationToken,
+    callback: (confirmedToken: unknown) => T,
+  ): T => callback(tokenFor(observation));
+}
+
+function depsForObservation(
+  base: RosterAdmissionDependencies,
+  observation: ServerRosterObservation,
+): RosterAdmissionDependencies {
+  return {
+    ...base,
+    readServerObservation: async () => structuredClone(observation),
+    withServerObservationFence: fenceFor(observation),
   };
 }
 
@@ -245,36 +315,31 @@ function observationDeps(
   base: RosterAdmissionDependencies,
   models: ModelInfo[],
 ): RosterAdmissionDependencies {
-  return {
-    ...base,
-    readCatalogue: async () => models,
-    readDesiredRoster: async () => models
-      .filter((model) => model.loaded)
-      .map((model) => desiredIdentity(model.key, model.loadedContext ?? 1)),
-    readResidentModelIds: async () => models.map((model) => model.key).sort(),
-    readRunningModelIds: async () => models
-      .filter((model) => model.loaded)
-      .map((model) => model.key)
-      .sort(),
-  };
+  const observation = serverObservation(models);
+  return depsForObservation(base, observation);
 }
 
 beforeEach(() => {
   db = new Database(":memory:");
   const evidence = snapshot();
+  const observation = serverObservation();
   deps = {
-    readCatalogue: vi.fn(async () => structuredClone(liveModels)),
+    readServerObservation: vi.fn(async () => structuredClone(observation)),
+    withServerObservationFence: vi.fn(fenceFor(observation)),
     readEvidence: vi.fn((hash) => hash === evidence.identityHash ? structuredClone(evidence) : null),
-    readDesiredRoster: vi.fn(async () => [desiredIdentity("qwen-main", 8_192)]),
-    readResidentModelIds: vi.fn(async () => ["qwen-main"]),
-    readRunningModelIds: vi.fn(async () => ["qwen-main"]),
-    readCandidateTemplateIdentity: vi.fn((modelId) => ({
-      modelId,
-      digest: evidenceBundle.renderedPrompt.kind === "digest"
-        ? evidenceBundle.renderedPrompt.digest
-        : "",
-      observedAt: "2026-07-27T14:59:00Z",
-    })),
+    readCandidateTemplateIdentity: vi.fn((modelId) => {
+      const identity = {
+        modelId,
+        digest: evidenceBundle.renderedPrompt.kind === "digest"
+          ? evidenceBundle.renderedPrompt.digest
+          : "",
+        observedAt: "2026-07-27T14:59:00Z",
+      };
+      return {
+        ...identity,
+        identityDigest: templateIdentityDigest(identity),
+      };
+    }),
     resolveRestoreDescriptor: vi.fn((ref) => {
       const candidates = [
         candidate(),
@@ -297,8 +362,6 @@ beforeEach(() => {
           definition.registryId === id && definition.registryVersion === version,
       ) ?? null;
     }),
-    readBackendCapability: vi.fn(async (): Promise<ServerRosterBackendCapability> =>
-      backendCapabilityIdentity("lmstudio")),
     now: () => new Date(now),
   };
 });
@@ -332,10 +395,7 @@ describe("gille roster-proposal v1 contract", () => {
       ROSTER_PROPOSAL_PRINCIPAL,
       {
         db,
-        dependencies: {
-          ...deps,
-          readCatalogue: async () => [],
-        },
+        dependencies: observationDeps(deps, []),
       },
     );
     expect(result.kind).toBe("rejected");
@@ -366,7 +426,7 @@ describe("gille roster-proposal v1 contract", () => {
     expect(result.record.admissionDigest).toMatch(/^sha256:/);
     expect(rosterProposalEvents(result.record.proposalId, db).map((event) => event.state))
       .toEqual(["submitted", "accepted", "armed"]);
-    expect(deps.readCatalogue).toHaveBeenCalledTimes(1);
+    expect(deps.readServerObservation).toHaveBeenCalledTimes(1);
     expect(deps.readEvidence).toHaveBeenCalledTimes(1);
   });
 
@@ -377,7 +437,7 @@ describe("gille roster-proposal v1 contract", () => {
     if (first.kind === "armed" && retry.kind === "existing") {
       expect(retry.record.recordId).toBe(first.record.recordId);
     }
-    expect(deps.readCatalogue).toHaveBeenCalledTimes(1);
+    expect(deps.readServerObservation).toHaveBeenCalledTimes(1);
 
     const changed = proposal({
       canary: {
@@ -447,8 +507,11 @@ describe("fail-closed admission and durable lifecycle", () => {
   }
 
   it("durably rejects catalogue outage and baseline mismatch", async () => {
-    const outage = { ...deps, readCatalogue: async () => { throw new Error("offline"); } };
-    expect(await reasonFor(proposal(), outage)).toBe("CATALOGUE_UNAVAILABLE");
+    const outage = {
+      ...deps,
+      readServerObservation: async () => { throw new Error("offline"); },
+    };
+    expect(await reasonFor(proposal(), outage)).toBe("ROSTER_OBSERVER_UNAVAILABLE");
     expect(rosterProposalEvents(proposal().proposal_id, db).map((event) => event.state))
       .toEqual(["submitted", "rejected"]);
 
@@ -657,9 +720,12 @@ describe("fail-closed admission and durable lifecycle", () => {
     })).toBe("BASELINE_RESTORE_MISMATCH");
 
     db = new Database(":memory:");
+    const staleObservation = serverObservation(models, {
+      resident_model_ids: ["fallback"],
+      running_model_ids: ["fallback"],
+    });
     expect(await reasonFor(input, {
-      ...observed,
-      readResidentModelIds: async () => ["fallback"],
+      ...depsForObservation(observed, staleObservation),
     })).toBe("BASELINE_NON_RESIDENT");
   });
 
@@ -684,16 +750,16 @@ describe("fail-closed admission and durable lifecycle", () => {
           context_length: 4_096,
         });
       const desired = [firstEntry, secondEntry].map((entry) => ({
-        modelId: entry.model_id,
+        model_id: entry.model_id,
         alias: entry.alias,
-        contextLength: entry.context_length,
-        artifactDigest: entry.artifact_digest,
-        servingConfigDigest: entry.serving_config_digest,
-        templateDigest: entry.template_digest,
+        context_length: entry.context_length,
+        artifact_digest: entry.artifact_digest,
+        serving_config_digest: entry.serving_config_digest,
+        template_digest: entry.template_digest,
         quantization: entry.quantization,
-        evidenceIdentityHash: entry.evidence_identity_hash,
-        restoreDescriptorRef: entry.restore_descriptor_ref,
-        restoreDescriptorDigest: entry.restore_descriptor_digest,
+        evidence_identity_hash: entry.evidence_identity_hash,
+        restore_descriptor_ref: entry.restore_descriptor_ref,
+        restore_descriptor_digest: entry.restore_descriptor_digest,
       }));
       const baseline = liveCatalogueIdentity(models);
       const input = proposal({
@@ -704,14 +770,136 @@ describe("fail-closed admission and durable lifecycle", () => {
           roster_digest: candidateRosterDigest([firstEntry, secondEntry]),
         },
       });
-      expect(await reasonFor(input, {
-        ...deps,
-        readCatalogue: async () => models,
-        readDesiredRoster: async () => desired,
-        readResidentModelIds: async () => ["qwen-main", "second"],
-      })).toBe("BASELINE_DUPLICATE");
+      const observation = serverObservation(models, {
+        desired_roster: desired,
+        resident_model_ids: ["qwen-main", "second"],
+      });
+      expect(await reasonFor(
+        input,
+        depsForObservation(deps, observation),
+      )).toBe("BASELINE_DUPLICATE");
     },
   );
+
+  it("rejects duplicate catalogue keys and running models outside residency", async () => {
+    const base = serverObservation();
+    const duplicateCatalogue = serverObservation(liveModels, {
+      catalogue: [...base.catalogue, { ...base.catalogue[0]! }],
+    });
+    expect(await reasonFor(
+      proposal(),
+      depsForObservation(deps, duplicateCatalogue),
+    )).toBe("ROSTER_OBSERVATION_INVALID");
+
+    db = new Database(":memory:");
+    const second: ModelInfo = {
+      key: "second",
+      type: "llm",
+      displayName: "Second",
+      loaded: false,
+      loadedContext: null,
+      quantization: "q4-k-m",
+    };
+    const invalidRuntime = serverObservation([...liveModels, second], {
+      resident_model_ids: ["qwen-main"],
+      running_model_ids: ["qwen-main", "second"],
+    });
+    expect(await reasonFor(
+      proposal({
+        baseline: {
+          ...proposal().baseline,
+          catalogue_digest: liveCatalogueIdentity([...liveModels, second]).catalogueDigest,
+        },
+      }),
+      depsForObservation(deps, invalidRuntime),
+    )).toBe("ROSTER_OBSERVATION_INVALID");
+  });
+
+  it.each([
+    ["digest drift", () => ({
+      ...serverObservation(),
+      observation_digest: contentDigest("wrong-observation"),
+    })],
+    ["unknown field", () => ({
+      ...serverObservation(),
+      private_locator: "/must/not/cross",
+    })],
+    ["noncanonical observation time", () => {
+      const base = serverObservation();
+      const { observation_digest: _oldDigest, ...unsigned } = {
+        ...base,
+        observed_at: "2026-07-27T14:59:30.000Z",
+      };
+      return {
+        ...unsigned,
+        observation_digest: serverRosterObservationDigest(unsigned),
+      };
+    }],
+    ["future observation time", () => {
+      const base = serverObservation();
+      const { observation_digest: _oldDigest, ...unsigned } = {
+        ...base,
+        observed_at: "2026-07-27T15:00:06Z",
+      };
+      return {
+        ...unsigned,
+        observation_digest: serverRosterObservationDigest(unsigned),
+      };
+    }],
+    ["desired roster overflow", () => {
+      const base = serverObservation();
+      const unsigned = {
+        ...base,
+        desired_roster: Array.from({ length: 65 }, (_, index) => ({
+          ...base.desired_roster[0]!,
+          model_id: `model:${String(index).padStart(3, "0")}`,
+          alias: `alias:${String(index).padStart(3, "0")}`,
+        })),
+      };
+      const { observation_digest: _oldDigest, ...withoutDigest } = unsigned;
+      return {
+        ...withoutDigest,
+        observation_digest: serverRosterObservationDigest(withoutDigest),
+      };
+    }],
+  ])("rejects closed observation %s", async (_label, makeObservation) => {
+    expect(await reasonFor(proposal(), {
+      ...deps,
+      readServerObservation: async () => makeObservation(),
+    })).toBe("ROSTER_OBSERVATION_INVALID");
+  });
+
+  it("rejects a self-consistent but noncanonical backend capability claim", async () => {
+    const maliciousCapability = {
+      schema_version: "gille-roster-backend-capability-v1" as const,
+      backend: "llamaswap" as const,
+      supported_operations: ["load", "unload", "reload-config"] as const,
+      alias_control: false,
+      context_control: false,
+    };
+    const maliciousDigest = rosterDigest(maliciousCapability);
+    const observation = serverObservation(liveModels, {
+      backend_capability: {
+        backend: "llamaswap",
+        supported_operations: [...maliciousCapability.supported_operations],
+        alias_control: false,
+        context_control: false,
+        capability_digest: maliciousDigest,
+      },
+    });
+    const input = proposal({
+      delta: {
+        operation: "reload-config",
+        model_id: "qwen-main",
+        backend: "llamaswap",
+        backend_capability_digest: maliciousDigest,
+      },
+    });
+    expect(await reasonFor(
+      input,
+      depsForObservation(deps, observation),
+    )).toBe("BACKEND_CAPABILITY_MISMATCH");
+  });
 
   it("rejects a backend-unsupported reload/config mutation", async () => {
     const capability = backendCapabilityIdentity("llamaswap");
@@ -727,10 +915,19 @@ describe("fail-closed admission and durable lifecycle", () => {
         operation: "reload-config",
       },
     });
-    expect(await reasonFor(input, {
-      ...deps,
-      readBackendCapability: async () => capability,
-    })).toBe("UNSUPPORTED_OPERATION");
+    const observation = serverObservation(liveModels, {
+      backend_capability: {
+        backend: capability.backend,
+        supported_operations: [...capability.supportedOperations],
+        alias_control: capability.aliasControl,
+        context_control: capability.contextControl,
+        capability_digest: capability.capabilityDigest,
+      },
+    });
+    expect(await reasonFor(
+      input,
+      depsForObservation(deps, observation),
+    )).toBe("UNSUPPORTED_OPERATION");
   });
 
   it("rejects missing, incomplete, stale, and mismatched evidence", async () => {
@@ -812,9 +1009,9 @@ describe("fail-closed admission and durable lifecycle", () => {
       db,
       dependencies: {
         ...deps,
-        readCatalogue: async () => {
+        readServerObservation: async () => {
           await Promise.resolve();
-          return structuredClone(liveModels);
+          return structuredClone(serverObservation());
         },
         now: () => clock.shift() ?? new Date("2026-07-27T15:00:01Z"),
       },
@@ -824,8 +1021,178 @@ describe("fail-closed admission and durable lifecycle", () => {
       expect(result.record.reasonCode).toBe("PROPOSAL_EXPIRED");
       expect(result.record.updatedAt).toBe("2026-07-27T15:00:01Z");
       expect(result.record.baselineSnapshot?.observed_at)
-        .toBe("2026-07-27T15:00:01Z");
+        .toBe("2026-07-27T14:59:30Z");
+      expect(result.record.decisionAt).toBe("2026-07-27T15:00:01Z");
     }
+  });
+
+  it.each([
+    ["new epoch", (initial: ServerRosterObservation) => ({
+      ...tokenFor(initial),
+      observation_epoch: "epoch:test:v2",
+    })],
+    ["new digest", (initial: ServerRosterObservation) => ({
+      ...tokenFor(initial),
+      observation_digest: contentDigest("changed-observation"),
+    })],
+    ["malformed token", (_initial: ServerRosterObservation) => ({})],
+  ])("rejects a fenced pre-commit %s without arming", async (caseName, confirmedTokenForCase) => {
+    const initial = serverObservation();
+    const id = caseName.replace(" ", "-");
+    const result = await admitRosterProposal(
+      proposal({
+        proposal_id: `proposal:w5:fence-${id}`,
+        idempotency_key: `idem:w5:fence-${id}`,
+      }),
+      ROSTER_PROPOSAL_PRINCIPAL,
+      {
+        db,
+        dependencies: {
+          ...depsForObservation(deps, initial),
+          withServerObservationFence: <T>(
+            _expected: ServerRosterObservationToken,
+            callback: (rawConfirmedToken: unknown) => T,
+          ): T => callback(confirmedTokenForCase(initial)),
+        },
+      },
+    );
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode).toBe(
+        caseName === "malformed token"
+          ? "OBSERVATION_REVALIDATION_UNAVAILABLE"
+          : "OBSERVATION_CHANGED",
+      );
+      expect(result.record.state).toBe("rejected");
+      expect(result.record.baselineSnapshot?.observation_epoch)
+        .toBe(initial.observation_epoch);
+    }
+    expect(rosterProposalEvents(`proposal:w5:fence-${id}`, db))
+      .toEqual([
+        { sequence: 1, state: "submitted", reasonCode: null },
+        {
+          sequence: 2,
+          state: "rejected",
+          reasonCode: caseName === "malformed token"
+            ? "OBSERVATION_REVALIDATION_UNAVAILABLE"
+            : "OBSERVATION_CHANGED",
+        },
+      ]);
+  });
+
+  it("prevents a retained fence callback from mutating after the provider returns", async () => {
+    const observation = serverObservation();
+    let retained: ((confirmedToken: unknown) => unknown) | null = null;
+    const result = await admitRosterProposal(
+      proposal({
+        proposal_id: "proposal:w5:fence-retained",
+        idempotency_key: "idem:w5:fence-retained",
+      }),
+      ROSTER_PROPOSAL_PRINCIPAL,
+      {
+        db,
+        dependencies: {
+          ...depsForObservation(deps, observation),
+          withServerObservationFence: <T>(
+            _expected: ServerRosterObservationToken,
+            callback: (confirmedToken: unknown) => T,
+          ): T => {
+            retained = callback as (confirmedToken: unknown) => unknown;
+            return undefined as T;
+          },
+        },
+      },
+    );
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode)
+        .toBe("OBSERVATION_REVALIDATION_UNAVAILABLE");
+    }
+    expect(retained).not.toBeNull();
+    expect(() => retained!(tokenFor(observation)))
+      .toThrow("escaped its synchronous lifetime");
+    const persisted = getRosterProposalForPrincipal(
+      ROSTER_PROPOSAL_PRINCIPAL,
+      "proposal:w5:fence-retained",
+      db,
+      new Date(now),
+    );
+    expect(persisted?.state).toBe("rejected");
+    expect(rosterProposalEvents("proposal:w5:fence-retained", db))
+      .toHaveLength(2);
+  });
+
+  it("rolls back an armed callback when a provider invokes the fence twice", async () => {
+    const observation = serverObservation();
+    const result = await admitRosterProposal(
+      proposal({
+        proposal_id: "proposal:w5:fence-twice",
+        idempotency_key: "idem:w5:fence-twice",
+      }),
+      ROSTER_PROPOSAL_PRINCIPAL,
+      {
+        db,
+        dependencies: {
+          ...depsForObservation(deps, observation),
+          withServerObservationFence: <T>(
+            _expected: ServerRosterObservationToken,
+            callback: (confirmedToken: unknown) => T,
+          ): T => {
+            callback(tokenFor(observation));
+            return callback(tokenFor(observation));
+          },
+        },
+      },
+    );
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode)
+        .toBe("OBSERVATION_REVALIDATION_UNAVAILABLE");
+      expect(result.record.state).toBe("rejected");
+    }
+    expect(rosterProposalEvents("proposal:w5:fence-twice", db)
+      .map((event) => event.state))
+      .toEqual(["submitted", "rejected"]);
+  });
+
+  it("rolls back an armed callback when a provider returns a thenable", async () => {
+    const observation = serverObservation();
+    const result = await admitRosterProposal(
+      proposal({
+        proposal_id: "proposal:w5:fence-thenable",
+        idempotency_key: "idem:w5:fence-thenable",
+      }),
+      ROSTER_PROPOSAL_PRINCIPAL,
+      {
+        db,
+        dependencies: {
+          ...depsForObservation(deps, observation),
+          withServerObservationFence: <T>(
+            _expected: ServerRosterObservationToken,
+            callback: (confirmedToken: unknown) => T,
+          ): T => {
+            callback(tokenFor(observation));
+            return Promise.resolve(undefined) as T;
+          },
+        },
+      },
+    );
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode)
+        .toBe("OBSERVATION_REVALIDATION_UNAVAILABLE");
+      expect(result.record.state).toBe("rejected");
+    }
+    const events = rosterProposalEvents("proposal:w5:fence-thenable", db);
+    expect(events).toEqual([
+      { sequence: 1, state: "submitted", reasonCode: null },
+      {
+        sequence: 2,
+        state: "rejected",
+        reasonCode: "OBSERVATION_REVALIDATION_UNAVAILABLE",
+      },
+    ]);
+    expect(events.some((event) => event.state === "armed")).toBe(false);
   });
 
   it("rejects an incoherent protected clock before any decision write", async () => {
@@ -914,6 +1281,8 @@ describe("fail-closed admission and durable lifecycle", () => {
     );
     expect(expired?.state).toBe("expired");
     expect(expired?.reasonCode).toBe("TTL_EXPIRED");
+    expect(expired?.decisionAt).toBe(now);
+    expect(expired?.updatedAt).toBe("2026-07-27T16:00:01Z");
     expect(rosterProposalEvents(proposal().proposal_id, db).map((event) => event.state))
       .toEqual(["submitted", "accepted", "armed", "expired"]);
   });
@@ -926,7 +1295,7 @@ describe("fail-closed admission and durable lifecycle", () => {
   it("fails closed when observer, restore, or canary registries are unavailable", async () => {
     expect(await reasonFor(proposal(), {
       ...deps,
-      readDesiredRoster: async () => null,
+      readServerObservation: async () => null,
     })).toBe("ROSTER_OBSERVER_UNAVAILABLE");
 
     db = new Database(":memory:");

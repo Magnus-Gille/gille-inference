@@ -24,12 +24,16 @@ import {
   canonicalRosterProposalDigest,
   canaryRegistryDigest,
   liveCatalogueIdentity,
+  serverRosterObservationDigest,
+  templateIdentityDigest,
   restoreDescriptorDigest,
   type RosterAdmissionDependencies,
   type RosterCandidateEntry,
   type RosterProposal,
   type ServerCanaryDefinition,
   type ServerRestoreDescriptor,
+  type ServerRosterObservation,
+  type ServerRosterObservationToken,
 } from "../src/homeserver/roster-proposal.js";
 import { listKeys, rotateKey } from "../src/homeserver/keystore.js";
 
@@ -255,28 +259,65 @@ beforeAll(async () => {
     expires_at: expires,
   };
   proposalBody = { ...unsigned, proposal_digest: canonicalRosterProposalDigest(unsigned) };
-  rosterDependencies = {
-    readCatalogue: async () => models.map((model) => ({ ...model })),
-    readEvidence: (hash) => getEvidenceIdentitySnapshot(hash),
-    readDesiredRoster: async () => [{
-      modelId: entry.model_id,
+  const backendCapability = backendCapabilityIdentity("llamaswap");
+  const observationUnsigned: Omit<ServerRosterObservation, "observation_digest"> = {
+    schema_version: "gille-roster-server-observation-v1",
+    observed_at: new Date().toISOString().replace(".000Z", "Z"),
+    observation_epoch: "epoch:http:v1",
+    catalogue: models.map((model) => ({
+      model_id: model.key,
+      type: model.type,
+      quantization: null,
+    })),
+    backend_capability: {
+      backend: backendCapability.backend,
+      supported_operations: [...backendCapability.supportedOperations],
+      alias_control: backendCapability.aliasControl,
+      context_control: backendCapability.contextControl,
+      capability_digest: backendCapability.capabilityDigest,
+    },
+    desired_roster: [{
+      model_id: entry.model_id,
       alias: entry.alias,
-      contextLength: entry.context_length,
-      artifactDigest: entry.artifact_digest,
-      servingConfigDigest: entry.serving_config_digest,
-      templateDigest: entry.template_digest,
+      context_length: entry.context_length,
+      artifact_digest: entry.artifact_digest,
+      serving_config_digest: entry.serving_config_digest,
+      template_digest: entry.template_digest,
       quantization: entry.quantization,
-      evidenceIdentityHash: entry.evidence_identity_hash,
-      restoreDescriptorRef: entry.restore_descriptor_ref,
-      restoreDescriptorDigest: entry.restore_descriptor_digest,
+      evidence_identity_hash: entry.evidence_identity_hash,
+      restore_descriptor_ref: entry.restore_descriptor_ref,
+      restore_descriptor_digest: entry.restore_descriptor_digest,
     }],
-    readResidentModelIds: async () => ["qwen-main", "second"],
-    readRunningModelIds: async () => ["qwen-main"],
-    readCandidateTemplateIdentity: (modelId) => ({
-      modelId,
-      digest: template.digest,
-      observedAt: new Date().toISOString().replace(".000Z", "Z"),
-    }),
+    resident_model_ids: ["qwen-main", "second"],
+    running_model_ids: ["qwen-main"],
+  };
+  const observation: ServerRosterObservation = {
+    ...observationUnsigned,
+    observation_digest: serverRosterObservationDigest(observationUnsigned),
+  };
+  const observationToken: ServerRosterObservationToken = {
+    schema_version: "gille-roster-server-observation-token-v1",
+    observation_epoch: observation.observation_epoch,
+    observation_digest: observation.observation_digest,
+  };
+  rosterDependencies = {
+    readServerObservation: async () => structuredClone(observation),
+    withServerObservationFence: <T>(
+      _expected: ServerRosterObservationToken,
+      callback: (confirmedToken: unknown) => T,
+    ): T => callback(observationToken),
+    readEvidence: (hash) => getEvidenceIdentitySnapshot(hash),
+    readCandidateTemplateIdentity: (modelId) => {
+      const identity = {
+        modelId,
+        digest: template.digest,
+        observedAt: new Date().toISOString().replace(".000Z", "Z"),
+      };
+      return {
+        ...identity,
+        identityDigest: templateIdentityDigest(identity),
+      };
+    },
     resolveRestoreDescriptor: (ref) => {
       const candidate = [entry, addedEntry].find(
         (item) => item.restore_descriptor_ref === ref,
@@ -287,7 +328,6 @@ beforeAll(async () => {
       id === canaryDefinition.registryId && version === canaryDefinition.registryVersion
         ? canaryDefinition
         : null,
-    readBackendCapability: async () => backendCapabilityIdentity("llamaswap"),
     now: () => new Date(),
   };
 

@@ -1,8 +1,9 @@
 /**
  * W5 roster-proposal admission.
  *
- * This module deliberately owns no actuator. It can read the live catalogue and
- * content-addressed evidence, then persist a content-blind proposal lifecycle.
+ * This module deliberately owns no actuator. It validates one atomic,
+ * epoch-bound server observation plus content-addressed evidence, then persists
+ * a content-blind proposal lifecycle under the provider's synchronous fence.
  * It does not import model load/unload/download, routing, deploy, restart, key,
  * config-writer, or artifact-writer primitives.
  */
@@ -20,8 +21,7 @@ import {
   getEvidenceIdentitySnapshot,
   type EvidenceIdentitySnapshot,
 } from "./evidence-identity-store.js";
-import { loadConfig } from "./config.js";
-import { listModels, type ModelInfo } from "./model-admin.js";
+import type { ModelInfo } from "./model-admin.js";
 
 export const ROSTER_PROPOSAL_CONTRACT_VERSION = "gille-roster-proposal-v1" as const;
 export const ROSTER_PROPOSAL_SCHEMA_EPOCH = "gille-roster-admission-schema-v1" as const;
@@ -172,23 +172,11 @@ export const rosterProposalSchema = proposalWithoutDigestSchema.extend({
 export type RosterProposal = z.infer<typeof rosterProposalSchema>;
 export type RosterCandidateEntry = z.infer<typeof candidateEntrySchema>;
 
-export interface ServerBaselineEntryIdentity {
-  modelId: string;
-  alias: string;
-  contextLength: number | null;
-  artifactDigest: string;
-  servingConfigDigest: string;
-  templateDigest: string;
-  quantization: string;
-  evidenceIdentityHash: string;
-  restoreDescriptorRef: string;
-  restoreDescriptorDigest: string;
-}
-
 export interface ServerTemplateIdentity {
   modelId: string;
   digest: string;
   observedAt: string;
+  identityDigest: string;
 }
 
 export interface ServerRestoreDescriptor {
@@ -229,9 +217,53 @@ const baselineEntrySchema = z.object({
   restore_descriptor_digest: digestSchema,
 }).strict();
 
+const observedCatalogueEntrySchema = z.object({
+  model_id: idSchema,
+  type: idSchema,
+  quantization: idSchema.nullable(),
+}).strict();
+
+const observedBackendCapabilitySchema = z.object({
+  backend: z.enum(["llamaswap", "lmstudio"]),
+  supported_operations: z.array(
+    z.enum(["load", "unload", "reload-config"]),
+  ).min(1).max(3),
+  alias_control: z.boolean(),
+  context_control: z.boolean(),
+  capability_digest: digestSchema,
+}).strict();
+
+const serverRosterObservationWithoutDigestSchema = z.object({
+  schema_version: z.literal("gille-roster-server-observation-v1"),
+  observed_at: timestampSchema,
+  observation_epoch: idSchema,
+  catalogue: z.array(observedCatalogueEntrySchema).max(256),
+  backend_capability: observedBackendCapabilitySchema,
+  desired_roster: z.array(baselineEntrySchema).max(64),
+  resident_model_ids: z.array(idSchema).max(64),
+  running_model_ids: z.array(idSchema).max(64),
+}).strict();
+
+export const serverRosterObservationSchema =
+  serverRosterObservationWithoutDigestSchema.extend({
+    observation_digest: digestSchema,
+  }).strict();
+
+export const serverRosterObservationTokenSchema = z.object({
+  schema_version: z.literal("gille-roster-server-observation-token-v1"),
+  observation_epoch: idSchema,
+  observation_digest: digestSchema,
+}).strict();
+
+export type ServerRosterObservation = z.infer<typeof serverRosterObservationSchema>;
+export type ServerRosterObservationToken =
+  z.infer<typeof serverRosterObservationTokenSchema>;
+
 const baselineSnapshotWithoutDigestSchema = z.object({
   schema_version: z.literal("gille-roster-baseline-v1"),
   observed_at: timestampSchema,
+  observation_epoch: idSchema,
+  observation_digest: digestSchema,
   backend: z.enum(["llamaswap", "lmstudio"]),
   backend_capability_digest: digestSchema,
   catalogue_digest: digestSchema,
@@ -249,6 +281,12 @@ export type DurableRosterBaselineSnapshot = z.infer<typeof baselineSnapshotSchem
 
 export function rosterDigest(value: unknown): string {
   return `sha256:${createHash("sha256").update(jcsCanonicalize(value), "utf8").digest("hex")}`;
+}
+
+export function serverRosterObservationDigest(
+  observation: Omit<ServerRosterObservation, "observation_digest">,
+): string {
+  return rosterDigest(observation);
 }
 
 export function canonicalRosterProposalDigest(
@@ -275,6 +313,17 @@ export function restoreDescriptorDigest(
     serving_config_digest: descriptor.servingConfigDigest,
     evidence_identity_hash: descriptor.evidenceIdentityHash,
     ref: descriptor.ref,
+  });
+}
+
+export function templateIdentityDigest(
+  identity: Omit<ServerTemplateIdentity, "identityDigest">,
+): string {
+  return rosterDigest({
+    schema_version: "gille-roster-template-identity-v1",
+    model_id: identity.modelId,
+    template_digest: identity.digest,
+    observed_at: identity.observedAt,
   });
 }
 
@@ -357,6 +406,9 @@ export const ROSTER_REJECTION_REASONS = [
   "BASELINE_NON_RESIDENT",
   "BASELINE_RESTORE_UNAVAILABLE",
   "BASELINE_RESTORE_MISMATCH",
+  "ROSTER_OBSERVATION_INVALID",
+  "OBSERVATION_REVALIDATION_UNAVAILABLE",
+  "OBSERVATION_CHANGED",
   "BACKEND_CAPABILITY_MISMATCH",
   "BACKEND_CONFIG_MISMATCH",
   "UNSUPPORTED_OPERATION",
@@ -388,6 +440,8 @@ export interface DurableRosterProposal {
   reasonCode: RosterRejectionReason | "TTL_EXPIRED" | null;
   createdAt: string;
   expiresAt: string;
+  /** Final protected-clock time at which the durable decision was persisted. */
+  decisionAt: string;
   updatedAt: string;
   normalizedDelta: RosterProposal["delta"];
   proposal: RosterProposal;
@@ -408,9 +462,11 @@ interface ProposalRow {
   reason_code: string | null;
   created_at: string;
   expires_at: string;
+  decision_at: string;
   updated_at: string;
   created_at_ms: number;
   expires_at_ms: number;
+  decision_at_ms: number;
   updated_at_ms: number;
   proposal_json: string;
   delta_json: string;
@@ -437,9 +493,11 @@ function ensureSchema(db: Database.Database): void {
       reason_code TEXT,
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
+      decision_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       created_at_ms INTEGER NOT NULL,
       expires_at_ms INTEGER NOT NULL,
+      decision_at_ms INTEGER NOT NULL,
       updated_at_ms INTEGER NOT NULL,
       proposal_json TEXT NOT NULL,
       delta_json TEXT NOT NULL,
@@ -461,6 +519,40 @@ function ensureSchema(db: Database.Database): void {
       PRIMARY KEY (proposal_id, sequence)
     );
   `);
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(roster_proposals)").all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!columns.has("decision_at")) {
+    db.exec("ALTER TABLE roster_proposals ADD COLUMN decision_at TEXT");
+  }
+  if (!columns.has("decision_at_ms")) {
+    db.exec("ALTER TABLE roster_proposals ADD COLUMN decision_at_ms INTEGER");
+  }
+  db.exec(`
+    UPDATE roster_proposals
+       SET decision_at = COALESCE(
+             decision_at,
+             (SELECT recorded_at
+                FROM roster_proposal_events
+               WHERE roster_proposal_events.proposal_id = roster_proposals.proposal_id
+                 AND state IN ('armed', 'rejected')
+               ORDER BY sequence DESC LIMIT 1),
+             updated_at
+           )
+     WHERE decision_at IS NULL
+  `);
+  const missingDecisionTimes = db.prepare(`
+    SELECT proposal_id, decision_at
+      FROM roster_proposals
+     WHERE decision_at_ms IS NULL
+  `).all() as Array<{ proposal_id: string; decision_at: string }>;
+  const backfillDecisionTime = db.prepare(`
+    UPDATE roster_proposals SET decision_at_ms = ? WHERE proposal_id = ?
+  `);
+  for (const row of missingDecisionTimes) {
+    backfillDecisionTime.run(Date.parse(row.decision_at), row.proposal_id);
+  }
   initialized.add(db);
 }
 
@@ -481,6 +573,13 @@ export class RosterProposalStateCorruptError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RosterProposalStateCorruptError";
+  }
+}
+
+class ServerObservationFenceProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ServerObservationFenceProtocolError";
   }
 }
 
@@ -521,6 +620,13 @@ function rowToRecord(
       baseline_snapshot_digest: baseline?.success
         ? baseline.data.snapshot_digest
         : null,
+      observation_epoch: baseline?.success
+        ? baseline.data.observation_epoch
+        : null,
+      observation_digest: baseline?.success
+        ? baseline.data.observation_digest
+        : null,
+      decision_at: row.decision_at,
       normalized_delta: delta,
     })
     : "";
@@ -544,8 +650,11 @@ function rowToRecord(
     || row.expires_at !== parsed.data.expires_at
     || row.created_at_ms !== Date.parse(row.created_at)
     || row.expires_at_ms !== Date.parse(row.expires_at)
+    || row.decision_at_ms !== Date.parse(row.decision_at)
     || row.updated_at_ms !== Date.parse(row.updated_at)
+    || !isCanonicalRosterUtc(row.decision_at)
     || !isCanonicalRosterUtc(row.updated_at)
+    || row.decision_at_ms > row.updated_at_ms
     || jcsCanonicalize(JSON.parse(row.delta_json)) !== jcsCanonicalize(parsed.data.delta)
     || canonicalRosterProposalDigest((() => {
       const unsigned = { ...parsed.data } as Partial<RosterProposal>;
@@ -610,6 +719,7 @@ function rowToRecord(
     reasonCode: row.reason_code as DurableRosterProposal["reasonCode"],
     createdAt: row.created_at,
     expiresAt: row.expires_at,
+    decisionAt: row.decision_at,
     updatedAt: row.updated_at,
     normalizedDelta: parsed.data.delta,
     proposal: parsed.data,
@@ -622,7 +732,8 @@ const selectColumns = `
   record_id, proposal_id, principal_id, credential_binding_digest,
   producer_id, idempotency_key,
   proposal_digest, axis, state, reason_code, created_at, expires_at,
-  updated_at, created_at_ms, expires_at_ms, updated_at_ms,
+  decision_at, updated_at, created_at_ms, expires_at_ms,
+  decision_at_ms, updated_at_ms,
   proposal_json, delta_json
   , baseline_json, baseline_digest, admission_digest
 `;
@@ -731,31 +842,45 @@ export function rosterProposalEvents(
 }
 
 export interface RosterAdmissionDependencies {
-  readCatalogue(): Promise<ModelInfo[]>;
+  /**
+   * One atomic provider observation. The admission layer validates this unknown
+   * value as a closed, content-addressed object before using any field.
+   */
+  readServerObservation(): Promise<unknown>;
+  /**
+   * Synchronous provider fence. The provider must hold the same local lock
+   * honored by every roster/backend mutator while it confirms the current
+   * token and invokes the callback. The callback performs the final protected
+   * checks and SQLite transaction before that lock is released.
+   */
+  withServerObservationFence<T>(
+    expectedToken: ServerRosterObservationToken,
+    callback: (confirmedToken: unknown) => T,
+  ): T;
   readEvidence(identityHash: string): EvidenceIdentitySnapshot | null;
-  readDesiredRoster(): Promise<ServerBaselineEntryIdentity[] | null>;
-  readResidentModelIds(): Promise<string[] | null>;
-  readRunningModelIds(): Promise<string[] | null>;
   readCandidateTemplateIdentity(modelId: string): ServerTemplateIdentity | null;
   resolveRestoreDescriptor(ref: string): ServerRestoreDescriptor | null;
   resolveCanary(registryId: string, registryVersion: string): ServerCanaryDefinition | null;
-  readBackendCapability(): Promise<ServerRosterBackendCapability>;
   now(): Date;
 }
 
 const defaultDependencies: RosterAdmissionDependencies = {
-  readCatalogue: listModels,
+  // No backend currently exposes an atomic, epoch-bound observation over all
+  // five required values. Production therefore fails closed until #113
+  // supplies this boundary.
+  readServerObservation: async () => null,
+  withServerObservationFence: () => {
+    throw new RosterProposalContractError(
+      "server observation fence unavailable",
+    );
+  },
   readEvidence: (hash) => getEvidenceIdentitySnapshot(hash),
   // No backend currently exposes a stable, server-observed template identity.
   // Admission therefore stays unavailable in production instead of deriving or
   // guessing one from per-request rendered-prompt evidence.
-  readDesiredRoster: async () => null,
-  readResidentModelIds: async () => null,
-  readRunningModelIds: async () => null,
   readCandidateTemplateIdentity: () => null,
   resolveRestoreDescriptor: () => null,
   resolveCanary: () => null,
-  readBackendCapability: async () => backendCapabilityIdentity(loadConfig().backend),
   now: () => new Date(),
 };
 
@@ -810,101 +935,134 @@ function digestIdentity(
     : null;
 }
 
-async function buildServerBaselineSnapshot(
-  models: ModelInfo[],
-  deps: RosterAdmissionDependencies,
-  backendCapability: ServerRosterBackendCapability,
-  now: Date,
-): Promise<DurableRosterBaselineSnapshot | null> {
-  const live = liveCatalogueIdentity(models);
-  const desired = await deps.readDesiredRoster();
-  const residentModelIds = await deps.readResidentModelIds();
-  const runningModelIds = await deps.readRunningModelIds();
-  if (desired === null || residentModelIds === null || runningModelIds === null) {
-    return null;
-  }
-  const configured = new Set(models.map((model) => model.key));
-  const entries: DurableRosterBaselineSnapshot["entries"] = [];
-  for (const identity of desired) {
-    if (
-      !configured.has(identity.modelId)
-      || identity.contextLength === null
-      || !Number.isSafeInteger(identity.contextLength)
-      || identity.contextLength <= 0
-      || !/^sha256:[a-f0-9]{64}$/.test(identity.artifactDigest)
-      || !/^sha256:[a-f0-9]{64}$/.test(identity.servingConfigDigest)
-      || !/^sha256:[a-f0-9]{64}$/.test(identity.templateDigest)
-      || !/^sha256:[a-f0-9]{64}$/.test(identity.evidenceIdentityHash)
-      || !/^sha256:[a-f0-9]{64}$/.test(identity.restoreDescriptorRef)
-      || !/^sha256:[a-f0-9]{64}$/.test(identity.restoreDescriptorDigest)
-    ) return null;
-    entries.push({
-      model_id: identity.modelId,
-      alias: identity.alias,
-      context_length: identity.contextLength,
-      artifact_digest: identity.artifactDigest,
-      serving_config_digest: identity.servingConfigDigest,
-      template_digest: identity.templateDigest,
-      quantization: identity.quantization,
-      evidence_identity_hash: identity.evidenceIdentityHash,
-      restore_descriptor_ref: identity.restoreDescriptorRef,
-      restore_descriptor_digest: identity.restoreDescriptorDigest,
-    });
-  }
-  entries.sort((left, right) => left.model_id.localeCompare(right.model_id));
-  const resident = [...new Set(residentModelIds)].sort();
-  const running = [...new Set(runningModelIds)].sort();
-  if (
-    resident.length !== residentModelIds.length
-    || running.length !== runningModelIds.length
-    || resident.some((id) => !configured.has(id))
-    || running.some((id) => !configured.has(id))
-  ) return null;
-  const withoutDigest: Omit<DurableRosterBaselineSnapshot, "snapshot_digest"> = {
-    schema_version: "gille-roster-baseline-v1",
-    observed_at: now.toISOString().replace(".000Z", "Z"),
-    backend: backendCapability.backend,
-    backend_capability_digest: backendCapability.capabilityDigest,
-    catalogue_digest: live.catalogueDigest,
-    roster_digest: candidateRosterDigest(entries),
-    resident_model_ids: resident,
-    running_model_ids: running,
-    entries,
-  };
-  return {
-    ...withoutDigest,
-    snapshot_digest: rosterDigest(withoutDigest),
-  };
+interface ValidatedServerObservation {
+  observation: ServerRosterObservation;
+  baselineSnapshot: DurableRosterBaselineSnapshot;
+  backendCapability: ServerRosterBackendCapability;
 }
 
-function restampBaselineSnapshot(
-  snapshot: DurableRosterBaselineSnapshot | null,
+function isUnique(values: readonly string[]): boolean {
+  return new Set(values).size === values.length;
+}
+
+function isCanonicalOrder(values: readonly string[]): boolean {
+  return [...values].sort().join("\0") === values.join("\0");
+}
+
+function validateServerObservation(
+  raw: unknown,
   now: Date,
-): DurableRosterBaselineSnapshot | null {
-  if (snapshot === null) return null;
-  const { snapshot_digest: _oldDigest, observed_at: _oldObservedAt, ...stable } = snapshot;
-  const withoutDigest: Omit<DurableRosterBaselineSnapshot, "snapshot_digest"> = {
-    ...stable,
-    observed_at: now.toISOString().replace(".000Z", "Z"),
+): { value: ValidatedServerObservation | null; reason: RosterRejectionReason | null } {
+  const parsed = serverRosterObservationSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { value: null, reason: "ROSTER_OBSERVATION_INVALID" };
+  }
+  const observation = parsed.data;
+  const unsigned = { ...observation } as Partial<ServerRosterObservation>;
+  delete unsigned.observation_digest;
+  if (
+    serverRosterObservationDigest(
+      unsigned as Omit<ServerRosterObservation, "observation_digest">,
+    ) !== observation.observation_digest
+    || Date.parse(observation.observed_at) > now.getTime() + CLOCK_SKEW_MS
+  ) {
+    return { value: null, reason: "ROSTER_OBSERVATION_INVALID" };
+  }
+
+  const catalogueIds = observation.catalogue.map((entry) => entry.model_id);
+  const desiredIds = observation.desired_roster.map((entry) => entry.model_id);
+  const desiredAliases = observation.desired_roster.map((entry) => entry.alias);
+  const residentIds = observation.resident_model_ids;
+  const runningIds = observation.running_model_ids;
+  if (
+    !isUnique(catalogueIds)
+    || !isUnique(residentIds)
+    || !isUnique(runningIds)
+    || !isCanonicalOrder(catalogueIds)
+    || !isCanonicalOrder(desiredIds)
+    || !isCanonicalOrder(residentIds)
+    || !isCanonicalOrder(runningIds)
+  ) {
+    return { value: null, reason: "ROSTER_OBSERVATION_INVALID" };
+  }
+  if (!isUnique(desiredIds) || !isUnique(desiredAliases)) {
+    return { value: null, reason: "BASELINE_DUPLICATE" };
+  }
+
+  const configured = new Set(catalogueIds);
+  const resident = new Set(residentIds);
+  if (
+    desiredIds.some((id) => !configured.has(id))
+    || residentIds.some((id) => !configured.has(id))
+    || runningIds.some((id) => !configured.has(id) || !resident.has(id))
+  ) {
+    return { value: null, reason: "ROSTER_OBSERVATION_INVALID" };
+  }
+  if (desiredIds.some((id) => !resident.has(id))) {
+    return { value: null, reason: "BASELINE_NON_RESIDENT" };
+  }
+
+  const expectedCapability =
+    backendCapabilityIdentity(observation.backend_capability.backend);
+  const observedCapability = observation.backend_capability;
+  if (
+    observedCapability.capability_digest !== expectedCapability.capabilityDigest
+    || observedCapability.alias_control !== expectedCapability.aliasControl
+    || observedCapability.context_control !== expectedCapability.contextControl
+    || observedCapability.supported_operations.join("\0")
+      !== expectedCapability.supportedOperations.join("\0")
+  ) {
+    return { value: null, reason: "BACKEND_CAPABILITY_MISMATCH" };
+  }
+
+  const withoutSnapshotDigest: Omit<
+    DurableRosterBaselineSnapshot,
+    "snapshot_digest"
+  > = {
+    schema_version: "gille-roster-baseline-v1",
+    observed_at: observation.observed_at,
+    observation_epoch: observation.observation_epoch,
+    observation_digest: observation.observation_digest,
+    backend: expectedCapability.backend,
+    backend_capability_digest: expectedCapability.capabilityDigest,
+    catalogue_digest: rosterDigest({ catalogue: observation.catalogue }),
+    roster_digest: candidateRosterDigest(observation.desired_roster),
+    resident_model_ids: [...residentIds],
+    running_model_ids: [...runningIds],
+    entries: observation.desired_roster.map((entry) => ({ ...entry })),
   };
   return {
-    ...withoutDigest,
-    snapshot_digest: rosterDigest(withoutDigest),
+    value: {
+      observation,
+      backendCapability: expectedCapability,
+      baselineSnapshot: {
+        ...withoutSnapshotDigest,
+        snapshot_digest: rosterDigest(withoutSnapshotDigest),
+      },
+    },
+    reason: null,
   };
 }
 
 function semanticDecision(
   proposal: RosterProposal,
-  models: ModelInfo[] | null,
+  observation: ValidatedServerObservation | null,
+  observationFailureReason: RosterRejectionReason | null,
   baselineSnapshot: DurableRosterBaselineSnapshot | null,
   backendCapability: ServerRosterBackendCapability | null,
   deps: RosterAdmissionDependencies,
-  now: Date,
+  timing: Array<{
+    observedAtMs: number;
+    maxAgeMs: number;
+    reason: "EVIDENCE_STALE" | "TEMPLATE_IDENTITY_MISMATCH";
+  }>,
 ): RosterRejectionReason | null {
-  if (Date.parse(proposal.expires_at) <= now.getTime()) return "PROPOSAL_EXPIRED";
-  if (models === null) return "CATALOGUE_UNAVAILABLE";
-  const live = liveCatalogueIdentity(models);
-  if (live.catalogueDigest !== proposal.baseline.catalogue_digest) {
+  if (observationFailureReason !== null) return observationFailureReason;
+  if (observation === null) return "ROSTER_OBSERVER_UNAVAILABLE";
+  const catalogue = observation.observation.catalogue;
+  if (
+    rosterDigest({ catalogue }) !== proposal.baseline.catalogue_digest
+  ) {
     return "BASELINE_MISMATCH";
   }
   if (baselineSnapshot === null) return "ROSTER_OBSERVER_UNAVAILABLE";
@@ -967,7 +1125,7 @@ function semanticDecision(
   const aliases = proposal.candidate.entries.map((entry) => entry.alias);
   if (new Set(aliases).size !== aliases.length) return "DUPLICATE_ALIAS";
 
-  const byId = new Map(models.map((model) => [model.key, model]));
+  const byId = new Map(catalogue.map((model) => [model.model_id, model]));
   for (const entry of proposal.candidate.entries) {
     const model = byId.get(entry.model_id);
     if (!model) return "UNKNOWN_MODEL";
@@ -993,10 +1151,11 @@ function semanticDecision(
       || artifactIdentity.origin !== "server-observed"
     ) return "NON_RESIDENT_MODEL";
     if (evidenceIdentityDisclosure(evidence.bundle) !== "complete") return "EVIDENCE_INCOMPLETE";
-    if (
-      lastSeenAt > now.getTime() + CLOCK_SKEW_MS
-      || now.getTime() - lastSeenAt > proposal.evidence.freshness_seconds * 1_000
-    ) return "EVIDENCE_STALE";
+    timing.push({
+      observedAtMs: lastSeenAt,
+      maxAgeMs: proposal.evidence.freshness_seconds * 1_000,
+      reason: "EVIDENCE_STALE",
+    });
     const artifact = digestIdentity(evidence.bundle, "modelArtifact");
     const config = digestIdentity(evidence.bundle, "configEpoch");
     const template = deps.readCandidateTemplateIdentity(entry.model_id);
@@ -1010,12 +1169,20 @@ function semanticDecision(
     if (!template) return "TEMPLATE_IDENTITY_UNAVAILABLE";
     const templateObservedAt = Date.parse(template.observedAt);
     if (
-      template.modelId !== entry.model_id
+      template.identityDigest !== templateIdentityDigest({
+        modelId: template.modelId,
+        digest: template.digest,
+        observedAt: template.observedAt,
+      })
+      || template.modelId !== entry.model_id
       || template.digest !== entry.template_digest
       || !isCanonicalRosterUtc(template.observedAt)
-      || templateObservedAt > now.getTime() + CLOCK_SKEW_MS
-      || now.getTime() - templateObservedAt > proposal.evidence.freshness_seconds * 1_000
     ) return "TEMPLATE_IDENTITY_MISMATCH";
+    timing.push({
+      observedAtMs: templateObservedAt,
+      maxAgeMs: proposal.evidence.freshness_seconds * 1_000,
+      reason: "TEMPLATE_IDENTITY_MISMATCH",
+    });
     const descriptor = deps.resolveRestoreDescriptor(entry.restore_descriptor_ref);
     if (!descriptor) return "RESTORE_DESCRIPTOR_UNAVAILABLE";
     if (
@@ -1127,7 +1294,28 @@ function semanticDecision(
   return null;
 }
 
-function insertDecision(
+function finalTimeDecision(
+  proposal: RosterProposal,
+  timing: ReadonlyArray<{
+    observedAtMs: number;
+    maxAgeMs: number;
+    reason: "EVIDENCE_STALE" | "TEMPLATE_IDENTITY_MISMATCH";
+  }>,
+  now: Date,
+): RosterRejectionReason | null {
+  if (Date.parse(proposal.expires_at) <= now.getTime()) {
+    return "PROPOSAL_EXPIRED";
+  }
+  for (const observation of timing) {
+    if (
+      observation.observedAtMs > now.getTime() + CLOCK_SKEW_MS
+      || now.getTime() - observation.observedAtMs > observation.maxAgeMs
+    ) return observation.reason;
+  }
+  return null;
+}
+
+function insertDecisionLocked(
   proposal: RosterProposal,
   principalId: string,
   credentialBindingDigest: string,
@@ -1137,95 +1325,120 @@ function insertDecision(
   db: Database.Database,
 ): RosterAdmissionResult {
   const at = now.toISOString().replace(".000Z", "Z");
-  return db.transaction(() => {
-    expireRosterProposals(now, db);
-    const collision = findCollision(db, proposal);
-    if (collision) {
-      return isExactRetry(collision, principalId, proposal)
-        ? { kind: "existing" as const, record: collision }
-        : { kind: "conflict" as const };
-    }
-    let finalReason = reason;
-    if (finalReason === null) {
-      const active = db.prepare(`
+  expireRosterProposals(now, db);
+  const collision = findCollision(db, proposal);
+  if (collision) {
+    return isExactRetry(collision, principalId, proposal)
+      ? { kind: "existing" as const, record: collision }
+      : { kind: "conflict" as const };
+  }
+  let finalReason = reason;
+  if (finalReason === null) {
+    const active = db.prepare(`
         SELECT proposal_id FROM roster_proposals
          WHERE axis = ? AND state = 'armed' LIMIT 1
       `).get(ROSTER_PROPOSAL_AXIS);
-      if (active) finalReason = "ACTIVE_PROPOSAL_EXISTS";
-    }
-    const recordId = randomUUID();
-    const state = finalReason === null ? "armed" : "rejected";
-    if (finalReason === null && baselineSnapshot === null) {
-      throw new RosterProposalStateCorruptError(
-        "cannot arm without a server-derived baseline",
-      );
-    }
-    const admissionDigest = rosterDigest({
-      proposal_digest: proposal.proposal_digest,
-      authenticated_principal_id: principalId,
-      credential_binding_digest: credentialBindingDigest,
-      baseline_snapshot_digest: baselineSnapshot?.snapshot_digest ?? null,
-      normalized_delta: proposal.delta,
-    });
-    db.prepare(`
+    if (active) finalReason = "ACTIVE_PROPOSAL_EXISTS";
+  }
+  const recordId = randomUUID();
+  const state = finalReason === null ? "armed" : "rejected";
+  if (finalReason === null && baselineSnapshot === null) {
+    throw new RosterProposalStateCorruptError(
+      "cannot arm without a server-derived baseline",
+    );
+  }
+  const admissionDigest = rosterDigest({
+    proposal_digest: proposal.proposal_digest,
+    authenticated_principal_id: principalId,
+    credential_binding_digest: credentialBindingDigest,
+    baseline_snapshot_digest: baselineSnapshot?.snapshot_digest ?? null,
+    observation_epoch: baselineSnapshot?.observation_epoch ?? null,
+    observation_digest: baselineSnapshot?.observation_digest ?? null,
+    decision_at: at,
+    normalized_delta: proposal.delta,
+  });
+  db.prepare(`
       INSERT INTO roster_proposals (
         record_id, proposal_id, principal_id, credential_binding_digest,
         producer_id, idempotency_key,
         proposal_digest, axis, state, reason_code, created_at, expires_at,
-        updated_at, created_at_ms, expires_at_ms, updated_at_ms,
+        decision_at, updated_at, created_at_ms, expires_at_ms,
+        decision_at_ms, updated_at_ms,
         proposal_json, delta_json, baseline_json, baseline_digest,
         admission_digest
       ) VALUES (
         @recordId, @proposalId, @principalId, @credentialBindingDigest,
         @producerId, @idempotencyKey,
         @proposalDigest, @axis, @state, @reasonCode, @createdAt, @expiresAt,
-        @updatedAt, @createdAtMs, @expiresAtMs, @updatedAtMs,
+        @decisionAt, @updatedAt, @createdAtMs, @expiresAtMs,
+        @decisionAtMs, @updatedAtMs,
         @proposalJson, @deltaJson, @baselineJson, @baselineDigest,
         @admissionDigest
       )
-    `).run({
-      recordId,
-      proposalId: proposal.proposal_id,
-      principalId,
-      credentialBindingDigest,
-      producerId: proposal.producer.instance_id,
-      idempotencyKey: proposal.idempotency_key,
-      proposalDigest: proposal.proposal_digest,
-      axis: ROSTER_PROPOSAL_AXIS,
-      state,
-      reasonCode: finalReason,
-      createdAt: proposal.created_at,
-      expiresAt: proposal.expires_at,
-      updatedAt: at,
-      createdAtMs: Date.parse(proposal.created_at),
-      expiresAtMs: Date.parse(proposal.expires_at),
-      updatedAtMs: now.getTime(),
-      proposalJson: JSON.stringify(proposal),
-      deltaJson: JSON.stringify(proposal.delta),
-      baselineJson: baselineSnapshot === null
-        ? null
-        : JSON.stringify(baselineSnapshot),
-      baselineDigest: baselineSnapshot?.snapshot_digest ?? null,
-      admissionDigest,
-    });
-    const events: Array<[RosterProposalState, string | null]> = finalReason === null
-      ? [["submitted", null], ["accepted", null], ["armed", null]]
-      : [["submitted", null], ["rejected", finalReason]];
-    for (const [index, [eventState, eventReason]] of events.entries()) {
-      db.prepare(`
+  `).run({
+    recordId,
+    proposalId: proposal.proposal_id,
+    principalId,
+    credentialBindingDigest,
+    producerId: proposal.producer.instance_id,
+    idempotencyKey: proposal.idempotency_key,
+    proposalDigest: proposal.proposal_digest,
+    axis: ROSTER_PROPOSAL_AXIS,
+    state,
+    reasonCode: finalReason,
+    createdAt: proposal.created_at,
+    expiresAt: proposal.expires_at,
+    decisionAt: at,
+    updatedAt: at,
+    createdAtMs: Date.parse(proposal.created_at),
+    expiresAtMs: Date.parse(proposal.expires_at),
+    decisionAtMs: now.getTime(),
+    updatedAtMs: now.getTime(),
+    proposalJson: JSON.stringify(proposal),
+    deltaJson: JSON.stringify(proposal.delta),
+    baselineJson: baselineSnapshot === null
+      ? null
+      : JSON.stringify(baselineSnapshot),
+    baselineDigest: baselineSnapshot?.snapshot_digest ?? null,
+    admissionDigest,
+  });
+  const events: Array<[RosterProposalState, string | null]> = finalReason === null
+    ? [["submitted", null], ["accepted", null], ["armed", null]]
+    : [["submitted", null], ["rejected", finalReason]];
+  for (const [index, [eventState, eventReason]] of events.entries()) {
+    db.prepare(`
         INSERT INTO roster_proposal_events
           (proposal_id, sequence, state, reason_code, recorded_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(proposal.proposal_id, index + 1, eventState, eventReason, at);
-    }
-    const row = db.prepare(`
+  }
+  const row = db.prepare(`
       SELECT ${selectColumns} FROM roster_proposals WHERE proposal_id = ?
     `).get(proposal.proposal_id) as ProposalRow;
-    const record = rowToRecord(row, db);
-    return finalReason === null
-      ? { kind: "armed" as const, record }
-      : { kind: "rejected" as const, record };
-  }).immediate();
+  const record = rowToRecord(row, db);
+  return finalReason === null
+    ? { kind: "armed" as const, record }
+    : { kind: "rejected" as const, record };
+}
+
+function persistRejectedOutsideFence(
+  proposal: RosterProposal,
+  principalId: string,
+  credentialBindingDigest: string,
+  reason: RosterRejectionReason,
+  baselineSnapshot: DurableRosterBaselineSnapshot | null,
+  now: Date,
+  db: Database.Database,
+): RosterAdmissionResult {
+  return db.transaction(() => insertDecisionLocked(
+    proposal,
+    principalId,
+    credentialBindingDigest,
+    reason,
+    baselineSnapshot,
+    now,
+    db,
+  )).immediate();
 }
 
 export async function admitRosterProposal(
@@ -1280,46 +1493,179 @@ export async function admitRosterProposal(
       ? { kind: "existing", record: existing }
       : { kind: "conflict" };
   }
-  let models: ModelInfo[] | null = null;
-  let baselineSnapshot: DurableRosterBaselineSnapshot | null = null;
-  let backendCapability: ServerRosterBackendCapability | null = null;
+  let rawObservation: unknown = null;
+  let observationReadFailed = false;
   try {
-    models = await deps.readCatalogue();
-    backendCapability = await deps.readBackendCapability();
-    baselineSnapshot = await buildServerBaselineSnapshot(
-      models,
-      deps,
-      backendCapability,
-      startedAt,
-    );
+    rawObservation = await deps.readServerObservation();
   } catch {
-    models = null;
+    observationReadFailed = true;
   }
-  const finalNow = deps.now();
-  if (
-    !Number.isFinite(finalNow.getTime())
-    || finalNow.getTime() < startedAt.getTime()
-  ) {
-    throw new RosterProposalContractError(
-      "protected admission clock became incoherent",
+  const validated = observationReadFailed || rawObservation === null
+    ? { value: null, reason: "ROSTER_OBSERVER_UNAVAILABLE" as RosterRejectionReason }
+    : validateServerObservation(rawObservation, startedAt);
+  const observation = validated.value;
+  if (observation === null) {
+    const decisionNow = deps.now();
+    if (
+      !Number.isFinite(decisionNow.getTime())
+      || decisionNow.getTime() < startedAt.getTime()
+    ) {
+      throw new RosterProposalContractError(
+        "protected admission clock became incoherent",
+      );
+    }
+    const reason = Date.parse(proposal.expires_at) <= decisionNow.getTime()
+      ? "PROPOSAL_EXPIRED"
+      : validated.reason ?? "ROSTER_OBSERVER_UNAVAILABLE";
+    return persistRejectedOutsideFence(
+      proposal,
+      authenticatedPrincipalId,
+      credentialBindingDigest,
+      reason,
+      null,
+      decisionNow,
+      db,
     );
   }
-  baselineSnapshot = restampBaselineSnapshot(baselineSnapshot, finalNow);
-  const reason = semanticDecision(
-    proposal,
-    models,
-    baselineSnapshot,
-    backendCapability,
-    deps,
-    finalNow,
-  );
-  return insertDecision(
-    proposal,
-    authenticatedPrincipalId,
-    credentialBindingDigest,
-    reason,
-    baselineSnapshot,
-    finalNow,
-    db,
-  );
+
+  const expectedObservationEpoch = observation.observation.observation_epoch;
+  const expectedObservationDigest = observation.observation.observation_digest;
+  const expectedToken: ServerRosterObservationToken = Object.freeze({
+    schema_version: "gille-roster-server-observation-token-v1",
+    observation_epoch: expectedObservationEpoch,
+    observation_digest: expectedObservationDigest,
+  });
+  let callbackCalls = 0;
+  let callbackError: unknown = null;
+  let outcome: RosterAdmissionResult | null = null;
+  let fenceOpen = false;
+  try {
+    // DEFERRED is deliberate: the provider acquires its roster-state fence
+    // before the callback performs the first SQLite read/write. The transaction
+    // still spans the whole synchronous provider invocation, so a zero/multiple
+    // callback or thenable protocol failure rolls back a tentative arm.
+    return db.transaction(() => {
+      fenceOpen = true;
+      try {
+        const providerResult = deps.withServerObservationFence(
+          expectedToken,
+          (rawConfirmedToken) => {
+            if (!fenceOpen) {
+              const error = new ServerObservationFenceProtocolError(
+                "server observation fence callback escaped its synchronous lifetime",
+              );
+              callbackError = error;
+              throw error;
+            }
+            callbackCalls += 1;
+            if (callbackCalls !== 1) {
+              const error = new ServerObservationFenceProtocolError(
+                "server observation fence invoked callback multiple times",
+              );
+              callbackError = error;
+              throw error;
+            }
+            try {
+              const confirmed =
+                serverRosterObservationTokenSchema.safeParse(rawConfirmedToken);
+              let reason: RosterRejectionReason | null = null;
+              const timing: Array<{
+                observedAtMs: number;
+                maxAgeMs: number;
+                reason: "EVIDENCE_STALE" | "TEMPLATE_IDENTITY_MISMATCH";
+              }> = [];
+              if (!confirmed.success) {
+                reason = "OBSERVATION_REVALIDATION_UNAVAILABLE";
+              } else if (
+                confirmed.data.observation_epoch !== expectedObservationEpoch
+                || confirmed.data.observation_digest !== expectedObservationDigest
+              ) {
+                reason = "OBSERVATION_CHANGED";
+              } else {
+                reason = semanticDecision(
+                  proposal,
+                  observation,
+                  null,
+                  observation.baselineSnapshot,
+                  observation.backendCapability,
+                  deps,
+                  timing,
+                );
+              }
+              const decisionNow = deps.now();
+              if (
+                !Number.isFinite(decisionNow.getTime())
+                || decisionNow.getTime() < startedAt.getTime()
+              ) {
+                throw new RosterProposalContractError(
+                  "protected admission clock became incoherent",
+                );
+              }
+              const timeReason = finalTimeDecision(proposal, timing, decisionNow);
+              if (timeReason === "PROPOSAL_EXPIRED" || reason === null) {
+                reason = timeReason ?? reason;
+              }
+              outcome = insertDecisionLocked(
+                proposal,
+                authenticatedPrincipalId,
+                credentialBindingDigest,
+                reason,
+                observation.baselineSnapshot,
+                decisionNow,
+                db,
+              );
+              return outcome;
+            } catch (error) {
+              callbackError = error;
+              throw error;
+            }
+          },
+        );
+        if (
+          typeof providerResult === "object"
+          && providerResult !== null
+          && "then" in providerResult
+        ) {
+          throw new ServerObservationFenceProtocolError(
+            "server observation fence returned a thenable",
+          );
+        }
+      } finally {
+        fenceOpen = false;
+      }
+      if (callbackError !== null) throw callbackError;
+      if (callbackCalls !== 1 || outcome === null) {
+        throw new RosterProposalContractError(
+          "server observation fence did not invoke callback exactly once",
+        );
+      }
+      return outcome;
+    }).deferred();
+  } catch (error) {
+    fenceOpen = false;
+    if (
+      callbackError !== null
+      && !(callbackError instanceof ServerObservationFenceProtocolError)
+    ) throw callbackError;
+    const decisionNow = deps.now();
+    if (
+      !Number.isFinite(decisionNow.getTime())
+      || decisionNow.getTime() < startedAt.getTime()
+    ) {
+      throw new RosterProposalContractError(
+        "protected admission clock became incoherent",
+      );
+    }
+    return persistRejectedOutsideFence(
+      proposal,
+      authenticatedPrincipalId,
+      credentialBindingDigest,
+      Date.parse(proposal.expires_at) <= decisionNow.getTime()
+        ? "PROPOSAL_EXPIRED"
+        : "OBSERVATION_REVALIDATION_UNAVAILABLE",
+      observation.baselineSnapshot,
+      decisionNow,
+      db,
+    );
+  }
 }
