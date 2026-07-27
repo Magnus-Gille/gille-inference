@@ -923,14 +923,12 @@ export class ConstitutionalRoutingWatchdog {
         if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
           return { outcome: "terminally-blocked", reason: "durable-target-block-without-journal" };
         }
-        this.recovery.clearRouteBlock(routeFence);
         return { outcome: "noop", reason: "no-journal" };
       }
       // Establish the fail-closed target block before parsing any controller-
       // writable recovery state or consulting clock/liveness. Corruption can
       // therefore strand the target blocked, never active with an exception
-      // loop. A healthy waiting watch removes this evaluation block below.
-      let evaluationBlockCreated = false;
+      // loop. Healthy/no-journal passes never clear a block they did not create.
       let journal: JournalV2;
       try {
         journal = loadJournal(this.paths);
@@ -940,6 +938,13 @@ export class ConstitutionalRoutingWatchdog {
       }
       const last = journal.entries.at(-1);
       if (!last) return { outcome: "terminally-blocked", reason: "empty-journal" };
+      if (this.terminalReceiptPersistencePending()) {
+        // A terminal transition already exhausted its signer path but could
+        // not durably append the terminal receipt. Retrying the signer would
+        // turn a persistence fault into an unbounded privileged side effect.
+        this.recovery.blockRoute(routeFence);
+        return { outcome: "terminally-blocked", reason: "terminal-owner-reconciliation-required", journal };
+      }
       if (["commit", "disarm", "terminally-blocked"].includes(last.phase)) {
         if (last.phase === "commit") {
           try {
@@ -968,7 +973,6 @@ export class ConstitutionalRoutingWatchdog {
           this.recovery.blockRoute(routeFence);
           return { outcome: "terminally-blocked", reason: "terminal-owner-reconciliation-required", journal };
         }
-        if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
         if (last.phase !== "terminally-blocked") this.recovery.clearRouteBlock(routeFence);
         return { outcome: "noop", reason: `terminal-${last.phase}`, journal };
       }
@@ -1021,7 +1025,6 @@ export class ConstitutionalRoutingWatchdog {
         }
       }
       if (!expired && !kill && last.phase === "watch" && watchFailure === undefined) {
-        this.recovery.clearRouteBlock(routeFence);
         return { outcome: "waiting", reason: "watch-active", journal };
       }
 
@@ -1029,8 +1032,6 @@ export class ConstitutionalRoutingWatchdog {
       // already selected recovery/ambiguity/deadline fail-closed obtains the
       // serving-side block.
       this.recovery.blockRoute(routeFence);
-      evaluationBlockCreated = !constitutionalResourceExists(this.paths.lock, this.paths.targetBlock);
-
       let gate: FreshGate;
       try {
         // Recovery validates against the cryptographically verified authority
@@ -1195,6 +1196,15 @@ export class ConstitutionalRoutingWatchdog {
         // Keep the last valid journal prefix. The authoritative route block is
         // already durable; never replace a valid prefix with an invalid
         // terminal fallback.
+        lease.writeResource(this.paths.targetBlock, `${canonicalJson({
+          schema_version: 1,
+          target_scope_digest: journal.binding.target_scope_digest,
+          binding_digest: journal.binding_digest,
+          reason_digest: reasonDigest(reason),
+          blocked_at: now,
+          signed_demotion_pending: true,
+          terminal_receipt_persistence_pending: true,
+        })}\n`);
       }
     }
     try {
@@ -1203,6 +1213,19 @@ export class ConstitutionalRoutingWatchdog {
       // Best effort by design.
     }
     return { outcome: "terminally-blocked", reason, journal: terminalPersisted ? terminalJournal : journal };
+  }
+
+  private terminalReceiptPersistencePending(): boolean {
+    const bytes = readConstitutionalResource(this.paths.lock, this.paths.targetBlock);
+    if (bytes === undefined) return false;
+    try {
+      const marker = JSON.parse(bytes) as { terminal_receipt_persistence_pending?: unknown };
+      return marker.terminal_receipt_persistence_pending === true;
+    } catch {
+      // The target remains blocked by the resource-local marker; malformed
+      // marker bytes must never authorize another signer attempt.
+      return true;
+    }
   }
 
   private requirePersistedDemotion(

@@ -532,6 +532,57 @@ describe("constitutional micro-routing controller", () => {
     expect(clears).toBe(1);
   });
 
+  it("keeps a successfully committed real route served when a later watchdog reconciles its already-cleared deadline", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-real-commit-reconcile-"));
+    const routePath = join(root, "routing.db");
+    const baseline = '{"route":"mellum"}\n';
+    initializeConstitutionalRouteDatabase(routePath, baseline);
+    const routeDb = new ConstitutionalRouteDatabase(routePath);
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = {
+      store: routeDb,
+      read: () => routeDb.read(),
+      restore: (expected: string, next: string, fence: { epoch: number; token: string }) =>
+        routeDb.restoreExact(expected, next, fence),
+    } as ReturnType<typeof fakeStore>;
+    const controller = new ConstitutionalRoutingController(
+      root,
+      routeDb,
+      authority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    );
+    const mutation = plan(table, synthetic.snapshot);
+    expect(controller.begin(mutation).outcome).toBe("watching");
+    authority.setNow("2026-07-26T01:00:00Z");
+    expect(controller.commit().outcome).toBe("committed");
+    expect(routeDb.read()).toBe(mutation.candidate);
+
+    const recovery = recoveryCapability(
+      table,
+      synthetic.recoveryPrivateKey,
+      synthetic.authorizationDigest,
+      synthetic.snapshot,
+    );
+    recovery.clearCandidateDeadline = (candidate, fence) => {
+      if (!routeDb.clearCandidateDeadline(candidate, fence)) {
+        throw new Error("real committed deadline reconciliation failed");
+      }
+    };
+    recovery.blockRoute = (fence) => {
+      if (!routeDb.block(fence)) throw new Error("failed to block real route database");
+    };
+    recovery.clearRouteBlock = (fence) => {
+      if (!routeDb.clearBlock(fence)) throw new Error("failed to clear real route database");
+    };
+
+    expect(new ConstitutionalRoutingWatchdog(root, authority.reader, recovery).tick())
+      .toMatchObject({ outcome: "noop", reason: "terminal-commit" });
+    expect(routeDb.isBlocked()).toBe(false);
+    expect(readConstitutionalRouteDatabase(routePath)).toBe(mutation.candidate);
+  });
+
   it("turns a verifier that crosses the 300 second pre-watch budget into immediate recovery", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-verify-budget-"));
     const synthetic = syntheticAuthority();
@@ -664,6 +715,7 @@ describe("constitutional micro-routing controller", () => {
       recoveryRegistrar,
     ).begin(plan(healthyTable, healthySynthetic.snapshot));
     let healthyBlocks = 0;
+    let healthyClears = 0;
     expect(new ConstitutionalRoutingWatchdog(
       healthyRoot,
       healthyAuthority.reader,
@@ -672,7 +724,10 @@ describe("constitutional micro-routing controller", () => {
         healthySynthetic.recoveryPrivateKey,
         healthySynthetic.authorizationDigest,
         healthySynthetic.snapshot,
-        { onBlock: () => { healthyBlocks += 1; } },
+        {
+          onBlock: () => { healthyBlocks += 1; },
+          onClearBlock: () => { healthyClears += 1; },
+        },
       ),
       undefined,
       undefined,
@@ -680,6 +735,7 @@ describe("constitutional micro-routing controller", () => {
       proofVerifier,
     ).tick().outcome).toBe("waiting");
     expect(healthyBlocks).toBe(0);
+    expect(healthyClears).toBe(0);
 
     const failedRoot = mkdtempSync(join(tmpdir(), "constitutional-watch-failed-"));
     const failedSynthetic = syntheticAuthority();
@@ -710,6 +766,26 @@ describe("constitutional micro-routing controller", () => {
     ).tick();
     expect(result).toMatchObject({ outcome: "reverted", reason: "baseline-restored-and-target-demoted" });
     expect(failedTable.read()).toBe(baseline);
+  });
+
+  it("does not clear a serving block it does not own when no journal exists", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-no-journal-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    let clears = 0;
+    expect(new ConstitutionalRoutingWatchdog(
+      root,
+      authority.reader,
+      recoveryCapability(
+        table,
+        synthetic.recoveryPrivateKey,
+        synthetic.authorizationDigest,
+        synthetic.snapshot,
+        { onClearBlock: () => { clears += 1; } },
+      ),
+    ).tick()).toMatchObject({ outcome: "noop", reason: "no-journal" });
+    expect(clears).toBe(0);
   });
 
   it("keeps the target blocked when signer output was not durably persisted", () => {
@@ -770,6 +846,46 @@ describe("constitutional micro-routing controller", () => {
       reason: "terminal-owner-reconciliation-required",
     });
     expect(signCalls).toBe(1);
+  });
+
+  it("does not retry the signer when a terminal receipt could not be persisted", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-terminal-persistence-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    const controller = new ConstitutionalRoutingController(
+      root,
+      table.store,
+      authority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    );
+    controller.begin(plan(table, synthetic.snapshot));
+    const paths = constitutionalPaths(root);
+    const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!);
+    const lease = ConstitutionalFencedLease.acquire(paths.lock);
+    lease.writeResource(paths.targetBlock, `${canonicalJson({
+      schema_version: 1,
+      target_scope_digest: journal.binding.target_scope_digest,
+      binding_digest: journal.binding_digest,
+      reason_digest: `sha256:${"8".repeat(64)}`,
+      blocked_at: "2026-07-26T01:10:01Z",
+      signed_demotion_pending: true,
+      terminal_receipt_persistence_pending: true,
+    })}\n`);
+    lease.release();
+    let signCalls = 0;
+    expect(new ConstitutionalRoutingWatchdog(
+      root,
+      authority.reader,
+      recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot, {
+        onSign: () => { signCalls += 1; },
+      }),
+    ).tick()).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: "terminal-owner-reconciliation-required",
+    });
+    expect(signCalls).toBe(0);
   });
 
   it("terminally blocks and consumes recovery when exact restore fails", () => {

@@ -150,9 +150,14 @@ export class ConstitutionalRouteDatabase {
           SELECT journal_id, attempt_id, binding_digest, target_scope_digest, candidate_digest, not_after
           FROM constitutional_route_candidate_deadline WHERE id=1
         `).get() as CandidateDeadlineRow | undefined;
-        if (!route || !stored || route.value_digest !== candidate.candidateDigest || !routeLeaseCurrent(db, fence)) return false;
-        if (!sameCandidateDeadline(stored, candidate)) return false;
-        clearCandidateDeadline(db);
+        // Commit is durable before this deadline cleanup. A watchdog must be
+        // able to replay the cleanup after a crash, including when the
+        // controller already cleared the exact row successfully. The route
+        // digest and current fence remain mandatory; a missing row is only an
+        // idempotent success for that already-committed candidate.
+        if (!route || route.value_digest !== candidate.candidateDigest || !routeLeaseCurrent(db, fence)) return false;
+        if (stored !== undefined && !sameCandidateDeadline(stored, candidate)) return false;
+        if (stored !== undefined) clearCandidateDeadline(db);
         return true;
       }).immediate();
     } finally {
@@ -213,23 +218,28 @@ export function readConstitutionalRouteDatabase(path: string, clock: Constitutio
   const db = new Database(path, { readonly: true, fileMustExist: true });
   try {
     db.pragma("query_only = ON");
-    const guard = db.prepare("SELECT blocked FROM constitutional_route_guard WHERE id=1")
-      .get() as { blocked: number } | undefined;
-    if (guard?.blocked === 1) throw new ConstitutionalRouteBlockedError();
-    const row = db.prepare("SELECT value FROM constitutional_route WHERE id=1")
-      .get() as { value: string } | undefined;
-    if (!row) throw new Error("constitutional route database is not owner-initialized");
-    const deadline = db.prepare(`
-      SELECT journal_id, attempt_id, binding_digest, target_scope_digest, candidate_digest, not_after,
-             activated_wall_ms, activated_monotonic_ns, activated_boot_id
-      FROM constitutional_route_candidate_deadline WHERE id=1
-    `).get() as CandidateDeadlineRow | undefined;
-    if (deadline !== undefined) {
-      if (sha(row.value) !== deadline.candidate_digest || candidateExpired(deadline, clock)) {
-        throw new ConstitutionalRouteBlockedError();
+    return db.transaction(() => {
+      // A serving decision is one coherent resource snapshot. Without this
+      // transaction, a concurrent restore/block could interleave between the
+      // guard, route, and deadline reads and serve a mixed generation.
+      const guard = db.prepare("SELECT blocked FROM constitutional_route_guard WHERE id=1")
+        .get() as { blocked: number } | undefined;
+      if (guard?.blocked === 1) throw new ConstitutionalRouteBlockedError();
+      const row = db.prepare("SELECT value FROM constitutional_route WHERE id=1")
+        .get() as { value: string } | undefined;
+      if (!row) throw new Error("constitutional route database is not owner-initialized");
+      const deadline = db.prepare(`
+        SELECT journal_id, attempt_id, binding_digest, target_scope_digest, candidate_digest, not_after,
+               activated_wall_ms, activated_monotonic_ns, activated_boot_id
+        FROM constitutional_route_candidate_deadline WHERE id=1
+      `).get() as CandidateDeadlineRow | undefined;
+      if (deadline !== undefined) {
+        if (sha(row.value) !== deadline.candidate_digest || candidateExpired(deadline, clock)) {
+          throw new ConstitutionalRouteBlockedError();
+        }
       }
-    }
-    return row.value;
+      return row.value;
+    })();
   } finally {
     db.close();
   }
