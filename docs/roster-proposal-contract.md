@@ -1,4 +1,4 @@
-# Roster proposal admission v1
+# Roster proposal admission v2
 
 `POST /v1/roster-proposals` is a content-blind, authenticated admission surface for Hugin. It
 validates and durably records one bounded proposal for the `served-model-roster` axis. It has no
@@ -7,7 +7,41 @@ operation.
 
 The exact wire schema and durable validator live in
 `src/homeserver/roster-proposal.ts`. The contract version is
-`gille-roster-proposal-v1`; unknown fields and non-canonical timestamps are rejected.
+`gille-roster-proposal-v2`; unknown fields and non-canonical timestamps are rejected.
+
+## Authenticated Hugin provenance
+
+Every v2 proposal carries one closed `hugin-roster-provenance-v1` envelope. It
+is an Ed25519 signature over the JCS bytes of the envelope excluding its
+`signature` member. The envelope binds all of the following without trusting a
+caller assertion:
+
+1. the exact W4 source receipt and its canonical digest;
+2. the source base revision and the Gille-computed combined baseline digest;
+3. the candidate roster digest, experiment reference, and sorted unique
+   evidence fingerprints;
+4. the ADR-008 policy and constitution identities/digests;
+5. `service:hugin` as the proposal principal; and
+6. `proposal_content_digest`, the JCS/SHA-256 digest of every proposal member
+   other than `provenance` and `proposal_digest`.
+
+The final `proposal_digest` covers the envelope as well. Together the detached
+signature and both digests bind the complete submitted proposal without a
+self-referential digest cycle. Gille recomputes every binding at initial
+validation and again inside the protected server-observation fence. The
+receipt expiry must equal the proposal expiry; the protected final clock turns
+an expiry crossing into the normal durable `PROPOSAL_EXPIRED` decision.
+
+Hugin alone holds the Ed25519 private issuer key. Gille owns the pinned SPKI
+public verification key (`hugin-roster-provenance`) at server composition; it
+is never accepted from an HTTP request, proposal, environment dump, or durable
+record. A missing, malformed, mismatched, or unverifiable deployment key is a
+fail-closed admission error. The embedded W4 HMAC-style receipt is evidence
+covered by the outer asymmetric signature, not a shared Hugin→Gille secret.
+
+Production remains unconfigured until its deployment owner installs the
+public key and the #113 observation provider. This change creates no actuator,
+does not arm a live canary, and contains no private key or private locator.
 
 ## Authority and identity
 
@@ -124,7 +158,11 @@ observation epoch+digest plus content-addressed identities before any mutation.
 
 ## Cross-repository sequencing
 
-`tests/fixtures/gille-roster-proposal-v1-seed.json` is a gille-owned seed/interchange example. It is
-not output from a real Hugin serializer and is not cross-repository compatibility evidence. Grimnir
-issue #108 remains open until this schema merges, Hugin implements the producer, and
-gille-inference consumes Hugin's byte-pinned positive and adversarial fixtures.
+`tests/fixtures/gille-roster-proposal-v1-seed.json` is a superseded gille-owned
+seed example and must fail closed under v2. It is not output from a real Hugin
+serializer and is not cross-repository compatibility evidence. Hugin must now
+produce byte-pinned v2 positive and adversarial fixtures using the exact closed
+envelope above, including its own W4 receipt bytes and an issuer key whose
+public half is pinned in the Gille test composition. Gille can only claim
+cross-repository fixture interoperability after consuming those Hugin-produced
+artifacts; this repository intentionally does not manufacture them.

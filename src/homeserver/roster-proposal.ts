@@ -7,7 +7,7 @@
  * It does not import model load/unload/download, routing, deploy, restart, key,
  * config-writer, or artifact-writer primitives.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createPublicKey, randomUUID, verify } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { getDb } from "../db.js";
@@ -23,7 +23,8 @@ import {
 } from "./evidence-identity-store.js";
 import type { ModelInfo } from "./model-admin.js";
 
-export const ROSTER_PROPOSAL_CONTRACT_VERSION = "gille-roster-proposal-v1" as const;
+export const ROSTER_PROPOSAL_CONTRACT_VERSION = "gille-roster-proposal-v2" as const;
+export const HUGIN_ROSTER_PROVENANCE_VERSION = "hugin-roster-provenance-v1" as const;
 export const ROSTER_PROPOSAL_SCHEMA_EPOCH = "gille-roster-admission-schema-v1" as const;
 export const ROSTER_PROPOSAL_POLICY_EPOCH = "grimnir-autonomy-v2" as const;
 export const ROSTER_PROPOSAL_PRINCIPAL = "service:hugin" as const;
@@ -126,6 +127,34 @@ const canarySchema = z.discriminatedUnion("operation", [
   }).strict(),
 ]);
 
+const huginSourceReceiptSchema = z.object({
+  schemaVersion: z.literal("v1"), proposalId: idSchema, experimentRef: z.string().regex(/^ref:[a-z][a-z0-9-]{2,120}$/),
+  evidenceFingerprints: z.array(digestSchema).min(1).max(64), targetId: z.literal("gille-served-model-roster"),
+  axis: z.literal(ROSTER_PROPOSAL_AXIS), owner: z.literal("gille-inference"), disposition: z.literal("proposal-only"),
+  ownershipRegistry: z.object({ version: z.literal("v1"), digest: digestSchema }).strict(),
+  base: z.object({ revision: idSchema, digest: digestSchema }).strict(), candidateContentDigest: digestSchema,
+  expiresAt: timestampSchema, policyEpoch: z.object({ id: z.literal("grimnir-adr-008-v2"), constitutionId: z.literal("grimnir-autonomy-v2"), constitutionDigest: digestSchema }).strict(),
+  canonicalProposalDigest: digestSchema, signerKeyId: z.literal("hugin-autonomy-proposer"),
+  signature: z.string().regex(/^v1:hugin-autonomy-proposer:[a-f0-9]{64}$/),
+}).strict();
+
+const huginProvenanceSchema = z.object({
+  schema_version: z.literal(HUGIN_ROSTER_PROVENANCE_VERSION),
+  source_receipt: huginSourceReceiptSchema,
+  source_receipt_digest: digestSchema,
+  source_base: z.object({ revision: idSchema, digest: digestSchema }).strict(),
+  /** Digest of the complete proposal payload before provenance is attached. */
+  proposal_content_digest: digestSchema,
+  candidate_digest: digestSchema,
+  experiment_ref: z.string().regex(/^ref:[a-z][a-z0-9-]{2,120}$/),
+  evidence_fingerprints: z.array(digestSchema).min(1).max(64),
+  policy_epoch: z.object({ id: z.literal("grimnir-adr-008-v2"), constitution_id: z.literal("grimnir-autonomy-v2"), constitution_digest: digestSchema }).strict(),
+  constitution_digest: digestSchema,
+  principal_id: z.literal(ROSTER_PROPOSAL_PRINCIPAL),
+  issuer: z.object({ key_id: z.literal("hugin-roster-provenance"), algorithm: z.literal("Ed25519") }).strict(),
+  signature: z.object({ algorithm: z.literal("Ed25519"), value_base64: z.string().min(1).max(4096) }).strict(),
+}).strict();
+
 const proposalWithoutDigestSchema = z.object({
   contract_version: z.literal(ROSTER_PROPOSAL_CONTRACT_VERSION),
   proposal_id: idSchema,
@@ -141,6 +170,7 @@ const proposalWithoutDigestSchema = z.object({
     catalogue_digest: digestSchema,
     roster_digest: digestSchema,
   }).strict(),
+  provenance: huginProvenanceSchema,
   candidate: z.object({
     entries: z.array(candidateEntrySchema).min(1).max(64),
     roster_digest: digestSchema,
@@ -170,6 +200,7 @@ export const rosterProposalSchema = proposalWithoutDigestSchema.extend({
 }).strict();
 
 export type RosterProposal = z.infer<typeof rosterProposalSchema>;
+export type HuginRosterProvenance = z.infer<typeof huginProvenanceSchema>;
 export type RosterCandidateEntry = z.infer<typeof candidateEntrySchema>;
 
 export interface ServerTemplateIdentity {
@@ -297,6 +328,10 @@ export function canonicalRosterProposalDigest(
 
 export function candidateRosterDigest(entries: RosterCandidateEntry[]): string {
   return rosterDigest({ entries });
+}
+
+export function combinedRosterBaselineDigest(baseline: RosterProposal["baseline"]): string {
+  return rosterDigest({ schema_version: "gille-roster-combined-baseline-v1", ...baseline });
 }
 
 export function restoreDescriptorDigest(
@@ -659,6 +694,7 @@ function rowToRecord(
       observation_digest: baseline?.success
         ? baseline.data.observation_digest
         : null,
+      provenance_digest: parsed.success ? rosterDigest(parsed.data.provenance) : null,
       decision_at: row.decision_at,
       normalized_delta: delta,
     })
@@ -880,6 +916,8 @@ export function rosterProposalEvents(
 }
 
 export interface RosterAdmissionDependencies {
+  /** Gille-owned deployment trust root; never supplied by the request body. */
+  huginProvenanceTrust: { keyId: "hugin-roster-provenance"; publicKeyPem: string } | null;
   /**
    * One atomic provider observation. The admission layer validates this unknown
    * value as a closed, content-addressed object before using any field.
@@ -903,6 +941,7 @@ export interface RosterAdmissionDependencies {
 }
 
 const defaultDependencies: RosterAdmissionDependencies = {
+  huginProvenanceTrust: null,
   // No backend currently exposes an atomic, epoch-bound observation over all
   // five required values. Production therefore fails closed until #113
   // supplies this boundary.
@@ -961,6 +1000,63 @@ function validateContract(raw: unknown): RosterProposal {
     throw new RosterProposalContractError("candidate entries and aliases must be canonical-sort ordered");
   }
   return proposal;
+}
+
+function validateHuginProvenance(
+  proposal: RosterProposal,
+  observation: ServerRosterObservation,
+  now: Date,
+  trust: RosterAdmissionDependencies["huginProvenanceTrust"],
+  enforceSourceExpiry = true,
+): void {
+  if (!trust || trust.keyId !== "hugin-roster-provenance") {
+    throw new RosterProposalContractError("hugin provenance trust root unavailable");
+  }
+  const provenance = proposal.provenance;
+  const receipt = provenance.source_receipt;
+  const { provenance: _provenance, proposal_digest: _proposalDigest, ...proposalContent } = proposal;
+  const { canonicalProposalDigest, signature: _sourceSignature, ...receiptBody } = receipt;
+  const canonicalReceiptDigest = rosterDigest(receiptBody);
+  const { signature: envelopeSignature, ...unsignedProvenance } = provenance;
+  let envelopeVerified = false;
+  try {
+    envelopeVerified = verify(
+      null,
+      Buffer.from(jcsCanonicalize(unsignedProvenance)),
+      createPublicKey(trust.publicKeyPem),
+      Buffer.from(envelopeSignature.value_base64, "base64"),
+    );
+  } catch { /* invalid deployment key is a fail-closed contract error */ }
+  const evidence = [...provenance.evidence_fingerprints].sort();
+  const candidateEvidence = [...new Set(proposal.candidate.entries.map((entry) => entry.evidence_identity_hash))].sort();
+  const expectedBase = {
+    revision: observation.observation_epoch,
+    digest: combinedRosterBaselineDigest(proposal.baseline),
+  };
+  if (
+    canonicalReceiptDigest !== canonicalProposalDigest
+    || !envelopeVerified
+    || provenance.source_receipt_digest !== rosterDigest(receipt)
+    || provenance.source_base.revision !== receipt.base.revision
+    || provenance.source_base.digest !== receipt.base.digest
+    || provenance.source_base.revision !== expectedBase.revision
+    || provenance.source_base.digest !== expectedBase.digest
+    || provenance.proposal_content_digest !== rosterDigest(proposalContent)
+    || provenance.candidate_digest !== proposal.candidate.roster_digest
+    || receipt.candidateContentDigest !== proposal.candidate.roster_digest
+    || provenance.experiment_ref !== receipt.experimentRef
+    || jcsCanonicalize(evidence) !== jcsCanonicalize(candidateEvidence)
+    || jcsCanonicalize(evidence) !== jcsCanonicalize([...receipt.evidenceFingerprints].sort())
+    || provenance.policy_epoch.id !== receipt.policyEpoch.id
+    || provenance.policy_epoch.constitution_id !== receipt.policyEpoch.constitutionId
+    || provenance.policy_epoch.constitution_digest !== receipt.policyEpoch.constitutionDigest
+    || provenance.constitution_digest !== receipt.policyEpoch.constitutionDigest
+    || provenance.issuer.key_id !== trust.keyId
+    || provenance.principal_id !== proposal.expected_transport_principal_id
+    || receipt.proposalId !== proposal.proposal_id
+    || receipt.expiresAt !== proposal.expires_at
+    || (enforceSourceExpiry && Date.parse(receipt.expiresAt) <= now.getTime())
+  ) throw new RosterProposalContractError("hugin provenance binding invalid");
 }
 
 function digestIdentity(
@@ -1394,6 +1490,7 @@ function insertDecisionLocked(
     observation_digest: baselineSnapshot?.observation_digest ?? null,
     decision_at: at,
     normalized_delta: proposal.delta,
+    provenance_digest: rosterDigest(proposal.provenance),
   });
   db.prepare(`
       INSERT INTO roster_proposals (
@@ -1568,6 +1665,12 @@ export async function admitRosterProposal(
 
   const expectedObservationEpoch = observation.observation.observation_epoch;
   const expectedObservationDigest = observation.observation.observation_digest;
+  validateHuginProvenance(
+    proposal,
+    observation.observation,
+    startedAt,
+    deps.huginProvenanceTrust,
+  );
   const expectedToken: ServerRosterObservationToken = Object.freeze({
     schema_version: "gille-roster-server-observation-token-v1",
     observation_epoch: expectedObservationEpoch,
@@ -1610,6 +1713,15 @@ export async function admitRosterProposal(
               try {
                 const confirmed =
                   serverRosterObservationTokenSchema.safeParse(rawConfirmedToken);
+                const decisionNow = deps.now();
+                if (
+                  !Number.isFinite(decisionNow.getTime())
+                  || decisionNow.getTime() < startedAt.getTime()
+                ) {
+                  throw new RosterProposalContractError(
+                    "protected admission clock became incoherent",
+                  );
+                }
                 let reason: RosterRejectionReason | null = null;
                 const timing: Array<{
                   observedAtMs: number;
@@ -1624,6 +1736,20 @@ export async function admitRosterProposal(
                 ) {
                   reason = "OBSERVATION_CHANGED";
                 } else {
+                  // Recheck the signed source/base binding at the protected
+                  // clock sample while the provider's current-observation
+                  // fence is held. A caller cannot provide this trust root.
+                  validateHuginProvenance(
+                    proposal,
+                    observation.observation,
+                    decisionNow,
+                    deps.huginProvenanceTrust,
+                    // Expiry is classified by the protected final-time
+                    // decision below, so an otherwise authentic proposal
+                    // crossing its TTL becomes a durable rejection rather
+                    // than an exception that escapes the fence.
+                    false,
+                  );
                   reason = semanticDecision(
                     proposal,
                     observation,
@@ -1632,15 +1758,6 @@ export async function admitRosterProposal(
                     observation.backendCapability,
                     deps,
                     timing,
-                  );
-                }
-                const decisionNow = deps.now();
-                if (
-                  !Number.isFinite(decisionNow.getTime())
-                  || decisionNow.getTime() < startedAt.getTime()
-                ) {
-                  throw new RosterProposalContractError(
-                    "protected admission clock became incoherent",
                   );
                 }
                 const timeReason = finalTimeDecision(proposal, timing, decisionNow);
