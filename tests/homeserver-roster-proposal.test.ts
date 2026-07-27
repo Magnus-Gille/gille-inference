@@ -1200,6 +1200,72 @@ describe("fail-closed admission and durable lifecycle", () => {
       .toEqual(["submitted", "rejected"]);
   });
 
+  it("preserves a first SQLite callback failure when the provider invokes the fence again", async () => {
+    ensureRosterProposalSchema(db);
+    db.exec(`
+      CREATE TRIGGER fail_first_armed_insert
+      BEFORE INSERT ON roster_proposals
+      WHEN NEW.state = 'armed'
+      BEGIN
+        SELECT RAISE(ABORT, 'first callback storage failure');
+      END;
+    `);
+    const observation = serverObservation();
+    const input = proposal({
+      proposal_id: "proposal:w5:fence-storage-then-twice",
+      idempotency_key: "idem:w5:fence-storage-then-twice",
+    });
+    let providerCaughtFirst = false;
+    let thrown: unknown;
+
+    try {
+      await admitRosterProposal(
+        input,
+        ROSTER_PROPOSAL_PRINCIPAL,
+        {
+          db,
+          dependencies: {
+            ...depsForObservation(deps, observation),
+            withServerObservationFence: (
+              _expected: ServerRosterObservationToken,
+              callback: (confirmedToken: unknown) => unknown,
+            ): unknown => {
+              try {
+                callback(tokenFor(observation));
+              } catch {
+                providerCaughtFirst = true;
+              }
+              return callback(tokenFor(observation));
+            },
+          },
+        },
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(providerCaughtFirst).toBe(true);
+    expect(thrown).toMatchObject({
+      name: "SqliteError",
+      code: "SQLITE_CONSTRAINT_TRIGGER",
+    });
+    expect(String(thrown)).toContain("first callback storage failure");
+    expect(
+      (db.prepare(`
+        SELECT COUNT(*) AS count
+          FROM roster_proposals
+         WHERE proposal_id = ?
+      `).get(input.proposal_id) as { count: number }).count,
+    ).toBe(0);
+    expect(
+      (db.prepare(`
+        SELECT COUNT(*) AS count
+          FROM roster_proposal_events
+         WHERE proposal_id = ?
+      `).get(input.proposal_id) as { count: number }).count,
+    ).toBe(0);
+  });
+
   it.each([
     ["object", () => Promise.resolve(undefined)],
     ["function", () => Object.assign(

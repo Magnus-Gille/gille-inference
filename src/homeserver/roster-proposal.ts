@@ -1604,7 +1604,7 @@ export async function admitRosterProposal(
                 const error = new ServerObservationFenceProtocolError(
                   "server observation fence invoked callback multiple times",
                 );
-                callbackError = error;
+                if (callbackError === null) callbackError = error;
                 throw error;
               }
               try {
