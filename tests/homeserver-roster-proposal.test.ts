@@ -764,6 +764,80 @@ describe("fail-closed admission and durable lifecycle", () => {
     ).toThrow("durable roster proposal is invalid");
   });
 
+  it.each(["submitted", "accepted", "armed"])(
+    "fails closed when the %s event carries a reason",
+    async (state) => {
+      await admitRosterProposal(
+        proposal(),
+        ROSTER_PROPOSAL_PRINCIPAL,
+        { db, dependencies: deps },
+      );
+      db.prepare(`
+        UPDATE roster_proposal_events
+           SET reason_code = 'tampered'
+         WHERE proposal_id = ? AND state = ?
+      `).run(proposal().proposal_id, state);
+      expect(() =>
+        getRosterProposalForPrincipal(
+          ROSTER_PROPOSAL_PRINCIPAL,
+          proposal().proposal_id,
+          db,
+          new Date(now),
+        ),
+      ).toThrow("durable roster proposal is invalid");
+    },
+  );
+
+  it.each([
+    ["noncanonical", "submitted", "2026-07-27T15:00:00.000Z"],
+    ["backdated", "accepted", "2026-07-27T14:59:59Z"],
+    ["terminal mismatch", "armed", "2026-07-27T15:00:01Z"],
+  ])(
+    "fails closed on %s lifecycle event time",
+    async (_label, state, recordedAt) => {
+      await admitRosterProposal(
+        proposal(),
+        ROSTER_PROPOSAL_PRINCIPAL,
+        { db, dependencies: deps },
+      );
+      db.prepare(`
+        UPDATE roster_proposal_events
+           SET recorded_at = ?
+         WHERE proposal_id = ? AND state = ?
+      `).run(recordedAt, proposal().proposal_id, state);
+      expect(() =>
+        getRosterProposalForPrincipal(
+          ROSTER_PROPOSAL_PRINCIPAL,
+          proposal().proposal_id,
+          db,
+          new Date(now),
+        ),
+      ).toThrow("durable roster proposal is invalid");
+    },
+  );
+
+  it("prevalidates a due record before expiry so corruption cannot be repaired", async () => {
+    const input = proposal({ expires_at: "2026-07-27T15:00:01Z" });
+    await admitRosterProposal(
+      input,
+      ROSTER_PROPOSAL_PRINCIPAL,
+      { db, dependencies: deps },
+    );
+    db.prepare(`
+      UPDATE roster_proposal_events
+         SET reason_code = 'tampered'
+       WHERE proposal_id = ? AND state = 'submitted'
+    `).run(input.proposal_id);
+    expect(() =>
+      expireRosterProposals(new Date("2026-07-27T15:00:02Z"), db),
+    ).toThrow("durable roster proposal is invalid");
+    expect(
+      (db.prepare(`
+        SELECT state FROM roster_proposals WHERE proposal_id = ?
+      `).get(input.proposal_id) as { state: string }).state,
+    ).toBe("armed");
+  });
+
   it("fails closed on mirrored credential/timestamp corruption during exact retry", async () => {
     await admitRosterProposal(
       proposal(),

@@ -490,7 +490,7 @@ function rowToRecord(
     ? parsed.data.delta
     : null;
   const events = db.prepare(`
-    SELECT sequence, state, reason_code
+    SELECT sequence, state, reason_code, recorded_at
       FROM roster_proposal_events
      WHERE proposal_id = ?
      ORDER BY sequence
@@ -498,6 +498,7 @@ function rowToRecord(
     sequence: number;
     state: string;
     reason_code: string | null;
+    recorded_at: string;
   }>;
   const expectedStates = row.state === "armed"
     ? ["submitted", "accepted", "armed"]
@@ -517,6 +518,12 @@ function rowToRecord(
       normalized_delta: delta,
     })
     : "";
+  const eventTimes = events.map((event) => Date.parse(event.recorded_at));
+  const expectedEventReason = (eventState: string): string | null => {
+    if (eventState === "rejected") return row.reason_code;
+    if (eventState === "expired") return "TTL_EXPIRED";
+    return null;
+  };
   if (
     !parsed.success
     || (baseline !== null && !baseline.success)
@@ -532,6 +539,7 @@ function rowToRecord(
     || row.created_at_ms !== Date.parse(row.created_at)
     || row.expires_at_ms !== Date.parse(row.expires_at)
     || row.updated_at_ms !== Date.parse(row.updated_at)
+    || !isCanonicalRosterUtc(row.updated_at)
     || jcsCanonicalize(JSON.parse(row.delta_json)) !== jcsCanonicalize(parsed.data.delta)
     || canonicalRosterProposalDigest((() => {
       const unsigned = { ...parsed.data } as Partial<RosterProposal>;
@@ -556,8 +564,15 @@ function rowToRecord(
     || expectedStates.length !== events.length
     || events.some(
       (event, index) =>
-        event.sequence !== index + 1 || event.state !== expectedStates[index],
+        event.sequence !== index + 1
+        || event.state !== expectedStates[index]
+        || event.reason_code !== expectedEventReason(event.state)
+        || !isCanonicalRosterUtc(event.recorded_at)
+        || !Number.isFinite(eventTimes[index])
+        || (index > 0 && eventTimes[index]! < eventTimes[index - 1]!)
+        || eventTimes[index]! > row.updated_at_ms,
     )
+    || eventTimes.at(-1) !== row.updated_at_ms
     || (row.state === "armed" && (row.reason_code !== null || baseline === null))
     || (
       row.state === "rejected"
@@ -647,10 +662,13 @@ export function expireRosterProposals(
   const atMs = now.getTime();
   return db.transaction(() => {
     const due = db.prepare(`
-      SELECT proposal_id FROM roster_proposals
+      SELECT ${selectColumns} FROM roster_proposals
        WHERE state = 'armed' AND expires_at_ms <= ?
        ORDER BY proposal_id
-    `).all(atMs) as Array<{ proposal_id: string }>;
+    `).all(atMs) as ProposalRow[];
+    // Validate every due record before the first mutation. A corrupt event
+    // tail must never be "repaired" by appending an expiry event.
+    for (const row of due) rowToRecord(row, db);
     for (const row of due) {
       db.prepare(`
         UPDATE roster_proposals
