@@ -26,6 +26,7 @@ import { pathToFileURL } from "node:url";
 import {
   ConstitutionalRoutingController,
   ConstitutionalRoutingWatchdog,
+  MICRO_ROUTING_CONSTITUTIONAL_POLICY,
   constitutionalPaths,
   type AuthoritySnapshot,
   type ProtectedAuthorityReader,
@@ -320,7 +321,11 @@ export function runJsonBin(path: string, input: unknown): any {
   const fd = openSync(checked, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const opened = fstatSync(fd);
-    if (!sameOpenedInode(before, opened) || !opened.isFile() || (opened.mode & 0o111) === 0) {
+    if (
+      !sameOpenedInode(before, opened)
+      || !opened.isFile()
+      || (opened.mode & 0o111) === 0
+    ) {
       throw new Error(`protected helper changed during open or is not executable: ${path}`);
     }
     const stdout = execFileSync("/dev/fd/3", [], {
@@ -336,20 +341,68 @@ export function runJsonBin(path: string, input: unknown): any {
   }
 }
 
-function runUnixJson(
+export function assertProtectedExecutable(path: string, requiredUid?: number): void {
+  const checked = protectedPath(path, requiredUid);
+  const before = lstatSync(checked);
+  const fd = openSync(checked, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(fd);
+    if (
+      !sameOpenedInode(before, opened)
+      || !opened.isFile()
+      || opened.size > 1_000_000
+      || (opened.mode & 0o111) === 0
+    ) {
+      throw new Error(`recovery signer is not a bounded regular executable: ${path}`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function assertRecoverySignerReady(path: string, requiredUid?: number): void {
+  assertProtectedExecutable(path, requiredUid);
+  let result: unknown;
+  try {
+    result = runJsonBin(path, {
+      kind: "constitutional-recovery-signer-readiness",
+      schema_version: 1,
+    });
+  } catch (error) {
+    throw new Error(`recovery signer readiness failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (
+    !exactKeys(result, ["kind", "schema_version", "ready"])
+    || result.kind !== "constitutional-recovery-signer-readiness"
+    || result.schema_version !== 1
+    || result.ready !== true
+  ) {
+    throw new Error("recovery signer readiness returned an invalid closed response");
+  }
+}
+
+export type RecoverySocketEndpoint =
+  | "/register"
+  | "/actuate"
+  | "/demote"
+  | "/fence/acquire"
+  | "/fence/release"
+  | "/route/read"
+  | "/route/fence/acquire"
+  | "/route/fence/release"
+  | "/route/apply"
+  | "/route/block"
+  | "/route/unblock";
+
+export type UnixJsonTransport = (
   socket: string,
-  endpoint:
-    | "/register"
-    | "/actuate"
-    | "/demote"
-    | "/fence/acquire"
-    | "/fence/release"
-    | "/route/read"
-    | "/route/fence/acquire"
-    | "/route/fence/release"
-    | "/route/apply"
-    | "/route/block"
-    | "/route/unblock",
+  endpoint: RecoverySocketEndpoint,
+  input: unknown,
+) => any;
+
+export function runUnixJson(
+  socket: string,
+  endpoint: RecoverySocketEndpoint,
   input: unknown,
 ): any {
   const stdout = execFileSync("/usr/bin/curl", [
@@ -365,6 +418,136 @@ function runUnixJson(
   return JSON.parse(stdout) as unknown;
 }
 
+export function createControllerRecoverySocketClient(
+  socket = RECOVERY_REGISTRATION_SOCKET,
+  transport: UnixJsonTransport = runUnixJson,
+): {
+  store: ConstitutionalRouteStore;
+  recoveryRegistrar: RecoveryRegistrar;
+  activeRegistration(): {
+    handle: string;
+    journalId: string;
+    bindingDigest: string;
+    targetScopeDigest: string;
+  } | undefined;
+} {
+  let activeRegistration: {
+    handle: string;
+    journalId: string;
+    bindingDigest: string;
+    targetScopeDigest: string;
+  } | undefined;
+  const store: ConstitutionalRouteStore = {
+    read: (): string => {
+      const result = transport(socket, "/route/read", {});
+      if (!exactKeys(result, ["value"]) || typeof result.value !== "string") {
+        throw new Error("route service returned an invalid closed read");
+      }
+      return result.value;
+    },
+    acquireWriterLease: () => {
+      const acquired = transport(socket, "/route/fence/acquire", {});
+      if (!exactKeys(acquired, ["epoch", "token"])) {
+        throw new Error("route service returned an invalid controller fence");
+      }
+      const fence = { epoch: Number(acquired.epoch), token: String(acquired.token) };
+      return {
+        ...fence,
+        release: () => {
+          const released = transport(socket, "/route/fence/release", fence);
+          if (!exactKeys(released, ["released"]) || released.released !== true) {
+            throw new Error("route service refused the controller fence release");
+          }
+        },
+      };
+    },
+    compareAndSwap: (_expected: string, next: string, fence: { epoch: number; token: string }): boolean => {
+      if (!activeRegistration) throw new Error("route apply requires durable recovery preregistration");
+      const result = transport(socket, "/route/apply", {
+        ...activeRegistration,
+        candidate: next,
+        fenceEpoch: fence.epoch,
+        fenceToken: fence.token,
+      });
+      if (!exactKeys(result, ["applied"]) || typeof result.applied !== "boolean") {
+        throw new Error("route service returned an invalid closed apply result");
+      }
+      return result.applied;
+    },
+  };
+  const recoveryRegistrar: RecoveryRegistrar = {
+    registerPreRecovery: (input) => {
+      const { baseline: _baseline, ...closedRequest } = input;
+      const result = transport(socket, "/register", closedRequest);
+      if (!exactKeys(result, ["handle", "registrationDigest"])) {
+        throw new Error("recovery registration service returned an invalid closed receipt");
+      }
+      activeRegistration = {
+        handle: String(result.handle),
+        journalId: input.journalId,
+        bindingDigest: input.bindingDigest,
+        targetScopeDigest: input.targetScopeDigest,
+      };
+      return { handle: activeRegistration.handle, registrationDigest: String(result.registrationDigest) };
+    },
+  };
+  return {
+    store,
+    recoveryRegistrar,
+    activeRegistration: () => activeRegistration === undefined
+      ? undefined
+      : structuredClone(activeRegistration),
+  };
+}
+
+export function createWatchdogRecoverySocketClient(
+  socket = RECOVERY_ACTION_SOCKET,
+  transport: UnixJsonTransport = runUnixJson,
+): RestoreOnlyCapability {
+  return {
+    recoveryWorkerIdentity: "micro-route-revert-worker",
+    acquireRouteFence: () => {
+      const result = transport(socket, "/fence/acquire", {});
+      if (!exactKeys(result, ["epoch", "token"])) throw new Error("recovery service returned an invalid route fence");
+      return { epoch: Number(result.epoch), token: String(result.token) };
+    },
+    releaseRouteFence: (fence) => {
+      const result = transport(socket, "/fence/release", fence);
+      if (!exactKeys(result, ["released"]) || result.released !== true) {
+        throw new Error("recovery service refused the route-fence release");
+      }
+    },
+    blockRoute: (fence) => {
+      const result = transport(socket, "/route/block", fence);
+      if (!exactKeys(result, ["changed"]) || result.changed !== true) {
+        throw new Error("recovery service refused the route block");
+      }
+    },
+    clearRouteBlock: (fence) => {
+      const result = transport(socket, "/route/unblock", fence);
+      if (!exactKeys(result, ["changed"]) || result.changed !== true) {
+        throw new Error("recovery service refused the route unblock");
+      }
+    },
+    actuatePreRegisteredRecovery: (input) => {
+      const result = transport(socket, "/actuate", input);
+      if (!exactKeys(result, ["classification", "registrationDigest"])) {
+        throw new Error("recovery action service returned an invalid closed result");
+      }
+      return ["restored", "already-baseline", "superseded", "failed"].includes(String(result.classification))
+        ? result.classification
+        : "failed";
+    },
+    signAndPersistDemotion: (input) => {
+      const result = transport(socket, "/demote", input);
+      if (!exactKeys(result, ["ledger", "registry", "checkpoint"])) {
+        throw new Error("recovery signer returned an invalid closed response");
+      }
+      return result as unknown as { ledger: unknown; registry: unknown; checkpoint: unknown };
+    },
+  };
+}
+
 export async function run(args: string[]): Promise<number> {
   const command = args[0];
   if (!["controller", "begin", "commit", "watchdog"].includes(command ?? "")) {
@@ -378,50 +561,8 @@ export async function run(args: string[]): Promise<number> {
   const config = loadAuthorityConfig(configPath);
   const dataDir = PRODUCTION_STATE_DIR;
   const authority = authorityReader(config);
-  let activeRegistration: {
-    handle: string;
-    journalId: string;
-    bindingDigest: string;
-    targetScopeDigest: string;
-  } | undefined;
-  const store = {
-    read: (): string => {
-      const result = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/read", {});
-      if (!exactKeys(result, ["value"]) || typeof result.value !== "string") {
-        throw new Error("route service returned an invalid closed read");
-      }
-      return result.value;
-    },
-    acquireWriterLease: () => {
-      const acquired = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/fence/acquire", {});
-      if (!exactKeys(acquired, ["epoch", "token"])) {
-        throw new Error("route service returned an invalid controller fence");
-      }
-      const fence = { epoch: Number(acquired.epoch), token: String(acquired.token) };
-      return {
-        ...fence,
-        release: () => {
-          const released = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/fence/release", fence);
-          if (!exactKeys(released, ["released"]) || released.released !== true) {
-            throw new Error("route service refused the controller fence release");
-          }
-        },
-      };
-    },
-    compareAndSwap: (_expected: string, next: string, fence: { epoch: number; token: string }): boolean => {
-      if (!activeRegistration) throw new Error("route apply requires durable recovery preregistration");
-      const result = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/apply", {
-        ...activeRegistration,
-        candidate: next,
-        fenceEpoch: fence.epoch,
-        fenceToken: fence.token,
-      });
-      if (!exactKeys(result, ["applied"]) || typeof result.applied !== "boolean") {
-        throw new Error("route service returned an invalid closed apply result");
-      }
-      return result.applied;
-    },
-  };
+  const controllerSocket = createControllerRecoverySocketClient();
+  const store = controllerSocket.store;
   const verifier = { verify: (verificationInput: {
     configDigest: string;
     evidenceDigest: string;
@@ -448,35 +589,23 @@ export async function run(args: string[]): Promise<number> {
     };
   } };
     if (command === "controller" || command === "begin" || command === "commit") {
-      const recoveryRegistrar: RecoveryRegistrar = {
-        registerPreRecovery: (input) => {
-          const { baseline: _baseline, ...closedRequest } = input;
-          const result = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/register", closedRequest);
-          if (!exactKeys(result, ["handle", "registrationDigest"])) {
-            throw new Error("recovery registration service returned an invalid closed receipt");
-          }
-          activeRegistration = {
-            handle: String(result.handle),
-            journalId: input.journalId,
-            bindingDigest: input.bindingDigest,
-            targetScopeDigest: input.targetScopeDigest,
-          };
-          return { handle: activeRegistration.handle, registrationDigest: String(result.registrationDigest) };
-        },
-      };
+      const recoveryRegistrar = controllerSocket.recoveryRegistrar;
       const controller = new ConstitutionalRoutingController(dataDir, store, authority, verifier, recoveryRegistrar);
       let operation: "begin" | "commit" = command === "commit" ? "commit" : "begin";
       let plan: RouteMutationPlan | undefined;
       if (command === "controller") {
         const paths = constitutionalPaths(dataDir);
         if (constitutionalResourceExists(paths.lock, paths.journal)) {
-          const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!) as { binding?: { canary?: { watch_deadline?: string } }; entries?: Array<{ phase?: string }> };
+          const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!) as { entries?: Array<{ phase?: string; recorded_at?: string }> };
           const phase = journal.entries?.at(-1)?.phase;
           if (phase !== "watch") {
             process.stdout.write(`${JSON.stringify({ outcome: "noop", reason: `journal-${phase ?? "invalid"}-awaits-watchdog-or-owner` })}\n`);
             return 0;
           }
-          if (Date.parse(authority.trustedNowIso()) < Date.parse(String(journal.binding?.canary?.watch_deadline))) {
+          const watchReceipt = journal.entries?.find((entry) => entry.phase === "watch");
+          const watchStartedAt = Date.parse(String(watchReceipt?.recorded_at));
+          if (!Number.isFinite(watchStartedAt)) throw new Error("durable watch receipt is missing or invalid");
+          if (Date.parse(authority.trustedNowIso()) < watchStartedAt + MICRO_ROUTING_CONSTITUTIONAL_POLICY.minimumWatchSeconds * 1000) {
             process.stdout.write(`${JSON.stringify({ outcome: "waiting", reason: "watch-window-active" })}\n`);
             return 0;
           }
@@ -501,46 +630,7 @@ export async function run(args: string[]): Promise<number> {
       return result.outcome === "unknown" ? 3 : 0;
   }
 
-  const recovery: RestoreOnlyCapability = {
-      recoveryWorkerIdentity: "micro-route-revert-worker",
-      acquireRouteFence: () => {
-        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/fence/acquire", {});
-        if (!exactKeys(result, ["epoch", "token"])) throw new Error("recovery service returned an invalid route fence");
-        return { epoch: Number(result.epoch), token: String(result.token) };
-      },
-      releaseRouteFence: (fence) => {
-        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/fence/release", fence);
-        if (!exactKeys(result, ["released"]) || result.released !== true) {
-          throw new Error("recovery service refused the route-fence release");
-        }
-      },
-      blockRoute: (fence) => {
-        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/route/block", fence);
-        if (!exactKeys(result, ["changed"]) || result.changed !== true) {
-          throw new Error("recovery service refused the route block");
-        }
-      },
-      clearRouteBlock: (fence) => {
-        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/route/unblock", fence);
-        if (!exactKeys(result, ["changed"]) || result.changed !== true) {
-          throw new Error("recovery service refused the route unblock");
-        }
-      },
-      actuatePreRegisteredRecovery: (input) => {
-        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/actuate", input);
-        if (!exactKeys(result, ["classification", "registrationDigest"])) {
-          throw new Error("recovery action service returned an invalid closed result");
-        }
-        return ["restored", "already-baseline", "superseded", "failed"].includes(String(result.classification))
-          ? result.classification
-          : "failed";
-      },
-      signAndPersistDemotion: (input) => {
-        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/demote", input);
-        if (!exactKeys(result, ["ledger", "registry", "checkpoint"])) throw new Error("recovery signer returned an invalid closed response");
-        return result as unknown as { ledger: unknown; registry: unknown; checkpoint: unknown };
-      },
-  };
+  const recovery = createWatchdogRecoverySocketClient();
   const watchdog = new ConstitutionalRoutingWatchdog(
     dataDir,
     authority,

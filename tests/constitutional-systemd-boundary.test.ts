@@ -75,8 +75,8 @@ describe("rendered constitutional systemd capability boundary", () => {
     const recovery = unit("gille-constitutional-recovery.service");
     expect(recovery).toContain("ConditionPathExists=/etc/gille-inference/autonomy/recovery-config.json");
     expect(recoveryEntrypoint).toContain('Object.keys(recoveryConfig).sort().join(",") !== "recovery_signer_bin"');
-    expect(recoveryEntrypoint).toContain("protectedPath(recoveryConfig.recovery_signer_bin, 0)");
-    expect(recoveryEntrypoint.indexOf("protectedPath(recoveryConfig.recovery_signer_bin, 0)"))
+    expect(recoveryEntrypoint).toContain("assertRecoverySignerReady(recoveryConfig.recovery_signer_bin, 0)");
+    expect(recoveryEntrypoint.indexOf("assertRecoverySignerReady(recoveryConfig.recovery_signer_bin, 0)"))
       .toBeLessThan(recoveryEntrypoint.indexOf("await startRecoveryService"));
   });
 

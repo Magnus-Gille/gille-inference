@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { microRoutingAdmission } from "../src/homeserver/autonomy-constitution.js";
 
-const root = new URL("../contracts/grimnir-autonomy-v1/", import.meta.url).pathname;
+const root = new URL("../contracts/grimnir-autonomy-v2/", import.meta.url).pathname;
 const attestations = join(root, "owner-attestations.json");
 describe("ADR-008 micro-routing admission", () => {
-  it("refuses the checked-in disarmed W0 registry", () => {
+  it("refuses the checked-in disarmed v2 registry", () => {
     expect(microRoutingAdmission(join(root, "constitution.json"), join(root, "coverage.json"), attestations)).toEqual({ allowed: false, reason: "coverage-disarmed" });
   });
   it("fails closed when the constitution is unavailable or tampered", () => {

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/autonomy-coverage-registry/v2/schema.json",
+  "title": "Grimnir autonomy coverage registry v2",
+  "description": "Owner-controlled protected registry that binds an autonomous class to concrete component writers and target scopes. Checked-in W0.2 production data is globally disarmed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "registry_id", "issued_at", "constitution_digest", "mutation_policy", "global_state", "domains", "registry_digest", "extensions"],
+  "properties": {
+    "kind": { "const": "autonomy-coverage-registry" },
+    "schema_version": { "const": "v2" },
+    "registry_id": { "$ref": "#/$defs/id" },
+    "issued_at": { "$ref": "#/$defs/utc" },
+    "constitution_digest": { "$ref": "#/$defs/digest" },
+    "mutation_policy": { "const": "owner-widen-recovery-worker-narrow" },
+    "global_state": { "enum": ["disarmed", "armed"] },
+    "domains": { "type": "array", "minItems": 17, "maxItems": 17, "uniqueItems": true, "items": { "$ref": "#/$defs/domain" } },
+    "registry_digest": { "$ref": "#/$defs/digest" },
+    "extensions": { "type": "array", "maxItems": 0 }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "utc": { "type": "string", "format": "date-time" },
+    "opaque-ref": { "type": "string", "pattern": "^ref:[a-z][a-z0-9-]{2,120}$" },
+    "levels": { "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": { "enum": ["L4", "L5", "permanent"] } },
+    "identities": { "type": "object", "additionalProperties": false, "required": ["owner", "controller", "watchdog", "kill_switch", "recovery_worker"], "properties": { "owner": { "$ref": "#/$defs/id" }, "controller": { "$ref": "#/$defs/id" }, "watchdog": { "$ref": "#/$defs/id" }, "kill_switch": { "$ref": "#/$defs/id" }, "recovery_worker": { "$ref": "#/$defs/id" } } },
+    "binding": { "type": "object", "additionalProperties": false, "required": ["writer_owner", "owner_authority_ref", "owner_authority_digest", "configuration_owner", "configuration_owner_authority_ref", "configuration_owner_authority_digest", "target_scope_digest", "state", "identities"], "properties": { "writer_owner": { "$ref": "#/$defs/id" }, "owner_authority_ref": { "$ref": "#/$defs/opaque-ref" }, "owner_authority_digest": { "$ref": "#/$defs/digest" }, "configuration_owner": { "$ref": "#/$defs/id" }, "configuration_owner_authority_ref": { "$ref": "#/$defs/opaque-ref" }, "configuration_owner_authority_digest": { "$ref": "#/$defs/digest" }, "target_scope_digest": { "$ref": "#/$defs/digest" }, "state": { "enum": ["shadow", "armed-canary", "armed-fleet"] }, "identities": { "$ref": "#/$defs/identities" } } },
+    "domain": { "type": "object", "additionalProperties": false, "required": ["domain", "required_for_levels", "owner_scope", "owner", "recovery_class", "coverage", "target_state", "bindings"], "properties": {
+      "domain": { "enum": ["micro-routing", "macro-routing", "prompt", "harness", "tool-policy", "served-model-roster", "no-reboot-security-bugfix-maintenance", "credentials-and-auth", "owner-policy", "constitution-and-safety-gates", "deployments-and-code", "privacy-retention-and-erasure", "firmware", "remote-recovery", "model-weight-training", "irreversible-external-actions", "package-downgrade"] },
+      "required_for_levels": { "$ref": "#/$defs/levels" },
+      "owner_scope": { "enum": ["fixed-component", "owning-component", "owner-only"] },
+      "owner": { "enum": ["hugin", "gille-inference", "brokkr", "owning-component", "owner"] },
+      "recovery_class": { "enum": ["R-exact", "R-forward", "none"] },
+      "coverage": { "enum": ["out-of-scope", "protected", "shadow", "armed-canary", "armed-fleet"] },
+      "target_state": { "enum": ["never-mechanical", "shadow-only", "armed-canary", "armed-fleet"] },
+      "bindings": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/binding" } }
+    } }
+  }
+}

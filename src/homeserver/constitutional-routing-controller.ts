@@ -4,7 +4,7 @@
  * This is the only autonomous route-writer path. It deliberately does not
  * reuse the legacy approval-token/adoption-watchdog path: that path remains
  * useful for shadow proposals and owner-driven adoption, but its journal and
- * recovery authority do not satisfy the W0.1 constitution.
+ * recovery authority do not satisfy the ADR-008 v2 constitution.
  *
  * Security boundary:
  * - protected authority readers are injected and re-read immediately before
@@ -13,7 +13,7 @@
  *   runtime-narrowing signing capability;
  * - a separately composed watchdog receives a restore-only recovery
  *   capability and a pre-registered recovery-worker signer;
- * - the exact public journal-v1 envelope is the authoritative state machine.
+ * - the exact public journal-v2 envelope is the authoritative state machine.
  *   Raw baseline/candidate bytes live in a mode-0600 recovery sidecar bound by
  *   the journal digests and cannot affect authorization.
  */
@@ -22,9 +22,9 @@ import { join } from "node:path";
 import {
   canonicalJson,
   digestJson,
-  validateJournalV1,
-  validateJournalV1Prefix,
-  verifyMicroRoutingTargetState,
+  validateJournalV2,
+  validateJournalV2Prefix,
+  verifyMicroRoutingTargetStateV2,
   verifyOwnerAuthorization,
   verifyRuntimeNarrowing,
   type OwnerAuthorizationInputs,
@@ -94,13 +94,14 @@ export interface RouteMutationPlan {
   postconditionsDigest: string;
   recoveryDescriptorDigest: string;
   deadline: string;
-  watchDeadline: string;
   contentRef: string;
 }
 
 export interface ConstitutionalPolicy {
+  applyVerifySeconds: number;
   deadlineSeconds: number;
-  watchSeconds: number;
+  minimumWatchSeconds: number;
+  commitGraceSeconds: number;
   maxAttempts: number;
   minSecondsBetweenAttempts: number;
   maxAttemptsPerWindow: number;
@@ -127,8 +128,10 @@ export interface CandidateVerifier {
 }
 
 export const MICRO_ROUTING_CONSTITUTIONAL_POLICY: ConstitutionalPolicy = {
-  deadlineSeconds: 3600,
-  watchSeconds: 3600,
+  applyVerifySeconds: 300,
+  deadlineSeconds: 4200,
+  minimumWatchSeconds: 3600,
+  commitGraceSeconds: 300,
   maxAttempts: 1,
   minSecondsBetweenAttempts: 3600,
   maxAttemptsPerWindow: 1,
@@ -184,7 +187,7 @@ interface JournalBinding {
   baseline_digest: string;
   postconditions_digest: string;
   deadline: string;
-  canary: { scope_digest: string; target_count: 1; watch_deadline: string };
+  canary: { scope_digest: string; target_count: 1 };
   recovery: {
     class: "R-exact";
     worker_identity: string;
@@ -214,9 +217,9 @@ interface JournalEntry {
   content_refs: string[];
 }
 
-export interface JournalV1 {
+export interface JournalV2 {
   kind: "autonomous-mutation-journal";
-  schema_version: "v1";
+  schema_version: "v2";
   journal_id: string;
   domain: "micro-routing";
   constitution_digest: string;
@@ -259,7 +262,7 @@ export function constitutionalPaths(dataDir: string): ConstitutionalPaths {
   const root = join(dataDir, "autonomy-constitution", "micro-routing");
   return {
     root,
-    journal: "journal-v1.json",
+    journal: "journal-v2.json",
     recoveryMaterial: "recovery-material.json",
     attemptIndex: "attempt-index.json",
     lock: join(root, "constitutional-state.db"),
@@ -355,12 +358,8 @@ function requirePlan(plan: RouteMutationPlan, policy: ConstitutionalPolicy, now:
   }
   const start = strictUtc(now);
   const deadline = strictUtc(plan.deadline);
-  const watch = strictUtc(plan.watchDeadline);
   if (deadline <= start || deadline - start > policy.deadlineSeconds * 1000) {
     throw new Error("whole-operation deadline exceeds constitution");
-  }
-  if (watch <= start || watch > deadline || watch - start > policy.watchSeconds * 1000) {
-    throw new Error("watch window exceeds constitution");
   }
   if (plan.baseline === plan.candidate) throw new Error("candidate is identical to baseline");
 }
@@ -404,7 +403,7 @@ function freshGate(
     verified,
     snapshot.runtimeNarrowingCheckpoint,
   );
-  const target = verifyMicroRoutingTargetState({
+  const target = verifyMicroRoutingTargetStateV2({
     coverage: snapshot.coverage,
     attestations: snapshot.attestations,
     verified,
@@ -468,7 +467,7 @@ function makeBinding(plan: RouteMutationPlan, gate: FreshGate): JournalBinding {
     baseline_digest: sha(plan.baseline),
     postconditions_digest: plan.postconditionsDigest,
     deadline: plan.deadline,
-    canary: { scope_digest: plan.targetScopeDigest, target_count: 1, watch_deadline: plan.watchDeadline },
+    canary: { scope_digest: plan.targetScopeDigest, target_count: 1 },
     recovery: {
       class: "R-exact",
       worker_identity: identities.recovery_worker,
@@ -479,11 +478,11 @@ function makeBinding(plan: RouteMutationPlan, gate: FreshGate): JournalBinding {
 }
 
 function reasonDigest(reason: string): string {
-  return sha(`constitutional-reason-v1:${reason}`);
+  return sha(`constitutional-reason-v2:${reason}`);
 }
 
 function append(
-  journal: JournalV1,
+  journal: JournalV2,
   phase: Phase,
   outcome: Outcome,
   executor: string,
@@ -547,12 +546,12 @@ function enforceAttemptBounds(index: AttemptIndex, plan: RouteMutationPlan, now:
   }
 }
 
-function loadJournal(paths: ConstitutionalPaths): JournalV1 {
+function loadJournal(paths: ConstitutionalPaths): JournalV2 {
   if (!constitutionalResourceExists(paths.lock, paths.journal)) throw new Error("no constitutional journal");
-  return readJson(paths.lock, paths.journal) as JournalV1;
+  return readJson(paths.lock, paths.journal) as JournalV2;
 }
 
-function loadMaterial(paths: ConstitutionalPaths, journal: JournalV1): RecoveryMaterial {
+function loadMaterial(paths: ConstitutionalPaths, journal: JournalV2): RecoveryMaterial {
   const material = readJson(paths.lock, paths.recoveryMaterial) as RecoveryMaterial;
   const claimed = material.material_digest;
   const computed = digestJson(material, "material_digest");
@@ -577,22 +576,22 @@ function loadMaterial(paths: ConstitutionalPaths, journal: JournalV1): RecoveryM
 
 function saveAndValidate(
   paths: ConstitutionalPaths,
-  journal: JournalV1,
+  journal: JournalV2,
   gate: FreshGate,
   terminal: boolean,
   lease: ConstitutionalFencedLease,
 ): void {
   if (terminal) {
-    validateJournalV1(journal, gate.snapshot.constitution, gate.snapshot.coverage, gate.snapshot.attestations);
+    validateJournalV2(journal, gate.snapshot.constitution, gate.snapshot.coverage, gate.snapshot.attestations);
   } else {
-    validateJournalV1Prefix(journal, gate.snapshot.constitution, gate.snapshot.coverage, gate.snapshot.attestations);
+    validateJournalV2Prefix(journal, gate.snapshot.constitution, gate.snapshot.coverage, gate.snapshot.attestations);
   }
   lease.writeResource(paths.journal, `${canonicalJson(journal)}\n`);
 }
 
 export type BeginResult =
-  | { outcome: "watching"; journal: JournalV1 }
-  | { outcome: "unknown"; journal: JournalV1; reason: string };
+  | { outcome: "watching"; journal: JournalV2 }
+  | { outcome: "unknown"; journal: JournalV2; reason: string };
 
 export interface RecoveryRegistrar {
   registerPreRecovery(input: {
@@ -643,9 +642,9 @@ export class ConstitutionalRoutingController {
       const index = loadAttemptIndex(this.paths);
       enforceAttemptBounds(index, plan, initial.now, this.policy);
       const binding = makeBinding(plan, initial);
-      const journal: JournalV1 = {
+      const journal: JournalV2 = {
         kind: "autonomous-mutation-journal",
-        schema_version: "v1",
+        schema_version: "v2",
         journal_id: plan.journalId,
         domain: "micro-routing",
         constitution_digest: (initial.snapshot.constitution as Record<string, string>).constitution_digest,
@@ -702,7 +701,11 @@ export class ConstitutionalRoutingController {
         // No stale admission window: independently re-read all protected
         // authorization, narrowing, kill-switch, evidence/config, time and
         // liveness inputs immediately before the CAS.
-        requirePreparedEpoch(freshGate(this.authority, plan, this.policy), material);
+        const preApply = freshGate(this.authority, plan, this.policy);
+        requirePreparedEpoch(preApply, material);
+        if (strictUtc(preApply.now) - strictUtc(initial.now) > this.policy.applyVerifySeconds * 1000) {
+          throw new Error("apply/readback/verify budget expired before apply");
+        }
       } catch (error) {
         return this.unknown(journal, plan, `pre-apply-gate:${error instanceof Error ? error.message : String(error)}`, lease);
       }
@@ -714,6 +717,9 @@ export class ConstitutionalRoutingController {
         return this.unknown(journal, plan, "apply-or-candidate-readback-failed", lease);
       }
       const appliedAt = this.authority.trustedNowIso();
+      if (strictUtc(appliedAt) - strictUtc(initial.now) > this.policy.applyVerifySeconds * 1000) {
+        return this.unknown(journal, plan, "apply-readback-exceeded-budget", lease);
+      }
       append(journal, "apply", "applied", binding.controller_identity, appliedAt, "candidate-readback-matches", plan.contentRef);
       saveAndValidate(this.paths, journal, initial, false, lease);
 
@@ -724,6 +730,9 @@ export class ConstitutionalRoutingController {
         return this.unknown(journal, plan, `verify-gate:${error instanceof Error ? error.message : String(error)}`, lease);
       }
       const verifiedAt = this.authority.trustedNowIso();
+      if (strictUtc(verifiedAt) - strictUtc(initial.now) > this.policy.applyVerifySeconds * 1000) {
+        return this.unknown(journal, plan, "verify-exceeded-apply-readback-budget", lease);
+      }
       append(journal, "verify", "verified", binding.controller_identity, verifiedAt, "verifier-passes", plan.contentRef);
       append(journal, "watch", "watching", binding.controller_identity, verifiedAt, "canary-watch-started", plan.contentRef);
       saveAndValidate(this.paths, journal, initial, false, lease);
@@ -731,7 +740,7 @@ export class ConstitutionalRoutingController {
     });
   }
 
-  commit(): { outcome: "committed" | "unknown"; journal: JournalV1; reason?: string } {
+  commit(): { outcome: "committed" | "unknown"; journal: JournalV2; reason?: string } {
     return withRouteAndStateLease(this.paths.lock, this.table, this.leaseOptions, (lease, _routeFence) => {
       const journal = loadJournal(this.paths);
       const material = loadMaterial(this.paths, journal);
@@ -744,7 +753,11 @@ export class ConstitutionalRoutingController {
         gate = freshGate(this.authority, plan, this.policy);
         requirePreparedEpoch(gate, material);
         const now = strictUtc(gate.now);
-        if (now < strictUtc(journal.binding.canary.watch_deadline)) throw new Error("watch window is incomplete");
+        const watchReceipt = journal.entries.find((entry) => entry.phase === "watch");
+        if (!watchReceipt) throw new Error("durable watch receipt is missing");
+        const watchStart = strictUtc(watchReceipt.recorded_at);
+        if (now < watchStart + this.policy.minimumWatchSeconds * 1000) throw new Error("watch window is incomplete");
+        if (now > watchStart + (this.policy.minimumWatchSeconds + this.policy.commitGraceSeconds) * 1000) throw new Error("commit grace expired");
         if (now > strictUtc(journal.binding.deadline)) throw new Error("whole-operation deadline expired");
         if (sha(this.table.read()) !== journal.binding.candidate_digest) throw new Error("candidate readback changed during watch");
         this.requireProof(material);
@@ -779,7 +792,7 @@ export class ConstitutionalRoutingController {
   }
 
   private unknown(
-    journal: JournalV1,
+    journal: JournalV2,
     plan: Omit<RouteMutationPlan, "baseline">,
     reason: string,
     lease: ConstitutionalFencedLease,
@@ -837,7 +850,7 @@ export interface RestoreOnlyCapability {
 export interface WatchdogTickResult {
   outcome: "noop" | "waiting" | "reverted" | "terminally-blocked";
   reason: string;
-  journal?: JournalV1;
+  journal?: JournalV2;
 }
 
 export class ConstitutionalRoutingWatchdog {
@@ -883,7 +896,7 @@ export class ConstitutionalRoutingWatchdog {
           signed_demotion_pending: true,
         })}\n`);
       }
-      let journal: JournalV1;
+      let journal: JournalV2;
       try {
         journal = loadJournal(this.paths);
       } catch (error) {
@@ -906,14 +919,11 @@ export class ConstitutionalRoutingWatchdog {
               fenceEpoch: routeFence.epoch,
               fenceToken: routeFence.token,
             }));
-            const narrowed = verifyRuntimeNarrowing(demotion.ledger, demotion.registry, verified, demotion.checkpoint);
-            const entries = (demotion.ledger as { entries?: Array<{ journal_receipt_digest?: unknown }> }).entries;
-            if (
-              entries?.at(-1)?.journal_receipt_digest !== last.receipt_digest
-              || !narrowed.narrowedTargets.has(`micro-routing:${journal.binding.target_scope_digest}`)
-            ) {
-              throw new Error("reconciled demotion is not bound to the terminal receipt and target");
-            }
+            this.requirePersistedDemotion(
+              demotion,
+              journal.binding.target_scope_digest,
+              last.receipt_digest,
+            );
             lease.removeResource(this.paths.targetBlock);
             this.recovery.clearRouteBlock(routeFence);
             return { outcome: "noop", reason: "terminal-signed-demotion-reconciled", journal };
@@ -944,13 +954,21 @@ export class ConstitutionalRoutingWatchdog {
           journal,
         };
       }
-      const expired = strictUtc(now) >= strictUtc(journal.binding.deadline);
+      const watchReceipt = journal.entries.find((entry) => entry.phase === "watch");
+      const watchGraceExpired = watchReceipt !== undefined
+        && strictUtc(now) > strictUtc(watchReceipt.recorded_at)
+          + (this.policy.minimumWatchSeconds + this.policy.commitGraceSeconds) * 1000;
+      const expired = strictUtc(now) > strictUtc(journal.binding.deadline) || watchGraceExpired;
       const kill = this.authority.killSwitchActive();
       // maxSilenceSeconds constrains the independently advancing protected
       // liveness proof in freshGate; it is not a journal-receipt cadence. A
       // one-hour canary is intentionally quiet between watch and commit.
-      let watchFailure: string | undefined;
-      if (!expired && !kill && last.phase !== "unknown") {
+      let watchFailure = ["prepare", "apply", "verify"].includes(last.phase)
+        ? `interrupted-${last.phase}-phase`
+        : last.phase === "revert"
+          ? "resume-persisted-demotion"
+          : undefined;
+      if (!expired && !kill && last.phase === "watch") {
         try {
           const currentGate = freshGate(this.authority, material.plan, this.policy);
           requirePreparedEpoch(currentGate, material);
@@ -960,7 +978,7 @@ export class ConstitutionalRoutingWatchdog {
           watchFailure = `watch-gate:${error instanceof Error ? error.message : String(error)}`;
         }
       }
-      if (!expired && !kill && last.phase !== "unknown" && watchFailure === undefined) {
+      if (!expired && !kill && last.phase === "watch" && watchFailure === undefined) {
         if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
         this.recovery.clearRouteBlock(routeFence);
         return { outcome: "waiting", reason: "watch-active", journal };
@@ -980,7 +998,7 @@ export class ConstitutionalRoutingWatchdog {
           verified,
           snapshot.runtimeNarrowingCheckpoint,
         );
-        const target = verifyMicroRoutingTargetState({
+        const target = verifyMicroRoutingTargetStateV2({
           coverage: snapshot.coverage,
           attestations: snapshot.attestations,
           verified,
@@ -1004,7 +1022,7 @@ export class ConstitutionalRoutingWatchdog {
         if (authorityEpochDigest(gate) !== material.authority_epoch_digest) {
           throw new Error("prepared authority history does not match its bound epoch digest");
         }
-        validateJournalV1Prefix(journal, snapshot.constitution, snapshot.coverage, snapshot.attestations);
+        validateJournalV2Prefix(journal, snapshot.constitution, snapshot.coverage, snapshot.attestations);
       } catch (error) {
         return this.terminalBlock(
           journal,
@@ -1019,7 +1037,7 @@ export class ConstitutionalRoutingWatchdog {
         return this.terminalBlock(journal, material, "recovery-worker-identity-mismatch", now, undefined, lease);
       }
 
-      if (last.phase !== "unknown") {
+      if (!["unknown", "revert"].includes(last.phase)) {
         append(
           journal,
           "unknown",
@@ -1040,20 +1058,22 @@ export class ConstitutionalRoutingWatchdog {
         signed_demotion_pending: true,
       })}\n`);
 
-      const restored = lease.transition(() => this.recovery.actuatePreRegisteredRecovery({
-        handle: material.recovery_handle,
-        journalId: journal.journal_id,
-        bindingDigest: journal.binding_digest,
-        targetScopeDigest: journal.binding.target_scope_digest,
-        journalReceiptDigest: journal.entries.at(-1)!.receipt_digest,
-        fenceEpoch: routeFence.epoch,
-        fenceToken: routeFence.token,
-      }));
-      if (!["restored", "already-baseline"].includes(restored)) {
-        return this.terminalBlock(journal, material, "exact-baseline-restore-failed", now, gate, lease);
+      if (last.phase !== "revert") {
+        const restored = lease.transition(() => this.recovery.actuatePreRegisteredRecovery({
+          handle: material.recovery_handle,
+          journalId: journal.journal_id,
+          bindingDigest: journal.binding_digest,
+          targetScopeDigest: journal.binding.target_scope_digest,
+          journalReceiptDigest: journal.entries.at(-1)!.receipt_digest,
+          fenceEpoch: routeFence.epoch,
+          fenceToken: routeFence.token,
+        }));
+        if (!["restored", "already-baseline"].includes(restored)) {
+          return this.terminalBlock(journal, material, "exact-baseline-restore-failed", now, gate, lease);
+        }
+        append(journal, "revert", "reverted", journal.binding.recovery_worker_identity, now, "baseline-digest-restored", material.plan.contentRef);
+        saveAndValidate(this.paths, journal, gate, false, lease);
       }
-      append(journal, "revert", "reverted", journal.binding.recovery_worker_identity, now, "baseline-digest-restored", material.plan.contentRef);
-      saveAndValidate(this.paths, journal, gate, false, lease);
 
       let demotion: ReturnType<RestoreOnlyCapability["signAndPersistDemotion"]>;
       try {
@@ -1066,19 +1086,11 @@ export class ConstitutionalRoutingWatchdog {
           fenceEpoch: routeFence.epoch,
           fenceToken: routeFence.token,
         }));
-        const narrowed = verifyRuntimeNarrowing(
-          demotion.ledger,
-          demotion.registry,
-          gate.verified,
-          demotion.checkpoint,
+        this.requirePersistedDemotion(
+          demotion,
+          journal.binding.target_scope_digest,
+          journal.entries.at(-1)!.receipt_digest,
         );
-        const entries = (demotion.ledger as { entries?: Array<{ journal_receipt_digest?: unknown }> }).entries;
-        if (entries?.at(-1)?.journal_receipt_digest !== journal.entries.at(-1)!.receipt_digest) {
-          throw new Error("signed demotion is not bound to the exact revert receipt");
-        }
-        if (!narrowed.narrowedTargets.has(`micro-routing:${journal.binding.target_scope_digest}`)) {
-          throw new Error("signed demotion did not narrow the exact target");
-        }
       } catch (error) {
         return this.terminalBlock(
           journal,
@@ -1106,7 +1118,7 @@ export class ConstitutionalRoutingWatchdog {
   }
 
   private terminalBlock(
-    journal: JournalV1,
+    journal: JournalV2,
     material: RecoveryMaterial,
     reason: string,
     now: string,
@@ -1144,6 +1156,40 @@ export class ConstitutionalRoutingWatchdog {
       // Best effort by design.
     }
     return { outcome: "terminally-blocked", reason, journal: terminalPersisted ? terminalJournal : journal };
+  }
+
+  private requirePersistedDemotion(
+    returned: ReturnType<RestoreOnlyCapability["signAndPersistDemotion"]>,
+    targetScopeDigest: string,
+    journalReceiptDigest: string,
+  ): void {
+    // The signer response is not durability evidence. Re-read the independently
+    // protected authority paths after the helper returns, then require both the
+    // returned view and durable view to identify the exact same signed tail.
+    const persisted = this.authority.read();
+    const verified = verifyOwnerAuthorization(persisted);
+    const narrowed = verifyRuntimeNarrowing(
+      persisted.runtimeNarrowing,
+      persisted.recoveryRegistry,
+      verified,
+      persisted.runtimeNarrowingCheckpoint,
+    );
+    if (
+      canonicalJson(returned.ledger) !== canonicalJson(persisted.runtimeNarrowing)
+      || canonicalJson(returned.registry) !== canonicalJson(persisted.recoveryRegistry)
+      || canonicalJson(returned.checkpoint) !== canonicalJson(persisted.runtimeNarrowingCheckpoint)
+    ) {
+      throw new Error("signed demotion response is not the independently persisted protected state");
+    }
+    const entries = (persisted.runtimeNarrowing as {
+      entries?: Array<{ journal_receipt_digest?: unknown }>;
+    }).entries;
+    if (entries?.at(-1)?.journal_receipt_digest !== journalReceiptDigest) {
+      throw new Error("persisted signed demotion is not bound to the exact revert receipt");
+    }
+    if (!narrowed.narrowedTargets.has(`micro-routing:${targetScopeDigest}`)) {
+      throw new Error("persisted signed demotion did not narrow the exact target");
+    }
   }
 }
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { request } from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -321,6 +322,29 @@ function post(socketPath: string, path: string, body: unknown): Promise<{ status
   });
 }
 
+function runSocketClient(args: string[]): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--import",
+      "tsx",
+      new URL("./fixtures/constitutional-cli-socket-client.ts", import.meta.url).pathname,
+      ...args,
+    ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`socket client exited ${code}: ${Buffer.concat(stderr).toString("utf8")}`));
+        return;
+      }
+      resolve(JSON.parse(Buffer.concat(stdout).toString("utf8")));
+    });
+  });
+}
+
 describe("permission-separated AF_UNIX recovery service", () => {
   it("exposes registration only on the controller socket and actuation only on the watchdog socket", async () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-recovery-sockets-"));
@@ -428,6 +452,46 @@ describe("permission-separated AF_UNIX recovery service", () => {
         epoch: superseding.body.epoch,
         token: superseding.body.token,
       })).status).toBe(200);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("uses the production CLI socket mapping and recovers a lost apply response under a successor fence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-cli-sockets-"));
+    const registrationSocketPath = join(root, "register.sock");
+    const actionSocketPath = join(root, "action.sock");
+    const live = route(baseline);
+    const journal = journalAuthority();
+    const service = await startRecoveryService({
+      registrationSocketPath,
+      actionSocketPath,
+      registry: new RecoveryRegistry(join(root, "registrations")),
+      route: live,
+      journalAuthority: journal.authority,
+      demote: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
+      routeLeaseOptions: { durationMs: 2_000 },
+    });
+    try {
+      const controller = await runSocketClient([
+        "controller-response-loss",
+        registrationSocketPath,
+      ]);
+      expect(controller.lost).toMatch(/simulated response loss/);
+      expect(controller.activeRegistration).toMatchObject({
+        handle: expect.stringMatching(/^recovery-/),
+        journalId: "micro-route-journal",
+      });
+      expect(live.read()).toBe(candidate);
+
+      journal.setPhase("unknown");
+      const watchdog = await runSocketClient([
+        "watchdog-recover",
+        actionSocketPath,
+        controller.activeRegistration.handle,
+      ]);
+      expect(watchdog.classification).toBe("restored");
+      expect(live.read()).toBe(baseline);
     } finally {
       await service.close();
     }

@@ -1,0 +1,21 @@
+{
+  "kind": "autonomy-owner-authorization",
+  "schema_version": "v1",
+  "authorization_id": "test-owner-authorization",
+  "authorization_sequence": 1,
+  "previous_authorization_digest": null,
+  "issued_at": "2026-07-26T00:00:00Z",
+  "authority": {
+    "key_id": "test-owner-ed25519",
+    "algorithm": "Ed25519",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAJdzbqfVRm32Di5/Iqff07Gi2Vu+CPeTMzg5sML01Reg=\n-----END PUBLIC KEY-----\n",
+    "public_key_fingerprint": "sha256:3e9145fc7210d1c7817e52ce7f249cc0d32ca7f97dcbc440275720c1223dcd09"
+  },
+  "bindings": {
+    "constitution_digest": "sha256:51efdb78c4524780919649f285862543db8b38a6a3a07894f0fad8bdab40fc6c",
+    "coverage_intent_digest": "sha256:bab7f9befaed14ede60ff049ec85630c5ac0c6e99b48a5ca175101689ba8649a",
+    "owner_attestation_registry_digest": "sha256:17000ba6f8a4344d0ddfb3515932fa67b69c226edcf67f3743e111a53730d067",
+    "recovery_worker_registry_digest": "sha256:dae24ae00175afb1dd8450aa9aad62296965ba67b3e4937b94696eebc56edd28"
+  },
+  "signature": { "algorithm": "Ed25519", "value_base64": "WiPbKMyHdYbRgKb7SEEmV6LmzJ514W6ZKSx1xXQcpQsixNII3WxFVLwOPgoNtt0oujEXvW8DZDlSctYzh+06Aw==" }
+}

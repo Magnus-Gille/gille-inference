@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertRecoverySignerReady,
   boundedProtectedRead,
   loadAuthorityConfig,
   protectedPath,
@@ -52,6 +53,11 @@ describe("constitutional CLI protected roots", () => {
     expect(sameOpenedInode({ dev: 1, ino: 10 }, { dev: 1, ino: 10 })).toBe(true);
     expect(sameOpenedInode({ dev: 1, ino: 10 }, { dev: 1, ino: 11 })).toBe(false);
     expect(sameOpenedInode({ dev: 1, ino: 10 }, { dev: 2, ino: 10 })).toBe(false);
+  });
+
+  it("rejects a non-executable or protocol-unready recovery signer before arming", () => {
+    expect(() => assertRecoverySignerReady("/etc/hosts", 0)).toThrow();
+    expect(() => assertRecoverySignerReady("/usr/bin/true", 0)).toThrow(/readiness/);
   });
 
   it("expires replayed clock/liveness evidence against independent wall and monotonic time", () => {

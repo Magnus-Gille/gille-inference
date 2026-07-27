@@ -15,6 +15,7 @@ import {
   PRODUCTION_STATE_DIR,
   RECOVERY_ACTION_SOCKET,
   RECOVERY_REGISTRATION_SOCKET,
+  assertRecoverySignerReady,
   runJsonBin,
   loadAuthorityConfig,
   protectedPath,
@@ -80,7 +81,7 @@ if (typeof recoveryConfig.recovery_signer_bin !== "string") {
 if (!recoveryConfig.recovery_signer_bin.startsWith("/etc/gille-inference/autonomy/")) {
   throw new Error("recovery signer must stay below the protected root");
 }
-protectedPath(recoveryConfig.recovery_signer_bin, 0);
+assertRecoverySignerReady(recoveryConfig.recovery_signer_bin, 0);
 
 await startRecoveryService({
   registrationSocketPath: RECOVERY_REGISTRATION_SOCKET,

@@ -1,0 +1,16 @@
+{
+  "kind": "autonomy-owner-attestation-registry",
+  "schema_version": "v1",
+  "registry_id": "grimnir-autonomy-owner-attestations",
+  "issued_at": "2026-07-26T00:00:00Z",
+  "issuer_identity": "grimnir-owner",
+  "mutation_policy": "owner-controlled-protected-lane",
+  "attestations": [
+    { "attestation_id": "micro-route-config-owner-attestation", "domain": "micro-routing", "target_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "configuration_owner": "gille-inference", "issued_at": "2026-07-26T00:00:00Z", "attestation_digest": "sha256:3ed685d4ec1fb679ecad660152391350fa0660966d843937a97d71b4d2ba9d0b" },
+    { "attestation_id": "macro-route-config-owner-attestation", "domain": "macro-routing", "target_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "configuration_owner": "hugin", "issued_at": "2026-07-26T00:00:00Z", "attestation_digest": "sha256:928ee4f53dd66d9d0f1fa16f1d1479b923df23554c65891e39f4b3780a836b4d" },
+    { "attestation_id": "roster-config-owner-attestation", "domain": "served-model-roster", "target_scope_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "configuration_owner": "gille-inference", "issued_at": "2026-07-26T00:00:00Z", "attestation_digest": "sha256:aa629812d356e289a226c984d040d72b7e1a5d4ad1ee3a8051803da65c127d08" },
+    { "attestation_id": "maintenance-config-owner-attestation", "domain": "no-reboot-security-bugfix-maintenance", "target_scope_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555", "configuration_owner": "brokkr", "issued_at": "2026-07-26T00:00:00Z", "attestation_digest": "sha256:1882a6274747dc248d9ea4d180e576fdba0463a2781a9dcbf864904887806ac2" }
+  ],
+  "registry_digest": "sha256:17000ba6f8a4344d0ddfb3515932fa67b69c226edcf67f3743e111a53730d067",
+  "extensions": []
+}

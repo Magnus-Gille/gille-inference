@@ -23,8 +23,8 @@ import {
 import {
   canonicalJson,
   digestJson,
-  validateJournalV1,
-  validateJournalV1Prefix,
+  validateJournalV2,
+  validateJournalV2Prefix,
 } from "../src/homeserver/autonomy-contract-v1.js";
 import {
   ConstitutionalRouteDatabase,
@@ -35,7 +35,7 @@ import {
   readConstitutionalResource,
 } from "../src/homeserver/constitutional-fenced-lease.js";
 
-const contractRoot = new URL("../contracts/grimnir-autonomy-v1/", import.meta.url).pathname;
+const contractRoot = new URL("../contracts/grimnir-autonomy-v2/", import.meta.url).pathname;
 const artifact = (name: string): any => JSON.parse(readFileSync(join(contractRoot, name), "utf8"));
 const fixture = (name: string): any => JSON.parse(readFileSync(join(contractRoot, "fixtures", name), "utf8"));
 const sha = (bytes: Buffer): string => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -206,8 +206,7 @@ function plan(store: ReturnType<typeof fakeStore>, snapshot: AuthoritySnapshot):
     policyDigest: POLICY,
     postconditionsDigest: POSTCONDITIONS,
     recoveryDescriptorDigest: digestJson(snapshot),
-    deadline: "2026-07-26T01:00:00Z",
-    watchDeadline: "2026-07-26T00:30:00Z",
+    deadline: "2026-07-26T01:10:00Z",
     contentRef: "ref:micro-route-candidate",
   };
 }
@@ -217,7 +216,7 @@ function recoveryCapability(
   privateKey: KeyObject,
   authorizationDigest: string,
   snapshot: AuthoritySnapshot,
-  opts: { restoreFails?: boolean } = {},
+  opts: { restoreFails?: boolean; persistDemotion?: boolean } = {},
 ): RestoreOnlyCapability {
   let activeRouteLease: { epoch: number; token: string; release(): void } | undefined;
   return {
@@ -270,7 +269,7 @@ function recoveryCapability(
         entries: [entry],
         extensions: [],
       };
-      return {
+      const result = {
         ledger,
         registry: snapshot.recoveryRegistry,
         checkpoint: {
@@ -281,6 +280,11 @@ function recoveryCapability(
           minimum_entries: 1,
         },
       };
+      if (opts.persistDemotion !== false) {
+        snapshot.runtimeNarrowing = structuredClone(result.ledger);
+        snapshot.runtimeNarrowingCheckpoint = structuredClone(result.checkpoint);
+      }
+      return result;
     },
   };
 }
@@ -353,7 +357,9 @@ describe("constitutional micro-routing controller", () => {
         return routeDb.restoreExact(expected, next, fence);
       },
     };
-    authority.setNow("2026-07-26T01:00:01Z");
+    // The watchdog must reconcile an interrupted prepare/apply immediately,
+    // not leave an unreceipted candidate active until the absolute deadline.
+    authority.setNow("2026-07-26T00:00:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
       authority.reader,
@@ -392,21 +398,92 @@ describe("constitutional micro-routing controller", () => {
     expect(recoveryMaterial).not.toHaveProperty("baseline");
     expect(recoveryMaterial.plan).not.toHaveProperty("baseline");
     expect(recoveryMaterial.recovery_handle).toMatch(/^recovery-/);
-    expect(validateJournalV1Prefix(
+    expect(validateJournalV2Prefix(
       journal,
       synthetic.snapshot.constitution,
       synthetic.snapshot.coverage,
       synthetic.snapshot.attestations,
     )).toMatchObject({ phase: "watch", terminal: false });
-    authority.setNow("2026-07-26T00:30:00Z");
+    authority.setNow("2026-07-26T01:00:00Z");
     const committed = controller.commit();
     expect(committed.outcome).toBe("committed");
-    expect(validateJournalV1(
+    expect(validateJournalV2(
       committed.journal,
       synthetic.snapshot.constitution,
       synthetic.snapshot.coverage,
       synthetic.snapshot.attestations,
     )).toMatchObject({ terminal: "commit" });
+  });
+
+  it("accepts the exact 300 second commit-grace boundary and recovers one second later", () => {
+    const commitRoot = mkdtempSync(join(tmpdir(), "constitutional-commit-grace-"));
+    const commitSynthetic = syntheticAuthority();
+    const commitAuthority = fakeAuthority(commitSynthetic.snapshot);
+    const commitTable = fakeStore();
+    const commitController = new ConstitutionalRoutingController(
+      commitRoot,
+      commitTable.store,
+      commitAuthority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    );
+    commitController.begin(plan(commitTable, commitSynthetic.snapshot));
+    commitAuthority.setNow("2026-07-26T01:05:00Z");
+    expect(commitController.commit().outcome).toBe("committed");
+
+    const recoveryRoot = mkdtempSync(join(tmpdir(), "constitutional-missed-grace-"));
+    const recoverySynthetic = syntheticAuthority();
+    const recoveryAuthority = fakeAuthority(recoverySynthetic.snapshot);
+    const recoveryTable = fakeStore();
+    const baseline = recoveryTable.read();
+    new ConstitutionalRoutingController(
+      recoveryRoot,
+      recoveryTable.store,
+      recoveryAuthority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    ).begin(plan(recoveryTable, recoverySynthetic.snapshot));
+    recoveryAuthority.setNow("2026-07-26T01:05:01Z");
+    const result = new ConstitutionalRoutingWatchdog(
+      recoveryRoot,
+      recoveryAuthority.reader,
+      recoveryCapability(
+        recoveryTable,
+        recoverySynthetic.recoveryPrivateKey,
+        recoverySynthetic.authorizationDigest,
+        recoverySynthetic.snapshot,
+      ),
+    ).tick();
+    expect(result.outcome).toBe("reverted");
+    expect(recoveryTable.read()).toBe(baseline);
+  });
+
+  it("turns a verifier that crosses the 300 second pre-watch budget into immediate recovery", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-verify-budget-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    const baseline = table.read();
+    const result = new ConstitutionalRoutingController(
+      root,
+      table.store,
+      authority.reader,
+      {
+        verify: (input) => {
+          authority.setNow("2026-07-26T00:05:01Z");
+          return proofVerifier.verify(input);
+        },
+      },
+      recoveryRegistrar,
+    ).begin(plan(table, synthetic.snapshot));
+    expect(result).toMatchObject({ outcome: "unknown", reason: "verify-exceeded-apply-readback-budget" });
+    expect(table.read()).not.toBe(baseline);
+    expect(new ConstitutionalRoutingWatchdog(
+      root,
+      authority.reader,
+      recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+    ).tick().outcome).toBe("reverted");
+    expect(table.read()).toBe(baseline);
   });
 
   it("kill -9 after the route write is recovered exactly by the independent restore-only worker", () => {
@@ -420,17 +497,66 @@ describe("constitutional micro-routing controller", () => {
     const controller = new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar);
     expect(() => controller.begin(mutation)).toThrow(/simulated kill -9/);
     expect(table.read()).toBe(mutation.candidate);
-    authority.setNow("2026-07-26T01:00:01Z");
+    authority.setNow("2026-07-26T00:00:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
       authority.reader,
       recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+      undefined,
+      undefined,
+      undefined,
+      proofVerifier,
     );
     const result = watchdog.tick();
     expect(result.outcome).toBe("reverted");
     expect(table.read()).toBe(baseline);
     expect(result.journal?.entries.map((entry) => entry.phase)).toEqual(["prepare", "unknown", "revert", "disarm"]);
   });
+
+  it.each(["prepare", "apply", "verify"] as const)(
+    "recovers an interrupted %s receipt before the deadline instead of treating it as watch",
+    (phase) => {
+      const root = mkdtempSync(join(tmpdir(), `constitutional-interrupted-${phase}-`));
+      const synthetic = syntheticAuthority();
+      const authority = fakeAuthority(synthetic.snapshot);
+      const table = fakeStore();
+      const baseline = table.read();
+      new ConstitutionalRoutingController(
+        root,
+        table.store,
+        authority.reader,
+        proofVerifier,
+        recoveryRegistrar,
+      ).begin(plan(table, synthetic.snapshot));
+      const paths = constitutionalPaths(root);
+      const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!) as {
+        entries: Array<{ phase: string }>;
+      };
+      const terminalIndex = journal.entries.findIndex((entry) => entry.phase === phase);
+      journal.entries = journal.entries.slice(0, terminalIndex + 1);
+      const lease = ConstitutionalFencedLease.acquire(paths.lock);
+      lease.writeResource(paths.journal, `${canonicalJson(journal)}\n`);
+      lease.release();
+      authority.setNow("2026-07-26T00:00:01Z");
+      const result = new ConstitutionalRoutingWatchdog(
+        root,
+        authority.reader,
+        recoveryCapability(
+          table,
+          synthetic.recoveryPrivateKey,
+          synthetic.authorizationDigest,
+          synthetic.snapshot,
+        ),
+        undefined,
+        undefined,
+        undefined,
+        proofVerifier,
+      ).tick();
+      expect(result.outcome).toBe("reverted");
+      expect(table.read()).toBe(baseline);
+      expect(result.journal?.entries.at(-1)?.phase).toBe("disarm");
+    },
+  );
 
   it("recovers a kill-STOP during watch after the absolute deadline even when notification is offline", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-stop-"));
@@ -440,7 +566,7 @@ describe("constitutional micro-routing controller", () => {
     const baseline = table.read();
     const mutation = plan(table, synthetic.snapshot);
     new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
-    authority.setNow("2026-07-26T01:00:01Z");
+    authority.setNow("2026-07-26T01:10:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
       authority.reader,
@@ -509,6 +635,40 @@ describe("constitutional micro-routing controller", () => {
     expect(failedTable.read()).toBe(baseline);
   });
 
+  it("keeps the target blocked when signer output was not durably persisted", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-demotion-durability-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    new ConstitutionalRoutingController(
+      root,
+      table.store,
+      authority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    ).begin(plan(table, synthetic.snapshot));
+    authority.setNow("2026-07-26T01:10:01Z");
+    const result = new ConstitutionalRoutingWatchdog(
+      root,
+      authority.reader,
+      recoveryCapability(
+        table,
+        synthetic.recoveryPrivateKey,
+        synthetic.authorizationDigest,
+        synthetic.snapshot,
+        { persistDemotion: false },
+      ),
+    ).tick();
+    expect(result).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: expect.stringMatching(/^signed-demotion-failed:/),
+    });
+    expect(readConstitutionalResource(
+      constitutionalPaths(root).lock,
+      constitutionalPaths(root).targetBlock,
+    )).toBeDefined();
+  });
+
   it("terminally blocks and consumes recovery when exact restore fails", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-restore-fail-"));
     const synthetic = syntheticAuthority();
@@ -516,7 +676,7 @@ describe("constitutional micro-routing controller", () => {
     const table = fakeStore();
     const mutation = plan(table, synthetic.snapshot);
     new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
-    authority.setNow("2026-07-26T01:00:01Z");
+    authority.setNow("2026-07-26T01:10:01Z");
     const watchdog = new ConstitutionalRoutingWatchdog(
       root,
       authority.reader,

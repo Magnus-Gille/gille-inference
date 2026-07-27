@@ -26,11 +26,11 @@ function proposal() {
 }
 
 describe("constitutional scheduler composition", () => {
-  it("leaves timer jitter margin between the watch and whole-operation deadline", () => {
+  it("binds the immutable attempt to the complete ADR-008 v2 4200 second budget", () => {
     const parsed = parseRouteMutationProposal(proposal());
     const plan = composeImmutablePlan(parsed, '{"route":"mellum"}\n', {} as any, "2026-07-27T10:00:00Z", "abcdef123456");
-    expect(plan.watchDeadline).toBe("2026-07-27T10:55:00Z");
-    expect(plan.deadline).toBe("2026-07-27T11:00:00Z");
+    expect(plan).not.toHaveProperty("watchDeadline");
+    expect(plan.deadline).toBe("2026-07-27T11:10:00Z");
   });
 
   it("rejects non-exact UTC and tampered proposals", () => {
@@ -62,10 +62,10 @@ describe("constitutional scheduler composition", () => {
       "abcdef123456",
     );
     persistImmutablePlan(path, plan);
-    expect(removeExpiredImmutablePlan(path, "2026-07-27T10:59:59Z")).toBe(false);
+    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:09:59Z")).toBe(false);
     expect(existsSync(path)).toBe(true);
-    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:00:00Z")).toBe(true);
+    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:10:00Z")).toBe(true);
     expect(existsSync(path)).toBe(false);
-    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:00:01Z")).toBe(false);
+    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:10:01Z")).toBe(false);
   });
 });

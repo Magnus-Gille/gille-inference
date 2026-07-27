@@ -17,6 +17,7 @@ import {
   canonicalJson,
   digestJson,
   validateJournalV1Prefix,
+  validateJournalV2Prefix,
   verifyOwnerAuthorization,
 } from "./autonomy-contract-v1.js";
 import Database from "better-sqlite3";
@@ -96,7 +97,13 @@ export function authenticateRecoveryJournal(input: {
 }): RecoveryJournalView {
   const { journalId, journal, material, protectedSnapshot } = input;
   const verified = verifyOwnerAuthorization(protectedSnapshot);
-  validateJournalV1Prefix(
+  const validateJournalPrefix = journal?.schema_version === "v2"
+    ? validateJournalV2Prefix
+    : journal?.schema_version === "v1"
+      ? validateJournalV1Prefix
+      : undefined;
+  if (!validateJournalPrefix) throw new Error("unsupported recovery journal contract epoch");
+  validateJournalPrefix(
     journal,
     protectedSnapshot.constitution,
     protectedSnapshot.coverage,
@@ -482,6 +489,16 @@ function listen(server: Server, path: string, mode: number, fd?: number): Promis
 export async function startRecoveryService(options: RecoveryServiceOptions): Promise<{ close(): Promise<void> }> {
   let controllerRouteLease: RouteLease | undefined;
   let recoveryRouteLease: RouteLease | undefined;
+  const requireControllerFence = (body: unknown): RouteFence => {
+    const fence = body as Partial<RouteApplicationRequest>;
+    if (
+      controllerRouteLease === undefined
+      || !controllerRouteLease.isCurrent()
+      || fence.fenceEpoch !== controllerRouteLease.epoch
+      || fence.fenceToken !== controllerRouteLease.token
+    ) throw new Error("request does not match the current controller route fence");
+    return { epoch: fence.fenceEpoch, token: fence.fenceToken };
+  };
   const requireRecoveryFence = (body: unknown): RouteFence => {
     const fence = body as Partial<RecoveryActuationRequest> & Partial<RouteFence>;
     const epoch = typeof fence.fenceEpoch === "number" ? fence.fenceEpoch : fence.epoch;
@@ -537,6 +554,7 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
         return respond(response, 200, { released: true });
       }
       if (request.url === "/route/apply") {
+        requireControllerFence(body);
         return respond(response, 200, {
           applied: options.registry.applyCandidate(
             body as RouteApplicationRequest,

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/autonomy-runtime-narrowing/v1/schema.json",
+  "title": "Grimnir runtime narrowing ledger v1",
+  "description": "Append-only recovery-worker records. It can only narrow an owner-signed armed intent to shadow.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "ledger_id", "owner_authorization_digest", "entries", "extensions"],
+  "properties": { "kind": { "const": "autonomy-runtime-narrowing" }, "schema_version": { "const": "v1" }, "ledger_id": { "$ref": "#/$defs/id" }, "owner_authorization_digest": { "$ref": "#/$defs/digest" }, "entries": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/entry" } }, "extensions": { "type": "array", "maxItems": 0 } },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" }, "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }, "utc": { "type": "string", "format": "date-time" },
+    "entry": { "type": "object", "additionalProperties": false, "required": ["sequence", "recorded_at", "domain", "target_scope_digest", "from_state", "to_state", "recovery_worker_identity", "journal_receipt_digest", "previous_entry_digest", "entry_digest", "signature"], "properties": { "sequence": { "type": "integer", "minimum": 1 }, "recorded_at": { "$ref": "#/$defs/utc" }, "domain": { "enum": ["micro-routing", "macro-routing", "prompt", "harness", "tool-policy", "served-model-roster", "no-reboot-security-bugfix-maintenance"] }, "target_scope_digest": { "$ref": "#/$defs/digest" }, "from_state": { "enum": ["armed-canary", "armed-fleet"] }, "to_state": { "const": "shadow" }, "recovery_worker_identity": { "$ref": "#/$defs/id" }, "journal_receipt_digest": { "$ref": "#/$defs/digest" }, "previous_entry_digest": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/digest" }] }, "entry_digest": { "$ref": "#/$defs/digest" }, "signature": { "type": "object", "additionalProperties": false, "required": ["algorithm", "value_base64"], "properties": { "algorithm": { "const": "Ed25519" }, "value_base64": { "type": "string", "pattern": "^[A-Za-z0-9+/]+={0,2}$" } } } } }
+  }
+}

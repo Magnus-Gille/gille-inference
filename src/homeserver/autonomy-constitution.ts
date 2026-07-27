@@ -6,8 +6,8 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-/** Exact ADR-008 W0.1 constitution at pinned Grimnir commit 298526972b46d4f8f0c40fbe92e830adb91087a8. */
-export const GRIMNIR_CONSTITUTION_DIGEST = "sha256:51efdb78c4524780919649f285862543db8b38a6a3a07894f0fad8bdab40fc6c";
+/** Exact ADR-008 v2 constitution at merged Grimnir commit 16edee0a5a0111f0142569f5b0cf2f90e807060c. */
+export const GRIMNIR_CONSTITUTION_DIGEST = "sha256:836aba8abbc48e05294dac301354ec6b1aa21307b992db78202342ce29aa8dc1";
 
 type UnknownRecord = Record<string, unknown>;
 function isRecord(value: unknown): value is UnknownRecord {
@@ -41,10 +41,10 @@ export function microRoutingAdmission(constitutionPath: string, coveragePath: st
   } catch (error) {
     return { allowed: false, reason: `constitution-unavailable:${error instanceof Error ? error.message : String(error)}` };
   }
-  if (constitution.kind !== "autonomy-constitution" || constitution.schema_version !== "v1" || constitution.constitution_digest !== GRIMNIR_CONSTITUTION_DIGEST || digestWithout(constitution, "constitution_digest") !== GRIMNIR_CONSTITUTION_DIGEST) {
+  if (constitution.kind !== "autonomy-constitution" || constitution.schema_version !== "v2" || constitution.constitution_id !== "grimnir-autonomy-v2" || constitution.constitution_digest !== GRIMNIR_CONSTITUTION_DIGEST || digestWithout(constitution, "constitution_digest") !== GRIMNIR_CONSTITUTION_DIGEST) {
     return { allowed: false, reason: "constitution-tampered-or-unapproved" };
   }
-  if (coverage.kind !== "autonomy-coverage-registry" || coverage.schema_version !== "v1" || coverage.constitution_digest !== GRIMNIR_CONSTITUTION_DIGEST || typeof coverage.registry_digest !== "string" || digestWithout(coverage, "registry_digest") !== coverage.registry_digest) {
+  if (coverage.kind !== "autonomy-coverage-registry" || coverage.schema_version !== "v2" || coverage.registry_id !== "grimnir-autonomy-coverage-v2" || coverage.constitution_digest !== GRIMNIR_CONSTITUTION_DIGEST || typeof coverage.registry_digest !== "string" || digestWithout(coverage, "registry_digest") !== coverage.registry_digest) {
     return { allowed: false, reason: "coverage-tampered-or-unapproved" };
   }
   if (coverage.global_state !== "armed") return { allowed: false, reason: "coverage-disarmed" };

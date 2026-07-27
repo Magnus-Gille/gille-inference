@@ -1,0 +1,24 @@
+{
+  "upstream_repository": "Magnus-Gille/grimnir",
+  "upstream_commit": "16edee0a5a0111f0142569f5b0cf2f90e807060c",
+  "upstream_ref_at_import": "origin/main",
+  "contract_version": "ADR-008 v2",
+  "imported_at": "2026-07-27",
+  "production_state": "unconfigured-and-disarmed",
+  "layout": {
+    "constitution.json": "docs/autonomy-constitution-v2.json",
+    "coverage.json": "docs/autonomy-coverage-registry-v2.json",
+    "owner-attestations.json": "docs/autonomy-owner-attestation-registry-v1.json",
+    "owner-authorization-unconfigured.json": "docs/autonomy-owner-authorization-v1.json",
+    "owner-authorization-checkpoint-unconfigured.json": "docs/autonomy-owner-authorization-checkpoint-v1.example.json",
+    "recovery-workers-unconfigured.json": "docs/autonomy-recovery-worker-registry-v1.json",
+    "runtime-narrowing-unconfigured.json": "docs/autonomy-runtime-narrowing-v1.json",
+    "schemas/": "v2 constitution, coverage, and journal schemas plus shared v1 authorization/recovery/narrowing schemas",
+    "fixtures/": "tests/fixtures/autonomy-contract-v2/ plus shared public v1 authorization/recovery/narrowing fixtures and public test keys"
+  },
+  "notes": [
+    "The v2 constitution, coverage, journal schemas, and journal fixtures are exact public artifacts from the pinned upstream commit; shared authorization, recovery, and runtime-narrowing envelopes intentionally remain v1.",
+    "fixtures/ contains public conformance records and public test keys only; test private keys and all production private keys are deliberately excluded.",
+    "Production arming requires an independently protected Ed25519 owner key and checkpoints outside this repository."
+  ]
+}

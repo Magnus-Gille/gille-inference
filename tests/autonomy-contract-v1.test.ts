@@ -57,6 +57,16 @@ describe("ADR-008 W0.1 authorization and narrowing", () => {
     expect(() => verifyOwnerAuthorization({ ...inputs, coverage })).toThrow(/artifact digest binding mismatch/);
   });
 
+  it("rejects a self-consistent constitution outside the exact pinned Grimnir epochs", () => {
+    const inputs = authorizationInputs();
+    const constitution = clone(inputs.constitution) as any;
+    constitution.constitution_id = "attacker-autonomy-v1";
+    constitution.constitution_digest = digestJson(constitution, "constitution_digest");
+    expect(() => verifyOwnerAuthorization({ ...inputs, constitution })).toThrow(
+      /artifact digest binding mismatch|exact supported Grimnir epoch/,
+    );
+  });
+
   it("rejects authorization replay and owner-key substitution", () => {
     const inputs = authorizationInputs();
     const replayCheckpoint = clone(inputs.checkpoint) as any;

@@ -94,13 +94,11 @@ export function composeImmutablePlan(
     policyDigest: proposal.policy_digest,
     postconditionsDigest: proposal.postconditions_digest,
     recoveryDescriptorDigest: digestJson(authority),
-    // W0.1 permits a one-hour watch and a one-hour whole-operation
-    // deadline. The controller timer attempts commit at this exact boundary;
-    // if it misses, the independent watchdog recovers instead.
-    deadline: timestamp(3600),
-    // Keep five minutes of deterministic timer/restart margin while staying
-    // within the constitutional one-hour maximum.
-    watchDeadline: timestamp(3300),
+    // ADR-008 v2 anchors its one-hour minimum watch to the durable watch
+    // receipt, not to a precomputed plan timestamp. The immutable attempt
+    // deadline covers the 300 s apply/readback/verify budget, 3600 s watch,
+    // and 300 s commit grace.
+    deadline: timestamp(4200),
     contentRef: proposal.content_ref,
   };
 }

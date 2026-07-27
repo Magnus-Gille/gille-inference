@@ -1,5 +1,15 @@
 # Constitutional micro-routing (ADR-008 / W1)
 
+W1 consumes the complete ADR-008 v2 bundle pinned at merged Grimnir revision
+`16edee0a5a0111f0142569f5b0cf2f90e807060c`. The canonical constitution digest is
+`sha256:836aba8abbc48e05294dac301354ec6b1aa21307b992db78202342ce29aa8dc1`; the
+checked-in disarmed production coverage digest is
+`sha256:b7303c8f02b03b7330a0fc49cd685428a28ddd2d6306e0c47a7fd24e5c0c3cbd`.
+Constitution, coverage, journal schemas, conformance fixtures, and provenance live under
+`contracts/grimnir-autonomy-v2/`. Owner authorization, recovery-worker authorization, and runtime
+narrowing intentionally retain their shared v1 envelopes. The frozen v1 bundle remains available
+only for historical validation and recovery; new W1 attempts are journal v2.
+
 The legacy autonomy timer remains useful for review, evidence evaluation, and standing proposals,
 but is structurally shadow-only. Autonomous route writes use only the production composition in
 `scripts/constitutional-routing-cli.ts`.
@@ -40,11 +50,13 @@ The watchdog receives only an opaque recovery handle and two exact-receipt-bound
 candidate-to-preregistered-baseline restore, followed by `armed-* -> shadow` narrowing. The
 recovery service accepts only the exact eligible `prepare`, `unknown`, or `revert` receipt. A live
 third revision is classified as superseding state and is never overwritten. Notification is best
-effort and cannot suppress restore or disarm.
+effort and cannot suppress restore or disarm. Only a `watch` receipt may remain active between
+watchdog passes. An interrupted `prepare`, `apply`, or `verify` receipt is reconciled immediately,
+including when the candidate CAS succeeded but its socket response was lost.
 
 ## Durable state and fencing
 
-The `journal-v1` resource is the ADR-008 journal envelope with a monotone digest-linked receipt chain. It
+The `journal-v2` resource is the ADR-008 journal envelope with a monotone digest-linked receipt chain. It
 distinguishes prepared, applied, verified, watching, committed, unknown, reverted, disarmed, and
 terminally blocked states. Controller state holds the candidate, opaque recovery handle, digests,
 and prepared signed authority snapshot, but never baseline bytes. The recovery service captures
@@ -71,10 +83,15 @@ stale controller is rejected by the resource transaction even when it was stoppe
 client-side check. If a watchdog dies without releasing its recovery-service session, a new
 acquisition is refused while the lease is current and advances to a new epoch after expiry.
 
-The one-hour whole-operation deadline is independent of receipt cadence. The watch deadline is
-five minutes earlier, leaving deterministic timer/restart jitter margin. Every watchdog pass
-rechecks protected liveness, current digests, the prepared authority epoch, and the independently
-bound candidate proof; fresh protected liveness is bounded to fifteen minutes.
+The immutable attempt deadline is at most 4200 seconds after the durable `prepare` receipt. Apply,
+candidate readback, verifier success, and the durable `watch` receipt must complete within the
+first 300 seconds. That persisted watch receipt—not a precomputed plan timestamp—anchors at least
+3600 seconds of observation. Commit then has at most 300 seconds of grace and must also remain
+within the attempt deadline. Only `watch` may wait between timer activations; interrupted
+`prepare`, `apply`, or `verify`, a missed commit grace, and an exceeded total deadline all enter
+recovery. The 900-second maximum silence is an independently advancing liveness heartbeat, not a
+synthetic journal phase or receipt cadence. Every watchdog pass rechecks protected liveness,
+current digests, the prepared authority epoch, and the independently bound candidate proof.
 
 ## Owner-installed configuration
 
@@ -93,7 +110,14 @@ The owner-supplied recovery signer is an arming prerequisite, not an optional no
 It must sign and durably persist the narrowed ledger plus protected checkpoint before returning
 them. This repository deliberately ships neither that helper nor its key. If the closed recovery
 config, root-owned executable, or persistence implementation is absent, the recovery service
-cannot start, preregistration fails before route apply, and production W1 remains unarmed.
+cannot start, preregistration fails before route apply, and production W1 remains unarmed. Before
+opening either socket, the service requires a bounded root-owned regular executable and sends the
+non-mutating closed readiness request
+`{"kind":"constitutional-recovery-signer-readiness","schema_version":1}`; the only accepted response
+is `{"kind":"constitutional-recovery-signer-readiness","schema_version":1,"ready":true}`. After a
+demotion call, the watchdog independently rereads the protected ledger, registry, and checkpoint.
+It keeps both target blocks in place unless those durable bytes match the helper response, validate
+under the current protected owner authorization, and end at the exact recovery receipt and target.
 
 Targets are compiled and schema-fixed. Flags and environment variables cannot substitute them:
 
@@ -123,8 +147,9 @@ npm run autonomy:constitutional -- watchdog
 ```
 
 `controller` composes one immutable plan from the fixed proposal when none exists, begins it, and
-on later timer activations commits only after the watch deadline. The independent watchdog
-recovers at the absolute deadline.
+on later timer activations commits only after 3600 seconds measured from the durable watch
+receipt. The independent watchdog recovers after missed commit grace, total deadline, kill switch,
+or failed protected watch gate.
 
 ## Fault evidence
 
@@ -139,6 +164,7 @@ The regression harness covers:
 - corrupt material before clock access;
 - live serving fallback while the resource-local block is set;
 - protected-authority rotation after prepare and response-loss replay under a successor fence;
+- the production curl/AF_UNIX controller and watchdog clients, including apply-response loss;
 - stale liveness or failed proof during the active watch window;
 - third-revision preservation;
 - signer-oracle, target substitution, stale freshness, and wrong-identity refusal.

@@ -7,8 +7,18 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
-const UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+const UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/;
 const DOMAINS = new Set(["micro-routing", "macro-routing", "prompt", "harness", "tool-policy", "served-model-roster", "no-reboot-security-bugfix-maintenance"]);
+const CONSTITUTION_EPOCHS = new Map([
+  ["v1", {
+    id: "grimnir-autonomy-v1",
+    digest: "sha256:51efdb78c4524780919649f285862543db8b38a6a3a07894f0fad8bdab40fc6c",
+  }],
+  ["v2", {
+    id: "grimnir-autonomy-v2",
+    digest: "sha256:836aba8abbc48e05294dac301354ec6b1aa21307b992db78202342ce29aa8dc1",
+  }],
+]);
 const plain = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 export const canonicalJson = (v: unknown): string => {
   if (v === undefined || typeof v === "function" || typeof v === "symbol") throw new Error("ADR-008 authorization rejected: non-JSON canonical value");
@@ -20,7 +30,13 @@ export const canonicalJson = (v: unknown): string => {
 };
 export const digestJson = (v: unknown, omit?: string): string => { const x = structuredClone(v) as Record<string, unknown>; if (omit) delete x[omit]; return `sha256:${createHash("sha256").update(canonicalJson(x)).digest("hex")}`; };
 const exact = (v: unknown, keys: string[]) => plain(v) && Object.keys(v).sort().join(",") === [...keys].sort().join(",");
-const utc = (v: unknown) => { if (typeof v !== "string" || !UTC.test(v)) return false; const ms = Date.parse(v); return Number.isFinite(ms) && new Date(ms).toISOString().replace(".000Z", "Z") === v; };
+const utc = (v: unknown) => {
+  if (typeof v !== "string" || !UTC.test(v)) return false;
+  const ms = Date.parse(v);
+  if (!Number.isFinite(ms)) return false;
+  const normalized = new Date(ms).toISOString();
+  return normalized === v || normalized.replace(".000Z", "Z") === v;
+};
 function fail(reason: string): never { throw new Error(`ADR-008 authorization rejected: ${reason}`); }
 function bounded(v: unknown): void { let nodes = 0; const walk = (x: unknown, depth = 0) => { if (++nodes > 10_000 || depth > 64) fail("input exceeds structural limits"); if (plain(x)) Object.values(x).forEach((y) => walk(y, depth + 1)); else if (Array.isArray(x)) x.forEach((y) => walk(y, depth + 1)); }; walk(v); if (Buffer.byteLength(canonicalJson(v)) > 1_000_000) fail("input exceeds 1 MiB"); }
 
@@ -42,6 +58,14 @@ export function verifyOwnerAuthorization(i: OwnerAuthorizationInputs): VerifiedA
   const bindings = a.bindings as Record<string, unknown>;
   if (bindings.constitution_digest !== digestJson(i.constitution, "constitution_digest") || bindings.coverage_intent_digest !== digestJson(i.coverage, "registry_digest") || bindings.owner_attestation_registry_digest !== digestJson(i.attestations, "registry_digest") || bindings.recovery_worker_registry_digest !== digestJson(i.recoveryRegistry, "registry_digest")) fail("artifact digest binding mismatch");
   if (!plain(i.constitution) || !plain(i.coverage) || !plain(i.attestations) || !plain(i.recoveryRegistry) || i.constitution.constitution_digest !== digestJson(i.constitution, "constitution_digest") || i.coverage.registry_digest !== digestJson(i.coverage, "registry_digest") || i.attestations.registry_digest !== digestJson(i.attestations, "registry_digest") || i.recoveryRegistry.registry_digest !== digestJson(i.recoveryRegistry, "registry_digest")) fail("artifact self-digest mismatch");
+  const constitutionEpoch = CONSTITUTION_EPOCHS.get(String(i.constitution.schema_version));
+  if (
+    !exact(i.constitution, ["kind", "schema_version", "constitution_id", "issued_at", "promotion_mode", "safety_floors", "autonomous_classes", "protected_lanes", "constitution_digest", "extensions"])
+    || i.constitution.kind !== "autonomy-constitution"
+    || constitutionEpoch === undefined
+    || i.constitution.constitution_id !== constitutionEpoch.id
+    || i.constitution.constitution_digest !== constitutionEpoch.digest
+  ) fail("constitution is not an exact supported Grimnir epoch");
   const rr = i.recoveryRegistry as Record<string, any>;
   if (!exact(rr, ["kind", "schema_version", "registry_id", "entries", "registry_digest", "extensions"]) || rr.kind !== "autonomy-recovery-worker-registry" || rr.schema_version !== "v1" || !ID.test(String(rr.registry_id)) || !Array.isArray(rr.entries) || rr.entries.length > 256 || !Array.isArray(rr.extensions) || rr.extensions.length) fail("invalid closed recovery registry");
   const tuples = new Set<string>(), fingerprints = new Set<string>();
@@ -101,11 +125,20 @@ const ATTESTATION_KEYS = ["attestation_id", "domain", "target_scope_digest", "co
 
 /** Resolves one exact owner-attested target from signed intent plus the signed runtime tail. */
 export function verifyMicroRoutingTargetState(i: TargetStateVerificationInputs): { admittedState: "armed-canary" | "armed-fleet"; effectiveState: "armed-canary" | "armed-fleet" | "shadow" } {
+  return verifyMicroRoutingTargetStateVersion(i, "v1");
+}
+
+/** Resolves an exact target under the merged ADR-008 v2 constitution epoch. */
+export function verifyMicroRoutingTargetStateV2(i: TargetStateVerificationInputs): { admittedState: "armed-canary" | "armed-fleet"; effectiveState: "armed-canary" | "armed-fleet" | "shadow" } {
+  return verifyMicroRoutingTargetStateVersion(i, "v2");
+}
+
+function verifyMicroRoutingTargetStateVersion(i: TargetStateVerificationInputs, version: "v1" | "v2"): { admittedState: "armed-canary" | "armed-fleet"; effectiveState: "armed-canary" | "armed-fleet" | "shadow" } {
   bounded(i.coverage); bounded(i.attestations);
   const coverage = i.coverage as Record<string, any>, attestations = i.attestations as Record<string, any>;
   const authorizationBindings = i.verified.authorization["bindings"] as Record<string, unknown>;
   if (authorizationBindings["coverage_intent_digest"] !== digestJson(coverage, "registry_digest") || authorizationBindings["owner_attestation_registry_digest"] !== digestJson(attestations, "registry_digest")) fail("current state is not owner-authorized");
-  if (!exact(coverage, ["kind", "schema_version", "registry_id", "issued_at", "constitution_digest", "mutation_policy", "global_state", "domains", "registry_digest", "extensions"]) || coverage.kind !== "autonomy-coverage-registry" || coverage.schema_version !== "v1" || coverage.global_state !== "armed" || coverage.registry_digest !== digestJson(coverage, "registry_digest") || !Array.isArray(coverage.domains) || !Array.isArray(coverage.extensions) || coverage.extensions.length) fail("invalid or disarmed current coverage");
+  if (!exact(coverage, ["kind", "schema_version", "registry_id", "issued_at", "constitution_digest", "mutation_policy", "global_state", "domains", "registry_digest", "extensions"]) || coverage.kind !== "autonomy-coverage-registry" || coverage.schema_version !== version || coverage.global_state !== "armed" || coverage.registry_digest !== digestJson(coverage, "registry_digest") || !Array.isArray(coverage.domains) || !Array.isArray(coverage.extensions) || coverage.extensions.length) fail("invalid or disarmed current coverage");
   if (!exact(attestations, ["kind", "schema_version", "registry_id", "issued_at", "issuer_identity", "mutation_policy", "attestations", "registry_digest", "extensions"]) || attestations.kind !== "autonomy-owner-attestation-registry" || attestations.schema_version !== "v1" || attestations.mutation_policy !== "owner-controlled-protected-lane" || attestations.registry_digest !== digestJson(attestations, "registry_digest") || !Array.isArray(attestations.attestations) || !Array.isArray(attestations.extensions) || attestations.extensions.length) fail("invalid owner attestation registry");
   for (const row of coverage.domains) {
     if (!exact(row, COVERAGE_ROW_KEYS) || !Array.isArray(row.bindings)) fail("invalid closed coverage row");
@@ -150,7 +183,7 @@ export interface JournalPrefixValidationResult {
 
 /** Strict schema + semantic verifier for the exact public journal-v1 contract. */
 export function validateJournalV1(journal: unknown, constitution: unknown, coverage: unknown, attestations: unknown): JournalValidationResult {
-  const result = validateJournal(journal, constitution, coverage, attestations, true);
+  const result = validateJournal(journal, constitution, coverage, attestations, true, "v1");
   return {
     terminal: result.phase as JournalValidationResult["terminal"],
     entries: result.entries,
@@ -174,7 +207,26 @@ export function validateJournalV1Prefix(
   coverage: unknown,
   attestations: unknown,
 ): JournalPrefixValidationResult {
-  return validateJournal(journal, constitution, coverage, attestations, false);
+  return validateJournal(journal, constitution, coverage, attestations, false, "v1");
+}
+
+/** Strict schema + semantic verifier for the merged public journal-v2 contract. */
+export function validateJournalV2(journal: unknown, constitution: unknown, coverage: unknown, attestations: unknown): JournalValidationResult {
+  const result = validateJournal(journal, constitution, coverage, attestations, true, "v2");
+  return {
+    terminal: result.phase as JournalValidationResult["terminal"],
+    entries: result.entries,
+    bindingDigest: result.bindingDigest,
+  };
+}
+
+export function validateJournalV2Prefix(
+  journal: unknown,
+  constitution: unknown,
+  coverage: unknown,
+  attestations: unknown,
+): JournalPrefixValidationResult {
+  return validateJournal(journal, constitution, coverage, attestations, false, "v2");
 }
 
 function validateJournal(
@@ -183,19 +235,21 @@ function validateJournal(
   coverage: unknown,
   attestations: unknown,
   requireTerminal: boolean,
+  version: "v1" | "v2",
 ): JournalPrefixValidationResult {
   bounded(journal); bounded(constitution); bounded(coverage); bounded(attestations);
   const j = journal as Record<string, any>, c = constitution as Record<string, any>, registry = coverage as Record<string, any>, owners = attestations as Record<string, any>;
-  if (!exact(j, ["kind", "schema_version", "journal_id", "domain", "constitution_digest", "binding", "binding_digest", "entries", "extensions"]) || j.kind !== "autonomous-mutation-journal" || j.schema_version !== "v1" || !ID.test(String(j.journal_id)) || !DOMAINS.has(String(j.domain)) || !Array.isArray(j.entries) || j.entries.length < (requireTerminal ? 2 : 1) || !Array.isArray(j.extensions) || j.extensions.length) fail("malformed journal envelope");
+  if (!plain(c) || !plain(registry) || !exact(j, ["kind", "schema_version", "journal_id", "domain", "constitution_digest", "binding", "binding_digest", "entries", "extensions"]) || j.kind !== "autonomous-mutation-journal" || j.schema_version !== version || c.schema_version !== version || registry.schema_version !== version || !ID.test(String(j.journal_id)) || !DOMAINS.has(String(j.domain)) || !Array.isArray(j.entries) || j.entries.length < (requireTerminal ? 2 : 1) || !Array.isArray(j.extensions) || j.extensions.length) fail("malformed journal envelope");
   if (!plain(c) || c.constitution_digest !== digestJson(c, "constitution_digest") || j.constitution_digest !== c.constitution_digest || !Array.isArray(c.autonomous_classes)) fail("journal constitution binding mismatch");
   const policy = c.autonomous_classes.find((candidate: any) => candidate?.class === j.domain);
   if (!policy || !plain(policy.bounds)) fail("journal domain is not an approved class");
   const b = j.binding as Record<string, any>;
-  if (!exact(b, BINDING_KEYS) || !exact(b.canary, ["scope_digest", "target_count", "watch_deadline"]) || !exact(b.recovery, ["class", "worker_identity", "descriptor_digest", "disarms_after_action"])) fail("invalid closed journal binding");
+  const canaryKeys = version === "v2" ? ["scope_digest", "target_count"] : ["scope_digest", "target_count", "watch_deadline"];
+  if (!exact(b, BINDING_KEYS) || !exact(b.canary, canaryKeys) || !exact(b.recovery, ["class", "worker_identity", "descriptor_digest", "disarms_after_action"])) fail("invalid closed journal binding");
   const identities = [b.owner_identity, b.controller_identity, b.watchdog_identity, b.kill_switch_identity, b.recovery_worker_identity];
   if (![b.mutation_id, b.attempt_id, b.recovery_disarm_id, b.idempotency_key, b.writer_owner, b.configuration_owner, ...identities, b.risk_scope].every((x) => ID.test(String(x))) || new Set(identities).size !== 5 || b.attempt_id === b.recovery_disarm_id) fail("journal binding identities invalid");
   if (![b.owner_authority_digest, b.configuration_owner_authority_digest, b.target_scope_digest, b.admission_coverage_digest, b.candidate_digest, b.config_digest, b.evidence_digest, b.policy_digest, b.baseline_digest, b.postconditions_digest, b.recovery.descriptor_digest].every((x) => DIGEST.test(String(x))) || !/^ref:[a-z][a-z0-9-]{2,120}$/.test(String(b.owner_authority_ref)) || !/^ref:[a-z][a-z0-9-]{2,120}$/.test(String(b.configuration_owner_authority_ref))) fail("journal binding formats invalid");
-  if (!utc(b.deadline) || !utc(b.canary.watch_deadline) || b.canary.target_count !== 1 || b.canary.scope_digest !== b.target_scope_digest || b.recovery.class !== policy.recovery_class || b.recovery.worker_identity !== b.recovery_worker_identity || b.recovery.disarms_after_action !== true || b.risk_scope !== j.domain || !["armed-canary", "armed-fleet"].includes(b.admission_binding_state) || j.binding_digest !== digestJson(b)) fail("journal immutable binding mismatch");
+  if (!utc(b.deadline) || (version === "v1" && !utc(b.canary.watch_deadline)) || b.canary.target_count !== 1 || b.canary.scope_digest !== b.target_scope_digest || b.recovery.class !== policy.recovery_class || b.recovery.worker_identity !== b.recovery_worker_identity || b.recovery.disarms_after_action !== true || b.risk_scope !== j.domain || !["armed-canary", "armed-fleet"].includes(b.admission_binding_state) || j.binding_digest !== digestJson(b)) fail("journal immutable binding mismatch");
   if (!exact(registry, ["kind", "schema_version", "registry_id", "issued_at", "constitution_digest", "mutation_policy", "global_state", "domains", "registry_digest", "extensions"]) || registry.registry_digest !== digestJson(registry, "registry_digest") || registry.global_state !== "armed" || b.admission_coverage_digest !== registry.registry_digest || !Array.isArray(registry.domains) || !Array.isArray(registry.extensions) || registry.extensions.length) fail("journal admission coverage mismatch");
   for (const coverageRow of registry.domains) {
     if (!exact(coverageRow, COVERAGE_ROW_KEYS) || !Array.isArray(coverageRow.bindings)) fail("invalid closed journal coverage row");
@@ -211,7 +265,7 @@ function validateJournal(
   const identityFields: Array<[string, string]> = [["owner_identity", "owner"], ["controller_identity", "controller"], ["watchdog_identity", "watchdog"], ["kill_switch_identity", "kill_switch"], ["recovery_worker_identity", "recovery_worker"]];
   for (const [field, identity] of identityFields) if (b[field] !== ownerBinding.identities?.[identity]) fail("journal authority identity does not match coverage");
   const start = Date.parse(j.entries[0]?.recorded_at);
-  if (!Number.isFinite(start) || Date.parse(b.deadline) - start > policy.bounds.deadline_seconds * 1000 || Date.parse(b.canary.watch_deadline) > Date.parse(b.deadline)) fail("journal deadline exceeds constitutional bound");
+  if (!Number.isFinite(start) || Date.parse(b.deadline) <= start || Date.parse(b.deadline) - start > policy.bounds.deadline_seconds * 1000 || (version === "v1" && Date.parse(b.canary.watch_deadline) > Date.parse(b.deadline))) fail("journal deadline exceeds constitutional bound");
   const transitions: Record<string, string[]> = policy.recovery_class === "R-exact"
     ? { prepare: ["apply", "unknown"], apply: ["verify", "unknown"], verify: ["watch", "unknown"], watch: ["commit", "unknown"], commit: [], unknown: ["revert", "terminally-blocked"], revert: ["disarm", "terminally-blocked"], disarm: [], "terminally-blocked": [] }
     : { prepare: ["apply", "unknown"], apply: ["verify", "unknown"], verify: ["watch", "unknown"], watch: ["commit", "unknown"], commit: [], unknown: ["recover", "terminally-blocked"], recover: ["quarantine", "terminally-blocked"], quarantine: ["disarm", "terminally-blocked"], disarm: [], "terminally-blocked": [] };
@@ -227,8 +281,8 @@ function validateJournal(
       if (Date.parse(e.recorded_at) < Date.parse(prior.recorded_at) || !transitions[prior.phase]?.includes(e.phase)) fail(`illegal journal transition ${prior.phase} -> ${e.phase}`);
     }
     if (["prepare", "apply", "verify", "watch", "commit"].includes(e.phase) && Date.parse(e.recorded_at) > Date.parse(b.deadline)) fail("late admission or mutation phase");
-    if (e.phase === "watch" && (Date.parse(e.recorded_at) > Date.parse(b.canary.watch_deadline) || Date.parse(b.canary.watch_deadline) - Date.parse(e.recorded_at) > policy.bounds.watch_seconds * 1000)) fail("watch deadline exceeds constitutional bound");
-    if (e.phase === "commit" && Date.parse(e.recorded_at) < Date.parse(b.canary.watch_deadline)) fail("commit occurred before watch completion");
+    if (version === "v1" && e.phase === "watch" && (Date.parse(e.recorded_at) > Date.parse(b.canary.watch_deadline) || Date.parse(b.canary.watch_deadline) - Date.parse(e.recorded_at) > policy.bounds.watch_seconds * 1000)) fail("watch deadline exceeds constitutional bound");
+    if (version === "v1" && e.phase === "commit" && Date.parse(e.recorded_at) < Date.parse(b.canary.watch_deadline)) fail("commit occurred before watch completion");
     const recoveryPhase = ["revert", "recover", "quarantine", "disarm", "terminally-blocked"].includes(e.phase);
     if (e.phase === "unknown") {
       if (![b.controller_identity, b.watchdog_identity].includes(e.executor_identity)) fail("unknown was not declared by controller or watchdog");
@@ -240,6 +294,22 @@ function validateJournal(
       if (!exact(transition, ["from_state", "to_state", "target_scope_digest", "actor_identity"]) || transition.from_state !== b.admission_binding_state || transition.to_state !== "shadow" || transition.target_scope_digest !== b.target_scope_digest || transition.actor_identity !== b.recovery_worker_identity || transition.actor_identity !== e.executor_identity) fail("invalid recovery coverage transition");
     } else if (e.coverage_transition !== null) fail("non-recovery phase changed coverage");
     previous = e.receipt_digest;
+  }
+  if (version === "v2") {
+    const watch = j.entries.find((entry: any) => entry.phase === "watch");
+    const commit = j.entries.find((entry: any) => entry.phase === "commit");
+    for (const phase of ["apply", "verify", "watch"]) {
+      const receipt = j.entries.find((entry: any) => entry.phase === phase);
+      if (receipt && Date.parse(receipt.recorded_at) - start > policy.bounds.apply_verify_budget_seconds * 1000) {
+        fail(`${phase} receipt exceeded apply/readback/verify budget`);
+      }
+    }
+    if (commit) {
+      if (!watch) fail("commit lacks durable watch receipt");
+      const elapsed = Date.parse(commit.recorded_at) - Date.parse(watch.recorded_at);
+      if (elapsed < policy.bounds.minimum_watch_seconds * 1000) fail("commit occurred before minimum durable watch");
+      if (elapsed > (policy.bounds.minimum_watch_seconds + policy.bounds.commit_grace_seconds) * 1000) fail("commit exceeded post-watch grace");
+    }
   }
   if (j.entries[0].phase !== "prepare") fail("journal does not start prepared");
   const terminal = j.entries.at(-1).phase as string;
