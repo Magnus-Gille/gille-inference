@@ -64,9 +64,7 @@ if (mode === "controller-response-loss") {
   const watchdog = createWatchdogRecoverySocketClient(socket);
   const fence = watchdog.acquireRouteFence();
   try {
-    watchdog.blockRoute(fence);
     const digest = watchdog.readRouteDigest(fence);
-    watchdog.clearRouteBlock(fence);
     process.stdout.write(`${JSON.stringify({ digest })}\n`);
   } finally {
     watchdog.releaseRouteFence(fence);

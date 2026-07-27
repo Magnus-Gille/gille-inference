@@ -266,7 +266,6 @@ function recoveryCapability(
       }
     },
     blockRoute: () => { opts.onBlock?.(); },
-    clearRouteBlock: () => { opts.onClearBlock?.(); },
     clearOwnedRouteBlock: () => false,
     clearCandidateDeadline: () => { opts.onClearDeadline?.(); },
     readRouteDigest: () => `sha256:${createHash("sha256").update(store.read()).digest("hex")}`,
@@ -571,12 +570,7 @@ describe("constitutional micro-routing controller", () => {
         throw new Error("real committed deadline reconciliation failed");
       }
     };
-    recovery.blockRoute = (fence) => {
-      if (!routeDb.block(fence)) throw new Error("failed to block real route database");
-    };
-    recovery.clearRouteBlock = (fence) => {
-      if (!routeDb.clearBlock(fence)) throw new Error("failed to clear real route database");
-    };
+    recovery.blockRoute = (fence) => { routeDb.block(fence); };
 
     expect(new ConstitutionalRoutingWatchdog(root, authority.reader, recovery).tick())
       .toMatchObject({ outcome: "noop", reason: "terminal-commit" });
@@ -781,6 +775,17 @@ describe("constitutional micro-routing controller", () => {
     new ConstitutionalRoutingController(root, routeDb, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
     let held: ReturnType<typeof routeDb.acquireWriterLease> | undefined;
     let crashAfterBlock = true;
+    const guardJournal = JSON.parse(readConstitutionalResource(
+      constitutionalPaths(root).lock,
+      constitutionalPaths(root).journal,
+    )!) as any;
+    const ownerFor = (journalId: string) => ({
+      journalId,
+      attemptId: guardJournal.binding.attempt_id,
+      bindingDigest: guardJournal.binding_digest,
+      targetScopeDigest: guardJournal.binding.target_scope_digest,
+      watchdogIdentity: guardJournal.binding.watchdog_identity,
+    });
     const recovery: RestoreOnlyCapability = {
       recoveryWorkerIdentity: "micro-route-revert-worker",
       acquireRouteFence: () => {
@@ -788,12 +793,11 @@ describe("constitutional micro-routing controller", () => {
         return { epoch: held.epoch, token: held.token };
       },
       releaseRouteFence: () => { held?.release(); held = undefined; },
-      blockRoute: (fence, owner) => {
-        expect(routeDb.block(fence, owner)).toBe(true);
+      blockRoute: (fence, journalId) => {
+        expect(routeDb.block(fence, journalId === undefined ? undefined : ownerFor(journalId))).toBe(true);
         if (crashAfterBlock) throw new Error("fault-injected crash after serving DB block");
       },
-      clearRouteBlock: (fence) => { expect(routeDb.clearBlock(fence)).toBe(true); },
-      clearOwnedRouteBlock: (fence, owner) => routeDb.clearOwnedBlock(fence, owner),
+      clearOwnedRouteBlock: (fence, journalId) => routeDb.clearOwnedBlock(fence, ownerFor(journalId)),
       clearCandidateDeadline: () => undefined,
       readRouteDigest: () => `sha256:${createHash("sha256").update(routeDb.read()).digest("hex")}`,
       actuatePreRegisteredRecovery: () => "failed",
@@ -833,9 +837,8 @@ describe("constitutional micro-routing controller", () => {
       recoveryWorkerIdentity: "micro-route-revert-worker",
       acquireRouteFence: () => { held = routeDb.acquireWriterLease(); return { epoch: held.epoch, token: held.token }; },
       releaseRouteFence: () => { held?.release(); held = undefined; },
-      blockRoute: (fence, owner) => { if (!routeDb.block(fence, owner)) throw new Error("block failed"); },
-      clearRouteBlock: (fence) => { if (!routeDb.clearBlock(fence)) throw new Error("clear failed"); },
-      clearOwnedRouteBlock: (fence, owner) => routeDb.clearOwnedBlock(fence, owner),
+      blockRoute: () => undefined,
+      clearOwnedRouteBlock: () => false,
       clearCandidateDeadline: () => undefined, readRouteDigest: () => `sha256:${createHash("sha256").update(routeDb.read()).digest("hex")}`,
       actuatePreRegisteredRecovery: () => "failed", signAndPersistDemotion: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
     };
@@ -1018,12 +1021,7 @@ describe("constitutional micro-routing controller", () => {
       synthetic.snapshot,
       { restoreFails: true },
     );
-    recovery.blockRoute = (fence) => {
-      if (!routeDb.block(fence)) throw new Error("failed to block real route database");
-    };
-    recovery.clearRouteBlock = (fence) => {
-      if (!routeDb.clearBlock(fence)) throw new Error("failed to clear real route database");
-    };
+    recovery.blockRoute = (fence) => { routeDb.block(fence); };
     const watchdog = new ConstitutionalRoutingWatchdog(root, authority.reader, recovery);
 
     expect(watchdog.tick()).toMatchObject({

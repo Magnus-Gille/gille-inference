@@ -394,7 +394,6 @@ export type RecoverySocketEndpoint =
   | "/route/apply"
   | "/route/promote"
   | "/route/block"
-  | "/route/unblock"
   | "/route/unblock-owned"
   | "/route/digest";
 
@@ -528,20 +527,14 @@ export function createWatchdogRecoverySocketClient(
         throw new Error("recovery service refused the route-fence release");
       }
     },
-    blockRoute: (fence, owner) => {
-      const result = transport(socket, "/route/block", owner ? { ...fence, owner } : fence);
-      if (!exactKeys(result, ["changed"]) || result.changed !== true) {
+    blockRoute: (fence, journalId) => {
+      const result = transport(socket, "/route/block", journalId === undefined ? fence : { ...fence, journalId });
+      if (!exactKeys(result, ["changed"]) || typeof result.changed !== "boolean") {
         throw new Error("recovery service refused the route block");
       }
     },
-    clearRouteBlock: (fence) => {
-      const result = transport(socket, "/route/unblock", fence);
-      if (!exactKeys(result, ["changed"]) || result.changed !== true) {
-        throw new Error("recovery service refused the route unblock");
-      }
-    },
-    clearOwnedRouteBlock: (fence, owner) => {
-      const result = transport(socket, "/route/unblock-owned", { ...fence, owner });
+    clearOwnedRouteBlock: (fence, journalId) => {
+      const result = transport(socket, "/route/unblock-owned", { ...fence, journalId });
       if (!exactKeys(result, ["changed"]) || typeof result.changed !== "boolean") {
         throw new Error("recovery service returned an invalid owned route unblock");
       }

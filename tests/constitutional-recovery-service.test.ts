@@ -58,6 +58,7 @@ function journalAuthority(phase: "prepare" | "unknown" | "revert" | "commit" = "
         deadline: "2030-07-26T01:10:00Z",
         descriptorDigest: `sha256:${"3".repeat(64)}`,
         ownerAuthorizationDigest: `sha256:${"5".repeat(64)}`,
+        watchdogIdentity: "micro-route-watchdog",
         phase: currentPhase,
         receiptDigest: `sha256:${"4".repeat(64)}`,
         });
@@ -104,6 +105,9 @@ function route(initial: string) {
     clearCandidateDeadline: (_candidate: unknown, suppliedFence: { epoch: number; token: string }) => (
       suppliedFence.epoch === currentFence.epoch && suppliedFence.token === currentFence.token
     ),
+    clearOwnedBlock: (suppliedFence: { epoch: number; token: string }) => (
+      suppliedFence.epoch === currentFence.epoch && suppliedFence.token === currentFence.token
+    ),
     compareAndSwap: (expected: string, next: string, suppliedFence: { epoch: number; token: string }) => {
       if (suppliedFence.epoch !== currentFence.epoch || suppliedFence.token !== currentFence.token) return false;
       if (current !== expected) return false;
@@ -121,7 +125,7 @@ function route(initial: string) {
 }
 
 describe("recovery-owned preregistration", () => {
-  it("authenticates prepare receipts against protected pins/checkpoints and rejects their substitution", () => {
+  it("rejects the frozen v1 journal at the privileged recovery boundary", () => {
     const snapshot = {
       authorization: fixture("test-owner-authorization.json"),
       constitution: artifact("constitution.json"),
@@ -134,32 +138,11 @@ describe("recovery-owned preregistration", () => {
       runtimeNarrowingCheckpoint: fixture("test-runtime-narrowing-checkpoint.json"),
     };
     const journal = fixture("journal-happy-commit.json");
-    journal.entries = [journal.entries[0]];
-    journal.binding.recovery.descriptor_digest = digestJson(snapshot);
-    journal.binding_digest = digestJson(journal.binding);
-    journal.entries[0].binding_digest = journal.binding_digest;
-    journal.entries[0].previous_receipt_digest = null;
-    journal.entries[0].receipt_digest = digestJson(journal.entries[0], "receipt_digest");
-    expect(authenticateRecoveryJournal({
+    expect(() => authenticateRecoveryJournal({
       journalId: journal.journal_id,
       journal,
       protectedSnapshot: snapshot,
-    })).toMatchObject({ phase: "prepare", receiptDigest: journal.entries[0].receipt_digest });
-    expect(() => authenticateRecoveryJournal({
-      journalId: journal.journal_id,
-      journal,
-      protectedSnapshot: {
-        ...snapshot,
-        pinnedOwnerPublicKeyPem: pem("test-attacker-ed25519-public.pem"),
-      },
-    })).toThrow(/pinned|fingerprint|signature/);
-    const staleCheckpoint = structuredClone(snapshot);
-    staleCheckpoint.checkpoint.minimum_sequence = 2;
-    expect(() => authenticateRecoveryJournal({
-      journalId: journal.journal_id,
-      journal,
-      protectedSnapshot: staleCheckpoint,
-    })).toThrow(/sequence|checkpoint/);
+    })).toThrow(/unsupported recovery journal contract epoch/);
   });
 
   it("restores only candidate to the exact preregistered baseline", () => {
@@ -437,6 +420,28 @@ describe("permission-separated AF_UNIX recovery service", () => {
       expect(superseding.body.epoch).toBeGreaterThan(acquired.body.epoch);
       expect((await post(actionSocketPath, "/fence/release", acquired.body)).status).toBe(400);
       const heldFence = { fenceEpoch: superseding.body.epoch, fenceToken: superseding.body.token };
+      // AF_UNIX peer authorization permits an action request, not a caller-
+      // supplied watchdog owner tuple. The service must derive it from the
+      // authenticated journal it owns.
+      expect((await post(actionSocketPath, "/route/block", {
+        ...superseding.body,
+        owner: {
+          journalId: "attacker-journal", attemptId: "attacker-attempt",
+          bindingDigest: `sha256:${"9".repeat(64)}`,
+          targetScopeDigest: `sha256:${"8".repeat(64)}`,
+          watchdogIdentity: "attacker-watchdog",
+        },
+      })).status).toBe(400);
+      journal.setPhase("watch" as any);
+      expect(await post(actionSocketPath, "/route/block", {
+        ...superseding.body,
+        journalId: "micro-route-journal",
+      })).toMatchObject({ status: 200, body: { changed: true } });
+      expect(await post(actionSocketPath, "/route/unblock-owned", {
+        ...superseding.body,
+        journalId: "micro-route-journal",
+      })).toMatchObject({ status: 200, body: { changed: true } });
+      journal.setPhase("unknown");
       expect((await post(actionSocketPath, "/route/block", superseding.body)).status).toBe(200);
       const actuated = await post(actionSocketPath, "/actuate", {
         handle: registered.body.handle,
@@ -482,7 +487,9 @@ describe("permission-separated AF_UNIX recovery service", () => {
         journalReceiptDigest: `sha256:${"4".repeat(64)}`,
         ...heldFence,
       })).status).toBe(200);
-      expect((await post(actionSocketPath, "/route/unblock", superseding.body)).status).toBe(200);
+      // Generic unblock is intentionally not exposed: the recovery service
+      // clears only an owner it has derived from an authenticated journal.
+      expect((await post(actionSocketPath, "/route/unblock", superseding.body)).status).toBe(404);
       expect((await post(actionSocketPath, "/fence/release", {
         epoch: superseding.body.epoch,
         token: superseding.body.token,

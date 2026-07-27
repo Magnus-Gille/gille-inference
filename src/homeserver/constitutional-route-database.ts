@@ -176,11 +176,7 @@ export class ConstitutionalRouteDatabase {
 
   block(fence: RouteFence, owner?: RouteGuardOwner): boolean {
     if (owner !== undefined) validateGuardOwner(owner);
-    return this.setBlocked(true, fence, owner);
-  }
-
-  clearBlock(fence: RouteFence): boolean {
-    return this.setBlocked(false, fence);
+    return this.setBlocked(fence, owner);
   }
 
   /** Clears only the exact watchdog attempt which created this guard. */
@@ -212,19 +208,26 @@ export class ConstitutionalRouteDatabase {
     }
   }
 
-  private setBlocked(blocked: boolean, fence: RouteFence, owner?: RouteGuardOwner): boolean {
+  private setBlocked(fence: RouteFence, owner?: RouteGuardOwner): boolean {
     validateFence(fence);
     const db = open(this.path);
     try {
       return db.transaction(() => {
         if (!routeLeaseCurrent(db, fence)) return false;
+        // Guard ownership is a capability boundary, not diagnostic metadata.
+        // A watchdog can attach its identity only while atomically taking an
+        // unblocked route. Once blocked, including by an operator or a
+        // different watchdog attempt, the existing guard must remain intact.
         const result = db.prepare(`
-          UPDATE constitutional_route_guard SET blocked=?, owner_journal_id=?, owner_attempt_id=?,
+          UPDATE constitutional_route_guard SET blocked=1, owner_journal_id=?, owner_attempt_id=?,
             owner_binding_digest=?, owner_target_scope_digest=?, owner_watchdog_identity=?,
-            owner_fence_epoch=?, owner_fence_token=? WHERE id=1
-        `).run(blocked ? 1 : 0, owner?.journalId ?? null, owner?.attemptId ?? null,
+            owner_fence_epoch=?, owner_fence_token=?
+          WHERE id=1 AND blocked=0
+        `).run(
+          owner?.journalId ?? null, owner?.attemptId ?? null,
           owner?.bindingDigest ?? null, owner?.targetScopeDigest ?? null, owner?.watchdogIdentity ?? null,
-          owner ? fence.epoch : null, owner ? fence.token : null);
+          owner ? fence.epoch : null, owner ? fence.token : null,
+        );
         return result.changes === 1;
       }).immediate();
     } finally {

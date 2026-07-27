@@ -8,7 +8,8 @@ checked-in disarmed production coverage digest is
 Constitution, coverage, journal schemas, conformance fixtures, and provenance live under
 `contracts/grimnir-autonomy-v2/`. Owner authorization, recovery-worker authorization, and runtime
 narrowing intentionally retain their shared v1 envelopes. The frozen v1 bundle remains available
-only for historical validation and recovery; new W1 attempts are journal v2.
+only for historical validation. It was never deployed as a W1 recovery protocol, so the privileged
+recovery service accepts journal-v2 only; this avoids ambiguous v1/v2 epoch dispatch.
 
 The legacy autonomy timer remains useful for review, evidence evaluation, and standing proposals,
 but is structurally shadow-only. Autonomous route writes use only the production composition in
@@ -120,9 +121,10 @@ The owner-supplied recovery signer is an arming prerequisite, not an optional no
 It must sign and durably persist the narrowed ledger plus protected checkpoint before returning
 them. This repository deliberately ships neither that helper nor its key. If the closed recovery
 config, root-owned executable, or persistence implementation is absent, the recovery service
-cannot start, preregistration fails before route apply, and production W1 remains unarmed. Before
-opening either socket, the service requires a bounded root-owned regular executable and sends the
-non-mutating closed readiness request
+cannot start, preregistration fails before route apply, and production W1 remains unarmed. The
+systemd socket units may exist before their service is ready, but the recovery process performs no
+operation and accepts no request until it has required a bounded root-owned regular executable and
+sent the non-mutating closed readiness request
 `{"kind":"constitutional-recovery-signer-readiness","schema_version":1}`; the only accepted response
 is `{"kind":"constitutional-recovery-signer-readiness","schema_version":1,"ready":true}`. After a
 demotion call, the watchdog independently rereads the protected ledger, registry, and checkpoint.

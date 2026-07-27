@@ -16,7 +16,6 @@ import { dirname, join } from "node:path";
 import {
   canonicalJson,
   digestJson,
-  validateJournalV1Prefix,
   validateJournalV2Prefix,
   verifyOwnerAuthorization,
 } from "./autonomy-contract-v1.js";
@@ -82,7 +81,8 @@ export interface RecoveryJournalView {
   deadline: string;
   descriptorDigest: string;
   ownerAuthorizationDigest: string;
-  phase: "prepare" | "unknown" | "revert" | "terminally-blocked" | "disarm" | "commit";
+  watchdogIdentity: string;
+  phase: "prepare" | "unknown" | "revert" | "terminally-blocked" | "disarm" | "commit" | "watch" | "apply" | "verify";
   receiptDigest: string;
 }
 
@@ -98,14 +98,12 @@ export function authenticateRecoveryJournal(input: {
   protectedSnapshot: any;
 }): RecoveryJournalView {
   const { journalId, journal, material, protectedSnapshot } = input;
+  // W1 was introduced with journal-v2; the frozen v1 material was never an
+  // operational recovery protocol. Accepting its differently bound envelope
+  // here would make epoch dispatch ambiguous at the privileged boundary.
+  if (journal?.schema_version !== "v2") throw new Error("unsupported recovery journal contract epoch");
   const verified = verifyOwnerAuthorization(protectedSnapshot);
-  const validateJournalPrefix = journal?.schema_version === "v2"
-    ? validateJournalV2Prefix
-    : journal?.schema_version === "v1"
-      ? validateJournalV1Prefix
-      : undefined;
-  if (!validateJournalPrefix) throw new Error("unsupported recovery journal contract epoch");
-  validateJournalPrefix(
+  validateJournalV2Prefix(
     journal,
     protectedSnapshot.constitution,
     protectedSnapshot.coverage,
@@ -136,6 +134,7 @@ export function authenticateRecoveryJournal(input: {
     deadline: journal.binding.deadline,
     descriptorDigest: journal.binding.recovery.descriptor_digest,
     ownerAuthorizationDigest: verified.authorizationDigest,
+    watchdogIdentity: journal.binding.watchdog_identity,
     phase: last.phase,
     receiptDigest: last.receipt_digest,
   };
@@ -461,7 +460,6 @@ export interface RecoveryServiceOptions {
   route: RecoveryRoute & {
     compareAndSwap(expected: string, next: string, fence: RouteFence, candidateDeadline?: CandidateRouteDeadline): boolean;
     block(fence: RouteFence, owner?: RouteGuardOwner): boolean;
-    clearBlock(fence: RouteFence): boolean;
     clearOwnedBlock(fence: RouteFence, owner: RouteGuardOwner): boolean;
   };
   journalAuthority: RecoveryJournalAuthority;
@@ -551,6 +549,31 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
       || token !== recoveryRouteLease.token
     ) throw new Error("request does not match the current recovery route fence");
     return { epoch, token };
+  };
+  const authenticatedGuardOwner = (journalId: unknown, purpose: "block" | "clear"): RouteGuardOwner => {
+    if (typeof journalId !== "string" || !ID.test(journalId)) {
+      throw new Error("route guard request requires a valid journal id");
+    }
+    // The AF_UNIX caller is authorized only to request a journal id. It never
+    // supplies a trusted tuple: the recovery service re-reads the protected
+    // authenticated journal and derives all owner fields itself.
+    const journal = options.journalAuthority.read(
+      journalId,
+      options.registry.protectedAuthorityFor(journalId),
+    );
+    if (journal.journalId !== journalId) throw new Error("route guard journal identity mismatch");
+    const clearEligible = ["watch", "commit", "disarm"].includes(journal.phase);
+    const blockEligible = ["prepare", "apply", "verify", "watch", "unknown", "revert", "terminally-blocked", "disarm", "commit"].includes(journal.phase);
+    if ((purpose === "clear" && !clearEligible) || (purpose === "block" && !blockEligible)) {
+      throw new Error(`route guard ${purpose} is not eligible for the authenticated journal phase`);
+    }
+    return {
+      journalId: journal.journalId,
+      attemptId: journal.attemptId,
+      bindingDigest: journal.bindingDigest,
+      targetScopeDigest: journal.targetScopeDigest,
+      watchdogIdentity: journal.watchdogIdentity,
+    };
   };
   const registration = createServer(async (request, response) => {
     try {
@@ -670,23 +693,29 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
           promoted: options.registry.promoteCandidate(candidate, candidate, options.route, options.journalAuthority),
         });
       }
-      if (request.url === "/route/block" || request.url === "/route/unblock" || request.url === "/route/unblock-owned") {
+      if (request.url === "/route/block" || request.url === "/route/unblock-owned") {
         const fence = body as RouteFence;
         if (
           typeof body !== "object"
           || body === null
           || Array.isArray(body)
-          || !["epoch,token", "epoch,owner,token"].includes(Object.keys(body).sort().join(","))
+          || !["epoch,token", "epoch,journalId,token"].includes(Object.keys(body).sort().join(","))
         ) throw new Error("route guard request does not match the held recovery fence");
         requireRecoveryFence(body);
-        const owner = (body as { owner?: unknown }).owner;
-        if (request.url === "/route/unblock-owned" && owner === undefined) throw new Error("owned route unblock requires guard owner");
+        const journalId = (body as { journalId?: unknown }).journalId;
+        if (request.url === "/route/unblock-owned" && journalId === undefined) {
+          throw new Error("owned route unblock requires an authenticated journal id");
+        }
+        const owner = journalId === undefined ? undefined : authenticatedGuardOwner(
+          journalId,
+          request.url === "/route/block" ? "block" : "clear",
+        );
+        // An already-blocked route is deliberately a successful fail-closed
+        // outcome for block. The caller must not retry by overwriting the
+        // existing watchdog or operator owner.
         const changed = request.url === "/route/block"
-          ? options.route.block(fence, owner as any)
-          : request.url === "/route/unblock-owned"
-            ? options.route.clearOwnedBlock(fence, owner as any)
-            : options.route.clearBlock(fence);
-        if (!changed && request.url !== "/route/unblock-owned") throw new Error("route guard fence is stale");
+          ? options.route.block(fence, owner)
+          : options.route.clearOwnedBlock(fence, owner!);
         return respond(response, 200, { changed });
       }
       if (request.url === "/route/digest") {

@@ -54,16 +54,50 @@ describe("constitutional route resource fencing", () => {
     const route = new ConstitutionalRouteDatabase(path);
     const first = route.acquireWriterLease();
     const firstFence = { epoch: first.epoch, token: first.token };
-    expect(route.block(firstFence)).toBe(true);
+    const owner = {
+      journalId: "micro-route-journal", attemptId: "micro-route-attempt",
+      bindingDigest: `sha256:${"1".repeat(64)}`,
+      targetScopeDigest: `sha256:${"2".repeat(64)}`,
+      watchdogIdentity: "micro-route-watchdog",
+    };
+    expect(route.block(firstFence, owner)).toBe(true);
     expect(route.isBlocked()).toBe(true);
     first.release();
     const successor = route.acquireWriterLease();
     const successorFence = { epoch: successor.epoch, token: successor.token };
-    expect(route.clearBlock(firstFence)).toBe(false);
+    expect(route.clearOwnedBlock(firstFence, owner)).toBe(false);
     expect(route.isBlocked()).toBe(true);
-    expect(route.clearBlock(successorFence)).toBe(true);
+    expect(route.clearOwnedBlock(successorFence, owner)).toBe(true);
     expect(route.isBlocked()).toBe(false);
     successor.release();
+  });
+
+  it("assigns a watchdog owner only on a 0-to-1 transition and never lets a later guard replace it", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "constitutional-route-db-")), "routing.db");
+    initializeConstitutionalRouteDatabase(path, "{}");
+    const route = new ConstitutionalRouteDatabase(path);
+    const lease = route.acquireWriterLease();
+    const fence = { epoch: lease.epoch, token: lease.token };
+    const owner = {
+      journalId: "micro-route-journal", attemptId: "micro-route-attempt",
+      bindingDigest: `sha256:${"1".repeat(64)}`,
+      targetScopeDigest: `sha256:${"2".repeat(64)}`,
+      watchdogIdentity: "micro-route-watchdog",
+    };
+    const foreign = {
+      ...owner, journalId: "foreign-journal", attemptId: "foreign-attempt",
+      bindingDigest: `sha256:${"3".repeat(64)}`,
+      targetScopeDigest: `sha256:${"4".repeat(64)}`,
+      watchdogIdentity: "foreign-watchdog",
+    };
+
+    expect(route.block(fence, owner)).toBe(true);
+    expect(route.block(fence, foreign)).toBe(false);
+    expect(route.clearOwnedBlock(fence, foreign)).toBe(false);
+    expect(route.isBlocked()).toBe(true);
+    expect(route.clearOwnedBlock(fence, owner)).toBe(true);
+    expect(route.isBlocked()).toBe(false);
+    lease.release();
   });
 
   it("fails closed at the durable candidate deadline even with no watchdog, and clears only on exact commit or revert", async () => {

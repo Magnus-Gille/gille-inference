@@ -50,14 +50,18 @@ function currentProtectedAuthority(config = authorityConfig()): any {
 function journalView(journalId: string, protectedAuthority?: unknown): RecoveryJournalView {
   const paths = constitutionalPaths(PRODUCTION_STATE_DIR);
   const journalBytes = readConstitutionalResourceReadonly(paths.lock, paths.journal);
+  const materialBytes = readConstitutionalResourceReadonly(paths.lock, paths.recoveryMaterial);
   if (journalBytes === undefined) throw new Error("recovery journal is missing");
+  if (materialBytes === undefined) throw new Error("recovery material is missing");
   const journal = JSON.parse(journalBytes) as any;
+  const material = JSON.parse(materialBytes) as any;
   const snapshot = protectedAuthority === undefined
     ? currentProtectedAuthority()
     : structuredClone(protectedAuthority);
   return authenticateRecoveryJournal({
     journalId,
     journal,
+    material,
     protectedSnapshot: snapshot,
   });
 }
