@@ -1670,6 +1670,7 @@ export async function admitRosterProposal(
             error,
           );
         }
+        if (callbackError !== null) throw callbackError;
         let providerThen: unknown;
         try {
           if (

@@ -1200,7 +1200,33 @@ describe("fail-closed admission and durable lifecycle", () => {
       .toEqual(["submitted", "rejected"]);
   });
 
-  it("preserves a first SQLite callback failure when the provider invokes the fence again", async () => {
+  it.each([
+    {
+      shape: "a second callback",
+      id: "second-callback",
+      afterFirst: (
+        callback: (confirmedToken: unknown) => unknown,
+        confirmedToken: ServerRosterObservationToken,
+      ): unknown => callback(confirmedToken),
+    },
+    {
+      shape: "a Promise",
+      id: "promise",
+      afterFirst: (): unknown => Promise.resolve(undefined),
+    },
+    {
+      shape: "a throwing then getter",
+      id: "throwing-then-getter",
+      afterFirst: (): unknown => Object.defineProperty({}, "then", {
+        get: () => {
+          throw new Error("provider then getter failed after callback failure");
+        },
+      }),
+    },
+  ])("preserves a first SQLite callback failure before provider returns $shape", async ({
+    id,
+    afterFirst,
+  }) => {
     ensureRosterProposalSchema(db);
     db.exec(`
       CREATE TRIGGER fail_first_armed_insert
@@ -1212,8 +1238,8 @@ describe("fail-closed admission and durable lifecycle", () => {
     `);
     const observation = serverObservation();
     const input = proposal({
-      proposal_id: "proposal:w5:fence-storage-then-twice",
-      idempotency_key: "idem:w5:fence-storage-then-twice",
+      proposal_id: `proposal:w5:fence-storage-${id}`,
+      idempotency_key: `idem:w5:fence-storage-${id}`,
     });
     let providerCaughtFirst = false;
     let thrown: unknown;
@@ -1235,7 +1261,7 @@ describe("fail-closed admission and durable lifecycle", () => {
               } catch {
                 providerCaughtFirst = true;
               }
-              return callback(tokenFor(observation));
+              return afterFirst(callback, tokenFor(observation));
             },
           },
         },
