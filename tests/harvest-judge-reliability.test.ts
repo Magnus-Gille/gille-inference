@@ -265,6 +265,10 @@ describe("shouldWriteVerdict ('other'-row noise must not teach routing when harv
     expect(shouldWriteVerdict("other", "on", ["other"])).toBe(false);
   });
 
+  it("does not let a known taxonomy spelling variant escape an exclusion", () => {
+    expect(shouldWriteVerdict("Other", "on", ["other"])).toBe(false);
+  });
+
   it("still allows the excluded type in shadow mode (shadow stats keep flowing)", () => {
     expect(shouldWriteVerdict("other", "shadow", ["other"])).toBe(true);
   });

@@ -2,6 +2,7 @@ import { loadConfig } from "./config.js";
 import { listModels, loadModel, unloadModel, downloadModel, ensureLoaded, getLoaded } from "./model-admin.js";
 import { delegate } from "./orchestrator.js";
 import { ledgerReport, recentDelegations } from "./ledger.js";
+import { findUnpricedDelegatorModels, type UnpricedDelegatorModel } from "./delegation-cost.js";
 import { PROBES, getProbe } from "./probes.js";
 import { startGateway } from "./gateway.js";
 import { mintKey, rotateKey, listKeys, revokeKey, KeyAliasExistsError, createInvite, listInvites, type Tier, type InvitePublic } from "./keystore.js";
@@ -265,11 +266,21 @@ async function cmdDelegate(args: ParsedArgs): Promise<void> {
   }
 }
 
-function cmdLedger(): void {
+export function formatUnpricedDelegatorWarnings(rows: readonly UnpricedDelegatorModel[]): string[] {
+  if (rows.length === 0) return [];
+  return [
+    "PRICING WARNINGS — savings remain $0 until first-party pricing is refreshed:",
+    ...rows.map((row) => `  ${row.modelId}: ${row.reason} (${row.rows} ledger row${row.rows === 1 ? "" : "s"}; last ${row.lastSeenAt})`),
+  ];
+}
+
+export function cmdLedger(): void {
   const cfg = loadConfig();
   const rows = ledgerReport(cfg.policy);
+  const pricingWarnings = formatUnpricedDelegatorWarnings(findUnpricedDelegatorModels());
   if (rows.length === 0) {
     console.log("Ledger is empty — run `probe --all` first.");
+    if (pricingWarnings.length > 0) console.log(`\n${pricingWarnings.join("\n")}`);
     return;
   }
   console.log("CAPABILITY LEDGER — verdicts per task type × model\n");
@@ -290,6 +301,7 @@ function cmdLedger(): void {
   for (const d of recent) {
     console.log(`  ${d.ts.slice(11, 19)} ${d.taskType.padEnd(14)} ${d.outcome.padEnd(10)} ${d.verifier ?? ""}`);
   }
+  if (pricingWarnings.length > 0) console.log(`\n${pricingWarnings.join("\n")}`);
 }
 
 function cmdKeys(args: ParsedArgs): void {

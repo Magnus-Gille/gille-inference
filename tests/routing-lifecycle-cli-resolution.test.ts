@@ -63,9 +63,11 @@ describe("resolveGatewayUrl (issue #38)", () => {
   it("derives from the gateway's OWN configured listener (not loopback) when nothing explicit is set — the #38 fix", () => {
     stashEnv();
     delete process.env["GATEWAY_URL"];
-    // Mimics the live box: HOMESERVER_HOST set to the tailnet interface, HOMESERVER_PORT default.
-    const url = resolveGatewayUrl([], { gatewayHost: "100.76.72.59", gatewayPort: 8080 });
-    expect(url).toBe("http://100.76.72.59:8080");
+    // Mimics the live box: HOMESERVER_HOST set to the tailnet interface, HOMESERVER_PORT
+    // default. The address is a synthetic value from the same CGNAT range Tailscale
+    // allocates from — never the real node address (see tests/public-host-identifiers.test.ts).
+    const url = resolveGatewayUrl([], { gatewayHost: "100.64.0.10", gatewayPort: 8080 });
+    expect(url).toBe("http://100.64.0.10:8080");
   });
 
   it("still falls back to the historical loopback default when config itself resolves to loopback (bare local dev, no .env)", () => {

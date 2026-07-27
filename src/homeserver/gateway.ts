@@ -273,10 +273,27 @@ function decInflight(alias: string): void {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────────
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+/**
+ * Serialize an HTTP JSON response without allowing JavaScript's special
+ * `JSON.stringify(undefined) === undefined` result to become an empty 2xx body.
+ *
+ * A route which accidentally hands us no top-level value is a server failure, not
+ * a successful empty response. Keeping this at the shared write boundary covers
+ * every JSON route, including `/delegate`, without changing task-type semantics.
+ */
+export function serializeJsonResponse(body: unknown): { status: number; payload: string } {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(payload);
+  if (payload === undefined) {
+    const error = makeError("internal_error");
+    return { status: error.status, payload: JSON.stringify(error.body) };
+  }
+  return { status: 200, payload };
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const serialized = serializeJsonResponse(body);
+  res.writeHead(serialized.status === 200 ? status : serialized.status, { "content-type": "application/json" });
+  res.end(serialized.payload);
 }
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────

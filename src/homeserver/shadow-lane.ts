@@ -39,6 +39,8 @@
  */
 import { disagreementScore } from "./disagreement-gate.js";
 import type { Outcome } from "./ledger.js";
+import { isKnownTaskType } from "./taxonomy.js";
+import { policyTaskTypeIdentity } from "./task-type-identity.js";
 import type { Verifier, VerifyResult } from "./verifier.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────────
@@ -112,7 +114,13 @@ export function shadowEligible(args: {
   if (delegated) {
     return { eligible: false, reason: "local model already attempted — real evidence recorded" };
   }
-  if (config.taskTypes.length > 0 && !config.taskTypes.includes(taskType)) {
+  const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
+  if (
+    config.taskTypes.length > 0 &&
+    !config.taskTypes.some(
+      (allowed) => policyTaskTypeIdentity(allowed, isKnownTaskType) === policyTaskType
+    )
+  ) {
     return { eligible: false, reason: `task type ${taskType} not in shadow lane allow-list` };
   }
   if (running >= 1) {

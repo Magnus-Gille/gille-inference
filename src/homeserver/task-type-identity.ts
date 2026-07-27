@@ -14,10 +14,11 @@
  * never invent a new one. For the advisory-only guardrail that direction is the fail-safe one — it
  * can only ever catch MORE input as advisory-only, never less.
  *
- * Deliberately NOT applied to the recorded ledger bucket: `orchestrator.resolveTaskType` trims but
- * otherwise preserves an explicit caller-supplied type verbatim (#155), so a caller's domain
- * bucket keeps the spelling it asserted. This module is for POLICY/LOOKUP comparisons, which must
- * agree with each other regardless of how a caller or an operator spelled the same lane.
+ * Applied to recorded ledger buckets only when the normalized spelling is a known taxonomy id:
+ * `orchestrator.resolveTaskType` still preserves an explicit caller-supplied type verbatim (#155),
+ * so a caller's genuine domain bucket keeps the spelling it asserted. This module is for
+ * POLICY/LOOKUP comparisons and that narrow canonical-ledger boundary, which must agree whenever
+ * a caller merely respells a taxonomy lane.
  *
  * This is a leaf module (no imports) on purpose: taxonomy.ts already imports review-bounded.ts, so
  * a shared helper living in either of those would close an import cycle.
@@ -38,15 +39,15 @@ export function normalizeTaskType(raw: string): string {
  * `orchestrator.resolveTaskType` produces for a non-blank explicit task type (#155).
  *
  * Use this whenever the answer must PREDICT real behavior rather than restrict it. Case-folding
- * here would be a lie about RECORDED IDENTITY: the orchestrator writes `taskType` to the ledger
- * verbatim (#155), so `"Code-Review"` remains a different recorded evidence bucket from
- * `"code-review"` no matter what a capability advertisement claims.
+ * here would be a lie about caller identity: an unrecognized caller-domain spelling remains a
+ * different recorded evidence bucket from a case variant, no matter what a capability
+ * advertisement claims.
  *
  * #91 NOTE — policy DECISIONS no longer key off the raw spelling. `policyTaskTypeIdentity`
  * canonicalizes a spelling whose normalized form is a known taxonomy id, and routing
  * (`routeViaTable`), the judgment-verifier guard, the broad/low-risk lookups and the policy-side
- * evidence read all use that canonical identity. A case variant is therefore no longer a policy
- * bypass; it is only still a distinct RECORDED bucket.
+ * evidence reads and ledger writes all use that canonical identity. A case variant is therefore
+ * neither a policy bypass nor a distinct recorded bucket.
  *
  * The asymmetry with `normalizeTaskType` is deliberate and both halves fail safe:
  * - the advisory-only guardrail case-folds, so a spelling variant can only ever be caught by it;
@@ -87,8 +88,9 @@ export function isPromotedAdvisoryTaskType(
  *
  * The rule (decided on the orchestrator side, #155/#91): canonicalize a spelling ONLY when its
  * normalized (trim + case-fold) form is a KNOWN taxonomy id. That canonical identity is then used
- * for routing, the judgment/broad/low-risk lookups, the JSON response contract, and evidence-bucket
- * reads — so a real task type cannot dodge those gates by spelling. A spelling whose normalized form
+ * for routing, the judgment/broad/low-risk lookups, the JSON response contract, evidence-bucket
+ * reads, and ledger writes — so a real task type cannot dodge those gates by spelling and its
+ * failures degrade the lane being gated. A spelling whose normalized form
  * is NOT a known id keeps its #155 ingress identity (trimmed, otherwise verbatim) and still falls
  * through to the existing unknown-lane policy unchanged — canonicalizing an unrecognized spelling
  * would fold arbitrary caller buckets together (e.g. two different ratatoskr domain buckets that

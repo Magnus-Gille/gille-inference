@@ -243,10 +243,8 @@ export function evaluateDelegatePolicy(input: DelegatePolicyInput): DelegatePoli
   const verifierName = normalizeVerifierName(input.verifierName);
   // #91: read evidence from the same canonical policy identity `decideDelegatePolicy` gates
   // against below — a lane's evidence key is (taskType, modelId, nodeId, verifier), so a case
-  // variant of a known task type must read the REAL lane's evidence, not accumulate its own
-  // parallel bucket that a caller could grow independently of the canonical lane's track record.
-  // (Recorded ledger rows themselves are unaffected — `recordDelegation` still writes whatever
-  // spelling `orchestrator.resolveTaskType` produced, per #155.)
+  // variant of a known task type reads and writes the REAL lane's evidence, not a parallel bucket
+  // that a caller could grow independently of the canonical lane's track record (#95).
   const policyTaskType = policyTaskTypeIdentity(input.taskType, isKnownTaskType);
   const evidence =
     input.delegatePolicy.mode === "off" || isLearningSource(input.source)

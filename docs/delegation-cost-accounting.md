@@ -34,8 +34,17 @@ Two baselines are tracked:
   `delegator_model_id` argument, with `delegatorModelId` accepted as a JSON alias.
 - `premiumBaselineModelId`: the fixed high-end baseline, default `claude-fable-5`
 
-If a model has no known price, the trace records a `missing-price:<model>` note and savings for that
-baseline remains zero.
+Every catalog price records its first-party vendor URL, verification date, and expiry date. After an
+entry expires, the gateway treats it as unpriced rather than letting an old tariff continue to book
+a confident savings figure. Models with no first-party per-token tariff (for example a local
+open-weight model), or an ambiguous id that cannot be mapped to a vendor model without guessing,
+are explicitly marked unavailable. Both unavailable and missing/stale models record a
+`missing-price:<model>` note and savings for that baseline remains zero.
+
+`findUnpricedDelegatorModels()` reports the distinct delegator ids already present in
+`delegation_costs` whose catalog status is `missing`, `stale`, or `unavailable`, together with only
+their row counts and first/last timestamps. It is content-blind and exists so a newly used model
+does not remain an unexplained zero in the savings ledger.
 
 ## Delegator model provenance
 

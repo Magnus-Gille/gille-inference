@@ -28,6 +28,8 @@ import {
   upsertEvidenceIdentitySnapshot,
   type EvidenceIdentitySnapshot,
 } from "./evidence-identity-store.js";
+import { isKnownTaskType } from "./taxonomy.js";
+import { policyTaskTypeIdentity } from "./task-type-identity.js";
 
 export type {
   EvidenceIdentityBundle,
@@ -281,6 +283,11 @@ export function recordDelegation(rec: DelegationRecord): string {
   const id = randomUUID();
   const ts = new Date().toISOString();
   const excerpt = rec.prompt.slice(0, 280);
+  // #95: policy reads a known taxonomy spelling from its canonical identity. Write the same
+  // identity so failures supplied as e.g. "Summarize" degrade the "summarize" lane rather than
+  // accumulating in an orphaned bucket. Unknown caller-domain buckets retain #155's verbatim
+  // (trimmed-at-ingress) semantics: only a normalized known taxonomy id is canonicalized.
+  const ledgerTaskType = policyTaskTypeIdentity(rec.taskType, isKnownTaskType);
 
   // #5: fail closed BEFORE the row (or its snapshot) ever touches the DB — a placeholder/fictional
   // identity must never become admissible production evidence. See evidence-identity.ts's doc
@@ -351,7 +358,7 @@ export function recordDelegation(rec: DelegationRecord): string {
     insertRow.run({
       id,
       ts,
-      taskType: rec.taskType,
+      taskType: ledgerTaskType,
       nodeId: rec.nodeId ?? "m5",
       modelId: rec.modelId,
       promptHash: hashPrompt(rec.prompt),
@@ -447,9 +454,13 @@ const VALID_OUTCOMES: ReadonlySet<string> = new Set([
  * a second hand-maintained copy that could silently drift from this one.
  */
 export function importId(rec: ImportableDelegation): string {
+  // #95: this identity must key the same task-type bucket that importDelegations() stores.
+  // Canonical taxonomy IDs retain their historical hash because their normalized form is unchanged;
+  // only spelling variants now coalesce. Unknown caller-domain labels remain verbatim.
+  const ledgerTaskType = policyTaskTypeIdentity(rec.taskType, isKnownTaskType);
   const key = JSON.stringify([
     rec.ts,
-    rec.taskType,
+    ledgerTaskType,
     rec.nodeId ?? "m5",
     rec.modelId,
     hashPrompt(rec.prompt),
@@ -516,6 +527,9 @@ export function importDelegations(records: ImportableDelegation[]): {
   let inserted = 0;
   db.transaction(() => {
     for (const rec of records) {
+      // Keep imported evidence aligned with the live writer: canonical taxonomy spellings share
+      // their policy lane; unknown caller-domain buckets remain verbatim.
+      const ledgerTaskType = policyTaskTypeIdentity(rec.taskType, isKnownTaskType);
       const identityHash =
         rec.evidenceIdentity !== undefined ? upsertEvidenceIdentitySnapshot(rec.evidenceIdentity, rec.ts, db) : null;
       const evidenceLane =
@@ -523,7 +537,7 @@ export function importDelegations(records: ImportableDelegation[]): {
       const info = stmt.run({
         id: importId(rec),
         ts: rec.ts,
-        taskType: rec.taskType,
+        taskType: ledgerTaskType,
         nodeId: rec.nodeId ?? "m5",
         modelId: rec.modelId,
         promptHash: hashPrompt(rec.prompt),
@@ -835,6 +849,9 @@ export function getVerdict(
   nodeId: "m5" | "orin" = "m5",
   opts?: EvidenceReadOpts
 ): VerdictResult {
+  // Policy/evidence lookups share the #91 identity rule. Keep `taskType` itself for the returned
+  // audit attribution; only the decision key is canonicalized when this is a known taxonomy lane.
+  const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
   const db = ledgerDb();
   const rows = db
     .prepare(
@@ -842,11 +859,11 @@ export function getVerdict(
        WHERE task_type = ? AND model_id = ? AND node_id = ? AND outcome != 'unverified'
          AND superseded_at IS NULL${shadowFilter(opts)}`
     )
-    .all(taskType, modelId, nodeId) as OutcomeRow[];
+    .all(policyTaskType, modelId, nodeId) as OutcomeRow[];
 
   const { passes, partials, fails, errors, effective, mechanicalFormatAttempts } = accumulateOutcomeRows(
     rows,
-    taskType,
+    policyTaskType,
     policy
   );
 

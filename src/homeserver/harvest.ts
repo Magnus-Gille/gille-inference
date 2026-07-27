@@ -1,4 +1,6 @@
 import type { ImportableDelegation, Outcome } from "./ledger.js";
+import { isKnownTaskType } from "./taxonomy.js";
+import { policyTaskTypeIdentity } from "./task-type-identity.js";
 
 /**
  * Harvest — turn REAL delegation traffic into REAL capability evidence.
@@ -598,7 +600,13 @@ export function shouldWriteVerdict(
   mode: HarvestMode,
   excludedTaskTypes: readonly string[]
 ): boolean {
-  return mode !== "on" || !excludedTaskTypes.includes(taskType);
+  const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
+  return (
+    mode !== "on" ||
+    !excludedTaskTypes.some(
+      (excluded) => policyTaskTypeIdentity(excluded, isKnownTaskType) === policyTaskType
+    )
+  );
 }
 
 // ─── Record construction (pure) ────────────────────────────────────────────────────

@@ -27,6 +27,8 @@ import {
   FRONTIER,
   UNKNOWN_ROUTE,
 } from "../src/homeserver/routing-table.js";
+import { eligibleIncumbents } from "../src/homeserver/incumbent-audit-registry.js";
+import { evidenceIdentityFromServedModelCmd } from "../src/homeserver/evidence-identity.js";
 
 // ── Test helpers ────────────────────────────────────────────────────────────────
 
@@ -158,6 +160,21 @@ describe("generateRoutingTable — per-task-type selection", () => {
     expect(doc.modelProfiles["qwen35-a3b"]).toBeDefined();
   });
 
+  it("integration: a configuration-mismatched incumbent audit excludes its otherwise viable route", () => {
+    const audited = "llama-server -m /models/mellum-Q4.gguf -c 8192";
+    const eligibility = eligibleIncumbents(
+      new Map([["mellum", "llama-server -m /models/mellum-Q4.gguf -c 16384"]]),
+      [{ schemaVersion: 1, source: "live-served-model", auditedAt: "2026-07-04T00:00:00.000Z", model: "mellum", trigger: "config-change", probeBatteryVersion: "v1", corpusFingerprint: "sha256:test", servedCommand: audited, evidenceIdentity: evidenceIdentityFromServedModelCmd(audited), status: "completed", summary: {} as never }],
+      Date.parse("2026-07-04T01:00:00.000Z"), 86_400_000
+    );
+    const inputs = baseInputs([row("classify", "mellum", { successRate: 1, attempts: 3, recommendation: "delegate-local", avgTokPerSec: 200 })]);
+    inputs.servableModelIds = eligibility.eligibleModelIds;
+    inputs.sources = [{ source: "incumbent served-model audits (JSONL)", path: "fixture", present: true, records: 1, latest: "2026-07-04T00:00:00.000Z", note: eligibility.reasons.mellum }];
+    const doc = generateRoutingTable(inputs);
+    expect(doc.routing.classify?.model).toBeNull();
+    expect(doc.sources[0]?.note).toContain("configuration changed");
+  });
+
   it("falls back to an EXPLORE (marginal) local route when no model is viable but one is marginal", () => {
     const doc = generateRoutingTable(
       baseInputs([
@@ -234,6 +251,14 @@ describe("generateRoutingTable — missing evidence is surfaced, never guessed",
 // local route — the same "insufficient evidence → null+reason" rule the model profiles already use.
 
 describe("generateRoutingTable — thin evidence never becomes a local route", () => {
+  it("labels a measured failure as a characterized gap even when another model has a thin pass", () => {
+    const doc = generateRoutingTable(baseInputs([
+      row("code-edit", "mellum", { successRate: 1, attempts: 1, recommendation: "explore", verdict: "unknown" }),
+      row("code-edit", "qwen3-coder-next-80b", { successRate: 0.07, attempts: 15, passes: 1, recommendation: "escalate-frontier", verdict: "not_viable" }),
+    ]));
+    expect(doc.routing["code-edit"]?.note).toMatch(/characterized gap.*qwen3-coder-next-80b/i);
+  });
+
   it("escalates a below-minSamples 'explore' (unknown) row to frontier instead of routing local", () => {
     const doc = generateRoutingTable(
       baseInputs([
