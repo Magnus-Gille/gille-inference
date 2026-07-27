@@ -877,7 +877,6 @@ export class ConstitutionalRoutingWatchdog {
     ConstitutionalFencedLease.assertAcquirable(this.paths.lock, this.leaseOptions);
     const routeFence = this.recovery.acquireRouteFence();
     try {
-      this.recovery.blockRoute(routeFence);
       return withLease(this.paths.lock, this.leaseOptions, (lease) => {
       if (!constitutionalResourceExists(this.paths.lock, this.paths.journal)) {
         if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
@@ -890,21 +889,12 @@ export class ConstitutionalRoutingWatchdog {
       // writable recovery state or consulting clock/liveness. Corruption can
       // therefore strand the target blocked, never active with an exception
       // loop. A healthy waiting watch removes this evaluation block below.
-      const evaluationBlockCreated = !constitutionalResourceExists(this.paths.lock, this.paths.targetBlock);
-      if (evaluationBlockCreated) {
-        lease.writeResource(this.paths.targetBlock, `${canonicalJson({
-          schema_version: 1,
-          target_scope_digest: "unknown-until-journal-validated",
-          binding_digest: "unknown-until-journal-validated",
-          reason_digest: reasonDigest("watchdog-evaluation-in-progress"),
-          blocked_at: "unknown-until-protected-clock-validated",
-          signed_demotion_pending: true,
-        })}\n`);
-      }
+      let evaluationBlockCreated = false;
       let journal: JournalV2;
       try {
         journal = loadJournal(this.paths);
       } catch (error) {
+        this.recovery.blockRoute(routeFence);
         return { outcome: "terminally-blocked", reason: `journal-unreadable:${error instanceof Error ? error.message : String(error)}` };
       }
       const last = journal.entries.at(-1);
@@ -954,8 +944,17 @@ export class ConstitutionalRoutingWatchdog {
         now = this.authority.trustedNowIso();
         strictUtc(now);
       } catch (error) {
-        // The target block was already fsync'd above. Never throw back into a
-        // timer loop while a possibly-active candidate remains unblocked.
+        this.recovery.blockRoute(routeFence);
+        lease.writeResource(this.paths.targetBlock, `${canonicalJson({
+          schema_version: 1,
+          target_scope_digest: journal.binding.target_scope_digest,
+          binding_digest: journal.binding_digest,
+          reason_digest: reasonDigest("recovery-input-unreadable"),
+          blocked_at: "protected-clock-unavailable",
+          signed_demotion_pending: true,
+        })}\n`);
+        // Material/clock corruption is a recovery condition, so block only
+        // now—not during every healthy watch evaluation.
         return {
           outcome: "terminally-blocked",
           reason: `recovery-input-unreadable:${error instanceof Error ? error.message : String(error)}`,
@@ -987,10 +986,15 @@ export class ConstitutionalRoutingWatchdog {
         }
       }
       if (!expired && !kill && last.phase === "watch" && watchFailure === undefined) {
-        if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
         this.recovery.clearRouteBlock(routeFence);
         return { outcome: "waiting", reason: "watch-active", journal };
       }
+
+      // A healthy watch is served uninterrupted. Only a condition that has
+      // already selected recovery/ambiguity/deadline fail-closed obtains the
+      // serving-side block.
+      this.recovery.blockRoute(routeFence);
+      evaluationBlockCreated = !constitutionalResourceExists(this.paths.lock, this.paths.targetBlock);
 
       let gate: FreshGate;
       try {
@@ -1135,7 +1139,7 @@ export class ConstitutionalRoutingWatchdog {
   ): WatchdogTickResult {
     if (!lease) throw new Error("terminal block requires a current fenced lease");
     const terminalJournal = structuredClone(journal);
-    if (terminalJournal.entries.at(-1)?.phase !== "unknown") {
+    if (!["unknown", "revert"].includes(terminalJournal.entries.at(-1)?.phase ?? "")) {
       append(terminalJournal, "unknown", "unknown", terminalJournal.binding.watchdog_identity, now, reason, material.plan.contentRef);
     }
     append(terminalJournal, "terminally-blocked", "terminally-blocked", terminalJournal.binding.recovery_worker_identity, now, reason, material.plan.contentRef);

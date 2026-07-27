@@ -29,6 +29,7 @@ import {
   MICRO_ROUTING_CONSTITUTIONAL_POLICY,
   constitutionalPaths,
   type AuthoritySnapshot,
+  type ConstitutionalRouteStore,
   type ProtectedAuthorityReader,
   type RecoveryRegistrar,
   type RestoreOnlyCapability,
