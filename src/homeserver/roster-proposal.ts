@@ -475,10 +475,66 @@ interface ProposalRow {
   admission_digest: string;
 }
 
+export class RosterProposalSchemaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RosterProposalSchemaError";
+  }
+}
+
+const ROSTER_PROPOSAL_COLUMNS = [
+  "record_id",
+  "proposal_id",
+  "principal_id",
+  "credential_binding_digest",
+  "producer_id",
+  "idempotency_key",
+  "proposal_digest",
+  "axis",
+  "state",
+  "reason_code",
+  "created_at",
+  "expires_at",
+  "decision_at",
+  "updated_at",
+  "created_at_ms",
+  "expires_at_ms",
+  "decision_at_ms",
+  "updated_at_ms",
+  "proposal_json",
+  "delta_json",
+  "baseline_json",
+  "baseline_digest",
+  "admission_digest",
+] as const;
+
 const initialized = new WeakSet<Database.Database>();
 
 function ensureSchema(db: Database.Database): void {
   if (initialized.has(db)) return;
+  const existing = db.prepare(`
+    SELECT name FROM sqlite_master
+     WHERE type = 'table' AND name = 'roster_proposals'
+  `).get() as { name: string } | undefined;
+  if (existing) {
+    const actualColumns = (
+      db.prepare("PRAGMA table_info(roster_proposals)").all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name);
+    if (
+      actualColumns.length !== ROSTER_PROPOSAL_COLUMNS.length
+      || actualColumns.some(
+        (column, index) => column !== ROSTER_PROPOSAL_COLUMNS[index],
+      )
+    ) {
+      throw new RosterProposalSchemaError(
+        "existing roster_proposals schema is incompatible; " +
+        "no legacy migration is supported because pre-fence rows lack " +
+        "observation epoch/digest and the current admission-digest formula",
+      );
+    }
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS roster_proposals (
       record_id TEXT PRIMARY KEY,
@@ -519,40 +575,6 @@ function ensureSchema(db: Database.Database): void {
       PRIMARY KEY (proposal_id, sequence)
     );
   `);
-  const columns = new Set(
-    (db.prepare("PRAGMA table_info(roster_proposals)").all() as Array<{ name: string }>)
-      .map((column) => column.name),
-  );
-  if (!columns.has("decision_at")) {
-    db.exec("ALTER TABLE roster_proposals ADD COLUMN decision_at TEXT");
-  }
-  if (!columns.has("decision_at_ms")) {
-    db.exec("ALTER TABLE roster_proposals ADD COLUMN decision_at_ms INTEGER");
-  }
-  db.exec(`
-    UPDATE roster_proposals
-       SET decision_at = COALESCE(
-             decision_at,
-             (SELECT recorded_at
-                FROM roster_proposal_events
-               WHERE roster_proposal_events.proposal_id = roster_proposals.proposal_id
-                 AND state IN ('armed', 'rejected')
-               ORDER BY sequence DESC LIMIT 1),
-             updated_at
-           )
-     WHERE decision_at IS NULL
-  `);
-  const missingDecisionTimes = db.prepare(`
-    SELECT proposal_id, decision_at
-      FROM roster_proposals
-     WHERE decision_at_ms IS NULL
-  `).all() as Array<{ proposal_id: string; decision_at: string }>;
-  const backfillDecisionTime = db.prepare(`
-    UPDATE roster_proposals SET decision_at_ms = ? WHERE proposal_id = ?
-  `);
-  for (const row of missingDecisionTimes) {
-    backfillDecisionTime.run(Date.parse(row.decision_at), row.proposal_id);
-  }
   initialized.add(db);
 }
 
@@ -582,6 +604,17 @@ class ServerObservationFenceProtocolError extends Error {
     this.name = "ServerObservationFenceProtocolError";
   }
 }
+
+class ServerObservationFenceProviderError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "ServerObservationFenceProviderError";
+  }
+}
+
+const LATE_FENCE_CALLBACK_IGNORED = Object.freeze({
+  kind: "late-fence-callback-ignored",
+} as const);
 
 function rowToRecord(
   row: ProposalRow,
@@ -685,7 +718,12 @@ function rowToRecord(
         || !isCanonicalRosterUtc(event.recorded_at)
         || !Number.isFinite(eventTimes[index])
         || (index > 0 && eventTimes[index]! < eventTimes[index - 1]!)
-        || eventTimes[index]! > row.updated_at_ms,
+        || eventTimes[index]! > row.updated_at_ms
+        || eventTimes[index] !== (
+          event.state === "expired"
+            ? row.updated_at_ms
+            : row.decision_at_ms
+        ),
     )
     || eventTimes.at(-1) !== row.updated_at_ms
     || (row.state === "armed" && (row.reason_code !== null || baseline === null))
@@ -853,10 +891,10 @@ export interface RosterAdmissionDependencies {
    * token and invokes the callback. The callback performs the final protected
    * checks and SQLite transaction before that lock is released.
    */
-  withServerObservationFence<T>(
+  withServerObservationFence(
     expectedToken: ServerRosterObservationToken,
-    callback: (confirmedToken: unknown) => T,
-  ): T;
+    callback: (confirmedToken: unknown) => unknown,
+  ): unknown;
   readEvidence(identityHash: string): EvidenceIdentitySnapshot | null;
   readCandidateTemplateIdentity(modelId: string): ServerTemplateIdentity | null;
   resolveRestoreDescriptor(ref: string): ServerRestoreDescriptor | null;
@@ -1539,6 +1577,7 @@ export async function admitRosterProposal(
   let callbackError: unknown = null;
   let outcome: RosterAdmissionResult | null = null;
   let fenceOpen = false;
+  let fenceRequestActive = true;
   try {
     // DEFERRED is deliberate: the provider acquires its roster-state fence
     // before the callback performs the first SQLite read/write. The transaction
@@ -1547,80 +1586,90 @@ export async function admitRosterProposal(
     return db.transaction(() => {
       fenceOpen = true;
       try {
-        const providerResult = deps.withServerObservationFence(
-          expectedToken,
-          (rawConfirmedToken) => {
-            if (!fenceOpen) {
-              const error = new ServerObservationFenceProtocolError(
-                "server observation fence callback escaped its synchronous lifetime",
-              );
-              callbackError = error;
-              throw error;
-            }
-            callbackCalls += 1;
-            if (callbackCalls !== 1) {
-              const error = new ServerObservationFenceProtocolError(
-                "server observation fence invoked callback multiple times",
-              );
-              callbackError = error;
-              throw error;
-            }
-            try {
-              const confirmed =
-                serverRosterObservationTokenSchema.safeParse(rawConfirmedToken);
-              let reason: RosterRejectionReason | null = null;
-              const timing: Array<{
-                observedAtMs: number;
-                maxAgeMs: number;
-                reason: "EVIDENCE_STALE" | "TEMPLATE_IDENTITY_MISMATCH";
-              }> = [];
-              if (!confirmed.success) {
-                reason = "OBSERVATION_REVALIDATION_UNAVAILABLE";
-              } else if (
-                confirmed.data.observation_epoch !== expectedObservationEpoch
-                || confirmed.data.observation_digest !== expectedObservationDigest
-              ) {
-                reason = "OBSERVATION_CHANGED";
-              } else {
-                reason = semanticDecision(
+        let providerResult: unknown;
+        try {
+          providerResult = deps.withServerObservationFence(
+            expectedToken,
+            (rawConfirmedToken) => {
+              if (!fenceOpen) {
+                if (fenceRequestActive && callbackError === null) {
+                  callbackError = new ServerObservationFenceProtocolError(
+                    "server observation fence callback escaped its synchronous lifetime",
+                  );
+                }
+                return LATE_FENCE_CALLBACK_IGNORED;
+              }
+              callbackCalls += 1;
+              if (callbackCalls !== 1) {
+                const error = new ServerObservationFenceProtocolError(
+                  "server observation fence invoked callback multiple times",
+                );
+                callbackError = error;
+                throw error;
+              }
+              try {
+                const confirmed =
+                  serverRosterObservationTokenSchema.safeParse(rawConfirmedToken);
+                let reason: RosterRejectionReason | null = null;
+                const timing: Array<{
+                  observedAtMs: number;
+                  maxAgeMs: number;
+                  reason: "EVIDENCE_STALE" | "TEMPLATE_IDENTITY_MISMATCH";
+                }> = [];
+                if (!confirmed.success) {
+                  reason = "OBSERVATION_REVALIDATION_UNAVAILABLE";
+                } else if (
+                  confirmed.data.observation_epoch !== expectedObservationEpoch
+                  || confirmed.data.observation_digest !== expectedObservationDigest
+                ) {
+                  reason = "OBSERVATION_CHANGED";
+                } else {
+                  reason = semanticDecision(
+                    proposal,
+                    observation,
+                    null,
+                    observation.baselineSnapshot,
+                    observation.backendCapability,
+                    deps,
+                    timing,
+                  );
+                }
+                const decisionNow = deps.now();
+                if (
+                  !Number.isFinite(decisionNow.getTime())
+                  || decisionNow.getTime() < startedAt.getTime()
+                ) {
+                  throw new RosterProposalContractError(
+                    "protected admission clock became incoherent",
+                  );
+                }
+                const timeReason = finalTimeDecision(proposal, timing, decisionNow);
+                if (timeReason === "PROPOSAL_EXPIRED" || reason === null) {
+                  reason = timeReason ?? reason;
+                }
+                outcome = insertDecisionLocked(
                   proposal,
-                  observation,
-                  null,
+                  authenticatedPrincipalId,
+                  credentialBindingDigest,
+                  reason,
                   observation.baselineSnapshot,
-                  observation.backendCapability,
-                  deps,
-                  timing,
+                  decisionNow,
+                  db,
                 );
+                return outcome;
+              } catch (error) {
+                callbackError = error;
+                throw error;
               }
-              const decisionNow = deps.now();
-              if (
-                !Number.isFinite(decisionNow.getTime())
-                || decisionNow.getTime() < startedAt.getTime()
-              ) {
-                throw new RosterProposalContractError(
-                  "protected admission clock became incoherent",
-                );
-              }
-              const timeReason = finalTimeDecision(proposal, timing, decisionNow);
-              if (timeReason === "PROPOSAL_EXPIRED" || reason === null) {
-                reason = timeReason ?? reason;
-              }
-              outcome = insertDecisionLocked(
-                proposal,
-                authenticatedPrincipalId,
-                credentialBindingDigest,
-                reason,
-                observation.baselineSnapshot,
-                decisionNow,
-                db,
-              );
-              return outcome;
-            } catch (error) {
-              callbackError = error;
-              throw error;
-            }
-          },
-        );
+            },
+          );
+        } catch (error) {
+          if (callbackError !== null) throw callbackError;
+          throw new ServerObservationFenceProviderError(
+            "server observation fence provider failed",
+            error,
+          );
+        }
         if (
           typeof providerResult === "object"
           && providerResult !== null
@@ -1635,7 +1684,7 @@ export async function admitRosterProposal(
       }
       if (callbackError !== null) throw callbackError;
       if (callbackCalls !== 1 || outcome === null) {
-        throw new RosterProposalContractError(
+        throw new ServerObservationFenceProtocolError(
           "server observation fence did not invoke callback exactly once",
         );
       }
@@ -1644,9 +1693,9 @@ export async function admitRosterProposal(
   } catch (error) {
     fenceOpen = false;
     if (
-      callbackError !== null
-      && !(callbackError instanceof ServerObservationFenceProtocolError)
-    ) throw callbackError;
+      !(error instanceof ServerObservationFenceProtocolError)
+      && !(error instanceof ServerObservationFenceProviderError)
+    ) throw error;
     const decisionNow = deps.now();
     if (
       !Number.isFinite(decisionNow.getTime())
@@ -1667,5 +1716,8 @@ export async function admitRosterProposal(
       decisionNow,
       db,
     );
+  } finally {
+    fenceOpen = false;
+    fenceRequestActive = false;
   }
 }

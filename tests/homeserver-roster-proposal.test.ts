@@ -22,6 +22,7 @@ import {
   candidateRosterDigest,
   canonicalRosterProposalDigest,
   expireRosterProposals,
+  ensureRosterProposalSchema,
   getRosterProposalForPrincipal,
   isCanonicalRosterUtc,
   liveCatalogueIdentity,
@@ -233,10 +234,10 @@ function tokenFor(observation: ServerRosterObservation): ServerRosterObservation
 function fenceFor(
   observation: ServerRosterObservation,
 ): RosterAdmissionDependencies["withServerObservationFence"] {
-  return <T>(
+  return (
     _expected: ServerRosterObservationToken,
-    callback: (confirmedToken: unknown) => T,
-  ): T => callback(tokenFor(observation));
+    callback: (confirmedToken: unknown) => unknown,
+  ): unknown => callback(tokenFor(observation));
 }
 
 function depsForObservation(
@@ -367,6 +368,44 @@ beforeEach(() => {
 });
 
 describe("gille roster-proposal v1 contract", () => {
+  it("refuses a pre-fence roster schema instead of partially backfilling it", () => {
+    const legacyDb = new Database(":memory:");
+    legacyDb.exec(`
+      CREATE TABLE roster_proposals (
+        record_id TEXT PRIMARY KEY,
+        proposal_id TEXT NOT NULL UNIQUE,
+        principal_id TEXT NOT NULL,
+        credential_binding_digest TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        proposal_digest TEXT NOT NULL,
+        axis TEXT NOT NULL,
+        state TEXT NOT NULL,
+        reason_code TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        proposal_json TEXT NOT NULL,
+        delta_json TEXT NOT NULL,
+        baseline_json TEXT,
+        baseline_digest TEXT,
+        admission_digest TEXT NOT NULL
+      );
+    `);
+
+    expect(() => ensureRosterProposalSchema(legacyDb))
+      .toThrow(/schema is incompatible.*no legacy migration is supported/);
+    expect(
+      (legacyDb.prepare("PRAGMA table_info(roster_proposals)").all() as Array<{
+        name: string;
+      }>).map((column) => column.name),
+    ).not.toContain("decision_at");
+    legacyDb.close();
+  });
+
   it("materializes and accepts the gille-owned seed/interchange fixture", async () => {
     const fixture = JSON.parse(readFileSync(
       new URL("./fixtures/gille-roster-proposal-v1-seed.json", import.meta.url),
@@ -1049,10 +1088,10 @@ describe("fail-closed admission and durable lifecycle", () => {
         db,
         dependencies: {
           ...depsForObservation(deps, initial),
-          withServerObservationFence: <T>(
+          withServerObservationFence: (
             _expected: ServerRosterObservationToken,
-            callback: (rawConfirmedToken: unknown) => T,
-          ): T => callback(confirmedTokenForCase(initial)),
+            callback: (rawConfirmedToken: unknown) => unknown,
+          ): unknown => callback(confirmedTokenForCase(initial)),
         },
       },
     );
@@ -1080,9 +1119,13 @@ describe("fail-closed admission and durable lifecycle", () => {
       ]);
   });
 
-  it("prevents a retained fence callback from mutating after the provider returns", async () => {
+  it("makes a retained asynchronous fence callback inert after the request completes", async () => {
     const observation = serverObservation();
-    let retained: ((confirmedToken: unknown) => unknown) | null = null;
+    let lateResult: unknown;
+    let resolveLateCall: (() => void) | null = null;
+    const lateCall = new Promise<void>((resolve) => {
+      resolveLateCall = resolve;
+    });
     const result = await admitRosterProposal(
       proposal({
         proposal_id: "proposal:w5:fence-retained",
@@ -1093,12 +1136,15 @@ describe("fail-closed admission and durable lifecycle", () => {
         db,
         dependencies: {
           ...depsForObservation(deps, observation),
-          withServerObservationFence: <T>(
+          withServerObservationFence: (
             _expected: ServerRosterObservationToken,
-            callback: (confirmedToken: unknown) => T,
-          ): T => {
-            retained = callback as (confirmedToken: unknown) => unknown;
-            return undefined as T;
+            callback: (confirmedToken: unknown) => unknown,
+          ): unknown => {
+            queueMicrotask(() => {
+              lateResult = callback(tokenFor(observation));
+              resolveLateCall?.();
+            });
+            return undefined;
           },
         },
       },
@@ -1108,9 +1154,8 @@ describe("fail-closed admission and durable lifecycle", () => {
       expect(result.record.reasonCode)
         .toBe("OBSERVATION_REVALIDATION_UNAVAILABLE");
     }
-    expect(retained).not.toBeNull();
-    expect(() => retained!(tokenFor(observation)))
-      .toThrow("escaped its synchronous lifetime");
+    await lateCall;
+    expect(lateResult).toEqual({ kind: "late-fence-callback-ignored" });
     const persisted = getRosterProposalForPrincipal(
       ROSTER_PROPOSAL_PRINCIPAL,
       "proposal:w5:fence-retained",
@@ -1134,10 +1179,10 @@ describe("fail-closed admission and durable lifecycle", () => {
         db,
         dependencies: {
           ...depsForObservation(deps, observation),
-          withServerObservationFence: <T>(
+          withServerObservationFence: (
             _expected: ServerRosterObservationToken,
-            callback: (confirmedToken: unknown) => T,
-          ): T => {
+            callback: (confirmedToken: unknown) => unknown,
+          ): unknown => {
             callback(tokenFor(observation));
             return callback(tokenFor(observation));
           },
@@ -1167,12 +1212,12 @@ describe("fail-closed admission and durable lifecycle", () => {
         db,
         dependencies: {
           ...depsForObservation(deps, observation),
-          withServerObservationFence: <T>(
+          withServerObservationFence: (
             _expected: ServerRosterObservationToken,
-            callback: (confirmedToken: unknown) => T,
-          ): T => {
+            callback: (confirmedToken: unknown) => unknown,
+          ): unknown => {
             callback(tokenFor(observation));
-            return Promise.resolve(undefined) as T;
+            return Promise.resolve(undefined);
           },
         },
       },
@@ -1193,6 +1238,55 @@ describe("fail-closed admission and durable lifecycle", () => {
       },
     ]);
     expect(events.some((event) => event.state === "armed")).toBe(false);
+  });
+
+  it("propagates a deferred SQLite COMMIT failure without downgrading or retrying", async () => {
+    db.pragma("foreign_keys = ON");
+    ensureRosterProposalSchema(db);
+    db.exec(`
+      CREATE TABLE roster_commit_guard_parent (
+        id TEXT PRIMARY KEY
+      );
+      CREATE TABLE roster_commit_guard_child (
+        proposal_id TEXT PRIMARY KEY,
+        parent_id TEXT NOT NULL,
+        FOREIGN KEY (parent_id)
+          REFERENCES roster_commit_guard_parent(id)
+          DEFERRABLE INITIALLY DEFERRED
+      );
+      CREATE TRIGGER roster_commit_guard
+      AFTER INSERT ON roster_proposals
+      WHEN NEW.state = 'armed'
+      BEGIN
+        INSERT INTO roster_commit_guard_child(proposal_id, parent_id)
+        VALUES (NEW.proposal_id, 'missing-parent');
+      END;
+    `);
+    const input = proposal({
+      proposal_id: "proposal:w5:commit-failure",
+      idempotency_key: "idem:w5:commit-failure",
+    });
+
+    await expect(
+      admitRosterProposal(input, ROSTER_PROPOSAL_PRINCIPAL, {
+        db,
+        dependencies: deps,
+      }),
+    ).rejects.toThrow(/FOREIGN KEY constraint failed/);
+    expect(
+      (db.prepare(`
+        SELECT COUNT(*) AS count
+          FROM roster_proposals
+         WHERE proposal_id = ?
+      `).get(input.proposal_id) as { count: number }).count,
+    ).toBe(0);
+    expect(
+      (db.prepare(`
+        SELECT COUNT(*) AS count
+          FROM roster_proposal_events
+         WHERE proposal_id = ?
+      `).get(input.proposal_id) as { count: number }).count,
+    ).toBe(0);
   });
 
   it("rejects an incoherent protected clock before any decision write", async () => {
@@ -1285,6 +1379,33 @@ describe("fail-closed admission and durable lifecycle", () => {
     expect(expired?.updatedAt).toBe("2026-07-27T16:00:01Z");
     expect(rosterProposalEvents(proposal().proposal_id, db).map((event) => event.state))
       .toEqual(["submitted", "accepted", "armed", "expired"]);
+  });
+
+  it("fails closed when an expired row has a non-decision armed event time", async () => {
+    const input = proposal({
+      proposal_id: "proposal:w5:expired-event-time",
+      idempotency_key: "idem:w5:expired-event-time",
+    });
+    await admitRosterProposal(
+      input,
+      ROSTER_PROPOSAL_PRINCIPAL,
+      { db, dependencies: deps },
+    );
+    expect(expireRosterProposals(new Date("2026-07-27T16:00:01Z"), db)).toBe(1);
+    db.prepare(`
+      UPDATE roster_proposal_events
+         SET recorded_at = '2026-07-27T15:30:00Z'
+       WHERE proposal_id = ? AND state = 'armed'
+    `).run(input.proposal_id);
+
+    expect(() =>
+      getRosterProposalForPrincipal(
+        ROSTER_PROPOSAL_PRINCIPAL,
+        input.proposal_id,
+        db,
+        new Date("2026-07-27T16:00:01Z"),
+      ),
+    ).toThrow("durable roster proposal is invalid");
   });
 
   it("never exposes another principal's proposal through the scoped read", async () => {

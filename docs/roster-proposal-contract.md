@@ -65,10 +65,17 @@ Immediately before persistence, gille-inference calls
 `withServerObservationFence(expectedToken, syncCallback)`. The provider must hold the same local
 roster-state lock or lease honored by every catalogue/backend/desired/resident/running mutator while
 it confirms the exact epoch+digest and synchronously invokes the callback. Gille rejects invalid,
-changed, missing, asynchronous, escaped, zero-call, or multiple-call fence behavior; the SQLite
-transaction rolls back any tentative arm on a fence protocol failure. The callback performs
+changed, missing, zero-call, multiple-call, or thenable fence behavior; the SQLite transaction
+rolls back any tentative arm on a fence protocol failure. A callback retained past the active
+request/fence lifetime becomes an inert, non-throwing sentinel and cannot mutate durable state.
+The callback performs
 content-addressed registry/evidence validation, the final protected-clock/expiry check, and the
 SQLite decision transaction before the provider releases the lock.
+
+Only an explicitly classified provider or fence-protocol failure becomes the durable
+`OBSERVATION_REVALIDATION_UNAVAILABLE` decision. SQLite acquisition/BEGIN/COMMIT failures, durable
+corruption, and callback semantic errors preserve and propagate their original error context; they
+are never retried as a second rejection write.
 
 ## Deliberately unavailable by default
 
@@ -103,8 +110,13 @@ observation timestamp, epoch, and digest. A separate immutable `decisionAt` reco
 protected-clock sample taken inside the fence/SQLite transaction; later lifecycle updates change
 `updatedAt`, not `decisionAt`. Every insert, retry, scoped read, and expiry validates the
 closed record: proposal/candidate/baseline/admission digests, mirrored columns, credential binding,
-normalized delta, state/reason legality, and lifecycle-event tail. Any mismatch is treated as
-durable corruption and fails closed.
+normalized delta, state/reason legality, and exact lifecycle-event times. Submitted, accepted, and
+armed events are pinned to `decisionAt`; only an expired event is pinned to its later `updatedAt`.
+Any mismatch is treated as durable corruption and fails closed.
+
+Schema initialization requires the exact current column set. A pre-fence `roster_proposals` table
+is refused with an explicit diagnostic rather than partially backfilled: legacy rows do not carry
+the observation epoch/digest needed by the current admission-digest formula.
 
 An `armed` record is authorization data for a future actuator, not an applied change. This version
 contains no actuator route. W5b must reuse the same provider fence and revalidate the persisted

@@ -302,10 +302,10 @@ beforeAll(async () => {
   };
   rosterDependencies = {
     readServerObservation: async () => structuredClone(observation),
-    withServerObservationFence: <T>(
+    withServerObservationFence: (
       _expected: ServerRosterObservationToken,
-      callback: (confirmedToken: unknown) => T,
-    ): T => callback(observationToken),
+      callback: (confirmedToken: unknown) => unknown,
+    ): unknown => callback(observationToken),
     readEvidence: (hash) => getEvidenceIdentitySnapshot(hash),
     readCandidateTemplateIdentity: (modelId) => {
       const identity = {
