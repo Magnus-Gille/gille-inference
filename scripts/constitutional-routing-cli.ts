@@ -392,6 +392,7 @@ export type RecoverySocketEndpoint =
   | "/route/fence/acquire"
   | "/route/fence/release"
   | "/route/apply"
+  | "/route/promote"
   | "/route/block"
   | "/route/unblock"
   | "/route/digest";
@@ -556,8 +557,9 @@ export function createWatchdogRecoverySocketClient(
       if (!exactKeys(result, ["classification", "registrationDigest"])) {
         throw new Error("recovery action service returned an invalid closed result");
       }
-      return ["restored", "already-baseline", "superseded", "failed"].includes(String(result.classification))
-        ? result.classification
+      const classification = String(result.classification);
+      return ["restored", "already-baseline", "superseded", "failed"].includes(classification)
+        ? classification as "restored" | "already-baseline" | "superseded" | "failed"
         : "failed";
     },
     signAndPersistDemotion: (input) => {
@@ -672,11 +674,6 @@ export function resolveAuthorityConfigPath(args: string[], configuredPath?: stri
   const fixed = PRODUCTION_AUTHORITY_CONFIG;
   if (configuredPath && resolve(configuredPath) !== fixed) throw new Error("authority config substitution is refused");
   return fixed;
-}
-
-function contentSha(value: string): string {
-  // Kept local to avoid another authority-affecting serialization helper.
-  return createHash("sha256").update(value).digest("hex");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

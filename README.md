@@ -195,6 +195,9 @@ npm run typecheck
 npm test
 ```
 
+`npm run typecheck` covers both the runtime source tree and the production
+constitutional routing/recovery composition scripts.
+
 Copy [`deploy/env.example`](./deploy/env.example) to `.env` only when configuring the gateway;
 keep that populated file mode `0600` and out of Git. The root [`.env.example`](./.env.example) is
 only for optional external evaluation credentials.

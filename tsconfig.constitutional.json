@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "declaration": false
+  },
+  "include": [
+    "scripts/constitutional-routing-cli.ts",
+    "scripts/constitutional-recovery-service.ts"
+  ]
+}

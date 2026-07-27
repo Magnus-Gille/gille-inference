@@ -709,6 +709,14 @@ describe("scripts/deploy-gateway.sh", () => {
   });
 
   describe("routing-table copy-if-absent seeding (issue #44)", () => {
+    it("excludes SQLite -wal and -shm sidecars so live route state is never rsynced", () => {
+      const script = readFileSync(SCRIPT, "utf8");
+      expect(script).toContain("--exclude '*.db-wal'");
+      expect(script).toContain("--exclude '*.db-shm'");
+      expect(script).toContain("--exclude '*.sqlite-wal'");
+      expect(script).toContain("--exclude '*.sqlite-shm'");
+    });
+
     it("an already-adopted routing table SURVIVES a deploy (adopt -> deploy -> still adopted)", async () => {
       const src = initSourceRepo();
       writeCommittedRoutingTable(src, '{"routing":{},"escalateToFrontier":[],"_fixture":"committed-v2"}\n');

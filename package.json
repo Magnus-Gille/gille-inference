@@ -17,7 +17,8 @@
     "autonomy:constitutional": "tsx scripts/constitutional-routing-cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && npm run typecheck:constitutional",
+    "typecheck:constitutional": "tsc --noEmit -p tsconfig.constitutional.json"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
