@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   composeImmutablePlan,
   parseRouteMutationProposal,
   persistImmutablePlan,
+  removeExpiredImmutablePlan,
 } from "../src/homeserver/constitutional-routing-scheduler.js";
 
 function proposal() {
@@ -49,5 +50,22 @@ describe("constitutional scheduler composition", () => {
     expect(persistImmutablePlan(path, plan)).toBe("same");
     expect(() => persistImmutablePlan(path, { ...plan, candidate: "other" })).toThrow(/immutable/);
     expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ attemptId: plan.attemptId });
+  });
+
+  it("removes only an expired immutable plan so the scheduler cannot deadlock forever", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "constitutional-plan-expiry-")), "plan.json");
+    const plan = composeImmutablePlan(
+      parseRouteMutationProposal(proposal()),
+      '{"route":"mellum"}\n',
+      {} as any,
+      "2026-07-27T10:00:00Z",
+      "abcdef123456",
+    );
+    persistImmutablePlan(path, plan);
+    expect(removeExpiredImmutablePlan(path, "2026-07-27T10:59:59Z")).toBe(false);
+    expect(existsSync(path)).toBe(true);
+    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:00:00Z")).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(removeExpiredImmutablePlan(path, "2026-07-27T11:00:01Z")).toBe(false);
   });
 });

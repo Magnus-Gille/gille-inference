@@ -229,7 +229,10 @@ non-lingering timer means the autonomy controller silently stops ticking.
 root-owned authority inputs, and explicitly provisioned state groups. `deploy-gateway.sh` neither
 installs nor enables them. The legacy user timer above remains shadow-only; merely deploying a
 revision cannot arm W1. See [`../docs/constitutional-micro-routing.md`](../docs/constitutional-micro-routing.md)
-for the intentionally separate owner/root ceremony and closed config schemas.
+for the intentionally separate owner/root ceremony and closed config schemas. Its authoritative
+SQLite route database and `-wal`/`-shm` siblings are under `/var/lib/gille-inference/routing`,
+outside the rsync payload; the deploy's database/WAL excludes are an additional guard against
+shipping or deleting such live state if a copy ever appears inside the payload tree.
 
 **Autonomy notification hook (gi#58).** `deploy/autonomy-notify.sh` is the repo-managed template
 for the already-live `AUTONOMY_NOTIFY_CMD` behavior. During the final IaC phase, the bound

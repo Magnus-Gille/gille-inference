@@ -49,6 +49,15 @@ export interface RecoveryActuationRequest {
   fenceEpoch: number;
   fenceToken: string;
 }
+export interface RouteApplicationRequest {
+  handle: string;
+  journalId: string;
+  bindingDigest: string;
+  targetScopeDigest: string;
+  candidate: string;
+  fenceEpoch: number;
+  fenceToken: string;
+}
 export type RecoveryClassification = "restored" | "already-baseline" | "superseded" | "failed";
 
 interface StoredRegistration extends RecoveryRegistrationRequest {
@@ -59,6 +68,7 @@ interface StoredRegistration extends RecoveryRegistrationRequest {
   consumed: boolean;
   classification: RecoveryClassification | null;
   actuationRequestDigest: string | null;
+  protectedAuthority: unknown;
 }
 
 export interface RecoveryJournalView {
@@ -74,7 +84,8 @@ export interface RecoveryJournalView {
 }
 
 export interface RecoveryJournalAuthority {
-  read(journalId: string): RecoveryJournalView;
+  read(journalId: string, protectedAuthority?: unknown): RecoveryJournalView;
+  protectedAuthority(): unknown;
 }
 
 export function authenticateRecoveryJournal(input: {
@@ -164,6 +175,11 @@ function exactRequest(stored: StoredRegistration, request: RecoveryActuationRequ
     && /^[a-f0-9-]{36}$/.test(request.fenceToken);
 }
 
+function stableActuationRequestDigest(request: RecoveryActuationRequest): string {
+  const { fenceEpoch: _fenceEpoch, fenceToken: _fenceToken, ...stable } = request;
+  return sha(canonicalJson(stable));
+}
+
 /**
  * Recovery-owned registry. The controller receives only an opaque handle and
  * receipt; baseline bytes never cross back out of the registration boundary.
@@ -201,7 +217,8 @@ export class RecoveryRegistry {
       "journalId", "bindingDigest", "targetScopeDigest", "baselineDigest",
       "candidateDigest", "descriptorDigest",
     ];
-    const journal = authority.read(request.journalId);
+    const protectedAuthority = authority.protectedAuthority();
+    const journal = authority.read(request.journalId, protectedAuthority);
     const baseline = route.read();
     if (
       !ID.test(request.journalId)
@@ -226,7 +243,7 @@ export class RecoveryRegistry {
       throw new Error("invalid recovery preregistration");
     }
     const handle = `recovery-${randomUUID()}`;
-    const immutable = { schema_version: 1 as const, ...request, baseline, handle };
+    const immutable = { schema_version: 1 as const, ...request, baseline, handle, protectedAuthority };
     const stored: StoredRegistration = {
       ...immutable,
       registrationDigest: registrationDigest(immutable),
@@ -272,8 +289,9 @@ export class RecoveryRegistry {
         candidateDigest: stored.candidateDigest,
         descriptorDigest: stored.descriptorDigest,
         handle: stored.handle,
+        protectedAuthority: stored.protectedAuthority,
       };
-      const journal = authority.read(request.journalId);
+      const journal = authority.read(request.journalId, stored.protectedAuthority);
       if (
         stored.schema_version !== 1
         || stored.registrationDigest !== registrationDigest(immutable)
@@ -289,12 +307,16 @@ export class RecoveryRegistry {
       ) {
         throw new Error("recovery request is not the exact eligible unknown journal receipt");
       }
-      const requestDigest = sha(canonicalJson(request));
+      const requestDigest = stableActuationRequestDigest(request);
       if (stored.consumed) {
         if (stored.actuationRequestDigest !== requestDigest || stored.classification === null) {
           throw new Error("recovery preregistration was already consumed by another request");
         }
-        return { classification: stored.classification, registrationDigest: stored.registrationDigest };
+        const live = sha(route.read());
+        return {
+          classification: live === stored.baselineDigest ? stored.classification : "superseded",
+          registrationDigest: stored.registrationDigest,
+        };
       }
 
       // The route database is the effect-owning fence. Do not hold a
@@ -329,6 +351,58 @@ export class RecoveryRegistry {
       db.close();
     }
   }
+
+  applyCandidate(
+    request: RouteApplicationRequest,
+    route: RecoveryRoute & { compareAndSwap(expected: string, next: string, fence: RouteFence): boolean },
+    authority: RecoveryJournalAuthority,
+  ): boolean {
+    if (
+      Object.keys(request).sort().join(",") !== [
+        "handle", "journalId", "bindingDigest", "targetScopeDigest",
+        "candidate", "fenceEpoch", "fenceToken",
+      ].sort().join(",")
+      || !HANDLE.test(request.handle)
+    ) throw new Error("invalid closed route application request");
+    const db = this.open();
+    try {
+      const row = db.prepare("SELECT record_json FROM recovery_registration WHERE handle=?")
+        .get(request.handle) as { record_json: string } | undefined;
+      if (!row) throw new Error("unknown recovery preregistration");
+      const stored = JSON.parse(row.record_json) as StoredRegistration;
+      const journal = authority.read(request.journalId, stored.protectedAuthority);
+      if (
+        stored.consumed
+        || journal.phase !== "prepare"
+        || journal.journalId !== stored.journalId
+        || journal.bindingDigest !== stored.bindingDigest
+        || journal.targetScopeDigest !== stored.targetScopeDigest
+        || request.journalId !== stored.journalId
+        || request.bindingDigest !== stored.bindingDigest
+        || request.targetScopeDigest !== stored.targetScopeDigest
+        || sha(request.candidate) !== stored.candidateDigest
+      ) throw new Error("route application is not the exact preregistered prepared candidate");
+      return route.compareAndSwap(stored.baseline, request.candidate, {
+        epoch: request.fenceEpoch,
+        token: request.fenceToken,
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  protectedAuthorityFor(journalId: string): unknown {
+    const db = this.open();
+    try {
+      const row = db.prepare(
+        "SELECT record_json FROM recovery_registration WHERE json_extract(record_json, '$.journalId')=?",
+      ).get(journalId) as { record_json: string } | undefined;
+      if (!row) throw new Error("unknown recovery preregistration journal");
+      return structuredClone((JSON.parse(row.record_json) as StoredRegistration).protectedAuthority);
+    } finally {
+      db.close();
+    }
+  }
 }
 
 export interface RecoveryServiceOptions {
@@ -337,7 +411,11 @@ export interface RecoveryServiceOptions {
   registrationFd?: number;
   actionFd?: number;
   registry: RecoveryRegistry;
-  route: RecoveryRoute;
+  route: RecoveryRoute & {
+    compareAndSwap(expected: string, next: string, fence: RouteFence): boolean;
+    block(fence: RouteFence): boolean;
+    clearBlock(fence: RouteFence): boolean;
+  };
   journalAuthority: RecoveryJournalAuthority;
   demote(input: {
     journalId: string;
@@ -402,23 +480,79 @@ function listen(server: Server, path: string, mode: number, fd?: number): Promis
  * the watchdog group; neither endpoint accepts the other operation.
  */
 export async function startRecoveryService(options: RecoveryServiceOptions): Promise<{ close(): Promise<void> }> {
-  let routeLease: RouteLease | undefined;
+  let controllerRouteLease: RouteLease | undefined;
+  let recoveryRouteLease: RouteLease | undefined;
+  const requireRecoveryFence = (body: unknown): RouteFence => {
+    const fence = body as Partial<RecoveryActuationRequest> & Partial<RouteFence>;
+    const epoch = typeof fence.fenceEpoch === "number" ? fence.fenceEpoch : fence.epoch;
+    const token = typeof fence.fenceToken === "string" ? fence.fenceToken : fence.token;
+    if (
+      recoveryRouteLease === undefined
+      || !recoveryRouteLease.isCurrent()
+      || epoch !== recoveryRouteLease.epoch
+      || token !== recoveryRouteLease.token
+    ) throw new Error("request does not match the current recovery route fence");
+    return { epoch, token };
+  };
   const registration = createServer(async (request, response) => {
     try {
-      if (request.method !== "POST" || request.url !== "/register") return respond(response, 404, { error: "not-found" });
-      const receipt = options.registry.register(
-        await readBody(request) as RecoveryRegistrationRequest,
-        options.route,
-        options.journalAuthority,
-      );
-      respond(response, 200, receipt);
+      if (request.method !== "POST") return respond(response, 404, { error: "not-found" });
+      const body = await readBody(request);
+      if (request.url === "/register") {
+        const receipt = options.registry.register(
+          body as RecoveryRegistrationRequest,
+          options.route,
+          options.journalAuthority,
+        );
+        return respond(response, 200, receipt);
+      }
+      if (request.url === "/route/read") {
+        if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).length !== 0) {
+          throw new Error("invalid closed route read request");
+        }
+        return respond(response, 200, { value: options.route.read() });
+      }
+      if (request.url === "/route/fence/acquire") {
+        if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).length !== 0) {
+          throw new Error("invalid closed controller route-fence acquisition request");
+        }
+        if (controllerRouteLease?.isCurrent()) throw new Error("controller route fence is already held");
+        controllerRouteLease?.release();
+        controllerRouteLease = options.route.acquireWriterLease(options.routeLeaseOptions);
+        return respond(response, 200, { epoch: controllerRouteLease.epoch, token: controllerRouteLease.token });
+      }
+      if (request.url === "/route/fence/release") {
+        const fence = body as RouteFence;
+        if (
+          controllerRouteLease === undefined
+          || typeof body !== "object"
+          || body === null
+          || Array.isArray(body)
+          || Object.keys(body).sort().join(",") !== "epoch,token"
+          || fence.epoch !== controllerRouteLease.epoch
+          || fence.token !== controllerRouteLease.token
+        ) throw new Error("controller route-fence release does not match the held lease");
+        controllerRouteLease.release();
+        controllerRouteLease = undefined;
+        return respond(response, 200, { released: true });
+      }
+      if (request.url === "/route/apply") {
+        return respond(response, 200, {
+          applied: options.registry.applyCandidate(
+            body as RouteApplicationRequest,
+            options.route,
+            options.journalAuthority,
+          ),
+        });
+      }
+      return respond(response, 404, { error: "not-found" });
     } catch (error) {
       respond(response, 400, { error: error instanceof Error ? error.message : String(error) });
     }
   });
   const action = createServer(async (request, response) => {
     try {
-  if (request.method !== "POST") return respond(response, 404, { error: "not-found" });
+      if (request.method !== "POST") return respond(response, 404, { error: "not-found" });
       const body = await readBody(request);
       if (request.url === "/fence/acquire") {
         if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).length !== 0) {
@@ -427,32 +561,48 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
         // A watchdog may die after acquisition and before release. Permit a
         // later request to replace only an expired/superseded in-process
         // handle; never preempt a current recovery action.
-        if (routeLease?.isCurrent()) throw new Error("recovery route fence is already held");
-        routeLease?.release();
-        routeLease = options.route.acquireWriterLease(options.routeLeaseOptions);
-        return respond(response, 200, { epoch: routeLease.epoch, token: routeLease.token });
+        if (recoveryRouteLease?.isCurrent()) throw new Error("recovery route fence is already held");
+        recoveryRouteLease?.release();
+        recoveryRouteLease = options.route.acquireWriterLease(options.routeLeaseOptions);
+        return respond(response, 200, { epoch: recoveryRouteLease.epoch, token: recoveryRouteLease.token });
       }
       if (request.url === "/fence/release") {
         const fence = body as RouteFence;
         if (
-          routeLease === undefined
+          recoveryRouteLease === undefined
           || typeof body !== "object"
           || body === null
           || Array.isArray(body)
           || Object.keys(body).sort().join(",") !== "epoch,token"
-          || fence.epoch !== routeLease.epoch
-          || fence.token !== routeLease.token
+          || fence.epoch !== recoveryRouteLease.epoch
+          || fence.token !== recoveryRouteLease.token
         ) throw new Error("route-fence release does not match the held lease");
-        routeLease.release();
-        routeLease = undefined;
+        recoveryRouteLease.release();
+        recoveryRouteLease = undefined;
         return respond(response, 200, { released: true });
       }
       if (request.url === "/actuate") {
+        requireRecoveryFence(body);
         return respond(response, 200, options.registry.actuate(
           body as RecoveryActuationRequest,
           options.route,
           options.journalAuthority,
         ));
+      }
+      if (request.url === "/route/block" || request.url === "/route/unblock") {
+        const fence = body as RouteFence;
+        if (
+          typeof body !== "object"
+          || body === null
+          || Array.isArray(body)
+          || Object.keys(body).sort().join(",") !== "epoch,token"
+        ) throw new Error("route guard request does not match the held recovery fence");
+        requireRecoveryFence(body);
+        const changed = request.url === "/route/block"
+          ? options.route.block(fence)
+          : options.route.clearBlock(fence);
+        if (!changed) throw new Error("route guard fence is stale");
+        return respond(response, 200, { changed: true });
       }
       if (request.url === "/demote") {
         const input = body as Parameters<RecoveryServiceOptions["demote"]>[0];
@@ -466,7 +616,12 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
               "journalReceiptDigest", "fenceEpoch", "fenceToken",
             ].sort().join(",")
         ) throw new Error("invalid closed demotion request");
-        const journal = options.journalAuthority.read(String((input as { journalId?: unknown }).journalId ?? ""));
+        requireRecoveryFence(body);
+        const journalId = String((input as { journalId?: unknown }).journalId ?? "");
+        const journal = options.journalAuthority.read(
+          journalId,
+          options.registry.protectedAuthorityFor(journalId),
+        );
         if (
           !["revert", "terminally-blocked"].includes(journal.phase)
           || journal.journalId !== input.journalId
@@ -492,8 +647,10 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
   ]);
   return {
     close: async () => {
-      routeLease?.release();
-      routeLease = undefined;
+      controllerRouteLease?.release();
+      controllerRouteLease = undefined;
+      recoveryRouteLease?.release();
+      recoveryRouteLease = undefined;
       await Promise.all([registration, action].map((server) => new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve());
       })));

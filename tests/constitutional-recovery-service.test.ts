@@ -31,9 +31,19 @@ const registration = (): RecoveryRegistrationRequest => ({
 
 function journalAuthority(phase: "prepare" | "unknown" | "revert" = "prepare") {
   let currentPhase = phase;
+  let currentProtectedAuthority = { epoch: "prepared-authority" };
+  const preparedProtectedAuthority = structuredClone(currentProtectedAuthority);
   return {
     authority: {
-      read: () => ({
+      read: (_journalId: string, expectedAuthority?: unknown) => {
+        if (
+          expectedAuthority !== undefined
+          && JSON.stringify(expectedAuthority) !== JSON.stringify(preparedProtectedAuthority)
+          && JSON.stringify(expectedAuthority) !== JSON.stringify(currentProtectedAuthority)
+        ) {
+          throw new Error("wrong protected authority");
+        }
+        return ({
         journalId: "micro-route-journal",
         bindingDigest: `sha256:${"1".repeat(64)}`,
         targetScopeDigest: `sha256:${"2".repeat(64)}`,
@@ -43,9 +53,12 @@ function journalAuthority(phase: "prepare" | "unknown" | "revert" = "prepare") {
         ownerAuthorizationDigest: `sha256:${"5".repeat(64)}`,
         phase: currentPhase,
         receiptDigest: `sha256:${"4".repeat(64)}`,
-      }),
+        });
+      },
+      protectedAuthority: () => structuredClone(currentProtectedAuthority),
     },
     setPhase: (next: "prepare" | "unknown" | "revert") => { currentPhase = next; },
+    rotateAuthority: () => { currentProtectedAuthority = { epoch: "rotated-authority" }; },
   };
 }
 
@@ -81,6 +94,19 @@ function route(initial: string) {
       current = next;
       return true;
     },
+    compareAndSwap: (expected: string, next: string, suppliedFence: { epoch: number; token: string }) => {
+      if (suppliedFence.epoch !== currentFence.epoch || suppliedFence.token !== currentFence.token) return false;
+      if (current !== expected) return false;
+      writes += 1;
+      current = next;
+      return true;
+    },
+    block: (suppliedFence: { epoch: number; token: string }) => (
+      suppliedFence.epoch === currentFence.epoch && suppliedFence.token === currentFence.token
+    ),
+    clearBlock: (suppliedFence: { epoch: number; token: string }) => (
+      suppliedFence.epoch === currentFence.epoch && suppliedFence.token === currentFence.token
+    ),
   };
 }
 
@@ -231,6 +257,53 @@ describe("recovery-owned preregistration", () => {
     expect(live.read()).toBe(baseline);
     expect(registry.actuate(request, live, journal.authority).classification).toBe("already-baseline");
   });
+
+  it("replays a completed recovery through a successor resource fence", () => {
+    const registry = new RecoveryRegistry(mkdtempSync(join(tmpdir(), "constitutional-recovery-")));
+    const live = route(baseline);
+    const journal = journalAuthority();
+    const receipt = registry.register(registration(), live, journal.authority);
+    journal.setPhase("unknown");
+    live.set(candidate);
+    const firstLease = live.acquireWriterLease();
+    const request = {
+      handle: receipt.handle,
+      journalId: "micro-route-journal",
+      bindingDigest: `sha256:${"1".repeat(64)}`,
+      targetScopeDigest: `sha256:${"2".repeat(64)}`,
+      journalReceiptDigest: `sha256:${"4".repeat(64)}`,
+      fenceEpoch: firstLease.epoch,
+      fenceToken: firstLease.token,
+    };
+    expect(registry.actuate(request, live, journal.authority).classification).toBe("restored");
+    firstLease.release();
+    const successor = live.acquireWriterLease();
+    expect(registry.actuate({
+      ...request,
+      fenceEpoch: successor.epoch,
+      fenceToken: successor.token,
+    }, live, journal.authority).classification).toBe("restored");
+    expect(live.writes()).toBe(1);
+    successor.release();
+  });
+
+  it("retains the authenticated prepare authority across later authority rotation", () => {
+    const registry = new RecoveryRegistry(mkdtempSync(join(tmpdir(), "constitutional-recovery-")));
+    const live = route(baseline);
+    const journal = journalAuthority();
+    const receipt = registry.register(registration(), live, journal.authority);
+    journal.rotateAuthority();
+    journal.setPhase("unknown");
+    live.set(candidate);
+    expect(registry.actuate({
+      handle: receipt.handle,
+      journalId: "micro-route-journal",
+      bindingDigest: `sha256:${"1".repeat(64)}`,
+      targetScopeDigest: `sha256:${"2".repeat(64)}`,
+      journalReceiptDigest: `sha256:${"4".repeat(64)}`,
+      ...fence,
+    }, live, journal.authority).classification).toBe("restored");
+  });
 });
 
 function post(socketPath: string, path: string, body: unknown): Promise<{ status: number; body: any }> {
@@ -262,7 +335,7 @@ describe("permission-separated AF_UNIX recovery service", () => {
       route: live,
       journalAuthority: journal.authority,
       demote: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
-      routeLeaseOptions: { durationMs: 20 },
+      routeLeaseOptions: { durationMs: 100 },
     });
     try {
       expect((await post(actionSocketPath, "/register", registration())).status).toBe(404);
@@ -273,18 +346,39 @@ describe("permission-separated AF_UNIX recovery service", () => {
       const registered = await post(registrationSocketPath, "/register", registration());
       expect(registered.status).toBe(200);
       expect(registered.body).toMatchObject({ handle: expect.stringMatching(/^recovery-/) });
+      const controllerFence = await post(registrationSocketPath, "/route/fence/acquire", {});
+      expect(controllerFence.status).toBe(200);
+      expect((await post(registrationSocketPath, "/route/apply", {
+        handle: registered.body.handle,
+        journalId: "micro-route-journal",
+        bindingDigest: `sha256:${"1".repeat(64)}`,
+        targetScopeDigest: `sha256:${"2".repeat(64)}`,
+        candidate,
+        fenceEpoch: controllerFence.body.epoch,
+        fenceToken: controllerFence.body.token,
+      }))).toMatchObject({ status: 200, body: { applied: true } });
+      expect((await post(registrationSocketPath, "/route/read", {})).body.value).toBe(candidate);
+      expect((await post(registrationSocketPath, "/route/fence/release", controllerFence.body)).status).toBe(200);
       journal.setPhase("unknown");
-      live.set(candidate);
       expect((await post(registrationSocketPath, "/actuate", {})).status).toBe(404);
+      expect((await post(actionSocketPath, "/actuate", {
+        handle: registered.body.handle,
+        journalId: "micro-route-journal",
+        bindingDigest: `sha256:${"1".repeat(64)}`,
+        targetScopeDigest: `sha256:${"2".repeat(64)}`,
+        journalReceiptDigest: `sha256:${"4".repeat(64)}`,
+        ...fence,
+      })).status).toBe(400);
       const acquired = await post(actionSocketPath, "/fence/acquire", {});
       expect(acquired).toMatchObject({ status: 200, body: { epoch: expect.any(Number), token: expect.any(String) } });
       expect((await post(actionSocketPath, "/fence/acquire", {})).status).toBe(400);
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      await new Promise((resolve) => setTimeout(resolve, 120));
       const superseding = await post(actionSocketPath, "/fence/acquire", {});
       expect(superseding.status).toBe(200);
       expect(superseding.body.epoch).toBeGreaterThan(acquired.body.epoch);
       expect((await post(actionSocketPath, "/fence/release", acquired.body)).status).toBe(400);
       const heldFence = { fenceEpoch: superseding.body.epoch, fenceToken: superseding.body.token };
+      expect((await post(actionSocketPath, "/route/block", superseding.body)).status).toBe(200);
       const actuated = await post(actionSocketPath, "/actuate", {
         handle: registered.body.handle,
         journalId: "micro-route-journal",
@@ -294,6 +388,7 @@ describe("permission-separated AF_UNIX recovery service", () => {
         ...heldFence,
       });
       expect(actuated.body.classification).toBe("restored");
+      expect(live.read()).toBe(baseline);
       journal.setPhase("revert");
       expect((await post(actionSocketPath, "/demote", {
         journalId: "micro-route-journal",
@@ -328,6 +423,7 @@ describe("permission-separated AF_UNIX recovery service", () => {
         journalReceiptDigest: `sha256:${"4".repeat(64)}`,
         ...heldFence,
       })).status).toBe(200);
+      expect((await post(actionSocketPath, "/route/unblock", superseding.body)).status).toBe(200);
       expect((await post(actionSocketPath, "/fence/release", {
         epoch: superseding.body.epoch,
         token: superseding.body.token,

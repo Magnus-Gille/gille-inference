@@ -232,8 +232,11 @@ function recoveryCapability(
         activeRouteLease = undefined;
       }
     },
-    actuatePreRegisteredRecovery: ({ candidateDigest, fenceEpoch, fenceToken }) => {
+    blockRoute: () => undefined,
+    clearRouteBlock: () => undefined,
+    actuatePreRegisteredRecovery: ({ fenceEpoch, fenceToken }) => {
       if (opts.restoreFails) return "failed";
+      const candidateDigest = `sha256:${createHash("sha256").update('{"route":"qwen"}\n').digest("hex")}`;
       const current = `sha256:${createHash("sha256").update(store.read()).digest("hex")}`;
       const baseline = '{"route":"mellum"}\n';
       const baselineDigest = `sha256:${createHash("sha256").update(baseline).digest("hex")}`;
@@ -446,6 +449,64 @@ describe("constitutional micro-routing controller", () => {
     );
     expect(watchdog.tick().outcome).toBe("reverted");
     expect(table.read()).toBe(baseline);
+  });
+
+  it("rechecks protected liveness and candidate proof during the watch window", () => {
+    const healthyRoot = mkdtempSync(join(tmpdir(), "constitutional-watch-healthy-"));
+    const healthySynthetic = syntheticAuthority();
+    const healthyAuthority = fakeAuthority(healthySynthetic.snapshot);
+    const healthyTable = fakeStore();
+    new ConstitutionalRoutingController(
+      healthyRoot,
+      healthyTable.store,
+      healthyAuthority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    ).begin(plan(healthyTable, healthySynthetic.snapshot));
+    expect(new ConstitutionalRoutingWatchdog(
+      healthyRoot,
+      healthyAuthority.reader,
+      recoveryCapability(
+        healthyTable,
+        healthySynthetic.recoveryPrivateKey,
+        healthySynthetic.authorizationDigest,
+        healthySynthetic.snapshot,
+      ),
+      undefined,
+      undefined,
+      undefined,
+      proofVerifier,
+    ).tick().outcome).toBe("waiting");
+
+    const failedRoot = mkdtempSync(join(tmpdir(), "constitutional-watch-failed-"));
+    const failedSynthetic = syntheticAuthority();
+    const failedAuthority = fakeAuthority(failedSynthetic.snapshot);
+    const failedTable = fakeStore();
+    const baseline = failedTable.read();
+    new ConstitutionalRoutingController(
+      failedRoot,
+      failedTable.store,
+      failedAuthority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    ).begin(plan(failedTable, failedSynthetic.snapshot));
+    failedAuthority.setHealthy(false);
+    const result = new ConstitutionalRoutingWatchdog(
+      failedRoot,
+      failedAuthority.reader,
+      recoveryCapability(
+        failedTable,
+        failedSynthetic.recoveryPrivateKey,
+        failedSynthetic.authorizationDigest,
+        failedSynthetic.snapshot,
+      ),
+      undefined,
+      undefined,
+      undefined,
+      proofVerifier,
+    ).tick();
+    expect(result).toMatchObject({ outcome: "reverted", reason: "baseline-restored-and-target-demoted" });
+    expect(failedTable.read()).toBe(baseline);
   });
 
   it("terminally blocks and consumes recovery when exact restore fails", () => {

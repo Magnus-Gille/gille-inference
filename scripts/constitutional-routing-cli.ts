@@ -37,8 +37,8 @@ import {
   composeImmutablePlan,
   parseRouteMutationProposal,
   persistImmutablePlan,
+  removeExpiredImmutablePlan,
 } from "../src/homeserver/constitutional-routing-scheduler.js";
-import { ConstitutionalRouteDatabase } from "../src/homeserver/constitutional-route-database.js";
 import {
   constitutionalResourceExists,
   readConstitutionalResource,
@@ -338,7 +338,18 @@ export function runJsonBin(path: string, input: unknown): any {
 
 function runUnixJson(
   socket: string,
-  endpoint: "/register" | "/actuate" | "/demote" | "/fence/acquire" | "/fence/release",
+  endpoint:
+    | "/register"
+    | "/actuate"
+    | "/demote"
+    | "/fence/acquire"
+    | "/fence/release"
+    | "/route/read"
+    | "/route/fence/acquire"
+    | "/route/fence/release"
+    | "/route/apply"
+    | "/route/block"
+    | "/route/unblock",
   input: unknown,
 ): any {
   const stdout = execFileSync("/usr/bin/curl", [
@@ -366,35 +377,77 @@ export async function run(args: string[]): Promise<number> {
   }
   const config = loadAuthorityConfig(configPath);
   const dataDir = PRODUCTION_STATE_DIR;
-  const tablePath = PRODUCTION_ROUTE_TABLE;
   const authority = authorityReader(config);
-  const store = new ConstitutionalRouteDatabase(tablePath);
+  let activeRegistration: {
+    handle: string;
+    journalId: string;
+    bindingDigest: string;
+    targetScopeDigest: string;
+  } | undefined;
+  const store = {
+    read: (): string => {
+      const result = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/read", {});
+      if (!exactKeys(result, ["value"]) || typeof result.value !== "string") {
+        throw new Error("route service returned an invalid closed read");
+      }
+      return result.value;
+    },
+    acquireWriterLease: () => {
+      const acquired = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/fence/acquire", {});
+      if (!exactKeys(acquired, ["epoch", "token"])) {
+        throw new Error("route service returned an invalid controller fence");
+      }
+      const fence = { epoch: Number(acquired.epoch), token: String(acquired.token) };
+      return {
+        ...fence,
+        release: () => {
+          const released = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/fence/release", fence);
+          if (!exactKeys(released, ["released"]) || released.released !== true) {
+            throw new Error("route service refused the controller fence release");
+          }
+        },
+      };
+    },
+    compareAndSwap: (_expected: string, next: string, fence: { epoch: number; token: string }): boolean => {
+      if (!activeRegistration) throw new Error("route apply requires durable recovery preregistration");
+      const result = runUnixJson(RECOVERY_REGISTRATION_SOCKET, "/route/apply", {
+        ...activeRegistration,
+        candidate: next,
+        fenceEpoch: fence.epoch,
+        fenceToken: fence.token,
+      });
+      if (!exactKeys(result, ["applied"]) || typeof result.applied !== "boolean") {
+        throw new Error("route service returned an invalid closed apply result");
+      }
+      return result.applied;
+    },
+  };
+  const verifier = { verify: (verificationInput: {
+    configDigest: string;
+    evidenceDigest: string;
+    policyDigest: string;
+    candidateDigest: string;
+    postconditionsDigest: string;
+  }) => {
+    const result = runJsonBin(config.verifier_bin, {
+      kind: "constitutional-micro-route-verify",
+      candidate_digest: verificationInput.candidateDigest,
+      config_digest: verificationInput.configDigest,
+      evidence_digest: verificationInput.evidenceDigest,
+      policy_digest: verificationInput.policyDigest,
+      postconditions_digest: verificationInput.postconditionsDigest,
+    });
+    if (!exactKeys(result, ["ok", "candidate_digest", "postconditions_digest", "proof_digest"])) {
+      throw new Error("verifier returned an invalid closed proof");
+    }
+    return {
+      ok: result.ok === true,
+      candidateDigest: String(result.candidate_digest),
+      postconditionsDigest: String(result.postconditions_digest),
+      proofDigest: String(result.proof_digest),
+    };
+  } };
     if (command === "controller" || command === "begin" || command === "commit") {
-      const verifier = { verify: (verificationInput: {
-        configDigest: string;
-        evidenceDigest: string;
-        policyDigest: string;
-        candidateDigest: string;
-        postconditionsDigest: string;
-      }) => {
-        const result = runJsonBin(config.verifier_bin, {
-          kind: "constitutional-micro-route-verify",
-          candidate_digest: verificationInput.candidateDigest,
-          config_digest: verificationInput.configDigest,
-          evidence_digest: verificationInput.evidenceDigest,
-          policy_digest: verificationInput.policyDigest,
-          postconditions_digest: verificationInput.postconditionsDigest,
-        });
-        if (!exactKeys(result, ["ok", "candidate_digest", "postconditions_digest", "proof_digest"])) {
-          throw new Error("verifier returned an invalid closed proof");
-        }
-        return {
-          ok: result.ok === true,
-          candidateDigest: String(result.candidate_digest),
-          postconditionsDigest: String(result.postconditions_digest),
-          proofDigest: String(result.proof_digest),
-        };
-      } };
       const recoveryRegistrar: RecoveryRegistrar = {
         registerPreRecovery: (input) => {
           const { baseline: _baseline, ...closedRequest } = input;
@@ -402,7 +455,13 @@ export async function run(args: string[]): Promise<number> {
           if (!exactKeys(result, ["handle", "registrationDigest"])) {
             throw new Error("recovery registration service returned an invalid closed receipt");
           }
-          return { handle: String(result.handle), registrationDigest: String(result.registrationDigest) };
+          activeRegistration = {
+            handle: String(result.handle),
+            journalId: input.journalId,
+            bindingDigest: input.bindingDigest,
+            targetScopeDigest: input.targetScopeDigest,
+          };
+          return { handle: activeRegistration.handle, registrationDigest: String(result.registrationDigest) };
         },
       };
       const controller = new ConstitutionalRoutingController(dataDir, store, authority, verifier, recoveryRegistrar);
@@ -424,6 +483,7 @@ export async function run(args: string[]): Promise<number> {
           operation = "commit";
         } else {
           operation = "begin";
+          removeExpiredImmutablePlan(PRODUCTION_PLAN, authority.trustedNowIso());
           if (!existsSync(PRODUCTION_PLAN)) {
             const proposal = parseRouteMutationProposal(JSON.parse(boundedProtectedRead(PRODUCTION_PROPOSAL)));
             persistImmutablePlan(PRODUCTION_PLAN, composeImmutablePlan(
@@ -454,6 +514,18 @@ export async function run(args: string[]): Promise<number> {
           throw new Error("recovery service refused the route-fence release");
         }
       },
+      blockRoute: (fence) => {
+        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/route/block", fence);
+        if (!exactKeys(result, ["changed"]) || result.changed !== true) {
+          throw new Error("recovery service refused the route block");
+        }
+      },
+      clearRouteBlock: (fence) => {
+        const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/route/unblock", fence);
+        if (!exactKeys(result, ["changed"]) || result.changed !== true) {
+          throw new Error("recovery service refused the route unblock");
+        }
+      },
       actuatePreRegisteredRecovery: (input) => {
         const result = runUnixJson(RECOVERY_ACTION_SOCKET, "/actuate", input);
         if (!exactKeys(result, ["classification", "registrationDigest"])) {
@@ -469,7 +541,15 @@ export async function run(args: string[]): Promise<number> {
         return result as unknown as { ledger: unknown; registry: unknown; checkpoint: unknown };
       },
   };
-  const watchdog = new ConstitutionalRoutingWatchdog(dataDir, authority, recovery);
+  const watchdog = new ConstitutionalRoutingWatchdog(
+    dataDir,
+    authority,
+    recovery,
+    () => undefined,
+    undefined,
+    undefined,
+    verifier,
+  );
   const result = watchdog.tick();
   process.stdout.write(`${JSON.stringify(result)}\n`);
   return result.outcome === "terminally-blocked" ? 3 : 0;

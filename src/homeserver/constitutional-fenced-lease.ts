@@ -260,6 +260,22 @@ export function readConstitutionalResource(path: string, name: string): string |
   }
 }
 
+/**
+ * Recovery-side journal projection. This path never initializes schema,
+ * changes journal mode, or requests a writable database handle.
+ */
+export function readConstitutionalResourceReadonly(path: string, name: string): string | undefined {
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    db.pragma("query_only = ON");
+    const row = db.prepare("SELECT value FROM constitutional_resource WHERE name=?")
+      .get(name) as { value: string } | undefined;
+    return row?.value;
+  } finally {
+    db.close();
+  }
+}
+
 export function constitutionalResourceExists(path: string, name: string): boolean {
   return readConstitutionalResource(path, name) !== undefined;
 }

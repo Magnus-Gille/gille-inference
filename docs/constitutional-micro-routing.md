@@ -12,8 +12,10 @@ The ordinary gateway deploy does not install or enable the constitutional units.
 
 `controller` runs under `gille-autonomy-controller`; the deadline watchdog runs under
 `gille-autonomy-watchdog`; restore and demotion run under `gille-autonomy-recovery`. The three
-accounts share only the narrowly required state or route-writer groups. Registration and action
-use distinct systemd-owned AF_UNIX sockets, so the controller cannot invoke restore/demotion and
+accounts share only the narrowly required state group. Only the recovery identity has route-writer
+filesystem access. Registration and action use distinct systemd-owned AF_UNIX sockets: the
+controller can request only an authenticated preregistered candidate CAS, while the watchdog can
+request only block, exact restore, and demotion. The controller cannot invoke restore/demotion and
 the watchdog cannot register arbitrary baselines.
 
 All authority inputs, including the owner public-key pin and both anti-rollback checkpoints, are
@@ -28,9 +30,11 @@ Before apply and commit, the controller re-reads:
 - the exact owner-controlled coverage binding and five distinct identities;
 - kill-switch state, config/evidence/policy/postcondition digests, trusted time, and liveness.
 
-The prepared authority epoch is bound into recovery state. Rotation after prepare cannot turn an
-old proposal into a cross-epoch write. Recovery authenticates the prepared signed records with its
-root-owned pin and checkpoints, so later rotation cannot strand an already-written candidate.
+The prepared authority epoch is bound into the recovery service's private registration record
+after it authenticates the prepared journal against the then-current root-owned pin and
+checkpoints. Rotation after prepare cannot turn an old proposal into a cross-epoch write, and
+recovery validates later unknown/revert receipts against that retained authenticated epoch rather
+than substituting newer pins or checkpoints that could strand an already-written candidate.
 
 The watchdog receives only an opaque recovery handle and two exact-receipt-bound operations:
 candidate-to-preregistered-baseline restore, followed by `armed-* -> shadow` narrowing. The
@@ -49,8 +53,9 @@ registry.
 
 Recovery registration and the prepared journal are durable before route-table CAS. The attempt
 index follows the recoverable journal, so a crash cannot consume an attempt without durable state
-that the watchdog can reconcile. Missing or corrupt recovery material creates a durable target
-block before parsing or clock access; no exception loop can leave a possibly active candidate
+that the watchdog can reconcile. Missing or corrupt recovery material creates both a durable state
+record and a resource-local serving block before parsing or clock access. The gateway treats a
+blocked route database as FRONTIER, so no exception loop can leave a possibly active candidate
 optimistically eligible.
 
 The writer mutex is an expiring monotonic fenced lease. Each acquisition advances a durable epoch,
@@ -67,8 +72,9 @@ client-side check. If a watchdog dies without releasing its recovery-service ses
 acquisition is refused while the lease is current and advances to a new epoch after expiry.
 
 The one-hour whole-operation deadline is independent of receipt cadence. The watch deadline is
-five minutes earlier, leaving deterministic timer/restart jitter margin. Fresh protected liveness
-is still bounded to fifteen minutes.
+five minutes earlier, leaving deterministic timer/restart jitter margin. Every watchdog pass
+rechecks protected liveness, current digests, the prepared authority epoch, and the independently
+bound candidate proof; fresh protected liveness is bounded to fifteen minutes.
 
 ## Owner-installed configuration
 
@@ -82,6 +88,12 @@ socket units, services, and timers, then install:
   `deploy/constitutional-recovery-config-v1.schema.json`; and
 - every referenced authority record, public pin, checkpoint, freshness record, verifier, and
   recovery signer below the protected root.
+
+The owner-supplied recovery signer is an arming prerequisite, not an optional notification hook.
+It must sign and durably persist the narrowed ledger plus protected checkpoint before returning
+them. This repository deliberately ships neither that helper nor its key. If the closed recovery
+config, root-owned executable, or persistence implementation is absent, the recovery service
+cannot start, preregistration fails before route apply, and production W1 remains unarmed.
 
 Targets are compiled and schema-fixed. Flags and environment variables cannot substitute them:
 
@@ -97,7 +109,9 @@ The owner ceremony must provision the shared state directory for `gille-autonomy
 dedicated route directory for `gille-routing-writers`, initialize `m5-routing.db` from the current
 reviewed JSON route bytes, and set the live gateway's
 `HOMESERVER_ROUTING_TABLE_PATH=/var/lib/gille-inference/routing/m5-routing.db`. The gateway opens
-that database read-only. The recovery registry remains accessible only to
+that database read-only, including its SQLite WAL view. The database and sibling `-wal`/`-shm`
+files live under `/var/lib`, outside the ordinary gateway rsync payload; the deploy also excludes
+all SQLite database/WAL patterns defensively. The recovery registry remains accessible only to
 `gille-autonomy-recovery`. Missing unit conditions cleanly skip execution. Wrong-owner, writable,
 malformed, oversized, stale, disarmed, or cryptographically invalid inputs fail closed.
 
@@ -123,6 +137,9 @@ The regression harness covers:
 - observer failure during recovery;
 - failed exact restore, which terminally blocks and is not retried;
 - corrupt material before clock access;
+- live serving fallback while the resource-local block is set;
+- protected-authority rotation after prepare and response-loss replay under a successor fence;
+- stale liveness or failed proof during the active watch window;
 - third-revision preservation;
 - signer-oracle, target substitution, stale freshness, and wrong-identity refusal.
 

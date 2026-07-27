@@ -28,5 +28,5 @@ ReadOnlyPaths=/etc/gille-inference/autonomy
 ReadOnlyPaths=/var/lib/gille-inference/routing
 ReadWritePaths=/var/lib/gille-inference/autonomy
 InaccessiblePaths=/var/lib/gille-inference/autonomy-recovery
-RuntimeMaxSec=20s
+RuntimeMaxSec=120s
 UMask=0007

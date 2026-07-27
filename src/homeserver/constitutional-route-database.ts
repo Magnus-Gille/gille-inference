@@ -15,6 +15,13 @@ export interface RouteFence {
 
 const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
+export class ConstitutionalRouteBlockedError extends Error {
+  constructor() {
+    super("constitutional route is fail-closed blocked");
+    this.name = "ConstitutionalRouteBlockedError";
+  }
+}
+
 export class ConstitutionalRouteDatabase {
   constructor(private readonly path: string) {
     const db = open(this.path);
@@ -89,6 +96,41 @@ export class ConstitutionalRouteDatabase {
       db.close();
     }
   }
+
+  block(fence: RouteFence): boolean {
+    return this.setBlocked(true, fence);
+  }
+
+  clearBlock(fence: RouteFence): boolean {
+    return this.setBlocked(false, fence);
+  }
+
+  isBlocked(): boolean {
+    const db = open(this.path);
+    try {
+      const row = db.prepare("SELECT blocked FROM constitutional_route_guard WHERE id=1")
+        .get() as { blocked: number } | undefined;
+      return row?.blocked === 1;
+    } finally {
+      db.close();
+    }
+  }
+
+  private setBlocked(blocked: boolean, fence: RouteFence): boolean {
+    validateFence(fence);
+    const db = open(this.path);
+    try {
+      return db.transaction(() => {
+        if (!routeLeaseCurrent(db, fence)) return false;
+        const result = db.prepare(`
+          UPDATE constitutional_route_guard SET blocked=? WHERE id=1
+        `).run(blocked ? 1 : 0);
+        return result.changes === 1;
+      }).immediate();
+    } finally {
+      db.close();
+    }
+  }
 }
 
 export function initializeConstitutionalRouteDatabase(path: string, value: string): void {
@@ -108,6 +150,9 @@ export function readConstitutionalRouteDatabase(path: string): string {
   const db = new Database(path, { readonly: true, fileMustExist: true });
   try {
     db.pragma("query_only = ON");
+    const guard = db.prepare("SELECT blocked FROM constitutional_route_guard WHERE id=1")
+      .get() as { blocked: number } | undefined;
+    if (guard?.blocked === 1) throw new ConstitutionalRouteBlockedError();
     const row = db.prepare("SELECT value FROM constitutional_route WHERE id=1")
       .get() as { value: string } | undefined;
     if (!row) throw new Error("constitutional route database is not owner-initialized");
@@ -152,6 +197,12 @@ function open(path: string): Database.Database {
       value TEXT NOT NULL,
       value_digest TEXT NOT NULL
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS constitutional_route_guard (
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      blocked INTEGER NOT NULL CHECK(blocked IN (0,1))
+    ) STRICT;
+    INSERT INTO constitutional_route_guard(id, blocked) VALUES(1, 0)
+      ON CONFLICT(id) DO NOTHING;
   `);
   return db;
 }

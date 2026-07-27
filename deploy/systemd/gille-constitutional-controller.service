@@ -11,7 +11,7 @@ ConditionPathExists=/var/lib/gille-inference/proposals/micro-routing.json
 Type=oneshot
 User=gille-autonomy-controller
 Group=gille-autonomy-controller
-SupplementaryGroups=gille-autonomy-state gille-routing-writers
+SupplementaryGroups=gille-autonomy-state
 WorkingDirectory=@@REMOTE_DIR@@
 EnvironmentFile=/etc/gille-inference/autonomy/autonomy.env
 Environment=GILLE_AUTONOMY_AUTHORITY_CONFIG=/etc/gille-inference/autonomy/authority-config.json
@@ -27,9 +27,7 @@ ReadOnlyPaths=@@REMOTE_DIR@@
 ReadOnlyPaths=/etc/gille-inference/autonomy
 ReadOnlyPaths=/var/lib/gille-inference/proposals
 ReadWritePaths=/var/lib/gille-inference/autonomy
-# SQLite requires sibling -wal/-shm files. This dedicated directory contains
-# only the constitutional route database and is group-owned by route writers.
-ReadWritePaths=/var/lib/gille-inference/routing
+InaccessiblePaths=/var/lib/gille-inference/routing
 InaccessiblePaths=/var/lib/gille-inference/autonomy-recovery
-RuntimeMaxSec=20s
+RuntimeMaxSec=120s
 UMask=0007

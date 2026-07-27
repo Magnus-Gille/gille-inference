@@ -6,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -126,4 +127,33 @@ export function persistImmutablePlan(path: string, plan: RouteMutationPlan): "cr
     closeSync(directory);
   }
   return "created";
+}
+
+/**
+ * A never-started immutable plan is authority for one bounded time window, not
+ * a permanent scheduler tombstone. Remove it only after its exact UTC deadline
+ * has elapsed so the next timer can compose a fresh plan from the standing
+ * proposal and current baseline.
+ */
+export function removeExpiredImmutablePlan(path: string, nowIso: string): boolean {
+  if (!existsSync(path)) return false;
+  const now = Date.parse(nowIso);
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RouteMutationPlan>;
+  const deadline = typeof parsed.deadline === "string" ? Date.parse(parsed.deadline) : Number.NaN;
+  if (
+    !Number.isFinite(now)
+    || !Number.isFinite(deadline)
+    || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(nowIso)
+    || typeof parsed.deadline !== "string"
+    || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(parsed.deadline)
+  ) throw new Error("immutable constitutional plan has invalid scheduler time");
+  if (now < deadline) return false;
+  unlinkSync(path);
+  const directory = openSync(dirname(path), "r");
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
+  return true;
 }

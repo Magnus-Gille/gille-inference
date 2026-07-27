@@ -6,7 +6,7 @@ import {
   type RecoveryJournalView,
 } from "../src/homeserver/constitutional-recovery-service.js";
 import { constitutionalPaths } from "../src/homeserver/constitutional-routing-controller.js";
-import { readConstitutionalResource } from "../src/homeserver/constitutional-fenced-lease.js";
+import { readConstitutionalResourceReadonly } from "../src/homeserver/constitutional-fenced-lease.js";
 import { ConstitutionalRouteDatabase } from "../src/homeserver/constitutional-route-database.js";
 import {
   boundedProtectedRead,
@@ -32,19 +32,8 @@ function authorityConfig(): any {
   return value;
 }
 
-function journalView(journalId: string): RecoveryJournalView {
-  const paths = constitutionalPaths(PRODUCTION_STATE_DIR);
-  const journalBytes = readConstitutionalResource(paths.lock, paths.journal);
-  if (journalBytes === undefined) throw new Error("recovery journal is missing");
-  const journal = JSON.parse(journalBytes) as any;
-  const config = authorityConfig();
-  const last = journal.entries?.at(-1);
-  const materialBytes = readConstitutionalResource(paths.lock, paths.recoveryMaterial);
-  const preparedWithoutMaterial = last?.phase === "prepare" && materialBytes === undefined;
-  const material = preparedWithoutMaterial
-    ? undefined
-    : JSON.parse(String(materialBytes)) as any;
-  const snapshot = preparedWithoutMaterial ? {
+function currentProtectedAuthority(config = authorityConfig()): any {
+  return {
     authorization: json(config.authorization_path),
     constitution: json(config.constitution_path),
     coverage: json(config.coverage_path),
@@ -54,17 +43,20 @@ function journalView(journalId: string): RecoveryJournalView {
     checkpoint: json(config.authorization_checkpoint_path),
     runtimeNarrowing: json(config.runtime_narrowing_path),
     runtimeNarrowingCheckpoint: json(config.runtime_narrowing_checkpoint_path),
-  } : structuredClone(material.prepared_authority);
-  // Replace every anti-rollback/authentication root with the recovery
-  // process's independently root-owned copy before cryptographic validation.
-  snapshot.pinnedOwnerPublicKeyPem = boundedProtectedRead(config.pinned_owner_public_key_path, 64_000);
-  snapshot.checkpoint = json(config.authorization_checkpoint_path);
-  snapshot.recoveryRegistry = json(config.recovery_registry_path);
-  snapshot.runtimeNarrowingCheckpoint = json(config.runtime_narrowing_checkpoint_path);
+  };
+}
+
+function journalView(journalId: string, protectedAuthority?: unknown): RecoveryJournalView {
+  const paths = constitutionalPaths(PRODUCTION_STATE_DIR);
+  const journalBytes = readConstitutionalResourceReadonly(paths.lock, paths.journal);
+  if (journalBytes === undefined) throw new Error("recovery journal is missing");
+  const journal = JSON.parse(journalBytes) as any;
+  const snapshot = protectedAuthority === undefined
+    ? currentProtectedAuthority()
+    : structuredClone(protectedAuthority);
   return authenticateRecoveryJournal({
     journalId,
     journal,
-    material,
     protectedSnapshot: snapshot,
   });
 }
@@ -96,7 +88,13 @@ await startRecoveryService({
   registrationFd: inheritedFd("registration"),
   actionFd: inheritedFd("action"),
   registry: new RecoveryRegistry(RECOVERY_REGISTRY_DIR),
-  journalAuthority: { read: journalView },
+  journalAuthority: {
+    read: journalView,
+    protectedAuthority: () => currentProtectedAuthority(),
+  },
   route: new ConstitutionalRouteDatabase(PRODUCTION_ROUTE_TABLE),
   demote: (input) => runJsonBin(String(recoveryConfig.recovery_signer_bin), input),
+  // Longer than the 120-second oneshot ceiling so a live operation never
+  // loses its resource-local fence before systemd terminates it.
+  routeLeaseOptions: { durationMs: 150_000 },
 });

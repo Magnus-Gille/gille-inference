@@ -4,6 +4,10 @@ import { describe, expect, it } from "vitest";
 
 const root = new URL("../deploy/systemd/", import.meta.url).pathname;
 const deployRoot = new URL("../deploy/", import.meta.url).pathname;
+const recoveryEntrypoint = readFileSync(
+  new URL("../scripts/constitutional-recovery-service.ts", import.meta.url),
+  "utf8",
+);
 const unit = (name: string) => readFileSync(join(root, name), "utf8");
 
 describe("rendered constitutional systemd capability boundary", () => {
@@ -14,12 +18,15 @@ describe("rendered constitutional systemd capability boundary", () => {
     expect(controller).toContain("User=gille-autonomy-controller");
     expect(watchdog).toContain("User=gille-autonomy-watchdog");
     expect(recovery).toContain("User=gille-autonomy-recovery");
-    expect(controller).toContain("SupplementaryGroups=gille-autonomy-state gille-routing-writers");
+    expect(controller).toContain("SupplementaryGroups=gille-autonomy-state");
+    expect(controller).not.toContain("gille-routing-writers");
     expect(watchdog).toContain("SupplementaryGroups=gille-autonomy-state");
     expect(watchdog).not.toContain("gille-routing-writers");
     expect(recovery).toContain("SupplementaryGroups=gille-autonomy-state gille-routing-writers");
     expect(controller).toContain("UMask=0007");
     expect(watchdog).toContain("UMask=0007");
+    expect(controller).toContain("RuntimeMaxSec=120");
+    expect(watchdog).toContain("RuntimeMaxSec=120");
     for (const rendered of [controller, watchdog, recovery]) {
       expect(rendered).toContain("ProtectSystem=strict");
       expect(rendered).toContain("ProtectClock=true");
@@ -47,6 +54,7 @@ describe("rendered constitutional systemd capability boundary", () => {
     const watchdog = unit("gille-constitutional-watchdog.service");
     const recovery = unit("gille-constitutional-recovery.service");
     expect(controller).not.toContain("ReadWritePaths=/var/lib/gille-inference/autonomy-recovery");
+    expect(controller).toContain("InaccessiblePaths=/var/lib/gille-inference/routing");
     expect(watchdog).toContain("ReadOnlyPaths=/var/lib/gille-inference/routing");
     expect(watchdog).not.toContain("ReadWritePaths=/var/lib/gille-inference/routing");
     expect(recovery).toContain("ReadWritePaths=/var/lib/gille-inference/autonomy-recovery");
@@ -61,6 +69,15 @@ describe("rendered constitutional systemd capability boundary", () => {
     expect(unit("gille-constitutional-watchdog.timer")).toContain("OnUnitActiveSec=60s");
     expect(unit("gille-constitutional-controller.service")).toContain("constitutional-routing-cli.ts controller");
     expect(unit("gille-constitutional-watchdog.service")).toContain("constitutional-routing-cli.ts watchdog");
+  });
+
+  it("cannot bypass the absent owner-installed sign-and-persist prerequisite", () => {
+    const recovery = unit("gille-constitutional-recovery.service");
+    expect(recovery).toContain("ConditionPathExists=/etc/gille-inference/autonomy/recovery-config.json");
+    expect(recoveryEntrypoint).toContain('Object.keys(recoveryConfig).sort().join(",") !== "recovery_signer_bin"');
+    expect(recoveryEntrypoint).toContain("protectedPath(recoveryConfig.recovery_signer_bin, 0)");
+    expect(recoveryEntrypoint.indexOf("protectedPath(recoveryConfig.recovery_signer_bin, 0)"))
+      .toBeLessThan(recoveryEntrypoint.indexOf("await startRecoveryService"));
   });
 
   it("ships closed schemas with the same fixed production targets as the composition root", () => {

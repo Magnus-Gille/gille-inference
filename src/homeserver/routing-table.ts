@@ -22,7 +22,10 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { readConstitutionalRouteDatabase } from "./constitutional-route-database.js";
+import {
+  ConstitutionalRouteBlockedError,
+  readConstitutionalRouteDatabase,
+} from "./constitutional-route-database.js";
 
 /** A single per-task-type routing verdict from the cartography. */
 export interface RoutingEntry {
@@ -110,10 +113,17 @@ export function resetRoutingTable(): void {
  *
  * Two task types are "routing-equivalent" iff `routingTarget` returns the same string for both.
  *
- * @param table Optional injected table (defaults to the memoized real routing JSON).
+ * @param table Optional injected table (defaults to the current route resource).
+ * @param filePath Optional route-resource path for deterministic integration tests.
  */
-export function routingTarget(taskType: string, table?: RoutingTable): string {
-  const t = table ?? currentRoutingTable();
+export function routingTarget(taskType: string, table?: RoutingTable, filePath?: string): string {
+  let t: RoutingTable;
+  try {
+    t = table ?? currentRoutingTable(filePath);
+  } catch (error) {
+    if (error instanceof ConstitutionalRouteBlockedError) return FRONTIER;
+    throw error;
+  }
   if (t.escalateToFrontier.includes(taskType)) return FRONTIER;
   // Own-property lookup only: task types are now caller-supplied verbatim (#155), so a prototype-
   // named key ("__proto__"/"constructor"/"toString"/…) must NOT resolve to an inherited property

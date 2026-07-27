@@ -804,6 +804,8 @@ export interface RestoreOnlyCapability {
   /** Recovery service acquires the lease stored beside the route value. */
   acquireRouteFence(): RouteFence;
   releaseRouteFence(fence: RouteFence): void;
+  blockRoute(fence: RouteFence): void;
+  clearRouteBlock(fence: RouteFence): void;
   /**
    * Implemented by a separately privileged worker. It can write only the
    * pre-registered baseline bound to this journal, never arbitrary bytes.
@@ -814,7 +816,6 @@ export interface RestoreOnlyCapability {
     bindingDigest: string;
     targetScopeDigest: string;
     journalReceiptDigest: string;
-    candidateDigest: string;
     fenceEpoch: number;
     fenceToken: string;
   }): "restored" | "already-baseline" | "superseded" | "failed";
@@ -849,6 +850,7 @@ export class ConstitutionalRoutingWatchdog {
     private readonly notifyBestEffort: (summary: string) => void = () => undefined,
     private readonly policy: ConstitutionalPolicy = MICRO_ROUTING_CONSTITUTIONAL_POLICY,
     private readonly leaseOptions: ConstitutionalLeaseOptions = {},
+    private readonly verifier?: CandidateVerifier,
   ) {
     this.paths = constitutionalPaths(dataDir);
   }
@@ -860,8 +862,12 @@ export class ConstitutionalRoutingWatchdog {
     ConstitutionalFencedLease.assertAcquirable(this.paths.lock, this.leaseOptions);
     const routeFence = this.recovery.acquireRouteFence();
     try {
+      this.recovery.blockRoute(routeFence);
       return withLease(this.paths.lock, this.leaseOptions, (lease) => {
-      if (!constitutionalResourceExists(this.paths.lock, this.paths.journal)) return { outcome: "noop", reason: "no-journal" };
+      if (!constitutionalResourceExists(this.paths.lock, this.paths.journal)) {
+        this.recovery.clearRouteBlock(routeFence);
+        return { outcome: "noop", reason: "no-journal" };
+      }
       // Establish the fail-closed target block before parsing any controller-
       // writable recovery state or consulting clock/liveness. Corruption can
       // therefore strand the target blocked, never active with an exception
@@ -909,6 +915,7 @@ export class ConstitutionalRoutingWatchdog {
               throw new Error("reconciled demotion is not bound to the terminal receipt and target");
             }
             lease.removeResource(this.paths.targetBlock);
+            this.recovery.clearRouteBlock(routeFence);
             return { outcome: "noop", reason: "terminal-signed-demotion-reconciled", journal };
           } catch (error) {
             return {
@@ -919,6 +926,7 @@ export class ConstitutionalRoutingWatchdog {
           }
         }
         if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
+        if (last.phase !== "terminally-blocked") this.recovery.clearRouteBlock(routeFence);
         return { outcome: "noop", reason: `terminal-${last.phase}`, journal };
       }
       let material: RecoveryMaterial;
@@ -941,8 +949,20 @@ export class ConstitutionalRoutingWatchdog {
       // maxSilenceSeconds constrains the independently advancing protected
       // liveness proof in freshGate; it is not a journal-receipt cadence. A
       // one-hour canary is intentionally quiet between watch and commit.
+      let watchFailure: string | undefined;
       if (!expired && !kill && last.phase !== "unknown") {
+        try {
+          const currentGate = freshGate(this.authority, material.plan, this.policy);
+          requirePreparedEpoch(currentGate, material);
+          if (!this.verifier) throw new Error("watchdog candidate verifier is unavailable");
+          requireCandidateProof(this.verifier, material);
+        } catch (error) {
+          watchFailure = `watch-gate:${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+      if (!expired && !kill && last.phase !== "unknown" && watchFailure === undefined) {
         if (evaluationBlockCreated) lease.removeResource(this.paths.targetBlock);
+        this.recovery.clearRouteBlock(routeFence);
         return { outcome: "waiting", reason: "watch-active", journal };
       }
 
@@ -1000,7 +1020,15 @@ export class ConstitutionalRoutingWatchdog {
       }
 
       if (last.phase !== "unknown") {
-        append(journal, "unknown", "unknown", journal.binding.watchdog_identity, now, expired ? "deadline-expired" : "kill-switch-active", material.plan.contentRef);
+        append(
+          journal,
+          "unknown",
+          "unknown",
+          journal.binding.watchdog_identity,
+          now,
+          expired ? "deadline-expired" : kill ? "kill-switch-active" : watchFailure!,
+          material.plan.contentRef,
+        );
         saveAndValidate(this.paths, journal, gate, false, lease);
       }
       lease.writeResource(this.paths.targetBlock, `${canonicalJson({
@@ -1018,7 +1046,6 @@ export class ConstitutionalRoutingWatchdog {
         bindingDigest: journal.binding_digest,
         targetScopeDigest: journal.binding.target_scope_digest,
         journalReceiptDigest: journal.entries.at(-1)!.receipt_digest,
-        candidateDigest: material.candidate_digest,
         fenceEpoch: routeFence.epoch,
         fenceToken: routeFence.token,
       }));
@@ -1065,6 +1092,7 @@ export class ConstitutionalRoutingWatchdog {
       append(journal, "disarm", "disarmed", journal.binding.recovery_worker_identity, now, "recovery-worker-disarm-confirmed", material.plan.contentRef);
       saveAndValidate(this.paths, journal, gate, true, lease);
       lease.removeResource(this.paths.targetBlock);
+      this.recovery.clearRouteBlock(routeFence);
       try {
         this.notifyBestEffort(canonicalJson({ kind: "constitutional-route-reverted", journal_id: journal.journal_id }));
       } catch {
@@ -1086,10 +1114,11 @@ export class ConstitutionalRoutingWatchdog {
     lease?: ConstitutionalFencedLease,
   ): WatchdogTickResult {
     if (!lease) throw new Error("terminal block requires a current fenced lease");
-    if (journal.entries.at(-1)?.phase !== "unknown") {
-      append(journal, "unknown", "unknown", journal.binding.watchdog_identity, now, reason, material.plan.contentRef);
+    const terminalJournal = structuredClone(journal);
+    if (terminalJournal.entries.at(-1)?.phase !== "unknown") {
+      append(terminalJournal, "unknown", "unknown", terminalJournal.binding.watchdog_identity, now, reason, material.plan.contentRef);
     }
-    append(journal, "terminally-blocked", "terminally-blocked", journal.binding.recovery_worker_identity, now, reason, material.plan.contentRef);
+    append(terminalJournal, "terminally-blocked", "terminally-blocked", terminalJournal.binding.recovery_worker_identity, now, reason, material.plan.contentRef);
     lease.writeResource(this.paths.targetBlock, `${canonicalJson({
       schema_version: 1,
       target_scope_digest: journal.binding.target_scope_digest,
@@ -1098,20 +1127,40 @@ export class ConstitutionalRoutingWatchdog {
       blocked_at: now,
       signed_demotion_pending: true,
     })}\n`);
+    let terminalPersisted = false;
     if (gate) {
       try {
-        saveAndValidate(this.paths, journal, gate, true, lease);
+        saveAndValidate(this.paths, terminalJournal, gate, true, lease);
+        terminalPersisted = true;
       } catch {
-        lease.writeResource(this.paths.journal, `${canonicalJson(journal)}\n`);
+        // Keep the last valid journal prefix. The authoritative route block is
+        // already durable; never replace a valid prefix with an invalid
+        // terminal fallback.
       }
-    } else {
-      lease.writeResource(this.paths.journal, `${canonicalJson(journal)}\n`);
     }
     try {
       this.notifyBestEffort(canonicalJson({ kind: "constitutional-route-terminally-blocked", journal_id: journal.journal_id, reason_digest: reasonDigest(reason) }));
     } catch {
       // Best effort by design.
     }
-    return { outcome: "terminally-blocked", reason, journal };
+    return { outcome: "terminally-blocked", reason, journal: terminalPersisted ? terminalJournal : journal };
   }
+}
+
+function requireCandidateProof(verifier: CandidateVerifier, material: RecoveryMaterial): CandidateProof {
+  const proof = verifier.verify({
+    candidate: material.candidate,
+    candidateDigest: material.candidate_digest,
+    configDigest: material.plan.configDigest,
+    evidenceDigest: material.plan.evidenceDigest,
+    policyDigest: material.plan.policyDigest,
+    postconditionsDigest: material.plan.postconditionsDigest,
+  });
+  if (
+    proof.ok !== true
+    || proof.candidateDigest !== material.candidate_digest
+    || proof.postconditionsDigest !== material.plan.postconditionsDigest
+    || !DIGEST.test(proof.proofDigest)
+  ) throw new Error("candidate verifier returned an unbound or failed proof");
+  return proof;
 }

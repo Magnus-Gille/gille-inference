@@ -68,6 +68,19 @@ describe("loadRoutingTable", () => {
     expect(currentRoutingTable(path).routing.summarize?.model).toBe("qwen");
     lease.release();
   });
+
+  it("fails closed to FRONTIER while the authoritative route is blocked", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "routing-table-blocked-db-")), "m5-routing.db");
+    initializeConstitutionalRouteDatabase(path, JSON.stringify({
+      routing: { summarize: { model: "mellum", passRate: 1, tokPerSec: 100, verdict: "delegate-local" } },
+      escalateToFrontier: [],
+    }));
+    const route = new ConstitutionalRouteDatabase(path);
+    const lease = route.acquireWriterLease();
+    expect(route.block({ epoch: lease.epoch, token: lease.token })).toBe(true);
+    expect(routingTarget("summarize", undefined, path)).toBe(FRONTIER);
+    lease.release();
+  });
 });
 
 describe("routingTarget", () => {

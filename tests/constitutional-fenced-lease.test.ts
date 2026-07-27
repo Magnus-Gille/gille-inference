@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   ConstitutionalLeaseBusyError,
   ConstitutionalLeaseStaleError,
   readConstitutionalResource,
+  readConstitutionalResourceReadonly,
 } from "../src/homeserver/constitutional-fenced-lease.js";
 
 describe("constitutional expiring fenced lease", () => {
@@ -48,5 +49,17 @@ describe("constitutional expiring fenced lease", () => {
     expect(after.epoch).toBe(before.epoch + 1);
     before.release();
     after.release();
+  });
+
+  it("lets recovery read state without opening a writable database handle", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "constitutional-readonly-")), "state.db");
+    const lease = ConstitutionalFencedLease.acquire(path);
+    lease.writeResource("journal", "prepared");
+    lease.release();
+    const before = statSync(path);
+    expect(readConstitutionalResourceReadonly(path, "journal")).toBe("prepared");
+    const after = statSync(path);
+    expect(after.size).toBe(before.size);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
   });
 });
