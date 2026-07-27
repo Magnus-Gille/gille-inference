@@ -146,6 +146,15 @@ function readFlag(args: string[], name: string): string | undefined {
   return v;
 }
 
+/**
+ * Defense-in-depth UX guard only. `approvedBy` is free text and is not an
+ * authority boundary; the structural boundary is autonomy-tick-cli wiring its
+ * legacy controller with actuation permanently disabled.
+ */
+export function legacyAdoptIdentityAllowed(approvedBy: string): boolean {
+  return !approvedBy.startsWith("autonomy:") && !approvedBy.startsWith("autonomy-controller:");
+}
+
 function loadAdoptedTable(path: string): DiffableRoutingTable | null {
   if (!existsSync(path)) return null;
   const raw = readFileSync(path, "utf8");
@@ -444,6 +453,13 @@ async function cmdAdopt(args: string[]): Promise<void> {
   if (!artifactPath || !approvedBy || !reason || !decisionRef) {
     process.stderr.write(
       "adopt requires --artifact <path> --approved-by <name> --reason \"<why>\" --decision-ref <issue/PR>\n"
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (!legacyAdoptIdentityAllowed(approvedBy)) {
+    process.stderr.write(
+      "adopt refuses autonomous approver identities on the legacy approval-token path; use the signed ADR-008 constitutional writer\n"
     );
     process.exitCode = 2;
     return;

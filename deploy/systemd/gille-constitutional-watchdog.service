@@ -1,0 +1,23 @@
+# Rendered by scripts/deploy-gateway.sh; the repository ships no arming data,
+# signing key, or live authorization. The optional environment file is
+# owner-installed outside the deploy tree.
+[Unit]
+Description=Grimnir constitutional micro-routing R-exact watchdog
+After=home-gateway.service
+ConditionPathExists=%h/.config/gille-inference/autonomy.env
+ConditionPathExists=%h/.config/gille-inference/authority-config.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=@@REMOTE_DIR@@
+EnvironmentFile=-%h/.config/gille-inference/autonomy.env
+Environment=GILLE_AUTONOMY_AUTHORITY_CONFIG=%h/.config/gille-inference/authority-config.json
+ExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/constitutional-routing-cli.ts watchdog
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+ReadOnlyPaths=@@REMOTE_DIR@@

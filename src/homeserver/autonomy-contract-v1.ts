@@ -136,13 +136,57 @@ const OUTCOME_FOR: Record<string, string> = {
 const BINDING_KEYS = ["mutation_id", "attempt_id", "recovery_disarm_id", "idempotency_key", "writer_owner", "owner_authority_ref", "owner_authority_digest", "configuration_owner", "configuration_owner_authority_ref", "configuration_owner_authority_digest", "target_scope_digest", "admission_coverage_digest", "admission_binding_state", "owner_identity", "controller_identity", "watchdog_identity", "kill_switch_identity", "recovery_worker_identity", "risk_scope", "candidate_digest", "config_digest", "evidence_digest", "policy_digest", "baseline_digest", "postconditions_digest", "deadline", "canary", "recovery"];
 const ENTRY_KEYS = ["entry_id", "sequence", "recorded_at", "phase", "outcome", "executor_identity", "binding_digest", "quarantine", "coverage_transition", "terminal_reason_digest", "previous_receipt_digest", "receipt_digest", "content_refs"];
 
-export interface JournalValidationResult { terminal: "commit" | "disarm" | "terminally-blocked"; entries: number; bindingDigest: string; }
+export interface JournalValidationResult {
+  terminal: "commit" | "disarm" | "terminally-blocked";
+  entries: number;
+  bindingDigest: string;
+}
+export interface JournalPrefixValidationResult {
+  phase: string;
+  terminal: boolean;
+  entries: number;
+  bindingDigest: string;
+}
 
 /** Strict schema + semantic verifier for the exact public journal-v1 contract. */
 export function validateJournalV1(journal: unknown, constitution: unknown, coverage: unknown, attestations: unknown): JournalValidationResult {
+  const result = validateJournal(journal, constitution, coverage, attestations, true);
+  return {
+    terminal: result.phase as JournalValidationResult["terminal"],
+    entries: result.entries,
+    bindingDigest: result.bindingDigest,
+  };
+}
+
+/**
+ * Strictly validates an in-flight prefix of journal-v1.
+ *
+ * The public terminal fixtures intentionally require an explicit commit,
+ * disarm, or terminally-blocked outcome. A durable executor must also be able
+ * to validate the prepared/applied/verified/watching prefix after a crash
+ * without pretending that it is terminal. This function applies every
+ * envelope, binding, receipt-chain, authority, deadline, role, and transition
+ * check below, but returns the current phase instead of requiring a terminal.
+ */
+export function validateJournalV1Prefix(
+  journal: unknown,
+  constitution: unknown,
+  coverage: unknown,
+  attestations: unknown,
+): JournalPrefixValidationResult {
+  return validateJournal(journal, constitution, coverage, attestations, false);
+}
+
+function validateJournal(
+  journal: unknown,
+  constitution: unknown,
+  coverage: unknown,
+  attestations: unknown,
+  requireTerminal: boolean,
+): JournalPrefixValidationResult {
   bounded(journal); bounded(constitution); bounded(coverage); bounded(attestations);
   const j = journal as Record<string, any>, c = constitution as Record<string, any>, registry = coverage as Record<string, any>, owners = attestations as Record<string, any>;
-  if (!exact(j, ["kind", "schema_version", "journal_id", "domain", "constitution_digest", "binding", "binding_digest", "entries", "extensions"]) || j.kind !== "autonomous-mutation-journal" || j.schema_version !== "v1" || !ID.test(String(j.journal_id)) || !DOMAINS.has(String(j.domain)) || !Array.isArray(j.entries) || j.entries.length < 2 || !Array.isArray(j.extensions) || j.extensions.length) fail("malformed journal envelope");
+  if (!exact(j, ["kind", "schema_version", "journal_id", "domain", "constitution_digest", "binding", "binding_digest", "entries", "extensions"]) || j.kind !== "autonomous-mutation-journal" || j.schema_version !== "v1" || !ID.test(String(j.journal_id)) || !DOMAINS.has(String(j.domain)) || !Array.isArray(j.entries) || j.entries.length < (requireTerminal ? 2 : 1) || !Array.isArray(j.extensions) || j.extensions.length) fail("malformed journal envelope");
   if (!plain(c) || c.constitution_digest !== digestJson(c, "constitution_digest") || j.constitution_digest !== c.constitution_digest || !Array.isArray(c.autonomous_classes)) fail("journal constitution binding mismatch");
   const policy = c.autonomous_classes.find((candidate: any) => candidate?.class === j.domain);
   if (!policy || !plain(policy.bounds)) fail("journal domain is not an approved class");
@@ -199,10 +243,11 @@ export function validateJournalV1(journal: unknown, constitution: unknown, cover
   }
   if (j.entries[0].phase !== "prepare") fail("journal does not start prepared");
   const terminal = j.entries.at(-1).phase as string;
-  if (!["commit", "disarm", "terminally-blocked"].includes(terminal)) fail("journal has no explicit terminal state");
+  const isTerminal = ["commit", "disarm", "terminally-blocked"].includes(terminal);
+  if (requireTerminal && !isTerminal) fail("journal has no explicit terminal state");
   if (terminal === "commit" && j.entries.some((e: any) => ["unknown", "revert", "recover", "quarantine", "disarm", "terminally-blocked"].includes(e.phase))) fail("successful journal entered recovery");
-  if (j.entries.some((e: any) => e.phase === "unknown") && !["disarm", "terminally-blocked"].includes(terminal)) fail("unknown did not terminally disarm");
+  if (requireTerminal && j.entries.some((e: any) => e.phase === "unknown") && !["disarm", "terminally-blocked"].includes(terminal)) fail("unknown did not terminally disarm");
   if (terminal === "disarm" && policy.recovery_class === "R-exact" && !j.entries.some((e: any) => e.phase === "revert")) fail("R-exact disarm lacks revert");
   if (terminal === "disarm" && policy.recovery_class === "R-forward" && (!j.entries.some((e: any) => e.phase === "recover") || !j.entries.some((e: any) => e.phase === "quarantine" && e.quarantine.state === "active"))) fail("R-forward disarm lacks recover and quarantine");
-  return { terminal: terminal as JournalValidationResult["terminal"], entries: j.entries.length, bindingDigest: j.binding_digest };
+  return { phase: terminal, terminal: isTerminal, entries: j.entries.length, bindingDigest: j.binding_digest };
 }
