@@ -1671,9 +1671,12 @@ export async function admitRosterProposal(
           );
         }
         if (
-          typeof providerResult === "object"
-          && providerResult !== null
-          && "then" in providerResult
+          providerResult !== null
+          && (
+            typeof providerResult === "object"
+            || typeof providerResult === "function"
+          )
+          && typeof (providerResult as { then?: unknown }).then === "function"
         ) {
           throw new ServerObservationFenceProtocolError(
             "server observation fence returned a thenable",

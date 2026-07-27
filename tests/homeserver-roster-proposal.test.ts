@@ -1200,12 +1200,22 @@ describe("fail-closed admission and durable lifecycle", () => {
       .toEqual(["submitted", "rejected"]);
   });
 
-  it("rolls back an armed callback when a provider returns a thenable", async () => {
+  it.each([
+    ["object", () => Promise.resolve(undefined)],
+    ["function", () => Object.assign(
+      () => undefined,
+      { then: () => undefined },
+    )],
+  ])("rolls back an armed callback when a provider returns a %s thenable", async (
+    shape,
+    makeThenable,
+  ) => {
     const observation = serverObservation();
+    const proposalId = `proposal:w5:fence-thenable-${shape}`;
     const result = await admitRosterProposal(
       proposal({
-        proposal_id: "proposal:w5:fence-thenable",
-        idempotency_key: "idem:w5:fence-thenable",
+        proposal_id: proposalId,
+        idempotency_key: `idem:w5:fence-thenable-${shape}`,
       }),
       ROSTER_PROPOSAL_PRINCIPAL,
       {
@@ -1217,7 +1227,7 @@ describe("fail-closed admission and durable lifecycle", () => {
             callback: (confirmedToken: unknown) => unknown,
           ): unknown => {
             callback(tokenFor(observation));
-            return Promise.resolve(undefined);
+            return makeThenable();
           },
         },
       },
@@ -1228,7 +1238,7 @@ describe("fail-closed admission and durable lifecycle", () => {
         .toBe("OBSERVATION_REVALIDATION_UNAVAILABLE");
       expect(result.record.state).toBe("rejected");
     }
-    const events = rosterProposalEvents("proposal:w5:fence-thenable", db);
+    const events = rosterProposalEvents(proposalId, db);
     expect(events).toEqual([
       { sequence: 1, state: "submitted", reasonCode: null },
       {
