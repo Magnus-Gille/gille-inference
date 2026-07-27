@@ -2743,6 +2743,37 @@ export interface GatewayComposition {
   rosterAdmissionDependencies?: RosterAdmissionDependencies;
 }
 
+export interface GatewayRegistryInitializers {
+  initializeTaskExposureRegistry: typeof initializeTaskExposureRegistry;
+  ensureRosterProposalSchema: typeof ensureRosterProposalSchema;
+  expireRosterProposals: typeof expireRosterProposals;
+}
+
+/**
+ * Initialize the independent startup registries before accepting traffic.
+ * Keep their failure attribution separate: the recovery path for an incompatible
+ * roster-proposal schema is different from the task-exposure registry path.
+ */
+export function initializeGatewayRegistries(
+  initializers: GatewayRegistryInitializers = {
+    initializeTaskExposureRegistry,
+    ensureRosterProposalSchema,
+    expireRosterProposals,
+  },
+): void {
+  try {
+    initializers.initializeTaskExposureRegistry();
+  } catch (err) {
+    throw new Error(`Could not initialize task exposure registry: ${(err as Error).message}`);
+  }
+  try {
+    initializers.ensureRosterProposalSchema();
+    initializers.expireRosterProposals();
+  } catch (err) {
+    throw new Error(`Could not initialize roster proposal registry: ${(err as Error).message}`);
+  }
+}
+
 export function startGateway(
   composition: GatewayComposition = {},
 ): Promise<GatewayHandle> {
@@ -2750,11 +2781,9 @@ export function startGateway(
   try {
     // #257: install the content-blind exposure schema and finish the idempotent retained-log
     // backfill before the port accepts traffic. The lookup route itself remains strictly read-only.
-    initializeTaskExposureRegistry();
-    ensureRosterProposalSchema();
-    expireRosterProposals();
+    initializeGatewayRegistries();
   } catch (err) {
-    return Promise.reject(new Error(`Could not initialize task exposure registry: ${(err as Error).message}`));
+    return Promise.reject(err);
   }
   const loopback =
     cfg.gatewayHost === "127.0.0.1" || cfg.gatewayHost === "localhost" || cfg.gatewayHost === "::1";
