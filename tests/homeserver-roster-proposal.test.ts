@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildEvidenceIdentityBundle,
@@ -369,6 +369,57 @@ function observationDeps(
   return depsForObservation(base, observation);
 }
 
+const huginFixturePositive = new URL(
+  "./fixtures/hugin-gille-roster-proposal-v2-positive.json",
+  import.meta.url,
+);
+const huginFixtureAdversarial = new URL(
+  "./fixtures/hugin-gille-roster-proposal-v2-adversarial.json",
+  import.meta.url,
+);
+
+function huginFixtureDependencies(): RosterAdmissionDependencies {
+  const observation = serverObservation(liveModels, {
+    observation_epoch: "epoch-gille-fixture",
+    desired_roster: [desiredIdentity("qwen-main", 8_192)],
+  });
+  return depsForObservation({
+    ...deps,
+    huginProvenanceTrust: {
+      keyId: "hugin-roster-provenance",
+      publicKeyPem: readFileSync(
+        new URL("./fixtures/hugin-roster-provenance-v1-test-public.pem", import.meta.url),
+        "utf8",
+      ),
+    },
+  }, observation);
+}
+
+function applyHuginFixtureMutations(
+  source: Record<string, unknown>,
+  mutations: Array<{ op: string; path: string; value: unknown }>,
+): Record<string, unknown> {
+  const output = structuredClone(source);
+  for (const mutation of mutations) {
+    if (mutation.op !== "replace" || !mutation.path.startsWith("/")) {
+      throw new Error(`unsupported Hugin fixture mutation ${mutation.op} ${mutation.path}`);
+    }
+    const segments = mutation.path.slice(1).split("/").map((segment) =>
+      segment.replace(/~1/g, "/").replace(/~0/g, "~"),
+    );
+    let target: Record<string, unknown> = output;
+    for (const segment of segments.slice(0, -1)) {
+      const next = target[segment];
+      if (next === null || typeof next !== "object" || Array.isArray(next)) {
+        throw new Error(`Hugin fixture mutation path missing: ${mutation.path}`);
+      }
+      target = next as Record<string, unknown>;
+    }
+    target[segments.at(-1)!] = mutation.value;
+  }
+  return output;
+}
+
 beforeEach(() => {
   db = new Database(":memory:");
   const evidence = snapshot();
@@ -510,6 +561,58 @@ describe("gille roster-proposal v2 contract", () => {
       .toEqual(["submitted", "accepted", "armed"]);
     expect(deps.readServerObservation).toHaveBeenCalledTimes(1);
     expect(deps.readEvidence).toHaveBeenCalledTimes(1);
+  });
+
+  it("byte-verifies and arms the exact Hugin v2 producer fixture", async () => {
+    const sourceBytes = readFileSync(huginFixturePositive, "utf8");
+    expect(createHash("sha256").update(sourceBytes, "utf8").digest("hex"))
+      .toBe("d03d263b5f9cf6606d98fe9f1cfd85ec390eec0706dffffd80675538150dc963");
+
+    const result = await admitRosterProposal(
+      JSON.parse(sourceBytes),
+      ROSTER_PROPOSAL_PRINCIPAL,
+      { db, dependencies: huginFixtureDependencies() },
+    );
+    expect(result.kind, result.kind === "rejected" ? String(result.record.reasonCode) : result.kind)
+      .toBe("armed");
+  });
+
+  it("mechanically applies and rejects every imported Hugin v2 adversarial case", async () => {
+    const sourceBytes = readFileSync(huginFixturePositive, "utf8");
+    const manifest = JSON.parse(readFileSync(huginFixtureAdversarial, "utf8")) as {
+      source: string;
+      source_bytes_sha256: string;
+      cases: Array<{
+        name: string;
+        mutations: Array<{ op: string; path: string; value: unknown }>;
+      }>;
+    };
+    expect(manifest.source).toBe("gille-roster-proposal-v2-positive.json");
+    expect(createHash("sha256").update(
+      readFileSync(huginFixtureAdversarial, "utf8"),
+      "utf8",
+    ).digest("hex")).toBe("5e4470e771c80f7ad03f13c9a8ed6cf3ca18c1c2d5e65e63bd72f173fc01fa78");
+    expect(createHash("sha256").update(sourceBytes, "utf8").digest("hex"))
+      .toBe(manifest.source_bytes_sha256);
+    expect(manifest.cases.map((fixtureCase) => fixtureCase.name)).toEqual([
+      "source-receipt-digest-tamper",
+      "source-base-tamper",
+      "candidate-digest-tamper",
+      "evidence-set-tamper",
+      "policy-tamper",
+      "principal-tamper",
+      "proposal-content-digest-tamper",
+      "envelope-signature-tamper",
+    ]);
+
+    const source = JSON.parse(sourceBytes) as Record<string, unknown>;
+    for (const fixtureCase of manifest.cases) {
+      await expect(admitRosterProposal(
+        applyHuginFixtureMutations(source, fixtureCase.mutations),
+        ROSTER_PROPOSAL_PRINCIPAL,
+        { db, dependencies: huginFixtureDependencies() },
+      ), fixtureCase.name).rejects.toThrow(RosterProposalContractError);
+    }
   });
 
   it("fails closed unless the Gille-owned asymmetric provenance root is configured", async () => {

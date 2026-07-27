@@ -160,9 +160,11 @@ observation epoch+digest plus content-addressed identities before any mutation.
 
 `tests/fixtures/gille-roster-proposal-v1-seed.json` is a superseded gille-owned
 seed example and must fail closed under v2. It is not output from a real Hugin
-serializer and is not cross-repository compatibility evidence. Hugin must now
-produce byte-pinned v2 positive and adversarial fixtures using the exact closed
-envelope above, including its own W4 receipt bytes and an issuer key whose
-public half is pinned in the Gille test composition. Gille can only claim
-cross-repository fixture interoperability after consuming those Hugin-produced
-artifacts; this repository intentionally does not manufacture them.
+serializer and is not cross-repository compatibility evidence. The checked-in
+Hugin-produced v2 positive and adversarial artifacts are imported byte-for-byte
+from `Magnus-Gille/hugin@b85e5dd`; their provenance note records the exact
+paths and source-byte SHA-256. The Gille consumer test verifies that SHA,
+accepts the positive artifact under the fixture-only issuer key and matching
+observation, and mechanically applies then rejects every adversarial case.
+This proves the producer/consumer handshake, not production configuration:
+the production trust root remains unconfigured and no live canary is armed.
