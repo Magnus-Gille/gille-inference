@@ -762,6 +762,9 @@ export class ConstitutionalRoutingController {
 
   commit(): { outcome: "committed" | "unknown"; journal: JournalV2; reason?: string } {
     return withRouteAndStateLease(this.paths.lock, this.table, this.leaseOptions, (lease, routeFence) => {
+      if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
+        throw new Error("micro-routing target is persistently blocked pending signed demotion reconciliation");
+      }
       const journal = loadJournal(this.paths);
       const material = loadMaterial(this.paths, journal);
       const plan = material.plan;
@@ -946,6 +949,18 @@ export class ConstitutionalRoutingWatchdog {
         return { outcome: "terminally-blocked", reason: "terminal-owner-reconciliation-required", journal };
       }
       if (["commit", "disarm", "terminally-blocked"].includes(last.phase)) {
+        if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
+          // A durable resource-local block is authoritative even when the
+          // controller journal reached a terminal phase. In particular, a
+          // pending signed demotion must never be bypassed by generic terminal
+          // deadline/block reconciliation.
+          this.recovery.blockRoute(routeFence);
+          return {
+            outcome: "terminally-blocked",
+            reason: "terminal-owner-reconciliation-required",
+            journal,
+          };
+        }
         if (last.phase === "commit") {
           try {
             this.recovery.clearCandidateDeadline({
@@ -964,14 +979,6 @@ export class ConstitutionalRoutingWatchdog {
               journal,
             };
           }
-        }
-        if (last.phase === "terminally-blocked" && constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
-          // Terminal means terminal. In particular, a signer failure after a
-          // successful exact restore must not become an unbounded signer retry
-          // loop. The durable terminal receipt plus resource-local block leaves
-          // an explicit owner reconciliation ceremony as the only next action.
-          this.recovery.blockRoute(routeFence);
-          return { outcome: "terminally-blocked", reason: "terminal-owner-reconciliation-required", journal };
         }
         if (last.phase !== "terminally-blocked") this.recovery.clearRouteBlock(routeFence);
         return { outcome: "noop", reason: `terminal-${last.phase}`, journal };

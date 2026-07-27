@@ -23,7 +23,7 @@ import {
 
 const RECOVERY_CONFIG = "/etc/gille-inference/autonomy/recovery-config.json";
 const RECOVERY_REGISTRY_DIR = "/var/lib/gille-inference/autonomy-recovery";
-const json = (path: string) => JSON.parse(boundedProtectedRead(path)) as any;
+const json = (path: string) => JSON.parse(boundedProtectedRead(path, 1_000_000, 0)) as any;
 
 function authorityConfig(): any {
   const value = loadAuthorityConfig(PRODUCTION_AUTHORITY_CONFIG);
@@ -40,7 +40,7 @@ function currentProtectedAuthority(config = authorityConfig()): any {
     coverage: json(config.coverage_path),
     attestations: json(config.owner_attestations_path),
     recoveryRegistry: json(config.recovery_registry_path),
-    pinnedOwnerPublicKeyPem: boundedProtectedRead(config.pinned_owner_public_key_path, 64_000),
+    pinnedOwnerPublicKeyPem: boundedProtectedRead(config.pinned_owner_public_key_path, 64_000, 0),
     checkpoint: json(config.authorization_checkpoint_path),
     runtimeNarrowing: json(config.runtime_narrowing_path),
     runtimeNarrowingCheckpoint: json(config.runtime_narrowing_checkpoint_path),
@@ -70,7 +70,7 @@ function inheritedFd(name: string): number | undefined {
 }
 
 const recoveryConfig = JSON.parse(
-  boundedProtectedRead(protectedPath(RECOVERY_CONFIG, 0), 64_000),
+  boundedProtectedRead(protectedPath(RECOVERY_CONFIG, 0), 64_000, 0),
 ) as Record<string, unknown>;
 if (Object.keys(recoveryConfig).sort().join(",") !== "recovery_signer_bin") {
   throw new Error("invalid closed recovery-only config");

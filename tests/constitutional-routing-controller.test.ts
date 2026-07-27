@@ -1062,6 +1062,112 @@ describe("constitutional micro-routing controller", () => {
     expect(readConstitutionalResource(paths.lock, paths.targetBlock)).toBeDefined();
   });
 
+  it("refuses commit after unreadable recovery input durably blocks the target, even if controller-owned material is repaired", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-blocked-commit-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    const controller = new ConstitutionalRoutingController(
+      root,
+      table.store,
+      authority.reader,
+      proofVerifier,
+      recoveryRegistrar,
+    );
+    controller.begin(plan(table, synthetic.snapshot));
+    const paths = constitutionalPaths(root);
+    const material = readConstitutionalResource(paths.lock, paths.recoveryMaterial)!;
+    const corruptor = ConstitutionalFencedLease.acquire(paths.lock);
+    corruptor.writeResource(paths.recoveryMaterial, "{broken");
+    corruptor.release();
+
+    expect(new ConstitutionalRoutingWatchdog(
+      root,
+      authority.reader,
+      recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+    ).tick()).toMatchObject({
+      outcome: "terminally-blocked",
+      reason: expect.stringMatching(/^recovery-input-unreadable:/),
+    });
+
+    const repairer = ConstitutionalFencedLease.acquire(paths.lock);
+    repairer.writeResource(paths.recoveryMaterial, material);
+    repairer.release();
+    authority.setNow("2026-07-26T01:00:00Z");
+    expect(() => controller.commit()).toThrow(/persistently blocked pending signed demotion reconciliation/);
+    const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!);
+    expect(journal.entries.at(-1).phase).toBe("watch");
+    expect(JSON.parse(readConstitutionalResource(paths.lock, paths.targetBlock)!))
+      .toMatchObject({ signed_demotion_pending: true });
+  });
+
+  it.each(["commit", "disarm"] as const)(
+    "does not clear a serving block during terminal %s reconciliation while signed demotion remains pending",
+    (terminal) => {
+      const root = mkdtempSync(join(tmpdir(), `constitutional-terminal-${terminal}-block-`));
+      const synthetic = syntheticAuthority();
+      const authority = fakeAuthority(synthetic.snapshot);
+      const table = fakeStore();
+      const controller = new ConstitutionalRoutingController(
+        root,
+        table.store,
+        authority.reader,
+        proofVerifier,
+        recoveryRegistrar,
+      );
+      controller.begin(plan(table, synthetic.snapshot));
+      if (terminal === "commit") {
+        authority.setNow("2026-07-26T01:00:00Z");
+        expect(controller.commit().outcome).toBe("committed");
+      } else {
+        authority.setNow("2026-07-26T01:10:01Z");
+        expect(new ConstitutionalRoutingWatchdog(
+          root,
+          authority.reader,
+          recoveryCapability(table, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+        ).tick().outcome).toBe("reverted");
+      }
+
+      const paths = constitutionalPaths(root);
+      const journal = JSON.parse(readConstitutionalResource(paths.lock, paths.journal)!);
+      const marker = {
+        schema_version: 1,
+        target_scope_digest: journal.binding.target_scope_digest,
+        binding_digest: journal.binding_digest,
+        reason_digest: `sha256:${"8".repeat(64)}`,
+        blocked_at: "2026-07-26T01:10:02Z",
+        signed_demotion_pending: true,
+      };
+      const blocker = ConstitutionalFencedLease.acquire(paths.lock);
+      blocker.writeResource(paths.targetBlock, `${canonicalJson(marker)}\n`);
+      blocker.release();
+      let blocks = 0;
+      let clears = 0;
+      const result = new ConstitutionalRoutingWatchdog(
+        root,
+        authority.reader,
+        recoveryCapability(
+          table,
+          synthetic.recoveryPrivateKey,
+          synthetic.authorizationDigest,
+          synthetic.snapshot,
+          {
+            onBlock: () => { blocks += 1; },
+            onClearBlock: () => { clears += 1; },
+          },
+        ),
+      ).tick();
+      expect(result).toMatchObject({
+        outcome: "terminally-blocked",
+        reason: "terminal-owner-reconciliation-required",
+      });
+      expect(blocks).toBe(1);
+      expect(clears).toBe(0);
+      expect(JSON.parse(readConstitutionalResource(paths.lock, paths.targetBlock)!))
+        .toEqual(marker);
+    },
+  );
+
   it("rejects a kill switch, stale liveness, concurrent journal, and second attempt without mutating", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-refusals-"));
     const synthetic = syntheticAuthority();

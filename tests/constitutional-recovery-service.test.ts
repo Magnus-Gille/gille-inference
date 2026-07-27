@@ -547,7 +547,10 @@ describe("permission-separated AF_UNIX recovery service", () => {
       route: live,
       journalAuthority: journal.authority,
       demote: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
-      routeLeaseOptions: { durationMs: 100 },
+      // The production CLI performs four sequential synchronous curl calls
+      // while holding this fence. Give loaded CI a deterministic margin while
+      // remaining 75x below the 150-second production lease.
+      routeLeaseOptions: { durationMs: 2_000 },
     });
     try {
       const cli = await runSocketClient([
@@ -564,7 +567,7 @@ describe("permission-separated AF_UNIX recovery service", () => {
         token: "ffffffff-ffff-4fff-8fff-ffffffffffff",
       })).status).toBe(400);
 
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
       const successor = await post(actionSocketPath, "/fence/acquire", {});
       expect(successor.status).toBe(200);
       expect(successor.body.epoch).toBeGreaterThan(acquired.body.epoch);
