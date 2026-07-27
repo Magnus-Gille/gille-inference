@@ -250,7 +250,7 @@ function post(socketPath: string, path: string, body: unknown): Promise<{ status
 
 describe("permission-separated AF_UNIX recovery service", () => {
   it("exposes registration only on the controller socket and actuation only on the watchdog socket", async () => {
-    const root = mkdtempSync("/private/tmp/constitutional-recovery-sockets-");
+    const root = mkdtempSync(join(tmpdir(), "constitutional-recovery-sockets-"));
     const registrationSocketPath = join(root, "register.sock");
     const actionSocketPath = join(root, "action.sock");
     const live = route(baseline);
