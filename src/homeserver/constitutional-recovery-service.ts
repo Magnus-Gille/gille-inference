@@ -21,7 +21,7 @@ import {
   verifyOwnerAuthorization,
 } from "./autonomy-contract-v1.js";
 import Database from "better-sqlite3";
-import type { CandidateRouteDeadline, RouteFence } from "./constitutional-route-database.js";
+import type { CandidateRouteDeadline, RouteFence, RouteGuardOwner } from "./constitutional-route-database.js";
 import type { ConstitutionalLeaseOptions } from "./constitutional-fenced-lease.js";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -460,8 +460,9 @@ export interface RecoveryServiceOptions {
   registry: RecoveryRegistry;
   route: RecoveryRoute & {
     compareAndSwap(expected: string, next: string, fence: RouteFence, candidateDeadline?: CandidateRouteDeadline): boolean;
-    block(fence: RouteFence): boolean;
+    block(fence: RouteFence, owner?: RouteGuardOwner): boolean;
     clearBlock(fence: RouteFence): boolean;
+    clearOwnedBlock(fence: RouteFence, owner: RouteGuardOwner): boolean;
   };
   journalAuthority: RecoveryJournalAuthority;
   demote(input: {
@@ -669,20 +670,24 @@ export async function startRecoveryService(options: RecoveryServiceOptions): Pro
           promoted: options.registry.promoteCandidate(candidate, candidate, options.route, options.journalAuthority),
         });
       }
-      if (request.url === "/route/block" || request.url === "/route/unblock") {
+      if (request.url === "/route/block" || request.url === "/route/unblock" || request.url === "/route/unblock-owned") {
         const fence = body as RouteFence;
         if (
           typeof body !== "object"
           || body === null
           || Array.isArray(body)
-          || Object.keys(body).sort().join(",") !== "epoch,token"
+          || !["epoch,token", "epoch,owner,token"].includes(Object.keys(body).sort().join(","))
         ) throw new Error("route guard request does not match the held recovery fence");
         requireRecoveryFence(body);
+        const owner = (body as { owner?: unknown }).owner;
+        if (request.url === "/route/unblock-owned" && owner === undefined) throw new Error("owned route unblock requires guard owner");
         const changed = request.url === "/route/block"
-          ? options.route.block(fence)
-          : options.route.clearBlock(fence);
-        if (!changed) throw new Error("route guard fence is stale");
-        return respond(response, 200, { changed: true });
+          ? options.route.block(fence, owner as any)
+          : request.url === "/route/unblock-owned"
+            ? options.route.clearOwnedBlock(fence, owner as any)
+            : options.route.clearBlock(fence);
+        if (!changed && request.url !== "/route/unblock-owned") throw new Error("route guard fence is stale");
+        return respond(response, 200, { changed });
       }
       if (request.url === "/route/digest") {
         const fence = body as RouteFence;

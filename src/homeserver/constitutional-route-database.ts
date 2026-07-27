@@ -13,6 +13,15 @@ export interface RouteFence {
   token: string;
 }
 
+/** Immutable identity of a watchdog-created serving guard. */
+export interface RouteGuardOwner {
+  journalId: string;
+  attemptId: string;
+  bindingDigest: string;
+  targetScopeDigest: string;
+  watchdogIdentity: string;
+}
+
 /**
  * Immutable identity and absolute serving deadline for an in-flight candidate.
  * This is deliberately stored with the route value, rather than only in the
@@ -165,12 +174,31 @@ export class ConstitutionalRouteDatabase {
     }
   }
 
-  block(fence: RouteFence): boolean {
-    return this.setBlocked(true, fence);
+  block(fence: RouteFence, owner?: RouteGuardOwner): boolean {
+    if (owner !== undefined) validateGuardOwner(owner);
+    return this.setBlocked(true, fence, owner);
   }
 
   clearBlock(fence: RouteFence): boolean {
     return this.setBlocked(false, fence);
+  }
+
+  /** Clears only the exact watchdog attempt which created this guard. */
+  clearOwnedBlock(fence: RouteFence, owner: RouteGuardOwner): boolean {
+    validateFence(fence);
+    validateGuardOwner(owner);
+    const db = open(this.path);
+    try {
+      return db.transaction(() => {
+        if (!routeLeaseCurrent(db, fence)) return false;
+        const result = db.prepare(`
+          UPDATE constitutional_route_guard SET blocked=0
+          WHERE id=1 AND blocked=1 AND owner_journal_id=? AND owner_attempt_id=?
+            AND owner_binding_digest=? AND owner_target_scope_digest=? AND owner_watchdog_identity=?
+        `).run(owner.journalId, owner.attemptId, owner.bindingDigest, owner.targetScopeDigest, owner.watchdogIdentity);
+        return result.changes === 1;
+      }).immediate();
+    } finally { db.close(); }
   }
 
   isBlocked(): boolean {
@@ -184,15 +212,19 @@ export class ConstitutionalRouteDatabase {
     }
   }
 
-  private setBlocked(blocked: boolean, fence: RouteFence): boolean {
+  private setBlocked(blocked: boolean, fence: RouteFence, owner?: RouteGuardOwner): boolean {
     validateFence(fence);
     const db = open(this.path);
     try {
       return db.transaction(() => {
         if (!routeLeaseCurrent(db, fence)) return false;
         const result = db.prepare(`
-          UPDATE constitutional_route_guard SET blocked=? WHERE id=1
-        `).run(blocked ? 1 : 0);
+          UPDATE constitutional_route_guard SET blocked=?, owner_journal_id=?, owner_attempt_id=?,
+            owner_binding_digest=?, owner_target_scope_digest=?, owner_watchdog_identity=?,
+            owner_fence_epoch=?, owner_fence_token=? WHERE id=1
+        `).run(blocked ? 1 : 0, owner?.journalId ?? null, owner?.attemptId ?? null,
+          owner?.bindingDigest ?? null, owner?.targetScopeDigest ?? null, owner?.watchdogIdentity ?? null,
+          owner ? fence.epoch : null, owner ? fence.token : null);
         return result.changes === 1;
       }).immediate();
     } finally {
@@ -248,6 +280,13 @@ export function readConstitutionalRouteDatabase(path: string, clock: Constitutio
 function validateFence(fence: RouteFence): void {
   if (!Number.isSafeInteger(fence.epoch) || fence.epoch < 1 || !/^[a-f0-9-]{36}$/.test(fence.token)) {
     throw new Error("invalid constitutional route fence");
+  }
+}
+
+function validateGuardOwner(owner: RouteGuardOwner): void {
+  if (!ID.test(owner.journalId) || !ID.test(owner.attemptId) || !ID.test(owner.watchdogIdentity)
+    || !DIGEST.test(owner.bindingDigest) || !DIGEST.test(owner.targetScopeDigest)) {
+    throw new Error("invalid constitutional route guard owner");
   }
 }
 
@@ -358,7 +397,10 @@ function open(path: string): Database.Database {
     ) STRICT;
     CREATE TABLE IF NOT EXISTS constitutional_route_guard (
       id INTEGER PRIMARY KEY CHECK(id=1),
-      blocked INTEGER NOT NULL CHECK(blocked IN (0,1))
+      blocked INTEGER NOT NULL CHECK(blocked IN (0,1)),
+      owner_journal_id TEXT, owner_attempt_id TEXT, owner_binding_digest TEXT,
+      owner_target_scope_digest TEXT, owner_watchdog_identity TEXT,
+      owner_fence_epoch INTEGER, owner_fence_token TEXT
     ) STRICT;
     INSERT INTO constitutional_route_guard(id, blocked) VALUES(1, 0)
       ON CONFLICT(id) DO NOTHING;
@@ -375,5 +417,14 @@ function open(path: string): Database.Database {
       activated_boot_id TEXT NOT NULL
     ) STRICT;
   `);
+  // Existing databases predate the guard ownership columns. SQLite has no
+  // ADD COLUMN IF NOT EXISTS, so tolerate the duplicate-column migration.
+  for (const column of [
+    "owner_journal_id TEXT", "owner_attempt_id TEXT", "owner_binding_digest TEXT",
+    "owner_target_scope_digest TEXT", "owner_watchdog_identity TEXT",
+    "owner_fence_epoch INTEGER", "owner_fence_token TEXT",
+  ]) {
+    try { db.exec(`ALTER TABLE constitutional_route_guard ADD COLUMN ${column}`); } catch { /* already present */ }
+  }
   return db;
 }

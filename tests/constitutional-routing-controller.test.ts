@@ -267,6 +267,7 @@ function recoveryCapability(
     },
     blockRoute: () => { opts.onBlock?.(); },
     clearRouteBlock: () => { opts.onClearBlock?.(); },
+    clearOwnedRouteBlock: () => false,
     clearCandidateDeadline: () => { opts.onClearDeadline?.(); },
     readRouteDigest: () => `sha256:${createHash("sha256").update(store.read()).digest("hex")}`,
     actuatePreRegisteredRecovery: ({ fenceEpoch, fenceToken }) => {
@@ -557,7 +558,7 @@ describe("constitutional micro-routing controller", () => {
     expect(controller.begin(mutation).outcome).toBe("watching");
     authority.setNow("2026-07-26T01:00:00Z");
     expect(controller.commit().outcome).toBe("committed");
-    expect(routeDb.read()).toBe(mutation.candidate);
+    expect(readConstitutionalRouteDatabase(routePath)).toBe(mutation.candidate);
 
     const recovery = recoveryCapability(
       table,
@@ -766,6 +767,81 @@ describe("constitutional micro-routing controller", () => {
     ).tick();
     expect(result).toMatchObject({ outcome: "reverted", reason: "baseline-restored-and-target-demoted" });
     expect(failedTable.read()).toBe(baseline);
+  });
+
+  it("reconciles only its exact SQLite-owned orphan guard after a crash between block and marker", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-owned-orphan-"));
+    const routePath = join(root, "routing.db");
+    const baseline = '{"route":"mellum"}\n';
+    initializeConstitutionalRouteDatabase(routePath, baseline);
+    const routeDb = new ConstitutionalRouteDatabase(routePath);
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const mutation = { ...plan(fakeStore(), synthetic.snapshot), baseline, candidate: '{"route":"qwen"}\n' };
+    new ConstitutionalRoutingController(root, routeDb, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
+    let held: ReturnType<typeof routeDb.acquireWriterLease> | undefined;
+    let crashAfterBlock = true;
+    const recovery: RestoreOnlyCapability = {
+      recoveryWorkerIdentity: "micro-route-revert-worker",
+      acquireRouteFence: () => {
+        held = routeDb.acquireWriterLease();
+        return { epoch: held.epoch, token: held.token };
+      },
+      releaseRouteFence: () => { held?.release(); held = undefined; },
+      blockRoute: (fence, owner) => {
+        expect(routeDb.block(fence, owner)).toBe(true);
+        if (crashAfterBlock) throw new Error("fault-injected crash after serving DB block");
+      },
+      clearRouteBlock: (fence) => { expect(routeDb.clearBlock(fence)).toBe(true); },
+      clearOwnedRouteBlock: (fence, owner) => routeDb.clearOwnedBlock(fence, owner),
+      clearCandidateDeadline: () => undefined,
+      readRouteDigest: () => `sha256:${createHash("sha256").update(routeDb.read()).digest("hex")}`,
+      actuatePreRegisteredRecovery: () => "failed",
+      signAndPersistDemotion: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
+    };
+    authority.setHealthy(false);
+    expect(() => new ConstitutionalRoutingWatchdog(root, authority.reader, recovery, undefined, undefined, undefined, proofVerifier).tick())
+      .toThrow("fault-injected crash");
+    expect(routeDb.isBlocked()).toBe(true);
+    expect(readConstitutionalResource(constitutionalPaths(root).lock, constitutionalPaths(root).targetBlock)).toBeUndefined();
+
+    crashAfterBlock = false;
+    authority.setHealthy(true);
+    expect(new ConstitutionalRoutingWatchdog(root, authority.reader, recovery, undefined, undefined, undefined, proofVerifier).tick())
+      .toMatchObject({ outcome: "waiting" });
+    expect(routeDb.isBlocked()).toBe(false);
+    expect(routeDb.read()).toBe(mutation.candidate);
+  });
+
+  it("preserves a foreign SQLite serving guard during an otherwise healthy watch", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-foreign-guard-"));
+    const routePath = join(root, "routing.db");
+    initializeConstitutionalRouteDatabase(routePath, '{"route":"mellum"}\n');
+    const routeDb = new ConstitutionalRouteDatabase(routePath);
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const mutation = { ...plan(fakeStore(), synthetic.snapshot), baseline: routeDb.read(), candidate: '{"route":"qwen"}\n' };
+    new ConstitutionalRoutingController(root, routeDb, authority.reader, proofVerifier, recoveryRegistrar).begin(mutation);
+    const foreign = routeDb.acquireWriterLease();
+    expect(routeDb.block({ epoch: foreign.epoch, token: foreign.token }, {
+      journalId: "other-journal", attemptId: "other-attempt", bindingDigest: `sha256:${"a".repeat(64)}`,
+      targetScopeDigest: `sha256:${"b".repeat(64)}`, watchdogIdentity: "other-watchdog",
+    })).toBe(true);
+    foreign.release();
+    let held: ReturnType<typeof routeDb.acquireWriterLease> | undefined;
+    const recovery: RestoreOnlyCapability = {
+      recoveryWorkerIdentity: "micro-route-revert-worker",
+      acquireRouteFence: () => { held = routeDb.acquireWriterLease(); return { epoch: held.epoch, token: held.token }; },
+      releaseRouteFence: () => { held?.release(); held = undefined; },
+      blockRoute: (fence, owner) => { if (!routeDb.block(fence, owner)) throw new Error("block failed"); },
+      clearRouteBlock: (fence) => { if (!routeDb.clearBlock(fence)) throw new Error("clear failed"); },
+      clearOwnedRouteBlock: (fence, owner) => routeDb.clearOwnedBlock(fence, owner),
+      clearCandidateDeadline: () => undefined, readRouteDigest: () => `sha256:${createHash("sha256").update(routeDb.read()).digest("hex")}`,
+      actuatePreRegisteredRecovery: () => "failed", signAndPersistDemotion: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
+    };
+    expect(new ConstitutionalRoutingWatchdog(root, authority.reader, recovery, undefined, undefined, undefined, proofVerifier).tick())
+      .toMatchObject({ outcome: "waiting" });
+    expect(routeDb.isBlocked()).toBe(true);
   });
 
   it("does not clear a serving block it does not own when no journal exists", () => {

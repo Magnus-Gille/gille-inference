@@ -36,7 +36,7 @@ import {
   readConstitutionalResource,
   type ConstitutionalLeaseOptions,
 } from "./constitutional-fenced-lease.js";
-import type { CandidateRouteDeadline, RouteFence } from "./constitutional-route-database.js";
+import type { CandidateRouteDeadline, RouteFence, RouteGuardOwner } from "./constitutional-route-database.js";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
@@ -859,8 +859,10 @@ export interface RestoreOnlyCapability {
   /** Recovery service acquires the lease stored beside the route value. */
   acquireRouteFence(): RouteFence;
   releaseRouteFence(fence: RouteFence): void;
-  blockRoute(fence: RouteFence): void;
+  blockRoute(fence: RouteFence, owner?: RouteGuardOwner): void;
   clearRouteBlock(fence: RouteFence): void;
+  /** Fenced reconciliation for a guard proven to belong to this watchdog attempt. */
+  clearOwnedRouteBlock(fence: RouteFence, owner: RouteGuardOwner): boolean;
   /** Clears an exact committed candidate's serving deadline. */
   clearCandidateDeadline(candidateDeadline: CandidateRouteDeadline, fence: RouteFence): void;
   /** Independently reads the serving route digest under the held recovery fence. */
@@ -945,7 +947,7 @@ export class ConstitutionalRoutingWatchdog {
         // A terminal transition already exhausted its signer path but could
         // not durably append the terminal receipt. Retrying the signer would
         // turn a persistence fault into an unbounded privileged side effect.
-        this.recovery.blockRoute(routeFence);
+        this.recovery.blockRoute(routeFence, guardOwner(journal));
         return { outcome: "terminally-blocked", reason: "terminal-owner-reconciliation-required", journal };
       }
       if (["commit", "disarm", "terminally-blocked"].includes(last.phase)) {
@@ -954,7 +956,7 @@ export class ConstitutionalRoutingWatchdog {
           // controller journal reached a terminal phase. In particular, a
           // pending signed demotion must never be bypassed by generic terminal
           // deadline/block reconciliation.
-          this.recovery.blockRoute(routeFence);
+          this.recovery.blockRoute(routeFence, guardOwner(journal));
           return {
             outcome: "terminally-blocked",
             reason: "terminal-owner-reconciliation-required",
@@ -972,7 +974,7 @@ export class ConstitutionalRoutingWatchdog {
               notAfter: journal.binding.deadline,
             }, routeFence);
           } catch (error) {
-            this.recovery.blockRoute(routeFence);
+            this.recovery.blockRoute(routeFence, guardOwner(journal));
             return {
               outcome: "terminally-blocked",
               reason: `committed-deadline-reconciliation-pending:${error instanceof Error ? error.message : String(error)}`,
@@ -990,7 +992,7 @@ export class ConstitutionalRoutingWatchdog {
         now = this.authority.trustedNowIso();
         strictUtc(now);
       } catch (error) {
-        this.recovery.blockRoute(routeFence);
+        this.recovery.blockRoute(routeFence, guardOwner(journal));
         lease.writeResource(this.paths.targetBlock, `${canonicalJson({
           schema_version: 1,
           target_scope_digest: journal.binding.target_scope_digest,
@@ -1032,13 +1034,18 @@ export class ConstitutionalRoutingWatchdog {
         }
       }
       if (!expired && !kill && last.phase === "watch" && watchFailure === undefined) {
+        // A crash can land after the SQLite serving block but before the
+        // controller-state marker. Reconcile only an exact guard owned by this
+        // journal/attempt/binding/target watchdog; operator and other-attempt
+        // blocks deliberately remain fail-closed.
+        this.recovery.clearOwnedRouteBlock(routeFence, guardOwner(journal));
         return { outcome: "waiting", reason: "watch-active", journal };
       }
 
       // A healthy watch is served uninterrupted. Only a condition that has
       // already selected recovery/ambiguity/deadline fail-closed obtains the
       // serving-side block.
-      this.recovery.blockRoute(routeFence);
+      this.recovery.blockRoute(routeFence, guardOwner(journal));
       let gate: FreshGate;
       try {
         // Recovery validates against the cryptographically verified authority
@@ -1268,6 +1275,16 @@ export class ConstitutionalRoutingWatchdog {
       throw new Error("persisted signed demotion did not narrow the exact target");
     }
   }
+}
+
+function guardOwner(journal: JournalV2): RouteGuardOwner {
+  return {
+    journalId: journal.journal_id,
+    attemptId: journal.binding.attempt_id,
+    bindingDigest: journal.binding_digest,
+    targetScopeDigest: journal.binding.target_scope_digest,
+    watchdogIdentity: journal.binding.watchdog_identity,
+  };
 }
 
 function requireCandidateProof(verifier: CandidateVerifier, material: RecoveryMaterial): CandidateProof {
