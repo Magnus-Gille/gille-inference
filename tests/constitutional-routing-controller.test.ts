@@ -792,10 +792,42 @@ describe("constitutional micro-routing controller", () => {
     ["canonical domain registry", (coverage: any) => {
       coverage.domains.pop();
     }],
-    ["protected lane", (coverage: any) => {
+    ["unique canonical domain registry", (coverage: any) => {
+      const protectedRow = structuredClone(
+        coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth"),
+      );
+      protectedRow.coverage = "armed-canary";
+      protectedRow.target_state = "armed-canary";
+      protectedRow.bindings = [structuredClone(coverage.domains[0].bindings[0])];
+      coverage.domains.push(protectedRow);
+    }],
+    ["protected lane required levels", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
+      row.required_for_levels = ["L4"];
+    }],
+    ["protected lane owner scope", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
+      row.owner_scope = "fixed-component";
+    }],
+    ["protected lane owner", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
+      row.owner = "gille-inference";
+    }],
+    ["protected lane recovery class", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
+      row.recovery_class = "R-exact";
+    }],
+    ["protected lane coverage", (coverage: any) => {
       const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
       row.coverage = "shadow";
+    }],
+    ["protected lane target state", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
       row.target_state = "armed-canary";
+    }],
+    ["protected lane bindings", (coverage: any) => {
+      const row = coverage.domains.find((candidate: any) => candidate.domain === "credentials-and-auth");
+      row.bindings = [structuredClone(coverage.domains[0].bindings[0])];
     }],
     ["mutation policy", (coverage: any) => {
       coverage.mutation_policy = "recovery-worker-may-widen";

@@ -60,6 +60,17 @@ if (mode === "controller-response-loss") {
   } finally {
     watchdog.releaseRouteFence(fence);
   }
+} else if (mode === "watchdog-route-digest") {
+  const watchdog = createWatchdogRecoverySocketClient(socket);
+  const fence = watchdog.acquireRouteFence();
+  try {
+    watchdog.blockRoute(fence);
+    const digest = watchdog.readRouteDigest(fence);
+    watchdog.clearRouteBlock(fence);
+    process.stdout.write(`${JSON.stringify({ digest })}\n`);
+  } finally {
+    watchdog.releaseRouteFence(fence);
+  }
 } else {
   throw new Error(`unknown constitutional socket-client fixture mode: ${mode}`);
 }

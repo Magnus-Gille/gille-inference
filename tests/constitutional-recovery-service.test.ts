@@ -12,6 +12,10 @@ import {
   type RecoveryRegistrationRequest,
 } from "../src/homeserver/constitutional-recovery-service.js";
 import { digestJson } from "../src/homeserver/autonomy-contract-v1.js";
+import {
+  ConstitutionalRouteDatabase,
+  initializeConstitutionalRouteDatabase,
+} from "../src/homeserver/constitutional-route-database.js";
 
 const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const baseline = '{"route":"mellum"}\n';
@@ -492,6 +496,53 @@ describe("permission-separated AF_UNIX recovery service", () => {
       ]);
       expect(watchdog.classification).toBe("restored");
       expect(live.read()).toBe(baseline);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("proves the real route digest through the service and production CLI under only the current fence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-route-digest-"));
+    const registrationSocketPath = join(root, "register.sock");
+    const actionSocketPath = join(root, "action.sock");
+    const routePath = join(root, "routing.db");
+    initializeConstitutionalRouteDatabase(routePath, baseline);
+    const live = new ConstitutionalRouteDatabase(routePath);
+    const journal = journalAuthority();
+    const service = await startRecoveryService({
+      registrationSocketPath,
+      actionSocketPath,
+      registry: new RecoveryRegistry(join(root, "registrations")),
+      route: live,
+      journalAuthority: journal.authority,
+      demote: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
+      routeLeaseOptions: { durationMs: 100 },
+    });
+    try {
+      const cli = await runSocketClient([
+        "watchdog-route-digest",
+        actionSocketPath,
+      ]);
+      expect(cli.digest).toBe(digest(baseline));
+      expect(live.isBlocked()).toBe(false);
+
+      const acquired = await post(actionSocketPath, "/fence/acquire", {});
+      expect(acquired.status).toBe(200);
+      expect((await post(actionSocketPath, "/route/digest", {
+        epoch: acquired.body.epoch,
+        token: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      })).status).toBe(400);
+
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const successor = await post(actionSocketPath, "/fence/acquire", {});
+      expect(successor.status).toBe(200);
+      expect(successor.body.epoch).toBeGreaterThan(acquired.body.epoch);
+      expect((await post(actionSocketPath, "/route/digest", acquired.body)).status).toBe(400);
+      expect(await post(actionSocketPath, "/route/digest", successor.body)).toMatchObject({
+        status: 200,
+        body: { digest: digest(baseline) },
+      });
+      expect((await post(actionSocketPath, "/fence/release", successor.body)).status).toBe(200);
     } finally {
       await service.close();
     }

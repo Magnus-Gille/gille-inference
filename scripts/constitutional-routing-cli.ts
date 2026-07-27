@@ -392,7 +392,8 @@ export type RecoverySocketEndpoint =
   | "/route/fence/release"
   | "/route/apply"
   | "/route/block"
-  | "/route/unblock";
+  | "/route/unblock"
+  | "/route/digest";
 
 export type UnixJsonTransport = (
   socket: string,

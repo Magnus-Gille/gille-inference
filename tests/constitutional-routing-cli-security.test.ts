@@ -6,10 +6,12 @@ import { describe, expect, it } from "vitest";
 import {
   assertRecoverySignerReady,
   boundedProtectedRead,
+  createWatchdogRecoverySocketClient,
   loadAuthorityConfig,
   protectedPath,
   resolveAuthorityConfigPath,
   sameOpenedInode,
+  type UnixJsonTransport,
   verifiedFreshness,
 } from "../scripts/constitutional-routing-cli.js";
 
@@ -95,5 +97,17 @@ describe("constitutional CLI protected roots", () => {
       "boot-b",
       160_000_000_000n,
     )).toThrow(/cross-boot/);
+  });
+
+  it("rejects a malformed route digest returned by the recovery service", () => {
+    const transport: UnixJsonTransport = (_socket, endpoint) => {
+      if (endpoint !== "/route/digest") throw new Error(`unexpected endpoint ${endpoint}`);
+      return { digest: "sha256:not-a-real-digest" };
+    };
+    const client = createWatchdogRecoverySocketClient("/tmp/not-used.sock", transport);
+    expect(() => client.readRouteDigest({
+      epoch: 1,
+      token: "11111111-1111-4111-8111-111111111111",
+    })).toThrow(/invalid route digest/);
   });
 });

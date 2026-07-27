@@ -156,10 +156,25 @@ function verifyMicroRoutingTargetStateVersion(i: TargetStateVerificationInputs, 
     const v2 = CONSTITUTION_EPOCHS.get("v2")!;
     if (coverage.constitution_digest !== v2.digest || coverage.mutation_policy !== "owner-widen-recovery-worker-narrow") fail("coverage does not bind the canonical v2 constitution or mutation policy");
     const domains = new Set(coverage.domains.map((row: any) => row?.domain));
-    if (domains.size !== COVERAGE_DOMAINS_V2.size || [...COVERAGE_DOMAINS_V2].some((domain) => !domains.has(domain))) fail("coverage does not contain the canonical v2 domain registry");
+    if (
+      coverage.domains.length !== COVERAGE_DOMAINS_V2.size
+      || domains.size !== COVERAGE_DOMAINS_V2.size
+      || [...COVERAGE_DOMAINS_V2].some((domain) => !domains.has(domain))
+    ) fail("coverage does not contain exactly one row for every canonical v2 domain");
     for (const domain of PROTECTED_LANES_V2) {
       const row = coverage.domains.find((candidate: any) => candidate?.domain === domain);
-      if (row?.coverage !== "protected" || row.target_state !== "never-mechanical" || !Array.isArray(row.bindings) || row.bindings.length !== 0) fail("coverage violates a canonical protected lane");
+      if (
+        !Array.isArray(row?.required_for_levels)
+        || row.required_for_levels.length !== 1
+        || row.required_for_levels[0] !== "permanent"
+        || row.owner_scope !== "owner-only"
+        || row.owner !== "owner"
+        || row.recovery_class !== "none"
+        || row.coverage !== "protected"
+        || row.target_state !== "never-mechanical"
+        || !Array.isArray(row.bindings)
+        || row.bindings.length !== 0
+      ) fail("coverage violates a canonical protected lane");
     }
   }
   if (!exact(attestations, ["kind", "schema_version", "registry_id", "issued_at", "issuer_identity", "mutation_policy", "attestations", "registry_digest", "extensions"]) || attestations.kind !== "autonomy-owner-attestation-registry" || attestations.schema_version !== "v1" || attestations.mutation_policy !== "owner-controlled-protected-lane" || attestations.registry_digest !== digestJson(attestations, "registry_digest") || !Array.isArray(attestations.attestations) || !Array.isArray(attestations.extensions) || attestations.extensions.length) fail("invalid owner attestation registry");
