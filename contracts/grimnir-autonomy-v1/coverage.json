@@ -3,7 +3,7 @@
   "schema_version": "v1",
   "registry_id": "grimnir-autonomy-coverage",
   "issued_at": "2026-07-26T00:00:00Z",
-  "constitution_digest": "sha256:76b0f28adca0046fad9f1d3d4b3a57046f9a1d11ee2ed232bbc495d2ab663bd0",
+  "constitution_digest": "sha256:51efdb78c4524780919649f285862543db8b38a6a3a07894f0fad8bdab40fc6c",
   "mutation_policy": "owner-widen-recovery-worker-narrow",
   "global_state": "disarmed",
   "domains": [
@@ -33,6 +33,6 @@
     { "domain": "irreversible-external-actions", "required_for_levels": ["permanent"], "owner_scope": "owner-only", "owner": "owner", "recovery_class": "none", "coverage": "protected", "target_state": "never-mechanical", "bindings": [] },
     { "domain": "package-downgrade", "required_for_levels": ["permanent"], "owner_scope": "owner-only", "owner": "owner", "recovery_class": "none", "coverage": "protected", "target_state": "never-mechanical", "bindings": [] }
   ],
-  "registry_digest": "sha256:f5584eeffa24595f6854cc48edcc05e6e30298e24e66b4e15218a189faaef40a",
+  "registry_digest": "sha256:379b4d274d93d7c6bd0eda88fd24c35977511565c13967e5467174354286cd90",
   "extensions": []
 }

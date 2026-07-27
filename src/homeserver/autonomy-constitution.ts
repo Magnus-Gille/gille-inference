@@ -6,7 +6,8 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-export const GRIMNIR_CONSTITUTION_DIGEST = "sha256:76b0f28adca0046fad9f1d3d4b3a57046f9a1d11ee2ed232bbc495d2ab663bd0";
+/** Exact ADR-008 W0.1 constitution at pinned Grimnir commit 298526972b46d4f8f0c40fbe92e830adb91087a8. */
+export const GRIMNIR_CONSTITUTION_DIGEST = "sha256:51efdb78c4524780919649f285862543db8b38a6a3a07894f0fad8bdab40fc6c";
 
 type UnknownRecord = Record<string, unknown>;
 function isRecord(value: unknown): value is UnknownRecord {

@@ -1,0 +1,24 @@
+{
+  "upstream_repository": "Magnus-Gille/grimnir",
+  "upstream_commit": "298526972b46d4f8f0c40fbe92e830adb91087a8",
+  "upstream_ref_at_import": "origin/main",
+  "contract_version": "ADR-008 W0.1",
+  "imported_at": "2026-07-27",
+  "production_state": "unconfigured-and-disarmed",
+  "layout": {
+    "constitution.json": "docs/autonomy-constitution-v1.json",
+    "coverage.json": "docs/autonomy-coverage-registry-v1.json",
+    "owner-attestations.json": "docs/autonomy-owner-attestation-registry-v1.json",
+    "owner-authorization-unconfigured.json": "docs/autonomy-owner-authorization-v1.json",
+    "owner-authorization-checkpoint-unconfigured.json": "docs/autonomy-owner-authorization-checkpoint-v1.example.json",
+    "recovery-workers-unconfigured.json": "docs/autonomy-recovery-worker-registry-v1.json",
+    "runtime-narrowing-unconfigured.json": "docs/autonomy-runtime-narrowing-v1.json",
+    "schemas/": "docs/*autonomy*v1.schema.json and docs/autonomous-mutation-journal-v1.schema.json",
+    "fixtures/": "tests/fixtures/autonomy-contract/ (public records and public test keys only)"
+  },
+  "notes": [
+    "Contract, schema, and fixture files in this directory are exact public artifacts from the pinned upstream commit; this metadata file is local.",
+    "fixtures/ contains public conformance records and public test keys only; test private keys and all production private keys are deliberately excluded.",
+    "Production arming requires an independently protected Ed25519 owner key and checkpoints outside this repository."
+  ]
+}
