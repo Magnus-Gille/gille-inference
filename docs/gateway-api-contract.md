@@ -69,6 +69,8 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
+| POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |
+| GET | `/v1/roster-proposals/:proposalId` | authenticated owner | Read only that principal's durable proposal |
 | GET | `/v1/capabilities/review-lane` | owner or guest | Review-lane preflight (#74) — which task types are local-eligible (`review-bounded`) vs frontier-only (`code-review`), and whether local output has been promoted past advisory-only |
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |

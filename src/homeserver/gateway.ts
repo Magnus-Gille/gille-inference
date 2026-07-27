@@ -86,6 +86,15 @@ import {
   claimLearningTaskAdmission,
   lookupLearningTaskAdmission,
 } from "./learning-task-admission-store.js";
+import {
+  ROSTER_PROPOSAL_PRINCIPAL,
+  RosterProposalContractError,
+  admitRosterProposal,
+  ensureRosterProposalSchema,
+  expireRosterProposals,
+  getRosterProposalForPrincipal,
+  type RosterAdmissionDependencies,
+} from "./roster-proposal.js";
 
 /**
  * Authenticated LAN gateway — the "endpoint with suitable auth" that sits in front of
@@ -107,7 +116,10 @@ import {
 // ─── Principal resolution ──────────────────────────────────────────────────────────
 
 interface PrincipalContext {
+  /** Concrete credential alias; rotates with the key. */
   alias: string;
+  /** Stable owner identity shared by a key-rotation family. */
+  logicalAlias: string;
   tier: Tier;
   isAdmin: boolean;
   /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models. */
@@ -170,6 +182,7 @@ function resolvePrincipal(
     if (implicitAdminAllowed) {
       return {
         alias: "static:admin",
+        logicalAlias: "static:admin",
         tier: "owner",
         isAdmin: true,
         modelAllowList: [],
@@ -188,6 +201,7 @@ function resolvePrincipal(
   if (rec) {
     return {
       alias: rec.alias,
+      logicalAlias: rec.logicalAlias ?? rec.alias,
       tier: rec.tier,
       isAdmin: rec.tier === "owner",
       modelAllowList: rec.modelAllowList,
@@ -203,6 +217,7 @@ function resolvePrincipal(
   if (keyMatches(token, cfg.adminApiKeys)) {
     return {
       alias: "static:admin",
+      logicalAlias: "static:admin",
       tier: "owner",
       isAdmin: true,
       modelAllowList: [],
@@ -218,6 +233,7 @@ function resolvePrincipal(
   if (keyMatches(token, cfg.apiKeys)) {
     return {
       alias: "static:user",
+      logicalAlias: "static:user",
       tier: "guest",
       isAdmin: false,
       modelAllowList: [],
@@ -235,6 +251,7 @@ function resolvePrincipal(
   if (keyMatches(token, cfg.monitorApiKeys)) {
     return {
       alias: "static:monitor",
+      logicalAlias: "static:monitor",
       tier: "guest",
       isAdmin: false,
       isMonitor: true,
@@ -2717,12 +2734,25 @@ export interface GatewayHandle {
   stop: () => Promise<void>;
 }
 
-export function startGateway(): Promise<GatewayHandle> {
+export interface GatewayComposition {
+  /**
+   * Protected local provider for server-owned roster observations and registries.
+   * The default is deliberately empty/fail-closed; deployment wrappers may inject
+   * a private adapter without putting locators or registry material in source.
+   */
+  rosterAdmissionDependencies?: RosterAdmissionDependencies;
+}
+
+export function startGateway(
+  composition: GatewayComposition = {},
+): Promise<GatewayHandle> {
   const cfg = loadConfig();
   try {
     // #257: install the content-blind exposure schema and finish the idempotent retained-log
     // backfill before the port accepts traffic. The lookup route itself remains strictly read-only.
     initializeTaskExposureRegistry();
+    ensureRosterProposalSchema();
+    expireRosterProposals();
   } catch (err) {
     return Promise.reject(new Error(`Could not initialize task exposure registry: ${(err as Error).message}`));
   }
@@ -2800,6 +2830,17 @@ export function startGateway(): Promise<GatewayHandle> {
     codeLoopSweepTimer = setInterval(sweepOnce, 60_000);
     codeLoopSweepTimer.unref();
   }
+  // W5 proposals expire and disarm durably without requiring a caller, request,
+  // or external observer. This timer is state-only and owns no model/routing
+  // actuator. The startup sweep above covers restarts and downtime.
+  const rosterProposalExpiryTimer = setInterval(() => {
+    try {
+      expireRosterProposals();
+    } catch (err) {
+      console.error("[roster-proposal] expiry sweep failed closed:", err);
+    }
+  }, 1_000);
+  rosterProposalExpiryTimer.unref();
 
   const server: Server = createServer((req, res) => {
     void handleRequest(
@@ -2809,6 +2850,7 @@ export function startGateway(): Promise<GatewayHandle> {
       controller,
       implicitAdminAllowed,
       learningTaskCapabilityEpoch,
+      composition.rosterAdmissionDependencies,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -2834,6 +2876,7 @@ export function startGateway(): Promise<GatewayHandle> {
           new Promise<void>((r) => {
             if (imageWorker) imageWorker.stop();
             if (codeLoopSweepTimer !== null) clearInterval(codeLoopSweepTimer);
+            clearInterval(rosterProposalExpiryTimer);
             server.close(() => r());
           }),
       });
@@ -2897,6 +2940,7 @@ async function handleRequest(
   controller: AdmissionController,
   implicitAdminAllowed: boolean,
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch,
+  rosterAdmissionDependencies?: RosterAdmissionDependencies,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -2952,6 +2996,29 @@ async function handleRequest(
             param: null,
             message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models).",
           })
+        );
+        return;
+      }
+    }
+
+    // The Hugin roster credential is a route-scoped service principal, not a
+    // general owner/admin key. Enforce its closed allowlist before public,
+    // inference, or generic admin dispatch so tier=owner cannot widen it.
+    if (principal?.logicalAlias === ROSTER_PROPOSAL_PRINCIPAL) {
+      const rosterPost = method === "POST" && path === "/v1/roster-proposals";
+      const rosterOwnGet =
+        method === "GET"
+        && /^\/v1\/roster-proposals\/[^/]+$/.test(path);
+      if (!rosterPost && !rosterOwnGet) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "The Hugin roster service principal is limited to proposal submit and own-read.",
+          }),
         );
         return;
       }
@@ -3265,6 +3332,119 @@ async function handleRequest(
     lctx.tier = principal.tier;
     // keyHash is stored only in the owner-queryable request_log (never in the access log / metrics).
     lctx.keyHash = principal.keyHash;
+
+    // W5: authenticated Hugin proposal admission only. This surface persists a
+    // zero-mutation armed-canary record; it cannot apply, re-arm, widen, list,
+    // route, load, unload, download, restart, or alter configuration.
+    if (path === "/v1/roster-proposals" && method === "POST") {
+      if (
+        principal.logicalAlias !== ROSTER_PROPOSAL_PRINCIPAL
+        || principal.tier !== "owner"
+        || principal.keyHash === null
+      ) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "Roster proposal admission requires the authenticated Hugin service principal.",
+          }),
+        );
+        return;
+      }
+      let body: unknown;
+      try {
+        body = JSON.parse(await readBody(req)) as unknown;
+      } catch {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(
+          res,
+          makeError("invalid_request_error", {
+            param: null,
+            message: "Roster proposal body must be valid JSON.",
+          }),
+        );
+        return;
+      }
+      try {
+        const result = await admitRosterProposal(body, principal.logicalAlias, {
+          credentialBindingDigest: `sha256:${principal.keyHash}`,
+          dependencies: rosterAdmissionDependencies,
+        });
+        if (result.kind === "conflict") {
+          lctx.status = 409;
+          lctx.outcome = "conflict";
+          lctx.errorClass = "idempotency_conflict";
+          sendError(
+            res,
+            makeError("invalid_request_error", {
+              param: "idempotency_key",
+              message: "Roster proposal identity is already bound to different content.",
+            }),
+          );
+          return;
+        }
+        const status = result.kind === "armed"
+          ? 201
+          : result.kind === "rejected"
+            ? 422
+            : 200;
+        sendJson(res, status, result.record);
+        lctx.status = status;
+        lctx.outcome = result.record.state;
+        lctx.admission = result.record.state;
+        return;
+      } catch (err) {
+        if (err instanceof RosterProposalContractError) {
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "invalid_request_error";
+          sendError(
+            res,
+            makeError("invalid_request_error", {
+              param: null,
+              message: err.message,
+            }),
+          );
+          return;
+        }
+        throw err;
+      }
+    }
+    if (path.startsWith("/v1/roster-proposals/") && method === "GET") {
+      lctx.route = "/v1/roster-proposals/:proposalId";
+      const proposalId = decodePathSegmentOrSend(
+        path.slice("/v1/roster-proposals/".length),
+        res,
+        lctx,
+      );
+      if (proposalId === null) return;
+      const record = getRosterProposalForPrincipal(
+        principal.logicalAlias,
+        proposalId,
+      );
+      if (!record) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        lctx.errorClass = "not_found";
+        sendError(
+          res,
+          makeError("not_found", {
+            message: "No roster proposal exists for this authenticated principal.",
+          }),
+        );
+        return;
+      }
+      sendJson(res, 200, record);
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
 
     // Authenticated, content-blind LearningTaskContract negotiation. The response shape is the
     // accepted Grimnir v1 schema exactly; feature count is the closed four-item array, advertised_at

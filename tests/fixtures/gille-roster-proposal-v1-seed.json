@@ -1,0 +1,59 @@
+{
+  "seed_owner": "gille-inference",
+  "seed_version": "gille-roster-proposal-v1-seed",
+  "proposal": {
+    "contract_version": "gille-roster-proposal-v1",
+    "proposal_id": "proposal:w5:fixture",
+    "idempotency_key": "idem:w5:fixture",
+    "expected_transport_principal_id": "service:hugin",
+    "axis": "served-model-roster",
+    "baseline": {
+      "catalogue_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "roster_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "candidate": {
+      "entries": [{
+        "model_id": "qwen-main",
+        "alias": "qwen-main",
+        "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "quantization": "q4-k-m",
+        "template_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "context_length": 8192,
+        "serving_config_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "evidence_identity_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "restore_descriptor_ref": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "restore_descriptor_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }],
+      "roster_digest": "sha256:b6dec2e4284218939a3398ae48ae7b8fd5fedcdec9fea5a38d7caf68c2792314"
+    },
+    "delta": {
+      "operation": "load",
+      "model_id": "qwen-main",
+      "backend": "llamaswap",
+      "backend_capability_digest": "sha256:7b6e219c2c21b7d0a6588c6b8f6751e9f545f468a88e4fd69b574850fe548a9a"
+    },
+    "evidence": {
+      "schema_epoch": "gille-roster-admission-schema-v1",
+      "policy_epoch": "grimnir-autonomy-v2",
+      "freshness_seconds": 3600
+    },
+    "canary": {
+      "operation": "load",
+      "model_id": "qwen-main",
+      "expected_state": "served",
+      "fallback_model_id": null,
+      "registry_id": "canary:load:qwen-main",
+      "registry_version": "version:v1",
+      "registry_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "max_requests": 5,
+      "duration_seconds": 600,
+      "max_concurrency": 1
+    },
+    "requested_bounds": {
+      "max_changed_entries": 1
+    },
+    "requested_operations": ["admit", "arm"],
+    "created_at": "2026-07-27T14:58:00Z",
+    "expires_at": "2026-07-27T16:00:00Z"
+  }
+}
