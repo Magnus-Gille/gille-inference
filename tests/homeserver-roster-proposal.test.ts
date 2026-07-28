@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildEvidenceIdentityBundle,
@@ -11,6 +12,7 @@ import {
 } from "../src/homeserver/evidence-identity.js";
 import type { EvidenceIdentitySnapshot } from "../src/homeserver/evidence-identity-store.js";
 import type { ModelInfo } from "../src/homeserver/model-admin.js";
+import { jcsCanonicalize } from "../src/homeserver/learning-task-contract.js";
 import {
   ROSTER_PROPOSAL_CONTRACT_VERSION,
   ROSTER_PROPOSAL_POLICY_EPOCH,
@@ -32,6 +34,7 @@ import {
   templateIdentityDigest,
   restoreDescriptorDigest,
   canaryRegistryDigest,
+  combinedRosterBaselineDigest,
   type RosterAdmissionDependencies,
   type RosterCandidateEntry,
   type RosterProposal,
@@ -43,6 +46,9 @@ import {
 
 const now = "2026-07-27T15:00:00Z";
 const credentialBindingDigest = contentDigest("credential:hugin:test");
+const huginProvenanceKeys = generateKeyPairSync("ed25519");
+const huginProvenancePublicKey = huginProvenanceKeys.publicKey
+  .export({ type: "spki", format: "pem" }).toString();
 
 function admitRosterProposal(
   raw: unknown,
@@ -258,7 +264,7 @@ function proposal(
   const desired = candidate({ context_length: 8_192 });
   const registry = canaryDefinition();
   const entries = overrides.candidate?.entries ?? [candidate()];
-  const unsigned: Omit<RosterProposal, "proposal_digest"> = {
+  const unsignedBase = {
     contract_version: ROSTER_PROPOSAL_CONTRACT_VERSION,
     proposal_id: "proposal:w5:001",
     idempotency_key: "idem:w5:001",
@@ -306,7 +312,65 @@ function proposal(
     expires_at: "2026-07-27T16:00:00Z",
     ...overrides,
   };
+  const observation = serverObservation();
+  const receiptBody = {
+    schemaVersion: "v1" as const, proposalId: unsignedBase.proposal_id,
+    experimentRef: "ref:w5-roster-fixture", evidenceFingerprints: [...new Set(unsignedBase.candidate.entries.map((entry) => entry.evidence_identity_hash))].sort(),
+    targetId: "gille-served-model-roster" as const, axis: "served-model-roster" as const, owner: "gille-inference" as const, disposition: "proposal-only" as const,
+    ownershipRegistry: { version: "v1" as const, digest: contentDigest("hugin-w4-registry") },
+    base: { revision: observation.observation_epoch, digest: combinedRosterBaselineDigest(unsignedBase.baseline) },
+    candidateContentDigest: unsignedBase.candidate.roster_digest, expiresAt: unsignedBase.expires_at,
+    policyEpoch: { id: "grimnir-adr-008-v2" as const, constitutionId: "grimnir-autonomy-v2" as const, constitutionDigest: contentDigest("grimnir-autonomy-v2") },
+    signerKeyId: "hugin-autonomy-proposer" as const,
+  };
+  const sourceReceipt = { ...receiptBody, canonicalProposalDigest: rosterDigest(receiptBody), signature: `v1:hugin-autonomy-proposer:${"0".repeat(64)}` };
+  const proposalContentDigest = rosterDigest(unsignedBase);
+  const unsignedProvenance = {
+    schema_version: "hugin-roster-provenance-v1" as const, source_receipt: sourceReceipt,
+    source_receipt_digest: rosterDigest(sourceReceipt), source_base: receiptBody.base,
+    proposal_content_digest: proposalContentDigest,
+    candidate_digest: unsignedBase.candidate.roster_digest, experiment_ref: receiptBody.experimentRef,
+    evidence_fingerprints: receiptBody.evidenceFingerprints,
+    policy_epoch: { id: receiptBody.policyEpoch.id, constitution_id: receiptBody.policyEpoch.constitutionId, constitution_digest: receiptBody.policyEpoch.constitutionDigest },
+    constitution_digest: receiptBody.policyEpoch.constitutionDigest, principal_id: ROSTER_PROPOSAL_PRINCIPAL,
+    issuer: { key_id: "hugin-roster-provenance" as const, algorithm: "Ed25519" as const },
+  };
+  const provenance = { ...unsignedProvenance, signature: { algorithm: "Ed25519" as const, value_base64: sign(null, Buffer.from(jcsCanonicalize(unsignedProvenance)), huginProvenanceKeys.privateKey).toString("base64") } };
+  const unsigned: Omit<RosterProposal, "proposal_digest"> = { ...unsignedBase, provenance };
   return { ...unsigned, proposal_digest: canonicalRosterProposalDigest(unsigned) };
+}
+
+function resignProvenance(input: RosterProposal): RosterProposal {
+  const proposal = structuredClone(input);
+  const { signature: _signature, ...unsignedProvenance } = proposal.provenance;
+  proposal.provenance.signature = {
+    algorithm: "Ed25519",
+    value_base64: sign(
+      null,
+      Buffer.from(jcsCanonicalize(unsignedProvenance)),
+      huginProvenanceKeys.privateKey,
+    ).toString("base64"),
+  };
+  const { proposal_digest: _digest, ...unsignedProposal } = proposal;
+  return {
+    ...unsignedProposal,
+    proposal_digest: canonicalRosterProposalDigest(unsignedProposal),
+  };
+}
+
+function withProposalDigest(input: RosterProposal): RosterProposal {
+  const proposal = structuredClone(input);
+  const { proposal_digest: _digest, ...unsignedProposal } = proposal;
+  return {
+    ...unsignedProposal,
+    proposal_digest: canonicalRosterProposalDigest(unsignedProposal),
+  };
+}
+
+function withForgedEnvelope(input: RosterProposal): RosterProposal {
+  const proposal = structuredClone(input);
+  proposal.provenance.signature.value_base64 = "0".repeat(88);
+  return withProposalDigest(proposal);
 }
 
 let db: Database.Database;
@@ -320,11 +384,63 @@ function observationDeps(
   return depsForObservation(base, observation);
 }
 
+const huginFixturePositive = new URL(
+  "./fixtures/hugin-gille-roster-proposal-v2-positive.json",
+  import.meta.url,
+);
+const huginFixtureAdversarial = new URL(
+  "./fixtures/hugin-gille-roster-proposal-v2-adversarial.json",
+  import.meta.url,
+);
+
+function huginFixtureDependencies(): RosterAdmissionDependencies {
+  const observation = serverObservation(liveModels, {
+    observation_epoch: "epoch-gille-fixture",
+    desired_roster: [desiredIdentity("qwen-main", 8_192)],
+  });
+  return depsForObservation({
+    ...deps,
+    huginProvenanceTrust: {
+      keyId: "hugin-roster-provenance",
+      publicKeyPem: readFileSync(
+        new URL("./fixtures/hugin-roster-provenance-v1-test-public.pem", import.meta.url),
+        "utf8",
+      ),
+    },
+  }, observation);
+}
+
+function applyHuginFixtureMutations(
+  source: Record<string, unknown>,
+  mutations: Array<{ op: string; path: string; value: unknown }>,
+): Record<string, unknown> {
+  const output = structuredClone(source);
+  for (const mutation of mutations) {
+    if (mutation.op !== "replace" || !mutation.path.startsWith("/")) {
+      throw new Error(`unsupported Hugin fixture mutation ${mutation.op} ${mutation.path}`);
+    }
+    const segments = mutation.path.slice(1).split("/").map((segment) =>
+      segment.replace(/~1/g, "/").replace(/~0/g, "~"),
+    );
+    let target: Record<string, unknown> = output;
+    for (const segment of segments.slice(0, -1)) {
+      const next = target[segment];
+      if (next === null || typeof next !== "object" || Array.isArray(next)) {
+        throw new Error(`Hugin fixture mutation path missing: ${mutation.path}`);
+      }
+      target = next as Record<string, unknown>;
+    }
+    target[segments.at(-1)!] = mutation.value;
+  }
+  return output;
+}
+
 beforeEach(() => {
   db = new Database(":memory:");
   const evidence = snapshot();
   const observation = serverObservation();
   deps = {
+    huginProvenanceTrust: { keyId: "hugin-roster-provenance", publicKeyPem: huginProvenancePublicKey },
     readServerObservation: vi.fn(async () => structuredClone(observation)),
     withServerObservationFence: vi.fn(fenceFor(observation)),
     readEvidence: vi.fn((hash) => hash === evidence.identityHash ? structuredClone(evidence) : null),
@@ -367,7 +483,7 @@ beforeEach(() => {
   };
 });
 
-describe("gille roster-proposal v1 contract", () => {
+describe("gille roster-proposal v2 contract", () => {
   it("refuses a pre-fence roster schema instead of partially backfilling it", () => {
     const legacyDb = new Database(":memory:");
     legacyDb.exec(`
@@ -406,7 +522,7 @@ describe("gille roster-proposal v1 contract", () => {
     legacyDb.close();
   });
 
-  it("materializes and accepts the gille-owned seed/interchange fixture", async () => {
+  it("fails closed on the superseded gille-owned v1 seed fixture", async () => {
     const fixture = JSON.parse(readFileSync(
       new URL("./fixtures/gille-roster-proposal-v1-seed.json", import.meta.url),
       "utf8",
@@ -429,18 +545,11 @@ describe("gille roster-proposal v1 contract", () => {
       ...unsigned,
       proposal_digest: canonicalRosterProposalDigest(unsigned),
     };
-    const result = await admitRosterProposal(
+    await expect(admitRosterProposal(
       materialized,
       ROSTER_PROPOSAL_PRINCIPAL,
-      {
-        db,
-        dependencies: observationDeps(deps, []),
-      },
-    );
-    expect(result.kind).toBe("rejected");
-    if (result.kind === "rejected") {
-      expect(result.record.reasonCode).toBe("BASELINE_MISMATCH");
-    }
+      { db, dependencies: observationDeps(deps, []) },
+    )).rejects.toThrow(RosterProposalContractError);
   });
 
   it("accepts, persists, and arms one bounded proposal without an actuator dependency", async () => {
@@ -467,6 +576,269 @@ describe("gille roster-proposal v1 contract", () => {
       .toEqual(["submitted", "accepted", "armed"]);
     expect(deps.readServerObservation).toHaveBeenCalledTimes(1);
     expect(deps.readEvidence).toHaveBeenCalledTimes(1);
+  });
+
+  it("byte-verifies and arms the exact Hugin v2 producer fixture", async () => {
+    const sourceBytes = readFileSync(huginFixturePositive, "utf8");
+    expect(createHash("sha256").update(sourceBytes, "utf8").digest("hex"))
+      .toBe("f92f9226f6cc85c905b90d4cce4fa8dd4f150c0a534242aa5e6bdb4b96501d62");
+
+    const result = await admitRosterProposal(
+      JSON.parse(sourceBytes),
+      ROSTER_PROPOSAL_PRINCIPAL,
+      { db, dependencies: huginFixtureDependencies() },
+    );
+    expect(result.kind, result.kind === "rejected" ? String(result.record.reasonCode) : result.kind)
+      .toBe("armed");
+  });
+
+  it("mechanically applies and rejects every imported Hugin v2 adversarial case", async () => {
+    const sourceBytes = readFileSync(huginFixturePositive, "utf8");
+    const manifest = JSON.parse(readFileSync(huginFixtureAdversarial, "utf8")) as {
+      source: string;
+      source_bytes_sha256: string;
+      cases: Array<{
+        name: string;
+        mutations: Array<{ op: string; path: string; value: unknown }>;
+      }>;
+    };
+    expect(manifest.source).toBe("gille-roster-proposal-v2-positive.json");
+    expect(createHash("sha256").update(
+      readFileSync(huginFixtureAdversarial, "utf8"),
+      "utf8",
+    ).digest("hex")).toBe("5d179375d528de198aad44b7612fdb29456851535b8f6d1818c8874f792868d2");
+    expect(createHash("sha256").update(sourceBytes, "utf8").digest("hex"))
+      .toBe(manifest.source_bytes_sha256);
+    expect(manifest.cases.map((fixtureCase) => fixtureCase.name)).toEqual([
+      "source-receipt-digest-tamper",
+      "source-receipt-signature-tamper",
+      "source-base-tamper",
+      "candidate-digest-tamper",
+      "evidence-set-tamper",
+      "policy-tamper",
+      "principal-tamper",
+      "proposal-content-digest-tamper",
+      "envelope-signature-tamper",
+    ]);
+
+    const source = JSON.parse(sourceBytes) as Record<string, unknown>;
+    for (const fixtureCase of manifest.cases) {
+      await expect(admitRosterProposal(
+        applyHuginFixtureMutations(source, fixtureCase.mutations),
+        ROSTER_PROPOSAL_PRINCIPAL,
+        { db, dependencies: huginFixtureDependencies() },
+      ), fixtureCase.name).rejects.toThrow(RosterProposalContractError);
+    }
+  });
+
+  it("fails closed unless the Gille-owned asymmetric provenance root is configured", async () => {
+    const unconfigured = { ...deps, huginProvenanceTrust: null };
+    await expect(admitRosterProposal(proposal(), ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: unconfigured,
+    })).rejects.toThrow("hugin provenance trust root unavailable");
+  });
+
+  it("authenticates before default observer handling or any durable side effect", async () => {
+    await expect(admitRosterProposal(proposal(), ROSTER_PROPOSAL_PRINCIPAL, { db }))
+      .rejects.toThrow("hugin provenance trust root unavailable");
+    expect(getRosterProposalForPrincipal(
+      ROSTER_PROPOSAL_PRINCIPAL,
+      proposal().proposal_id,
+      db,
+    )).toBeNull();
+  });
+
+  it("does not durably reject an unavailable-observer proposal with a forged envelope", async () => {
+    const forged = withForgedEnvelope(proposal({
+      proposal_id: "proposal:w5:unavailable-forged",
+      idempotency_key: "idem:w5:unavailable-forged",
+    }));
+    await expect(admitRosterProposal(forged, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, readServerObservation: async () => null },
+    })).rejects.toThrow("hugin provenance binding invalid");
+    expect(getRosterProposalForPrincipal(ROSTER_PROPOSAL_PRINCIPAL, forged.proposal_id, db)).toBeNull();
+  });
+
+  it("does not let an unverified proposal or idempotency key squat on a later authentic admission", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:unsquatted",
+      idempotency_key: "idem:w5:unsquatted",
+    });
+    await expect(admitRosterProposal(withForgedEnvelope(valid), ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, readServerObservation: async () => null },
+    })).rejects.toThrow("hugin provenance binding invalid");
+
+    const result = await admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    });
+    expect(result.kind).toBe("armed");
+  });
+
+  it("authenticates an exact retry before returning its existing durable row", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:retry-authentication",
+      idempotency_key: "idem:w5:retry-authentication",
+    });
+    await expect(admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, { db, dependencies: deps }))
+      .resolves.toMatchObject({ kind: "armed" });
+    await expect(admitRosterProposal(withForgedEnvelope(valid), ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    })).rejects.toThrow("hugin provenance binding invalid");
+  });
+
+  it("preserves a signed exact retry after TTL while expiring its prior durable row", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:retry-after-ttl",
+      idempotency_key: "idem:w5:retry-after-ttl",
+      created_at: "2026-07-27T14:00:00Z",
+      expires_at: "2026-07-27T15:00:00Z",
+    });
+    const beforeExpiry = { ...deps, now: () => new Date("2026-07-27T14:59:35Z") };
+    await expect(admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: beforeExpiry,
+    })).resolves.toMatchObject({ kind: "armed" });
+
+    const retry = await admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, now: () => new Date("2026-07-27T15:00:00Z") },
+    });
+    expect(retry).toMatchObject({ kind: "existing", record: { state: "expired" } });
+  });
+
+  it("only durably rejects an observer-unavailable proposal after authenticating its envelope", async () => {
+    const valid = proposal({
+      proposal_id: "proposal:w5:unavailable-authentic",
+      idempotency_key: "idem:w5:unavailable-authentic",
+    });
+    const result = await admitRosterProposal(valid, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, readServerObservation: async () => null },
+    });
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") {
+      expect(result.record.reasonCode).toBe("ROSTER_OBSERVER_UNAVAILABLE");
+    }
+  });
+
+  it("does not sweep an expired row while rejecting an unauthenticated proposal", async () => {
+    const expiring = proposal({
+      proposal_id: "proposal:w5:expiry-authentication",
+      idempotency_key: "idem:w5:expiry-authentication",
+      created_at: "2026-07-27T14:00:00Z",
+      expires_at: "2026-07-27T15:00:00Z",
+    });
+    const earlyDeps = { ...deps, now: () => new Date("2026-07-27T14:59:35Z") };
+    const armed = await admitRosterProposal(expiring, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: earlyDeps,
+    });
+    expect(armed).toMatchObject({ kind: "armed" });
+
+    const forged = withForgedEnvelope(proposal({
+      proposal_id: "proposal:w5:expiry-forged",
+      idempotency_key: "idem:w5:expiry-forged",
+    }));
+    await expect(admitRosterProposal(forged, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: { ...deps, now: () => new Date("2026-07-27T15:00:00Z") },
+    })).rejects.toThrow("hugin provenance binding invalid");
+
+    expect(getRosterProposalForPrincipal(
+      ROSTER_PROPOSAL_PRINCIPAL,
+      expiring.proposal_id,
+      db,
+      new Date("2026-07-27T14:59:35Z"),
+    )?.state).toBe("armed");
+  });
+
+  it("rejects absent and unrecognized provenance before making a durable decision", async () => {
+    const absent = structuredClone(proposal()) as Record<string, unknown>;
+    delete absent.provenance;
+    await expect(admitRosterProposal(absent, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    })).rejects.toThrow(RosterProposalContractError);
+
+    const unknownVersion = structuredClone(proposal());
+    (unknownVersion.provenance as { schema_version: string }).schema_version = "hugin-roster-provenance-v999";
+    const { proposal_digest: _digest, ...unsigned } = unknownVersion;
+    unknownVersion.proposal_digest = canonicalRosterProposalDigest(unsigned);
+    await expect(admitRosterProposal(unknownVersion, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    })).rejects.toThrow(RosterProposalContractError);
+  });
+
+  it("rejects signed provenance drift across every Hugin-to-Gille binding", async () => {
+    const cases: Array<(input: RosterProposal) => RosterProposal> = [
+      (input) => {
+        input.provenance.source_receipt_digest = contentDigest("other-source-receipt");
+        return resignProvenance(input);
+      },
+      (input) => {
+        input.provenance.source_base.digest = contentDigest("other-base");
+        return resignProvenance(input);
+      },
+      (input) => {
+        input.provenance.source_base.revision = "epoch:other:v1";
+        input.provenance.source_receipt.base.revision = "epoch:other:v1";
+        const { canonicalProposalDigest: _digest, signature: _signature, ...receiptBody } = input.provenance.source_receipt;
+        input.provenance.source_receipt.canonicalProposalDigest = rosterDigest(receiptBody);
+        input.provenance.source_receipt_digest = rosterDigest(input.provenance.source_receipt);
+        return resignProvenance(input);
+      },
+      (input) => {
+        input.provenance.source_receipt.candidateContentDigest = contentDigest("other-candidate");
+        return resignProvenance(input);
+      },
+      (input) => {
+        input.provenance.evidence_fingerprints = [contentDigest("other-evidence")];
+        return resignProvenance(input);
+      },
+      (input) => {
+        input.provenance.policy_epoch.constitution_digest = contentDigest("other-constitution");
+        return resignProvenance(input);
+      },
+    ];
+    for (const mutate of cases) {
+      await expect(admitRosterProposal(
+        mutate(structuredClone(proposal())),
+        ROSTER_PROPOSAL_PRINCIPAL,
+        { db, dependencies: deps },
+      )).rejects.toThrow("hugin provenance binding invalid");
+    }
+  });
+
+  it("binds the signed envelope to the complete proposal payload and rejects a forged signer", async () => {
+    const altered = structuredClone(proposal());
+    altered.evidence.freshness_seconds = 3_599;
+    const { proposal_digest: _digest, ...alteredUnsigned } = altered;
+    altered.proposal_digest = canonicalRosterProposalDigest(alteredUnsigned);
+    await expect(admitRosterProposal(altered, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    })).rejects.toThrow("hugin provenance binding invalid");
+
+    const forged = structuredClone(proposal());
+    const attacker = generateKeyPairSync("ed25519");
+    const { signature: _signature, ...unsignedProvenance } = forged.provenance;
+    forged.provenance.signature.value_base64 = sign(
+      null,
+      Buffer.from(jcsCanonicalize(unsignedProvenance)),
+      attacker.privateKey,
+    ).toString("base64");
+    const { proposal_digest: _forgedDigest, ...forgedUnsigned } = forged;
+    forged.proposal_digest = canonicalRosterProposalDigest(forgedUnsigned);
+    await expect(admitRosterProposal(forged, ROSTER_PROPOSAL_PRINCIPAL, {
+      db,
+      dependencies: deps,
+    })).rejects.toThrow("hugin provenance binding invalid");
   });
 
   it("returns the same durable row on exact retry and conflicts on changed content", async () => {

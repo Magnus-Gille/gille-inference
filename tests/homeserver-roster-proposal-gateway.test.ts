@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ import {
   candidateRosterDigest,
   canonicalRosterProposalDigest,
   canaryRegistryDigest,
+  combinedRosterBaselineDigest,
   liveCatalogueIdentity,
   serverRosterObservationDigest,
   templateIdentityDigest,
@@ -35,6 +37,7 @@ import {
   type ServerRosterObservation,
   type ServerRosterObservationToken,
 } from "../src/homeserver/roster-proposal.js";
+import { jcsCanonicalize } from "../src/homeserver/learning-task-contract.js";
 import { listKeys, rotateKey } from "../src/homeserver/keystore.js";
 
 let upstream: Server;
@@ -53,6 +56,7 @@ const keyDefaults = {
   dailyTokenBudget: 0,
   maxParallel: 1,
 };
+const huginProvenanceKeys = generateKeyPairSync("ed25519");
 
 const models = [
   {
@@ -77,6 +81,38 @@ function auth(key: string): Record<string, string> {
 
 function url(path: string): string {
   return `http://127.0.0.1:${gatewayPort}${path}`;
+}
+
+function resignHuginProvenance(input: RosterProposal): RosterProposal {
+  const proposal = structuredClone(input);
+  proposal.provenance.source_receipt.proposalId = proposal.proposal_id;
+  const {
+    canonicalProposalDigest: _receiptDigest,
+    signature: _receiptSignature,
+    ...receiptBody
+  } = proposal.provenance.source_receipt;
+  proposal.provenance.source_receipt.canonicalProposalDigest = contentDigest(
+    jcsCanonicalize(receiptBody),
+  );
+  proposal.provenance.source_receipt_digest = contentDigest(
+    jcsCanonicalize(proposal.provenance.source_receipt),
+  );
+  const { provenance: _oldProvenance, proposal_digest: _oldProposalDigest, ...proposalContent } = proposal;
+  proposal.provenance.proposal_content_digest = contentDigest(jcsCanonicalize(proposalContent));
+  const { signature: _envelopeSignature, ...unsignedProvenance } = proposal.provenance;
+  proposal.provenance.signature = {
+    algorithm: "Ed25519",
+    value_base64: sign(
+      null,
+      Buffer.from(jcsCanonicalize(unsignedProvenance)),
+      huginProvenanceKeys.privateKey,
+    ).toString("base64"),
+  };
+  const { proposal_digest: _digest, ...unsignedProposal } = proposal;
+  return {
+    ...unsignedProposal,
+    proposal_digest: canonicalRosterProposalDigest(unsignedProposal),
+  };
 }
 
 beforeAll(async () => {
@@ -211,7 +247,7 @@ beforeAll(async () => {
   const baseline = liveCatalogueIdentity(models.map((model) => ({ ...model })));
   const created = new Date(Date.now() - 1_000).toISOString().replace(".000Z", "Z");
   const expires = new Date(Date.now() + 60_000).toISOString().replace(".000Z", "Z");
-  const unsigned: Omit<RosterProposal, "proposal_digest"> = {
+  const unsignedBase = {
     contract_version: ROSTER_PROPOSAL_CONTRACT_VERSION,
     proposal_id: "proposal:w5:http",
     idempotency_key: "idem:w5:http",
@@ -258,6 +294,38 @@ beforeAll(async () => {
     created_at: created,
     expires_at: expires,
   };
+  const receiptBody = {
+    schemaVersion: "v1" as const, proposalId: unsignedBase.proposal_id, experimentRef: "ref:w5-http-fixture",
+    evidenceFingerprints: [...new Set(unsignedBase.candidate.entries.map((entry) => entry.evidence_identity_hash))].sort(),
+    targetId: "gille-served-model-roster" as const, axis: "served-model-roster" as const, owner: "gille-inference" as const, disposition: "proposal-only" as const,
+    ownershipRegistry: { version: "v1" as const, digest: contentDigest("hugin-w4-registry") },
+    base: { revision: "epoch:http:v1", digest: combinedRosterBaselineDigest(unsignedBase.baseline) },
+    candidateContentDigest: unsignedBase.candidate.roster_digest, expiresAt: unsignedBase.expires_at,
+    policyEpoch: { id: "grimnir-adr-008-v2" as const, constitutionId: "grimnir-autonomy-v2" as const, constitutionDigest: contentDigest("grimnir-autonomy-v2") }, signerKeyId: "hugin-autonomy-proposer" as const,
+  };
+  const sourceReceipt = { ...receiptBody, canonicalProposalDigest: contentDigest(jcsCanonicalize(receiptBody)), signature: `v1:hugin-autonomy-proposer:${"0".repeat(64)}` };
+  const unsignedProvenance = {
+    schema_version: "hugin-roster-provenance-v1" as const,
+    source_receipt: sourceReceipt,
+    source_receipt_digest: contentDigest(jcsCanonicalize(sourceReceipt)),
+    source_base: receiptBody.base,
+    proposal_content_digest: contentDigest(jcsCanonicalize(unsignedBase)),
+    candidate_digest: unsignedBase.candidate.roster_digest,
+    experiment_ref: receiptBody.experimentRef,
+    evidence_fingerprints: receiptBody.evidenceFingerprints,
+    policy_epoch: { id: receiptBody.policyEpoch.id, constitution_id: receiptBody.policyEpoch.constitutionId, constitution_digest: receiptBody.policyEpoch.constitutionDigest },
+    constitution_digest: receiptBody.policyEpoch.constitutionDigest,
+    principal_id: ROSTER_PROPOSAL_PRINCIPAL,
+    issuer: { key_id: "hugin-roster-provenance" as const, algorithm: "Ed25519" as const },
+  };
+  const provenance = {
+    ...unsignedProvenance,
+    signature: {
+      algorithm: "Ed25519" as const,
+      value_base64: sign(null, Buffer.from(jcsCanonicalize(unsignedProvenance)), huginProvenanceKeys.privateKey).toString("base64"),
+    },
+  };
+  const unsigned: Omit<RosterProposal, "proposal_digest"> = { ...unsignedBase, provenance };
   proposalBody = { ...unsigned, proposal_digest: canonicalRosterProposalDigest(unsigned) };
   const backendCapability = backendCapabilityIdentity("llamaswap");
   const observationUnsigned: Omit<ServerRosterObservation, "observation_digest"> = {
@@ -301,6 +369,7 @@ beforeAll(async () => {
     observation_digest: observation.observation_digest,
   };
   rosterDependencies = {
+    huginProvenanceTrust: { keyId: "hugin-roster-provenance", publicKeyPem: huginProvenanceKeys.publicKey.export({ type: "spki", format: "pem" }).toString() },
     readServerObservation: async () => structuredClone(observation),
     withServerObservationFence: (
       _expected: ServerRosterObservationToken,
@@ -416,10 +485,10 @@ describe("authenticated zero-mutation roster-proposal HTTP boundary", () => {
       proposal_id: "proposal:w5:http:rotated",
       idempotency_key: "idem:w5:http:rotated",
     };
-    const nextProposal: RosterProposal = {
+    const nextProposal = resignHuginProvenance({
       ...nextUnsigned,
       proposal_digest: canonicalRosterProposalDigest(nextUnsigned),
-    };
+    });
     const next = await fetch(url("/v1/roster-proposals"), {
       method: "POST",
       headers: auth(serviceKey),
