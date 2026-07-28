@@ -1,0 +1,149 @@
+{
+  "kind": "autonomous-mutation-journal",
+  "schema_version": "v2",
+  "journal_id": "micro-route-happy-journal",
+  "domain": "micro-routing",
+  "constitution_digest": "sha256:836aba8abbc48e05294dac301354ec6b1aa21307b992db78202342ce29aa8dc1",
+  "binding": {
+    "mutation_id": "micro-happy-mutation",
+    "attempt_id": "micro-happy-attempt",
+    "recovery_disarm_id": "micro-happy-recovery-disarm",
+    "idempotency_key": "micro-happy-idem",
+    "writer_owner": "gille-inference",
+    "owner_authority_ref": "ref:gille-inference-owner-authority",
+    "owner_authority_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    "configuration_owner": "gille-inference",
+    "configuration_owner_authority_ref": "ref:micro-route-config-owner-attestation",
+    "configuration_owner_authority_digest": "sha256:3ed685d4ec1fb679ecad660152391350fa0660966d843937a97d71b4d2ba9d0b",
+    "target_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "admission_coverage_digest": "sha256:24c6b51064797b4434b5d1b11b0d7dd22a9dc5eec4dd8ef40ab79d9d5b9f1863",
+    "admission_binding_state": "armed-canary",
+    "owner_identity": "gille-owner",
+    "controller_identity": "micro-route-controller",
+    "watchdog_identity": "micro-route-watchdog",
+    "kill_switch_identity": "micro-route-kill-switch",
+    "recovery_worker_identity": "micro-route-revert-worker",
+    "risk_scope": "micro-routing",
+    "candidate_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policy_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "baseline_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "postconditions_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "deadline": "2026-07-27T01:10:00Z",
+    "canary": {
+      "scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "target_count": 1
+    },
+    "recovery": {
+      "class": "R-exact",
+      "worker_identity": "micro-route-revert-worker",
+      "descriptor_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "disarms_after_action": true
+    }
+  },
+  "binding_digest": "sha256:4c87b4d8e492f288039e1c9a659061c0b14c2db09dae798cf092f79f8935f7f2",
+  "entries": [
+    {
+      "entry_id": "micro-happy-prepare",
+      "sequence": 1,
+      "recorded_at": "2026-07-27T00:00:00Z",
+      "phase": "prepare",
+      "outcome": "prepared",
+      "executor_identity": "micro-route-controller",
+      "binding_digest": "sha256:4c87b4d8e492f288039e1c9a659061c0b14c2db09dae798cf092f79f8935f7f2",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": null,
+      "receipt_digest": "sha256:73e19e3fdfaf48ec3cae08d4d5a71f8277249cee285fa41cd4eb0200e5d54edf",
+      "content_refs": [
+        "ref:micro-happy-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "micro-happy-apply",
+      "sequence": 2,
+      "recorded_at": "2026-07-27T00:00:30Z",
+      "phase": "apply",
+      "outcome": "applied",
+      "executor_identity": "micro-route-controller",
+      "binding_digest": "sha256:4c87b4d8e492f288039e1c9a659061c0b14c2db09dae798cf092f79f8935f7f2",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:73e19e3fdfaf48ec3cae08d4d5a71f8277249cee285fa41cd4eb0200e5d54edf",
+      "receipt_digest": "sha256:16f281c6a962e5013380c7f3ebb7259de7d5ffb5028578aa321f98da7e294398",
+      "content_refs": [
+        "ref:micro-happy-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "micro-happy-verify",
+      "sequence": 3,
+      "recorded_at": "2026-07-27T00:04:59.999Z",
+      "phase": "verify",
+      "outcome": "verified",
+      "executor_identity": "micro-route-controller",
+      "binding_digest": "sha256:4c87b4d8e492f288039e1c9a659061c0b14c2db09dae798cf092f79f8935f7f2",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:16f281c6a962e5013380c7f3ebb7259de7d5ffb5028578aa321f98da7e294398",
+      "receipt_digest": "sha256:e302b1a1badff53f0fc30addf7a4b9f626dd52033eec44cdec34e9bb5d194e88",
+      "content_refs": [
+        "ref:micro-happy-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "micro-happy-watch",
+      "sequence": 4,
+      "recorded_at": "2026-07-27T00:05:00Z",
+      "phase": "watch",
+      "outcome": "watching",
+      "executor_identity": "micro-route-controller",
+      "binding_digest": "sha256:4c87b4d8e492f288039e1c9a659061c0b14c2db09dae798cf092f79f8935f7f2",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:e302b1a1badff53f0fc30addf7a4b9f626dd52033eec44cdec34e9bb5d194e88",
+      "receipt_digest": "sha256:5829d7ab3b3da3d6e031aa9e015c3e00f454b3b3306d27bc72f4cfb91dfa1652",
+      "content_refs": [
+        "ref:micro-happy-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "micro-happy-commit",
+      "sequence": 5,
+      "recorded_at": "2026-07-27T01:10:00Z",
+      "phase": "commit",
+      "outcome": "committed",
+      "executor_identity": "micro-route-controller",
+      "binding_digest": "sha256:4c87b4d8e492f288039e1c9a659061c0b14c2db09dae798cf092f79f8935f7f2",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:5829d7ab3b3da3d6e031aa9e015c3e00f454b3b3306d27bc72f4cfb91dfa1652",
+      "receipt_digest": "sha256:651147cbfeb8a9d171ae0b272429fdd10a9f490b4908070f5f71f7f1182e4692",
+      "content_refs": [
+        "ref:micro-happy-candidate"
+      ],
+      "coverage_transition": null
+    }
+  ],
+  "extensions": []
+}

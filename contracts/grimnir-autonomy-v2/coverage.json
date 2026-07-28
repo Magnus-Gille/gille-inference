@@ -1,0 +1,290 @@
+{
+  "kind": "autonomy-coverage-registry",
+  "schema_version": "v2",
+  "registry_id": "grimnir-autonomy-coverage-v2",
+  "issued_at": "2026-07-27T00:00:00Z",
+  "constitution_digest": "sha256:836aba8abbc48e05294dac301354ec6b1aa21307b992db78202342ce29aa8dc1",
+  "mutation_policy": "owner-widen-recovery-worker-narrow",
+  "global_state": "disarmed",
+  "domains": [
+    {
+      "domain": "micro-routing",
+      "required_for_levels": [
+        "L4",
+        "L5"
+      ],
+      "owner_scope": "fixed-component",
+      "owner": "gille-inference",
+      "recovery_class": "R-exact",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": [
+        {
+          "writer_owner": "gille-inference",
+          "owner_authority_ref": "ref:gille-inference-owner-authority",
+          "owner_authority_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+          "configuration_owner": "gille-inference",
+          "configuration_owner_authority_ref": "ref:micro-route-config-owner-attestation",
+          "configuration_owner_authority_digest": "sha256:3ed685d4ec1fb679ecad660152391350fa0660966d843937a97d71b4d2ba9d0b",
+          "target_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "state": "shadow",
+          "identities": {
+            "owner": "gille-owner",
+            "controller": "micro-route-controller",
+            "watchdog": "micro-route-watchdog",
+            "kill_switch": "micro-route-kill-switch",
+            "recovery_worker": "micro-route-revert-worker"
+          }
+        }
+      ]
+    },
+    {
+      "domain": "macro-routing",
+      "required_for_levels": [
+        "L5"
+      ],
+      "owner_scope": "fixed-component",
+      "owner": "hugin",
+      "recovery_class": "R-exact",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": [
+        {
+          "writer_owner": "hugin",
+          "owner_authority_ref": "ref:hugin-owner-authority",
+          "owner_authority_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "configuration_owner": "hugin",
+          "configuration_owner_authority_ref": "ref:macro-route-config-owner-attestation",
+          "configuration_owner_authority_digest": "sha256:928ee4f53dd66d9d0f1fa16f1d1479b923df23554c65891e39f4b3780a836b4d",
+          "target_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "state": "shadow",
+          "identities": {
+            "owner": "hugin-owner",
+            "controller": "macro-route-controller",
+            "watchdog": "macro-route-watchdog",
+            "kill_switch": "macro-route-kill-switch",
+            "recovery_worker": "macro-route-revert-worker"
+          }
+        }
+      ]
+    },
+    {
+      "domain": "prompt",
+      "required_for_levels": [
+        "L5"
+      ],
+      "owner_scope": "owning-component",
+      "owner": "owning-component",
+      "recovery_class": "R-exact",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": []
+    },
+    {
+      "domain": "harness",
+      "required_for_levels": [
+        "L5"
+      ],
+      "owner_scope": "owning-component",
+      "owner": "owning-component",
+      "recovery_class": "R-exact",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": []
+    },
+    {
+      "domain": "tool-policy",
+      "required_for_levels": [
+        "L5"
+      ],
+      "owner_scope": "owning-component",
+      "owner": "owning-component",
+      "recovery_class": "R-exact",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": []
+    },
+    {
+      "domain": "served-model-roster",
+      "required_for_levels": [
+        "L5"
+      ],
+      "owner_scope": "fixed-component",
+      "owner": "gille-inference",
+      "recovery_class": "R-exact",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": [
+        {
+          "writer_owner": "gille-inference",
+          "owner_authority_ref": "ref:gille-inference-owner-authority",
+          "owner_authority_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+          "configuration_owner": "gille-inference",
+          "configuration_owner_authority_ref": "ref:roster-config-owner-attestation",
+          "configuration_owner_authority_digest": "sha256:aa629812d356e289a226c984d040d72b7e1a5d4ad1ee3a8051803da65c127d08",
+          "target_scope_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "state": "shadow",
+          "identities": {
+            "owner": "roster-owner",
+            "controller": "roster-controller",
+            "watchdog": "roster-watchdog",
+            "kill_switch": "roster-kill-switch",
+            "recovery_worker": "roster-revert-worker"
+          }
+        }
+      ]
+    },
+    {
+      "domain": "no-reboot-security-bugfix-maintenance",
+      "required_for_levels": [
+        "L4"
+      ],
+      "owner_scope": "fixed-component",
+      "owner": "brokkr",
+      "recovery_class": "R-forward",
+      "coverage": "shadow",
+      "target_state": "armed-canary",
+      "bindings": [
+        {
+          "writer_owner": "brokkr",
+          "owner_authority_ref": "ref:brokkr-owner-authority",
+          "owner_authority_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "configuration_owner": "brokkr",
+          "configuration_owner_authority_ref": "ref:maintenance-config-owner-attestation",
+          "configuration_owner_authority_digest": "sha256:1882a6274747dc248d9ea4d180e576fdba0463a2781a9dcbf864904887806ac2",
+          "target_scope_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+          "state": "shadow",
+          "identities": {
+            "owner": "brokkr-owner",
+            "controller": "maintenance-controller",
+            "watchdog": "maintenance-watchdog",
+            "kill_switch": "maintenance-kill-switch",
+            "recovery_worker": "maintenance-recovery-worker"
+          }
+        }
+      ]
+    },
+    {
+      "domain": "credentials-and-auth",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "owner-policy",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "constitution-and-safety-gates",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "deployments-and-code",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "privacy-retention-and-erasure",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "firmware",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "remote-recovery",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "model-weight-training",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "irreversible-external-actions",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    },
+    {
+      "domain": "package-downgrade",
+      "required_for_levels": [
+        "permanent"
+      ],
+      "owner_scope": "owner-only",
+      "owner": "owner",
+      "recovery_class": "none",
+      "coverage": "protected",
+      "target_state": "never-mechanical",
+      "bindings": []
+    }
+  ],
+  "registry_digest": "sha256:b7303c8f02b03b7330a0fc49cd685428a28ddd2d6306e0c47a7fd24e5c0c3cbd",
+  "extensions": []
+}

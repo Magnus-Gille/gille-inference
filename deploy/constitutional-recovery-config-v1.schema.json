@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/gille-inference/constitutional-recovery-config-v1.schema.json",
+  "title": "Gille constitutional restore-only recovery config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["recovery_signer_bin"],
+  "properties": {
+    "recovery_signer_bin": {
+      "type": "string",
+      "pattern": "^/etc/gille-inference/autonomy/[A-Za-z0-9._/-]+$"
+    }
+  }
+}

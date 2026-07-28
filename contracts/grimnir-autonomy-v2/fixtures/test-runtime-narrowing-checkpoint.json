@@ -1,0 +1,1 @@
+{ "kind": "autonomy-runtime-narrowing-checkpoint", "schema_version": "v1", "owner_authorization_digest": "sha256:ab707d44a0d8c6ecd7b69a3f3002893380c93c0bb74293ad9323d33edc5c5c08", "ledger_tail_digest": "sha256:1c653554a952f4ec4cae0f986c0bc667eeeec17f3ed145fa7185d919aade57cd", "minimum_entries": 1 }

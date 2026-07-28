@@ -10,11 +10,19 @@
 import { describe, it, expect } from "vitest";
 import {
   loadRoutingTable,
+  currentRoutingTable,
   routingTarget,
   FRONTIER,
   UNKNOWN_ROUTE,
   type RoutingTable,
 } from "../src/homeserver/routing-table.js";
+import {
+  ConstitutionalRouteDatabase,
+  initializeConstitutionalRouteDatabase,
+} from "../src/homeserver/constitutional-route-database.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 describe("loadRoutingTable", () => {
   it("reads the real docs/m5-routing.json and exposes the routing map", () => {
@@ -27,6 +35,51 @@ describe("loadRoutingTable", () => {
     for (const gap of table.escalateToFrontier) {
       expect(table.routing[gap]?.model ?? null).toBeNull();
     }
+  });
+
+  it("reads the production-style SQLite route resource rather than a stale JSON projection", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "routing-table-db-")), "m5-routing.db");
+    initializeConstitutionalRouteDatabase(path, JSON.stringify({
+      routing: { summarize: { model: "mellum", passRate: 1, tokPerSec: 100, verdict: "delegate-local" } },
+      escalateToFrontier: ["sql"],
+    }));
+    expect(loadRoutingTable(path)).toMatchObject({
+      routing: { summarize: { model: "mellum" } },
+      escalateToFrontier: ["sql"],
+    });
+  });
+
+  it("does not memoize a live database across a fenced route mutation", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "routing-table-live-db-")), "m5-routing.db");
+    const firstBytes = JSON.stringify({
+      routing: { summarize: { model: "mellum", passRate: 1, tokPerSec: 100, verdict: "delegate-local" } },
+      escalateToFrontier: [],
+    });
+    const secondBytes = JSON.stringify({
+      routing: { summarize: { model: "qwen", passRate: 1, tokPerSec: 100, verdict: "delegate-local" } },
+      escalateToFrontier: [],
+    });
+    initializeConstitutionalRouteDatabase(path, firstBytes);
+    const route = new ConstitutionalRouteDatabase(path);
+    const lease = route.acquireWriterLease();
+    const fence = { epoch: lease.epoch, token: lease.token };
+    expect(currentRoutingTable(path).routing.summarize?.model).toBe("mellum");
+    expect(route.compareAndSwap(firstBytes, secondBytes, fence)).toBe(true);
+    expect(currentRoutingTable(path).routing.summarize?.model).toBe("qwen");
+    lease.release();
+  });
+
+  it("fails closed to FRONTIER while the authoritative route is blocked", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "routing-table-blocked-db-")), "m5-routing.db");
+    initializeConstitutionalRouteDatabase(path, JSON.stringify({
+      routing: { summarize: { model: "mellum", passRate: 1, tokPerSec: 100, verdict: "delegate-local" } },
+      escalateToFrontier: [],
+    }));
+    const route = new ConstitutionalRouteDatabase(path);
+    const lease = route.acquireWriterLease();
+    expect(route.block({ epoch: lease.epoch, token: lease.token })).toBe(true);
+    expect(routingTarget("summarize", undefined, path)).toBe(FRONTIER);
+    lease.release();
   });
 });
 

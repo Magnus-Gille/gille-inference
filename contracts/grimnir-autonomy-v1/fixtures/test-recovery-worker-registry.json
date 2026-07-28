@@ -1,0 +1,5 @@
+{
+  "kind": "autonomy-recovery-worker-registry", "schema_version": "v1", "registry_id": "test-recovery-workers",
+  "entries": [{ "domain": "micro-routing", "target_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "recovery_worker_identity": "micro-route-revert-worker", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2PSCUe6y4qimN/ZqMQzelnHrVxQZhsQbfZ0F79AM634=\n-----END PUBLIC KEY-----\n", "public_key_fingerprint": "sha256:0098a137105873f3735fe79c5254d5667f78ede3609c3644ef8a5ecf06ea6b22" }],
+  "registry_digest": "sha256:dae24ae00175afb1dd8450aa9aad62296965ba67b3e4937b94696eebc56edd28", "extensions": []
+}

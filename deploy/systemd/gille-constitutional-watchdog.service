@@ -1,0 +1,32 @@
+# System-scope template. Installation is a separate owner/root ceremony; the
+# ordinary gateway deploy deliberately does not install or enable this unit.
+[Unit]
+Description=Grimnir constitutional micro-routing deadline watchdog
+After=gille-constitutional-recovery.service
+Requires=gille-constitutional-recovery-action.socket
+ConditionPathExists=/etc/gille-inference/autonomy/autonomy.env
+ConditionPathExists=/etc/gille-inference/autonomy/authority-config.json
+
+[Service]
+Type=oneshot
+User=gille-autonomy-watchdog
+Group=gille-autonomy-watchdog
+SupplementaryGroups=gille-autonomy-state
+WorkingDirectory=@@REMOTE_DIR@@
+EnvironmentFile=/etc/gille-inference/autonomy/autonomy.env
+Environment=GILLE_AUTONOMY_AUTHORITY_CONFIG=/etc/gille-inference/autonomy/authority-config.json
+ExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/constitutional-routing-cli.ts watchdog
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+PrivateTmp=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=@@REMOTE_DIR@@
+ReadOnlyPaths=/etc/gille-inference/autonomy
+ReadOnlyPaths=/var/lib/gille-inference/routing
+ReadWritePaths=/var/lib/gille-inference/autonomy
+InaccessiblePaths=/var/lib/gille-inference/autonomy-recovery
+RuntimeMaxSec=120s
+UMask=0007

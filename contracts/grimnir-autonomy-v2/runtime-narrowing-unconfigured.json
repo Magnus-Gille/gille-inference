@@ -1,0 +1,8 @@
+{
+  "kind": "autonomy-runtime-narrowing",
+  "schema_version": "v1",
+  "ledger_id": "grimnir-autonomy-runtime-narrowing",
+  "owner_authorization_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "entries": [],
+  "extensions": []
+}

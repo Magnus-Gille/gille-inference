@@ -17,7 +17,16 @@ import {
   resolveGatewayUrl,
   resolveAdminKey,
   ADMIN_KEY_ENV_VARS,
+  legacyAdoptIdentityAllowed,
 } from "../scripts/routing-lifecycle-cli.js";
+
+describe("legacy manual adopt defense in depth", () => {
+  it("warns off autonomous display identities without treating free text as the authority boundary", () => {
+    expect(legacyAdoptIdentityAllowed("magnus")).toBe(true);
+    expect(legacyAdoptIdentityAllowed("autonomy:1")).toBe(false);
+    expect(legacyAdoptIdentityAllowed("autonomy-controller:tier1")).toBe(false);
+  });
+});
 
 const ENV_KEYS = ["GATEWAY_URL", "ROUTING_LIFECYCLE_ADMIN_KEY", "HOMESERVER_OWNER_KEY"] as const;
 const savedEnv: Record<string, string | undefined> = {};

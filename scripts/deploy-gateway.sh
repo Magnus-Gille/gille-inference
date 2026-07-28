@@ -118,7 +118,8 @@ fi
 #   .env, .env.*      secrets/config live only on the box; never overwrite or exfiltrate them.
 #   data/             the live SQLite stores (keystore, ledger, request_log, image jobs, ...) and
 #                     any scratch/harvest output. Losing this is losing production state.
-#   *.db / *.sqlite*  belt-and-braces in case a DB file ever lives outside data/.
+#   *.db / *.sqlite* and their -wal/-shm siblings: belt-and-braces in case a
+#                     live SQLite database ever lives outside data/.
 #   *.log             operational logs are box-local, not part of the reviewed payload.
 #   .deployed-commit* managed exclusively by this script's invalidate/write steps, never by rsync.
 #   docs/m5-routing.json  runtime state, NOT reviewed-payload content (issue #44): the #7
@@ -150,7 +151,7 @@ RSYNC_EXCLUDES=(
   --exclude .env --exclude '.env.*'
   --exclude data/
   --exclude '*.db' --exclude '*.sqlite' --exclude '*.sqlite3'
-  --exclude '*.sqlite-wal' --exclude '*.sqlite-shm'
+  --exclude '*.db-wal' --exclude '*.db-shm' --exclude '*.sqlite-wal' --exclude '*.sqlite-shm'
   --exclude '*.log'
   --exclude .deployed-commit --exclude .deployed-commit.tmp
   --exclude docs/m5-routing.json

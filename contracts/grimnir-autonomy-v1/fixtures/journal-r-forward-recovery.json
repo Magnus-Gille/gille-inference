@@ -1,0 +1,175 @@
+{
+  "kind": "autonomous-mutation-journal",
+  "schema_version": "v1",
+  "journal_id": "maintenance-recovery-journal",
+  "domain": "no-reboot-security-bugfix-maintenance",
+  "constitution_digest": "sha256:51efdb78c4524780919649f285862543db8b38a6a3a07894f0fad8bdab40fc6c",
+  "binding": {
+    "mutation_id": "maintenance-recovery-mutation",
+    "attempt_id": "maintenance-recovery-attempt",
+    "recovery_disarm_id": "maintenance-recovery-disarm",
+    "idempotency_key": "maintenance-recovery-idem",
+    "writer_owner": "brokkr",
+    "owner_authority_ref": "ref:brokkr-owner-authority",
+    "owner_authority_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "configuration_owner": "brokkr",
+    "configuration_owner_authority_ref": "ref:maintenance-config-owner-attestation",
+    "configuration_owner_authority_digest": "sha256:1882a6274747dc248d9ea4d180e576fdba0463a2781a9dcbf864904887806ac2",
+    "target_scope_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "admission_coverage_digest": "sha256:bab7f9befaed14ede60ff049ec85630c5ac0c6e99b48a5ca175101689ba8649a",
+    "admission_binding_state": "armed-canary",
+    "owner_identity": "brokkr-owner",
+    "controller_identity": "maintenance-controller",
+    "watchdog_identity": "maintenance-watchdog",
+    "kill_switch_identity": "maintenance-kill-switch",
+    "recovery_worker_identity": "maintenance-recovery-worker",
+    "risk_scope": "no-reboot-security-bugfix-maintenance",
+    "candidate_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policy_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "baseline_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "postconditions_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "deadline": "2026-07-26T01:00:00Z",
+    "canary": {
+      "scope_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "target_count": 1,
+      "watch_deadline": "2026-07-26T00:30:00Z"
+    },
+    "recovery": {
+      "class": "R-forward",
+      "worker_identity": "maintenance-recovery-worker",
+      "descriptor_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "disarms_after_action": true
+    }
+  },
+  "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+  "entries": [
+    {
+      "entry_id": "maintenance-prepare",
+      "sequence": 1,
+      "recorded_at": "2026-07-26T00:00:00Z",
+      "phase": "prepare",
+      "outcome": "prepared",
+      "executor_identity": "maintenance-controller",
+      "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": null,
+      "receipt_digest": "sha256:2882e4cbdce245b6fd6ad4f400350dedb1201da90601a6d7a54c7382728fc929",
+      "content_refs": [
+        "ref:maintenance-recovery-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "maintenance-apply",
+      "sequence": 2,
+      "recorded_at": "2026-07-26T00:05:00Z",
+      "phase": "apply",
+      "outcome": "applied",
+      "executor_identity": "maintenance-controller",
+      "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:2882e4cbdce245b6fd6ad4f400350dedb1201da90601a6d7a54c7382728fc929",
+      "receipt_digest": "sha256:2f8d8383b3f2f97b421bf058ef8fd029a94512b4661b52a4bb017b32cf7cfbba",
+      "content_refs": [
+        "ref:maintenance-recovery-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "maintenance-unknown",
+      "sequence": 3,
+      "recorded_at": "2026-07-26T01:01:00Z",
+      "phase": "unknown",
+      "outcome": "unknown",
+      "executor_identity": "maintenance-controller",
+      "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+      "quarantine": {
+        "state": "active",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "previous_receipt_digest": "sha256:2f8d8383b3f2f97b421bf058ef8fd029a94512b4661b52a4bb017b32cf7cfbba",
+      "receipt_digest": "sha256:b0bba0160615bd09243a8d2e5bbad7a6610e952c9c775586014372dc7da0030a",
+      "content_refs": [
+        "ref:maintenance-recovery-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "maintenance-recover",
+      "sequence": 4,
+      "recorded_at": "2026-07-26T01:02:00Z",
+      "phase": "recover",
+      "outcome": "recovered",
+      "executor_identity": "maintenance-recovery-worker",
+      "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+      "quarantine": {
+        "state": "active",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:b0bba0160615bd09243a8d2e5bbad7a6610e952c9c775586014372dc7da0030a",
+      "receipt_digest": "sha256:fef0225c839459196e71b02151d2be2aadb802eabcb302522c8ddd0cc637450c",
+      "content_refs": [
+        "ref:maintenance-recovery-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "maintenance-quarantine",
+      "sequence": 5,
+      "recorded_at": "2026-07-26T01:03:00Z",
+      "phase": "quarantine",
+      "outcome": "quarantined",
+      "executor_identity": "maintenance-recovery-worker",
+      "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+      "quarantine": {
+        "state": "active",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:fef0225c839459196e71b02151d2be2aadb802eabcb302522c8ddd0cc637450c",
+      "receipt_digest": "sha256:b426d9bd4b2ba8b6724774618c2b08423d5fad8d099fca39ede1333a7ae709a2",
+      "content_refs": [
+        "ref:maintenance-recovery-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "maintenance-disarm",
+      "sequence": 6,
+      "recorded_at": "2026-07-26T01:04:00Z",
+      "phase": "disarm",
+      "outcome": "disarmed",
+      "executor_identity": "maintenance-recovery-worker",
+      "binding_digest": "sha256:38929f96924e53d37c671812d326b4be0edc4a35227c2171fff121d27cc0bb7d",
+      "quarantine": {
+        "state": "active",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "previous_receipt_digest": "sha256:b426d9bd4b2ba8b6724774618c2b08423d5fad8d099fca39ede1333a7ae709a2",
+      "receipt_digest": "sha256:72536df6c727b9b8eeaa4a9cbbbef3961883c0a833e7a4730e1767e35dc02bdc",
+      "content_refs": [
+        "ref:maintenance-recovery-candidate"
+      ],
+      "coverage_transition": {
+        "from_state": "armed-canary",
+        "to_state": "shadow",
+        "target_scope_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "actor_identity": "maintenance-recovery-worker"
+      }
+    }
+  ],
+  "extensions": []
+}

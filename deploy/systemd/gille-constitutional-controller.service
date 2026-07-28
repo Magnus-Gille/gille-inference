@@ -1,0 +1,33 @@
+# System-scope, owner-installed, and inert while the root-owned conditions are absent.
+[Unit]
+Description=Grimnir constitutional micro-routing proposal scheduler/controller
+After=home-gateway.service gille-constitutional-recovery.service
+Requires=gille-constitutional-recovery-register.socket
+ConditionPathExists=/etc/gille-inference/autonomy/autonomy.env
+ConditionPathExists=/etc/gille-inference/autonomy/authority-config.json
+ConditionPathExists=/var/lib/gille-inference/proposals/micro-routing.json
+
+[Service]
+Type=oneshot
+User=gille-autonomy-controller
+Group=gille-autonomy-controller
+SupplementaryGroups=gille-autonomy-state
+WorkingDirectory=@@REMOTE_DIR@@
+EnvironmentFile=/etc/gille-inference/autonomy/autonomy.env
+Environment=GILLE_AUTONOMY_AUTHORITY_CONFIG=/etc/gille-inference/autonomy/authority-config.json
+ExecStart=@@REMOTE_DIR@@/node_modules/.bin/tsx scripts/constitutional-routing-cli.ts controller
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+PrivateTmp=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=@@REMOTE_DIR@@
+ReadOnlyPaths=/etc/gille-inference/autonomy
+ReadOnlyPaths=/var/lib/gille-inference/proposals
+ReadWritePaths=/var/lib/gille-inference/autonomy
+InaccessiblePaths=/var/lib/gille-inference/routing
+InaccessiblePaths=/var/lib/gille-inference/autonomy-recovery
+RuntimeMaxSec=120s
+UMask=0007

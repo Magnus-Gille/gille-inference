@@ -59,6 +59,7 @@ import { computeLiveCalibrationGate } from "../src/homeserver/calibration-gate-l
 import { buildCandidatePair } from "../src/homeserver/routing-lifecycle.js";
 import { DEFAULT_WATCHDOG_POLICY } from "../src/homeserver/adoption-watchdog.js";
 import { buildAdoptDeps } from "./routing-lifecycle-cli.js";
+import { microRoutingAdmission } from "../src/homeserver/autonomy-constitution.js";
 import {
   runAutonomyTick,
   DEFAULT_AUTONOMY_POLICY,
@@ -70,6 +71,9 @@ const DEFAULT_TABLE_PATH = resolve("./docs/m5-routing.json");
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const DEFAULT_DATA_DIR = resolve("./data");
 const DEFAULT_DECISION_REF = "gille-inference#49";
+const DEFAULT_CONSTITUTION_PATH = resolve("./contracts/grimnir-autonomy-v1/constitution.json");
+const DEFAULT_COVERAGE_PATH = resolve("./contracts/grimnir-autonomy-v1/coverage.json");
+const DEFAULT_OWNER_ATTESTATIONS_PATH = resolve("./contracts/grimnir-autonomy-v1/owner-attestations.json");
 
 /**
  * Round 9 finding 3: the SINGLE source of truth for this CLI's exit code, extracted as a pure
@@ -136,6 +140,17 @@ async function main(): Promise<void> {
   const tablePath = resolve(readFlag(args, "--table") ?? DEFAULT_TABLE_PATH);
   const dataDir = resolve(readFlag(args, "--data-dir") ?? DEFAULT_DATA_DIR);
   const decisionRef = readFlag(args, "--decision-ref") ?? DEFAULT_DECISION_REF;
+  // ADR-008 leaves this legacy controller useful for shadow review only. Its
+  // approval-token/adoption-watchdog journal predates exact journal-v1 and
+  // therefore must never regain an autonomous write path merely because a
+  // coverage file says "armed". Acting mutations are composed exclusively by
+  // scripts/constitutional-routing-cli.ts, which verifies signed W0.1
+  // authority immediately before apply and commit.
+  const constitutionalAdmission = microRoutingAdmission(
+    resolve(readFlag(args, "--constitution") ?? DEFAULT_CONSTITUTION_PATH),
+    resolve(readFlag(args, "--coverage") ?? DEFAULT_COVERAGE_PATH),
+    resolve(readFlag(args, "--owner-attestations") ?? DEFAULT_OWNER_ATTESTATIONS_PATH)
+  );
 
   const config = loadConfig();
   const generatedAt = new Date().toISOString();
@@ -179,7 +194,7 @@ async function main(): Promise<void> {
   const deps: AutonomyTickDeps = {
     dataDir,
     nowIso: () => new Date().toISOString(),
-    killSwitchOn,
+    killSwitchOn: () => true,
     decisionRef,
     policy: DEFAULT_AUTONOMY_POLICY,
     watchdogPolicy: DEFAULT_WATCHDOG_POLICY,
@@ -209,6 +224,9 @@ async function main(): Promise<void> {
   process.stderr.write(
     `autonomy tick @ ${report.evaluatedAt} — tier ${report.tierBefore}->${report.tierAfter}` +
       `${report.tierEvent ? ` (${report.tierEvent.kind}: ${report.tierEvent.reason})` : ""}\n`
+  );
+  process.stderr.write(
+    `  ADR-008: legacy controller is permanently shadow-only (${constitutionalAdmission.allowed ? "constitutional writer required" : constitutionalAdmission.reason})\n`
   );
   process.stderr.write(
     `  kill-switch: ${report.killSwitchActive ? "ON (no adopt/promote)" : "off"}${dryRun ? " | DRY-RUN (zero mutation)" : ""} | cycle: ${report.cycleOutcome} (healthy-cycle: ${report.healthyCycle})\n`

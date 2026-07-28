@@ -224,6 +224,16 @@ tick armed any earlier could fire against a gateway that is still mid-restart):
 `.deployed-commit` left unwritten), never a silent skip — an un-rendered, un-enabled, or
 non-lingering timer means the autonomy controller silently stops ticking.
 
+**ADR-008 constitutional units are not part of this deploy.** The system-scope
+`gille-constitutional-*` templates require three dedicated UIDs, capability-separated sockets,
+root-owned authority inputs, and explicitly provisioned state groups. `deploy-gateway.sh` neither
+installs nor enables them. The legacy user timer above remains shadow-only; merely deploying a
+revision cannot arm W1. See [`../docs/constitutional-micro-routing.md`](../docs/constitutional-micro-routing.md)
+for the intentionally separate owner/root ceremony and closed config schemas. Its authoritative
+SQLite route database and `-wal`/`-shm` siblings are under `/var/lib/gille-inference/routing`,
+outside the rsync payload; the deploy's database/WAL excludes are an additional guard against
+shipping or deleting such live state if a copy ever appears inside the payload tree.
+
 **Autonomy notification hook (gi#58).** `deploy/autonomy-notify.sh` is the repo-managed template
 for the already-live `AUTONOMY_NOTIFY_CMD` behavior. During the final IaC phase, the bound
 `deploy <accepted-full-sha>` mode renders its `@@REMOTE_DIR@@` placeholder against the same

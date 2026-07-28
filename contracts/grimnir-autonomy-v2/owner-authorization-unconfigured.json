@@ -1,0 +1,11 @@
+{
+  "kind": "autonomy-owner-authorization",
+  "schema_version": "v1",
+  "authorization_id": "grimnir-autonomy-owner-authorization-unconfigured",
+  "authorization_sequence": 1,
+  "previous_authorization_digest": null,
+  "issued_at": "2026-07-26T00:00:00Z",
+  "authority": { "key_id": "owner-key-unconfigured", "algorithm": "Ed25519", "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END PUBLIC KEY-----\n", "public_key_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+  "bindings": { "constitution_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "coverage_intent_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "owner_attestation_registry_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "recovery_worker_registry_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+  "signature": { "algorithm": "Ed25519", "value_base64": "AA==" }
+}

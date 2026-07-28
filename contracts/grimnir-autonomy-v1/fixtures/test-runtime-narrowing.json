@@ -1,0 +1,6 @@
+{
+  "kind": "autonomy-runtime-narrowing", "schema_version": "v1", "ledger_id": "test-runtime-narrowing",
+  "owner_authorization_digest": "sha256:ab707d44a0d8c6ecd7b69a3f3002893380c93c0bb74293ad9323d33edc5c5c08",
+  "entries": [{ "sequence": 1, "recorded_at": "2026-07-26T01:00:00Z", "domain": "micro-routing", "target_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "from_state": "armed-canary", "to_state": "shadow", "recovery_worker_identity": "micro-route-revert-worker", "journal_receipt_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "previous_entry_digest": null, "entry_digest": "sha256:1c653554a952f4ec4cae0f986c0bc667eeeec17f3ed145fa7185d919aade57cd", "signature": { "algorithm": "Ed25519", "value_base64": "dQVsvKwhfeWgtQTp14gM8OvgB5nKkBZGoKVvoSN+CwtMhQV8AUoD6Y2yN9W375Kyf2mGUJbNQi1W8Fyde9P6Bw==" } }],
+  "extensions": []
+}

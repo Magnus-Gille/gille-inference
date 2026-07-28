@@ -1,0 +1,154 @@
+{
+  "kind": "autonomous-mutation-journal",
+  "schema_version": "v2",
+  "journal_id": "macro-route-revert-journal",
+  "domain": "macro-routing",
+  "constitution_digest": "sha256:836aba8abbc48e05294dac301354ec6b1aa21307b992db78202342ce29aa8dc1",
+  "binding": {
+    "mutation_id": "macro-revert-mutation",
+    "attempt_id": "macro-revert-attempt",
+    "recovery_disarm_id": "macro-revert-disarm",
+    "idempotency_key": "macro-revert-idem",
+    "writer_owner": "hugin",
+    "owner_authority_ref": "ref:hugin-owner-authority",
+    "owner_authority_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "configuration_owner": "hugin",
+    "configuration_owner_authority_ref": "ref:macro-route-config-owner-attestation",
+    "configuration_owner_authority_digest": "sha256:928ee4f53dd66d9d0f1fa16f1d1479b923df23554c65891e39f4b3780a836b4d",
+    "target_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "admission_coverage_digest": "sha256:24c6b51064797b4434b5d1b11b0d7dd22a9dc5eec4dd8ef40ab79d9d5b9f1863",
+    "admission_binding_state": "armed-canary",
+    "owner_identity": "hugin-owner",
+    "controller_identity": "macro-route-controller",
+    "watchdog_identity": "macro-route-watchdog",
+    "kill_switch_identity": "macro-route-kill-switch",
+    "recovery_worker_identity": "macro-route-revert-worker",
+    "risk_scope": "macro-routing",
+    "candidate_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policy_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "baseline_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "postconditions_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "deadline": "2026-07-27T01:10:00Z",
+    "canary": {
+      "scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "target_count": 1
+    },
+    "recovery": {
+      "class": "R-exact",
+      "worker_identity": "macro-route-revert-worker",
+      "descriptor_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "disarms_after_action": true
+    }
+  },
+  "binding_digest": "sha256:ff79483c5a5793210dcdd6a5a679360cdf567e1788ddd9640e2ed5d612da1cd9",
+  "entries": [
+    {
+      "entry_id": "macro-revert-prepare",
+      "sequence": 1,
+      "recorded_at": "2026-07-27T00:00:00Z",
+      "phase": "prepare",
+      "outcome": "prepared",
+      "executor_identity": "macro-route-controller",
+      "binding_digest": "sha256:ff79483c5a5793210dcdd6a5a679360cdf567e1788ddd9640e2ed5d612da1cd9",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": null,
+      "receipt_digest": "sha256:59d9357b72dcbe191c5136970f0fa7e5b75c8f7ef7f3d752315d48b025d8be49",
+      "content_refs": [
+        "ref:macro-revert-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "macro-revert-apply",
+      "sequence": 2,
+      "recorded_at": "2026-07-27T00:01:00Z",
+      "phase": "apply",
+      "outcome": "applied",
+      "executor_identity": "macro-route-controller",
+      "binding_digest": "sha256:ff79483c5a5793210dcdd6a5a679360cdf567e1788ddd9640e2ed5d612da1cd9",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:59d9357b72dcbe191c5136970f0fa7e5b75c8f7ef7f3d752315d48b025d8be49",
+      "receipt_digest": "sha256:d7793352e38143b5ac0916e481c580917079f3dc57bf486547672f1819dc7ca2",
+      "content_refs": [
+        "ref:macro-revert-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "macro-revert-unknown",
+      "sequence": 3,
+      "recorded_at": "2026-07-27T01:10:00.001Z",
+      "phase": "unknown",
+      "outcome": "unknown",
+      "executor_identity": "macro-route-controller",
+      "binding_digest": "sha256:ff79483c5a5793210dcdd6a5a679360cdf567e1788ddd9640e2ed5d612da1cd9",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "previous_receipt_digest": "sha256:d7793352e38143b5ac0916e481c580917079f3dc57bf486547672f1819dc7ca2",
+      "receipt_digest": "sha256:8c6c87837b6ea9dc0e04106a62148e1fdee0b4a6f16cc91aca76a1c969f402bb",
+      "content_refs": [
+        "ref:macro-revert-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "macro-revert-action",
+      "sequence": 4,
+      "recorded_at": "2026-07-27T01:10:01Z",
+      "phase": "revert",
+      "outcome": "reverted",
+      "executor_identity": "macro-route-revert-worker",
+      "binding_digest": "sha256:ff79483c5a5793210dcdd6a5a679360cdf567e1788ddd9640e2ed5d612da1cd9",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": null,
+      "previous_receipt_digest": "sha256:8c6c87837b6ea9dc0e04106a62148e1fdee0b4a6f16cc91aca76a1c969f402bb",
+      "receipt_digest": "sha256:eff8db40bff6df64ec1aea53b6d98dde5cbafd034bb385a1b53c6b096b9ed4a8",
+      "content_refs": [
+        "ref:macro-revert-candidate"
+      ],
+      "coverage_transition": null
+    },
+    {
+      "entry_id": "macro-revert-disarm",
+      "sequence": 5,
+      "recorded_at": "2026-07-27T01:10:02Z",
+      "phase": "disarm",
+      "outcome": "disarmed",
+      "executor_identity": "macro-route-revert-worker",
+      "binding_digest": "sha256:ff79483c5a5793210dcdd6a5a679360cdf567e1788ddd9640e2ed5d612da1cd9",
+      "quarantine": {
+        "state": "not-applicable",
+        "reason_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "terminal_reason_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "previous_receipt_digest": "sha256:eff8db40bff6df64ec1aea53b6d98dde5cbafd034bb385a1b53c6b096b9ed4a8",
+      "receipt_digest": "sha256:696c7fb458daaf9606f1e33dd40e0c84d0884d078a08deb15bd9cd571241d913",
+      "content_refs": [
+        "ref:macro-revert-candidate"
+      ],
+      "coverage_transition": {
+        "from_state": "armed-canary",
+        "to_state": "shadow",
+        "target_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "actor_identity": "macro-route-revert-worker"
+      }
+    }
+  ],
+  "extensions": []
+}
