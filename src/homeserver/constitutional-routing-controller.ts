@@ -946,6 +946,46 @@ export class ConstitutionalRoutingWatchdog {
       }
       const last = journal.entries.at(-1);
       if (!last) return { outcome: "terminally-blocked", reason: "empty-journal" };
+      const failClosedUnreadableRecoveryInput = (
+        error: unknown,
+        ownerJournalId?: string,
+      ): WatchdogTickResult => {
+        let blockFailure: unknown;
+        try {
+          // Corrupt or missing recovery material cannot authenticate an exact
+          // journal owner at the privileged service. Take the intentionally
+          // unowned, owner-intervention-only guard in that case. Once material
+          // has authenticated, failures such as protected-clock unavailability
+          // retain the exact journal owner.
+          this.recovery.blockRoute(routeFence, ownerJournalId);
+        } catch (blockError) {
+          blockFailure = blockError;
+        }
+        // Persist the controller-side stop even if the route service itself is
+        // unavailable. Block-first ordering means a crash between these two
+        // effects strands serving fail-closed; marker-first would not.
+        lease.writeResource(this.paths.targetBlock, `${canonicalJson({
+          schema_version: 1,
+          target_scope_digest: journal.binding.target_scope_digest,
+          binding_digest: journal.binding_digest,
+          reason_digest: reasonDigest("recovery-input-unreadable"),
+          blocked_at: "protected-clock-unavailable",
+          signed_demotion_pending: true,
+        })}\n`);
+        if (blockFailure !== undefined) {
+          throw new Error(
+            `recovery input is unreadable and the serving route block failed: ${
+              blockFailure instanceof Error ? blockFailure.message : String(blockFailure)
+            }`,
+            { cause: blockFailure },
+          );
+        }
+        return {
+          outcome: "terminally-blocked",
+          reason: `recovery-input-unreadable:${error instanceof Error ? error.message : String(error)}`,
+          journal,
+        };
+      };
       if (this.terminalReceiptPersistencePending()) {
         // A terminal transition already exhausted its signer path but could
         // not durably append the terminal receipt. Retrying the signer would
@@ -989,28 +1029,17 @@ export class ConstitutionalRoutingWatchdog {
         return { outcome: "noop", reason: `terminal-${last.phase}`, journal };
       }
       let material: RecoveryMaterial;
-      let now: string;
       try {
         material = loadMaterial(this.paths, journal);
+      } catch (error) {
+        return failClosedUnreadableRecoveryInput(error);
+      }
+      let now: string;
+      try {
         now = this.authority.trustedNowIso();
         strictUtc(now);
       } catch (error) {
-        this.recovery.blockRoute(routeFence, journal.journal_id);
-        lease.writeResource(this.paths.targetBlock, `${canonicalJson({
-          schema_version: 1,
-          target_scope_digest: journal.binding.target_scope_digest,
-          binding_digest: journal.binding_digest,
-          reason_digest: reasonDigest("recovery-input-unreadable"),
-          blocked_at: "protected-clock-unavailable",
-          signed_demotion_pending: true,
-        })}\n`);
-        // Material/clock corruption is a recovery condition, so block only
-        // now—not during every healthy watch evaluation.
-        return {
-          outcome: "terminally-blocked",
-          reason: `recovery-input-unreadable:${error instanceof Error ? error.message : String(error)}`,
-          journal,
-        };
+        return failClosedUnreadableRecoveryInput(error, journal.journal_id);
       }
       const watchReceipt = journal.entries.find((entry) => entry.phase === "watch");
       const watchGraceExpired = watchReceipt !== undefined

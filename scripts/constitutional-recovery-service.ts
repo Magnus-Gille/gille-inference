@@ -1,9 +1,8 @@
 #!/usr/bin/env tsx
 import {
-  authenticateRecoveryJournal,
+  createRecoveryJournalAuthority,
   RecoveryRegistry,
   startRecoveryService,
-  type RecoveryJournalView,
 } from "../src/homeserver/constitutional-recovery-service.js";
 import { constitutionalPaths } from "../src/homeserver/constitutional-routing-controller.js";
 import { readConstitutionalResourceReadonly } from "../src/homeserver/constitutional-fenced-lease.js";
@@ -47,25 +46,6 @@ function currentProtectedAuthority(config = authorityConfig()): any {
   };
 }
 
-function journalView(journalId: string, protectedAuthority?: unknown): RecoveryJournalView {
-  const paths = constitutionalPaths(PRODUCTION_STATE_DIR);
-  const journalBytes = readConstitutionalResourceReadonly(paths.lock, paths.journal);
-  const materialBytes = readConstitutionalResourceReadonly(paths.lock, paths.recoveryMaterial);
-  if (journalBytes === undefined) throw new Error("recovery journal is missing");
-  if (materialBytes === undefined) throw new Error("recovery material is missing");
-  const journal = JSON.parse(journalBytes) as any;
-  const material = JSON.parse(materialBytes) as any;
-  const snapshot = protectedAuthority === undefined
-    ? currentProtectedAuthority()
-    : structuredClone(protectedAuthority);
-  return authenticateRecoveryJournal({
-    journalId,
-    journal,
-    material,
-    protectedSnapshot: snapshot,
-  });
-}
-
 function inheritedFd(name: string): number | undefined {
   const count = Number(process.env["LISTEN_FDS"] ?? "0");
   const names = (process.env["LISTEN_FDNAMES"] ?? "").split(":");
@@ -86,6 +66,12 @@ if (!recoveryConfig.recovery_signer_bin.startsWith("/etc/gille-inference/autonom
   throw new Error("recovery signer must stay below the protected root");
 }
 assertRecoverySignerReady(recoveryConfig.recovery_signer_bin, 0);
+const paths = constitutionalPaths(PRODUCTION_STATE_DIR);
+const journalAuthority = createRecoveryJournalAuthority({
+  readJournalBytes: () => readConstitutionalResourceReadonly(paths.lock, paths.journal),
+  readMaterialBytes: () => readConstitutionalResourceReadonly(paths.lock, paths.recoveryMaterial),
+  protectedAuthority: () => currentProtectedAuthority(),
+});
 
 await startRecoveryService({
   registrationSocketPath: RECOVERY_REGISTRATION_SOCKET,
@@ -93,10 +79,7 @@ await startRecoveryService({
   registrationFd: inheritedFd("registration"),
   actionFd: inheritedFd("action"),
   registry: new RecoveryRegistry(RECOVERY_REGISTRY_DIR),
-  journalAuthority: {
-    read: journalView,
-    protectedAuthority: () => currentProtectedAuthority(),
-  },
+  journalAuthority,
   route: new ConstitutionalRouteDatabase(PRODUCTION_ROUTE_TABLE),
   demote: (input) => runJsonBin(String(recoveryConfig.recovery_signer_bin), input),
   // Longer than the 120-second oneshot ceiling so a live operation never

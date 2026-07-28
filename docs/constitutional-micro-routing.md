@@ -64,11 +64,15 @@ and prepared signed authority snapshot, but never baseline bytes. The recovery s
 the exact baseline directly from the canonical route database and stores it only in its private
 registry.
 
-Recovery registration and the prepared journal are durable before route-table CAS. The attempt
+Recovery registration and the prepared journal are durable before route-table CAS. Preregistration
+authenticates the prepared journal before the controller can persist the returned opaque handle in
+recovery material; every later privileged journal read requires that material. The attempt
 index follows the recoverable journal, so a crash cannot consume an attempt without durable state
 that the watchdog can reconcile. Missing or corrupt recovery material creates both a durable state
-record and a resource-local serving block before parsing or clock access. The gateway treats a
-blocked route database as FRONTIER, so no exception loop can leave a possibly active candidate
+record and an unowned resource-local serving block before clock access. Because that guard cannot
+be authenticated to an exact journal owner, no watchdog pass may clear it automatically; owner
+intervention is required even if controller-owned material is later repaired. The gateway treats
+a blocked route database as FRONTIER, so no exception loop can leave a possibly active candidate
 optimistically eligible.
 
 The candidate CAS also persists its exact journal, attempt, binding, target, candidate digest,

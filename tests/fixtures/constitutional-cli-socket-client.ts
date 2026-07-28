@@ -3,8 +3,14 @@ import {
   createWatchdogRecoverySocketClient,
   runUnixJson,
 } from "../../scripts/constitutional-routing-cli.js";
+import {
+  ConstitutionalRoutingWatchdog,
+  type AuthoritySnapshot,
+  type ProtectedAuthorityReader,
+} from "../../src/homeserver/constitutional-routing-controller.js";
+import { readFileSync } from "node:fs";
 
-const [mode, socket, handle] = process.argv.slice(2);
+const [mode, socket, handle, snapshotPath] = process.argv.slice(2);
 if (!mode || !socket) throw new Error("missing constitutional socket-client fixture argument");
 
 const baseline = '{"route":"mellum"}\n';
@@ -69,6 +75,40 @@ if (mode === "controller-response-loss") {
   } finally {
     watchdog.releaseRouteFence(fence);
   }
+} else if (mode === "watchdog-tick") {
+  if (!handle || !snapshotPath) throw new Error("missing watchdog data-dir or authority snapshot");
+  const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as AuthoritySnapshot;
+  const now = "2026-07-26T00:00:00Z";
+  const authority: ProtectedAuthorityReader = {
+    read: () => structuredClone(snapshot),
+    killSwitchActive: () => false,
+    trustedNowIso: () => now,
+    liveness: () => ({ healthy: true, observedAt: now, digest: `sha256:${"9".repeat(64)}` }),
+    currentDigests: () => ({
+      config: `sha256:${"b".repeat(64)}`,
+      evidence: `sha256:${"c".repeat(64)}`,
+      policy: `sha256:${"d".repeat(64)}`,
+      postconditions: `sha256:${"f".repeat(64)}`,
+    }),
+  };
+  const verifier = {
+    verify: (input: { candidateDigest: string; postconditionsDigest: string }) => ({
+      ok: true,
+      candidateDigest: input.candidateDigest,
+      postconditionsDigest: input.postconditionsDigest,
+      proofDigest: `sha256:${"7".repeat(64)}`,
+    }),
+  };
+  const result = new ConstitutionalRoutingWatchdog(
+    handle,
+    authority,
+    createWatchdogRecoverySocketClient(socket),
+    undefined,
+    undefined,
+    undefined,
+    verifier,
+  ).tick();
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 } else {
   throw new Error(`unknown constitutional socket-client fixture mode: ${mode}`);
 }

@@ -1,30 +1,139 @@
-import { createHash } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  sign,
+} from "node:crypto";
 import { spawn } from "node:child_process";
 import { request } from "node:http";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   authenticateRecoveryJournal,
+  createRecoveryJournalAuthority,
   RecoveryRegistry,
   startRecoveryService,
   type RecoveryRegistrationRequest,
 } from "../src/homeserver/constitutional-recovery-service.js";
-import { digestJson } from "../src/homeserver/autonomy-contract-v1.js";
+import {
+  canonicalJson,
+  digestJson,
+} from "../src/homeserver/autonomy-contract-v1.js";
 import {
   ConstitutionalRouteDatabase,
   initializeConstitutionalRouteDatabase,
 } from "../src/homeserver/constitutional-route-database.js";
+import {
+  ConstitutionalRoutingController,
+  constitutionalPaths,
+  type AuthoritySnapshot,
+  type ProtectedAuthorityReader,
+  type RouteMutationPlan,
+} from "../src/homeserver/constitutional-routing-controller.js";
+import {
+  ConstitutionalFencedLease,
+  readConstitutionalResource,
+  readConstitutionalResourceReadonly,
+} from "../src/homeserver/constitutional-fenced-lease.js";
 
-const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const digest = (value: string | Buffer) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const baseline = '{"route":"mellum"}\n';
 const candidate = '{"route":"qwen"}\n';
 const fence = { fenceEpoch: 2, fenceToken: "22222222-2222-4222-8222-222222222222" };
 const contractRoot = new URL("../contracts/grimnir-autonomy-v1/", import.meta.url).pathname;
+const contractV2Root = new URL("../contracts/grimnir-autonomy-v2/", import.meta.url).pathname;
 const artifact = (name: string): any => JSON.parse(readFileSync(join(contractRoot, name), "utf8"));
 const fixture = (name: string): any => JSON.parse(readFileSync(join(contractRoot, "fixtures", name), "utf8"));
 const pem = (name: string): string => readFileSync(join(contractRoot, "fixtures", name), "utf8");
+const artifactV2 = (name: string): any => JSON.parse(readFileSync(join(contractV2Root, name), "utf8"));
+const fixtureV2 = (name: string): any => JSON.parse(readFileSync(join(contractV2Root, "fixtures", name), "utf8"));
+
+function syntheticV2Authority(): AuthoritySnapshot {
+  const owner = generateKeyPairSync("ed25519");
+  const recovery = generateKeyPairSync("ed25519");
+  const ownerPem = owner.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const recoveryPem = recovery.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const constitution = artifactV2("constitution.json");
+  const coverage = fixtureV2("coverage-armed-canary.json");
+  const attestations = artifactV2("owner-attestations.json");
+  const recoveryRegistry: any = {
+    kind: "autonomy-recovery-worker-registry",
+    schema_version: "v1",
+    registry_id: "synthetic-recovery-workers",
+    entries: [{
+      domain: "micro-routing",
+      target_scope_digest: coverage.domains[0].bindings[0].target_scope_digest,
+      recovery_worker_identity: "micro-route-revert-worker",
+      public_key_pem: recoveryPem,
+      public_key_fingerprint: digest(recovery.publicKey.export({ type: "spki", format: "der" })),
+    }],
+    registry_digest: "",
+    extensions: [],
+  };
+  recoveryRegistry.registry_digest = digestJson(recoveryRegistry, "registry_digest");
+  const unsignedAuthorization: any = {
+    kind: "autonomy-owner-authorization",
+    schema_version: "v1",
+    authorization_id: "synthetic-owner-authorization",
+    authorization_sequence: 1,
+    previous_authorization_digest: null,
+    issued_at: "2026-07-26T00:00:00Z",
+    authority: {
+      key_id: "synthetic-owner-key",
+      algorithm: "Ed25519",
+      public_key_pem: ownerPem,
+      public_key_fingerprint: digest(owner.publicKey.export({ type: "spki", format: "der" })),
+    },
+    bindings: {
+      constitution_digest: digestJson(constitution, "constitution_digest"),
+      coverage_intent_digest: digestJson(coverage, "registry_digest"),
+      owner_attestation_registry_digest: digestJson(attestations, "registry_digest"),
+      recovery_worker_registry_digest: digestJson(recoveryRegistry, "registry_digest"),
+    },
+  };
+  const authorization = {
+    ...unsignedAuthorization,
+    signature: {
+      algorithm: "Ed25519",
+      value_base64: sign(
+        null,
+        Buffer.from(canonicalJson(unsignedAuthorization)),
+        owner.privateKey,
+      ).toString("base64"),
+    },
+  };
+  const authorizationDigest = digestJson(authorization);
+  return {
+    authorization,
+    constitution,
+    coverage,
+    attestations,
+    recoveryRegistry,
+    pinnedOwnerPublicKeyPem: ownerPem,
+    checkpoint: {
+      kind: "autonomy-owner-authorization-checkpoint",
+      schema_version: "v1",
+      authorization_digest: authorizationDigest,
+      minimum_sequence: 1,
+    },
+    runtimeNarrowing: {
+      kind: "autonomy-runtime-narrowing",
+      schema_version: "v1",
+      ledger_id: "synthetic-runtime-narrowing",
+      owner_authorization_digest: authorizationDigest,
+      entries: [],
+      extensions: [],
+    },
+    runtimeNarrowingCheckpoint: {
+      kind: "autonomy-runtime-narrowing-checkpoint",
+      schema_version: "v1",
+      owner_authorization_digest: authorizationDigest,
+      ledger_tail_digest: null,
+      minimum_entries: 0,
+    },
+  };
+}
 const registration = (): RecoveryRegistrationRequest => ({
   journalId: "micro-route-journal",
   bindingDigest: `sha256:${"1".repeat(64)}`,
@@ -364,6 +473,123 @@ function runSocketClient(args: string[]): Promise<any> {
 }
 
 describe("permission-separated AF_UNIX recovery service", () => {
+  it.each(["corrupt", "missing"] as const)(
+    "blocks immediately through the production journal authority when recovery material is %s, and never auto-clears the unowned guard",
+    async (failureMode) => {
+      const root = mkdtempSync(join(tmpdir(), "ccms-"));
+      const dataDir = join(root, "state");
+      const routePath = join(root, "routing.db");
+      const registrationSocketPath = join(root, "register.sock");
+      const actionSocketPath = join(root, "action.sock");
+      const snapshotPath = join(root, "authority.json");
+      const snapshot = syntheticV2Authority();
+      writeFileSync(snapshotPath, JSON.stringify(snapshot));
+      initializeConstitutionalRouteDatabase(routePath, baseline);
+      const live = new ConstitutionalRouteDatabase(routePath);
+      const paths = constitutionalPaths(dataDir);
+      const journalAuthority = createRecoveryJournalAuthority({
+        readJournalBytes: () => readConstitutionalResourceReadonly(paths.lock, paths.journal),
+        readMaterialBytes: () => readConstitutionalResourceReadonly(paths.lock, paths.recoveryMaterial),
+        protectedAuthority: () => structuredClone(snapshot),
+      });
+      const registry = new RecoveryRegistry(join(root, "registrations"));
+      const now = "2026-07-26T00:00:00Z";
+      const authority: ProtectedAuthorityReader = {
+        read: () => structuredClone(snapshot),
+        killSwitchActive: () => false,
+        trustedNowIso: () => now,
+        liveness: () => ({ healthy: true, observedAt: now, digest: `sha256:${"9".repeat(64)}` }),
+        currentDigests: () => ({
+          config: `sha256:${"b".repeat(64)}`,
+          evidence: `sha256:${"c".repeat(64)}`,
+          policy: `sha256:${"d".repeat(64)}`,
+          postconditions: `sha256:${"f".repeat(64)}`,
+        }),
+      };
+      const verifier = {
+        verify: (input: { candidateDigest: string; postconditionsDigest: string }) => ({
+          ok: true,
+          candidateDigest: input.candidateDigest,
+          postconditionsDigest: input.postconditionsDigest,
+          proofDigest: `sha256:${"7".repeat(64)}`,
+        }),
+      };
+      const plan: RouteMutationPlan = {
+        mutationId: "micro-route-mutation",
+        attemptId: "micro-route-attempt",
+        recoveryDisarmId: "micro-route-disarm",
+        idempotencyKey: "micro-route-idempotency",
+        journalId: "micro-route-journal",
+        baseline,
+        candidate,
+        targetScopeDigest: `sha256:${"1".repeat(64)}`,
+        configDigest: `sha256:${"b".repeat(64)}`,
+        evidenceDigest: `sha256:${"c".repeat(64)}`,
+        policyDigest: `sha256:${"d".repeat(64)}`,
+        postconditionsDigest: `sha256:${"f".repeat(64)}`,
+        recoveryDescriptorDigest: digestJson(snapshot),
+        deadline: "2026-07-26T01:10:00Z",
+        contentRef: "ref:micro-route-candidate",
+      };
+      const controller = new ConstitutionalRoutingController(
+        dataDir,
+        live,
+        authority,
+        verifier,
+        {
+          registerPreRecovery: ({ baseline: _baseline, ...request }) =>
+            registry.register(request, live, journalAuthority),
+        },
+      );
+      expect(controller.begin(plan).outcome).toBe("watching");
+      const validMaterial = readConstitutionalResource(paths.lock, paths.recoveryMaterial)!;
+      const corruptor = ConstitutionalFencedLease.acquire(paths.lock);
+      if (failureMode === "corrupt") {
+        corruptor.writeResource(paths.recoveryMaterial, "{broken");
+      } else {
+        corruptor.removeResource(paths.recoveryMaterial);
+      }
+      corruptor.release();
+
+      const service = await startRecoveryService({
+        registrationSocketPath,
+        actionSocketPath,
+        registry,
+        route: live,
+        journalAuthority,
+        demote: () => ({ ledger: {}, registry: {}, checkpoint: {} }),
+        routeLeaseOptions: { durationMs: 2_000 },
+      });
+      try {
+        const failedClosed = await runSocketClient([
+          "watchdog-tick",
+          actionSocketPath,
+          dataDir,
+          snapshotPath,
+        ]);
+        expect(failedClosed).toMatchObject({
+          outcome: "terminally-blocked",
+          reason: expect.stringMatching(/^recovery-input-unreadable:/),
+        });
+        expect(live.isBlocked()).toBe(true);
+        expect(readConstitutionalResource(paths.lock, paths.targetBlock)).toBeDefined();
+
+        const repairer = ConstitutionalFencedLease.acquire(paths.lock);
+        repairer.writeResource(paths.recoveryMaterial, validMaterial);
+        repairer.release();
+        expect(await runSocketClient([
+          "watchdog-tick",
+          actionSocketPath,
+          dataDir,
+          snapshotPath,
+        ])).toMatchObject({ outcome: "waiting", reason: "watch-active" });
+        expect(live.isBlocked()).toBe(true);
+      } finally {
+        await service.close();
+      }
+    },
+  );
+
   it("exposes registration only on the controller socket and actuation only on the watchdog socket", async () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-recovery-sockets-"));
     const registrationSocketPath = join(root, "register.sock");

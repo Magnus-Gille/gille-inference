@@ -1136,6 +1136,62 @@ describe("constitutional micro-routing controller", () => {
     expect(readConstitutionalResource(paths.lock, paths.targetBlock)).toBeDefined();
   });
 
+  it("persists the target marker when the unreadable-material route block itself fails", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-corrupt-block-failure-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar)
+      .begin(plan(table, synthetic.snapshot));
+    const paths = constitutionalPaths(root);
+    const corruptor = ConstitutionalFencedLease.acquire(paths.lock);
+    corruptor.writeResource(paths.recoveryMaterial, "{broken");
+    corruptor.release();
+    const recovery = recoveryCapability(
+      table,
+      synthetic.recoveryPrivateKey,
+      synthetic.authorizationDigest,
+      synthetic.snapshot,
+    );
+    recovery.blockRoute = () => { throw new Error("route service unavailable"); };
+
+    expect(() => new ConstitutionalRoutingWatchdog(root, authority.reader, recovery).tick())
+      .toThrow(/serving route block failed: route service unavailable/);
+    expect(JSON.parse(readConstitutionalResource(paths.lock, paths.targetBlock)!))
+      .toMatchObject({
+        signed_demotion_pending: true,
+        blocked_at: "protected-clock-unavailable",
+      });
+  });
+
+  it("retains exact journal guard ownership when material authenticates before protected clock failure", () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-clock-block-owner-"));
+    const synthetic = syntheticAuthority();
+    const authority = fakeAuthority(synthetic.snapshot);
+    const table = fakeStore();
+    new ConstitutionalRoutingController(root, table.store, authority.reader, proofVerifier, recoveryRegistrar)
+      .begin(plan(table, synthetic.snapshot));
+    const recovery = recoveryCapability(
+      table,
+      synthetic.recoveryPrivateKey,
+      synthetic.authorizationDigest,
+      synthetic.snapshot,
+    );
+    let blockOwner: string | undefined;
+    recovery.blockRoute = (_fence, journalId) => { blockOwner = journalId; };
+    const clockUnavailable: ProtectedAuthorityReader = {
+      ...authority.reader,
+      trustedNowIso: () => { throw new Error("protected clock unavailable"); },
+    };
+
+    expect(new ConstitutionalRoutingWatchdog(root, clockUnavailable, recovery).tick())
+      .toMatchObject({
+        outcome: "terminally-blocked",
+        reason: expect.stringContaining("protected clock unavailable"),
+      });
+    expect(blockOwner).toBe("micro-route-journal");
+  });
+
   it("refuses commit after unreadable recovery input durably blocks the target, even if controller-owned material is repaired", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-blocked-commit-"));
     const synthetic = syntheticAuthority();

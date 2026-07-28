@@ -86,9 +86,48 @@ export interface RecoveryJournalView {
   receiptDigest: string;
 }
 
+export type RecoveryJournalMaterialRequirement = "required" | "optional";
+
 export interface RecoveryJournalAuthority {
-  read(journalId: string, protectedAuthority?: unknown): RecoveryJournalView;
+  read(
+    journalId: string,
+    protectedAuthority?: unknown,
+    materialRequirement?: RecoveryJournalMaterialRequirement,
+  ): RecoveryJournalView;
   protectedAuthority(): unknown;
+}
+
+export function createRecoveryJournalAuthority(input: {
+  readJournalBytes(): string | undefined;
+  readMaterialBytes(): string | undefined;
+  protectedAuthority(): unknown;
+}): RecoveryJournalAuthority {
+  return {
+    protectedAuthority: input.protectedAuthority,
+    read: (
+      journalId,
+      protectedAuthority,
+      materialRequirement: RecoveryJournalMaterialRequirement = "required",
+    ) => {
+      const journalBytes = input.readJournalBytes();
+      const materialBytes = input.readMaterialBytes();
+      if (journalBytes === undefined) throw new Error("recovery journal is missing");
+      if (materialRequirement === "required" && materialBytes === undefined) {
+        throw new Error("recovery material is missing");
+      }
+      const journal = JSON.parse(journalBytes) as any;
+      const material = materialBytes === undefined ? undefined : JSON.parse(materialBytes) as any;
+      const snapshot = protectedAuthority === undefined
+        ? input.protectedAuthority()
+        : structuredClone(protectedAuthority);
+      return authenticateRecoveryJournal({
+        journalId,
+        journal,
+        material,
+        protectedSnapshot: snapshot,
+      });
+    },
+  };
 }
 
 export function authenticateRecoveryJournal(input: {
@@ -229,7 +268,11 @@ export class RecoveryRegistry {
       "candidateDigest", "descriptorDigest",
     ];
     const protectedAuthority = authority.protectedAuthority();
-    const journal = authority.read(request.journalId, protectedAuthority);
+    // The prepared journal is durable before preregistration, while controller
+    // recovery material is deliberately written only after the recovery
+    // service has returned its opaque handle. All later privileged reads keep
+    // the default material-required behavior.
+    const journal = authority.read(request.journalId, protectedAuthority, "optional");
     const baseline = route.read();
     if (
       !ID.test(request.journalId)
