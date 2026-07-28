@@ -8,6 +8,7 @@ import { request } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
   authenticateRecoveryJournal,
@@ -582,13 +583,147 @@ describe("permission-separated AF_UNIX recovery service", () => {
           actionSocketPath,
           dataDir,
           snapshotPath,
-        ])).toMatchObject({ outcome: "waiting", reason: "watch-active" });
+        ])).toMatchObject({
+          outcome: "terminally-blocked",
+          reason: "terminal-owner-reconciliation-required",
+        });
         expect(live.isBlocked()).toBe(true);
       } finally {
         await service.close();
       }
     },
   );
+
+  it("keeps the exact-owned serving guard after the protected clock recovers", async () => {
+    const root = mkdtempSync(join(tmpdir(), "constitutional-clock-guard-"));
+    const dataDir = join(root, "state");
+    const routePath = join(root, "routing.db");
+    const registrationSocketPath = join(root, "register.sock");
+    const actionSocketPath = join(root, "action.sock");
+    const snapshotPath = join(root, "authority.json");
+    const snapshot = syntheticV2Authority();
+    writeFileSync(snapshotPath, JSON.stringify(snapshot));
+    initializeConstitutionalRouteDatabase(routePath, baseline);
+    const live = new ConstitutionalRouteDatabase(routePath);
+    const paths = constitutionalPaths(dataDir);
+    const journalAuthority = createRecoveryJournalAuthority({
+      readJournalBytes: () => readConstitutionalResourceReadonly(paths.lock, paths.journal),
+      readMaterialBytes: () => readConstitutionalResourceReadonly(paths.lock, paths.recoveryMaterial),
+      protectedAuthority: () => structuredClone(snapshot),
+    });
+    const registry = new RecoveryRegistry(join(root, "registrations"));
+    const now = "2026-07-26T00:00:00Z";
+    const authority: ProtectedAuthorityReader = {
+      read: () => structuredClone(snapshot),
+      killSwitchActive: () => false,
+      trustedNowIso: () => now,
+      liveness: () => ({ healthy: true, observedAt: now, digest: `sha256:${"9".repeat(64)}` }),
+      currentDigests: () => ({
+        config: `sha256:${"b".repeat(64)}`,
+        evidence: `sha256:${"c".repeat(64)}`,
+        policy: `sha256:${"d".repeat(64)}`,
+        postconditions: `sha256:${"f".repeat(64)}`,
+      }),
+    };
+    const verifier = {
+      verify: (input: { candidateDigest: string; postconditionsDigest: string }) => ({
+        ok: true,
+        candidateDigest: input.candidateDigest,
+        postconditionsDigest: input.postconditionsDigest,
+        proofDigest: `sha256:${"7".repeat(64)}`,
+      }),
+    };
+    const plan: RouteMutationPlan = {
+      mutationId: "micro-route-mutation",
+      attemptId: "micro-route-attempt",
+      recoveryDisarmId: "micro-route-disarm",
+      idempotencyKey: "micro-route-idempotency",
+      journalId: "micro-route-journal",
+      baseline,
+      candidate,
+      targetScopeDigest: `sha256:${"1".repeat(64)}`,
+      configDigest: `sha256:${"b".repeat(64)}`,
+      evidenceDigest: `sha256:${"c".repeat(64)}`,
+      policyDigest: `sha256:${"d".repeat(64)}`,
+      postconditionsDigest: `sha256:${"f".repeat(64)}`,
+      recoveryDescriptorDigest: digestJson(snapshot),
+      deadline: "2026-07-26T01:10:00Z",
+      contentRef: "ref:micro-route-candidate",
+    };
+    const controller = new ConstitutionalRoutingController(
+      dataDir,
+      live,
+      authority,
+      verifier,
+      {
+        registerPreRecovery: ({ baseline: _baseline, ...request }) =>
+          registry.register(request, live, journalAuthority),
+      },
+    );
+    expect(controller.begin(plan).outcome).toBe("watching");
+    let demoteCalls = 0;
+    const service = await startRecoveryService({
+      registrationSocketPath,
+      actionSocketPath,
+      registry,
+      route: live,
+      journalAuthority,
+      demote: () => {
+        demoteCalls += 1;
+        return { ledger: {}, registry: {}, checkpoint: {} };
+      },
+      routeLeaseOptions: { durationMs: 2_000 },
+    });
+    try {
+      expect(await runSocketClient([
+        "watchdog-tick",
+        actionSocketPath,
+        dataDir,
+        snapshotPath,
+        "unavailable",
+      ])).toMatchObject({
+        outcome: "terminally-blocked",
+        reason: expect.stringContaining("protected clock unavailable"),
+      });
+      const marker = readConstitutionalResource(paths.lock, paths.targetBlock);
+      expect(marker).toBeDefined();
+      expect(live.isBlocked()).toBe(true);
+      expect(live.read()).toBe(candidate);
+      const routeView = new Database(routePath, { readonly: true });
+      try {
+        expect(routeView.prepare(`
+          SELECT owner_journal_id, owner_attempt_id, owner_binding_digest,
+                 owner_target_scope_digest, owner_watchdog_identity
+          FROM constitutional_route_guard WHERE id=1
+        `).get()).toMatchObject({
+          owner_journal_id: "micro-route-journal",
+          owner_attempt_id: "micro-route-attempt",
+          owner_binding_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          owner_target_scope_digest: `sha256:${"1".repeat(64)}`,
+          owner_watchdog_identity: "micro-route-watchdog",
+        });
+      } finally {
+        routeView.close();
+      }
+
+      expect(await runSocketClient([
+        "watchdog-tick",
+        actionSocketPath,
+        dataDir,
+        snapshotPath,
+        "healthy",
+      ])).toMatchObject({
+        outcome: "terminally-blocked",
+        reason: "terminal-owner-reconciliation-required",
+      });
+      expect(readConstitutionalResource(paths.lock, paths.targetBlock)).toBe(marker);
+      expect(live.isBlocked()).toBe(true);
+      expect(live.read()).toBe(candidate);
+      expect(demoteCalls).toBe(0);
+    } finally {
+      await service.close();
+    }
+  });
 
   it("exposes registration only on the controller socket and actuation only on the watchdog socket", async () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-recovery-sockets-"));

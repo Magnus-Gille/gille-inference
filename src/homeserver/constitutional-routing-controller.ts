@@ -1066,6 +1066,19 @@ export class ConstitutionalRoutingWatchdog {
         }
       }
       if (!expired && !kill && last.phase === "watch" && watchFailure === undefined) {
+        if (constitutionalResourceExists(this.paths.lock, this.paths.targetBlock)) {
+          // Once an error path has durably marked this target for owner
+          // reconciliation, a later healthy observation cannot resume serving
+          // by clearing the exact watchdog-owned guard. Reasserting the block
+          // is safe for both cases: an exact owner remains exact, while an
+          // unowned/foreign guard cannot be overwritten or auto-cleared.
+          this.recovery.blockRoute(routeFence, journal.journal_id);
+          return {
+            outcome: "terminally-blocked",
+            reason: "terminal-owner-reconciliation-required",
+            journal,
+          };
+        }
         // A crash can land after the SQLite serving block but before the
         // controller-state marker. Reconcile only an exact guard owned by this
         // journal/attempt/binding/target watchdog; operator and other-attempt

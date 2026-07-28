@@ -10,7 +10,7 @@ import {
 } from "../../src/homeserver/constitutional-routing-controller.js";
 import { readFileSync } from "node:fs";
 
-const [mode, socket, handle, snapshotPath] = process.argv.slice(2);
+const [mode, socket, handle, snapshotPath, clockMode] = process.argv.slice(2);
 if (!mode || !socket) throw new Error("missing constitutional socket-client fixture argument");
 
 const baseline = '{"route":"mellum"}\n';
@@ -82,7 +82,10 @@ if (mode === "controller-response-loss") {
   const authority: ProtectedAuthorityReader = {
     read: () => structuredClone(snapshot),
     killSwitchActive: () => false,
-    trustedNowIso: () => now,
+    trustedNowIso: () => {
+      if (clockMode === "unavailable") throw new Error("protected clock unavailable");
+      return now;
+    },
     liveness: () => ({ healthy: true, observedAt: now, digest: `sha256:${"9".repeat(64)}` }),
     currentDigests: () => ({
       config: `sha256:${"b".repeat(64)}`,
