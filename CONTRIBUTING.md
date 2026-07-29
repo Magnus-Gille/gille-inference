@@ -9,6 +9,10 @@ Thanks for helping improve Gille Inference.
   and model files out of commits and test fixtures.
 - Use reserved examples such as `example.com`, `192.0.2.0/24`, and `/srv/gille-inference` in
   documentation and tests.
+- Keep public operational tickets at the contract level: intended behavior, sanitized evidence,
+  generic prechecks, acceptance criteria, and rollback semantics. Exact live execution belongs in
+  the private Grimnir operations tracker; security vulnerabilities belong in GitHub's private
+  advisory workflow. See [`docs/operations-ticket-boundary.md`](docs/operations-ticket-boundary.md).
 - Add a regression test for behavior changes and manually review generated or benchmark data
   before committing it.
 
