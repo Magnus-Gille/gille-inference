@@ -625,7 +625,7 @@ describe("portal page content", () => {
     // Hardware facts
     expect(body).toContain("Strix Halo");
     expect(body).toContain("128");
-    // All seven publicly advertised chat-model IDs
+    // All eight publicly advertised chat-model IDs
     expect(body).toContain("mellum");
     expect(body).toContain("gemma4");
     expect(body).toContain("qwen36-a3b");
@@ -633,11 +633,12 @@ describe("portal page content", () => {
     expect(body).toContain("vibethinker-3b");
     expect(body).toContain("qwen3-coder-next-80b");
     expect(body).toContain("gpt-oss-120b");
+    expect(body).toContain("qwen35-122b-a10b");
     // Quant and context facts
     expect(body).toContain("Q4_K_M");
     expect(body).toContain("Q8_0");
     expect(body).toContain("MXFP4");
-    expect(body).toContain("40&#8211;60s");
+    expect(body).toContain("40&#8211;70s");
     expect(body).toContain("131,072");
     expect(body).toContain("65,536");
     // External-user examples document VibeThinker's full sampler profile and higher explicit cap.

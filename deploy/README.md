@@ -105,6 +105,47 @@ to point here rather than re-describing the topology.
   placeholder path* for docs/tests, the same way it uses `example.com` — that usage is intentional
   and unrelated to this correction.)
 
+### Deploying llama-swap roster changes
+
+The model roster is separate mutable production state and is not an input to
+`deploy-gateway.sh`; merging these files does not apply them to a live host. Public changes record
+the reusable serving contract with placeholders; exact live paths, backups, config bytes, service
+state, canary commands, and rollback execution belong in the private Grimnir operations tracker.
+The public
+[`llama-swap-large-models.example.yaml`](./llama-swap-large-models.example.yaml) is a reviewable
+settings example, not a live-config mirror or directly deployable file.
+
+For a reviewed roster release:
+
+1. Review model identity, context, cache, KV, slot, reasoning, and runtime requirements in the
+   public example and decision record.
+2. In the private deployment ticket, resolve `<runtime-root>` and `<model-root>` to stable,
+   non-`scratch` operator paths. For a runtime introduced by the release, build the complete bundle
+   from the audited commit with an origin-relative runpath; copying only the small `llama-server`
+   launcher or a build tree with an absolute `scratch` runpath is invalid. Verify shard totals,
+   the launcher checksum,
+   `readelf -d <stable-bin>/llama-server`, and `ldd <stable-bin>/llama-server`; reject any
+   dependency or runpath that still resolves through `scratch`.
+3. Back up the live config and service drop-in, render the reviewed settings into the private live
+   configuration, and verify the applied bytes without copying them into the public ticket.
+4. Install the [`systemd/llama-swap-memory.conf`](./systemd/llama-swap-memory.conf) limits, reload
+   systemd, and verify the effective `MemoryMax`, `MemorySwapMax`, and `OOMPolicy`.
+5. Restart llama-swap, verify model readiness, then issue one explicit owner-only completion
+   against the new model. A roster addition is not an automatic route change.
+6. Apply only the non-secret shadow/canary routing settings from the accepted release, restart the
+   gateway, and verify private-network health plus the authenticated model list.
+7. Roll back through the private ticket's recorded backups and re-run the same health checks.
+
+The 2026-07-28 `qwen35-122b-a10b` release uses a pinned llama.cpp `9a3bf2b84` runtime, 32K
+context, reasoning off, F16 KV, a 2 GiB prompt cache, one slot, and the service-level 96 GiB/no-swap
+ceiling. It is an explicit/shadow precision specialist; `gpt-oss-120b` remains the standard large
+model and preferred 64K tier. The measured rationale and authority boundary are in
+[`docs/gpt-oss-qwen35-production-decision-2026-07-28.md`](../docs/gpt-oss-qwen35-production-decision-2026-07-28.md).
+The origin-relative production rebuild's `llama-server` SHA-256 is
+`7e1fa95bf414d8491166d9976a028555b2ebf12c481868a5582d63256865ee22`; its runtime
+dependencies must all resolve inside the rendered
+`<runtime-root>/releases/9a3bf2b84/bin`.
+
 ### Deploying
 
 ```bash
