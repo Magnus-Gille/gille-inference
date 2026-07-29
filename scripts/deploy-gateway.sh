@@ -286,15 +286,24 @@ read_clean_deploy_sha() {
 # are never archived, and a concurrent writer cannot change Git object bytes while rsync reads the
 # materialized payload.
 materialize_deploy_payload() {
-  local expected_sha="$1" payload_root="$2"
+  local expected_sha="$1" payload_root="$2" archive_path="${2}.tar"
   if ! mkdir -m 0755 "$payload_root"; then
     echo "ERROR: could not create the immutable deploy payload root." >&2
     return 1
   fi
-  if ! git archive --format=tar "$expected_sha" | tar -xf - -C "$payload_root"; then
-    echo "ERROR: could not materialize immutable deploy payload for $expected_sha." >&2
+  # Do not pipe git archive directly into tar. For small archives, bsdtar can stop reading after
+  # the end marker while git is still writing padding, which makes git exit on SIGPIPE (141) and
+  # turns a valid immutable payload into a false deployment failure under pipefail.
+  if ! git archive --format=tar --output="$archive_path" "$expected_sha"; then
+    echo "ERROR: could not create the immutable deploy archive for $expected_sha." >&2
     return 1
   fi
+  if ! tar -xf "$archive_path" -C "$payload_root"; then
+    echo "ERROR: could not materialize immutable deploy payload for $expected_sha." >&2
+    rm -f -- "$archive_path"
+    return 1
+  fi
+  rm -f -- "$archive_path"
 }
 
 # ── remote probes ───────────────────────────────────────────────────────────────────────────
