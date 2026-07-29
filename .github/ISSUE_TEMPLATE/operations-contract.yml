@@ -1,0 +1,59 @@
+name: Operational engineering contract
+description: Propose a public-safe deployment, maintenance, or operational behavior change.
+title: "[ops] "
+labels:
+  - "operations"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This public issue records reusable engineering truth, not live operator execution.
+        Use placeholders for infrastructure. Do not include private paths or addresses, live state,
+        credentials, prompts, responses, databases, owner logs, customer data, or raw logs.
+        Security vulnerabilities belong in the repository's private advisory workflow.
+  - type: textarea
+    id: objective
+    attributes:
+      label: Public objective
+      description: What public behavior or capability should become true?
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Intended contract and non-goals
+      description: Define behavior, invariants, authority boundaries, and what this work will not do.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Use public fixtures, aggregate measurements, or placeholders. Do not paste live output.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and compatibility impact
+      description: Authentication, privacy, availability, migration, and backward-compatibility effects.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance, canary, and rollback semantics
+      description: Public-safe checks and rollback conditions; exact execution is tracked privately.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Information boundary
+      options:
+        - label: This issue contains no private host identifiers, personal paths, or exact live state.
+          required: true
+        - label: This issue contains no credentials, content, databases, owner logs, customer data, or raw sensitive logs.
+          required: true
+        - label: Any exact operator execution will be tracked privately without changing repository ownership.
+          required: true
