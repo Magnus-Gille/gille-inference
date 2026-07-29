@@ -10,9 +10,10 @@ read-only.
 After a substantive session, record public work in the relevant issue or pull request. Public
 tickets contain only the reusable engineering contract and sanitized evidence. Private deployment
 state and exact operator handoffs belong in a gitignored local `STATUS.md`; durable multi-session
-deployments, incidents, and maintenance are coordinated in the private Grimnir operations tracker,
-never in this public repository. The private tracker does not own this service's code or
-architecture. Log durable decisions before replacing mutable project status.
+deployments, incidents, and maintenance are coordinated in the private GitHub repository
+`Magnus-Gille/grimnir-ops`, never in this public repository. That repository is an execution
+tracker; it does not own this service's code or architecture. Log durable decisions before
+replacing mutable project status.
 
 `AGENTS.md` is the canonical cross-harness project guidance. `CLAUDE.md` only imports it for Claude
 Code. Put recurring portable behavior here and keep harness-specific additions in the relevant
