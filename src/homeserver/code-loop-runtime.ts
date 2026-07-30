@@ -284,12 +284,12 @@ export async function runCageSelfTestWithRelay(
   }
 }
 
-// ─── MCP dispatch (owner-gated; called from mcp.ts callTool) ────────────────────────────
+// ─── MCP dispatch (owner-agent-gated; called from mcp.ts callTool) ──────────────────────
 
 /**
- * Handle one code_loop_* tool call. The CALLER (mcp.ts) has ALREADY verified the owner gate
- * (tier === "owner" && keyHash !== null) — a non-owner never reaches here (it falls through to
- * the byte-identical unknown-tool error). Returns a JSON text block; never throws.
+ * Handle one code_loop_* tool call. The CALLER (mcp.ts) has ALREADY verified the owner-agent gate
+ * (owner tier, real minted key, agent|admin scope) — an ineligible caller never reaches here
+ * (it falls through to the byte-identical unknown-tool error). Returns JSON text; never throws.
  */
 export async function handleCodeLoopTool(
   name: string,

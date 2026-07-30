@@ -90,12 +90,13 @@ tsx src/homeserver/cli.ts delegate --type extract --prompt "Return only the year
 
 # Mint / list / revoke per-key credentials (the plaintext is shown ONCE)
 tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner
+tsx src/homeserver/cli.ts keys mint --alias claude-agent --tier owner --scope agent
 tsx src/homeserver/cli.ts keys mint --alias guest1 --tier guest --models qwen3-coder --rpm 30 --daily 200000
 tsx src/homeserver/cli.ts keys list
 tsx src/homeserver/cli.ts keys revoke --alias guest1
 
 # Rotate a leaked/refreshed key in ONE step (#99): revokes the active key for the name and mints a
-# fresh one, inheriting its tier + limits. Do NOT `revoke A` then `mint A` — `alias` is the PRIMARY
+# fresh one, inheriting its tier + scope + limits. Do NOT `revoke A` then `mint A` — `alias` is the PRIMARY
 # KEY, so the revoked row keeps owning the name and the re-mint fails (a naive pipeline then clobbers
 # the stored token with an empty value). --tier is only needed for a brand-new name.
 tsx src/homeserver/cli.ts keys rotate --alias laptop
@@ -159,7 +160,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks). |
 | `GET /` · `GET /portal` | none | Serves the self-service portal page (HTML; `nosniff` + restrictive CSP + `no-store`). Per-IP throttled. |
 | `POST /portal/redeem` | none (the **code** is the credential) | `{code}` → `200 {key, alias, model, models, creditLimit}` (`Cache-Control: no-store`). Trades a one-time invite code for a freshly minted key. Uniform `409 invite_invalid` for an unknown **or** already-used code (identical body — no enumeration oracle); `400` for a missing code. Per-IP throttled (`HOMESERVER_REDEEM_RPM`, default 10 / 10 min) → `429`. |
-| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, models, creditLimit, creditsUsed, rpm, tpm}` (`Cache-Control: no-store`). |
+| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` (`Cache-Control: no-store`). |
 | `GET /portal/stats` | none | **PUBLIC, content-blind grand aggregate** powering the portal's "Served so far" card → `200 {total_tokens, total_requests, since}` (`Cache-Control: public, max-age=30`). Summed from the **durable** `request_log` (survives restarts — the honest "served so far"), NOT the in-memory Prometheus counters. Exposes ONLY fleet-wide totals — never any per-user / per-key / per-alias / per-model / content dimension. Per-IP throttled (shares the redeem window). Deliberately distinct from authed `/metrics`. |
 | `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the weekly Model Scout's registry (`model-registry.ts`, `docs/weekly-model-scout-runbook.md`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
@@ -171,9 +172,9 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /v1/images/generations` | user | **OpenAI-compatible text→image.** Three advertised models, each a tier: `image-fast` (synchronous → `200 {created, data:[{b64_json}]}`), `image-balanced` + `image-high` (asynchronous → `202 {id:"imgjob_…", status:"queued", …}`). **Inert** unless `HOMESERVER_IMAGE_URL` is set (else `404`). **Metered like the audio path:** worst-case `n × per-image credits` reserved up-front (`402` on overdraft, before any work), `n` image-units against the per-key quota (`429`), both reconciled to the **delivered** count; **full refund** on failure/timeout/cancel. A dedicated **single-slot diffusion worker** acquires the shared admission slot only around the sidecar dispatch (owner chat can still preempt; an honest guest at cap gets `503`). `403 model_not_allowed` off the allow-list; `502/504` on sidecar fault. Content-blind: the prompt + bytes are **never** in `image_jobs` / request_log / metrics; owner-logged **only** under the owner guard. Forwards to an sd-server-style sidecar (`HOMESERVER_IMAGE_URL`, e.g. `http://127.0.0.1:8093`) `POST /v1/images/generations`. |
 | `GET /v1/images/generations/jobs/{id}` | user | Poll an async job (scoped to the creator; bare `404` otherwise). `succeeded` returns `data:[{b64_json}]` until the result TTL sweeps it (`expired`). |
 | `DELETE /v1/images/generations/jobs/{id}` | user | Cancel + refund a job, **idempotent**; scoped to the creator. |
-| `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client (Claude Code) as tools — `list_models` + `ask` (all keys) and, for a real **owner** key only, `code_loop_start` / `code_loop_status` / `code_loop_result` (invisible + byte-identical unknown-tool error to non-owners, #116). `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-ONLY** optional `files` array (blind-context delegation, issue #128). `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
-| `POST /delegate` | **owner** | Orchestrated path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
-| `POST /admin/task-exposures/lookup` | **minted owner** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
+| `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys) and, for a real owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` (invisible + byte-identical unknown-tool error otherwise, #116). `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
+| `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
+| `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
 | `GET /models` | user | Models on disk + loaded. |
 | `GET /ledger` | **admin or monitor** | The learning report + recent delegations (`recent[]` rows carry `id`, #227). Read-only monitors (e.g. Heimdall) via `HOMESERVER_MONITOR_API_KEYS`. |
 | `GET /ledger/{id}` | **admin or monitor** | The single evidence row for a `ledgerId` (`recordDelegation`'s return value, echoed by `POST /delegate` as `costTrace.delegationId`) — the join target so a caller can retrieve its exact row without timestamp matching (#227). Stamped delegate rows add the exact non-null `evidenceIdentityHash`, `learningTaskBinding:"bound"`, server admission id, and immutable `taskInstanceId` / `attemptId`; legacy rows expose an explicit `legacy` + null binding (#61). Same auth as `GET /ledger`; unknown id → bare `404 not_found`. |
@@ -181,7 +182,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/models/load` | **admin** | `{modelKey, contextLength?, parallel?, gpu?, ttlSeconds?}`. |
 | `POST /admin/models/unload` | **admin** | `{modelKey?}` (omit to unload all). |
 | `POST /admin/models/download` | **admin** | `{modelKey, wait?}`. |
-| `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). |
+| `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). Scope defaults preserve compatibility: owner→`admin`, guest→`inference`; guest keys cannot carry `agent` or `admin`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
 | `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, inflight, ownerQueued, maxInflight}`. |
@@ -194,6 +195,14 @@ Invites bake in a `creditLimit` and carry it onto the key at redemption. Invite 
 stored as **sha256 hashes only** (plaintext shown once), redemption is **strictly one-time**,
 and the redeem path uses a uniform error so it cannot be used to probe which codes exist.
 
+**Tier and scope are separate.** `tier` controls privacy classification and the owner/guest
+admission lane. `scope` controls route authority: `admin` includes operator routes, `agent`
+adds `code_loop` without operator authority, and `inference` is the ordinary inference
+surface. Existing owner keys default to `admin`; new interactive Claude/Codex agent credentials should use
+`--tier owner --scope agent` so owner-content learning and owner-priority admission remain
+intact while `/delegate`, every `/admin/*` route, and `/ledger` stay forbidden. External
+exposure-receipt producers are a distinct service role and currently still require admin scope.
+
 Auth is `Authorization: Bearer <key>`. **Safety default:** the gateway refuses to bind a
 non-loopback host when no API keys are configured (no legacy keys **and** no minted keys) —
 you cannot accidentally expose an unauthenticated endpoint to the LAN.
@@ -205,8 +214,8 @@ named guest-tier key and treat the alias as the tenant identity. Example:
 tsx src/homeserver/cli.ts keys mint --alias codex-cli --tier guest --models qwen3-coder --rpm 30 --daily 200000
 ```
 
-`POST /delegate` is still owner-only; tenant validation runs that need that route should
-use a named owner-tier key rather than the shared static owner key. `GET /ledger` exposes
+`POST /delegate` is owner-admin only; tenant validation runs that need that route should
+use a named admin-scope owner key rather than the shared static owner key. `GET /ledger` exposes
 the alias as `recent[].keyAlias` for gateway/MCP delegation rows, so auditors can verify
 which tenant key produced a routing verdict without exposing the bearer token or key hash.
 Legacy static keys appear as `static:*`; probe, CLI, and imported evidence rows keep
@@ -299,15 +308,16 @@ sees only the model's answer text.
   They DO reach the owner-only full-content log (`owner-log.ts`) and the capability-ledger prompt
   excerpt (`ledger.ts`), exactly like the rest of an owner's own `ask` content already does — this
   is not a new exposure, since `files` is itself owner-tier-only.
-**Owner-only tools** (`code_loop_start` / `code_loop_status` / `code_loop_result`, issue #116)
-appear in `tools/list` **only** for a real minted **owner** key (`tier === "owner" && keyHash
-!== null` — the exact `owner_request_log` guard; legacy static / implicit-admin are excluded).
+**Owner-agent tools** (`code_loop_start` / `code_loop_status` / `code_loop_result`, issue #116)
+appear in `tools/list` **only** for a real minted owner-tier key with `scope=agent|admin`
+(`tier === "owner" && keyHash !== null` preserves the owner-content boundary, while the
+scope check supplies route authority; legacy static / implicit-admin are excluded).
 A non-owner never sees them, and a direct `tools/call` on one returns the **byte-identical
 unknown-tool error** a nonexistent tool would (invisible, not merely forbidden). See
 *code_loop* below. The owner-visible `code_loop_start` description carries the stable pre-paid
 advertisement `contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]`.
 
-### code_loop — owner-only sandboxed agentic coding (#116)
+### code_loop — owner-agent sandboxed agentic coding (#116)
 
 An **async** job that wraps a **pi** subprocess (`@mariozechner/pi-coding-agent`, native
 tool-calling: read/edit/write/bash) driving the local coding model inside an **OS cage**,
@@ -430,7 +440,7 @@ failing probe refuses the job with `cage-unavailable`.
    `pi-engine.ts`) from `HOMESERVER_CODE_LOOP_API_KEY`. Never write the literal key value into
    `models.json`. Set `HOMESERVER_CODE_LOOP_PI_AGENT_DIR` to that dir.
 3. Mint the service key with a **fresh timestamped alias**:
-   `keys mint --alias code-loop-$(date +%Y%m%d-%H%M%S) --tier owner` allow-listed to
+   `keys mint --alias code-loop-$(date +%Y%m%d-%H%M%S) --tier owner --scope agent` allow-listed to
    `qwen3-coder-next-80b` with TPM/daily quotas → `.env` as `HOMESERVER_CODE_LOOP_API_KEY`.
    The key must be a **real keystore owner key** (non-null `keyHash`) — that is what makes
    `owner_request_log` fire per turn. Never write the key value into `models.json`.
@@ -616,7 +626,7 @@ HOMESERVER_FORMAT_DISCOUNT_WEIGHT=0.5          # weight in [0,1] applied to a fo
 # ── code_loop — owner-only sandboxed agentic coding tool (#116) ──
 HOMESERVER_CODE_LOOP=off                       # master switch. off (default) → the MCP tools are visible to owners but code_loop_start returns `disabled`. on → runs.
 HOMESERVER_CODE_LOOP_PI_BIN=                   # abs path to the pinned pi binary (vendor install OUTSIDE the rsync root, e.g. ~/.local/bin/pi)
-HOMESERVER_CODE_LOOP_API_KEY=                  # the minted OWNER-tier service key pi calls back with (allow-listed to the 80b). Real keystore key → owner_request_log fires per turn. Never in models.json.
+HOMESERVER_CODE_LOOP_API_KEY=                  # minted owner-tier, agent-scope service key pi calls back with (allow-listed to the 80b). Real key → owner_request_log fires; agent scope denies admin. Never in models.json.
 HOMESERVER_CODE_LOOP_PI_AGENT_DIR=             # PI_CODING_AGENT_DIR — holds models.json (see deploy/pi-models.json.example; baseUrl = the loopback forward, NOT the tailnet IP) AND pi's own auth.json credential store; the cage binds ONLY <dir>/models.json (auth.json stays hidden in-cage)
 HOMESERVER_CODE_LOOP_WORKROOT=./data/code-loop-work  # throwaway sandbox root (under ./data so rsync never touches it; under the deploy dir so check_cmd's `npx --no-install` walk-up resolves node_modules)
 HOMESERVER_CODE_LOOP_MODEL=qwen3-coder-next-80b      # the single loop model (allow-listed on the service key)

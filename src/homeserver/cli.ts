@@ -5,7 +5,18 @@ import { ledgerReport, recentDelegations } from "./ledger.js";
 import { findUnpricedDelegatorModels, type UnpricedDelegatorModel } from "./delegation-cost.js";
 import { PROBES, getProbe } from "./probes.js";
 import { startGateway } from "./gateway.js";
-import { mintKey, rotateKey, listKeys, revokeKey, KeyAliasExistsError, createInvite, listInvites, type Tier, type InvitePublic } from "./keystore.js";
+import {
+  mintKey,
+  rotateKey,
+  listKeys,
+  revokeKey,
+  KeyAliasExistsError,
+  createInvite,
+  listInvites,
+  type KeyScope,
+  type Tier,
+  type InvitePublic,
+} from "./keystore.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
 import { buildCageArgv } from "./code-loop-cage.js";
@@ -311,8 +322,17 @@ function cmdKeys(args: ParsedArgs): void {
   if (sub === "mint") {
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : undefined;
     const tier = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
+    const scope = typeof args.flags["scope"] === "string" ? (args.flags["scope"] as string) : undefined;
     if (!alias || (tier !== "owner" && tier !== "guest")) {
-      throw new Error("usage: keys mint --alias A --tier owner|guest [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]");
+      throw new Error("usage: keys mint --alias A --tier owner|guest [--scope admin|agent|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]");
+    }
+    if (
+      scope !== undefined
+      && scope !== "admin"
+      && scope !== "agent"
+      && scope !== "inference"
+    ) {
+      throw new Error("keys mint: --scope must be admin|agent|inference");
     }
     const models =
       typeof args.flags["models"] === "string"
@@ -324,6 +344,7 @@ function cmdKeys(args: ParsedArgs): void {
         {
           alias,
           tier: tier as Tier,
+          ...(scope ? { scope: scope as KeyScope } : {}),
           modelAllowList: models,
           rpm: strictNumFlag(args.flags, "rpm"),
           tpm: strictNumFlag(args.flags, "tpm"),
@@ -354,15 +375,24 @@ function cmdKeys(args: ParsedArgs): void {
   if (sub === "rotate") {
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : args.positional[1];
     const tierRaw = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
+    const scopeRaw = typeof args.flags["scope"] === "string" ? (args.flags["scope"] as string) : undefined;
     if (!alias) {
       throw new Error(
-        "usage: keys rotate --alias A [--tier owner|guest] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]\n" +
-          "  Revokes the active key(s) for A and mints a fresh one, inheriting tier+limits from the\n" +
-          "  current key (override with flags). --tier is required only for a brand-new name."
+        "usage: keys rotate --alias A [--tier owner|guest] [--scope admin|agent|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]\n" +
+          "  Revokes the active key(s) for A and mints a fresh one, inheriting tier+scope+limits from\n" +
+          "  the current key (override with flags). --tier is required only for a brand-new name."
       );
     }
     if (tierRaw !== undefined && tierRaw !== "owner" && tierRaw !== "guest") {
       throw new Error("keys rotate: --tier must be owner|guest");
+    }
+    if (
+      scopeRaw !== undefined
+      && scopeRaw !== "admin"
+      && scopeRaw !== "agent"
+      && scopeRaw !== "inference"
+    ) {
+      throw new Error("keys rotate: --scope must be admin|agent|inference");
     }
     const models =
       typeof args.flags["models"] === "string"
@@ -372,6 +402,7 @@ function cmdKeys(args: ParsedArgs): void {
       alias,
       {
         ...(tierRaw ? { tier: tierRaw as Tier } : {}),
+        ...(scopeRaw ? { scope: scopeRaw as KeyScope } : {}),
         ...(models ? { modelAllowList: models } : {}),
         rpm: strictNumFlag(args.flags, "rpm"),
         tpm: strictNumFlag(args.flags, "tpm"),
@@ -400,13 +431,13 @@ function cmdKeys(args: ParsedArgs): void {
       return;
     }
     console.log(
-      `${"ALIAS".padEnd(20)} ${"LOGICAL".padEnd(16)} ${"TIER".padEnd(6)} ${"RPM".padEnd(7)} ${"TPM".padEnd(9)} ${"DAILY".padEnd(9)} ${"PAR".padEnd(4)} ${"EXPIRES".padEnd(22)} REVOKED`
+      `${"ALIAS".padEnd(20)} ${"LOGICAL".padEnd(16)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ${"RPM".padEnd(7)} ${"TPM".padEnd(9)} ${"DAILY".padEnd(9)} ${"PAR".padEnd(4)} ${"EXPIRES".padEnd(22)} REVOKED`
     );
     for (const k of keys) {
       // LOGICAL is the rotation family a key belongs to (#99) — what you pass to `keys rotate`.
       const logical = k.logicalAlias ?? "";
       console.log(
-        `${k.alias.slice(0, 19).padEnd(20)} ${logical.slice(0, 15).padEnd(16)} ${k.tier.padEnd(6)} ${String(k.rpm).padEnd(7)} ${String(k.tpm).padEnd(9)} ${String(k.dailyTokenBudget).padEnd(9)} ${String(k.maxParallel).padEnd(4)} ${(k.expiresAt ?? "never").padEnd(22)} ${k.revokedAt ?? ""}`
+        `${k.alias.slice(0, 19).padEnd(20)} ${logical.slice(0, 15).padEnd(16)} ${k.tier.padEnd(6)} ${k.scope.padEnd(10)} ${String(k.rpm).padEnd(7)} ${String(k.tpm).padEnd(9)} ${String(k.dailyTokenBudget).padEnd(9)} ${String(k.maxParallel).padEnd(4)} ${(k.expiresAt ?? "never").padEnd(22)} ${k.revokedAt ?? ""}`
       );
     }
     return;
@@ -756,6 +787,7 @@ async function main(): Promise<void> {
           '  tsx src/homeserver/cli.ts delegate --prompt "Return OK" --model mellum --delegator openai/gpt-5.5   # local model + cloud brain\n' +
           "  tsx src/homeserver/cli.ts ledger\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner\n" +
+          "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
           "  tsx src/homeserver/cli.ts keys invite --credits 500000 --tier guest --model qwen3\n" +
           "  tsx src/homeserver/cli.ts keys list\n" +

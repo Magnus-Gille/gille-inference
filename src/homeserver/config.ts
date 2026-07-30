@@ -503,8 +503,8 @@ export interface HomeserverConfig {
   codeLoop: "on" | "off";
   /** Absolute path to the pinned pi binary (vendor install OUTSIDE the rsync root). "" = unprovisioned. */
   codeLoopPiBin: string;
-  /** The dedicated owner-tier service key pi calls the gateway back with (real keystore key —
-   *  keyHash !== null is what makes owner_request_log fire per turn). Never logged. */
+  /** The dedicated owner-tier, agent-scope service key pi calls the gateway back with (real
+   *  keystore key — owner_request_log fires per turn without admin authority). Never logged. */
   codeLoopApiKey: string;
   /** Sandbox work root. Under ./data so rsync deploys never touch it and `npx --no-install`
    *  resolves node_modules by walk-up. */
