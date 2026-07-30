@@ -746,9 +746,13 @@ async function admitAndMeterLogged(
   // estimate to ZERO — a failed request is never billed at the full estimate.
   let actualTokens = 0;
   let creditsCharged = 0;
+  // A background measurement must not observe the foreground request as active. Defer it
+  // until this wrapper has released the admission lease and completed accounting.
+  let afterRelease: (() => void) | undefined;
   try {
     const result = await handler();
     actualTokens = result.totalTokens;
+    afterRelease = result.afterRelease;
     // R6: the handler may already have classified a DISTINCT failure outcome (an upstream
     // connection/timeout failure, or a mid-stream abort that cannot change the already-sent 200
     // status). Preserve that — do NOT clobber it with the generic ok/error derivation below.
@@ -796,6 +800,7 @@ async function admitAndMeterLogged(
     }
     // M3: feed the credits charged for this request into the metrics record site.
     lctx.creditsCharged = creditsCharged;
+    afterRelease?.();
   }
 }
 
@@ -817,6 +822,8 @@ export interface MeteredResult {
   canonicalModel: string | null;
   /** Time-to-first-token (ms) for a streaming completion; null for non-streaming / no content. */
   ttftMs: number | null;
+  /** Best-effort work that must start only once this request's lease is released. */
+  afterRelease?: () => void;
 }
 
 // L1 (Codex LOW): the stale exported canonicalizeModel() helper was removed. It pre-dated the
@@ -1867,11 +1874,11 @@ async function handleDelegate(
       ? {}
       : { learningTaskGatewayEcho }),
   });
-  // #132 is attached only after the caller response is formed. It is owner-only and its
-  // background lease is preempted/drained by every subsequent normal gateway admission.
-  if (ownerContent && result.nodeId === "m5" && !result.delegated && result.escalate) {
-    scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller);
-  }
+  // #132 is attached only after the caller response *and* its foreground admission lease are
+  // complete. Otherwise its own queue-depth gate can see the just-finished request and skip.
+  const afterRelease = ownerContent && result.nodeId === "m5" && !result.delegated && result.escalate
+    ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
+    : undefined;
   lctx.node = result.nodeId;
   lctx.model = result.modelId;
   const m = result.metrics;
@@ -1884,9 +1891,10 @@ async function handleDelegate(
       // but it is also not allow-list-canonicalized here, so keep it out of metrics → null.
       canonicalModel: null,
       ttftMs: null,
+      afterRelease,
     };
   }
-  return { totalTokens: effectiveMax, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
+  return { totalTokens: effectiveMax, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null, afterRelease };
 }
 
 function scheduleReviewCascadeAfterDelegate(

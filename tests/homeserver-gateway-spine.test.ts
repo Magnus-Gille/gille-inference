@@ -110,6 +110,10 @@ beforeAll(async () => {
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
+  process.env["HOMESERVER_REVIEW_CASCADE"] = "shadow";
+  process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] = "gpt-oss-120b";
+  process.env["HOMESERVER_REVIEW_CASCADE_QWEN_MODEL"] = "qwen35-122b-a10b";
+  process.env["HOMESERVER_REVIEW_CASCADE_TASK_TYPES"] = "code-review";
   // Bootstrap admin via the legacy static admin key so we can mint store keys over HTTP.
   process.env["HOMESERVER_ADMIN_API_KEYS"] = "admin-static-key";
   process.env["HOMESERVER_API_KEYS"] = "legacy-user-key";
@@ -671,6 +675,36 @@ describe("gateway spine — HTTP integration", () => {
     // proving the owner reached the handler (not a 403 route refusal).
     expect(res.status).not.toBe(403);
     expect(res.status).toBe(400);
+  });
+
+  it("#132 starts a valid-label shadow cascade after the foreground delegate response", async () => {
+    expect(loadConfig().reviewCascadeShadow).toMatchObject({
+      mode: "shadow", gptModel: "gpt-oss-120b", qwenModel: "qwen35-122b-a10b", taskTypes: ["code-review"],
+    });
+    mockMode = "sse";
+    const owner = mintKey({ alias: `cascade-owner-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const res = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({
+        taskType: "code-review",
+        maxTokens: 16,
+        prompt: "L1|function findUser(db, id) {\nL2|  return db.query(\"SELECT * FROM users WHERE id = \" + id);\nL3|}",
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ delegated: false, escalate: true, taskType: "code-review" });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const { reviewCascadeShadowIdle } = await import("../src/homeserver/review-cascade-shadow.js");
+    await reviewCascadeShadowIdle();
+    // The mock's "ok" is deliberately invalid candidate JSON. One GPT recall call proves the
+    // cascade ran; the invalid output prevents a second precision call.
+    expect(upstreamInferenceRequestCount).toBe(1);
+    const metrics = await (await fetch(url("/metrics"), {
+      headers: { authorization: `Bearer ${owner.plaintextKey}` },
+    })).text();
+    expect(metrics).toContain('homeserver_review_cascade_runs_total{terminal="candidate-invalid"} 1');
   });
 
   it("#87: an explicit classify delegate request has a non-empty JSON outcome", async () => {
