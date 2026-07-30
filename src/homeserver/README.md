@@ -494,6 +494,15 @@ friends can drop on their `$PATH` to talk to the gateway without writing curl or
 Everything is the OpenAI API + portal under the hood; the `hs` wrapper just handles auth,
 SSE stream parsing, and config persistence.
 
+### Production text roster
+
+llama-swap serves one of eight text models at a time. `gpt-oss-120b` remains the standard large
+reasoning model and the preferred 64K tier. `qwen35-122b-a10b` is a 32K, reasoning-off precision
+specialist for explicit authenticated requests and the `code-review` shadow lane; adding it to the
+roster does not make it a default or an enforced route. The other served IDs are `mellum`,
+`qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`, and
+`qwen3-coder-next-80b`.
+
 ## Coordinating heavy GPU jobs — `gpu` (issue #88)
 
 The box serves **one model at a time** (serial GPU via llama-swap). Two concurrent heavy owner
@@ -528,10 +537,10 @@ LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1   # LM Studio OpenAI-compat base (als
 HOMESERVER_BACKEND=llamaswap                  # Model-admin backend: "llamaswap" (default, #146) | "lmstudio" (DEPRECATED — kept one release)
 HOMESERVER_USE_ROUTING_TABLE=off              # "on" → orchestrator uses docs/m5-routing.json (routing-table.ts) to pick the model per task type + escalate gap types (sql) to frontier. Default "off" (loaded-model + ledger). Explicit task.modelId always wins. Pairs best with HOMESERVER_BACKEND=llamaswap (hot-swaps the routed model in); on the deprecated lmstudio backend a routed-but-not-resident model fails SAFE — the local call errors and escalates to frontier (never a wrong answer, just an extra escalation). Owner-tier /delegate path only.
 HOMESERVER_SHADOW_LANE=off                    # "on" → after a no-local-attempt frontier escalation, run a lowest-priority M5 candidate in the background and store shadow-flagged candidate evidence. Never returned to the caller; excluded from normal ledger rollups.
-HOMESERVER_SHADOW_LANE_MODEL=                  # Explicit local candidate model. Empty falls back to the currently loaded model.
+HOMESERVER_SHADOW_LANE_MODEL=                  # Explicit local candidate model. Live precision canary: qwen35-122b-a10b. Empty falls back to the currently loaded model.
 HOMESERVER_SHADOW_LANE_TASK_TYPES=             # Optional comma-separated allow-list; empty shadows every escalated task type.
 HOMESERVER_SHADOW_LANE_MAX_TOKENS=0            # 0 inherits the task budget; positive values cap it deliberately.
-HOMESERVER_SHADOW_LANE_TIMEOUT_MS=120000       # Background call wall-clock ceiling.
+HOMESERVER_SHADOW_LANE_TIMEOUT_MS=120000       # Background call wall-clock ceiling. Large cold-swap candidates may require 600000.
 HOMESERVER_SHADOW_LANE_AGREEMENT=0.7           # Pass threshold when grading against a returned frontier answer (candidate evidence only).
 HOMESERVER_DELEGATE_POLICY=off                # Production lane gate: off (default, behaviour-preserving) | shadow (compute/log allow|shadow|deny, do not change routing) | enforce (only certified verifier-backed lanes call local inference; shadow/deny escalates).
 HOMESERVER_DELEGATE_POLICY_MIN_SAMPLES=10     # exact task_type+model+verifier evidence floor before production allow
