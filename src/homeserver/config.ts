@@ -1,7 +1,12 @@
 import { loadEnv } from "../env.js";
 import type { ShadowLaneConfig } from "./shadow-lane.js";
+import {
+  DEFAULT_REVIEW_CASCADE_SHADOW,
+  type ReviewCascadeShadowConfig,
+} from "./review-cascade-shadow.js";
 
 export type { ShadowLaneConfig };
+export type { ReviewCascadeShadowConfig };
 
 /**
  * Home-server scaffold configuration.
@@ -321,6 +326,8 @@ export interface HomeserverConfig {
   delegatePolicy: DelegatePolicyConfig;
   /** #234: background candidate-evidence lane on router-escalated leaves. Default OFF. */
   shadowLane: ShadowLaneConfig;
+  /** #132: owner-only GPT-OSS → Qwen review measurement lane. Default OFF. */
+  reviewCascadeShadow: ReviewCascadeShadowConfig;
   /** Whether structured access logging is enabled ('on' | 'off'). Default: 'on'. */
   accessLog: "on" | "off";
   /**
@@ -741,6 +748,17 @@ export function loadConfig(): HomeserverConfig {
         0,
         1
       ),
+    },
+    reviewCascadeShadow: {
+      // Shadow is deliberately the only enabled value. There is no enforce mode in this config.
+      mode: process.env["HOMESERVER_REVIEW_CASCADE"] === "shadow" ? "shadow" : "off",
+      gptModel: process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] ?? DEFAULT_REVIEW_CASCADE_SHADOW.gptModel,
+      qwenModel: process.env["HOMESERVER_REVIEW_CASCADE_QWEN_MODEL"] ?? DEFAULT_REVIEW_CASCADE_SHADOW.qwenModel,
+      taskTypes: process.env["HOMESERVER_REVIEW_CASCADE_TASK_TYPES"] !== undefined
+        ? envList("HOMESERVER_REVIEW_CASCADE_TASK_TYPES")
+        : [...DEFAULT_REVIEW_CASCADE_SHADOW.taskTypes],
+      maxTokens: Math.max(1, Math.floor(envNum("HOMESERVER_REVIEW_CASCADE_MAX_TOKENS", DEFAULT_REVIEW_CASCADE_SHADOW.maxTokens))),
+      timeoutMs: Math.max(1, Math.floor(envNum("HOMESERVER_REVIEW_CASCADE_TIMEOUT_MS", DEFAULT_REVIEW_CASCADE_SHADOW.timeoutMs))),
     },
     accessLog: (process.env["HOMESERVER_ACCESS_LOG"] ?? "on") === "off" ? "off" : "on",
     ownerRequestLog:

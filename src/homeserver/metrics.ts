@@ -89,6 +89,11 @@ const codeLoopInterleavedTotal: LabelMap = new Map();
 // Content-blind: no path label (the path could echo an injection attempt).
 const codeLoopRelayDeniedTotal: LabelMap = new Map();
 
+// #132: strictly aggregate review-cascade evidence. Labels are terminal state only; candidate
+// claims, source text, model output, and caller identity are forbidden here.
+const reviewCascadeRunsTotal: LabelMap = new Map();
+let reviewCascadeGpuMsTotal = 0;
+
 // homeserver_code_loop_active — gauge: is a code_loop run currently in flight (0|1; single-flight).
 // Like the inflight gauge, it is only EXPOSED once code_loop has been touched, so a fresh box
 // (nothing recorded) still renders an empty /metrics body.
@@ -210,6 +215,15 @@ export function recordRequest(opts: RecordRequestOpts): void {
 export function recordTtft(model: string | null | undefined, ttftMs: number): void {
   if (!Number.isFinite(ttftMs) || ttftMs < 0) return;
   observeHistogram(ttftHistogram, modelLabel(model), ttftMs / 1000, TTFT_BUCKETS);
+}
+
+/** Record #132 shadow work without content or identity. */
+export function recordReviewCascade(row: {
+  terminal: "completed" | "skipped" | "candidate-invalid" | "adjudication-invalid" | "error";
+  gpuOccupancyMs: number;
+}): void {
+  incCounter(reviewCascadeRunsTotal, labelKey({ terminal: sanitizeLabel(row.terminal) }));
+  if (Number.isFinite(row.gpuOccupancyMs) && row.gpuOccupancyMs > 0) reviewCascadeGpuMsTotal += row.gpuOccupancyMs;
 }
 
 /**
@@ -456,6 +470,14 @@ export function renderMetrics(): string {
       "Requests the caged pi tried to send to a non-allowlisted gateway path (relay 403, not forwarded)",
       codeLoopRelayDeniedTotal
     ),
+    renderCounter(
+      "homeserver_review_cascade_runs_total",
+      "Owner-only shadow review-cascade runs by terminal state; contains no review content",
+      reviewCascadeRunsTotal
+    ),
+    reviewCascadeRunsTotal.size > 0
+      ? `# HELP homeserver_review_cascade_gpu_seconds_total Aggregate GPU occupancy of shadow review cascades\n# TYPE homeserver_review_cascade_gpu_seconds_total counter\nhomeserver_review_cascade_gpu_seconds_total ${(reviewCascadeGpuMsTotal / 1000).toFixed(3)}`
+      : "",
     codeLoopTouched
       ? `# HELP homeserver_code_loop_active Whether a code_loop run is currently in flight (0|1)\n# TYPE homeserver_code_loop_active gauge\nhomeserver_code_loop_active ${codeLoopActive}`
       : "",
@@ -496,6 +518,8 @@ export function resetMetrics(): void {
   codeLoopRunsTotal.clear();
   codeLoopInterleavedTotal.clear();
   codeLoopRelayDeniedTotal.clear();
+  reviewCascadeRunsTotal.clear();
+  reviewCascadeGpuMsTotal = 0;
   codeLoopActive = 0;
   codeLoopTouched = false;
   durationHistogram.buckets.clear();

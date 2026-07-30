@@ -1773,6 +1773,7 @@ async function handleDelegate(
   res: ServerResponse,
   effectiveMax: number,
   keyAlias: string,
+  ownerContent: boolean,
   lctx: LogCtx,
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
@@ -1838,6 +1839,9 @@ async function handleDelegate(
     minP: params.minP,
     source: "gateway",
     keyAlias,
+    // #132 must never inspect guest/legacy content. The extra keyHash guard mirrors owner-log.ts:
+    // only a deliberately minted owner key is a valid owner-content principal.
+    ownerContent,
     // #4: the stamp was structurally validated in parseDelegateBody and — on the live /delegate
     // route — semantically validated by validateHuginRequestStamp before handleDelegate ever runs.
     // raw_fingerprint.digest is the canonical logical-task identity; record it alongside (never
@@ -4011,7 +4015,14 @@ async function handleRequest(
       );
       const est = estimateTokens(raw, effectiveMax);
       await admitAndMeterLogged(res, cfg, controller, principal, null, est, lctx, () =>
-        handleDelegate(parsed.params, res, effectiveMax, principal.alias, lctx)
+        handleDelegate(
+          parsed.params,
+          res,
+          effectiveMax,
+          principal.alias,
+          principal.tier === "owner" && principal.keyHash !== null,
+          lctx
+        )
       );
       return;
     }

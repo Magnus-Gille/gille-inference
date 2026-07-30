@@ -22,7 +22,7 @@ import { getDb } from "../db.js";
  * idempotently in the shared eval DB, coexisting with runs / api_keys / etc.
  */
 
-export type OwnerLogRoute = "chat" | "mcp" | "audio" | "image";
+export type OwnerLogRoute = "chat" | "mcp" | "audio" | "image" | "review-cascade";
 
 export interface OwnerLogRow {
   /** Key alias of the owner principal (NOT the key hash). */

@@ -27,6 +27,12 @@ import {
   type ShadowInference,
   type ShadowLedgerRow,
 } from "./shadow-lane.js";
+import {
+  scheduleReviewCascadeShadow,
+  type ReviewCascadeAggregate,
+} from "./review-cascade-shadow.js";
+import { recordOwnerRequest } from "./owner-log.js";
+import { recordReviewCascade } from "./metrics.js";
 import type { HomeserverConfig } from "./config.js";
 import { recordTaskExposureBestEffort } from "./task-exposure.js";
 import type { HuginRequestStamp } from "./learning-task-contract.js";
@@ -89,6 +95,8 @@ export interface DelegationTask {
   source?: string;
   /** Authenticated gateway/MCP key alias when the caller has one. */
   keyAlias?: string | null;
+  /** True only for a real minted owner key; guests/legacy keys are prohibited from #132. */
+  ownerContent?: boolean;
   /**
    * Authoritative canonical logical-task fingerprint (#4), taken directly from an admitted
    * LearningTaskContract Hugin request stamp's `raw_fingerprint.digest` — the pre-context/system-
@@ -304,6 +312,69 @@ function maybeScheduleEscalationShadow(
               })
             : undefined;
         recordDelegation({ ...row, evidenceIdentity });
+      },
+    }
+  );
+}
+
+/**
+ * #132's two-stage lane is narrower than the general shadow lane: it can run only for a real
+ * owner request that supplied strictly line-addressable source. Its callback deliberately records
+ * aggregate metrics separately from the detailed owner record; no guest input reaches either
+ * model or the owner evidence table.
+ */
+function maybeScheduleReviewCascadeShadow(
+  task: DelegationTask,
+  outcome: DelegationOutcome,
+  cfg: HomeserverConfig
+): void {
+  if (outcome.nodeId !== "m5" || outcome.delegated || !outcome.escalate) return;
+  scheduleReviewCascadeShadow(
+    {
+      taskType: outcome.taskType,
+      ownerContent: task.ownerContent === true,
+      source: task.prompt,
+    },
+    {
+      config: cfg.reviewCascadeShadow,
+      queueDepth: () => activeDelegations,
+      infer: async (modelId, prompt, cascadeCfg) => {
+        const controller = new AbortController();
+        let timedOut = false;
+        const timer = setTimeout(() => { timedOut = true; controller.abort(); }, cascadeCfg.timeoutMs);
+        try {
+          const result = await runLmStudioInference(modelId, prompt, {
+            maxTokens: cascadeCfg.maxTokens,
+            temperature: 0,
+            signal: controller.signal,
+          });
+          if (timedOut) return { ok: false, error: `timeout after ${cascadeCfg.timeoutMs}ms` };
+          return result.ok
+            ? { ok: true, response: result.response, latencyMs: result.durationMs }
+            : { ok: false, error: result.error, latencyMs: result.durationMs };
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      recordAggregate: (row: ReviewCascadeAggregate) => recordReviewCascade(row),
+      recordOwnerDetails: (details) => {
+        // This callback is reachable only after ownerContent eligibility, which gateway.ts binds
+        // to tier=owner AND a real minted key. Keep content in this owner-only store, never metrics.
+        if (!task.keyAlias) return;
+        recordOwnerRequest({
+          alias: task.keyAlias,
+          model: cfg.reviewCascadeShadow.qwenModel,
+          route: "review-cascade",
+          messagesJson: JSON.stringify({ source: details.source, findings: details.findings }),
+          completion: JSON.stringify({ adjudications: details.adjudications }),
+          promptTokens: null,
+          completionTokens: null,
+          latencyMs: (details.gptLatencyMs ?? 0) + (details.qwenLatencyMs ?? 0),
+          tokPerSec: null,
+          outcome: "shadow",
+        });
       },
     }
   );
@@ -687,6 +758,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
   ): Promise<DelegationOutcome> => {
     const outcome = attachCostTrace(task, await callFrontier(task, base), cfg);
     maybeScheduleEscalationShadow(task, outcome, cfg);
+    maybeScheduleReviewCascadeShadow(task, outcome, cfg);
     return outcome;
   };
 
