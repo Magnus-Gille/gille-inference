@@ -154,6 +154,8 @@ export class AdmissionController {
   private ownerWaiters: Waiter[] = [];
   /** Per-key in-flight tracking for drainQueue re-check. Only populated for requests that carry a keyId. */
   private keyInflight = new Map<string, number>();
+  /** A single preemptible, lowest-priority measurement lease (never a caller request). */
+  private background: { abort: () => void; drained: Promise<void>; release: () => void } | null = null;
   private now: () => number;
 
   constructor(cfg: {
@@ -187,7 +189,14 @@ export class AdmissionController {
    * Resolves with a release() fn on admit; throws AdmissionRejected on guest-busy or
    * owner-queue-timeout. release() is idempotent.
    */
-  acquire(req: AdmissionRequest): Promise<() => void> {
+  async acquire(req: AdmissionRequest): Promise<() => void> {
+    // A real request always wins. Abort and drain background work before applying its ordinary
+    // owner/guest admission decision; this prevents a shadow job from causing a 503 or GPU swap.
+    if (this.background !== null) {
+      const background = this.background;
+      background.abort();
+      await background.drained;
+    }
     const decision = admit(this.state(), req, {
       ownerQueueMaxMs: this.ownerQueueMaxMs,
       retryAfterAtCapSeconds: this.retryAfterAtCapSeconds,
@@ -197,10 +206,10 @@ export class AdmissionController {
     if (decision.decision === "admit") {
       this.inflight++;
       this.incKeyInflight(req.keyId);
-      return Promise.resolve(this.makeRelease(req.keyId));
+      return this.makeRelease(req.keyId);
     }
     if (decision.decision === "reject") {
-      return Promise.reject(new AdmissionRejected(decision.retryAfterSeconds));
+      throw new AdmissionRejected(decision.retryAfterSeconds);
     }
     // queue (owner only)
     return new Promise<() => void>((resolve, reject) => {
@@ -211,6 +220,28 @@ export class AdmissionController {
       }, decision.maxWaitMs);
       this.ownerWaiters.push({ resolve, reject, timer, keyId: req.keyId, keyMaxParallel: req.keyMaxParallel });
     });
+  }
+
+  /**
+   * Reserve the GPU for best-effort measurement only if completely idle. The returned release
+   * must run once the work settles. Every later normal acquire aborts and awaits that release.
+   */
+  tryAcquireBackground(abort: () => void): (() => void) | null {
+    if (this.background !== null || this.inflight !== 0 || this.ownerWaiters.length !== 0) return null;
+    this.inflight++;
+    let released = false;
+    let resolveDrained!: () => void;
+    const drained = new Promise<void>((resolve) => { resolveDrained = resolve; });
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (this.background?.release === release) this.background = null;
+      this.inflight--;
+      resolveDrained();
+      this.drainQueue();
+    };
+    this.background = { abort, drained, release };
+    return release;
   }
 
   private incKeyInflight(keyId: string | undefined): void {

@@ -76,6 +76,29 @@ describe("admit() pure decision", () => {
 });
 
 describe("AdmissionController", () => {
+  it("preempts and drains a background lease before admitting a real request", async () => {
+    const ctrl = new AdmissionController({ maxInflight: 1, ownerQueueMaxMs: 5000, retryAfterAtCapSeconds: 2 });
+    let aborts = 0;
+    let releaseBackground!: () => void;
+    const release = ctrl.tryAcquireBackground(() => { aborts++; releaseBackground(); });
+    expect(release).not.toBeNull();
+    releaseBackground = release!;
+    expect(ctrl.snapshot().inflight).toBe(1);
+    const owner = ctrl.acquire(reqFor("owner"));
+    await Promise.resolve();
+    expect(aborts).toBe(1);
+    const releaseOwner = await owner;
+    expect(ctrl.snapshot().inflight).toBe(1);
+    releaseOwner();
+    expect(ctrl.snapshot().inflight).toBe(0);
+  });
+
+  it("does not reserve a background lease while real work is active", async () => {
+    const ctrl = new AdmissionController({ maxInflight: 1, ownerQueueMaxMs: 5000, retryAfterAtCapSeconds: 2 });
+    const owner = await ctrl.acquire(reqFor("owner"));
+    expect(ctrl.tryAcquireBackground(() => undefined)).toBeNull();
+    owner();
+  });
   it("guest rejects immediately at cap while owner queues then admits on release", async () => {
     const ctrl = new AdmissionController({
       maxInflight: 1,
