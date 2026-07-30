@@ -65,7 +65,9 @@ export interface ReviewCascadeShadowDeps {
   config: ReviewCascadeShadowConfig;
   /** Must count active real delegate work. Shadow work never reserves an admission slot. */
   queueDepth: () => number;
-  infer: (modelId: string, prompt: string, cfg: ReviewCascadeShadowConfig) => Promise<CascadeInference>;
+  /** Atomically reserve an idle, preemptible background slot. null means skip. */
+  acquireBackground: (abort: () => void) => (() => void) | null;
+  infer: (modelId: string, prompt: string, cfg: ReviewCascadeShadowConfig, signal: AbortSignal) => Promise<CascadeInference>;
   /** Aggregate-only: implementation must never persist source, findings, or identities. */
   recordAggregate: (aggregate: ReviewCascadeAggregate) => void;
   /** Called only after `ownerContent` eligibility succeeds. */
@@ -135,10 +137,16 @@ export function scheduleReviewCascadeShadow(job: ReviewCascadeShadowJob, deps: R
       deps.recordAggregate(aggregate("skipped"));
       return;
     }
+    const controller = new AbortController();
+    const release = deps.acquireBackground(() => controller.abort());
+    if (release === null) {
+      deps.recordAggregate(aggregate("skipped"));
+      return;
+    }
     running++;
     let occupancyMs = 0;
     try {
-      const recall = await deps.infer(deps.config.gptModel, buildRecallPrompt(job.source), deps.config);
+      const recall = await deps.infer(deps.config.gptModel, buildRecallPrompt(job.source), deps.config, controller.signal);
       occupancyMs += recall.latencyMs ?? 0;
       if (!recall.ok || recall.response === undefined) {
         deps.recordAggregate(aggregate("error", [], [], occupancyMs));
@@ -152,7 +160,8 @@ export function scheduleReviewCascadeShadow(job: ReviewCascadeShadowJob, deps: R
       const precision = await deps.infer(
         deps.config.qwenModel,
         buildAdjudicationPrompt(job.source, findings.findings),
-        deps.config
+        deps.config,
+        controller.signal
       );
       occupancyMs += precision.latencyMs ?? 0;
       if (!precision.ok || precision.response === undefined) {
@@ -177,6 +186,7 @@ export function scheduleReviewCascadeShadow(job: ReviewCascadeShadowJob, deps: R
       deps.recordAggregate(aggregate("error", [], [], occupancyMs));
     } finally {
       running--;
+      release();
     }
   })();
   pending.add(task);

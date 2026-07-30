@@ -3,7 +3,7 @@ import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import { listModels, loadModel, unloadModel, downloadModel } from "./model-admin.js";
-import { delegate, resolveTaskType } from "./orchestrator.js";
+import { delegate, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
@@ -34,12 +34,14 @@ import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-lo
 import { handleMcpPost } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
-import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, inflightInc, inflightDec, renderMetrics } from "./metrics.js";
+import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
 import { DegeneracyWatchdog } from "./degeneracy-watchdog.js";
 import { recordOwnerRequest } from "./owner-log.js";
+import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
+import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import { recordRequestLog, cachedRequestLogTotals } from "./request-log.js";
 import { canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
 import { isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
@@ -1774,6 +1776,8 @@ async function handleDelegate(
   effectiveMax: number,
   keyAlias: string,
   ownerContent: boolean,
+  cfg: HomeserverConfig,
+  controller: AdmissionController,
   lctx: LogCtx,
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
@@ -1839,9 +1843,6 @@ async function handleDelegate(
     minP: params.minP,
     source: "gateway",
     keyAlias,
-    // #132 must never inspect guest/legacy content. The extra keyHash guard mirrors owner-log.ts:
-    // only a deliberately minted owner key is a valid owner-content principal.
-    ownerContent,
     // #4: the stamp was structurally validated in parseDelegateBody and — on the live /delegate
     // route — semantically validated by validateHuginRequestStamp before handleDelegate ever runs.
     // raw_fingerprint.digest is the canonical logical-task identity; record it alongside (never
@@ -1866,6 +1867,11 @@ async function handleDelegate(
       ? {}
       : { learningTaskGatewayEcho }),
   });
+  // #132 is attached only after the caller response is formed. It is owner-only and its
+  // background lease is preempted/drained by every subsequent normal gateway admission.
+  if (ownerContent && result.nodeId === "m5" && !result.delegated && result.escalate) {
+    scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller);
+  }
   lctx.node = result.nodeId;
   lctx.model = result.modelId;
   const m = result.metrics;
@@ -1881,6 +1887,59 @@ async function handleDelegate(
     };
   }
   return { totalTokens: effectiveMax, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
+}
+
+function scheduleReviewCascadeAfterDelegate(
+  source: string,
+  keyAlias: string,
+  outcome: DelegationOutcome,
+  cfg: HomeserverConfig,
+  controller: AdmissionController
+): void {
+  scheduleReviewCascadeShadow(
+    { taskType: outcome.taskType, ownerContent: true, source },
+    {
+      config: cfg.reviewCascadeShadow,
+      queueDepth: () => controller.snapshot().inflight,
+      acquireBackground: (abort) => controller.tryAcquireBackground(abort),
+      infer: async (modelId, prompt, cascadeCfg, signal) => {
+        const call = new AbortController();
+        const propagate = () => call.abort();
+        signal.addEventListener("abort", propagate, { once: true });
+        const timer = setTimeout(() => call.abort(), cascadeCfg.timeoutMs);
+        try {
+          const result = await runLmStudioInference(modelId, prompt, {
+            maxTokens: cascadeCfg.maxTokens, temperature: 0, signal: call.signal,
+          });
+          return result.ok
+            ? { ok: true, response: result.response, latencyMs: result.durationMs }
+            : { ok: false, error: result.error, latencyMs: result.durationMs };
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        } finally {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", propagate);
+        }
+      },
+      recordAggregate: recordReviewCascade,
+      recordOwnerDetails: (details) => {
+        // Existing owner-log kill switch applies to ALL detailed cascade evidence.
+        if (cfg.ownerRequestLog !== "on") return;
+        recordOwnerRequest({
+          alias: keyAlias,
+          model: cfg.reviewCascadeShadow.qwenModel,
+          route: "review-cascade",
+          messagesJson: JSON.stringify({ source: details.source, findings: details.findings }),
+          completion: JSON.stringify({ adjudications: details.adjudications }),
+          promptTokens: null,
+          completionTokens: null,
+          latencyMs: (details.gptLatencyMs ?? 0) + (details.qwenLatencyMs ?? 0),
+          tokPerSec: null,
+          outcome: "shadow",
+        });
+      },
+    }
+  );
 }
 
 // ─── Speech-to-text (OpenAI /v1/audio/transcriptions) ─────────────────────────────────
@@ -4021,6 +4080,8 @@ async function handleRequest(
           effectiveMax,
           principal.alias,
           principal.tier === "owner" && principal.keyHash !== null,
+          cfg,
+          controller,
           lctx
         )
       );

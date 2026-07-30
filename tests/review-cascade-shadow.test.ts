@@ -21,6 +21,7 @@ describe("review cascade shadow lane", () => {
     let calls = 0;
     scheduleReviewCascadeShadow({ taskType: "code-review", ownerContent: true, source: "not-labelled" }, {
       config: cfg, queueDepth: () => 0,
+      acquireBackground: () => () => undefined,
       infer: async () => { calls++; return { ok: true, response: candidate }; },
       recordAggregate: () => undefined, recordOwnerDetails: () => undefined,
     });
@@ -34,6 +35,7 @@ describe("review cascade shadow lane", () => {
     const details: unknown[] = [];
     const returned = scheduleReviewCascadeShadow({ taskType: "code-review", ownerContent: true, source }, {
       config: cfg, queueDepth: () => 0,
+      acquireBackground: () => () => undefined,
       infer: async (model) => { calls.push(model); return { ok: true, response: model === cfg.gptModel ? candidate : decision, latencyMs: 10 }; },
       recordAggregate: (row) => totals.push(row), recordOwnerDetails: (row) => details.push(row),
     });
@@ -48,6 +50,18 @@ describe("review cascade shadow lane", () => {
     let calls = 0;
     scheduleReviewCascadeShadow({ taskType: "code-review", ownerContent: true, source }, {
       config: cfg, queueDepth: () => 1,
+      acquireBackground: () => () => undefined,
+      infer: async () => { calls++; return { ok: true, response: candidate }; },
+      recordAggregate: () => undefined, recordOwnerDetails: () => undefined,
+    });
+    await reviewCascadeShadowIdle();
+    expect(calls).toBe(0);
+  });
+
+  it("skips when gateway background admission cannot reserve an idle slot", async () => {
+    let calls = 0;
+    scheduleReviewCascadeShadow({ taskType: "code-review", ownerContent: true, source }, {
+      config: cfg, queueDepth: () => 0, acquireBackground: () => null,
       infer: async () => { calls++; return { ok: true, response: candidate }; },
       recordAggregate: () => undefined, recordOwnerDetails: () => undefined,
     });
