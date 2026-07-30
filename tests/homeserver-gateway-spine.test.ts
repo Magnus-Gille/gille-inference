@@ -701,6 +701,7 @@ describe("gateway spine — HTTP integration", () => {
     // The mock's "ok" is deliberately invalid candidate JSON. One GPT recall call proves the
     // cascade ran; the invalid output prevents a second precision call.
     expect(upstreamInferenceRequestCount).toBe(1);
+    expect(JSON.parse(lastUpstreamBody)).toMatchObject({ response_format: { type: "json_object" } });
     const metrics = await (await fetch(url("/metrics"), {
       headers: { authorization: `Bearer ${owner.plaintextKey}` },
     })).text();

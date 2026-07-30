@@ -1917,7 +1917,10 @@ function scheduleReviewCascadeAfterDelegate(
         const timer = setTimeout(() => call.abort(), cascadeCfg.timeoutMs);
         try {
           const result = await runLmStudioInference(modelId, prompt, {
-            maxTokens: cascadeCfg.maxTokens, temperature: 0, signal: call.signal,
+            maxTokens: cascadeCfg.maxTokens,
+            temperature: 0,
+            responseFormat: { type: "json_object" },
+            signal: call.signal,
           });
           return result.ok
             ? { ok: true, response: result.response, latencyMs: result.durationMs }
