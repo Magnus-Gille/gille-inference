@@ -38,6 +38,13 @@ assertEqual(
   readFileSync(join(repoRoot, "LICENSE"), "utf8"),
   "packaged license text",
 );
+const readme = readFileSync(join(clientDir, "README.md"), "utf8");
+if (!readme.includes('npx --package gille-inference hs ask "What is the capital of France?"')) {
+  fail("README zero-install example must select the hs binary explicitly");
+}
+if (readme.includes("npx gille-inference")) {
+  fail("README must not use npm exec's ambiguous package-name command form");
+}
 
 const cache = mkdtempSync(join(tmpdir(), "gille-inference-client-pack-"));
 try {
@@ -65,6 +72,30 @@ try {
   for (const binary of ["hs.mjs", "m5.mjs"]) {
     const file = files.find((entry) => entry.path === binary);
     if (!file || (file.mode & 0o111) === 0) fail(`${binary} must be executable in the tarball`);
+  }
+
+  const archiveOutput = execFileSync("npm", ["pack", "--json", clientDir], {
+    cwd: cache,
+    encoding: "utf8",
+    env: { ...process.env, npm_config_cache: cache },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const archives = JSON.parse(archiveOutput);
+  if (!Array.isArray(archives) || archives.length !== 1 || typeof archives[0]?.filename !== "string") {
+    fail("npm pack did not produce a local tarball for the zero-install smoke test");
+  }
+  const help = execFileSync(
+    "npm",
+    ["exec", "--offline", "--yes", "--package", join(cache, archives[0].filename), "--", "hs", "--help"],
+    {
+      cwd: cache,
+      encoding: "utf8",
+      env: { ...process.env, npm_config_cache: cache },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (!help.includes("hs — Gille Inference CLI")) {
+    fail("zero-install hs smoke test did not execute the packaged hs binary");
   }
 } finally {
   rmSync(cache, { recursive: true, force: true });
