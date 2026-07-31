@@ -466,6 +466,7 @@ describe("GET /portal/me", () => {
     const j = (await res.json()) as {
       alias: string;
       tier: string;
+      scope: string;
       models: string[];
       creditLimit: number;
       creditsUsed: number;
@@ -473,6 +474,7 @@ describe("GET /portal/me", () => {
       tpm: number;
     };
     expect(j.tier).toBe("guest");
+    expect(j.scope).toBe("inference");
     expect(j.creditLimit).toBe(9000);
     expect(j.creditsUsed).toBe(1234);
     expect(j.models).toEqual(["m1"]);

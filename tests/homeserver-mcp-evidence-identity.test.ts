@@ -108,6 +108,7 @@ function makePrincipal(rec: ReturnType<typeof lookupKey>) {
   return {
     alias: rec!.alias,
     tier: rec!.tier,
+    scope: rec!.scope,
     modelAllowList: rec!.modelAllowList,
     limits: { rpm: rec!.rpm, tpm: rec!.tpm, dailyTokenBudget: rec!.dailyTokenBudget },
     maxParallel: rec!.maxParallel,

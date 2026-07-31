@@ -2,13 +2,14 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 
 /**
- * Owner gating for the code_loop_* MCP tools (docs/agentic-code-tool-design.md §6, §11 test 1).
+ * Owner-agent gating for the code_loop_* MCP tools (docs/agentic-code-tool-design.md §6, §11).
  *
- * The gate is the exact owner_request_log guard: tier === "owner" && keyHash !== null.
+ * The gate combines the owner-content guard with explicit agent/admin route scope.
  *   • A minted OWNER key sees the three tools in tools/list.
+ *   • A minted owner-tier AGENT key sees them but cannot use operator routes.
  *   • A GUEST key never sees them, and calling one returns the BYTE-IDENTICAL unknown-tool
  *     error a genuinely unknown tool produces — invisible, not just forbidden.
  *   • A legacy static ADMIN key (tier owner but keyHash === null) is ALSO excluded.
@@ -25,6 +26,9 @@ const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 
 const STATIC_ADMIN_KEY = "legacy-static-admin-key-for-code-loop-gate-test";
 
 let ownerKey = "";
+let agentKey = "";
+let inferenceOwnerKey = "";
+let legacyNullScopeOwnerKey = "";
 let guestKey = "";
 
 beforeAll(async () => {
@@ -45,6 +49,22 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   ownerKey = ks.mintKey({ alias: "cl-owner", tier: "owner" }, DEFAULTS).plaintextKey;
+  agentKey = ks.mintKey(
+    { alias: "cl-agent", tier: "owner", scope: "agent" },
+    DEFAULTS
+  ).plaintextKey;
+  inferenceOwnerKey = ks.mintKey(
+    { alias: "cl-owner-inference", tier: "owner", scope: "inference" },
+    DEFAULTS
+  ).plaintextKey;
+  const legacyNullScopeOwner = ks.mintKey(
+    { alias: "cl-owner-legacy-null", tier: "owner" },
+    DEFAULTS
+  );
+  legacyNullScopeOwnerKey = legacyNullScopeOwner.plaintextKey;
+  getDb()
+    .prepare("UPDATE api_keys SET scope = NULL WHERE alias = ?")
+    .run(legacyNullScopeOwner.record.alias);
   guestKey = ks.mintKey({ alias: "cl-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   const gw = await import("../src/homeserver/gateway.js");
@@ -137,6 +157,13 @@ describe("code_loop_* visibility in tools/list", () => {
     expect(names).toContain("ask");
   });
 
+  it("a least-privilege AGENT key sees ask and all three code_loop tools", async () => {
+    const names = await listedToolNames(agentKey);
+    expect(names).toContain("list_models");
+    expect(names).toContain("ask");
+    for (const t of CODE_LOOP_TOOLS) expect(names).toContain(t);
+  });
+
   it("puts owner-only delegation instructions in initialize and never leaks them to guests", async () => {
     expect(String((await initialized(ownerKey))["instructions"])).toMatch(/self-contained.*seed-file/i);
     expect((await initialized(guestKey))["instructions"]).toBeUndefined();
@@ -194,9 +221,142 @@ describe("code_loop_* visibility in tools/list", () => {
     for (const t of CODE_LOOP_TOOLS) expect(names).not.toContain(t);
   });
 
+  it("an owner-tier INFERENCE key sees none of them", async () => {
+    const names = await listedToolNames(inferenceOwnerKey);
+    for (const t of CODE_LOOP_TOOLS) expect(names).not.toContain(t);
+  });
+
+  it("a legacy owner key with a null stored scope keeps admin compatibility", async () => {
+    const names = await listedToolNames(legacyNullScopeOwnerKey);
+    for (const t of CODE_LOOP_TOOLS) expect(names).toContain(t);
+  });
+
   it("a legacy static ADMIN (owner tier, keyHash null) sees none of them", async () => {
     const names = await listedToolNames(STATIC_ADMIN_KEY);
     for (const t of CODE_LOOP_TOOLS) expect(names).not.toContain(t);
+  });
+});
+
+describe("agent scope cannot use operator routes", () => {
+  it("reports owner privacy/admission tier separately from non-admin agent scope", async () => {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/portal/me`, {
+      headers: { authorization: `Bearer ${agentKey}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      alias: "cl-agent",
+      tier: "owner",
+      scope: "agent",
+    });
+  });
+
+  it.each([
+    ["GET", "/admin/keys", undefined],
+    ["POST", "/admin/models/load", JSON.stringify({ modelKey: "never-load" })],
+    ["POST", "/delegate", JSON.stringify({ prompt: "must not write ledger evidence" })],
+    ["GET", "/ledger", undefined],
+  ])("%s %s returns route_not_allowed", async (method, path, body) => {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${agentKey}`,
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      body,
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      error: { code: "route_not_allowed" },
+    });
+  });
+
+  it("is admitted as owner traffic while a guest is refused during maintenance", async () => {
+    const maintenanceUrl = `http://127.0.0.1:${gatewayPort}/admin/maintenance`;
+    const chatUrl = `http://127.0.0.1:${gatewayPort}/v1/chat/completions`;
+    const chatBody = JSON.stringify({
+      model: "m1",
+      messages: [{ role: "user", content: "hello" }],
+    });
+
+    const enabled = await fetch(maintenanceUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${STATIC_ADMIN_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ on: true }),
+    });
+    expect(enabled.status).toBe(200);
+
+    try {
+      const guest = await fetch(chatUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${guestKey}`,
+          "content-type": "application/json",
+        },
+        body: chatBody,
+      });
+      expect(guest.status).toBe(503);
+
+      const agent = await fetch(chatUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${agentKey}`,
+          "content-type": "application/json",
+        },
+        body: chatBody,
+      });
+      // Port 9 has no upstream. Reaching the upstream error proves the owner-tier
+      // agent passed maintenance admission instead of being treated as a guest.
+      expect(agent.status).toBe(502);
+    } finally {
+      const disabled = await fetch(maintenanceUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${STATIC_ADMIN_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ on: false }),
+      });
+      expect(disabled.status).toBe(200);
+    }
+  });
+
+  it("allows an admin to mint an agent-scoped credential over HTTP", async () => {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/admin/keys`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${STATIC_ADMIN_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        alias: "cl-http-agent",
+        tier: "owner",
+        scope: "agent",
+      }),
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({
+      record: {
+        alias: "cl-http-agent",
+        tier: "owner",
+        scope: "agent",
+      },
+    });
+  });
+});
+
+describe("legacy null-scope owner compatibility", () => {
+  it.each([
+    ["GET", "/admin/keys"],
+    ["GET", "/ledger"],
+  ])("%s %s remains allowed", async (method, path) => {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${legacyNullScopeOwnerKey}` },
+    });
+    expect(response.status).toBe(200);
   });
 });
 
@@ -224,6 +384,10 @@ describe("code_loop_* calls by non-owners — byte-identical unknown-tool error"
 
   it("guest calling code_loop_result", async () => {
     await assertByteIdentical(guestKey, "code_loop_result");
+  });
+
+  it("owner-tier inference key calling code_loop_start", async () => {
+    await assertByteIdentical(inferenceOwnerKey, "code_loop_start");
   });
 
   it("legacy static admin (keyHash null) calling code_loop_start", async () => {

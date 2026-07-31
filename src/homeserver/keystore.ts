@@ -14,11 +14,23 @@ import { getDb } from "../db.js";
  */
 
 export type Tier = "owner" | "guest";
+/**
+ * Route authority carried by a key, independent of its privacy/admission tier.
+ *
+ * - admin: operator routes plus agent/inference surfaces
+ * - agent: bounded agent/inference surfaces, never operator routes
+ * - inference: ordinary inference surfaces only
+ *
+ * Existing rows predate this column. A null stored scope is interpreted as the
+ * legacy-compatible default for its tier (owner→admin, guest→inference).
+ */
+export type KeyScope = "admin" | "agent" | "inference";
 
 export interface ApiKeyRecord {
   alias: string;
   keyHash: string;
   tier: Tier;
+  scope: KeyScope;
   modelAllowList: string[]; // [] = all models allowed
   rpm: number;
   tpm: number;
@@ -48,6 +60,7 @@ export interface KeyDefaults {
 export interface MintOptions {
   alias: string;
   tier: Tier;
+  scope?: KeyScope;
   modelAllowList?: string[];
   rpm?: number;
   tpm?: number;
@@ -95,6 +108,30 @@ export class InvalidParamError extends Error {
     super(`'${param}' must be a non-negative integer (got ${String(value)})`);
     this.name = "InvalidParamError";
   }
+}
+
+/** Thrown when a requested route scope is incompatible with the key's trust tier. */
+export class InvalidScopeError extends Error {
+  constructor(public tier: Tier, public scope: KeyScope) {
+    super(
+      `tier '${tier}' cannot carry '${scope}' scope`
+      + (tier === "guest" ? "; use scope 'inference' for guest keys" : "")
+    );
+    this.name = "InvalidScopeError";
+  }
+}
+
+/** Preserve the authority of keys minted before explicit route scopes existed. */
+export function defaultScopeForTier(tier: Tier): KeyScope {
+  return tier === "owner" ? "admin" : "inference";
+}
+
+function storedScope(tier: Tier, value: string | null): KeyScope {
+  if (value === null) return defaultScopeForTier(tier);
+  if (value === "inference") return value;
+  if (tier === "owner" && (value === "admin" || value === "agent")) return value;
+  // A malformed or tier-incompatible stored value must not expand authority.
+  return "inference";
 }
 
 /**
@@ -167,6 +204,9 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("logical_alias")) {
       db.exec(`ALTER TABLE api_keys ADD COLUMN logical_alias TEXT`);
     }
+    if (!names.has("scope")) {
+      db.exec(`ALTER TABLE api_keys ADD COLUMN scope TEXT`);
+    }
     // The index backs rotateKey's family lookup (no full scan under the write lock). Created
     // UNCONDITIONALLY (IF NOT EXISTS) — NOT only alongside the column-add — so a DB that already
     // has the column but is missing the index (partial/manual migration) still gets it. (Codex #99.)
@@ -188,6 +228,7 @@ interface KeyRow {
   alias: string;
   key_hash: string;
   tier: string;
+  scope: string | null;
   model_allow_list: string;
   rpm: number;
   tpm: number;
@@ -202,10 +243,12 @@ interface KeyRow {
 }
 
 function rowToRecord(r: KeyRow): ApiKeyRecord {
+  const tier = r.tier as Tier;
   return {
     alias: r.alias,
     keyHash: r.key_hash,
-    tier: r.tier as Tier,
+    tier,
+    scope: storedScope(tier, r.scope),
     modelAllowList: JSON.parse(r.model_allow_list) as string[],
     rpm: r.rpm,
     tpm: r.tpm,
@@ -245,6 +288,10 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
   assertNonNegativeInt("dailyTokenBudget", opts.dailyTokenBudget);
   assertNonNegativeInt("maxParallel", opts.maxParallel);
   assertNonNegativeInt("ttlSeconds", opts.ttlSeconds);
+  const scope = opts.scope ?? defaultScopeForTier(opts.tier);
+  if (opts.tier === "guest" && scope !== "inference") {
+    throw new InvalidScopeError(opts.tier, scope);
+  }
 
   const db = ksDb();
   const plaintextKey = `hs_${opts.tier}_${randomBytes(32).toString("base64url")}`;
@@ -260,6 +307,7 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
     alias: opts.alias,
     keyHash,
     tier: opts.tier,
+    scope,
     modelAllowList: opts.modelAllowList ?? [],
     rpm: opts.rpm ?? defaults.rpm,
     tpm: opts.tpm ?? defaults.tpm,
@@ -276,15 +324,16 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
   try {
     db.prepare(
       `INSERT INTO api_keys
-         (alias, key_hash, tier, model_allow_list, rpm, tpm, daily_token_budget,
+         (alias, key_hash, tier, scope, model_allow_list, rpm, tpm, daily_token_budget,
           max_parallel, credit_limit, credits_used, expires_at, created_at, revoked_at, logical_alias)
        VALUES
-         (@alias, @keyHash, @tier, @modelAllowList, @rpm, @tpm, @dailyTokenBudget,
+         (@alias, @keyHash, @tier, @scope, @modelAllowList, @rpm, @tpm, @dailyTokenBudget,
           @maxParallel, @creditLimit, @creditsUsed, @expiresAt, @createdAt, @revokedAt, @logicalAlias)`
     ).run({
       alias: record.alias,
       keyHash: record.keyHash,
       tier: record.tier,
+      scope: record.scope,
       modelAllowList: JSON.stringify(record.modelAllowList),
       rpm: record.rpm,
       tpm: record.tpm,
@@ -446,6 +495,7 @@ export function rotateKey(
         `rotate: no prior key for '${logicalAlias}' to inherit from — pass --tier owner|guest`
       );
     }
+    const scope = opts.scope ?? current?.scope ?? defaultScopeForTier(tier);
 
     const allAliases = new Set(
       (db.prepare(`SELECT alias FROM api_keys`).all() as Array<{ alias: string }>).map((r) => r.alias)
@@ -468,6 +518,7 @@ export function rotateKey(
         alias: newAlias,
         logicalAlias,
         tier,
+        scope,
         modelAllowList: opts.modelAllowList ?? current?.modelAllowList,
         rpm: opts.rpm ?? current?.rpm,
         tpm: opts.tpm ?? current?.tpm,

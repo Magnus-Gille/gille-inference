@@ -149,8 +149,9 @@ export interface GatewayRelay {
 
 /**
  * The gateway paths the caged pi is allowed to reach through the relay — the SECURITY BOUNDARY
- * of the one egress hole. The service key is owner-tier (⇒ isAdmin on the gateway), so a RAW
- * byte-pipe would let a prompt-injected pi POST /admin/keys (persist a key), unload models, toggle
+ * of the one egress hole. The service key is owner-tier and should carry agent scope; the relay
+ * still treats a legacy/admin-scoped key as possible during migration. A RAW byte-pipe could let
+ * a prompt-injected pi POST /admin/keys (persist a key), unload models, toggle
  * maintenance, revoke keys — nullifying the cage's egress win. This allowlist restricts the relay
  * to the two routes pi legitimately needs plus the unauthenticated liveness probe the cage
  * self-test uses; everything else is 403'd WITHOUT contacting upstream.

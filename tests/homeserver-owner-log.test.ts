@@ -85,6 +85,7 @@ let stopGateway: (() => Promise<void>) | null = null;
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 
 let ownerKey = "";
+let agentKey = "";
 let guestKey = "";
 
 beforeAll(async () => {
@@ -113,6 +114,10 @@ beforeAll(async () => {
   getOwnerLog(1);
 
   ownerKey = mintKey({ alias: "ol-owner", tier: "owner" }, DEFAULTS).plaintextKey;
+  agentKey = mintKey(
+    { alias: "ol-agent", tier: "owner", scope: "agent" },
+    DEFAULTS
+  ).plaintextKey;
   guestKey = mintKey({ alias: "ol-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   const gw = await import("../src/homeserver/gateway.js");
@@ -172,6 +177,20 @@ describe("owner non-streaming chat is fully logged", () => {
     expect(row.completion).toBe(NONSTREAM_COMPLETION);
     expect(row.promptTokens).toBe(5);
     expect(row.completionTokens).toBe(5);
+  });
+
+  it("an agent-scope owner key retains deliberate owner-content logging", async () => {
+    const marker = "AGENT_SCOPE_OWNER_LOG_MARKER";
+    expect(rowsWithMarker(marker)).toBe(0);
+
+    const res = await chat(agentKey, marker, false);
+    expect(res.status).toBe(200);
+
+    expect(rowsWithMarker(marker)).toBe(1);
+    const row = getOwnerLog(50).find((e) => e.messagesJson.includes(marker))!;
+    expect(row.alias).toBe("ol-agent");
+    expect(row.route).toBe("chat");
+    expect(row.completion).toBe(NONSTREAM_COMPLETION);
   });
 });
 

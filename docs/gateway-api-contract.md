@@ -25,12 +25,19 @@ Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-rou
 
 ## Auth model
 
-Per-key Bearer tokens (`Authorization: Bearer <key>`), hashed in the keystore, each with a tier and an allow-list:
+Per-key Bearer tokens (`Authorization: Bearer <key>`), hashed in the keystore, each with a
+privacy/admission tier, route scope, and model allow-list:
 
-| Tier | Meaning |
-|------|---------|
-| `owner` | Full access incl. `/delegate` and `/admin/*`. Preempts guests for the serial GPU. |
-| `guest` | Inference only (`/v1/chat/completions`, `/models`). Guest → `/delegate` returns `403 route_not_allowed`; guest → `/admin/*` returns `403 route_not_allowed` (requireAdmin relabelled it in PR #39 — a route-permission failure, not a model-allow-list violation); guest → `/ledger` (and `/ledger/{id}`) also returns `403 route_not_allowed` (admin/monitor only, #7). |
+| Dimension | Value | Meaning |
+|---|---|---|
+| Tier | `owner` | Deliberate owner-content logging and owner-priority admission. |
+| Tier | `guest` | Content-blind guest admission; cannot carry privileged scopes. |
+| Scope | `admin` | Operator routes plus agent/inference surfaces. Legacy owner-key default. |
+| Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
+| Scope | `inference` | Ordinary inference only. Legacy guest-key default. |
+
+Tier does not imply admin authority. New harness credentials use `tier=owner, scope=agent`;
+existing owner rows without a stored scope resolve compatibly to `admin`.
 
 Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
 
@@ -48,7 +55,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 |------|----------------|-------|
 | 400 | `invalid_request_error`, `model_not_found` | Missing/invalid body field; **malformed JSON body**; unknown model; **malformed percent-encoding in a decoded path segment** (`/ledger/{id}`, `/v1/images/generations/jobs/{id}`, `/admin/keys/{alias}`) — a decode failure is a client-input error, not a missing resource, so it 400s rather than 404ing or 500ing (#229) |
 | 401 | `invalid_api_key` | Missing/unknown Bearer key |
-| 403 | `route_not_allowed` (guest → `/delegate`, `/admin/*`, `/ledger`), `model_not_allowed` (a key's model allow-list on chat) | Tier/route or model not permitted |
+| 403 | `route_not_allowed` (guest → `/delegate`; non-admin scope → `/admin/*` or `/ledger`), `model_not_allowed` (a key's model allow-list on chat) | Scope/tier/route or model not permitted |
 | 404 | `not_found` | Unknown route / no such resource |
 | 409 | `learning_task_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity |
 | 413 | `payload_too_large` | Request body exceeds the size cap |
@@ -75,10 +82,10 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio) |
-| POST | `/delegate` | owner | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
-| POST | `/admin/models/load` | owner | Load a model (modelKey **syntax** validated) |
-| POST | `/admin/models/unload` | owner | Unload one/all models |
-| POST | `/admin/models/download` | owner | Download a model (fire-and-forget; modelKey **syntax** validated) |
+| POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
+| POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
+| POST | `/admin/models/unload` | admin scope | Unload one/all models |
+| POST | `/admin/models/download` | admin scope | Download a model (fire-and-forget; modelKey **syntax** validated) |
 
 ### GET `/healthz`
 
@@ -315,8 +322,8 @@ and `getLaneEvidence()` (the production-routing evidence path).
 
 For tenant onboarding, mint named keys and use the alias as the audit identity. Guest-tier
 keys are the standard default for ordinary inference/MCP surfaces; owner-only surfaces such
-as `POST /delegate` require a named owner-tier key if a tenant validation run must exercise
-that route. `recent[].keyAlias` is nullable for CLI/probe/imported evidence and for legacy
+as `POST /delegate` require a named admin-scope owner key if a tenant validation run must
+exercise that route. `recent[].keyAlias` is nullable for CLI/probe/imported evidence and for legacy
 rows created before the alias column existed.
 
 ### GET `/ledger/{id}` (#227)
@@ -382,7 +389,7 @@ Poll an async job. **Scoped to the creator** — a non-owner or unknown id retur
 
 Cancel + refund a job, **idempotent**. Scoped to the creator (`404` otherwise). Body: `{ id, status }`. Malformed percent-encoding in `{id}` → `400 invalid_request_error` rather than a 500 (#229).
 
-### POST `/delegate` (owner only)
+### POST `/delegate` (owner-admin only)
 
 Ledger-gated one-shot delegation: classify task type → consult ledger → run a local model → record a ledger row. The handler accepts `modelId` (pin the local model), `frontierModelId` (run a frontier-fallback arm via OpenRouter), and a `verifier` **spec** that attaches a deterministic pass/fail grader — so a delegated run produces a real ledger verdict (`pass`/`fail`) instead of `unverified`, which is what lets the ledger actually *learn* from nightly traffic (#14, ADR-004).
 
@@ -457,7 +464,7 @@ explicitly ineligible for joined learning-task evidence.
 `costTrace.verifiedSavings*` is zero unless the local verifier returns `pass`; see
 `docs/delegation-cost-accounting.md` for the accounting rules and env knobs.
 
-### POST `/admin/models/{load,unload,download}` (owner only)
+### POST `/admin/models/{load,unload,download}` (admin scope only)
 
 - **load** — body `{ modelKey: string, contextLength?, parallel?, gpu?: "max"|"off"|"0".."1", ttlSeconds? }` → `LoadResult { ok, modelKey, identifier, contextLength?, durationMs, message }` (200 ok / 500 fail; missing `modelKey` → `400 invalid_request_error`, `param: "modelKey"`).
 - **unload** — body `{ modelKey?: string }` (omit → unload all) → `{ ok, message }`.
@@ -472,7 +479,7 @@ explicitly ineligible for joined learning-task evidence.
 1. **Liveness:** `GET /healthz` before routing to the M5 node.
 2. **Capability check:** `GET /ledger` (verdict per task_type) + `GET /models` (loaded/vision/tool-use) decide *whether* the M5 can take a sub-task. `delegate-local` → send it; `escalate-frontier` → keep it on a frontier model; `explore` → send a probe.
 3. **Dispatch:**
-   - **Ledger-gated sub-tasks** (nightly local work, verifiable one-shots) → stamped `POST /delegate` (owner key). Attach the current preflight and stamp plus a `verifier` spec (and optionally `modelId`/`frontierModelId`) so the run is joinable and records a real `pass`/`fail` verdict; pass `delegatorModelId` so savings are estimated against the actual cloud brain. An unstamped call remains a legacy compatibility path and is not eligible for joined learning-task evidence. Omit the verifier and the run records `unverified`; a later trusted grade becomes capability evidence only through the gateway/repo's defined evidence-import path. Hugin may retain its operational outcome, but must not create a competing capability ledger. Verified savings stays zero until trusted evidence lands.
+   - **Ledger-gated sub-tasks** (nightly local work, verifiable one-shots) → stamped `POST /delegate` (admin-scope owner key). Attach the current preflight and stamp plus a `verifier` spec (and optionally `modelId`/`frontierModelId`) so the run is joinable and records a real `pass`/`fail` verdict; pass `delegatorModelId` so savings are estimated against the actual cloud brain. An unstamped call remains a legacy compatibility path and is not eligible for joined learning-task evidence. Omit the verifier and the run records `unverified`; a later trusted grade becomes capability evidence only through the gateway/repo's defined evidence-import path. Hugin may retain its operational outcome, but must not create a competing capability ledger. Verified savings stays zero until trusted evidence lands.
    - **Raw inference** (chat, streaming, agent inner loops) → `POST /v1/chat/completions`.
 4. **Backpressure:** honor `429` (quota) and `503` + `Retry-After` (owner preemption) — surface as a route-elsewhere or retry signal, never a hard error to the user.
 

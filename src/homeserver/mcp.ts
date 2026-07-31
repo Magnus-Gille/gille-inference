@@ -19,6 +19,7 @@ import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
+import type { KeyScope } from "./keystore.js";
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
 // deriveEvidenceIdentity doc comment for why this is lane-agnostic and safe to share.
 import { deriveEvidenceIdentity } from "./orchestrator.js";
@@ -46,6 +47,7 @@ import { deriveEvidenceIdentity } from "./orchestrator.js";
 export interface McpPrincipal {
   alias: string;
   tier: "owner" | "guest";
+  scope: KeyScope;
   modelAllowList: string[];
   limits: { rpm: number; tpm: number; dailyTokenBudget: number };
   maxParallel: number;
@@ -100,22 +102,26 @@ const ASK_DESCRIPTION =
   "`files` is always rejected, never silently ignored.";
 
 const CODE_LOOP_OWNER_INSTRUCTIONS =
-  "code_loop is OWNER-ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
+  "code_loop is OWNER-AGENT ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
 
 /**
- * The code_loop owner gate — the EXACT owner_request_log guard (owner-log.ts:13 /
- * gateway.ts): a real minted OWNER key. EXCLUDES implicit-admin and legacy static admins
- * (both keyHash === null). The tools are invisible to anyone this returns false for.
+ * The code_loop owner-agent gate. A real minted owner key preserves the deliberate
+ * owner-content/privacy boundary; agent or admin scope supplies route authority. Implicit-admin,
+ * legacy static admins (both keyHash === null), inference scope, and guests are excluded.
  */
 function isCodeLoopOwner(principal: McpPrincipal): boolean {
-  return principal.tier === "owner" && principal.keyHash !== null;
+  return (
+    principal.tier === "owner"
+    && principal.keyHash !== null
+    && (principal.scope === "admin" || principal.scope === "agent")
+  );
 }
 
 /**
  * Static tool catalogue. inputSchemas are fixed; the *visible model set* is conveyed at call
  * time (list_models) and enforced server-side (ask), not by mutating these schemas. The
- * owner-only code_loop_* tools (#116) are appended ONLY for a real minted owner key — a guest
- * never sees them in tools/list.
+ * owner-agent code_loop_* tools (#116) are appended only for a real minted owner key carrying
+ * agent or admin scope — everyone else never sees them in tools/list.
  */
 function toolDefs(principal: McpPrincipal): unknown[] {
   const base: unknown[] = [

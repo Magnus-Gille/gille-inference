@@ -22,6 +22,8 @@ import {
   KeyAliasExistsError,
   InviteInvalidError,
   InvalidParamError,
+  InvalidScopeError,
+  type KeyScope,
   type Tier,
 } from "./keystore.js";
 import { checkQuota, recordUsage, checkRateWindow, type QuotaLimits, type QuotaReservation } from "./quota.js";
@@ -123,6 +125,7 @@ interface PrincipalContext {
   /** Stable owner identity shared by a key-rotation family. */
   logicalAlias: string;
   tier: Tier;
+  scope: KeyScope;
   isAdmin: boolean;
   /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models. */
   isMonitor?: boolean;
@@ -186,6 +189,7 @@ function resolvePrincipal(
         alias: "static:admin",
         logicalAlias: "static:admin",
         tier: "owner",
+        scope: "admin",
         isAdmin: true,
         modelAllowList: [],
         limits: keyLimits(cfg),
@@ -205,7 +209,8 @@ function resolvePrincipal(
       alias: rec.alias,
       logicalAlias: rec.logicalAlias ?? rec.alias,
       tier: rec.tier,
-      isAdmin: rec.tier === "owner",
+      scope: rec.scope,
+      isAdmin: rec.scope === "admin",
       modelAllowList: rec.modelAllowList,
       limits: { rpm: rec.rpm, tpm: rec.tpm, dailyTokenBudget: rec.dailyTokenBudget },
       maxParallel: rec.maxParallel,
@@ -221,6 +226,7 @@ function resolvePrincipal(
       alias: "static:admin",
       logicalAlias: "static:admin",
       tier: "owner",
+      scope: "admin",
       isAdmin: true,
       modelAllowList: [],
       limits: keyLimits(cfg),
@@ -237,6 +243,7 @@ function resolvePrincipal(
       alias: "static:user",
       logicalAlias: "static:user",
       tier: "guest",
+      scope: "inference",
       isAdmin: false,
       modelAllowList: [],
       limits: keyLimits(cfg),
@@ -255,6 +262,7 @@ function resolvePrincipal(
       alias: "static:monitor",
       logicalAlias: "static:monitor",
       tier: "guest",
+      scope: "inference",
       isAdmin: false,
       isMonitor: true,
       modelAllowList: [],
@@ -2748,6 +2756,7 @@ async function handleKeysMint(
   const body = JSON.parse(await readBody(req)) as {
     alias?: string;
     tier?: Tier;
+    scope?: KeyScope;
     modelAllowList?: string[];
     rpm?: number;
     tpm?: number;
@@ -2756,8 +2765,17 @@ async function handleKeysMint(
     creditLimit?: number;
     ttlSeconds?: number;
   };
-  if (!body.alias || (body.tier !== "owner" && body.tier !== "guest")) {
-    sendError(res, makeError("invalid_request_error", { message: "Require 'alias' and 'tier' (owner|guest)." }));
+  if (
+    !body.alias
+    || (body.tier !== "owner" && body.tier !== "guest")
+    || (body.scope !== undefined
+      && body.scope !== "admin"
+      && body.scope !== "agent"
+      && body.scope !== "inference")
+  ) {
+    sendError(res, makeError("invalid_request_error", {
+      message: "Require 'alias' and 'tier' (owner|guest); optional 'scope' is admin|agent|inference.",
+    }));
     return;
   }
   let result;
@@ -2766,6 +2784,7 @@ async function handleKeysMint(
       {
         alias: body.alias,
         tier: body.tier,
+        scope: body.scope,
         modelAllowList: body.modelAllowList,
         rpm: body.rpm,
         tpm: body.tpm,
@@ -2784,6 +2803,13 @@ async function handleKeysMint(
       sendError(
         res,
         makeError("invalid_request_error", { param: err.param, message: err.message })
+      );
+      return;
+    }
+    if (err instanceof InvalidScopeError) {
+      sendError(
+        res,
+        makeError("invalid_request_error", { param: "scope", message: err.message })
       );
       return;
     }
@@ -3618,19 +3644,19 @@ async function handleRequest(
     };
 
     // ─── Owner-only, content-blind task exposure lookup (#257) ───
-    // A real minted owner key is required, matching the owner-content/code_loop boundary. Legacy
-    // static/implicit admins have no per-principal identity and cannot query this privacy-sensitive
-    // freshness oracle. The handler performs SELECTs only: migrations/backfill happen at startup.
+    // A real minted owner-admin key is required. Agent scope deliberately retains owner-content
+    // learning without receiving this privacy-sensitive operator oracle. Legacy static/implicit
+    // admins have no per-principal identity and are also excluded. SELECT-only.
     if (path === "/admin/task-exposures/lookup" && method === "POST") {
       lctx.admission = "n/a";
-      if (principal.tier !== "owner" || principal.keyHash === null) {
+      if (!principal.isAdmin || principal.tier !== "owner" || principal.keyHash === null) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "route_not_allowed";
         sendError(
           res,
           makeError("route_not_allowed", {
-            message: "This endpoint requires a minted owner key.",
+            message: "This endpoint requires a minted owner-admin key.",
           })
         );
         return;
@@ -3677,18 +3703,18 @@ async function handleRequest(
     // ─── External-surface exposure-receipt intake (#10) ───
     // Authenticated, content-blind producer-receipt path for Codex App/Codex CLI/Pi exposure
     // observations — gille's half of the pair with Magnus-Gille/hugin#237. Same boundary as
-    // /admin/task-exposures/lookup: a real minted owner key is required (every external producer/
+    // /admin/task-exposures/lookup: a real minted owner-admin key is required (every external producer/
     // subscription is provisioned its own minted key); legacy static/implicit admins have no
     // per-principal identity to bind a subscription alias to and are denied. The authenticated
     // principal's OWN alias — never a body-supplied claim — becomes the receipt's subscription
     // alias, so a receipt can never impersonate a different subscription.
     if (path === "/admin/exposure-receipts" && method === "POST") {
       lctx.admission = "n/a";
-      if (principal.tier !== "owner" || principal.keyHash === null) {
+      if (!principal.isAdmin || principal.tier !== "owner" || principal.keyHash === null) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "route_not_allowed";
-        sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner key." }));
+        sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner-admin key." }));
         return;
       }
       let raw: string;
@@ -3734,11 +3760,11 @@ async function handleRequest(
     // /admin/task-exposures/lookup (see task-exposure.ts's externalProducerSurfaceHeartbeats).
     if (path === "/admin/exposure-receipts/heartbeat" && method === "POST") {
       lctx.admission = "n/a";
-      if (principal.tier !== "owner" || principal.keyHash === null) {
+      if (!principal.isAdmin || principal.tier !== "owner" || principal.keyHash === null) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "route_not_allowed";
-        sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner key." }));
+        sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner-admin key." }));
         return;
       }
       let raw: string;
@@ -3980,9 +4006,10 @@ async function handleRequest(
     }
     if (path === "/delegate" && method === "POST") {
       // /delegate hands an unscoped prompt to the orchestrator, which then picks ANY model —
-      // bypassing per-key allow-lists. Until it honours allow-lists, restrict it to owner-tier
-      // principals (interim fix). A non-owner key is refused before any orchestration runs.
-      if (principal.tier !== "owner") {
+      // bypassing per-key allow-lists and writing capability-ledger evidence. Until it honours
+      // allow-lists and has a narrower write capability, restrict it to admin-scope owner
+      // principals. Agent/guest keys are refused before any orchestration runs.
+      if (principal.tier !== "owner" || !principal.isAdmin) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "route_not_allowed";
@@ -3990,7 +4017,7 @@ async function handleRequest(
           res,
           makeError("route_not_allowed", {
             param: null,
-            message: "/delegate is restricted to owner-tier keys.",
+            message: "/delegate is restricted to admin-scope owner keys.",
           })
         );
         return;
@@ -4107,6 +4134,7 @@ async function handleRequest(
       sendJson(res, 200, {
         alias: principal.alias,
         tier: principal.tier,
+        scope: principal.scope,
         models: principal.modelAllowList,
         creditLimit: principal.creditLimit,
         creditsUsed: principal.creditsUsed,

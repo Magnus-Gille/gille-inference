@@ -33,6 +33,54 @@ function alias(): string {
 }
 
 describe("keystore mint / lookup", () => {
+  it("defaults legacy tiers to compatible access scopes and persists an explicit agent scope", () => {
+    const owner = mintKey({ alias: alias(), tier: "owner" }, DEFAULTS);
+    expect(owner.record.scope).toBe("admin");
+    expect(lookupKey(owner.plaintextKey)?.scope).toBe("admin");
+
+    const guest = mintKey({ alias: alias(), tier: "guest" }, DEFAULTS);
+    expect(guest.record.scope).toBe("inference");
+    expect(lookupKey(guest.plaintextKey)?.scope).toBe("inference");
+
+    const agent = mintKey({ alias: alias(), tier: "owner", scope: "agent" }, DEFAULTS);
+    expect(agent.record.scope).toBe("agent");
+    expect(lookupKey(agent.plaintextKey)?.scope).toBe("agent");
+  });
+
+  it("rejects privileged scopes on guest-tier keys", () => {
+    expect(() =>
+      mintKey({ alias: alias(), tier: "guest", scope: "agent" }, DEFAULTS)
+    ).toThrow(/guest.*agent|agent.*guest/i);
+    expect(() =>
+      mintKey({ alias: alias(), tier: "guest", scope: "admin" }, DEFAULTS)
+    ).toThrow(/guest.*admin|admin.*guest/i);
+  });
+
+  it("maps a pre-scope legacy row to its compatible default and fails malformed scope closed", () => {
+    const legacyToken = "hs_owner_legacy-scope-fixture";
+    const legacyAlias = alias();
+    const malformedToken = "hs_owner_malformed-scope-fixture";
+    const malformedAlias = alias();
+    const now = new Date().toISOString();
+    const insert = getDb().prepare(`
+      INSERT INTO api_keys
+        (alias, key_hash, tier, scope, model_allow_list, rpm, tpm, daily_token_budget,
+         max_parallel, credit_limit, credits_used, expires_at, created_at, revoked_at, logical_alias)
+      VALUES
+        (@alias, @keyHash, 'owner', @scope, '[]', 60, 60000, 0, 1, 0, 0, NULL, @now, NULL, NULL)
+    `);
+    insert.run({ alias: legacyAlias, keyHash: hashKey(legacyToken), scope: null, now });
+    insert.run({
+      alias: malformedAlias,
+      keyHash: hashKey(malformedToken),
+      scope: "unexpected-superuser",
+      now,
+    });
+
+    expect(lookupKey(legacyToken)?.scope).toBe("admin");
+    expect(lookupKey(malformedToken)?.scope).toBe("inference");
+  });
+
   it("mintKey returns a tier-prefixed plaintext key and persists only a hash", () => {
     const a = alias();
     const owner = mintKey({ alias: a, tier: "owner" }, DEFAULTS);
@@ -263,6 +311,26 @@ describe("nextFreeAlias (pure)", () => {
 });
 
 describe("rotateKey (#99)", () => {
+  it("inherits agent scope within one rotation family without affecting another harness", () => {
+    const claude = alias();
+    const codex = alias();
+    const claudeFirst = mintKey(
+      { alias: claude, tier: "owner", scope: "agent" },
+      DEFAULTS
+    );
+    const codexFirst = mintKey(
+      { alias: codex, tier: "owner", scope: "agent" },
+      DEFAULTS
+    );
+
+    const claudeRotated = rotateKey(claude, {}, DEFAULTS);
+
+    expect(lookupKey(claudeFirst.plaintextKey)).toBeNull();
+    expect(lookupKey(claudeRotated.plaintextKey)?.scope).toBe("agent");
+    expect(lookupKey(codexFirst.plaintextKey)?.alias).toBe(codex);
+    expect(lookupKey(codexFirst.plaintextKey)?.scope).toBe("agent");
+  });
+
   it("rotates a fresh name: mints the bare alias, revokes nothing, key works", () => {
     const base = alias();
     const r = rotateKey(base, { tier: "owner" }, DEFAULTS);
