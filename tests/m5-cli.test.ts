@@ -159,6 +159,32 @@ describe("m5 command surface", () => {
     expect(error.text()).toBe("");
   });
 
+  it("submits a content-free adoption report through MCP without exposing the credential", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "adoption", "report"], {
+      input: Readable.from(['{"harness":"codex_cli","execution_mode":"code_loop","traffic_purpose":"organic","result":"not_attempted","deterministic_check":"not_run","reviewer_usefulness":"not_reported","fallback_reason":"m5_auth_unavailable","eligible_opportunities":1}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number; params: { name: string; arguments: Record<string, unknown> } };
+        expect(request.params.name).toBe("record_adoption_evidence");
+        expect(request.params.arguments).not.toHaveProperty("prompt");
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { content: [{ type: "text", text: "accepted" }], isError: false, structuredContent: { accepted: true } },
+        }), { status: 200 });
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({ accepted: true });
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
   it("redacts malicious upstream bodies from stdout, stderr, and serialized errors", async () => {
     const output = sink();
     const error = sink();

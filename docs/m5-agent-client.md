@@ -14,10 +14,10 @@ route.
 ## Installation and versioning contract
 
 The `m5` executable ships in the same npm package as `hs`, starting with client package version
-`1.1.0`:
+`1.2.0`:
 
 ```bash
-npm install --global gille-inference@1.1.0
+npm install --global gille-inference@1.2.0
 m5 --version
 ```
 
@@ -98,6 +98,9 @@ m5 --profile codex models
 printf '%s' '{"model":"mellum","prompt":"Classify this bounded input."}' \
   | m5 --profile codex ask
 
+printf '%s' '{"harness":"codex_cli","execution_mode":"code_loop","traffic_purpose":"organic","result":"not_attempted","deterministic_check":"not_run","reviewer_usefulness":"not_reported","fallback_reason":"m5_auth_unavailable","eligible_opportunities":1}' \
+  | m5 --profile codex adoption report
+
 printf '%s' '{
   "instruction": "Update the supplied seed file and run its focused check.",
   "files": [{"path":"src/example.ts","content":"export const value = 1;\n"}],
@@ -123,7 +126,7 @@ validation, protected paths, caps, and diff-only result remain authoritative.
 2. gateway reachability;
 3. authenticated identity;
 4. `owner` plus `agent|admin` route scope;
-5. visibility of `list_models`, `ask`, and all three `code_loop_*` tools;
+5. visibility of `list_models`, `ask`, all three `code_loop_*` tools, and `record_adoption_evidence`;
 6. identity and tool parity between configured public and private paths.
 
 Its top-level `status` distinguishes:
@@ -139,6 +142,11 @@ Its top-level `status` distinguishes:
 - `healthy`
 
 No token or endpoint locator is included in the result.
+
+`m5 1.2.0` adds the direct, content-free `adoption report` command and requires the reporting tool
+for a healthy doctor result. A generic `1.1.0` stdio bridge can still pass an MCP tool call through
+when a compatible server exposes it, but it does not provide the direct report command or this
+doctor parity check; integrations that use adoption measurement must pin `1.2.0`.
 
 ## Transport and redaction behavior
 

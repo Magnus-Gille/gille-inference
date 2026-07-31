@@ -4,8 +4,8 @@ The gateway's observability layer is **content-blind and pseudonymous by design*
 operator answer fleet questions — *how many distinct users, how concurrent, time-to-first-token,
 throughput, outcomes* — **without ever storing any non-owner prompt or response content**.
 
-There are three data sinks. Two are metadata-only for everyone; one (the owner-log) is the single
-place content can live, and it is strictly owner-only.
+There are four data sinks. Three are metadata-only; one (the owner-log) is the single place content
+can live, and it is strictly owner-only.
 
 ## 1. `request_log` (SQLite) — durable, metadata-only, for EVERYONE
 
@@ -87,7 +87,60 @@ New series in this layer:
   `failed` count means the box could not self-heal a dirty recurrent model and may need a manual
   restart. See `docs/m5-qwen3next-recurrent-degeneration-2026-06-24.md`.
 
-## 3. `owner_request_log` (SQLite) — the ONLY content sink, owner-only
+## 3. `adoption_evidence` (SQLite) — declared M5-agent adoption, content-blind
+
+`src/homeserver/adoption-evidence.ts`. This is a narrow, opt-in observation written by the
+owner-agent MCP tool `record_adoption_evidence` (or `m5 adoption report`). It exists because a
+healthy gateway/request count does **not** prove that eligible implementation work actually used
+M5 rather than silently falling back to a frontier model.
+
+Every report has only these closed, low-cardinality fields:
+
+| field | allowed values / meaning |
+|---|---|
+| `harness` | `claude`, `codex_cli`, `codex_app`, `pi`, `direct_cli`, `evaluation_runner` |
+| `execution_mode` | `ask`, `code_loop`, `delegate` |
+| `traffic_purpose` | `organic`, `evaluation`, `synthetic` |
+| `result` | `completed`, `refused`, `failed`, `not_attempted` |
+| `deterministic_check` | `pass`, `fail`, `not_run` |
+| `reviewer_usefulness` | `pass`, `partial`, `redo`, `wrong`, `not_reported` |
+| `fallback_reason` | closed reason enum, including **separate** `m5_tool_missing` and `m5_auth_unavailable` |
+| `eligible_opportunities` | non-negative L1-declared count; `0` means the denominator was unknown, never inferred from raw call volume |
+
+**Never stored or accepted:** prompt/output text, file paths, repository names, aliases, key hashes,
+user/session IDs, free-text notes, or caller-provided timestamps. The writer rejects unknown fields
+before storage. It has no event ID or precise timestamp: the server derives only a UTC calendar day
+for the rolling-week query. Accepted and rejected authenticated report calls deliberately suppress
+the normal per-request access/request/owner logs, so this table cannot be correlated to a principal
+or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot;
+it is bounded by a transient per-key rate limit and a 25-row server-day cap, with generic refusal
+when either bound is full.
+
+The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
+
+- **MEASURED — organic M5 agent adoption:** only `traffic_purpose=organic`, by harness.
+- **MEASURED — organic M5 agent adoption by harness:** closed, content-free per-harness rows
+  alongside the fleet total.
+- **MEASURED — organic M5 fallback reasons:** closed aggregate counts, including tool/auth gaps.
+- **LAB — evaluation and synthetic M5 evidence:** formal evaluation/probe traffic, never added to
+  the primary organic panel.
+
+Use the maturity labels literally:
+
+- **MEASURED** means a number came from submitted reports; an empty panel is not evidence of zero
+  eligible work.
+- **ENFORCED** means the schema rejects content/high-cardinality fields and the primary query
+  filters out evaluation/synthetic traffic.
+- **SHADOW** means adoption measurement itself does not route, block, or authorize work. It cannot
+  prove quality, production autonomy, cost savings, or a routing policy change.
+
+The initial review is deliberately not a raw-call target: by **2026-08-28**, review whether at
+least **20 known organic eligible opportunities** have been reported and whether useful completions
+(`pass` or `partial`, without a deterministic-check failure) are at least **60% of attempted
+delegations**. Reconsider the measure and the adoption path then; do not optimize the number of
+reports.
+
+## 4. `owner_request_log` (SQLite) — the ONLY content sink, owner-only
 
 `src/homeserver/owner-log.ts`. This is the **only** place request/response content is captured, and
 it is captured **only** for the operator's own real, deliberately-minted owner keys. The guard is:
@@ -117,5 +170,7 @@ background, so it never blocks the request hot path.
 - **`owner_request_log` (content):** the most sensitive table — keep the shortest window you find
   useful (e.g. 30 days) or set `HOMESERVER_OWNER_REQUEST_LOG=off` if you don't need content capture.
   Prune by `ts` and `VACUUM`.
+- **`adoption_evidence` (content-blind):** the canonical retention registry enforces its
+  predeclared 90-day trial window; it has no per-user value to join.
 - Back up the eval DB (`EVAL_DB_PATH`, default `./data/eval.db`) like any private dataset; it
   contains your own content in `owner_request_log`.

@@ -132,7 +132,11 @@ function performDeletes(
       throw new RetentionPruneGateError(`unknown store in dry-run report: ${result.storeId}`);
     }
     if (descriptor.mechanism === "sqlite" && descriptor.table && descriptor.timestampColumn) {
-      const cutoffValue = descriptor.timestampKind === "epoch-ms" ? Date.parse(result.cutoffIso) : result.cutoffIso;
+      const cutoffValue = descriptor.timestampKind === "epoch-ms"
+        ? Date.parse(result.cutoffIso)
+        : descriptor.timestampKind === "date"
+          ? result.cutoffIso.slice(0, 10)
+          : result.cutoffIso;
       if (descriptor.pruneAction === "delete-row") {
         const info = db
           .prepare(`DELETE FROM ${descriptor.table} WHERE ${descriptor.timestampColumn} < ?`)

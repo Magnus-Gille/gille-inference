@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import { recordRequestLog } from "../src/homeserver/request-log.js";
+import { parseAdoptionEvidence, recordAdoptionEvidence } from "../src/homeserver/adoption-evidence.js";
 import { runRetentionDryRun, retentionReportContentHash } from "../src/homeserver/retention-enforcement.js";
 import {
   approveRetentionPrune,
@@ -126,6 +127,39 @@ describe("retention-prune-gate — default-off by construction", () => {
 });
 
 describe("retention-prune-gate — executes ONLY when all three conditions hold (test-only injection)", () => {
+  it("includes and prunes expired 90-day adoption evidence without an event-id reference", () => {
+    const parsed = parseAdoptionEvidence({
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "pass",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    });
+    if (!parsed.ok) throw new Error("fixture must parse");
+    expect(recordAdoptionEvidence(parsed.value)).toBe(true);
+    getDb().prepare("UPDATE adoption_evidence SET recorded_day = '2026-01-01'").run();
+
+    const workroot = mkdtempSync(join(tmpdir(), "hs-retention-prune-gate-wr-"));
+    const report = runRetentionDryRun(getDb(), { now: NOW, workroot });
+    expect(report.stores.find((store) => store.storeId === "adoption-evidence")).toMatchObject({
+      expiredCount: 1,
+      sampleRefs: ["2026-01-01"],
+    });
+    const token = approveRetentionPrune(report, {
+      reviewerId: "magnus", reason: "test", decisionRef: "issue-136", reviewedAt: NOW,
+    });
+    const result = executeRetentionPrune({
+      db: getDb(), token, confirm: RETENTION_LIVE_PRUNE_CONFIRM, now: NOW, workroot, liveEnableEnvValue: "on",
+    });
+    expect(result.status).toBe("executed");
+    if (result.status !== "executed") return;
+    expect(result.affectedCounts["adoption-evidence"]).toBe(1);
+    expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence").get()).toEqual({ count: 0 });
+  });
+
   it("deletes exactly the expired rows and redacts exactly the expired content columns, nothing else", () => {
     seedOneExpiredRequestLogRow("req-gate-execute");
     const freshCountBefore = getDb().prepare("SELECT COUNT(*) AS n FROM request_log").get() as { n: number };

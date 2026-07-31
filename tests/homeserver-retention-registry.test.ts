@@ -21,13 +21,13 @@ describe("retention-registry — harvest store inventory", () => {
     }
   });
 
-  it("every sqlite descriptor has table/timestampColumn/primaryKeyColumn (or is documented as unenforced)", () => {
+  it("every sqlite descriptor has table/timestampColumn/reference (or is documented as unenforced)", () => {
     for (const d of HARVEST_STORE_REGISTRY) {
       if (d.mechanism !== "sqlite") continue;
       expect(d.table).toBeTruthy();
       if (d.prunable) {
         expect(d.timestampColumn, `${d.storeId} must have a timestampColumn to be prunable`).toBeTruthy();
-        expect(d.primaryKeyColumn, `${d.storeId} must have a primaryKeyColumn to be prunable`).toBeTruthy();
+        expect(d.primaryKeyColumn ?? d.sampleRefColumn, `${d.storeId} must have a content-blind reference to be prunable`).toBeTruthy();
       }
     }
   });
@@ -70,6 +70,22 @@ describe("retention-registry — harvest store inventory", () => {
     const content = getHarvestStoreDescriptor("owner-request-log");
     const row = getHarvestStoreDescriptor("owner-request-log-row");
     expect(content?.retentionDays).toBeLessThanOrEqual(row?.retentionDays ?? 0);
+  });
+
+  it("registers content-blind adoption evidence for the bounded 90-day trial window", () => {
+    const adoption = getHarvestStoreDescriptor("adoption-evidence");
+    expect(adoption).toMatchObject({
+      table: "adoption_evidence",
+      classification: "content-blind",
+      retentionDays: 90,
+      policyEpoch: "2026-07-31-m5-adoption-v1",
+      pruneAction: "delete-row",
+      timestampColumn: "recorded_day",
+      timestampKind: "date",
+      primaryKeyColumn: null,
+      sampleRefColumn: "recorded_day",
+    });
+    expect(prunableHarvestStores().some((s) => s.storeId === "adoption-evidence")).toBe(true);
   });
 
   it("prunableHarvestStores excludes every prunable:false descriptor", () => {

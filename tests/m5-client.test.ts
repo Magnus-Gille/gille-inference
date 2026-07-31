@@ -39,6 +39,7 @@ const REQUIRED_TOOLS = [
   "code_loop_start",
   "code_loop_status",
   "code_loop_result",
+  "record_adoption_evidence",
 ];
 
 describe("profile-based Keychain resolution", () => {
@@ -293,6 +294,78 @@ describe("secret-safe M5 client", () => {
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
   });
 
+  it("rejects content or unknown fields in an adoption report before Keychain resolution or fetch", async () => {
+    let credentialResolutions = 0;
+    let fetches = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: {
+        resolve: async () => {
+          credentialResolutions += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        fetches += 1;
+        throw new Error("must not fetch");
+      },
+    });
+
+    const validReport = {
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "pass",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    };
+    for (const forbidden of [
+      { ...validReport, prompt: "never send this" },
+      { ...validReport, path: "/private/never-send" },
+      { ...validReport, repository: "private/never-send" },
+    ]) {
+      await expect(client.reportAdoption(forbidden)).rejects.toMatchObject({ code: "invalid_adoption_report" });
+    }
+    expect(credentialResolutions).toBe(0);
+    expect(fetches).toBe(0);
+  });
+
+  it("retries a transient Keychain failure on the same long-lived client", async () => {
+    let credentialResolutions = 0;
+    let fetches = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: {
+        resolve: async () => {
+          credentialResolutions += 1;
+          if (credentialResolutions === 1) {
+            throw new M5ClientError("credential_timeout", "temporary Keychain timeout");
+          }
+          return SECRET;
+        },
+      },
+      fetch: async (_input, init) => {
+        fetches += 1;
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
+          isError: false,
+        });
+      },
+    });
+
+    await expect(client.models()).rejects.toMatchObject({ code: "credential_timeout" });
+    await expect(client.models()).resolves.toEqual({
+      models: [{ id: "mellum", description: "fast" }],
+    });
+    expect(credentialResolutions).toBe(2);
+    expect(fetches).toBe(1);
+  });
+
   it("runs the async code path to a validated diff/result without applying it locally", async () => {
     const names: string[] = [];
     const client = await createM5Client({
@@ -482,7 +555,7 @@ describe("m5 doctor diagnostic distinctions", () => {
   it("distinguishes missing MCP tools", async () => {
     await expect(diagnose({ publicTools: ["list_models", "ask"] })).resolves.toMatchObject({
       status: "missing_tools",
-      missing_tools: ["code_loop_start", "code_loop_status", "code_loop_result"],
+      missing_tools: ["code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
     });
   });
 
