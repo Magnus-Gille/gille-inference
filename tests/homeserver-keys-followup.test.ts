@@ -1,10 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
-import { lookupKey, mintKey, type KeyDefaults } from "../src/homeserver/keystore.js";
+import { listKeys, lookupKey, mintKey, type KeyDefaults } from "../src/homeserver/keystore.js";
 import { cmdKeys, parseArgs, strictNumFlag } from "../src/homeserver/cli.js";
 
 // Codex second-pass review of #99 (post-merge) — two follow-up fixes.
@@ -53,6 +53,14 @@ describe("strictNumFlag — invalid key-mgmt numeric flags fail loud (#99 Codex 
 describe("keys CLI — valueless scope fails closed (#139 review)", () => {
   const DEFAULTS: KeyDefaults = { rpm: 60, tpm: 60_000, dailyTokenBudget: 0, maxParallel: 1 };
   const nextAlias = (prefix: string): string => `${prefix}-${randomUUID()}`;
+
+  // These CLI assertions inspect api_keys directly to prove a rejected command cannot leave a
+  // credential behind. Give every case its own initialized database rather than depending on a
+  // sibling worker having happened to create the schema first.
+  beforeEach(() => {
+    initDb(join(mkdtempSync(join(tmpdir(), "hs-keys-followup-")), "test.db"));
+    listKeys(); // creates the lazily-owned api_keys schema through the public keystore seam
+  });
 
   it("rejects bare --scope on mint before it can create a default-admin credential", () => {
     const alias = nextAlias("bare-scope-mint");
