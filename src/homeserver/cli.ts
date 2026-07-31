@@ -103,6 +103,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a.startsWith("--")) {
+      const equal = a.indexOf("=");
+      if (equal > 2) {
+        flags[a.slice(2, equal)] = a.slice(equal + 1);
+        continue;
+      }
       const key = a.slice(2);
       const next = argv[i + 1];
       if (next === undefined || next.startsWith("--")) {
@@ -167,6 +172,20 @@ export function strictScopeFlag(flags: Record<string, string | boolean>): KeySco
     throw new Error("keys: --scope must be admin|agent|inference");
   }
   return value;
+}
+
+const KEY_MUTATION_FLAGS = new Set([
+  "alias", "tier", "scope", "models", "rpm", "tpm", "daily", "parallel", "credits", "ttl",
+]);
+
+/**
+ * Key creation and rotation are authority-bearing operations, so an ignored typo can silently
+ * widen a credential. Reject every unrecognised flag before applying defaults or inheritance.
+ */
+function assertKnownKeyMutationFlags(flags: Record<string, string | boolean>, subcommand: "mint" | "rotate"): void {
+  for (const name of Object.keys(flags)) {
+    if (!KEY_MUTATION_FLAGS.has(name)) throw new Error(`keys ${subcommand}: unknown flag --${name}`);
+  }
 }
 
 async function cmdModels(): Promise<void> {
@@ -338,6 +357,7 @@ export function cmdKeys(args: ParsedArgs): void {
   const cfg = loadConfig();
 
   if (sub === "mint") {
+    assertKnownKeyMutationFlags(args.flags, "mint");
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : undefined;
     const tier = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
     const scope = strictScopeFlag(args.flags);
@@ -383,6 +403,7 @@ export function cmdKeys(args: ParsedArgs): void {
   }
 
   if (sub === "rotate") {
+    assertKnownKeyMutationFlags(args.flags, "rotate");
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : args.positional[1];
     const tierRaw = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
     const scopeRaw = strictScopeFlag(args.flags);

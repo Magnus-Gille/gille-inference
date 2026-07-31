@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -8,6 +8,17 @@ import { lookupKey, mintKey, type KeyDefaults } from "../src/homeserver/keystore
 import { cmdKeys, parseArgs, strictNumFlag } from "../src/homeserver/cli.js";
 
 // Codex second-pass review of #99 (post-merge) — two follow-up fixes.
+
+function runKeysWithoutCredentialOutput(args: Parameters<typeof cmdKeys>[0]): void {
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    cmdKeys(args);
+  } finally {
+    log.mockRestore();
+    warn.mockRestore();
+  }
+}
 
 describe("strictNumFlag — invalid key-mgmt numeric flags fail loud (#99 Codex M)", () => {
   it("absent flag → undefined (caller inherits / applies a default)", () => {
@@ -59,6 +70,45 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
 
     expect(args.flags["scope"]).toBe(true);
     expect(() => cmdKeys(args)).toThrow(/--scope.*value/i);
+    expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "admin" });
+    expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
+  });
+
+  it("parses --scope=agent on mint instead of defaulting to admin", () => {
+    const alias = nextAlias("equals-scope-mint");
+    const args = parseArgs(["mint", "--alias", alias, "--tier", "owner", "--scope=agent"]);
+
+    expect(args.flags["scope"]).toBe("agent");
+    expect(() => runKeysWithoutCredentialOutput(args)).not.toThrow();
+    const row = getDb().prepare("SELECT scope FROM api_keys WHERE alias = ?").get(alias) as { scope: string };
+    expect(row.scope).toBe("agent");
+  });
+
+  it("parses --scope=agent on rotate instead of inheriting admin", () => {
+    const alias = nextAlias("equals-scope-rotate");
+    mintKey({ alias, tier: "owner" }, DEFAULTS);
+    const args = parseArgs(["rotate", "--alias", alias, "--scope=agent"]);
+
+    expect(args.flags["scope"]).toBe("agent");
+    expect(() => runKeysWithoutCredentialOutput(args)).not.toThrow();
+    const row = getDb().prepare("SELECT scope FROM api_keys WHERE alias = ?").get(`${alias}-r2`) as { scope: string };
+    expect(row.scope).toBe("agent");
+  });
+
+  it("rejects a scope typo before mint can silently default to admin", () => {
+    const alias = nextAlias("typo-scope-mint");
+    const args = parseArgs(["mint", "--alias", alias, "--tier", "owner", "--scpoe", "agent"]);
+
+    expect(() => cmdKeys(args)).toThrow(/unknown.*scpoe/i);
+    expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(alias)).toBeUndefined();
+  });
+
+  it("rejects a scope typo before rotate can silently inherit admin", () => {
+    const alias = nextAlias("typo-scope-rotate");
+    const original = mintKey({ alias, tier: "owner" }, DEFAULTS);
+    const args = parseArgs(["rotate", "--alias", alias, "--scpoe", "agent"]);
+
+    expect(() => cmdKeys(args)).toThrow(/unknown.*scpoe/i);
     expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "admin" });
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
   });
