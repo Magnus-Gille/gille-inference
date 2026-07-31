@@ -1,5 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,8 +31,8 @@ assertEqual(manifest.version, expectedVersion, "package version");
 assertEqual(manifest.type, "module", "module type");
 assertEqual(manifest.engines?.node, ">=18", "Node engine");
 assertEqual(manifest.publishConfig?.access, "public", "publish access");
-assertEqual(manifest.bin?.hs, "./hs.mjs", "hs bin");
-assertEqual(manifest.bin?.m5, "./m5.mjs", "m5 bin");
+assertEqual(manifest.bin?.hs, "hs.mjs", "hs bin");
+assertEqual(manifest.bin?.m5, "m5.mjs", "m5 bin");
 assertEqual(
   readFileSync(join(clientDir, "LICENSE"), "utf8"),
   readFileSync(join(repoRoot, "LICENSE"), "utf8"),
@@ -48,13 +48,30 @@ if (readme.includes("npx gille-inference")) {
 
 const cache = mkdtempSync(join(tmpdir(), "gille-inference-client-pack-"));
 try {
+  const npmHome = join(cache, "npm-home");
+  const npmGlobalConfig = join(cache, "global-npmrc");
+  const npmUserConfig = join(cache, "npmrc");
+  mkdirSync(npmHome);
+  writeFileSync(npmGlobalConfig, "");
+  writeFileSync(npmUserConfig, "");
+  // Keep publish normalization offline and prevent host npm configuration or credentials participating.
+  const isolatedNpmEnv = {
+    HOME: npmHome,
+    PATH: process.env.PATH ?? "",
+    TMPDIR: process.env.TMPDIR ?? tmpdir(),
+    npm_config_cache: join(cache, "npm-cache"),
+    npm_config_globalconfig: npmGlobalConfig,
+    npm_config_offline: "true",
+    npm_config_registry: "http://127.0.0.1:9",
+    npm_config_userconfig: npmUserConfig,
+  };
   const output = execFileSync(
     "npm",
     ["pack", "--dry-run", "--json", "./client"],
     {
       cwd: repoRoot,
       encoding: "utf8",
-      env: { ...process.env, npm_config_cache: cache },
+      env: isolatedNpmEnv,
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -77,7 +94,7 @@ try {
   const archiveOutput = execFileSync("npm", ["pack", "--json", clientDir], {
     cwd: cache,
     encoding: "utf8",
-    env: { ...process.env, npm_config_cache: cache },
+    env: isolatedNpmEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   const archives = JSON.parse(archiveOutput);
@@ -90,12 +107,51 @@ try {
     {
       cwd: cache,
       encoding: "utf8",
-      env: { ...process.env, npm_config_cache: cache },
+      env: isolatedNpmEnv,
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
   if (!help.includes("hs — Gille Inference CLI")) {
     fail("zero-install hs smoke test did not execute the packaged hs binary");
+  }
+  const m5Version = execFileSync(
+    "npm",
+    ["exec", "--offline", "--yes", "--package", join(cache, archives[0].filename), "--", "m5", "--version"],
+    {
+      cwd: cache,
+      encoding: "utf8",
+      env: isolatedNpmEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (!m5Version.includes(`{"name":"m5","version":"${expectedVersion}"}`)) {
+    fail("zero-install m5 smoke test did not execute the packaged m5 binary");
+  }
+
+  const publishDir = join(cache, "publish");
+  cpSync(clientDir, publishDir, { recursive: true });
+  const publish = spawnSync(
+    "npm",
+    [
+      "publish",
+      "--dry-run",
+      "--offline",
+      "--ignore-scripts",
+      "--registry",
+      "http://127.0.0.1:9",
+    ],
+    {
+      cwd: publishDir,
+      encoding: "utf8",
+      env: isolatedNpmEnv,
+    },
+  );
+  if (publish.error || publish.status !== 0) {
+    fail("offline npm publish dry run did not complete");
+  }
+  const publishOutput = `${publish.stdout}\n${publish.stderr}`;
+  if (/auto-corrected|bin\[(?:hs|m5)\].*(?:invalid|removed)|script name (?:hs|m5)\.mjs was invalid/i.test(publishOutput)) {
+    fail("npm publish would remove a declared client binary");
   }
 } finally {
   rmSync(cache, { recursive: true, force: true });

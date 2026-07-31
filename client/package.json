@@ -4,8 +4,8 @@
   "description": "Dependency-free friend and secret-safe owner-agent clients for Gille Inference.",
   "type": "module",
   "bin": {
-    "hs": "./hs.mjs",
-    "m5": "./m5.mjs"
+    "hs": "hs.mjs",
+    "m5": "m5.mjs"
   },
   "files": [
     "hs.mjs",
