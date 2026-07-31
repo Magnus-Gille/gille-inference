@@ -396,8 +396,8 @@ not reuse a routing-lifecycle key, a guest key, or a different service's key. Pe
 owner-only ceremony from a private terminal with history/transcript capture disabled; record only
 sanitized aliases, timestamps, HTTP status, and deployed revision in the private operations record.
 
-Run the configured/default and tailnet checks separately. Their messages and exit codes are deliberately
-content-free:
+Run the configured/default and tailnet path checks separately. Their messages and exit codes are
+deliberately content-free:
 
 | Exit | State | Operator action |
 |---:|---|---|
