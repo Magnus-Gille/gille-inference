@@ -514,7 +514,8 @@ for chunk in stream:
   --header "Authorization: Bearer hs_..."</pre>
         <p>
           The same key, credit budget, and model allow-list apply as for the HTTP API.
-          Two tools are exposed:
+          Basic tools are exposed to every permitted key. A real minted owner-agent key also gets
+          the bounded code-loop tools and a content-free adoption-report tool:
         </p>
         <table>
           <tr><th>Tool</th><th>What it does</th></tr>
@@ -525,6 +526,10 @@ for chunk in stream:
           <tr>
             <td><span class="badge mono">ask</span></td>
             <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
+          </tr>
+          <tr>
+            <td><span class="badge mono">record_adoption_evidence</span></td>
+            <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. It accepts no prompt, response, path, repository, or identifier; measured adoption remains shadow-only and never changes routing.</td>
           </tr>
         </table>
       </div>

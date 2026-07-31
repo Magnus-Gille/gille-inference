@@ -113,6 +113,7 @@ function help() {
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
       "printf '%s' '<json>' | m5 --profile <claude|codex> ask",
+      "printf '%s' '<content-free-json>' | m5 --profile <claude|codex> adoption report",
       "printf '%s' '<json>' | m5 --profile <claude|codex> code run",
       "m5 --profile <claude|codex> code status <work_id>",
       "m5 --profile <claude|codex> code result <work_id>",
@@ -206,6 +207,13 @@ export async function main(
     }
     if (command === "ask") {
       writeJson(output, await client.ask(await readBoundedInput(input)));
+      return 0;
+    }
+    if (command === "adoption") {
+      if (positional[1] !== "report") {
+        throw new M5ClientError("invalid_args", "adoption requires: report.");
+      }
+      writeJson(output, await client.reportAdoption(await readBoundedInput(input)));
       return 0;
     }
     if (command === "code") {

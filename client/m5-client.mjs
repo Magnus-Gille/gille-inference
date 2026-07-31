@@ -1,6 +1,6 @@
 import { execFile as nodeExecFile } from "node:child_process";
 
-export const M5_CLIENT_VERSION = "1.1.0";
+export const M5_CLIENT_VERSION = "1.2.0";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
@@ -509,6 +509,23 @@ export async function createM5Client({
         throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
       }
       return { model: input.model, text };
+    },
+
+    async reportAdoption(input) {
+      if (!input || typeof input !== "object" || Array.isArray(input)) {
+        throw new M5ClientError(
+          "invalid_input",
+          "adoption report requires one content-free JSON object.",
+        );
+      }
+      const result = await client.tool("record_adoption_evidence", input);
+      if (!result || typeof result !== "object" || result.accepted !== true) {
+        throw new M5ClientError(
+          "invalid_adoption_report",
+          "The gateway returned a malformed adoption-report acknowledgement.",
+        );
+      }
+      return { accepted: true };
     },
 
     async codeStatus(workId) {

@@ -18,6 +18,7 @@ import { expandBlindContext, type BlindContextConfig } from "./blind-context.js"
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
+import { parseAdoptionEvidence, recordAdoptionEvidence } from "./adoption-evidence.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
 import type { KeyScope } from "./keystore.js";
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
@@ -118,6 +119,20 @@ function isCodeLoopOwner(principal: McpPrincipal): boolean {
 }
 
 /**
+ * Adoption evidence is written only by a real, minted owner credential with agent/admin scope.
+ * The report itself intentionally carries no principal/session identity, but an authenticated
+ * gate prevents guests and legacy static keys from poisoning the operator's adoption measure.
+ */
+function isAdoptionReporter(principal: McpPrincipal): boolean {
+  return isCodeLoopOwner(principal);
+}
+
+const ADOPTION_REPORT_DESCRIPTION =
+  "Record one content-free M5 adoption observation for the private operator dashboard. " +
+  "Use this when an eligible task was completed, refused, failed, or could not even attempt M5; " +
+  "report missing M5 tool and missing/auth-unavailable credentials distinctly. Never include task text, output, paths, repositories, or identifiers.";
+
+/**
  * Static tool catalogue. inputSchemas are fixed; the *visible model set* is conveyed at call
  * time (list_models) and enforced server-side (ask), not by mutating these schemas. The
  * owner-agent code_loop_* tools (#116) are appended only for a real minted owner key carrying
@@ -164,6 +179,27 @@ function toolDefs(principal: McpPrincipal): unknown[] {
       },
     },
   ];
+  if (isAdoptionReporter(principal)) {
+    base.push({
+      name: "record_adoption_evidence",
+      description: ADOPTION_REPORT_DESCRIPTION,
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          harness: { type: "string", enum: ["claude", "codex_cli", "codex_app", "pi", "direct_cli", "evaluation_runner"] },
+          execution_mode: { type: "string", enum: ["ask", "code_loop", "delegate"] },
+          traffic_purpose: { type: "string", enum: ["organic", "evaluation", "synthetic"] },
+          result: { type: "string", enum: ["completed", "refused", "failed", "not_attempted"] },
+          deterministic_check: { type: "string", enum: ["pass", "fail", "not_run"] },
+          reviewer_usefulness: { type: "string", enum: ["pass", "partial", "redo", "wrong", "not_reported"] },
+          fallback_reason: { type: "string", enum: ["none", "m5_tool_missing", "m5_auth_unavailable", "m5_unreachable", "m5_busy", "m5_refused", "local_result_unusable", "other_known"] },
+          eligible_opportunities: { type: "integer", minimum: 0, maximum: 10_000 },
+        },
+        required: ["harness", "execution_mode", "traffic_purpose", "result", "deterministic_check", "reviewer_usefulness", "fallback_reason", "eligible_opportunities"],
+      },
+    });
+  }
   if (isCodeLoopOwner(principal)) base.push(...codeLoopToolDefs());
   return base;
 }
@@ -672,6 +708,20 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
     }
     const lines = models.map((m) => `- ${m} — ${strengthHint(m)}`);
     return { text: `Models available to you:\n${lines.join("\n")}`, isError: false };
+  }
+
+  if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {
+    const parsed = parseAdoptionEvidence(args);
+    if (!parsed.ok) {
+      return { text: "Invalid content-blind adoption evidence.", isError: true };
+    }
+    try {
+      recordAdoptionEvidence(parsed.value);
+    } catch {
+      // Do not expose a database path or driver diagnostic in the tool response.
+      return { text: "Adoption evidence storage is temporarily unavailable.", isError: true };
+    }
+    return { text: "Accepted.", isError: false, structuredContent: { accepted: true } };
   }
 
   if (name === "ask") {
