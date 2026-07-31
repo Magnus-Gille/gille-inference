@@ -44,6 +44,7 @@ function startUpstream(): Promise<void> {
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 let ownerKey = "";
+let rotationOwnerKey = "";
 let guestKey = "";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 
@@ -61,6 +62,7 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   ownerKey = ks.mintKey({ alias: "v1models-owner", tier: "owner" }, DEFAULTS).plaintextKey;
+  rotationOwnerKey = ks.mintKey({ alias: "v1models-rotation-owner", tier: "owner" }, DEFAULTS).plaintextKey;
   guestKey = ks.mintKey({ alias: "v1models-guest", tier: "guest", modelAllowList: ["alpha"] }, DEFAULTS).plaintextKey;
 
   const gw = await import("../src/homeserver/gateway.js");
@@ -99,5 +101,20 @@ describe("GET /v1/models (OpenAI-compatible, allow-list filtered)", () => {
   it("rejects an unauthenticated request", async () => {
     const r = await fetch(url("/v1/models"));
     expect(r.status).toBe(401);
+  });
+
+  it("accepts the replacement owner key and rejects the retired key after rotation (#98)", async () => {
+    const ks = await import("../src/homeserver/keystore.js");
+    const rotated = ks.rotateKey("v1models-rotation-owner", {}, DEFAULTS);
+
+    const oldKey = await fetch(url("/v1/models"), {
+      headers: { Authorization: `Bearer ${rotationOwnerKey}` },
+    });
+    expect(oldKey.status).toBe(401);
+
+    const replacement = await fetch(url("/v1/models"), {
+      headers: { Authorization: `Bearer ${rotated.plaintextKey}` },
+    });
+    expect(replacement.status).toBe(200);
   });
 });

@@ -380,6 +380,58 @@ curl -fsS -o /dev/null -w '%{http_code}\n' \
   "http://<tailnet-ip>:8080/v1/capabilities/learning-task"
 ```
 
+### Canonical `m5-auth` owner-key rotation and revocation (issue #98)
+
+`m5-auth` is the only approved laptop-side source of the dedicated owner credential used for
+authenticated delegation and this deploy probe. Its Keychain service/account are selected by
+`GILLE_KEYCHAIN_SERVICE` and `GILLE_KEYCHAIN_ACCOUNT` (the defaults are intentionally generic;
+the selected account name is private operator state). Do not copy a key from the M5 `.env`, a
+harness configuration, terminal history, a ticket, or a scratch file. Do not reuse the routing
+lifecycle key, a guest key, or a different service's key.
+
+Perform this owner-only ceremony from a private terminal with history/transcript capture disabled;
+keep exact aliases, Keychain account names, and private network locators in the private operations
+record, not this repository or a public issue.
+
+1. **Preflight without revealing a key.** On the M5, inspect the logical rotation family with
+   `keys list --all`; confirm the chosen family is a dedicated owner-tier **admin-scope** key.
+   Admin scope is required for the `/delegate` path; preserve its deliberate quota and
+   parallelism limits. From the laptop, run `m5-auth --help` (not bare `m5-auth`) to verify the
+   helper exists without emitting a token. Record only aliases, timestamps, HTTP status, and
+   deployed revision in the private operations ticket.
+2. **Rotate; do not revoke then re-mint.** On the M5, run
+   `tsx src/homeserver/cli.ts keys rotate --alias <logical-owner-alias>`. Rotation is one SQLite
+   transaction: it revokes the active family member(s) and creates a collision-free replacement
+   alias while inheriting tier, scope, allow-list, and limits. A failed mint rolls the revocation
+   back. Never target a `-rN` child alias, and never use `keys revoke` followed by `keys mint`:
+   the old alias remains a primary-key row, so that sequence can leave the laptop with no usable
+   credential.
+3. **Store the replacement directly in the configured macOS Keychain item.** The CLI prints the
+   replacement exactly once. Use an operator-approved Keychain UI or equivalent secret-store
+   mechanism that does not put the value in argv, shell history, a file, or a public log. Replace
+   the existing configured service/account atomically from the operator's perspective; do not
+   delete the old Keychain item before the new value has been saved. The raw key must never be
+   pasted into a command shown in this runbook.
+4. **Prove the canonical tailnet path.** In a fresh terminal, run
+   `eval "$(m5-auth --env --tailnet)"`, then make the content-free authenticated capability
+   request above using `"$M5_GATEWAY_URL/v1/capabilities/learning-task"` and
+   `"$M5_API_KEY"`. A `200` proves that the canonical helper, Keychain item, tailnet listener,
+   and replacement key agree. Run one bounded authenticated `/delegate` or MCP call only after
+   this succeeds; capture its status/outcome but not request content or response text.
+5. **Prove revocation.** In the same controlled ceremony, submit the *retired* key only to the
+   content-free capability endpoint and verify `401 invalid_api_key`; never place that key in a
+   ticket, shell history, or committed test fixture. If it is accepted, stop: do not deploy and
+   investigate the selected logical family before retrying.
+6. **Re-establish deploy evidence.** Export the replacement only through `m5-auth --env --tailnet`
+   and run `scripts/deploy-gateway.sh deploy <accepted-full-sha>`. Its authenticated capability
+   probe is the deploy-side verification; no alternate credential transport is permitted.
+
+Rotation intentionally revokes the preceding bearer value and therefore has no rollback that can
+make that old value valid again. If the replacement cannot be stored or authenticate, mint/rotate
+another replacement in the same logical family, update the Keychain item, and repeat the two
+content-free checks. Leave the gateway running on its last known-good deployment; do not weaken
+authentication or substitute an unrelated credential.
+
 ### Adopting a routing-table change (routing-lifecycle-cli.ts)
 
 `scripts/routing-lifecycle-cli.ts` (issue #7) is the reviewed GENERATE → VALIDATE → REVIEW →
