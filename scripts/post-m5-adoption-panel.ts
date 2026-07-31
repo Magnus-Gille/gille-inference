@@ -58,7 +58,7 @@ export interface LabAdoptionByPurpose {
   completed: number;
 }
 
-interface OrganicDbRow {
+interface OrganicSummaryDbRow {
   harness: AdoptionHarness;
   reports: number;
   eligible_opportunities: number;
@@ -67,6 +67,10 @@ interface OrganicDbRow {
   useful_completions: number;
   deterministic_checks: number;
   deterministic_check_passes: number;
+}
+
+interface OrganicFallbackDbRow {
+  harness: AdoptionHarness;
   fallback_reason: AdoptionFallbackReason;
   fallback_reports: number;
 }
@@ -128,7 +132,7 @@ export function queryOrganicAdoptionByHarness(
   now: number = Date.now()
 ): OrganicAdoptionByHarness[] {
   if (!hasAdoptionEvidenceTable(db)) return [];
-  const rows = db.prepare(
+  const summaries = db.prepare(
     `SELECT
        harness,
        COUNT(*) AS reports,
@@ -139,20 +143,23 @@ export function queryOrganicAdoptionByHarness(
                   AND deterministic_check <> 'fail'
                   AND reviewer_usefulness IN ('pass', 'partial') THEN 1 ELSE 0 END) AS useful_completions,
        SUM(CASE WHEN deterministic_check <> 'not_run' THEN 1 ELSE 0 END) AS deterministic_checks,
-       SUM(CASE WHEN deterministic_check = 'pass' THEN 1 ELSE 0 END) AS deterministic_check_passes,
-       fallback_reason,
-       COUNT(*) AS fallback_reports
+       SUM(CASE WHEN deterministic_check = 'pass' THEN 1 ELSE 0 END) AS deterministic_check_passes
      FROM adoption_evidence
      WHERE recorded_day >= @sinceDay AND traffic_purpose = 'organic'
-     GROUP BY harness, fallback_reason
-     ORDER BY harness ASC, fallback_reason ASC`
-  ).all({ sinceDay: windowStartDay(now, days) }) as OrganicDbRow[];
+     GROUP BY harness
+     ORDER BY harness ASC`
+  ).all({ sinceDay: windowStartDay(now, days) }) as OrganicSummaryDbRow[];
+  const fallbackRows = db.prepare(
+    `SELECT harness, fallback_reason, COUNT(*) AS fallback_reports
+       FROM adoption_evidence
+      WHERE recorded_day >= @sinceDay AND traffic_purpose = 'organic'
+      GROUP BY harness, fallback_reason
+      ORDER BY harness ASC, fallback_reason ASC`
+  ).all({ sinceDay: windowStartDay(now, days) }) as OrganicFallbackDbRow[];
 
   const byHarness = new Map<AdoptionHarness, OrganicAdoptionByHarness>();
-  for (const row of rows) {
-    const value = byHarness.get(row.harness) ?? emptyOrganic(row.harness);
-    // All grouped rows repeat the overall aggregation fields. Capture them once, then keep the
-    // fallback dimension only in its closed reason bucket.
+  for (const row of summaries) {
+    const value = emptyOrganic(row.harness);
     value.reports = row.reports;
     value.eligibleOpportunities = row.eligible_opportunities;
     value.attemptedDelegations = row.attempted_delegations;
@@ -160,8 +167,13 @@ export function queryOrganicAdoptionByHarness(
     value.usefulCompletions = row.useful_completions;
     value.deterministicChecks = row.deterministic_checks;
     value.deterministicCheckPasses = row.deterministic_check_passes;
-    value.fallbackCounts[row.fallback_reason] = row.fallback_reports;
     byHarness.set(row.harness, value);
+  }
+  for (const row of fallbackRows) {
+    const value = byHarness.get(row.harness);
+    // Every fallback row comes from an aggregate row with the same organic WHERE clause.
+    if (!value) continue;
+    value.fallbackCounts[row.fallback_reason] = row.fallback_reports;
   }
   return [...byHarness.values()].sort((a, b) => a.harness.localeCompare(b.harness));
 }

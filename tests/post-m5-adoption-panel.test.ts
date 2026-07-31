@@ -58,9 +58,26 @@ describe("post-m5-adoption-panel (#136)", () => {
   });
 
   it("reports M5 tool and auth fallbacks as separate, content-free reason counts", () => {
+    report();
     report({ result: "not_attempted", deterministic_check: "not_run", reviewer_usefulness: "not_reported", fallback_reason: "m5_tool_missing" });
     report({ result: "not_attempted", deterministic_check: "not_run", reviewer_usefulness: "not_reported", fallback_reason: "m5_auth_unavailable" });
-    const panels = buildAdoptionPanels(queryOrganicAdoptionByHarness(getDb(), 7, Date.now()), queryLabAdoptionByPurpose(getDb(), 7, Date.now()), 7);
+    const organic = queryOrganicAdoptionByHarness(getDb(), 7, Date.now());
+    expect(organic).toEqual([expect.objectContaining({
+      harness: "codex_cli",
+      reports: 3,
+      eligibleOpportunities: 3,
+      attemptedDelegations: 1,
+      completed: 1,
+      usefulCompletions: 1,
+      deterministicChecks: 1,
+      deterministicCheckPasses: 1,
+      fallbackCounts: expect.objectContaining({
+        none: 1,
+        m5_tool_missing: 1,
+        m5_auth_unavailable: 1,
+      }),
+    })]);
+    const panels = buildAdoptionPanels(organic, queryLabAdoptionByPurpose(getDb(), 7, Date.now()), 7);
     const fallbacks = panels.fallbacks.rows;
     expect(fallbacks).toEqual(expect.arrayContaining([
       { reason: "m5_tool_missing", reports: 1 },
