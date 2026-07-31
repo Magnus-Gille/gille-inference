@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-07-31",
+  "purpose": "Operational support declaration for bounded M5 delegation. It is evidence inventory, not credential provisioning or a routing policy.",
+  "contexts": [
+    {
+      "id": "codex-root",
+      "harness": "Codex",
+      "context": "root interactive session",
+      "status": "supported",
+      "surface": "owner /delegate",
+      "evidence": {
+        "kind": "issue-observation",
+        "source": "gille-inference#72 issue description",
+        "claim": "The root Codex session successfully called /delegate on the same Mac where the original subagent Keychain failure was observed."
+      }
+    },
+    {
+      "id": "codex-repo-subagent",
+      "harness": "Codex",
+      "context": "repository implementation subagent",
+      "status": "supported",
+      "surface": "owner /delegate",
+      "evidence": {
+        "kind": "ledger-receipts",
+        "source": "gille-inference#72 owner comment",
+        "ledger_ids": [
+          "83084d86-c22b-44c6-906d-0a2b62323523",
+          "fc5f5c01-670b-43fd-9705-5d8fbf3089d2",
+          "0e6f665e-e304-4fba-b79b-5b38e335aea0"
+        ],
+        "claim": "Three separate Codex repository subagents completed bounded /delegate calls without copying or printing a bearer token."
+      }
+    },
+    {
+      "id": "claude-real-session",
+      "harness": "Claude Code",
+      "context": "real interactive session",
+      "status": "supported",
+      "surface": "secret-safe M5 client / MCP ask",
+      "evidence": {
+        "kind": "redacted-acceptance-evidence",
+        "source": "https://github.com/Magnus-Gille/gille-inference/issues/72#issuecomment-5143969558",
+        "claim": "A fresh real Claude Code session discovered the installed least-privilege M5 MCP tools, completed a bounded isolated code-loop task, and passed its deterministic local test. This is current interactive-session MCP/code-loop support, not a capability-promotion receipt."
+      }
+    },
+    {
+      "id": "pi-delegated-leaf",
+      "harness": "Pi",
+      "context": "delegated harness leaf",
+      "status": "unsupported",
+      "surface": "none accepted",
+      "reason": "No completed Pi owner-agent credential smoke test or bounded M5 delegation receipt is recorded. The client can mechanically name a pi profile, but that does not establish provisioned credentials, safe harness wiring, or support.",
+      "next_probe": "Run the bounded classification procedure in docs/m5-delegated-contexts.md with a minted owner-agent Pi credential; publish only the ledger ID and deterministic result."
+    }
+  ]
+}

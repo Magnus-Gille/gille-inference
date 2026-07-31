@@ -14,6 +14,7 @@
     "homeserver:probe": "tsx src/homeserver/cli.ts probe --all",
     "homeserver:ledger": "tsx src/homeserver/cli.ts ledger",
     "release:check-client": "node scripts/verify-client-package.mjs",
+    "check:m5-contexts": "node scripts/check-m5-delegated-contexts.mjs",
     "autonomy:tick": "tsx scripts/autonomy-tick-cli.ts",
     "autonomy:constitutional": "tsx scripts/constitutional-routing-cli.ts",
     "test": "vitest run",
