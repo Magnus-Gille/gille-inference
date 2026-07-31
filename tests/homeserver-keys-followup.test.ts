@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { mkdtempSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
-import { mintKey, type KeyDefaults } from "../src/homeserver/keystore.js";
-import { strictNumFlag } from "../src/homeserver/cli.js";
+import { lookupKey, mintKey, type KeyDefaults } from "../src/homeserver/keystore.js";
+import { cmdKeys, parseArgs, strictNumFlag } from "../src/homeserver/cli.js";
 
 // Codex second-pass review of #99 (post-merge) — two follow-up fixes.
 
@@ -35,6 +36,31 @@ describe("strictNumFlag — invalid key-mgmt numeric flags fail loud (#99 Codex 
 
   it("trims surrounding whitespace around a valid number", () => {
     expect(strictNumFlag({ credits: " 500 " }, "credits")).toBe(500);
+  });
+});
+
+describe("keys CLI — valueless scope fails closed (#139 review)", () => {
+  const DEFAULTS: KeyDefaults = { rpm: 60, tpm: 60_000, dailyTokenBudget: 0, maxParallel: 1 };
+  const nextAlias = (prefix: string): string => `${prefix}-${randomUUID()}`;
+
+  it("rejects bare --scope on mint before it can create a default-admin credential", () => {
+    const alias = nextAlias("bare-scope-mint");
+    const args = parseArgs(["mint", "--alias", alias, "--tier", "owner", "--scope"]);
+
+    expect(args.flags["scope"]).toBe(true);
+    expect(() => cmdKeys(args)).toThrow(/--scope.*value/i);
+    expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(alias)).toBeUndefined();
+  });
+
+  it("rejects bare --scope on rotate before it can mint an admin-inheriting replacement", () => {
+    const alias = nextAlias("bare-scope-rotate");
+    const original = mintKey({ alias, tier: "owner" }, DEFAULTS);
+    const args = parseArgs(["rotate", "--alias", alias, "--scope"]);
+
+    expect(args.flags["scope"]).toBe(true);
+    expect(() => cmdKeys(args)).toThrow(/--scope.*value/i);
+    expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "admin" });
+    expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
   });
 });
 

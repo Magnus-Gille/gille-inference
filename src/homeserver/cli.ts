@@ -92,12 +92,12 @@ export function formatInvitesTable(invites: InvitePublic[]): string {
   return [header, ...rows].join("\n");
 }
 
-interface ParsedArgs {
+export interface ParsedArgs {
   positional: string[];
   flags: Record<string, string | boolean>;
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
@@ -149,6 +149,24 @@ export function strictNumFlag(
   const n = Number(raw);
   if (!Number.isFinite(n)) throw new Error(`keys: --${name} must be a number (got '${v}')`);
   return n;
+}
+
+/**
+ * Strict route-scope flag for key-management commands. ABSENT preserves mint defaults and rotate
+ * inheritance; PRESENT must carry one of the explicit, valid scopes. In particular, the parser
+ * represents a bare `--scope` as boolean true, which must never be silently treated as absent:
+ * that would mint a default-admin key or rotate while inheriting admin scope.
+ */
+export function strictScopeFlag(flags: Record<string, string | boolean>): KeyScope | undefined {
+  if (!("scope" in flags)) return undefined;
+  const value = flags["scope"];
+  if (typeof value !== "string") {
+    throw new Error("keys: --scope requires a value (admin|agent|inference)");
+  }
+  if (value !== "admin" && value !== "agent" && value !== "inference") {
+    throw new Error("keys: --scope must be admin|agent|inference");
+  }
+  return value;
 }
 
 async function cmdModels(): Promise<void> {
@@ -315,24 +333,16 @@ export function cmdLedger(): void {
   if (pricingWarnings.length > 0) console.log(`\n${pricingWarnings.join("\n")}`);
 }
 
-function cmdKeys(args: ParsedArgs): void {
+export function cmdKeys(args: ParsedArgs): void {
   const sub = args.positional[0];
   const cfg = loadConfig();
 
   if (sub === "mint") {
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : undefined;
     const tier = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
-    const scope = typeof args.flags["scope"] === "string" ? (args.flags["scope"] as string) : undefined;
+    const scope = strictScopeFlag(args.flags);
     if (!alias || (tier !== "owner" && tier !== "guest")) {
       throw new Error("usage: keys mint --alias A --tier owner|guest [--scope admin|agent|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]");
-    }
-    if (
-      scope !== undefined
-      && scope !== "admin"
-      && scope !== "agent"
-      && scope !== "inference"
-    ) {
-      throw new Error("keys mint: --scope must be admin|agent|inference");
     }
     const models =
       typeof args.flags["models"] === "string"
@@ -375,7 +385,7 @@ function cmdKeys(args: ParsedArgs): void {
   if (sub === "rotate") {
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : args.positional[1];
     const tierRaw = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
-    const scopeRaw = typeof args.flags["scope"] === "string" ? (args.flags["scope"] as string) : undefined;
+    const scopeRaw = strictScopeFlag(args.flags);
     if (!alias) {
       throw new Error(
         "usage: keys rotate --alias A [--tier owner|guest] [--scope admin|agent|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]\n" +
@@ -385,14 +395,6 @@ function cmdKeys(args: ParsedArgs): void {
     }
     if (tierRaw !== undefined && tierRaw !== "owner" && tierRaw !== "guest") {
       throw new Error("keys rotate: --tier must be owner|guest");
-    }
-    if (
-      scopeRaw !== undefined
-      && scopeRaw !== "admin"
-      && scopeRaw !== "agent"
-      && scopeRaw !== "inference"
-    ) {
-      throw new Error("keys rotate: --scope must be admin|agent|inference");
     }
     const models =
       typeof args.flags["models"] === "string"
