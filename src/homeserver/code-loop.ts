@@ -86,6 +86,10 @@ const CODE_LOOP_REFUSAL_ENUM = [
 ] as const;
 
 const CODE_LOOP_START_OUTPUT_SCHEMA = {
+  // Claude Code validates the top-level MCP output schema as an object before applying
+  // JSON Schema combinators. Keep the existing response variants, but advertise that
+  // required object root explicitly for interoperable clients.
+  type: "object",
   oneOf: [
     {
       type: "object",
@@ -193,7 +197,7 @@ export function codeLoopToolDefs(): unknown[] {
       name: "code_loop_status",
       description: "OWNER-ONLY. Poll async code_loop state.",
       inputSchema: { type: "object", additionalProperties: false, properties: { work_id: { type: "string", minLength: 1 } }, required: ["work_id"] },
-      outputSchema: { oneOf: [
+      outputSchema: { type: "object", oneOf: [
         { type: "object", properties: { status: { enum: CODE_LOOP_JOB_STATUS_ENUM } }, required: ["status"] },
         { type: "object", properties: { error: { const: "unknown work_id" } }, required: ["error"] },
       ] },
@@ -203,7 +207,7 @@ export function codeLoopToolDefs(): unknown[] {
       description:
         "OWNER-ONLY. Fetch async code_loop result.",
       inputSchema: { type: "object", additionalProperties: false, properties: { work_id: { type: "string", minLength: 1 } }, required: ["work_id"] },
-      outputSchema: { oneOf: [
+      outputSchema: { type: "object", oneOf: [
         { type: "object", properties: { status: { const: "running" } }, required: ["status"] },
         { type: "object", properties: { status: { enum: CODE_LOOP_TERMINAL_STATUS_ENUM }, error: { const: "terminal result unavailable after restart" } }, required: ["status", "error"] },
         { type: "object", not: { required: ["error"] }, properties: { status: { enum: CODE_LOOP_TERMINAL_STATUS_ENUM } }, required: ["status"] },
