@@ -21,6 +21,11 @@ npm install --global gille-inference@1.2.0
 m5 --version
 ```
 
+`gille-inference@1.0.0` is the existing public `hs`-only package. The initial M5 client was
+prepared as `1.1.0` but was never published; `1.2.0` adds the required content-free adoption
+reporting contract. Publish `1.2.0` as the first public M5-capable version rather than releasing
+the superseded intermediate version.
+
 `m5 --version` emits structured JSON. `claude-config` integrations must:
 
 1. Pin an exact accepted `gille-inference` client version rather than `latest`.

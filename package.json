@@ -13,6 +13,7 @@
     "homeserver:serve": "tsx src/homeserver/cli.ts serve",
     "homeserver:probe": "tsx src/homeserver/cli.ts probe --all",
     "homeserver:ledger": "tsx src/homeserver/cli.ts ledger",
+    "release:check-client": "node scripts/verify-client-package.mjs",
     "autonomy:tick": "tsx scripts/autonomy-tick-cli.ts",
     "autonomy:constitutional": "tsx scripts/constitutional-routing-cli.ts",
     "test": "vitest run",
