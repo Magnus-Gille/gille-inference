@@ -20,7 +20,7 @@ npm install -g gille-inference
 Or zero-install with npx:
 
 ```bash
-npx gille-inference ask "What is the capital of France?"
+npx --package gille-inference hs ask "What is the capital of France?"
 ```
 
 Alternatively, download directly from the gateway:
