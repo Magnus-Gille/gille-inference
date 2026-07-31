@@ -34,8 +34,9 @@ regexTarget = "match"
 paths = ['''^src/homeserver/delegation-cost\.ts$''']
 regexes = ['''opts\.m5(?:Marginal|Amortized)UsdPerMTok''']
 
-# These fixed identifiers are adoption telemetry vocabulary, not credential values.
-# Keep this exception exact and scoped to the three enum declarations.
+# This fixed telemetry enum is not a credential; it distinguishes missing
+# agent authentication from other M5 fallbacks. Keep the exception exact and
+# scoped to its three enum declarations.
 [[allowlists]]
 description = "M5 adoption missing-auth fallback reason"
 condition = "AND"
@@ -46,14 +47,6 @@ paths = [
   '''^src/homeserver/adoption-evidence\.ts$''',
 ]
 regexes = ['''m5_auth_unavailable''']
-
-# This is the documented name of a server-side allow-list configuration variable.
-[[allowlists]]
-description = "blind-context allow-list environment variable name"
-condition = "AND"
-regexTarget = "match"
-paths = ['''^src/homeserver/mcp\.ts$''']
-regexes = ['''HOMESERVER_BLIND_CONTEXT_ROOTS''']
 
 # Explicit fake keys used to prove redaction and CLI request behavior. Keep the
 # exact literals and exact test paths narrow so a new token-shaped value fails.
