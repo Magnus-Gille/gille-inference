@@ -1,13 +1,17 @@
 {
   "name": "gille-inference",
-  "version": "1.0.0",
-  "description": "Dependency-free terminal client for a self-hosted Gille Inference gateway.",
+  "version": "1.1.0",
+  "description": "Dependency-free friend and secret-safe owner-agent clients for Gille Inference.",
   "type": "module",
   "bin": {
-    "hs": "./hs.mjs"
+    "hs": "./hs.mjs",
+    "m5": "./m5.mjs"
   },
   "files": [
     "hs.mjs",
+    "m5.mjs",
+    "m5-client.mjs",
+    "m5-stdio-bridge.mjs",
     "README.md"
   ],
   "engines": {
