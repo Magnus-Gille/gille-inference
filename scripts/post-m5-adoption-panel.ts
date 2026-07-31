@@ -337,13 +337,29 @@ export function parseArgs(argv: string[]): { dryRun: boolean; dbPath: string; da
   return { dryRun, dbPath, days };
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<number> {
+export interface AdoptionPanelMainDependencies {
+  openReadOnlyDb?: (dbPath: string) => Database.Database;
+  pushPanel?: typeof pushPanel;
+  verifyPanelLanded?: typeof verifyPanelLanded;
+  writeStdout?: (text: string) => void;
+  writeStderr?: (text: string) => void;
+}
+
+export async function main(
+  argv = process.argv.slice(2),
+  dependencies: AdoptionPanelMainDependencies = {},
+): Promise<number> {
+  const openReadOnlyDb = dependencies.openReadOnlyDb ?? openReadOnlyAdoptionDb;
+  const postPanel = dependencies.pushPanel ?? pushPanel;
+  const verifyPostedPanel = dependencies.verifyPanelLanded ?? verifyPanelLanded;
+  const writeStdout = dependencies.writeStdout ?? ((text: string) => process.stdout.write(text));
+  const writeStderr = dependencies.writeStderr ?? ((text: string) => process.stderr.write(text));
   const { dryRun, dbPath, days } = parseArgs(argv);
   let db: Database.Database;
   try {
-    db = openReadOnlyAdoptionDb(dbPath);
+    db = openReadOnlyDb(dbPath);
   } catch (error) {
-    process.stderr.write(
+    writeStderr(
       `[m5-adoption-panel] cannot open authoritative EVAL_DB_PATH at ${dbPath}: ${error instanceof Error ? error.message : String(error)}\n`
     );
     return 2;
@@ -355,20 +371,25 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       days
     );
     if (dryRun) {
-      process.stdout.write(`${JSON.stringify(panels, null, 2)}\n`);
+      writeStdout(`${JSON.stringify(panels, null, 2)}\n`);
       return 0;
     }
+    let failed = false;
     for (const panel of Object.values(panels)) {
-      const pushed = await pushPanel(panel);
+      const pushed = await postPanel(panel);
       if (!pushed.ok) {
-        process.stderr.write(`[m5-adoption-panel] ${panel.panel}: push failed: ${pushed.error ?? `HTTP ${pushed.status}`}\n`);
+        writeStderr(`[m5-adoption-panel] ${panel.panel}: push failed: ${pushed.error ?? `HTTP ${pushed.status}`}\n`);
+        failed = true;
         continue;
       }
-      const readback = await verifyPanelLanded(SERVICE, panel.panel, { maxAgeMs: READBACK_MAX_AGE_MS });
-      if (readback.ok) process.stdout.write(`[m5-adoption-panel] ${panel.panel}: published and verified\n`);
-      else process.stderr.write(`[m5-adoption-panel] ${panel.panel}: ${verifyProblem(readback)}\n`);
+      const readback = await verifyPostedPanel(SERVICE, panel.panel, { maxAgeMs: READBACK_MAX_AGE_MS });
+      if (readback.ok) writeStdout(`[m5-adoption-panel] ${panel.panel}: published and verified\n`);
+      else {
+        writeStderr(`[m5-adoption-panel] ${panel.panel}: ${verifyProblem(readback)}\n`);
+        failed = true;
+      }
     }
-    return 0;
+    return failed ? 1 : 0;
   } finally {
     db.close();
   }

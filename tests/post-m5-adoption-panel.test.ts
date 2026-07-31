@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getDb, initDb } from "../src/db.js";
+import Database from "better-sqlite3";
 import { ensureAdoptionEvidenceSchema, parseAdoptionEvidence, recordAdoptionEvidence } from "../src/homeserver/adoption-evidence.js";
 import {
   INITIAL_ADOPTION_TARGET,
@@ -141,5 +142,24 @@ describe("post-m5-adoption-panel (#136)", () => {
       if (originalHomeserverDb === undefined) delete process.env["HOMESERVER_DB_PATH"];
       else process.env["HOMESERVER_DB_PATH"] = originalHomeserverDb;
     }
+  });
+
+  it("returns nonzero when any Heimdall push or readback fails", async () => {
+    const pushErrors: string[] = [];
+    await expect(main([], {
+      openReadOnlyDb: () => new Database(":memory:"),
+      pushPanel: async () => ({ ok: false, error: "test push failure" }),
+      writeStderr: (text) => pushErrors.push(text),
+    })).resolves.toBe(1);
+    expect(pushErrors.join("")).toContain("push failed");
+
+    const readbackErrors: string[] = [];
+    await expect(main([], {
+      openReadOnlyDb: () => new Database(":memory:"),
+      pushPanel: async () => ({ ok: true }),
+      verifyPanelLanded: async () => ({ ok: false, found: false }),
+      writeStderr: (text) => readbackErrors.push(text),
+    })).resolves.toBe(1);
+    expect(readbackErrors.join("")).toContain("panel absent");
   });
 });

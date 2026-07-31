@@ -333,6 +333,39 @@ describe("secret-safe M5 client", () => {
     expect(fetches).toBe(0);
   });
 
+  it("retries a transient Keychain failure on the same long-lived client", async () => {
+    let credentialResolutions = 0;
+    let fetches = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: {
+        resolve: async () => {
+          credentialResolutions += 1;
+          if (credentialResolutions === 1) {
+            throw new M5ClientError("credential_timeout", "temporary Keychain timeout");
+          }
+          return SECRET;
+        },
+      },
+      fetch: async (_input, init) => {
+        fetches += 1;
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
+          isError: false,
+        });
+      },
+    });
+
+    await expect(client.models()).rejects.toMatchObject({ code: "credential_timeout" });
+    await expect(client.models()).resolves.toEqual({
+      models: [{ id: "mellum", description: "fast" }],
+    });
+    expect(credentialResolutions).toBe(2);
+    expect(fetches).toBe(1);
+  });
+
   it("runs the async code path to a validated diff/result without applying it locally", async () => {
     const names: string[] = [];
     const client = await createM5Client({

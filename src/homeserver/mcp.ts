@@ -138,7 +138,7 @@ const ADOPTION_REPORT_DESCRIPTION =
 
 /**
  * The gateway needs this narrow transport classifier before its finally block emits per-request
- * telemetry. It intentionally recognizes only a syntactically valid `tools/call` by exact name;
+ * telemetry. It intentionally recognizes only a parseable `tools/call` envelope by exact name;
  * normal MCP methods and every other tool retain their ordinary access/request logging.
  */
 export function isAdoptionEvidenceToolCall(rawBody: string): boolean {
@@ -736,11 +736,13 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
   }
 
   if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {
-    const parsed = parseAdoptionEvidence(args);
-    if (!parsed.ok) {
+    // Reserve the transient slot before parsing. Invalid/content-bearing reports are deliberately
+    // correlation-log-suppressed too, so they must not become an invisible unbounded flood.
+    if (!allowAdoptionEvidenceReportForPrincipal(ctx.principal.keyHash!)) {
       return { text: "Adoption report was not accepted.", isError: true };
     }
-    if (!allowAdoptionEvidenceReportForPrincipal(ctx.principal.keyHash!)) {
+    const parsed = parseAdoptionEvidence(args);
+    if (!parsed.ok) {
       return { text: "Adoption report was not accepted.", isError: true };
     }
     try {

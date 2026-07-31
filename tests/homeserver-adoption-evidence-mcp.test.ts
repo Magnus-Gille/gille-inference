@@ -114,6 +114,19 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     expect(accessLines).toEqual([]);
   });
 
+  it("rate-bounds invisible invalid-report floods before schema rejection", async () => {
+    const invalidFloodKey = mintKey({ alias: "adoption-invalid-flood-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
+    for (let i = 0; i < MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW; i += 1) {
+      const raw = await rpc(callBody(60 + i, "record_adoption_evidence", { ...report, path: "/never/persist" }), invalidFloodKey);
+      expect(JSON.parse(raw)).toMatchObject({ result: { isError: true } });
+    }
+    const validAfterFlood = JSON.parse(await rpc(callBody(70, "record_adoption_evidence", report), invalidFloodKey)) as { result: { isError: boolean } };
+    expect(validAfterFlood.result.isError).toBe(true);
+    expect(tableCount("adoption_evidence")).toBe(0);
+    expect(tableCount("request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
+  });
+
   it("bounds a valid reporter flood without persisting an identity or transport correlation", async () => {
     const floodKey = mintKey({ alias: "adoption-flood-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
     const responses: Array<{ result: { isError: boolean } }> = [];

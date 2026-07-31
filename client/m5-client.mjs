@@ -381,27 +381,34 @@ export async function createM5Client({
 
   async function resolveToken() {
     if (token !== undefined) return token;
-    if (!tokenPromise) {
-      tokenPromise = (async () => {
-        let resolved;
-        try {
-          resolved = await credentialStore.resolve(profile);
-        } catch (error) {
-          if (error instanceof M5ClientError) throw error;
-          throw new M5ClientError(
-            "credential_unavailable",
-            "The selected Keychain credential could not be resolved.",
-          );
-        }
-        if (typeof resolved !== "string" || resolved.length === 0) {
-          throw new M5ClientError("missing_credential", "The selected credential is empty.");
-        }
-        token = resolved;
-        secrets.push(resolved);
-        return resolved;
-      })();
+    if (tokenPromise) return tokenPromise;
+    const pending = (async () => {
+      let resolved;
+      try {
+        resolved = await credentialStore.resolve(profile);
+      } catch (error) {
+        if (error instanceof M5ClientError) throw error;
+        throw new M5ClientError(
+          "credential_unavailable",
+          "The selected Keychain credential could not be resolved.",
+        );
+      }
+      if (typeof resolved !== "string" || resolved.length === 0) {
+        throw new M5ClientError("missing_credential", "The selected credential is empty.");
+      }
+      token = resolved;
+      secrets.push(resolved);
+      return resolved;
+    })();
+    tokenPromise = pending;
+    try {
+      return await pending;
+    } catch (error) {
+      // A long-lived stdio bridge must recover when Keychain was briefly unavailable. Do not cache
+      // the rejected promise (or its error); a later RPC gets one fresh credential resolution.
+      if (tokenPromise === pending) tokenPromise = undefined;
+      throw error;
     }
-    return tokenPromise;
   }
 
   async function request(message, retrySession = true) {
