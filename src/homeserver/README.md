@@ -504,6 +504,20 @@ friends can drop on their `$PATH` to talk to the gateway without writing curl or
 Everything is the OpenAI API + portal under the hood; the `hs` wrapper just handles auth,
 SSE stream parsing, and config persistence.
 
+## Agent client (`m5`) — secret-safe MCP and automation surface
+
+`client/m5.mjs` is the separate owner-agent client for Claude, Codex, and structured shell
+automation. It resolves a mandatory named profile from macOS Keychain, bridges stdio JSON-RPC only
+to `/mcp`, and exposes JSON `doctor`, `models`, `ask`, and `code run|status|result` commands.
+Credentials are not accepted through environment variables, client config, argv, or HTTP header
+configuration in the parent harness. Claude and Codex map to independently revocable Keychain
+accounts.
+
+The client never applies a code-loop diff and does not claim to enforce a local sandbox. The
+gateway's principal scope, OS cage, caps, protected paths, and diff-only result are authoritative.
+See [`../../docs/m5-agent-client.md`](../../docs/m5-agent-client.md) for installation, versioning,
+profile configuration, diagnostics, and transport behavior.
+
 ### Production text roster
 
 llama-swap serves one of eight text models at a time. `gpt-oss-120b` remains the standard large

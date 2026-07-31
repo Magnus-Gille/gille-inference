@@ -1,8 +1,13 @@
-# gille-inference
+# gille-inference clients
 
-A zero-dependency terminal client for a Gille Inference gateway. Redeem an invite code, list
-available models, chat with streaming output, and check your credit usage. All `example.com` URLs
-below are reserved documentation examples; replace them with your deployment URL.
+This package contains two deliberately separate zero-dependency clients:
+
+- `hs` is the friend-facing invite, streaming chat, and usage client described below.
+- `m5` is the profile-based, Keychain-backed owner-agent client and stdio MCP bridge.
+
+The box-local operator CLI remains `src/homeserver/cli.ts`; neither packaged client replaces it.
+All `example.com` URLs below are reserved documentation examples; replace them with your
+deployment URL.
 
 Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 
@@ -51,3 +56,22 @@ hs whoami
 ## More
 
 Your deployment's root URL serves the portal, invite flow, and client documentation.
+
+## Owner-agent `m5` client
+
+`m5` requires a named profile and resolves its credential internally from macOS Keychain. It has
+no bearer-token environment variable, config field, or argv flag. Public profiles require HTTPS;
+HTTP is accepted only for an explicitly selected private endpoint, and redirects fail closed.
+
+```bash
+m5 --profile codex doctor
+m5 --profile codex models
+printf '%s' '{"model":"mellum","prompt":"Summarize this."}' | m5 --profile codex ask
+m5 --profile codex mcp
+```
+
+See the
+[`m5` agent client guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-agent-client.md)
+for the profile schema, Keychain account mapping, structured code commands, `claude-config`
+installation/versioning contract, and security boundary. The server-side cage and diff-only result
+are authoritative; the client never applies a returned diff.
