@@ -205,6 +205,16 @@ describe("code_loop_* visibility in tools/list", () => {
     expect(start?.outputSchema).toBeDefined();
   });
 
+  it("advertises a Claude-compatible object root for every output schema", async () => {
+    const tools = await listedTools(ownerKey);
+    const toolsWithOutputSchemas = tools.filter((tool) => tool.outputSchema !== undefined);
+
+    expect(toolsWithOutputSchemas.map((tool) => tool.name)).toEqual(CODE_LOOP_TOOLS);
+    for (const tool of toolsWithOutputSchemas) {
+      expect(tool.outputSchema).toMatchObject({ type: "object" });
+    }
+  });
+
   it("advertises a well-formed start lifecycle with closed state and refusal variants", async () => {
     const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
     const schemaText = JSON.stringify(start?.outputSchema);
