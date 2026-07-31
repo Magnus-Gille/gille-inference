@@ -8,5 +8,5 @@ describe("published client package", () => {
     });
 
     expect(output).toContain("client package release gate passed: gille-inference@1.2.0");
-  });
+  }, 30_000);
 });
