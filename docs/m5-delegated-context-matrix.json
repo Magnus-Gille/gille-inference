@@ -39,9 +39,9 @@
       "status": "supported",
       "surface": "secret-safe M5 client / MCP ask",
       "evidence": {
-        "kind": "operator-observation",
-        "source": "2026-07-31 implementation handoff",
-        "claim": "A real Claude session has completed bounded M5 work. No ledger ID is published here, so this is operational support evidence only, not a capability-promotion receipt."
+        "kind": "redacted-acceptance-evidence",
+        "source": "https://github.com/Magnus-Gille/gille-inference/issues/72#issuecomment-5143969558",
+        "claim": "A fresh real Claude Code session discovered the installed least-privilege M5 MCP tools, completed a bounded isolated code-loop task, and passed its deterministic local test. This is current interactive-session MCP/code-loop support, not a capability-promotion receipt."
       }
     },
     {
