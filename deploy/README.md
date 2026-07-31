@@ -371,66 +371,84 @@ The bound deploy mode's capability probe calls
 `GET /v1/capabilities/learning-task` with `Authorization: Bearer $HOMESERVER_OWNER_KEY` (the env
 var name is configurable via `DEPLOY_CAPABILITY_KEY_ENV`) and checks only the HTTP status code. The
 key is read from the environment, never placed on the command line, and never appears in the
-script's stdout/stderr (covered by a regression test in `tests/deploy-gateway.test.ts`). Run the
-same check by hand for a one-off:
+script's stdout/stderr (covered by a regression test in `tests/deploy-gateway.test.ts`). From a
+provisioned macOS owner workstation, use the canonical Keychain-backed check instead of composing
+a bearer-bearing `curl` command:
 
 ```bash
-curl -fsS -o /dev/null -w '%{http_code}\n' \
-  -H "Authorization: Bearer ${HOMESERVER_OWNER_KEY}" \
-  "http://<tailnet-ip>:8080/v1/capabilities/learning-task"
+m5-auth --check
+m5-auth --check --tailnet
 ```
 
-### Canonical `m5-auth` owner-key rotation and revocation (issue #98)
+The helper passes the bearer to `curl` over stdin, discards the response body, suppresses
+locator-bearing transport diagnostics, and emits neither the credential nor the endpoint.
 
-`m5-auth` is the only approved laptop-side source of the dedicated owner credential used for
-authenticated delegation and this deploy probe. Its Keychain service/account are selected by
-`GILLE_KEYCHAIN_SERVICE` and `GILLE_KEYCHAIN_ACCOUNT` (the defaults are intentionally generic;
-the selected account name is private operator state). Do not copy a key from the M5 `.env`, a
-harness configuration, terminal history, a ticket, or a scratch file. Do not reuse the routing
-lifecycle key, a guest key, or a different service's key.
+### Credential preflight and owner-key rotation (issues #98, #110)
 
-Perform this owner-only ceremony from a private terminal with history/transcript capture disabled;
-keep exact aliases, Keychain account names, and private network locators in the private operations
-record, not this repository or a public issue.
+The live gateway's active keystore (plus any explicitly configured gateway environment keys) is
+the authentication source of truth. The macOS Keychain item used by `m5-auth` is a client-side copy,
+not another authority. By default it is service `gille-inference`, account `gateway-owner`; change
+those selectors only through `GILLE_KEYCHAIN_SERVICE` / `GILLE_KEYCHAIN_ACCOUNT`.
 
-1. **Preflight without revealing a key.** On the M5, inspect the logical rotation family with
-   `keys list --all`; confirm the chosen family is a dedicated owner-tier **admin-scope** key.
-   Admin scope is required for the `/delegate` path; preserve its deliberate quota and
-   parallelism limits. From the laptop, run `m5-auth --help` (not bare `m5-auth`) to verify the
-   helper exists without emitting a token. Record only aliases, timestamps, HTTP status, and
-   deployed revision in the private operations ticket.
-2. **Rotate; do not revoke then re-mint.** On the M5, run
-   `tsx src/homeserver/cli.ts keys rotate --alias <logical-owner-alias>`. Rotation is one SQLite
-   transaction: it revokes the active family member(s) and creates a collision-free replacement
-   alias while inheriting tier, scope, allow-list, and limits. A failed mint rolls the revocation
-   back. Never target a `-rN` child alias, and never use `keys revoke` followed by `keys mint`:
-   the old alias remains a primary-key row, so that sequence can leave the laptop with no usable
-   credential.
-3. **Store the replacement directly in the configured macOS Keychain item.** The CLI prints the
-   replacement exactly once. Use an operator-approved Keychain UI or equivalent secret-store
-   mechanism that does not put the value in argv, shell history, a file, or a public log. Replace
-   the existing configured service/account atomically from the operator's perspective; do not
-   delete the old Keychain item before the new value has been saved. The raw key must never be
-   pasted into a command shown in this runbook.
-4. **Prove the canonical tailnet path.** In a fresh terminal, run
-   `eval "$(m5-auth --env --tailnet)"`, then make the content-free authenticated capability
-   request above using `"$M5_GATEWAY_URL/v1/capabilities/learning-task"` and
-   `"$M5_API_KEY"`. A `200` proves that the canonical helper, Keychain item, tailnet listener,
-   and replacement key agree. Run one bounded authenticated `/delegate` or MCP call only after
-   this succeeds; capture its status/outcome but not request content or response text.
-5. **Prove revocation.** In the same controlled ceremony, submit the *retired* key only to the
-   content-free capability endpoint and verify `401 invalid_api_key`; never place that key in a
-   ticket, shell history, or committed test fixture. If it is accepted, stop: do not deploy and
-   investigate the selected logical family before retrying.
-6. **Re-establish deploy evidence.** Export the replacement only through `m5-auth --env --tailnet`
-   and run `scripts/deploy-gateway.sh deploy <accepted-full-sha>`. Its authenticated capability
-   probe is the deploy-side verification; no alternate credential transport is permitted.
+`m5-auth` is the only approved laptop-side source of this dedicated owner credential. Do not copy a
+key from the M5 `.env`, a harness configuration, terminal history, a ticket, or a scratch file. Do
+not reuse a routing-lifecycle key, a guest key, or a different service's key. Perform this
+owner-only ceremony from a private terminal with history/transcript capture disabled; record only
+sanitized aliases, timestamps, HTTP status, and deployed revision in the private operations record.
 
-Rotation intentionally revokes the preceding bearer value and therefore has no rollback that can
-make that old value valid again. If the replacement cannot be stored or authenticate, mint/rotate
-another replacement in the same logical family, update the Keychain item, and repeat the two
-content-free checks. Leave the gateway running on its last known-good deployment; do not weaken
-authentication or substitute an unrelated credential.
+Run the configured/default and tailnet checks separately. Their messages and exit codes are deliberately
+content-free:
+
+| Exit | State | Operator action |
+|---:|---|---|
+| `0` | credential accepted | Continue. |
+| `1` | Keychain credential missing | Restore the intended item selectors or provision the item through the prompt-only step below. |
+| `3` | gateway unreachable | Check transport, DNS/Tailscale, and service health; authentication was not evaluated. |
+| `4` | credential present but rejected (`401`) | Reconcile the gateway target first, then rotate if the authoritative active key is actually stale/revoked. |
+| `5` | gateway reachable but preflight inconclusive | Inspect gateway service logs; do not infer that the credential is valid or invalid. |
+
+If the configured/default check succeeds while the tailnet check returns `4` (or vice versa), do **not** rotate
+blindly. Production is intended to expose one gateway process on both paths, backed by one
+keystore. Verify that the Cloudflare Tunnel origin and the resolved tailnet target reach the same
+running service, deployment revision, working directory, and configured keystore. A path routed to
+an old gateway/configuration is source-of-truth drift; rotating the still-valid key would only
+revoke a working credential without correcting that routing/configuration fault.
+
+When both paths reach the authoritative gateway and the stored credential is genuinely stale:
+
+1. In a private interactive terminal on the live M5, inspect the logical rotation family with
+   `npx tsx src/homeserver/cli.ts keys list --all`. Identify the intended logical owner alias and
+   confirm it is a dedicated owner-tier **admin-scope** key with its intended quota and parallelism
+   limits. Do not paste that output into a public ticket if local aliases are sensitive.
+2. Rotate that logical family atomically with
+   `npx tsx src/homeserver/cli.ts keys rotate --alias <logical-alias>`. Do not use a
+   revoke-then-mint sequence; rotation preserves the tier/scope/limits and avoids the occupied-alias
+   failure described in the CLI documentation. Never target a `-rN` child alias. A failed mint
+   rolls the transaction back, but a successful rotation intentionally makes the retired bearer
+   permanently invalid.
+3. On the macOS workstation, update only the canonical Keychain item with a prompt, keeping the
+   plaintext out of argv and shell history:
+
+   ```bash
+   security add-generic-password -U -a gateway-owner -s gille-inference -w
+   ```
+
+   Enter the one-time value at the password prompt. Do not put it in an environment file, harness
+   config, issue, chat, clipboard manager, or command argument. If custom selectors are in use,
+   substitute those selector names, not the credential value.
+4. Re-run both `m5-auth --check` commands. Acceptance requires `0` on each intended path. If one
+   still returns `4`, stop and reconcile path/deployment parity rather than rotating again.
+5. In the same private ceremony, use an approved secret-safe operator path to send the retired key
+   only to the content-free capability endpoint and verify `401 invalid_api_key`. Record only that
+   sanitized status. If it is accepted, stop: do not deploy and investigate the selected logical
+   family before retrying.
+6. Export the replacement only through `m5-auth --env --tailnet` and run
+   `scripts/deploy-gateway.sh deploy <accepted-full-sha>`. Its authenticated capability probe is
+   the deploy-side verification; no alternate credential transport is permitted.
+
+If the replacement cannot be stored or authenticate, rotate another replacement in the same logical
+family, update the Keychain item, and repeat the two non-emitting checks. Leave the gateway running
+on its last known-good deployment; do not weaken authentication or substitute an unrelated credential.
 
 ### Adopting a routing-table change (routing-lifecycle-cli.ts)
 

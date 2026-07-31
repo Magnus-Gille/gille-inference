@@ -8,6 +8,7 @@
 #   M5_API_KEY=$(m5-auth)                 # print the token (for a harness env var)
 #   eval "$(m5-auth --env)"               # export token + OpenAI and gateway-root bases
 #   eval "$(m5-auth --env --tailnet)"     # as --env, but bases → m5 tailnet :8080 (#109)
+#   m5-auth --check [--tailnet]            # authenticate without emitting the token (#110)
 #   M5_AUTH_FILE=<(m5-auth) ./harness     # bridge for file-based harnesses (bash/zsh)
 #
 # The token is emitted for a bare call, `--env`, or `--env --tailnet` (the recognized
@@ -36,6 +37,8 @@ m5-auth — emit the home-server (M5) gateway bearer token from the macOS Keycha
   m5-auth                      print the token   (for: M5_API_KEY=$(m5-auth))
   m5-auth --env                print: export M5_API_KEY + M5_OPENAI_BASE_URL + M5_GATEWAY_URL
   m5-auth --env --tailnet      as --env, but bases → m5 tailnet (:8080, bypasses Cloudflare)
+  m5-auth --check              safely verify Keychain presence, reachability, and authentication
+  m5-auth --check --tailnet    run the same non-emitting check against the tailnet gateway
   M5_AUTH_FILE=<(m5-auth) …    bridge a file-based harness (no on-disk file)
 M5_OPENAI_BASE_URL ends in /v1 (for /chat/completions); M5_GATEWAY_URL has no /v1
 (for /delegate and /ledger). M5_BASE_URL remains the M5_OPENAI_BASE_URL compatibility alias.
@@ -97,6 +100,11 @@ emit() {
     echo "m5-auth: configure GILLE_KEYCHAIN_SERVICE and GILLE_KEYCHAIN_ACCOUNT." >&2
     exit 1
   }
+  if [ -z "$KEY" ]; then
+    echo "m5-auth: missing credential (the configured Keychain item is empty)." >&2
+    echo "m5-auth: follow the owner rotation/recovery runbook; do not use an empty item." >&2
+    exit 1
+  fi
   if [ "$1" = "env" ]; then
     # These two distinct bases make route composition mechanically unambiguous:
     #   "$M5_OPENAI_BASE_URL/chat/completions" → /v1/chat/completions
@@ -109,6 +117,56 @@ emit() {
   else
     printf '%s' "$KEY"
   fi
+}
+
+# preflight — authenticate against a cheap capability route without emitting the token,
+# response body, or configured gateway locator. Feed the Authorization header to curl over
+# stdin so the bearer does not appear in curl's process arguments. Curl diagnostics are
+# suppressed because they may contain a private locator; the categorized message below is the
+# complete operator-facing result.
+preflight() {
+  prepare_env_bases
+
+  local KEY HTTP_CODE
+  KEY=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null) || {
+    echo "m5-auth: missing credential (no token in the configured Keychain item)." >&2
+    echo "m5-auth: configure GILLE_KEYCHAIN_SERVICE and GILLE_KEYCHAIN_ACCOUNT; see the recovery runbook." >&2
+    exit 1
+  }
+  if [ -z "$KEY" ]; then
+    echo "m5-auth: missing credential (the configured Keychain item is empty)." >&2
+    echo "m5-auth: follow the owner rotation/recovery runbook; do not use an empty item." >&2
+    exit 1
+  fi
+
+  if ! HTTP_CODE=$(
+    printf 'Authorization: Bearer %s\n' "$KEY" |
+      curl --silent --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time 10 --header @- \
+        "$M5_AUTH_GATEWAY_URL/v1/capabilities/learning-task" 2>/dev/null
+  ); then
+    echo "m5-auth: gateway unreachable; credential presence was verified but authentication was not." >&2
+    exit 3
+  fi
+
+  case "$HTTP_CODE" in
+    2??)
+      echo "m5-auth: credential accepted." >&2
+      ;;
+    401)
+      echo "m5-auth: credential rejected by the gateway (present but stale, revoked, or out of sync)." >&2
+      echo "m5-auth: follow the owner rotation/recovery runbook; do not copy tokens between configs." >&2
+      exit 4
+      ;;
+    [1-5][0-9][0-9])
+      echo "m5-auth: gateway reachable, but the authenticated preflight was inconclusive (HTTP $HTTP_CODE)." >&2
+      exit 5
+      ;;
+    *)
+      echo "m5-auth: gateway returned an invalid preflight response; credential status is inconclusive." >&2
+      exit 5
+      ;;
+  esac
 }
 
 # resolve_m5_host — print the m5 tailnet host for the :8080 gateway. Prefer the live
@@ -124,11 +182,12 @@ resolve_m5_host() {
 # for a bare call or a combination of recognized emit-flags (--env, --tailnet). Help wins
 # over emission; any unknown arg (including "") forces the no-token error path. The error
 # path never echoes the offending argument (it could itself be a token-shaped secret).
-want_env=0; want_tailnet=0; want_help=0; bad=0
+want_env=0; want_tailnet=0; want_check=0; want_help=0; bad=0
 for arg in "$@"; do
   case "$arg" in
     --env) want_env=1 ;;
     --tailnet) want_tailnet=1 ;;
+    --check) want_check=1 ;;
     -h|--help) want_help=1 ;;
     *) bad=1 ;;
   esac
@@ -140,8 +199,12 @@ if [ "$bad" -eq 1 ]; then
   exit 2
 elif [ "$want_help" -eq 1 ]; then
   usage
-elif [ "$want_tailnet" -eq 1 ] && [ "$want_env" -eq 0 ]; then
-  echo "m5-auth: --tailnet only applies together with --env (it sets the gateway base URLs)." >&2
+elif [ "$want_check" -eq 1 ] && [ "$want_env" -eq 1 ]; then
+  echo "m5-auth: --check cannot be combined with --env; the check never emits credentials." >&2
+  usage
+  exit 2
+elif [ "$want_tailnet" -eq 1 ] && [ "$want_env" -eq 0 ] && [ "$want_check" -eq 0 ]; then
+  echo "m5-auth: --tailnet only applies together with --env or --check." >&2
   usage
   exit 2
 elif [ "$want_tailnet" -eq 1 ]; then
@@ -149,7 +212,9 @@ elif [ "$want_tailnet" -eq 1 ]; then
   M5_OPENAI_BASE_URL="$M5_GATEWAY_URL/v1"
   M5_BASE_URL="$M5_OPENAI_BASE_URL"
   export M5_GATEWAY_URL M5_OPENAI_BASE_URL M5_BASE_URL
-  emit env
+  if [ "$want_check" -eq 1 ]; then preflight; else emit env; fi
+elif [ "$want_check" -eq 1 ]; then
+  preflight
 elif [ "$want_env" -eq 1 ]; then
   emit env
 else

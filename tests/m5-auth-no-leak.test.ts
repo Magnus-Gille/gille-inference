@@ -21,8 +21,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, "..", "bin", "m5-auth");
 const SENTINEL = "hs_owner_FAKE_TEST_TOKEN_deadbeef";
 
-let binDir: string; // security + a tailscale that resolves to a fixed IP
+let binDir: string; // security + curl + a tailscale that resolves to a fixed IP
 let binDirNoTs: string; // security + a tailscale that FAILS (exercises the MagicDNS fallback)
+let binDirRejected: string;
+let binDirUnreachable: string;
+let binDirMissing: string;
+let binDirEmpty: string;
 
 /** Write an executable mock script and mark it +x. */
 function writeMock(dir: string, name: string, body: string): void {
@@ -46,12 +50,33 @@ beforeAll(() => {
     "tailscale",
     `#!/usr/bin/env bash\nif [ "$*" != "ip -4 inference-node" ]; then echo "fake-tailscale: unexpected argv: $*" >&2; exit 64; fi\nprintf '%s\\n' '192.0.2.10'\n`
   );
+  writeMock(
+    binDir,
+    "curl",
+    `#!/usr/bin/env bash\n[[ "$*" != *'${SENTINEL}'* ]] || exit 66\nIFS= read -r header\n[ "$header" = 'Authorization: Bearer ${SENTINEL}' ] || exit 65\nprintf '200'\n`
+  );
 
   // A second mock dir whose `tailscale` FAILS (non-zero, no stdout) — so resolve_m5_host
   // must fall back to the MagicDNS name `m5` cleanly under `set -euo pipefail`.
   binDirNoTs = mkdtempSync(join(tmpdir(), "m5-auth-noTS-"));
   writeMock(binDirNoTs, "security", securityMock);
   writeMock(binDirNoTs, "tailscale", `#!/usr/bin/env bash\nexit 1\n`);
+
+  binDirRejected = mkdtempSync(join(tmpdir(), "m5-auth-rejected-"));
+  writeMock(binDirRejected, "security", securityMock);
+  writeMock(binDirRejected, "curl", `#!/usr/bin/env bash\nIFS= read -r _header\nprintf '401'\n`);
+
+  binDirUnreachable = mkdtempSync(join(tmpdir(), "m5-auth-unreachable-"));
+  writeMock(binDirUnreachable, "security", securityMock);
+  writeMock(binDirUnreachable, "curl", `#!/usr/bin/env bash\nIFS= read -r _header\nexit 7\n`);
+
+  binDirMissing = mkdtempSync(join(tmpdir(), "m5-auth-missing-"));
+  writeMock(binDirMissing, "security", `#!/usr/bin/env bash\nexit 44\n`);
+  writeMock(binDirMissing, "curl", `#!/usr/bin/env bash\necho 'curl must not run' >&2\nexit 99\n`);
+
+  binDirEmpty = mkdtempSync(join(tmpdir(), "m5-auth-empty-"));
+  writeMock(binDirEmpty, "security", `#!/usr/bin/env bash\nexit 0\n`);
+  writeMock(binDirEmpty, "curl", `#!/usr/bin/env bash\necho 'curl must not run' >&2\nexit 99\n`);
 });
 
 function run(args: string[], dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
@@ -140,6 +165,74 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     expect(stderr).not.toContain(SENTINEL);
     expect(stderr).toMatch(/tailnet/i);
   });
+});
+
+describe("m5-auth — authenticated preflight (gille-inference#110)", () => {
+  it("reports an accepted credential without emitting it or the configured locator", () => {
+    const locator = "https://private.example";
+    const { code, stdout, stderr } = run(["--check"], binDir, { M5_GATEWAY_URL: locator });
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/credential accepted/i);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(locator);
+  });
+
+  it("distinguishes a present-but-rejected Keychain credential without leaking it", () => {
+    const locator = "https://stale.example";
+    const { code, stdout, stderr } = run(["--check"], binDirRejected, { M5_GATEWAY_URL: locator });
+    expect(code).toBe(4);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/credential rejected/i);
+    expect(stderr).toMatch(/rotate|recovery/i);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(locator);
+  });
+
+  it("distinguishes a missing Keychain credential and never attempts the request", () => {
+    const { code, stdout, stderr } = run(["--check"], binDirMissing);
+    expect(code).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/no token|missing credential/i);
+    expect(stderr).not.toContain("curl must not run");
+  });
+
+  it("treats an empty Keychain item as missing and never attempts the request", () => {
+    const { code, stdout, stderr } = run(["--check"], binDirEmpty);
+    expect(code).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/missing credential/i);
+    expect(stderr).not.toContain("curl must not run");
+  });
+
+  it("distinguishes an unreachable gateway without leaking the credential or locator", () => {
+    const locator = "https://unreachable.example";
+    const { code, stdout, stderr } = run(["--check"], binDirUnreachable, { M5_GATEWAY_URL: locator });
+    expect(code).toBe(3);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/gateway unreachable/i);
+    expect(stderr).not.toContain(SENTINEL);
+    expect(stderr).not.toContain(locator);
+  });
+
+  it("supports a tailnet preflight without emitting the resolved private locator", () => {
+    const { code, stdout, stderr } = run(["--check", "--tailnet"]);
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/credential accepted/i);
+    expect(stderr).not.toContain("192.0.2.10");
+    expect(stderr).not.toContain(SENTINEL);
+  });
+
+  it.each([["--check", "--env"], ["--check", "extra"]])(
+    "rejects incompatible preflight args %j without reading or emitting the token",
+    (...args) => {
+      const { code, stdout, stderr } = run(args);
+      expect(code).toBe(2);
+      expect(stdout).not.toContain(SENTINEL);
+      expect(stderr).not.toContain(SENTINEL);
+    }
+  );
 });
 
 describe("m5-auth — authenticated base URL contract (#71)", () => {
