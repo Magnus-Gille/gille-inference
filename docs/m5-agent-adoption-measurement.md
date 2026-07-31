@@ -35,15 +35,24 @@ Run the read-only panel poster weekly from the deployment environment after its 
 tsx scripts/post-m5-adoption-panel.ts --days 7
 ```
 
-It publishes three Heimdall panels:
+It publishes four Heimdall panels:
 
 | panel | status | interpretation |
 |---|---|---|
 | `m5-adoption-organic` | **MEASURED** | organic declared opportunities/attempts/useful completions/check pass rate by harness; evaluation and synthetic traffic are **ENFORCED** out |
+| `m5-adoption-organic-by-harness` | **MEASURED** | the same organic measures as closed, low-cardinality rows by harness; no caller, task, request, or repository identifier |
 | `m5-adoption-fallbacks` | **MEASURED** | organic closed fallback counts, including missing M5 tool/auth |
 | `m5-adoption-lab` | **LAB** | formal evaluation and synthetic probe evidence, separate from user/agent adoption |
 
-All three panels are **SHADOW** with respect to routing: they do not enable a route, prevent a frontier escalation, establish cost savings, or authorize autonomous action.
+All four panels are **SHADOW** with respect to routing: they do not enable a route, prevent a frontier escalation, establish cost savings, or authorize autonomous action.
+
+The report call itself is deliberately a privacy blind spot in the normal MCP telemetry: accepted
+and rejected reports from an authenticated owner-agent suppress per-request access, request, and
+owner logging. An accepted report leaves only its coarse `recorded_day` aggregate; a rejected one
+leaves no evidence. This prevents a report from being joined back to a principal or precise time.
+The tradeoff is that this narrow tool cannot be used for per-request debugging or auditing. It is
+rate-limited in memory per authenticated key and capped at 25 accepted rows per server day; either
+limit produces a generic refusal rather than a durable identity-bearing diagnostic.
 
 ## Predeclared review
 

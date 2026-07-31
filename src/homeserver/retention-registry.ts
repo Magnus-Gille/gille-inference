@@ -26,6 +26,8 @@
 const SIX_MONTHS_DAYS = 183;
 /** grimnir docs/data-lifecycle.md "Transient task artifacts: 30 days after task completion". */
 const THIRTY_DAYS = 30;
+/** Narrow, content-blind adoption evidence is retained only for its predeclared trial review. */
+const NINETY_DAYS = 90;
 
 export const RETENTION_DATA_CLASSES = {
   /** "Operational telemetry ... 6 months from collection" — verdict/routing evidence rows. */
@@ -38,6 +40,11 @@ export const RETENTION_DATA_CLASSES = {
   "transient-task-artifact": {
     retentionDays: THIRTY_DAYS,
     source: "grimnir docs/data-lifecycle.md — Default classes: Transient task artifacts",
+  },
+  /** #136's deliberately minimal, day-granularity adoption trial telemetry. */
+  "adoption-observation": {
+    retentionDays: NINETY_DAYS,
+    source: "gille-inference #136 — content-blind adoption trial; 90-day predeclared review window",
   },
 } as const;
 export type HarvestDataClass = keyof typeof RETENTION_DATA_CLASSES;
@@ -79,10 +86,16 @@ export interface HarvestStoreDescriptor {
    *  enforceable timestamp today (documented as a target, not enforced — mirrors grimnir's own
    *  Current/Target store-map convention). */
   readonly timestampColumn: string | null;
-  readonly timestampKind: "iso" | "epoch-ms" | null;
+  readonly timestampKind: "iso" | "date" | "epoch-ms" | null;
   readonly primaryKeyColumn: string | null;
+  /**
+   * A content-blind dry-run sample reference where the table deliberately has no row identity.
+   * Normally null because `primaryKeyColumn` supplies the reference; `adoption_evidence` uses its
+   * coarse day bucket so the retention report never reconstructs a high-cardinality event id.
+   */
+  readonly sampleRefColumn?: string | null;
   /** Columns holding actual prompt/response/content bytes. Empty for a content-blind store. Never
-   *  read by the dry-run reporter — only their COUNT and the row's primary key are ever reported. */
+   *  read by the dry-run reporter — only their COUNT and a safe row reference are ever reported. */
   readonly contentColumns: readonly string[];
   /**
    * The value a `redact-content` action writes into every `contentColumns` entry, and the value a
@@ -102,6 +115,7 @@ export interface HarvestStoreDescriptor {
 }
 
 const POLICY_EPOCH_2026_07_20 = "2026-07-20-data-lifecycle-v1";
+const POLICY_EPOCH_2026_07_31 = "2026-07-31-m5-adoption-v1";
 
 function retentionDaysFor(dataClass: HarvestDataClass): number {
   return RETENTION_DATA_CLASSES[dataClass].retentionDays;
@@ -132,6 +146,33 @@ export const HARVEST_STORE_REGISTRY: readonly HarvestStoreDescriptor[] = [
     purpose:
       "Content-blind, pseudonymous-by-alias fleet telemetry (distinct users, throughput, outcome " +
       "breakdown) for every principal including the owner. Basis: operational-telemetry.",
+  },
+
+  // ── adoption-evidence.ts — #136's explicit, content-free M5 adoption measure. A row has no
+  //    event id, caller, or precise timestamp; `recorded_day` is both the retention cutoff and the
+  //    only safe dry-run sample reference. Its shorter, predeclared window is intentional.
+  {
+    storeId: "adoption-evidence",
+    mechanism: "sqlite",
+    table: "adoption_evidence",
+    classification: "content-blind",
+    dataClass: "adoption-observation",
+    retentionDays: retentionDaysFor("adoption-observation"),
+    prunable: true,
+    pruneAction: "delete-row",
+    timestampColumn: "recorded_day",
+    timestampKind: "date",
+    primaryKeyColumn: null,
+    sampleRefColumn: "recorded_day",
+    contentColumns: [],
+    redactedContentValue: null,
+    ownerSource: "gille-inference",
+    sensitivity: "low",
+    policyEpoch: POLICY_EPOCH_2026_07_31,
+    purpose:
+      "Content-blind, day-granularity adoption observations for the #136 M5 agent trial. " +
+      "No caller identity, event id, task content, path, repository, or precise timestamp exists " +
+      "in this table; retain only through the 90-day predeclared review window.",
   },
 
   // ── owner-log.ts — owner_request_log: the FULL prompt/response for authenticated owner keys

@@ -5,10 +5,12 @@ import { tmpdir } from "node:os";
 import { getDb, initDb } from "../src/db.js";
 import {
   ADOPTION_EVIDENCE_COLUMNS,
+  MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY,
   ensureAdoptionEvidenceSchema,
   parseAdoptionEvidence,
   recordAdoptionEvidence,
 } from "../src/homeserver/adoption-evidence.js";
+import { isAdoptionEvidenceToolCall } from "../src/homeserver/mcp.js";
 
 beforeAll(() => {
   const dir = mkdtempSync(join(tmpdir(), "hs-adoption-evidence-test-"));
@@ -32,6 +34,22 @@ const organicPass = {
 };
 
 describe("M5 adoption evidence (#136)", () => {
+  it("identifies only the exact adoption MCP call for the narrow correlation-log suppression", () => {
+    expect(isAdoptionEvidenceToolCall(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "record_adoption_evidence", arguments: { prompt: "rejected before storage" } },
+    }))).toBe(true);
+    expect(isAdoptionEvidenceToolCall(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "ask", arguments: {} },
+    }))).toBe(false);
+    expect(isAdoptionEvidenceToolCall("not-json")).toBe(false);
+  });
+
   it("accepts the closed, content-blind organic evidence shape", () => {
     expect(parseAdoptionEvidence(organicPass)).toEqual({ ok: true, value: expect.objectContaining({
       harness: "codex_cli",
@@ -133,5 +151,18 @@ describe("M5 adoption evidence (#136)", () => {
       harness: "unbounded-runtime-label",
     } as unknown as typeof parsed.value)).toThrow("Invalid content-blind adoption report.");
     expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence").get()).toEqual({ count: 0 });
+  });
+
+  it("caps the server-day aggregate before insert without introducing a per-report id", () => {
+    const parsed = parseAdoptionEvidence(organicPass);
+    if (!parsed.ok) throw new Error("fixture must parse");
+    const accepted = Array.from({ length: MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY + 1 }, () =>
+      recordAdoptionEvidence(parsed.value)
+    );
+    expect(accepted.filter(Boolean)).toHaveLength(MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY);
+    expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence").get()).toEqual({
+      count: MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY,
+    });
+    expect(ADOPTION_EVIDENCE_COLUMNS).not.toContain("id");
   });
 });

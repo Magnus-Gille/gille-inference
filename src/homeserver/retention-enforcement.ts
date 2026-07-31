@@ -3,8 +3,9 @@
  *
  * Pure reporting: every function here only ever SELECTs (sqlite) or `stat`s (filesystem) — never a
  * DELETE/UPDATE. Reports are content-blind by construction: a sample-ref list carries only primary
- * keys (already-opaque ids/digests for every registered store — see retention-registry.ts's
- * comments), never a content column's value. The destructive counterpart
+ * safe references (normally already-opaque ids/digests; day buckets for deliberately identifier-
+ * free stores — see retention-registry.ts's comments), never a content column's value. The
+ * destructive counterpart
  * (`retention-prune-gate.ts::executeRetentionPrune`) always recomputes and re-verifies a report
  * from this module before it is allowed to delete anything; nothing here performs enforcement on
  * its own, and nothing in this repository schedules it to run automatically (issue #9 STRICT:
@@ -41,7 +42,7 @@ export interface StoreDryRunResult {
   cutoffIso: string;
   /** Count of rows/files that WOULD be affected. Never larger than the store's true count. */
   expiredCount: number;
-  /** Capped, content-blind primary-key/file-name sample — never a content column's value. */
+  /** Capped, content-blind row-reference/file-name sample — never a content column's value. */
   sampleRefs: string[];
 }
 
@@ -71,13 +72,18 @@ export function scanSqliteStoreForExpiry(
   nowIso: string,
 ): StoreDryRunResult {
   requireIsoNow(nowIso);
-  if (descriptor.mechanism !== "sqlite" || !descriptor.table || !descriptor.timestampColumn || !descriptor.primaryKeyColumn) {
+  const sampleRefColumn = descriptor.primaryKeyColumn ?? descriptor.sampleRefColumn;
+  if (descriptor.mechanism !== "sqlite" || !descriptor.table || !descriptor.timestampColumn || !sampleRefColumn) {
     throw new RetentionEnforcementError(
-      `store ${descriptor.storeId} is not a fully-specified sqlite descriptor (mechanism/table/timestampColumn/primaryKeyColumn required)`,
+      `store ${descriptor.storeId} is not a fully-specified sqlite descriptor (mechanism/table/timestampColumn/reference required)`,
     );
   }
   const cutoffIso = cutoffIsoFor(nowIso, descriptor.retentionDays);
-  const cutoffValue = descriptor.timestampKind === "epoch-ms" ? Date.parse(cutoffIso) : cutoffIso;
+  const cutoffValue = descriptor.timestampKind === "epoch-ms"
+    ? Date.parse(cutoffIso)
+    : descriptor.timestampKind === "date"
+      ? cutoffIso.slice(0, 10)
+      : cutoffIso;
 
   // For redact-content descriptors, "expired" additionally requires the content column to still
   // carry an un-redacted value — an already-redacted row is not reported again as pending work.
@@ -114,9 +120,9 @@ export function scanSqliteStoreForExpiry(
     .get(cutoffValue) as { n: number };
   const sampleRows = db
     .prepare(
-      `SELECT ${descriptor.primaryKeyColumn} AS ref FROM ${descriptor.table} ` +
+      `SELECT ${sampleRefColumn} AS ref FROM ${descriptor.table} ` +
         `WHERE ${descriptor.timestampColumn} < ?${contentGuard} ` +
-        `ORDER BY ${descriptor.primaryKeyColumn} LIMIT ${MAX_SAMPLE_REFS}`,
+        `ORDER BY ${sampleRefColumn} LIMIT ${MAX_SAMPLE_REFS}`,
     )
     .all(cutoffValue) as Array<{ ref: string | number }>;
 

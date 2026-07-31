@@ -110,11 +110,17 @@ Every report has only these closed, low-cardinality fields:
 **Never stored or accepted:** prompt/output text, file paths, repository names, aliases, key hashes,
 user/session IDs, free-text notes, or caller-provided timestamps. The writer rejects unknown fields
 before storage. It has no event ID or precise timestamp: the server derives only a UTC calendar day
-for the rolling-week query.
+for the rolling-week query. Accepted and rejected authenticated report calls deliberately suppress
+the normal per-request access/request/owner logs, so this table cannot be correlated to a principal
+or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot;
+it is bounded by a transient per-key rate limit and a 25-row server-day cap, with generic refusal
+when either bound is full.
 
-The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has three separate panels:
+The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
 
 - **MEASURED — organic M5 agent adoption:** only `traffic_purpose=organic`, by harness.
+- **MEASURED — organic M5 agent adoption by harness:** closed, content-free per-harness rows
+  alongside the fleet total.
 - **MEASURED — organic M5 fallback reasons:** closed aggregate counts, including tool/auth gaps.
 - **LAB — evaluation and synthetic M5 evidence:** formal evaluation/probe traffic, never added to
   the primary organic panel.
@@ -164,7 +170,7 @@ background, so it never blocks the request hot path.
 - **`owner_request_log` (content):** the most sensitive table — keep the shortest window you find
   useful (e.g. 30 days) or set `HOMESERVER_OWNER_REQUEST_LOG=off` if you don't need content capture.
   Prune by `ts` and `VACUUM`.
-- **`adoption_evidence` (content-blind):** retain long enough to make the predeclared review
-  possible (90 days is sufficient for the initial trial); it has no per-user value to join.
+- **`adoption_evidence` (content-blind):** the canonical retention registry enforces its
+  predeclared 90-day trial window; it has no per-user value to join.
 - Back up the eval DB (`EVAL_DB_PATH`, default `./data/eval.db`) like any private dataset; it
   contains your own content in `owner_request_log`.

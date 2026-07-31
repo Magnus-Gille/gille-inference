@@ -21,8 +21,10 @@ import { getDb } from "../db.js";
  *     per-key by alias"). `key_hash` (sha256 of the minted key, nullable) is stored ONLY so the
  *     owner can join their own rows; the RAW plaintext key is NEVER stored.
  *   • Writes are strictly BEST-EFFORT — every insert is wrapped in try/catch, so a log failure
- *     can never fail, slow, or alter a request. Written on EVERY request from both the HTTP and
- *     the MCP path. Gate via HOMESERVER_REQUEST_LOG (config.requestLog; default "on").
+ *     can never fail, slow, or alter a request. Written on every ordinary HTTP/MCP request; the
+ *     deliberately content-blind `record_adoption_evidence` MCP submission is the narrow exception
+ *     because even metadata would correlate its protected day-level evidence to a principal/time.
+ *     Gate via HOMESERVER_REQUEST_LOG (config.requestLog; default "on").
  *
  * The schema is additive and created idempotently in the shared eval DB, coexisting with
  * runs / api_keys / owner_request_log / etc.

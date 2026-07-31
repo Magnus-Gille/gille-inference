@@ -15,6 +15,7 @@ import { initDb, getDb } from "../src/db.js";
 import { recordRequestLog } from "../src/homeserver/request-log.js";
 import { recordOwnerRequest } from "../src/homeserver/owner-log.js";
 import { recordDelegation } from "../src/homeserver/ledger.js";
+import { parseAdoptionEvidence, recordAdoptionEvidence } from "../src/homeserver/adoption-evidence.js";
 import {
   runRetentionDryRun,
   scanSqliteStoreForExpiry,
@@ -106,6 +107,27 @@ describe("retention-enforcement — sqlite dry-run", () => {
     const result = scanSqliteStoreForExpiry(freshDb, descriptor, NOW);
     expect(result.expiredCount).toBe(0);
     expect(result.sampleRefs).toEqual([]);
+  });
+
+  it("includes 90-day content-blind adoption evidence in the dry-run without exposing an event id", () => {
+    const parsed = parseAdoptionEvidence({
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "pass",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    });
+    if (!parsed.ok) throw new Error("fixture must parse");
+    recordAdoptionEvidence(parsed.value);
+    getDb().prepare("UPDATE adoption_evidence SET recorded_day = '2026-01-01'").run();
+
+    const report = runRetentionDryRun(getDb(), { now: NOW, workroot: mkdtempSync(join(tmpdir(), "hs-retention-workroot-")) });
+    const adoption = report.stores.find((store) => store.storeId === "adoption-evidence");
+    expect(adoption).toMatchObject({ retentionDays: 90, expiredCount: 1, sampleRefs: ["2026-01-01"] });
+    expect(JSON.stringify(adoption)).not.toMatch(/alias|principal|prompt|response|path|repo/i);
   });
 
   it("rejects a non-ISO 'now'", () => {

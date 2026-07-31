@@ -77,6 +77,14 @@ export const ADOPTION_EVIDENCE_COLUMNS = [
   "eligible_opportunities",
 ] as const;
 
+/** Hard aggregate bound: enough for a small weekly trial, never an unbounded telemetry sink. */
+export const MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY = 25;
+/** Transient, per-minted-key flood bound. The key hash is never written to adoption_evidence. */
+export const MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW = 8;
+const ADOPTION_REPORT_WINDOW_MS = 60_000;
+
+const reporterWindows = new Map<string, number[]>();
+
 let initializedDb: Database.Database | null = null;
 
 function ensureSchema(db: Database.Database): void {
@@ -206,12 +214,39 @@ export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult
   };
 }
 
-/** Write one already-validated, content-free evidence report with only its server-derived UTC day. */
-export function recordAdoptionEvidence(report: AdoptionEvidenceReport): void {
+/**
+ * Reserve one short, in-memory reporting slot for an authenticated principal. The key hash exists
+ * only in this process memory and expires from its bucket after one minute; it never reaches the
+ * evidence table, panel, request log, or access log.
+ */
+export function allowAdoptionEvidenceReportForPrincipal(keyHash: string, nowMs = Date.now()): boolean {
+  if (!keyHash) return false;
+  const windowStart = nowMs - ADOPTION_REPORT_WINDOW_MS;
+  const active = (reporterWindows.get(keyHash) ?? []).filter((at) => at > windowStart);
+  if (active.length >= MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW) {
+    reporterWindows.set(keyHash, active);
+    return false;
+  }
+  active.push(nowMs);
+  reporterWindows.set(keyHash, active);
+  return true;
+}
+
+/**
+ * Write one already-validated, content-free evidence report with only its server-derived UTC day.
+ * Returns false when the bounded daily aggregate is full; it never generates a report/event id.
+ */
+export function recordAdoptionEvidence(report: AdoptionEvidenceReport): boolean {
   if (!isValidAdoptionEvidenceReport(report)) {
     throw new Error("Invalid content-blind adoption report.");
   }
-  evidenceDb()
+  const db = evidenceDb();
+  const recordedDay = new Date().toISOString().slice(0, 10);
+  const count = db
+    .prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day = ?")
+    .get(recordedDay) as { count: number };
+  if (count.count >= MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY) return false;
+  db
     .prepare(
       `INSERT INTO adoption_evidence
          (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
@@ -220,5 +255,6 @@ export function recordAdoptionEvidence(report: AdoptionEvidenceReport): void {
          (@recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
           @reviewerUsefulness, @fallbackReason, @eligibleOpportunities)`
     )
-    .run({ recordedDay: new Date().toISOString().slice(0, 10), ...report });
+    .run({ recordedDay, ...report });
+  return true;
 }

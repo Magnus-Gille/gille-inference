@@ -29,6 +29,7 @@ of that registry; if the two drift, the registry (and its own unit tests) win.
 | storeId | table / mechanism | classification | data class | window | action |
 |---|---|---|---|---|---|
 | `request-log` | `request_log` (sqlite) | content-blind | operational-telemetry | 183d | delete-row |
+| `adoption-evidence` | `adoption_evidence` (sqlite) | content-blind | adoption-observation | 90d | delete-row |
 | `owner-request-log` | `owner_request_log` (sqlite) | content-bearing | transient-task-artifact | 30d | redact-content (`messages_json`, `completion`) |
 | `owner-request-log-row` | `owner_request_log` (sqlite) | content-blind (post-redaction) | operational-telemetry | 183d | delete-row |
 | `delegations-content` | `delegations` (sqlite) | content-bearing | transient-task-artifact | 30d | redact-content (`prompt_excerpt`) |
@@ -66,6 +67,7 @@ pass; they are natural candidates for a follow-up ticket using the same registry
 |---|---|---|
 | `operational-telemetry` | 183 (~6 months) | "Operational telemetry ... 6 months from collection" |
 | `transient-task-artifact` | 30 | "Transient task artifacts ... 30 days after task completion" |
+| `adoption-observation` | 90 | #136's predeclared, content-blind adoption-trial window |
 
 ## Enforcement — dry-run first, always
 

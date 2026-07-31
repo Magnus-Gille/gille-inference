@@ -7,6 +7,9 @@ import { ensureAdoptionEvidenceSchema, parseAdoptionEvidence, recordAdoptionEvid
 import {
   INITIAL_ADOPTION_TARGET,
   buildAdoptionPanels,
+  main,
+  openReadOnlyAdoptionDb,
+  parseArgs,
   queryLabAdoptionByPurpose,
   queryOrganicAdoptionByHarness,
 } from "../scripts/post-m5-adoption-panel.js";
@@ -86,11 +89,27 @@ describe("post-m5-adoption-panel (#136)", () => {
   });
 
   it("labels observed numbers as measured, collection separation as enforced, and routing as shadow only", () => {
+    report();
     const panels = buildAdoptionPanels(queryOrganicAdoptionByHarness(getDb(), 7, Date.now()), [], 7);
     expect(panels.organic.label).toContain("MEASURED");
     expect(panels.organic.message).toContain("ENFORCED");
     expect(panels.organic.message).toContain("SHADOW");
     expect(panels.organic.detail?.cols).toEqual(["metric", "value"]);
+    expect(panels.organicByHarness.cols).toEqual([
+      "harness",
+      "known eligible opportunities",
+      "attempted delegations",
+      "useful completions",
+      "deterministic check pass rate",
+      "fallback reports",
+    ]);
+    expect(panels.organicByHarness.rows).toEqual([expect.objectContaining({
+      harness: "codex_cli",
+      "known eligible opportunities": 1,
+      "attempted delegations": 1,
+      "useful completions": 1,
+    })]);
+    expect(JSON.stringify(panels.organicByHarness)).not.toMatch(/"prompt"|"response"|"path"|"repository"|"alias"|"identity"|"request_id"/i);
     expect(panels.fallbacks.cols).toEqual(["reason", "reports"]);
     expect(panels.lab.cols).toEqual(["purpose", "reports", "known eligible opportunities", "attempted delegations", "completed"]);
   });
@@ -104,5 +123,23 @@ describe("post-m5-adoption-panel (#136)", () => {
     const panels = buildAdoptionPanels(queryOrganicAdoptionByHarness(getDb(), 7, Date.now()), [], 7);
     expect(JSON.stringify(panels.organic.detail)).toContain("2026-08-28");
     expect(JSON.stringify(panels.organic.detail)).toContain("20");
+  });
+
+  it("uses EVAL_DB_PATH and refuses an explicitly missing evidence database before publishing", async () => {
+    const originalEvalDb = process.env["EVAL_DB_PATH"];
+    const originalHomeserverDb = process.env["HOMESERVER_DB_PATH"];
+    const missing = join(tmpdir(), `missing-adoption-evidence-${Date.now()}.db`);
+    try {
+      process.env["EVAL_DB_PATH"] = "/authoritative/eval.db";
+      process.env["HOMESERVER_DB_PATH"] = "/wrong/homeserver.db";
+      expect(parseArgs([]).dbPath).toBe("/authoritative/eval.db");
+      expect(() => openReadOnlyAdoptionDb(missing)).toThrow(/does not exist/i);
+      await expect(main(["--dry-run", "--db", missing])).resolves.toBe(2);
+    } finally {
+      if (originalEvalDb === undefined) delete process.env["EVAL_DB_PATH"];
+      else process.env["EVAL_DB_PATH"] = originalEvalDb;
+      if (originalHomeserverDb === undefined) delete process.env["HOMESERVER_DB_PATH"];
+      else process.env["HOMESERVER_DB_PATH"] = originalHomeserverDb;
+    }
   });
 });

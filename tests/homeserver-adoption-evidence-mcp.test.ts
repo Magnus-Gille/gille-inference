@@ -1,14 +1,18 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getDb, initDb } from "../src/db.js";
+import { createAccessLogger, setDefaultLogger } from "../src/homeserver/access-log.js";
+import { MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW } from "../src/homeserver/adoption-evidence.js";
 
 const DEFAULTS = { rpm: 1_000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 let agentKey = "";
 let guestKey = "";
+let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
+let accessLines: string[] = [];
 
 function callBody(id: number, name: string, args: Record<string, unknown> = {}): unknown {
   return { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } };
@@ -34,6 +38,12 @@ const report = {
   eligible_opportunities: 2,
 };
 
+function tableCount(table: string): number {
+  const exists = getDb().prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+  if (!exists) return 0;
+  return (getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+}
+
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), "hs-adoption-evidence-mcp-"));
   initDb(join(dir, "test.db"));
@@ -44,7 +54,7 @@ beforeAll(async () => {
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
   const { resetConfig } = await import("../src/homeserver/config.js");
   resetConfig();
-  const { mintKey } = await import("../src/homeserver/keystore.js");
+  ({ mintKey } = await import("../src/homeserver/keystore.js"));
   agentKey = mintKey({ alias: "adoption-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
   guestKey = mintKey({ alias: "adoption-guest", tier: "guest" }, DEFAULTS).plaintextKey;
   const { startGateway } = await import("../src/homeserver/gateway.js");
@@ -53,8 +63,19 @@ beforeAll(async () => {
   stopGateway = handle.stop;
 });
 
+beforeEach(() => {
+  for (const table of ["adoption_evidence", "request_log", "owner_request_log"]) {
+    if (getDb().prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) {
+      getDb().prepare(`DELETE FROM ${table}`).run();
+    }
+  }
+  accessLines = [];
+  setDefaultLogger(createAccessLogger((line) => accessLines.push(line)));
+});
+
 afterAll(async () => {
   if (stopGateway) await stopGateway();
+  setDefaultLogger(createAccessLogger());
 });
 
 describe("record_adoption_evidence MCP tool (#136)", () => {
@@ -71,6 +92,9 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
       fallback_reason: "m5_auth_unavailable",
       eligible_opportunities: 2,
     });
+    expect(tableCount("request_log")).toBe(0);
+    expect(tableCount("owner_request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
   });
 
   it("does not expose an identity, prompt, response, or path in the acceptance payload", async () => {
@@ -79,10 +103,36 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     expect(raw).not.toMatch(/adoption-agent|prompt|response|path|repo|alias/i);
   });
 
+  it("refuses an invalid adoption report without evidence or per-request correlation logs", async () => {
+    const raw = await rpc(callBody(3, "record_adoption_evidence", { ...report, prompt: "never accept content" }), agentKey);
+    const parsed = JSON.parse(raw) as { result: { isError: boolean } };
+    expect(parsed.result.isError).toBe(true);
+    expect(raw).not.toContain("never accept content");
+    expect(tableCount("adoption_evidence")).toBe(0);
+    expect(tableCount("request_log")).toBe(0);
+    expect(tableCount("owner_request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
+  });
+
+  it("bounds a valid reporter flood without persisting an identity or transport correlation", async () => {
+    const floodKey = mintKey({ alias: "adoption-flood-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
+    const responses: Array<{ result: { isError: boolean } }> = [];
+    for (let i = 0; i < MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW + 1; i += 1) {
+      responses.push(JSON.parse(await rpc(callBody(100 + i, "record_adoption_evidence", report), floodKey)) as { result: { isError: boolean } });
+    }
+    expect(responses.filter((response) => !response.result.isError)).toHaveLength(MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW);
+    expect(tableCount("adoption_evidence")).toBe(MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW);
+    expect(tableCount("request_log")).toBe(0);
+    expect(tableCount("owner_request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
+    const storedColumns = getDb().prepare("PRAGMA table_info(adoption_evidence)").all() as Array<{ name: string }>;
+    expect(storedColumns.map((column) => column.name).join(" ")).not.toMatch(/id|alias|principal|request|prompt|response|path|repo/i);
+  });
+
   it("keeps the reporting tool invisible to guest credentials", async () => {
-    const list = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/list" }, guestKey);
-    const direct = await rpc(callBody(4, "record_adoption_evidence", report), guestKey);
-    const unknown = await rpc(callBody(5, "unknown_tool", report), guestKey);
+    const list = await rpc({ jsonrpc: "2.0", id: 30, method: "tools/list" }, guestKey);
+    const direct = await rpc(callBody(40, "record_adoption_evidence", report), guestKey);
+    const unknown = await rpc(callBody(50, "unknown_tool", report), guestKey);
     expect(list).not.toContain("record_adoption_evidence");
     const directResult = JSON.parse(direct) as { result: unknown };
     const unknownResult = JSON.parse(unknown) as { result: unknown };

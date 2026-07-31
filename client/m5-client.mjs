@@ -7,6 +7,27 @@ export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "code_loop_start",
   "code_loop_status",
   "code_loop_result",
+  "record_adoption_evidence",
+]);
+
+const ADOPTION_REPORT_FIELDS = Object.freeze([
+  "harness",
+  "execution_mode",
+  "traffic_purpose",
+  "result",
+  "deterministic_check",
+  "reviewer_usefulness",
+  "fallback_reason",
+  "eligible_opportunities",
+]);
+const ADOPTION_HARNESSES = new Set(["claude", "codex_cli", "codex_app", "pi", "direct_cli", "evaluation_runner"]);
+const ADOPTION_EXECUTION_MODES = new Set(["ask", "code_loop", "delegate"]);
+const ADOPTION_TRAFFIC_PURPOSES = new Set(["organic", "evaluation", "synthetic"]);
+const ADOPTION_RESULTS = new Set(["completed", "refused", "failed", "not_attempted"]);
+const ADOPTION_CHECKS = new Set(["pass", "fail", "not_run"]);
+const ADOPTION_USEFULNESS = new Set(["pass", "partial", "redo", "wrong", "not_reported"]);
+const ADOPTION_FALLBACKS = new Set([
+  "none", "m5_tool_missing", "m5_auth_unavailable", "m5_unreachable", "m5_busy", "m5_refused", "local_result_unusable", "other_known",
 ]);
 
 const TOKEN_PATTERNS = [
@@ -276,6 +297,37 @@ function validateWorkId(workId) {
   }
 }
 
+/**
+ * The standalone distributed client must reject content-bearing or malformed adoption reports
+ * before it resolves a Keychain credential or serializes any request. The gateway repeats this
+ * same closed contract authoritatively; it cannot share the TypeScript source without breaking the
+ * npm client's standalone installation boundary.
+ */
+function isValidAdoptionReport(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const keys = Object.keys(input);
+  if (keys.length !== ADOPTION_REPORT_FIELDS.length || keys.some((key) => !ADOPTION_REPORT_FIELDS.includes(key))) return false;
+  if (
+    !ADOPTION_HARNESSES.has(input.harness) ||
+    !ADOPTION_EXECUTION_MODES.has(input.execution_mode) ||
+    !ADOPTION_TRAFFIC_PURPOSES.has(input.traffic_purpose) ||
+    !ADOPTION_RESULTS.has(input.result) ||
+    !ADOPTION_CHECKS.has(input.deterministic_check) ||
+    !ADOPTION_USEFULNESS.has(input.reviewer_usefulness) ||
+    !ADOPTION_FALLBACKS.has(input.fallback_reason) ||
+    !Number.isInteger(input.eligible_opportunities) ||
+    input.eligible_opportunities < 0 ||
+    input.eligible_opportunities > 10_000
+  ) {
+    return false;
+  }
+  return input.result === "completed"
+    ? input.fallback_reason === "none"
+    : input.deterministic_check === "not_run" &&
+      input.reviewer_usefulness === "not_reported" &&
+      input.fallback_reason !== "none";
+}
+
 function validateCodeResult(result) {
   if (!result || typeof result !== "object") {
     throw new M5ClientError("invalid_code_result", "The code-loop result is malformed.");
@@ -321,35 +373,49 @@ export async function createM5Client({
   const origin = normalizeGatewayUrl(gatewayUrl, "gatewayUrl", {
     allowHttp: endpoint === "private",
   });
-  let token;
-  try {
-    token = await credentialStore.resolve(profile);
-  } catch (error) {
-    if (error instanceof M5ClientError) throw error;
-    throw new M5ClientError(
-      "credential_unavailable",
-      "The selected Keychain credential could not be resolved.",
-    );
-  }
-  if (typeof token !== "string" || token.length === 0) {
-    throw new M5ClientError("missing_credential", "The selected credential is empty.");
-  }
-
   let nextId = 1;
   let sessionId = null;
-  const secrets = [token];
+  let token;
+  let tokenPromise;
+  const secrets = [];
+
+  async function resolveToken() {
+    if (token !== undefined) return token;
+    if (!tokenPromise) {
+      tokenPromise = (async () => {
+        let resolved;
+        try {
+          resolved = await credentialStore.resolve(profile);
+        } catch (error) {
+          if (error instanceof M5ClientError) throw error;
+          throw new M5ClientError(
+            "credential_unavailable",
+            "The selected Keychain credential could not be resolved.",
+          );
+        }
+        if (typeof resolved !== "string" || resolved.length === 0) {
+          throw new M5ClientError("missing_credential", "The selected credential is empty.");
+        }
+        token = resolved;
+        secrets.push(resolved);
+        return resolved;
+      })();
+    }
+    return tokenPromise;
+  }
 
   async function request(message, retrySession = true) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      const resolvedToken = await resolveToken();
       const response = await fetchImpl(`${origin}/mcp`, {
         method: "POST",
         redirect: "error",
         headers: {
           "content-type": "application/json",
           accept: "application/json",
-          authorization: `Bearer ${token}`,
+          authorization: `Bearer ${resolvedToken}`,
           "user-agent": `m5-cli/${M5_CLIENT_VERSION}`,
           ...(sessionId === null ? {} : { "mcp-session-id": sessionId }),
         },
@@ -512,10 +578,10 @@ export async function createM5Client({
     },
 
     async reportAdoption(input) {
-      if (!input || typeof input !== "object" || Array.isArray(input)) {
+      if (!isValidAdoptionReport(input)) {
         throw new M5ClientError(
-          "invalid_input",
-          "adoption report requires one content-free JSON object.",
+          "invalid_adoption_report",
+          "adoption report must use the closed, content-free evidence contract.",
         );
       }
       const result = await client.tool("record_adoption_evidence", input);

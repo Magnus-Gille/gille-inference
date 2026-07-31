@@ -100,7 +100,9 @@ export function hasAdoptionEvidenceTable(db: Database.Database): boolean {
 }
 
 export function openReadOnlyAdoptionDb(dbPath: string): Database.Database {
-  if (!existsSync(dbPath)) return new Database(":memory:");
+  if (!existsSync(dbPath)) {
+    throw new Error(`adoption evidence database does not exist: ${dbPath}`);
+  }
   return new Database(dbPath, { readonly: true, fileMustExist: true });
 }
 
@@ -240,7 +242,7 @@ export function buildAdoptionPanels(
   organicRows: OrganicAdoptionByHarness[],
   labRows: LabAdoptionByPurpose[],
   days: number
-): { organic: StatusPanel; fallbacks: TablePanel; lab: TablePanel } {
+): { organic: StatusPanel; organicByHarness: TablePanel; fallbacks: TablePanel; lab: TablePanel } {
   const totals = aggregateOrganic(organicRows);
   const organic: StatusPanel = {
     service: SERVICE,
@@ -269,6 +271,31 @@ export function buildAdoptionPanels(
     },
   };
 
+  const organicByHarness: TablePanel = {
+    service: SERVICE,
+    panel: "m5-adoption-organic-by-harness",
+    kind: "table",
+    label: "MEASURED — organic M5 agent adoption by harness",
+    cols: [
+      "harness",
+      "known eligible opportunities",
+      "attempted delegations",
+      "useful completions",
+      "deterministic check pass rate",
+      "fallback reports",
+    ],
+    rows: organicRows.map((row) => ({
+      harness: row.harness,
+      "known eligible opportunities": row.eligibleOpportunities,
+      "attempted delegations": row.attemptedDelegations,
+      "useful completions": row.usefulCompletions,
+      "deterministic check pass rate": pct(row.deterministicCheckPasses, row.deterministicChecks),
+      "fallback reports": ADOPTION_FALLBACK_REASONS
+        .filter((reason) => reason !== "none")
+        .reduce((sum, reason) => sum + row.fallbackCounts[reason], 0),
+    })),
+  };
+
   const fallbacks: TablePanel = {
     service: SERVICE,
     panel: FALLBACKS_PANEL,
@@ -294,12 +321,12 @@ export function buildAdoptionPanels(
       completed: row.completed,
     })),
   };
-  return { organic, fallbacks, lab };
+  return { organic, organicByHarness, fallbacks, lab };
 }
 
-function parseArgs(argv: string[]): { dryRun: boolean; dbPath: string; days: number } {
+export function parseArgs(argv: string[]): { dryRun: boolean; dbPath: string; days: number } {
   let dryRun = false;
-  let dbPath = process.env["HOMESERVER_DB_PATH"] ?? "./data/eval.db";
+  let dbPath = process.env["EVAL_DB_PATH"] ?? "./data/eval.db";
   let days = DEFAULT_DAYS;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--dry-run") dryRun = true;
@@ -312,7 +339,15 @@ function parseArgs(argv: string[]): { dryRun: boolean; dbPath: string; days: num
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const { dryRun, dbPath, days } = parseArgs(argv);
-  const db = openReadOnlyAdoptionDb(dbPath);
+  let db: Database.Database;
+  try {
+    db = openReadOnlyAdoptionDb(dbPath);
+  } catch (error) {
+    process.stderr.write(
+      `[m5-adoption-panel] cannot open authoritative EVAL_DB_PATH at ${dbPath}: ${error instanceof Error ? error.message : String(error)}\n`
+    );
+    return 2;
+  }
   try {
     const panels = buildAdoptionPanels(
       queryOrganicAdoptionByHarness(db, days),

@@ -33,7 +33,7 @@ import { dirname, join, resolve } from "node:path";
 import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
-import { handleMcpPost } from "./mcp.js";
+import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, renderMetrics } from "./metrics.js";
@@ -3103,6 +3103,10 @@ async function handleRequest(
   };
   // Default: log every request. Healthz is gated by cfg.accessLogHealthz (default off).
   let logThis = true;
+  // An accepted OR refused authenticated adoption report deliberately leaves no per-request
+  // correlation trail. Its only durable signal is the content-blind, day-level aggregate row on
+  // acceptance; rejected reports leave no adoption evidence. Other MCP tools retain normal logs.
+  let suppressRequestTelemetry = false;
 
   // Single finally block — the ONLY emit site for gateway_request events.
   try {
@@ -3905,6 +3909,12 @@ async function handleRequest(
     // allow-list as /v1/chat/completions, via the shared runChatCompletion helper.
     if (path === "/mcp" && method === "POST") {
       const raw = await readBody(req);
+      suppressRequestTelemetry =
+        isAdoptionEvidenceToolCall(raw) &&
+        principal.tier === "owner" &&
+        principal.keyHash !== null &&
+        (principal.scope === "agent" || principal.scope === "admin");
+      if (suppressRequestTelemetry) logThis = false;
       await handleMcpPost(raw, res, {
         principal,
         cfg,
@@ -4435,7 +4445,7 @@ async function handleRequest(
     throw err;
   } finally {
     lctx.totalMs = Date.now() - startMs;
-    recordRequest({
+    if (!suppressRequestTelemetry) recordRequest({
       // C3: lctx.model is canonicalized (allow-list / resident catalogue) for the inference
       // surface — never the raw request string. Non-inference routes leave it null → "none".
       model: lctx.model,
@@ -4453,7 +4463,7 @@ async function handleRequest(
     // Mirrors the access-log fields to SQLite so the owner can query #users / concurrency / TTFT /
     // throughput / outcomes. NO content is ever written here. The model label is already
     // canonicalized; coerce null → "none" to mirror the metrics convention.
-    if (cfg.requestLog === "on") {
+    if (!suppressRequestTelemetry && cfg.requestLog === "on") {
       recordRequestLog({
         requestId: lctx.requestId,
         alias: lctx.principal,
@@ -4474,6 +4484,6 @@ async function handleRequest(
         admission: lctx.admission,
       });
     }
-    if (logThis) defaultLogger.log({ event: "gateway_request", ...lctx });
+    if (!suppressRequestTelemetry && logThis) defaultLogger.log({ event: "gateway_request", ...lctx });
   }
 }

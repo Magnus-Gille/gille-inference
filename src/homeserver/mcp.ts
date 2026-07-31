@@ -18,7 +18,11 @@ import { expandBlindContext, type BlindContextConfig } from "./blind-context.js"
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
-import { parseAdoptionEvidence, recordAdoptionEvidence } from "./adoption-evidence.js";
+import {
+  allowAdoptionEvidenceReportForPrincipal,
+  parseAdoptionEvidence,
+  recordAdoptionEvidence,
+} from "./adoption-evidence.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
 import type { KeyScope } from "./keystore.js";
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
@@ -131,6 +135,27 @@ const ADOPTION_REPORT_DESCRIPTION =
   "Record one content-free M5 adoption observation for the private operator dashboard. " +
   "Use this when an eligible task was completed, refused, failed, or could not even attempt M5; " +
   "report missing M5 tool and missing/auth-unavailable credentials distinctly. Never include task text, output, paths, repositories, or identifiers.";
+
+/**
+ * The gateway needs this narrow transport classifier before its finally block emits per-request
+ * telemetry. It intentionally recognizes only a syntactically valid `tools/call` by exact name;
+ * normal MCP methods and every other tool retain their ordinary access/request logging.
+ */
+export function isAdoptionEvidenceToolCall(rawBody: string): boolean {
+  try {
+    const message = JSON.parse(rawBody) as JsonRpcRequest;
+    if (!message || typeof message !== "object" || Array.isArray(message) || message.method !== "tools/call") return false;
+    const params = message.params;
+    return Boolean(
+      params &&
+      typeof params === "object" &&
+      !Array.isArray(params) &&
+      (params as { name?: unknown }).name === "record_adoption_evidence"
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Static tool catalogue. inputSchemas are fixed; the *visible model set* is conveyed at call
@@ -713,13 +738,18 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
   if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {
     const parsed = parseAdoptionEvidence(args);
     if (!parsed.ok) {
-      return { text: "Invalid content-blind adoption evidence.", isError: true };
+      return { text: "Adoption report was not accepted.", isError: true };
+    }
+    if (!allowAdoptionEvidenceReportForPrincipal(ctx.principal.keyHash!)) {
+      return { text: "Adoption report was not accepted.", isError: true };
     }
     try {
-      recordAdoptionEvidence(parsed.value);
+      if (!recordAdoptionEvidence(parsed.value)) {
+        return { text: "Adoption report was not accepted.", isError: true };
+      }
     } catch {
-      // Do not expose a database path or driver diagnostic in the tool response.
-      return { text: "Adoption evidence storage is temporarily unavailable.", isError: true };
+      // Do not expose a database path, rate state, or driver diagnostic in the tool response.
+      return { text: "Adoption report was not accepted.", isError: true };
     }
     return { text: "Accepted.", isError: false, structuredContent: { accepted: true } };
   }
