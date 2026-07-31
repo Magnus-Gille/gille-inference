@@ -415,7 +415,7 @@ export async function createM5Client({
         !hasError ||
         (parsed.error &&
           typeof parsed.error === "object" &&
-          typeof parsed.error.code === "number" &&
+          Number.isInteger(parsed.error.code) &&
           typeof parsed.error.message === "string");
       if (
         hasResult === hasError ||

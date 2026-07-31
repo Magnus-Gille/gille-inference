@@ -236,6 +236,7 @@ describe("m5 stdio MCP conformance", () => {
   it.each([
     {},
     { code: "-32000", message: "wrong code type" },
+    { code: -32000.5, message: "fractional code" },
     { code: -32000, message: 42 },
   ])("rejects malformed upstream JSON-RPC error envelope %#", async (error) => {
     const bridge = await makeBridge(async () =>
