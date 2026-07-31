@@ -66,8 +66,10 @@ The non-secret configuration lives at `~/.config/m5/config.json`:
 }
 ```
 
-The URLs above are examples. Profile files may contain endpoint locators, but credential-like
-fields are rejected. Keep private locator files local and out of Git.
+The URLs above are examples. `publicGatewayUrl` must use HTTPS. HTTP is accepted only for the
+explicit `privateGatewayUrl` path selected with `--private`; HTTPS also works there. These are the
+only two allowed profile fields: credential-like and unknown fields are rejected rather than
+ignored. Keep private locator files local and out of Git.
 
 The credential itself lives in macOS Keychain under service `gille-inference`. Accounts are
 derived mechanically from the selected profile:
@@ -127,6 +129,8 @@ validation, protected paths, caps, and diff-only result remain authoritative.
 Its top-level `status` distinguishes:
 
 - `missing_credential`
+- `credential_timeout`
+- `credential_unavailable`
 - `rejected_credential`
 - `network_failure`
 - `wrong_scope`
@@ -140,15 +144,17 @@ No token or endpoint locator is included in the result.
 
 The bridge accepts one newline-delimited JSON-RPC message at a time. It preserves the MCP session
 identifier returned by `initialize`, accepts notification `202`/empty responses without emitting
-stdout, rejects malformed input locally, bounds each HTTP request with a timeout, and continues
-serving later messages after a failed request. A stale HTTP MCP session (`404`/`410`) is retried
-once without the session identifier.
+stdout, rejects malformed input and upstream envelopes locally, bounds each HTTP request through
+response-body consumption, and continues serving later messages after a failed request. A stale
+HTTP MCP session (`404`/`410`) is retried once without the session identifier.
 
 The Keychain value is captured inside the client process and used only to construct the outbound
 HTTP `Authorization` header. It is never exported, passed to a subprocess, accepted from client
 config/argv, printed, logged, or persisted as an artifact. Error paths discard upstream bodies and
 redact bearer/token-shaped values, including Keychain subprocess failures and malformed upstream
-JSON-RPC errors.
+JSON-RPC errors. Keychain lookup is itself bounded and distinguishes a missing item from timeout or
+service failure. Authenticated HTTP requests use `redirect: error`, so the bearer is never
+automatically forwarded to a redirect target.
 
 `hs` remains a single-file, zero-dependency download served at `/hs`; importing the multi-file
 agent library into it would break that installation contract. The narrower `m5-client.mjs` library

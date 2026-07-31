@@ -67,6 +67,7 @@ describe("m5 command surface", () => {
       configLoader,
       credentialStore: { resolve: async () => SECRET },
       fetch: async (_input, init) => {
+        expect(init?.redirect).toBe("error");
         const request = JSON.parse(String(init?.body)) as { id: number };
         return new Response(
           JSON.stringify({
@@ -93,6 +94,39 @@ describe("m5 command surface", () => {
     });
     expect(error.text()).toBe("");
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("allows HTTP only when the configured private endpoint is selected explicitly", async () => {
+    const output = sink();
+    const error = sink();
+    const seen: string[] = [];
+    const exitCode = await main(["--profile", "codex", "--private", "models"], {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        seen.push(String(input));
+        expect(init?.redirect).toBe("error");
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [{ type: "text", text: "No models are available to this key." }],
+              isError: false,
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(seen).toEqual([`${PRIVATE_URL}/mcp`]);
+    expect(error.text()).toBe("");
   });
 
   it("accepts ask input only as bounded JSON stdin", async () => {

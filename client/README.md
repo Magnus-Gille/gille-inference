@@ -60,7 +60,8 @@ Your deployment's root URL serves the portal, invite flow, and client documentat
 ## Owner-agent `m5` client
 
 `m5` requires a named profile and resolves its credential internally from macOS Keychain. It has
-no bearer-token environment variable, config field, or argv flag.
+no bearer-token environment variable, config field, or argv flag. Public profiles require HTTPS;
+HTTP is accepted only for an explicitly selected private endpoint, and redirects fail closed.
 
 ```bash
 m5 --profile codex doctor

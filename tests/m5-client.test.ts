@@ -66,9 +66,10 @@ describe("profile-based Keychain resolution", () => {
     ]);
     expect(JSON.stringify(calls)).not.toContain(SECRET);
     expect(calls.every((call) => !("env" in call.options))).toBe(true);
+    expect(calls.every((call) => call.options.timeout === 5_000)).toBe(true);
   });
 
-  it("redacts subprocess failures and distinguishes a missing item", async () => {
+  it("redacts subprocess failures and distinguishes missing, timeout, and unavailable", async () => {
     const store = createKeychainCredentialStore({
       execFile: (_file, _args, _options, callback) => {
         const error = Object.assign(new Error(`security failed: ${SECRET}`), {
@@ -88,6 +89,37 @@ describe("profile-based Keychain resolution", () => {
     } catch (error) {
       expect(String(error)).not.toContain(SECRET);
     }
+
+    const timedOut = createKeychainCredentialStore({
+      timeoutMs: 7,
+      execFile: (_file, _args, options, callback) => {
+        expect(options.timeout).toBe(7);
+        callback(
+          Object.assign(new Error(`timed out ${SECRET}`), {
+            killed: true,
+            signal: "SIGTERM",
+          }),
+          "",
+          SECRET,
+        );
+      },
+    });
+    await expect(timedOut.resolve("codex")).rejects.toMatchObject({
+      code: "credential_timeout",
+    });
+
+    const unavailable = createKeychainCredentialStore({
+      execFile: (_file, _args, _options, callback) => {
+        callback(
+          Object.assign(new Error(`spawn failed ${SECRET}`), { code: "ENOENT" }),
+          "",
+          SECRET,
+        );
+      },
+    });
+    await expect(unavailable.resolve("codex")).rejects.toMatchObject({
+      code: "credential_unavailable",
+    });
   });
 
   it("rejects credential material in client configuration", () => {
@@ -104,6 +136,31 @@ describe("profile-based Keychain resolution", () => {
         publicGatewayUrl: `https://public.invalid/?token=${SECRET}`,
       }),
     ).toThrowError(/query parameters/i);
+    expect(() =>
+      validateProfileConfig({
+        ...PROFILE,
+        publicGatewayUrl: "http://public.invalid",
+      }),
+    ).toThrowError(/HTTPS/i);
+    expect(
+      validateProfileConfig({
+        ...PROFILE,
+        privateGatewayUrl: "http://private.invalid:8080",
+      }).privateGatewayUrl,
+    ).toBe("http://private.invalid:8080");
+
+    for (const extra of [
+      { apiKey: SECRET },
+      { api_key: SECRET },
+      { accessToken: SECRET },
+      { password: SECRET },
+      { headers: { authorization: `Bearer ${SECRET}` } },
+      { unexpected: "value" },
+    ]) {
+      expect(() =>
+        validateProfileConfig({ ...PROFILE, ...extra }),
+      ).toThrowError(/only.*publicGatewayUrl.*privateGatewayUrl/i);
+    }
   });
 
   it("keeps the executable version synchronized with the npm package", () => {
@@ -131,6 +188,7 @@ describe("secret-safe M5 client", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.url).toBe("https://gateway.invalid/mcp");
+    expect(requests[0]?.init?.redirect).toBe("error");
     expect((requests[0]?.init?.headers as Record<string, string>).authorization).toBe(
       `Bearer ${SECRET}`,
     );
@@ -163,6 +221,40 @@ describe("secret-safe M5 client", () => {
         expect(JSON.stringify(error)).not.toContain(SECRET);
       }
     }
+  });
+
+  it("keeps the request timeout active while consuming the response body", async () => {
+    let attempts = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      timeoutMs: 5,
+      fetch: async (_input, init) => {
+        attempts += 1;
+        if (attempts === 1) {
+          return {
+            status: 200,
+            headers: new Headers(),
+            text: () =>
+              new Promise<string>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () => {
+                  reject(new DOMException("body aborted", "AbortError"));
+                });
+              }),
+          } as Response;
+        }
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, tools([]));
+      },
+    });
+
+    await expect(
+      client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    ).rejects.toMatchObject({ code: "timeout" });
+    await expect(
+      client.rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    ).resolves.toMatchObject({ id: 2, result: { tools: [] } });
   });
 
   it("maps models and ask into structured JSON without forking MCP semantics", async () => {
@@ -340,6 +432,26 @@ describe("m5 doctor diagnostic distinctions", () => {
     await expect(diagnose({ credential: null })).resolves.toMatchObject({
       status: "missing_credential",
     });
+  });
+
+  it.each([
+    ["credential_timeout", "credential_timeout"],
+    ["credential_unavailable", "credential_unavailable"],
+  ])("distinguishes %s from a missing item", async (code, status) => {
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: PROFILE,
+      credentialStore: {
+        resolve: async () => {
+          throw new M5ClientError(code, `must redact ${SECRET}`);
+        },
+      },
+      fetch: async () => {
+        throw new Error("must not fetch");
+      },
+    });
+    expect(result).toMatchObject({ status, credential: "unavailable" });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
   it("distinguishes a rejected credential", async () => {

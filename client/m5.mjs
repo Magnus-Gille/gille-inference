@@ -189,6 +189,7 @@ export async function main(
     }
     const client = await createM5Client({
       gatewayUrl,
+      endpoint,
       profile,
       credentialStore,
       fetch: fetchImpl,

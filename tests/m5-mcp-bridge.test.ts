@@ -232,4 +232,25 @@ describe("m5 stdio MCP conformance", () => {
       error: { code: -32603, message: expect.stringMatching(/malformed JSON-RPC/i) },
     });
   });
+
+  it.each([
+    {},
+    { code: "-32000", message: "wrong code type" },
+    { code: -32000, message: 42 },
+  ])("rejects malformed upstream JSON-RPC error envelope %#", async (error) => {
+    const bridge = await makeBridge(async () =>
+      new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 13, error }),
+        { status: 200 },
+      ),
+    );
+
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":13,"method":"tools/list"}',
+    );
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 13,
+      error: { code: -32603, message: expect.stringMatching(/malformed JSON-RPC/i) },
+    });
+  });
 });

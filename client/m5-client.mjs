@@ -90,7 +90,10 @@ function profileAccount(profile) {
 export function createKeychainCredentialStore({
   execFile = nodeExecFile,
   service = "gille-inference",
+  timeoutMs = 5_000,
 } = {}) {
+  const boundedTimeoutMs =
+    Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : 5_000;
   return {
     async resolve(profile) {
       const account = profileAccount(profile);
@@ -98,9 +101,34 @@ export function createKeychainCredentialStore({
         execFile(
           "security",
           ["find-generic-password", "-s", service, "-a", account, "-w"],
-          { encoding: "utf8", maxBuffer: 4096 },
+          {
+            encoding: "utf8",
+            maxBuffer: 4096,
+            timeout: boundedTimeoutMs,
+            killSignal: "SIGTERM",
+          },
           (error, stdout) => {
             if (error) {
+              const timedOut =
+                error.killed === true || error.code === "ETIMEDOUT";
+              if (timedOut) {
+                reject(
+                  new M5ClientError(
+                    "credential_timeout",
+                    "The selected Keychain credential lookup timed out.",
+                  ),
+                );
+                return;
+              }
+              if (error.code !== 44 && error.code !== "44") {
+                reject(
+                  new M5ClientError(
+                    "credential_unavailable",
+                    "The macOS Keychain credential service is unavailable.",
+                  ),
+                );
+                return;
+              }
               reject(
                 new M5ClientError(
                   "missing_credential",
@@ -136,7 +164,7 @@ function containsCredentialField(value) {
   return false;
 }
 
-function normalizeGatewayUrl(raw, field) {
+function normalizeGatewayUrl(raw, field, { allowHttp = false } = {}) {
   if (typeof raw !== "string" || raw.length === 0) {
     throw new M5ClientError("invalid_config", `${field} must be an absolute HTTP(S) URL.`);
   }
@@ -146,10 +174,14 @@ function normalizeGatewayUrl(raw, field) {
   } catch {
     throw new M5ClientError("invalid_config", `${field} must be an absolute HTTP(S) URL.`);
   }
-  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+  const protocolAllowed =
+    parsed.protocol === "https:" || (allowHttp && parsed.protocol === "http:");
+  if (!protocolAllowed || parsed.username || parsed.password) {
     throw new M5ClientError(
       "invalid_config",
-      `${field} must be an HTTP(S) URL without embedded credentials.`,
+      allowHttp
+        ? `${field} must be an HTTP(S) URL without embedded credentials.`
+        : `${field} must use HTTPS without embedded credentials.`,
     );
   }
   if (parsed.search || parsed.hash) {
@@ -165,10 +197,14 @@ export function validateProfileConfig(config) {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new M5ClientError("invalid_config", "The selected profile configuration is invalid.");
   }
-  if (containsCredentialField(config)) {
+  const allowedFields = new Set(["publicGatewayUrl", "privateGatewayUrl"]);
+  const unexpectedFields = Object.keys(config).filter(
+    (field) => !allowedFields.has(field),
+  );
+  if (unexpectedFields.length > 0 || containsCredentialField(config)) {
     throw new M5ClientError(
       "invalid_config",
-      "Credential material is forbidden in m5 client configuration.",
+      "Only publicGatewayUrl and privateGatewayUrl are allowed; credential material and extra fields are forbidden.",
     );
   }
   const publicGatewayUrl = normalizeGatewayUrl(
@@ -178,7 +214,9 @@ export function validateProfileConfig(config) {
   const privateGatewayUrl =
     config.privateGatewayUrl === undefined
       ? undefined
-      : normalizeGatewayUrl(config.privateGatewayUrl, "privateGatewayUrl");
+      : normalizeGatewayUrl(config.privateGatewayUrl, "privateGatewayUrl", {
+          allowHttp: true,
+        });
   return { publicGatewayUrl, ...(privateGatewayUrl ? { privateGatewayUrl } : {}) };
 }
 
@@ -268,12 +306,21 @@ function delay(ms) {
 export async function createM5Client({
   gatewayUrl,
   profile,
+  endpoint = "public",
   credentialStore = createKeychainCredentialStore(),
   fetch: fetchImpl = globalThis.fetch,
   timeoutMs = 30_000,
   sleep = delay,
 }) {
-  const origin = normalizeGatewayUrl(gatewayUrl, "gatewayUrl");
+  if (endpoint !== "public" && endpoint !== "private") {
+    throw new M5ClientError(
+      "invalid_config",
+      "The gateway endpoint kind must be public or private.",
+    );
+  }
+  const origin = normalizeGatewayUrl(gatewayUrl, "gatewayUrl", {
+    allowHttp: endpoint === "private",
+  });
   let token;
   try {
     token = await credentialStore.resolve(profile);
@@ -295,10 +342,10 @@ export async function createM5Client({
   async function request(message, retrySession = true) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response;
     try {
-      response = await fetchImpl(`${origin}/mcp`, {
+      const response = await fetchImpl(`${origin}/mcp`, {
         method: "POST",
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           accept: "application/json",
@@ -309,10 +356,85 @@ export async function createM5Client({
         body: JSON.stringify(message),
         signal: controller.signal,
       });
+
+      if ((response.status === 404 || response.status === 410) && sessionId !== null && retrySession) {
+        sessionId = null;
+        return request(message, false);
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new M5ClientError(
+          "rejected_credential",
+          "The gateway rejected the selected credential.",
+          { httpStatus: response.status },
+        );
+      }
+      if (response.status >= 400) {
+        throw new M5ClientError(
+          "upstream_http_error",
+          `The MCP gateway returned HTTP ${response.status}.`,
+          { httpStatus: response.status },
+        );
+      }
+
+      const returnedSession = response.headers.get("mcp-session-id");
+      if (returnedSession) sessionId = returnedSession;
+      // Keep the same abort deadline active through body consumption. Fetch resolving headers
+      // is not completion: a peer can otherwise hold this sequential stdio bridge forever.
+      const text = await response.text();
+      if (text.trim() === "") {
+        if (message.id === undefined || message.id === null) return null;
+        throw new M5ClientError(
+          "empty_response",
+          "The MCP gateway returned an empty response for a request.",
+        );
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new M5ClientError(
+          "malformed_mcp",
+          "The MCP gateway returned malformed JSON.",
+        );
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        parsed.jsonrpc !== "2.0"
+      ) {
+        throw new M5ClientError(
+          "malformed_mcp",
+          "The MCP gateway returned a malformed JSON-RPC envelope.",
+        );
+      }
+      const hasResult = Object.prototype.hasOwnProperty.call(parsed, "result");
+      const hasError = Object.prototype.hasOwnProperty.call(parsed, "error");
+      const validError =
+        !hasError ||
+        (parsed.error &&
+          typeof parsed.error === "object" &&
+          typeof parsed.error.code === "number" &&
+          typeof parsed.error.message === "string");
+      if (
+        hasResult === hasError ||
+        !validError ||
+        (message.id !== undefined &&
+          message.id !== null &&
+          parsed.id !== message.id)
+      ) {
+        throw new M5ClientError(
+          "malformed_mcp",
+          "The MCP gateway returned a malformed JSON-RPC envelope.",
+        );
+      }
+      return redactValue(parsed, secrets);
     } catch (error) {
       if (controller.signal.aborted) {
         throw new M5ClientError("timeout", "The M5 gateway request timed out.");
       }
+      if (error instanceof M5ClientError) throw error;
       throw new M5ClientError(
         "network_failure",
         redactText(
@@ -323,72 +445,6 @@ export async function createM5Client({
     } finally {
       clearTimeout(timer);
     }
-
-    if ((response.status === 404 || response.status === 410) && sessionId !== null && retrySession) {
-      sessionId = null;
-      return request(message, false);
-    }
-    if (response.status === 401 || response.status === 403) {
-      throw new M5ClientError(
-        "rejected_credential",
-        "The gateway rejected the selected credential.",
-        { httpStatus: response.status },
-      );
-    }
-    if (response.status >= 400) {
-      throw new M5ClientError(
-        "upstream_http_error",
-        `The MCP gateway returned HTTP ${response.status}.`,
-        { httpStatus: response.status },
-      );
-    }
-
-    const returnedSession = response.headers.get("mcp-session-id");
-    if (returnedSession) sessionId = returnedSession;
-    const text = await response.text();
-    if (text.trim() === "") {
-      if (message.id === undefined || message.id === null) return null;
-      throw new M5ClientError(
-        "empty_response",
-        "The MCP gateway returned an empty response for a request.",
-      );
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new M5ClientError(
-        "malformed_mcp",
-        "The MCP gateway returned malformed JSON.",
-      );
-    }
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed) ||
-      parsed.jsonrpc !== "2.0"
-    ) {
-      throw new M5ClientError(
-        "malformed_mcp",
-        "The MCP gateway returned a malformed JSON-RPC envelope.",
-      );
-    }
-    const hasResult = Object.prototype.hasOwnProperty.call(parsed, "result");
-    const hasError = Object.prototype.hasOwnProperty.call(parsed, "error");
-    if (
-      hasResult === hasError ||
-      (hasError && (!parsed.error || typeof parsed.error !== "object")) ||
-      (message.id !== undefined &&
-        message.id !== null &&
-        parsed.id !== message.id)
-    ) {
-      throw new M5ClientError(
-        "malformed_mcp",
-        "The MCP gateway returned a malformed JSON-RPC envelope.",
-      );
-    }
-    return redactValue(parsed, secrets);
   }
 
   const client = {
@@ -535,6 +591,7 @@ async function identityRequest(baseUrl, token, fetchImpl, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(`${baseUrl}/portal/me`, {
+      redirect: "error",
       headers: {
         authorization: `Bearer ${token}`,
         "user-agent": `m5-cli/${M5_CLIENT_VERSION}`,
@@ -573,6 +630,7 @@ async function identityRequest(baseUrl, token, fetchImpl, timeoutMs) {
 
 async function endpointDoctor({
   baseUrl,
+  endpoint,
   profile,
   token,
   credentialStore,
@@ -582,6 +640,7 @@ async function endpointDoctor({
   const identity = await identityRequest(baseUrl, token, fetchImpl, timeoutMs);
   const client = await createM5Client({
     gatewayUrl: baseUrl,
+    endpoint,
     profile,
     credentialStore,
     fetch: fetchImpl,
@@ -632,8 +691,13 @@ export async function diagnoseProfile({
         endpoints: { public: "not_checked", private: "not_checked" },
       });
     }
+    const status =
+      error instanceof M5ClientError &&
+      ["credential_timeout", "credential_unavailable"].includes(error.code)
+        ? error.code
+        : "credential_unavailable";
     return safeDoctorResult({
-      status: "missing_credential",
+      status,
       profile,
       credential: "unavailable",
       endpoints: { public: "not_checked", private: "not_checked" },
@@ -645,6 +709,7 @@ export async function diagnoseProfile({
   try {
     publicProbe = await endpointDoctor({
       baseUrl: config.publicGatewayUrl,
+      endpoint: "public",
       profile,
       token,
       credentialStore: internalStore,
@@ -702,6 +767,7 @@ export async function diagnoseProfile({
   try {
     privateProbe = await endpointDoctor({
       baseUrl: config.privateGatewayUrl,
+      endpoint: "private",
       profile,
       token,
       credentialStore: internalStore,
