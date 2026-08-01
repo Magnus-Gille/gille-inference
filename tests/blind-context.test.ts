@@ -77,32 +77,52 @@ describe("expandBlindContext — disabled-by-default posture", () => {
 });
 
 describe("describeBlindContextAvailability", () => {
-  it("reports 'unconfigured' for an empty root list", () => {
-    expect(describeBlindContextAvailability([])).toEqual({
-      enabled: false,
-      reason: "unconfigured",
-      resolvedRootCount: 0,
-    });
-  });
+  const base = makeTmpRoot("bc-capability-roots-");
+  const validRoot = join(base, "allowed");
+  const validRootAlias = join(base, "allowed-link");
+  const regularFileRoot = join(base, "not-a-directory.txt");
+  const missingRoot = join(base, "missing");
+  mkdirSync(validRoot);
+  symlinkSync(validRoot, validRootAlias);
+  writeFileSync(regularFileRoot, "not a directory");
 
-  it("reports 'no_resolved_roots' when every configured root is unusable", () => {
-    expect(describeBlindContextAvailability(["/definitely/does/not/exist/anywhere"])).toEqual({
-      enabled: false,
-      reason: "no_resolved_roots",
-      resolvedRootCount: 0,
-    });
-  });
+  const cases = [
+    {
+      name: "empty roots stay unconfigured",
+      roots: [] as string[],
+      expected: { enabled: false, reason: "unconfigured", resolvedRootCount: 0 },
+    },
+    {
+      name: "missing roots fail closed",
+      roots: [missingRoot],
+      expected: { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 },
+    },
+    {
+      name: "regular files are not treated as roots",
+      roots: [regularFileRoot],
+      expected: { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 },
+    },
+    {
+      name: "real directories enable the feature",
+      roots: [validRoot],
+      expected: { enabled: true, reason: "enabled", resolvedRootCount: 1 },
+    },
+    {
+      name: "canonical duplicate and symlink-alias roots deduplicate",
+      roots: [validRoot, validRoot, validRootAlias],
+      expected: { enabled: true, reason: "enabled", resolvedRootCount: 1 },
+    },
+    {
+      name: "mixed valid and invalid roots keep only the real directory",
+      roots: [regularFileRoot, missingRoot, validRoot, validRootAlias],
+      expected: { enabled: true, reason: "enabled", resolvedRootCount: 1 },
+    },
+  ] as const;
 
-  it("counts only real directories from a mixed root list and does not mutate the input", () => {
-    const validRoot = makeTmpRoot("bc-capability-valid-");
-    const mixedRoots = [validRoot, "/definitely/does/not/exist/anywhere"];
-
-    expect(describeBlindContextAvailability(mixedRoots)).toEqual({
-      enabled: true,
-      reason: "enabled",
-      resolvedRootCount: 1,
-    });
-    expect(mixedRoots).toEqual([validRoot, "/definitely/does/not/exist/anywhere"]);
+  it.each(cases)("$name", ({ roots, expected }) => {
+    const snapshot = [...roots];
+    expect(describeBlindContextAvailability(roots)).toEqual(expected);
+    expect(roots).toEqual(snapshot);
   });
 });
 

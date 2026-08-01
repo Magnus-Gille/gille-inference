@@ -302,14 +302,30 @@ function parseAskCapabilities(value) {
     return null;
   }
   const { files_enabled, files_reason, resolved_root_count } = value;
+  const validReason =
+    files_reason === "enabled" ||
+    files_reason === "owner_tier_required" ||
+    files_reason === "unconfigured" ||
+    files_reason === "no_resolved_roots";
   if (
     typeof files_enabled !== "boolean" ||
-    typeof files_reason !== "string" ||
+    !validReason ||
     !(
       resolved_root_count === null ||
       (Number.isSafeInteger(resolved_root_count) && resolved_root_count >= 0)
     )
   ) {
+    return null;
+  }
+  if (files_enabled) {
+    if (files_reason !== "enabled" || resolved_root_count === null || resolved_root_count < 1) {
+      return null;
+    }
+  } else if (files_reason === "owner_tier_required") {
+    if (resolved_root_count !== null) {
+      return null;
+    }
+  } else if (resolved_root_count !== 0) {
     return null;
   }
   return { files_enabled, files_reason, resolved_root_count };

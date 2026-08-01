@@ -318,16 +318,68 @@ describe("MCP tools/call list_models", () => {
 });
 
 describe("parseAskFilesCapabilityMeta", () => {
-  it("returns null for malformed optional capability metadata", () => {
-    expect(parseAskFilesCapabilityMeta(undefined)).toBeNull();
-    expect(parseAskFilesCapabilityMeta({ files_enabled: "true" })).toBeNull();
-    expect(
-      parseAskFilesCapabilityMeta({
-        files_enabled: true,
-        files_reason: "enabled",
-        resolved_root_count: -1,
-      })
-    ).toBeNull();
+  const validCases = [
+    {
+      name: "enabled owner capability",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: 2 },
+    },
+    {
+      name: "guest-safe owner-tier gate",
+      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: null },
+    },
+    {
+      name: "unconfigured root state",
+      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: 0 },
+    },
+    {
+      name: "configured but unresolved roots",
+      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: 0 },
+    },
+  ] as const;
+
+  it.each(validCases)("accepts coherent optional capability metadata: $name", ({ value }) => {
+    expect(parseAskFilesCapabilityMeta(value)).toEqual(value);
+  });
+
+  const invalidCases: Array<{ name: string; value: unknown }> = [
+    { name: "missing object", value: undefined },
+    { name: "wrong files_enabled type", value: { files_enabled: "true" } },
+    {
+      name: "unknown reason string",
+      value: { files_enabled: false, files_reason: "disabled", resolved_root_count: null },
+    },
+    {
+      name: "unsafe integer count",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: Number.MAX_SAFE_INTEGER + 1 },
+    },
+    {
+      name: "negative count",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: -1 },
+    },
+    {
+      name: "enabled with zero roots",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: 0 },
+    },
+    {
+      name: "enabled with disabled reason",
+      value: { files_enabled: true, files_reason: "unconfigured", resolved_root_count: 1 },
+    },
+    {
+      name: "owner-tier-required with disclosed count",
+      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: 0 },
+    },
+    {
+      name: "unconfigured with null count",
+      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: null },
+    },
+    {
+      name: "no_resolved_roots with positive count",
+      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: 1 },
+    },
+  ];
+
+  it.each(invalidCases)("returns null for malformed optional capability metadata: $name", ({ value }) => {
+    expect(parseAskFilesCapabilityMeta(value)).toBeNull();
   });
 });
 

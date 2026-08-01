@@ -294,43 +294,57 @@ describe("secret-safe M5 client", () => {
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
   });
 
-  it("accepts the enriched list_models structuredContent without breaking model discovery", async () => {
-    const client = await createM5Client({
-      gatewayUrl: "https://gateway.invalid",
-      profile: "codex",
-      credentialStore: { resolve: async () => SECRET },
-      fetch: async (_input, init) => {
-        const request = JSON.parse(String(init?.body)) as {
-          id: number;
-          params?: { name?: string };
-        };
-        if (request.params?.name !== "list_models") {
-          throw new Error("unexpected tool");
-        }
-        return rpcResult(request.id, {
-          content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
-          isError: false,
-          structuredContent: {
-            models: [{ id: "mellum", description: "fast" }],
-            ask_capabilities: {
-              files_enabled: false,
-              files_reason: "owner_tier_required",
-              resolved_root_count: null,
-            },
-          },
-        });
-      },
-    });
+  const validCapabilities = [
+    {
+      name: "enabled owner capability",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: 2 },
+    },
+    {
+      name: "guest-safe owner-tier gate",
+      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: null },
+    },
+    {
+      name: "unconfigured root state",
+      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: 0 },
+    },
+    {
+      name: "configured but unresolved roots",
+      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: 0 },
+    },
+  ] as const;
 
-    await expect(client.models()).resolves.toEqual({
-      models: [{ id: "mellum", description: "fast" }],
-      ask_capabilities: {
-        files_enabled: false,
-        files_reason: "owner_tier_required",
-        resolved_root_count: null,
-      },
-    });
-  });
+  it.each(validCapabilities)(
+    "accepts coherent enriched list_models structuredContent without breaking model discovery: $name",
+    async ({ value }) => {
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        fetch: async (_input, init) => {
+          const request = JSON.parse(String(init?.body)) as {
+            id: number;
+            params?: { name?: string };
+          };
+          if (request.params?.name !== "list_models") {
+            throw new Error("unexpected tool");
+          }
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
+            isError: false,
+            structuredContent: {
+              models: [{ id: "mellum", description: "fast" }],
+              ask_capabilities: value,
+            },
+          });
+        },
+      });
+
+      await expect(client.models()).resolves.toEqual({
+        models: [{ id: "mellum", description: "fast" }],
+        ask_capabilities: value,
+      });
+    },
+  );
 
   it("parses the current list_models text fallback without inventing capability pseudo-models", async () => {
     const client = await createM5Client({
@@ -401,25 +415,48 @@ describe("secret-safe M5 client", () => {
     await expect(client.models()).resolves.toEqual({ models: [] });
   });
 
-  it("ignores malformed optional ask_capabilities structured metadata when models stay valid", async () => {
-    const malformedCapabilities = [
-      {
-        files_enabled: "false",
-        files_reason: "owner_tier_required",
-        resolved_root_count: null,
-      },
-      {
-        files_enabled: false,
-        files_reason: "owner_tier_required",
-        resolved_root_count: -1,
-      },
-      {
-        files_enabled: false,
-        resolved_root_count: null,
-      },
-    ];
+  const malformedCapabilities: Array<{ name: string; value: unknown }> = [
+    {
+      name: "wrong files_enabled type",
+      value: { files_enabled: "false", files_reason: "owner_tier_required", resolved_root_count: null },
+    },
+    {
+      name: "unknown reason string",
+      value: { files_enabled: false, files_reason: "disabled", resolved_root_count: null },
+    },
+    {
+      name: "unsafe integer count",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: Number.MAX_SAFE_INTEGER + 1 },
+    },
+    {
+      name: "negative root count",
+      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: -1 },
+    },
+    {
+      name: "enabled with zero roots",
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: 0 },
+    },
+    {
+      name: "enabled with disabled reason",
+      value: { files_enabled: true, files_reason: "unconfigured", resolved_root_count: 1 },
+    },
+    {
+      name: "owner-tier-required with disclosed count",
+      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: 0 },
+    },
+    {
+      name: "unconfigured with null count",
+      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: null },
+    },
+    {
+      name: "missing reason field",
+      value: { files_enabled: false, resolved_root_count: null },
+    },
+  ];
 
-    for (const ask_capabilities of malformedCapabilities) {
+  it.each(malformedCapabilities)(
+    "ignores malformed optional ask_capabilities structured metadata when models stay valid: $name",
+    async ({ value }) => {
       const client = await createM5Client({
         gatewayUrl: "https://gateway.invalid",
         profile: "codex",
@@ -437,7 +474,7 @@ describe("secret-safe M5 client", () => {
             isError: false,
             structuredContent: {
               models: [{ id: "mellum", description: "fast" }],
-              ask_capabilities,
+              ask_capabilities: value,
             },
           });
         },
@@ -446,8 +483,8 @@ describe("secret-safe M5 client", () => {
       await expect(client.models()).resolves.toEqual({
         models: [{ id: "mellum", description: "fast" }],
       });
-    }
-  });
+    },
+  );
 
   it("rejects content or unknown fields in an adoption report before Keychain resolution or fetch", async () => {
     let credentialResolutions = 0;

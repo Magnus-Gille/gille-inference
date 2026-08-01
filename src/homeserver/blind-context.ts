@@ -40,10 +40,11 @@ import { isAbsolute } from "node:path";
  *     the root string — otherwise an allowed root of `/data/allowed` would wrongly admit a
  *     sibling directory named `/data/allowed-2` that was never intended to be exposed.
  *
- *   • Roots must be ABSOLUTE: a relative entry in HOMESERVER_BLIND_CONTEXT_ROOTS would resolve
- *     against whatever CWD the gateway happened to launch from (systemd WorkingDirectory, a test
- *     runner, …) — the allowlist would silently change meaning per launch context. Relative
- *     entries are DROPPED by resolveRoots(); if none survive, the feature behaves as disabled.
+ *   • Roots must be ABSOLUTE DIRECTORIES: a relative entry in HOMESERVER_BLIND_CONTEXT_ROOTS
+ *     would resolve against whatever CWD the gateway happened to launch from (systemd
+ *     WorkingDirectory, a test runner, …) — the allowlist would silently change meaning per
+ *     launch context. Relative entries and non-directory targets are DROPPED by resolveRoots();
+ *     if none survive, the feature behaves as disabled.
  *
  *   • TOCTOU hardening (realpath → open race): after the containment check we do NOT read by
  *     path. The canonical path is opened with O_NOFOLLOW|O_NONBLOCK, the OPEN DESCRIPTOR is
@@ -146,23 +147,27 @@ const PREAMBLE = (n: number): string =>
   `[${n} file${n === 1 ? "" : "s"} attached server-side by the caller — provided below as additional local context]`;
 
 /**
- * Resolve every configured root to its canonical (symlink-free) path. A root that fails to
- * resolve (misconfigured / deleted / permission-denied) — or is RELATIVE (its meaning would
- * depend on the gateway's launch CWD; see the security model above) — is silently dropped rather
- * than crashing every request — the operator notices only if EVERY configured root is bad, at
- * which point the feature behaves identically to "disabled" (fail-safe, not fail-open).
+ * Resolve every configured root to one canonical (symlink-free) DIRECTORY path. A root that fails
+ * to resolve (misconfigured / deleted / permission-denied), resolves to a non-directory, or is
+ * RELATIVE (its meaning would depend on the gateway's launch CWD; see the security model above)
+ * is silently dropped rather than crashing every request. Canonical duplicates are collapsed so a
+ * raw duplicate or symlink alias never inflates the allowlist or the discovery count. The
+ * operator notices only if EVERY configured root is bad, at which point the feature behaves
+ * identically to "disabled" (fail-safe, not fail-open).
  */
 function resolveRoots(roots: readonly string[]): string[] {
-  const resolved: string[] = [];
+  const resolved = new Set<string>();
   for (const root of roots) {
     if (!isAbsolute(root)) continue; // never let a CWD-dependent entry into the allowlist
     try {
-      resolved.push(realpathSync(root));
+      const canonical = realpathSync(root);
+      if (!statSync(canonical).isDirectory()) continue;
+      resolved.add(canonical);
     } catch {
       // Skip an unusable root — see doc comment above.
     }
   }
-  return resolved;
+  return [...resolved];
 }
 
 /**

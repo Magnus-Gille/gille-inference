@@ -108,7 +108,10 @@ const ASK_DESCRIPTION =
   "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); a guest key supplying " +
   "`files` is always rejected, never silently ignored.";
 
-type AskFilesReason = "enabled" | "owner_tier_required" | "unconfigured" | "no_resolved_roots";
+const ASK_FILES_REASON_VALUES = ["enabled", "owner_tier_required", "unconfigured", "no_resolved_roots"] as const;
+const MAX_SAFE_ROOT_COUNT = Number.MAX_SAFE_INTEGER;
+
+type AskFilesReason = (typeof ASK_FILES_REASON_VALUES)[number];
 
 interface AskFilesCapability {
   files_enabled: boolean;
@@ -136,15 +139,45 @@ const ASK_FILES_CAPABILITY_SCHEMA = {
   additionalProperties: false,
   properties: {
     files_enabled: { type: "boolean" },
-    files_reason: { type: "string", enum: ["enabled", "owner_tier_required", "unconfigured", "no_resolved_roots"] },
+    files_reason: { type: "string", enum: ASK_FILES_REASON_VALUES },
     resolved_root_count: {
       oneOf: [
-        { type: "integer", minimum: 0 },
+        { type: "integer", minimum: 0, maximum: MAX_SAFE_ROOT_COUNT },
         { type: "null" },
       ],
     },
   },
   required: ["files_enabled", "files_reason", "resolved_root_count"],
+  oneOf: [
+    {
+      properties: {
+        files_enabled: { const: true },
+        files_reason: { const: "enabled" },
+        resolved_root_count: { type: "integer", minimum: 1, maximum: MAX_SAFE_ROOT_COUNT },
+      },
+    },
+    {
+      properties: {
+        files_enabled: { const: false },
+        files_reason: { const: "owner_tier_required" },
+        resolved_root_count: { type: "null" },
+      },
+    },
+    {
+      properties: {
+        files_enabled: { const: false },
+        files_reason: { const: "unconfigured" },
+        resolved_root_count: { const: 0 },
+      },
+    },
+    {
+      properties: {
+        files_enabled: { const: false },
+        files_reason: { const: "no_resolved_roots" },
+        resolved_root_count: { const: 0 },
+      },
+    },
+  ],
 } as const;
 
 const LIST_MODELS_OUTPUT_SCHEMA = {
@@ -219,26 +252,38 @@ export function parseAskFilesCapabilityMeta(value: unknown): AskFilesCapability 
   const filesEnabled = candidate["files_enabled"];
   const filesReason = candidate["files_reason"];
   const resolvedRootCount = candidate["resolved_root_count"];
-  if (typeof filesEnabled !== "boolean") return null;
-  if (
-    filesReason !== "enabled"
-    && filesReason !== "owner_tier_required"
-    && filesReason !== "unconfigured"
-    && filesReason !== "no_resolved_roots"
-  ) {
-    return null;
+  if (typeof filesEnabled !== "boolean" || !isAskFilesReason(filesReason)) return null;
+  if (resolvedRootCount !== null && !isSafeNonNegativeRootCount(resolvedRootCount)) return null;
+  if (filesEnabled) {
+    if (filesReason !== "enabled" || typeof resolvedRootCount !== "number" || resolvedRootCount < 1) return null;
+    return {
+      files_enabled: filesEnabled,
+      files_reason: filesReason,
+      resolved_root_count: resolvedRootCount,
+    };
   }
-  if (
-    resolvedRootCount !== null
-    && (typeof resolvedRootCount !== "number" || !Number.isInteger(resolvedRootCount) || resolvedRootCount < 0)
-  ) {
-    return null;
+  if (filesReason === "owner_tier_required") {
+    if (resolvedRootCount !== null) return null;
+    return {
+      files_enabled: filesEnabled,
+      files_reason: filesReason,
+      resolved_root_count: resolvedRootCount,
+    };
   }
+  if (resolvedRootCount !== 0) return null;
   return {
     files_enabled: filesEnabled,
     files_reason: filesReason,
     resolved_root_count: resolvedRootCount,
   };
+}
+
+function isAskFilesReason(value: unknown): value is AskFilesReason {
+  return typeof value === "string" && ASK_FILES_REASON_VALUES.includes(value as AskFilesReason);
+}
+
+function isSafeNonNegativeRootCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function buildListModelsStructuredContent(models: readonly string[], capability: AskFilesCapability): ListModelsStructuredContent {

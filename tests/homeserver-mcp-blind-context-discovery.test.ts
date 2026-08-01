@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.js";
@@ -252,8 +252,11 @@ describe("MCP blind-context discovery", () => {
   });
 
   it("surfaces configured-but-unusable roots without leaking paths and agrees across tools/list, list_models, and ask", async () => {
-    const missingRoot = join(tmpdir(), "hs-mcp-bc-discovery-missing", "nope");
-    const harness = await createHarness(missingRoot);
+    const base = mkdtempSync(join(tmpdir(), "hs-mcp-bc-discovery-invalid-"));
+    const missingRoot = join(base, "missing", "nope");
+    const regularFileRoot = join(base, "not-a-directory.txt");
+    writeFileSync(regularFileRoot, "not a directory");
+    const harness = await createHarness(`${missingRoot}:${regularFileRoot}`);
     try {
       const tools = await listTools(harness.gatewayPort, harness.ownerKey);
       const askDef = askTool(tools);
@@ -265,11 +268,13 @@ describe("MCP blind-context discovery", () => {
       });
       expect(askDef.description).not.toMatch(/resolve to no real directories/i);
       expect(JSON.stringify(askDef)).not.toContain(missingRoot);
+      expect(JSON.stringify(askDef)).not.toContain(regularFileRoot);
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
       expect(models.structuredContent?.ask_capabilities).toEqual(capability);
       expectCapabilityText(models.text, capability);
       expect(JSON.stringify(models)).not.toContain(missingRoot);
+      expect(JSON.stringify(models)).not.toContain(regularFileRoot);
 
       const result = await ask(harness.gatewayPort, harness.ownerKey, {
         model: "any-model",
@@ -287,10 +292,12 @@ describe("MCP blind-context discovery", () => {
   it("advertises only the bounded resolved-root count for an owner on mixed valid/invalid roots and keeps config immutable", async () => {
     const base = mkdtempSync(join(tmpdir(), "hs-mcp-bc-discovery-mixed-"));
     const allowedRoot = join(base, "allowed");
+    const allowedRootAlias = join(base, "allowed-link");
     const missingRoot = join(base, "missing");
     mkdirSync(allowedRoot);
+    symlinkSync(allowedRoot, allowedRootAlias);
     writeFileSync(join(allowedRoot, "notes.txt"), "the secret ingredient is basil");
-    const harness = await createHarness(`${allowedRoot}:${missingRoot}`);
+    const harness = await createHarness(`${allowedRoot}:${allowedRoot}:${allowedRootAlias}:${missingRoot}`);
     try {
       const before = [...loadConfig().blindContextRoots];
       const tools = await listTools(harness.gatewayPort, harness.ownerKey);
@@ -303,12 +310,14 @@ describe("MCP blind-context discovery", () => {
       });
       expect(askDef.description).not.toMatch(/currently enabled/i);
       expect(JSON.stringify(askDef)).not.toContain(allowedRoot);
+      expect(JSON.stringify(askDef)).not.toContain(allowedRootAlias);
       expect(JSON.stringify(askDef)).not.toContain(missingRoot);
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
       expect(models.structuredContent?.ask_capabilities).toEqual(capability);
       expectCapabilityText(models.text, capability);
       expect(JSON.stringify(models)).not.toContain(allowedRoot);
+      expect(JSON.stringify(models)).not.toContain(allowedRootAlias);
       expect(JSON.stringify(models)).not.toContain(missingRoot);
       expect(loadConfig().blindContextRoots).toEqual(before);
 
