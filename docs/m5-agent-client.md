@@ -117,6 +117,30 @@ m5 --profile codex code status cl-example
 m5 --profile codex code result cl-example
 ```
 
+`m5 ask` returns structured JSON:
+
+```json
+{
+  "model": "mellum",
+  "text": "answer text",
+  "finish_reason": "stop",
+  "truncated": false,
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 34,
+    "total_tokens": 46,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+  }
+}
+```
+
+If the backend ends with `finish_reason:"length"`, `m5 ask` still returns the same JSON shape,
+but with `truncated:true`, so automation can retry with a higher `max_tokens` instead of treating
+an empty or partial answer as a normal completion. Usage fields remain content-blind and stay
+`null` when the backend omits them; the client does not guess.
+
 `code run` starts the server-side async job, polls it, and returns the terminal structured result,
 including the unified diff and verification evidence. It can use `"wait": false` to return the
 start response for later `status`/`result` calls. It never applies the diff, writes into a live

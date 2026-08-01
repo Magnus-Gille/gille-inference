@@ -18,7 +18,7 @@ import {
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "nonjson" | "reset" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "nonjson" | "reset" | "length" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
@@ -68,6 +68,17 @@ function startUpstream(): Promise<void> {
         await new Promise<void>((resolve) => {
           releaseStall = resolve;
         });
+      }
+      if (mockMode === "length") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-length",
+            choices: [{ message: { role: "assistant", content: "" }, finish_reason: "length" }],
+            usage: { prompt_tokens: 5, completion_tokens: 64, total_tokens: 69 },
+          })
+        );
+        return;
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -529,6 +540,25 @@ describe("gateway spine — HTTP integration", () => {
     expect(after.status).toBe(401);
     const j = (await after.json()) as { error: { code: string } };
     expect(j.error.code).toBe("invalid_api_key");
+  });
+
+  it("preserves finish_reason=length and upstream usage on the direct non-streaming chat surface", async () => {
+    mockMode = "length";
+    const res = await chat("legacy-user-key", { stream: false, max_tokens: 64 });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      choices: Array<{ finish_reason?: string | null; message: { content: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    };
+    expect(body.choices[0]).toMatchObject({
+      finish_reason: "length",
+      message: { content: "" },
+    });
+    expect(body.usage).toMatchObject({
+      prompt_tokens: 5,
+      completion_tokens: 64,
+      total_tokens: 69,
+    });
   });
 
   it("admin can mint a key over HTTP and the plaintext appears only there", async () => {

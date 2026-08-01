@@ -155,7 +155,82 @@ describe("m5 command surface", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(JSON.parse(output.text())).toEqual({ model: "mellum", text: "small" });
+    expect(JSON.parse(output.text())).toEqual({
+      model: "mellum",
+      text: "small",
+      finish_reason: null,
+      truncated: null,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
+    expect(error.text()).toBe("");
+  });
+
+  it("returns structured truncation metadata for ask instead of failing hard", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: "The model response was truncated (finish_reason=length). Retry with a higher max_tokens.",
+                },
+              ],
+              isError: true,
+              structuredContent: {
+                model: "mellum",
+                text: "partial",
+                finish_reason: "length",
+                truncated: true,
+                usage: {
+                  prompt_tokens: 11,
+                  completion_tokens: 22,
+                  total_tokens: 33,
+                  reasoning_tokens: 7,
+                  cache_creation_input_tokens: null,
+                  cache_read_input_tokens: 5,
+                },
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({
+      model: "mellum",
+      text: "partial",
+      finish_reason: "length",
+      truncated: true,
+      usage: {
+        prompt_tokens: 11,
+        completion_tokens: 22,
+        total_tokens: 33,
+        reasoning_tokens: 7,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 5,
+      },
+    });
     expect(error.text()).toBe("");
   });
 

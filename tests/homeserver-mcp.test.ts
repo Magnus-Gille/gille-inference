@@ -49,11 +49,28 @@ function startUpstream(): Promise<void> {
         res.end(JSON.stringify({ error: { message: "boom" } }));
         return;
       }
+      if (reqModel === "truncated-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-truncated",
+            choices: [{ message: { role: "assistant", content: "F-2" }, finish_reason: "length" }],
+            usage: {
+              prompt_tokens: 5,
+              completion_tokens: 64,
+              total_tokens: 69,
+              prompt_tokens_details: { cached_tokens: 9 },
+              completion_tokens_details: { reasoning_tokens: 17 },
+            },
+          })
+        );
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           id: "cmpl-1",
-          choices: [{ message: { role: "assistant", content: "STUBBED COMPLETION" } }],
+          choices: [{ message: { role: "assistant", content: "STUBBED COMPLETION" }, finish_reason: "stop" }],
           usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
         })
       );
@@ -265,12 +282,94 @@ describe("MCP tools/call ask", () => {
       creditKey
     );
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { content: Array<{ type: string; text: string }>; isError: boolean } };
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent: {
+          model: string;
+          text: string;
+          finish_reason: string | null;
+          truncated: boolean | null;
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_creation_input_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
     expect(j.result.isError).toBe(false);
     expect(j.result.content[0]!.text).toBe("STUBBED COMPLETION");
+    expect(j.result.structuredContent).toEqual({
+      model: "any-model",
+      text: "STUBBED COMPLETION",
+      finish_reason: "stop",
+      truncated: false,
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 5,
+        total_tokens: 10,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
     // The stub reports total_tokens: 10 — credits must reflect real usage.
     const after = lookupKey(creditKey)!.creditsUsed;
     expect(after - before).toBe(10);
+  });
+
+  it("surfaces token-limit truncation as a tool error with structured finish-reason and usage metadata", async () => {
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 43,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "truncated-model", prompt: "hello", max_tokens: 64 } },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent: {
+          model: string;
+          text: string;
+          finish_reason: string | null;
+          truncated: boolean | null;
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_creation_input_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
+    expect(j.result.isError).toBe(true);
+    expect(j.result.content[0]!.text).toMatch(/truncated/i);
+    expect(j.result.structuredContent).toEqual({
+      model: "truncated-model",
+      text: "F-2",
+      finish_reason: "length",
+      truncated: true,
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 64,
+        total_tokens: 69,
+        reasoning_tokens: 17,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 9,
+      },
+    });
   });
 
   it("M3: an ask call feeds usage into /metrics (tokens + credits counters increment)", async () => {

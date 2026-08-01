@@ -279,6 +279,20 @@ describe("secret-safe M5 client", () => {
         return rpcResult(request.id, {
           content: [{ type: "text", text: "answer" }],
           isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            usage: {
+              prompt_tokens: 11,
+              completion_tokens: 4,
+              total_tokens: 15,
+              reasoning_tokens: 2,
+              cache_creation_input_tokens: null,
+              cache_read_input_tokens: 3,
+            },
+          },
         });
       },
     });
@@ -289,9 +303,66 @@ describe("secret-safe M5 client", () => {
     await expect(client.ask({ model: "mellum", prompt: "bounded task" })).resolves.toEqual({
       model: "mellum",
       text: "answer",
+      finish_reason: "stop",
+      truncated: false,
+      usage: {
+        prompt_tokens: 11,
+        completion_tokens: 4,
+        total_tokens: 15,
+        reasoning_tokens: 2,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 3,
+      },
     });
     expect(JSON.stringify(seen)).toContain('"name":"list_models"');
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
+  });
+
+  it("returns structured truncation metadata instead of collapsing a token-limited ask into plain text", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "ask") {
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "The model response was truncated. Please retry." }],
+            isError: true,
+            structuredContent: {
+              model: "mellum",
+              text: "F-2",
+              finish_reason: "length",
+              truncated: true,
+              usage: {
+                prompt_tokens: 5,
+                completion_tokens: 64,
+                total_tokens: 69,
+                reasoning_tokens: 17,
+                cache_creation_input_tokens: null,
+                cache_read_input_tokens: 9,
+              },
+            },
+          });
+        }
+        return rpcResult(request.id, tools(["ask"]));
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task" })).resolves.toEqual({
+      model: "mellum",
+      text: "F-2",
+      finish_reason: "length",
+      truncated: true,
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 64,
+        total_tokens: 69,
+        reasoning_tokens: 17,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 9,
+      },
+    });
   });
 
   it("rejects content or unknown fields in an adoption report before Keychain resolution or fetch", async () => {

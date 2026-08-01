@@ -291,6 +291,74 @@ function parseModels(text) {
     .filter((model) => model.id.length > 0);
 }
 
+function emptyAskUsage() {
+  return {
+    prompt_tokens: null,
+    completion_tokens: null,
+    total_tokens: null,
+    reasoning_tokens: null,
+    cache_creation_input_tokens: null,
+    cache_read_input_tokens: null,
+  };
+}
+
+function normalizeAskUsage(usage) {
+  if (usage === undefined) return emptyAskUsage();
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed usage metadata.");
+  }
+  const numberOrNull = (value) =>
+    typeof value === "number" && Number.isFinite(value) ? value : null;
+  return {
+    prompt_tokens: numberOrNull(usage.prompt_tokens),
+    completion_tokens: numberOrNull(usage.completion_tokens),
+    total_tokens: numberOrNull(usage.total_tokens),
+    reasoning_tokens: numberOrNull(usage.reasoning_tokens),
+    cache_creation_input_tokens: numberOrNull(usage.cache_creation_input_tokens),
+    cache_read_input_tokens: numberOrNull(usage.cache_read_input_tokens),
+  };
+}
+
+function normalizeAskPayload(payload, fallbackModel) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
+  }
+  const model =
+    typeof payload.model === "string" && payload.model.length > 0
+      ? payload.model
+      : fallbackModel;
+  if (typeof model !== "string" || model.length === 0) {
+    throw new M5ClientError("malformed_mcp", "The ask tool omitted the model id.");
+  }
+  if (typeof payload.text !== "string") {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
+  }
+  const finishReason =
+    payload.finish_reason === undefined || payload.finish_reason === null
+      ? null
+      : typeof payload.finish_reason === "string"
+        ? payload.finish_reason
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed finish-reason metadata.");
+          })();
+  let truncated =
+    payload.truncated === undefined || payload.truncated === null
+      ? null
+      : typeof payload.truncated === "boolean"
+        ? payload.truncated
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed truncation metadata.");
+          })();
+  if (truncated === null && finishReason !== null) truncated = finishReason === "length";
+  return {
+    model,
+    text: payload.text,
+    finish_reason: finishReason,
+    truncated,
+    usage: normalizeAskUsage(payload.usage),
+  };
+}
+
 function validateWorkId(workId) {
   if (typeof workId !== "string" || !/^cl-[A-Za-z0-9._-]+$/.test(workId)) {
     throw new M5ClientError("invalid_work_id", "A valid code-loop work_id is required.");
@@ -577,11 +645,52 @@ export async function createM5Client({
           "ask requires JSON with non-empty model and prompt strings.",
         );
       }
-      const text = await client.tool("ask", input);
+      const id = nextId++;
+      const response = await client.rpc({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "ask", arguments: input },
+      });
+      if (response?.error) {
+        throw new M5ClientError(
+          "mcp_error",
+          redactText(rpcErrorMessage(response), secrets),
+        );
+      }
+      const result = redactValue(response?.result, secrets);
+      if (!result || typeof result !== "object") {
+        throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
+      }
+      if (result.isError === true) {
+        if (result.structuredContent !== undefined) {
+          const structured = normalizeAskPayload(result.structuredContent, input.model);
+          if (structured.truncated === true) return structured;
+        }
+        const text = Array.isArray(result.content)
+          ? result.content.find((entry) => entry?.type === "text")?.text
+          : undefined;
+        throw new M5ClientError(
+          "tool_error",
+          typeof text === "string" ? text : "The MCP tool reported an error.",
+        );
+      }
+      if (result.structuredContent !== undefined) {
+        return normalizeAskPayload(result.structuredContent, input.model);
+      }
+      const text = Array.isArray(result.content)
+        ? result.content.find((entry) => entry?.type === "text")?.text
+        : undefined;
       if (typeof text !== "string") {
         throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
       }
-      return { model: input.model, text };
+      return {
+        model: input.model,
+        text,
+        finish_reason: null,
+        truncated: null,
+        usage: emptyAskUsage(),
+      };
     },
 
     async reportAdoption(input) {

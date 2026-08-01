@@ -78,6 +78,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 |--------|------|------|---------|
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
+| POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,usage}`; token-limit truncation returns `isError:true` with the same structured payload so callers can retry explicitly. |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |
 | GET | `/v1/roster-proposals/:proposalId` | authenticated owner | Read only that principal's durable proposal |
