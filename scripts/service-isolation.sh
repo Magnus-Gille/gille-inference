@@ -301,9 +301,22 @@ require_show_exact_device_allow() {
   local unit="$1" actual expected
   shift
   # systemctl show emits DeviceAllow as whitespace-separated path/access pairs.
-  actual="$(show_value "$unit" DeviceAllow | awk '{ for (i = 1; i <= NF; i += 2) { if (i + 1 > NF) exit 1; print $i ":" $(i + 1) } }' | sort -u)" || die "$unit DeviceAllow has an unparseable effective form"
-  expected="$(printf '%s\n' "$@" | sort -u)"
+  actual="$(show_value "$unit" DeviceAllow | awk '{ if (NF % 2 != 0) exit 1; for (i = 1; i <= NF; i += 2) print $i ":" $(i + 1) }' | LC_ALL=C sort -u)" || die "$unit DeviceAllow has an unparseable effective form"
+  expected="$(printf '%s\n' "$@" | LC_ALL=C sort -u)"
   [ "$actual" = "$expected" ] || die "$unit effective DeviceAllow differs from the reviewed allowlist"
+}
+require_llama_device_allow() {
+  local unit="$1"
+  # ProtectClock=true implicitly adds the abstract `char-rtc r` rule to the
+  # effective DeviceAllow set. Keep that protection enabled and accept only
+  # this documented systemd-derived rule plus the source-authored allowlist.
+  require_show_exact_device_allow "$unit" \
+    "/dev/null:rw" \
+    "/dev/urandom:r" \
+    "/dev/random:r" \
+    "$LLAMA_GPU_RENDER_DEVICE:rw" \
+    "$LLAMA_GPU_CARD_DEVICE:rw" \
+    "char-rtc:r"
 }
 assert_unit_prerequisites() {
   local service="$1" unit user actual_user fragment execstart
@@ -863,7 +876,8 @@ verify() {
       require_owner_group "$ROOT/llama-swap" "$LLAMA_USER" "$LLAMA_USER"
       [ "$(show_value "$unit" PrivateDevices)" = no ] || die "llama-swap PrivateDevices must remain disabled for reviewed GPU access"
       [ "$(show_value "$unit" DevicePolicy)" = closed ] || die "llama-swap DevicePolicy is not closed"
-      require_show_exact_device_allow "$unit" "/dev/null:rw" "/dev/urandom:r" "/dev/random:r" "$LLAMA_GPU_RENDER_DEVICE:rw" "$LLAMA_GPU_CARD_DEVICE:rw"
+      [ "$(show_value "$unit" ProtectClock)" = yes ] || die "llama-swap ProtectClock is not enabled"
+      require_llama_device_allow "$unit"
       # systemd canonicalizes `IPAddressDeny=any` to these universal CIDRs in
       # `systemctl show`; validate the effective representation, not source text.
       require_show_exact_set "$unit" IPAddressDeny 0.0.0.0/0 ::/0
