@@ -160,6 +160,7 @@ describe("m5 command surface", () => {
       text: "small",
       finish_reason: null,
       truncated: null,
+      metered: true,
       usage: {
         prompt_tokens: null,
         completion_tokens: null,
@@ -200,6 +201,7 @@ describe("m5 command surface", () => {
                 text: "partial",
                 finish_reason: "length",
                 truncated: true,
+                metered: true,
                 usage: {
                   prompt_tokens: 11,
                   completion_tokens: 22,
@@ -222,6 +224,7 @@ describe("m5 command surface", () => {
       text: "partial",
       finish_reason: "length",
       truncated: true,
+      metered: true,
       usage: {
         prompt_tokens: 11,
         completion_tokens: 22,
@@ -232,6 +235,255 @@ describe("m5 command surface", () => {
       },
     });
     expect(error.text()).toBe("");
+  });
+
+  it("derives truncated=true from finish_reason=length when the server omits the explicit flag", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: "WARNING: truncated. Partial response follows.\n\npartial",
+                },
+              ],
+              isError: true,
+              structuredContent: {
+                model: "mellum",
+                text: "partial",
+                finish_reason: "length",
+                usage: null,
+                metered: true,
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({
+      model: "mellum",
+      text: "partial",
+      finish_reason: "length",
+      truncated: true,
+      metered: true,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
+    expect(error.text()).toBe("");
+  });
+
+  it("keeps null usage content-blind on successful structured ask results", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [{ type: "text", text: "small" }],
+              isError: false,
+              structuredContent: {
+                model: "mellum",
+                text: "small",
+                finish_reason: "stop",
+                truncated: false,
+                usage: null,
+                metered: true,
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({
+      model: "mellum",
+      text: "small",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
+    expect(error.text()).toBe("");
+  });
+
+  it("nulls malformed usage counters instead of trusting negative or fractional values", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [{ type: "text", text: "small" }],
+              isError: false,
+              structuredContent: {
+                model: "mellum",
+                text: "small",
+                finish_reason: "stop",
+                truncated: false,
+                usage: {
+                  prompt_tokens: -1,
+                  completion_tokens: 2.5,
+                  total_tokens: 3.5,
+                  reasoning_tokens: -4,
+                  cache_creation_input_tokens: 1,
+                  cache_read_input_tokens: 0,
+                },
+                metered: true,
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({
+      model: "mellum",
+      text: "small",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: 1,
+        cache_read_input_tokens: 0,
+      },
+    });
+    expect(error.text()).toBe("");
+  });
+
+  it("falls through malformed structured ask errors to the real tool_error text", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [{ type: "text", text: "owner-tier only" }],
+              isError: true,
+              structuredContent: {
+                model: 7,
+                usage: "bad",
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: {
+        code: "tool_error",
+        message: "owner-tier only",
+      },
+    });
+  });
+
+  it("treats non-length structured ask errors as real tool errors, preserving exit 1", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [{ type: "text", text: "ordinary structured error" }],
+              isError: true,
+              structuredContent: {
+                model: "mellum",
+                text: "partial",
+                finish_reason: "stop",
+                truncated: true,
+                usage: null,
+                metered: true,
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: {
+        code: "tool_error",
+        message: "ordinary structured error",
+      },
+    });
   });
 
   it("submits a content-free adoption report through MCP without exposing the credential", async () => {

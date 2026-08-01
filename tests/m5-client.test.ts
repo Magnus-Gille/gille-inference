@@ -284,6 +284,7 @@ describe("secret-safe M5 client", () => {
             text: "answer",
             finish_reason: "stop",
             truncated: false,
+            metered: true,
             usage: {
               prompt_tokens: 11,
               completion_tokens: 4,
@@ -305,6 +306,7 @@ describe("secret-safe M5 client", () => {
       text: "answer",
       finish_reason: "stop",
       truncated: false,
+      metered: true,
       usage: {
         prompt_tokens: 11,
         completion_tokens: 4,
@@ -334,6 +336,7 @@ describe("secret-safe M5 client", () => {
               text: "F-2",
               finish_reason: "length",
               truncated: true,
+              metered: true,
               usage: {
                 prompt_tokens: 5,
                 completion_tokens: 64,
@@ -354,6 +357,7 @@ describe("secret-safe M5 client", () => {
       text: "F-2",
       finish_reason: "length",
       truncated: true,
+      metered: true,
       usage: {
         prompt_tokens: 5,
         completion_tokens: 64,
@@ -362,6 +366,105 @@ describe("secret-safe M5 client", () => {
         cache_creation_input_tokens: null,
         cache_read_input_tokens: 9,
       },
+    });
+  });
+
+  it("derives truncation from finish_reason=length when the structured payload omits the explicit flag", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "ask") {
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "WARNING: truncated. Partial response follows.\n\nF-2" }],
+            isError: true,
+            structuredContent: {
+              model: "mellum",
+              text: "F-2",
+              finish_reason: "length",
+              usage: null,
+              metered: true,
+            },
+          });
+        }
+        return rpcResult(request.id, tools(["ask"]));
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task" })).resolves.toEqual({
+      model: "mellum",
+      text: "F-2",
+      finish_reason: "length",
+      truncated: true,
+      metered: true,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
+  });
+
+  it("falls through malformed structured ask errors to tool_error instead of masking them as malformed_mcp", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "ask") {
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "owner-tier only" }],
+            isError: true,
+            structuredContent: {
+              model: 7,
+              usage: "bad",
+            },
+          });
+        }
+        return rpcResult(request.id, tools(["ask"]));
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task" })).rejects.toMatchObject({
+      code: "tool_error",
+      message: "owner-tier only",
+    });
+  });
+
+  it("treats non-length structured ask errors as ordinary tool errors", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "ask") {
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "ordinary structured error" }],
+            isError: true,
+            structuredContent: {
+              model: "mellum",
+              text: "partial",
+              finish_reason: "stop",
+              truncated: true,
+              usage: null,
+              metered: true,
+            },
+          });
+        }
+        return rpcResult(request.id, tools(["ask"]));
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task" })).rejects.toMatchObject({
+      code: "tool_error",
+      message: "ordinary structured error",
     });
   });
 

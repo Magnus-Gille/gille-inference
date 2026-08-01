@@ -66,6 +66,48 @@ function startUpstream(): Promise<void> {
         );
         return;
       }
+      if (reqModel === "derived-usage-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-derived-usage",
+            choices: [{ message: { role: "assistant", content: "DERIVED USAGE" }, finish_reason: "stop" }],
+            usage: {
+              input_tokens: 13,
+              output_tokens: 27,
+            },
+          })
+        );
+        return;
+      }
+      if (reqModel === "null-usage-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-null-usage",
+            choices: [{ message: { role: "assistant", content: "NULL USAGE" }, finish_reason: "stop" }],
+            usage: null,
+          })
+        );
+        return;
+      }
+      if (reqModel === "invalid-usage-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-invalid-usage",
+            choices: [{ message: { role: "assistant", content: "INVALID USAGE" }, finish_reason: "stop" }],
+            usage: {
+              prompt_tokens: -5,
+              completion_tokens: 1.5,
+              total_tokens: 6.5,
+              prompt_tokens_details: { cached_tokens: -1 },
+              completion_tokens_details: { reasoning_tokens: 2.2 },
+            },
+          })
+        );
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -197,7 +239,15 @@ describe("MCP tools/list", () => {
   it("lists list_models and ask with inputSchemas", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { tools: Array<{ name: string; inputSchema: { type: string; properties: Record<string, unknown> } }> } };
+    const j = (await res.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          inputSchema: { type: string; properties: Record<string, unknown> };
+          outputSchema?: { type?: string; properties?: Record<string, unknown> };
+        }>;
+      };
+    };
     const names = j.result.tools.map((t) => t.name);
     expect(names).toContain("list_models");
     expect(names).toContain("ask");
@@ -206,6 +256,17 @@ describe("MCP tools/list", () => {
     expect(ask.inputSchema.properties).toHaveProperty("model");
     expect(ask.inputSchema.properties).toHaveProperty("prompt");
     expect(ask.inputSchema.properties).toHaveProperty("delegator_model_id");
+    expect(ask.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        model: { type: "string" },
+        text: { type: "string" },
+        finish_reason: {},
+        truncated: {},
+        usage: { type: "object" },
+        metered: { const: true },
+      },
+    });
     const list = j.result.tools.find((t) => t.name === "list_models")!;
     expect(list.inputSchema.type).toBe("object");
   });
@@ -291,6 +352,7 @@ describe("MCP tools/call ask", () => {
           text: string;
           finish_reason: string | null;
           truncated: boolean | null;
+          metered: boolean;
           usage: {
             prompt_tokens: number | null;
             completion_tokens: number | null;
@@ -309,6 +371,7 @@ describe("MCP tools/call ask", () => {
       text: "STUBBED COMPLETION",
       finish_reason: "stop",
       truncated: false,
+      metered: true,
       usage: {
         prompt_tokens: 5,
         completion_tokens: 5,
@@ -343,6 +406,7 @@ describe("MCP tools/call ask", () => {
           text: string;
           finish_reason: string | null;
           truncated: boolean | null;
+          metered: boolean;
           usage: {
             prompt_tokens: number | null;
             completion_tokens: number | null;
@@ -356,11 +420,14 @@ describe("MCP tools/call ask", () => {
     };
     expect(j.result.isError).toBe(true);
     expect(j.result.content[0]!.text).toMatch(/truncated/i);
+    expect(j.result.content[0]!.text).toContain("F-2");
+    expect(j.result.content[0]!.text).toMatch(/billable|metered/i);
     expect(j.result.structuredContent).toEqual({
       model: "truncated-model",
       text: "F-2",
       finish_reason: "length",
       truncated: true,
+      metered: true,
       usage: {
         prompt_tokens: 5,
         completion_tokens: 64,
@@ -370,6 +437,130 @@ describe("MCP tools/call ask", () => {
         cache_read_input_tokens: 9,
       },
     });
+  });
+
+  it("derives total usage from input_tokens plus output_tokens and reconciles credits to the real total", async () => {
+    const before = lookupKey(creditKey)!.creditsUsed;
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 44,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "derived-usage-model", prompt: "hello" } },
+      },
+      creditKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+          };
+          metered: boolean;
+        };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent).toMatchObject({
+      metered: true,
+      usage: {
+        prompt_tokens: 13,
+        completion_tokens: 27,
+        total_tokens: 40,
+      },
+    });
+    const after = lookupKey(creditKey)!.creditsUsed;
+    expect(after - before).toBe(40);
+  });
+
+  it("tolerates a null usage object and surfaces content-blind null counters", async () => {
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 45,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "null-usage-model", prompt: "hello" } },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          model: string;
+          text: string;
+          metered: boolean;
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_creation_input_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent).toEqual({
+      model: "null-usage-model",
+      text: "NULL USAGE",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
+  });
+
+  it("drops negative and non-integer usage counters instead of trusting malformed numbers", async () => {
+    const before = lookupKey(creditKey)!.creditsUsed;
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 46,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "invalid-usage-model", prompt: "abcd" } },
+      },
+      creditKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent.usage).toEqual({
+      prompt_tokens: null,
+      completion_tokens: null,
+      total_tokens: null,
+      reasoning_tokens: null,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+    });
+    const after = lookupKey(creditKey)!.creditsUsed;
+    expect(after - before).toBe(1);
   });
 
   it("M3: an ask call feeds usage into /metrics (tokens + credits counters increment)", async () => {

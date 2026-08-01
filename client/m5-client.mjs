@@ -302,20 +302,30 @@ function emptyAskUsage() {
   };
 }
 
+const ASK_TRUNCATION_FINISH_REASON = "length";
+
+function nonNegativeIntegerOrNull(value) {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
 function normalizeAskUsage(usage) {
-  if (usage === undefined) return emptyAskUsage();
-  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+  if (usage === undefined || usage === null) return emptyAskUsage();
+  if (typeof usage !== "object" || Array.isArray(usage)) {
     throw new M5ClientError("malformed_mcp", "The ask tool returned malformed usage metadata.");
   }
-  const numberOrNull = (value) =>
-    typeof value === "number" && Number.isFinite(value) ? value : null;
+  const promptTokens = nonNegativeIntegerOrNull(usage.prompt_tokens);
+  const completionTokens = nonNegativeIntegerOrNull(usage.completion_tokens);
   return {
-    prompt_tokens: numberOrNull(usage.prompt_tokens),
-    completion_tokens: numberOrNull(usage.completion_tokens),
-    total_tokens: numberOrNull(usage.total_tokens),
-    reasoning_tokens: numberOrNull(usage.reasoning_tokens),
-    cache_creation_input_tokens: numberOrNull(usage.cache_creation_input_tokens),
-    cache_read_input_tokens: numberOrNull(usage.cache_read_input_tokens),
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens:
+      nonNegativeIntegerOrNull(usage.total_tokens) ??
+      (promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null),
+    reasoning_tokens: nonNegativeIntegerOrNull(usage.reasoning_tokens),
+    cache_creation_input_tokens: nonNegativeIntegerOrNull(usage.cache_creation_input_tokens),
+    cache_read_input_tokens: nonNegativeIntegerOrNull(usage.cache_read_input_tokens),
   };
 }
 
@@ -349,14 +359,46 @@ function normalizeAskPayload(payload, fallbackModel) {
         : (() => {
             throw new M5ClientError("malformed_mcp", "The ask tool returned malformed truncation metadata.");
           })();
-  if (truncated === null && finishReason !== null) truncated = finishReason === "length";
+  if (truncated === null) truncated = finishReason === null ? null : finishReason === ASK_TRUNCATION_FINISH_REASON;
+  if (truncated === true && finishReason !== ASK_TRUNCATION_FINISH_REASON) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The ask tool returned unsupported truncation metadata.",
+    );
+  }
+  if (truncated === false && finishReason === ASK_TRUNCATION_FINISH_REASON) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The ask tool returned conflicting truncation metadata.",
+    );
+  }
+  const metered =
+    payload.metered === undefined || payload.metered === null
+      ? true
+      : typeof payload.metered === "boolean"
+        ? payload.metered
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed metering metadata.");
+          })();
   return {
     model,
     text: payload.text,
     finish_reason: finishReason,
     truncated,
+    metered,
     usage: normalizeAskUsage(payload.usage),
   };
+}
+
+function toolResultText(result) {
+  const text = Array.isArray(result?.content)
+    ? result.content.find((entry) => entry?.type === "text")?.text
+    : undefined;
+  return typeof text === "string" ? text : "The MCP tool reported an error.";
+}
+
+function isSupportedAskTruncation(payload) {
+  return payload.truncated === true && payload.finish_reason === ASK_TRUNCATION_FINISH_REASON;
 }
 
 function validateWorkId(workId) {
@@ -664,15 +706,16 @@ export async function createM5Client({
       }
       if (result.isError === true) {
         if (result.structuredContent !== undefined) {
-          const structured = normalizeAskPayload(result.structuredContent, input.model);
-          if (structured.truncated === true) return structured;
+          try {
+            const structured = normalizeAskPayload(result.structuredContent, input.model);
+            if (isSupportedAskTruncation(structured)) return structured;
+          } catch {
+            // A broken structured error payload must not mask the real tool_error content.
+          }
         }
-        const text = Array.isArray(result.content)
-          ? result.content.find((entry) => entry?.type === "text")?.text
-          : undefined;
         throw new M5ClientError(
           "tool_error",
-          typeof text === "string" ? text : "The MCP tool reported an error.",
+          toolResultText(result),
         );
       }
       if (result.structuredContent !== undefined) {
@@ -689,6 +732,7 @@ export async function createM5Client({
         text,
         finish_reason: null,
         truncated: null,
+        metered: true,
         usage: emptyAskUsage(),
       };
     },
