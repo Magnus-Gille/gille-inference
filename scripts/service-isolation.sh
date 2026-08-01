@@ -442,6 +442,18 @@ gateway_health_url() {
   fi
 }
 
+wait_for_gateway_health() {
+  local unit="$1"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    systemctl is-active --quiet "$unit" || die "gateway service became inactive before readiness completed"
+    if curl --fail --silent --show-error --connect-timeout 1 --max-time 1 "$(gateway_health_url)" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "gateway did not become healthy within the bounded 30s readiness window; inspect its journal before retrying"
+}
+
 gateway_user_bus_ready() {
   [ -S "/run/user/$1/bus" ]
 }
@@ -729,8 +741,7 @@ verify() {
         [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json is absent"
         [ ! -e "$home/.pi-code-loop/auth.json" ] || die "dedicated Pi runtime must not hold auth.json"
       fi
-      systemctl is-active --quiet "$unit" || die "$unit is not active"
-      curl --fail --silent --show-error --max-time 5 "$(gateway_health_url)" >/dev/null || die "gateway configured-listener health failed"
+      wait_for_gateway_health "$unit"
       systemctl is-active --quiet gille-autonomy-tick.timer || die "isolated autonomy timer is not active"
       ;;
     cloudflared)
