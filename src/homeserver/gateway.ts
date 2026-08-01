@@ -76,8 +76,10 @@ import {
   REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
   reviewerUsefulnessRecordingCapability,
+  reviewerUsefulnessRecordingCapabilityForPrincipal,
   parseReviewerUsefulnessWriteBody,
   type ReviewLaneReviewerUsefulness,
+  type ReviewerUsefulnessPrincipal,
 } from "./review-bounded.js";
 
 import { ingressTaskType } from "./task-type-identity.js";
@@ -361,27 +363,139 @@ function reviewerUsefulnessWriteResponse(args: {
   };
 }
 
+function reviewerUsefulnessPrincipal(
+  principal: PrincipalContext | null,
+): ReviewerUsefulnessPrincipal | null {
+  if (principal === null) return null;
+  return {
+    tier: principal.tier,
+    scope: principal.scope,
+    keyHash: principal.keyHash,
+    logicalAlias: principal.logicalAlias,
+  };
+}
+
+function reviewerUsefulnessRouteDeniedMessage(principal: PrincipalContext | null): string {
+  const capability = reviewerUsefulnessRecordingCapabilityForPrincipal(
+    reviewerUsefulnessPrincipal(principal),
+  );
+  switch (capability.availabilityReason) {
+    case "missing_reviewer_identity":
+      return "Reviewer usefulness recording requires a non-empty authenticated logical alias.";
+    case "requires_minted_owner_admin":
+      return "Reviewer usefulness recording requires a minted owner-admin key.";
+    case "requires_owner_admin":
+    default:
+      return "Reviewer usefulness recording requires a minted owner-admin key.";
+  }
+}
+
 function reviewerUsefulnessConflictMessage(args: {
-  ledgerId: string;
-  existingUsefulness: string | null;
-  existingReviewer: string | null;
-  existingTs: string | null;
-  existingNotes: string | null;
-  attemptedUsefulness: ReviewLaneReviewerUsefulness;
-  attemptedReviewer: string;
-  attemptedNotes: string | null;
+  existing: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+  attempted: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
 }): string {
-  return "Reviewer usefulness is already recorded differently for ledger row '" + args.ledgerId
-    + "' (existing usefulness='" + (args.existingUsefulness ?? "none")
-    + "', reviewer='" + (args.existingReviewer ?? "none")
-    + "', ts='" + (args.existingTs ?? "none")
-    + "', notesPresent=" + String(args.existingNotes !== null)
-    + ", noteChars=" + String(args.existingNotes?.length ?? 0)
-    + "); attempted usefulness='" + args.attemptedUsefulness
-    + "', reviewer='" + args.attemptedReviewer
-    + "', notesPresent=" + String(args.attemptedNotes !== null)
-    + ", noteChars=" + String(args.attemptedNotes?.length ?? 0)
+  return "Reviewer usefulness is already recorded differently (existing usefulness='"
+    + (args.existing.reviewerUsefulness ?? "none")
+    + "', reviewer='" + (args.existing.reviewerUsefulnessBy ?? "none")
+    + "', ts='" + (args.existing.reviewerUsefulnessTs ?? "none")
+    + "', notesPresent=" + String(args.existing.notesPresent)
+    + ", noteChars=" + String(args.existing.noteChars)
+    + "); attempted usefulness='" + (args.attempted.reviewerUsefulness ?? "none")
+    + "', reviewer='" + (args.attempted.reviewerUsefulnessBy ?? "none")
+    + "', notesPresent=" + String(args.attempted.notesPresent)
+    + ", noteChars=" + String(args.attempted.noteChars)
     + ". Exact retries are idempotent; differing overwrites are rejected.";
+}
+
+function reviewerUsefulnessConflictResponse(
+  message: string,
+  conflict: unknown,
+): { error: { message: string; type: string; code: "reviewer_usefulness_conflict"; param: string | null }; conflict: unknown } {
+  return {
+    error: {
+      type: "invalid_request_error",
+      code: "reviewer_usefulness_conflict",
+      message,
+      param: null,
+    },
+    conflict,
+  };
+}
+
+function reviewerUsefulnessConflictApiShape(conflict: {
+  kind: "wrong_task_type";
+  taskType: string;
+} | {
+  kind: "missing_verifier";
+} | {
+  kind: "already_recorded";
+  mismatchFields: string[];
+  existing: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+  attempted: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+}): unknown {
+  if (conflict.kind !== "already_recorded") return conflict;
+  return {
+    kind: conflict.kind,
+    mismatchFields: conflict.mismatchFields,
+    existing: {
+      reviewerUsefulness: conflict.existing.reviewerUsefulness,
+      reviewerIdentity: conflict.existing.reviewerUsefulnessBy,
+      reviewerUsefulnessTs: conflict.existing.reviewerUsefulnessTs,
+      notesPresent: conflict.existing.notesPresent,
+      noteChars: conflict.existing.noteChars,
+    },
+    attempted: {
+      reviewerUsefulness: conflict.attempted.reviewerUsefulness,
+      reviewerIdentity: conflict.attempted.reviewerUsefulnessBy,
+      reviewerUsefulnessTs: conflict.attempted.reviewerUsefulnessTs,
+      notesPresent: conflict.attempted.notesPresent,
+      noteChars: conflict.attempted.noteChars,
+    },
+  };
+}
+
+function hasJsonContentType(req: IncomingMessage): boolean {
+  const header = req.headers["content-type"];
+  const value = Array.isArray(header) ? (header[0] ?? "") : (header ?? "");
+  return /^application\/json(?:\s*(?:;|$))/i.test(value);
+}
+
+function projectLedgerRowForRead(
+  principal: PrincipalContext,
+  row: NonNullable<ReturnType<typeof getDelegationById>>,
+): Record<string, unknown> {
+  const notesPresent = row.reviewerUsefulnessNotes !== null;
+  const noteChars = row.reviewerUsefulnessNotes?.length ?? 0;
+  return {
+    ...row,
+    reviewerUsefulnessNotes: principal.isMonitor ? null : row.reviewerUsefulnessNotes,
+    reviewerUsefulnessNotesPresent: notesPresent,
+    reviewerUsefulnessNoteChars: noteChars,
+  };
 }
 
 
@@ -3691,7 +3805,9 @@ export async function handleRequest(
         endpoint: REVIEW_LANE_CAPABILITY_ENDPOINT,
         contract_version: REVIEW_BOUNDED_CONTRACT_VERSION,
         generated_at: new Date().toISOString(),
-        reviewerUsefulnessRecording: reviewerUsefulnessRecordingCapability(),
+        reviewerUsefulnessRecording: reviewerUsefulnessRecordingCapabilityForPrincipal(
+          reviewerUsefulnessPrincipal(principal)
+        ),
         lanes,
       });
       lctx.status = 200;
@@ -4325,10 +4441,10 @@ export async function handleRequest(
         lctx.status = 404;
         lctx.outcome = "not_found";
         lctx.errorClass = "not_found";
-        sendError(res, makeError("not_found", { message: `No such ledger row '${id}'.` }));
+        sendError(res, makeError("not_found"));
         return;
       }
-      sendJson(res, 200, row);
+      sendJson(res, 200, projectLedgerRowForRead(principal, row));
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -4336,7 +4452,11 @@ export async function handleRequest(
     }
     if (method === "PUT" && path.startsWith("/ledger/") && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
       lctx.route = "/ledger/:id/reviewer-usefulness";
-      if (!principal.isAdmin) {
+      lctx.admission = "n/a";
+      const reviewerWriteCapability = reviewerUsefulnessRecordingCapabilityForPrincipal(
+        reviewerUsefulnessPrincipal(principal)
+      );
+      if (!reviewerWriteCapability.available) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "route_not_allowed";
@@ -4344,7 +4464,7 @@ export async function handleRequest(
           res,
           makeError("route_not_allowed", {
             param: null,
-            message: "Reviewer usefulness recording requires an owner/admin key.",
+            message: reviewerUsefulnessRouteDeniedMessage(principal),
           })
         );
         return;
@@ -4359,7 +4479,31 @@ export async function handleRequest(
       }
       const ledgerId = decodePathSegmentOrSend(rawId, res, lctx);
       if (ledgerId === null) return;
-      const parsedBody = parseReviewerUsefulnessWriteBody(await readBody(req, 4 * 1024));
+      if (!hasJsonContentType(req)) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(
+          res,
+          makeError("invalid_request_error", {
+            param: "content-type",
+            message: "Reviewer usefulness recording requires Content-Type: application/json.",
+          })
+        );
+        return;
+      }
+      let rawBody: string;
+      try {
+        rawBody = await readBody(req, 4 * 1024);
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+        return;
+      }
+      const parsedBody = parseReviewerUsefulnessWriteBody(rawBody);
       if (!parsedBody.ok) {
         lctx.status = 400;
         lctx.outcome = "bad_request";
@@ -4367,96 +4511,72 @@ export async function handleRequest(
         sendError(res, makeError("invalid_request_error", { param: parsedBody.param, message: parsedBody.message }));
         return;
       }
-      const row = getDelegationById(ledgerId);
-      if (!row) {
-        lctx.status = 404;
-        lctx.outcome = "not_found";
-        lctx.errorClass = "not_found";
-        sendError(res, makeError("not_found", { message: "No such ledger row '" + ledgerId + "'." }));
+      const reviewerIdentity = principal.logicalAlias.trim();
+      if (reviewerIdentity === "") {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            message: "Reviewer usefulness recording requires a non-empty authenticated logical alias.",
+          })
+        );
         return;
       }
-      if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE || row.verifier === null) {
-        lctx.status = 409;
-        lctx.outcome = "conflict";
-        lctx.errorClass = "reviewer_usefulness_conflict";
-        const message = row.taskType !== REVIEW_BOUNDED_TASK_TYPE
-          ? "Ledger row '" + ledgerId + "' has taskType '" + row.taskType + "'. Reviewer usefulness recording is only available for validated review-bounded delegations."
-          : "Ledger row '" + ledgerId + "' has no verifier. Reviewer usefulness recording is only available for validated review-bounded delegations.";
-        sendError(res, makeError("reviewer_usefulness_conflict", { message }));
-        return;
-      }
-      const reviewerIdentity = principal.logicalAlias;
       const { usefulness, notes } = parsedBody.value;
-      const alreadyRecorded =
-        row.reviewerUsefulness !== null
-        || row.reviewerUsefulnessBy !== null
-        || row.reviewerUsefulnessNotes !== null
-        || row.reviewerUsefulnessTs !== null;
-      if (alreadyRecorded) {
-        const identical =
-          row.reviewerUsefulness === usefulness
-          && (row.reviewerUsefulnessNotes ?? null) === notes
-          && (row.reviewerUsefulnessBy ?? null) === reviewerIdentity
-          && row.reviewerUsefulnessTs !== null;
-        if (identical) {
-          sendJson(res, 200, reviewerUsefulnessWriteResponse({
-            ledgerId,
-            taskType: row.taskType,
-            usefulness,
-            reviewerIdentity,
-            reviewerUsefulnessTs: row.reviewerUsefulnessTs!,
-            notes,
-            writeState: "unchanged",
-          }));
-          lctx.status = 200;
-          lctx.outcome = "ok";
-          lctx.admission = "n/a";
-          return;
-        }
-        lctx.status = 409;
-        lctx.outcome = "conflict";
-        lctx.errorClass = "reviewer_usefulness_conflict";
-        sendError(res, makeError("reviewer_usefulness_conflict", {
-          message: reviewerUsefulnessConflictMessage({
-            ledgerId,
-            existingUsefulness: row.reviewerUsefulness,
-            existingReviewer: row.reviewerUsefulnessBy,
-            existingTs: row.reviewerUsefulnessTs,
-            existingNotes: row.reviewerUsefulnessNotes,
-            attemptedUsefulness: usefulness,
-            attemptedReviewer: reviewerIdentity,
-            attemptedNotes: notes,
-          }),
-        }));
-        return;
-      }
-      const now = new Date().toISOString();
-      const changed = recordReviewerUsefulness({
+      const result = recordReviewerUsefulness({
         ledgerId,
         usefulness,
         notes,
         judgedBy: reviewerIdentity,
-        now,
       });
-      if (!changed) {
+      if (result.kind === "not_found") {
         lctx.status = 404;
         lctx.outcome = "not_found";
         lctx.errorClass = "not_found";
-        sendError(res, makeError("not_found", { message: "No such ledger row '" + ledgerId + "'." }));
+        sendError(res, makeError("not_found"));
         return;
       }
-      sendJson(res, 201, reviewerUsefulnessWriteResponse({
-        ledgerId,
-        taskType: row.taskType,
-        usefulness,
-        reviewerIdentity,
-        reviewerUsefulnessTs: now,
-        notes,
-        writeState: "recorded",
-      }));
-      lctx.status = 201;
-      lctx.outcome = "ok";
-      lctx.admission = "n/a";
+      if (result.kind === "recorded" || result.kind === "unchanged") {
+        sendJson(res, result.kind === "recorded" ? 201 : 200, reviewerUsefulnessWriteResponse({
+          ledgerId,
+          taskType: REVIEW_BOUNDED_TASK_TYPE,
+          usefulness,
+          reviewerIdentity,
+          reviewerUsefulnessTs: result.record.reviewerUsefulnessTs!,
+          notes,
+          writeState: result.kind,
+        }));
+        lctx.status = result.kind === "recorded" ? 201 : 200;
+        lctx.outcome = "ok";
+        return;
+      }
+
+      lctx.status = 409;
+      lctx.outcome = "conflict";
+      lctx.errorClass = "reviewer_usefulness_conflict";
+      if (result.conflict.kind === "wrong_task_type") {
+        sendJson(res, 409, reviewerUsefulnessConflictResponse(
+          "Reviewer usefulness recording is only available for validated review-bounded delegations.",
+          reviewerUsefulnessConflictApiShape(result.conflict),
+        ));
+        return;
+      }
+      if (result.conflict.kind === "missing_verifier") {
+        sendJson(res, 409, reviewerUsefulnessConflictResponse(
+          "Reviewer usefulness recording is only available for validated review-bounded delegations.",
+          reviewerUsefulnessConflictApiShape(result.conflict),
+        ));
+        return;
+      }
+      sendJson(res, 409, reviewerUsefulnessConflictResponse(
+        reviewerUsefulnessConflictMessage({
+          existing: result.conflict.existing,
+          attempted: result.conflict.attempted,
+        }),
+        reviewerUsefulnessConflictApiShape(result.conflict),
+      ));
       return;
     }
     if (path === "/metrics" && method === "GET") {

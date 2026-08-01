@@ -9,6 +9,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.js";
+import { reviewerUsefulnessRecordingCapabilityForPrincipal } from "../src/homeserver/review-bounded.js";
 import { createDirectGatewayHarness, type DirectGatewayHarness } from "./helpers/direct-gateway.js";
 
 let harness: DirectGatewayHarness;
@@ -27,7 +28,7 @@ beforeAll(async () => {
   delete process.env["HOMESERVER_DELEGATE_POLICY_PROMOTED_ADVISORY_TASK_TYPES"];
 
   const ks = await import("../src/homeserver/keystore.js");
-  ownerKey = ks.mintKey({ alias: "review-lane-owner", tier: "owner" }, DEFAULTS).plaintextKey;
+  ownerKey = ks.mintKey({ alias: "review-lane-owner", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
   guestKey = ks.mintKey({ alias: "review-lane-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   harness = createDirectGatewayHarness();
@@ -39,6 +40,8 @@ interface CapabilityResponse {
   generated_at: string;
   reviewerUsefulnessRecording: {
     available: boolean;
+    authorization: string;
+    availabilityReason: string;
     method: string;
     endpoint: string;
     taskTypes: string[];
@@ -85,6 +88,8 @@ describe("GET /v1/capabilities/review-lane", () => {
     ]);
     expect(j.reviewerUsefulnessRecording).toEqual({
       available: true,
+      authorization: "minted-owner-admin",
+      availabilityReason: "allowed",
       method: "PUT",
       endpoint: "/ledger/{id}/reviewer-usefulness",
       taskTypes: ["review-bounded"],
@@ -93,7 +98,7 @@ describe("GET /v1/capabilities/review-lane", () => {
     });
   });
 
-  it("a guest key gets the same capability advertisement (content-blind, no privileged info)", async () => {
+  it("a guest key gets a truthful capability advertisement without write access", async () => {
     const r = await harness.invoke({
       method: "GET",
       path: "/v1/capabilities/review-lane",
@@ -102,7 +107,9 @@ describe("GET /v1/capabilities/review-lane", () => {
     expect(r.status).toBe(200);
     const j = r.json as CapabilityResponse;
     expect(j.lanes["review-bounded"]!.eligible).toBe("local-advisory");
-    expect(j.reviewerUsefulnessRecording.available).toBe(true);
+    expect(j.reviewerUsefulnessRecording.available).toBe(false);
+    expect(j.reviewerUsefulnessRecording.authorization).toBe("minted-owner-admin");
+    expect(j.reviewerUsefulnessRecording.availabilityReason).toBe("requires_owner_admin");
   });
 
   it("an explicit ?taskType= for an unknown type is echoed back as frontier-only", async () => {
@@ -140,5 +147,35 @@ describe("GET /v1/capabilities/review-lane", () => {
     expect(j.lanes["Review-Bounded"]!.eligible).toBe("frontier-only");
     expect(j.lanes["Review-Bounded"]!.reason).toMatch(/no local-eligible review lane/i);
     expect(j.lanes["review-bounded"]!.eligible).toBe("local-advisory");
+  });
+});
+
+describe("reviewerUsefulnessRecordingCapabilityForPrincipal", () => {
+  it("fails closed for identity-less admins and a blank logical alias", () => {
+    expect(
+      reviewerUsefulnessRecordingCapabilityForPrincipal({
+        tier: "owner",
+        scope: "admin",
+        keyHash: null,
+        logicalAlias: "static:admin",
+      })
+    ).toMatchObject({
+      available: false,
+      authorization: "minted-owner-admin",
+      availabilityReason: "requires_minted_owner_admin",
+    });
+
+    expect(
+      reviewerUsefulnessRecordingCapabilityForPrincipal({
+        tier: "owner",
+        scope: "admin",
+        keyHash: "sha256:test",
+        logicalAlias: "   ",
+      })
+    ).toMatchObject({
+      available: false,
+      authorization: "minted-owner-admin",
+      availabilityReason: "missing_reviewer_identity",
+    });
   });
 });

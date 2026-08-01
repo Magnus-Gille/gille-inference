@@ -50,10 +50,18 @@ describe("recordReviewerUsefulness (#74)", () => {
     const changed = recordReviewerUsefulness({
       ledgerId: id,
       usefulness: "pass",
-      notes: "confirmed correct on validation — see gille-inference#25",
+      notes: "ref:gille-inference#25 check:manual",
       judgedBy: "grimnir-session-2026-07-24",
     });
-    expect(changed).toBe(true);
+    expect(changed).toMatchObject({
+      kind: "recorded",
+      record: {
+        reviewerUsefulness: "pass",
+        reviewerUsefulnessBy: "grimnir-session-2026-07-24",
+        notesPresent: true,
+        noteChars: "ref:gille-inference#25 check:manual".length,
+      },
+    });
     const row = getDelegationById(id);
     expect(row?.reviewerUsefulness).toBe("pass");
     expect(row?.reviewerUsefulnessNotes).toContain("gille-inference#25");
@@ -71,13 +79,18 @@ describe("recordReviewerUsefulness (#74)", () => {
       outcome: "pass",
       verifier: "reviewBoundedVerifier",
     });
-    recordReviewerUsefulness({ ledgerId: id, usefulness: "wrong", notes: "refuted on validation" });
+    recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "wrong",
+      notes: "verdict:refuted check:manual",
+      judgedBy: "grimnir-session-2026-07-24",
+    });
     const row = getDelegationById(id);
     expect(row?.outcome).toBe("pass");
     expect(row?.reviewerUsefulness).toBe("wrong");
   });
 
-  it("a later call overwrites an earlier judgment (current-status field, not an append log)", () => {
+  it("treats an exact retry as unchanged but rejects a differing second write", () => {
     const id = recordDelegation({
       taskType: "review-bounded",
       modelId: "qwen3-coder-next-80b",
@@ -85,14 +98,54 @@ describe("recordReviewerUsefulness (#74)", () => {
       outcome: "partial",
       verifier: "reviewBoundedVerifier",
     });
-    recordReviewerUsefulness({ ledgerId: id, usefulness: "redo" });
-    recordReviewerUsefulness({ ledgerId: id, usefulness: "partial", notes: "usable after a small edit" });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "redo",
+      notes: null,
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "recorded",
+      record: {
+        reviewerUsefulness: "redo",
+        notesPresent: false,
+        noteChars: 0,
+      },
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "redo",
+      notes: null,
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "unchanged",
+      record: {
+        reviewerUsefulness: "redo",
+        notesPresent: false,
+        noteChars: 0,
+      },
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "partial",
+      notes: "check:manual action:edit",
+      judgedBy: "grimnir-session-2026-07-24-r2",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: {
+        kind: "already_recorded",
+        mismatchFields: ["usefulness", "reviewerIdentity", "notes"],
+      },
+    });
     const row = getDelegationById(id);
-    expect(row?.reviewerUsefulness).toBe("partial");
-    expect(row?.reviewerUsefulnessNotes).toBe("usable after a small edit");
+    expect(row?.reviewerUsefulness).toBe("redo");
+    expect(row?.reviewerUsefulnessNotes).toBeNull();
   });
 
-  it("returns false (never throws) for an unknown ledger id", () => {
-    expect(recordReviewerUsefulness({ ledgerId: "does-not-exist", usefulness: "pass" })).toBe(false);
+  it("returns a closed not_found result for an unknown ledger id", () => {
+    expect(recordReviewerUsefulness({
+      ledgerId: "does-not-exist",
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({ kind: "not_found" });
   });
 });

@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { AdmissionController } from "../../src/homeserver/admission.js";
-import { loadConfig } from "../../src/homeserver/config.js";
+import { loadConfig, resetConfig } from "../../src/homeserver/config.js";
 import {
   createLearningTaskCapabilityEpoch,
   type LearningTaskCapabilityEpoch,
@@ -108,6 +108,7 @@ function makeRequest(args: DirectGatewayInvokeArgs): IncomingMessage {
 
 export function createDirectGatewayHarness(): DirectGatewayHarness {
   initializeGatewayRegistries();
+  resetConfig();
   const cfg = loadConfig();
   const controller = new AdmissionController({
     maxInflight: cfg.maxInflight,

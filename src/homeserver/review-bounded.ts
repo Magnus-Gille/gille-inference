@@ -429,11 +429,26 @@ export const REVIEWER_USEFULNESS_VALUES = ["pass", "partial", "redo", "wrong"] a
 export type ReviewLaneReviewerUsefulness = (typeof REVIEWER_USEFULNESS_VALUES)[number];
 export const REVIEWER_USEFULNESS_NOTES_MAX_CHARS = 160;
 
+export type ReviewerUsefulnessAvailabilityReason =
+  | "allowed"
+  | "requires_owner_admin"
+  | "requires_minted_owner_admin"
+  | "missing_reviewer_identity";
+
+export interface ReviewerUsefulnessPrincipal {
+  tier: "owner" | "guest";
+  scope: "admin" | "agent" | "inference" | "monitor";
+  keyHash: string | null;
+  logicalAlias: string;
+}
+
 const REVIEWER_USEFULNESS_NOTE_TOKEN = "[a-z][a-z0-9_-]{1,23}:[A-Za-z0-9][A-Za-z0-9._#/@+=-]{0,31}";
 const REVIEWER_USEFULNESS_NOTES_RE = new RegExp(`^${REVIEWER_USEFULNESS_NOTE_TOKEN}( ${REVIEWER_USEFULNESS_NOTE_TOKEN}){0,5}$`);
 
 export interface ReviewerUsefulnessRecordingCapability {
-  available: true;
+  available: boolean;
+  authorization: "minted-owner-admin";
+  availabilityReason: ReviewerUsefulnessAvailabilityReason;
   method: "PUT";
   endpoint: typeof REVIEWER_USEFULNESS_ROUTE_ENDPOINT;
   taskTypes: readonly [typeof REVIEW_BOUNDED_TASK_TYPE];
@@ -441,15 +456,38 @@ export interface ReviewerUsefulnessRecordingCapability {
   reviewerIdentity: "authenticated logical alias";
 }
 
-export function reviewerUsefulnessRecordingCapability(): ReviewerUsefulnessRecordingCapability {
+export function reviewerUsefulnessRecordingCapabilityForPrincipal(
+  principal: ReviewerUsefulnessPrincipal | null,
+): ReviewerUsefulnessRecordingCapability {
+  let availabilityReason: ReviewerUsefulnessAvailabilityReason;
+  if (principal === null || principal.tier !== "owner" || principal.scope !== "admin") {
+    availabilityReason = "requires_owner_admin";
+  } else if (principal.keyHash === null) {
+    availabilityReason = "requires_minted_owner_admin";
+  } else if (principal.logicalAlias.trim() === "") {
+    availabilityReason = "missing_reviewer_identity";
+  } else {
+    availabilityReason = "allowed";
+  }
   return {
-    available: true,
+    available: availabilityReason === "allowed",
+    authorization: "minted-owner-admin",
+    availabilityReason,
     method: "PUT",
     endpoint: REVIEWER_USEFULNESS_ROUTE_ENDPOINT,
     taskTypes: [REVIEW_BOUNDED_TASK_TYPE],
     closedValues: REVIEWER_USEFULNESS_VALUES,
     reviewerIdentity: "authenticated logical alias",
   };
+}
+
+export function reviewerUsefulnessRecordingCapability(): ReviewerUsefulnessRecordingCapability {
+  return reviewerUsefulnessRecordingCapabilityForPrincipal({
+    tier: "owner",
+    scope: "admin",
+    keyHash: "capability-preview",
+    logicalAlias: "reviewer",
+  });
 }
 
 export interface ReviewerUsefulnessWrite {

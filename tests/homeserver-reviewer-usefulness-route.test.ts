@@ -2,14 +2,16 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 import { recordDelegation, getDelegationById } from "../src/homeserver/ledger.js";
 import { createDirectGatewayHarness, type DirectGatewayHarness } from "./helpers/direct-gateway.js";
 
 let harness: DirectGatewayHarness;
 let adminKey = "";
+let secondAdminKey = "";
 let guestKey = "";
 let monitorKey = "";
+let agentKey = "";
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 const NOTES = "ref:gille-inference#112 check:manual";
@@ -26,8 +28,10 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   adminKey = ks.mintKey({ alias: "reviewer-admin", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
+  secondAdminKey = ks.mintKey({ alias: "reviewer-admin-r2", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
   guestKey = ks.mintKey({ alias: "reviewer-guest", tier: "guest" }, DEFAULTS).plaintextKey;
   monitorKey = ks.mintKey({ alias: "reviewer-monitor", tier: "guest", scope: "monitor" }, DEFAULTS).plaintextKey;
+  agentKey = ks.mintKey({ alias: "reviewer-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
 
   harness = createDirectGatewayHarness();
 });
@@ -41,6 +45,31 @@ interface ReviewerUsefulnessWriteResponse {
   notesPresent: boolean;
   noteChars: number;
   writeState: "recorded" | "unchanged";
+}
+
+interface ReviewerUsefulnessConflictResponse {
+  error: {
+    code: string;
+    message: string;
+  };
+  conflict: {
+    kind: string;
+    mismatchFields?: string[];
+    existing?: {
+      reviewerUsefulness: string | null;
+      reviewerIdentity: string | null;
+      reviewerUsefulnessTs: string | null;
+      notesPresent: boolean;
+      noteChars: number;
+    };
+    attempted?: {
+      reviewerUsefulness: string;
+      reviewerIdentity: string;
+      notesPresent: boolean;
+      noteChars: number;
+    };
+    taskType?: string;
+  };
 }
 
 function makeReviewBoundedRow(): string {
@@ -68,15 +97,39 @@ function makeNonReviewRow(): string {
 async function putReviewerUsefulness(
   ledgerId: string,
   body: string | Record<string, unknown>,
-  token?: string
+  token?: string,
+  contentType = "application/json",
 ) {
   return harness.invoke({
     method: "PUT",
     path: `/ledger/${ledgerId}/reviewer-usefulness`,
     token,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": contentType },
     body,
   });
+}
+
+function latestReviewerUsefulnessRequest(alias: string): {
+  route: string;
+  status: number;
+  outcome: string;
+  error_class: string | null;
+  admission: string | null;
+} {
+  return getDb().prepare(`
+    SELECT route, status, outcome, error_class, admission
+     FROM request_log
+     WHERE alias = @alias
+       AND route = '/ledger/:id/reviewer-usefulness'
+     ORDER BY rowid DESC
+     LIMIT 1
+  `).get({ alias }) as {
+    route: string;
+    status: number;
+    outcome: string;
+    error_class: string | null;
+    admission: string | null;
+  };
 }
 
 describe("PUT /ledger/:id/reviewer-usefulness", () => {
@@ -105,6 +158,13 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(row?.reviewerUsefulnessBy).toBe("reviewer-admin");
     expect(row?.reviewerUsefulnessNotes).toBe(NOTES);
     expect(row?.reviewerUsefulnessTs).toBe(body.reviewerUsefulnessTs);
+    expect(latestReviewerUsefulnessRequest("reviewer-admin")).toMatchObject({
+      route: "/ledger/:id/reviewer-usefulness",
+      status: 201,
+      outcome: "ok",
+      error_class: null,
+      admission: "n/a",
+    });
   });
 
   it("treats an exact retry as idempotent and preserves the original timestamp", async () => {
@@ -130,7 +190,54 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(row?.reviewerUsefulnessTs).toBe(firstBody.reviewerUsefulnessTs);
   });
 
-  it("fails closed on a conflicting overwrite and does not leak notes in the conflict response", async () => {
+  it("treats omitted notes as part of the exact-retry identity and rejects a second reviewer", async () => {
+    const ledgerId = makeReviewBoundedRow();
+    const first = await putReviewerUsefulness(ledgerId, {
+      usefulness: "redo",
+    }, adminKey);
+    expect(first.status).toBe(201);
+
+    const retry = await putReviewerUsefulness(ledgerId, {
+      usefulness: "redo",
+    }, adminKey);
+    expect(retry.status).toBe(200);
+    expect(retry.json as ReviewerUsefulnessWriteResponse).toMatchObject({
+      reviewerIdentity: "reviewer-admin",
+      notesPresent: false,
+      noteChars: 0,
+      writeState: "unchanged",
+    });
+
+    const secondReviewer = await putReviewerUsefulness(ledgerId, {
+      usefulness: "redo",
+    }, secondAdminKey);
+    expect(secondReviewer.status).toBe(409);
+    expect(secondReviewer.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      error: { code: "reviewer_usefulness_conflict" },
+      conflict: {
+        kind: "already_recorded",
+        mismatchFields: ["reviewerIdentity"],
+        existing: {
+          reviewerIdentity: "reviewer-admin",
+          notesPresent: false,
+          noteChars: 0,
+        },
+        attempted: {
+          reviewerIdentity: "reviewer-admin-r2",
+          notesPresent: false,
+          noteChars: 0,
+        },
+      },
+    });
+    expect(latestReviewerUsefulnessRequest("reviewer-admin-r2")).toMatchObject({
+      status: 409,
+      outcome: "conflict",
+      error_class: "reviewer_usefulness_conflict",
+      admission: "n/a",
+    });
+  });
+
+  it("fails closed on a conflicting overwrite, exposes machine conflict detail, and does not leak notes", async () => {
     const ledgerId = makeReviewBoundedRow();
     await putReviewerUsefulness(ledgerId, {
       usefulness: "pass",
@@ -142,16 +249,24 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
       notes: "ref:gille-inference#112 verdict:refuted",
     }, adminKey);
     expect(conflicting.status).toBe(409);
-    const body = conflicting.json as {
-      error: {
-        code: string;
-        message: string;
-      };
-    };
+    const body = conflicting.json as ReviewerUsefulnessConflictResponse;
     expect(body.error.code).toBe("reviewer_usefulness_conflict");
     expect(body.error.message).toContain("Exact retries are idempotent");
-    expect(body.error.message).toContain("reviewer-admin");
-    expect(body.error.message).toContain("pass");
+    expect(body.conflict).toMatchObject({
+      kind: "already_recorded",
+      mismatchFields: ["usefulness", "notes"],
+      existing: {
+        reviewerUsefulness: "pass",
+        reviewerIdentity: "reviewer-admin",
+        notesPresent: true,
+        noteChars: NOTES.length,
+      },
+      attempted: {
+        reviewerUsefulness: "wrong",
+        reviewerIdentity: "reviewer-admin",
+        notesPresent: true,
+      },
+    });
     expect(conflicting.text).not.toContain(NOTES);
     expect(conflicting.text).not.toContain("ref:gille-inference#112 verdict:refuted");
 
@@ -160,12 +275,33 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(row?.reviewerUsefulnessNotes).toBe(NOTES);
   });
 
-  it("rejects malformed or non-content-blind / bounded input", async () => {
+  it("rejects malformed, oversized, non-JSON, or non-content-blind / bounded input without changing the row", async () => {
     const ledgerId = makeReviewBoundedRow();
     const invalidJson = await putReviewerUsefulness(ledgerId, "{", adminKey);
     expect(invalidJson.status).toBe(400);
     expect(invalidJson.json as { error: { message: string } }).toMatchObject({
       error: { message: "Request body must be valid JSON." },
+    });
+
+    const wrongContentType = await putReviewerUsefulness(
+      ledgerId,
+      JSON.stringify({ usefulness: "pass", notes: NOTES }),
+      adminKey,
+      "text/plain",
+    );
+    expect(wrongContentType.status).toBe(400);
+    expect(wrongContentType.json as { error: { code: string; param: string | null } }).toMatchObject({
+      error: { code: "invalid_request_error", param: "content-type" },
+    });
+
+    const oversized = await putReviewerUsefulness(
+      ledgerId,
+      { usefulness: "pass", notes: `ref:${"a".repeat(5000)}` },
+      adminKey,
+    );
+    expect(oversized.status).toBe(413);
+    expect(oversized.json as { error: { code: string } }).toMatchObject({
+      error: { code: "payload_too_large" },
     });
 
     const invalidCases = [
@@ -180,9 +316,17 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
       const payload = res.json as { error: { code: string } };
       expect(payload.error.code).toBe("invalid_request_error");
     }
+    expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
+    expect(latestReviewerUsefulnessRequest("reviewer-admin")).toMatchObject({
+      status: 400,
+      outcome: "bad_request",
+      error_class: "invalid_request_error",
+      admission: "n/a",
+    });
   });
 
-  it("404s for an unknown ledger id", async () => {
+  it("404s for an unknown ledger id without reflecting the caller-supplied id", async () => {
+    const unknownId = "no-such-ledger-id";
     const res = await putReviewerUsefulness("no-such-ledger-id", {
       usefulness: "pass",
       notes: NOTES,
@@ -191,6 +335,7 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(res.json as { error: { code: string } }).toMatchObject({
       error: { code: "not_found" },
     });
+    expect(res.text).not.toContain(unknownId);
   });
 
   it("rejects a ledger row that is not review-bounded", async () => {
@@ -202,12 +347,14 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(res.status).toBe(409);
     const body = res.json as { error: { code: string; message: string } };
     expect(body.error.code).toBe("reviewer_usefulness_conflict");
-    expect(body.error.message).toContain("review-bounded");
-    expect(body.error.message).toContain("summarize");
+    expect(body.conflict).toMatchObject({
+      kind: "wrong_task_type",
+      taskType: "summarize",
+    });
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
 
-  it("stays owner-authenticated: unauthenticated, guest, and monitor callers cannot write", async () => {
+  it("stays minted-owner-admin only: unauthenticated, guest, monitor, and owner-agent callers cannot write", async () => {
     const ledgerId = makeReviewBoundedRow();
 
     const unauthenticated = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES });
@@ -218,6 +365,9 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
 
     const monitor = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES }, monitorKey);
     expect(monitor.status).toBe(403);
+
+    const agent = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES }, agentKey);
+    expect(agent.status).toBe(403);
 
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
