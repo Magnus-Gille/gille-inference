@@ -32,9 +32,14 @@ async function settlesWithin<T>(
   pollMs = 10,
 ): Promise<boolean> {
   let settled = false;
-  promise.finally(() => {
-    settled = true;
-  });
+  void promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
   const deadline = Date.now() + timeoutMs;
   while (!settled && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(pollMs, deadline - Date.now()))));
@@ -233,6 +238,13 @@ async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Prom
 }
 
 describe("gateway spine — HTTP integration", () => {
+  it("observes rejected promises without creating a second unhandled rejection", async () => {
+    const rejectingPromise = Promise.reject(new Error("boom"));
+
+    await expect(settlesWithin(rejectingPromise, 100)).resolves.toBe(true);
+    await expect(rejectingPromise).rejects.toThrow("boom");
+  });
+
   it("recovers stamped /delegate before quota, busy admission, and a rotated gateway epoch", async () => {
     const owner = mintKey({
       alias: `service-hugin-${randomUUID()}`,
