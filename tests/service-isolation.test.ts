@@ -63,6 +63,19 @@ prepare_gateway_user_manager
 }
 
 describe("service-isolation migration contract (#151)", () => {
+  it("waits for delayed gateway health but times out fail-closed without printing its locator", () => {
+    const delayed = execFileSync("bash", ["-c", `source "$1"; count=0; systemctl(){ return 0; }; gateway_health_url(){ printf 'private-locator'; }; curl(){ count=$((count+1)); [ "$count" -ge 3 ]; }; sleep(){ :; }; wait_for_gateway_health home-gateway.service; printf '%s' "$count"`, "--", script], { encoding: "utf8" });
+    expect(delayed).toBe("3");
+    let timeoutOutput = "";
+    try {
+      execFileSync("bash", ["-c", `source "$1"; systemctl(){ return 0; }; gateway_health_url(){ printf 'private-locator'; }; curl(){ return 1; }; sleep(){ :; }; wait_for_gateway_health home-gateway.service`, "--", script], { encoding: "utf8", stderr: "pipe" });
+    } catch (error: any) {
+      timeoutOutput = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+    }
+    expect(timeoutOutput).toContain("bounded 30s readiness window");
+    expect(timeoutOutput).not.toContain("private-locator");
+  });
+
   it("waits for a delayed lingered user manager bus after explicitly starting user@UID", () => {
     const result = runUserManagerHarness(3);
     expect(result.status).toBe(0);
