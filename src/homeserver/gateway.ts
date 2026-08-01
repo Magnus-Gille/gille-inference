@@ -3142,10 +3142,10 @@ async function handleRequest(
       if (!monitorOk) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
-        lctx.errorClass = "model_not_allowed";
+        lctx.errorClass = "route_not_allowed";
         sendError(
           res,
-          makeError("model_not_allowed", {
+          makeError("route_not_allowed", {
             param: null,
             message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models).",
           })

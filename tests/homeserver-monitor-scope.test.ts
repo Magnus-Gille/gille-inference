@@ -93,6 +93,12 @@ function url(path: string): string {
 }
 const auth = (key: string) => ({ Authorization: `Bearer ${key}` });
 
+async function expectMonitorRouteDenied(res: Response): Promise<void> {
+  expect(res.status).toBe(403);
+  const body = (await res.json()) as { error?: { code?: string } };
+  expect(body.error?.code).toBe("route_not_allowed");
+}
+
 describe("read-only monitor scope (#35)", () => {
   it("monitor key CAN read GET /ledger (200 + report/recent)", async () => {
     const res = await fetch(url("/ledger"), { headers: auth(MONITOR_KEY) });
@@ -110,9 +116,9 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MINTED_MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ model: "x", messages: [{ role: "user", content: "hi" }] }),
     });
-    expect(inference.status).toBe(403);
+    await expectMonitorRouteDenied(inference);
     const admin = await fetch(url("/admin/keys"), { headers: auth(MINTED_MONITOR_KEY) });
-    expect(admin.status).toBe(403);
+    await expectMonitorRouteDenied(admin);
   });
 
   it("rotation preflight requires an actual successful gateway request by the replacement", async () => {
@@ -156,7 +162,7 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ model: "x", messages: [{ role: "user", content: "hi" }] }),
     });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("monitor key CANNOT delegate — POST /delegate is 403", async () => {
@@ -165,12 +171,12 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi" }),
     });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("monitor key CANNOT hit admin — GET /admin/keys is 403", async () => {
     const res = await fetch(url("/admin/keys"), { headers: auth(MONITOR_KEY) });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("guest/user key still CANNOT read /ledger (403)", async () => {
@@ -195,12 +201,12 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ text: "hello" }),
     });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("monitor key blocked on GET /hs (403) but allowed on GET /healthz (200)", async () => {
     const hs = await fetch(url("/hs"), { headers: auth(MONITOR_KEY) });
-    expect(hs.status).toBe(403);
+    await expectMonitorRouteDenied(hs);
     const health = await fetch(url("/healthz"), { headers: auth(MONITOR_KEY) });
     expect(health.status).toBe(200);
   });
@@ -225,6 +231,6 @@ describe("read-only monitor scope (#35)", () => {
 
   it("monitor key still CANNOT hit a non-allowed route — GET /admin/keys stays 403", async () => {
     const res = await fetch(url("/admin/keys"), { headers: auth(MONITOR_KEY) });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 });
