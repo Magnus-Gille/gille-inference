@@ -14,7 +14,7 @@ import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
 import { canonicalizeModelTrusted } from "./catalogue.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
-import { expandBlindContext, type BlindContextConfig } from "./blind-context.js";
+import { describeBlindContextAvailability, expandBlindContext, type BlindContextConfig } from "./blind-context.js";
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
@@ -106,6 +106,14 @@ const ASK_DESCRIPTION =
   "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); a guest key supplying " +
   "`files` is always rejected, never silently ignored.";
 
+type AskFilesReason = "enabled" | "owner_tier_required" | "unconfigured" | "no_resolved_roots";
+
+interface AskFilesCapability {
+  files_enabled: boolean;
+  files_reason: AskFilesReason;
+  resolved_root_count: number | null;
+}
+
 const CODE_LOOP_OWNER_INSTRUCTIONS =
   "code_loop is OWNER-AGENT ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
 
@@ -129,6 +137,39 @@ function isCodeLoopOwner(principal: McpPrincipal): boolean {
  */
 function isAdoptionReporter(principal: McpPrincipal): boolean {
   return isCodeLoopOwner(principal);
+}
+
+function askFilesCapability(principal: McpPrincipal, cfg: HomeserverConfig): AskFilesCapability {
+  if (principal.tier !== "owner") {
+    return {
+      files_enabled: false,
+      files_reason: "owner_tier_required",
+      resolved_root_count: null,
+    };
+  }
+  const availability = describeBlindContextAvailability(cfg.blindContextRoots);
+  return {
+    files_enabled: availability.enabled,
+    files_reason: availability.reason,
+    resolved_root_count: availability.resolvedRootCount,
+  };
+}
+
+function askFilesDiscoverySentence(capability: AskFilesCapability): string {
+  switch (capability.files_reason) {
+    case "enabled":
+      return `DISCOVERY: for this key, \`files\` is currently enabled across ${capability.resolved_root_count} resolved allow-listed root${capability.resolved_root_count === 1 ? "" : "s"}; discovery never reveals the root paths.`;
+    case "unconfigured":
+      return "DISCOVERY: for this key, `files` is currently disabled because HOMESERVER_BLIND_CONTEXT_ROOTS is unset or empty; any `ask` call with `files` will return the existing disabled error.";
+    case "no_resolved_roots":
+      return "DISCOVERY: for this key, `files` is currently disabled because the configured HOMESERVER_BLIND_CONTEXT_ROOTS resolve to no real directories; any `ask` call with `files` will return the existing disabled error.";
+    case "owner_tier_required":
+      return "DISCOVERY: for this key, `files` is unavailable because guest-tier keys are rejected before any blind-context root check.";
+  }
+}
+
+function askDescription(principal: McpPrincipal, cfg: HomeserverConfig): string {
+  return `${ASK_DESCRIPTION} ${askFilesDiscoverySentence(askFilesCapability(principal, cfg))}`;
 }
 
 const ADOPTION_REPORT_DESCRIPTION =
@@ -181,7 +222,8 @@ export function isAdoptionEvidenceToolCall(rawBody: string): boolean {
  * owner-agent code_loop_* tools (#116) are appended only for a real minted owner key carrying
  * agent or admin scope — everyone else never sees them in tools/list.
  */
-function toolDefs(principal: McpPrincipal): unknown[] {
+function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): unknown[] {
+  const filesCapability = askFilesCapability(principal, cfg);
   const base: unknown[] = [
     {
       name: "list_models",
@@ -192,7 +234,8 @@ function toolDefs(principal: McpPrincipal): unknown[] {
     },
     {
       name: "ask",
-      description: ASK_DESCRIPTION,
+      description: askDescription(principal, cfg),
+      annotations: filesCapability,
       inputSchema: {
         type: "object",
         properties: {
@@ -746,11 +789,15 @@ interface ToolCallContext {
 async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<{ text: string; isError: boolean; structuredContent?: unknown }> {
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal);
+    const structuredContent = {
+      models: models.map((id) => ({ id, description: strengthHint(id) })),
+      ask_capabilities: askFilesCapability(ctx.principal, ctx.cfg),
+    };
     if (models.length === 0) {
-      return { text: "No models are available to this key.", isError: false };
+      return { text: "No models are available to this key.", isError: false, structuredContent };
     }
     const lines = models.map((m) => `- ${m} — ${strengthHint(m)}`);
-    return { text: `Models available to you:\n${lines.join("\n")}`, isError: false };
+    return { text: `Models available to you:\n${lines.join("\n")}`, isError: false, structuredContent };
   }
 
   if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {
@@ -962,7 +1009,7 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
 
   if (method === "tools/list") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcResult(id, { tools: toolDefs(ctx.principal) }));
+    res.end(rpcResult(id, { tools: toolDefs(ctx.principal, ctx.cfg) }));
     return;
   }
 

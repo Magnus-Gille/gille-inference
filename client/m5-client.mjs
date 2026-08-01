@@ -276,6 +276,12 @@ function toolPayload(result) {
   return text;
 }
 
+function toolText(result) {
+  return Array.isArray(result?.content)
+    ? result.content.find((entry) => entry?.type === "text")?.text
+    : undefined;
+}
+
 function parseModels(text) {
   if (typeof text !== "string") {
     throw new M5ClientError("malformed_mcp", "The model catalogue response is malformed.");
@@ -289,6 +295,52 @@ function parseModels(text) {
       return { id: id.trim(), description: description.join(" — ").trim() };
     })
     .filter((model) => model.id.length > 0);
+}
+
+function parseAskCapabilities(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The blind-context discovery payload is malformed.",
+    );
+  }
+  const { files_enabled, files_reason, resolved_root_count } = value;
+  if (
+    typeof files_enabled !== "boolean" ||
+    typeof files_reason !== "string" ||
+    !(typeof resolved_root_count === "number" || resolved_root_count === null)
+  ) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The blind-context discovery payload is malformed.",
+    );
+  }
+  return { files_enabled, files_reason, resolved_root_count };
+}
+
+function parseStructuredModelsPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (!Array.isArray(payload.models)) return null;
+  const models = payload.models.map((entry) => {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      typeof entry.id !== "string" ||
+      typeof entry.description !== "string"
+    ) {
+      throw new M5ClientError(
+        "malformed_mcp",
+        "The model catalogue response is malformed.",
+      );
+    }
+    return { id: entry.id, description: entry.description };
+  });
+  return {
+    models,
+    ...(Object.prototype.hasOwnProperty.call(payload, "ask_capabilities")
+      ? { ask_capabilities: parseAskCapabilities(payload.ask_capabilities) }
+      : {}),
+  };
 }
 
 function validateWorkId(workId) {
@@ -551,18 +603,53 @@ export async function createM5Client({
     },
 
     async models() {
-      const payload = await client.tool("list_models", {});
-      const models = parseModels(payload);
-      if (
-        models.length === 0 &&
-        !(typeof payload === "string" && /^No models are available/i.test(payload))
-      ) {
-        throw new M5ClientError(
-          "malformed_mcp",
-          "The model catalogue response is malformed.",
-        );
+      try {
+        const id = nextId++;
+        const response = await client.rpc({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "list_models", arguments: {} },
+        });
+        if (response?.error) {
+          throw new M5ClientError(
+            "mcp_error",
+            redactText(rpcErrorMessage(response), secrets),
+          );
+        }
+        const result = response?.result;
+        if (!result || typeof result !== "object") {
+          throw new M5ClientError(
+            "malformed_mcp",
+            "The MCP tool result is malformed.",
+          );
+        }
+        if (result.isError === true) {
+          const text = toolText(result);
+          throw new M5ClientError(
+            "tool_error",
+            typeof text === "string" ? text : "The MCP tool reported an error.",
+          );
+        }
+
+        const structured = parseStructuredModelsPayload(result.structuredContent);
+        if (structured) return structured;
+
+        const text = toolText(result);
+        const models = parseModels(text);
+        if (
+          models.length === 0 &&
+          !(typeof text === "string" && /^No models are available/i.test(text))
+        ) {
+          throw new M5ClientError(
+            "malformed_mcp",
+            "The model catalogue response is malformed.",
+          );
+        }
+        return { models };
+      } catch (error) {
+        throw safeError(error, secrets);
       }
-      return { models };
     },
 
     async ask(input) {

@@ -294,6 +294,44 @@ describe("secret-safe M5 client", () => {
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
   });
 
+  it("accepts the enriched list_models structuredContent without breaking model discovery", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          id: number;
+          params?: { name?: string };
+        };
+        if (request.params?.name !== "list_models") {
+          throw new Error("unexpected tool");
+        }
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
+          isError: false,
+          structuredContent: {
+            models: [{ id: "mellum", description: "fast" }],
+            ask_capabilities: {
+              files_enabled: false,
+              files_reason: "owner_tier_required",
+              resolved_root_count: null,
+            },
+          },
+        });
+      },
+    });
+
+    await expect(client.models()).resolves.toEqual({
+      models: [{ id: "mellum", description: "fast" }],
+      ask_capabilities: {
+        files_enabled: false,
+        files_reason: "owner_tier_required",
+        resolved_root_count: null,
+      },
+    });
+  });
+
   it("rejects content or unknown fields in an adoption report before Keychain resolution or fetch", async () => {
     let credentialResolutions = 0;
     let fetches = 0;

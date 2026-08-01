@@ -177,10 +177,19 @@ describe("MCP ping", () => {
 // ─── tools/list ──────────────────────────────────────────────────────────────────────
 
 describe("MCP tools/list", () => {
-  it("lists list_models and ask with inputSchemas", async () => {
+  it("lists list_models and ask with inputSchemas and disabled blind-context metadata for an owner key by default", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { tools: Array<{ name: string; inputSchema: { type: string; properties: Record<string, unknown> } }> } };
+    const j = (await res.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          description: string;
+          annotations?: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null };
+          inputSchema: { type: string; properties: Record<string, unknown> };
+        }>;
+      };
+    };
     const names = j.result.tools.map((t) => t.name);
     expect(names).toContain("list_models");
     expect(names).toContain("ask");
@@ -189,20 +198,79 @@ describe("MCP tools/list", () => {
     expect(ask.inputSchema.properties).toHaveProperty("model");
     expect(ask.inputSchema.properties).toHaveProperty("prompt");
     expect(ask.inputSchema.properties).toHaveProperty("delegator_model_id");
+    expect(ask.annotations).toEqual({
+      files_enabled: false,
+      files_reason: "unconfigured",
+      resolved_root_count: 0,
+    });
+    expect(ask.description).toMatch(/currently disabled because HOMESERVER_BLIND_CONTEXT_ROOTS is unset or empty/i);
     const list = j.result.tools.find((t) => t.name === "list_models")!;
     expect(list.inputSchema.type).toBe("object");
+  });
+
+  it("tells a guest key that files are unavailable before any root/config check", async () => {
+    const res = await rpc({ jsonrpc: "2.0", id: 21, method: "tools/list" }, scopedKey);
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          description: string;
+          annotations?: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null };
+        }>;
+      };
+    };
+    const ask = j.result.tools.find((t) => t.name === "ask")!;
+    expect(ask.annotations).toEqual({
+      files_enabled: false,
+      files_reason: "owner_tier_required",
+      resolved_root_count: null,
+    });
+    expect(ask.description).toMatch(/guest-tier keys are rejected before any blind-context root check/i);
   });
 });
 
 // ─── tools/call list_models ─────────────────────────────────────────────────────────
 
 describe("MCP tools/call list_models", () => {
+  it("returns structured blind-context discovery for an owner when the feature is unset/default-disabled", async () => {
+    const res = await rpc(
+      { jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "list_models", arguments: {} } },
+      creditKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent?: { ask_capabilities: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent?.ask_capabilities).toEqual({
+      files_enabled: false,
+      files_reason: "unconfigured",
+      resolved_root_count: 0,
+    });
+  });
+
   it("a scoped key sees only its allow-listed model", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_models", arguments: {} } }, scopedKey);
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { content: Array<{ type: string; text: string }>; isError: boolean } };
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent?: { ask_capabilities: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } };
+      };
+    };
     expect(j.result.isError).toBe(false);
     expect(j.result.content[0]!.text).toContain("only-this-model");
+    expect(j.result.structuredContent?.ask_capabilities).toEqual({
+      files_enabled: false,
+      files_reason: "owner_tier_required",
+      resolved_root_count: null,
+    });
   });
 
   it("describes VibeThinker as a verifiable-reasoning specialist", async () => {

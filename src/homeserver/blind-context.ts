@@ -128,6 +128,14 @@ export interface BlindContextExpansion {
 
 export type BlindContextResult = ({ ok: true } & BlindContextExpansion) | { ok: false; error: BlindContextError };
 
+export type BlindContextAvailabilityReason = "enabled" | "unconfigured" | "no_resolved_roots";
+
+export interface BlindContextAvailability {
+  enabled: boolean;
+  reason: BlindContextAvailabilityReason;
+  resolvedRootCount: number;
+}
+
 const FILE_HEADER = (p: string): string => `===== FILE: ${p} =====`;
 const FILE_FOOTER = "===== END FILE =====";
 const PREAMBLE = (n: number): string =>
@@ -151,6 +159,21 @@ function resolveRoots(roots: readonly string[]): string[] {
     }
   }
   return resolved;
+}
+
+/**
+ * Content-blind availability summary for discovery surfaces: tell callers whether the feature is
+ * truly usable without exposing any root locators or mutating the configured root list.
+ */
+export function describeBlindContextAvailability(roots: readonly string[]): BlindContextAvailability {
+  if (roots.length === 0) {
+    return { enabled: false, reason: "unconfigured", resolvedRootCount: 0 };
+  }
+  const resolved = resolveRoots(roots);
+  if (resolved.length === 0) {
+    return { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 };
+  }
+  return { enabled: true, reason: "enabled", resolvedRootCount: resolved.length };
 }
 
 /**
@@ -179,30 +202,21 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
     return { ok: true, text: "", fileCount: 0, totalBytes: 0 };
   }
 
-  if (cfg.roots.length === 0) {
+  const availability = describeBlindContextAvailability(cfg.roots);
+  if (!availability.enabled) {
     return {
       ok: false,
       error: {
         code: "disabled",
         path: null,
         message:
-          "File attachments are disabled on this server (HOMESERVER_BLIND_CONTEXT_ROOTS is not configured).",
+          availability.reason === "unconfigured"
+            ? "File attachments are disabled on this server (HOMESERVER_BLIND_CONTEXT_ROOTS is not configured)."
+            : "File attachments are disabled — none of the configured HOMESERVER_BLIND_CONTEXT_ROOTS resolve to a real directory.",
       },
     };
   }
-
   const roots = resolveRoots(cfg.roots);
-  if (roots.length === 0) {
-    return {
-      ok: false,
-      error: {
-        code: "disabled",
-        path: null,
-        message:
-          "File attachments are disabled — none of the configured HOMESERVER_BLIND_CONTEXT_ROOTS resolve to a real directory.",
-      },
-    };
-  }
 
   // Count cap — bounds the un-byte-metered delimiter/header overhead (see MAX_FILES_PER_REQUEST).
   if (filePaths.length > MAX_FILES_PER_REQUEST) {

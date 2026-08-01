@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
+  describeBlindContextAvailability,
   expandBlindContext,
   MAX_FILES_PER_REQUEST,
   type BlindContextConfig,
@@ -48,6 +49,36 @@ describe("expandBlindContext — disabled-by-default posture", () => {
     const result = expandBlindContext(["/definitely/does/not/exist/anywhere/x.txt"], cfg);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("disabled");
+  });
+});
+
+describe("describeBlindContextAvailability", () => {
+  it("reports 'unconfigured' for an empty root list", () => {
+    expect(describeBlindContextAvailability([])).toEqual({
+      enabled: false,
+      reason: "unconfigured",
+      resolvedRootCount: 0,
+    });
+  });
+
+  it("reports 'no_resolved_roots' when every configured root is unusable", () => {
+    expect(describeBlindContextAvailability(["/definitely/does/not/exist/anywhere"])).toEqual({
+      enabled: false,
+      reason: "no_resolved_roots",
+      resolvedRootCount: 0,
+    });
+  });
+
+  it("counts only real directories from a mixed root list and does not mutate the input", () => {
+    const validRoot = makeTmpRoot("bc-capability-valid-");
+    const mixedRoots = [validRoot, "/definitely/does/not/exist/anywhere"];
+
+    expect(describeBlindContextAvailability(mixedRoots)).toEqual({
+      enabled: true,
+      reason: "enabled",
+      resolvedRootCount: 1,
+    });
+    expect(mixedRoots).toEqual([validRoot, "/definitely/does/not/exist/anywhere"]);
   });
 });
 
