@@ -74,6 +74,7 @@ describe("service-isolation migration contract (#151)", () => {
     }
     expect(timeoutOutput).toContain("bounded 30s readiness window");
     expect(timeoutOutput).not.toContain("private-locator");
+    expect(readFileSync(script, "utf8")).toContain("--connect-timeout 1 --max-time 4");
   });
 
   it("waits for a delayed lingered user manager bus after explicitly starting user@UID", () => {
