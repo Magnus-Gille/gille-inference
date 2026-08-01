@@ -415,7 +415,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
     // The guest key test (above) leaves the assembled===null path; this covers assembled!==null.
     mockMode = "sse-abort";
     // owner tier + creditLimit so the gateway activates the ownerLog path.
-    const k = mintKey({ alias: "deg-stream-owner", tier: "owner", creditLimit: 1_000_000 }, DEFAULTS);
+    const k = mintKey({ alias: "deg-stream-owner", tier: "owner", scope: "admin", creditLimit: 1_000_000 }, DEFAULTS);
 
     const res = await chat(gatewayPort, k.plaintextKey, { stream: true });
     expect(res.status).toBe(200);
@@ -556,7 +556,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
   }
 
   it("#14 /delegate missing prompt → 400 invalid_request_error param=prompt", async () => {
-    const k = mintKey({ alias: "del-noprompt", tier: "owner" }, DEFAULTS);
+    const k = mintKey({ alias: "del-noprompt", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await delegateReq(k.plaintextKey, {});
     expect(res.status).toBe(400);
     const j = (await res.json()) as { error: { code: string; param: string } };
@@ -565,7 +565,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
   });
 
   it("#14 /delegate non-string modelId → 400 param=modelId", async () => {
-    const k = mintKey({ alias: "del-badmodel", tier: "owner" }, DEFAULTS);
+    const k = mintKey({ alias: "del-badmodel", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await delegateReq(k.plaintextKey, { prompt: "hi", modelId: 123 });
     expect(res.status).toBe(400);
     const j = (await res.json()) as { error: { param: string } };
@@ -573,7 +573,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
   });
 
   it("#14 /delegate invalid verifier spec → 400 param=verifier", async () => {
-    const k = mintKey({ alias: "del-badverifier", tier: "owner" }, DEFAULTS);
+    const k = mintKey({ alias: "del-badverifier", tier: "owner", scope: "admin" }, DEFAULTS);
     // answerIs requires a string 'expected' — omitting it is a build error → 400.
     const res = await delegateReq(k.plaintextKey, { prompt: "hi", verifier: { type: "answerIs" } });
     expect(res.status).toBe(400);
@@ -591,7 +591,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
   });
 
   it("#14 /delegate malformed JSON → 400 bad_request (validated before admission)", async () => {
-    const k = mintKey({ alias: "del-badjson", tier: "owner" }, DEFAULTS);
+    const k = mintKey({ alias: "del-badjson", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url(gatewayPort, "/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${k.plaintextKey}` },
@@ -606,7 +606,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
   it("#14 (Codex finding 3) a bad /delegate body 400s even when the key is credit-exhausted", async () => {
     // creditLimit:1 means any real request 402s at the credit reserve (estTokens > 1). With
     // validation moved BEFORE admission, a missing-prompt request must still return 400 — not 402.
-    const k = mintKey({ alias: "del-broke", tier: "owner", creditLimit: 1 }, DEFAULTS);
+    const k = mintKey({ alias: "del-broke", tier: "owner", scope: "admin", creditLimit: 1 }, DEFAULTS);
     const res = await delegateReq(k.plaintextKey, { taskType: "summarize" }); // no prompt
     expect(res.status).toBe(400);
     const j = (await res.json()) as { error: { code: string; param: string } };

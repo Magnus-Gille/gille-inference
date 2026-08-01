@@ -32,12 +32,15 @@ privacy/admission tier, route scope, and model allow-list:
 |---|---|---|
 | Tier | `owner` | Deliberate owner-content logging and owner-priority admission. |
 | Tier | `guest` | Content-blind guest admission; cannot carry privileged scopes. |
-| Scope | `admin` | Operator routes plus agent/inference surfaces. Legacy owner-key default. |
+| Scope | `admin` | Operator routes plus agent/inference surfaces. Explicit for new keys; legacy null-scope owner rows retain it compatibly. |
 | Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
 | Scope | `inference` | Ordinary inference only. Legacy guest-key default. |
+| Scope | `monitor` | Read-only `GET /healthz`, `/models`, `/metrics`, and `/ledger*`; no inference or mutation. |
 
-Tier does not imply admin authority. New harness credentials use `tier=owner, scope=agent`;
-existing owner rows without a stored scope resolve compatibly to `admin`.
+Tier does not imply admin authority. New owner credentials default to `agent`; admin must be
+explicit. New credentials are lifetime-bounded (admin 30 days, agent 90 days, inference/monitor
+365 days). Existing owner rows without a stored scope resolve compatibly to `admin` so they can be
+migrated through the staged lifecycle in `docs/credential-lifecycle-runbook.md`.
 
 Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
 

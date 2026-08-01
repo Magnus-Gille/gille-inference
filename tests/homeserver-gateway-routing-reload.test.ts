@@ -45,7 +45,7 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   const defs = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
-  ownerKey = ks.mintKey({ alias: "routing-reload-owner", tier: "owner" }, defs).plaintextKey;
+  ownerKey = ks.mintKey({ alias: "routing-reload-owner", tier: "owner", scope: "admin" }, defs).plaintextKey;
   guestKey = ks.mintKey({ alias: "routing-reload-guest", tier: "guest", modelAllowList: ["m1"] }, defs).plaintextKey;
 
   const gw = await import("../src/homeserver/gateway.js");

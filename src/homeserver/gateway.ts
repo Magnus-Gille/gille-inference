@@ -19,10 +19,12 @@ import {
   reserveCredits,
   reconcileCredits,
   recordUsage as recordCreditUsage,
+  recordKeyUse,
   KeyAliasExistsError,
   InviteInvalidError,
   InvalidParamError,
   InvalidScopeError,
+  KeyLifetimePolicyError,
   type KeyScope,
   type Tier,
 } from "./keystore.js";
@@ -211,6 +213,7 @@ function resolvePrincipal(
       tier: rec.tier,
       scope: rec.scope,
       isAdmin: rec.scope === "admin",
+      isMonitor: rec.scope === "monitor",
       modelAllowList: rec.modelAllowList,
       limits: { rpm: rec.rpm, tpm: rec.tpm, dailyTokenBudget: rec.dailyTokenBudget },
       maxParallel: rec.maxParallel,
@@ -2774,10 +2777,11 @@ async function handleKeysMint(
     || (body.scope !== undefined
       && body.scope !== "admin"
       && body.scope !== "agent"
-      && body.scope !== "inference")
+      && body.scope !== "inference"
+      && body.scope !== "monitor")
   ) {
     sendError(res, makeError("invalid_request_error", {
-      message: "Require 'alias' and 'tier' (owner|guest); optional 'scope' is admin|agent|inference.",
+      message: "Require 'alias' and 'tier' (owner|guest); optional 'scope' is admin|agent|inference|monitor.",
     }));
     return;
   }
@@ -2813,6 +2817,13 @@ async function handleKeysMint(
       sendError(
         res,
         makeError("invalid_request_error", { param: "scope", message: err.message })
+      );
+      return;
+    }
+    if (err instanceof KeyLifetimePolicyError) {
+      sendError(
+        res,
+        makeError("invalid_request_error", { param: "ttlSeconds", message: err.message })
       );
       return;
     }
@@ -4448,6 +4459,25 @@ async function handleRequest(
     throw err;
   } finally {
     lctx.totalMs = Date.now() - startMs;
+    // A staged-rotation preflight must mean the replacement completed an allowed gateway route,
+    // not merely that its token matched the local DB. Record only successful minted-key requests;
+    // static credentials have no keystore hash and failed/forbidden requests never advance proof.
+    if (
+      lctx.principal !== null
+      && lctx.keyHash !== null
+      && lctx.status !== null
+      && lctx.status >= 200
+      && lctx.status < 400
+    ) {
+      try {
+        recordKeyUse(lctx.principal);
+      } catch (err) {
+        // Usage evidence strengthens a later rotation preflight, but a telemetry-store failure
+        // must not turn an already completed gateway response into an unhandled request failure.
+        // Keep the preflight fail-closed by leaving the evidence absent and retain diagnostics.
+        console.error("[credential-lifecycle] failed to record successful key use", err);
+      }
+    }
     if (!suppressRequestTelemetry) recordRequest({
       // C3: lctx.model is canonicalized (allow-list / resident catalogue) for the inference
       // surface — never the raw request string. Non-inference routes leave it null → "none".

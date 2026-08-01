@@ -490,7 +490,13 @@ m5-auth --check --tailnet
 The helper passes the bearer to `curl` over stdin, discards the response body, suppresses
 locator-bearing transport diagnostics, and emits neither the credential nor the endpoint.
 
-### Credential preflight and owner-key rotation (issues #98, #110)
+### Credential preflight and owner-key rotation (issues #98, #110, #152)
+
+Planned service/harness migrations use the overlap, gateway-observed preflight, atomic commit, and
+abort workflow in [`docs/credential-lifecycle-runbook.md`](../docs/credential-lifecycle-runbook.md).
+The immediate `keys rotate` ceremony below is retained only for the already-reviewed #98 dedicated
+owner-key recovery path; it is not the default for migrating a live consumer because it has no
+overlap window.
 
 The live gateway's active keystore (plus any explicitly configured gateway environment keys) is
 the authentication source of truth. The macOS Keychain item used by `m5-auth` is a client-side copy,
@@ -521,7 +527,8 @@ running service, deployment revision, working directory, and configured keystore
 an old gateway/configuration is source-of-truth drift; rotating the still-valid key would only
 revoke a working credential without correcting that routing/configuration fault.
 
-When both paths reach the authoritative gateway and the stored credential is genuinely stale:
+For #98 owner-key recovery only, when both paths reach the authoritative gateway and the stored
+credential is genuinely stale:
 
 1. In a private interactive terminal on the live M5, inspect the logical rotation family with
    `npx tsx src/homeserver/cli.ts keys list --all`. Identify the intended logical owner alias and

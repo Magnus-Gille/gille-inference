@@ -66,7 +66,7 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   const defs = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
-  ownerKey = ks.mintKey({ alias: "maint-owner", tier: "owner" }, defs).plaintextKey;
+  ownerKey = ks.mintKey({ alias: "maint-owner", tier: "owner", scope: "admin" }, defs).plaintextKey;
   // Guest needs the model on its allow-list to be served when maintenance is off.
   guestKey = ks.mintKey({ alias: "maint-guest", tier: "guest", modelAllowList: ["m1"] }, defs).plaintextKey;
 
