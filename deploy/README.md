@@ -59,7 +59,7 @@ actually true:
 
 ## Order of operations
 
-1. **Run the gateway** (loopback): `tsx src/homeserver/cli.ts serve`
+1. **Run the gateway** (configured listener): `tsx src/homeserver/cli.ts serve`
    - Configure it first via env — see `env.example`. Copy to `.env`, `chmod 600`.
 2. **Mint the first owner key for yourself** (loopback bootstrap):
    ```bash
@@ -367,6 +367,74 @@ scripts/deploy-gateway.sh dry-run <accepted-full-sha>
 read-only `WorkingDirectory` check, so a path mismatch is caught before a real deploy would hit it.
 Add `DEPLOY_DRY_RUN_OFFLINE=1` for a fully offline plan (no network at all).
 
+### Least-privilege service-account migration (issue #151)
+
+This is a separate, **owner-attended host migration**, not part of `deploy-gateway.sh` and not
+triggered by merging a source release. It moves the three network/compute services away from the
+interactive `magnus` account while preserving their distinct connections: gateway → llama-swap on
+loopback, cloudflared → the configured gateway listener plus outbound Tunnel transport, and llama-swap → the
+specific GPU render/card devices and read-only model/runtime trees.
+
+The executable contract is [`../scripts/service-isolation.sh`](../scripts/service-isolation.sh).
+It accepts exactly one of `gateway`, `cloudflared`, or `llama-swap` on every invocation—there is
+no `all` mode. It refuses unfamiliar unit identity/path state, non-empty target state, missing GPU
+devices/groups, or an unavailable user manager rather than guessing. It never prints application
+data, environment contents, bearer keys, or tunnel credentials.
+
+Gateway apply migrates the legacy owner `gille-autonomy-tick` user timer in the same transaction:
+it disables that timer before moving `.env`/`data`, installs an equivalent hardened system timer
+under `gille-gateway`, preserves the 05:30 persistent cadence, gives it the migrated state/env and
+a service-visible notification hook, then verifies the replacement. A later source deploy detects
+the isolated timer and refreshes its hook/unit instead of recreating the owner user timer. Rollback
+removes the isolated timer and re-enables the legacy user timer only after restoring its original
+state/config. Do not work around this contract by sharing the gateway service group with the owner
+user or by leaving a second `.env` in the owner home.
+
+Run the services in this order, stopping if any preflight or verification fails:
+
+```bash
+sudo scripts/service-isolation.sh preflight --service gateway
+sudo scripts/service-isolation.sh apply --service gateway --ack-service-restart
+sudo scripts/service-isolation.sh preflight --service cloudflared
+sudo scripts/service-isolation.sh apply --service cloudflared --ack-service-restart
+sudo scripts/service-isolation.sh preflight --service llama-swap
+sudo scripts/service-isolation.sh apply --service llama-swap --ack-service-restart
+```
+
+The gateway state and environment move to service-restricted roots, but the reviewed application
+tree is made visible only as an exact read-only mount; the rest of the owner home is masked. Its
+code-loop path gets a distinct `gille-gateway` user manager with lingering enabled, a dedicated
+pinned Pi runtime, and just `models.json`. The migration rejects `auth.json` in that runtime and
+does not copy the owner's Pi configuration or home directory. The workroot is service-owned.
+
+Cloudflared's configuration and credentials become `root:gille-cloudflared` (directory `0750`,
+files `0640`): the network-facing process may read but not replace them. Llama-swap receives no
+general Linux capabilities; its only deliberate sandbox exception is direct access to the specific
+render/card devices and membership in `render`/`video`, needed for hardware inference. It remains
+loopback-only. The source/model/runtime mounts are exact read-only paths, not a broad owner-home
+mount.
+
+Each attempted apply creates a sanitized unit/plan backup record before moving state, so it is
+available even if the restart or verification fails. Record in the private operations tracker:
+
+- service name, UTC start/end, resulting `systemctl show` identity/sandbox summary, and health
+  status—not environment/configuration contents;
+- the backup record path printed by the script, deployed commit marker before/after, and whether a
+  restart interrupted MCP traffic; and
+- a result of `verify` plus the public-edge verifier for a gateway change.
+
+Rollback is likewise one service at a time and explicit:
+
+```bash
+sudo scripts/service-isolation.sh rollback --service gateway --ack-rollback
+```
+
+It stops the selected service, restores only its moved source paths, removes the isolation
+drop-in (leaving other pre-existing drop-ins intact), reloads systemd, and demands a recovered
+legacy `magnus` unit. It refuses any merge with a non-empty original state directory. The
+dedicated inactive account/runtime is retained, mode-restricted, for forensic recovery; delete it
+only in a separate owner-approved cleanup.
+
 ### Verifying what's actually deployed
 
 ```bash
@@ -548,7 +616,7 @@ The ones that shape best-effort behaviour:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `HOMESERVER_PORT` | `8080` | gateway listen port (loopback) |
+| `HOMESERVER_PORT` | `8080` | gateway configured listen port |
 | `HOMESERVER_MAX_INFLIGHT` | `2` | global GPU slots; guests get `503` past this |
 | `HOMESERVER_OWNER_QUEUE_MAX_MS` | `5000` | how long an owner request may queue before `503` |
 | `HOMESERVER_BUSY_RETRY_AFTER_S` | `2` | `Retry-After` seconds on `503` |
