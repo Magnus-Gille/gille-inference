@@ -441,12 +441,20 @@ describe("secret-safe M5 client", () => {
       value: { files_enabled: true, files_reason: "unconfigured", resolved_root_count: 1 },
     },
     {
+      name: "disabled with enabled reason and zero roots",
+      value: { files_enabled: false, files_reason: "enabled", resolved_root_count: 0 },
+    },
+    {
       name: "owner-tier-required with disclosed count",
       value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: 0 },
     },
     {
       name: "unconfigured with null count",
       value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: null },
+    },
+    {
+      name: "no_resolved_roots with null count",
+      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: null },
     },
     {
       name: "missing reason field",

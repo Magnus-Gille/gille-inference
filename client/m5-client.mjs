@@ -325,7 +325,10 @@ function parseAskCapabilities(value) {
     if (resolved_root_count !== null) {
       return null;
     }
-  } else if (resolved_root_count !== 0) {
+  } else if (
+    (files_reason !== "unconfigured" && files_reason !== "no_resolved_roots")
+    || resolved_root_count !== 0
+  ) {
     return null;
   }
   return { files_enabled, files_reason, resolved_root_count };

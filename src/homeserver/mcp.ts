@@ -270,12 +270,17 @@ export function parseAskFilesCapabilityMeta(value: unknown): AskFilesCapability 
       resolved_root_count: resolvedRootCount,
     };
   }
-  if (resolvedRootCount !== 0) return null;
-  return {
-    files_enabled: filesEnabled,
-    files_reason: filesReason,
-    resolved_root_count: resolvedRootCount,
-  };
+  if (
+    (filesReason === "unconfigured" || filesReason === "no_resolved_roots")
+    && resolvedRootCount === 0
+  ) {
+    return {
+      files_enabled: filesEnabled,
+      files_reason: filesReason,
+      resolved_root_count: resolvedRootCount,
+    };
+  }
+  return null;
 }
 
 function isAskFilesReason(value: unknown): value is AskFilesReason {
