@@ -332,6 +332,123 @@ describe("secret-safe M5 client", () => {
     });
   });
 
+  it("parses the current list_models text fallback without inventing capability pseudo-models", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          id: number;
+          params?: { name?: string };
+        };
+        if (request.params?.name !== "list_models") {
+          throw new Error("unexpected tool");
+        }
+        return rpcResult(request.id, {
+          content: [{
+            type: "text",
+            text:
+              "Models available to you:\n" +
+              "- mellum — fast\n" +
+              "- vibethinker-3b — verifiable math, code, and STEM reasoning\n\n" +
+              "Current ask.files capability:\n" +
+              "files_enabled: false\n" +
+              "files_reason: owner_tier_required\n" +
+              "resolved_root_count: null",
+          }],
+          isError: false,
+        });
+      },
+    });
+
+    await expect(client.models()).resolves.toEqual({
+      models: [
+        { id: "mellum", description: "fast" },
+        { id: "vibethinker-3b", description: "verifiable math, code, and STEM reasoning" },
+      ],
+    });
+  });
+
+  it("preserves an empty catalogue when the current text fallback includes capability lines", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          id: number;
+          params?: { name?: string };
+        };
+        if (request.params?.name !== "list_models") {
+          throw new Error("unexpected tool");
+        }
+        return rpcResult(request.id, {
+          content: [{
+            type: "text",
+            text:
+              "No models are available to this key.\n\n" +
+              "Current ask.files capability:\n" +
+              "files_enabled: false\n" +
+              "files_reason: unconfigured\n" +
+              "resolved_root_count: 0",
+          }],
+          isError: false,
+        });
+      },
+    });
+
+    await expect(client.models()).resolves.toEqual({ models: [] });
+  });
+
+  it("ignores malformed optional ask_capabilities structured metadata when models stay valid", async () => {
+    const malformedCapabilities = [
+      {
+        files_enabled: "false",
+        files_reason: "owner_tier_required",
+        resolved_root_count: null,
+      },
+      {
+        files_enabled: false,
+        files_reason: "owner_tier_required",
+        resolved_root_count: -1,
+      },
+      {
+        files_enabled: false,
+        resolved_root_count: null,
+      },
+    ];
+
+    for (const ask_capabilities of malformedCapabilities) {
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        fetch: async (_input, init) => {
+          const request = JSON.parse(String(init?.body)) as {
+            id: number;
+            params?: { name?: string };
+          };
+          if (request.params?.name !== "list_models") {
+            throw new Error("unexpected tool");
+          }
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
+            isError: false,
+            structuredContent: {
+              models: [{ id: "mellum", description: "fast" }],
+              ask_capabilities,
+            },
+          });
+        },
+      });
+
+      await expect(client.models()).resolves.toEqual({
+        models: [{ id: "mellum", description: "fast" }],
+      });
+    }
+  });
+
   it("rejects content or unknown fields in an adoption report before Keychain resolution or fetch", async () => {
     let credentialResolutions = 0;
     let fetches = 0;

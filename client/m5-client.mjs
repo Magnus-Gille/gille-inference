@@ -299,21 +299,18 @@ function parseModels(text) {
 
 function parseAskCapabilities(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new M5ClientError(
-      "malformed_mcp",
-      "The blind-context discovery payload is malformed.",
-    );
+    return null;
   }
   const { files_enabled, files_reason, resolved_root_count } = value;
   if (
     typeof files_enabled !== "boolean" ||
     typeof files_reason !== "string" ||
-    !(typeof resolved_root_count === "number" || resolved_root_count === null)
+    !(
+      resolved_root_count === null ||
+      (Number.isSafeInteger(resolved_root_count) && resolved_root_count >= 0)
+    )
   ) {
-    throw new M5ClientError(
-      "malformed_mcp",
-      "The blind-context discovery payload is malformed.",
-    );
+    return null;
   }
   return { files_enabled, files_reason, resolved_root_count };
 }
@@ -335,11 +332,12 @@ function parseStructuredModelsPayload(payload) {
     }
     return { id: entry.id, description: entry.description };
   });
+  const askCapabilities = Object.prototype.hasOwnProperty.call(payload, "ask_capabilities")
+    ? parseAskCapabilities(payload.ask_capabilities)
+    : null;
   return {
     models,
-    ...(Object.prototype.hasOwnProperty.call(payload, "ask_capabilities")
-      ? { ask_capabilities: parseAskCapabilities(payload.ask_capabilities) }
-      : {}),
+    ...(askCapabilities === null ? {} : { ask_capabilities: askCapabilities }),
   };
 }
 

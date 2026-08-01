@@ -275,7 +275,8 @@ describe("MCP tools/call list_models", () => {
       resolved_root_count: 0,
     });
     expect(j.result.content[0]!.text).toContain("Current ask.files capability:");
-    expect(j.result.content[0]!.text).toContain("- files_reason: unconfigured");
+    expect(j.result.content[0]!.text).toContain("files_reason: unconfigured");
+    expect(j.result.content[0]!.text).not.toContain("- files_reason: unconfigured");
   });
 
   it("a scoped key sees only its allow-listed model", async () => {
@@ -295,7 +296,8 @@ describe("MCP tools/call list_models", () => {
       files_reason: "owner_tier_required",
       resolved_root_count: null,
     });
-    expect(j.result.content[0]!.text).toContain("- files_reason: owner_tier_required");
+    expect(j.result.content[0]!.text).toContain("files_reason: owner_tier_required");
+    expect(j.result.content[0]!.text).not.toContain("- files_reason: owner_tier_required");
   });
 
   it("describes VibeThinker as a verifiable-reasoning specialist", async () => {

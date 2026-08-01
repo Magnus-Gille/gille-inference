@@ -256,7 +256,7 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 | `notifications/initialized` | `202 Accepted`, empty body. |
 | `ping` | `{}`. |
 | `tools/list` | the tool defs below, including content-blind blind-context discovery on `ask._meta["gille-inference/ask_capabilities"]` (`files_enabled`, stable `files_reason`, `resolved_root_count` with guest-safe `null`). |
-| `tools/call` | `{content:[{type:"text", text}], isError}`. |
+| `tools/call` | `{content:[{type:"text", text}], isError, structuredContent?}`. |
 | unknown / malformed | JSON-RPC `-32601` / `-32700` / `-32600` error (HTTP 200). |
 
 **Tools** (both scoped to the key's allow-list):

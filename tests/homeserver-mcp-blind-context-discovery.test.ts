@@ -211,11 +211,12 @@ function askCapability(tool: ToolDef): FilesCapability {
 
 function expectCapabilityText(text: string, capability: FilesCapability): void {
   expect(text).toContain("Current ask.files capability:");
-  expect(text).toContain(`- files_enabled: ${capability.files_enabled}`);
-  expect(text).toContain(`- files_reason: ${capability.files_reason}`);
+  expect(text).toContain(`files_enabled: ${capability.files_enabled}`);
+  expect(text).toContain(`files_reason: ${capability.files_reason}`);
   expect(text).toContain(
-    `- resolved_root_count: ${capability.resolved_root_count === null ? "null" : capability.resolved_root_count}`
+    `resolved_root_count: ${capability.resolved_root_count === null ? "null" : capability.resolved_root_count}`
   );
+  expect(text).not.toContain(`- files_enabled: ${capability.files_enabled}`);
 }
 
 describe("MCP blind-context discovery", () => {

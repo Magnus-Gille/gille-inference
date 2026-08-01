@@ -14,7 +14,7 @@ import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
 import { canonicalizeModelTrusted } from "./catalogue.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
-import { describeBlindContextAvailability, expandBlindContext, inspectBlindContextAvailability, type BlindContextConfig } from "./blind-context.js";
+import { describeBlindContextAvailability, expandBlindContext, type BlindContextConfig } from "./blind-context.js";
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
@@ -241,15 +241,6 @@ export function parseAskFilesCapabilityMeta(value: unknown): AskFilesCapability 
   };
 }
 
-function askFilesCapabilityFromToolMetaOrCurrent(
-  tool: Pick<McpToolDef, "_meta"> | undefined,
-  principal: McpPrincipal,
-  cfg: HomeserverConfig
-): AskFilesCapability {
-  const fromMeta = parseAskFilesCapabilityMeta(tool?._meta?.[ASK_FILES_META_KEY]);
-  return fromMeta ?? askFilesCapability(principal, cfg);
-}
-
 function buildListModelsStructuredContent(models: readonly string[], capability: AskFilesCapability): ListModelsStructuredContent {
   return {
     models: models.map((id) => ({ id, description: strengthHint(id) })),
@@ -265,9 +256,9 @@ function renderListModelsText(content: ListModelsStructuredContent): string {
   lines.push(
     "",
     "Current ask.files capability:",
-    `- files_enabled: ${content.ask_capabilities.files_enabled}`,
-    `- files_reason: ${content.ask_capabilities.files_reason}`,
-    `- resolved_root_count: ${content.ask_capabilities.resolved_root_count === null ? "null" : content.ask_capabilities.resolved_root_count}`
+    `files_enabled: ${content.ask_capabilities.files_enabled}`,
+    `files_reason: ${content.ask_capabilities.files_reason}`,
+    `resolved_root_count: ${content.ask_capabilities.resolved_root_count === null ? "null" : content.ask_capabilities.resolved_root_count}`
   );
   return lines.join("\n");
 }
@@ -330,7 +321,7 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
       description:
         "List the local models THIS key is permitted to use, each with a one-line strength hint, " +
         "plus the fresh call-time ask.files capability state for this request.",
-      inputSchema: { type: "object", additionalProperties: false, properties: {}, required: [] },
+      inputSchema: { type: "object", properties: {}, required: [] },
       outputSchema: LIST_MODELS_OUTPUT_SCHEMA,
     },
     {
@@ -339,7 +330,6 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
       _meta: { [ASK_FILES_META_KEY]: filesCapability },
       inputSchema: {
         type: "object",
-        additionalProperties: false,
         properties: {
           model: { type: "string", description: "one of the available model ids (see list_models)" },
           prompt: { type: "string", description: "the task / question for the model" },
@@ -891,11 +881,9 @@ interface ToolCallContext {
 async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<{ text: string; isError: boolean; structuredContent?: unknown }> {
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal);
-    const tools = toolDefs(ctx.principal, ctx.cfg);
-    const askTool = tools.find((tool) => tool.name === "ask");
     const structuredContent = buildListModelsStructuredContent(
       models,
-      askFilesCapabilityFromToolMetaOrCurrent(askTool, ctx.principal, ctx.cfg)
+      askFilesCapability(ctx.principal, ctx.cfg)
     );
     return { text: renderListModelsText(structuredContent), isError: false, structuredContent };
   }
@@ -990,10 +978,8 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
 
     let promptWithContext = prompt;
     if (files !== undefined && files.length > 0) {
-      const availability = inspectBlindContextAvailability(ctx.cfg.blindContextRoots);
       const blindCfg: BlindContextConfig = {
         roots: ctx.cfg.blindContextRoots,
-        resolvedRoots: availability.resolvedRoots,
         maxFileBytes: ctx.cfg.blindContextMaxFileBytes,
         maxTotalBytes: ctx.cfg.blindContextMaxTotalBytes,
       };

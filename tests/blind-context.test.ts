@@ -50,6 +50,30 @@ describe("expandBlindContext — disabled-by-default posture", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("disabled");
   });
+
+  it("ignores forged or mismatched pre-resolved roots on the caller config object", () => {
+    const root = makeTmpRoot("bc-forged-");
+    const file = join(root, "a.txt");
+    writeFileSync(file, "hello");
+
+    const forgedEmptyCfg = {
+      roots: [],
+      resolvedRoots: ["/"],
+      ...DEFAULT_CAPS,
+    } as BlindContextConfig & { resolvedRoots: readonly string[] };
+    const forgedEmptyResult = expandBlindContext([file], forgedEmptyCfg);
+    expect(forgedEmptyResult.ok).toBe(false);
+    if (!forgedEmptyResult.ok) expect(forgedEmptyResult.error.code).toBe("disabled");
+
+    const mismatchedCfg = {
+      roots: ["/definitely/does/not/exist/anywhere"],
+      resolvedRoots: [root],
+      ...DEFAULT_CAPS,
+    } as BlindContextConfig & { resolvedRoots: readonly string[] };
+    const mismatchedResult = expandBlindContext([file], mismatchedCfg);
+    expect(mismatchedResult.ok).toBe(false);
+    if (!mismatchedResult.ok) expect(mismatchedResult.error.code).toBe("disabled");
+  });
 });
 
 describe("describeBlindContextAvailability", () => {

@@ -89,12 +89,6 @@ export const MAX_FILES_PER_REQUEST = 64;
 export interface BlindContextConfig {
   /** Allowlist root directories (raw, as configured). Empty array = feature DISABLED. */
   roots: readonly string[];
-  /**
-   * Optional reusable resolved roots from `inspectBlindContextAvailability()`. Lets a caller that
-   * already inspected discovery state avoid repeating the same `realpathSync` work before
-   * expansion, while preserving the same fail-closed behavior when omitted.
-   */
-  resolvedRoots?: readonly string[];
   /** Per-file byte cap (checked via fstat before the read, re-checked on the actual bytes read). */
   maxFileBytes: number;
   /** Cumulative byte cap across every file in one request. */
@@ -186,7 +180,7 @@ export function describeBlindContextAvailability(roots: readonly string[]): Blin
 
 /**
  * The richer availability form for callers that need both the content-blind discovery summary and
- * the resolved allowlist roots for immediate reuse in the same request path.
+ * the resolved allowlist roots without exposing those roots on discovery surfaces.
  */
 export function inspectBlindContextAvailability(
   roots: readonly string[]
@@ -232,13 +226,7 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
     return { ok: true, text: "", fileCount: 0, totalBytes: 0 };
   }
 
-  const resolvedRoots = cfg.resolvedRoots !== undefined ? [...cfg.resolvedRoots] : null;
-  const availability: BlindContextAvailabilityInspection =
-    resolvedRoots === null
-      ? inspectBlindContextAvailability(cfg.roots)
-      : resolvedRoots.length === 0
-        ? { enabled: false, reason: cfg.roots.length === 0 ? "unconfigured" : "no_resolved_roots", resolvedRootCount: 0, resolvedRoots }
-        : { enabled: true, reason: "enabled", resolvedRootCount: resolvedRoots.length, resolvedRoots };
+  const availability = inspectBlindContextAvailability(cfg.roots);
   if (!availability.enabled) {
     return {
       ok: false,
