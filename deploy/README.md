@@ -80,6 +80,42 @@ actually true:
 6. **Smoke-test** end-to-end with `stream=true` (see `ONBOARDING.md`).
 7. **Hand a friend** their key + `https://inference.example.com/v1` + `ONBOARDING.md`.
 
+### HTTPS edge policy (required before inviting users)
+
+Cloudflare Tunnel intentionally connects to `gateway.ts` over **HTTP**. Enforce HTTPS at the
+Cloudflare edge, not in the gateway: an origin redirect based on `X-Forwarded-Proto` or the
+origin connection would redirect every externally HTTPS request back through the Tunnel and loop.
+
+For the public hostname, configure one Cloudflare **Redirect Rule** with the expression
+`http.host eq "inference.example.com" and http.request.scheme eq "http"`. Use a **301 or 308**
+dynamic redirect to `concat("https://", http.host, http.request.uri.path)` and preserve the query
+string. This single rule must cover every method and path; do not add path-specific application
+redirects. Then enable HSTS in Cloudflare's Edge Certificates settings with a non-zero `max-age`.
+Do this only after the HTTPS certificate is active and the verifier below passes. Do not enable
+preload or include subdomains without a separate owner decision.
+
+`gateway.ts` supplies the portal's clickjacking, referrer, and permissions headers. The public
+edge must retain those origin headers and add HSTS to the HTTPS response.
+
+From the release operator's network, verify the real public edge before certifying a deploy:
+
+```bash
+scripts/verify-public-edge.sh "$DEPLOY_PUBLIC_HTTP_URL" "$DEPLOY_PUBLIC_HTTPS_URL"
+```
+
+The verifier checks permanent redirects for `/`, `/hs`, `POST /portal/redeem`, an API path with a
+query string, and an unknown path; it then checks the HTTPS portal for HSTS and the portal security
+headers. `scripts/deploy-gateway.sh deploy <full-sha>` runs the same check before it writes the
+deployment marker, and `verify` runs it read-only. The check is credential-free and never sends an
+invite or bearer key.
+
+**Rollback:** retain the Cloudflare HTTPS rule and HSTS when rolling back gateway code; they are
+transport protections, not application-release state. If the edge rule itself is misconfigured,
+disable or correct that single Redirect Rule in Cloudflare, then re-run the verifier. Do not roll
+back by adding a redirect to `gateway.ts`, changing the Tunnel service to HTTPS, or trusting a
+tailnet probe as public-edge evidence. HSTS is cached by browsers, so an HSTS rollback cannot make
+previously visited clients use plaintext; fix the certificate/edge path instead.
+
 ## Live deployment (authoritative)
 
 This is the single authoritative description of how the M5 gateway is actually deployed and kept
@@ -180,12 +216,15 @@ deployment it did not actually probe):
 |---|---|
 | `DEPLOY_HEALTH_TAILNET_URL` | `http://<tailnet-ip>:8080/healthz` — export it locally; never commit the literal address |
 | `DEPLOY_CAPABILITY_URL` | `http://<tailnet-ip>:8080/v1/capabilities/learning-task` — cheap authenticated smoke test, no model call |
+| `DEPLOY_PUBLIC_HTTP_URL` / `DEPLOY_PUBLIC_HTTPS_URL` | Required credential-free public-edge verification origins. Export the private live hostname locally; public examples use `inference.example.com`. |
 | `HOMESERVER_OWNER_KEY` (or the var named by `DEPLOY_CAPABILITY_KEY_ENV`) | An owner-tier bearer key. Read from the environment; never printed, logged, or passed on the command line. |
 
 `DEPLOY_HEALTH_LOCAL_URL` has **no default** (issue #30 — the gateway binds only the tailnet
 interface, so a default loopback probe could never legitimately answer); set it explicitly only if
 something in your environment actually listens on loopback. `DEPLOY_HEALTH_TAILNET_URL` above is
-the mandatory probe of the box's real listener and is unaffected.
+the mandatory probe of the box's real listener and is unaffected. The public-edge verification is
+also mandatory, but runs from the release operator rather than the box so it validates Cloudflare,
+not merely the Tunnel origin.
 
 `DEPLOY_REMOTE_HOST` defaults to the `m5` ssh alias and `DEPLOY_REMOTE_DIR` defaults to
 `/home/magnus/home-server-eval`; override either if the live topology ever changes. Run

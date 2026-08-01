@@ -372,7 +372,10 @@ function sendHtml(res: ServerResponse, status: number, html: string): void {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
-    "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+    "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "geolocation=(), camera=(), microphone=()",
   });
   res.end(html);
 }

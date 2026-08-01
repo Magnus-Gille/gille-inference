@@ -181,6 +181,8 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     DEPLOY_LINGER_CHECK_CMD: "true",
     DEPLOY_UNITS_ENABLE_CMD: "true",
     DEPLOY_NOTIFY_INSTALL_CMD: "true",
+    // The live verifier is independently covered below. Fixture deploys must remain offline.
+    DEPLOY_PUBLIC_EDGE_VERIFY_CMD: "true",
     HOMESERVER_OWNER_KEY: OWNER_KEY,
     ...overrides,
   };
@@ -568,6 +570,25 @@ describe("scripts/deploy-gateway.sh", () => {
     );
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/authenticated capability probe returned HTTP 401/);
+    expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+  });
+
+  it("leaves the marker absent when public HTTPS edge verification fails", async () => {
+    const src = initSourceRepo();
+    const remote = tmpDir("dg-remote-");
+    const tailnet = await startOkServer();
+    const cap = await startCapabilityServer(OWNER_KEY);
+    const r = await runScript(
+      "deploy",
+      src,
+      baseEnv(remote, {
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+        DEPLOY_PUBLIC_EDGE_VERIFY_CMD: "false",
+      })
+    );
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/public HTTPS edge verification failed/);
     expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
   });
 
