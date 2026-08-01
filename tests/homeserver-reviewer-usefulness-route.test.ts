@@ -108,6 +108,17 @@ function makeReviewBoundedRowWithoutVerifier(): string {
   });
 }
 
+function makeReviewBoundedRowWithUngradedVerifier(): string {
+  return recordDelegation({
+    taskType: "review-bounded",
+    modelId: "qwen3-coder-next-80b",
+    prompt: "gille review-bounded contract v1 ...",
+    outcome: "unverified",
+    verifier: "none",
+    source: "gateway",
+  });
+}
+
 async function putReviewerUsefulness(
   ledgerId: string,
   body: string | Record<string, unknown>,
@@ -394,6 +405,25 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
       conflict: {
         kind: "missing_verifier",
       },
+    });
+    expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
+  });
+
+  it("rejects the normal ungraded verifier sentinel emitted by the orchestrator", async () => {
+    const ledgerId = makeReviewBoundedRowWithUngradedVerifier();
+    const res = await putReviewerUsefulness(ledgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+
+    expect(res.status).toBe(409);
+    expect(res.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      error: {
+        code: "reviewer_usefulness_conflict",
+        type: "invalid_request_error",
+        param: "ledgerId",
+      },
+      conflict: { kind: "missing_verifier" },
     });
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });

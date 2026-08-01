@@ -751,7 +751,7 @@ export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): Review
     if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) {
       return { kind: "conflict", conflict: { kind: "wrong_task_type", taskType: row.taskType } };
     }
-    if (row.verifier === null) {
+    if (classifyVerifierKind(row.verifier) === "ungraded") {
       return { kind: "conflict", conflict: { kind: "missing_verifier" } };
     }
 

@@ -216,6 +216,28 @@ describe("recordReviewerUsefulness (#74)", () => {
     });
   });
 
+  it.each(["none", "none(ungraded)", "   "])(
+    "rejects review-bounded rows with the ungraded verifier sentinel %j",
+    (verifier) => {
+      const id = recordDelegation({
+        taskType: "review-bounded",
+        modelId: "qwen3-coder-next-80b",
+        prompt: "gille review-bounded contract v1 ...",
+        outcome: "unverified",
+        verifier,
+      });
+
+      expect(recordReviewerUsefulness({
+        ledgerId: id,
+        usefulness: "pass",
+        judgedBy: "grimnir-session-2026-07-24",
+      })).toMatchObject({
+        kind: "conflict",
+        conflict: { kind: "missing_verifier" },
+      });
+    },
+  );
+
   it("fails closed on legacy partially populated reviewer-usefulness columns", () => {
     const id = recordDelegation({
       taskType: "review-bounded",
