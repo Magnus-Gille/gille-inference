@@ -444,9 +444,11 @@ gateway_health_url() {
 
 wait_for_gateway_health() {
   local unit="$1"
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  # `/healthz` may include the configured secondary-node probe. Give one
+  # request four seconds, but retain a strict <=30s total readiness window.
+  for _ in 1 2 3 4 5 6; do
     systemctl is-active --quiet "$unit" || die "gateway service became inactive before readiness completed"
-    if curl --fail --silent --show-error --connect-timeout 1 --max-time 1 "$(gateway_health_url)" >/dev/null 2>&1; then
+    if curl --fail --silent --show-error --connect-timeout 1 --max-time 4 "$(gateway_health_url)" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
