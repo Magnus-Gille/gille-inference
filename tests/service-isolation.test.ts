@@ -147,25 +147,29 @@ install_gateway_autonomy_timer
 }
 
 function runLlamaTransactionHarness(
-  command: "apply" | "rollback" | "failed-apply-rollback" | "failed-apply-invalid-evidence-rollback" | "failed-rollback-retry",
+  command: "apply" | "rollback" | "verification-fatal" | "failed-apply-rollback" | "failed-apply-invalid-evidence-rollback" | "failed-rollback-retry",
   gatewayInitiallyActive: boolean,
   failure: "none" | "start" | "health" = "none",
-): { status: number; log: string[]; output: string } {
+): { status: number; log: string[]; output: string; transactionBackup: string; newerBackup: string } {
   const work = mkdtempSync(join(tmpdir(), "gille-llama-dependent-harness-"));
   const log = join(work, "order.log");
   const backup = join(work, "backup");
+  const transactionBackup = join(backup, "20260801T120000Z-llama-swap.ABC123");
+  const newerBackup = join(backup, "20990101T000000Z-llama-swap.ZZZ999");
   const harness = join(work, "harness.sh");
   execFileSync("mkdir", ["-p", backup]);
+  execFileSync("mkdir", ["-p", newerBackup]);
   writeFileSync(join(backup, "unit.before.txt"), "legacy unit\n");
   writeFileSync(harness, `#!/usr/bin/env bash
-LOG="$2"; BACKUP="$3"; COMMAND="$4"; gateway_active="$5"; FAILURE="$6"; source "$1"
+LOG="$2"; BACKUP="$3"; COMMAND="$4"; gateway_active="$5"; FAILURE="$6"; TRANSACTION_BACKUP="$7"; source "$1"
 record() { printf '%s\\n' "$1" >> "$LOG"; }
-note() { case "$1" in APPLIED:*|ROLLED\\ BACK:*) record success ;; esac; }
+note() { case "$1" in APPLIED:*|ROLLED\\ BACK:*) record success ;; *) printf '%s\\n' "$1" ;; esac; }
 root_only() { :; }; need() { :; }; preflight() { :; }; create_service_user() { :; }
 require_atomic_move() { :; }; install() { :; }; rollback_feasible() { :; }; install_dropin() { :; }
 backup_unit() { mkdir -p "$3"; printf 'legacy unit\\n' > "$3/unit.before.txt"; }
+mktemp() { mkdir -p "$TRANSACTION_BACKUP"; printf '%s\\n' "$TRANSACTION_BACKUP"; }
 migrate_llama_state() { record migrate; gateway_active=0; }
-verify() { record verify; }
+verify() { record verify; [ "$COMMAND" != verification-fatal ] || die "verifier fatal after restart"; }
 mv() { :; }; chown() { :; }; chmod() { :; }; rm() { :; }; rmdir() { :; }
 show_value() {
   if [ "$2" = User ]; then printf 'magnus\\n'; return; fi
@@ -203,7 +207,7 @@ wait_for_gateway_health() {
   [ "$FAILURE" != health ]
 }
 case "$COMMAND" in
-  apply) apply llama-swap "$BACKUP" ;;
+  apply|verification-fatal) apply llama-swap "$BACKUP" ;;
   rollback) rollback llama-swap "$BACKUP" ;;
   failed-apply-rollback|failed-apply-invalid-evidence-rollback)
     TRANSACTION=failed-apply
@@ -229,17 +233,19 @@ case "$COMMAND" in
 esac
 `, { mode: 0o755 });
   try {
-    const output = execFileSync("bash", [harness, script, log, backup, command, gatewayInitiallyActive ? "1" : "0", failure], {
+    const output = execFileSync("bash", [harness, script, log, backup, command, gatewayInitiallyActive ? "1" : "0", failure, transactionBackup], {
       cwd: root,
       encoding: "utf8",
       stderr: "pipe",
     });
-    return { status: 0, log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean), output };
+    return { status: 0, log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean), output, transactionBackup, newerBackup };
   } catch (error: any) {
     return {
       status: error.status ?? 1,
       log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean),
       output: `${error.stdout ?? ""}${error.stderr ?? ""}`,
+      transactionBackup,
+      newerBackup,
     };
   }
 }
@@ -446,7 +452,7 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain("NO-OP: $service is already rolled back and verified");
     expect(source).toContain('systemctl stop "$unit" || die "could not stop $unit; refusing rollback mutation"');
     expect(source).toContain("isolated autonomy timer stayed active");
-    expect(source).toContain('if ! verify "$service" 0; then');
+    expect(source).toContain('if verify "$service" 0; then');
     expect(source).toContain('rollback_feasible "$service"\n  install_dropin "$service"');
   });
 
@@ -514,6 +520,19 @@ describe("service-isolation migration contract (#151)", () => {
     expect(result.status).not.toBe(0);
     expect(result.log).not.toContain("verify");
     expect(result.output).not.toContain("private-locator");
+  });
+
+  it("reports the exact transaction backup once when verification dies after restart", () => {
+    const result = runLlamaTransactionHarness("verification-fatal", true);
+    expect(result.status).toBe(1);
+    expect(result.log).toContain("llama-restart");
+    expect(result.log).toContain("verify");
+    expect(result.output).toContain("ERROR: verifier fatal after restart");
+    expect(result.output.split(result.transactionBackup)).toHaveLength(2);
+    expect(result.output).toContain(`Backup evidence: ${result.transactionBackup}`);
+    expect(result.output).not.toContain(result.newerBackup);
+    expect(existsSync(join(result.transactionBackup, "receipt"))).toBe(false);
+    expect(result.log).not.toContain("success");
   });
 
   it("uses original pre-apply evidence when rollback follows a failed llama-swap apply", () => {
