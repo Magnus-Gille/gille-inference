@@ -22,6 +22,7 @@ import {
   type LoadOptions,
   type LoadResult,
 } from "./lmstudio-admin.js";
+import { currentTraceHeaders, recordReadinessObservation, updateCurrentTraceSpan, withTraceSpan } from "./tracing.js";
 
 export type { ModelInfo, LoadOptions, LoadResult };
 // Re-export validators so the facade shape matches typeof lmstudio-admin
@@ -44,7 +45,8 @@ async function fetchWithTimeout(
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
+    const headers = { ...(init.headers ?? {}), ...currentTraceHeaders() };
+    return await fetch(url, { ...init, headers, signal: ctrl.signal });
   } finally {
     clearTimeout(t);
   }
@@ -164,57 +166,73 @@ export async function loadModel(
   modelKey: string,
   opts: LoadOptions = {}
 ): Promise<LoadResult> {
-  void opts; // opts ignored — llama-swap owns startup config
-  assertModelKey(modelKey);
-  const origin = getOrigin();
-  const start = Date.now();
+  return withTraceSpan("model_load", {}, async () => {
+    void opts; // opts ignored — llama-swap owns startup config
+    assertModelKey(modelKey);
+    const origin = getOrigin();
+    const start = Date.now();
 
-  // Check if already loaded
-  const running = await fetchRunning(origin);
-  const alreadyLoaded = running.some((r) => r.model === modelKey && r.state === "ready");
-  if (alreadyLoaded) {
-    return {
-      ok: true,
-      modelKey,
-      identifier: modelKey,
-      durationMs: Date.now() - start,
-      message: "already loaded",
-    };
-  }
-
-  // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
-  const cfg = loadConfig();
-  const timeoutMs = cfg.callTimeoutMs ?? 300_000;
-  try {
-    const res = await fetchWithTimeout(
-      `${origin}/v1/chat/completions`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: modelKey,
-          messages: [{ role: "user", content: "." }],
-          max_tokens: 1,
-        }),
-      },
-      timeoutMs
-    );
-    const durationMs = Date.now() - start;
-    if (!res.ok) {
-      const msg = await res.text().catch(() => "");
-      return { ok: false, modelKey, identifier: modelKey, durationMs, message: msg || `HTTP ${res.status}` };
+    // Check if already loaded
+    const running = await fetchRunning(origin);
+    const alreadyLoaded = running.some((r) => r.model === modelKey && r.state === "ready");
+    if (alreadyLoaded) {
+      updateCurrentTraceSpan({ modelArtifactIdentity: modelKey });
+      recordReadinessObservation("model", "ok", { modelArtifactIdentity: modelKey });
+      return {
+        ok: true,
+        modelKey,
+        identifier: modelKey,
+        durationMs: Date.now() - start,
+        message: "already loaded",
+      };
     }
-    return { ok: true, modelKey, identifier: modelKey, durationMs, message: "loaded" };
-  } catch (err) {
-    const durationMs = Date.now() - start;
-    return {
-      ok: false,
-      modelKey,
-      identifier: modelKey,
-      durationMs,
-      message: err instanceof Error ? err.message : String(err),
-    };
-  }
+
+    // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
+    const cfg = loadConfig();
+    const timeoutMs = cfg.callTimeoutMs ?? 300_000;
+    try {
+      const res = await fetchWithTimeout(
+        `${origin}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: modelKey,
+            messages: [{ role: "user", content: "." }],
+            max_tokens: 1,
+          }),
+        },
+        timeoutMs
+      );
+      const durationMs = Date.now() - start;
+      if (!res.ok) {
+        updateCurrentTraceSpan({ modelArtifactIdentity: modelKey, errorClass: "upstream_unavailable" });
+        recordReadinessObservation("model", "failed", {
+          modelArtifactIdentity: modelKey,
+          errorClass: "upstream_unavailable",
+        });
+        const msg = await res.text().catch(() => "");
+        return { ok: false, modelKey, identifier: modelKey, durationMs, message: msg || `HTTP ${res.status}` };
+      }
+      updateCurrentTraceSpan({ modelArtifactIdentity: modelKey });
+      recordReadinessObservation("model", "ok", { modelArtifactIdentity: modelKey });
+      return { ok: true, modelKey, identifier: modelKey, durationMs, message: "loaded" };
+    } catch (err) {
+      const durationMs = Date.now() - start;
+      updateCurrentTraceSpan({ modelArtifactIdentity: modelKey, errorClass: "upstream_unavailable" });
+      recordReadinessObservation("model", "failed", {
+        modelArtifactIdentity: modelKey,
+        errorClass: "upstream_unavailable",
+      });
+      return {
+        ok: false,
+        modelKey,
+        identifier: modelKey,
+        durationMs,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }, { surface: "model" });
 }
 
 /**

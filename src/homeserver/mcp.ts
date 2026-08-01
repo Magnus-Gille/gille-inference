@@ -28,6 +28,7 @@ import type { KeyScope } from "./keystore.js";
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
 // deriveEvidenceIdentity doc comment for why this is lane-agnostic and safe to share.
 import { deriveEvidenceIdentity } from "./orchestrator.js";
+import { currentTraceHeaders } from "./tracing.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -494,7 +495,7 @@ export async function runChatCompletion(
   try {
     const upstream = await fetch(`${cfg.lmStudioBaseUrl}/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
       // #8: a single completion only — the MCP path never forwards an `n` parameter, so it cannot
       // be abused for GPU amplification / credit under-reservation.
       body: JSON.stringify({

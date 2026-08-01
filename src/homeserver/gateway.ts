@@ -101,6 +101,15 @@ import {
   getRosterProposalForPrincipal,
   type RosterAdmissionDependencies,
 } from "./roster-proposal.js";
+import {
+  beginGatewayTrace,
+  currentTraceHeaders,
+  recordCompletedSpan,
+  recordReadinessObservation,
+  setTraceDefaults,
+  withTraceSpan,
+  type GatewayTraceHandle,
+} from "./tracing.js";
 
 /**
  * Authenticated LAN gateway — the "endpoint with suitable auth" that sits in front of
@@ -620,6 +629,7 @@ async function admitAndMeterLogged(
   lctx: LogCtx,
   handler: () => Promise<MeteredResult>
 ): Promise<void> {
+  return withTraceSpan("admission", {}, async () => {
   // Lifetime credit cap (non-resetting). Refuse BEFORE any inference if the key has spent
   // its budget. Distinct from the daily-resetting quota below: this never frees up on its own.
   //
@@ -718,13 +728,15 @@ async function admitAndMeterLogged(
   const admitStart = Date.now();
   let release: () => void;
   try {
-    release = await controller.acquire({
-      lane: principal.tier as Lane,
-      requestedModel,
-      keyMaxParallel: principal.maxParallel,
-      keyInflight: keyInflight.get(principal.alias) ?? 0,
-      keyId: principal.alias,
-    });
+    release = await withTraceSpan("queue", {}, async () =>
+      controller.acquire({
+        lane: principal.tier as Lane,
+        requestedModel,
+        keyMaxParallel: principal.maxParallel,
+        keyInflight: keyInflight.get(principal.alias) ?? 0,
+        keyId: principal.alias,
+      })
+    );
     // queueWaitMs > 0 only when the owner had to wait (the acquire resolved via drainQueue).
     // For a direct admit it rounds to ~0ms, which we record as null (not meaningful).
     const waited = Date.now() - admitStart;
@@ -816,6 +828,7 @@ async function admitAndMeterLogged(
     lctx.creditsCharged = creditsCharged;
     afterRelease?.();
   }
+  });
 }
 
 // ─── Route handlers ──────────────────────────────────────────────────────────────────
@@ -838,6 +851,19 @@ export interface MeteredResult {
   ttftMs: number | null;
   /** Best-effort work that must start only once this request's lease is released. */
   afterRelease?: () => void;
+}
+
+function gatewayTraceTaskType(route: string): string {
+  if (route === "/delegate") return "delegation";
+  if (route === "/v1/chat/completions") return "chat";
+  if (route === "/mcp") return "mcp";
+  return "gateway";
+}
+
+function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" | "degraded" | "failed" {
+  if (status !== null && status >= 200 && status < 400 && outcome !== "client_closed") return "ok";
+  if (outcome === "busy" || outcome === "rate_limited" || outcome === "client_closed") return "degraded";
+  return "failed";
 }
 
 // L1 (Codex LOW): the stale exported canonicalizeModel() helper was removed. It pre-dated the
@@ -898,6 +924,15 @@ async function handleChatProxy(
     ? parsed.obj["messages"]
     : [];
   const chatStart = Date.now();
+  const responseTraceStart = chatStart;
+  const emitResponseTrace = (outcome: string): void => {
+    recordCompletedSpan("response", {
+      startedAtMs: responseTraceStart,
+      endedAtMs: Date.now(),
+      outcome,
+      errorClass: lctx.errorClass ?? undefined,
+    });
+  };
 
   // Rewrite max_tokens to the capped value before proxying upstream.
   const body: Record<string, unknown> = { ...parsed.obj, max_tokens: effectiveMax };
@@ -944,6 +979,14 @@ async function handleChatProxy(
       lctx.status = timeout ? 504 : 502;
       lctx.outcome = timeout ? "upstream_timeout" : "upstream_unavailable";
       lctx.errorClass = lctx.outcome;
+      recordCompletedSpan("inference", {
+        startedAtMs: chatStart,
+        endedAtMs: Date.now(),
+        outcome: lctx.outcome,
+        errorClass: lctx.errorClass ?? undefined,
+        surface: "model",
+      });
+      emitResponseTrace(lctx.outcome);
       sendError(
         res,
         timeout
@@ -968,6 +1011,13 @@ async function handleChatProxy(
     sendJson(res, 200, openAi);
     lctx.status = 200;
     lctx.outcome = "ok";
+    recordCompletedSpan("inference", {
+      startedAtMs: chatStart,
+      endedAtMs: Date.now(),
+      outcome: "ok",
+      surface: "model",
+    });
+    emitResponseTrace("ok");
     if (ownerLog) recordOwnerChat(principal, parsed.model, reqMessages, v.response, v.promptTokens, v.completionTokens, Date.now() - chatStart, "ok");
     return {
       totalTokens: v.promptTokens + v.completionTokens,
@@ -980,6 +1030,15 @@ async function handleChatProxy(
 
   // TTFT clock: ms from the upstream call start to the first CONTENT chunk we receive (streaming).
   const upstreamCallStart = Date.now();
+  const emitInferenceTrace = (outcome: string): void => {
+    recordCompletedSpan("inference", {
+      startedAtMs: upstreamCallStart,
+      endedAtMs: Date.now(),
+      outcome,
+      errorClass: lctx.errorClass ?? undefined,
+      surface: "model",
+    });
+  };
   // #22: wire a client-disconnect AbortController into the upstream fetch signal. If the client
   // goes away (closes the connection before we finish), we abort the upstream fetch so the GPU
   // generation is CANCELLED (not left running to completion, wasted) and the call is billed 0.
@@ -1026,7 +1085,7 @@ async function handleChatProxy(
     }
     upstream = await fetch(`${cfg.lmStudioBaseUrl}/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
       body: JSON.stringify(body),
       // Abort on EITHER the call timeout OR a client disconnect (whichever fires first).
       signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
@@ -1042,6 +1101,8 @@ async function handleChatProxy(
       // hybrid recurrent model's SSM state — unload it (allow-listed + cooldown) so the next request
       // loads a clean model instead of inheriting a dirty seed.
       poisonClearOnDisconnect(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs);
+      emitInferenceTrace("client_closed");
+      emitResponseTrace("client_closed");
       return ZERO_RESULT;
     }
     const kind = classifyUpstreamError(err);
@@ -1049,6 +1110,8 @@ async function handleChatProxy(
       lctx.status = 504;
       lctx.outcome = "upstream_timeout";
       lctx.errorClass = "upstream_timeout";
+      emitInferenceTrace("upstream_timeout");
+      emitResponseTrace("upstream_timeout");
       sendError(res, makeError("upstream_timeout", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
       return ZERO_RESULT;
     }
@@ -1056,6 +1119,8 @@ async function handleChatProxy(
       lctx.status = 502;
       lctx.outcome = "upstream_unavailable";
       lctx.errorClass = "upstream_unavailable";
+      emitInferenceTrace("upstream_unavailable");
+      emitResponseTrace("upstream_unavailable");
       sendError(res, makeError("upstream_unavailable"));
       return ZERO_RESULT;
     }
@@ -1076,6 +1141,8 @@ async function handleChatProxy(
       const text = await upstream.text();
       if (upstream.status === 404 || /model.*not.*found/i.test(text)) {
         lctx.errorClass = "model_not_found";
+        emitInferenceTrace("model_not_found");
+        emitResponseTrace("model_not_found");
         sendError(
           res,
           makeError("model_not_found", {
@@ -1094,6 +1161,8 @@ async function handleChatProxy(
       lctx.status = 502;
       lctx.outcome = "upstream_unavailable";
       lctx.errorClass = "upstream_unavailable";
+      emitInferenceTrace("upstream_unavailable");
+      emitResponseTrace("upstream_unavailable");
       sendError(res, makeError("upstream_unavailable"));
       return ZERO_RESULT;
     }
@@ -1113,6 +1182,8 @@ async function handleChatProxy(
       lctx.status = 502;
       lctx.outcome = "upstream_unavailable";
       lctx.errorClass = "upstream_unavailable";
+      emitInferenceTrace("upstream_unavailable");
+      emitResponseTrace("upstream_unavailable");
       res.end();
       return ZERO_RESULT;
     }
@@ -1227,6 +1298,8 @@ async function handleChatProxy(
         recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "degenerate");
       }
       // A degenerate (garbage) completion is not a valid response → charge 0.
+      emitInferenceTrace("degenerate");
+      emitResponseTrace("degenerate");
       return ZERO_RESULT;
     }
 
@@ -1244,6 +1317,8 @@ async function handleChatProxy(
       if (assembled !== null) {
         recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "client_closed");
       }
+      emitInferenceTrace("client_closed");
+      emitResponseTrace("client_closed");
       return ZERO_RESULT;
     }
 
@@ -1271,6 +1346,8 @@ async function handleChatProxy(
         recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "stream_failed");
       }
       // Billing invariant: a truncated/failed stream is not a successful completion → charge 0.
+      emitInferenceTrace("stream_failed");
+      emitResponseTrace("stream_failed");
       return ZERO_RESULT;
     }
 
@@ -1302,8 +1379,20 @@ async function handleChatProxy(
       if (assembled !== null) {
         recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "degenerate");
       }
+      emitInferenceTrace("degenerate");
+      emitResponseTrace("degenerate");
       return ZERO_RESULT;
     }
+    if (ttftMs !== null) {
+      recordCompletedSpan("ttft", {
+        startedAtMs: upstreamCallStart,
+        endedAtMs: upstreamCallStart + ttftMs,
+        outcome: "ok",
+        surface: "model",
+      });
+    }
+    emitInferenceTrace("ok");
+    emitResponseTrace("ok");
     if (assembled !== null) {
       recordOwnerChat(principal, parsed.model, reqMessages, assembled, prompt, completion, Date.now() - chatStart, "ok");
     }
@@ -1342,6 +1431,8 @@ async function handleChatProxy(
       // Recurrent poison-clear: a non-streaming abort can also interrupt a decode mid-write to the
       // recurrent SSM state — unload it (allow-listed + cooldown) so the next request is clean.
       poisonClearOnDisconnect(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs);
+      emitInferenceTrace("client_closed");
+      emitResponseTrace("client_closed");
       return ZERO_RESULT;
     }
     const kind = classifyUpstreamError(err);
@@ -1349,6 +1440,8 @@ async function handleChatProxy(
       lctx.status = 504;
       lctx.outcome = "upstream_timeout";
       lctx.errorClass = "upstream_timeout";
+      emitInferenceTrace("upstream_timeout");
+      emitResponseTrace("upstream_timeout");
       sendError(res, makeError("upstream_timeout", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
       return ZERO_RESULT;
     }
@@ -1356,6 +1449,8 @@ async function handleChatProxy(
       lctx.status = 502;
       lctx.outcome = "upstream_unavailable";
       lctx.errorClass = "upstream_unavailable";
+      emitInferenceTrace("upstream_unavailable");
+      emitResponseTrace("upstream_unavailable");
       sendError(res, makeError("upstream_unavailable"));
       return ZERO_RESULT;
     }
@@ -1373,6 +1468,8 @@ async function handleChatProxy(
   if (upstream.status >= 400) {
     if (upstream.status === 404 || /model.*not.*found/i.test(text)) {
       lctx.errorClass = "model_not_found";
+      emitInferenceTrace("model_not_found");
+      emitResponseTrace("model_not_found");
       sendError(
         res,
         makeError("model_not_found", {
@@ -1387,6 +1484,8 @@ async function handleChatProxy(
     lctx.status = 502;
     lctx.outcome = "upstream_unavailable";
     lctx.errorClass = "upstream_unavailable";
+    emitInferenceTrace("upstream_unavailable");
+    emitResponseTrace("upstream_unavailable");
     sendError(res, makeError("upstream_unavailable"));
     return ZERO_RESULT;
   }
@@ -1418,6 +1517,8 @@ async function handleChatProxy(
       if (ownerLog) {
         recordOwnerChat(principal, parsed.model, reqMessages, nsContent, null, null, Date.now() - chatStart, "degenerate");
       }
+      emitInferenceTrace("degenerate");
+      emitResponseTrace("degenerate");
       return ZERO_RESULT;
     }
     if (ownerLog) {
@@ -1433,6 +1534,8 @@ async function handleChatProxy(
       );
     }
     if (json.usage?.total_tokens !== undefined) {
+      emitInferenceTrace("ok");
+      emitResponseTrace("ok");
       return {
         totalTokens: json.usage.total_tokens,
         promptTokens: json.usage.prompt_tokens ?? null,
@@ -1445,6 +1548,8 @@ async function handleChatProxy(
     // Non-JSON 2xx body — we cannot read real usage and there is no reliable completion
     // count, so charge only the prompt estimate (never the full effectiveMax reservation,
     // which would over-bill an unmetered response).
+    emitInferenceTrace("ok");
+    emitResponseTrace("ok");
     return {
       totalTokens: estimatePromptTokens(rawBody),
       promptTokens: estimatePromptTokens(rawBody),
@@ -1454,6 +1559,8 @@ async function handleChatProxy(
     };
   }
   // 2xx JSON without a usage frame — fall back to the prompt-only estimate as well.
+  emitInferenceTrace("ok");
+  emitResponseTrace("ok");
   return {
     totalTokens: estimatePromptTokens(rawBody),
     promptTokens: estimatePromptTokens(rawBody),
@@ -3121,6 +3228,7 @@ async function handleRequest(
   // correlation trail. Its only durable signal is the content-blind, day-level aggregate row on
   // acceptance; rejected reports leave no adoption evidence. Other MCP tools retain normal logs.
   let suppressRequestTelemetry = false;
+  let traceHandle: GatewayTraceHandle | null = null;
 
   // Single finally block — the ONLY emit site for gateway_request events.
   try {
@@ -3485,6 +3593,15 @@ async function handleRequest(
     lctx.tier = principal.tier;
     // keyHash is stored only in the owner-queryable request_log (never in the access log / metrics).
     lctx.keyHash = principal.keyHash;
+    traceHandle = beginGatewayTrace(req.headers, cfg.tracing, {
+      taskType: gatewayTraceTaskType(path),
+      lane: "default",
+      retryOrdinal: 0,
+    });
+    if (traceHandle.responseTraceparent) res.setHeader("traceparent", traceHandle.responseTraceparent);
+    if (traceHandle.responseTracestate) res.setHeader("tracestate", traceHandle.responseTracestate);
+
+    await traceHandle.run(async () => {
 
     // W5: authenticated Hugin proposal admission only. This surface persists a
     // zero-mutation armed-canary record; it cannot apply, re-arm, widen, list,
@@ -4058,6 +4175,17 @@ async function handleRequest(
         sendError(res, makeError("invalid_request_error", { param: parsed.param, message: parsed.message }));
         return;
       }
+      setTraceDefaults({
+        taskType: "delegation",
+        lane: "default",
+        retryOrdinal: 0,
+        ...(parsed.params.learningTaskStamp
+          ? {
+              taskContractId: parsed.params.learningTaskStamp.contract_request.contract_version,
+              taskContractTimestamp: parsed.params.learningTaskStamp.stamped_at,
+            }
+          : {}),
+      });
       if (parsed.params.learningTaskStamp !== undefined) {
         if (parsed.params.taskType === undefined || parsed.params.taskType.trim() === "") {
           lctx.status = 400;
@@ -4425,6 +4553,8 @@ async function handleRequest(
     lctx.outcome = "not_found";
     lctx.errorClass = "not_found";
     lctx.admission = "n/a";
+    });
+    return;
   } catch (err) {
     // #15: a client-side body error (invalid JSON / oversized body) is a 4xx, not a 500.
     // Map it to the uniform envelope here BEFORE the generic 500 fallthrough.
@@ -4459,6 +4589,24 @@ async function handleRequest(
     throw err;
   } finally {
     lctx.totalMs = Date.now() - startMs;
+    if (traceHandle?.enabled) {
+      await traceHandle.run(async () => {
+        setTraceDefaults({
+          taskType: gatewayTraceTaskType(lctx.route),
+          lane: "default",
+          retryOrdinal: 0,
+          ...(lctx.errorClass ? { errorClass: lctx.errorClass } : {}),
+        });
+        recordReadinessObservation("gateway", gatewayReadinessOutcome(lctx.status, lctx.outcome), {
+          errorClass: lctx.errorClass ?? undefined,
+        });
+      });
+      traceHandle.finish({
+        outcome: lctx.outcome,
+        errorClass: lctx.errorClass ?? undefined,
+        endedAtMs: startMs + (lctx.totalMs ?? 0),
+      });
+    }
     // A staged-rotation preflight must mean the replacement completed an allowed gateway route,
     // not merely that its token matched the local DB. Record only successful minted-key requests;
     // static credentials have no keystore hash and failed/forbidden requests never advance proof.

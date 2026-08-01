@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import { performance } from 'node:perf_hooks';
 import type { InferenceOptions } from './openrouter-client.js';
 import type { LocalInferenceResult } from './local-client.js';
+import { currentTraceHeaders } from '../homeserver/tracing.js';
 
 /**
  * LM Studio inference client.
@@ -29,7 +30,9 @@ function createClient(): OpenAI {
 /** Check the LM Studio server is reachable and report the loaded model ids. */
 export async function listLmStudioModels(): Promise<string[]> {
   try {
-    const res = await fetch(`${getBaseUrl()}/models`);
+    const res = await fetch(`${getBaseUrl()}/models`, {
+      headers: currentTraceHeaders(),
+    });
     if (!res.ok) return [];
     const data = (await res.json()) as { data?: Array<{ id: string }> };
     return (data.data ?? []).map((m) => m.id);
@@ -71,6 +74,7 @@ export async function runLmStudioInference(
   let content = '';
 
   try {
+    const traceHeaders = currentTraceHeaders();
     const stream = await client.chat.completions.create({
       model: modelId,
       messages,
@@ -87,7 +91,9 @@ export async function runLmStudioInference(
       stream: true,
       stream_options: { include_usage: true },
     } as OpenAI.Chat.ChatCompletionCreateParamsStreaming & { top_k: number; min_p?: number },
-      options.signal ? { signal: options.signal } : undefined);
+      options.signal || Object.keys(traceHeaders).length > 0
+        ? { signal: options.signal, headers: traceHeaders }
+        : undefined);
 
     let promptTokens = 0;
     let completionTokens = 0;
