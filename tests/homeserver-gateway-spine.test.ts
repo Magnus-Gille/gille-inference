@@ -22,6 +22,25 @@ let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "nonjson" | "re
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
+// Keep this below HOMESERVER_OWNER_QUEUE_MAX_MS (3000ms in this file): a wrongly queued owner
+// must NOT be able to "pass" by timing out while we still hold the only slot.
+const BUSY_RECOVERY_SETTLE_BUDGET_MS = 2_500;
+
+async function settlesWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  pollMs = 10,
+): Promise<boolean> {
+  let settled = false;
+  promise.finally(() => {
+    settled = true;
+  });
+  const deadline = Date.now() + timeoutMs;
+  while (!settled && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(pollMs, deadline - Date.now()))));
+  }
+  return settled;
+}
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -340,19 +359,17 @@ describe("gateway spine — HTTP integration", () => {
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
       body: JSON.stringify(requestBody),
     });
-    // The structural proof is that the holder's slot is released only after this race. Allow a
-    // generous scheduler budget so a heavily loaded parallel test worker cannot turn that proof
-    // into a wall-clock flake; an implementation queued behind the holder still cannot win.
-    const busyRecoverySchedulerBudgetMs = 500;
-    const busyRecoveryWasImmediate = await Promise.race([
-      busyRecoveryPromise.then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), busyRecoverySchedulerBudgetMs)),
-    ]);
-    releaseStall?.();
+    const busyRecoverySettledWhileHeld = await settlesWithin(
+      busyRecoveryPromise,
+      BUSY_RECOVERY_SETTLE_BUDGET_MS,
+    );
+    const releaseHeldSlot = releaseStall;
+    releaseStall = null;
+    releaseHeldSlot?.();
     const [heldResponse, busyRecovery] = await Promise.all([heldRequest, busyRecoveryPromise]);
     mockMode = "ok";
     expect(heldResponse.status).toBe(200);
-    expect(busyRecoveryWasImmediate).toBe(true);
+    expect(busyRecoverySettledWhileHeld).toBe(true);
     expect(busyRecovery.status).toBe(200);
     expect(await busyRecovery.json()).toMatchObject({
       learningTaskAdmission: { recovered: true, outcomeAvailable: false },
