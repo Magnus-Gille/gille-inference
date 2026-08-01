@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -59,6 +59,76 @@ prepare_gateway_user_manager
     return { status: 0, output: execFileSync("bash", [harness, script], { cwd: root, encoding: "utf8", stderr: "pipe" }) };
   } catch (error: any) {
     return { status: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
+  }
+}
+
+function runAutonomyRefreshHarness(failChown = false): { status: number; log: string[]; work: string; output: string } {
+  const work = mkdtempSync(join(tmpdir(), "gille-autonomy-refresh-harness-"));
+  const harness = join(work, "harness.sh");
+  writeFileSync(harness, `#!/usr/bin/env bash
+WORK="$2"; FAIL_CHOWN="$3"; LOG="$WORK/order.log"; source "$1"
+record() { printf '%s\\n' "$1" >> "$LOG"; }
+install() {
+  record "install:$*"
+  case " $* " in
+    *" /dev/stdin "*) record rejected-dev-stdin; return 72 ;;
+    *" -d "*) return 0 ;;
+  esac
+  return 98
+}
+mktemp() {
+  local requested="$1" path
+  case "$requested" in
+    */.autonomy-notify.sh.XXXXXX) path="$WORK/.autonomy-notify.sh.tmp" ;;
+    */.gille-autonomy-tick.service.XXXXXX) path="$WORK/.gille-autonomy-tick.service.tmp" ;;
+    */.gille-autonomy-tick.timer.XXXXXX) path="$WORK/.gille-autonomy-tick.timer.tmp" ;;
+    *) return 97 ;;
+  esac
+  : > "$path"
+  printf '%s\\n' "$path"
+}
+sed() { printf '%s\\n' '#!/usr/bin/env bash' 'exec true'; }
+chown() {
+  record "chown:$*"
+  if [ "$FAIL_CHOWN" = 1 ] && [[ "$*" = *"gille-autonomy-tick.timer"* ]]; then return 73; fi
+}
+chmod() {
+  local mode="$1" path="$2"
+  record "chmod:$*"
+  case "$path" in
+    /var/lib/gille-inference/gateway/bin/*|/etc/systemd/system/*) path="$WORK/installed-\${path##*/}" ;;
+  esac
+  command chmod "$mode" "$path"
+}
+mv() {
+  local source="$1" destination="$2" translated
+  record "mv:$destination"
+  translated="$WORK/installed-\${destination##*/}"
+  command mv "$source" "$translated"
+}
+rm() { record "rm:$*"; command rm "$@"; }
+systemctl() {
+  record "systemctl:$*"
+  case "$1" in daemon-reload|enable|is-active) return 0 ;; *) return 96 ;; esac
+}
+install_gateway_autonomy_timer
+`, { mode: 0o755 });
+  try {
+    const output = execFileSync("bash", [harness, script, work, failChown ? "1" : "0"], {
+      cwd: root,
+      encoding: "utf8",
+      stderr: "pipe",
+    });
+    return { status: 0, log: readFileSync(join(work, "order.log"), "utf8").trim().split("\n").filter(Boolean), work, output };
+  } catch (error: any) {
+    return {
+      status: error.status ?? 1,
+      log: existsSync(join(work, "order.log"))
+        ? readFileSync(join(work, "order.log"), "utf8").trim().split("\n").filter(Boolean)
+        : [],
+      work,
+      output: `${error.stdout ?? ""}${error.stderr ?? ""}`,
+    };
   }
 }
 
@@ -299,6 +369,28 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain("install_gateway_autonomy_timer");
     expect(source).toContain("Environment=GILLE_AUTONOMY_ENV_FILE=$ETC/gateway/gateway.env");
     expect(source).toContain("systemctl is-active --quiet gille-autonomy-tick.timer");
+  });
+
+  it("refreshes real rendered autonomy units without passing process-substitution stdin to install", () => {
+    const result = runAutonomyRefreshHarness();
+    expect(result.status, result.output).toBe(0);
+    expect(result.log).not.toContain("rejected-dev-stdin");
+    expect(readFileSync(join(result.work, "installed-gille-autonomy-tick.service"), "utf8"))
+      .toContain("EnvironmentFile=/etc/gille-inference/gateway/gateway.env");
+    expect(readFileSync(join(result.work, "installed-gille-autonomy-tick.timer"), "utf8"))
+      .toContain("OnCalendar=*-*-* 05:30:00");
+    expect(result.log).toContain("chown:root:root " + join(result.work, ".gille-autonomy-tick.service.tmp"));
+    expect(result.log).toContain("chmod:0644 " + join(result.work, ".gille-autonomy-tick.timer.tmp"));
+    expect(result.log.indexOf("mv:/etc/systemd/system/gille-autonomy-tick.timer"))
+      .toBeLessThan(result.log.indexOf("systemctl:daemon-reload"));
+    expect(readdirSync(result.work).filter((name) => name.startsWith(".gille-autonomy-tick"))).toEqual([]);
+  });
+
+  it("cleans destination-filesystem unit temporaries and stays fail-closed when refresh preparation fails", () => {
+    const result = runAutonomyRefreshHarness(true);
+    expect(result.status).not.toBe(0);
+    expect(result.log).not.toContain("systemctl:daemon-reload");
+    expect(readdirSync(result.work).filter((name) => name.startsWith(".gille-autonomy-tick"))).toEqual([]);
   });
 
   it("uses the configured tailnet listener rather than assuming gateway loopback", () => {
