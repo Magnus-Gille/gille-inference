@@ -198,6 +198,7 @@ ReadOnlyPaths=$ETC/llama-swap
 ReadWritePaths=$ROOT/llama-swap
 PrivateDevices=false
 DevicePolicy=closed
+DeviceAllow=
 DeviceAllow=/dev/null rw
 DeviceAllow=/dev/urandom r
 DeviceAllow=/dev/random r
