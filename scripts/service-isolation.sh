@@ -906,6 +906,9 @@ rollback() {
 main() {
   [ "$#" -ge 1 ] || { usage; exit 2; }
   local command="$1"; shift
+  case "$command" in
+    -h|--help) usage; exit 0 ;;
+  esac
   local service="" output_dir="." backup_dir="$ROOT/isolation-backups" ack_restart=0 ack_rollback=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
