@@ -150,6 +150,7 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("IPAddressDeny=any");
     expect(unit).toContain("IPAddressAllow=127.0.0.0/8");
     expect(unit).toContain("IPAddressAllow=::1/128");
+    expect(unit.indexOf("DeviceAllow=\n")).toBeLessThan(unit.indexOf("DeviceAllow=/dev/null rw"));
   });
 
   it("rejects unknown services and does not silently apply all services", () => {
