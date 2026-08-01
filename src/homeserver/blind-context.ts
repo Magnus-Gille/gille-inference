@@ -89,6 +89,12 @@ export const MAX_FILES_PER_REQUEST = 64;
 export interface BlindContextConfig {
   /** Allowlist root directories (raw, as configured). Empty array = feature DISABLED. */
   roots: readonly string[];
+  /**
+   * Optional reusable resolved roots from `inspectBlindContextAvailability()`. Lets a caller that
+   * already inspected discovery state avoid repeating the same `realpathSync` work before
+   * expansion, while preserving the same fail-closed behavior when omitted.
+   */
+  resolvedRoots?: readonly string[];
   /** Per-file byte cap (checked via fstat before the read, re-checked on the actual bytes read). */
   maxFileBytes: number;
   /** Cumulative byte cap across every file in one request. */
@@ -136,6 +142,10 @@ export interface BlindContextAvailability {
   resolvedRootCount: number;
 }
 
+export interface BlindContextAvailabilityInspection extends BlindContextAvailability {
+  resolvedRoots: string[];
+}
+
 const FILE_HEADER = (p: string): string => `===== FILE: ${p} =====`;
 const FILE_FOOTER = "===== END FILE =====";
 const PREAMBLE = (n: number): string =>
@@ -166,14 +176,34 @@ function resolveRoots(roots: readonly string[]): string[] {
  * truly usable without exposing any root locators or mutating the configured root list.
  */
 export function describeBlindContextAvailability(roots: readonly string[]): BlindContextAvailability {
+  const inspection = inspectBlindContextAvailability(roots);
+  return {
+    enabled: inspection.enabled,
+    reason: inspection.reason,
+    resolvedRootCount: inspection.resolvedRootCount,
+  };
+}
+
+/**
+ * The richer availability form for callers that need both the content-blind discovery summary and
+ * the resolved allowlist roots for immediate reuse in the same request path.
+ */
+export function inspectBlindContextAvailability(
+  roots: readonly string[]
+): BlindContextAvailabilityInspection {
   if (roots.length === 0) {
-    return { enabled: false, reason: "unconfigured", resolvedRootCount: 0 };
+    return { enabled: false, reason: "unconfigured", resolvedRootCount: 0, resolvedRoots: [] };
   }
-  const resolved = resolveRoots(roots);
-  if (resolved.length === 0) {
-    return { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 };
+  const resolvedRoots = resolveRoots(roots);
+  if (resolvedRoots.length === 0) {
+    return { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0, resolvedRoots };
   }
-  return { enabled: true, reason: "enabled", resolvedRootCount: resolved.length };
+  return {
+    enabled: true,
+    reason: "enabled",
+    resolvedRootCount: resolvedRoots.length,
+    resolvedRoots,
+  };
 }
 
 /**
@@ -202,7 +232,13 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
     return { ok: true, text: "", fileCount: 0, totalBytes: 0 };
   }
 
-  const availability = describeBlindContextAvailability(cfg.roots);
+  const resolvedRoots = cfg.resolvedRoots !== undefined ? [...cfg.resolvedRoots] : null;
+  const availability: BlindContextAvailabilityInspection =
+    resolvedRoots === null
+      ? inspectBlindContextAvailability(cfg.roots)
+      : resolvedRoots.length === 0
+        ? { enabled: false, reason: cfg.roots.length === 0 ? "unconfigured" : "no_resolved_roots", resolvedRootCount: 0, resolvedRoots }
+        : { enabled: true, reason: "enabled", resolvedRootCount: resolvedRoots.length, resolvedRoots };
   if (!availability.enabled) {
     return {
       ok: false,
@@ -216,7 +252,7 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
       },
     };
   }
-  const roots = resolveRoots(cfg.roots);
+  const roots = availability.resolvedRoots;
 
   // Count cap — bounds the un-byte-metered delimiter/header overhead (see MAX_FILES_PER_REQUEST).
   if (filePaths.length > MAX_FILES_PER_REQUEST) {

@@ -8,6 +8,7 @@ import { classifyTask } from "../src/homeserver/taxonomy.js";
 import { ensureLedgerSchema, getVerdict } from "../src/homeserver/ledger.js";
 import { ensureDelegationCostSchema } from "../src/homeserver/delegation-cost.js";
 import { DEFAULT_POLICY } from "../src/homeserver/config.js";
+import { parseAskFilesCapabilityMeta } from "../src/homeserver/mcp.js";
 import {
   TASK_FINGERPRINT_VERSION,
   lookupTaskExposures,
@@ -76,6 +77,7 @@ let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
+const ASK_FILES_META_KEY = "gille-inference/ask_capabilities";
 
 // Two keys: an open key (empty allow-list = all models visible) and a scoped key (one model).
 let openKey = "";
@@ -131,6 +133,16 @@ async function rpc(body: unknown, key = openKey): Promise<Response> {
   });
 }
 
+function askCapability(tool: {
+  annotations?: unknown;
+  _meta?: Record<string, unknown>;
+}): { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } {
+  expect(tool.annotations).toBeUndefined();
+  const capability = parseAskFilesCapabilityMeta(tool._meta?.[ASK_FILES_META_KEY]);
+  expect(capability).not.toBeNull();
+  return capability!;
+}
+
 // ─── initialize ─────────────────────────────────────────────────────────────────────
 
 describe("MCP initialize", () => {
@@ -177,7 +189,7 @@ describe("MCP ping", () => {
 // ─── tools/list ──────────────────────────────────────────────────────────────────────
 
 describe("MCP tools/list", () => {
-  it("lists list_models and ask with inputSchemas and disabled blind-context metadata for an owner key by default", async () => {
+  it("lists list_models and ask with inputSchemas and spec-compliant blind-context metadata for an owner key by default", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     expect(res.status).toBe(200);
     const j = (await res.json()) as {
@@ -185,8 +197,10 @@ describe("MCP tools/list", () => {
         tools: Array<{
           name: string;
           description: string;
+          _meta?: Record<string, unknown>;
           annotations?: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null };
           inputSchema: { type: string; properties: Record<string, unknown> };
+          outputSchema?: Record<string, unknown>;
         }>;
       };
     };
@@ -198,14 +212,21 @@ describe("MCP tools/list", () => {
     expect(ask.inputSchema.properties).toHaveProperty("model");
     expect(ask.inputSchema.properties).toHaveProperty("prompt");
     expect(ask.inputSchema.properties).toHaveProperty("delegator_model_id");
-    expect(ask.annotations).toEqual({
+    expect(askCapability(ask)).toEqual({
       files_enabled: false,
       files_reason: "unconfigured",
       resolved_root_count: 0,
     });
-    expect(ask.description).toMatch(/currently disabled because HOMESERVER_BLIND_CONTEXT_ROOTS is unset or empty/i);
+    expect(ask.description).toContain("Call list_models for the fresh, content-blind ask.files capability state before using file attachments.");
+    expect(ask.description).not.toMatch(/currently disabled/i);
     const list = j.result.tools.find((t) => t.name === "list_models")!;
     expect(list.inputSchema.type).toBe("object");
+    expect(list.outputSchema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["models", "ask_capabilities"],
+    });
+    expect(JSON.stringify(list.outputSchema)).toContain("files_reason");
   });
 
   it("tells a guest key that files are unavailable before any root/config check", async () => {
@@ -216,17 +237,18 @@ describe("MCP tools/list", () => {
         tools: Array<{
           name: string;
           description: string;
+          _meta?: Record<string, unknown>;
           annotations?: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null };
         }>;
       };
     };
     const ask = j.result.tools.find((t) => t.name === "ask")!;
-    expect(ask.annotations).toEqual({
+    expect(askCapability(ask)).toEqual({
       files_enabled: false,
       files_reason: "owner_tier_required",
       resolved_root_count: null,
     });
-    expect(ask.description).toMatch(/guest-tier keys are rejected before any blind-context root check/i);
+    expect(ask.description).not.toMatch(/guest-tier keys are rejected before any blind-context root check/i);
   });
 });
 
@@ -252,6 +274,8 @@ describe("MCP tools/call list_models", () => {
       files_reason: "unconfigured",
       resolved_root_count: 0,
     });
+    expect(j.result.content[0]!.text).toContain("Current ask.files capability:");
+    expect(j.result.content[0]!.text).toContain("- files_reason: unconfigured");
   });
 
   it("a scoped key sees only its allow-listed model", async () => {
@@ -271,6 +295,7 @@ describe("MCP tools/call list_models", () => {
       files_reason: "owner_tier_required",
       resolved_root_count: null,
     });
+    expect(j.result.content[0]!.text).toContain("- files_reason: owner_tier_required");
   });
 
   it("describes VibeThinker as a verifiable-reasoning specialist", async () => {
@@ -287,6 +312,20 @@ describe("MCP tools/call list_models", () => {
     expect(j.result.content[0]!.text).toContain(
       "vibethinker-3b — verifiable math, code, and STEM reasoning"
     );
+  });
+});
+
+describe("parseAskFilesCapabilityMeta", () => {
+  it("returns null for malformed optional capability metadata", () => {
+    expect(parseAskFilesCapabilityMeta(undefined)).toBeNull();
+    expect(parseAskFilesCapabilityMeta({ files_enabled: "true" })).toBeNull();
+    expect(
+      parseAskFilesCapabilityMeta({
+        files_enabled: true,
+        files_reason: "enabled",
+        resolved_root_count: -1,
+      })
+    ).toBeNull();
   });
 });
 

@@ -118,6 +118,7 @@ async function listedTools(key: string): Promise<Array<{ name: string; descripti
 }
 
 const CODE_LOOP_TOOLS = ["code_loop_start", "code_loop_status", "code_loop_result"];
+const TOOLS_WITH_OUTPUT_SCHEMAS = ["list_models", ...CODE_LOOP_TOOLS];
 
 describe("LearningTaskContract authenticated preflight", () => {
   it("does not advertise the learning seam without authentication", async () => {
@@ -209,7 +210,7 @@ describe("code_loop_* visibility in tools/list", () => {
     const tools = await listedTools(ownerKey);
     const toolsWithOutputSchemas = tools.filter((tool) => tool.outputSchema !== undefined);
 
-    expect(toolsWithOutputSchemas.map((tool) => tool.name)).toEqual(CODE_LOOP_TOOLS);
+    expect(toolsWithOutputSchemas.map((tool) => tool.name)).toEqual(TOOLS_WITH_OUTPUT_SCHEMAS);
     for (const tool of toolsWithOutputSchemas) {
       expect(tool.outputSchema).toMatchObject({ type: "object" });
     }

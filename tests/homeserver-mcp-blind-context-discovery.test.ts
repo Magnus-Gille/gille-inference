@@ -17,7 +17,8 @@ type FilesCapability = {
 type ToolDef = {
   name: string;
   description: string;
-  annotations?: FilesCapability;
+  annotations?: unknown;
+  _meta?: Record<string, unknown>;
   inputSchema: { type: string; properties: Record<string, unknown> };
 };
 
@@ -31,6 +32,7 @@ type Harness = {
 };
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
+const ASK_FILES_META_KEY = "gille-inference/ask_capabilities";
 let aliasSeq = 0;
 const ENV_KEYS = [
   "LMSTUDIO_BASE_URL",
@@ -200,21 +202,40 @@ function askTool(tools: Array<ToolDef>): ToolDef {
   return tool!;
 }
 
+function askCapability(tool: ToolDef): FilesCapability {
+  expect(tool.annotations).toBeUndefined();
+  const capability = tool._meta?.[ASK_FILES_META_KEY];
+  expect(capability).toBeDefined();
+  return capability as FilesCapability;
+}
+
+function expectCapabilityText(text: string, capability: FilesCapability): void {
+  expect(text).toContain("Current ask.files capability:");
+  expect(text).toContain(`- files_enabled: ${capability.files_enabled}`);
+  expect(text).toContain(`- files_reason: ${capability.files_reason}`);
+  expect(text).toContain(
+    `- resolved_root_count: ${capability.resolved_root_count === null ? "null" : capability.resolved_root_count}`
+  );
+}
+
 describe("MCP blind-context discovery", () => {
   it("treats an explicit empty roots env like unset: disabled, owner-only, and discoverable before ask", async () => {
     const harness = await createHarness("");
     try {
       const tools = await listTools(harness.gatewayPort, harness.ownerKey);
       const askDef = askTool(tools);
-      expect(askDef.annotations).toEqual({
+      const capability = askCapability(askDef);
+      expect(capability).toEqual({
         files_enabled: false,
         files_reason: "unconfigured",
         resolved_root_count: 0,
       });
-      expect(askDef.description).toMatch(/currently disabled because HOMESERVER_BLIND_CONTEXT_ROOTS is unset or empty/i);
+      expect(askDef.description).toContain("Call list_models for the fresh, content-blind ask.files capability state before using file attachments.");
+      expect(askDef.description).not.toMatch(/currently disabled/i);
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
-      expect(models.structuredContent?.ask_capabilities).toEqual(askDef.annotations);
+      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
+      expectCapabilityText(models.text, capability);
 
       const result = await ask(harness.gatewayPort, harness.ownerKey, {
         model: "any-model",
@@ -235,16 +256,18 @@ describe("MCP blind-context discovery", () => {
     try {
       const tools = await listTools(harness.gatewayPort, harness.ownerKey);
       const askDef = askTool(tools);
-      expect(askDef.annotations).toEqual({
+      const capability = askCapability(askDef);
+      expect(capability).toEqual({
         files_enabled: false,
         files_reason: "no_resolved_roots",
         resolved_root_count: 0,
       });
-      expect(askDef.description).toMatch(/resolve to no real directories/i);
+      expect(askDef.description).not.toMatch(/resolve to no real directories/i);
       expect(JSON.stringify(askDef)).not.toContain(missingRoot);
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
-      expect(models.structuredContent?.ask_capabilities).toEqual(askDef.annotations);
+      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
+      expectCapabilityText(models.text, capability);
       expect(JSON.stringify(models)).not.toContain(missingRoot);
 
       const result = await ask(harness.gatewayPort, harness.ownerKey, {
@@ -271,17 +294,19 @@ describe("MCP blind-context discovery", () => {
       const before = [...loadConfig().blindContextRoots];
       const tools = await listTools(harness.gatewayPort, harness.ownerKey);
       const askDef = askTool(tools);
-      expect(askDef.annotations).toEqual({
+      const capability = askCapability(askDef);
+      expect(capability).toEqual({
         files_enabled: true,
         files_reason: "enabled",
         resolved_root_count: 1,
       });
-      expect(askDef.description).toMatch(/currently enabled across 1 resolved allow-listed root/i);
+      expect(askDef.description).not.toMatch(/currently enabled/i);
       expect(JSON.stringify(askDef)).not.toContain(allowedRoot);
       expect(JSON.stringify(askDef)).not.toContain(missingRoot);
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
-      expect(models.structuredContent?.ask_capabilities).toEqual(askDef.annotations);
+      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
+      expectCapabilityText(models.text, capability);
       expect(JSON.stringify(models)).not.toContain(allowedRoot);
       expect(JSON.stringify(models)).not.toContain(missingRoot);
       expect(loadConfig().blindContextRoots).toEqual(before);
@@ -309,7 +334,7 @@ describe("MCP blind-context discovery", () => {
     try {
       const before = [...loadConfig().blindContextRoots];
       const initialAskDef = askTool(await listTools(harness.gatewayPort, harness.ownerKey));
-      expect(initialAskDef.annotations).toEqual({
+      expect(askCapability(initialAskDef)).toEqual({
         files_enabled: true,
         files_reason: "enabled",
         resolved_root_count: 1,
@@ -318,14 +343,16 @@ describe("MCP blind-context discovery", () => {
       rmSync(allowedRoot, { recursive: true, force: true });
 
       const askDef = askTool(await listTools(harness.gatewayPort, harness.ownerKey));
-      expect(askDef.annotations).toEqual({
+      const capability = askCapability(askDef);
+      expect(capability).toEqual({
         files_enabled: false,
         files_reason: "no_resolved_roots",
         resolved_root_count: 0,
       });
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
-      expect(models.structuredContent?.ask_capabilities).toEqual(askDef.annotations);
+      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
+      expectCapabilityText(models.text, capability);
       expect(loadConfig().blindContextRoots).toEqual(before);
 
       const result = await ask(harness.gatewayPort, harness.ownerKey, {
@@ -350,17 +377,35 @@ describe("MCP blind-context discovery", () => {
     try {
       const tools = await listTools(harness.gatewayPort, harness.guestKey);
       const askDef = askTool(tools);
-      expect(askDef.annotations).toEqual({
+      const capability = askCapability(askDef);
+      expect(capability).toEqual({
         files_enabled: false,
         files_reason: "owner_tier_required",
         resolved_root_count: null,
       });
-      expect(askDef.description).toMatch(/guest-tier keys are rejected before any blind-context root check/i);
+      expect(askDef.description).not.toMatch(/guest-tier keys are rejected before any blind-context root check/i);
       expect(JSON.stringify(askDef)).not.toContain(allowedRoot);
 
       const models = await listModels(harness.gatewayPort, harness.guestKey);
-      expect(models.structuredContent?.ask_capabilities).toEqual(askDef.annotations);
+      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
+      expectCapabilityText(models.text, capability);
       expect(JSON.stringify(models)).not.toContain(allowedRoot);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("preserves the empty-catalog text while still surfacing the current ask.files state", async () => {
+    const harness = await createHarness(undefined);
+    const openOwnerKey = mintKey({ alias: `bc-discovery-open-${++aliasSeq}`, tier: "owner" }, DEFAULTS).plaintextKey;
+    try {
+      const askDef = askTool(await listTools(harness.gatewayPort, openOwnerKey));
+      const capability = askCapability(askDef);
+      const models = await listModels(harness.gatewayPort, openOwnerKey);
+
+      expect(models.text.startsWith("No models are available to this key.")).toBe(true);
+      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
+      expectCapabilityText(models.text, capability);
     } finally {
       await harness.stop();
     }
