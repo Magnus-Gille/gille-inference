@@ -156,8 +156,8 @@ beforeAll(async () => {
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
 
   const { mintKey } = await import("../src/homeserver/keystore.js");
-  serviceKey = mintKey({ alias: ROSTER_PROPOSAL_PRINCIPAL, tier: "owner" }, keyDefaults).plaintextKey;
-  otherOwnerKey = mintKey({ alias: "service:other-owner", tier: "owner" }, keyDefaults).plaintextKey;
+  serviceKey = mintKey({ alias: ROSTER_PROPOSAL_PRINCIPAL, tier: "owner", scope: "admin" }, keyDefaults).plaintextKey;
+  otherOwnerKey = mintKey({ alias: "service:other-owner", tier: "owner", scope: "admin" }, keyDefaults).plaintextKey;
   guestKey = mintKey({ alias: "service:hugin-guest", tier: "guest" }, keyDefaults).plaintextKey;
 
   const bundle = buildEvidenceIdentityBundle({

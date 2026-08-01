@@ -4,6 +4,13 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.js";
+import {
+  commitKeyRotation,
+  mintKey,
+  preflightKeyRotation,
+  stageKeyRotation,
+  type KeyDefaults,
+} from "../src/homeserver/keystore.js";
 
 /**
  * Read-only MONITOR scope (gille-inference#35).
@@ -43,6 +50,8 @@ function startUpstream(): Promise<void> {
 const ADMIN_KEY = "admin-key-monitor-test";
 const USER_KEY = "user-key-monitor-test";
 const MONITOR_KEY = "monitor-key-monitor-test";
+const DEFAULTS: KeyDefaults = { rpm: 1_000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+let MINTED_MONITOR_KEY = "";
 
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
@@ -63,6 +72,10 @@ beforeAll(async () => {
   process.env["HOMESERVER_ADMIN_API_KEYS"] = ADMIN_KEY;
   process.env["HOMESERVER_API_KEYS"] = USER_KEY;
   process.env["HOMESERVER_MONITOR_API_KEYS"] = MONITOR_KEY;
+  MINTED_MONITOR_KEY = mintKey(
+    { alias: "heimdall-monitor", tier: "guest", scope: "monitor" },
+    DEFAULTS
+  ).plaintextKey;
 
   const gw = await import("../src/homeserver/gateway.js");
   const handle = await gw.startGateway();
@@ -80,6 +93,12 @@ function url(path: string): string {
 }
 const auth = (key: string) => ({ Authorization: `Bearer ${key}` });
 
+async function expectMonitorRouteDenied(res: Response): Promise<void> {
+  expect(res.status).toBe(403);
+  const body = (await res.json()) as { error?: { code?: string } };
+  expect(body.error?.code).toBe("route_not_allowed");
+}
+
 describe("read-only monitor scope (#35)", () => {
   it("monitor key CAN read GET /ledger (200 + report/recent)", async () => {
     const res = await fetch(url("/ledger"), { headers: auth(MONITOR_KEY) });
@@ -87,6 +106,43 @@ describe("read-only monitor scope (#35)", () => {
     const body = (await res.json()) as { report?: unknown; recent?: unknown };
     expect(body).toHaveProperty("report");
     expect(body).toHaveProperty("recent");
+  });
+
+  it("minted monitor scope uses the same read-only route fence", async () => {
+    const ledger = await fetch(url("/ledger"), { headers: auth(MINTED_MONITOR_KEY) });
+    expect(ledger.status).toBe(200);
+    const inference = await fetch(url("/v1/chat/completions"), {
+      method: "POST",
+      headers: { ...auth(MINTED_MONITOR_KEY), "content-type": "application/json" },
+      body: JSON.stringify({ model: "x", messages: [{ role: "user", content: "hi" }] }),
+    });
+    await expectMonitorRouteDenied(inference);
+    const admin = await fetch(url("/admin/keys"), { headers: auth(MINTED_MONITOR_KEY) });
+    await expectMonitorRouteDenied(admin);
+  });
+
+  it("rotation preflight requires an actual successful gateway request by the replacement", async () => {
+    const old = mintKey(
+      { alias: "monitor-rotation", tier: "guest", scope: "monitor" },
+      DEFAULTS
+    );
+    const staged = stageKeyRotation("monitor-rotation", {}, DEFAULTS, { overlapSeconds: 3_600 });
+
+    expect(() => preflightKeyRotation(staged.plan.planId)).toThrow(/no successful.*gateway/i);
+    const rejected = await fetch(url("/ledger"), { headers: auth("invalid-replacement-token") });
+    expect(rejected.status).toBe(401);
+    expect(() => preflightKeyRotation(staged.plan.planId)).toThrow(/no successful.*gateway/i);
+
+    const accepted = await fetch(url("/ledger"), { headers: auth(staged.plaintextKey) });
+    expect(accepted.status).toBe(200);
+    expect(preflightKeyRotation(staged.plan.planId)).toMatchObject({
+      replacementAlias: staged.newAlias,
+      preflightUseCount: 1,
+    });
+    commitKeyRotation(staged.plan.planId);
+
+    expect((await fetch(url("/ledger"), { headers: auth(old.plaintextKey) })).status).toBe(401);
+    expect((await fetch(url("/ledger"), { headers: auth(staged.plaintextKey) })).status).toBe(200);
   });
 
   // #227: GET /ledger/:id must honor the same read-only monitor scope as GET /ledger — the
@@ -106,7 +162,7 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ model: "x", messages: [{ role: "user", content: "hi" }] }),
     });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("monitor key CANNOT delegate — POST /delegate is 403", async () => {
@@ -115,12 +171,12 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi" }),
     });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("monitor key CANNOT hit admin — GET /admin/keys is 403", async () => {
     const res = await fetch(url("/admin/keys"), { headers: auth(MONITOR_KEY) });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("guest/user key still CANNOT read /ledger (403)", async () => {
@@ -145,12 +201,12 @@ describe("read-only monitor scope (#35)", () => {
       headers: { ...auth(MONITOR_KEY), "content-type": "application/json" },
       body: JSON.stringify({ text: "hello" }),
     });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 
   it("monitor key blocked on GET /hs (403) but allowed on GET /healthz (200)", async () => {
     const hs = await fetch(url("/hs"), { headers: auth(MONITOR_KEY) });
-    expect(hs.status).toBe(403);
+    await expectMonitorRouteDenied(hs);
     const health = await fetch(url("/healthz"), { headers: auth(MONITOR_KEY) });
     expect(health.status).toBe(200);
   });
@@ -175,6 +231,6 @@ describe("read-only monitor scope (#35)", () => {
 
   it("monitor key still CANNOT hit a non-allowed route — GET /admin/keys stays 403", async () => {
     const res = await fetch(url("/admin/keys"), { headers: auth(MONITOR_KEY) });
-    expect(res.status).toBe(403);
+    await expectMonitorRouteDenied(res);
   });
 });

@@ -8,6 +8,12 @@ import { startGateway } from "./gateway.js";
 import {
   mintKey,
   rotateKey,
+  stageKeyRotation,
+  preflightKeyRotation,
+  commitKeyRotation,
+  abortKeyRotation,
+  listKeyRotations,
+  credentialInventory,
   listKeys,
   revokeKey,
   KeyAliasExistsError,
@@ -166,10 +172,10 @@ export function strictScopeFlag(flags: Record<string, string | boolean>): KeySco
   if (!("scope" in flags)) return undefined;
   const value = flags["scope"];
   if (typeof value !== "string") {
-    throw new Error("keys: --scope requires a value (admin|agent|inference)");
+    throw new Error("keys: --scope requires a value (admin|agent|inference|monitor)");
   }
-  if (value !== "admin" && value !== "agent" && value !== "inference") {
-    throw new Error("keys: --scope must be admin|agent|inference");
+  if (value !== "admin" && value !== "agent" && value !== "inference" && value !== "monitor") {
+    throw new Error("keys: --scope must be admin|agent|inference|monitor");
   }
   return value;
 }
@@ -182,9 +188,13 @@ const KEY_MUTATION_FLAGS = new Set([
  * Key creation and rotation are authority-bearing operations, so an ignored typo can silently
  * widen a credential. Reject every unrecognised flag before applying defaults or inheritance.
  */
-function assertKnownKeyMutationFlags(flags: Record<string, string | boolean>, subcommand: "mint" | "rotate"): void {
+function assertKnownKeyMutationFlags(
+  flags: Record<string, string | boolean>,
+  subcommand: "mint" | "rotate" | "stage"
+): void {
   for (const name of Object.keys(flags)) {
-    if (!KEY_MUTATION_FLAGS.has(name)) throw new Error(`keys ${subcommand}: unknown flag --${name}`);
+    const allowed = KEY_MUTATION_FLAGS.has(name) || (subcommand === "stage" && name === "overlap");
+    if (!allowed) throw new Error(`keys ${subcommand}: unknown flag --${name}`);
   }
 }
 
@@ -444,6 +454,138 @@ export function cmdKeys(args: ParsedArgs): void {
     );
     console.log(`\n  ${plaintextKey}\n`);
     console.warn("⚠  This is the ONLY time the key is shown — store it now. Only its sha256 hash is persisted.");
+    return;
+  }
+
+  if (sub === "stage") {
+    assertKnownKeyMutationFlags(args.flags, "stage");
+    const alias = typeof args.flags["alias"] === "string" ? args.flags["alias"] : args.positional[1];
+    const tierRaw = typeof args.flags["tier"] === "string" ? args.flags["tier"] : undefined;
+    const scope = strictScopeFlag(args.flags);
+    if (!alias) {
+      throw new Error(
+        "usage: keys stage --alias A [--scope admin|agent|inference|monitor] [--overlap S] " +
+        "[--ttl S] [limit overrides]\n" +
+        "  Mints a replacement while the current credential remains active for a bounded overlap."
+      );
+    }
+    if (tierRaw !== undefined && tierRaw !== "owner" && tierRaw !== "guest") {
+      throw new Error("keys stage: --tier must be owner|guest");
+    }
+    const models = typeof args.flags["models"] === "string"
+      ? args.flags["models"].split(",").map((value) => value.trim()).filter(Boolean)
+      : undefined;
+    const staged = stageKeyRotation(
+      alias,
+      {
+        ...(tierRaw ? { tier: tierRaw as Tier } : {}),
+        ...(scope ? { scope } : {}),
+        ...(models ? { modelAllowList: models } : {}),
+        rpm: strictNumFlag(args.flags, "rpm"),
+        tpm: strictNumFlag(args.flags, "tpm"),
+        dailyTokenBudget: strictNumFlag(args.flags, "daily"),
+        maxParallel: strictNumFlag(args.flags, "parallel"),
+        creditLimit: strictNumFlag(args.flags, "credits"),
+        ttlSeconds: strictNumFlag(args.flags, "ttl"),
+      },
+      cfg.keyDefaults,
+      { overlapSeconds: strictNumFlag(args.flags, "overlap") }
+    );
+    console.log(`✓ staged '${alias}' → replacement '${staged.newAlias}'`);
+    console.log(`  plan: ${staged.plan.planId}`);
+    console.log(`  overlap expires: ${staged.plan.overlapExpiresAt}`);
+    console.log(`\n  ${staged.plaintextKey}\n`);
+    console.warn(
+      "⚠  Store this replacement now. Run an allowed gateway probe, then preflight before commit; it is never persisted."
+    );
+    return;
+  }
+
+  if (sub === "preflight") {
+    const allowed = new Set(["plan"]);
+    for (const name of Object.keys(args.flags)) {
+      if (!allowed.has(name)) throw new Error(`keys preflight: unknown flag --${name}`);
+    }
+    const planId = typeof args.flags["plan"] === "string" ? args.flags["plan"] : args.positional[1];
+    if (!planId) throw new Error("usage: keys preflight --plan PLAN");
+    const plan = preflightKeyRotation(planId);
+    console.log(`✓ replacement preflight passed for plan '${plan.planId}' at ${plan.preflightAt}`);
+    return;
+  }
+
+  if (sub === "commit") {
+    for (const name of Object.keys(args.flags)) {
+      if (name !== "plan") throw new Error(`keys commit: unknown flag --${name}`);
+    }
+    const planId = typeof args.flags["plan"] === "string" ? args.flags["plan"] : args.positional[1];
+    if (!planId) throw new Error("usage: keys commit --plan PLAN");
+    const result = commitKeyRotation(planId);
+    console.log(`✓ committed plan '${planId}'; active replacement '${result.activeAlias}'`);
+    console.log(`  retired: ${result.revokedAliases.join(", ")}`);
+    return;
+  }
+
+  if (sub === "abort") {
+    for (const name of Object.keys(args.flags)) {
+      if (name !== "plan") throw new Error(`keys abort: unknown flag --${name}`);
+    }
+    const planId = typeof args.flags["plan"] === "string" ? args.flags["plan"] : args.positional[1];
+    if (!planId) throw new Error("usage: keys abort --plan PLAN");
+    const plan = abortKeyRotation(planId);
+    console.log(`✓ aborted plan '${plan.planId}'; prior credential set remains active`);
+    return;
+  }
+
+  if (sub === "rotations") {
+    const plans = listKeyRotations();
+    if (plans.length === 0) {
+      console.log("No credential rotation plans.");
+      return;
+    }
+    console.log(
+      `${"PLAN".padEnd(21)} ${"LOGICAL".padEnd(18)} ${"REPLACEMENT".padEnd(20)} ` +
+      `${"STATUS".padEnd(10)} PREFLIGHT`
+    );
+    for (const plan of plans) {
+      console.log(
+        `${plan.planId.slice(0, 20).padEnd(21)} ${plan.logicalAlias.slice(0, 17).padEnd(18)} ` +
+        `${plan.replacementAlias.slice(0, 19).padEnd(20)} ${plan.status.padEnd(10)} ` +
+        `${plan.preflightAt ?? "pending"}`
+      );
+    }
+    return;
+  }
+
+  if (sub === "inventory") {
+    const allowed = new Set(["all", "stale-days", "json"]);
+    for (const name of Object.keys(args.flags)) {
+      if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
+    }
+    const report = credentialInventory({
+      includeRevoked: args.flags["all"] === true,
+      staleAfterDays: strictNumFlag(args.flags, "stale-days"),
+    });
+    const staticCounts = {
+      admin: cfg.adminApiKeys.length,
+      inference: cfg.apiKeys.length,
+      monitor: cfg.monitorApiKeys.length,
+    };
+    if (args.flags["json"] === true) {
+      console.log(JSON.stringify({ ...report, legacyStaticCounts: staticCounts }, null, 2));
+      return;
+    }
+    console.log(
+      `${"ALIAS".padEnd(20)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ` +
+      `${"STATUS".padEnd(9)} ${"LAST USED".padEnd(24)} FINDINGS`
+    );
+    for (const key of report.keys) {
+      console.log(
+        `${key.alias.slice(0, 19).padEnd(20)} ${key.tier.padEnd(6)} ${key.scope.padEnd(10)} ` +
+        `${key.status.padEnd(9)} ${(key.lastUsedAt ?? "never").padEnd(24)} ${key.findings.join(",") || "none"}`
+      );
+    }
+    console.log(`summary: ${JSON.stringify(report.summary)}`);
+    console.log(`legacy static credential counts (values never read): ${JSON.stringify(staticCounts)}`);
     return;
   }
 
@@ -809,9 +951,13 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts probe --all\n" +
           '  tsx src/homeserver/cli.ts delegate --prompt "Return OK" --model mellum --delegator openai/gpt-5.5   # local model + cloud brain\n' +
           "  tsx src/homeserver/cli.ts ledger\n" +
-          "  tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner\n" +
+          "  tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner   # defaults to agent + 90d\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
+          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30\n" +
+          "  tsx src/homeserver/cli.ts keys stage --alias harness --scope agent --overlap 3600\n" +
+          "  tsx src/homeserver/cli.ts keys preflight --plan rot_...\n" +
+          "  tsx src/homeserver/cli.ts keys commit --plan rot_...\n" +
           "  tsx src/homeserver/cli.ts keys invite --credits 500000 --tier guest --model qwen3\n" +
           "  tsx src/homeserver/cli.ts keys list\n" +
           '  tsx src/homeserver/cli.ts deep-research --query "impact of GLP-1 drugs on cardiovascular outcomes" --depth thorough\n' +

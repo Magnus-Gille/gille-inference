@@ -62,7 +62,7 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     listKeys(); // creates the lazily-owned api_keys schema through the public keystore seam
   });
 
-  it("rejects bare --scope on mint before it can create a default-admin credential", () => {
+  it("rejects bare --scope on mint before it can create a credential with unintended authority", () => {
     const alias = nextAlias("bare-scope-mint");
     const args = parseArgs(["mint", "--alias", alias, "--tier", "owner", "--scope"]);
 
@@ -71,14 +71,14 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(alias)).toBeUndefined();
   });
 
-  it("rejects bare --scope on rotate before it can mint an admin-inheriting replacement", () => {
+  it("rejects bare --scope on rotate before it can mint an inheriting replacement", () => {
     const alias = nextAlias("bare-scope-rotate");
     const original = mintKey({ alias, tier: "owner" }, DEFAULTS);
     const args = parseArgs(["rotate", "--alias", alias, "--scope"]);
 
     expect(args.flags["scope"]).toBe(true);
     expect(() => cmdKeys(args)).toThrow(/--scope.*value/i);
-    expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "admin" });
+    expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "agent" });
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
   });
 
@@ -103,7 +103,7 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     expect(row.scope).toBe("agent");
   });
 
-  it("rejects a scope typo before mint can silently default to admin", () => {
+  it("rejects a scope typo before mint can silently apply any default", () => {
     const alias = nextAlias("typo-scope-mint");
     const args = parseArgs(["mint", "--alias", alias, "--tier", "owner", "--scpoe", "agent"]);
 
@@ -111,13 +111,13 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(alias)).toBeUndefined();
   });
 
-  it("rejects a scope typo before rotate can silently inherit admin", () => {
+  it("rejects a scope typo before rotate can silently inherit authority", () => {
     const alias = nextAlias("typo-scope-rotate");
     const original = mintKey({ alias, tier: "owner" }, DEFAULTS);
     const args = parseArgs(["rotate", "--alias", alias, "--scpoe", "agent"]);
 
     expect(() => cmdKeys(args)).toThrow(/unknown.*scpoe/i);
-    expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "admin" });
+    expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "agent" });
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
   });
 });

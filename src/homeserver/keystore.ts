@@ -24,7 +24,18 @@ export type Tier = "owner" | "guest";
  * Existing rows predate this column. A null stored scope is interpreted as the
  * legacy-compatible default for its tier (owner→admin, guest→inference).
  */
-export type KeyScope = "admin" | "agent" | "inference";
+export type KeyScope = "admin" | "agent" | "inference" | "monitor";
+
+/**
+ * Maximum lifetime for newly minted credentials. Existing rows with no expiry remain readable so
+ * operators can inventory and migrate them, but every newly created key is bounded by default.
+ */
+export const MAX_KEY_LIFETIME_SECONDS: Readonly<Record<KeyScope, number>> = Object.freeze({
+  admin: 30 * 24 * 60 * 60,
+  agent: 90 * 24 * 60 * 60,
+  inference: 365 * 24 * 60 * 60,
+  monitor: 365 * 24 * 60 * 60,
+});
 
 export interface ApiKeyRecord {
   alias: string;
@@ -45,6 +56,10 @@ export interface ApiKeyRecord {
   revokedAt: string | null; // ISO; non-null = soft-revoked
   /** #99: logical name grouping a key with its rotations. null = never produced by `rotate`. */
   logicalAlias: string | null;
+  /** Successful authenticated use, populated by the gateway. null means never observed. */
+  lastUsedAt: string | null;
+  /** Successful authenticated uses observed by the gateway. */
+  useCount: number;
 }
 
 /** Public shape returned by listKeys / GET /admin/keys — keyHash REMOVED. */
@@ -115,20 +130,35 @@ export class InvalidScopeError extends Error {
   constructor(public tier: Tier, public scope: KeyScope) {
     super(
       `tier '${tier}' cannot carry '${scope}' scope`
-      + (tier === "guest" ? "; use scope 'inference' for guest keys" : "")
+      + (tier === "guest" ? "; use scope 'inference' or 'monitor' for guest keys" : "")
     );
     this.name = "InvalidScopeError";
   }
 }
 
-/** Preserve the authority of keys minted before explicit route scopes existed. */
+/** Thrown before persistence when a requested TTL exceeds the scope's maximum lifetime. */
+export class KeyLifetimePolicyError extends Error {
+  constructor(public scope: KeyScope, public ttlSeconds: number, public maximumSeconds: number) {
+    super(
+      `requested lifetime ${ttlSeconds}s exceeds the maximum ${maximumSeconds}s for '${scope}' scope`
+    );
+    this.name = "KeyLifetimePolicyError";
+  }
+}
+
+/** Least-privilege default for NEW keys. Owner does not imply administrative route authority. */
 export function defaultScopeForTier(tier: Tier): KeyScope {
+  return tier === "owner" ? "agent" : "inference";
+}
+
+/** Preserve authority only when reading rows minted before explicit route scopes existed. */
+function legacyScopeForTier(tier: Tier): KeyScope {
   return tier === "owner" ? "admin" : "inference";
 }
 
 function storedScope(tier: Tier, value: string | null): KeyScope {
-  if (value === null) return defaultScopeForTier(tier);
-  if (value === "inference") return value;
+  if (value === null) return legacyScopeForTier(tier);
+  if (value === "inference" || value === "monitor") return value;
   if (tier === "owner" && (value === "admin" || value === "agent")) return value;
   // A malformed or tier-incompatible stored value must not expand authority.
   return "inference";
@@ -161,14 +191,20 @@ function ensureSchema(db: Database.Database): void {
       alias              TEXT PRIMARY KEY,
       key_hash           TEXT NOT NULL UNIQUE,
       tier               TEXT NOT NULL,
+      scope              TEXT,
       model_allow_list   TEXT NOT NULL DEFAULT '[]',
       rpm                INTEGER NOT NULL,
       tpm                INTEGER NOT NULL,
       daily_token_budget INTEGER NOT NULL DEFAULT 0,
       max_parallel       INTEGER NOT NULL DEFAULT 1,
+      credit_limit       INTEGER NOT NULL DEFAULT 0,
+      credits_used       INTEGER NOT NULL DEFAULT 0,
       expires_at         TEXT,
       created_at         TEXT NOT NULL,
-      revoked_at         TEXT
+      revoked_at         TEXT,
+      logical_alias      TEXT,
+      last_used_at       TEXT,
+      use_count          INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 
@@ -207,10 +243,48 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("scope")) {
       db.exec(`ALTER TABLE api_keys ADD COLUMN scope TEXT`);
     }
+    if (!names.has("last_used_at")) {
+      db.exec(`ALTER TABLE api_keys ADD COLUMN last_used_at TEXT`);
+    }
+    if (!names.has("use_count")) {
+      db.exec(`ALTER TABLE api_keys ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0`);
+    }
     // The index backs rotateKey's family lookup (no full scan under the write lock). Created
     // UNCONDITIONALLY (IF NOT EXISTS) — NOT only alongside the column-add — so a DB that already
     // has the column but is missing the index (partial/manual migration) still gets it. (Codex #99.)
     db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_logical_alias ON api_keys(logical_alias)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS key_rotation_plans (
+        plan_id             TEXT PRIMARY KEY,
+        logical_alias       TEXT NOT NULL,
+        replacement_alias   TEXT NOT NULL,
+        previous_aliases    TEXT NOT NULL,
+        staged_at           TEXT NOT NULL,
+        overlap_expires_at  TEXT NOT NULL,
+        status              TEXT NOT NULL CHECK (status IN ('staged','committed','aborted')),
+        baseline_use_count  INTEGER NOT NULL DEFAULT 0,
+        preflight_at        TEXT,
+        preflight_use_count INTEGER,
+        preflight_last_used_at TEXT,
+        completed_at        TEXT,
+        FOREIGN KEY(replacement_alias) REFERENCES api_keys(alias)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_key_rotation_one_staged
+        ON key_rotation_plans(logical_alias) WHERE status = 'staged';
+    `);
+    const rotationCols = db.prepare(`PRAGMA table_info(key_rotation_plans)`).all() as Array<{ name: string }>;
+    if (!rotationCols.some((column) => column.name === "preflight_at")) {
+      db.exec(`ALTER TABLE key_rotation_plans ADD COLUMN preflight_at TEXT`);
+    }
+    if (!rotationCols.some((column) => column.name === "baseline_use_count")) {
+      db.exec(`ALTER TABLE key_rotation_plans ADD COLUMN baseline_use_count INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!rotationCols.some((column) => column.name === "preflight_use_count")) {
+      db.exec(`ALTER TABLE key_rotation_plans ADD COLUMN preflight_use_count INTEGER`);
+    }
+    if (!rotationCols.some((column) => column.name === "preflight_last_used_at")) {
+      db.exec(`ALTER TABLE key_rotation_plans ADD COLUMN preflight_last_used_at TEXT`);
+    }
   })();
 
   _ksInitDb = db;
@@ -240,6 +314,8 @@ interface KeyRow {
   created_at: string;
   revoked_at: string | null;
   logical_alias: string | null;
+  last_used_at: string | null;
+  use_count: number;
 }
 
 function rowToRecord(r: KeyRow): ApiKeyRecord {
@@ -260,6 +336,8 @@ function rowToRecord(r: KeyRow): ApiKeyRecord {
     createdAt: r.created_at,
     revokedAt: r.revoked_at,
     logicalAlias: r.logical_alias,
+    lastUsedAt: r.last_used_at,
+    useCount: r.use_count,
   };
 }
 
@@ -280,6 +358,11 @@ export function hashKey(plaintext: string): string {
 // ─── Mint ─────────────────────────────────────────────────────────────────────────
 
 export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
+  return mintKeyAt(opts, defaults, new Date());
+}
+
+/** Internal clock-injected mint used to keep staged plan and replacement timestamps coherent. */
+function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintResult {
   // Reject non-integer / negative numeric limits BEFORE touching the DB. A negative
   // creditLimit is the dangerous case (it would read as "unlimited" in isCreditExhausted).
   assertNonNegativeInt("creditLimit", opts.creditLimit);
@@ -289,19 +372,20 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
   assertNonNegativeInt("maxParallel", opts.maxParallel);
   assertNonNegativeInt("ttlSeconds", opts.ttlSeconds);
   const scope = opts.scope ?? defaultScopeForTier(opts.tier);
-  if (opts.tier === "guest" && scope !== "inference") {
+  if (opts.tier === "guest" && scope !== "inference" && scope !== "monitor") {
     throw new InvalidScopeError(opts.tier, scope);
+  }
+  const ttlSeconds = opts.ttlSeconds ?? MAX_KEY_LIFETIME_SECONDS[scope];
+  const maximumSeconds = MAX_KEY_LIFETIME_SECONDS[scope];
+  if (ttlSeconds > maximumSeconds) {
+    throw new KeyLifetimePolicyError(scope, ttlSeconds, maximumSeconds);
   }
 
   const db = ksDb();
   const plaintextKey = `hs_${opts.tier}_${randomBytes(32).toString("base64url")}`;
   const keyHash = hashKey(plaintextKey);
-  const now = new Date();
   const createdAt = now.toISOString();
-  const expiresAt =
-    opts.ttlSeconds !== undefined
-      ? new Date(now.getTime() + opts.ttlSeconds * 1000).toISOString()
-      : null;
+  const expiresAt = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
 
   const record: ApiKeyRecord = {
     alias: opts.alias,
@@ -319,16 +403,20 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
     createdAt,
     revokedAt: null,
     logicalAlias: opts.logicalAlias ?? null,
+    lastUsedAt: null,
+    useCount: 0,
   };
 
   try {
     db.prepare(
       `INSERT INTO api_keys
          (alias, key_hash, tier, scope, model_allow_list, rpm, tpm, daily_token_budget,
-          max_parallel, credit_limit, credits_used, expires_at, created_at, revoked_at, logical_alias)
+          max_parallel, credit_limit, credits_used, expires_at, created_at, revoked_at, logical_alias,
+          last_used_at, use_count)
        VALUES
          (@alias, @keyHash, @tier, @scope, @modelAllowList, @rpm, @tpm, @dailyTokenBudget,
-          @maxParallel, @creditLimit, @creditsUsed, @expiresAt, @createdAt, @revokedAt, @logicalAlias)`
+          @maxParallel, @creditLimit, @creditsUsed, @expiresAt, @createdAt, @revokedAt, @logicalAlias,
+          @lastUsedAt, @useCount)`
     ).run({
       alias: record.alias,
       keyHash: record.keyHash,
@@ -345,6 +433,8 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
       createdAt: record.createdAt,
       revokedAt: record.revokedAt,
       logicalAlias: record.logicalAlias,
+      lastUsedAt: record.lastUsedAt,
+      useCount: record.useCount,
     });
   } catch (err) {
     // Translate ONLY the known UNIQUE-constraint collision into a typed, clean error so the
@@ -447,8 +537,8 @@ export function nextFreeAlias(
  * Settings for the new key are INHERITED from the most-recent family member — active OR already
  * revoked, so the common "revoke-then-rotate" sequence needs no `--tier` — and individually
  * overridable via `opts`. A brand-new name has nothing to inherit, so `opts.tier` is required
- * there. The rotated key always starts with a clean credit balance and no expiry unless
- * `opts.ttlSeconds` is given.
+ * there. The rotated key always starts with a clean credit balance and receives the scope's
+ * bounded default lifetime unless `opts.ttlSeconds` selects a shorter allowed lifetime.
  */
 export function rotateKey(
   logicalAlias: string,
@@ -536,6 +626,325 @@ export function rotateKey(
   return run();
 }
 
+// ─── Staged rotation (#152) ───────────────────────────────────────────────────────
+
+export type KeyRotationStatus = "staged" | "committed" | "aborted";
+
+export interface KeyRotationPlan {
+  planId: string;
+  logicalAlias: string;
+  replacementAlias: string;
+  previousAliases: string[];
+  stagedAt: string;
+  overlapExpiresAt: string;
+  status: KeyRotationStatus;
+  baselineUseCount: number;
+  preflightAt: string | null;
+  preflightUseCount: number | null;
+  preflightLastUsedAt: string | null;
+  completedAt: string | null;
+}
+
+interface KeyRotationPlanRow {
+  plan_id: string;
+  logical_alias: string;
+  replacement_alias: string;
+  previous_aliases: string;
+  staged_at: string;
+  overlap_expires_at: string;
+  status: string;
+  baseline_use_count: number;
+  preflight_at: string | null;
+  preflight_use_count: number | null;
+  preflight_last_used_at: string | null;
+  completed_at: string | null;
+}
+
+function rotationPlanFromRow(row: KeyRotationPlanRow): KeyRotationPlan {
+  return {
+    planId: row.plan_id,
+    logicalAlias: row.logical_alias,
+    replacementAlias: row.replacement_alias,
+    previousAliases: JSON.parse(row.previous_aliases) as string[],
+    stagedAt: row.staged_at,
+    overlapExpiresAt: row.overlap_expires_at,
+    status: row.status as KeyRotationStatus,
+    baselineUseCount: row.baseline_use_count,
+    preflightAt: row.preflight_at,
+    preflightUseCount: row.preflight_use_count,
+    preflightLastUsedAt: row.preflight_last_used_at,
+    completedAt: row.completed_at,
+  };
+}
+
+function rotationFamilyRows(db: Database.Database, logicalAlias: string): Array<KeyRow & { _rowid: number }> {
+  const self = db
+    .prepare(`SELECT logical_alias FROM api_keys WHERE alias = @logical`)
+    .get({ logical: logicalAlias }) as { logical_alias: string | null } | undefined;
+  if (self && self.logical_alias !== null && self.logical_alias !== logicalAlias) {
+    throw new Error(
+      `rotation: '${logicalAlias}' is a rotation of '${self.logical_alias}', not a logical name`
+    );
+  }
+  return db
+    .prepare(
+      `SELECT rowid AS _rowid, * FROM api_keys
+        WHERE logical_alias = @logical OR (logical_alias IS NULL AND alias = @logical)`
+    )
+    .all({ logical: logicalAlias }) as Array<KeyRow & { _rowid: number }>;
+}
+
+export interface StageKeyRotationResult extends MintResult {
+  newAlias: string;
+  plan: KeyRotationPlan;
+}
+
+/**
+ * Mint a replacement while leaving the current family active for a bounded overlap window.
+ * Only one staged plan may exist per family. The new plaintext is returned once and is never
+ * persisted in the plan.
+ */
+export function stageKeyRotation(
+  logicalAlias: string,
+  opts: Partial<Omit<MintOptions, "alias" | "logicalAlias">>,
+  defaults: KeyDefaults,
+  lifecycle: { now?: Date; overlapSeconds?: number } = {}
+): StageKeyRotationResult {
+  const db = ksDb();
+  const now = lifecycle.now ?? new Date();
+  const overlapSeconds = lifecycle.overlapSeconds ?? 3_600;
+  assertNonNegativeInt("overlapSeconds", overlapSeconds);
+  if (overlapSeconds < 60 || overlapSeconds > 24 * 60 * 60) {
+    throw new InvalidParamError("overlapSeconds", overlapSeconds);
+  }
+
+  return db.transaction((): StageKeyRotationResult => {
+    const existingPlan = db
+      .prepare(`SELECT plan_id FROM key_rotation_plans WHERE logical_alias = ? AND status = 'staged'`)
+      .get(logicalAlias) as { plan_id: string } | undefined;
+    if (existingPlan) {
+      throw new Error(`rotation: '${logicalAlias}' already has staged plan '${existingPlan.plan_id}'`);
+    }
+
+    const family = rotationFamilyRows(db, logicalAlias)
+      .map((row) => ({ rec: rowToRecord(row), rowid: row._rowid }))
+      .sort((a, b) => b.rec.createdAt.localeCompare(a.rec.createdAt) || b.rowid - a.rowid);
+    const active = family.filter(({ rec }) =>
+      rec.revokedAt === null
+      && (rec.expiresAt === null || Date.parse(rec.expiresAt) > now.getTime())
+    );
+    const current = active[0]?.rec;
+    if (!current) {
+      throw new Error(`rotation: '${logicalAlias}' has no active key; mint a new credential instead`);
+    }
+
+    const tier = opts.tier ?? current.tier;
+    const scope = opts.scope ?? current.scope;
+    const replacementTtl = opts.ttlSeconds ?? MAX_KEY_LIFETIME_SECONDS[scope];
+    if (replacementTtl < overlapSeconds) {
+      throw new Error("rotation: replacement lifetime must cover the entire overlap window");
+    }
+    const allAliases = new Set(
+      (db.prepare(`SELECT alias FROM api_keys`).all() as Array<{ alias: string }>).map((row) => row.alias)
+    );
+    const newAlias = nextFreeAlias(logicalAlias, allAliases);
+    const minted = mintKeyAt(
+      {
+        alias: newAlias,
+        logicalAlias,
+        tier,
+        scope,
+        modelAllowList: opts.modelAllowList ?? current.modelAllowList,
+        rpm: opts.rpm ?? current.rpm,
+        tpm: opts.tpm ?? current.tpm,
+        dailyTokenBudget: opts.dailyTokenBudget ?? current.dailyTokenBudget,
+        maxParallel: opts.maxParallel ?? current.maxParallel,
+        creditLimit: opts.creditLimit ?? current.creditLimit,
+        ttlSeconds: replacementTtl,
+      },
+      defaults,
+      now
+    );
+    const plan: KeyRotationPlan = {
+      planId: `rot_${randomBytes(12).toString("base64url")}`,
+      logicalAlias,
+      replacementAlias: newAlias,
+      previousAliases: active.map(({ rec }) => rec.alias),
+      stagedAt: now.toISOString(),
+      overlapExpiresAt: new Date(now.getTime() + overlapSeconds * 1_000).toISOString(),
+      status: "staged",
+      baselineUseCount: minted.record.useCount,
+      preflightAt: null,
+      preflightUseCount: null,
+      preflightLastUsedAt: null,
+      completedAt: null,
+    };
+    db.prepare(
+      `INSERT INTO key_rotation_plans
+        (plan_id, logical_alias, replacement_alias, previous_aliases, staged_at,
+         overlap_expires_at, status, baseline_use_count, preflight_at, preflight_use_count,
+         preflight_last_used_at, completed_at)
+       VALUES
+        (@planId, @logicalAlias, @replacementAlias, @previousAliases, @stagedAt,
+         @overlapExpiresAt, @status, @baselineUseCount, @preflightAt, @preflightUseCount,
+         @preflightLastUsedAt, @completedAt)`
+    ).run({ ...plan, previousAliases: JSON.stringify(plan.previousAliases) });
+    return { ...minted, newAlias, plan };
+  })();
+}
+
+/**
+ * Mechanically prove the staged replacement has authenticated through the running gateway.
+ * handleRequest records successful minted-key requests after a 2xx/3xx response; this gate requires
+ * a post-stage timestamp and use-count increase for the exact replacement alias. Merely
+ * possessing or looking up the plaintext cannot satisfy it. Only sanitized counters/timestamps
+ * are persisted, and commit refuses to run until this succeeds.
+ */
+export function preflightKeyRotation(
+  planId: string,
+  now: Date = new Date()
+): KeyRotationPlan {
+  const db = ksDb();
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT * FROM key_rotation_plans WHERE plan_id = ?`).get(planId) as
+      KeyRotationPlanRow | undefined;
+    if (!row || row.status !== "staged") throw new Error("rotation preflight: plan is not staged");
+    if (Date.parse(row.overlap_expires_at) <= now.getTime()) {
+      throw new Error("rotation preflight: overlap window has expired; abort and stage again");
+    }
+    const replacement = db
+      .prepare(`SELECT last_used_at, use_count, revoked_at, expires_at FROM api_keys WHERE alias = ?`)
+      .get(row.replacement_alias) as {
+        last_used_at: string | null;
+        use_count: number;
+        revoked_at: string | null;
+        expires_at: string | null;
+      } | undefined;
+    if (
+      !replacement
+      || replacement.revoked_at !== null
+      || (replacement.expires_at !== null && Date.parse(replacement.expires_at) <= now.getTime())
+    ) {
+      throw new Error("rotation preflight: replacement is not active");
+    }
+    if (
+      replacement.last_used_at === null
+      || Date.parse(replacement.last_used_at) < Date.parse(row.staged_at)
+      || replacement.use_count <= row.baseline_use_count
+    ) {
+      throw new Error(
+        "rotation preflight: replacement has no successful post-stage gateway authentication"
+      );
+    }
+    const ts = now.toISOString();
+    db.prepare(
+      `UPDATE key_rotation_plans
+          SET preflight_at = ?, preflight_use_count = ?, preflight_last_used_at = ?
+        WHERE plan_id = ? AND status = 'staged'`
+    ).run(ts, replacement.use_count, replacement.last_used_at, planId);
+    return rotationPlanFromRow({
+      ...row,
+      preflight_at: ts,
+      preflight_use_count: replacement.use_count,
+      preflight_last_used_at: replacement.last_used_at,
+    });
+  })();
+}
+
+export function commitKeyRotation(
+  planId: string,
+  now: Date = new Date()
+): { plan: KeyRotationPlan; revokedAliases: string[]; activeAlias: string } {
+  const db = ksDb();
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT * FROM key_rotation_plans WHERE plan_id = ?`).get(planId) as
+      KeyRotationPlanRow | undefined;
+    if (!row || row.status !== "staged") throw new Error("rotation commit: plan is not staged");
+    if (Date.parse(row.overlap_expires_at) <= now.getTime()) {
+      throw new Error("rotation commit: overlap window has expired; abort and stage again");
+    }
+    if (
+      row.preflight_at === null
+      || row.preflight_use_count === null
+      || row.preflight_last_used_at === null
+      || row.preflight_use_count <= row.baseline_use_count
+      || Date.parse(row.preflight_last_used_at) < Date.parse(row.staged_at)
+    ) {
+      throw new Error("rotation commit: replacement preflight has not passed");
+    }
+
+    const replacement = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(row.replacement_alias) as
+      KeyRow | undefined;
+    if (
+      !replacement
+      || replacement.revoked_at !== null
+      || (replacement.expires_at !== null && Date.parse(replacement.expires_at) <= now.getTime())
+      || replacement.use_count < row.preflight_use_count
+    ) {
+      throw new Error("rotation commit: replacement is not active");
+    }
+    const previousAliases = JSON.parse(row.previous_aliases) as string[];
+    const placeholders = previousAliases.map(() => "?").join(",");
+    const previousRows = db.prepare(
+      `SELECT alias, revoked_at, expires_at FROM api_keys WHERE alias IN (${placeholders})`
+    ).all(...previousAliases) as Array<{ alias: string; revoked_at: string | null; expires_at: string | null }>;
+    if (
+      previousRows.length !== previousAliases.length
+      || previousRows.some((previous) =>
+        previous.revoked_at !== null
+        || (previous.expires_at !== null && Date.parse(previous.expires_at) <= now.getTime()))
+    ) {
+      throw new Error("rotation commit: prior credential set changed; no revocation was performed");
+    }
+
+    const revokedAliases: string[] = [];
+    for (const alias of previousAliases) {
+      if (!revokeKey(alias, now)) throw new Error("rotation commit: atomic revoke failed");
+      revokedAliases.push(alias);
+    }
+    const completedAt = now.toISOString();
+    db.prepare(
+      `UPDATE key_rotation_plans SET status = 'committed', completed_at = ?
+        WHERE plan_id = ? AND status = 'staged'`
+    ).run(completedAt, planId);
+    const plan = rotationPlanFromRow({ ...row, status: "committed", completed_at: completedAt });
+    return { plan, revokedAliases, activeAlias: row.replacement_alias };
+  })();
+}
+
+export function abortKeyRotation(planId: string, now: Date = new Date()): KeyRotationPlan {
+  const db = ksDb();
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT * FROM key_rotation_plans WHERE plan_id = ?`).get(planId) as
+      KeyRotationPlanRow | undefined;
+    if (!row || row.status !== "staged") throw new Error("rotation abort: plan is not staged");
+    const previousAliases = JSON.parse(row.previous_aliases) as string[];
+    const placeholders = previousAliases.map(() => "?").join(",");
+    const livePrevious = db.prepare(
+      `SELECT COUNT(*) AS n FROM api_keys
+        WHERE alias IN (${placeholders}) AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at > ?)`
+    ).get(...previousAliases, now.toISOString()) as { n: number };
+    if (livePrevious.n !== previousAliases.length) {
+      throw new Error("rotation abort: prior credential set is no longer active; manual recovery required");
+    }
+    if (!revokeKey(row.replacement_alias, now)) {
+      throw new Error("rotation abort: replacement is not active");
+    }
+    const completedAt = now.toISOString();
+    db.prepare(
+      `UPDATE key_rotation_plans SET status = 'aborted', completed_at = ?
+        WHERE plan_id = ? AND status = 'staged'`
+    ).run(completedAt, planId);
+    return rotationPlanFromRow({ ...row, status: "aborted", completed_at: completedAt });
+  })();
+}
+
+export function listKeyRotations(): KeyRotationPlan[] {
+  return (ksDb().prepare(`SELECT * FROM key_rotation_plans ORDER BY staged_at`).all() as KeyRotationPlanRow[])
+    .map(rotationPlanFromRow);
+}
+
 // ─── List ─────────────────────────────────────────────────────────────────────────
 
 export function listKeys(opts: { includeRevoked?: boolean } = {}): ApiKeyPublic[] {
@@ -545,6 +954,101 @@ export function listKeys(opts: { includeRevoked?: boolean } = {}): ApiKeyPublic[
     : `SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`;
   const rows = db.prepare(sql).all() as KeyRow[];
   return rows.map((r) => toPublic(rowToRecord(r)));
+}
+
+/** Record a successful authenticated use without accepting or exposing token material. */
+export function recordKeyUse(alias: string, now: Date = new Date()): boolean {
+  const ts = now.toISOString();
+  const info = ksDb()
+    .prepare(
+      `UPDATE api_keys
+          SET last_used_at = @ts, use_count = use_count + 1
+        WHERE alias = @alias
+          AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at > @ts)`
+    )
+    .run({ alias, ts });
+  return info.changes === 1;
+}
+
+export type CredentialFinding =
+  | "no_expiry"
+  | "over_scoped"
+  | "stale"
+  | "unused"
+  | "expired"
+  | "revoked";
+
+export interface CredentialInventoryEntry extends ApiKeyPublic {
+  status: "active" | "expired" | "revoked";
+  findings: CredentialFinding[];
+}
+
+export interface CredentialInventoryReport {
+  generatedAt: string;
+  staleAfterDays: number;
+  summary: {
+    total: number;
+    active: number;
+    expired: number;
+    revoked: number;
+    findings: Record<CredentialFinding, number>;
+  };
+  /** Public metadata only. The keystore hash is excluded by the ApiKeyPublic boundary. */
+  keys: CredentialInventoryEntry[];
+}
+
+/**
+ * Build a conservative, secret-safe inventory. Admin credentials are deliberately reported as
+ * over-scoped review candidates: the operator must prove an owner-only administrative purpose;
+ * service and harness consumers should migrate to agent, monitor, or inference scope.
+ */
+export function credentialInventory(opts: {
+  now?: Date;
+  staleAfterDays?: number;
+  includeRevoked?: boolean;
+} = {}): CredentialInventoryReport {
+  const now = opts.now ?? new Date();
+  const staleAfterDays = opts.staleAfterDays ?? 30;
+  assertNonNegativeInt("staleAfterDays", staleAfterDays);
+  const staleCutoffMs = now.getTime() - staleAfterDays * 24 * 60 * 60 * 1000;
+  const source = listKeys({ includeRevoked: true });
+
+  const all = source.map((key): CredentialInventoryEntry => {
+    const expired = key.expiresAt !== null && Date.parse(key.expiresAt) <= now.getTime();
+    const status = key.revokedAt !== null ? "revoked" : expired ? "expired" : "active";
+    const findings: CredentialFinding[] = [];
+    if (status === "revoked") findings.push("revoked");
+    if (status === "expired") findings.push("expired");
+    if (status === "active") {
+      if (key.expiresAt === null) findings.push("no_expiry");
+      if (key.scope === "admin") findings.push("over_scoped");
+      if (key.useCount === 0 || key.lastUsedAt === null) {
+        findings.push("unused");
+      } else if (Date.parse(key.lastUsedAt) <= staleCutoffMs) {
+        findings.push("stale");
+      }
+    }
+    return { ...key, status, findings };
+  });
+  const keys = opts.includeRevoked ? all : all.filter((key) => key.status !== "revoked");
+  const findingNames: CredentialFinding[] = [
+    "no_expiry", "over_scoped", "stale", "unused", "expired", "revoked",
+  ];
+  return {
+    generatedAt: now.toISOString(),
+    staleAfterDays,
+    summary: {
+      total: keys.length,
+      active: keys.filter((key) => key.status === "active").length,
+      expired: keys.filter((key) => key.status === "expired").length,
+      revoked: keys.filter((key) => key.status === "revoked").length,
+      findings: Object.fromEntries(
+        findingNames.map((name) => [name, keys.filter((key) => key.findings.includes(name)).length])
+      ) as Record<CredentialFinding, number>,
+    },
+    keys,
+  };
 }
 
 // ─── Credit accounting (lifetime, non-resetting) ────────────────────────────────────

@@ -182,7 +182,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/models/load` | **admin** | `{modelKey, contextLength?, parallel?, gpu?, ttlSeconds?}`. |
 | `POST /admin/models/unload` | **admin** | `{modelKey?}` (omit to unload all). |
 | `POST /admin/models/download` | **admin** | `{modelKey, wait?}`. |
-| `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). Scope defaults preserve compatibility: owner→`admin`, guest→`inference`; guest keys cannot carry `agent` or `admin`. |
+| `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). New keys are lifetime-bounded and least-scope by default: owner→`agent`, guest→`inference`; admin must be explicit. Guest keys may carry only `inference` or read-only `monitor`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
 | `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, inflight, ownerQueued, maxInflight}`. |
@@ -197,11 +197,16 @@ and the redeem path uses a uniform error so it cannot be used to probe which cod
 
 **Tier and scope are separate.** `tier` controls privacy classification and the owner/guest
 admission lane. `scope` controls route authority: `admin` includes operator routes, `agent`
-adds `code_loop` without operator authority, and `inference` is the ordinary inference
-surface. Existing owner keys default to `admin`; new interactive Claude/Codex agent credentials should use
-`--tier owner --scope agent` so owner-content learning and owner-priority admission remain
-intact while `/delegate`, every `/admin/*` route, and `/ledger` stay forbidden. External
+adds `code_loop` without operator authority, `monitor` is the closed read-only observer surface,
+and `inference` is ordinary inference. New owner keys default to `agent`; only pre-scope legacy
+owner rows retain admin compatibility. Interactive Claude/Codex credentials should use `--tier
+owner --scope agent` so owner-content learning and owner-priority admission remain intact while
+`/delegate`, every `/admin/*` route, and `/ledger` stay forbidden. External
 exposure-receipt producers are a distinct service role and currently still require admin scope.
+
+New keys expire automatically: admin at no more than 30 days, agent at 90 days, and inference or
+monitor at 365 days. Inventory and staged migration commands are documented in
+[`docs/credential-lifecycle-runbook.md`](../../docs/credential-lifecycle-runbook.md).
 
 Auth is `Authorization: Bearer <key>`. **Safety default:** the gateway refuses to bind a
 non-loopback host when no API keys are configured (no legacy keys **and** no minted keys) —

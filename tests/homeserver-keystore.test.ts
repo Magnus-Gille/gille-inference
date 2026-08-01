@@ -33,10 +33,10 @@ function alias(): string {
 }
 
 describe("keystore mint / lookup", () => {
-  it("defaults legacy tiers to compatible access scopes and persists an explicit agent scope", () => {
+  it("defaults new owner keys to agent, guest keys to inference, and preserves explicit scope", () => {
     const owner = mintKey({ alias: alias(), tier: "owner" }, DEFAULTS);
-    expect(owner.record.scope).toBe("admin");
-    expect(lookupKey(owner.plaintextKey)?.scope).toBe("admin");
+    expect(owner.record.scope).toBe("agent");
+    expect(lookupKey(owner.plaintextKey)?.scope).toBe("agent");
 
     const guest = mintKey({ alias: alias(), tier: "guest" }, DEFAULTS);
     expect(guest.record.scope).toBe("inference");

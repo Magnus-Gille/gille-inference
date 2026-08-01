@@ -218,6 +218,7 @@ describe("gateway spine — HTTP integration", () => {
     const owner = mintKey({
       alias: `service-hugin-${randomUUID()}`,
       tier: "owner",
+      scope: "admin",
       rpm: 1,
       creditLimit: 1_000_000,
     }, DEFAULTS);
@@ -323,7 +324,7 @@ describe("gateway spine — HTTP integration", () => {
     // Clear the quota window first so this assertion exercises the busy gate independently.
     resetQuotaWindows();
     mockMode = "stall";
-    const holder = mintKey({ alias: `delegate-holder-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const holder = mintKey({ alias: `delegate-holder-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const heldRequest = fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${holder.plaintextKey}` },
@@ -339,9 +340,13 @@ describe("gateway spine — HTTP integration", () => {
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
       body: JSON.stringify(requestBody),
     });
+    // The structural proof is that the holder's slot is released only after this race. Allow a
+    // generous scheduler budget so a heavily loaded parallel test worker cannot turn that proof
+    // into a wall-clock flake; an implementation queued behind the holder still cannot win.
+    const busyRecoverySchedulerBudgetMs = 500;
     const busyRecoveryWasImmediate = await Promise.race([
       busyRecoveryPromise.then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 150)),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), busyRecoverySchedulerBudgetMs)),
     ]);
     releaseStall?.();
     const [heldResponse, busyRecovery] = await Promise.all([heldRequest, busyRecoveryPromise]);
@@ -407,7 +412,7 @@ describe("gateway spine — HTTP integration", () => {
     });
     expect(changedFingerprintResponse.status).toBe(409);
 
-    const otherOwner = mintKey({ alias: `delegate-recovery-other-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const otherOwner = mintKey({ alias: `delegate-recovery-other-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const changedPrincipalResponse = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${otherOwner.plaintextKey}` },
@@ -422,7 +427,7 @@ describe("gateway spine — HTTP integration", () => {
   // stamp must therefore be admitted rather than rejected with a confusing "stamped task type does
   // not match", while a genuinely different type must still fail closed.
   it("stamped /delegate compares the stamp against the resolved (trimmed) task type", async () => {
-    const owner = mintKey({ alias: `service-hugin-padded-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `service-hugin-padded-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const { stamp, requestBody } = await makeStampedDelegateRequest(owner);
     expect(requestBody.taskType).toBe(stamp.task_type.id);
     // Use a taskType cell no other test in this file writes to (same reasoning as the evidence
@@ -466,7 +471,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("preserves stamped /delegate admission when ledger persistence throws after inference", async () => {
-    const owner = mintKey({ alias: `service-hugin-post-inference-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `service-hugin-post-inference-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const { requestBody } = await makeStampedDelegateRequest(owner);
     const { recordDelegation } = await import("../src/homeserver/ledger.js");
     // Initialize the ledger schema before installing a deterministic post-inference failure.
@@ -567,7 +572,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("model allow-list: an empty allow-list (owner) MAY omit the model", async () => {
-    const owner = mintKey({ alias: "allow-list-owner-omit", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "allow-list-owner-omit", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/v1/chat/completions"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -591,7 +596,7 @@ describe("gateway spine — HTTP integration", () => {
   it("admission 503: guest is rejected while a slot is held; a queued owner succeeds on release", async () => {
     mockMode = "stall";
     // Owner needs maxParallel >= 2 so a second owner request can queue while the first holds the slot.
-    const owner = mintKey({ alias: "adm-owner", tier: "owner", maxParallel: 2 }, DEFAULTS);
+    const owner = mintKey({ alias: "adm-owner", tier: "owner", scope: "admin", maxParallel: 2 }, DEFAULTS);
     const guest = mintKey({ alias: "adm-guest", tier: "guest" }, DEFAULTS);
 
     // Owner holds the single slot (request stalls in upstream).
@@ -665,7 +670,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("/delegate is owner-only: an owner key is NOT rejected at the route gate (Fix #5)", async () => {
-    const owner = mintKey({ alias: "del-owner", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "del-owner", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -682,7 +687,7 @@ describe("gateway spine — HTTP integration", () => {
       mode: "shadow", gptModel: "gpt-oss-120b", qwenModel: "qwen35-122b-a10b", taskTypes: ["code-review"],
     });
     mockMode = "sse";
-    const owner = mintKey({ alias: `cascade-owner-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `cascade-owner-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -709,7 +714,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("#87: an explicit classify delegate request has a non-empty JSON outcome", async () => {
-    const owner = mintKey({ alias: `delegate-classify-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `delegate-classify-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -733,12 +738,12 @@ describe("gateway spine — HTTP integration", () => {
 
   it("a minted owner can look up chat and direct-delegate exposure without raw task text", async () => {
     const chatOwner = mintKey(
-      { alias: "task-exposure-chat-owner", tier: "owner", modelAllowList: ["m1"] },
+      { alias: "task-exposure-chat-owner", tier: "owner", scope: "admin", modelAllowList: ["m1"] },
       DEFAULTS
     );
     // /delegate is intentionally restricted to an unscoped owner key because the orchestrator
     // may select a model after admission; pin m1 in the request so the asserted metadata is stable.
-    const owner = mintKey({ alias: "task-exposure-owner", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "task-exposure-owner", tier: "owner", scope: "admin" }, DEFAULTS);
     const chatMarker = "EXPOSURE_CHAT_RAW_MARKER_257";
     const legacyOwnerChatMarker = "EXPOSURE_LEGACY_OWNER_CHAT_MARKER_257";
     const delegateMarker = "EXPOSURE_DELEGATE_RAW_MARKER_257";
@@ -811,7 +816,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("finds a stamped Hugin delegate task by its canonical identity, distinct from its rendered prompt (#4)", async () => {
-    const owner = mintKey({ alias: `task-exposure-canonical-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `task-exposure-canonical-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const { requestBody } = await makeStampedDelegateRequest(owner);
     // Grimnir's vendored bc8cf09 "ASCII trim" vector — the fixture's raw_fingerprint.digest was
     // constructed to equal this exact vector (see tests/fixtures/learning-task-contract/PROVENANCE.md).
@@ -878,7 +883,7 @@ describe("gateway spine — HTTP integration", () => {
     // that already drives canonicalTaskFingerprintSha256 into orchestrator.delegate() as
     // learningTaskStamp, which binds DelegationRecord.evidenceIdentity on the real write path
     // (previously nothing populated it at all — PR #28 shipped only the pure derivation + storage).
-    const owner = mintKey({ alias: `evidence-identity-http-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `evidence-identity-http-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const { requestBody } = await makeStampedDelegateRequest(owner);
     // A never-elsewhere-used-in-this-file taskType (still a valid taxonomy enum member — the stamp
     // schema restricts task_type.id to the fixed taxonomy list). This file's shared real ledger DB
@@ -941,7 +946,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("task exposure lookup validates the versioned bounded fingerprint contract", async () => {
-    const owner = mintKey({ alias: "task-exposure-validation", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "task-exposure-validation", tier: "owner", scope: "admin" }, DEFAULTS);
     const response = await fetch(url("/admin/task-exposures/lookup"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -994,7 +999,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("#10 AC1: a Codex App exposure receipt is later found seen (and cross-surface linked) via the shared #4 lookup", async () => {
-    const owner = mintKey({ alias: `codex-app-work-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `codex-app-work-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const receipt = makeExposureReceipt();
 
     const intake = await fetch(url("/admin/exposure-receipts"), {
@@ -1038,7 +1043,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("#10: exposure-receipts intake rejects an unsupported schema version with a specific reason", async () => {
-    const owner = mintKey({ alias: `codex-cli-reject-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `codex-cli-reject-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const receipt = { ...makeExposureReceipt(), schemaVersion: 999 };
     const response = await fetch(url("/admin/exposure-receipts"), {
       method: "POST",
@@ -1051,7 +1056,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("#10: producer heartbeat endpoint accepts a registered surface and rejects an unknown one", async () => {
-    const owner = mintKey({ alias: `pi-heartbeat-${randomUUID()}`, tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: `pi-heartbeat-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const ok = await fetch(url("/admin/exposure-receipts/heartbeat"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -1173,7 +1178,7 @@ describe("gateway spine — HTTP integration", () => {
     mockMode = "stall";
     // Owner holds the single slot. The guest has a daily budget so that double-charging the
     // rejected request's estimate against the daily counter would block its next (real) call.
-    const owner = mintKey({ alias: "m1-owner", tier: "owner", maxParallel: 1 }, DEFAULTS);
+    const owner = mintKey({ alias: "m1-owner", tier: "owner", scope: "admin", maxParallel: 1 }, DEFAULTS);
     const guest = mintKey({ alias: "m1-guest", tier: "guest", dailyTokenBudget: 400 }, DEFAULTS);
 
     const heldP = chat(owner.plaintextKey, {});
@@ -1332,6 +1337,7 @@ describe("gateway spine — HTTP integration", () => {
     const owner = mintKey({
       alias: `service-hugin-ledger-binding-${randomUUID()}`,
       tier: "owner",
+      scope: "admin",
       creditLimit: 1_000_000,
     }, DEFAULTS);
     const first = await makeStampedDelegateRequest(owner);
@@ -1521,7 +1527,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("#15: invalid JSON body for /delegate → 400 envelope, not 500", async () => {
-    const owner = mintKey({ alias: "bad-json-delegate", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "bad-json-delegate", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -1534,7 +1540,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("#15: missing 'prompt' on /delegate → 400 envelope with param:prompt", async () => {
-    const owner = mintKey({ alias: "no-prompt-del", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "no-prompt-del", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
@@ -1547,7 +1553,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("/delegate rejects malformed sampler controls before admission", async () => {
-    const owner = mintKey({ alias: "bad-sampler-delegate", tier: "owner" }, DEFAULTS);
+    const owner = mintKey({ alias: "bad-sampler-delegate", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
