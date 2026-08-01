@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 const SCRIPT = join(__dirname, "..", "scripts", "verify-public-edge.sh");
 
-function fakeCurl(dir: string, redirectStatus = "308"): string {
+function fakeCurl(dir: string, redirectStatus = "308", hsts = "max-age=31536000"): string {
   const bin = join(dir, "curl");
   writeFileSync(
     bin,
@@ -22,7 +22,7 @@ case "\$url" in
   https://edge.test/portal)
     printf "%s\\r\\n" \\
       'HTTP/1.1 200 OK' \\
-      'Strict-Transport-Security: max-age=31536000' \\
+      'Strict-Transport-Security: ${hsts}' \\
       "Content-Security-Policy: default-src 'self'; frame-ancestors 'none'" \\
       'X-Frame-Options: DENY' \\
       'Referrer-Policy: no-referrer' \\
@@ -70,6 +70,36 @@ describe("scripts/verify-public-edge.sh", () => {
         encoding: "utf8",
         stdio: "pipe",
       })).toThrow(/expected one permanent redirect/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects HSTS max-age=0 instead of treating it as an active HSTS policy", () => {
+    const dir = mkdtempSync(join(tmpdir(), "public-edge-"));
+    try {
+      fakeCurl(dir, "308", "max-age=0");
+      expect(() => execFileSync("bash", [SCRIPT, "http://edge.test", "https://edge.test"], {
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CURL_LOG: join(dir, "curl.log") },
+        encoding: "utf8",
+        stdio: "pipe",
+      })).toThrow(/positive HSTS max-age/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects non-origin URLs and mismatched HTTP/HTTPS authorities before making requests", () => {
+    const dir = mkdtempSync(join(tmpdir(), "public-edge-"));
+    try {
+      fakeCurl(dir);
+      const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, CURL_LOG: join(dir, "curl.log") };
+      expect(() => execFileSync("bash", [SCRIPT, "http://edge.test/path", "https://edge.test"], {
+        env, encoding: "utf8", stdio: "pipe",
+      })).toThrow(/origin only/);
+      expect(() => execFileSync("bash", [SCRIPT, "http://edge.test", "https://other.test"], {
+        env, encoding: "utf8", stdio: "pipe",
+      })).toThrow(/same host and port/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

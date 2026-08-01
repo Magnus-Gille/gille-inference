@@ -5,10 +5,26 @@ set -euo pipefail
 
 http_base="${1:-http://inference.example.com}"
 https_base="${2:-https://inference.example.com}"
-case "$http_base" in http://*) ;; *) echo "ERROR: HTTP base must start with http://" >&2; exit 2 ;; esac
-case "$https_base" in https://*) ;; *) echo "ERROR: HTTPS base must start with https://" >&2; exit 2 ;; esac
+if [[ ! "$http_base" =~ ^http://[^/?#]+/?$ ]]; then
+  echo "ERROR: HTTP base must be an origin only (http://host[:port]), with no path, query, or fragment." >&2
+  exit 2
+fi
+if [[ ! "$https_base" =~ ^https://[^/?#]+/?$ ]]; then
+  echo "ERROR: HTTPS base must be an origin only (https://host[:port]), with no path, query, or fragment." >&2
+  exit 2
+fi
 http_base="${http_base%/}"
 https_base="${https_base%/}"
+http_authority="${http_base#http://}"
+https_authority="${https_base#https://}"
+if [[ "$http_authority" == *"@"* || "$https_authority" == *"@"* ]]; then
+  echo "ERROR: public-edge bases must not contain userinfo." >&2
+  exit 2
+fi
+if [ "$(printf '%s' "$http_authority" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$https_authority" | tr '[:upper:]' '[:lower:]')" ]; then
+  echo "ERROR: HTTP and HTTPS bases must use the same host and port authority." >&2
+  exit 2
+fi
 
 headers_for() {
   local method="$1" request_url="$2"
@@ -73,7 +89,8 @@ csp="$(header_value "$portal_headers" content-security-policy)"
 xfo="$(header_value "$portal_headers" x-frame-options)"
 referrer="$(header_value "$portal_headers" referrer-policy)"
 permissions="$(header_value "$portal_headers" permissions-policy)"
-[[ "$hsts" == *"max-age="* ]] || { echo "ERROR: HTTPS portal lacks HSTS max-age." >&2; exit 1; }
+hsts_max_age="$(printf '%s\n' "$hsts" | awk '{ line=tolower($0); if (match(line, /max-age[[:space:]]*=[[:space:]]*[0-9]+/)) { value=substr(line, RSTART, RLENGTH); sub(/.*=/, "", value); gsub(/[[:space:]]/, "", value); print value; exit } }')"
+[[ "$hsts_max_age" =~ ^[0-9]+$ && "$hsts_max_age" =~ [1-9] ]] || { echo "ERROR: HTTPS portal lacks a positive HSTS max-age." >&2; exit 1; }
 [[ "$csp" == *"frame-ancestors 'none'"* ]] || { echo "ERROR: HTTPS portal CSP lacks frame-ancestors 'none'." >&2; exit 1; }
 [ "$xfo" = "DENY" ] || { echo "ERROR: HTTPS portal lacks X-Frame-Options: DENY." >&2; exit 1; }
 [ "$referrer" = "no-referrer" ] || { echo "ERROR: HTTPS portal lacks Referrer-Policy: no-referrer." >&2; exit 1; }
