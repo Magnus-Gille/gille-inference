@@ -41,7 +41,49 @@ apply gateway "$BACKUP_ROOT"
   return readFileSync(log, "utf8");
 }
 
+function runUserManagerHarness(readyOnAttempt: number | null): { status: number; output: string } {
+  const work = mkdtempSync(join(tmpdir(), "gille-user-manager-harness-"));
+  const harness = join(work, "harness.sh");
+  writeFileSync(harness, `#!/usr/bin/env bash
+source "$1"
+attempt=0
+id() { printf '4242\\n'; }
+loginctl() { if [ "$1" = show-user ]; then printf 'yes\\n'; else return 0; fi; }
+systemctl() { [ "$1" = start ] && printf 'started:%s\\n' "$2"; }
+gateway_user_bus_ready() { attempt=$((attempt + 1)); [ "$attempt" -ge "${readyOnAttempt ?? 999}" ]; }
+runuser() { printf 'probe\\n'; }
+sleep() { :; }
+prepare_gateway_user_manager
+`, { mode: 0o755 });
+  try {
+    return { status: 0, output: execFileSync("bash", [harness, script], { cwd: root, encoding: "utf8", stderr: "pipe" }) };
+  } catch (error: any) {
+    return { status: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
+  }
+}
+
 describe("service-isolation migration contract (#151)", () => {
+  it("waits for a delayed lingered user manager bus after explicitly starting user@UID", () => {
+    const result = runUserManagerHarness(3);
+    expect(result.status).toBe(0);
+    expect(result.output).toContain("started:user@4242.service");
+  });
+
+  it("fails closed with actionable user-manager context when the bus never becomes ready", () => {
+    const result = runUserManagerHarness(null);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain("did not become ready after 10s");
+    expect(result.output).toContain("journalctl -u user@4242.service");
+  });
+
+  it("allows only reviewed Pi package provenance when cloning the code-loop runtime", () => {
+    const mario = "/home/magnus/.local/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js";
+    const earendil = "/home/magnus/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
+    expect(execFileSync("bash", ["-c", "source \"$1\"; gateway_codeloop_package_from_resolved_path \"$2\"", "--", script, mario], { encoding: "utf8" }).trim()).toBe("@mariozechner/pi-coding-agent");
+    expect(execFileSync("bash", ["-c", "source \"$1\"; gateway_codeloop_package_from_resolved_path \"$2\"", "--", script, earendil], { encoding: "utf8" }).trim()).toBe("@earendil-works/pi-coding-agent");
+    expect(() => execFileSync("bash", ["-c", "source \"$1\"; gateway_codeloop_package_from_resolved_path \"$2\"", "--", script, "/tmp/unknown/cli.js"], { encoding: "utf8" })).toThrow();
+  });
+
   it("is executable from the committed tree for the documented direct invocation", () => {
     expect(statSync(script).mode & 0o111).not.toBe(0);
     expect(execFileSync(script, ["--help"], { cwd: root, encoding: "utf8" })).toContain("Usage: scripts/service-isolation.sh");
