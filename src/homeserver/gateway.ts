@@ -75,7 +75,6 @@ import {
   REVIEW_BOUNDED_TASK_TYPE,
   REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
-  reviewerUsefulnessRecordingCapability,
   reviewerUsefulnessRecordingCapabilityForPrincipal,
   parseReviewerUsefulnessWriteBody,
   type ReviewLaneReviewerUsefulness,
@@ -422,14 +421,10 @@ function reviewerUsefulnessConflictMessage(args: {
 function reviewerUsefulnessConflictResponse(
   message: string,
   conflict: unknown,
-): { error: { message: string; type: string; code: "reviewer_usefulness_conflict"; param: string | null }; conflict: unknown } {
+): { error: ReturnType<typeof makeError>["body"]["error"]; conflict: unknown } {
+  const { body } = makeError("reviewer_usefulness_conflict", { message });
   return {
-    error: {
-      type: "invalid_request_error",
-      code: "reviewer_usefulness_conflict",
-      message,
-      param: null,
-    },
+    error: body.error,
     conflict,
   };
 }
@@ -4531,53 +4526,50 @@ export async function handleRequest(
         notes,
         judgedBy: reviewerIdentity,
       });
-      if (result.kind === "not_found") {
-        lctx.status = 404;
-        lctx.outcome = "not_found";
-        lctx.errorClass = "not_found";
-        sendError(res, makeError("not_found"));
-        return;
+      switch (result.kind) {
+        case "not_found":
+          lctx.status = 404;
+          lctx.outcome = "not_found";
+          lctx.errorClass = "not_found";
+          sendError(res, makeError("not_found"));
+          return;
+        case "recorded":
+        case "unchanged":
+          sendJson(res, result.kind === "recorded" ? 201 : 200, reviewerUsefulnessWriteResponse({
+            ledgerId,
+            taskType: result.taskType,
+            usefulness,
+            reviewerIdentity,
+            reviewerUsefulnessTs: result.record.reviewerUsefulnessTs!,
+            notes,
+            writeState: result.kind,
+          }));
+          lctx.status = result.kind === "recorded" ? 201 : 200;
+          lctx.outcome = "ok";
+          return;
+        case "conflict":
+          lctx.status = 409;
+          lctx.outcome = "conflict";
+          lctx.errorClass = "reviewer_usefulness_conflict";
+          switch (result.conflict.kind) {
+            case "wrong_task_type":
+            case "missing_verifier":
+              sendJson(res, 409, reviewerUsefulnessConflictResponse(
+                "Reviewer usefulness recording is only available for validated review-bounded delegations.",
+                reviewerUsefulnessConflictApiShape(result.conflict),
+              ));
+              return;
+            case "already_recorded":
+              sendJson(res, 409, reviewerUsefulnessConflictResponse(
+                reviewerUsefulnessConflictMessage({
+                  existing: result.conflict.existing,
+                  attempted: result.conflict.attempted,
+                }),
+                reviewerUsefulnessConflictApiShape(result.conflict),
+              ));
+              return;
+          }
       }
-      if (result.kind === "recorded" || result.kind === "unchanged") {
-        sendJson(res, result.kind === "recorded" ? 201 : 200, reviewerUsefulnessWriteResponse({
-          ledgerId,
-          taskType: REVIEW_BOUNDED_TASK_TYPE,
-          usefulness,
-          reviewerIdentity,
-          reviewerUsefulnessTs: result.record.reviewerUsefulnessTs!,
-          notes,
-          writeState: result.kind,
-        }));
-        lctx.status = result.kind === "recorded" ? 201 : 200;
-        lctx.outcome = "ok";
-        return;
-      }
-
-      lctx.status = 409;
-      lctx.outcome = "conflict";
-      lctx.errorClass = "reviewer_usefulness_conflict";
-      if (result.conflict.kind === "wrong_task_type") {
-        sendJson(res, 409, reviewerUsefulnessConflictResponse(
-          "Reviewer usefulness recording is only available for validated review-bounded delegations.",
-          reviewerUsefulnessConflictApiShape(result.conflict),
-        ));
-        return;
-      }
-      if (result.conflict.kind === "missing_verifier") {
-        sendJson(res, 409, reviewerUsefulnessConflictResponse(
-          "Reviewer usefulness recording is only available for validated review-bounded delegations.",
-          reviewerUsefulnessConflictApiShape(result.conflict),
-        ));
-        return;
-      }
-      sendJson(res, 409, reviewerUsefulnessConflictResponse(
-        reviewerUsefulnessConflictMessage({
-          existing: result.conflict.existing,
-          attempted: result.conflict.attempted,
-        }),
-        reviewerUsefulnessConflictApiShape(result.conflict),
-      ));
-      return;
     }
     if (path === "/metrics" && method === "GET") {
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });

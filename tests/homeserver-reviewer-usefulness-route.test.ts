@@ -11,6 +11,7 @@ let adminKey = "";
 let secondAdminKey = "";
 let guestKey = "";
 let monitorKey = "";
+let ownerMonitorKey = "";
 let agentKey = "";
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
@@ -31,6 +32,7 @@ beforeAll(async () => {
   secondAdminKey = ks.mintKey({ alias: "reviewer-admin-r2", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
   guestKey = ks.mintKey({ alias: "reviewer-guest", tier: "guest" }, DEFAULTS).plaintextKey;
   monitorKey = ks.mintKey({ alias: "reviewer-monitor", tier: "guest", scope: "monitor" }, DEFAULTS).plaintextKey;
+  ownerMonitorKey = ks.mintKey({ alias: "reviewer-owner-monitor", tier: "owner", scope: "monitor" }, DEFAULTS).plaintextKey;
   agentKey = ks.mintKey({ alias: "reviewer-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
 
   harness = createDirectGatewayHarness();
@@ -51,6 +53,8 @@ interface ReviewerUsefulnessConflictResponse {
   error: {
     code: string;
     message: string;
+    type: string;
+    param: string | null;
   };
   conflict: {
     kind: string;
@@ -90,6 +94,16 @@ function makeNonReviewRow(): string {
     prompt: "summarize this",
     outcome: "pass",
     verifier: "jsonValid",
+    source: "gateway",
+  });
+}
+
+function makeReviewBoundedRowWithoutVerifier(): string {
+  return recordDelegation({
+    taskType: "review-bounded",
+    modelId: "qwen3-coder-next-80b",
+    prompt: "gille review-bounded contract v1 ...",
+    outcome: "pass",
     source: "gateway",
   });
 }
@@ -213,7 +227,11 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     }, secondAdminKey);
     expect(secondReviewer.status).toBe(409);
     expect(secondReviewer.json as ReviewerUsefulnessConflictResponse).toMatchObject({
-      error: { code: "reviewer_usefulness_conflict" },
+      error: {
+        code: "reviewer_usefulness_conflict",
+        type: "invalid_request_error",
+        param: "ledgerId",
+      },
       conflict: {
         kind: "already_recorded",
         mismatchFields: ["reviewerIdentity"],
@@ -251,10 +269,12 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(conflicting.status).toBe(409);
     const body = conflicting.json as ReviewerUsefulnessConflictResponse;
     expect(body.error.code).toBe("reviewer_usefulness_conflict");
+    expect(body.error.type).toBe("invalid_request_error");
+    expect(body.error.param).toBe("ledgerId");
     expect(body.error.message).toContain("Exact retries are idempotent");
     expect(body.conflict).toMatchObject({
       kind: "already_recorded",
-      mismatchFields: ["usefulness", "notes"],
+      mismatchFields: ["reviewerUsefulness", "notes"],
       existing: {
         reviewerUsefulness: "pass",
         reviewerIdentity: "reviewer-admin",
@@ -345,8 +365,12 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
       notes: NOTES,
     }, adminKey);
     expect(res.status).toBe(409);
-    const body = res.json as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("reviewer_usefulness_conflict");
+    const body = res.json as ReviewerUsefulnessConflictResponse;
+    expect(body.error).toMatchObject({
+      code: "reviewer_usefulness_conflict",
+      type: "invalid_request_error",
+      param: "ledgerId",
+    });
     expect(body.conflict).toMatchObject({
       kind: "wrong_task_type",
       taskType: "summarize",
@@ -354,7 +378,27 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
 
-  it("stays minted-owner-admin only: unauthenticated, guest, monitor, and owner-agent callers cannot write", async () => {
+  it("rejects review-bounded rows that were never verifier-backed", async () => {
+    const ledgerId = makeReviewBoundedRowWithoutVerifier();
+    const res = await putReviewerUsefulness(ledgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(res.status).toBe(409);
+    expect(res.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      error: {
+        code: "reviewer_usefulness_conflict",
+        type: "invalid_request_error",
+        param: "ledgerId",
+      },
+      conflict: {
+        kind: "missing_verifier",
+      },
+    });
+    expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
+  });
+
+  it("stays minted-owner-admin only: unauthenticated, guest, monitor, owner-monitor, and owner-agent callers cannot write", async () => {
     const ledgerId = makeReviewBoundedRow();
 
     const unauthenticated = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES });
@@ -365,6 +409,9 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
 
     const monitor = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES }, monitorKey);
     expect(monitor.status).toBe(403);
+
+    const ownerMonitor = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES }, ownerMonitorKey);
+    expect(ownerMonitor.status).toBe(403);
 
     const agent = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES }, agentKey);
     expect(agent.status).toBe(403);

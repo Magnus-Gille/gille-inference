@@ -481,15 +481,6 @@ export function reviewerUsefulnessRecordingCapabilityForPrincipal(
   };
 }
 
-export function reviewerUsefulnessRecordingCapability(): ReviewerUsefulnessRecordingCapability {
-  return reviewerUsefulnessRecordingCapabilityForPrincipal({
-    tier: "owner",
-    scope: "admin",
-    keyHash: "capability-preview",
-    logicalAlias: "reviewer",
-  });
-}
-
 export interface ReviewerUsefulnessWrite {
   usefulness: ReviewLaneReviewerUsefulness;
   notes: string | null;

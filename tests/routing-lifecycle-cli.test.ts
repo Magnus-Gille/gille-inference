@@ -92,11 +92,10 @@ describe("routing-lifecycle-cli.ts review (issue #7)", () => {
 // ── issue #37: the live #6 calibration gate, and its fail-closed admissibility rule ──────────────
 
 describe("routing-lifecycle-cli.ts review — live #6 calibration gate wiring (issue #37)", () => {
-  // Reuses the SAME seeded db/dir as the outer describe block (module-scoped `dir`/`dbPath`) —
-  // ledger.ts's ensureSchema() guards table creation behind a process-wide `_initialised` flag, so a
-  // second `initDb(<new path>)` call within this same test file/process would silently skip
-  // creating the delegations table on a fresh db file. Adding rows to the already-initialised db is
-  // both correct and simpler.
+  // Reuses the SAME seeded db/dir as the outer describe block (module-scoped `dir`/`dbPath`) so
+  // these review-gate rows intentionally join the existing fixture state. The current ledger
+  // schema init is per-Database (WeakSet-keyed), so a fresh `initDb(<new path>)` would also work;
+  // reuse here is about the evidence shape, not a schema-init limitation.
   beforeAll(() => {
     // "instruction-multi-constraint" — an ad-hoc, evidence-backed task type OUTSIDE the base
     // taxonomy (routing-table-generator.ts's resolveRoutableTypes adds it as an "extra" from ledger

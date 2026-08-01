@@ -14,6 +14,7 @@ import { createDirectGatewayHarness, type DirectGatewayHarness } from "./helpers
 
 let harness: DirectGatewayHarness;
 let ownerKey = "";
+let ownerMonitorKey = "";
 let guestKey = "";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 
@@ -29,6 +30,7 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   ownerKey = ks.mintKey({ alias: "review-lane-owner", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
+  ownerMonitorKey = ks.mintKey({ alias: "review-lane-owner-monitor", tier: "owner", scope: "monitor" }, DEFAULTS).plaintextKey;
   guestKey = ks.mintKey({ alias: "review-lane-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   harness = createDirectGatewayHarness();
@@ -110,6 +112,20 @@ describe("GET /v1/capabilities/review-lane", () => {
     expect(j.reviewerUsefulnessRecording.available).toBe(false);
     expect(j.reviewerUsefulnessRecording.authorization).toBe("minted-owner-admin");
     expect(j.reviewerUsefulnessRecording.availabilityReason).toBe("requires_owner_admin");
+  });
+
+  it("an owner-tier monitor key is denied before review-lane capability dispatch", async () => {
+    const r = await harness.invoke({
+      method: "GET",
+      path: "/v1/capabilities/review-lane",
+      token: ownerMonitorKey,
+    });
+    expect(r.status).toBe(403);
+    expect(r.json).toMatchObject({
+      error: {
+        code: "route_not_allowed",
+      },
+    });
   });
 
   it("an explicit ?taskType= for an unknown type is echoed back as frontier-only", async () => {

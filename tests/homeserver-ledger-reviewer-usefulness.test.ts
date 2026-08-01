@@ -10,16 +10,74 @@
  * already returns.
  */
 import { describe, it, expect, beforeAll } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { initDb } from "../src/db.js";
-import { recordDelegation, recordReviewerUsefulness, getDelegationById } from "../src/homeserver/ledger.js";
+import {
+  recordDelegation,
+  recordReviewerUsefulness,
+  getDelegationById,
+  type ReviewerUsefulnessResult,
+} from "../src/homeserver/ledger.js";
+
+const REVIEWER_USEFULNESS_WORKER = fileURLToPath(
+  new URL("./fixtures/reviewer-usefulness-worker.ts", import.meta.url)
+);
+let dbPath = "";
 
 beforeAll(() => {
   const dir = mkdtempSync(join(tmpdir(), "hs-ledger-reviewer-usefulness-test-"));
-  initDb(join(dir, "test.db"));
+  dbPath = join(dir, "test.db");
+  initDb(dbPath);
 });
+
+function runReviewerUsefulnessWorker(args: {
+  ledgerId: string;
+  usefulness: "pass" | "partial" | "redo" | "wrong";
+  judgedBy: string;
+  notes: string | null;
+  startAtMs: number;
+}): Promise<ReviewerUsefulnessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--import",
+      "tsx",
+      REVIEWER_USEFULNESS_WORKER,
+      dbPath,
+      String(args.startAtMs),
+      args.ledgerId,
+      args.usefulness,
+      args.judgedBy,
+      args.notes ?? "__NULL__",
+    ], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`reviewer usefulness worker exited ${code}: ${stderr || stdout}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout) as ReviewerUsefulnessResult);
+      } catch (err) {
+        reject(new Error(`reviewer usefulness worker emitted invalid JSON: ${stdout}\n${String(err)}`));
+      }
+    });
+  });
+}
 
 describe("recordReviewerUsefulness (#74)", () => {
   it("a fresh delegation row has no reviewer usefulness yet", () => {
@@ -133,12 +191,138 @@ describe("recordReviewerUsefulness (#74)", () => {
       kind: "conflict",
       conflict: {
         kind: "already_recorded",
-        mismatchFields: ["usefulness", "reviewerIdentity", "notes"],
+        mismatchFields: ["reviewerUsefulness", "reviewerIdentity", "notes"],
       },
     });
     const row = getDelegationById(id);
     expect(row?.reviewerUsefulness).toBe("redo");
     expect(row?.reviewerUsefulnessNotes).toBeNull();
+  });
+
+  it("rejects review-bounded rows that have no verifier yet", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "missing_verifier" },
+    });
+  });
+
+  it("fails closed on legacy partially populated reviewer-usefulness columns", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+    });
+    const db = initDb(dbPath);
+    db.prepare(`
+      UPDATE delegations
+         SET reviewer_usefulness = @usefulness,
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = @judgedBy,
+             reviewer_usefulness_ts = NULL
+       WHERE id = @id
+    `).run({
+      usefulness: "pass",
+      notes: "ref:gille-inference#112 check:manual",
+      judgedBy: "grimnir-session-2026-07-24",
+      id,
+    });
+
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "pass",
+      notes: "ref:gille-inference#112 check:manual",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: {
+        kind: "already_recorded",
+        mismatchFields: [],
+      },
+    });
+  });
+
+  it("keeps exact concurrent double-writers idempotent on the real SQLite path", async () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+    });
+    const startAtMs = Date.now() + 500;
+    const [a, b] = await Promise.all([
+      runReviewerUsefulnessWorker({
+        ledgerId: id,
+        usefulness: "pass",
+        judgedBy: "grimnir-session-2026-07-24",
+        notes: "ref:gille-inference#112 check:manual",
+        startAtMs,
+      }),
+      runReviewerUsefulnessWorker({
+        ledgerId: id,
+        usefulness: "pass",
+        judgedBy: "grimnir-session-2026-07-24",
+        notes: "ref:gille-inference#112 check:manual",
+        startAtMs,
+      }),
+    ]);
+
+    expect([a.kind, b.kind].sort()).toEqual(["recorded", "unchanged"]);
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: "pass",
+      reviewerUsefulnessBy: "grimnir-session-2026-07-24",
+      reviewerUsefulnessNotes: "ref:gille-inference#112 check:manual",
+    });
+  });
+
+  it("serializes genuine conflicting double-writers so only one durable verdict lands", async () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+    });
+    const startAtMs = Date.now() + 500;
+    const [a, b] = await Promise.all([
+      runReviewerUsefulnessWorker({
+        ledgerId: id,
+        usefulness: "pass",
+        judgedBy: "grimnir-session-2026-07-24-a",
+        notes: "ref:gille-inference#112 check:manual",
+        startAtMs,
+      }),
+      runReviewerUsefulnessWorker({
+        ledgerId: id,
+        usefulness: "wrong",
+        judgedBy: "grimnir-session-2026-07-24-b",
+        notes: "ref:gille-inference#112 verdict:refuted",
+        startAtMs,
+      }),
+    ]);
+
+    expect([a.kind, b.kind].sort()).toEqual(["conflict", "recorded"]);
+    const row = getDelegationById(id);
+    expect(row?.reviewerUsefulness === "pass" || row?.reviewerUsefulness === "wrong").toBe(true);
+    if (row?.reviewerUsefulness === "pass") {
+      expect(row.reviewerUsefulnessBy).toBe("grimnir-session-2026-07-24-a");
+      expect(row.reviewerUsefulnessNotes).toBe("ref:gille-inference#112 check:manual");
+    } else {
+      expect(row?.reviewerUsefulnessBy).toBe("grimnir-session-2026-07-24-b");
+      expect(row?.reviewerUsefulnessNotes).toBe("ref:gille-inference#112 verdict:refuted");
+    }
   });
 
   it("returns a closed not_found result for an unknown ledger id", () => {
@@ -147,5 +331,39 @@ describe("recordReviewerUsefulness (#74)", () => {
       usefulness: "pass",
       judgedBy: "grimnir-session-2026-07-24",
     })).toMatchObject({ kind: "not_found" });
+  });
+
+  it("initializes the delegations schema on each fresh Database object in one process", () => {
+    const firstDir = mkdtempSync(join(tmpdir(), "hs-ledger-reviewer-usefulness-first-"));
+    initDb(join(firstDir, "first.db"));
+    const firstId = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+    });
+    expect(getDelegationById(firstId)?.reviewerUsefulness).toBeNull();
+
+    const secondDir = mkdtempSync(join(tmpdir(), "hs-ledger-reviewer-usefulness-second-"));
+    const secondPath = join(secondDir, "second.db");
+    initDb(secondPath);
+    const secondId = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: secondId,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "recorded",
+      taskType: "review-bounded",
+    });
+
+    initDb(dbPath);
   });
 });

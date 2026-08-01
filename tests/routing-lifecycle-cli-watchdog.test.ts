@@ -268,11 +268,11 @@ describe("routing-lifecycle-cli.ts watch --dry-run (issue #47)", () => {
   it("detects a breach from real ledger evidence and reports it without mutating any durable state", () => {
     const wDataDir = mkdtempSync(join(tmpdir(), "routing-lifecycle-cli-watchdog-watch-"));
 
-    // Reuse the OUTER suite's already-initialized `dbPath` rather than a second `initDb(<new path>)`
-    // call: ledger.ts's ensureSchema() guards table creation behind a process-wide `_initialised`
-    // flag (see routing-lifecycle-cli.test.ts's identical note), so a second init within this same
-    // test-file process would silently skip creating the delegations table on a fresh file. Seed a
-    // dedicated task type ("watchdog-probe") so these rows never interact with "classify"'s.
+    // Reuse the OUTER suite's already-initialized `dbPath` so these watchdog rows intentionally
+    // join the shared fixture state. The current ledger schema init is per-Database
+    // (WeakSet-keyed), so a fresh `initDb(<new path>)` would also work; reuse here is about the
+    // evidence window, not a schema-init limitation. Seed a dedicated task type
+    // ("watchdog-probe") so these rows never interact with "classify"'s.
     //
     // Seed 10 fresh 'error' rows — recordDelegation always stamps ts=now, so an adoptedAt far in the
     // past puts the ENTIRE baseline window before any of these rows exist (baseline sampleSize 0)

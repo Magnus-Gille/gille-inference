@@ -168,6 +168,9 @@ export interface DelegationDecision {
 
 // ─── Schema (additive; lives alongside the eval tables in the shared DB) ──────────
 
+// Schema init must be tracked PER Database object, not per process: initDb() can replace the
+// shared singleton with a different SQLite file in the same Node process (common in tests and
+// CLI flows), and each fresh connection still needs the additive delegations migration exactly once.
 const initialisedDbs = new WeakSet<Database.Database>();
 
 function ensureSchema(db: Database.Database): void {
@@ -649,11 +652,11 @@ export interface ReviewerUsefulnessRecordSummary {
   noteChars: number;
 }
 
-export type ReviewerUsefulnessMismatchField = "usefulness" | "reviewerIdentity" | "notes";
+export type ReviewerUsefulnessMismatchField = "reviewerUsefulness" | "reviewerIdentity" | "notes";
 
 export type ReviewerUsefulnessResult =
-  | { kind: "recorded"; record: ReviewerUsefulnessRecordSummary }
-  | { kind: "unchanged"; record: ReviewerUsefulnessRecordSummary }
+  | { kind: "recorded"; taskType: string; record: ReviewerUsefulnessRecordSummary }
+  | { kind: "unchanged"; taskType: string; record: ReviewerUsefulnessRecordSummary }
   | {
     kind: "conflict";
     conflict:
@@ -706,7 +709,7 @@ function reviewerUsefulnessMismatchFields(
   attempted: { usefulness: ReviewerUsefulness; judgedBy: string | null; notes: string | null },
 ): ReviewerUsefulnessMismatchField[] {
   const mismatches: ReviewerUsefulnessMismatchField[] = [];
-  if (row.reviewerUsefulness !== attempted.usefulness) mismatches.push("usefulness");
+  if (row.reviewerUsefulness !== attempted.usefulness) mismatches.push("reviewerUsefulness");
   if ((row.reviewerUsefulnessBy ?? null) !== attempted.judgedBy) mismatches.push("reviewerIdentity");
   if ((row.reviewerUsefulnessNotes ?? null) !== attempted.notes) mismatches.push("notes");
   return mismatches;
@@ -760,7 +763,7 @@ export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): Review
     if (alreadyRecorded) {
       const mismatchFields = reviewerUsefulnessMismatchFields(row, attempted);
       if (mismatchFields.length === 0 && row.reviewerUsefulnessTs !== null) {
-        return { kind: "unchanged", record: reviewerUsefulnessSummaryFromRow(row) };
+        return { kind: "unchanged", taskType: row.taskType, record: reviewerUsefulnessSummaryFromRow(row) };
       }
       return {
         kind: "conflict",
@@ -799,6 +802,7 @@ export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): Review
     if (info.changes > 0) {
       return {
         kind: "recorded",
+        taskType: row.taskType,
         record: reviewerUsefulnessSummary({
           usefulness: attempted.usefulness,
           judgedBy: attempted.judgedBy,
@@ -812,7 +816,7 @@ export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): Review
     if (fresh === null) return { kind: "not_found" };
     const mismatchFields = reviewerUsefulnessMismatchFields(fresh, attempted);
     if (mismatchFields.length === 0 && fresh.reviewerUsefulnessTs !== null) {
-      return { kind: "unchanged", record: reviewerUsefulnessSummaryFromRow(fresh) };
+      return { kind: "unchanged", taskType: fresh.taskType, record: reviewerUsefulnessSummaryFromRow(fresh) };
     }
     return {
       kind: "conflict",

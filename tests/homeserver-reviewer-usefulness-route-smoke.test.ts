@@ -49,6 +49,9 @@ async function canBindLoopback(): Promise<boolean> {
   }
 }
 
+const LOOPBACK_AVAILABLE = await canBindLoopback();
+const itIfLoopback = LOOPBACK_AVAILABLE ? it : it.skip;
+
 async function startModelStub(): Promise<{ server: Server; port: number }> {
   const server = createServer((req, res) => {
     if (req.url?.includes("/models")) {
@@ -70,9 +73,18 @@ async function startModelStub(): Promise<{ server: Server; port: number }> {
   return { server, port };
 }
 
+interface GatewaySetupResult {
+  token?: string;
+  ownerMonitorToken?: string;
+}
+
+interface GatewayRunContext extends GatewaySetupResult {
+  url: (path: string) => string;
+}
+
 async function withGateway(
-  setup: () => Promise<{ token?: string }>,
-  run: (ctx: { url: (path: string) => string; token?: string }) => Promise<void>,
+  setup: () => Promise<GatewaySetupResult>,
+  run: (ctx: GatewayRunContext) => Promise<void>,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "hs-reviewer-usefulness-smoke-"));
   initDb(join(dir, "test.db"));
@@ -93,6 +105,7 @@ async function withGateway(
     await run({
       url: (path) => `http://127.0.0.1:${handle.port}${path}`,
       token: setupResult.token,
+      ownerMonitorToken: setupResult.ownerMonitorToken,
     });
   } finally {
     await handle.stop();
@@ -101,9 +114,7 @@ async function withGateway(
 }
 
 describe("PUT /ledger/:id/reviewer-usefulness — real socket smoke", () => {
-  it("requires a minted owner-admin key on the live socket path", async () => {
-    if (!(await canBindLoopback())) return;
-
+  itIfLoopback("requires a minted owner-admin key on the live socket path", async () => {
     await withGateway(
       async () => {
         process.env["HOMESERVER_ADMIN_API_KEYS"] = "static-admin-key";
@@ -145,9 +156,7 @@ describe("PUT /ledger/:id/reviewer-usefulness — real socket smoke", () => {
     );
   });
 
-  it("denies loopback implicit-admin on the live socket path", async () => {
-    if (!(await canBindLoopback())) return;
-
+  itIfLoopback("denies loopback implicit-admin on the live socket path", async () => {
     await withGateway(
       async () => {
         delete process.env["HOMESERVER_ADMIN_API_KEYS"];
@@ -170,6 +179,44 @@ describe("PUT /ledger/:id/reviewer-usefulness — real socket smoke", () => {
           body: JSON.stringify({ usefulness: "pass" }),
         });
         expect(res.status).toBe(403);
+      },
+    );
+  });
+
+  itIfLoopback("keeps review-lane capability coverage on the real socket path", async () => {
+    await withGateway(
+      async () => {
+        process.env["HOMESERVER_ADMIN_API_KEYS"] = "static-admin-key";
+        delete process.env["HOMESERVER_API_KEYS"];
+        delete process.env["HOMESERVER_MONITOR_API_KEYS"];
+        const { mintKey } = await import("../src/homeserver/keystore.js");
+        const mintedAdmin = mintKey({ alias: "review-lane-smoke-admin", tier: "owner", scope: "admin" }, DEFAULTS);
+        const mintedOwnerMonitor = mintKey({ alias: "review-lane-smoke-owner-monitor", tier: "owner", scope: "monitor" }, DEFAULTS);
+        return { token: mintedAdmin.plaintextKey, ownerMonitorToken: mintedOwnerMonitor.plaintextKey };
+      },
+      async ({ url, token, ownerMonitorToken }) => {
+        const owner = await fetch(url("/v1/capabilities/review-lane"), {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        expect(owner.status).toBe(200);
+        expect(await owner.json()).toMatchObject({
+          endpoint: "/v1/capabilities/review-lane",
+          reviewerUsefulnessRecording: {
+            available: true,
+            authorization: "minted-owner-admin",
+            availabilityReason: "allowed",
+          },
+        });
+
+        const ownerMonitor = await fetch(url("/v1/capabilities/review-lane"), {
+          headers: { authorization: `Bearer ${ownerMonitorToken}` },
+        });
+        expect(ownerMonitor.status).toBe(403);
+        expect(await ownerMonitor.json()).toMatchObject({
+          error: {
+            code: "route_not_allowed",
+          },
+        });
       },
     );
   });
