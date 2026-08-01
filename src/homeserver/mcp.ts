@@ -136,6 +136,24 @@ const ADOPTION_REPORT_DESCRIPTION =
   "Use this when an eligible task was completed, refused, failed, or could not even attempt M5; " +
   "report missing M5 tool and missing/auth-unavailable credentials distinctly. Never include task text, output, paths, repositories, or identifiers.";
 
+type AdoptionReportRejectionReason =
+  | "invalid_report"
+  | "principal_rate_limited"
+  | "daily_capacity_reached"
+  | "storage_unavailable";
+
+function rejectAdoptionReport(reason: AdoptionReportRejectionReason): {
+  text: string;
+  isError: true;
+  structuredContent: { accepted: false; reason: AdoptionReportRejectionReason };
+} {
+  return {
+    text: `Adoption report was not accepted (${reason}).`,
+    isError: true,
+    structuredContent: { accepted: false, reason },
+  };
+}
+
 /**
  * The gateway needs this narrow transport classifier before its finally block emits per-request
  * telemetry. It intentionally recognizes only a parseable `tools/call` envelope by exact name;
@@ -739,19 +757,19 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
     // Reserve the transient slot before parsing. Invalid/content-bearing reports are deliberately
     // correlation-log-suppressed too, so they must not become an invisible unbounded flood.
     if (!allowAdoptionEvidenceReportForPrincipal(ctx.principal.keyHash!)) {
-      return { text: "Adoption report was not accepted.", isError: true };
+      return rejectAdoptionReport("principal_rate_limited");
     }
     const parsed = parseAdoptionEvidence(args);
     if (!parsed.ok) {
-      return { text: "Adoption report was not accepted.", isError: true };
+      return rejectAdoptionReport("invalid_report");
     }
     try {
       if (!recordAdoptionEvidence(parsed.value)) {
-        return { text: "Adoption report was not accepted.", isError: true };
+        return rejectAdoptionReport("daily_capacity_reached");
       }
     } catch {
       // Do not expose a database path, rate state, or driver diagnostic in the tool response.
-      return { text: "Adoption report was not accepted.", isError: true };
+      return rejectAdoptionReport("storage_unavailable");
     }
     return { text: "Accepted.", isError: false, structuredContent: { accepted: true } };
   }

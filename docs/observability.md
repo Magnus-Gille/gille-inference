@@ -113,8 +113,10 @@ before storage. It has no event ID or precise timestamp: the server derives only
 for the rolling-week query. Accepted and rejected authenticated report calls deliberately suppress
 the normal per-request access/request/owner logs, so this table cannot be correlated to a principal
 or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot;
-it is bounded by a transient per-key rate limit and a 25-row server-day cap, with generic refusal
-when either bound is full.
+it is bounded by a transient per-key rate limit and a 25-row server-day cap. Rejections expose only
+the stable content-free reason codes `invalid_report`, `principal_rate_limited`,
+`daily_capacity_reached`, or `storage_unavailable`; they never echo input or expose a credential,
+principal, request, database, or path detail.
 
 The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
 
