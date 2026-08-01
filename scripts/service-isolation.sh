@@ -457,6 +457,65 @@ wait_for_gateway_health() {
   die "gateway did not become healthy within the bounded 30s readiness window; inspect its journal before retrying"
 }
 
+capture_transaction_dependents() {
+  local service="$1" state_file="$2" unit active_state normalized
+  case "$service" in
+    llama-swap) unit="home-gateway.service" ;;
+    *) return 0 ;;
+  esac
+  if ! active_state="$(show_value "$unit" ActiveState)"; then
+    die "could not capture the dependent gateway state; refusing $service transaction"
+  fi
+  case "$active_state" in
+    active) normalized=active ;;
+    inactive|failed) normalized=inactive ;;
+    *) die "dependent gateway is changing state; refusing $service transaction" ;;
+  esac
+  printf '%s=%s\n' "$unit" "$normalized" >"$state_file"
+  validate_transaction_dependents "$service" "$state_file"
+}
+
+validate_transaction_dependents() {
+  local service="$1" state_file="$2" unit state count=0
+  case "$service" in
+    llama-swap) ;;
+    *) return 0 ;;
+  esac
+  [ -f "$state_file" ] && [ ! -L "$state_file" ] || die "dependent gateway state evidence is absent or unsafe"
+  while IFS='=' read -r unit state; do
+    count=$((count + 1))
+    [ "$unit" = home-gateway.service ] || die "dependent service state evidence is invalid"
+    case "$state" in active|inactive) ;; *) die "dependent gateway state evidence is invalid" ;; esac
+  done <"$state_file"
+  [ "$count" -eq 1 ] || die "dependent gateway state evidence is incomplete"
+}
+
+restore_transaction_dependents() {
+  local service="$1" state_file="$2" unit state active_state
+  case "$service" in
+    llama-swap) ;;
+    *) return 0 ;;
+  esac
+  validate_transaction_dependents "$service" "$state_file"
+  IFS='=' read -r unit state <"$state_file" || die "dependent gateway state evidence is invalid"
+  case "$state" in
+    active)
+      systemctl start "$unit" || die "dependent gateway could not be restored after $service transaction"
+      systemctl is-active --quiet "$unit" || die "dependent gateway is not active after $service transaction"
+      wait_for_gateway_health "$unit"
+      ;;
+    inactive)
+      if ! active_state="$(show_value "$unit" ActiveState)"; then
+        die "could not verify the intentionally inactive dependent gateway state"
+      fi
+      case "$active_state" in
+        inactive|failed) ;;
+        *) die "dependent gateway was inactive before the $service transaction but did not remain inactive" ;;
+      esac
+      ;;
+  esac
+}
+
 gateway_user_bus_ready() {
   [ -S "/run/user/$1/bus" ]
 }
@@ -793,7 +852,7 @@ verify() {
 }
 
 apply() {
-  local service="$1" backup_root="$2" unit stamp backup
+  local service="$1" backup_root="$2" unit stamp backup dependent_state_file
   root_only; need useradd; need install; need systemctl; need curl; need ss; need grep; need sed; need sudo; need runuser; need mktemp; need mv; need chown; need chmod; need find; need readlink
   if [ "$service" = gateway ]; then need awk; need loginctl; need npm; fi
   unit="$(unit_for "$service")"
@@ -825,6 +884,8 @@ apply() {
   mkdir -p "$backup_root"
   backup="$(mktemp -d "$backup_root/$stamp-$service.XXXXXX")"
   backup_unit "$service" "$unit" "$backup"
+  dependent_state_file="$backup/dependents.apply.state"
+  capture_transaction_dependents "$service" "$dependent_state_file"
   if [ "$service" = gateway ]; then
     APPLY_BACKUP="$backup"
     GATEWAY_APPLY_INFLIGHT=1
@@ -846,6 +907,7 @@ apply() {
     exit 1
   fi
   [ "$service" != gateway ] || install_gateway_autonomy_timer
+  restore_transaction_dependents "$service" "$dependent_state_file"
   if ! verify "$service" 0; then
     note "Verification failed; use rollback with --ack-rollback. Backup evidence: $backup"
     exit 1
@@ -862,7 +924,7 @@ apply() {
 }
 
 rollback() {
-  local service="$1" backup_root="$2" unit backup dropin
+  local service="$1" backup_root="$2" unit backup dropin dependent_state_file
   root_only; need systemctl; need install; need mv; need chown; need chmod; need find; need sed; need grep; need runuser
   unit="$(unit_for "$service")"
   if [ -f "$backup_root/unit.before.txt" ]; then
@@ -888,6 +950,22 @@ rollback() {
     return 0
   fi
   rollback_feasible "$service"
+  if [ "$service" = llama-swap ] && [ ! -f "$backup/receipt" ] && { [ -e "$backup/dependents.apply.state" ] || [ -L "$backup/dependents.apply.state" ]; }; then
+    # An interrupted apply may already have stopped the gateway. Preserve the
+    # original pre-apply intent rather than recapturing that outage as desired.
+    dependent_state_file="$backup/dependents.apply.state"
+    validate_transaction_dependents "$service" "$dependent_state_file"
+  elif [ "$service" = llama-swap ] && { [ -e "$backup/dependents.rollback.state" ] || [ -L "$backup/dependents.rollback.state" ]; }; then
+    # A retry continues the existing rollback transaction. Its first snapshot
+    # remains authoritative if that attempt stopped the gateway before failing.
+    dependent_state_file="$backup/dependents.rollback.state"
+    validate_transaction_dependents "$service" "$dependent_state_file"
+  else
+    # Completed applies and legacy backups without dependency evidence begin a
+    # new rollback transaction from the gateway state observed now.
+    dependent_state_file="$backup/dependents.rollback.state"
+    capture_transaction_dependents "$service" "$dependent_state_file"
+  fi
   dropin="/etc/systemd/system/$unit.d/50-service-isolation.conf"
   if [ "$service" = gateway ]; then
     if [ -e /etc/systemd/system/gille-autonomy-tick.timer ]; then
@@ -930,6 +1008,7 @@ rollback() {
   rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
   systemctl daemon-reload
   systemctl restart "$unit"
+  restore_transaction_dependents "$service" "$dependent_state_file"
   if [ "$service" = gateway ]; then
     restore_legacy_autonomy_timer "$backup"
   fi

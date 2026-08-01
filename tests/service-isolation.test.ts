@@ -62,6 +62,104 @@ prepare_gateway_user_manager
   }
 }
 
+function runLlamaTransactionHarness(
+  command: "apply" | "rollback" | "failed-apply-rollback" | "failed-apply-invalid-evidence-rollback" | "failed-rollback-retry",
+  gatewayInitiallyActive: boolean,
+  failure: "none" | "start" | "health" = "none",
+): { status: number; log: string[]; output: string } {
+  const work = mkdtempSync(join(tmpdir(), "gille-llama-dependent-harness-"));
+  const log = join(work, "order.log");
+  const backup = join(work, "backup");
+  const harness = join(work, "harness.sh");
+  execFileSync("mkdir", ["-p", backup]);
+  writeFileSync(join(backup, "unit.before.txt"), "legacy unit\n");
+  writeFileSync(harness, `#!/usr/bin/env bash
+LOG="$2"; BACKUP="$3"; COMMAND="$4"; gateway_active="$5"; FAILURE="$6"; source "$1"
+record() { printf '%s\\n' "$1" >> "$LOG"; }
+note() { case "$1" in APPLIED:*|ROLLED\\ BACK:*) record success ;; esac; }
+root_only() { :; }; need() { :; }; preflight() { :; }; create_service_user() { :; }
+require_atomic_move() { :; }; install() { :; }; rollback_feasible() { :; }; install_dropin() { :; }
+backup_unit() { mkdir -p "$3"; printf 'legacy unit\\n' > "$3/unit.before.txt"; }
+migrate_llama_state() { record migrate; gateway_active=0; }
+verify() { record verify; }
+mv() { :; }; chown() { :; }; chmod() { :; }; rm() { :; }; rmdir() { :; }
+show_value() {
+  if [ "$2" = User ]; then printf 'magnus\\n'; return; fi
+  if [ "$1" = home-gateway.service ] && [ "$2" = ActiveState ]; then
+    if [ "$gateway_active" = 1 ]; then printf 'active\\n'; else printf 'inactive\\n'; fi
+    return
+  fi
+  printf '\\n'
+}
+systemctl() {
+  local action="$1"; shift
+  [ "\${1:-}" != --quiet ] || shift
+  case "$action:\${1:-}" in
+    stop:llama-swap.service) record llama-stop; llama_active=0; gateway_active=0 ;;
+    restart:llama-swap.service)
+      record llama-restart
+      case "\${TRANSACTION:-$COMMAND}" in
+        failed-apply) return 1 ;;
+        failed-rollback) exit 1 ;;
+      esac
+      llama_active=1
+      ;;
+    start:home-gateway.service)
+      record gateway-start
+      [ "$FAILURE" != start ] || return 1
+      gateway_active=1
+      ;;
+    is-active:home-gateway.service) [ "$gateway_active" = 1 ] ;;
+    is-active:llama-swap.service) [ "\${llama_active:-1}" = 1 ] ;;
+    daemon-reload:) record daemon-reload ;;
+  esac
+}
+wait_for_gateway_health() {
+  record gateway-health
+  [ "$FAILURE" != health ]
+}
+case "$COMMAND" in
+  apply) apply llama-swap "$BACKUP" ;;
+  rollback) rollback llama-swap "$BACKUP" ;;
+  failed-apply-rollback|failed-apply-invalid-evidence-rollback)
+    TRANSACTION=failed-apply
+    if (apply llama-swap "$BACKUP"); then exit 99; fi
+    record apply-failed
+    gateway_active=0
+    TRANSACTION=rollback
+    transaction_backup="$(find "$BACKUP" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    if [ "$COMMAND" = failed-apply-invalid-evidence-rollback ]; then
+      printf 'unreviewed.service=active\\n' > "$transaction_backup/dependents.apply.state"
+    fi
+    rollback llama-swap "$transaction_backup"
+    ;;
+  failed-rollback-retry)
+    printf 'verified\\n' > "$BACKUP/receipt"
+    TRANSACTION=failed-rollback
+    if (rollback llama-swap "$BACKUP"); then exit 99; fi
+    record rollback-failed
+    gateway_active=0
+    TRANSACTION=rollback
+    rollback llama-swap "$BACKUP"
+    ;;
+esac
+`, { mode: 0o755 });
+  try {
+    const output = execFileSync("bash", [harness, script, log, backup, command, gatewayInitiallyActive ? "1" : "0", failure], {
+      cwd: root,
+      encoding: "utf8",
+      stderr: "pipe",
+    });
+    return { status: 0, log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean), output };
+  } catch (error: any) {
+    return {
+      status: error.status ?? 1,
+      log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean),
+      output: `${error.stdout ?? ""}${error.stderr ?? ""}`,
+    };
+  }
+}
+
 describe("service-isolation migration contract (#151)", () => {
   it("waits for delayed gateway health but times out fail-closed without printing its locator", () => {
     const delayed = execFileSync("bash", ["-c", `source "$1"; count=0; systemctl(){ return 0; }; gateway_health_url(){ printf 'private-locator'; }; curl(){ count=$((count+1)); [ "$count" -ge 3 ]; }; sleep(){ :; }; wait_for_gateway_health home-gateway.service; printf '%s' "$count"`, "--", script], { encoding: "utf8" });
@@ -260,5 +358,57 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain('install -d -m 0755 -o root -g root "$ETC"');
     expect(source).toContain('install -d -m 0750 -o root -g "$GATEWAY_USER" "$ETC/gateway"');
     expect(source).toContain('install -d -m 0750 -o root -g "$LLAMA_USER" "$ETC/llama-swap"');
+  });
+
+  it.each(["apply", "rollback"] as const)("restores and health-checks an active gateway after llama-swap %s", (command) => {
+    const result = runLlamaTransactionHarness(command, true);
+    expect(result.status, result.output).toBe(0);
+    expect(result.log).toContain("gateway-start");
+    expect(result.log).toContain("gateway-health");
+    expect(result.log.indexOf("gateway-start")).toBeLessThan(result.log.indexOf("gateway-health"));
+    expect(result.log.indexOf("gateway-health")).toBeLessThan(result.log.indexOf("success"));
+  });
+
+  it.each(["apply", "rollback"] as const)("preserves an intentionally inactive gateway during llama-swap %s", (command) => {
+    const result = runLlamaTransactionHarness(command, false);
+    expect(result.status, result.output).toBe(0);
+    expect(result.log).not.toContain("gateway-start");
+    expect(result.log).not.toContain("gateway-health");
+  });
+
+  it.each(["start", "health"] as const)("fails closed when active gateway restoration fails at %s", (failure) => {
+    const result = runLlamaTransactionHarness("apply", true, failure);
+    expect(result.status).not.toBe(0);
+    expect(result.log).not.toContain("verify");
+    expect(result.output).not.toContain("private-locator");
+  });
+
+  it("uses original pre-apply evidence when rollback follows a failed llama-swap apply", () => {
+    const result = runLlamaTransactionHarness("failed-apply-rollback", true);
+    expect(result.status, result.output).toBe(0);
+    expect(result.log).toContain("apply-failed");
+    expect(result.log).toContain("gateway-start");
+    expect(result.log).toContain("gateway-health");
+    expect(result.log.indexOf("gateway-start")).toBeGreaterThan(result.log.indexOf("apply-failed"));
+    expect(result.log.indexOf("gateway-health")).toBeLessThan(result.log.indexOf("success"));
+  });
+
+  it("rejects invalid pre-apply dependency evidence before mutating rollback state", () => {
+    const result = runLlamaTransactionHarness("failed-apply-invalid-evidence-rollback", true);
+    expect(result.status).not.toBe(0);
+    expect(result.log).not.toContain("llama-stop");
+    expect(result.log).not.toContain("success");
+    expect(result.output).toContain("state evidence is invalid");
+    expect(result.output).not.toContain("private-locator");
+  });
+
+  it("reuses pre-rollback evidence when a failed rollback is retried", () => {
+    const result = runLlamaTransactionHarness("failed-rollback-retry", true);
+    expect(result.status, result.output).toBe(0);
+    expect(result.log).toContain("rollback-failed");
+    expect(result.log).toContain("gateway-start");
+    expect(result.log).toContain("gateway-health");
+    expect(result.log.indexOf("gateway-start")).toBeGreaterThan(result.log.indexOf("rollback-failed"));
+    expect(result.log.indexOf("gateway-health")).toBeLessThan(result.log.indexOf("success"));
   });
 });
