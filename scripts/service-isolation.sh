@@ -418,6 +418,16 @@ gateway_codeloop_source_pi() {
   awk -F= '$1 == "HOMESERVER_CODE_LOOP_PI_BIN" { print substr($0, index($0, "=") + 1); exit }' "$(gateway_env_file)"
 }
 
+gateway_codeloop_package_from_resolved_path() {
+  case "$1" in
+    /home/magnus/.local/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js)
+      printf '%s\n' '@mariozechner/pi-coding-agent' ;;
+    /home/magnus/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js)
+      printf '%s\n' '@earendil-works/pi-coding-agent' ;;
+    *) die "code_loop Pi binary resolves outside the reviewed package allowlist" ;;
+  esac
+}
+
 gateway_health_url() {
   local env host port
   env="$(gateway_env_file)"
@@ -432,31 +442,43 @@ gateway_health_url() {
   fi
 }
 
+gateway_user_bus_ready() {
+  [ -S "/run/user/$1/bus" ]
+}
+
 prepare_gateway_user_manager() {
   local uid
   uid="$(id -u "$GATEWAY_USER")"
   loginctl enable-linger "$GATEWAY_USER"
   [ "$(loginctl show-user "$GATEWAY_USER" -p Linger --value)" = yes ] || die "could not enable lingering for $GATEWAY_USER"
   # The gateway's code_loop uses systemd-run --user. Its child process derives these exact
-  # pointers from its service UID; without a durable user manager it would regress after reboot.
-  [ -S "/run/user/$uid/bus" ] || die "gille-gateway user bus is absent after enabling linger"
-  runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null \
-    || die "gille-gateway user manager is not usable for code_loop"
+  # pointers from its service UID; explicitly start the lingered manager and wait briefly for
+  # its runtime bus rather than racing logind's asynchronous startup.
+  systemctl start "user@$uid.service" || die "could not start user@$uid.service for gille-gateway"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if gateway_user_bus_ready "$uid" && runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "gille-gateway user manager did not become ready after 10s (user@$uid.service and /run/user/$uid/bus); inspect journalctl -u user@$uid.service before retrying"
 }
 
 provision_gateway_codeloop_runtime() {
-  local home source_pi source_agent version
+  local home source_pi source_agent resolved_pi package version
   gateway_codeloop_enabled || return 0
   home="$(gateway_home)"
   source_pi="$(gateway_codeloop_source_pi)"
   source_agent="$(gateway_codeloop_source_dir)"
   [ -n "$source_pi" ] && [ -x "$source_pi" ] || die "code_loop is enabled but HOMESERVER_CODE_LOOP_PI_BIN is not an executable"
   [ -n "$source_agent" ] && [ -f "$source_agent/models.json" ] || die "code_loop is enabled but its models.json is absent"
+  resolved_pi="$(readlink -f "$source_pi")" || die "could not resolve code_loop Pi binary"
+  package="$(gateway_codeloop_package_from_resolved_path "$resolved_pi")"
   version="$($source_pi --version 2>/dev/null | head -n 1 | tr -cd '0-9.')"
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not derive a safe pinned Pi version from the existing runtime"
   install -d -m 0700 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$home/.pi-code-loop"
   # A dedicated pinned Pi runtime; do not copy the owner's ~/.local tree or auth.json.
-  runuser -u "$GATEWAY_USER" -- env HOME="$home" NPM_CONFIG_PREFIX="$home/.local" npm install --global "@mariozechner/pi-coding-agent@$version" >/dev/null
+  runuser -u "$GATEWAY_USER" -- env HOME="$home" NPM_CONFIG_PREFIX="$home/.local" npm install --global "$package@$version" >/dev/null
   install -m 0600 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$source_agent/models.json" "$home/.pi-code-loop/models.json"
   [ -x "$home/.local/bin/pi" ] || die "dedicated Pi runtime was not installed"
   [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json was not installed"
@@ -758,7 +780,7 @@ verify() {
 
 apply() {
   local service="$1" backup_root="$2" unit stamp backup
-  root_only; need useradd; need install; need systemctl; need curl; need ss; need grep; need sed; need sudo; need runuser; need mktemp; need mv; need chown; need chmod; need find
+  root_only; need useradd; need install; need systemctl; need curl; need ss; need grep; need sed; need sudo; need runuser; need mktemp; need mv; need chown; need chmod; need find; need readlink
   if [ "$service" = gateway ]; then need awk; need loginctl; need npm; fi
   unit="$(unit_for "$service")"
   if [ "$(show_value "$unit" User)" = "$(user_for "$service")" ]; then
