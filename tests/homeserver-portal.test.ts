@@ -280,10 +280,14 @@ describe("portal page", () => {
     const res = await fetch(url("/portal"));
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
     expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(res.headers.get("permissions-policy")).toBe("geolocation=(), camera=(), microphone=()");
     const csp = res.headers.get("content-security-policy") ?? "";
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("script-src 'unsafe-inline'");
     expect(csp).toContain("style-src 'unsafe-inline'");
+    expect(csp).toContain("frame-ancestors 'none'");
   });
 
   it("GET / also serves the portal HTML", async () => {
@@ -707,6 +711,7 @@ describe("portal HTML hs install URL", () => {
     const res = await fetch(url("/portal"));
     const body = await res.text();
     expect(body).toContain("inference.example.com/hs");
+    expect(body).not.toContain("http://inference.example.com/hs");
     expect(body).not.toContain("raw.githubusercontent.com");
   });
 });

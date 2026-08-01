@@ -97,6 +97,11 @@ DEPLOY_HEALTH_LOCAL_URL="${DEPLOY_HEALTH_LOCAL_URL:-}"
 DEPLOY_HEALTH_TAILNET_URL="${DEPLOY_HEALTH_TAILNET_URL:-}"
 DEPLOY_CAPABILITY_URL="${DEPLOY_CAPABILITY_URL:-}"
 DEPLOY_CAPABILITY_KEY_ENV="${DEPLOY_CAPABILITY_KEY_ENV:-HOMESERVER_OWNER_KEY}"
+# Cloudflare's edge, not the HTTP Tunnel origin, owns HTTPS redirects and HSTS. The public
+# hostname is private operator infrastructure, so it has no committed default. The command
+# override is only an offline test seam.
+DEPLOY_PUBLIC_HTTP_URL="${DEPLOY_PUBLIC_HTTP_URL:-}"
+DEPLOY_PUBLIC_HTTPS_URL="${DEPLOY_PUBLIC_HTTPS_URL:-}"
 DEPLOY_FORCE_RESTART="${DEPLOY_FORCE_RESTART:-0}"
 DEPLOY_SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
@@ -357,6 +362,26 @@ probe_health() {
     return 1
   fi
   echo "  OK: $label healthy ($url)"
+}
+
+# Validate the Cloudflare-facing view from the release operator. cloudflared intentionally
+# connects to the gateway over HTTP, so an origin-side redirect would loop for public HTTPS.
+verify_public_edge() {
+  local verifier="$DEPLOY_SOURCE_ROOT/scripts/verify-public-edge.sh"
+  if [ -n "${DEPLOY_PUBLIC_EDGE_VERIFY_CMD:-}" ]; then
+    if ! bash -c "$DEPLOY_PUBLIC_EDGE_VERIFY_CMD"; then
+      echo "ERROR: public HTTPS edge verification failed." >&2
+      return 1
+    fi
+  elif [ -z "$DEPLOY_PUBLIC_HTTP_URL" ] || [ -z "$DEPLOY_PUBLIC_HTTPS_URL" ]; then
+    echo "ERROR: DEPLOY_PUBLIC_HTTP_URL and DEPLOY_PUBLIC_HTTPS_URL must both be set — refusing" >&2
+    echo "       to certify a deployment without checking the public HTTPS edge." >&2
+    return 1
+  elif ! "$verifier" "$DEPLOY_PUBLIC_HTTP_URL" "$DEPLOY_PUBLIC_HTTPS_URL"; then
+    echo "ERROR: public HTTPS edge verification failed." >&2
+    return 1
+  fi
+  echo "  OK: public HTTPS edge redirects and portal headers verified"
 }
 
 # Copy-if-absent seed for the routing table (issue #44): a plain rsync of this ONE path with
@@ -633,6 +658,8 @@ cmd_verify() {
       status=1
     fi
   done
+  echo "==> Verifying public HTTPS edge..."
+  verify_public_edge || status=1
   return "$status"
 }
 
@@ -728,8 +755,10 @@ cmd_deploy() (
   probe_health "$DEPLOY_HEALTH_TAILNET_URL" "tailnet" || return 1
   echo "==> Probing authenticated capability endpoint..."
   probe_capability || return 1
+  echo "==> Verifying public HTTPS edge..."
+  verify_public_edge || return 1
 
-  # Armed LAST, only once restart-if-needed + every health/capability probe above has already
+  # Armed LAST, only once restart-if-needed + every health/capability/public-edge probe above has already
   # succeeded (review finding: Persistent=true's catch-up semantics mean arming any earlier risks
   # a missed tick firing against a gateway that is still mid-restart).
   echo "==> Installing the gi#58 autonomy notification hook..."
@@ -768,6 +797,8 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_HEALTH_TAILNET_URL   Required for `deploy` (no safe default -- never hardcode the IP)
   DEPLOY_CAPABILITY_URL       Authenticated capability probe URL, required for `deploy`
   DEPLOY_CAPABILITY_KEY_ENV   Name of the env var holding the bearer key (default: HOMESERVER_OWNER_KEY)
+  DEPLOY_PUBLIC_HTTP_URL      Required public HTTP origin to validate (no committed hostname default)
+  DEPLOY_PUBLIC_HTTPS_URL     Required public HTTPS origin to validate (no committed hostname default)
   DEPLOY_FORCE_RESTART=1      Restart even if rsync reported no changes
   DEPLOY_DRY_RUN_OFFLINE=1    dry-run only: skip even the read-only WorkingDirectory check
 

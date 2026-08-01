@@ -42,4 +42,10 @@ ingress:
 #         rule is the primary control and must be configured. Optionally also cover
 #         GET /portal and GET / .
 # 2. REQUIRED — Security → Bots → Bot Fight Mode: ON.
-# 3. Do not advertise the hostname publicly.
+# 3. REQUIRED — Rules → Redirect Rules: force every HTTP request for this hostname to the same
+#    HTTPS path with a permanent (301/308) edge redirect. Use a dynamic target such as
+#    concat("https://", http.host, http.request.uri.path) and preserve the query string. Do NOT
+#    add this redirect to the gateway origin: cloudflared speaks HTTP to it, so that loops.
+# 4. REQUIRED after the HTTPS certificate and redirect are verified — SSL/TLS → Edge Certificates:
+#    enable HSTS with a non-zero max-age. Do not preload/include subdomains without owner approval.
+# 5. Do not advertise the hostname publicly.
