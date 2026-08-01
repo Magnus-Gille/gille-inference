@@ -972,6 +972,69 @@ describe("scripts/deploy-gateway.sh", () => {
   });
 
   describe("gi#49 autonomy-tick systemd unit render/interpreter-check/lingering-check/enable", () => {
+    it("uses the durable isolation marker for an active isolated timer and never recreates owner units", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const fakeHome = tmpDir("dg-home-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript("deploy", src, baseEnv(remote, {
+        HOME: fakeHome,
+        DEPLOY_HEALTH_LOCAL_URL: local.url,
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+        DEPLOY_ISOLATED_TICK_MARKER_CMD: "true",
+        DEPLOY_ISOLATED_TICK_VERIFY_CMD: "true",
+        DEPLOY_ISOLATED_TICK_REFRESH_CMD: "true",
+      }));
+      expect(r.status).toBe(0);
+      expect(existsSync(join(fakeHome, "bin", "autonomy-notify.sh"))).toBe(false);
+      expect(existsSync(join(fakeHome, ".config", "systemd", "user", "gille-autonomy-tick.timer"))).toBe(false);
+      expect(r.stdout).toMatch(/isolated system-scope/);
+    });
+
+    it("fails closed for a failed or inactive isolated timer instead of falling back to owner units", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const fakeHome = tmpDir("dg-home-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript("deploy", src, baseEnv(remote, {
+        HOME: fakeHome,
+        DEPLOY_HEALTH_LOCAL_URL: local.url,
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+        DEPLOY_ISOLATED_TICK_MARKER_CMD: "true",
+        DEPLOY_ISOLATED_TICK_VERIFY_CMD: "false",
+        DEPLOY_ISOLATED_TICK_REFRESH_CMD: "true",
+      }));
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/isolated autonomy artifact.*incomplete or unhealthy/i);
+      expect(existsSync(join(fakeHome, "bin", "autonomy-notify.sh"))).toBe(false);
+    });
+
+    it("uses legacy owner units only when the durable isolation marker is absent", async () => {
+      const src = initSourceRepo();
+      writeAutonomyNotifyTemplate(src);
+      const remote = tmpDir("dg-remote-");
+      const fakeHome = tmpDir("dg-home-");
+      const local = await startOkServer();
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript("deploy", src, baseEnv(remote, {
+        HOME: fakeHome,
+        DEPLOY_HEALTH_LOCAL_URL: local.url,
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+        DEPLOY_ISOLATED_TICK_MARKER_CMD: "false",
+        DEPLOY_NOTIFY_INSTALL_CMD: "",
+      }));
+      expect(r.status).toBe(0);
+      expect(existsSync(join(fakeHome, "bin", "autonomy-notify.sh"))).toBe(true);
+    });
+
     it("renders, installs, and updates the autonomy notification hook at mode 0755 without leaking secrets", async () => {
       const src = initSourceRepo();
       writeAutonomyNotifyTemplate(src);

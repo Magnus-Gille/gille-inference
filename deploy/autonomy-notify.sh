@@ -8,7 +8,10 @@
 # authenticated tailnet-only owner notification endpoint.
 set -euo pipefail
 
+# System service migrations keep this secret file outside the owner home. The
+# legacy deploy leaves GILLE_AUTONOMY_ENV_FILE unset and retains the old default.
 ENV_FILE="@@REMOTE_DIR@@/.env"
+ENV_FILE="${GILLE_AUTONOMY_ENV_FILE:-$ENV_FILE}"
 key=$(grep "^RATATOSKR_SEND_API_KEY=" "$ENV_FILE" | cut -d= -f2-)
 chat=$(grep "^RATATOSKR_OWNER_CHAT_ID=" "$ENV_FILE" | cut -d= -f2-)
 payload=$(head -c 3000)

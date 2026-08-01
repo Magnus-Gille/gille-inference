@@ -482,9 +482,32 @@ preflight_interpreter() {
 #
 # Every sub-step is routed through remote_run (its own override var) so tests can stub each
 # independently, exactly like every other remote step in this script.
+isolated_autonomy_mode() {
+  # The marker is written only after the isolation transaction verifies. It is
+  # deliberately independent of timer health: a failed timer is an isolated
+  # deployment failure, never permission to recreate Magnus's owner timer.
+  remote_run DEPLOY_ISOLATED_TICK_MARKER_CMD \
+    "sudo test -f /var/lib/gille-inference/gateway/isolation-marker || sudo test -f /etc/systemd/system/gille-autonomy-tick.service || sudo test -f /etc/systemd/system/gille-autonomy-tick.timer"
+}
+
+verify_isolated_autonomy() {
+  if ! remote_run DEPLOY_ISOLATED_TICK_VERIFY_CMD "sudo test -f /var/lib/gille-inference/gateway/isolation-marker && sudo test -f /etc/systemd/system/gille-autonomy-tick.service && sudo test -f /etc/systemd/system/gille-autonomy-tick.timer && systemctl is-enabled --quiet gille-autonomy-tick.timer && systemctl is-active --quiet gille-autonomy-tick.timer"; then
+    echo "ERROR: isolated autonomy artifact is incomplete or unhealthy; refusing to recreate the legacy owner timer." >&2
+    return 1
+  fi
+}
+
 install_user_units() {
   local remote_dir="$1"
   local tsx_path="$remote_dir/node_modules/.bin/tsx"
+
+  # #151: once the root-owned isolated timer exists, it owns the same cadence. Never silently
+  # recreate the legacy magnus user timer on a later ordinary source deploy.
+  if isolated_autonomy_mode; then
+    verify_isolated_autonomy || return 1
+    echo "  OK: isolated system-scope gille-autonomy-tick.timer is active; legacy user timer remains disabled"
+    return 0
+  fi
 
   # 1. Render (substitute @@REMOTE_DIR@@ -> $remote_dir) + copy. `\$HOME` below is deliberate:
   # within this double-quoted string, backslash-dollar collapses to a literal, unescaped `$HOME`
@@ -543,6 +566,17 @@ install_user_units() {
 # partially-written executable in the path already configured by the live .env.
 install_autonomy_notify_hook() {
   local remote_dir="$1"
+
+  # #151: the isolated timer owns a service-visible hook/env, so refresh that reviewed template
+  # instead of recreating an owner-home hook on every normal source deploy.
+  if isolated_autonomy_mode; then
+    if ! remote_run DEPLOY_ISOLATED_TICK_REFRESH_CMD "sudo '$remote_dir/scripts/service-isolation.sh' refresh-autonomy --service gateway"; then
+      echo "ERROR: isolated autonomy refresh failed; refusing legacy owner-hook fallback." >&2
+      return 1
+    fi
+    verify_isolated_autonomy
+    return $?
+  fi
 
   # All $HOME/$tmp expansion is deliberately remote-side. See install_user_units() for the same
   # quoting convention. The template is shipped by the main rsync before this final IaC step.
@@ -614,8 +648,8 @@ cmd_dry_run() {
   echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
   echo "PLAN: probe tailnet health at ${DEPLOY_HEALTH_TAILNET_URL:-<unset - required for a real deploy>}"
   echo "PLAN: authenticated capability probe at ${DEPLOY_CAPABILITY_URL:-<unset - required for a real deploy>}"
-  echo "PLAN: LAST, only after every check above passes: render/install deploy/autonomy-notify.sh (gi#58) against the verified remote dir at \$HOME/bin/autonomy-notify.sh with mode 0755"
-  echo "PLAN: LAST, only after every check above passes: render gille-autonomy-tick.service (gi#49) against the verified remote dir, verify its tsx interpreter, confirm/enable user lingering, then 'systemctl --user enable --now gille-autonomy-tick.timer' (idempotent; any failure is a deploy ERROR, no marker)"
+  echo "PLAN: LAST, only after every check above passes: render/install deploy/autonomy-notify.sh and render gille-autonomy-tick.service only when the isolation marker is absent; otherwise refresh/verify isolated autonomy fail-closed (any failure is a deploy ERROR, no marker)"
+  echo "PLAN: LAST, only after every check above passes: render gille-autonomy-tick.service only in legacy marker-absent mode; isolated mode is refreshed and verified instead"
   echo "PLAN: write .deployed-commit=$sha only after every step above passes"
 }
 
