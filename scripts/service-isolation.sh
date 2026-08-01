@@ -698,16 +698,44 @@ disable_legacy_autonomy_timer() {
 
 install_gateway_autonomy_timer() {
   install -d -m 0750 -o root -g "$GATEWAY_USER" "$ROOT/gateway/bin"
-  local hook_tmp
+  local hook_tmp service_tmp timer_tmp
   hook_tmp="$(mktemp "$ROOT/gateway/bin/.autonomy-notify.sh.XXXXXX")"
-  sed "s|@@REMOTE_DIR@@|$GATEWAY_TREE|g" "$GATEWAY_TREE/deploy/autonomy-notify.sh" >"$hook_tmp"
-  chown root:"$GATEWAY_USER" "$hook_tmp"
-  chmod 0750 "$hook_tmp"
-  mv "$hook_tmp" "$ROOT/gateway/bin/autonomy-notify.sh"
-  chown root:"$GATEWAY_USER" "$ROOT/gateway/bin/autonomy-notify.sh"
-  chmod 0750 "$ROOT/gateway/bin/autonomy-notify.sh"
-  install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/gille-autonomy-tick.service < <(render_gateway_autonomy_service)
-  install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/gille-autonomy-tick.timer < <(render_gateway_autonomy_timer)
+  if ! sed "s|@@REMOTE_DIR@@|$GATEWAY_TREE|g" "$GATEWAY_TREE/deploy/autonomy-notify.sh" >"$hook_tmp" \
+    || ! chown root:"$GATEWAY_USER" "$hook_tmp" \
+    || ! chmod 0750 "$hook_tmp" \
+    || ! mv "$hook_tmp" "$ROOT/gateway/bin/autonomy-notify.sh"; then
+    rm -f -- "$hook_tmp"
+    die "could not atomically refresh the isolated autonomy notification hook"
+  fi
+
+  # GNU install cannot portably copy /dev/stdin when stdin is backed by Bash
+  # process substitution. Render each unit to a root-created temporary on the
+  # destination filesystem, then atomically rename it into place. Every failure
+  # before a rename removes both temporaries; a failed second rename leaves the
+  # timer unchanged and returns before daemon-reload/enable or deploy stamping.
+  service_tmp="$(mktemp /etc/systemd/system/.gille-autonomy-tick.service.XXXXXX)"
+  if ! timer_tmp="$(mktemp /etc/systemd/system/.gille-autonomy-tick.timer.XXXXXX)"; then
+    rm -f -- "$service_tmp"
+    die "could not create isolated autonomy timer temporary files"
+  fi
+  if ! render_gateway_autonomy_service >"$service_tmp" \
+    || ! render_gateway_autonomy_timer >"$timer_tmp" \
+    || ! chown root:root "$service_tmp" \
+    || ! chown root:root "$timer_tmp" \
+    || ! chmod 0644 "$service_tmp" \
+    || ! chmod 0644 "$timer_tmp"; then
+    rm -f -- "$service_tmp" "$timer_tmp"
+    die "could not prepare isolated autonomy timer units"
+  fi
+  if ! mv "$service_tmp" /etc/systemd/system/gille-autonomy-tick.service; then
+    rm -f -- "$service_tmp" "$timer_tmp"
+    die "could not install isolated autonomy service unit"
+  fi
+  service_tmp=""
+  if ! mv "$timer_tmp" /etc/systemd/system/gille-autonomy-tick.timer; then
+    rm -f -- "$timer_tmp"
+    die "could not install isolated autonomy timer unit"
+  fi
   systemctl daemon-reload
   systemctl enable --now gille-autonomy-tick.timer
   systemctl is-active --quiet gille-autonomy-tick.timer || die "isolated autonomy timer did not start"
