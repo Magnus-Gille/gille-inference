@@ -143,6 +143,14 @@ A reviewer's usefulness verdict may legitimately disagree with the deterministic
 `outcome` — a schema-valid ("pass") structured output can still be judged not useful in practice,
 exactly like gille-inference#78's four schema-fine-but-substantively-wrong findings.
 
+Issue #112 adds the owner-admin transport for this overlay: `PUT /ledger/{id}/reviewer-usefulness`.
+It is deliberately narrower than the underlying helper. The actual mutation still goes through
+`recordReviewerUsefulness`, but the route only allows validated `review-bounded` rows, derives
+`reviewer_usefulness_by` from the authenticated logical alias instead of caller input, accepts only
+closed `pass|partial|redo|wrong`, keeps `reviewer_usefulness_notes` bounded to content-blind
+`key:value` tokens, returns exact retries as `200 unchanged`, and fails closed on a differing
+overwrite with `409 reviewer_usefulness_conflict`.
+
 ## Preflight / capability discovery
 
 `GET /v1/capabilities/review-lane` (see `docs/gateway-api-contract.md`) lets an orchestrator ask

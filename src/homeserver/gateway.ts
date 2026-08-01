@@ -7,7 +7,7 @@ import { delegate, resolveTaskType, type DelegationOutcome } from "./orchestrato
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
-import { ledgerReport, recentDelegations, getDelegationById } from "./ledger.js";
+import { ledgerReport, recentDelegations, getDelegationById, recordReviewerUsefulness } from "./ledger.js";
 import { resetRoutingTable, loadRoutingTable } from "./routing-table.js";
 import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
@@ -72,8 +72,14 @@ import {
   REVIEW_LANE_KNOWN_TASK_TYPES,
   REVIEW_LANE_CAPABILITY_ENDPOINT,
   REVIEW_BOUNDED_CONTRACT_VERSION,
+  REVIEW_BOUNDED_TASK_TYPE,
+  REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
+  reviewerUsefulnessRecordingCapability,
+  parseReviewerUsefulnessWriteBody,
+  type ReviewLaneReviewerUsefulness,
 } from "./review-bounded.js";
+
 import { ingressTaskType } from "./task-type-identity.js";
 import {
   LEARNING_TASK_PREFLIGHT_ENDPOINT,
@@ -325,6 +331,59 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(serialized.status === 200 ? status : serialized.status, { "content-type": "application/json" });
   res.end(serialized.payload);
 }
+function reviewerUsefulnessWriteResponse(args: {
+  ledgerId: string;
+  taskType: string;
+  usefulness: ReviewLaneReviewerUsefulness;
+  reviewerIdentity: string;
+  reviewerUsefulnessTs: string;
+  notes: string | null;
+  writeState: "recorded" | "unchanged";
+}): {
+  ledgerId: string;
+  taskType: string;
+  reviewerUsefulness: ReviewLaneReviewerUsefulness;
+  reviewerIdentity: string;
+  reviewerUsefulnessTs: string;
+  notesPresent: boolean;
+  noteChars: number;
+  writeState: "recorded" | "unchanged";
+} {
+  return {
+    ledgerId: args.ledgerId,
+    taskType: args.taskType,
+    reviewerUsefulness: args.usefulness,
+    reviewerIdentity: args.reviewerIdentity,
+    reviewerUsefulnessTs: args.reviewerUsefulnessTs,
+    notesPresent: args.notes !== null,
+    noteChars: args.notes?.length ?? 0,
+    writeState: args.writeState,
+  };
+}
+
+function reviewerUsefulnessConflictMessage(args: {
+  ledgerId: string;
+  existingUsefulness: string | null;
+  existingReviewer: string | null;
+  existingTs: string | null;
+  existingNotes: string | null;
+  attemptedUsefulness: ReviewLaneReviewerUsefulness;
+  attemptedReviewer: string;
+  attemptedNotes: string | null;
+}): string {
+  return "Reviewer usefulness is already recorded differently for ledger row '" + args.ledgerId
+    + "' (existing usefulness='" + (args.existingUsefulness ?? "none")
+    + "', reviewer='" + (args.existingReviewer ?? "none")
+    + "', ts='" + (args.existingTs ?? "none")
+    + "', notesPresent=" + String(args.existingNotes !== null)
+    + ", noteChars=" + String(args.existingNotes?.length ?? 0)
+    + "); attempted usefulness='" + args.attemptedUsefulness
+    + "', reviewer='" + args.attemptedReviewer
+    + "', notesPresent=" + String(args.attemptedNotes !== null)
+    + ", noteChars=" + String(args.attemptedNotes?.length ?? 0)
+    + ". Exact retries are idempotent; differing overwrites are rejected.";
+}
+
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
 
@@ -3082,7 +3141,7 @@ function decodePathSegmentOrSend(raw: string, res: ServerResponse, lctx: LogCtx)
   }
 }
 
-async function handleRequest(
+export async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   cfg: HomeserverConfig,
@@ -3632,6 +3691,7 @@ async function handleRequest(
         endpoint: REVIEW_LANE_CAPABILITY_ENDPOINT,
         contract_version: REVIEW_BOUNDED_CONTRACT_VERSION,
         generated_at: new Date().toISOString(),
+        reviewerUsefulnessRecording: reviewerUsefulnessRecordingCapability(),
         lanes,
       });
       lctx.status = 200;
@@ -4270,6 +4330,131 @@ async function handleRequest(
       }
       sendJson(res, 200, row);
       lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (method === "PUT" && path.startsWith("/ledger/") && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
+      lctx.route = "/ledger/:id/reviewer-usefulness";
+      if (!principal.isAdmin) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "Reviewer usefulness recording requires an owner/admin key.",
+          })
+        );
+        return;
+      }
+      const rawId = path.slice("/ledger/".length, -REVIEWER_USEFULNESS_ROUTE_SUFFIX.length);
+      if (rawId.length === 0 || rawId.includes("/")) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        lctx.errorClass = "not_found";
+        sendError(res, makeError("not_found", { message: "Unknown route or resource." }));
+        return;
+      }
+      const ledgerId = decodePathSegmentOrSend(rawId, res, lctx);
+      if (ledgerId === null) return;
+      const parsedBody = parseReviewerUsefulnessWriteBody(await readBody(req, 4 * 1024));
+      if (!parsedBody.ok) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: parsedBody.param, message: parsedBody.message }));
+        return;
+      }
+      const row = getDelegationById(ledgerId);
+      if (!row) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        lctx.errorClass = "not_found";
+        sendError(res, makeError("not_found", { message: "No such ledger row '" + ledgerId + "'." }));
+        return;
+      }
+      if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE || row.verifier === null) {
+        lctx.status = 409;
+        lctx.outcome = "conflict";
+        lctx.errorClass = "reviewer_usefulness_conflict";
+        const message = row.taskType !== REVIEW_BOUNDED_TASK_TYPE
+          ? "Ledger row '" + ledgerId + "' has taskType '" + row.taskType + "'. Reviewer usefulness recording is only available for validated review-bounded delegations."
+          : "Ledger row '" + ledgerId + "' has no verifier. Reviewer usefulness recording is only available for validated review-bounded delegations.";
+        sendError(res, makeError("reviewer_usefulness_conflict", { message }));
+        return;
+      }
+      const reviewerIdentity = principal.logicalAlias;
+      const { usefulness, notes } = parsedBody.value;
+      const alreadyRecorded =
+        row.reviewerUsefulness !== null
+        || row.reviewerUsefulnessBy !== null
+        || row.reviewerUsefulnessNotes !== null
+        || row.reviewerUsefulnessTs !== null;
+      if (alreadyRecorded) {
+        const identical =
+          row.reviewerUsefulness === usefulness
+          && (row.reviewerUsefulnessNotes ?? null) === notes
+          && (row.reviewerUsefulnessBy ?? null) === reviewerIdentity
+          && row.reviewerUsefulnessTs !== null;
+        if (identical) {
+          sendJson(res, 200, reviewerUsefulnessWriteResponse({
+            ledgerId,
+            taskType: row.taskType,
+            usefulness,
+            reviewerIdentity,
+            reviewerUsefulnessTs: row.reviewerUsefulnessTs!,
+            notes,
+            writeState: "unchanged",
+          }));
+          lctx.status = 200;
+          lctx.outcome = "ok";
+          lctx.admission = "n/a";
+          return;
+        }
+        lctx.status = 409;
+        lctx.outcome = "conflict";
+        lctx.errorClass = "reviewer_usefulness_conflict";
+        sendError(res, makeError("reviewer_usefulness_conflict", {
+          message: reviewerUsefulnessConflictMessage({
+            ledgerId,
+            existingUsefulness: row.reviewerUsefulness,
+            existingReviewer: row.reviewerUsefulnessBy,
+            existingTs: row.reviewerUsefulnessTs,
+            existingNotes: row.reviewerUsefulnessNotes,
+            attemptedUsefulness: usefulness,
+            attemptedReviewer: reviewerIdentity,
+            attemptedNotes: notes,
+          }),
+        }));
+        return;
+      }
+      const now = new Date().toISOString();
+      const changed = recordReviewerUsefulness({
+        ledgerId,
+        usefulness,
+        notes,
+        judgedBy: reviewerIdentity,
+        now,
+      });
+      if (!changed) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        lctx.errorClass = "not_found";
+        sendError(res, makeError("not_found", { message: "No such ledger row '" + ledgerId + "'." }));
+        return;
+      }
+      sendJson(res, 201, reviewerUsefulnessWriteResponse({
+        ledgerId,
+        taskType: row.taskType,
+        usefulness,
+        reviewerIdentity,
+        reviewerUsefulnessTs: now,
+        notes,
+        writeState: "recorded",
+      }));
+      lctx.status = 201;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
       return;
