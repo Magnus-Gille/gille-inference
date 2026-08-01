@@ -16,6 +16,20 @@ function render(service: string): string {
   return readFileSync(join(out, `${service}.conf`), "utf8");
 }
 
+function verifyLlamaDeviceAllow(effective: string): string {
+  return execFileSync(
+    "bash",
+    [
+      "-c",
+      "source \"$1\"; effective=\"$2\"; show_value() { printf '%s\\n' \"$effective\"; }; require_llama_device_allow llama-swap.service",
+      "--",
+      script,
+      effective,
+    ],
+    { cwd: root, encoding: "utf8", stderr: "pipe" },
+  );
+}
+
 function runGatewayApplyFailureHarness(): string {
   const work = mkdtempSync(join(tmpdir(), "gille-isolation-harness-"));
   const log = join(work, "order.log");
@@ -315,10 +329,36 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("BindReadOnlyPaths=/home/magnus/llama.cpp");
     expect(unit).toContain("DeviceAllow=/dev/dri/renderD128 rw");
     expect(unit).toContain("DeviceAllow=/dev/dri/card0 rw");
+    expect(unit).toContain("ProtectClock=true");
     expect(unit).toContain("IPAddressDeny=any");
     expect(unit).toContain("IPAddressAllow=127.0.0.0/8");
     expect(unit).toContain("IPAddressAllow=::1/128");
     expect(unit.indexOf("DeviceAllow=\n")).toBeLessThan(unit.indexOf("DeviceAllow=/dev/null rw"));
+  });
+
+  it("accepts the exact llama-swap device set including ProtectClock's implied RTC rule regardless of order", () => {
+    const effective = [
+      "/dev/dri/card0 rw",
+      "char-rtc r",
+      "/dev/random r",
+      "/dev/null rw",
+      "/dev/dri/renderD128 rw",
+      "/dev/urandom r",
+    ].join(" ");
+    expect(verifyLlamaDeviceAllow(effective)).toBe("");
+  });
+
+  it("rejects every additional effective llama-swap device rule", () => {
+    const effective = [
+      "/dev/null rw",
+      "/dev/urandom r",
+      "/dev/random r",
+      "/dev/dri/renderD128 rw",
+      "/dev/dri/card0 rw",
+      "char-rtc r",
+      "/dev/mem r",
+    ].join(" ");
+    expect(() => verifyLlamaDeviceAllow(effective)).toThrow(/effective DeviceAllow differs from the reviewed allowlist/);
   });
 
   it("rejects unknown services and does not silently apply all services", () => {
@@ -416,7 +456,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain('require_show_exact_set "$unit" BindPaths "$ROOT/gateway/data:$GATEWAY_DATA"');
     expect(source).toContain('require_show_exact_set "$unit" InaccessiblePaths "-$GATEWAY_TREE/.claude"');
     expect(source).toContain('[ "$(show_value "$unit" DevicePolicy)" = closed ]');
-    expect(source).toContain('require_show_exact_device_allow "$unit" "/dev/null:rw"');
+    expect(source).toContain('require_llama_device_allow "$unit"');
+    expect(source).toContain('[ "$(show_value "$unit" ProtectClock)" = yes ]');
     expect(source).toContain('require_show_exact_set "$unit" IPAddressDeny 0.0.0.0/0 ::/0');
     expect(source).toContain('require_show_exact_set "$unit" IPAddressAllow 127.0.0.0/8 ::1/128');
   });
