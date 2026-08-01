@@ -52,7 +52,10 @@ owner logging. An accepted report leaves only its coarse `recorded_day` aggregat
 leaves no evidence. This prevents a report from being joined back to a principal or precise time.
 The tradeoff is that this narrow tool cannot be used for per-request debugging or auditing. It is
 rate-limited in memory per authenticated key and capped at 25 accepted rows per server day; either
-limit produces a generic refusal rather than a durable identity-bearing diagnostic.
+limit produces only a stable content-free reason code rather than a durable identity-bearing
+diagnostic. Rejections return one of `invalid_report`, `principal_rate_limited`,
+`daily_capacity_reached`, or `storage_unavailable`; they never echo input or expose database,
+credential, principal, request, or path details.
 
 ## Predeclared review
 

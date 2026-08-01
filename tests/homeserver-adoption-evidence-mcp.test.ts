@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getDb, initDb } from "../src/db.js";
 import { createAccessLogger, setDefaultLogger } from "../src/homeserver/access-log.js";
-import { MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW } from "../src/homeserver/adoption-evidence.js";
+import {
+  MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY,
+  MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW,
+  parseAdoptionEvidence,
+  recordAdoptionEvidence,
+} from "../src/homeserver/adoption-evidence.js";
 
 const DEFAULTS = { rpm: 1_000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 let gatewayPort = 0;
@@ -107,6 +112,10 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     const raw = await rpc(callBody(3, "record_adoption_evidence", { ...report, prompt: "never accept content" }), agentKey);
     const parsed = JSON.parse(raw) as { result: { isError: boolean } };
     expect(parsed.result.isError).toBe(true);
+    expect(parsed.result).toMatchObject({
+      structuredContent: { accepted: false, reason: "invalid_report" },
+    });
+    expect(raw).toContain("invalid_report");
     expect(raw).not.toContain("never accept content");
     expect(tableCount("adoption_evidence")).toBe(0);
     expect(tableCount("request_log")).toBe(0);
@@ -122,8 +131,63 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     }
     const validAfterFlood = JSON.parse(await rpc(callBody(70, "record_adoption_evidence", report), invalidFloodKey)) as { result: { isError: boolean } };
     expect(validAfterFlood.result.isError).toBe(true);
+    expect(validAfterFlood.result).toMatchObject({
+      structuredContent: { accepted: false, reason: "principal_rate_limited" },
+    });
     expect(tableCount("adoption_evidence")).toBe(0);
     expect(tableCount("request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
+  });
+
+  it("returns a stable redacted reason when the daily aggregate is full", async () => {
+    const parsedReport = parseAdoptionEvidence(report);
+    if (!parsedReport.ok) throw new Error("fixture must parse");
+    for (let i = 0; i < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY; i += 1) {
+      expect(recordAdoptionEvidence(parsedReport.value)).toBe(true);
+    }
+    const capacityKey = mintKey({ alias: "adoption-capacity-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
+
+    const raw = await rpc(callBody(80, "record_adoption_evidence", report), capacityKey);
+    const response = JSON.parse(raw) as { result: { isError: boolean } };
+
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { accepted: false, reason: "daily_capacity_reached" },
+    });
+    expect(raw).not.toContain("adoption-capacity-agent");
+    expect(raw).not.toMatch(/prompt|response|path|alias/i);
+    expect(tableCount("request_log")).toBe(0);
+    expect(tableCount("owner_request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
+  });
+
+  it("returns a stable redacted reason when adoption evidence storage is unavailable", async () => {
+    const storageKey = mintKey({ alias: "adoption-storage-agent", tier: "owner", scope: "agent" }, DEFAULTS).plaintextKey;
+    const db = getDb();
+    let raw = "";
+    db.exec(`
+      CREATE TEMP TRIGGER force_adoption_storage_failure
+      BEFORE INSERT ON adoption_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'forced adoption storage failure');
+      END;
+    `);
+    try {
+      raw = await rpc(callBody(90, "record_adoption_evidence", report), storageKey);
+    } finally {
+      db.exec("DROP TRIGGER force_adoption_storage_failure");
+    }
+    const response = JSON.parse(raw) as { result: { isError: boolean } };
+
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { accepted: false, reason: "storage_unavailable" },
+    });
+    expect(raw).not.toContain("adoption-storage-agent");
+    expect(raw).not.toMatch(/sqlite|readonly database|prompt|response|path|alias|principal/i);
+    expect(tableCount("adoption_evidence")).toBe(0);
+    expect(tableCount("request_log")).toBe(0);
+    expect(tableCount("owner_request_log")).toBe(0);
     expect(accessLines).toEqual([]);
   });
 

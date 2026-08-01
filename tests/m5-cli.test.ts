@@ -185,6 +185,40 @@ describe("m5 command surface", () => {
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 
+  it("surfaces a stable redacted gateway rejection reason for a valid completed ask", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "adoption", "report"], {
+      input: Readable.from(['{"harness":"codex_cli","execution_mode":"ask","traffic_purpose":"organic","result":"completed","deterministic_check":"pass","reviewer_usefulness":"partial","fallback_reason":"none","eligible_opportunities":1}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            content: [{ type: "text", text: "Adoption report was not accepted (daily_capacity_reached)." }],
+            isError: true,
+            structuredContent: { accepted: false, reason: "daily_capacity_reached" },
+          },
+        }), { status: 200 });
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: {
+        code: "tool_error",
+        message: expect.stringContaining("daily_capacity_reached"),
+      },
+    });
+    expect(error.text()).not.toContain(SECRET);
+  });
+
   it("redacts malicious upstream bodies from stdout, stderr, and serialized errors", async () => {
     const output = sink();
     const error = sink();

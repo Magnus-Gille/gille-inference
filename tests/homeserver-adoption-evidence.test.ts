@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { getDb, initDb } from "../src/db.js";
 import {
   ADOPTION_EVIDENCE_COLUMNS,
+  ADOPTION_CHECK_OUTCOMES,
+  ADOPTION_HARNESSES,
+  ADOPTION_TRAFFIC_PURPOSES,
+  ADOPTION_USEFULNESS,
   MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY,
   ensureAdoptionEvidenceSchema,
   parseAdoptionEvidence,
@@ -61,6 +65,30 @@ describe("M5 adoption evidence (#136)", () => {
       fallbackReason: "none",
       eligibleOpportunities: 1,
     }) });
+  });
+
+  it("accepts every documented enum combination relevant to a successful ask", () => {
+    let cases = 0;
+    for (const harness of ADOPTION_HARNESSES) {
+      for (const trafficPurpose of ADOPTION_TRAFFIC_PURPOSES) {
+        for (const deterministicCheck of ADOPTION_CHECK_OUTCOMES) {
+          for (const reviewerUsefulness of ADOPTION_USEFULNESS) {
+            expect(parseAdoptionEvidence({
+              harness,
+              execution_mode: "ask",
+              traffic_purpose: trafficPurpose,
+              result: "completed",
+              deterministic_check: deterministicCheck,
+              reviewer_usefulness: reviewerUsefulness,
+              fallback_reason: "none",
+              eligible_opportunities: 1,
+            })).toMatchObject({ ok: true });
+            cases += 1;
+          }
+        }
+      }
+    }
+    expect(cases).toBe(270);
   });
 
   it("rejects content, paths, identity claims, and unbounded labels at ingress", () => {
