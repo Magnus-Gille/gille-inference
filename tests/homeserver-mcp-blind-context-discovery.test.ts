@@ -334,7 +334,7 @@ describe("MCP blind-context discovery", () => {
         files: [join(allowedRoot, "notes.txt")],
       });
       expect(result.isError).toBe(true);
-      expect(result.text).toMatch(/resolve to no real directories/i);
+      expect(result.text).toMatch(/configured.*roots resolve to a real director/i);
       expect(harness.upstreamHits()).toBe(0);
     } finally {
       await harness.stop();

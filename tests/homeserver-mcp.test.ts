@@ -236,7 +236,7 @@ describe("MCP tools/call list_models", () => {
   it("returns structured blind-context discovery for an owner when the feature is unset/default-disabled", async () => {
     const res = await rpc(
       { jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "list_models", arguments: {} } },
-      creditKey
+      openKey
     );
     expect(res.status).toBe(200);
     const j = (await res.json()) as {
