@@ -38,6 +38,13 @@ import {
   type EvidenceIdentityBundle,
   type EvidenceLane,
 } from "./evidence-identity.js";
+import {
+  recordCompletedSpan,
+  setTraceDefaults,
+  updateCurrentTraceSpan,
+  withTraceSpan,
+  type TraceSpanFinish,
+} from "./tracing.js";
 
 /**
  * The orchestrator: the decision point where a frontier brain (Opus) hands a task down
@@ -632,6 +639,10 @@ function classifyError(error: string): ErrorClass {
   return "infra";
 }
 
+function classifyLocalInferenceTrace(result: LocalInferenceResult): TraceSpanFinish | undefined {
+  return result.ok ? undefined : { outcome: "error" };
+}
+
 /**
  * Run one delegation through the full policy + record loop.
  */
@@ -642,6 +653,7 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
   activeDelegations++;
 
   try {
+    setTraceDefaults({ taskType: "delegation", lane: "default", retryOrdinal: 0 });
     finalOutcome = await delegateImpl(task);
     return finalOutcome;
   } finally {
@@ -798,46 +810,63 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
     });
   }
-  const runLocalOnce = async (): Promise<LocalInferenceResult> => {
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, cfg.callTimeoutMs);
-    let r: LocalInferenceResult;
-    try {
-      r = nodeId === "orin"
-        ? await runOrinInference(modelId, task.prompt, {
-            systemPrompt: task.systemPrompt,
-            maxTokens,
-            temperature: sampling.temperature,
-            topP: sampling.topP,
-            topK: sampling.topK,
-            minP: sampling.minP,
-            responseFormat,
-            signal: controller.signal,
-          }, cfg)
-        : await runLmStudioInference(modelId, task.prompt, {
-            systemPrompt: task.systemPrompt,
-            maxTokens,
-            ...sampling,
-            responseFormat,
-            signal: controller.signal,
-          });
-    } catch (err) {
-      // runLmStudioInference catches its own errors, but if an abort (or anything else)
-      // ever escapes, fold it into a result instead of throwing out of delegate().
-      r = timedOut
-        ? { ok: false, error: TIMEOUT_SENTINEL }
-        : { ok: false, error: err instanceof Error ? err.message : String(err) };
-    } finally {
-      clearTimeout(timer);
-    }
-    return timedOut ? { ok: false, error: TIMEOUT_SENTINEL } : r;
+  const runLocalOnce = async (retryOrdinal: number): Promise<LocalInferenceResult> => {
+    return withTraceSpan("inference", { retryOrdinal }, async () => {
+      const controller = new AbortController();
+      const startedAtMs = Date.now();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, cfg.callTimeoutMs);
+      let r: LocalInferenceResult;
+      try {
+        r = nodeId === "orin"
+          ? await runOrinInference(modelId, task.prompt, {
+              systemPrompt: task.systemPrompt,
+              maxTokens,
+              temperature: sampling.temperature,
+              topP: sampling.topP,
+              topK: sampling.topK,
+              minP: sampling.minP,
+              responseFormat,
+              signal: controller.signal,
+            }, cfg)
+          : await runLmStudioInference(modelId, task.prompt, {
+              systemPrompt: task.systemPrompt,
+              maxTokens,
+              ...sampling,
+              responseFormat,
+              signal: controller.signal,
+            });
+      } catch (err) {
+        // runLmStudioInference catches its own errors, but if an abort (or anything else)
+        // ever escapes, fold it into a result instead of throwing out of delegate().
+        r = timedOut
+          ? { ok: false, error: TIMEOUT_SENTINEL }
+          : { ok: false, error: err instanceof Error ? err.message : String(err) };
+      } finally {
+        clearTimeout(timer);
+      }
+      const effective = timedOut ? { ok: false as const, error: TIMEOUT_SENTINEL } : r;
+      updateCurrentTraceSpan({
+        retryOrdinal,
+        ...(effective.ok ? {} : { errorClass: effective.truncated === true ? "truncated" : classifyError(effective.error) }),
+      });
+      if (effective.ok && typeof effective.ttftMs === "number") {
+        recordCompletedSpan("ttft", {
+          startedAtMs,
+          endedAtMs: startedAtMs + effective.ttftMs,
+          outcome: "ok",
+          retryOrdinal,
+          surface: "model",
+        });
+      }
+      return effective;
+    }, { surface: "model", classifyResult: classifyLocalInferenceTrace });
   };
 
-  let result = await runLocalOnce();
+  let result = await runLocalOnce(0);
   // ── Retry-on-transient-parse-error (#164) ──
   // The gpt-oss-120b harmony/PEG failure is non-deterministic per identical request, so ONE retry of
   // the same call recovers the majority. Cap at exactly one retry (no loop); a different error class
@@ -845,7 +874,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
   let formatRetried = false;
   if (!result.ok && isTransientFormatError(result.error)) {
     formatRetried = true;
-    result = await runLocalOnce();
+    result = await runLocalOnce(1);
   }
   // Surfaced on the ledger row + returned outcome so the retry is visible, not silent.
   const retryNote = formatRetried ? "format-retry(#164)" : undefined;
@@ -909,7 +938,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
   let notes: string | undefined;
 
   if (task.verifier) {
-    const vr = await task.verifier(result.response);
+    const vr = await withTraceSpan("verification", {}, async () => task.verifier!(result.response), { surface: "model" });
     outcome = vr.outcome;
     score = vr.score;
     errorClass = vr.errorClass;

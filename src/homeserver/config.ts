@@ -5,6 +5,7 @@ import {
   DEFAULT_REVIEW_CASCADE_SHADOW,
   type ReviewCascadeShadowConfig,
 } from "./review-cascade-shadow.js";
+import { sanitizeTraceIdentity } from "./tracing.js";
 
 export type { ShadowLaneConfig };
 export type { ReviewCascadeShadowConfig };
@@ -329,6 +330,16 @@ export interface HomeserverConfig {
   shadowLane: ShadowLaneConfig;
   /** #132: owner-only GPT-OSS → Qwen review measurement lane. Default OFF. */
   reviewCascadeShadow: ReviewCascadeShadowConfig;
+  /** Manual content-blind tracing/export. Instrumentation and export are separately gated. */
+  tracing: {
+    instrumentation: "on" | "off";
+    export: "on" | "off";
+    samplingRatePerMille: number;
+    exportUrl: string;
+    exportTimeoutMs: number;
+    release: string;
+    instanceId: string;
+  };
   /** Whether structured access logging is enabled ('on' | 'off'). Default: 'on'. */
   accessLog: "on" | "off";
   /**
@@ -766,6 +777,18 @@ export function loadConfig(): HomeserverConfig {
         : [...DEFAULT_REVIEW_CASCADE_SHADOW.taskTypes],
       maxTokens: Math.max(1, Math.floor(envNum("HOMESERVER_REVIEW_CASCADE_MAX_TOKENS", DEFAULT_REVIEW_CASCADE_SHADOW.maxTokens))),
       timeoutMs: Math.max(1, Math.floor(envNum("HOMESERVER_REVIEW_CASCADE_TIMEOUT_MS", DEFAULT_REVIEW_CASCADE_SHADOW.timeoutMs))),
+    },
+    tracing: {
+      instrumentation: (process.env["HOMESERVER_TRACE_INSTRUMENTATION"] ?? "off") === "on" ? "on" : "off",
+      export: (process.env["HOMESERVER_TRACE_EXPORT"] ?? "off") === "on" ? "on" : "off",
+      samplingRatePerMille: Math.max(
+        0,
+        Math.min(1000, Math.floor(envNum("HOMESERVER_TRACE_SAMPLING_PER_MILLE", 1000))),
+      ),
+      exportUrl: (process.env["HOMESERVER_TRACE_EXPORT_URL"] ?? "").trim(),
+      exportTimeoutMs: Math.max(1, Math.floor(envNum("HOMESERVER_TRACE_EXPORT_TIMEOUT_MS", 2_000))),
+      release: sanitizeTraceIdentity(process.env["HOMESERVER_TRACE_RELEASE"], "dev"),
+      instanceId: sanitizeTraceIdentity(process.env["HOMESERVER_TRACE_INSTANCE_ID"], "unknown"),
     },
     accessLog: (process.env["HOMESERVER_ACCESS_LOG"] ?? "on") === "off" ? "off" : "on",
     ownerRequestLog:
