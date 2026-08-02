@@ -1,6 +1,6 @@
 import { execFile as nodeExecFile } from "node:child_process";
 
-export const M5_CLIENT_VERSION = "1.2.0";
+export const M5_CLIENT_VERSION = "1.2.1";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
@@ -29,6 +29,7 @@ const ADOPTION_USEFULNESS = new Set(["pass", "partial", "redo", "wrong", "not_re
 const ADOPTION_FALLBACKS = new Set([
   "none", "m5_tool_missing", "m5_auth_unavailable", "m5_unreachable", "m5_busy", "m5_refused", "local_result_unusable", "other_known",
 ]);
+const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 const TOKEN_PATTERNS = [
   /\bBearer\s+[^\s"',}]+/gi,
@@ -253,6 +254,12 @@ function rpcErrorMessage(response) {
   return message;
 }
 
+function hasOnlyKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expectedKeys.length && expectedKeys.every((key) => keys.includes(key));
+}
+
 function toolPayload(result) {
   if (!result || typeof result !== "object") {
     throw new M5ClientError("malformed_mcp", "The MCP tool result is malformed.");
@@ -276,6 +283,12 @@ function toolPayload(result) {
   return text;
 }
 
+function toolText(result) {
+  return Array.isArray(result?.content)
+    ? result.content.find((entry) => entry?.type === "text")?.text
+    : undefined;
+}
+
 function parseModels(text) {
   if (typeof text !== "string") {
     throw new M5ClientError("malformed_mcp", "The model catalogue response is malformed.");
@@ -289,6 +302,82 @@ function parseModels(text) {
       return { id: id.trim(), description: description.join(" — ").trim() };
     })
     .filter((model) => model.id.length > 0);
+}
+
+function parseAskCapabilities(value) {
+  if (!hasOnlyKeys(value, ["files_enabled", "files_reason", "resolved_root_count"])) {
+    return null;
+  }
+  const { files_enabled, files_reason, resolved_root_count } = value;
+  const validReason =
+    files_reason === "enabled" ||
+    files_reason === "owner_tier_required" ||
+    files_reason === "unconfigured" ||
+    files_reason === "no_resolved_roots";
+  if (
+    typeof files_enabled !== "boolean" ||
+    !validReason ||
+    !(
+      resolved_root_count === null ||
+      (Number.isSafeInteger(resolved_root_count) && resolved_root_count >= 0 && resolved_root_count <= MAX_BLIND_CONTEXT_ROOTS)
+    )
+  ) {
+    return null;
+  }
+  if (files_enabled) {
+    if (files_reason !== "enabled" || resolved_root_count === null || resolved_root_count < 1) {
+      return null;
+    }
+  } else if (files_reason === "owner_tier_required") {
+    if (resolved_root_count !== null) {
+      return null;
+    }
+  } else if (
+    (files_reason !== "unconfigured" && files_reason !== "no_resolved_roots")
+    || resolved_root_count !== 0
+  ) {
+    return null;
+  }
+  return { files_enabled, files_reason, resolved_root_count };
+}
+
+function parseStructuredModelsPayload(payload) {
+  if (!hasOnlyKeys(payload, ["models", "ask_capabilities"])) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The model catalogue response is malformed.",
+    );
+  }
+  if (!Array.isArray(payload.models)) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The model catalogue response is malformed.",
+    );
+  }
+  const models = payload.models.map((entry) => {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      !hasOnlyKeys(entry, ["id", "description"]) ||
+      typeof entry.id !== "string" ||
+      typeof entry.description !== "string"
+    ) {
+      throw new M5ClientError(
+        "malformed_mcp",
+        "The model catalogue response is malformed.",
+      );
+    }
+    return { id: entry.id, description: entry.description };
+  });
+  const askCapabilities = parseAskCapabilities(payload.ask_capabilities);
+  if (askCapabilities === null) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The model catalogue response is malformed.",
+    );
+  }
+  return { models, ask_capabilities: askCapabilities };
 }
 
 function emptyAskUsage() {
@@ -661,18 +750,54 @@ export async function createM5Client({
     },
 
     async models() {
-      const payload = await client.tool("list_models", {});
-      const models = parseModels(payload);
-      if (
-        models.length === 0 &&
-        !(typeof payload === "string" && /^No models are available/i.test(payload))
-      ) {
-        throw new M5ClientError(
-          "malformed_mcp",
-          "The model catalogue response is malformed.",
-        );
+      try {
+        const id = nextId++;
+        const response = await client.rpc({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "list_models", arguments: {} },
+        });
+        if (response?.error) {
+          throw new M5ClientError(
+            "mcp_error",
+            redactText(rpcErrorMessage(response), secrets),
+          );
+        }
+        const result = response?.result;
+        if (!result || typeof result !== "object") {
+          throw new M5ClientError(
+            "malformed_mcp",
+            "The MCP tool result is malformed.",
+          );
+        }
+        if (result.isError === true) {
+          const text = toolText(result);
+          throw new M5ClientError(
+            "tool_error",
+            typeof text === "string" ? text : "The MCP tool reported an error.",
+          );
+        }
+
+        if (Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
+          return parseStructuredModelsPayload(result.structuredContent);
+        }
+
+        const text = toolText(result);
+        const models = parseModels(text);
+        if (
+          models.length === 0 &&
+          !(typeof text === "string" && /^No models are available/i.test(text))
+        ) {
+          throw new M5ClientError(
+            "malformed_mcp",
+            "The model catalogue response is malformed.",
+          );
+        }
+        return { models };
+      } catch (error) {
+        throw safeError(error, secrets);
       }
-      return { models };
     },
 
     async ask(input) {

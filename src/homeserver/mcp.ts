@@ -14,7 +14,12 @@ import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
 import { canonicalizeModelTrusted } from "./catalogue.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
-import { expandBlindContext, type BlindContextConfig } from "./blind-context.js";
+import {
+  describeBlindContextAvailability,
+  expandBlindContext,
+  MAX_BLIND_CONTEXT_ROOTS,
+  type BlindContextConfig,
+} from "./blind-context.js";
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
@@ -102,11 +107,107 @@ const ASK_DESCRIPTION =
   "Successful calls return the model text plus structuredContent {model,text,finish_reason,truncated,metered,usage}. " +
   "A token-limit finish (finish_reason=length) returns isError:true while preserving the partial text in content and the same structuredContent; the truncated call is already metered and any retry is a new billable call. " +
   "Use this liberally for bounded work to save cost and keep data local. " +
+  "Call list_models for the live, content-blind ask.files capability state before using file " +
+  "attachments. " +
   "OWNER-TIER KEYS ONLY: an optional `files` array of absolute paths on the box is expanded " +
   "SERVER-SIDE into the prompt as local context, so this tool can orchestrate over local data it " +
   "never ingests — only the box reads the file and the local model sees its content. Requires " +
   "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); a guest key supplying " +
   "`files` is always rejected, never silently ignored.";
+
+const ASK_FILES_REASON_VALUES = ["enabled", "owner_tier_required", "unconfigured", "no_resolved_roots"] as const;
+const MAX_SAFE_ROOT_COUNT = MAX_BLIND_CONTEXT_ROOTS;
+const STRUCTURED_LIST_MODELS_MIN_M5_CLIENT_VERSION = [1, 2, 1] as const;
+
+type AskFilesReason = (typeof ASK_FILES_REASON_VALUES)[number];
+
+interface AskFilesCapability {
+  files_enabled: boolean;
+  files_reason: AskFilesReason;
+  resolved_root_count: number | null;
+}
+
+interface ListModelsStructuredContent {
+  models: Array<{ id: string; description: string }>;
+  ask_capabilities: AskFilesCapability;
+}
+
+interface McpToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+}
+
+export const ASK_FILES_META_KEY = "gille-inference/ask_capabilities";
+
+const ASK_FILES_CAPABILITY_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    files_enabled: { type: "boolean" },
+    files_reason: { type: "string", enum: ASK_FILES_REASON_VALUES },
+    resolved_root_count: {
+      oneOf: [
+        { type: "integer", minimum: 0, maximum: MAX_SAFE_ROOT_COUNT },
+        { type: "null" },
+      ],
+    },
+  },
+  required: ["files_enabled", "files_reason", "resolved_root_count"],
+  oneOf: [
+    {
+      properties: {
+        files_enabled: { const: true },
+        files_reason: { const: "enabled" },
+        resolved_root_count: { type: "integer", minimum: 1, maximum: MAX_SAFE_ROOT_COUNT },
+      },
+    },
+    {
+      properties: {
+        files_enabled: { const: false },
+        files_reason: { const: "owner_tier_required" },
+        resolved_root_count: { type: "null" },
+      },
+    },
+    {
+      properties: {
+        files_enabled: { const: false },
+        files_reason: { const: "unconfigured" },
+        resolved_root_count: { const: 0 },
+      },
+    },
+    {
+      properties: {
+        files_enabled: { const: false },
+        files_reason: { const: "no_resolved_roots" },
+        resolved_root_count: { const: 0 },
+      },
+    },
+  ],
+} as const;
+
+const LIST_MODELS_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    models: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          description: { type: "string" },
+        },
+        required: ["id", "description"],
+      },
+    },
+    ask_capabilities: ASK_FILES_CAPABILITY_SCHEMA,
+  },
+  required: ["models", "ask_capabilities"],
+} as const;
 
 const ASK_USAGE_OUTPUT_SCHEMA = {
   type: "object",
@@ -166,6 +267,74 @@ function isAdoptionReporter(principal: McpPrincipal): boolean {
   return isCodeLoopOwner(principal);
 }
 
+function isAskFilesOwner(principal: McpPrincipal): boolean {
+  return principal.tier === "owner";
+}
+
+function askFilesCapability(principal: McpPrincipal, cfg: HomeserverConfig): AskFilesCapability {
+  if (!isAskFilesOwner(principal)) {
+    return {
+      files_enabled: false,
+      files_reason: "owner_tier_required",
+      resolved_root_count: null,
+    };
+  }
+  const availability = describeBlindContextAvailability(cfg.blindContextRoots);
+  return {
+    files_enabled: availability.enabled,
+    files_reason: availability.reason,
+    resolved_root_count: availability.resolvedRootCount,
+  };
+}
+
+function buildListModelsStructuredContent(models: readonly string[], capability: AskFilesCapability): ListModelsStructuredContent {
+  return {
+    models: models.map((id) => ({ id, description: strengthHint(id) })),
+    ask_capabilities: capability,
+  };
+}
+
+function parseSemverTriplet(raw: string): [number, number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(raw);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function compareSemverTriplets(
+  left: readonly [number, number, number],
+  right: readonly [number, number, number]
+): number {
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] === right[i]) continue;
+    return left[i]! < right[i]! ? -1 : 1;
+  }
+  return 0;
+}
+
+function supportsStructuredListModelsContent(userAgent: string | null | undefined): boolean {
+  if (!userAgent) return true;
+  const match = /\bm5-cli\/([^\s]+)/.exec(userAgent);
+  if (!match) return true;
+  const version = parseSemverTriplet(match[1]!);
+  if (!version) return false;
+  return compareSemverTriplets(version, STRUCTURED_LIST_MODELS_MIN_M5_CLIENT_VERSION) >= 0;
+}
+
+function renderListModelsText(content: ListModelsStructuredContent): string {
+  const lines =
+    content.models.length === 0
+      ? ["No models are available to this key."]
+      : ["Models available to you:", ...content.models.map((model) => `- ${model.id} — ${model.description}`)];
+  lines.push(
+    "",
+    "Current ask.files capability:",
+    `files_enabled: ${content.ask_capabilities.files_enabled}`,
+    `files_reason: ${content.ask_capabilities.files_reason}`,
+    `resolved_root_count: ${content.ask_capabilities.resolved_root_count === null ? "null" : content.ask_capabilities.resolved_root_count}`
+  );
+  return lines.join("\n");
+}
+
 const ADOPTION_REPORT_DESCRIPTION =
   "Record one content-free M5 adoption observation for the private operator dashboard. " +
   "Use this when an eligible task was completed, refused, failed, or could not even attempt M5; " +
@@ -216,18 +385,21 @@ export function isAdoptionEvidenceToolCall(rawBody: string): boolean {
  * owner-agent code_loop_* tools (#116) are appended only for a real minted owner key carrying
  * agent or admin scope — everyone else never sees them in tools/list.
  */
-function toolDefs(principal: McpPrincipal): unknown[] {
-  const base: unknown[] = [
+function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] {
+  const filesCapability = askFilesCapability(principal, cfg);
+  const base: McpToolDef[] = [
     {
       name: "list_models",
       description:
-        "List the local models THIS key is permitted to use, each with a one-line strength hint. " +
-        "Call this first to choose a model id for the `ask` tool.",
+        "List the local models THIS key is permitted to use, each with a one-line strength hint, " +
+        "plus the live call-time ask.files capability state for this request.",
       inputSchema: { type: "object", properties: {}, required: [] },
+      outputSchema: LIST_MODELS_OUTPUT_SCHEMA,
     },
     {
       name: "ask",
       description: ASK_DESCRIPTION,
+      _meta: { [ASK_FILES_META_KEY]: filesCapability },
       inputSchema: {
         type: "object",
         properties: {
@@ -279,7 +451,7 @@ function toolDefs(principal: McpPrincipal): unknown[] {
       },
     });
   }
-  if (isCodeLoopOwner(principal)) base.push(...codeLoopToolDefs());
+  if (isCodeLoopOwner(principal)) base.push(...(codeLoopToolDefs() as McpToolDef[]));
   return base;
 }
 
@@ -925,6 +1097,7 @@ interface ToolCallContext {
   cfg: HomeserverConfig;
   controller: AdmissionController;
   gatewayRequestId: string;
+  userAgent: string | null;
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch;
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
 }
@@ -933,11 +1106,15 @@ interface ToolCallContext {
 async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<{ text: string; isError: boolean; structuredContent?: unknown }> {
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal);
-    if (models.length === 0) {
-      return { text: "No models are available to this key.", isError: false };
-    }
-    const lines = models.map((m) => `- ${m} — ${strengthHint(m)}`);
-    return { text: `Models available to you:\n${lines.join("\n")}`, isError: false };
+    const structuredContent = buildListModelsStructuredContent(
+      models,
+      askFilesCapability(ctx.principal, ctx.cfg)
+    );
+    return {
+      text: renderListModelsText(structuredContent),
+      isError: false,
+      ...(supportsStructuredListModelsContent(ctx.userAgent) ? { structuredContent } : {}),
+    };
   }
 
   if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {
@@ -1017,7 +1194,7 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       }
       files = raw as string[];
     }
-    if (files !== undefined && files.length > 0 && ctx.principal.tier !== "owner") {
+    if (files !== undefined && files.length > 0 && !isAskFilesOwner(ctx.principal)) {
       const env = makeError("route_not_allowed", {
         message: "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
       });
@@ -1159,7 +1336,7 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
 
   if (method === "tools/list") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcResult(id, { tools: toolDefs(ctx.principal) }));
+    res.end(rpcResult(id, { tools: toolDefs(ctx.principal, ctx.cfg) }));
     return;
   }
 

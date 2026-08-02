@@ -255,13 +255,18 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 | `initialize` | `{protocolVersion:"2025-06-18", capabilities:{tools:{}}, serverInfo:{name:"m5-local-models", version:"1.0.0"}}` + an `Mcp-Session-Id` response header (we are stateless — never required back). |
 | `notifications/initialized` | `202 Accepted`, empty body. |
 | `ping` | `{}`. |
-| `tools/list` | the two tool defs (below). |
+| `tools/list` | the tool defs below, including content-blind blind-context discovery on `ask._meta["gille-inference/ask_capabilities"]` (`files_enabled`, stable `files_reason`, `resolved_root_count` with guest-safe `null`). |
 | `tools/call` | `{content:[{type:"text", text}], isError, structuredContent?}`. |
 | unknown / malformed | JSON-RPC `-32601` / `-32700` / `-32600` error (HTTP 200). |
 
 **Tools** (both scoped to the key's allow-list):
 
-- `list_models` — lists the model ids THIS key may use, each with a one-line strength hint.
+- `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. For
+  structured-capable callers it returns `structuredContent.ask_capabilities`, the **live
+  call-time** blind-context discovery state for `ask.files`, mirrored in backward-compatible text
+  and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
+  `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
+  text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
 - `ask` — `{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
   local model. Successful calls keep the text in the content block and also attach
   `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always
@@ -293,6 +298,13 @@ sees only the model's answer text.
 - **Disabled by default.** `HOMESERVER_BLIND_CONTEXT_ROOTS` (colon-separated absolute directories)
   is empty unless configured — with no roots, ANY `files` request errors with an actionable
   message. There is no way for an unset env var to silently widen into "everything is allowed."
+- **Truthful discovery before `ask`.** `tools/list` advertises the current `ask` blind-context
+  capability in content-blind `ask._meta["gille-inference/ask_capabilities"]`, and
+  `list_models` mirrors the same **live call-time** fields in text plus, for structured-capable
+  callers, `structuredContent.ask_capabilities`: `files_enabled`, stable `files_reason`
+  (`enabled`, `owner_tier_required`, `unconfigured`, `no_resolved_roots`), and
+  `resolved_root_count`. Discovery never leaks actual root paths; guest keys receive
+  `resolved_root_count: null`.
 - **Path safety** (`blind-context.ts`, the pure/unit-tested trust anchor): every input path (and
   every configured root) is resolved via `realpath` — which fully resolves symlinks AND collapses
   `..` segments — **before** the allow-list containment check runs. This closes both classic `../`

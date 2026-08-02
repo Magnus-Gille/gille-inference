@@ -96,6 +96,62 @@ describe("m5 command surface", () => {
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 
+  it("preserves structured ask.files discovery in models output", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "models"], {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    "Models available to you:\n- mellum — very fast\n\n" +
+                    "Current ask.files capability:\n" +
+                    "files_enabled: false\n" +
+                    "files_reason: owner_tier_required\n" +
+                    "resolved_root_count: null",
+                },
+              ],
+              isError: false,
+              structuredContent: {
+                models: [{ id: "mellum", description: "very fast" }],
+                ask_capabilities: {
+                  files_enabled: false,
+                  files_reason: "owner_tier_required",
+                  resolved_root_count: null,
+                },
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({
+      models: [{ id: "mellum", description: "very fast" }],
+      ask_capabilities: {
+        files_enabled: false,
+        files_reason: "owner_tier_required",
+        resolved_root_count: null,
+      },
+    });
+    expect(error.text()).toBe("");
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
   it("allows HTTP only when the configured private endpoint is selected explicitly", async () => {
     const output = sink();
     const error = sink();

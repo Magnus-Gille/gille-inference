@@ -1,4 +1,5 @@
 import { loadEnv } from "../env.js";
+import { MAX_BLIND_CONTEXT_ROOTS } from "./blind-context.js";
 import type { ShadowLaneConfig } from "./shadow-lane.js";
 import {
   DEFAULT_REVIEW_CASCADE_SHADOW,
@@ -611,6 +612,12 @@ export function loadConfig(): HomeserverConfig {
   // LM Studio reachable base — accept either a /v1 URL or a bare host:port.
   const lmBase = (process.env["LMSTUDIO_BASE_URL"] ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
   const origin = lmBase.replace(/\/v1$/, "");
+  const blindContextRoots = envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS");
+  if (blindContextRoots.length > MAX_BLIND_CONTEXT_ROOTS) {
+    throw new Error(
+      `HOMESERVER_BLIND_CONTEXT_ROOTS may list at most ${MAX_BLIND_CONTEXT_ROOTS} entries.`
+    );
+  }
   // The shared lmstudio-client reads LMSTUDIO_BASE_URL directly; keep it aligned so the
   // orchestrator and the raw client never disagree on where LM Studio lives.
   if (!process.env["LMSTUDIO_BASE_URL"]) process.env["LMSTUDIO_BASE_URL"] = lmBase;
@@ -817,7 +824,7 @@ export function loadConfig(): HomeserverConfig {
       balanced: process.env["HOMESERVER_IMAGE_MODEL_BALANCED"] ?? "sd3.5-large-turbo",
       high: process.env["HOMESERVER_IMAGE_MODEL_HIGH"] ?? "flux.1-schnell",
     },
-    blindContextRoots: envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS"),
+    blindContextRoots,
     blindContextMaxFileBytes: envNum("HOMESERVER_BLIND_CONTEXT_MAX_FILE_BYTES", 262_144),
     blindContextMaxTotalBytes: envNum("HOMESERVER_BLIND_CONTEXT_MAX_TOTAL_BYTES", 1_048_576),
     // code_loop (#116). Default off → the surface is visible to owners but inert until provisioned.
