@@ -81,12 +81,22 @@ interface LlamaSwapRunningEntry {
   [key: string]: unknown;
 }
 
-/** Fetch /running and return the array (empty if idle). */
-async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
+type RunningProbeResult =
+  | { ok: true; entries: LlamaSwapRunningEntry[] }
+  | { ok: false };
+
+/** Fetch /running, distinguishing an HTTP failure from a valid empty running list. */
+async function fetchRunningProbe(origin: string): Promise<RunningProbeResult> {
   const res = await fetchWithTimeout(`${origin}/running`, {}, 5000);
-  if (!res.ok) return [];
+  if (!res.ok) return { ok: false };
   const data = (await res.json()) as { running?: LlamaSwapRunningEntry[] };
-  return data.running ?? [];
+  return { ok: true, entries: data.running ?? [] };
+}
+
+/** Fetch /running and retain the established empty-list fallback for read-only callers. */
+async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
+  const probe = await fetchRunningProbe(origin);
+  return probe.ok ? probe.entries : [];
 }
 
 function classifyLoadTrace(result: LoadResult): TraceSpanFinish | undefined {
@@ -177,18 +187,28 @@ export async function loadModel(
   modelKey: string,
   opts: LoadOptions = {}
 ): Promise<LoadResult> {
+  let runningProbeFailed = false;
   return withTraceSpan("model_load", {}, async () => {
     void opts; // opts ignored — llama-swap owns startup config
     assertModelKey(modelKey);
     const origin = getOrigin();
     const start = Date.now();
 
-    // Check if already loaded. The probe is part of the model-load operation: annotate and
-    // rethrow probe failures so callers retain the existing thrown/API behaviour while tracing
-    // gets one fixed, content-free failure class and readiness observation.
+    // Check if already loaded. The probe is part of the model-load operation: thrown probe
+    // failures retain the existing thrown/API behaviour, while HTTP failures are recorded and
+    // the established warm-up fallback may continue. Both paths get a fixed, content-free
+    // failure class and readiness observation.
     try {
-      const running = await fetchRunning(origin);
-      const runningEntry = running.find((r) => r.model === modelKey && r.state === "ready");
+      const probe = await fetchRunningProbe(origin);
+      if (!probe.ok) {
+        runningProbeFailed = true;
+        const errorClass = "upstream_unavailable";
+        updateCurrentTraceSpan({ errorClass });
+        recordReadinessObservation("model", "failed", { errorClass });
+      }
+      const runningEntry = probe.ok
+        ? probe.entries.find((r) => r.model === modelKey && r.state === "ready")
+        : undefined;
       if (runningEntry) {
         const modelArtifactIdentity = traceModelArtifactIdentityFromServedModelCmd(runningEntry.cmd);
         const traceAttrs = modelArtifactIdentity ? { modelArtifactIdentity } : {};
@@ -247,7 +267,13 @@ export async function loadModel(
         message: err instanceof Error ? err.message : String(err),
       };
     }
-  }, { surface: "model", classifyResult: classifyLoadTrace });
+  }, {
+    surface: "model",
+    classifyResult: (result) =>
+      runningProbeFailed
+        ? { outcome: "error", errorClass: "upstream_unavailable" }
+        : classifyLoadTrace(result),
+  });
 }
 
 /**

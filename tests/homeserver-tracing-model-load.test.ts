@@ -209,6 +209,53 @@ describe("model-load tracing", () => {
     expectNoModelArtifact(await flushTracingForTests(), "ok", "ok");
   });
 
+  it("preserves a failed /running probe before a successful warm-up and keeps the load span unhealthy", async () => {
+    setTracingTestHooks({ captureExports: true });
+    let runningBodyRead = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/running")) {
+          return {
+            ok: false,
+            status: 503,
+            text: async () => {
+              runningBodyRead = true;
+              return "SECRET_RUNNING_PROBE_BODY";
+            },
+          } as Response;
+        }
+        if (url.endsWith("/v1/chat/completions")) {
+          return { ok: true, status: 200 } as Response;
+        }
+        throw new Error(`unexpected url ${url}`);
+      }),
+    );
+
+    const result = await runWithSyntheticTraceForTests(
+      { traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-b9c7c989f97918e1-01", exportEnabled: true },
+      async () => loadModel("m1"),
+    );
+
+    expect(result).toMatchObject({ ok: true, modelKey: "m1", identifier: "m1", message: "loaded" });
+    expect(runningBodyRead).toBe(false);
+    const records = await flushTracingForTests();
+    const joined = JSON.stringify(records);
+    expect(joined).not.toContain("SECRET_RUNNING_PROBE_BODY");
+    const readiness = records
+      .map(traceRecord)
+      .filter((record) => record.kind === "service-observation" && record.slot_id === "model-ready");
+    expect(readiness).toEqual([
+      expect.objectContaining({ outcome: "failed", error_class: "upstream_unavailable" }),
+      expect.objectContaining({ outcome: "ok" }),
+    ]);
+    const modelLoad = records
+      .map(traceRecord)
+      .find((record) => record.kind === "trace-span" && record.phase === "model_load");
+    expect(modelLoad).toMatchObject({ outcome: "error", error_class: "upstream_unavailable" });
+  });
+
   it("omits model artifact identity on the upstream-error path while preserving the API error response", async () => {
     setTracingTestHooks({ captureExports: true });
     vi.stubGlobal(

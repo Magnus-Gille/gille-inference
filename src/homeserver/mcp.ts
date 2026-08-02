@@ -671,6 +671,10 @@ function badRequestTrace(): McpTraceOverride {
   return { traceOutcome: "bad_request", traceErrorClass: "invalid_request_error" };
 }
 
+function genericToolErrorTrace(): McpTraceOverride {
+  return { traceOutcome: "error", traceErrorClass: "mcp_tool_error" };
+}
+
 /**
  * Run a non-streaming chat completion through the SAME metered spine as
  * /v1/chat/completions — credit reserve → quota → admission → upstream fetch → reconcile —
@@ -1386,10 +1390,12 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
       res.end();
       return {};
     }
-    // Any other notification is silently accepted (per JSON-RPC, no response for notifications).
+    // This server implements only the initialization notification. Preserve the no-body wire
+    // response for every other notification, but classify the unsupported method as client input
+    // so a 202 transport response cannot look healthy in content-blind telemetry.
     res.writeHead(202);
     res.end();
-    return {};
+    return { trace: badRequestTrace() };
   }
 
   if (method === "initialize") {
@@ -1424,7 +1430,8 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     const out = await callTool(name, toolArgs, ctx);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }) }));
-    return out.trace === undefined ? {} : { trace: out.trace };
+    const trace = out.trace ?? (out.isError ? genericToolErrorTrace() : undefined);
+    return trace === undefined ? {} : { trace };
   }
 
   // Unknown method.

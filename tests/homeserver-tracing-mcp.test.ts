@@ -18,7 +18,7 @@ let resetTracingTestHooks: typeof import("../src/homeserver/tracing.js").resetTr
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
 let releaseStall: (() => void) | null = null;
-let mode: "ok" | "stall" | "reset" | "hang" | "http-5xx" = "ok";
+let mode: "ok" | "stall" | "reset" | "hang" | "http-5xx" | "truncated" = "ok";
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -38,6 +38,15 @@ function startUpstream(): Promise<void> {
         if (mode === "http-5xx") {
           res.writeHead(500, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: { message: "UPSTREAM_ONLY_BODY" } }));
+          return;
+        }
+        if (mode === "truncated") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "cmpl-truncated",
+            choices: [{ message: { role: "assistant", content: "TRUNCATED_PRIVATE_TEXT" }, finish_reason: "length" }],
+            usage: { prompt_tokens: 5, completion_tokens: 64, total_tokens: 69 },
+          }));
           return;
         }
         if (mode === "stall") {
@@ -303,6 +312,28 @@ describe("MCP ask tracing", () => {
     expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
   });
 
+  it("marks an unsupported notification as a bad request without changing its 202 body", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-unsupported-notification", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4747";
+    const secretNotification = "notifications/SECRET_UNSUPPORTED";
+
+    const res = await mcpRaw(
+      key.plaintextKey,
+      JSON.stringify({ jsonrpc: "2.0", method: secretNotification }),
+      traceId,
+    );
+    expect(res.status).toBe(202);
+    expect(await res.text()).toBe("");
+
+    const records = await flushTracingForTests();
+    expect(JSON.stringify(records)).not.toContain(secretNotification);
+    const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+    const readiness = gatewayReadiness(records).find((record) => record.trace?.trace_id === traceId);
+    expect(gateway).toMatchObject({ outcome: "bad_request", error_class: "invalid_request_error" });
+    expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
+  });
+
   it("does not classify a valid notification as a bad request", async () => {
     setTracingTestHooks({ captureExports: true });
     const key = mintKey({ alias: "trace-mcp-notification", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
@@ -336,6 +367,58 @@ describe("MCP ask tracing", () => {
     const { gateway, readiness } = await askOutcomeForTrace(traceId);
     expect(gateway.outcome).toBe("ok");
     expect(readiness.outcome).toBe("ok");
+  });
+
+  it("marks a token-truncated isError result without exposing its partial content in tracing", async () => {
+    setTracingTestHooks({ captureExports: true });
+    mode = "truncated";
+    const key = mintKey({ alias: "trace-mcp-truncated", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4748";
+
+    const res = await mcpAsk(key.plaintextKey, { model: "m1", prompt: "hi" }, traceId, 210);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { result: { isError: boolean; content: Array<{ text: string }> } };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]?.text).toContain("TRUNCATED_PRIVATE_TEXT");
+
+    const records = await flushTracingForTests();
+    expect(JSON.stringify(records)).not.toContain("TRUNCATED_PRIVATE_TEXT");
+    const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+    const readiness = gatewayReadiness(records).find((record) => record.trace?.trace_id === traceId);
+    expect(gateway).toMatchObject({ outcome: "error", error_class: "mcp_tool_error" });
+    expect(readiness).toMatchObject({ outcome: "failed", error_class: "mcp_tool_error" });
+  });
+
+  it("marks a rejected non-ask isError result without exposing report content in tracing", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-adoption-rejected", tier: "owner", scope: "agent" }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4749";
+    const secretReportContent = "SECRET_ADOPTION_REPORT_CONTENT";
+
+    const res = await mcpRaw(
+      key.plaintextKey,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 211,
+        method: "tools/call",
+        params: {
+          name: "record_adoption_evidence",
+          arguments: { prompt: secretReportContent },
+        },
+      }),
+      traceId,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as { result: { isError: boolean; structuredContent: unknown } };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent).toEqual({ accepted: false, reason: "invalid_report" });
+
+    const records = await flushTracingForTests();
+    expect(JSON.stringify(records)).not.toContain(secretReportContent);
+    const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+    const readiness = gatewayReadiness(records).find((record) => record.trace?.trace_id === traceId);
+    expect(gateway).toMatchObject({ outcome: "error", error_class: "mcp_tool_error" });
+    expect(readiness).toMatchObject({ outcome: "failed", error_class: "mcp_tool_error" });
   });
 
   it("maps ordinary client/policy tool errors to semantic spans and unknown readiness", async () => {
