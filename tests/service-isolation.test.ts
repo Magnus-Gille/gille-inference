@@ -149,8 +149,8 @@ install_gateway_autonomy_timer
 function runLlamaTransactionHarness(
   command: "apply" | "rollback" | "failed-apply-rollback" | "failed-apply-invalid-evidence-rollback" | "failed-rollback-retry",
   gatewayInitiallyActive: boolean,
-  failure: "none" | "start" | "health" = "none",
-): { status: number; log: string[]; output: string } {
+  failure: "none" | "start" | "health" | "verify-fatal" = "none",
+): { status: number; log: string[]; output: string; transactionBackup: string | null } {
   const work = mkdtempSync(join(tmpdir(), "gille-llama-dependent-harness-"));
   const log = join(work, "order.log");
   const backup = join(work, "backup");
@@ -160,12 +160,18 @@ function runLlamaTransactionHarness(
   writeFileSync(harness, `#!/usr/bin/env bash
 LOG="$2"; BACKUP="$3"; COMMAND="$4"; gateway_active="$5"; FAILURE="$6"; source "$1"
 record() { printf '%s\\n' "$1" >> "$LOG"; }
-note() { case "$1" in APPLIED:*|ROLLED\\ BACK:*) record success ;; esac; }
+note() {
+  case "$1" in APPLIED:*|ROLLED\\ BACK:*) record success ;; esac
+  case "$1" in *"Backup evidence:"*) printf '%s\\n' "$1" ;; esac
+}
 root_only() { :; }; need() { :; }; preflight() { :; }; create_service_user() { :; }
 require_atomic_move() { :; }; install() { :; }; rollback_feasible() { :; }; install_dropin() { :; }
 backup_unit() { mkdir -p "$3"; printf 'legacy unit\\n' > "$3/unit.before.txt"; }
 migrate_llama_state() { record migrate; gateway_active=0; }
-verify() { record verify; }
+verify() {
+  record verify
+  [ "$FAILURE" != verify-fatal ] || die "synthetic verifier fatal after restart"
+}
 mv() { :; }; chown() { :; }; chmod() { :; }; rm() { :; }; rmdir() { :; }
 show_value() {
   if [ "$2" = User ]; then printf 'magnus\\n'; return; fi
@@ -228,18 +234,29 @@ case "$COMMAND" in
     ;;
 esac
 `, { mode: 0o755 });
+  const transactionBackupPaths = () => readdirSync(backup)
+    .map((name) => join(backup, name))
+    .filter((path) => statSync(path).isDirectory());
   try {
     const output = execFileSync("bash", [harness, script, log, backup, command, gatewayInitiallyActive ? "1" : "0", failure], {
       cwd: root,
       encoding: "utf8",
       stderr: "pipe",
     });
-    return { status: 0, log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean), output };
+    const transactionBackups = transactionBackupPaths();
+    return {
+      status: 0,
+      log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean),
+      output,
+      transactionBackup: transactionBackups.length === 1 ? transactionBackups[0]! : null,
+    };
   } catch (error: any) {
+    const transactionBackups = transactionBackupPaths();
     return {
       status: error.status ?? 1,
       log: readFileSync(log, "utf8").trim().split("\n").filter(Boolean),
       output: `${error.stdout ?? ""}${error.stderr ?? ""}`,
+      transactionBackup: transactionBackups.length === 1 ? transactionBackups[0]! : null,
     };
   }
 }
@@ -514,6 +531,21 @@ describe("service-isolation migration contract (#151)", () => {
     expect(result.status).not.toBe(0);
     expect(result.log).not.toContain("verify");
     expect(result.output).not.toContain("private-locator");
+  });
+
+  it("reports the exact transaction backup once when verify fatally exits after restart, without issuing a receipt", () => {
+    const result = runLlamaTransactionHarness("apply", true, "verify-fatal");
+    expect(result.status).not.toBe(0);
+    expect(result.log).toContain("gateway-start");
+    expect(result.log).toContain("gateway-health");
+    expect(result.log).toContain("verify");
+    expect(result.log).not.toContain("success");
+    expect(result.output).toContain("synthetic verifier fatal after restart");
+    expect(result.output).not.toContain("private-locator");
+    expect(result.transactionBackup).not.toBeNull();
+    const backupPath = result.transactionBackup!;
+    expect(result.output.split(backupPath)).toHaveLength(2);
+    expect(existsSync(join(backupPath, "receipt"))).toBe(false);
   });
 
   it("uses original pre-apply evidence when rollback follows a failed llama-swap apply", () => {

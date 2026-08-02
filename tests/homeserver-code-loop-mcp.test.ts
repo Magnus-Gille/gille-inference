@@ -118,7 +118,7 @@ async function listedTools(key: string): Promise<Array<{ name: string; descripti
 }
 
 const CODE_LOOP_TOOLS = ["code_loop_start", "code_loop_status", "code_loop_result"];
-const TOOLS_WITH_OUTPUT_SCHEMAS = ["list_models", ...CODE_LOOP_TOOLS];
+const TOOLS_WITH_OUTPUT_SCHEMAS = ["list_models", "ask", ...CODE_LOOP_TOOLS];
 
 describe("LearningTaskContract authenticated preflight", () => {
   it("does not advertise the learning seam without authentication", async () => {
