@@ -32,7 +32,6 @@ import { recordTaskExposureBestEffort } from "./task-exposure.js";
 import type { HuginRequestStamp } from "./learning-task-contract.js";
 import {
   buildEvidenceIdentityBundle,
-  contentDigest,
   evidenceIdentityFromAdmittedStamp,
   evidenceIdentityFromServedModelCmd,
   unknownIdentity,
@@ -42,6 +41,7 @@ import {
 import {
   recordCompletedSpan,
   setTraceDefaults,
+  traceModelArtifactIdentity,
   updateCurrentTraceSpan,
   withTraceSpan,
   type TraceSpanFinish,
@@ -642,15 +642,6 @@ function classifyError(error: string): ErrorClass {
 
 function classifyLocalInferenceTrace(result: LocalInferenceResult): TraceSpanFinish | undefined {
   return result.ok ? undefined : { outcome: "error" };
-}
-
-/**
- * /delegate's modelId is a caller override, not a trusted artifact identity. Keep the trace useful
- * for joining repeated attempts without exporting that arbitrary string; a future served-artifact
- * observation can replace this diagnostic value at the observation seam.
- */
-function traceModelArtifactIdentity(modelId: string): string {
-  return contentDigest(`gille.trace.model-id.v1:${modelId}`);
 }
 
 /**

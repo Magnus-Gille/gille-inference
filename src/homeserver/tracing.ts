@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
+import { contentDigest } from "./evidence-identity.js";
 
 export interface HomeserverTracingConfig {
   instrumentation: "on" | "off";
@@ -207,6 +208,15 @@ function isoAt(ms: number): string {
 export function sanitizeTraceIdentity(value: string | undefined, fallback: string): string {
   const trimmed = value?.trim() ?? "";
   return trimmed.length <= TRACE_ID_MAX_LENGTH && TRACE_ID_RE.test(trimmed) ? trimmed : fallback;
+}
+
+/**
+ * Convert a caller-controlled model key into the shared fixed-length, one-way diagnostic identity.
+ * This is a trace join key, not proof of a served artifact; an observed artifact can replace it at
+ * the observation seam in the future.
+ */
+export function traceModelArtifactIdentity(modelKey: string): string {
+  return contentDigest(`gille.trace.model-id.v1:${modelKey}`);
 }
 
 function safeToken(value: string | undefined): string | undefined {

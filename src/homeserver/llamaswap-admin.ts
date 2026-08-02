@@ -25,6 +25,7 @@ import {
 import {
   currentTraceHeaders,
   recordReadinessObservation,
+  traceModelArtifactIdentity,
   updateCurrentTraceSpan,
   withTraceSpan,
   type TraceSpanFinish,
@@ -179,6 +180,7 @@ export async function loadModel(
   return withTraceSpan("model_load", {}, async () => {
     void opts; // opts ignored — llama-swap owns startup config
     assertModelKey(modelKey);
+    const traceIdentity = traceModelArtifactIdentity(modelKey);
     const origin = getOrigin();
     const start = Date.now();
 
@@ -186,8 +188,8 @@ export async function loadModel(
     const running = await fetchRunning(origin);
     const alreadyLoaded = running.some((r) => r.model === modelKey && r.state === "ready");
     if (alreadyLoaded) {
-      updateCurrentTraceSpan({ modelArtifactIdentity: modelKey });
-      recordReadinessObservation("model", "ok", { modelArtifactIdentity: modelKey });
+      updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity });
+      recordReadinessObservation("model", "ok", { modelArtifactIdentity: traceIdentity });
       return {
         ok: true,
         modelKey,
@@ -216,22 +218,22 @@ export async function loadModel(
       );
       const durationMs = Date.now() - start;
       if (!res.ok) {
-        updateCurrentTraceSpan({ modelArtifactIdentity: modelKey, errorClass: "upstream_unavailable" });
+        updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity, errorClass: "upstream_unavailable" });
         recordReadinessObservation("model", "failed", {
-          modelArtifactIdentity: modelKey,
+          modelArtifactIdentity: traceIdentity,
           errorClass: "upstream_unavailable",
         });
         const msg = await res.text().catch(() => "");
         return { ok: false, modelKey, identifier: modelKey, durationMs, message: msg || `HTTP ${res.status}` };
       }
-      updateCurrentTraceSpan({ modelArtifactIdentity: modelKey });
-      recordReadinessObservation("model", "ok", { modelArtifactIdentity: modelKey });
+      updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity });
+      recordReadinessObservation("model", "ok", { modelArtifactIdentity: traceIdentity });
       return { ok: true, modelKey, identifier: modelKey, durationMs, message: "loaded" };
     } catch (err) {
       const durationMs = Date.now() - start;
-      updateCurrentTraceSpan({ modelArtifactIdentity: modelKey, errorClass: "upstream_unavailable" });
+      updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity, errorClass: "upstream_unavailable" });
       recordReadinessObservation("model", "failed", {
-        modelArtifactIdentity: modelKey,
+        modelArtifactIdentity: traceIdentity,
         errorClass: "upstream_unavailable",
       });
       return {
