@@ -2158,6 +2158,7 @@ async function handleDelegate(
   cfg: HomeserverConfig,
   controller: AdmissionController,
   lctx: LogCtx,
+  telemetryModelAllowList: string[],
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
   let learningTaskAdmissionId: string | undefined;
@@ -2252,7 +2253,10 @@ async function handleDelegate(
     ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
     : undefined;
   lctx.node = result.nodeId;
-  lctx.model = result.modelId;
+  // C3/#179: retain the exact model id in the response and ledger, but expose only the
+  // server-trusted catalogue/allow-list identity in gateway telemetry. This is synchronous and
+  // log-only; it must not change the orchestrator's routing input or returned outcome.
+  lctx.model = canonicalizeModelTrusted(result.modelId, telemetryModelAllowList);
   const m = result.metrics;
   if (m) {
     return {
@@ -4458,6 +4462,9 @@ export async function handleRequest(
         sendError(res, makeError("invalid_request_error", { param: parsed.param, message: parsed.message }));
         return;
       }
+      // C3/#179: carry the caller's model override into the request telemetry context only after
+      // canonicalization. The raw value continues unchanged through parse, routing, and response.
+      lctx.model = canonicalizeModelTrusted(parsed.params.modelId ?? null, principal.modelAllowList);
       setTraceDefaults({
         taskType: "delegation",
         lane: "default",
@@ -4555,7 +4562,8 @@ export async function handleRequest(
           principal.tier === "owner" && principal.keyHash !== null,
           cfg,
           controller,
-          lctx
+          lctx,
+          principal.modelAllowList,
         )
       );
       return;

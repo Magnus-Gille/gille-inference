@@ -12,6 +12,7 @@ import type { LocalInferenceResult } from "../runner/local-client.js";
 import { runInference, type ResponseFormat } from "../runner/openrouter-client.js";
 import { randomUUID } from "node:crypto";
 import { defaultLogger } from "./access-log.js";
+import { canonicalizeModelTrusted } from "./catalogue.js";
 import {
   buildDelegationCostTrace,
   tryRecordDelegationCost,
@@ -666,7 +667,9 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
     defaultLogger.log({
       event: "delegate_decision",
       requestId,
-      model: fo?.modelId ?? null,
+      // C3/#179: the outcome retains the exact model id for routing, ledger, accounting, and
+      // response behavior; only this metadata projection is catalogue-canonicalized.
+      model: canonicalizeModelTrusted(fo?.modelId ?? null, []),
       taskType: fo?.taskType ?? null,
       decision,
       outcome: summaryOutcome,

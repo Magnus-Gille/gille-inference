@@ -15,13 +15,14 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 import {
   createAccessLogger,
   setDefaultLogger,
   defaultLogger as originalDefaultLogger,
   type AccessLogRecord,
 } from "../src/homeserver/access-log.js";
+import { renderMetrics } from "../src/homeserver/metrics.js";
 
 // Captured log lines per test (reset in afterEach)
 let captured: string[] = [];
@@ -30,7 +31,19 @@ let upstream: Server;
 let upstreamPort = 0;
 
 function startUpstream(): Promise<void> {
-  upstream = createServer((_req: IncomingMessage, res: ServerResponse) => {
+  upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.url === "/api/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        models: [{
+          type: "llm",
+          key: "m1",
+          display_name: "m1",
+          loaded_instances: [],
+        }],
+      }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
@@ -51,6 +64,7 @@ function startUpstream(): Promise<void> {
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
+let warmCatalogue: typeof import("../src/homeserver/catalogue.js").warmCatalogue;
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
@@ -63,6 +77,7 @@ beforeAll(async () => {
 
   // Set env BEFORE importing the gateway (config is read at startGateway() time)
   process.env["LMSTUDIO_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
+  process.env["HOMESERVER_BACKEND"] = "lmstudio";
   process.env["HOMESERVER_HOST"] = "127.0.0.1";
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";
@@ -75,7 +90,9 @@ beforeAll(async () => {
 
   const gw = await import("../src/homeserver/gateway.js");
   const ks = await import("../src/homeserver/keystore.js");
+  const catalogue = await import("../src/homeserver/catalogue.js");
   mintKey = ks.mintKey;
+  warmCatalogue = catalogue.warmCatalogue;
 
   const handle = await gw.startGateway();
   gatewayPort = handle.port;
@@ -197,5 +214,91 @@ describe("gateway access-log integration", () => {
     expect(captured).toHaveLength(1);
     const rec = JSON.parse(captured[0]!) as AccessLogRecord;
     expect(rec.route).toBe("/v1/images/generations/jobs/:id");
+  });
+
+  it("(g) /delegate preserves the caller model for the response and ledger but canonicalizes every access/request record", async () => {
+    installCapturingLogger();
+    await warmCatalogue();
+    const owner = mintKey({
+      alias: "alog-delegate-secret",
+      tier: "owner",
+      scope: "admin",
+    }, DEFAULTS);
+    const secretModelId = "sk-delegate-model-secret-9f2a";
+    const prompt = "private delegate prompt must not enter telemetry";
+
+    const response = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({ prompt, taskType: "extract", modelId: secretModelId }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { modelId: string; ledgerId: string };
+    expect(body.modelId).toBe(secretModelId);
+    expect(body.ledgerId).toEqual(expect.any(String));
+
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    const decision = records.find((record) => record.event === "delegate_decision");
+    const gateway = records.find((record) => record.event === "gateway_request");
+    expect(records.filter((record) => record.event === "delegate_decision")).toHaveLength(1);
+    expect(records.filter((record) => record.event === "gateway_request")).toHaveLength(1);
+    expect(decision).toMatchObject({ model: "unknown", taskType: "extract" });
+    expect(gateway).toMatchObject({ route: "/delegate", model: "unknown", status: 200 });
+
+    const requestRow = getDb()
+      .prepare("SELECT * FROM request_log WHERE alias = ? ORDER BY ts DESC LIMIT 1")
+      .get(owner.record.alias) as Record<string, unknown>;
+    expect(requestRow.model).toBe("unknown");
+
+    // Routing, response, and ledger identity remain caller-exact; only telemetry is canonicalized.
+    const ledgerRow = getDb()
+      .prepare("SELECT model_id FROM delegations WHERE id = ?")
+      .get(body.ledgerId) as { model_id: string };
+    expect(ledgerRow.model_id).toBe(secretModelId);
+
+    const serializedTelemetry = JSON.stringify({ records, requestRow });
+    expect(serializedTelemetry).not.toContain(secretModelId);
+    expect(serializedTelemetry).not.toContain(prompt);
+  });
+
+  it("(h) /delegate exports a trusted configured model and collapses arbitrary IDs to one bounded sentinel", async () => {
+    installCapturingLogger();
+    await warmCatalogue();
+    const owner = mintKey({
+      alias: "alog-delegate-bounded",
+      tier: "owner",
+      scope: "admin",
+    }, DEFAULTS);
+    const requestedModelIds = ["m1", "caller-model-a", "caller-model-b"];
+
+    for (const modelId of requestedModelIds) {
+      const response = await fetch(url("/delegate"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: JSON.stringify({ prompt: "bounded telemetry probe", taskType: "extract", modelId }),
+      });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { modelId: string }).modelId).toBe(modelId);
+    }
+
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    const decisions = records.filter((record) => record.event === "delegate_decision");
+    const gateways = records.filter((record) => record.event === "gateway_request");
+    expect(decisions.map((record) => record.model)).toEqual(["m1", "unknown", "unknown"]);
+    expect(gateways.map((record) => record.model)).toEqual(["m1", "unknown", "unknown"]);
+
+    const requestRows = getDb()
+      .prepare("SELECT model FROM request_log WHERE alias = ? ORDER BY rowid ASC")
+      .all(owner.record.alias) as Array<{ model: string }>;
+    expect(requestRows.slice(-3).map((row) => row.model)).toEqual(["m1", "unknown", "unknown"]);
+    expect(new Set(requestRows.slice(-3).map((row) => row.model)).size).toBe(2);
+    const serializedTelemetry = JSON.stringify({ records, requestRows });
+    expect(serializedTelemetry).not.toContain("caller-model-a");
+    expect(serializedTelemetry).not.toContain("caller-model-b");
+    const metrics = renderMetrics();
+    expect(metrics).toContain('model="m1"');
+    expect(metrics).toContain('model="unknown"');
+    expect(metrics).not.toContain("caller-model-a");
+    expect(metrics).not.toContain("caller-model-b");
   });
 });

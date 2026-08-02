@@ -32,7 +32,7 @@ export interface AccessLogRecord {
   principal?: string | null;
   /** Owner or guest tier, or null for unauthenticated (should not reach log in normal flow). */
   tier?: "owner" | "guest" | null;
-  /** Model id from the request body or orchestrator selection. */
+  /** Server-trusted canonical model identity; never a raw caller-controlled model id. */
   model?: string | null;
   /** HTTP status code sent to the client. */
   status?: number | null;
