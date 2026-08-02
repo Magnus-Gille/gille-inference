@@ -460,6 +460,72 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
 
+  it("rejects unverified exact rows without mutation and hides pre-existing usefulness on read", async () => {
+    const ledgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+      { outcome: "unverified" },
+    );
+    const notes = "ref:gille-inference#112 hidden:unverified";
+    getDb().prepare(`
+      UPDATE delegations
+         SET reviewer_usefulness = 'wrong',
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = 'reviewer-admin-unverified',
+             reviewer_usefulness_ts = '2026-08-01T10:00:00.000Z'
+       WHERE id = @id
+    `).run({ id: ledgerId, notes });
+    const before = getDb().prepare(`
+      SELECT reviewer_usefulness AS reviewerUsefulness,
+             reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+             reviewer_usefulness_by AS reviewerUsefulnessBy,
+             reviewer_usefulness_ts AS reviewerUsefulnessTs,
+             reviewer_usefulness_legacy_json AS legacyJson,
+             reviewer_usefulness_legacy_reason AS legacyReason,
+             reviewer_usefulness_legacy_quarantined_at AS legacyQuarantinedAt
+        FROM delegations
+       WHERE id = ?
+    `).get(ledgerId);
+
+    const write = await putReviewerUsefulness(ledgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(write.status).toBe(409);
+    expect(write.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      conflict: { kind: "missing_verifier" },
+    });
+    expect(getDb().prepare(`
+      SELECT reviewer_usefulness AS reviewerUsefulness,
+             reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+             reviewer_usefulness_by AS reviewerUsefulnessBy,
+             reviewer_usefulness_ts AS reviewerUsefulnessTs,
+             reviewer_usefulness_legacy_json AS legacyJson,
+             reviewer_usefulness_legacy_reason AS legacyReason,
+             reviewer_usefulness_legacy_quarantined_at AS legacyQuarantinedAt
+        FROM delegations
+       WHERE id = ?
+    `).get(ledgerId)).toEqual(before);
+
+    const read = await harness.invoke({
+      method: "GET",
+      path: `/ledger/${ledgerId}`,
+      token: adminKey,
+    });
+    expect(read.status).toBe(200);
+    expect(read.json as Record<string, unknown>).toMatchObject({
+      id: ledgerId,
+      outcome: "unverified",
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: notes.length,
+    });
+    expect(read.text).not.toContain(notes);
+  });
+
   it("requires a genuine grade for gateway-reachable verifier labels and rejects shadow/superseded rows", async () => {
     const exactLedgerId = makeReviewBoundedRowWithVerifier(
       gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" })

@@ -248,6 +248,107 @@ describe("recordReviewerUsefulness (#74)", () => {
     },
   );
 
+  it("rejects an unverified row even with an exact verifier without mutating it", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "unverified",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    const db = initDb(dbPath);
+    const before = db.prepare(`
+      SELECT reviewer_usefulness AS reviewerUsefulness,
+             reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+             reviewer_usefulness_by AS reviewerUsefulnessBy,
+             reviewer_usefulness_ts AS reviewerUsefulnessTs,
+             reviewer_usefulness_legacy_json AS legacyJson,
+             reviewer_usefulness_legacy_reason AS legacyReason,
+             reviewer_usefulness_legacy_quarantined_at AS legacyQuarantinedAt
+        FROM delegations
+       WHERE id = ?
+    `).get(id);
+
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "missing_verifier" },
+    });
+
+    expect(db.prepare(`
+      SELECT reviewer_usefulness AS reviewerUsefulness,
+             reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+             reviewer_usefulness_by AS reviewerUsefulnessBy,
+             reviewer_usefulness_ts AS reviewerUsefulnessTs,
+             reviewer_usefulness_legacy_json AS legacyJson,
+             reviewer_usefulness_legacy_reason AS legacyReason,
+             reviewer_usefulness_legacy_quarantined_at AS legacyQuarantinedAt
+        FROM delegations
+       WHERE id = ?
+    `).get(id)).toEqual(before);
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: false,
+    });
+  });
+
+  it("hides pre-existing reviewer usefulness on an unverified exact row", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "unverified",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    const db = initDb(dbPath);
+    const notes = "ref:gille-inference#112 hidden:unverified";
+    db.prepare(`
+      UPDATE delegations
+         SET reviewer_usefulness = 'wrong',
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = 'grimnir-session-2026-07-24-unverified',
+             reviewer_usefulness_ts = '2026-08-01T10:00:00.000Z'
+       WHERE id = @id
+    `).run({ id, notes });
+
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: notes.length,
+    });
+  });
+
+  it.each(["pass", "partial", "fail", "error"] as const)(
+    "keeps %s graded rows eligible with an exact verifier",
+    (outcome) => {
+      const id = recordDelegation({
+        taskType: "review-bounded",
+        modelId: "qwen3-coder-next-80b",
+        prompt: "gille review-bounded contract v1 ...",
+        outcome,
+        verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+      });
+      expect(recordReviewerUsefulness({
+        ledgerId: id,
+        usefulness: "pass",
+        judgedBy: "grimnir-session-2026-07-24",
+      })).toMatchObject({
+        kind: "recorded",
+        taskType: "review-bounded",
+      });
+    },
+  );
+
   it("requires a genuine grade: gateway-built exact passes, gateway-built nonEmpty(0) does not", () => {
     const exactId = recordDelegation({
       taskType: "review-bounded",

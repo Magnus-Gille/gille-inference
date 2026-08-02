@@ -681,6 +681,7 @@ export type ReviewerUsefulnessResult =
 
 interface ReviewerUsefulnessRow {
   taskType: string;
+  outcome: string;
   verifier: string | null;
   shadow: 0 | 1;
   supersededAt: string | null;
@@ -710,6 +711,7 @@ function reviewerUsefulnessVisibleRecord(row: ReviewerUsefulnessRow): {
   if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) return null;
   if (row.shadow === 1) return null;
   if (row.supersededAt !== null) return null;
+  if (row.outcome === "unverified") return null;
   if (!isQualityBearingVerifier(row.verifier)) return null;
   return {
     usefulness,
@@ -779,6 +781,7 @@ function reviewerUsefulnessEligibilityConflict(
   }
   if (row.shadow === 1) return { kind: "shadow" };
   if (row.supersededAt !== null) return { kind: "superseded" };
+  if (row.outcome === "unverified") return { kind: "missing_verifier" };
   if (!isQualityBearingVerifier(row.verifier)) return { kind: "missing_verifier" };
   return null;
 }
@@ -827,6 +830,7 @@ function getReviewerUsefulnessRow(
 ): ReviewerUsefulnessRow | null {
   const row = db.prepare(`
     SELECT task_type AS taskType,
+           outcome,
            verifier,
            shadow,
            superseded_at AS supersededAt,
@@ -1803,6 +1807,7 @@ export function getDelegationById(id: string): DelegationById | null {
       : "invalid";
   const reviewerProjectionRow = {
     taskType: row.taskType,
+    outcome: row.outcome,
     verifier: row.verifier,
     shadow: row.shadow,
     supersededAt: row.supersededAt,
