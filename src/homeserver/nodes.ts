@@ -3,6 +3,7 @@ import type { LocalInferenceResult } from "../runner/local-client.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
 import { isKnownTaskType } from "./taxonomy.js";
 import { policyTaskTypeIdentity } from "./task-type-identity.js";
+import { currentTraceHeaders } from "./tracing.js";
 
 /** Stable identities used in logs, metrics and ledger evidence. */
 export type ComputeNodeId = "m5" | "orin";
@@ -41,7 +42,10 @@ export async function probeOrin(cfg: HomeserverConfig = loadConfig()): Promise<{
     return { id: "orin", configured: false, ok: false, model: cfg.orin.model, modelAvailable: false };
   }
   try {
-    const res = await fetch(`${cfg.orin.url}/api/tags`, { signal: AbortSignal.timeout(cfg.orin.healthTimeoutMs) });
+    const res = await fetch(`${cfg.orin.url}/api/tags`, {
+      headers: currentTraceHeaders(),
+      signal: AbortSignal.timeout(cfg.orin.healthTimeoutMs),
+    });
     if (!res.ok) return { id: "orin", configured: true, ok: false, model: cfg.orin.model, modelAvailable: false };
     const body = (await res.json()) as { models?: Array<{ name?: string; model?: string }> };
     const modelAvailable = (body.models ?? []).some((m) => m.name === cfg.orin.model || m.model === cfg.orin.model);
@@ -74,7 +78,7 @@ export async function runOrinChat(
   try {
     const res = await fetch(`${cfg.orin.url}/api/chat`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
       body: JSON.stringify({
         model,
         messages,

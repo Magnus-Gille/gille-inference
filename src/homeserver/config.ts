@@ -1,9 +1,11 @@
 import { loadEnv } from "../env.js";
+import { MAX_BLIND_CONTEXT_ROOTS } from "./blind-context.js";
 import type { ShadowLaneConfig } from "./shadow-lane.js";
 import {
   DEFAULT_REVIEW_CASCADE_SHADOW,
   type ReviewCascadeShadowConfig,
 } from "./review-cascade-shadow.js";
+import { sanitizeTraceIdentity } from "./tracing.js";
 
 export type { ShadowLaneConfig };
 export type { ReviewCascadeShadowConfig };
@@ -328,6 +330,16 @@ export interface HomeserverConfig {
   shadowLane: ShadowLaneConfig;
   /** #132: owner-only GPT-OSS → Qwen review measurement lane. Default OFF. */
   reviewCascadeShadow: ReviewCascadeShadowConfig;
+  /** Manual content-blind tracing/export. Instrumentation and export are separately gated. */
+  tracing: {
+    instrumentation: "on" | "off";
+    export: "on" | "off";
+    samplingRatePerMille: number;
+    exportUrl: string;
+    exportTimeoutMs: number;
+    release: string;
+    instanceId: string;
+  };
   /** Whether structured access logging is enabled ('on' | 'off'). Default: 'on'. */
   accessLog: "on" | "off";
   /**
@@ -611,6 +623,12 @@ export function loadConfig(): HomeserverConfig {
   // LM Studio reachable base — accept either a /v1 URL or a bare host:port.
   const lmBase = (process.env["LMSTUDIO_BASE_URL"] ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
   const origin = lmBase.replace(/\/v1$/, "");
+  const blindContextRoots = envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS");
+  if (blindContextRoots.length > MAX_BLIND_CONTEXT_ROOTS) {
+    throw new Error(
+      `HOMESERVER_BLIND_CONTEXT_ROOTS may list at most ${MAX_BLIND_CONTEXT_ROOTS} entries.`
+    );
+  }
   // The shared lmstudio-client reads LMSTUDIO_BASE_URL directly; keep it aligned so the
   // orchestrator and the raw client never disagree on where LM Studio lives.
   if (!process.env["LMSTUDIO_BASE_URL"]) process.env["LMSTUDIO_BASE_URL"] = lmBase;
@@ -760,6 +778,18 @@ export function loadConfig(): HomeserverConfig {
       maxTokens: Math.max(1, Math.floor(envNum("HOMESERVER_REVIEW_CASCADE_MAX_TOKENS", DEFAULT_REVIEW_CASCADE_SHADOW.maxTokens))),
       timeoutMs: Math.max(1, Math.floor(envNum("HOMESERVER_REVIEW_CASCADE_TIMEOUT_MS", DEFAULT_REVIEW_CASCADE_SHADOW.timeoutMs))),
     },
+    tracing: {
+      instrumentation: (process.env["HOMESERVER_TRACE_INSTRUMENTATION"] ?? "off") === "on" ? "on" : "off",
+      export: (process.env["HOMESERVER_TRACE_EXPORT"] ?? "off") === "on" ? "on" : "off",
+      samplingRatePerMille: Math.max(
+        0,
+        Math.min(1000, Math.floor(envNum("HOMESERVER_TRACE_SAMPLING_PER_MILLE", 1000))),
+      ),
+      exportUrl: (process.env["HOMESERVER_TRACE_EXPORT_URL"] ?? "").trim(),
+      exportTimeoutMs: Math.max(1, Math.floor(envNum("HOMESERVER_TRACE_EXPORT_TIMEOUT_MS", 2_000))),
+      release: sanitizeTraceIdentity(process.env["HOMESERVER_TRACE_RELEASE"], "dev"),
+      instanceId: sanitizeTraceIdentity(process.env["HOMESERVER_TRACE_INSTANCE_ID"], "unknown"),
+    },
     accessLog: (process.env["HOMESERVER_ACCESS_LOG"] ?? "on") === "off" ? "off" : "on",
     ownerRequestLog:
       (process.env["HOMESERVER_OWNER_REQUEST_LOG"] ?? "on") === "off" ? "off" : "on",
@@ -817,7 +847,7 @@ export function loadConfig(): HomeserverConfig {
       balanced: process.env["HOMESERVER_IMAGE_MODEL_BALANCED"] ?? "sd3.5-large-turbo",
       high: process.env["HOMESERVER_IMAGE_MODEL_HIGH"] ?? "flux.1-schnell",
     },
-    blindContextRoots: envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS"),
+    blindContextRoots,
     blindContextMaxFileBytes: envNum("HOMESERVER_BLIND_CONTEXT_MAX_FILE_BYTES", 262_144),
     blindContextMaxTotalBytes: envNum("HOMESERVER_BLIND_CONTEXT_MAX_TOTAL_BYTES", 1_048_576),
     // code_loop (#116). Default off → the surface is visible to owners but inert until provisioned.

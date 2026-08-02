@@ -1,0 +1,11 @@
+{
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "hugin_root_span_id": "00f067aa0ba902b7",
+  "gateway_parent_span_id": "b9c7c989f97918e1",
+  "gateway_span_id": "b9c7c989f97918e2",
+  "version": "00",
+  "flags": "01",
+  "task_type": "delegation",
+  "lane": "default",
+  "retry_ordinal": 0
+}

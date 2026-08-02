@@ -70,6 +70,10 @@ printf '%s' '{"model":"mellum","prompt":"Summarize this."}' | m5 --profile codex
 m5 --profile codex mcp
 ```
 
+`m5 ask` prints structured JSON including `finish_reason`, explicit `truncated`, and content-blind
+`usage`. A token-limit finish returns `truncated:true` so scripts can retry with a higher
+`max_tokens` instead of mistaking an empty or partial answer for a clean completion.
+
 See the
 [`m5` agent client guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-agent-client.md)
 for the profile schema, Keychain account mapping, structured code commands, `claude-config`

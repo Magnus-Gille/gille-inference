@@ -22,6 +22,14 @@ import {
   type LoadOptions,
   type LoadResult,
 } from "./lmstudio-admin.js";
+import {
+  currentTraceHeaders,
+  recordReadinessObservation,
+  traceModelArtifactIdentityFromServedModelCmd,
+  updateCurrentTraceSpan,
+  withTraceSpan,
+  type TraceSpanFinish,
+} from "./tracing.js";
 
 export type { ModelInfo, LoadOptions, LoadResult };
 // Re-export validators so the facade shape matches typeof lmstudio-admin
@@ -44,7 +52,8 @@ async function fetchWithTimeout(
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
+    const headers = { ...(init.headers ?? {}), ...currentTraceHeaders() };
+    return await fetch(url, { ...init, headers, signal: ctrl.signal });
   } finally {
     clearTimeout(t);
   }
@@ -72,12 +81,26 @@ interface LlamaSwapRunningEntry {
   [key: string]: unknown;
 }
 
-/** Fetch /running and return the array (empty if idle). */
-async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
+type RunningProbeResult =
+  | { ok: true; entries: LlamaSwapRunningEntry[] }
+  | { ok: false };
+
+/** Fetch /running, distinguishing an HTTP failure from a valid empty running list. */
+async function fetchRunningProbe(origin: string): Promise<RunningProbeResult> {
   const res = await fetchWithTimeout(`${origin}/running`, {}, 5000);
-  if (!res.ok) return [];
+  if (!res.ok) return { ok: false };
   const data = (await res.json()) as { running?: LlamaSwapRunningEntry[] };
-  return data.running ?? [];
+  return { ok: true, entries: data.running ?? [] };
+}
+
+/** Fetch /running and retain the established empty-list fallback for read-only callers. */
+async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
+  const probe = await fetchRunningProbe(origin);
+  return probe.ok ? probe.entries : [];
+}
+
+function classifyLoadTrace(result: LoadResult): TraceSpanFinish | undefined {
+  return result.ok ? undefined : { outcome: "error" };
 }
 
 /** List all configured models, merged with running state. */
@@ -164,57 +187,93 @@ export async function loadModel(
   modelKey: string,
   opts: LoadOptions = {}
 ): Promise<LoadResult> {
-  void opts; // opts ignored — llama-swap owns startup config
-  assertModelKey(modelKey);
-  const origin = getOrigin();
-  const start = Date.now();
+  let runningProbeFailed = false;
+  return withTraceSpan("model_load", {}, async () => {
+    void opts; // opts ignored — llama-swap owns startup config
+    assertModelKey(modelKey);
+    const origin = getOrigin();
+    const start = Date.now();
 
-  // Check if already loaded
-  const running = await fetchRunning(origin);
-  const alreadyLoaded = running.some((r) => r.model === modelKey && r.state === "ready");
-  if (alreadyLoaded) {
-    return {
-      ok: true,
-      modelKey,
-      identifier: modelKey,
-      durationMs: Date.now() - start,
-      message: "already loaded",
-    };
-  }
-
-  // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
-  const cfg = loadConfig();
-  const timeoutMs = cfg.callTimeoutMs ?? 300_000;
-  try {
-    const res = await fetchWithTimeout(
-      `${origin}/v1/chat/completions`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: modelKey,
-          messages: [{ role: "user", content: "." }],
-          max_tokens: 1,
-        }),
-      },
-      timeoutMs
-    );
-    const durationMs = Date.now() - start;
-    if (!res.ok) {
-      const msg = await res.text().catch(() => "");
-      return { ok: false, modelKey, identifier: modelKey, durationMs, message: msg || `HTTP ${res.status}` };
+    // Check if already loaded. The probe is part of the model-load operation: thrown probe
+    // failures retain the existing thrown/API behaviour, while HTTP failures are recorded and
+    // the established warm-up fallback may continue. Both paths get a fixed, content-free
+    // failure class and readiness observation.
+    try {
+      const probe = await fetchRunningProbe(origin);
+      if (!probe.ok) {
+        runningProbeFailed = true;
+        const errorClass = "upstream_unavailable";
+        updateCurrentTraceSpan({ errorClass });
+        recordReadinessObservation("model", "failed", { errorClass });
+      }
+      const runningEntry = probe.ok
+        ? probe.entries.find((r) => r.model === modelKey && r.state === "ready")
+        : undefined;
+      if (runningEntry) {
+        const modelArtifactIdentity = traceModelArtifactIdentityFromServedModelCmd(runningEntry.cmd);
+        const traceAttrs = modelArtifactIdentity ? { modelArtifactIdentity } : {};
+        updateCurrentTraceSpan(traceAttrs);
+        recordReadinessObservation("model", "ok", traceAttrs);
+        return {
+          ok: true,
+          modelKey,
+          identifier: modelKey,
+          durationMs: Date.now() - start,
+          message: "already loaded",
+        };
+      }
+    } catch (err) {
+      const errorClass = "upstream_unavailable";
+      updateCurrentTraceSpan({ errorClass });
+      recordReadinessObservation("model", "failed", { errorClass });
+      throw err;
     }
-    return { ok: true, modelKey, identifier: modelKey, durationMs, message: "loaded" };
-  } catch (err) {
-    const durationMs = Date.now() - start;
-    return {
-      ok: false,
-      modelKey,
-      identifier: modelKey,
-      durationMs,
-      message: err instanceof Error ? err.message : String(err),
-    };
-  }
+
+    // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
+    const cfg = loadConfig();
+    const timeoutMs = cfg.callTimeoutMs ?? 300_000;
+    try {
+      const res = await fetchWithTimeout(
+        `${origin}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: modelKey,
+            messages: [{ role: "user", content: "." }],
+            max_tokens: 1,
+          }),
+        },
+        timeoutMs
+      );
+      const durationMs = Date.now() - start;
+      if (!res.ok) {
+        updateCurrentTraceSpan({ errorClass: "upstream_unavailable" });
+        recordReadinessObservation("model", "failed", { errorClass: "upstream_unavailable" });
+        const msg = await res.text().catch(() => "");
+        return { ok: false, modelKey, identifier: modelKey, durationMs, message: msg || `HTTP ${res.status}` };
+      }
+      recordReadinessObservation("model", "ok");
+      return { ok: true, modelKey, identifier: modelKey, durationMs, message: "loaded" };
+    } catch (err) {
+      const durationMs = Date.now() - start;
+      updateCurrentTraceSpan({ errorClass: "upstream_unavailable" });
+      recordReadinessObservation("model", "failed", { errorClass: "upstream_unavailable" });
+      return {
+        ok: false,
+        modelKey,
+        identifier: modelKey,
+        durationMs,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }, {
+    surface: "model",
+    classifyResult: (result) =>
+      runningProbeFailed
+        ? { outcome: "error", errorClass: "upstream_unavailable" }
+        : classifyLoadTrace(result),
+  });
 }
 
 /**

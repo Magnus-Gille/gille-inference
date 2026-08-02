@@ -76,7 +76,7 @@ It uses the **same key** as the OpenAI-compatible endpoint above, so the **same 
 the same model allow-list apply** — calls through MCP draw down your credit budget exactly
 like a `/v1/chat/completions` call would. Two tools are exposed:
 
-- **`list_models`** — the models your key may use via `GET /v1/models`, each with a one-line strength hint.
+- **`list_models`** — the models your key may use via `GET /v1/models`, each with a one-line strength hint plus the current content-blind `ask.files` discovery state. Structured callers receive `structuredContent.ask_capabilities`; the published `m5-cli/1.2.0` user-agent keeps the text-only wire contract.
 - **`ask`** — `{model, prompt, system?, max_tokens?, delegator_model_id?}` → runs a completion via `POST /v1/chat/completions` on the chosen local
   model and returns the text. A model outside your allow-list, an exhausted credit budget, a
   quota hit, or a busy box come back as a tool error (with a clear message), not a crash.
