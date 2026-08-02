@@ -60,7 +60,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 401 | `invalid_api_key` | Missing/unknown Bearer key |
 | 403 | `route_not_allowed` (guest → `/delegate`; non-admin scope → `/admin/*` or `/ledger`), `model_not_allowed` (a key's model allow-list on chat) | Scope/tier/route or model not permitted |
 | 404 | `not_found` | Unknown route / no such resource |
-| 409 | `learning_task_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity |
+| 409 | `learning_task_conflict`, `reviewer_usefulness_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity; OR a reviewer-usefulness write failed closed because the row is the wrong task type, shadow/current-ineligible, lacks a verifier, or is already recorded differently |
 | 413 | `payload_too_large` | Request body exceeds the size cap |
 | 429 | quota codes | RPM/TPM/daily budget exceeded |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
@@ -82,9 +82,10 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |
 | GET | `/v1/roster-proposals/:proposalId` | authenticated owner | Read only that principal's durable proposal |
-| GET | `/v1/capabilities/review-lane` | owner or guest | Review-lane preflight (#74) — which task types are local-eligible (`review-bounded`) vs frontier-only (`code-review`), and whether local output has been promoted past advisory-only |
+| GET | `/v1/capabilities/review-lane` | owner or guest | Review-lane preflight (#74) — which task types are local-eligible (`review-bounded`) vs frontier-only (`code-review`), whether local output has been promoted past advisory-only, and whether reviewer-usefulness recording is available |
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |
+| PUT | `/ledger/{id}/reviewer-usefulness` | minted owner-admin | Record reviewer usefulness for one validated `review-bounded` ledger row by exact `ledgerId`; requires a non-empty authenticated logical alias, exact retries are idempotent, differing overwrites 409 |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio) |
 | POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
 | POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
@@ -240,6 +241,16 @@ GET /v1/capabilities/review-lane?taskType=review-bounded
   "endpoint": "/v1/capabilities/review-lane",
   "contract_version": "gille-inference.review-bounded/v1",
   "generated_at": "<RFC3339 UTC>",
+  "reviewerUsefulnessRecording": {
+    "available": true,
+    "method": "PUT",
+    "endpoint": "/ledger/{id}/reviewer-usefulness",
+    "taskTypes": ["review-bounded"],
+    "closedValues": ["pass", "partial", "redo", "wrong"],
+    "reviewerIdentity": "authenticated logical alias",
+    "authorization": "minted-owner-admin",
+    "availabilityReason": "allowed"
+  },
   "lanes": {
     "code-review": {
       "taskType": "code-review",
@@ -266,7 +277,15 @@ GET /v1/capabilities/review-lane?taskType=review-bounded
 reports `advisoryOnly:true` until an operator sets `HOMESERVER_DELEGATE_POLICY_PROMOTED_ADVISORY_TASK_TYPES`
 (comma-separated task types) after a measured pass rate; `decideDelegatePolicy` (`delegate-policy.ts`)
 enforces this identically regardless of what this endpoint reports — the endpoint is advisory
-discovery, not the enforcement point.
+discovery, not the enforcement point. `reviewerUsefulnessRecording` is also advisory: it tells a
+caller whether reviewer-usefulness recording is available for the CURRENT authenticated principal,
+what closed values the route accepts, and that the mutation requires a minted owner-tier admin key.
+Guest, owner-agent, identity-less static admin, and the implicit admin path all report
+`available:false` with a stable `availabilityReason` enum:
+`requires_owner_admin`, `requires_minted_owner_admin`, or `missing_reviewer_identity`.
+Monitor-scope keys do not reach this endpoint at all: the global read-only monitor fence returns
+`403 route_not_allowed` before review-lane dispatch. This endpoint does not claim any model output
+is ground truth.
 
 ### GET `/ledger`
 
@@ -306,6 +325,13 @@ interface DelegationById extends RecentDelegation {
   learningTaskAdmissionId: string | null;
   taskInstanceId: string | null;
   attemptId: string | null;
+  reviewerUsefulness: "pass" | "partial" | "redo" | "wrong" | null;
+  reviewerUsefulnessHidden: boolean;
+  reviewerUsefulnessNotes: string | null; // forced null for monitor readers
+  reviewerUsefulnessNotesPresent: boolean;
+  reviewerUsefulnessNoteChars: number;
+  reviewerUsefulnessBy: string | null;
+  reviewerUsefulnessTs: string | null;
 }
 ```
 
@@ -314,7 +340,10 @@ interface DelegationById extends RecentDelegation {
 `jsonValid`, `nonEmpty`, `matches`, `containsAll`, `containsNone`, `exact`, `answerIs`, `numeric`,
 `maxLength`) or `truth-oriented` (execution-based ground truth or model-judge checks: `tsGate`,
 `sqlExec`, `llm-judge:<model>`, and any unrecognised verifier by conservative default) or `ungraded`
-(no verifier ran). A high `formatOnlyShare` on a judgment-flavored task type (classify, qa-factual,
+(no verifier ran). Base-name matching is case-insensitive for this kind/admissibility decision, so
+mixed-case known verifiers still classify into the same kind, while a fully ungraded combination
+such as `none+NONE(ungraded)` collapses to `ungraded` rather than manufacturing evidence. A high
+`formatOnlyShare` on a judgment-flavored task type (classify, qa-factual,
 triage, claim-verify) means the headline pass rate is weaker evidence than it looks — the row only
 proved the output had the right SHAPE, not that it was correct. `PolicyConfig.discountFormatOnlyEvidence`
 (env `HOMESERVER_DISCOUNT_FORMAT_ONLY_EVIDENCE=on`, default off) discounts format-only passes/partials
@@ -351,12 +380,105 @@ inconsistent partially-populated historical/corrupt row returns `learningTaskBin
 and must also fail closed. New bound writes reject an unknown admission id, a non-delegate
 admission, a different authenticated principal, a cross-task/cross-attempt stamp, a missing
 evidence identity, or evidence fields inconsistent with the admitted stamp before inserting any
-ledger row. The response remains content-blind: it adds no prompt, output, credential, or private
-payload bytes.
+ledger row. Reviewer-usefulness note bytes follow the same content-blind rule: admin reads may
+include the raw `reviewerUsefulnessNotes` string, while monitor reads force
+`reviewerUsefulnessNotes:null` but still expose `reviewerUsefulnessNotesPresent` and
+`reviewerUsefulnessNoteChars`. If legacy/ineligible reviewer-usefulness columns are populated but no
+longer eligible to surface as the current verdict, the row reports `reviewerUsefulnessHidden:true`
+while keeping the verdict/identity/note fields themselves null and preserving only the bounded
+presence/count summaries. Unknown ids return the same bare `404 not_found` without reflecting the
+supplied `ledgerId`.
 
 **Errors:** unknown `id` → bare `404 not_found` (no enumeration oracle); non-admin/non-monitor key
 → `403 route_not_allowed`; malformed percent-encoding in `{id}` (e.g. a bare `%`) →
 `400 invalid_request_error` rather than a 500 (#229).
+
+### PUT `/ledger/{id}/reviewer-usefulness` (#112)
+
+Minted owner-admin, exact-ledger-id writer for verified `review-bounded` delegations only.
+`recordReviewerUsefulness()` owns the row-level narrowing and atomic write-once decision
+(`review-bounded`, verifier present, exact retry vs conflict). The route adds auth, content-type /
+JSON validation, reviewer-identity binding from the authenticated logical alias, bounded
+content-blind `notes`, and the HTTP error envelope. Static env admin keys, owner-monitor keys, and
+the implicit no-key loopback admin path are deliberately excluded; the caller must present a
+minted owner-tier admin credential with a non-empty logical alias.
+
+```
+PUT /ledger/4fd2d8f1-.../reviewer-usefulness
+```
+
+```json
+{
+  "usefulness": "pass",
+  "notes": "ref:gille-inference#112 check:manual"
+}
+```
+
+`usefulness` is required and closed to `pass`, `partial`, `redo`, `wrong`. `notes` is optional; if
+present it must be 1–6 ASCII `key:value` tokens separated by single spaces, trimmed, and at most
+160 characters. Unknown fields are rejected, so a caller cannot smuggle a free-text transcript or
+override the reviewer identity. The request must use `Content-Type: application/json`; oversized
+bodies fail with `413 payload_too_large`.
+
+**Response 201 / 200:**
+
+```json
+{
+  "ledgerId": "4fd2d8f1-...",
+  "taskType": "review-bounded",
+  "reviewerUsefulness": "pass",
+  "reviewerIdentity": "reviewer-admin",
+  "reviewerUsefulnessTs": "<RFC3339 UTC>",
+  "notesPresent": true,
+  "noteChars": 36,
+  "writeState": "recorded"
+}
+```
+
+A first write returns `201 recorded`. An exact authenticated retry returns `200 unchanged` and
+preserves the original timestamp. A different write against the same row returns
+`409 reviewer_usefulness_conflict`, with a content-blind machine-readable conflict body:
+
+```json
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "reviewer_usefulness_conflict",
+    "param": "ledgerId",
+    "message": "Reviewer usefulness is already recorded differently (existing usefulness='pass', reviewer='reviewer-admin', ts='<RFC3339 UTC>', notesPresent=true, noteChars=36); attempted usefulness='redo', reviewer='reviewer-admin', notesPresent=false, noteChars=0. Exact retries are idempotent; differing overwrites are rejected."
+  },
+  "conflict": {
+    "kind": "already_recorded",
+    "existing": {
+      "reviewerUsefulness": "pass",
+      "reviewerIdentity": "reviewer-admin",
+      "reviewerUsefulnessTs": "<RFC3339 UTC>",
+      "notesPresent": true,
+      "noteChars": 36
+    },
+    "attempted": {
+      "reviewerUsefulness": "redo",
+      "reviewerIdentity": "reviewer-admin",
+      "reviewerUsefulnessTs": null,
+      "notesPresent": false,
+      "noteChars": 0
+    },
+    "mismatchFields": ["reviewerUsefulness", "notes"]
+  }
+}
+```
+
+`kind` is one of `wrong_task_type`, `shadow`, `superseded`, `missing_verifier`, or `already_recorded`. Unknown `ledgerId`
+lookups return a bare `404 not_found` without reflecting the requested id. The actual atomic
+boundary is the ledger row mutation itself: `recordReviewerUsefulness()` runs the
+read/validate/conditional-update sequence inside one SQLite immediate transaction, so a race cannot
+partially overwrite or double-record the reviewer-usefulness columns. The content-blind
+`request_log` row is written afterward, best-effort, in a separate durability path.
+
+**Errors:** unknown `id` → `404 not_found`; guest / monitor / owner-agent / static admin /
+implicit-admin → `403 route_not_allowed`; bad content type, JSON, enum, notes, or extra field →
+`400 invalid_request_error`; oversized body → `413 payload_too_large`; wrong task type, shadow,
+superseded, missing verifier, or differing overwrite → `409 reviewer_usefulness_conflict`.
 
 ### POST `/v1/chat/completions`
 

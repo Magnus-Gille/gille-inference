@@ -92,13 +92,13 @@ export function requestLogColumns(): string[] {
   return [...COLUMNS];
 }
 
-let _rlInit = false;
+const initializedDbs = new WeakSet<Database.Database>();
 
 function ensureSchema(db: Database.Database): void {
   // Keep the established failure semantics if an operator has explicitly dropped the table: reads
   // should surface that outage rather than silently recreating storage. But if a test/recovery has
   // recreated an older-shaped table, run the additive migration even though this module is warm.
-  if (_rlInit) {
+  if (initializedDbs.has(db)) {
     const exists = db
       .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'request_log'`)
       .get() as { present: 1 } | undefined;
@@ -132,7 +132,7 @@ function ensureSchema(db: Database.Database): void {
   const cols = db.prepare(`PRAGMA table_info(request_log)`).all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "node")) db.exec(`ALTER TABLE request_log ADD COLUMN node TEXT NOT NULL DEFAULT 'm5'`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_request_log_node ON request_log(node)`);
-  _rlInit = true;
+  initializedDbs.add(db);
 }
 
 function rlDb(): Database.Database {

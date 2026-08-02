@@ -23,6 +23,7 @@ vi.mock("../src/homeserver/ledger.js", () => ({
   shouldDelegate: () => ({ delegate: true, reason: "test: delegate" }),
   recordDelegation: (rec: unknown) => recordDelegationMock(rec),
   getLaneEvidence: (...args: unknown[]) => getLaneEvidenceMock(...args),
+  normalizedVerifierName: (name: string | null | undefined) => name?.trim() || null,
 }));
 
 let delegate: typeof import("../src/homeserver/orchestrator.js").delegate;

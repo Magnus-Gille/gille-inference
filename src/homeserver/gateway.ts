@@ -7,7 +7,7 @@ import { delegate, resolveTaskType, type DelegationOutcome } from "./orchestrato
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
-import { ledgerReport, recentDelegations, getDelegationById } from "./ledger.js";
+import { ledgerReport, recentDelegations, getDelegationById, recordReviewerUsefulness } from "./ledger.js";
 import { resetRoutingTable, loadRoutingTable } from "./routing-table.js";
 import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
@@ -72,8 +72,15 @@ import {
   REVIEW_LANE_KNOWN_TASK_TYPES,
   REVIEW_LANE_CAPABILITY_ENDPOINT,
   REVIEW_BOUNDED_CONTRACT_VERSION,
+  REVIEW_BOUNDED_TASK_TYPE,
+  REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
+  reviewerUsefulnessRecordingCapabilityForPrincipal,
+  parseReviewerUsefulnessWriteBody,
+  type ReviewLaneReviewerUsefulness,
+  type ReviewerUsefulnessPrincipal,
 } from "./review-bounded.js";
+
 import { ingressTaskType } from "./task-type-identity.js";
 import {
   LEARNING_TASK_PREFLIGHT_ENDPOINT,
@@ -335,6 +342,171 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(serialized.status === 200 ? status : serialized.status, { "content-type": "application/json" });
   res.end(serialized.payload);
 }
+function reviewerUsefulnessWriteResponse(args: {
+  ledgerId: string;
+  taskType: string;
+  usefulness: ReviewLaneReviewerUsefulness;
+  reviewerIdentity: string;
+  reviewerUsefulnessTs: string;
+  notes: string | null;
+  writeState: "recorded" | "unchanged";
+}): {
+  ledgerId: string;
+  taskType: string;
+  reviewerUsefulness: ReviewLaneReviewerUsefulness;
+  reviewerIdentity: string;
+  reviewerUsefulnessTs: string;
+  notesPresent: boolean;
+  noteChars: number;
+  writeState: "recorded" | "unchanged";
+} {
+  return {
+    ledgerId: args.ledgerId,
+    taskType: args.taskType,
+    reviewerUsefulness: args.usefulness,
+    reviewerIdentity: args.reviewerIdentity,
+    reviewerUsefulnessTs: args.reviewerUsefulnessTs,
+    notesPresent: args.notes !== null,
+    noteChars: args.notes?.length ?? 0,
+    writeState: args.writeState,
+  };
+}
+
+function reviewerUsefulnessPrincipal(
+  principal: PrincipalContext | null,
+): ReviewerUsefulnessPrincipal | null {
+  if (principal === null) return null;
+  return {
+    tier: principal.tier,
+    scope: principal.scope,
+    keyHash: principal.keyHash,
+    logicalAlias: principal.logicalAlias,
+  };
+}
+
+function reviewerUsefulnessRouteDeniedMessage(principal: PrincipalContext | null): string {
+  const capability = reviewerUsefulnessRecordingCapabilityForPrincipal(
+    reviewerUsefulnessPrincipal(principal),
+  );
+  switch (capability.availabilityReason) {
+    case "missing_reviewer_identity":
+      return "Reviewer usefulness recording requires a non-empty authenticated logical alias.";
+    case "requires_minted_owner_admin":
+      return "Reviewer usefulness recording requires a minted owner-admin key.";
+    case "requires_owner_admin":
+    default:
+      return "Reviewer usefulness recording requires a minted owner-admin key.";
+  }
+}
+
+function reviewerUsefulnessConflictMessage(args: {
+  existing: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+  attempted: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+}): string {
+  return "Reviewer usefulness is already recorded differently (existing usefulness='"
+    + (args.existing.reviewerUsefulness ?? "none")
+    + "', reviewer='" + (args.existing.reviewerUsefulnessBy ?? "none")
+    + "', ts='" + (args.existing.reviewerUsefulnessTs ?? "none")
+    + "', notesPresent=" + String(args.existing.notesPresent)
+    + ", noteChars=" + String(args.existing.noteChars)
+    + "); attempted usefulness='" + (args.attempted.reviewerUsefulness ?? "none")
+    + "', reviewer='" + (args.attempted.reviewerUsefulnessBy ?? "none")
+    + "', notesPresent=" + String(args.attempted.notesPresent)
+    + ", noteChars=" + String(args.attempted.noteChars)
+    + ". Exact retries are idempotent; differing overwrites are rejected.";
+}
+
+function reviewerUsefulnessConflictResponse(
+  message: string,
+  conflict: unknown,
+): { error: ReturnType<typeof makeError>["body"]["error"]; conflict: unknown } {
+  const { body } = makeError("reviewer_usefulness_conflict", { message });
+  return {
+    error: body.error,
+    conflict,
+  };
+}
+
+function reviewerUsefulnessConflictApiShape(conflict: {
+  kind: "wrong_task_type";
+  taskType: string;
+} | {
+  kind: "shadow";
+} | {
+  kind: "superseded";
+} | {
+  kind: "missing_verifier";
+} | {
+  kind: "already_recorded";
+  mismatchFields: string[];
+  existing: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+  attempted: {
+    reviewerUsefulness: string | null;
+    reviewerUsefulnessBy: string | null;
+    reviewerUsefulnessTs: string | null;
+    notesPresent: boolean;
+    noteChars: number;
+  };
+}): unknown {
+  if (conflict.kind !== "already_recorded") return conflict;
+  return {
+    kind: conflict.kind,
+    mismatchFields: conflict.mismatchFields,
+    existing: {
+      reviewerUsefulness: conflict.existing.reviewerUsefulness,
+      reviewerIdentity: conflict.existing.reviewerUsefulnessBy,
+      reviewerUsefulnessTs: conflict.existing.reviewerUsefulnessTs,
+      notesPresent: conflict.existing.notesPresent,
+      noteChars: conflict.existing.noteChars,
+    },
+    attempted: {
+      reviewerUsefulness: conflict.attempted.reviewerUsefulness,
+      reviewerIdentity: conflict.attempted.reviewerUsefulnessBy,
+      reviewerUsefulnessTs: conflict.attempted.reviewerUsefulnessTs,
+      notesPresent: conflict.attempted.notesPresent,
+      noteChars: conflict.attempted.noteChars,
+    },
+  };
+}
+
+function assertNeverConflict(conflict: never): never {
+  throw new Error(`Unhandled reviewer usefulness conflict kind: ${JSON.stringify(conflict)}`);
+}
+
+function hasJsonContentType(req: IncomingMessage): boolean {
+  const header = req.headers["content-type"];
+  const value = Array.isArray(header) ? (header[0] ?? "") : (header ?? "");
+  return /^application\/json(?:\s*(?:;|$))/i.test(value);
+}
+
+function projectLedgerRowForRead(
+  principal: PrincipalContext,
+  row: NonNullable<ReturnType<typeof getDelegationById>>,
+): Record<string, unknown> {
+  return {
+    ...row,
+    reviewerUsefulnessNotes: principal.isMonitor ? null : row.reviewerUsefulnessNotes,
+  };
+}
+
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
 
@@ -3268,7 +3440,18 @@ function decodePathSegmentOrSend(raw: string, res: ServerResponse, lctx: LogCtx)
   }
 }
 
-async function handleRequest(
+function normalizeLoggedRoute(method: string, path: string): string {
+  if (path.startsWith("/ledger/")) {
+    if (method === "PUT" && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
+      return "/ledger/:id/reviewer-usefulness";
+    }
+    const rawId = path.slice("/ledger/".length);
+    if (method === "GET" && rawId.length > 0 && !rawId.includes("/")) return "/ledger/:id";
+  }
+  return path;
+}
+
+export async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   cfg: HomeserverConfig,
@@ -3307,6 +3490,9 @@ async function handleRequest(
   // correlation trail. Its only durable signal is the content-blind, day-level aggregate row on
   // acceptance; rejected reports leave no adoption evidence. Other MCP tools retain normal logs.
   let suppressRequestTelemetry = false;
+  // Rotation proof must come from the protected surface only. Public routes resolve principals
+  // early for logging and monitor fencing, but they never cross the canonical 401 gate below.
+  let authenticatedRouteReached = false;
   let traceHandle: GatewayTraceHandle | null = null;
   let traceOutcomeOverride: string | null = null;
   let traceErrorClassOverride: string | null = null;
@@ -3317,13 +3503,19 @@ async function handleRequest(
     const parsedUrl = new URL(req.url ?? "/", "http://localhost");
     const path = parsedUrl.pathname;
     const method = lctx.method;
-    lctx.route = path;
+    lctx.route = normalizeLoggedRoute(method, path);
 
     // Resolve the caller's principal once, up front, so the read-only MONITOR scope is enforced
     // before ANY route dispatch — including the public /portal*, /portal/feedback and /hs routes
     // below. principal may be null (no/invalid token): public routes tolerate that; protected
     // routes reject at the canonical 401 gate further down.
     const principal = resolvePrincipal(req, cfg, implicitAdminAllowed);
+    if (principal) {
+      lctx.principal = principal.alias;
+      lctx.tier = principal.tier;
+      // keyHash is stored only in the owner-queryable request_log (never in the access log / metrics).
+      lctx.keyHash = principal.keyHash;
+    }
     if (principal?.isMonitor) {
       const monitorOk =
         method === "GET" &&
@@ -3669,6 +3861,7 @@ async function handleRequest(
       sendError(res, makeError("invalid_api_key"));
       return;
     }
+    authenticatedRouteReached = true;
 
     lctx.principal = principal.alias;
     lctx.tier = principal.tier;
@@ -3830,6 +4023,9 @@ async function handleRequest(
         endpoint: REVIEW_LANE_CAPABILITY_ENDPOINT,
         contract_version: REVIEW_BOUNDED_CONTRACT_VERSION,
         generated_at: new Date().toISOString(),
+        reviewerUsefulnessRecording: reviewerUsefulnessRecordingCapabilityForPrincipal(
+          reviewerUsefulnessPrincipal(principal)
+        ),
         lanes,
       });
       lctx.status = 200;
@@ -4480,14 +4676,144 @@ async function handleRequest(
         lctx.status = 404;
         lctx.outcome = "not_found";
         lctx.errorClass = "not_found";
-        sendError(res, makeError("not_found", { message: `No such ledger row '${id}'.` }));
+        sendError(res, makeError("not_found"));
         return;
       }
-      sendJson(res, 200, row);
+      sendJson(res, 200, projectLedgerRowForRead(principal, row));
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
       return;
+    }
+    if (method === "PUT" && path.startsWith("/ledger/") && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
+      lctx.route = "/ledger/:id/reviewer-usefulness";
+      lctx.admission = "n/a";
+      const reviewerWriteCapability = reviewerUsefulnessRecordingCapabilityForPrincipal(
+        reviewerUsefulnessPrincipal(principal)
+      );
+      if (!reviewerWriteCapability.available) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: reviewerUsefulnessRouteDeniedMessage(principal),
+          })
+        );
+        return;
+      }
+      const rawId = path.slice("/ledger/".length, -REVIEWER_USEFULNESS_ROUTE_SUFFIX.length);
+      if (rawId.length === 0 || rawId.includes("/")) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        lctx.errorClass = "not_found";
+        sendError(res, makeError("not_found", { message: "Unknown route or resource." }));
+        return;
+      }
+      const ledgerId = decodePathSegmentOrSend(rawId, res, lctx);
+      if (ledgerId === null) return;
+      if (!hasJsonContentType(req)) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(
+          res,
+          makeError("invalid_request_error", {
+            param: "content-type",
+            message: "Reviewer usefulness recording requires Content-Type: application/json.",
+          })
+        );
+        return;
+      }
+      let rawBody: string;
+      try {
+        rawBody = await readBody(req, 4 * 1024);
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+        return;
+      }
+      const parsedBody = parseReviewerUsefulnessWriteBody(rawBody);
+      if (!parsedBody.ok) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: parsedBody.param, message: parsedBody.message }));
+        return;
+      }
+      const reviewerIdentity = principal.logicalAlias.trim();
+      if (reviewerIdentity === "") {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            message: "Reviewer usefulness recording requires a non-empty authenticated logical alias.",
+          })
+        );
+        return;
+      }
+      const { usefulness, notes } = parsedBody.value;
+      const result = recordReviewerUsefulness({
+        ledgerId,
+        usefulness,
+        notes,
+        judgedBy: reviewerIdentity,
+      });
+      switch (result.kind) {
+        case "not_found":
+          lctx.status = 404;
+          lctx.outcome = "not_found";
+          lctx.errorClass = "not_found";
+          sendError(res, makeError("not_found"));
+          return;
+        case "recorded":
+        case "unchanged":
+          sendJson(res, result.kind === "recorded" ? 201 : 200, reviewerUsefulnessWriteResponse({
+            ledgerId,
+            taskType: result.taskType,
+            usefulness,
+            reviewerIdentity,
+            reviewerUsefulnessTs: result.record.reviewerUsefulnessTs!,
+            notes,
+            writeState: result.kind,
+          }));
+          lctx.status = result.kind === "recorded" ? 201 : 200;
+          lctx.outcome = "ok";
+          return;
+        case "conflict":
+          lctx.status = 409;
+          lctx.outcome = "conflict";
+          lctx.errorClass = "reviewer_usefulness_conflict";
+          switch (result.conflict.kind) {
+            case "wrong_task_type":
+            case "shadow":
+            case "superseded":
+            case "missing_verifier":
+              sendJson(res, 409, reviewerUsefulnessConflictResponse(
+                "Reviewer usefulness recording is only available for genuinely graded, non-shadow, current review-bounded delegations.",
+                reviewerUsefulnessConflictApiShape(result.conflict),
+              ));
+              return;
+            case "already_recorded":
+              sendJson(res, 409, reviewerUsefulnessConflictResponse(
+                reviewerUsefulnessConflictMessage({
+                  existing: result.conflict.existing,
+                  attempted: result.conflict.attempted,
+                }),
+                reviewerUsefulnessConflictApiShape(result.conflict),
+              ));
+              return;
+            default:
+              return assertNeverConflict(result.conflict);
+          }
+      }
     }
     if (path === "/metrics" && method === "GET") {
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
@@ -4696,18 +5022,21 @@ async function handleRequest(
         endedAtMs: startMs + (lctx.totalMs ?? 0),
       });
     }
-    // A staged-rotation preflight must mean the replacement completed an allowed gateway route,
-    // not merely that its token matched the local DB. Record only successful minted-key requests;
-    // static credentials have no keystore hash and failed/forbidden requests never advance proof.
-    if (
-      lctx.principal !== null
+    // A staged-rotation preflight must mean the replacement crossed the canonical auth gate and
+    // then completed a successful protected route, not merely that its token matched the local DB
+    // or that it hit a public 200 such as /healthz, /hs, or /portal*.
+    const rotationProofAlias =
+      authenticatedRouteReached
+      && lctx.principal !== null
       && lctx.keyHash !== null
       && lctx.status !== null
       && lctx.status >= 200
       && lctx.status < 400
-    ) {
+        ? lctx.principal
+        : null;
+    if (rotationProofAlias !== null) {
       try {
-        recordKeyUse(lctx.principal);
+        recordKeyUse(rotationProofAlias);
       } catch (err) {
         // Usage evidence strengthens a later rotation preflight, but a telemetry-store failure
         // must not turn an already completed gateway response into an unhandled request failure.

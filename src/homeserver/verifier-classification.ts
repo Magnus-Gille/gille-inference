@@ -39,40 +39,112 @@ export const STRUCTURAL_VERIFIERS: ReadonlySet<string> = new Set(["nonEmpty", "j
  */
 export const UNGRADED_VERIFIER_SENTINELS: ReadonlySet<string> = new Set(["none"]);
 
+function canonicalVerifierBase(name: string): string {
+  return verifierBaseName(name).toLowerCase();
+}
+
+const STRUCTURAL_VERIFIER_KEYS: ReadonlySet<string> = new Set(
+  [...STRUCTURAL_VERIFIERS].map((name) => name.toLowerCase())
+);
+const UNGRADED_VERIFIER_SENTINEL_KEYS: ReadonlySet<string> = new Set(
+  [...UNGRADED_VERIFIER_SENTINELS].map((name) => name.toLowerCase())
+);
+
 /** Strip a parameter suffix so `nonEmpty(1)` / `maxLength(...)` classify by their base name. */
 export function verifierBaseName(name: string): string {
   const paren = name.indexOf("(");
   return (paren >= 0 ? name.slice(0, paren) : name).trim();
 }
 
-/** True iff `name` is a known structural (shape/presence-only) verifier. Null/empty → false. */
-export function isStructuralVerifier(name: string | null | undefined): boolean {
-  if (name == null) return false;
-  const base = verifierBaseName(name);
-  return base.length > 0 && STRUCTURAL_VERIFIERS.has(base);
+export type VerifierSyntaxError = "unmatched-closing-parenthesis" | "unclosed-parenthesis";
+
+export interface ParsedVerifierLabel {
+  components: string[];
+  valid: boolean;
+  error: VerifierSyntaxError | null;
 }
 
 /**
- * True iff a row graded by `name` is admissible as evidence of ANSWER QUALITY: a NAMED, NON-
- * structural verifier. A structural verifier (shape/presence only), an ungraded row (null / empty
- * verifier), or the orchestrator's `"none"` ungraded sentinel is NOT quality-bearing — for a
- * judgment-quality task type it must not count toward the verdict in EITHER direction. Any other
- * named verifier is treated as quality-bearing (the conservative default above).
+ * Parse a verifier label while validating the parenthesis structure used to protect `+` signs
+ * inside parameter payloads. Invalid labels return no components so every caller fails closed;
+ * the explicit error keeps syntax failure distinguishable from a valid ungraded label.
+ */
+export function parseVerifierLabel(name: string | null | undefined): ParsedVerifierLabel {
+  if (name == null) return { components: [], valid: true, error: null };
+
+  const components: string[] = [];
+  let componentStart = 0;
+  let parenthesisDepth = 0;
+
+  const appendComponent = (end: number): void => {
+    const base = canonicalVerifierBase(name.slice(componentStart, end));
+    if (base.length > 0 && !UNGRADED_VERIFIER_SENTINEL_KEYS.has(base)) {
+      components.push(base);
+    }
+  };
+
+  for (let index = 0; index < name.length; index += 1) {
+    const char = name[index];
+    if (char === "(") {
+      parenthesisDepth += 1;
+    } else if (char === ")") {
+      if (parenthesisDepth === 0) {
+        return { components: [], valid: false, error: "unmatched-closing-parenthesis" };
+      }
+      parenthesisDepth -= 1;
+    } else if (char === "+" && parenthesisDepth === 0) {
+      appendComponent(index);
+      componentStart = index + 1;
+    }
+  }
+
+  if (parenthesisDepth !== 0) {
+    return { components: [], valid: false, error: "unclosed-parenthesis" };
+  }
+
+  appendComponent(name.length);
+  return { components, valid: true, error: null };
+}
+
+/**
+ * Return canonical verifier bases from a possibly `+`-combined label. A plus is a component
+ * separator only at parenthesis depth zero, so parameter payloads such as `exact(a+b)` remain one
+ * verifier. Empty components and ungraded sentinels are discarded here so every classifier shares
+ * the same definition of a real verifier component.
+ */
+export function parseVerifierComponents(name: string | null | undefined): string[] {
+  return parseVerifierLabel(name).components;
+}
+
+/** True iff `name` is a known structural (shape/presence-only) verifier. Null/empty → false. */
+export function isStructuralVerifier(name: string | null | undefined): boolean {
+  const parsed = parseVerifierLabel(name);
+  return (
+    parsed.valid
+    && parsed.components.length > 0
+    && parsed.components.every((base) => STRUCTURAL_VERIFIER_KEYS.has(base))
+  );
+}
+
+/**
+ * True iff a row graded by `name` is admissible as evidence of ANSWER QUALITY: at least one named,
+ * non-structural component remains after parsing a combined label. A structural verifier
+ * (shape/presence only), an ungraded row (null / empty verifier), or the orchestrator's `"none"`
+ * ungraded sentinel is NOT quality-bearing — for a judgment-quality task type it must not count
+ * toward the verdict in EITHER direction. Any other named verifier is treated as quality-bearing
+ * (the conservative default above).
  */
 export function isQualityBearingVerifier(name: string | null | undefined): boolean {
-  if (name == null) return false;
-  const base = verifierBaseName(name);
-  if (base.length === 0) return false;
-  if (UNGRADED_VERIFIER_SENTINELS.has(base)) return false; // ungraded sentinel — no verifier ran
-  return !STRUCTURAL_VERIFIERS.has(base);
+  const parsed = parseVerifierLabel(name);
+  return parsed.valid && parsed.components.some((base) => !STRUCTURAL_VERIFIER_KEYS.has(base));
 }
 
 /**
  * True iff a row graded by `name` is admissible as evidence of JUDGMENT-QUALITY output (issue #168):
- * its base verifier name is in the caller's TRUSTED whitelist. This is the whitelist counterpart to
- * isQualityBearingVerifier's blacklist, and for a judgment-quality task type it is the RULE (see
- * ledger.getVerdict + config.trustedVerifiersForJudgment) — a whitelist is strictly stronger than
- * the blacklist and subsumes it, so the two are never run redundantly.
+ * at least one parsed component is in the caller's TRUSTED whitelist. This is the whitelist
+ * counterpart to isQualityBearingVerifier's blacklist, and for a judgment-quality task type it is
+ * the RULE (see ledger.getVerdict + config.trustedVerifiersForJudgment) — a whitelist is strictly
+ * stronger than the blacklist and subsumes it, so the two are never run redundantly.
  *
  * Why stronger: the blacklist could only exclude KNOWN-structural verifiers; it still admitted
  * opaque/non-adversarial checks (`predicate`, `matches`) that a model passes while finding ~6% of
@@ -84,10 +156,19 @@ export function isTrustedJudgmentVerifier(
   name: string | null | undefined,
   trusted: ReadonlySet<string>
 ): boolean {
-  if (name == null) return false;
-  const base = verifierBaseName(name);
-  if (base.length === 0) return false;
-  return trusted.has(base);
+  const parsed = parseVerifierLabel(name);
+  if (!parsed.valid || parsed.components.length === 0) return false;
+
+  const trustedComponents = new Set<string>();
+  for (const candidate of trusted) {
+    const parsedCandidate = parseVerifierLabel(candidate);
+    if (!parsedCandidate.valid) continue;
+    for (const component of parsedCandidate.components) {
+      trustedComponents.add(component);
+    }
+  }
+
+  return parsed.components.some((component) => trustedComponents.has(component));
 }
 
 /**
@@ -139,20 +220,19 @@ export const MECHANICAL_FORMAT_VERIFIERS: ReadonlySet<string> = new Set([
   "shadow-vs-frontier",
 ]);
 
+const MECHANICAL_FORMAT_VERIFIER_KEYS: ReadonlySet<string> = new Set(
+  [...MECHANICAL_FORMAT_VERIFIERS].map((name) => name.toLowerCase())
+);
+
 function classifyVerifierComponentKind(base: string): "mechanical-format" | "truth-oriented" {
-  return MECHANICAL_FORMAT_VERIFIERS.has(base) ? "mechanical-format" : "truth-oriented";
+  return MECHANICAL_FORMAT_VERIFIER_KEYS.has(base) ? "mechanical-format" : "truth-oriented";
 }
 
 /** Classify a (possibly `+`-combined) verifier name into a {@link VerifierKind}. */
 export function classifyVerifierKind(name: string | null | undefined): VerifierKind {
-  const trimmed = name?.trim();
-  if (!trimmed) return "ungraded";
-  const components = trimmed
-    .split("+")
-    .map((part) => verifierBaseName(part.trim()))
-    .filter((base) => base.length > 0 && !UNGRADED_VERIFIER_SENTINELS.has(base));
-  if (components.length === 0) return "ungraded";
-  return components.some((base) => classifyVerifierComponentKind(base) === "truth-oriented")
+  const parsed = parseVerifierLabel(name);
+  if (!parsed.valid || parsed.components.length === 0) return "ungraded";
+  return parsed.components.some((base) => classifyVerifierComponentKind(base) === "truth-oriented")
     ? "truth-oriented"
     : "mechanical-format";
 }

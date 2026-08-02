@@ -4,8 +4,8 @@ import { getDb } from "../db.js";
 import { DEFAULT_FORMAT_ONLY_DISCOUNT_TASK_TYPES, DEFAULT_JUDGMENT_QUALITY_TASK_TYPES, type PolicyConfig } from "./config.js";
 import {
   classifyVerifierKind,
+  isQualityBearingVerifier,
   isTrustedJudgmentVerifier,
-  verifierBaseName,
   type VerifierKind,
 } from "./verifier-classification.js";
 import {
@@ -28,6 +28,7 @@ import {
   upsertEvidenceIdentitySnapshot,
   type EvidenceIdentitySnapshot,
 } from "./evidence-identity-store.js";
+import { REVIEWER_USEFULNESS_VALUES, REVIEW_BOUNDED_TASK_TYPE } from "./review-bounded.js";
 import { isKnownTaskType } from "./taxonomy.js";
 import { policyTaskTypeIdentity } from "./task-type-identity.js";
 
@@ -70,6 +71,7 @@ export type ErrorClass = "empty" | "truncated" | "timeout" | "parse" | "infra";
  * incorrect (e.g. the four gille-inference#78 whole-patch findings that were all refuted).
  */
 export type ReviewerUsefulness = "pass" | "partial" | "redo" | "wrong";
+const REVIEWER_USEFULNESS_VALUE_SET: ReadonlySet<ReviewerUsefulness> = new Set(REVIEWER_USEFULNESS_VALUES);
 
 const INFRA_ERROR_CLASSES: ReadonlySet<string> = new Set(["infra"]);
 
@@ -167,10 +169,13 @@ export interface DelegationDecision {
 
 // ─── Schema (additive; lives alongside the eval tables in the shared DB) ──────────
 
-let _initialised = false;
+// Schema init must be tracked PER Database object, not per process: initDb() can replace the
+// shared singleton with a different SQLite file in the same Node process (common in tests and
+// CLI flows), and each fresh connection still needs the additive delegations migration exactly once.
+const initialisedDbs = new WeakSet<Database.Database>();
 
 function ensureSchema(db: Database.Database): void {
-  if (_initialised) return;
+  if (initialisedDbs.has(db)) return;
   db.exec(`
     CREATE TABLE IF NOT EXISTS delegations (
       id                TEXT PRIMARY KEY,
@@ -248,6 +253,11 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("reviewer_usefulness_notes")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_notes TEXT`);
     if (!names.has("reviewer_usefulness_by")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_by TEXT`);
     if (!names.has("reviewer_usefulness_ts")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_ts TEXT`);
+    if (!names.has("reviewer_usefulness_legacy_json")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_json TEXT`);
+    if (!names.has("reviewer_usefulness_legacy_reason")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_reason TEXT`);
+    if (!names.has("reviewer_usefulness_legacy_quarantined_at")) {
+      db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_quarantined_at TEXT`);
+    }
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -258,7 +268,7 @@ function ensureSchema(db: Database.Database): void {
   // Same reasoning: evidence_identity_hash is added above, index it only after.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_identity ON delegations(task_type, model_id, node_id, evidence_identity_hash)`);
 
-  _initialised = true;
+  initialisedDbs.add(db);
 }
 
 function ledgerDb(): Database.Database {
@@ -633,40 +643,313 @@ export interface ReviewerUsefulnessInput {
   /** The `recordDelegation` return value (or POST /delegate's echoed `costTrace.delegationId`). */
   ledgerId: string;
   usefulness: ReviewerUsefulness;
-  /** Free-text rationale, e.g. "refuted on validation — see gille-inference#78". */
+  /** Short structured notes summary. The HTTP route further constrains this to closed tokens. */
   notes?: string | null;
   /** Who judged it — e.g. "magnus" or a delegator session id. Never raw task content. */
   judgedBy?: string | null;
   now?: string;
 }
 
+export interface ReviewerUsefulnessRecordSummary {
+  reviewerUsefulness: ReviewerUsefulness | null;
+  reviewerUsefulnessBy: string | null;
+  reviewerUsefulnessTs: string | null;
+  notesPresent: boolean;
+  noteChars: number;
+}
+
+export type ReviewerUsefulnessMismatchField = "reviewerUsefulness" | "reviewerIdentity" | "notes";
+
+export type ReviewerUsefulnessResult =
+  | { kind: "recorded"; taskType: string; record: ReviewerUsefulnessRecordSummary }
+  | { kind: "unchanged"; taskType: string; record: ReviewerUsefulnessRecordSummary }
+  | {
+    kind: "conflict";
+    conflict:
+      | { kind: "wrong_task_type"; taskType: string }
+      | { kind: "shadow" }
+      | { kind: "superseded" }
+      | { kind: "missing_verifier" }
+      | {
+        kind: "already_recorded";
+        mismatchFields: ReviewerUsefulnessMismatchField[];
+        existing: ReviewerUsefulnessRecordSummary;
+        attempted: ReviewerUsefulnessRecordSummary;
+      };
+  }
+  | { kind: "not_found" };
+
+interface ReviewerUsefulnessRow {
+  taskType: string;
+  outcome: string;
+  verifier: string | null;
+  shadow: 0 | 1;
+  supersededAt: string | null;
+  reviewerUsefulness: string | null;
+  reviewerUsefulnessNotes: string | null;
+  reviewerUsefulnessBy: string | null;
+  reviewerUsefulnessTs: string | null;
+}
+
+type ReviewerUsefulnessLiveState = "absent" | "recorded" | "legacy";
+
+function reviewerUsefulnessValue(value: string | null): ReviewerUsefulness | null {
+  return value !== null && REVIEWER_USEFULNESS_VALUE_SET.has(value as ReviewerUsefulness)
+    ? value as ReviewerUsefulness
+    : null;
+}
+
+function reviewerUsefulnessVisibleRecord(row: ReviewerUsefulnessRow): {
+  usefulness: ReviewerUsefulness;
+  judgedBy: string;
+  notes: string | null;
+  ts: string;
+} | null {
+  const usefulness = reviewerUsefulnessValue(row.reviewerUsefulness);
+  const judgedBy = row.reviewerUsefulnessBy?.trim() ?? "";
+  if (usefulness === null || judgedBy === "" || row.reviewerUsefulnessTs === null) return null;
+  if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) return null;
+  if (row.shadow === 1) return null;
+  if (row.supersededAt !== null) return null;
+  if (row.outcome === "unverified") return null;
+  if (!isQualityBearingVerifier(row.verifier)) return null;
+  return {
+    usefulness,
+    judgedBy,
+    notes: row.reviewerUsefulnessNotes ?? null,
+    ts: row.reviewerUsefulnessTs,
+  };
+}
+
+function reviewerUsefulnessLiveState(row: ReviewerUsefulnessRow): ReviewerUsefulnessLiveState {
+  const hasAny =
+    row.reviewerUsefulness !== null
+    || row.reviewerUsefulnessNotes !== null
+    || row.reviewerUsefulnessBy !== null
+    || row.reviewerUsefulnessTs !== null;
+  if (!hasAny) return "absent";
+  return reviewerUsefulnessVisibleRecord(row) !== null ? "recorded" : "legacy";
+}
+
+function reviewerUsefulnessSummary(args: {
+  usefulness: ReviewerUsefulness | null;
+  judgedBy: string | null;
+  notes: string | null;
+  ts: string | null;
+}): ReviewerUsefulnessRecordSummary {
+  return {
+    reviewerUsefulness: args.usefulness,
+    reviewerUsefulnessBy: args.judgedBy,
+    reviewerUsefulnessTs: args.ts,
+    notesPresent: args.notes !== null,
+    noteChars: args.notes?.length ?? 0,
+  };
+}
+
+function reviewerUsefulnessSummaryFromRow(row: ReviewerUsefulnessRow): ReviewerUsefulnessRecordSummary {
+  const visible = reviewerUsefulnessVisibleRecord(row);
+  return reviewerUsefulnessSummary({
+    usefulness: visible?.usefulness ?? null,
+    judgedBy: visible?.judgedBy ?? null,
+    notes: visible?.notes ?? null,
+    ts: visible?.ts ?? null,
+  });
+}
+
+function reviewerUsefulnessMismatchFields(
+  row: ReviewerUsefulnessRow,
+  attempted: { usefulness: ReviewerUsefulness; judgedBy: string | null; notes: string | null },
+): ReviewerUsefulnessMismatchField[] {
+  const visible = reviewerUsefulnessVisibleRecord(row);
+  const mismatches: ReviewerUsefulnessMismatchField[] = [];
+  if (visible?.usefulness !== attempted.usefulness) mismatches.push("reviewerUsefulness");
+  if ((visible?.judgedBy ?? null) !== attempted.judgedBy) mismatches.push("reviewerIdentity");
+  if ((visible?.notes ?? null) !== attempted.notes) mismatches.push("notes");
+  return mismatches;
+}
+
+function reviewerUsefulnessEligibilityConflict(
+  row: ReviewerUsefulnessRow,
+):
+  | { kind: "wrong_task_type"; taskType: string }
+  | { kind: "shadow" }
+  | { kind: "superseded" }
+  | { kind: "missing_verifier" }
+  | null {
+  if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) {
+    return { kind: "wrong_task_type", taskType: row.taskType };
+  }
+  if (row.shadow === 1) return { kind: "shadow" };
+  if (row.supersededAt !== null) return { kind: "superseded" };
+  if (row.outcome === "unverified") return { kind: "missing_verifier" };
+  if (!isQualityBearingVerifier(row.verifier)) return { kind: "missing_verifier" };
+  return null;
+}
+
+function quarantineLegacyReviewerUsefulness(
+  db: Database.Database,
+  ledgerId: string,
+  row: ReviewerUsefulnessRow,
+  now: string,
+): void {
+  if (reviewerUsefulnessLiveState(row) !== "legacy") return;
+  db.prepare(`
+    UPDATE delegations
+       SET reviewer_usefulness_legacy_json = COALESCE(
+             reviewer_usefulness_legacy_json,
+             @legacyJson
+           ),
+           reviewer_usefulness_legacy_reason = COALESCE(
+             reviewer_usefulness_legacy_reason,
+             'malformed_live_columns'
+           ),
+           reviewer_usefulness_legacy_quarantined_at = COALESCE(
+             reviewer_usefulness_legacy_quarantined_at,
+             @quarantinedAt
+           ),
+           reviewer_usefulness = NULL,
+           reviewer_usefulness_notes = NULL,
+           reviewer_usefulness_by = NULL,
+           reviewer_usefulness_ts = NULL
+     WHERE id = @id
+  `).run({
+    id: ledgerId,
+    legacyJson: JSON.stringify({
+      reviewerUsefulness: row.reviewerUsefulness,
+      reviewerUsefulnessNotes: row.reviewerUsefulnessNotes,
+      reviewerUsefulnessBy: row.reviewerUsefulnessBy,
+      reviewerUsefulnessTs: row.reviewerUsefulnessTs,
+    }),
+    quarantinedAt: now,
+  });
+}
+
+function getReviewerUsefulnessRow(
+  db: Database.Database,
+  ledgerId: string,
+): ReviewerUsefulnessRow | null {
+  const row = db.prepare(`
+    SELECT task_type AS taskType,
+           outcome,
+           verifier,
+           shadow,
+           superseded_at AS supersededAt,
+           reviewer_usefulness AS reviewerUsefulness,
+           reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+           reviewer_usefulness_by AS reviewerUsefulnessBy,
+           reviewer_usefulness_ts AS reviewerUsefulnessTs
+      FROM delegations
+     WHERE id = ?
+  `).get(ledgerId) as ReviewerUsefulnessRow | undefined;
+  return row ?? null;
+}
+
 /**
- * Record (or overwrite) a reviewer's usefulness verdict on an existing delegation row (#74).
- * Idempotent-by-id: a later call simply replaces the earlier judgment, matching the mutable-
- * status-vs-immutable-log convention used elsewhere in this codebase (a usefulness verdict is a
- * current-status field, not an append-only event log). Returns false — never throws — when
- * `ledgerId` does not exist, mirroring `supersedeDelegationById`'s "safe no-op" discipline.
+ * Record a reviewer's usefulness verdict exactly once per existing review-bounded row (#112).
+ *
+ * The write is linearized under SQLite's immediate writer lock: exact retries become `unchanged`,
+ * differing second writes become a structured `conflict`, and unknown rows remain a closed
+ * `not_found` result. The route layer adds auth and transport validation around this primitive.
  */
-export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): boolean {
+export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): ReviewerUsefulnessResult {
   const db = ledgerDb();
   const now = input.now ?? new Date().toISOString();
-  const info = db
-    .prepare(
-      `UPDATE delegations
+  const judgedBy = input.judgedBy ?? null;
+  const notes = input.notes ?? null;
+  const attempted = { usefulness: input.usefulness, judgedBy, notes };
+  const write = db.transaction((): ReviewerUsefulnessResult => {
+    let row = getReviewerUsefulnessRow(db, input.ledgerId);
+    if (row === null) return { kind: "not_found" };
+    const eligibilityConflict = reviewerUsefulnessEligibilityConflict(row);
+    if (eligibilityConflict !== null) {
+      return { kind: "conflict", conflict: eligibilityConflict };
+    }
+
+    if (reviewerUsefulnessLiveState(row) === "legacy") {
+      quarantineLegacyReviewerUsefulness(db, input.ledgerId, row, now);
+      row = getReviewerUsefulnessRow(db, input.ledgerId);
+      if (row === null) return { kind: "not_found" };
+    }
+
+    if (reviewerUsefulnessLiveState(row) === "recorded") {
+      const mismatchFields = reviewerUsefulnessMismatchFields(row, attempted);
+      if (mismatchFields.length === 0 && reviewerUsefulnessVisibleRecord(row)?.ts !== undefined) {
+        return { kind: "unchanged", taskType: row.taskType, record: reviewerUsefulnessSummaryFromRow(row) };
+      }
+      return {
+        kind: "conflict",
+        conflict: {
+          kind: "already_recorded",
+          mismatchFields,
+          existing: reviewerUsefulnessSummaryFromRow(row),
+          attempted: reviewerUsefulnessSummary({
+            usefulness: attempted.usefulness,
+            judgedBy: attempted.judgedBy,
+            notes: attempted.notes,
+            ts: null,
+          }),
+        },
+      };
+    }
+
+    const info = db.prepare(`
+      UPDATE delegations
          SET reviewer_usefulness = @usefulness,
              reviewer_usefulness_notes = @notes,
              reviewer_usefulness_by = @judgedBy,
              reviewer_usefulness_ts = @ts
-       WHERE id = @id`
-    )
-    .run({
-      usefulness: input.usefulness,
-      notes: input.notes ?? null,
-      judgedBy: input.judgedBy ?? null,
+       WHERE id = @id
+         AND reviewer_usefulness IS NULL
+         AND reviewer_usefulness_notes IS NULL
+         AND reviewer_usefulness_by IS NULL
+         AND reviewer_usefulness_ts IS NULL
+    `).run({
+      usefulness: attempted.usefulness,
+      notes: attempted.notes,
+      judgedBy: attempted.judgedBy,
       ts: now,
       id: input.ledgerId,
     });
-  return info.changes > 0;
+    if (info.changes > 0) {
+      return {
+        kind: "recorded",
+        taskType: row.taskType,
+        record: reviewerUsefulnessSummary({
+          usefulness: attempted.usefulness,
+          judgedBy: attempted.judgedBy,
+          notes: attempted.notes,
+          ts: now,
+        }),
+      };
+    }
+
+    let fresh = getReviewerUsefulnessRow(db, input.ledgerId);
+    if (fresh === null) return { kind: "not_found" };
+    if (reviewerUsefulnessLiveState(fresh) === "legacy") {
+      quarantineLegacyReviewerUsefulness(db, input.ledgerId, fresh, now);
+      fresh = getReviewerUsefulnessRow(db, input.ledgerId);
+      if (fresh === null) return { kind: "not_found" };
+    }
+    const mismatchFields = reviewerUsefulnessMismatchFields(fresh, attempted);
+    if (mismatchFields.length === 0 && reviewerUsefulnessVisibleRecord(fresh)?.ts !== undefined) {
+      return { kind: "unchanged", taskType: fresh.taskType, record: reviewerUsefulnessSummaryFromRow(fresh) };
+    }
+    return {
+      kind: "conflict",
+      conflict: {
+        kind: "already_recorded",
+        mismatchFields,
+        existing: reviewerUsefulnessSummaryFromRow(fresh),
+        attempted: reviewerUsefulnessSummary({
+          usefulness: attempted.usefulness,
+          judgedBy: attempted.judgedBy,
+          notes: attempted.notes,
+          ts: null,
+        }),
+      },
+    };
+  });
+  return write.immediate();
 }
 
 // ─── Verdict computation ───────────────────────────────────────────────────────
@@ -702,9 +985,14 @@ export interface LaneEvidence {
 
 const EXCLUDED_LANE_EVIDENCE_SOURCES: ReadonlySet<string> = new Set(["harvest-shadow"]);
 
-function normalizedVerifierName(name: string | null | undefined): string | null {
+/**
+ * Shared evidence-reader normalization: trim transport noise, collapse a fully-ungraded verifier
+ * label (including `+`-combined sentinel variants) to null, and otherwise preserve the caller's
+ * original spelling so bucket matching does not silently merge historical case variants.
+ */
+export function normalizedVerifierName(name: string | null | undefined): string | null {
   const trimmed = name?.trim();
-  if (!trimmed || verifierBaseName(trimmed) === "none") return null;
+  if (!trimmed || classifyVerifierKind(trimmed) === "ungraded") return null;
   return trimmed;
 }
 
@@ -1420,7 +1708,11 @@ export interface DelegationById extends RecentDelegation {
   attemptId: string | null;
   /** #74: NULL until a reviewer judges this row (see recordReviewerUsefulness). */
   reviewerUsefulness: ReviewerUsefulness | null;
+  /** True when reviewer-usefulness columns are populated but hidden because the row is malformed or now ineligible. */
+  reviewerUsefulnessHidden: boolean;
   reviewerUsefulnessNotes: string | null;
+  reviewerUsefulnessNotesPresent: boolean;
+  reviewerUsefulnessNoteChars: number;
   reviewerUsefulnessBy: string | null;
   reviewerUsefulnessTs: string | null;
 }
@@ -1430,7 +1722,7 @@ interface DelegationByIdRow extends RecentDelegationRow {
   learningTaskAdmissionId: string | null;
   taskInstanceId: string | null;
   attemptId: string | null;
-  reviewerUsefulness: ReviewerUsefulness | null;
+  reviewerUsefulness: string | null;
   reviewerUsefulnessNotes: string | null;
   reviewerUsefulnessBy: string | null;
   reviewerUsefulnessTs: string | null;
@@ -1513,12 +1805,32 @@ export function getDelegationById(id: string): DelegationById | null {
     : bindingValues.every((value) => value !== null) && row.evidenceIdentityHash !== null
       ? "bound"
       : "invalid";
+  const reviewerProjectionRow = {
+    taskType: row.taskType,
+    outcome: row.outcome,
+    verifier: row.verifier,
+    shadow: row.shadow,
+    supersededAt: row.supersededAt,
+    reviewerUsefulness: row.reviewerUsefulness,
+    reviewerUsefulnessNotes: row.reviewerUsefulnessNotes,
+    reviewerUsefulnessBy: row.reviewerUsefulnessBy,
+    reviewerUsefulnessTs: row.reviewerUsefulnessTs,
+  };
+  const visibleReviewerRecord = reviewerUsefulnessVisibleRecord(reviewerProjectionRow);
+  const reviewerUsefulnessHidden = reviewerUsefulnessLiveState(reviewerProjectionRow) === "legacy";
   return {
     ...row,
     learningTaskBinding,
     gateWouldEscalate: row.gateWouldEscalate === null ? null : row.gateWouldEscalate === 1,
     verifierKind: classifyVerifierKind(row.verifier),
     shadow: row.shadow === 1,
+    reviewerUsefulness: visibleReviewerRecord?.usefulness ?? null,
+    reviewerUsefulnessHidden,
+    reviewerUsefulnessNotes: visibleReviewerRecord?.notes ?? null,
+    reviewerUsefulnessNotesPresent: row.reviewerUsefulnessNotes !== null,
+    reviewerUsefulnessNoteChars: row.reviewerUsefulnessNotes?.length ?? 0,
+    reviewerUsefulnessBy: visibleReviewerRecord?.judgedBy ?? null,
+    reviewerUsefulnessTs: visibleReviewerRecord?.ts ?? null,
   };
 }
 

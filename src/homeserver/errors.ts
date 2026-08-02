@@ -20,6 +20,7 @@ export type ErrorCode =
   | "alias_exists" // 409 (duplicate key alias on mint)
   | "invite_invalid" // 409 (unknown OR already-used invite code — uniform, no enumeration leak)
   | "learning_task_conflict" // 409 (durable task/request/attempt identity is already admitted)
+  | "reviewer_usefulness_conflict" // 409 (exact retry ok; differing reviewer-usefulness overwrite rejected)
   | "rate_limit_exceeded" // 429
   | "credits_exhausted" // 402 (lifetime credit budget spent)
   | "server_busy" // 503
@@ -106,6 +107,12 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
     type: "invalid_request_error",
     param: "learningTaskStamp",
     message: "This learning-task request, attempt, or idempotency identity is already admitted.",
+  },
+  reviewer_usefulness_conflict: {
+    status: 409,
+    type: "invalid_request_error",
+    param: "ledgerId",
+    message: "Reviewer usefulness is already recorded differently for this ledger row.",
   },
   rate_limit_exceeded: {
     status: 429,

@@ -422,3 +422,119 @@ export const REVIEW_LANE_KNOWN_TASK_TYPES = ["code-review", REVIEW_BOUNDED_TASK_
 
 /** GET endpoint path for the review-lane capability preflight (#74 acceptance criterion 4). */
 export const REVIEW_LANE_CAPABILITY_ENDPOINT = "/v1/capabilities/review-lane" as const;
+
+export const REVIEWER_USEFULNESS_ROUTE_SUFFIX = "/reviewer-usefulness" as const;
+export const REVIEWER_USEFULNESS_ROUTE_ENDPOINT = `/ledger/{id}${REVIEWER_USEFULNESS_ROUTE_SUFFIX}` as const;
+export const REVIEWER_USEFULNESS_VALUES = ["pass", "partial", "redo", "wrong"] as const;
+export type ReviewLaneReviewerUsefulness = (typeof REVIEWER_USEFULNESS_VALUES)[number];
+export const REVIEWER_USEFULNESS_NOTES_MAX_CHARS = 160;
+
+export type ReviewerUsefulnessAvailabilityReason =
+  | "allowed"
+  | "requires_owner_admin"
+  | "requires_minted_owner_admin"
+  | "missing_reviewer_identity";
+
+export interface ReviewerUsefulnessPrincipal {
+  tier: "owner" | "guest";
+  scope: "admin" | "agent" | "inference" | "monitor";
+  keyHash: string | null;
+  logicalAlias: string;
+}
+
+const REVIEWER_USEFULNESS_NOTE_TOKEN = "[a-z][a-z0-9_-]{1,23}:[A-Za-z0-9][A-Za-z0-9._#/@+=-]{0,31}";
+const REVIEWER_USEFULNESS_NOTES_RE = new RegExp(`^${REVIEWER_USEFULNESS_NOTE_TOKEN}( ${REVIEWER_USEFULNESS_NOTE_TOKEN}){0,5}$`);
+
+export interface ReviewerUsefulnessRecordingCapability {
+  available: boolean;
+  authorization: "minted-owner-admin";
+  availabilityReason: ReviewerUsefulnessAvailabilityReason;
+  method: "PUT";
+  endpoint: typeof REVIEWER_USEFULNESS_ROUTE_ENDPOINT;
+  taskTypes: readonly [typeof REVIEW_BOUNDED_TASK_TYPE];
+  closedValues: readonly ReviewLaneReviewerUsefulness[];
+  reviewerIdentity: "authenticated logical alias";
+}
+
+export function reviewerUsefulnessRecordingCapabilityForPrincipal(
+  principal: ReviewerUsefulnessPrincipal | null,
+): ReviewerUsefulnessRecordingCapability {
+  let availabilityReason: ReviewerUsefulnessAvailabilityReason;
+  if (principal === null || principal.tier !== "owner" || principal.scope !== "admin") {
+    availabilityReason = "requires_owner_admin";
+  } else if (principal.keyHash === null) {
+    availabilityReason = "requires_minted_owner_admin";
+  } else if (principal.logicalAlias.trim() === "") {
+    availabilityReason = "missing_reviewer_identity";
+  } else {
+    availabilityReason = "allowed";
+  }
+  return {
+    available: availabilityReason === "allowed",
+    authorization: "minted-owner-admin",
+    availabilityReason,
+    method: "PUT",
+    endpoint: REVIEWER_USEFULNESS_ROUTE_ENDPOINT,
+    taskTypes: [REVIEW_BOUNDED_TASK_TYPE],
+    closedValues: REVIEWER_USEFULNESS_VALUES,
+    reviewerIdentity: "authenticated logical alias",
+  };
+}
+
+export interface ReviewerUsefulnessWrite {
+  usefulness: ReviewLaneReviewerUsefulness;
+  notes: string | null;
+}
+
+export type ReviewerUsefulnessWriteParse =
+  | { ok: true; value: ReviewerUsefulnessWrite }
+  | { ok: false; param: string | null; message: string };
+
+export function parseReviewerUsefulnessWriteBody(rawBody: string): ReviewerUsefulnessWriteParse {
+  let body: unknown;
+  try {
+    body = JSON.parse(rawBody) as unknown;
+  } catch {
+    return { ok: false, param: null, message: "Request body must be valid JSON." };
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, param: null, message: "Reviewer usefulness body must be a JSON object." };
+  }
+
+  const record = body as Record<string, unknown>;
+  const extra = Object.keys(record).find((key) => key !== "usefulness" && key !== "notes");
+  if (extra) {
+    return { ok: false, param: extra, message: `Unexpected field '${extra}'.` };
+  }
+
+  const usefulness = record["usefulness"];
+  if (typeof usefulness !== "string" || !(REVIEWER_USEFULNESS_VALUES as readonly string[]).includes(usefulness)) {
+    return {
+      ok: false,
+      param: "usefulness",
+      message: "'usefulness' must be one of: pass, partial, redo, wrong.",
+    };
+  }
+
+  const rawNotes = record["notes"];
+  if (rawNotes !== undefined && rawNotes !== null && typeof rawNotes !== "string") {
+    return { ok: false, param: "notes", message: "'notes' must be a string when provided." };
+  }
+  const trimmedNotes = typeof rawNotes === "string" ? rawNotes.trim() : "";
+  if (trimmedNotes.length > REVIEWER_USEFULNESS_NOTES_MAX_CHARS) {
+    return {
+      ok: false,
+      param: "notes",
+      message: `'notes' must be at most ${REVIEWER_USEFULNESS_NOTES_MAX_CHARS} characters.`,
+    };
+  }
+  if (trimmedNotes.length > 0 && !REVIEWER_USEFULNESS_NOTES_RE.test(trimmedNotes)) {
+    return {
+      ok: false,
+      param: "notes",
+      message: "'notes' must be content-blind key:value tokens (1-6 ASCII tokens separated by single spaces).",
+    };
+  }
+
+  return { ok: true, value: { usefulness: usefulness as ReviewLaneReviewerUsefulness, notes: trimmedNotes.length > 0 ? trimmedNotes : null } };
+}

@@ -66,9 +66,11 @@ argv, a pipe assembled from shell history, logs, a ticket, chat, or a scratch fi
    npx tsx src/homeserver/cli.ts keys preflight --plan <plan-id>
    ```
 
-   Preflight succeeds only when the exact replacement alias has a post-stage successful gateway
-   request and increased use count. Knowing the replacement plaintext or looking it up in the
-   local database is insufficient.
+   Preflight succeeds only when the exact replacement alias has a post-stage successful
+   authenticated protected-route request and increased use count. Public `200` routes such as
+   `/healthz`, `/hs`, or `/portal*`, plus anonymous `401` and forbidden `403` requests, do not
+   advance proof. Knowing the replacement plaintext or looking it up in the local database is
+   insufficient.
 4. If consumer setup or preflight fails, point the consumer back to its prior secret and abort:
 
    ```bash

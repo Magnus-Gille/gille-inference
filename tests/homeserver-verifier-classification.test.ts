@@ -7,6 +7,7 @@ import {
   isQualityBearingVerifier,
   isTrustedJudgmentVerifier,
   classifyVerifierKind,
+  parseVerifierLabel,
 } from "../src/homeserver/verifier-classification.js";
 
 // #156 (proposal 1): structural vs quality-bearing verifier classification. STRUCTURAL verifiers
@@ -38,6 +39,20 @@ describe("isStructuralVerifier", () => {
     expect(isStructuralVerifier(null)).toBe(false);
     expect(isStructuralVerifier(undefined)).toBe(false);
     expect(isStructuralVerifier("")).toBe(false);
+  });
+  it("does not admit malformed structural labels", () => {
+    expect(isStructuralVerifier("nonEmpty(")).toBe(false);
+    expect(isStructuralVerifier("nonEmpty)")).toBe(false);
+    expect(isStructuralVerifier("nonEmpty(foo+predicate")).toBe(false);
+  });
+  it.each([
+    ["nonEmpty+jsonValid", true],
+    ["none+nonEmpty(1)+NONE(ungraded)", true],
+    ["nonEmpty+predicate", false],
+    ["none+none", false],
+    ["+", false],
+  ] as const)("classifies combined components coherently: %s", (label, expected) => {
+    expect(isStructuralVerifier(label)).toBe(expected);
   });
 });
 
@@ -72,9 +87,55 @@ describe("isQualityBearingVerifier", () => {
     expect(isQualityBearingVerifier("none")).toBe(false);
   });
 
+  it("treats free-text sentinel variants as ungraded too (trimmed, case-insensitive)", () => {
+    expect(isQualityBearingVerifier(" None ")).toBe(false);
+    expect(isQualityBearingVerifier("NONE(ungraded)")).toBe(false);
+  });
+
   it("keeps a named 'custom' verifier (a real grading function) quality-bearing", () => {
     // orchestrator.ts writes verifier:"custom" when an unnamed but REAL verifier fn graded the row.
     expect(isQualityBearingVerifier("custom")).toBe(true);
+  });
+
+  it.each([
+    ["none+NONE(ungraded)", false],
+    ["nonEmpty+jsonValid", false],
+    ["nonEmpty+predicate", true],
+    ["none+exact", true],
+    [" NONE + JSONVALID ", false],
+    [" NONE + NonEmpty + Predicate ", true],
+  ] as const)("evaluates combined verifier quality from real components: %s", (verifier, expected) => {
+    expect(isQualityBearingVerifier(verifier)).toBe(expected);
+  });
+
+  it("does not split plus signs inside parameter payloads", () => {
+    expect(isQualityBearingVerifier("maxLength(10+20)")).toBe(false);
+    expect(classifyVerifierKind("maxLength(10+20)")).toBe("mechanical-format");
+    expect(isQualityBearingVerifier("futureCheck(a+b)")).toBe(true);
+    expect(classifyVerifierKind("futureCheck(a+b)")).toBe("truth-oriented");
+  });
+
+  it.each([
+    ["none)", "unmatched-closing-parenthesis"],
+    ["nonEmpty)", "unmatched-closing-parenthesis"],
+    ["none(", "unclosed-parenthesis"],
+    ["nonEmpty(", "unclosed-parenthesis"],
+    ["exact)+none", "unmatched-closing-parenthesis"],
+    ["exact(foo+predicate", "unclosed-parenthesis"],
+  ] as const)("reports malformed syntax in %s", (label, error) => {
+    expect(parseVerifierLabel(label)).toEqual({ components: [], valid: false, error });
+  });
+
+  it.each([
+    "none)",
+    "nonEmpty)",
+    "none(",
+    "nonEmpty(",
+    "exact)+none",
+    "exact(foo+predicate",
+  ] as const)("fails closed for malformed quality-bearing label %s", (label) => {
+    expect(isQualityBearingVerifier(label)).toBe(false);
+    expect(classifyVerifierKind(label)).toBe("ungraded");
   });
 });
 
@@ -105,6 +166,35 @@ describe("isTrustedJudgmentVerifier", () => {
     for (const v of ["predicate", "matches", "nonEmpty(1)", "answerIs", "custom", "gtReview"]) {
       expect(isTrustedJudgmentVerifier(v, empty)).toBe(false);
     }
+  });
+
+  it("does not trust a malformed label even when its base is whitelisted", () => {
+    const trusted = new Set(["gtReview", "exact"]);
+    expect(isTrustedJudgmentVerifier("gtReview(", trusted)).toBe(false);
+    expect(isTrustedJudgmentVerifier("exact(foo+predicate", trusted)).toBe(false);
+    expect(isTrustedJudgmentVerifier("exact)+none", trusted)).toBe(false);
+  });
+
+  it("does not let a sentinel whitelist entry trust an ungraded label or variant", () => {
+    const trusted = new Set(["none"]);
+    for (const label of ["none", "NONE(ungraded)", "none+NONE(ungraded)", "+"]) {
+      expect(isTrustedJudgmentVerifier(label, trusted)).toBe(false);
+    }
+  });
+
+  it("matches canonical parsed components in well-formed combined labels", () => {
+    const trusted = new Set(["gtReview"]);
+    expect(isTrustedJudgmentVerifier("gtReview(strict)", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("none+gtReview(strict)", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("gtReview(strict)+none", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("predicate+gtReview", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("none+predicate", trusted)).toBe(false);
+  });
+
+  it("ignores empty, sentinel, and malformed whitelist entries", () => {
+    const trusted = new Set(["", "none", "gtReview)", "gtReview("]);
+    expect(isTrustedJudgmentVerifier("gtReview", trusted)).toBe(false);
+    expect(isTrustedJudgmentVerifier("none", trusted)).toBe(false);
   });
 });
 
@@ -155,6 +245,14 @@ describe("classifyVerifierKind", () => {
     expect(classifyVerifierKind("")).toBe("ungraded");
     expect(classifyVerifierKind("   ")).toBe("ungraded");
     expect(classifyVerifierKind("none")).toBe("ungraded");
+    expect(classifyVerifierKind(" None ")).toBe("ungraded");
+    expect(classifyVerifierKind("NONE(ungraded)")).toBe("ungraded");
+    expect(classifyVerifierKind(" none + NONE(ungraded) ")).toBe("ungraded");
+  });
+
+  it("classifies mixed-case known mechanical verifier bases without silently treating them as truth-oriented", () => {
+    expect(classifyVerifierKind(" JSONVALID + Exact({\"ok\":true}) ")).toBe("mechanical-format");
+    expect(classifyVerifierKind(" MaxLength(40) + containsALL ")).toBe("mechanical-format");
   });
 
   it("classifies a probe-native '+'-combined name as mechanical-format only if EVERY component is", () => {
@@ -164,5 +262,23 @@ describe("classifyVerifierKind", () => {
     // mechanical-format component — a real judgment ran as part of the pass.
     expect(classifyVerifierKind("maxLength+predicate")).toBe("truth-oriented");
     expect(classifyVerifierKind("nonEmpty+predicate")).toBe("truth-oriented");
+  });
+
+  it("removes ungraded components before classifying a combined name", () => {
+    expect(classifyVerifierKind("none+NONE(ungraded)")).toBe("ungraded");
+    expect(classifyVerifierKind("nonEmpty+jsonValid")).toBe("mechanical-format");
+    expect(classifyVerifierKind("nonEmpty+predicate")).toBe("truth-oriented");
+    expect(classifyVerifierKind("none+exact")).toBe("mechanical-format");
+  });
+
+  it.each([
+    "none)",
+    "nonEmpty)",
+    "none(",
+    "nonEmpty(",
+    "exact)+none",
+    "exact(foo+predicate",
+  ] as const)("classifies malformed labels as ungraded: %s", (label) => {
+    expect(classifyVerifierKind(label)).toBe("ungraded");
   });
 });

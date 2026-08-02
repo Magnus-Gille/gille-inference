@@ -156,6 +156,66 @@ describe("read-only monitor scope (#35)", () => {
     expect(body.id).toBe(id);
   });
 
+  it("monitor ledger projections never expose reviewer note bytes", async () => {
+    const { recordDelegation, recordReviewerUsefulness } = await import("../src/homeserver/ledger.js");
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "m1",
+      prompt: "x",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "pass",
+      notes: "ref:gille-inference#112 check:manual",
+      judgedBy: "grimnir-session-2026-08-01",
+    })).toMatchObject({ kind: "recorded" });
+
+    const res = await fetch(url(`/ledger/${id}`), { headers: auth(MONITOR_KEY) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      reviewerUsefulness: string | null;
+      reviewerUsefulnessNotes: string | null;
+      reviewerUsefulnessNotesPresent: boolean;
+      reviewerUsefulnessNoteChars: number;
+    };
+    expect(body.reviewerUsefulness).toBe("pass");
+    expect(body.reviewerUsefulnessNotes).toBeNull();
+    expect(body.reviewerUsefulnessNotesPresent).toBe(true);
+    expect(body.reviewerUsefulnessNoteChars).toBe("ref:gille-inference#112 check:manual".length);
+    expect(JSON.stringify(body)).not.toContain("ref:gille-inference#112 check:manual");
+  });
+
+  it("GET /ledger stays content-blind for monitor readers even when recent rows have reviewer notes", async () => {
+    const { recordDelegation, recordReviewerUsefulness } = await import("../src/homeserver/ledger.js");
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "m1",
+      prompt: "x",
+      outcome: "pass",
+      verifier: "reviewBoundedVerifier",
+      source: "gateway",
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "partial",
+      notes: "ref:gille-inference#112 followup:manual",
+      judgedBy: "grimnir-session-2026-08-01",
+    })).toMatchObject({ kind: "recorded" });
+
+    const res = await fetch(url("/ledger"), { headers: auth(MONITOR_KEY) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { report: unknown[]; recent: Array<Record<string, unknown>> };
+    expect(JSON.stringify(body)).not.toContain("ref:gille-inference#112 followup:manual");
+
+    const recentRow = body.recent.find((row) => row["id"] === id);
+    expect(recentRow).toBeDefined();
+    expect(recentRow).not.toHaveProperty("reviewerUsefulnessNotes");
+    expect(recentRow).not.toHaveProperty("reviewerUsefulnessNotesPresent");
+    expect(recentRow).not.toHaveProperty("reviewerUsefulnessNoteChars");
+  });
+
   it("monitor key CANNOT proxy inference — POST /v1/chat/completions is 403", async () => {
     const res = await fetch(url("/v1/chat/completions"), {
       method: "POST",

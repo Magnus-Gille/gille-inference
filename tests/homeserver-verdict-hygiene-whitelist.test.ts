@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.js";
 import { DEFAULT_POLICY, type PolicyConfig } from "../src/homeserver/config.js";
-import { recordDelegation, getVerdict, type Outcome } from "../src/homeserver/ledger.js";
+import { importDelegations, recordDelegation, getVerdict, type Outcome } from "../src/homeserver/ledger.js";
 
 // #168 (verdict hygiene — WHITELIST): tighten #156's structural blacklist into a whitelist for
 // JUDGMENT-QUALITY task types. A row is admissible as verdict evidence for such a type IFF its
@@ -80,5 +80,40 @@ describe("#168 verdict hygiene — trusted-verifier whitelist for judgment-quali
     const v = getVerdict("code-review", "param", withTrusted("gtReview"));
     expect(v.attempts).toBe(4);
     expect(v.verdict).toBe("viable");
+  });
+
+  it("(g) a whitelist containing only the ungraded sentinel cannot admit direct or imported pass rows", () => {
+    const directModel = "sentinel-direct";
+    for (const verifier of ["none", "NONE(ungraded)", "none+none"]) {
+      rec("code-review", directModel, "pass", verifier);
+    }
+
+    const importedModel = "sentinel-imported";
+    importDelegations([
+      {
+        ts: "2026-08-02T20:00:00.000Z",
+        taskType: "code-review",
+        modelId: importedModel,
+        prompt: "imported sentinel none",
+        outcome: "pass",
+        verifier: "none(ungraded)",
+        source: "probe-import",
+      },
+      {
+        ts: "2026-08-02T20:01:00.000Z",
+        taskType: "code-review",
+        modelId: importedModel,
+        prompt: "imported sentinel plus",
+        outcome: "pass",
+        verifier: "none+NONE(ungraded)",
+        source: "probe-import",
+      },
+    ]);
+
+    for (const modelId of [directModel, importedModel]) {
+      const verdict = getVerdict("code-review", modelId, withTrusted("none"));
+      expect(verdict.attempts).toBe(0);
+      expect(verdict.verdict).toBe("unknown");
+    }
   });
 });
