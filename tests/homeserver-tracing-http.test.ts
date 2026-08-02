@@ -363,6 +363,28 @@ describe("HTTP tracing", () => {
     expect(gatewayReadiness(records).at(-1)?.outcome).toBe("failed");
   });
 
+  it("records unknown gateway readiness for an authenticated traced client 400", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-http-bad-request", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+
+    const res = await fetch(gatewayUrl("/v1/chat/completions"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintextKey}`,
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-b9c7c989f97918e1-01",
+      },
+      body: JSON.stringify({ model: "m1", max_tokens: 0, messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("invalid_request_error");
+
+    const records = await flushTracingForTests();
+    expect(gatewayReadiness(records).at(-1)?.outcome).toBe("unknown");
+  });
+
   it("records client cancellation and a queued admission span without changing the request outcome path", async () => {
     setTracingTestHooks({ captureExports: true });
     const key = mintKey({ alias: "trace-cancel", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);

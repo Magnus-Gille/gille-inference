@@ -891,8 +891,10 @@ function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" |
   if (outcome === "client_closed") return "unknown";
   if (outcome === "busy" || outcome === "rate_limited") return "degraded";
   if (outcome === "stream_failed" || outcome === "degenerate") return "failed";
+  if (status === null) return "unknown";
   if (status !== null && status >= 200 && status < 400) return "ok";
-  return "failed";
+  if (status >= 500) return "failed";
+  return "unknown";
 }
 
 function traceErrorClassForOutcome(outcome: string, errorClass: string | null): string | undefined {
