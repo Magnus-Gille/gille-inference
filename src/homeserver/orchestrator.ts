@@ -41,7 +41,6 @@ import {
 import {
   recordCompletedSpan,
   setTraceDefaults,
-  traceModelArtifactIdentity,
   updateCurrentTraceSpan,
   withTraceSpan,
   type TraceSpanFinish,
@@ -852,7 +851,6 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       const effective = timedOut ? { ok: false as const, error: TIMEOUT_SENTINEL } : r;
       updateCurrentTraceSpan({
         retryOrdinal,
-        modelArtifactIdentity: traceModelArtifactIdentity(modelId),
         ...(effective.ok ? {} : { errorClass: effective.truncated === true ? "truncated" : classifyError(effective.error) }),
       });
       if (effective.ok && typeof effective.ttftMs === "number") {

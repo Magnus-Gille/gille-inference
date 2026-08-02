@@ -154,6 +154,18 @@ async function mcpAsk(
   });
 }
 
+async function mcpRaw(token: string, rawBody: string, traceId: string): Promise<Response> {
+  return fetch(gatewayUrl("/mcp"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+      traceparent: `00-${traceId}-b9c7c989f97918e1-01`,
+    },
+    body: rawBody,
+  });
+}
+
 function traceSpans(records: readonly unknown[]): Array<{
   phase: string;
   trace_id: string;
@@ -201,6 +213,87 @@ async function askOutcomeForTrace(
 }
 
 describe("MCP ask tracing", () => {
+  it("marks a parse error as a bad request while preserving the HTTP 200 JSON-RPC error", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-parse", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4742";
+
+    const res = await mcpRaw(key.plaintextKey, "{malformed SECRET_PARSE https://private.example", traceId);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32700, message: "Parse error" },
+    });
+
+    const { gateway, readiness } = await askOutcomeForTrace(traceId);
+    expect(gateway).toMatchObject({ outcome: "bad_request", error_class: "invalid_request_error" });
+    expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
+  });
+
+  it("marks an invalid JSON-RPC shape as a bad request while preserving its HTTP 200 body", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-shape", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4743";
+
+    const res = await mcpRaw(key.plaintextKey, JSON.stringify({ jsonrpc: "2.0", id: 301 }), traceId);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32600, message: "Invalid Request" },
+    });
+
+    const { gateway, readiness } = await askOutcomeForTrace(traceId);
+    expect(gateway).toMatchObject({ outcome: "bad_request", error_class: "invalid_request_error" });
+    expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
+  });
+
+  it("marks an unknown request method as a bad request without changing its JSON-RPC body", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-method", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4744";
+
+    const res = await mcpRaw(
+      key.plaintextKey,
+      JSON.stringify({ jsonrpc: "2.0", id: 302, method: "SECRET_UNKNOWN_METHOD" }),
+      traceId,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      jsonrpc: "2.0",
+      id: 302,
+      error: { code: -32601, message: "Method not found" },
+    });
+
+    const records = await flushTracingForTests();
+    expect(JSON.stringify(records)).not.toContain("SECRET_UNKNOWN_METHOD");
+    const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+    const readiness = gatewayReadiness(records).find((record) => record.trace?.trace_id === traceId);
+    expect(gateway).toMatchObject({ outcome: "bad_request", error_class: "invalid_request_error" });
+    expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
+  });
+
+  it("does not classify a valid notification as a bad request", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-notification", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4745";
+
+    const res = await mcpRaw(
+      key.plaintextKey,
+      JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      traceId,
+    );
+    expect(res.status).toBe(202);
+    expect(await res.text()).toBe("");
+
+    const { gateway, readiness } = await askOutcomeForTrace(traceId);
+    expect(gateway.outcome).toBe("ok");
+    expect(readiness.outcome).toBe("ok");
+    expect(gateway.error_class).toBeUndefined();
+    expect(readiness.error_class).toBeUndefined();
+  });
+
   it("keeps a successful ask at ok for both the gateway span and readiness", async () => {
     setTracingTestHooks({ captureExports: true });
     const key = mintKey({ alias: "trace-mcp-ok", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);

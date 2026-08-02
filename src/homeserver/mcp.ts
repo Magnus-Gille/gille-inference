@@ -1367,12 +1367,12 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
   } catch {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcError(null, PARSE_ERROR, "Parse error"));
-    return {};
+    return { trace: badRequestTrace() };
   }
   if (typeof msg !== "object" || msg === null || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcError(null, INVALID_REQUEST, "Invalid Request"));
-    return {};
+    return { trace: badRequestTrace() };
   }
 
   const method = msg.method;
@@ -1430,5 +1430,5 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
   // Unknown method.
   res.writeHead(200, { "content-type": "application/json" });
   res.end(rpcError(id, METHOD_NOT_FOUND, "Method not found"));
-  return {};
+  return { trace: badRequestTrace() };
 }

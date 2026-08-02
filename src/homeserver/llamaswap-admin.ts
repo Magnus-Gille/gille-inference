@@ -25,7 +25,7 @@ import {
 import {
   currentTraceHeaders,
   recordReadinessObservation,
-  traceModelArtifactIdentity,
+  traceModelArtifactIdentityFromServedModelCmd,
   updateCurrentTraceSpan,
   withTraceSpan,
   type TraceSpanFinish,
@@ -180,23 +180,33 @@ export async function loadModel(
   return withTraceSpan("model_load", {}, async () => {
     void opts; // opts ignored — llama-swap owns startup config
     assertModelKey(modelKey);
-    const traceIdentity = traceModelArtifactIdentity(modelKey);
     const origin = getOrigin();
     const start = Date.now();
 
-    // Check if already loaded
-    const running = await fetchRunning(origin);
-    const alreadyLoaded = running.some((r) => r.model === modelKey && r.state === "ready");
-    if (alreadyLoaded) {
-      updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity });
-      recordReadinessObservation("model", "ok", { modelArtifactIdentity: traceIdentity });
-      return {
-        ok: true,
-        modelKey,
-        identifier: modelKey,
-        durationMs: Date.now() - start,
-        message: "already loaded",
-      };
+    // Check if already loaded. The probe is part of the model-load operation: annotate and
+    // rethrow probe failures so callers retain the existing thrown/API behaviour while tracing
+    // gets one fixed, content-free failure class and readiness observation.
+    try {
+      const running = await fetchRunning(origin);
+      const runningEntry = running.find((r) => r.model === modelKey && r.state === "ready");
+      if (runningEntry) {
+        const modelArtifactIdentity = traceModelArtifactIdentityFromServedModelCmd(runningEntry.cmd);
+        const traceAttrs = modelArtifactIdentity ? { modelArtifactIdentity } : {};
+        updateCurrentTraceSpan(traceAttrs);
+        recordReadinessObservation("model", "ok", traceAttrs);
+        return {
+          ok: true,
+          modelKey,
+          identifier: modelKey,
+          durationMs: Date.now() - start,
+          message: "already loaded",
+        };
+      }
+    } catch (err) {
+      const errorClass = "upstream_unavailable";
+      updateCurrentTraceSpan({ errorClass });
+      recordReadinessObservation("model", "failed", { errorClass });
+      throw err;
     }
 
     // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
@@ -218,24 +228,17 @@ export async function loadModel(
       );
       const durationMs = Date.now() - start;
       if (!res.ok) {
-        updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity, errorClass: "upstream_unavailable" });
-        recordReadinessObservation("model", "failed", {
-          modelArtifactIdentity: traceIdentity,
-          errorClass: "upstream_unavailable",
-        });
+        updateCurrentTraceSpan({ errorClass: "upstream_unavailable" });
+        recordReadinessObservation("model", "failed", { errorClass: "upstream_unavailable" });
         const msg = await res.text().catch(() => "");
         return { ok: false, modelKey, identifier: modelKey, durationMs, message: msg || `HTTP ${res.status}` };
       }
-      updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity });
-      recordReadinessObservation("model", "ok", { modelArtifactIdentity: traceIdentity });
+      recordReadinessObservation("model", "ok");
       return { ok: true, modelKey, identifier: modelKey, durationMs, message: "loaded" };
     } catch (err) {
       const durationMs = Date.now() - start;
-      updateCurrentTraceSpan({ modelArtifactIdentity: traceIdentity, errorClass: "upstream_unavailable" });
-      recordReadinessObservation("model", "failed", {
-        modelArtifactIdentity: traceIdentity,
-        errorClass: "upstream_unavailable",
-      });
+      updateCurrentTraceSpan({ errorClass: "upstream_unavailable" });
+      recordReadinessObservation("model", "failed", { errorClass: "upstream_unavailable" });
       return {
         ok: false,
         modelKey,

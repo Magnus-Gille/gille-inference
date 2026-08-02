@@ -8,7 +8,8 @@ let setTracingTestHooks: typeof import("../src/homeserver/tracing.js").setTracin
 let resetTracingTestHooks: typeof import("../src/homeserver/tracing.js").resetTracingTestHooks;
 
 const HOSTILE_MODEL_KEY = "SECRET_TOKEN_ABC";
-const EXPECTED_TRACE_ID = "sha256:8c8cc79f473bb3a1757aff8e77c59b4bc3ec807be4be39ed5ae47c2e7f3acedb";
+const OBSERVED_CMD = "llama-server -m /srv/models/trusted.gguf -c 32768";
+const EXPECTED_OBSERVED_ARTIFACT = "sha256:51f0d9b504f0e8175b6478502fc16f88bb5a31bff264b0a5135ed98a7b904f16";
 
 interface TraceRecordLike {
   kind?: string;
@@ -22,7 +23,12 @@ function traceRecord(record: unknown): TraceRecordLike {
   return record as TraceRecordLike;
 }
 
-function expectSafeModelTrace(records: readonly unknown[], spanOutcome: string, readinessOutcome: string): void {
+function expectNoModelArtifact(
+  records: readonly unknown[],
+  spanOutcome: string,
+  readinessOutcome: string,
+  errorClass?: string,
+): void {
   const joined = JSON.stringify(records);
   expect(joined).not.toContain(HOSTILE_MODEL_KEY);
 
@@ -31,7 +37,36 @@ function expectSafeModelTrace(records: readonly unknown[], spanOutcome: string, 
     .find((record) => record.kind === "trace-span" && record.phase === "model_load");
   expect(modelLoad).toMatchObject({
     outcome: spanOutcome,
-    model_artifact_identity: EXPECTED_TRACE_ID,
+    ...(errorClass === undefined ? {} : { error_class: errorClass }),
+  });
+  expect(modelLoad).not.toHaveProperty("model_artifact_identity");
+
+  const readiness = records
+    .map(traceRecord)
+    .find((record) => record.kind === "service-observation" && record.slot_id === "model-ready");
+  expect(readiness).toMatchObject({
+    outcome: readinessOutcome,
+    ...(errorClass === undefined ? {} : { error_class: errorClass }),
+  });
+  expect(readiness).not.toHaveProperty("model_artifact_identity");
+
+  const identities = records
+    .map(traceRecord)
+    .map((record) => record.model_artifact_identity)
+    .filter((identity): identity is string => typeof identity === "string");
+  expect(new Set(identities).size).toBe(0);
+}
+
+function expectObservedModelArtifact(records: readonly unknown[], spanOutcome: string, readinessOutcome: string): void {
+  const joined = JSON.stringify(records);
+  expect(joined).not.toContain(HOSTILE_MODEL_KEY);
+
+  const modelLoad = records
+    .map(traceRecord)
+    .find((record) => record.kind === "trace-span" && record.phase === "model_load");
+  expect(modelLoad).toMatchObject({
+    outcome: spanOutcome,
+    model_artifact_identity: EXPECTED_OBSERVED_ARTIFACT,
   });
 
   const readiness = records
@@ -39,15 +74,8 @@ function expectSafeModelTrace(records: readonly unknown[], spanOutcome: string, 
     .find((record) => record.kind === "service-observation" && record.slot_id === "model-ready");
   expect(readiness).toMatchObject({
     outcome: readinessOutcome,
-    model_artifact_identity: EXPECTED_TRACE_ID,
+    model_artifact_identity: EXPECTED_OBSERVED_ARTIFACT,
   });
-
-  const identities = records
-    .map(traceRecord)
-    .map((record) => record.model_artifact_identity)
-    .filter((identity): identity is string => typeof identity === "string");
-  expect(identities).toEqual(expect.arrayContaining([EXPECTED_TRACE_ID]));
-  expect(identities.every((identity) => /^sha256:[a-f0-9]{64}$/.test(identity))).toBe(true);
 }
 
 beforeEach(async () => {
@@ -121,7 +149,7 @@ describe("model-load tracing", () => {
     expect(joined).not.toContain("SECRET");
   });
 
-  it("hashes a hostile key on the already-loaded success path", async () => {
+  it("uses only the server-observed artifact on the already-loaded success path", async () => {
     setTracingTestHooks({ captureExports: true });
     vi.stubGlobal(
       "fetch",
@@ -131,7 +159,7 @@ describe("model-load tracing", () => {
           return {
             ok: true,
             status: 200,
-            json: async () => ({ running: [{ model: HOSTILE_MODEL_KEY, state: "ready" }] }),
+            json: async () => ({ running: [{ model: HOSTILE_MODEL_KEY, state: "ready", cmd: OBSERVED_CMD }] }),
           } as Response;
         }
         throw new Error(`unexpected url ${url}`);
@@ -145,10 +173,10 @@ describe("model-load tracing", () => {
 
     expect(result).toMatchObject({ ok: true, modelKey: HOSTILE_MODEL_KEY, identifier: HOSTILE_MODEL_KEY });
     expect(result.message).toBe("already loaded");
-    expectSafeModelTrace(await flushTracingForTests(), "ok", "ok");
+    expectObservedModelArtifact(await flushTracingForTests(), "ok", "ok");
   });
 
-  it("hashes a hostile key on warm-up success while preserving routing and the response", async () => {
+  it("omits model artifact identity on warm-up success when no artifact was observed", async () => {
     setTracingTestHooks({ captureExports: true });
     let chatBody: { model?: string } | undefined;
     vi.stubGlobal(
@@ -178,10 +206,10 @@ describe("model-load tracing", () => {
     expect(chatBody).toMatchObject({ model: HOSTILE_MODEL_KEY });
     expect(result).toMatchObject({ ok: true, modelKey: HOSTILE_MODEL_KEY, identifier: HOSTILE_MODEL_KEY });
     expect(result.message).toBe("loaded");
-    expectSafeModelTrace(await flushTracingForTests(), "ok", "ok");
+    expectNoModelArtifact(await flushTracingForTests(), "ok", "ok");
   });
 
-  it("hashes a hostile key on the upstream-error path while preserving the API error response", async () => {
+  it("omits model artifact identity on the upstream-error path while preserving the API error response", async () => {
     setTracingTestHooks({ captureExports: true });
     vi.stubGlobal(
       "fetch",
@@ -216,10 +244,10 @@ describe("model-load tracing", () => {
       identifier: HOSTILE_MODEL_KEY,
       message: `backend rejected ${HOSTILE_MODEL_KEY}`,
     });
-    expectSafeModelTrace(await flushTracingForTests(), "error", "failed");
+    expectNoModelArtifact(await flushTracingForTests(), "error", "failed", "upstream_unavailable");
   });
 
-  it("hashes a hostile key on the caught-exception path while keeping the exception response unchanged", async () => {
+  it("omits model artifact identity on the caught-exception path while keeping the exception response unchanged", async () => {
     setTracingTestHooks({ captureExports: true });
     vi.stubGlobal(
       "fetch",
@@ -250,6 +278,66 @@ describe("model-load tracing", () => {
       identifier: HOSTILE_MODEL_KEY,
       message: `socket failed for ${HOSTILE_MODEL_KEY}`,
     });
-    expectSafeModelTrace(await flushTracingForTests(), "error", "failed");
+    expectNoModelArtifact(await flushTracingForTests(), "error", "failed", "upstream_unavailable");
+  });
+
+  it("records a fixed failed probe class and readiness before rethrowing /running failures", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const probeDetail = `probe failed for ${HOSTILE_MODEL_KEY} at https://private-upstream.example/running?token=SECRET`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/running")) throw new Error(probeDetail);
+        throw new Error(`unexpected url ${url}`);
+      }),
+    );
+
+    await runWithSyntheticTraceForTests(
+      { traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-b9c7c989f97918e1-01", exportEnabled: true },
+      async () => {
+        await expect(loadModel(HOSTILE_MODEL_KEY)).rejects.toThrow(probeDetail);
+      },
+    );
+
+    const records = await flushTracingForTests();
+    const joined = JSON.stringify(records);
+    expect(joined).not.toContain(probeDetail);
+    expect(joined).not.toContain("private-upstream.example");
+    expect(joined).not.toContain("SECRET");
+    expectNoModelArtifact(records, "error", "failed", "upstream_unavailable");
+  });
+
+  it("keeps caller-controlled load keys to one bounded exported identity set", async () => {
+    setTracingTestHooks({ captureExports: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/running")) {
+          return { ok: true, status: 200, json: async () => ({ running: [] }) } as Response;
+        }
+        if (url.endsWith("/v1/chat/completions")) {
+          return { ok: true, status: 200 } as Response;
+        }
+        throw new Error(`unexpected url ${url}`);
+      }),
+    );
+
+    const modelKeys = Array.from({ length: 1_000 }, (_, index) => `caller-model-${index}`);
+    await runWithSyntheticTraceForTests(
+      { traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-b9c7c989f97918e1-01", exportEnabled: true },
+      async () => {
+        for (const modelKey of modelKeys) await loadModel(modelKey);
+      },
+    );
+
+    const records = await flushTracingForTests();
+    const identities = records
+      .map(traceRecord)
+      .map((record) => record.model_artifact_identity)
+      .filter((identity): identity is string => typeof identity === "string");
+    expect(new Set(identities).size).toBeLessThanOrEqual(1);
+    expect(JSON.stringify(records)).not.toContain("caller-model-999");
   });
 });

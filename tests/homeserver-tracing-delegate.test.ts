@@ -45,6 +45,8 @@ let setTracingTestHooks: typeof import("../src/homeserver/tracing.js").setTracin
 let resetTracingTestHooks: typeof import("../src/homeserver/tracing.js").resetTracingTestHooks;
 let setConfig: typeof import("../src/homeserver/config.js").setConfig;
 let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
+let setDefaultLogger: typeof import("../src/homeserver/access-log.js").setDefaultLogger;
+let originalDefaultLogger: typeof import("../src/homeserver/access-log.js").defaultLogger;
 
 const PEG_ERROR =
   "LM Studio error: 500 status code (no body) Value does not match the expected peg-native format";
@@ -63,6 +65,10 @@ function lmOk(response: string) {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  const accessLog = await import("../src/homeserver/access-log.js");
+  setDefaultLogger = accessLog.setDefaultLogger;
+  originalDefaultLogger = accessLog.defaultLogger;
+  setDefaultLogger(accessLog.createAccessLogger(() => {}));
   const orch = await import("../src/homeserver/orchestrator.js");
   const tracing = await import("../src/homeserver/tracing.js");
   const cfg = await import("../src/homeserver/config.js");
@@ -79,12 +85,13 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  setDefaultLogger(originalDefaultLogger);
   resetTracingTestHooks();
   vi.restoreAllMocks();
 });
 
 describe("delegate tracing", () => {
-  it("records retry ordinals, verification, and a stable model identity token without leaking prompt/error text", async () => {
+  it("records retry ordinals and verification without exporting the caller model id", async () => {
     setTracingTestHooks({
       captureExports: true,
       nextSpanId: vi
@@ -144,7 +151,7 @@ describe("delegate tracing", () => {
     expect(spans.some((span) => span.phase === "verification")).toBe(true);
     expect(spans[0]?.task_type).toBe("delegation");
     expect(spans[0]?.lane).toBe("default");
-    expect(spans.find((span) => span.phase === "inference" && span.retry_ordinal === 1)?.model_artifact_identity).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(spans.find((span) => span.phase === "inference" && span.retry_ordinal === 1)?.model_artifact_identity).toBeUndefined();
     expect(JSON.stringify(records)).not.toContain("output ONLY JSON");
     expect(JSON.stringify(records)).not.toContain(PEG_ERROR);
   });
@@ -177,8 +184,37 @@ describe("delegate tracing", () => {
       (record as { kind?: string; phase?: string }).kind === "trace-span"
       && (record as { phase?: string }).phase === "inference"
     ) as { model_artifact_identity?: string } | undefined;
-    expect(inference?.model_artifact_identity).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(inference?.model_artifact_identity).toBeUndefined();
     expect(lmInferenceMock).toHaveBeenCalledWith(secretShapedModelId, expect.any(String), expect.anything());
+  });
+
+  it("does not create one exported identity per explicit model override", async () => {
+    setTracingTestHooks({ captureExports: true });
+    lmInferenceMock.mockResolvedValue(lmOk("SAFE ANSWER"));
+    const modelIds = Array.from({ length: 1_000 }, (_, index) => `caller-model-${index}`);
+
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4741-b9c7c989f97918e1-01",
+        taskType: "delegation",
+        lane: "default",
+        exportEnabled: true,
+      },
+      async () => {
+        for (const modelId of modelIds) {
+          await delegate({ prompt: "keep routing this request", taskType: "extract", modelId });
+        }
+      },
+      { outcome: "ok" },
+    );
+
+    const records = await flushTracingForTests();
+    const identities = records
+      .map((record) => (record as { model_artifact_identity?: unknown }).model_artifact_identity)
+      .filter((identity): identity is string => typeof identity === "string");
+    expect(new Set(identities).size).toBeLessThanOrEqual(1);
+    expect(JSON.stringify(records)).not.toContain("caller-model-999");
+    expect(lmInferenceMock).toHaveBeenCalledTimes(modelIds.length);
   });
 
   it("keeps delegate behaviour unchanged when export drops records", async () => {

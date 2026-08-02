@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
-import { contentDigest } from "./evidence-identity.js";
+import { evidenceIdentityFromServedModelCmd } from "./evidence-identity.js";
 
 export interface HomeserverTracingConfig {
   instrumentation: "on" | "off";
@@ -178,6 +178,7 @@ const TRACESTATE_MAX_MEMBER_LENGTH = 256;
 const DEFAULT_MAX_PENDING_EXPORTS = 128;
 const TRACE_ID_MAX_LENGTH = 64;
 const TRACE_ID_RE = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
+const TRACE_MODEL_ARTIFACT_IDENTITY_RE = /^sha256:[a-f0-9]{64}$/;
 const storage = new AsyncLocalStorage<TraceContext>();
 let hooks: TracingTestHooks = {};
 let pendingExports = new Set<Promise<void>>();
@@ -211,12 +212,20 @@ export function sanitizeTraceIdentity(value: string | undefined, fallback: strin
 }
 
 /**
- * Convert a caller-controlled model key into the shared fixed-length, one-way diagnostic identity.
- * This is a trace join key, not proof of a served artifact; an observed artifact can replace it at
- * the observation seam in the future.
+ * Convert genuinely observed llama-swap state into the only model-artifact trace identity we emit.
+ * A caller-controlled model key is deliberately not an input: absent or non-digest evidence is
+ * omitted so a request can never create one exported value per supplied model string.
  */
-export function traceModelArtifactIdentity(modelKey: string): string {
-  return contentDigest(`gille.trace.model-id.v1:${modelKey}`);
+export function traceModelArtifactIdentityFromServedModelCmd(
+  cmd: string | null | undefined,
+): string | undefined {
+  const artifact = evidenceIdentityFromServedModelCmd(cmd).modelArtifact;
+  if (artifact.kind !== "digest" || artifact.origin !== "server-observed") return undefined;
+  return TRACE_MODEL_ARTIFACT_IDENTITY_RE.test(artifact.digest) ? artifact.digest : undefined;
+}
+
+function safeModelArtifactIdentity(value: string | undefined): string | undefined {
+  return value !== undefined && TRACE_MODEL_ARTIFACT_IDENTITY_RE.test(value) ? value : undefined;
 }
 
 function safeToken(value: string | undefined): string | undefined {
@@ -338,6 +347,7 @@ function buildSpanRecord(
   attrs: TraceDefaults,
   outcome: string,
 ): TraceSpanRecord {
+  const modelArtifactIdentity = safeModelArtifactIdentity(attrs.modelArtifactIdentity);
   return {
     kind: "trace-span",
     contract_id: "gille.content-blind-tracing/v1",
@@ -359,7 +369,7 @@ function buildSpanRecord(
     ...(safeToken(attrs.taskType) ? { task_type: safeToken(attrs.taskType) } : {}),
     ...(safeToken(attrs.lane) ? { lane: safeToken(attrs.lane) } : {}),
     ...(typeof attrs.retryOrdinal === "number" ? { retry_ordinal: attrs.retryOrdinal } : {}),
-    ...(safeToken(attrs.modelArtifactIdentity) ? { model_artifact_identity: safeToken(attrs.modelArtifactIdentity) } : {}),
+    ...(modelArtifactIdentity ? { model_artifact_identity: modelArtifactIdentity } : {}),
     ...(safeToken(attrs.errorClass) ? { error_class: safeToken(attrs.errorClass) } : {}),
     ...(safeToken(attrs.taskContractId) ? { task_contract_id: safeToken(attrs.taskContractId) } : {}),
     ...(safeToken(attrs.taskContractTimestamp) ? { task_contract_timestamp: safeToken(attrs.taskContractTimestamp) } : {}),
@@ -628,6 +638,9 @@ export function recordReadinessObservation(
   const ctx = currentContext();
   if (!ctx) return;
   const observedAtMs = nowMs();
+  const modelArtifactIdentity = safeModelArtifactIdentity(
+    attrs.modelArtifactIdentity ?? ctx.session.defaults.modelArtifactIdentity,
+  );
   enqueueRecord({
     kind: "service-observation",
     contract_id: "gille.content-blind-readiness/v1",
@@ -647,9 +660,7 @@ export function recordReadinessObservation(
     ...(typeof (attrs.retryOrdinal ?? ctx.session.defaults.retryOrdinal) === "number"
       ? { retry_ordinal: attrs.retryOrdinal ?? ctx.session.defaults.retryOrdinal }
       : {}),
-    ...(safeToken(attrs.modelArtifactIdentity ?? ctx.session.defaults.modelArtifactIdentity)
-      ? { model_artifact_identity: safeToken(attrs.modelArtifactIdentity ?? ctx.session.defaults.modelArtifactIdentity) }
-      : {}),
+    ...(modelArtifactIdentity ? { model_artifact_identity: modelArtifactIdentity } : {}),
     ...(safeToken(attrs.errorClass) ? { error_class: safeToken(attrs.errorClass) } : {}),
   });
 }
