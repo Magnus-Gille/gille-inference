@@ -43,6 +43,7 @@ import {
   setTraceDefaults,
   updateCurrentTraceSpan,
   withTraceSpan,
+  type TraceSpanFinish,
 } from "./tracing.js";
 
 /**
@@ -638,6 +639,10 @@ function classifyError(error: string): ErrorClass {
   return "infra";
 }
 
+function classifyLocalInferenceTrace(result: LocalInferenceResult): TraceSpanFinish | undefined {
+  return result.ok ? undefined : { outcome: "error" };
+}
+
 /**
  * Run one delegation through the full policy + record loop.
  */
@@ -859,7 +864,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
         });
       }
       return effective;
-    }, { surface: "model" });
+    }, { surface: "model", classifyResult: classifyLocalInferenceTrace });
   };
 
   let result = await runLocalOnce(0);

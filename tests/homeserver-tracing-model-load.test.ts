@@ -65,7 +65,12 @@ describe("model-load tracing", () => {
 
     expect(result.ok).toBe(false);
     const records = await flushTracingForTests();
+    const modelLoad = records.find((record) =>
+      (record as { kind?: string; phase?: string }).kind === "trace-span"
+      && (record as { phase?: string }).phase === "model_load"
+    ) as { outcome?: string; error_class?: string } | undefined;
     const joined = JSON.stringify(records);
+    expect(modelLoad).toMatchObject({ outcome: "error", error_class: "upstream_unavailable" });
     expect(joined).toContain("model_load");
     expect(joined).toContain("model-ready");
     expect(joined).toContain("failed");

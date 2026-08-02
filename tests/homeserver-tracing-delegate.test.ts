@@ -133,10 +133,14 @@ describe("delegate tracing", () => {
       task_type?: string;
       lane?: string;
       model_artifact_identity?: string;
+      outcome?: string;
       error_class?: string;
     }>;
-    expect(spans.filter((span) => span.phase === "inference")).toHaveLength(2);
-    expect(spans.filter((span) => span.phase === "inference").map((span) => span.retry_ordinal)).toEqual([0, 1]);
+    const inferenceSpans = spans.filter((span) => span.phase === "inference");
+    expect(inferenceSpans).toHaveLength(2);
+    expect(inferenceSpans.map((span) => span.retry_ordinal)).toEqual([0, 1]);
+    expect(inferenceSpans[0]).toMatchObject({ retry_ordinal: 0, outcome: "error", error_class: "parse" });
+    expect(inferenceSpans[1]).toMatchObject({ retry_ordinal: 1, outcome: "ok" });
     expect(spans.some((span) => span.phase === "verification")).toBe(true);
     expect(spans[0]?.task_type).toBe("delegation");
     expect(spans[0]?.lane).toBe("default");

@@ -235,6 +235,38 @@ describe("content-blind tracing core", () => {
     await expect(flushTracingForTests()).resolves.not.toEqual([]);
   });
 
+  it("lets callers classify nonthrowing result-shaped failures as non-ok spans", async () => {
+    setTracingTestHooks({ captureExports: true });
+
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+        taskType: fixture.task_type,
+        lane: fixture.lane,
+        exportEnabled: true,
+      },
+      async () => {
+        await withTraceSpan(
+          "model_load",
+          {},
+          async () => ({ ok: false as const, reason: "busy" }),
+          {
+            surface: "model",
+            classifyResult: (result) => (result.ok ? undefined : { outcome: result.reason }),
+          },
+        );
+      },
+      { outcome: "ok" },
+    );
+
+    const records = await flushTracingForTests();
+    const modelLoad = records.find((record) =>
+      (record as { kind?: string; phase?: string }).kind === "trace-span"
+      && (record as { phase?: string }).phase === "model_load"
+    ) as { outcome?: string } | undefined;
+    expect(modelLoad?.outcome).toBe("busy");
+  });
+
   it("bounds long-running stuck exports and drops excess batches once the in-flight cap is reached", async () => {
     const exporter = vi.fn(() => new Promise<void>(() => {}));
     setTracingTestHooks({ exporter, maxPendingExports: 4 });

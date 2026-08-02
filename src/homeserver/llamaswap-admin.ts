@@ -22,7 +22,13 @@ import {
   type LoadOptions,
   type LoadResult,
 } from "./lmstudio-admin.js";
-import { currentTraceHeaders, recordReadinessObservation, updateCurrentTraceSpan, withTraceSpan } from "./tracing.js";
+import {
+  currentTraceHeaders,
+  recordReadinessObservation,
+  updateCurrentTraceSpan,
+  withTraceSpan,
+  type TraceSpanFinish,
+} from "./tracing.js";
 
 export type { ModelInfo, LoadOptions, LoadResult };
 // Re-export validators so the facade shape matches typeof lmstudio-admin
@@ -80,6 +86,10 @@ async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
   if (!res.ok) return [];
   const data = (await res.json()) as { running?: LlamaSwapRunningEntry[] };
   return data.running ?? [];
+}
+
+function classifyLoadTrace(result: LoadResult): TraceSpanFinish | undefined {
+  return result.ok ? undefined : { outcome: "error" };
 }
 
 /** List all configured models, merged with running state. */
@@ -232,7 +242,7 @@ export async function loadModel(
         message: err instanceof Error ? err.message : String(err),
       };
     }
-  }, { surface: "model" });
+  }, { surface: "model", classifyResult: classifyLoadTrace });
 }
 
 /**

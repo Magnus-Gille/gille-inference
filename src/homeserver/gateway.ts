@@ -630,7 +630,6 @@ async function admitAndMeterLogged(
   lctx: LogCtx,
   handler: () => Promise<MeteredResult>
 ): Promise<void> {
-  return withTraceSpan("admission", {}, async () => {
   // Lifetime credit cap (non-resetting). Refuse BEFORE any inference if the key has spent
   // its budget. Distinct from the daily-resetting quota below: this never frees up on its own.
   //
@@ -663,106 +662,134 @@ async function admitAndMeterLogged(
       creditReserved = false;
     }
   };
+  const admissionTrace = beginTraceSpan("admission", {});
+  let admissionTraceOutcome: string | null = null;
+  const finishAdmissionTrace = (outcome: string): void => {
+    if (admissionTraceOutcome !== null) return;
+    admissionTraceOutcome = outcome;
+    admissionTrace.finish({
+      endedAtMs: Date.now(),
+      outcome,
+      errorClass: lctx.errorClass ?? (outcome === "error" ? "internal_error" : undefined),
+    });
+  };
+  const admissionResult = await admissionTrace.run(async () => {
+    let reservation: QuotaReservation | null = null;
+    let release: (() => void) | null = null;
+    let admissionThrew = false;
+    try {
+      // Model allow-list check.
+      if (principal.modelAllowList.length > 0) {
+        if (requestedModel === null) {
+          releaseReserve();
+          lctx.status = 403;
+          lctx.outcome = "forbidden";
+          lctx.errorClass = "model_not_allowed";
+          lctx.admission = "n/a";
+          sendError(
+            res,
+            makeError("model_not_allowed", {
+              param: "model",
+              message: `Your API key must specify a 'model'. Allowed models: ${principal.modelAllowList.join(", ")}.`,
+            }),
+          );
+          finishAdmissionTrace(lctx.outcome);
+          return { admitted: false as const };
+        }
+        if (!principal.modelAllowList.includes(requestedModel)) {
+          releaseReserve();
+          lctx.status = 403;
+          lctx.outcome = "forbidden";
+          lctx.errorClass = "model_not_allowed";
+          lctx.admission = "n/a";
+          sendError(
+            res,
+            makeError("model_not_allowed", {
+              param: "model",
+              message: `Your API key is not permitted to use model '${requestedModel}'.`,
+            }),
+          );
+          finishAdmissionTrace(lctx.outcome);
+          return { admitted: false as const };
+        }
+      }
 
-  // Model allow-list check.
-  if (principal.modelAllowList.length > 0) {
-    if (requestedModel === null) {
-      releaseReserve();
-      lctx.status = 403;
-      lctx.outcome = "forbidden";
-      lctx.errorClass = "model_not_allowed";
-      lctx.admission = "n/a";
-      sendError(
-        res,
-        makeError("model_not_allowed", {
-          param: "model",
-          message: `Your API key must specify a 'model'. Allowed models: ${principal.modelAllowList.join(", ")}.`,
-        })
+      // Quota. On success this returns a reservation handle (M1): the daily budget is debited
+      // atomically here, and the handle lets recordUsage() reconcile the exact event + daily delta.
+      const q = checkQuota(principal.alias, principal.limits, estTokens);
+      if (!q.ok) {
+        releaseReserve();
+        const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+        lctx.status = 429;
+        lctx.outcome = "rate_limited";
+        lctx.errorClass = "rate_limit_exceeded";
+        lctx.retryAfterS = q.retryAfterSeconds;
+        lctx.admission = "n/a";
+        recordRateLimited("quota");
+        sendError(
+          res,
+          makeError("rate_limit_exceeded", {
+            retryAfterSeconds: q.retryAfterSeconds,
+            message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
+            rateLimit: {
+              limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
+              remaining: 0,
+              resetSeconds: q.snapshot.resetSeconds,
+            },
+          }),
+        );
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
+
+      reservation = q.reservation;
+
+      // Admission.
+      const admitStart = Date.now();
+      release = await withTraceSpan("queue", {}, async () =>
+        controller.acquire({
+          lane: principal.tier as Lane,
+          requestedModel,
+          keyMaxParallel: principal.maxParallel,
+          keyInflight: keyInflight.get(principal.alias) ?? 0,
+          keyId: principal.alias,
+        }),
       );
-      return;
-    }
-    if (!principal.modelAllowList.includes(requestedModel)) {
+      // queueWaitMs > 0 only when the owner had to wait (the acquire resolved via drainQueue).
+      // For a direct admit it rounds to ~0ms, which we record as null (not meaningful).
+      const waited = Date.now() - admitStart;
+      lctx.queueWaitMs = waited > 5 ? waited : null;
+      lctx.admission = "admitted";
+      finishAdmissionTrace("ok");
+      return { admitted: true as const, release, reservation };
+    } catch (err) {
+      if (err instanceof AdmissionRejected) {
+        releaseReserve();
+        // M1: the quota check already DEBITED the daily estimate; a request rejected at admission
+        // never ran, so roll that reservation back (reconcile to 0) — otherwise a busy box would
+        // silently burn each rejected request's estimate against the caller's daily budget.
+        if (reservation !== null) recordUsage(principal.alias, 0, Date.now(), reservation);
+        lctx.status = 503;
+        lctx.outcome = "busy";
+        lctx.errorClass = "server_busy";
+        lctx.retryAfterS = err.retryAfterSeconds;
+        lctx.admission = "busy";
+        recordAdmissionRejection(principal.tier);
+        sendError(res, makeError("server_busy", { retryAfterSeconds: err.retryAfterSeconds }));
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
+      release?.();
       releaseReserve();
-      lctx.status = 403;
-      lctx.outcome = "forbidden";
-      lctx.errorClass = "model_not_allowed";
-      lctx.admission = "n/a";
-      sendError(
-        res,
-        makeError("model_not_allowed", {
-          param: "model",
-          message: `Your API key is not permitted to use model '${requestedModel}'.`,
-        })
-      );
-      return;
+      if (reservation !== null) recordUsage(principal.alias, 0, Date.now(), reservation);
+      admissionThrew = true;
+      throw err;
+    } finally {
+      finishAdmissionTrace(admissionThrew ? "error" : (lctx.outcome === "ok" ? "ok" : lctx.outcome));
     }
-  }
-
-  // Quota. On success this returns a reservation handle (M1): the daily budget is debited
-  // atomically here, and the handle lets recordUsage() reconcile the exact event + daily delta.
-  const q = checkQuota(principal.alias, principal.limits, estTokens);
-  if (!q.ok) {
-    releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
-    lctx.status = 429;
-    lctx.outcome = "rate_limited";
-    lctx.errorClass = "rate_limit_exceeded";
-    lctx.retryAfterS = q.retryAfterSeconds;
-    lctx.admission = "n/a";
-    recordRateLimited("quota");
-    sendError(
-      res,
-      makeError("rate_limit_exceeded", {
-        retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
-      })
-    );
-    return;
-  }
-
-  // Admission.
-  const admitStart = Date.now();
-  let release: () => void;
-  try {
-    release = await withTraceSpan("queue", {}, async () =>
-      controller.acquire({
-        lane: principal.tier as Lane,
-        requestedModel,
-        keyMaxParallel: principal.maxParallel,
-        keyInflight: keyInflight.get(principal.alias) ?? 0,
-        keyId: principal.alias,
-      })
-    );
-    // queueWaitMs > 0 only when the owner had to wait (the acquire resolved via drainQueue).
-    // For a direct admit it rounds to ~0ms, which we record as null (not meaningful).
-    const waited = Date.now() - admitStart;
-    lctx.queueWaitMs = waited > 5 ? waited : null;
-    lctx.admission = "admitted";
-  } catch (err) {
-    if (err instanceof AdmissionRejected) {
-      releaseReserve();
-      // M1: the quota check already DEBITED the daily estimate; a request rejected at admission
-      // never ran, so roll that reservation back (reconcile to 0) — otherwise a busy box would
-      // silently burn each rejected request's estimate against the caller's daily budget.
-      recordUsage(principal.alias, 0, Date.now(), q.reservation);
-      lctx.status = 503;
-      lctx.outcome = "busy";
-      lctx.errorClass = "server_busy";
-      lctx.retryAfterS = err.retryAfterSeconds;
-      lctx.admission = "busy";
-      recordAdmissionRejection(principal.tier);
-      sendError(res, makeError("server_busy", { retryAfterSeconds: err.retryAfterSeconds }));
-      return;
-    }
-    releaseReserve();
-    recordUsage(principal.alias, 0, Date.now(), q.reservation);
-    throw err;
-  }
+  });
+  if (!admissionResult.admitted) return;
+  const { release, reservation } = admissionResult;
 
   incInflight(principal.alias);
   // Content-blind concurrency gauge: increment on admission acquire, decrement on release (below).
@@ -810,7 +837,7 @@ async function admitAndMeterLogged(
     decInflight(principal.alias);
     inflightDec(principal.tier);
     // M1: reconcile the EXACT admitted quota event + daily delta via the reservation handle.
-    recordUsage(principal.alias, actualTokens, Date.now(), q.reservation);
+    recordUsage(principal.alias, actualTokens, Date.now(), reservation);
     // Settle the lifetime credit ledger for minted store keys (keyHash present). Legacy
     // static keys and implicit-admin have no credit row and are skipped.
     if (principal.keyHash !== null) {
@@ -829,7 +856,6 @@ async function admitAndMeterLogged(
     lctx.creditsCharged = creditsCharged;
     afterRelease?.();
   }
-  });
 }
 
 // ─── Route handlers ──────────────────────────────────────────────────────────────────
@@ -867,6 +893,10 @@ function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" |
   if (outcome === "stream_failed" || outcome === "degenerate") return "failed";
   if (status !== null && status >= 200 && status < 400) return "ok";
   return "failed";
+}
+
+function traceErrorClassForOutcome(outcome: string, errorClass: string | null): string | undefined {
+  return errorClass ?? (outcome === "error" ? "internal_error" : undefined);
 }
 
 // L1 (Codex LOW): the stale exported canonicalizeModel() helper was removed. It pre-dated the
@@ -936,11 +966,12 @@ async function handleChatProxy(
     surface: "gateway",
     startedAtMs: responseTraceStart,
   });
+  let responseTraceThrew = false;
   const emitResponseTrace = (outcome: string): void => {
     responseTrace.finish({
       endedAtMs: Date.now(),
       outcome,
-      errorClass: lctx.errorClass ?? undefined,
+      errorClass: traceErrorClassForOutcome(outcome, lctx.errorClass),
     });
   };
   const runInferenceTrace = async <T>(
@@ -954,7 +985,7 @@ async function handleChatProxy(
       finished = true;
       inferenceTrace.finish({
         outcome,
-        errorClass: lctx.errorClass ?? undefined,
+        errorClass: traceErrorClassForOutcome(outcome, lctx.errorClass),
         endedAtMs: Date.now(),
       });
     };
@@ -967,6 +998,8 @@ async function handleChatProxy(
       throw err;
     }
   };
+
+  try {
 
   // Rewrite max_tokens to the capped value before proxying upstream.
   const body: Record<string, unknown> = { ...parsed.obj, max_tokens: effectiveMax };
@@ -990,7 +1023,7 @@ async function handleChatProxy(
       sendError(res, makeError("invalid_request_error", { param: "stream", message: "Streaming is not supported by the Orin backend." }));
       return ZERO_RESULT;
     }
-    return runInferenceTrace(chatStart, async (emitInferenceTrace) => {
+    return await runInferenceTrace(chatStart, async (emitInferenceTrace) => {
       if (ownerExposure) {
         recordMessageTaskExposuresBestEffort({
           messages: reqMessages,
@@ -1089,7 +1122,7 @@ async function handleChatProxy(
   // billing invariant intact (actualTokens stays 0 → the spine reconciles credits + quota to 0 —
   // a failed call is never charged), and setting lctx makes the metered finally + request_log
   // record the real outcome rather than a generic "error".
-  return runInferenceTrace(upstreamCallStart, async (emitInferenceTrace) => {
+  return await runInferenceTrace(upstreamCallStart, async (emitInferenceTrace) => {
     let upstream: Response;
     try {
       if (ownerExposure) {
@@ -1586,6 +1619,12 @@ async function handleChatProxy(
       ttftMs: null,
     };
   });
+  } catch (err) {
+    responseTraceThrew = true;
+    throw err;
+  } finally {
+    emitResponseTrace(responseTraceThrew && lctx.outcome === "ok" ? "error" : lctx.outcome);
+  }
 }
 
 /**

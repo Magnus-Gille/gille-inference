@@ -115,19 +115,25 @@ interface TraceContext {
   readonly span: ActiveSpan;
 }
 
+export interface TraceSpanFinish {
+  outcome?: string;
+  errorClass?: string;
+  endedAtMs?: number;
+}
+
 export interface GatewayTraceHandle {
   readonly enabled: boolean;
   readonly responseTraceparent?: string;
   readonly responseTracestate?: string;
   run<T>(fn: () => Promise<T>): Promise<T>;
   setDefaults(partial: Partial<TraceDefaults>): void;
-  finish(result?: { outcome?: string; errorClass?: string; endedAtMs?: number }): void;
+  finish(result?: TraceSpanFinish): void;
 }
 
 export interface TraceSpanHandle {
   readonly enabled: boolean;
   run<T>(fn: () => Promise<T>): Promise<T>;
-  finish(result?: { outcome?: string; errorClass?: string; endedAtMs?: number }): void;
+  finish(result?: TraceSpanFinish): void;
 }
 
 interface SyntheticTraceOptions extends TraceDefaults {
@@ -155,6 +161,11 @@ interface TracingTestHooks {
   exporter?: (records: readonly TracingRecord[]) => Promise<void> | void;
   captureExports?: boolean;
   maxPendingExports?: number;
+}
+
+interface WithTraceSpanOptions<T> {
+  surface?: "gateway" | "model";
+  classifyResult?: (result: T) => TraceSpanFinish | undefined;
 }
 
 const TRACEPARENT_RE = /^([a-f0-9]{2})-([a-f0-9]{32})-([a-f0-9]{16})-([a-f0-9]{2})$/;
@@ -538,13 +549,13 @@ export async function withTraceSpan<T>(
   phase: TracePhase,
   attrs: TraceDefaults,
   fn: () => Promise<T>,
-  opts: { surface?: "gateway" | "model" } = {},
+  opts: WithTraceSpanOptions<T> = {},
 ): Promise<T> {
   const span = beginTraceSpan(phase, attrs, opts);
   return span.run(async () => {
     try {
       const result = await fn();
-      span.finish();
+      span.finish(opts.classifyResult?.(result) ?? {});
       return result;
     } catch (err) {
       span.finish({ outcome: "error" });

@@ -140,7 +140,7 @@ beforeAll(async () => {
   const handle = await gw.startGateway();
   gatewayPort = handle.port;
   stopGateway = handle.stop;
-});
+}, 20_000);
 
 afterAll(async () => {
   if (stopGateway) await stopGateway();
@@ -167,13 +167,21 @@ function gatewayUrl(path: string): string {
 
 function traceSpans(records: readonly unknown[]): Array<{
   phase: string;
+  trace_id: string;
   span_id: string;
   parent_span_id?: string;
+  outcome: string;
+  error_class?: string;
+  started_at?: string;
 }> {
   return records.filter((record) => (record as { kind?: string }).kind === "trace-span") as Array<{
     phase: string;
+    trace_id: string;
     span_id: string;
     parent_span_id?: string;
+    outcome: string;
+    error_class?: string;
+    started_at?: string;
   }>;
 }
 
@@ -218,15 +226,23 @@ describe("HTTP tracing", () => {
     const joined = JSON.stringify(records);
     const spans = traceSpans(records);
     const gateway = spans.find((span) => span.phase === "gateway");
+    const admission = spans.find((span) => span.phase === "admission");
+    const queue = spans.find((span) => span.phase === "queue");
     const inference = spans.find((span) => span.phase === "inference");
     const ttft = spans.find((span) => span.phase === "ttft");
     const response = spans.find((span) => span.phase === "response");
     expect(seenTraceparents[0]).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${inference?.span_id}-01`);
     expect(gateway).toBeDefined();
+    expect(admission?.parent_span_id).toBe(gateway?.span_id);
+    expect(queue?.parent_span_id).toBe(admission?.span_id);
     expect(inference).toBeDefined();
+    expect(inference?.parent_span_id).toBe(gateway?.span_id);
     expect(ttft?.parent_span_id).toBe(inference?.span_id);
     expect(response?.parent_span_id).toBe(inference?.parent_span_id);
+    expect(response?.parent_span_id).toBe(gateway?.span_id);
     expect(response?.parent_span_id).not.toBe(inference?.span_id);
+    expect(response?.parent_span_id).not.toBe(admission?.span_id);
+    expect(inference?.parent_span_id).not.toBe(admission?.span_id);
     expect(Date.parse(response?.started_at ?? "")).toBeLessThanOrEqual(Date.parse(inference?.started_at ?? ""));
     expect(joined).toContain("\"phase\":\"response\"");
     expect(joined).not.toContain("\"content\":\"hi\"");
@@ -416,5 +432,58 @@ describe("HTTP tracing", () => {
     expect(spans.some((span) => span.phase === "queue")).toBe(true);
     expect(spans.some((span) => span.outcome === "client_closed")).toBe(true);
     expect(gatewayReadiness(records).some((record) => record.outcome === "unknown")).toBe(true);
+  });
+
+  it("finishes a busy admission span without creating response or inference spans for the rejected request", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-busy", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    mode = "slow-stream";
+
+    const held = fetch(gatewayUrl("/v1/chat/completions"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintextKey}`,
+      },
+      body: JSON.stringify({ model: "m1", stream: true, messages: [{ role: "user", content: "held" }] }),
+    });
+
+    for (let attempt = 0; attempt < 20 && releaseSlow === null; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(releaseSlow).not.toBeNull();
+
+    const busyTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const busy = await fetch(gatewayUrl("/v1/chat/completions"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintextKey}`,
+        traceparent: `00-${busyTraceId}-b9c7c989f97918e1-01`,
+      },
+      body: JSON.stringify({ model: "m1", stream: true, messages: [{ role: "user", content: "busy" }] }),
+    });
+
+    expect(busy.status).toBe(503);
+    await busy.text();
+    releaseSlow?.();
+    const heldRes = await held;
+    expect(heldRes.status).toBe(200);
+    await heldRes.text();
+
+    const records = await flushTracingForTests();
+    const busySpans = traceSpans(records).filter((span) => span.trace_id === busyTraceId);
+    const gateway = busySpans.find((span) => span.phase === "gateway");
+    const admission = busySpans.find((span) => span.phase === "admission");
+    const queue = busySpans.find((span) => span.phase === "queue");
+    expect(gateway).toBeDefined();
+    expect(admission).toMatchObject({
+      parent_span_id: gateway?.span_id,
+      outcome: "busy",
+      error_class: "server_busy",
+    });
+    expect(queue?.parent_span_id).toBe(admission?.span_id);
+    expect(busySpans.some((span) => span.phase === "response")).toBe(false);
+    expect(busySpans.some((span) => span.phase === "inference")).toBe(false);
   });
 });
