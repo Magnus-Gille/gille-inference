@@ -20,8 +20,11 @@ import {
   recordDelegation,
   recordReviewerUsefulness,
   getDelegationById,
+  importDelegations,
+  importId,
   type ReviewerUsefulnessResult,
 } from "../src/homeserver/ledger.js";
+import { buildVerifier, isVerifierBuildError } from "../src/homeserver/verifier-registry.js";
 
 const REVIEWER_USEFULNESS_WORKER = fileURLToPath(
   new URL("./fixtures/reviewer-usefulness-worker.ts", import.meta.url)
@@ -77,6 +80,12 @@ function runReviewerUsefulnessWorker(args: {
       }
     });
   });
+}
+
+function gatewayVerifierName(spec: Record<string, unknown>): string {
+  const built = buildVerifier(spec);
+  if (isVerifierBuildError(built)) throw new Error(`invalid test verifier spec: ${built.error}`);
+  return built.name;
 }
 
 describe("recordReviewerUsefulness (#74)", () => {
@@ -238,7 +247,121 @@ describe("recordReviewerUsefulness (#74)", () => {
     },
   );
 
-  it("fails closed on legacy partially populated reviewer-usefulness columns", () => {
+  it("requires a genuine grade: gateway-built exact passes, gateway-built nonEmpty(0) does not", () => {
+    const exactId = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: exactId,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "recorded",
+      taskType: "review-bounded",
+    });
+
+    const nonEmptyId = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "nonEmpty", minLen: 0 }),
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: nonEmptyId,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "missing_verifier" },
+    });
+  });
+
+  it("rejects imported free-text sentinel and structural verifier variants", () => {
+    const noneImported = {
+      ts: "2026-07-30T09:00:00.000Z",
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 import none",
+      outcome: "pass" as const,
+      verifier: " None ",
+      source: "probe-import",
+    };
+    importDelegations([noneImported]);
+    expect(recordReviewerUsefulness({
+      ledgerId: importId(noneImported),
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "missing_verifier" },
+    });
+
+    const structuralImported = {
+      ts: "2026-07-30T09:05:00.000Z",
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 import structural",
+      outcome: "pass" as const,
+      verifier: " nonEmpty(0) ",
+      source: "probe-import",
+    };
+    importDelegations([structuralImported]);
+    expect(recordReviewerUsefulness({
+      ledgerId: importId(structuralImported),
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "missing_verifier" },
+    });
+  });
+
+  it("rejects shadow and superseded rows before recording usefulness", () => {
+    const shadowId = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+      shadow: true,
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: shadowId,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "shadow" },
+    });
+
+    const supersededId = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    initDb(dbPath).prepare(`
+      UPDATE delegations
+         SET superseded_at = '2026-07-31T10:00:00.000Z'
+       WHERE id = ?
+    `).run(supersededId);
+    expect(recordReviewerUsefulness({
+      ledgerId: supersededId,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "conflict",
+      conflict: { kind: "superseded" },
+    });
+  });
+
+  it("does not treat legacy partially populated reviewer-usefulness columns as a current recorded verdict", () => {
     const id = recordDelegation({
       taskType: "review-bounded",
       modelId: "qwen3-coder-next-80b",
@@ -261,17 +384,88 @@ describe("recordReviewerUsefulness (#74)", () => {
       id,
     });
 
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+    });
+  });
+
+  it("quarantines malformed legacy reviewer-usefulness columns and allows a later first valid write", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    const db = initDb(dbPath);
+    db.prepare(`
+      UPDATE delegations
+         SET reviewer_usefulness = @usefulness,
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = @judgedBy,
+             reviewer_usefulness_ts = NULL
+       WHERE id = @id
+    `).run({
+      usefulness: "wrong",
+      notes: "ref:gille-inference#112 legacy:partial",
+      judgedBy: "grimnir-session-2026-07-24-legacy",
+      id,
+    });
+
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+    });
+
     expect(recordReviewerUsefulness({
       ledgerId: id,
-      usefulness: "pass",
+      usefulness: "partial",
       notes: "ref:gille-inference#112 check:manual",
       judgedBy: "grimnir-session-2026-07-24",
     })).toMatchObject({
-      kind: "conflict",
-      conflict: {
-        kind: "already_recorded",
-        mismatchFields: [],
+      kind: "recorded",
+      record: {
+        reviewerUsefulness: "partial",
+        reviewerUsefulnessBy: "grimnir-session-2026-07-24",
       },
+    });
+
+    const repaired = db.prepare(`
+      SELECT reviewer_usefulness AS reviewerUsefulness,
+             reviewer_usefulness_notes AS reviewerUsefulnessNotes,
+             reviewer_usefulness_by AS reviewerUsefulnessBy,
+             reviewer_usefulness_ts AS reviewerUsefulnessTs,
+             reviewer_usefulness_legacy_json AS legacyJson,
+             reviewer_usefulness_legacy_reason AS legacyReason,
+             reviewer_usefulness_legacy_quarantined_at AS legacyQuarantinedAt
+        FROM delegations
+       WHERE id = ?
+    `).get(id) as {
+      reviewerUsefulness: string | null;
+      reviewerUsefulnessNotes: string | null;
+      reviewerUsefulnessBy: string | null;
+      reviewerUsefulnessTs: string | null;
+      legacyJson: string | null;
+      legacyReason: string | null;
+      legacyQuarantinedAt: string | null;
+    };
+
+    expect(repaired.reviewerUsefulness).toBe("partial");
+    expect(repaired.reviewerUsefulnessNotes).toBe("ref:gille-inference#112 check:manual");
+    expect(repaired.reviewerUsefulnessBy).toBe("grimnir-session-2026-07-24");
+    expect(repaired.reviewerUsefulnessTs).not.toBeNull();
+    expect(repaired.legacyReason).toBe("malformed_live_columns");
+    expect(repaired.legacyQuarantinedAt).not.toBeNull();
+    expect(JSON.parse(repaired.legacyJson ?? "null")).toMatchObject({
+      reviewerUsefulness: "wrong",
+      reviewerUsefulnessNotes: "ref:gille-inference#112 legacy:partial",
+      reviewerUsefulnessBy: "grimnir-session-2026-07-24-legacy",
+      reviewerUsefulnessTs: null,
     });
   });
 

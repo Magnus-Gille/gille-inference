@@ -39,6 +39,17 @@ export const STRUCTURAL_VERIFIERS: ReadonlySet<string> = new Set(["nonEmpty", "j
  */
 export const UNGRADED_VERIFIER_SENTINELS: ReadonlySet<string> = new Set(["none"]);
 
+function canonicalVerifierBase(name: string): string {
+  return verifierBaseName(name).toLowerCase();
+}
+
+const STRUCTURAL_VERIFIER_KEYS: ReadonlySet<string> = new Set(
+  [...STRUCTURAL_VERIFIERS].map((name) => name.toLowerCase())
+);
+const UNGRADED_VERIFIER_SENTINEL_KEYS: ReadonlySet<string> = new Set(
+  [...UNGRADED_VERIFIER_SENTINELS].map((name) => name.toLowerCase())
+);
+
 /** Strip a parameter suffix so `nonEmpty(1)` / `maxLength(...)` classify by their base name. */
 export function verifierBaseName(name: string): string {
   const paren = name.indexOf("(");
@@ -48,8 +59,8 @@ export function verifierBaseName(name: string): string {
 /** True iff `name` is a known structural (shape/presence-only) verifier. Null/empty → false. */
 export function isStructuralVerifier(name: string | null | undefined): boolean {
   if (name == null) return false;
-  const base = verifierBaseName(name);
-  return base.length > 0 && STRUCTURAL_VERIFIERS.has(base);
+  const base = canonicalVerifierBase(name);
+  return base.length > 0 && STRUCTURAL_VERIFIER_KEYS.has(base);
 }
 
 /**
@@ -61,10 +72,10 @@ export function isStructuralVerifier(name: string | null | undefined): boolean {
  */
 export function isQualityBearingVerifier(name: string | null | undefined): boolean {
   if (name == null) return false;
-  const base = verifierBaseName(name);
+  const base = canonicalVerifierBase(name);
   if (base.length === 0) return false;
-  if (UNGRADED_VERIFIER_SENTINELS.has(base)) return false; // ungraded sentinel — no verifier ran
-  return !STRUCTURAL_VERIFIERS.has(base);
+  if (UNGRADED_VERIFIER_SENTINEL_KEYS.has(base)) return false; // ungraded sentinel — no verifier ran
+  return !STRUCTURAL_VERIFIER_KEYS.has(base);
 }
 
 /**
@@ -86,8 +97,13 @@ export function isTrustedJudgmentVerifier(
 ): boolean {
   if (name == null) return false;
   const base = verifierBaseName(name);
-  if (base.length === 0) return false;
-  return trusted.has(base);
+  const canonicalBase = base.toLowerCase();
+  if (canonicalBase.length === 0) return false;
+  if (trusted.has(base) || trusted.has(canonicalBase)) return true;
+  for (const candidate of trusted) {
+    if (candidate.toLowerCase() === canonicalBase) return true;
+  }
+  return false;
 }
 
 /**
@@ -139,8 +155,12 @@ export const MECHANICAL_FORMAT_VERIFIERS: ReadonlySet<string> = new Set([
   "shadow-vs-frontier",
 ]);
 
+const MECHANICAL_FORMAT_VERIFIER_KEYS: ReadonlySet<string> = new Set(
+  [...MECHANICAL_FORMAT_VERIFIERS].map((name) => name.toLowerCase())
+);
+
 function classifyVerifierComponentKind(base: string): "mechanical-format" | "truth-oriented" {
-  return MECHANICAL_FORMAT_VERIFIERS.has(base) ? "mechanical-format" : "truth-oriented";
+  return MECHANICAL_FORMAT_VERIFIER_KEYS.has(base) ? "mechanical-format" : "truth-oriented";
 }
 
 /** Classify a (possibly `+`-combined) verifier name into a {@link VerifierKind}. */
@@ -149,8 +169,8 @@ export function classifyVerifierKind(name: string | null | undefined): VerifierK
   if (!trimmed) return "ungraded";
   const components = trimmed
     .split("+")
-    .map((part) => verifierBaseName(part.trim()))
-    .filter((base) => base.length > 0 && !UNGRADED_VERIFIER_SENTINELS.has(base));
+    .map((part) => canonicalVerifierBase(part.trim()))
+    .filter((base) => base.length > 0 && !UNGRADED_VERIFIER_SENTINEL_KEYS.has(base));
   if (components.length === 0) return "ungraded";
   return components.some((base) => classifyVerifierComponentKind(base) === "truth-oriented")
     ? "truth-oriented"

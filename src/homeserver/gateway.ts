@@ -433,6 +433,10 @@ function reviewerUsefulnessConflictApiShape(conflict: {
   kind: "wrong_task_type";
   taskType: string;
 } | {
+  kind: "shadow";
+} | {
+  kind: "superseded";
+} | {
   kind: "missing_verifier";
 } | {
   kind: "already_recorded";
@@ -471,6 +475,10 @@ function reviewerUsefulnessConflictApiShape(conflict: {
       noteChars: conflict.attempted.noteChars,
     },
   };
+}
+
+function assertNeverConflict(conflict: never): never {
+  throw new Error(`Unhandled reviewer usefulness conflict kind: ${JSON.stringify(conflict)}`);
 }
 
 function hasJsonContentType(req: IncomingMessage): boolean {
@@ -3250,6 +3258,17 @@ function decodePathSegmentOrSend(raw: string, res: ServerResponse, lctx: LogCtx)
   }
 }
 
+function normalizeLoggedRoute(method: string, path: string): string {
+  if (path.startsWith("/ledger/")) {
+    if (method === "PUT" && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
+      return "/ledger/:id/reviewer-usefulness";
+    }
+    const rawId = path.slice("/ledger/".length);
+    if (method === "GET" && rawId.length > 0 && !rawId.includes("/")) return "/ledger/:id";
+  }
+  return path;
+}
+
 export async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -3296,13 +3315,19 @@ export async function handleRequest(
     const parsedUrl = new URL(req.url ?? "/", "http://localhost");
     const path = parsedUrl.pathname;
     const method = lctx.method;
-    lctx.route = path;
+    lctx.route = normalizeLoggedRoute(method, path);
 
     // Resolve the caller's principal once, up front, so the read-only MONITOR scope is enforced
     // before ANY route dispatch — including the public /portal*, /portal/feedback and /hs routes
     // below. principal may be null (no/invalid token): public routes tolerate that; protected
     // routes reject at the canonical 401 gate further down.
     const principal = resolvePrincipal(req, cfg, implicitAdminAllowed);
+    if (principal) {
+      lctx.principal = principal.alias;
+      lctx.tier = principal.tier;
+      // keyHash is stored only in the owner-queryable request_log (never in the access log / metrics).
+      lctx.keyHash = principal.keyHash;
+    }
     if (principal?.isMonitor) {
       const monitorOk =
         method === "GET" &&
@@ -3648,11 +3673,6 @@ export async function handleRequest(
       sendError(res, makeError("invalid_api_key"));
       return;
     }
-
-    lctx.principal = principal.alias;
-    lctx.tier = principal.tier;
-    // keyHash is stored only in the owner-queryable request_log (never in the access log / metrics).
-    lctx.keyHash = principal.keyHash;
 
     // W5: authenticated Hugin proposal admission only. This surface persists a
     // zero-mutation armed-canary record; it cannot apply, re-arm, widen, list,
@@ -4553,9 +4573,11 @@ export async function handleRequest(
           lctx.errorClass = "reviewer_usefulness_conflict";
           switch (result.conflict.kind) {
             case "wrong_task_type":
+            case "shadow":
+            case "superseded":
             case "missing_verifier":
               sendJson(res, 409, reviewerUsefulnessConflictResponse(
-                "Reviewer usefulness recording is only available for validated review-bounded delegations.",
+                "Reviewer usefulness recording is only available for genuinely graded, non-shadow, current review-bounded delegations.",
                 reviewerUsefulnessConflictApiShape(result.conflict),
               ));
               return;
@@ -4568,6 +4590,8 @@ export async function handleRequest(
                 reviewerUsefulnessConflictApiShape(result.conflict),
               ));
               return;
+            default:
+              return assertNeverConflict(result.conflict);
           }
       }
     }

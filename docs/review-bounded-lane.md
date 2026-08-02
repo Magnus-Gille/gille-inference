@@ -145,11 +145,22 @@ exactly like gille-inference#78's four schema-fine-but-substantively-wrong findi
 
 Issue #112 adds the owner-admin transport for this overlay: `PUT /ledger/{id}/reviewer-usefulness`.
 It is deliberately narrower than the underlying helper. The actual mutation still goes through
-`recordReviewerUsefulness`, but the route only allows validated `review-bounded` rows, derives
-`reviewer_usefulness_by` from the authenticated logical alias instead of caller input, accepts only
-closed `pass|partial|redo|wrong`, keeps `reviewer_usefulness_notes` bounded to content-blind
-`key:value` tokens, returns exact retries as `200 unchanged`, and fails closed on a differing
-overwrite with `409 reviewer_usefulness_conflict`.
+`recordReviewerUsefulness`, but the route only allows **genuinely graded, current**
+`review-bounded` rows: `task_type='review-bounded'`, `shadow=0`, `superseded_at IS NULL`, and a
+quality-bearing verifier rather than an ungraded or structural sentinel. That means free-text
+import variants such as `None`, ` none `, or `nonEmpty(0)` cannot bypass eligibility just because
+the `verifier` column is non-null. The route derives `reviewer_usefulness_by` from the
+authenticated logical alias instead of caller input, accepts only closed `pass|partial|redo|wrong`,
+keeps `reviewer_usefulness_notes` bounded to content-blind `key:value` tokens, returns exact
+retries as `200 unchanged`, and fails closed on a differing overwrite with
+`409 reviewer_usefulness_conflict`.
+
+Pre-#112 malformed or ineligible live reviewer-usefulness columns are handled additively rather
+than destructively. On read they no longer surface as a current reviewer verdict, and on the first
+later valid write the old live values are moved into the dedicated legacy quarantine columns
+(`reviewer_usefulness_legacy_json`, `reviewer_usefulness_legacy_reason`,
+`reviewer_usefulness_legacy_quarantined_at`) before the new verdict is recorded. Valid historical
+rows remain unchanged.
 
 ## Preflight / capability discovery
 

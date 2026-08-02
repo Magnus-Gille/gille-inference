@@ -4,8 +4,8 @@ import { getDb } from "../db.js";
 import { DEFAULT_FORMAT_ONLY_DISCOUNT_TASK_TYPES, DEFAULT_JUDGMENT_QUALITY_TASK_TYPES, type PolicyConfig } from "./config.js";
 import {
   classifyVerifierKind,
+  isQualityBearingVerifier,
   isTrustedJudgmentVerifier,
-  verifierBaseName,
   type VerifierKind,
 } from "./verifier-classification.js";
 import {
@@ -28,7 +28,7 @@ import {
   upsertEvidenceIdentitySnapshot,
   type EvidenceIdentitySnapshot,
 } from "./evidence-identity-store.js";
-import { REVIEW_BOUNDED_TASK_TYPE } from "./review-bounded.js";
+import { REVIEWER_USEFULNESS_VALUES, REVIEW_BOUNDED_TASK_TYPE } from "./review-bounded.js";
 import { isKnownTaskType } from "./taxonomy.js";
 import { policyTaskTypeIdentity } from "./task-type-identity.js";
 
@@ -71,6 +71,7 @@ export type ErrorClass = "empty" | "truncated" | "timeout" | "parse" | "infra";
  * incorrect (e.g. the four gille-inference#78 whole-patch findings that were all refuted).
  */
 export type ReviewerUsefulness = "pass" | "partial" | "redo" | "wrong";
+const REVIEWER_USEFULNESS_VALUE_SET: ReadonlySet<ReviewerUsefulness> = new Set(REVIEWER_USEFULNESS_VALUES);
 
 const INFRA_ERROR_CLASSES: ReadonlySet<string> = new Set(["infra"]);
 
@@ -252,6 +253,11 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("reviewer_usefulness_notes")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_notes TEXT`);
     if (!names.has("reviewer_usefulness_by")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_by TEXT`);
     if (!names.has("reviewer_usefulness_ts")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_ts TEXT`);
+    if (!names.has("reviewer_usefulness_legacy_json")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_json TEXT`);
+    if (!names.has("reviewer_usefulness_legacy_reason")) db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_reason TEXT`);
+    if (!names.has("reviewer_usefulness_legacy_quarantined_at")) {
+      db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_quarantined_at TEXT`);
+    }
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -661,6 +667,8 @@ export type ReviewerUsefulnessResult =
     kind: "conflict";
     conflict:
       | { kind: "wrong_task_type"; taskType: string }
+      | { kind: "shadow" }
+      | { kind: "superseded" }
       | { kind: "missing_verifier" }
       | {
         kind: "already_recorded";
@@ -674,10 +682,50 @@ export type ReviewerUsefulnessResult =
 interface ReviewerUsefulnessRow {
   taskType: string;
   verifier: string | null;
-  reviewerUsefulness: ReviewerUsefulness | null;
+  shadow: 0 | 1;
+  supersededAt: string | null;
+  reviewerUsefulness: string | null;
   reviewerUsefulnessNotes: string | null;
   reviewerUsefulnessBy: string | null;
   reviewerUsefulnessTs: string | null;
+}
+
+type ReviewerUsefulnessLiveState = "absent" | "recorded" | "legacy";
+
+function reviewerUsefulnessValue(value: string | null): ReviewerUsefulness | null {
+  return value !== null && REVIEWER_USEFULNESS_VALUE_SET.has(value as ReviewerUsefulness)
+    ? value as ReviewerUsefulness
+    : null;
+}
+
+function reviewerUsefulnessVisibleRecord(row: ReviewerUsefulnessRow): {
+  usefulness: ReviewerUsefulness;
+  judgedBy: string;
+  notes: string | null;
+  ts: string;
+} | null {
+  const usefulness = reviewerUsefulnessValue(row.reviewerUsefulness);
+  const judgedBy = row.reviewerUsefulnessBy?.trim() ?? "";
+  if (usefulness === null || judgedBy === "" || row.reviewerUsefulnessTs === null) return null;
+  if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) return null;
+  if (row.shadow === 1) return null;
+  if (!isQualityBearingVerifier(row.verifier)) return null;
+  return {
+    usefulness,
+    judgedBy,
+    notes: row.reviewerUsefulnessNotes ?? null,
+    ts: row.reviewerUsefulnessTs,
+  };
+}
+
+function reviewerUsefulnessLiveState(row: ReviewerUsefulnessRow): ReviewerUsefulnessLiveState {
+  const hasAny =
+    row.reviewerUsefulness !== null
+    || row.reviewerUsefulnessNotes !== null
+    || row.reviewerUsefulnessBy !== null
+    || row.reviewerUsefulnessTs !== null;
+  if (!hasAny) return "absent";
+  return reviewerUsefulnessVisibleRecord(row) !== null ? "recorded" : "legacy";
 }
 
 function reviewerUsefulnessSummary(args: {
@@ -696,11 +744,12 @@ function reviewerUsefulnessSummary(args: {
 }
 
 function reviewerUsefulnessSummaryFromRow(row: ReviewerUsefulnessRow): ReviewerUsefulnessRecordSummary {
+  const visible = reviewerUsefulnessVisibleRecord(row);
   return reviewerUsefulnessSummary({
-    usefulness: row.reviewerUsefulness,
-    judgedBy: row.reviewerUsefulnessBy,
-    notes: row.reviewerUsefulnessNotes,
-    ts: row.reviewerUsefulnessTs,
+    usefulness: visible?.usefulness ?? null,
+    judgedBy: visible?.judgedBy ?? null,
+    notes: visible?.notes ?? null,
+    ts: visible?.ts ?? null,
   });
 }
 
@@ -708,11 +757,67 @@ function reviewerUsefulnessMismatchFields(
   row: ReviewerUsefulnessRow,
   attempted: { usefulness: ReviewerUsefulness; judgedBy: string | null; notes: string | null },
 ): ReviewerUsefulnessMismatchField[] {
+  const visible = reviewerUsefulnessVisibleRecord(row);
   const mismatches: ReviewerUsefulnessMismatchField[] = [];
-  if (row.reviewerUsefulness !== attempted.usefulness) mismatches.push("reviewerUsefulness");
-  if ((row.reviewerUsefulnessBy ?? null) !== attempted.judgedBy) mismatches.push("reviewerIdentity");
-  if ((row.reviewerUsefulnessNotes ?? null) !== attempted.notes) mismatches.push("notes");
+  if (visible?.usefulness !== attempted.usefulness) mismatches.push("reviewerUsefulness");
+  if ((visible?.judgedBy ?? null) !== attempted.judgedBy) mismatches.push("reviewerIdentity");
+  if ((visible?.notes ?? null) !== attempted.notes) mismatches.push("notes");
   return mismatches;
+}
+
+function reviewerUsefulnessEligibilityConflict(
+  row: ReviewerUsefulnessRow,
+):
+  | { kind: "wrong_task_type"; taskType: string }
+  | { kind: "shadow" }
+  | { kind: "superseded" }
+  | { kind: "missing_verifier" }
+  | null {
+  if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) {
+    return { kind: "wrong_task_type", taskType: row.taskType };
+  }
+  if (row.shadow === 1) return { kind: "shadow" };
+  if (row.supersededAt !== null) return { kind: "superseded" };
+  if (!isQualityBearingVerifier(row.verifier)) return { kind: "missing_verifier" };
+  return null;
+}
+
+function quarantineLegacyReviewerUsefulness(
+  db: Database.Database,
+  ledgerId: string,
+  row: ReviewerUsefulnessRow,
+  now: string,
+): void {
+  if (reviewerUsefulnessLiveState(row) !== "legacy") return;
+  db.prepare(`
+    UPDATE delegations
+       SET reviewer_usefulness_legacy_json = COALESCE(
+             reviewer_usefulness_legacy_json,
+             @legacyJson
+           ),
+           reviewer_usefulness_legacy_reason = COALESCE(
+             reviewer_usefulness_legacy_reason,
+             'malformed_live_columns'
+           ),
+           reviewer_usefulness_legacy_quarantined_at = COALESCE(
+             reviewer_usefulness_legacy_quarantined_at,
+             @quarantinedAt
+           ),
+           reviewer_usefulness = NULL,
+           reviewer_usefulness_notes = NULL,
+           reviewer_usefulness_by = NULL,
+           reviewer_usefulness_ts = NULL
+     WHERE id = @id
+  `).run({
+    id: ledgerId,
+    legacyJson: JSON.stringify({
+      reviewerUsefulness: row.reviewerUsefulness,
+      reviewerUsefulnessNotes: row.reviewerUsefulnessNotes,
+      reviewerUsefulnessBy: row.reviewerUsefulnessBy,
+      reviewerUsefulnessTs: row.reviewerUsefulnessTs,
+    }),
+    quarantinedAt: now,
+  });
 }
 
 function getReviewerUsefulnessRow(
@@ -722,6 +827,8 @@ function getReviewerUsefulnessRow(
   const row = db.prepare(`
     SELECT task_type AS taskType,
            verifier,
+           shadow,
+           superseded_at AS supersededAt,
            reviewer_usefulness AS reviewerUsefulness,
            reviewer_usefulness_notes AS reviewerUsefulnessNotes,
            reviewer_usefulness_by AS reviewerUsefulnessBy,
@@ -746,23 +853,22 @@ export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): Review
   const notes = input.notes ?? null;
   const attempted = { usefulness: input.usefulness, judgedBy, notes };
   const write = db.transaction((): ReviewerUsefulnessResult => {
-    const row = getReviewerUsefulnessRow(db, input.ledgerId);
+    let row = getReviewerUsefulnessRow(db, input.ledgerId);
     if (row === null) return { kind: "not_found" };
-    if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) {
-      return { kind: "conflict", conflict: { kind: "wrong_task_type", taskType: row.taskType } };
-    }
-    if (classifyVerifierKind(row.verifier) === "ungraded") {
-      return { kind: "conflict", conflict: { kind: "missing_verifier" } };
+    const eligibilityConflict = reviewerUsefulnessEligibilityConflict(row);
+    if (eligibilityConflict !== null) {
+      return { kind: "conflict", conflict: eligibilityConflict };
     }
 
-    const alreadyRecorded =
-      row.reviewerUsefulness !== null
-      || row.reviewerUsefulnessNotes !== null
-      || row.reviewerUsefulnessBy !== null
-      || row.reviewerUsefulnessTs !== null;
-    if (alreadyRecorded) {
+    if (reviewerUsefulnessLiveState(row) === "legacy") {
+      quarantineLegacyReviewerUsefulness(db, input.ledgerId, row, now);
+      row = getReviewerUsefulnessRow(db, input.ledgerId);
+      if (row === null) return { kind: "not_found" };
+    }
+
+    if (reviewerUsefulnessLiveState(row) === "recorded") {
       const mismatchFields = reviewerUsefulnessMismatchFields(row, attempted);
-      if (mismatchFields.length === 0 && row.reviewerUsefulnessTs !== null) {
+      if (mismatchFields.length === 0 && reviewerUsefulnessVisibleRecord(row)?.ts !== undefined) {
         return { kind: "unchanged", taskType: row.taskType, record: reviewerUsefulnessSummaryFromRow(row) };
       }
       return {
@@ -812,10 +918,15 @@ export function recordReviewerUsefulness(input: ReviewerUsefulnessInput): Review
       };
     }
 
-    const fresh = getReviewerUsefulnessRow(db, input.ledgerId);
+    let fresh = getReviewerUsefulnessRow(db, input.ledgerId);
     if (fresh === null) return { kind: "not_found" };
+    if (reviewerUsefulnessLiveState(fresh) === "legacy") {
+      quarantineLegacyReviewerUsefulness(db, input.ledgerId, fresh, now);
+      fresh = getReviewerUsefulnessRow(db, input.ledgerId);
+      if (fresh === null) return { kind: "not_found" };
+    }
     const mismatchFields = reviewerUsefulnessMismatchFields(fresh, attempted);
-    if (mismatchFields.length === 0 && fresh.reviewerUsefulnessTs !== null) {
+    if (mismatchFields.length === 0 && reviewerUsefulnessVisibleRecord(fresh)?.ts !== undefined) {
       return { kind: "unchanged", taskType: fresh.taskType, record: reviewerUsefulnessSummaryFromRow(fresh) };
     }
     return {
@@ -871,7 +982,7 @@ const EXCLUDED_LANE_EVIDENCE_SOURCES: ReadonlySet<string> = new Set(["harvest-sh
 
 function normalizedVerifierName(name: string | null | undefined): string | null {
   const trimmed = name?.trim();
-  if (!trimmed || verifierBaseName(trimmed) === "none") return null;
+  if (!trimmed || classifyVerifierKind(trimmed) === "ungraded") return null;
   return trimmed;
 }
 
@@ -1597,7 +1708,7 @@ interface DelegationByIdRow extends RecentDelegationRow {
   learningTaskAdmissionId: string | null;
   taskInstanceId: string | null;
   attemptId: string | null;
-  reviewerUsefulness: ReviewerUsefulness | null;
+  reviewerUsefulness: string | null;
   reviewerUsefulnessNotes: string | null;
   reviewerUsefulnessBy: string | null;
   reviewerUsefulnessTs: string | null;
@@ -1680,12 +1791,26 @@ export function getDelegationById(id: string): DelegationById | null {
     : bindingValues.every((value) => value !== null) && row.evidenceIdentityHash !== null
       ? "bound"
       : "invalid";
+  const visibleReviewerRecord = reviewerUsefulnessVisibleRecord({
+    taskType: row.taskType,
+    verifier: row.verifier,
+    shadow: row.shadow,
+    supersededAt: row.supersededAt,
+    reviewerUsefulness: row.reviewerUsefulness,
+    reviewerUsefulnessNotes: row.reviewerUsefulnessNotes,
+    reviewerUsefulnessBy: row.reviewerUsefulnessBy,
+    reviewerUsefulnessTs: row.reviewerUsefulnessTs,
+  });
   return {
     ...row,
     learningTaskBinding,
     gateWouldEscalate: row.gateWouldEscalate === null ? null : row.gateWouldEscalate === 1,
     verifierKind: classifyVerifierKind(row.verifier),
     shadow: row.shadow === 1,
+    reviewerUsefulness: visibleReviewerRecord?.usefulness ?? null,
+    reviewerUsefulnessNotes: visibleReviewerRecord?.notes ?? null,
+    reviewerUsefulnessBy: visibleReviewerRecord?.judgedBy ?? null,
+    reviewerUsefulnessTs: visibleReviewerRecord?.ts ?? null,
   };
 }
 

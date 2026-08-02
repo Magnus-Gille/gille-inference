@@ -72,6 +72,11 @@ describe("isQualityBearingVerifier", () => {
     expect(isQualityBearingVerifier("none")).toBe(false);
   });
 
+  it("treats free-text sentinel variants as ungraded too (trimmed, case-insensitive)", () => {
+    expect(isQualityBearingVerifier(" None ")).toBe(false);
+    expect(isQualityBearingVerifier("NONE(ungraded)")).toBe(false);
+  });
+
   it("keeps a named 'custom' verifier (a real grading function) quality-bearing", () => {
     // orchestrator.ts writes verifier:"custom" when an unnamed but REAL verifier fn graded the row.
     expect(isQualityBearingVerifier("custom")).toBe(true);
@@ -155,6 +160,8 @@ describe("classifyVerifierKind", () => {
     expect(classifyVerifierKind("")).toBe("ungraded");
     expect(classifyVerifierKind("   ")).toBe("ungraded");
     expect(classifyVerifierKind("none")).toBe("ungraded");
+    expect(classifyVerifierKind(" None ")).toBe("ungraded");
+    expect(classifyVerifierKind("NONE(ungraded)")).toBe("ungraded");
   });
 
   it("classifies a probe-native '+'-combined name as mechanical-format only if EVERY component is", () => {

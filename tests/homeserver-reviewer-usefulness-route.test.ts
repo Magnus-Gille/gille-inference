@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, initDb } from "../src/db.js";
 import { recordDelegation, getDelegationById } from "../src/homeserver/ledger.js";
+import { buildVerifier, isVerifierBuildError } from "../src/homeserver/verifier-registry.js";
 import { createDirectGatewayHarness, type DirectGatewayHarness } from "./helpers/direct-gateway.js";
 
 let harness: DirectGatewayHarness;
@@ -87,6 +88,27 @@ function makeReviewBoundedRow(): string {
   });
 }
 
+function gatewayVerifierName(spec: Record<string, unknown>): string {
+  const built = buildVerifier(spec);
+  if (isVerifierBuildError(built)) throw new Error(`invalid test verifier spec: ${built.error}`);
+  return built.name;
+}
+
+function makeReviewBoundedRowWithVerifier(verifier: string, overrides: Partial<{
+  outcome: "pass" | "partial" | "fail" | "error" | "unverified";
+  shadow: boolean;
+}> = {}): string {
+  return recordDelegation({
+    taskType: "review-bounded",
+    modelId: "qwen3-coder-next-80b",
+    prompt: "gille review-bounded contract v1 ...",
+    outcome: overrides.outcome ?? "pass",
+    verifier,
+    shadow: overrides.shadow,
+    source: "gateway",
+  });
+}
+
 function makeNonReviewRow(): string {
   return recordDelegation({
     taskType: "summarize",
@@ -134,21 +156,31 @@ async function putReviewerUsefulness(
   });
 }
 
-function latestReviewerUsefulnessRequest(alias: string): {
+function latestReviewerUsefulnessRequest(alias: string | null): {
   route: string;
   status: number;
   outcome: string;
   error_class: string | null;
   admission: string | null;
 } {
-  return getDb().prepare(`
+  const query = alias === null
+    ? `
+    SELECT route, status, outcome, error_class, admission
+      FROM request_log
+     WHERE alias IS NULL
+       AND route = '/ledger/:id/reviewer-usefulness'
+     ORDER BY rowid DESC
+     LIMIT 1
+  `
+    : `
     SELECT route, status, outcome, error_class, admission
      FROM request_log
      WHERE alias = @alias
        AND route = '/ledger/:id/reviewer-usefulness'
      ORDER BY rowid DESC
      LIMIT 1
-  `).get({ alias }) as {
+  `;
+  return getDb().prepare(query).get(alias === null ? {} : { alias }) as {
     route: string;
     status: number;
     outcome: string;
@@ -428,6 +460,59 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
 
+  it("requires a genuine grade for gateway-reachable verifier labels and rejects shadow/superseded rows", async () => {
+    const exactLedgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" })
+    );
+    const exact = await putReviewerUsefulness(exactLedgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(exact.status).toBe(201);
+
+    const structuralLedgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "nonEmpty", minLen: 0 })
+    );
+    const structural = await putReviewerUsefulness(structuralLedgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(structural.status).toBe(409);
+    expect(structural.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      conflict: { kind: "missing_verifier" },
+    });
+
+    const shadowLedgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+      { shadow: true }
+    );
+    const shadow = await putReviewerUsefulness(shadowLedgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(shadow.status).toBe(409);
+    expect(shadow.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      conflict: { kind: "shadow" },
+    });
+
+    const supersededLedgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" })
+    );
+    getDb().prepare(`
+      UPDATE delegations
+         SET superseded_at = '2026-07-31T10:00:00.000Z'
+       WHERE id = ?
+    `).run(supersededLedgerId);
+    const superseded = await putReviewerUsefulness(supersededLedgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(superseded.status).toBe(409);
+    expect(superseded.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+      conflict: { kind: "superseded" },
+    });
+  });
+
   it("stays minted-owner-admin only: unauthenticated, guest, monitor, owner-monitor, and owner-agent callers cannot write", async () => {
     const ledgerId = makeReviewBoundedRow();
 
@@ -446,6 +531,18 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     const agent = await putReviewerUsefulness(ledgerId, { usefulness: "pass", notes: NOTES }, agentKey);
     expect(agent.status).toBe(403);
 
+    expect(latestReviewerUsefulnessRequest(null)).toMatchObject({
+      route: "/ledger/:id/reviewer-usefulness",
+      status: 401,
+      outcome: "auth_failed",
+      error_class: "invalid_api_key",
+    });
+    expect(latestReviewerUsefulnessRequest("reviewer-owner-monitor")).toMatchObject({
+      route: "/ledger/:id/reviewer-usefulness",
+      status: 403,
+      outcome: "forbidden",
+      error_class: "route_not_allowed",
+    });
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
 });
