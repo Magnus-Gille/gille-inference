@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
   BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+  type BlindContextOperatorSignal,
   describeBlindContextAvailability,
   expandBlindContext,
   MAX_FILES_PER_REQUEST,
@@ -234,6 +235,112 @@ describe("describeBlindContextAvailability live discovery", () => {
       signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
     });
     expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("emits the same dropped-root signal again after a healthy recovery within the TTL", () => {
+    const base = makeTmpRoot("bc-signal-recover-");
+    const root = join(base, "missing-secret-root");
+    let nowMs = 40_000;
+    const signals: BlindContextOperatorSignal[] = [];
+
+    expect(describeBlindContextAvailability([root], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 1,
+        resolved_root_count: 0,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+
+    mkdirSync(root);
+    nowMs += 1;
+
+    expect(describeBlindContextAvailability([root], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(signals).toHaveLength(1);
+
+    rmSync(root, { recursive: true, force: true });
+    nowMs += 1;
+
+    expect(describeBlindContextAvailability([root], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 1,
+        resolved_root_count: 0,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+      {
+        configured_root_count: 1,
+        resolved_root_count: 0,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+    expect(JSON.stringify(signals)).not.toContain(root);
+  });
+
+  it("treats different dropped roots with equal aggregate counts as distinct observations within the TTL", () => {
+    const base = makeTmpRoot("bc-signal-fingerprint-");
+    const rootA = join(base, "root-a-secret");
+    const rootB = join(base, "root-b-secret");
+    mkdirSync(rootA);
+    mkdirSync(rootB);
+    let nowMs = 50_000;
+    const signals: BlindContextOperatorSignal[] = [];
+
+    rmSync(rootA, { recursive: true, force: true });
+    expect(describeBlindContextAvailability([rootA, rootB], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 2,
+        resolved_root_count: 1,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+
+    mkdirSync(rootA);
+    rmSync(rootB, { recursive: true, force: true });
+    nowMs += 1;
+
+    expect(describeBlindContextAvailability([rootA, rootB], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 2,
+        resolved_root_count: 1,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+      {
+        configured_root_count: 2,
+        resolved_root_count: 1,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+    expect(JSON.stringify(signals)).not.toContain(rootA);
+    expect(JSON.stringify(signals)).not.toContain(rootB);
   });
 });
 

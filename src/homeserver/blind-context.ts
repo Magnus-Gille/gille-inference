@@ -160,6 +160,12 @@ export interface BlindContextAvailabilityInspection extends BlindContextAvailabi
   resolvedRoots: string[];
 }
 
+type BlindContextRootResolutionState = "resolved" | BlindContextRootDropReason;
+
+interface BlindContextAvailabilityInspectionWithRootStates extends BlindContextAvailabilityInspection {
+  rootStates: BlindContextRootResolutionState[];
+}
+
 interface BlindContextFsOps {
   realpathSync: typeof realpathSync;
   statSync: typeof statSync;
@@ -236,6 +242,7 @@ function defaultBlindContextSignal(signal: BlindContextOperatorSignal): void {
 interface BlindContextOperatorSignalCacheEntry {
   observedAtMs: number;
   signal: BlindContextOperatorSignal;
+  rootStateFingerprint: string;
 }
 
 const discoverySignalCache = new Map<string, BlindContextOperatorSignalCacheEntry>();
@@ -264,23 +271,28 @@ function sameOperatorSignal(left: BlindContextOperatorSignal, right: BlindContex
 function shouldEmitOperatorSignal(
   cacheKey: string,
   signal: BlindContextOperatorSignal,
+  rootStateFingerprint: string,
   nowMs: number,
   signalTtlMs: number
 ): boolean {
   const cached = discoverySignalCache.get(cacheKey);
   if (!cached) {
-    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal });
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal, rootStateFingerprint });
     return true;
   }
-  if (!sameOperatorSignal(cached.signal, signal)) {
-    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal });
+  if (cached.rootStateFingerprint !== rootStateFingerprint || !sameOperatorSignal(cached.signal, signal)) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal, rootStateFingerprint });
     return true;
   }
   if (nowMs - cached.observedAtMs >= signalTtlMs) {
-    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal });
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal, rootStateFingerprint });
     return true;
   }
   return false;
+}
+
+function fingerprintRootStates(rootStates: readonly BlindContextRootResolutionState[]): string {
+  return rootStates.join("\u0000");
 }
 
 /**
@@ -295,35 +307,46 @@ function shouldEmitOperatorSignal(
 function resolveRoots(
   roots: readonly string[],
   fsOps: BlindContextFsOps
-): { resolvedRoots: string[]; droppedRootCounts: BlindContextRootDropCounts } {
+): {
+  resolvedRoots: string[];
+  droppedRootCounts: BlindContextRootDropCounts;
+  rootStates: BlindContextRootResolutionState[];
+} {
   const resolved = new Set<string>();
   let droppedRootCounts = emptyDropCounts();
+  const rootStates: BlindContextRootResolutionState[] = [];
   for (const root of roots) {
     if (!isAbsolute(root)) {
       droppedRootCounts = countRootDrop(droppedRootCounts, "not_absolute");
+      rootStates.push("not_absolute");
       continue; // never let a CWD-dependent entry into the allowlist
     }
     try {
       const canonical = fsOps.realpathSync(root);
       if (!fsOps.statSync(canonical).isDirectory()) {
         droppedRootCounts = countRootDrop(droppedRootCounts, "not_directory");
+        rootStates.push("not_directory");
         continue;
       }
       resolved.add(canonical);
+      rootStates.push("resolved");
     } catch (error) {
       const code = (error as { code?: string }).code;
       if (code === "ENOENT") {
         droppedRootCounts = countRootDrop(droppedRootCounts, "not_found");
+        rootStates.push("not_found");
         continue;
       }
       if (code === "EACCES" || code === "EPERM") {
         droppedRootCounts = countRootDrop(droppedRootCounts, "unreadable");
+        rootStates.push("unreadable");
         continue;
       }
       droppedRootCounts = countRootDrop(droppedRootCounts, "unreadable");
+      rootStates.push("unreadable");
     }
   }
-  return { resolvedRoots: [...resolved], droppedRootCounts };
+  return { resolvedRoots: [...resolved], droppedRootCounts, rootStates };
 }
 
 /**
@@ -336,7 +359,8 @@ export function describeBlindContextAvailability(
   roots: readonly string[],
   options: BlindContextAvailabilityOptions = {}
 ): BlindContextAvailability {
-  const inspection = inspectBlindContextAvailability(roots, options);
+  const inspection = inspectBlindContextAvailabilityWithRootStates(roots, options);
+  const cacheKey = roots.join("\u0000");
   if (inspection.droppedRootCount > 0) {
     const operatorSignal = {
       configured_root_count: inspection.configuredRootCount,
@@ -346,9 +370,17 @@ export function describeBlindContextAvailability(
     };
     const nowMs = (options.now ?? Date.now)();
     const signalTtlMs = options.signalTtlMs ?? options.cacheTtlMs ?? BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
-    if (shouldEmitOperatorSignal(roots.join("\u0000"), operatorSignal, nowMs, signalTtlMs)) {
+    if (shouldEmitOperatorSignal(
+      cacheKey,
+      operatorSignal,
+      fingerprintRootStates(inspection.rootStates),
+      nowMs,
+      signalTtlMs
+    )) {
       (options.signal ?? defaultBlindContextSignal)(operatorSignal);
     }
+  } else {
+    discoverySignalCache.delete(cacheKey);
   }
   return {
     enabled: inspection.enabled,
@@ -365,6 +397,22 @@ export function inspectBlindContextAvailability(
   roots: readonly string[],
   options: BlindContextAvailabilityOptions = {}
 ): BlindContextAvailabilityInspection {
+  const inspection = inspectBlindContextAvailabilityWithRootStates(roots, options);
+  return {
+    enabled: inspection.enabled,
+    reason: inspection.reason,
+    configuredRootCount: inspection.configuredRootCount,
+    resolvedRootCount: inspection.resolvedRootCount,
+    droppedRootCount: inspection.droppedRootCount,
+    droppedRootCounts: inspection.droppedRootCounts,
+    resolvedRoots: inspection.resolvedRoots,
+  };
+}
+
+function inspectBlindContextAvailabilityWithRootStates(
+  roots: readonly string[],
+  options: BlindContextAvailabilityOptions = {}
+): BlindContextAvailabilityInspectionWithRootStates {
   const configuredRootCount = roots.length;
   const fsOps = options.fsOps ?? DEFAULT_FS_OPS;
   if (roots.length === 0) {
@@ -376,9 +424,10 @@ export function inspectBlindContextAvailability(
       droppedRootCount: 0,
       droppedRootCounts: emptyDropCounts(),
       resolvedRoots: [],
+      rootStates: [],
     };
   }
-  const { resolvedRoots, droppedRootCounts } = resolveRoots(roots, fsOps);
+  const { resolvedRoots, droppedRootCounts, rootStates } = resolveRoots(roots, fsOps);
   const droppedRootCount = totalDroppedRoots(droppedRootCounts);
   if (resolvedRoots.length === 0) {
     return {
@@ -389,6 +438,7 @@ export function inspectBlindContextAvailability(
       droppedRootCount,
       droppedRootCounts,
       resolvedRoots,
+      rootStates,
     };
   }
   return {
@@ -399,6 +449,7 @@ export function inspectBlindContextAvailability(
     droppedRootCount,
     droppedRootCounts,
     resolvedRoots,
+    rootStates,
   };
 }
 
