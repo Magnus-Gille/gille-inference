@@ -66,6 +66,15 @@ export interface McpPrincipal {
   creditLimit: number;
 }
 
+interface McpTraceOverride {
+  traceOutcome: string;
+  traceErrorClass?: string;
+}
+
+interface McpPostResult {
+  trace?: McpTraceOverride;
+}
+
 // ─── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────────────
 
 interface JsonRpcRequest {
@@ -532,7 +541,13 @@ export type RunChatResult =
       truncated: boolean | null;
       usage: AskUsageMetadata;
     }
-  | { ok: false; code: "credits_exhausted" | "rate_limited" | "server_busy" | "model_not_allowed" | "upstream_error"; message: string };
+  | {
+      ok: false;
+      code: "credits_exhausted" | "rate_limited" | "server_busy" | "model_not_allowed" | "upstream_error";
+      message: string;
+      traceOutcome: string;
+      traceErrorClass: string;
+    };
 
 const ASK_TRUNCATION_FINISH_REASON = "length";
 
@@ -652,6 +667,10 @@ function toAskStructuredContent(
   };
 }
 
+function badRequestTrace(): McpTraceOverride {
+  return { traceOutcome: "bad_request", traceErrorClass: "invalid_request_error" };
+}
+
 /**
  * Run a non-streaming chat completion through the SAME metered spine as
  * /v1/chat/completions — credit reserve → quota → admission → upstream fetch → reconcile —
@@ -726,6 +745,8 @@ export async function runChatCompletion(
       ok: false,
       code: "model_not_allowed",
       message: `Your API key is not permitted to use model '${args.model}'. Allowed: ${principal.modelAllowList.join(", ")}.`,
+      traceOutcome: "forbidden",
+      traceErrorClass: "model_not_allowed",
     };
   }
 
@@ -751,7 +772,13 @@ export async function runChatCompletion(
         creditsCharged: null,
       });
       logInferenceFailure(402, "credits_exhausted", "credits_exhausted", "n/a");
-      return { ok: false, code: "credits_exhausted", message: "Your credit budget is exhausted. Contact the operator for more credits." };
+      return {
+        ok: false,
+        code: "credits_exhausted",
+        message: "Your credit budget is exhausted. Contact the operator for more credits.",
+        traceOutcome: "credits_exhausted",
+        traceErrorClass: "credits_exhausted",
+      };
     }
     creditReserved = true;
   }
@@ -769,7 +796,13 @@ export async function runChatCompletion(
     releaseReserve();
     recordRateLimited("quota");
     logInferenceFailure(429, "rate_limited", "rate_limit_exceeded", "n/a");
-    return { ok: false, code: "rate_limited", message: `Rate limit reached. Retry after ${q.retryAfterSeconds}s.` };
+    return {
+      ok: false,
+      code: "rate_limited",
+      message: `Rate limit reached. Retry after ${q.retryAfterSeconds}s.`,
+      traceOutcome: "rate_limited",
+      traceErrorClass: "rate_limit_exceeded",
+    };
   }
   const reservation: QuotaReservation = q.reservation;
 
@@ -793,7 +826,13 @@ export async function runChatCompletion(
       // counter and logs a content-blind "/mcp/ask" busy row.
       recordAdmissionRejection(principal.tier);
       logInferenceFailure(503, "busy", "server_busy", "busy");
-      return { ok: false, code: "server_busy", message: `The server is busy. Retry after ${err.retryAfterSeconds}s.` };
+      return {
+        ok: false,
+        code: "server_busy",
+        message: `The server is busy. Retry after ${err.retryAfterSeconds}s.`,
+        traceOutcome: "busy",
+        traceErrorClass: "server_busy",
+      };
     }
     throw err;
   }
@@ -856,9 +895,21 @@ export async function runChatCompletion(
     if (upstream.status >= 400) {
       // No successful completion ⇒ no credit charge (actualTokens stays 0).
       if (upstream.status === 404 || /model.*not.*found/i.test(text)) {
-        return { ok: false, code: "upstream_error", message: `The model '${args.model}' does not exist or is not loaded.` };
+        return {
+          ok: false,
+          code: "upstream_error",
+          message: `The model '${args.model}' does not exist or is not loaded.`,
+          traceOutcome: "bad_request",
+          traceErrorClass: "invalid_request_error",
+        };
       }
-      return { ok: false, code: "upstream_error", message: `Upstream model error (HTTP ${upstream.status}).` };
+      return {
+        ok: false,
+        code: "upstream_error",
+        message: `Upstream model error (HTTP ${upstream.status}).`,
+        traceOutcome: "error",
+        traceErrorClass: "upstream_error",
+      };
     }
 
     let content = "";
@@ -933,6 +984,8 @@ export async function runChatCompletion(
         ok: false,
         code: "upstream_error",
         message: "The model backend timed out (it may be loading a model) — please retry in a few seconds.",
+        traceOutcome: "upstream_timeout",
+        traceErrorClass: "upstream_timeout",
       };
     }
     if (kind === "upstream_unavailable") {
@@ -942,6 +995,8 @@ export async function runChatCompletion(
         ok: false,
         code: "upstream_error",
         message: "The model backend is unavailable — please retry shortly.",
+        traceOutcome: "upstream_unavailable",
+        traceErrorClass: "upstream_unavailable",
       };
     }
     throw err;
@@ -1104,7 +1159,11 @@ interface ToolCallContext {
 }
 
 /** A tools/call result: a text content block + isError flag. Never throws for a tool error. */
-async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCallContext): Promise<{ text: string; isError: boolean; structuredContent?: unknown }> {
+async function callTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: ToolCallContext
+): Promise<{ text: string; isError: boolean; structuredContent?: unknown; trace?: McpTraceOverride }> {
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal);
     const structuredContent = buildListModelsStructuredContent(
@@ -1148,11 +1207,15 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       rawDelegatorModelId !== undefined &&
       (typeof rawDelegatorModelId !== "string" || rawDelegatorModelId.trim() === "")
     ) {
-      return { text: "'delegator_model_id' must be a non-empty string when supplied.", isError: true };
+      return {
+        text: "'delegator_model_id' must be a non-empty string when supplied.",
+        isError: true,
+        trace: badRequestTrace(),
+      };
     }
     const delegatorModelId = typeof rawDelegatorModelId === "string" ? rawDelegatorModelId : undefined;
     if (model === "" || prompt === "") {
-      return { text: "Both 'model' and 'prompt' are required.", isError: true };
+      return { text: "Both 'model' and 'prompt' are required.", isError: true, trace: badRequestTrace() };
     }
     const samplerSpecs = [
       ["temperature", 0, 2, false],
@@ -1173,6 +1236,7 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
         return {
           text: `'${field}' must be ${integer ? "an integer" : "a number"} in [${min}, ${max}].`,
           isError: true,
+          trace: badRequestTrace(),
         };
       }
     }
@@ -1191,7 +1255,11 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       // array would slip through as a SILENT no-op — for a guest that would contradict the
       // "supplying `files` is never silently ignored" contract this error message states.
       if (!Array.isArray(raw) || raw.length === 0 || !raw.every((f) => typeof f === "string" && f.length > 0)) {
-        return { text: "'files' must be a non-empty array of absolute path strings.", isError: true };
+        return {
+          text: "'files' must be a non-empty array of absolute path strings.",
+          isError: true,
+          trace: badRequestTrace(),
+        };
       }
       files = raw as string[];
     }
@@ -1199,7 +1267,11 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       const env = makeError("route_not_allowed", {
         message: "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
       });
-      return { text: env.body.error.message, isError: true };
+      return {
+        text: env.body.error.message,
+        isError: true,
+        trace: { traceOutcome: "forbidden", traceErrorClass: "route_not_allowed" },
+      };
     }
 
     // Cap max_tokens at the per-request ceiling (floor at 1).
@@ -1215,7 +1287,7 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       };
       const expansion = expandBlindContext(files, blindCfg);
       if (!expansion.ok) {
-        return { text: expansion.error.message, isError: true };
+        return { text: expansion.error.message, isError: true, trace: badRequestTrace() };
       }
       promptWithContext = `${expansion.text}\n\n${prompt}`;
     }
@@ -1246,7 +1318,11 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       }
       return { text: r.text, isError: false, structuredContent };
     }
-    return { text: r.message, isError: true };
+    return {
+      text: r.message,
+      isError: true,
+      trace: { traceOutcome: r.traceOutcome, traceErrorClass: r.traceErrorClass },
+    };
   }
 
   // Owner-only code_loop_* tools (#116). The gate is re-checked here (not just at tools/list): a
@@ -1284,19 +1360,19 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
  *
  * Always resolves; never throws to the gateway's top-level handler.
  */
-export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: ToolCallContext): Promise<void> {
+export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: ToolCallContext): Promise<McpPostResult> {
   let msg: JsonRpcRequest;
   try {
     msg = JSON.parse(rawBody) as JsonRpcRequest;
   } catch {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcError(null, PARSE_ERROR, "Parse error"));
-    return;
+    return {};
   }
   if (typeof msg !== "object" || msg === null || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcError(null, INVALID_REQUEST, "Invalid Request"));
-    return;
+    return {};
   }
 
   const method = msg.method;
@@ -1308,12 +1384,12 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     if (method === "notifications/initialized") {
       res.writeHead(202);
       res.end();
-      return;
+      return {};
     }
     // Any other notification is silently accepted (per JSON-RPC, no response for notifications).
     res.writeHead(202);
     res.end();
-    return;
+    return {};
   }
 
   if (method === "initialize") {
@@ -1326,19 +1402,19 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
         ...(isCodeLoopOwner(ctx.principal) ? { instructions: CODE_LOOP_OWNER_INSTRUCTIONS } : {}),
       })
     );
-    return;
+    return {};
   }
 
   if (method === "ping") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcResult(id, {}));
-    return;
+    return {};
   }
 
   if (method === "tools/list") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcResult(id, { tools: toolDefs(ctx.principal, ctx.cfg) }));
-    return;
+    return {};
   }
 
   if (method === "tools/call") {
@@ -1348,10 +1424,11 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     const out = await callTool(name, toolArgs, ctx);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }) }));
-    return;
+    return out.trace === undefined ? {} : { trace: out.trace };
   }
 
   // Unknown method.
   res.writeHead(200, { "content-type": "application/json" });
   res.end(rpcError(id, METHOD_NOT_FOUND, "Method not found"));
+  return {};
 }

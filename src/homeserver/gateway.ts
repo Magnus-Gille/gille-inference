@@ -889,8 +889,16 @@ function gatewayTraceTaskType(route: string): string {
 
 function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" | "degraded" | "failed" | "unknown" {
   if (outcome === "client_closed") return "unknown";
+  if (outcome === "bad_request" || outcome === "forbidden" || outcome === "credits_exhausted") return "unknown";
   if (outcome === "busy" || outcome === "rate_limited") return "degraded";
-  if (outcome === "stream_failed" || outcome === "degenerate") return "failed";
+  if (
+    outcome === "stream_failed"
+    || outcome === "degenerate"
+    || outcome === "upstream_timeout"
+    || outcome === "upstream_unavailable"
+  ) {
+    return "failed";
+  }
   if (status === null) return "unknown";
   if (status !== null && status >= 200 && status < 400) return "ok";
   if (status >= 500) return "failed";
@@ -3288,6 +3296,8 @@ async function handleRequest(
   // acceptance; rejected reports leave no adoption evidence. Other MCP tools retain normal logs.
   let suppressRequestTelemetry = false;
   let traceHandle: GatewayTraceHandle | null = null;
+  let traceOutcomeOverride: string | null = null;
+  let traceErrorClassOverride: string | null = null;
 
   // Single finally block — the ONLY emit site for gateway_request events.
   try {
@@ -4105,7 +4115,7 @@ async function handleRequest(
         principal.keyHash !== null &&
         (principal.scope === "agent" || principal.scope === "admin");
       if (suppressRequestTelemetry) logThis = false;
-      await handleMcpPost(raw, res, {
+      const mcpResult = await handleMcpPost(raw, res, {
         principal,
         cfg,
         controller,
@@ -4118,6 +4128,8 @@ async function handleRequest(
           current: (alias: string) => keyInflight.get(alias) ?? 0,
         },
       });
+      traceOutcomeOverride = mcpResult.trace?.traceOutcome ?? null;
+      traceErrorClassOverride = mcpResult.trace?.traceErrorClass ?? null;
       lctx.status = res.statusCode > 0 ? res.statusCode : 200;
       lctx.outcome = lctx.status < 400 ? "ok" : "error";
       lctx.admission = "n/a";
@@ -4650,20 +4662,22 @@ async function handleRequest(
   } finally {
     lctx.totalMs = Date.now() - startMs;
     if (traceHandle?.enabled) {
+      const traceOutcome = traceOutcomeOverride ?? lctx.outcome;
+      const traceErrorClass = traceErrorClassOverride ?? lctx.errorClass;
       await traceHandle.run(async () => {
         setTraceDefaults({
           taskType: gatewayTraceTaskType(lctx.route),
           lane: "default",
           retryOrdinal: 0,
-          ...(lctx.errorClass ? { errorClass: lctx.errorClass } : {}),
+          ...(traceErrorClass ? { errorClass: traceErrorClass } : {}),
         });
-        recordReadinessObservation("gateway", gatewayReadinessOutcome(lctx.status, lctx.outcome), {
-          errorClass: lctx.errorClass ?? undefined,
+        recordReadinessObservation("gateway", gatewayReadinessOutcome(lctx.status, traceOutcome), {
+          errorClass: traceErrorClass ?? undefined,
         });
       });
       traceHandle.finish({
-        outcome: lctx.outcome,
-        errorClass: lctx.errorClass ?? undefined,
+        outcome: traceOutcome,
+        errorClass: traceErrorClassForOutcome(traceOutcome, traceErrorClass),
         endedAtMs: startMs + (lctx.totalMs ?? 0),
       });
     }
