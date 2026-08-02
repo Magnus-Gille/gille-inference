@@ -18,6 +18,9 @@ readonly LLAMA_RUNTIME="/home/magnus/llama.cpp"
 readonly LLAMA_GPU_RENDER_DEVICE="${LLAMA_GPU_RENDER_DEVICE:-/dev/dri/renderD128}"
 readonly LLAMA_GPU_CARD_DEVICE="${LLAMA_GPU_CARD_DEVICE:-/dev/dri/card0}"
 readonly GATEWAY_ISOLATION_MARKER="$ROOT/gateway/isolation-marker"
+APPLY_BACKUP=""
+APPLY_SERVICE=""
+APPLY_BACKUP_REPORTED=0
 gateway_home() { printf '%s\n' "$ROOT/$GATEWAY_USER"; }
 
 usage() {
@@ -51,6 +54,13 @@ EOF
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
+report_apply_backup() {
+  local detail="${1:-Apply failed after creating a transaction backup.}"
+  [ -n "${APPLY_BACKUP:-}" ] || return 0
+  [ "${APPLY_BACKUP_REPORTED:-0}" = 0 ] || return 0
+  note "$detail Backup evidence: $APPLY_BACKUP"
+  APPLY_BACKUP_REPORTED=1
+}
 need() { command -v "$1" >/dev/null 2>&1 || die "required command missing: $1"; }
 root_only() { [ "$(id -u)" -eq 0 ] || die "this command must run as root (use sudo)"; }
 unit_for() {
@@ -655,21 +665,23 @@ cleanup_gateway_partial_secret() {
 apply_exit_handler() {
   local status="$1"
   [ "$status" -ne 0 ] || return 0
-  [ "${GATEWAY_APPLY_INFLIGHT:-0}" = 1 ] || return 0
   trap - EXIT
+  report_apply_backup "Apply failed after creating a transaction backup."
+  [ "${APPLY_SERVICE:-}" = gateway ] || exit "$status"
+  [ "${GATEWAY_APPLY_INFLIGHT:-0}" = 1 ] || exit "$status"
   note "Gateway migration interrupted; restoring the captured legacy timer state."
   # Same-device state moves are atomic. Once state is present, normal rollback
   # owns the complete restoration; before then only a copied secret can exist.
   if [ -d "$ROOT/gateway/data" ] && [ -f "$ETC/gateway/gateway.env" ]; then
     if ! rollback gateway "$APPLY_BACKUP"; then
-      note "Automatic gateway rollback failed; legacy timer restoration is still being attempted. Backup evidence: $APPLY_BACKUP"
+      note "Automatic gateway rollback failed; legacy timer restoration is still being attempted."
       restore_legacy_autonomy_timer "$APPLY_BACKUP" || true
     fi
   else
     cleanup_gateway_partial_secret
     restore_legacy_autonomy_timer "$APPLY_BACKUP" || true
     if ! systemctl is-active --quiet home-gateway.service; then
-      systemctl start home-gateway.service || note "Legacy gateway could not be restarted automatically; inspect $APPLY_BACKUP"
+      systemctl start home-gateway.service || note "Legacy gateway could not be restarted automatically; inspect the recorded backup evidence."
     fi
   fi
   exit "$status"
@@ -925,13 +937,15 @@ apply() {
   umask 077
   mkdir -p "$backup_root"
   backup="$(mktemp -d "$backup_root/$stamp-$service.XXXXXX")"
+  APPLY_SERVICE="$service"
+  APPLY_BACKUP="$backup"
+  APPLY_BACKUP_REPORTED=0
+  trap 'apply_exit_handler "$?"' EXIT
   backup_unit "$service" "$unit" "$backup"
   dependent_state_file="$backup/dependents.apply.state"
   capture_transaction_dependents "$service" "$dependent_state_file"
   if [ "$service" = gateway ]; then
-    APPLY_BACKUP="$backup"
     GATEWAY_APPLY_INFLIGHT=1
-    trap 'apply_exit_handler "$?"' EXIT
     disable_legacy_autonomy_timer
   fi
   case "$service" in
@@ -945,13 +959,13 @@ apply() {
   rollback_feasible "$service"
   install_dropin "$service"
   if ! systemctl restart "$unit"; then
-    note "Restart failed; use rollback with --ack-rollback. Backup evidence: $backup"
+    report_apply_backup "Restart failed; use rollback with --ack-rollback."
     exit 1
   fi
   [ "$service" != gateway ] || install_gateway_autonomy_timer
   restore_transaction_dependents "$service" "$dependent_state_file"
   if ! verify "$service" 0; then
-    note "Verification failed; use rollback with --ack-rollback. Backup evidence: $backup"
+    report_apply_backup "Verification failed; use rollback with --ack-rollback."
     exit 1
   fi
   printf 'service=%s\nunit=%s\nbackup=%s\nverified_at=%s\n' "$service" "$unit" "$backup" "$(date -u +%FT%TZ)" >"$backup/receipt"
@@ -961,6 +975,9 @@ apply() {
     install -m 0600 -o root -g root /dev/stdin "$GATEWAY_ISOLATION_MARKER" <"$backup/receipt"
   fi
   GATEWAY_APPLY_INFLIGHT=0
+  APPLY_BACKUP=""
+  APPLY_SERVICE=""
+  APPLY_BACKUP_REPORTED=0
   trap - EXIT
   note "APPLIED: $service. Backup/rollback evidence: $backup"
 }

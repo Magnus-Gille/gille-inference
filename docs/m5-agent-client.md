@@ -13,18 +13,23 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`, starting with client package version
-`1.2.0`:
+The `m5` executable ships in the same npm package as `hs`. The currently accepted pinned version
+is `1.2.1`:
 
 ```bash
-npm install --global gille-inference@1.2.0
+npm install --global gille-inference@1.2.1
 m5 --version
 ```
 
 `gille-inference@1.0.0` is the existing public `hs`-only package. The initial M5 client was
-prepared as `1.1.0` but was never published; `1.2.0` adds the required content-free adoption
-reporting contract. Publish `1.2.0` as the first public M5-capable version rather than releasing
-the superseded intermediate version.
+prepared as `1.1.0` but was never published; `1.2.0` added the required content-free adoption
+reporting contract as the first public M5-capable version. `1.2.1` keeps that surface and adds
+the structured `list_models` blind-context discovery contract without reusing the published
+`1.2.0` version string for a different client behavior.
+
+Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
+`m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
+`m5 1.2.1+` and other MCP callers may receive the structured object.
 
 `m5 --version` emits structured JSON. `claude-config` integrations must:
 
@@ -117,6 +122,35 @@ m5 --profile codex code status cl-example
 m5 --profile codex code result cl-example
 ```
 
+`m5 ask` returns structured JSON:
+
+```json
+{
+  "model": "mellum",
+  "text": "answer text",
+  "finish_reason": "stop",
+  "truncated": false,
+  "metered": true,
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 34,
+    "total_tokens": 46,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+  }
+}
+```
+
+If the backend ends with `finish_reason:"length"`, `m5 ask` still returns the same JSON shape,
+but with `truncated:true` and `metered:true`, so automation can retry with a higher `max_tokens`
+instead of treating an empty or partial answer as a normal completion. The CLI preserves its
+current exit semantics: truncation still exits `0` with structured JSON, while ordinary tool
+errors still exit `1` with a redacted stderr JSON envelope. Truncation is already billable on the
+first call, and any retry is a new metered request. Usage fields remain content-blind; the client
+accepts `null` usage, derives `total_tokens` only when prompt+completion counts are both valid,
+and nulls malformed negative or fractional counters instead of trusting them.
+
 `code run` starts the server-side async job, polls it, and returns the terminal structured result,
 including the unified diff and verification evidence. It can use `"wait": false` to return the
 start response for later `status`/`result` calls. It never applies the diff, writes into a live
@@ -148,10 +182,12 @@ Its top-level `status` distinguishes:
 
 No token or endpoint locator is included in the result.
 
-`m5 1.2.0` adds the direct, content-free `adoption report` command and requires the reporting tool
+`m5 1.2.0` added the direct, content-free `adoption report` command and requires the reporting tool
 for a healthy doctor result. A generic `1.1.0` stdio bridge can still pass an MCP tool call through
 when a compatible server exposes it, but it does not provide the direct report command or this
-doctor parity check; integrations that use adoption measurement must pin `1.2.0`.
+doctor parity check. `m5 1.2.1` keeps that requirement and additionally expects the structured
+`list_models` discovery contract when the gateway identifies it as a `1.2.1+` client;
+integrations that use adoption measurement or blind-context discovery should pin `1.2.1`.
 
 ## Transport and redaction behavior
 

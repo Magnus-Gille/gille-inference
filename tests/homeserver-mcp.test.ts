@@ -49,11 +49,70 @@ function startUpstream(): Promise<void> {
         res.end(JSON.stringify({ error: { message: "boom" } }));
         return;
       }
+      if (reqModel === "truncated-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-truncated",
+            choices: [{ message: { role: "assistant", content: "F-2" }, finish_reason: "length" }],
+            usage: {
+              prompt_tokens: 5,
+              completion_tokens: 64,
+              total_tokens: 69,
+              prompt_tokens_details: { cached_tokens: 9 },
+              completion_tokens_details: { reasoning_tokens: 17 },
+            },
+          })
+        );
+        return;
+      }
+      if (reqModel === "derived-usage-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-derived-usage",
+            choices: [{ message: { role: "assistant", content: "DERIVED USAGE" }, finish_reason: "stop" }],
+            usage: {
+              input_tokens: 13,
+              output_tokens: 27,
+            },
+          })
+        );
+        return;
+      }
+      if (reqModel === "null-usage-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-null-usage",
+            choices: [{ message: { role: "assistant", content: "NULL USAGE" }, finish_reason: "stop" }],
+            usage: null,
+          })
+        );
+        return;
+      }
+      if (reqModel === "invalid-usage-model") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "cmpl-invalid-usage",
+            choices: [{ message: { role: "assistant", content: "INVALID USAGE" }, finish_reason: "stop" }],
+            usage: {
+              prompt_tokens: -5,
+              completion_tokens: 1.5,
+              total_tokens: 6.5,
+              prompt_tokens_details: { cached_tokens: -1 },
+              completion_tokens_details: { reasoning_tokens: 2.2 },
+            },
+          })
+        );
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           id: "cmpl-1",
-          choices: [{ message: { role: "assistant", content: "STUBBED COMPLETION" } }],
+          choices: [{ message: { role: "assistant", content: "STUBBED COMPLETION" }, finish_reason: "stop" }],
           usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
         })
       );
@@ -76,6 +135,8 @@ let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
+const ASK_FILES_META_KEY = "gille-inference/ask_capabilities";
+const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 // Two keys: an open key (empty allow-list = all models visible) and a scoped key (one model).
 let openKey = "";
@@ -131,6 +192,40 @@ async function rpc(body: unknown, key = openKey): Promise<Response> {
   });
 }
 
+function askCapability(tool: {
+  annotations?: unknown;
+  _meta?: Record<string, unknown>;
+}): { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } {
+  expect(tool.annotations).toBeUndefined();
+  const capability = tool._meta?.[ASK_FILES_META_KEY] as Record<string, unknown> | undefined;
+  expect(capability).toBeDefined();
+  expect(Object.keys(capability!).sort()).toEqual([
+    "files_enabled",
+    "files_reason",
+    "resolved_root_count",
+  ]);
+  expect(typeof capability!.files_enabled).toBe("boolean");
+  expect([
+    "enabled",
+    "owner_tier_required",
+    "unconfigured",
+    "no_resolved_roots",
+  ]).toContain(capability!.files_reason);
+  const count = capability!.resolved_root_count;
+  expect(
+    count === null || (
+      Number.isSafeInteger(count) &&
+      count >= 0 &&
+      count <= MAX_BLIND_CONTEXT_ROOTS
+    )
+  ).toBe(true);
+  return capability! as {
+    files_enabled: boolean;
+    files_reason: string;
+    resolved_root_count: number | null;
+  };
+}
+
 // ─── initialize ─────────────────────────────────────────────────────────────────────
 
 describe("MCP initialize", () => {
@@ -177,10 +272,21 @@ describe("MCP ping", () => {
 // ─── tools/list ──────────────────────────────────────────────────────────────────────
 
 describe("MCP tools/list", () => {
-  it("lists list_models and ask with inputSchemas", async () => {
+  it("lists list_models and ask with inputSchemas and spec-compliant blind-context metadata for an owner key by default", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { tools: Array<{ name: string; inputSchema: { type: string; properties: Record<string, unknown> } }> } };
+    const j = (await res.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          description: string;
+          _meta?: Record<string, unknown>;
+          annotations?: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null };
+          inputSchema: { type: string; properties: Record<string, unknown> };
+          outputSchema?: Record<string, unknown>;
+        }>;
+      };
+    };
     const names = j.result.tools.map((t) => t.name);
     expect(names).toContain("list_models");
     expect(names).toContain("ask");
@@ -189,20 +295,132 @@ describe("MCP tools/list", () => {
     expect(ask.inputSchema.properties).toHaveProperty("model");
     expect(ask.inputSchema.properties).toHaveProperty("prompt");
     expect(ask.inputSchema.properties).toHaveProperty("delegator_model_id");
+    expect(askCapability(ask)).toEqual({
+      files_enabled: false,
+      files_reason: "unconfigured",
+      resolved_root_count: 0,
+    });
+    expect(ask.description).toContain("Call list_models for the live, content-blind ask.files capability state before using file attachments.");
+    expect(ask.description).not.toMatch(/currently disabled/i);
+    expect(ask.outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        model: { type: "string" },
+        text: { type: "string" },
+        finish_reason: {},
+        truncated: {},
+        usage: { type: "object" },
+        metered: { const: true },
+      },
+    });
     const list = j.result.tools.find((t) => t.name === "list_models")!;
     expect(list.inputSchema.type).toBe("object");
+    expect(list.outputSchema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["models", "ask_capabilities"],
+    });
+    expect(JSON.stringify(list.outputSchema)).toContain("files_reason");
+  });
+
+  it("tells a guest key that files are unavailable before any root/config check", async () => {
+    const res = await rpc({ jsonrpc: "2.0", id: 21, method: "tools/list" }, scopedKey);
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          description: string;
+          _meta?: Record<string, unknown>;
+          annotations?: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null };
+        }>;
+      };
+    };
+    const ask = j.result.tools.find((t) => t.name === "ask")!;
+    expect(askCapability(ask)).toEqual({
+      files_enabled: false,
+      files_reason: "owner_tier_required",
+      resolved_root_count: null,
+    });
+    expect(ask.description).not.toMatch(/guest-tier keys are rejected before any blind-context root check/i);
   });
 });
 
 // ─── tools/call list_models ─────────────────────────────────────────────────────────
 
 describe("MCP tools/call list_models", () => {
+  it("returns structured blind-context discovery for structured-capable callers when the feature is unset/default-disabled", async () => {
+    const res = await rpc(
+      { jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "list_models", arguments: {} } },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent?: { ask_capabilities: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent?.ask_capabilities).toEqual({
+      files_enabled: false,
+      files_reason: "unconfigured",
+      resolved_root_count: 0,
+    });
+    expect(j.result.content[0]!.text).toContain("Current ask.files capability:");
+    expect(j.result.content[0]!.text).toContain("files_reason: unconfigured");
+    expect(j.result.content[0]!.text).not.toContain("- files_reason: unconfigured");
+  });
+
+  it("keeps the published m5-cli/1.2.0 wire contract text-only", async () => {
+    const res = await fetch(mcpUrl(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${openKey}`,
+        "user-agent": "m5-cli/1.2.0",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 302,
+        method: "tools/call",
+        params: { name: "list_models", arguments: {} },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent?: unknown;
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent).toBeUndefined();
+    expect(j.result.content[0]!.text).toContain("Current ask.files capability:");
+    expect(j.result.content[0]!.text).toContain("files_reason: unconfigured");
+  });
+
   it("a scoped key sees only its allow-listed model", async () => {
     const res = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_models", arguments: {} } }, scopedKey);
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { content: Array<{ type: string; text: string }>; isError: boolean } };
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent?: { ask_capabilities: { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } };
+      };
+    };
     expect(j.result.isError).toBe(false);
     expect(j.result.content[0]!.text).toContain("only-this-model");
+    expect(j.result.structuredContent?.ask_capabilities).toEqual({
+      files_enabled: false,
+      files_reason: "owner_tier_required",
+      resolved_root_count: null,
+    });
+    expect(j.result.content[0]!.text).toContain("files_reason: owner_tier_required");
+    expect(j.result.content[0]!.text).not.toContain("- files_reason: owner_tier_required");
   });
 
   it("describes VibeThinker as a verifiable-reasoning specialist", async () => {
@@ -265,12 +483,224 @@ describe("MCP tools/call ask", () => {
       creditKey
     );
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { content: Array<{ type: string; text: string }>; isError: boolean } };
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent: {
+          model: string;
+          text: string;
+          finish_reason: string | null;
+          truncated: boolean | null;
+          metered: boolean;
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_creation_input_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
     expect(j.result.isError).toBe(false);
     expect(j.result.content[0]!.text).toBe("STUBBED COMPLETION");
+    expect(j.result.structuredContent).toEqual({
+      model: "any-model",
+      text: "STUBBED COMPLETION",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 5,
+        total_tokens: 10,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
     // The stub reports total_tokens: 10 — credits must reflect real usage.
     const after = lookupKey(creditKey)!.creditsUsed;
     expect(after - before).toBe(10);
+  });
+
+  it("surfaces token-limit truncation as a tool error with structured finish-reason and usage metadata", async () => {
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 43,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "truncated-model", prompt: "hello", max_tokens: 64 } },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent: {
+          model: string;
+          text: string;
+          finish_reason: string | null;
+          truncated: boolean | null;
+          metered: boolean;
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_creation_input_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
+    expect(j.result.isError).toBe(true);
+    expect(j.result.content[0]!.text).toMatch(/truncated/i);
+    expect(j.result.content[0]!.text).toContain("F-2");
+    expect(j.result.content[0]!.text).toMatch(/billable|metered/i);
+    expect(j.result.structuredContent).toEqual({
+      model: "truncated-model",
+      text: "F-2",
+      finish_reason: "length",
+      truncated: true,
+      metered: true,
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 64,
+        total_tokens: 69,
+        reasoning_tokens: 17,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 9,
+      },
+    });
+  });
+
+  it("derives total usage from input_tokens plus output_tokens and reconciles credits to the real total", async () => {
+    const before = lookupKey(creditKey)!.creditsUsed;
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 44,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "derived-usage-model", prompt: "hello" } },
+      },
+      creditKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+          };
+          metered: boolean;
+        };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent).toMatchObject({
+      metered: true,
+      usage: {
+        prompt_tokens: 13,
+        completion_tokens: 27,
+        total_tokens: 40,
+      },
+    });
+    const after = lookupKey(creditKey)!.creditsUsed;
+    expect(after - before).toBe(40);
+  });
+
+  it("tolerates a null usage object and surfaces content-blind null counters", async () => {
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 45,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "null-usage-model", prompt: "hello" } },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          model: string;
+          text: string;
+          metered: boolean;
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_creation_input_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent).toEqual({
+      model: "null-usage-model",
+      text: "NULL USAGE",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      usage: {
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        reasoning_tokens: null,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+      },
+    });
+  });
+
+  it("drops negative and non-integer usage counters instead of trusting malformed numbers", async () => {
+    const before = lookupKey(creditKey)!.creditsUsed;
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 46,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "invalid-usage-model", prompt: "abcd" } },
+      },
+      creditKey
+    );
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          usage: {
+            prompt_tokens: number | null;
+            completion_tokens: number | null;
+            total_tokens: number | null;
+            reasoning_tokens: number | null;
+            cache_read_input_tokens: number | null;
+          };
+        };
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent.usage).toEqual({
+      prompt_tokens: null,
+      completion_tokens: null,
+      total_tokens: null,
+      reasoning_tokens: null,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+    });
+    const after = lookupKey(creditKey)!.creditsUsed;
+    expect(after - before).toBe(1);
   });
 
   it("M3: an ask call feeds usage into /metrics (tokens + credits counters increment)", async () => {

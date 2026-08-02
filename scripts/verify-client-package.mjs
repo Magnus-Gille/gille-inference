@@ -15,7 +15,7 @@ const expectedFiles = [
   "m5.mjs",
   "package.json",
 ];
-const expectedVersion = "1.2.0";
+const expectedVersion = "1.2.1";
 
 function fail(message) {
   throw new Error(`client package release gate: ${message}`);

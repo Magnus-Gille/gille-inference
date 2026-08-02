@@ -4110,6 +4110,7 @@ async function handleRequest(
         cfg,
         controller,
         gatewayRequestId: `opaque:${lctx.requestId}`,
+        userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
         learningTaskCapabilityEpoch,
         inflight: {
           inc: incInflight,

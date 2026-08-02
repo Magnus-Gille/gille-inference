@@ -172,7 +172,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /v1/images/generations` | user | **OpenAI-compatible text→image.** Three advertised models, each a tier: `image-fast` (synchronous → `200 {created, data:[{b64_json}]}`), `image-balanced` + `image-high` (asynchronous → `202 {id:"imgjob_…", status:"queued", …}`). **Inert** unless `HOMESERVER_IMAGE_URL` is set (else `404`). **Metered like the audio path:** worst-case `n × per-image credits` reserved up-front (`402` on overdraft, before any work), `n` image-units against the per-key quota (`429`), both reconciled to the **delivered** count; **full refund** on failure/timeout/cancel. A dedicated **single-slot diffusion worker** acquires the shared admission slot only around the sidecar dispatch (owner chat can still preempt; an honest guest at cap gets `503`). `403 model_not_allowed` off the allow-list; `502/504` on sidecar fault. Content-blind: the prompt + bytes are **never** in `image_jobs` / request_log / metrics; owner-logged **only** under the owner guard. Forwards to an sd-server-style sidecar (`HOMESERVER_IMAGE_URL`, e.g. `http://127.0.0.1:8093`) `POST /v1/images/generations`. |
 | `GET /v1/images/generations/jobs/{id}` | user | Poll an async job (scoped to the creator; bare `404` otherwise). `succeeded` returns `data:[{b64_json}]` until the result TTL sweeps it (`expired`). |
 | `DELETE /v1/images/generations/jobs/{id}` | user | Cancel + refund a job, **idempotent**; scoped to the creator. |
-| `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys) and, for a real minted owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` plus `record_adoption_evidence` (invisible + unknown-tool-shaped error otherwise, #116/#136). The adoption tool accepts only a closed, content-free evidence shape; its weekly **MEASURED** dashboard is separate from evaluation/synthetic lab traffic and remains **SHADOW** for routing. Accepted and refused owner-agent report calls suppress normal per-request correlation logs, are transiently rate-limited and day-capped, and return only stable content-free rejection reason codes when bounded or invalid. `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
+| `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys) and, for a real minted owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` plus `record_adoption_evidence` (invisible + unknown-tool-shaped error otherwise, #116/#136). The adoption tool accepts only a closed, content-free evidence shape; its weekly **MEASURED** dashboard is separate from evaluation/synthetic lab traffic and remains **SHADOW** for routing. Accepted and refused owner-agent report calls suppress normal per-request correlation logs, are transiently rate-limited and day-capped, and return only stable content-free rejection reason codes when bounded or invalid. `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). Its structured result exposes `finish_reason`, explicit `truncated`, content-blind `usage`, and `metered:true`; a token-limit finish returns `isError:true`, keeps the paid partial answer in the content block behind a loud warning, and means any retry is a new billable call. `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
 | `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
 | `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
 | `GET /models` | user | Models on disk + loaded. |
@@ -255,20 +255,34 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 | `initialize` | `{protocolVersion:"2025-06-18", capabilities:{tools:{}}, serverInfo:{name:"m5-local-models", version:"1.0.0"}}` + an `Mcp-Session-Id` response header (we are stateless — never required back). |
 | `notifications/initialized` | `202 Accepted`, empty body. |
 | `ping` | `{}`. |
-| `tools/list` | the two tool defs (below). |
-| `tools/call` | `{content:[{type:"text", text}], isError}`. |
+| `tools/list` | the tool defs below, including content-blind blind-context discovery on `ask._meta["gille-inference/ask_capabilities"]` (`files_enabled`, stable `files_reason`, `resolved_root_count` with guest-safe `null`). |
+| `tools/call` | `{content:[{type:"text", text}], isError, structuredContent?}`. |
 | unknown / malformed | JSON-RPC `-32601` / `-32700` / `-32600` error (HTTP 200). |
 
 **Tools** (both scoped to the key's allow-list):
 
-- `list_models` — lists the model ids THIS key may use, each with a one-line strength hint.
+- `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. For
+  structured-capable callers it returns `structuredContent.ask_capabilities`, the **live
+  call-time** blind-context discovery state for `ask.files`, mirrored in backward-compatible text
+  and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
+  `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
+  text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
 - `ask` — `{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
-  local model and returns the text. A model outside the key's allow-list, an exhausted credit
-  budget, a quota hit, or a busy box all map to `isError:true` with a clear message (never a
-  thrown JSON-RPC fault). `max_tokens` uses the same fleet/per-model ceiling as raw chat.
-  `delegator_model_id` is optional telemetry: owner/cloud-agent callers should set it to the
-  cloud brain that delegated the task so the content-blind savings ledger can estimate actual
-  cloud spend avoided. It is not forwarded to the local model.
+  local model. Successful calls keep the text in the content block and also attach
+  `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always
+  content-blind `true` for this tool; `usage` is content-blind prompt/input, completion/output,
+  total, reasoning, and cache counters. Valid integer counters are surfaced directly; when the
+  backend omits `total_tokens` but reports prompt+completion, the gateway derives the total used
+  for metering. Invalid, negative, fractional, or missing counters stay `null`. A model outside
+  the key's allow-list, an exhausted credit budget, a quota hit, or a busy box all map to
+  `isError:true` with a clear message (never a thrown JSON-RPC fault). A token-limit finish
+  (`finish_reason="length"`) also returns `isError:true`, keeps the paid partial answer in the
+  content block behind a loud warning, preserves the same structured payload, and means any retry
+  is a new billable call. `max_tokens` uses the same fleet/per-model ceiling as raw chat.
+  `delegator_model_id` is optional telemetry:
+  owner/cloud-agent callers should set it to the cloud brain that delegated the task so the
+  content-blind savings ledger can estimate actual cloud spend avoided. It is not forwarded to the
+  local model.
 
 #### Blind-context delegation (`files`, issue #128) — OWNER-TIER ONLY
 
@@ -284,6 +298,13 @@ sees only the model's answer text.
 - **Disabled by default.** `HOMESERVER_BLIND_CONTEXT_ROOTS` (colon-separated absolute directories)
   is empty unless configured — with no roots, ANY `files` request errors with an actionable
   message. There is no way for an unset env var to silently widen into "everything is allowed."
+- **Truthful discovery before `ask`.** `tools/list` advertises the current `ask` blind-context
+  capability in content-blind `ask._meta["gille-inference/ask_capabilities"]`, and
+  `list_models` mirrors the same **live call-time** fields in text plus, for structured-capable
+  callers, `structuredContent.ask_capabilities`: `files_enabled`, stable `files_reason`
+  (`enabled`, `owner_tier_required`, `unconfigured`, `no_resolved_roots`), and
+  `resolved_root_count`. Discovery never leaks actual root paths; guest keys receive
+  `resolved_root_count: null`.
 - **Path safety** (`blind-context.ts`, the pure/unit-tested trust anchor): every input path (and
   every configured root) is resolved via `realpath` — which fully resolves symlinks AND collapses
   `..` segments — **before** the allow-list containment check runs. This closes both classic `../`

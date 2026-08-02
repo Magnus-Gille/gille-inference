@@ -40,10 +40,11 @@ import { isAbsolute } from "node:path";
  *     the root string — otherwise an allowed root of `/data/allowed` would wrongly admit a
  *     sibling directory named `/data/allowed-2` that was never intended to be exposed.
  *
- *   • Roots must be ABSOLUTE: a relative entry in HOMESERVER_BLIND_CONTEXT_ROOTS would resolve
- *     against whatever CWD the gateway happened to launch from (systemd WorkingDirectory, a test
- *     runner, …) — the allowlist would silently change meaning per launch context. Relative
- *     entries are DROPPED by resolveRoots(); if none survive, the feature behaves as disabled.
+ *   • Roots must be ABSOLUTE DIRECTORIES: a relative entry in HOMESERVER_BLIND_CONTEXT_ROOTS
+ *     would resolve against whatever CWD the gateway happened to launch from (systemd
+ *     WorkingDirectory, a test runner, …) — the allowlist would silently change meaning per
+ *     launch context. Relative entries and non-directory targets are DROPPED by resolveRoots();
+ *     if none survive, the feature behaves as disabled.
  *
  *   • TOCTOU hardening (realpath → open race): after the containment check we do NOT read by
  *     path. The canonical path is opened with O_NOFOLLOW|O_NONBLOCK, the OPEN DESCRIPTOR is
@@ -84,6 +85,13 @@ import { isAbsolute } from "node:path";
  * total cap, so legitimate use never hits this first.
  */
 export const MAX_FILES_PER_REQUEST = 64;
+export const MAX_BLIND_CONTEXT_ROOTS = 128;
+export const BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS = 5_000;
+/**
+ * @deprecated Discovery is live on every call; this legacy name now controls only repeated
+ * content-blind operator-signal deduping for the same dropped-root observation.
+ */
+export const BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS = BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
 
 /** Explicit, DI-friendly config — never read from env/global config inside this module. */
 export interface BlindContextConfig {
@@ -128,29 +136,321 @@ export interface BlindContextExpansion {
 
 export type BlindContextResult = ({ ok: true } & BlindContextExpansion) | { ok: false; error: BlindContextError };
 
+export type BlindContextAvailabilityReason = "enabled" | "unconfigured" | "no_resolved_roots";
+
+export type BlindContextRootDropReason = "not_absolute" | "not_found" | "not_directory" | "unreadable";
+
+export interface BlindContextRootDropCounts {
+  not_absolute: number;
+  not_found: number;
+  not_directory: number;
+  unreadable: number;
+}
+
+export interface BlindContextAvailability {
+  enabled: boolean;
+  reason: BlindContextAvailabilityReason;
+  resolvedRootCount: number;
+}
+
+export interface BlindContextAvailabilityInspection extends BlindContextAvailability {
+  configuredRootCount: number;
+  droppedRootCount: number;
+  droppedRootCounts: BlindContextRootDropCounts;
+  resolvedRoots: string[];
+}
+
+type BlindContextRootResolutionState = "resolved" | BlindContextRootDropReason;
+
+interface BlindContextAvailabilityInspectionWithRootStates extends BlindContextAvailabilityInspection {
+  rootStates: BlindContextRootResolutionState[];
+}
+
+interface BlindContextFsOps {
+  realpathSync: typeof realpathSync;
+  statSync: typeof statSync;
+}
+
+export interface BlindContextOperatorSignal {
+  configured_root_count: number;
+  resolved_root_count: number;
+  dropped_root_count: number;
+  dropped_root_reasons: Partial<Record<BlindContextRootDropReason, number>>;
+}
+
+export interface BlindContextAvailabilityOptions {
+  /**
+   * Optional TTL for deduping repeated content-blind operator signals about the same dropped-root
+   * observation. Discovery itself always re-inspects the filesystem on every call.
+   */
+  signalTtlMs?: number;
+  /**
+   * @deprecated Discovery is live on every call; retained only as a compatibility alias for
+   * `signalTtlMs`.
+   */
+  cacheTtlMs?: number;
+  fsOps?: BlindContextFsOps;
+  now?: () => number;
+  signal?: (signal: BlindContextOperatorSignal) => void;
+}
+
 const FILE_HEADER = (p: string): string => `===== FILE: ${p} =====`;
 const FILE_FOOTER = "===== END FILE =====";
 const PREAMBLE = (n: number): string =>
   `[${n} file${n === 1 ? "" : "s"} attached server-side by the caller — provided below as additional local context]`;
 
+const DEFAULT_FS_OPS: BlindContextFsOps = {
+  realpathSync,
+  statSync,
+};
+
+function emptyDropCounts(): BlindContextRootDropCounts {
+  return {
+    not_absolute: 0,
+    not_found: 0,
+    not_directory: 0,
+    unreadable: 0,
+  };
+}
+
+function totalDroppedRoots(counts: BlindContextRootDropCounts): number {
+  return counts.not_absolute + counts.not_found + counts.not_directory + counts.unreadable;
+}
+
+function countRootDrop(
+  counts: BlindContextRootDropCounts,
+  reason: BlindContextRootDropReason
+): BlindContextRootDropCounts {
+  return {
+    ...counts,
+    [reason]: counts[reason] + 1,
+  };
+}
+
+function nonZeroDropReasons(counts: BlindContextRootDropCounts): Partial<Record<BlindContextRootDropReason, number>> {
+  return Object.fromEntries(
+    Object.entries(counts).filter(([, count]) => count > 0)
+  ) as Partial<Record<BlindContextRootDropReason, number>>;
+}
+
+function defaultBlindContextSignal(signal: BlindContextOperatorSignal): void {
+  console.warn(
+    `[blind-context] dropped unusable configured roots ${JSON.stringify(signal)}`
+  );
+}
+
+interface BlindContextOperatorSignalCacheEntry {
+  observedAtMs: number;
+  signal: BlindContextOperatorSignal;
+  rootStateFingerprint: string;
+}
+
+const discoverySignalCache = new Map<string, BlindContextOperatorSignalCacheEntry>();
+
+function sameDropReasons(
+  left: Partial<Record<BlindContextRootDropReason, number>>,
+  right: Partial<Record<BlindContextRootDropReason, number>>
+): boolean {
+  return (
+    (left.not_absolute ?? 0) === (right.not_absolute ?? 0)
+    && (left.not_found ?? 0) === (right.not_found ?? 0)
+    && (left.not_directory ?? 0) === (right.not_directory ?? 0)
+    && (left.unreadable ?? 0) === (right.unreadable ?? 0)
+  );
+}
+
+function sameOperatorSignal(left: BlindContextOperatorSignal, right: BlindContextOperatorSignal): boolean {
+  return (
+    left.configured_root_count === right.configured_root_count
+    && left.resolved_root_count === right.resolved_root_count
+    && left.dropped_root_count === right.dropped_root_count
+    && sameDropReasons(left.dropped_root_reasons, right.dropped_root_reasons)
+  );
+}
+
+function shouldEmitOperatorSignal(
+  cacheKey: string,
+  signal: BlindContextOperatorSignal,
+  rootStateFingerprint: string,
+  nowMs: number,
+  signalTtlMs: number
+): boolean {
+  const cached = discoverySignalCache.get(cacheKey);
+  if (!cached) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal, rootStateFingerprint });
+    return true;
+  }
+  if (cached.rootStateFingerprint !== rootStateFingerprint || !sameOperatorSignal(cached.signal, signal)) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal, rootStateFingerprint });
+    return true;
+  }
+  if (nowMs - cached.observedAtMs >= signalTtlMs) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal, rootStateFingerprint });
+    return true;
+  }
+  return false;
+}
+
+function fingerprintRootStates(rootStates: readonly BlindContextRootResolutionState[]): string {
+  return rootStates.join("\u0000");
+}
+
 /**
- * Resolve every configured root to its canonical (symlink-free) path. A root that fails to
- * resolve (misconfigured / deleted / permission-denied) — or is RELATIVE (its meaning would
- * depend on the gateway's launch CWD; see the security model above) — is silently dropped rather
- * than crashing every request — the operator notices only if EVERY configured root is bad, at
- * which point the feature behaves identically to "disabled" (fail-safe, not fail-open).
+ * Resolve every configured root to one canonical (symlink-free) DIRECTORY path. A root that fails
+ * to resolve (misconfigured / deleted / permission-denied), resolves to a non-directory, or is
+ * RELATIVE (its meaning would depend on the gateway's launch CWD; see the security model above)
+ * is silently dropped rather than crashing every request. Canonical duplicates are collapsed so a
+ * raw duplicate or symlink alias never inflates the allowlist or the discovery count. The
+ * operator notices only if EVERY configured root is bad, at which point the feature behaves
+ * identically to "disabled" (fail-safe, not fail-open).
  */
-function resolveRoots(roots: readonly string[]): string[] {
-  const resolved: string[] = [];
+function resolveRoots(
+  roots: readonly string[],
+  fsOps: BlindContextFsOps
+): {
+  resolvedRoots: string[];
+  droppedRootCounts: BlindContextRootDropCounts;
+  rootStates: BlindContextRootResolutionState[];
+} {
+  const resolved = new Set<string>();
+  let droppedRootCounts = emptyDropCounts();
+  const rootStates: BlindContextRootResolutionState[] = [];
   for (const root of roots) {
-    if (!isAbsolute(root)) continue; // never let a CWD-dependent entry into the allowlist
+    if (!isAbsolute(root)) {
+      droppedRootCounts = countRootDrop(droppedRootCounts, "not_absolute");
+      rootStates.push("not_absolute");
+      continue; // never let a CWD-dependent entry into the allowlist
+    }
     try {
-      resolved.push(realpathSync(root));
-    } catch {
-      // Skip an unusable root — see doc comment above.
+      const canonical = fsOps.realpathSync(root);
+      if (!fsOps.statSync(canonical).isDirectory()) {
+        droppedRootCounts = countRootDrop(droppedRootCounts, "not_directory");
+        rootStates.push("not_directory");
+        continue;
+      }
+      resolved.add(canonical);
+      rootStates.push("resolved");
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === "ENOENT") {
+        droppedRootCounts = countRootDrop(droppedRootCounts, "not_found");
+        rootStates.push("not_found");
+        continue;
+      }
+      if (code === "EACCES" || code === "EPERM") {
+        droppedRootCounts = countRootDrop(droppedRootCounts, "unreadable");
+        rootStates.push("unreadable");
+        continue;
+      }
+      droppedRootCounts = countRootDrop(droppedRootCounts, "unreadable");
+      rootStates.push("unreadable");
     }
   }
-  return resolved;
+  return { resolvedRoots: [...resolved], droppedRootCounts, rootStates };
+}
+
+/**
+ * Live, content-blind availability summary for discovery surfaces: request-facing callers get the
+ * current usable state on every call without exposing any root locators or mutating the configured
+ * root list. Any optional TTL applies only to duplicate operator-signal suppression, never to the
+ * returned availability snapshot.
+ */
+export function describeBlindContextAvailability(
+  roots: readonly string[],
+  options: BlindContextAvailabilityOptions = {}
+): BlindContextAvailability {
+  const inspection = inspectBlindContextAvailabilityWithRootStates(roots, options);
+  const cacheKey = roots.join("\u0000");
+  if (inspection.droppedRootCount > 0) {
+    const operatorSignal = {
+      configured_root_count: inspection.configuredRootCount,
+      resolved_root_count: inspection.resolvedRootCount,
+      dropped_root_count: inspection.droppedRootCount,
+      dropped_root_reasons: nonZeroDropReasons(inspection.droppedRootCounts),
+    };
+    const nowMs = (options.now ?? Date.now)();
+    const signalTtlMs = options.signalTtlMs ?? options.cacheTtlMs ?? BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
+    if (shouldEmitOperatorSignal(
+      cacheKey,
+      operatorSignal,
+      fingerprintRootStates(inspection.rootStates),
+      nowMs,
+      signalTtlMs
+    )) {
+      (options.signal ?? defaultBlindContextSignal)(operatorSignal);
+    }
+  } else {
+    discoverySignalCache.delete(cacheKey);
+  }
+  return {
+    enabled: inspection.enabled,
+    reason: inspection.reason,
+    resolvedRootCount: inspection.resolvedRootCount,
+  };
+}
+
+/**
+ * The richer availability form for callers that need both the content-blind discovery summary and
+ * the resolved allowlist roots without exposing those roots on discovery surfaces.
+ */
+export function inspectBlindContextAvailability(
+  roots: readonly string[],
+  options: BlindContextAvailabilityOptions = {}
+): BlindContextAvailabilityInspection {
+  const inspection = inspectBlindContextAvailabilityWithRootStates(roots, options);
+  return {
+    enabled: inspection.enabled,
+    reason: inspection.reason,
+    configuredRootCount: inspection.configuredRootCount,
+    resolvedRootCount: inspection.resolvedRootCount,
+    droppedRootCount: inspection.droppedRootCount,
+    droppedRootCounts: inspection.droppedRootCounts,
+    resolvedRoots: inspection.resolvedRoots,
+  };
+}
+
+function inspectBlindContextAvailabilityWithRootStates(
+  roots: readonly string[],
+  options: BlindContextAvailabilityOptions = {}
+): BlindContextAvailabilityInspectionWithRootStates {
+  const configuredRootCount = roots.length;
+  const fsOps = options.fsOps ?? DEFAULT_FS_OPS;
+  if (roots.length === 0) {
+    return {
+      enabled: false,
+      reason: "unconfigured",
+      configuredRootCount,
+      resolvedRootCount: 0,
+      droppedRootCount: 0,
+      droppedRootCounts: emptyDropCounts(),
+      resolvedRoots: [],
+      rootStates: [],
+    };
+  }
+  const { resolvedRoots, droppedRootCounts, rootStates } = resolveRoots(roots, fsOps);
+  const droppedRootCount = totalDroppedRoots(droppedRootCounts);
+  if (resolvedRoots.length === 0) {
+    return {
+      enabled: false,
+      reason: "no_resolved_roots",
+      configuredRootCount,
+      resolvedRootCount: 0,
+      droppedRootCount,
+      droppedRootCounts,
+      resolvedRoots,
+      rootStates,
+    };
+  }
+  return {
+    enabled: true,
+    reason: "enabled",
+    configuredRootCount,
+    resolvedRootCount: resolvedRoots.length,
+    droppedRootCount,
+    droppedRootCounts,
+    resolvedRoots,
+    rootStates,
+  };
 }
 
 /**
@@ -179,30 +479,21 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
     return { ok: true, text: "", fileCount: 0, totalBytes: 0 };
   }
 
-  if (cfg.roots.length === 0) {
+  const availability = inspectBlindContextAvailability(cfg.roots);
+  if (!availability.enabled) {
     return {
       ok: false,
       error: {
         code: "disabled",
         path: null,
         message:
-          "File attachments are disabled on this server (HOMESERVER_BLIND_CONTEXT_ROOTS is not configured).",
+          availability.reason === "unconfigured"
+            ? "File attachments are disabled on this server (HOMESERVER_BLIND_CONTEXT_ROOTS is not configured)."
+            : "File attachments are disabled — none of the configured HOMESERVER_BLIND_CONTEXT_ROOTS resolve to a real directory.",
       },
     };
   }
-
-  const roots = resolveRoots(cfg.roots);
-  if (roots.length === 0) {
-    return {
-      ok: false,
-      error: {
-        code: "disabled",
-        path: null,
-        message:
-          "File attachments are disabled — none of the configured HOMESERVER_BLIND_CONTEXT_ROOTS resolve to a real directory.",
-      },
-    };
-  }
+  const roots = availability.resolvedRoots;
 
   // Count cap — bounds the un-byte-metered delimiter/header overhead (see MAX_FILES_PER_REQUEST).
   if (filePaths.length > MAX_FILES_PER_REQUEST) {

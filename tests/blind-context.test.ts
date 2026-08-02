@@ -1,8 +1,11 @@
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
+  BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+  type BlindContextOperatorSignal,
+  describeBlindContextAvailability,
   expandBlindContext,
   MAX_FILES_PER_REQUEST,
   type BlindContextConfig,
@@ -48,6 +51,296 @@ describe("expandBlindContext — disabled-by-default posture", () => {
     const result = expandBlindContext(["/definitely/does/not/exist/anywhere/x.txt"], cfg);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("disabled");
+  });
+
+  it("ignores forged or mismatched pre-resolved roots on the caller config object", () => {
+    const root = makeTmpRoot("bc-forged-");
+    const file = join(root, "a.txt");
+    writeFileSync(file, "hello");
+
+    const forgedEmptyCfg = {
+      roots: [],
+      resolvedRoots: ["/"],
+      ...DEFAULT_CAPS,
+    } as BlindContextConfig & { resolvedRoots: readonly string[] };
+    const forgedEmptyResult = expandBlindContext([file], forgedEmptyCfg);
+    expect(forgedEmptyResult.ok).toBe(false);
+    if (!forgedEmptyResult.ok) expect(forgedEmptyResult.error.code).toBe("disabled");
+
+    const mismatchedCfg = {
+      roots: ["/definitely/does/not/exist/anywhere"],
+      resolvedRoots: [root],
+      ...DEFAULT_CAPS,
+    } as BlindContextConfig & { resolvedRoots: readonly string[] };
+    const mismatchedResult = expandBlindContext([file], mismatchedCfg);
+    expect(mismatchedResult.ok).toBe(false);
+    if (!mismatchedResult.ok) expect(mismatchedResult.error.code).toBe("disabled");
+  });
+});
+
+describe("describeBlindContextAvailability", () => {
+  const base = makeTmpRoot("bc-capability-roots-");
+  const validRoot = join(base, "allowed");
+  const validRootAlias = join(base, "allowed-link");
+  const regularFileRoot = join(base, "not-a-directory.txt");
+  const missingRoot = join(base, "missing");
+  mkdirSync(validRoot);
+  symlinkSync(validRoot, validRootAlias);
+  writeFileSync(regularFileRoot, "not a directory");
+
+  const cases = [
+    {
+      name: "empty roots stay unconfigured",
+      roots: [] as string[],
+      expected: { enabled: false, reason: "unconfigured", resolvedRootCount: 0 },
+    },
+    {
+      name: "missing roots fail closed",
+      roots: [missingRoot],
+      expected: { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 },
+    },
+    {
+      name: "regular files are not treated as roots",
+      roots: [regularFileRoot],
+      expected: { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 },
+    },
+    {
+      name: "real directories enable the feature",
+      roots: [validRoot],
+      expected: { enabled: true, reason: "enabled", resolvedRootCount: 1 },
+    },
+    {
+      name: "canonical duplicate and symlink-alias roots deduplicate",
+      roots: [validRoot, validRoot, validRootAlias],
+      expected: { enabled: true, reason: "enabled", resolvedRootCount: 1 },
+    },
+    {
+      name: "mixed valid and invalid roots keep only the real directory",
+      roots: [regularFileRoot, missingRoot, validRoot, validRootAlias],
+      expected: { enabled: true, reason: "enabled", resolvedRootCount: 1 },
+    },
+  ] as const;
+
+  it.each(cases)("$name", ({ roots, expected }) => {
+    const snapshot = [...roots];
+    expect(describeBlindContextAvailability(roots, { signal: () => {} })).toEqual(expected);
+    expect(roots).toEqual(snapshot);
+  });
+});
+
+describe("describeBlindContextAvailability live discovery", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("re-inspects the filesystem on every call so root removal and re-creation show up immediately", () => {
+    const base = makeTmpRoot("bc-live-");
+    const root = join(base, "allowed");
+    mkdirSync(root);
+    const counts = { realpath: 0, stat: 0 };
+    const fsOps = {
+      realpathSync(path: Parameters<typeof realpathSync>[0]) {
+        counts.realpath += 1;
+        return realpathSync(path);
+      },
+      statSync(path: Parameters<typeof statSync>[0]) {
+        counts.stat += 1;
+        return statSync(path);
+      },
+    };
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 1, stat: 1 });
+
+    rmSync(root, { recursive: true, force: true });
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 });
+    expect(counts).toEqual({ realpath: 2, stat: 1 });
+
+    mkdirSync(root);
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 3, stat: 2 });
+  });
+
+  it("inspects each configured root list independently", () => {
+    const rootA = makeTmpRoot("bc-cache-a-");
+    const rootB = makeTmpRoot("bc-cache-b-");
+    const counts = { realpath: 0, stat: 0 };
+    const fsOps = {
+      realpathSync(path: Parameters<typeof realpathSync>[0]) {
+        counts.realpath += 1;
+        return realpathSync(path);
+      },
+      statSync(path: Parameters<typeof statSync>[0]) {
+        counts.stat += 1;
+        return statSync(path);
+      },
+    };
+
+    expect(describeBlindContextAvailability([rootA], {
+      fsOps,
+      now: () => 20_000,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(describeBlindContextAvailability([rootB], {
+      fsOps,
+      now: () => 20_000,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 2, stat: 2 });
+  });
+
+  it("emits a content-blind operator signal once per stable dropped-root observation and signal window", () => {
+    const base = makeTmpRoot("bc-signal-");
+    const regularFileRoot = join(base, "root-secret.txt");
+    const missingRoot = join(base, "missing-secret-root");
+    writeFileSync(regularFileRoot, "not a directory");
+    let nowMs = 30_000;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    describeBlindContextAvailability([missingRoot, regularFileRoot], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+    });
+    describeBlindContextAvailability([missingRoot, regularFileRoot], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+    });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const firstMessage = warn.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(firstMessage).toContain("configured_root_count");
+    expect(firstMessage).toContain("dropped_root_reasons");
+    expect(firstMessage).not.toContain(missingRoot);
+    expect(firstMessage).not.toContain(regularFileRoot);
+
+    nowMs += BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
+    describeBlindContextAvailability([missingRoot, regularFileRoot], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+    });
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("emits the same dropped-root signal again after a healthy recovery within the TTL", () => {
+    const base = makeTmpRoot("bc-signal-recover-");
+    const root = join(base, "missing-secret-root");
+    let nowMs = 40_000;
+    const signals: BlindContextOperatorSignal[] = [];
+
+    expect(describeBlindContextAvailability([root], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 1,
+        resolved_root_count: 0,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+
+    mkdirSync(root);
+    nowMs += 1;
+
+    expect(describeBlindContextAvailability([root], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(signals).toHaveLength(1);
+
+    rmSync(root, { recursive: true, force: true });
+    nowMs += 1;
+
+    expect(describeBlindContextAvailability([root], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 1,
+        resolved_root_count: 0,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+      {
+        configured_root_count: 1,
+        resolved_root_count: 0,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+    expect(JSON.stringify(signals)).not.toContain(root);
+  });
+
+  it("treats different dropped roots with equal aggregate counts as distinct observations within the TTL", () => {
+    const base = makeTmpRoot("bc-signal-fingerprint-");
+    const rootA = join(base, "root-a-secret");
+    const rootB = join(base, "root-b-secret");
+    mkdirSync(rootA);
+    mkdirSync(rootB);
+    let nowMs = 50_000;
+    const signals: BlindContextOperatorSignal[] = [];
+
+    rmSync(rootA, { recursive: true, force: true });
+    expect(describeBlindContextAvailability([rootA, rootB], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 2,
+        resolved_root_count: 1,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+
+    mkdirSync(rootA);
+    rmSync(rootB, { recursive: true, force: true });
+    nowMs += 1;
+
+    expect(describeBlindContextAvailability([rootA, rootB], {
+      now: () => nowMs,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: (signal) => signals.push(signal),
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(signals).toEqual([
+      {
+        configured_root_count: 2,
+        resolved_root_count: 1,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+      {
+        configured_root_count: 2,
+        resolved_root_count: 1,
+        dropped_root_count: 1,
+        dropped_root_reasons: { not_found: 1 },
+      },
+    ]);
+    expect(JSON.stringify(signals)).not.toContain(rootA);
+    expect(JSON.stringify(signals)).not.toContain(rootB);
   });
 });
 
