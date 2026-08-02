@@ -124,6 +124,12 @@ export interface GatewayTraceHandle {
   finish(result?: { outcome?: string; errorClass?: string; endedAtMs?: number }): void;
 }
 
+export interface TraceSpanHandle {
+  readonly enabled: boolean;
+  run<T>(fn: () => Promise<T>): Promise<T>;
+  finish(result?: { outcome?: string; errorClass?: string; endedAtMs?: number }): void;
+}
+
 interface SyntheticTraceOptions extends TraceDefaults {
   traceparent?: string;
   tracestate?: string;
@@ -147,12 +153,20 @@ interface TracingTestHooks {
   nextTraceId?: () => string;
   nextSpanId?: () => string;
   exporter?: (records: readonly TracingRecord[]) => Promise<void> | void;
+  captureExports?: boolean;
+  maxPendingExports?: number;
 }
 
 const TRACEPARENT_RE = /^([a-f0-9]{2})-([a-f0-9]{32})-([a-f0-9]{16})-([a-f0-9]{2})$/;
+const TRACESTATE_KEY_RE = /^[a-z0-9][a-z0-9_*/-]*(?:@[a-z0-9][a-z0-9_*/-]{0,13})?$/;
+const TRACEPARENT_VERSION = "00";
+const TRACESTATE_MAX_LENGTH = 512;
+const TRACESTATE_MAX_MEMBERS = 32;
+const TRACESTATE_MAX_MEMBER_LENGTH = 256;
+const DEFAULT_MAX_PENDING_EXPORTS = 128;
 const storage = new AsyncLocalStorage<TraceContext>();
 let hooks: TracingTestHooks = {};
-let pendingExports: Promise<void>[] = [];
+let pendingExports = new Set<Promise<void>>();
 let capturedBatches: TracingRecord[][] = [];
 
 function nowMs(): number {
@@ -185,11 +199,50 @@ function safeOutcome(value: string | undefined, fallback = "ok"): string {
   return safeToken(value) ?? fallback;
 }
 
+function isValidTracestateKey(value: string): boolean {
+  return value.length <= TRACESTATE_MAX_MEMBER_LENGTH && TRACESTATE_KEY_RE.test(value);
+}
+
+function isValidTracestateValue(value: string): boolean {
+  if (value === "" || value.length > TRACESTATE_MAX_MEMBER_LENGTH) return false;
+  if (value !== value.trim()) return false;
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (code < 0x20 || code > 0x7e || ch === "," || ch === "=") return false;
+  }
+  return true;
+}
+
+function sanitizeTracestate(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (trimmed === "" || trimmed.length > TRACESTATE_MAX_LENGTH) return undefined;
+  const members = trimmed.split(",");
+  if (members.length > TRACESTATE_MAX_MEMBERS) return undefined;
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const rawMember of members) {
+    const member = rawMember.trim();
+    if (member === "" || member.length > TRACESTATE_MAX_MEMBER_LENGTH) return undefined;
+    const eq = member.indexOf("=");
+    if (eq <= 0 || eq !== member.lastIndexOf("=")) return undefined;
+    const key = member.slice(0, eq);
+    const entryValue = member.slice(eq + 1);
+    if (!isValidTracestateKey(key) || !isValidTracestateValue(entryValue) || seen.has(key)) {
+      return undefined;
+    }
+    seen.add(key);
+    normalized.push(`${key}=${entryValue}`);
+  }
+  return normalized.join(",");
+}
+
 function parseTraceparent(value: string | undefined): TraceParseResult | null {
   if (!value) return null;
   const match = TRACEPARENT_RE.exec(value.trim());
   if (!match) return null;
   const [, version, traceId, parentSpanId, flags] = match;
+  if (version !== TRACEPARENT_VERSION) return null;
   if (/^0+$/.test(traceId) || /^0+$/.test(parentSpanId)) return null;
   return {
     version,
@@ -200,13 +253,13 @@ function parseTraceparent(value: string | undefined): TraceParseResult | null {
 }
 
 function formatTraceparent(traceId: string, spanId: string, sampled: boolean): string {
-  return `00-${traceId}-${spanId}-${sampled ? "01" : "00"}`;
+  return `${TRACEPARENT_VERSION}-${traceId}-${spanId}-${sampled ? "01" : "00"}`;
 }
 
 function shouldTrace(config: HomeserverTracingConfig, headers?: IncomingHttpHeaders | Record<string, string | undefined>): boolean {
   if (config.instrumentation === "on") return true;
   const traceparent = headers ? String(headers["traceparent"] ?? "") : "";
-  return traceparent.trim() !== "";
+  return parseTraceparent(traceparent) !== null;
 }
 
 function shouldSample(config: HomeserverTracingConfig, inbound: TraceParseResult | null): boolean {
@@ -283,7 +336,9 @@ function enqueueRecord(record: TracingRecord): void {
 function exportBatch(session: TraceSession): void {
   if (!session.sampled || session.records.length === 0) return;
   const batch = session.records.slice();
-  capturedBatches.push(batch);
+  if (hooks.captureExports === true) capturedBatches.push(batch);
+  const maxPending = Math.max(0, hooks.maxPendingExports ?? DEFAULT_MAX_PENDING_EXPORTS);
+  if (pendingExports.size >= maxPending) return;
   const exporter = hooks.exporter;
   const url = session.config.exportUrl;
   const work = (async () => {
@@ -307,7 +362,10 @@ function exportBatch(session: TraceSession): void {
   })().catch(() => {
     // Export is deliberately best-effort; failures never perturb request behaviour.
   });
-  pendingExports.push(work);
+  pendingExports.add(work);
+  void work.finally(() => {
+    pendingExports.delete(work);
+  });
 }
 
 function createSession(
@@ -326,7 +384,7 @@ function createSession(
     traceId,
     sampled,
     rootSpanId,
-    tracestate: inbound && headers ? String(headers["tracestate"] ?? "") || undefined : undefined,
+    tracestate: inbound && headers ? sanitizeTracestate(String(headers["tracestate"] ?? "")) : undefined,
     responseTraceparent: formatTraceparent(traceId, rootSpanId, sampled),
     defaults: { ...defaults },
     finished: false,
@@ -341,6 +399,16 @@ function noopHandle(): GatewayTraceHandle {
       return fn();
     },
     setDefaults(): void {},
+    finish(): void {},
+  };
+}
+
+function noopSpanHandle(): TraceSpanHandle {
+  return {
+    enabled: false,
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+      return fn();
+    },
     finish(): void {},
   };
 }
@@ -422,16 +490,15 @@ export function currentTraceHeaders(): Record<string, string> {
   return headers;
 }
 
-export async function withTraceSpan<T>(
+export function beginTraceSpan(
   phase: TracePhase,
   attrs: TraceDefaults,
-  fn: () => Promise<T>,
-  opts: { surface?: "gateway" | "model" } = {},
-): Promise<T> {
+  opts: { surface?: "gateway" | "model"; startedAtMs?: number } = {},
+): TraceSpanHandle {
   const ctx = currentContext();
-  if (!ctx) return fn();
+  if (!ctx) return noopSpanHandle();
   const spanId = nextSpanId();
-  const startedAtMs = nowMs();
+  const startedAtMs = opts.startedAtMs ?? nowMs();
   const child: ActiveSpan = {
     session: ctx.session,
     spanId,
@@ -441,37 +508,46 @@ export async function withTraceSpan<T>(
     startedAtMs,
     attrs: { ...ctx.session.defaults, ...attrs },
   };
-  return storage.run({ session: ctx.session, span: child }, async () => {
+  let finished = false;
+  return {
+    enabled: true,
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+      return storage.run({ session: ctx.session, span: child }, fn);
+    },
+    finish(result = {}): void {
+      if (finished) return;
+      finished = true;
+      ctx.session.records.push(
+        buildSpanRecord(
+          ctx.session,
+          spanId,
+          child.parentSpanId,
+          phase,
+          child.surface,
+          startedAtMs,
+          result.endedAtMs ?? nowMs(),
+          { ...child.attrs, ...(result.errorClass ? { errorClass: result.errorClass } : {}) },
+          result.outcome ?? (result.errorClass ? "error" : "ok"),
+        ),
+      );
+    },
+  };
+}
+
+export async function withTraceSpan<T>(
+  phase: TracePhase,
+  attrs: TraceDefaults,
+  fn: () => Promise<T>,
+  opts: { surface?: "gateway" | "model" } = {},
+): Promise<T> {
+  const span = beginTraceSpan(phase, attrs, opts);
+  return span.run(async () => {
     try {
       const result = await fn();
-      ctx.session.records.push(
-        buildSpanRecord(
-          ctx.session,
-          spanId,
-          child.parentSpanId,
-          phase,
-          child.surface,
-          startedAtMs,
-          nowMs(),
-          child.attrs,
-          child.attrs.errorClass ? "error" : "ok",
-        ),
-      );
+      span.finish();
       return result;
     } catch (err) {
-      ctx.session.records.push(
-        buildSpanRecord(
-          ctx.session,
-          spanId,
-          child.parentSpanId,
-          phase,
-          child.surface,
-          startedAtMs,
-          nowMs(),
-          child.attrs,
-          "error",
-        ),
-      );
+      span.finish({ outcome: "error" });
       throw err;
     }
   });
@@ -559,8 +635,7 @@ export async function runWithSyntheticTraceForTests<T>(
 }
 
 export async function flushTracingForTests(): Promise<readonly TracingRecord[]> {
-  const work = pendingExports.slice();
-  pendingExports = [];
+  const work = Array.from(pendingExports);
   await Promise.all(work);
   const flat = capturedBatches.flat();
   capturedBatches = [];
@@ -573,6 +648,6 @@ export function setTracingTestHooks(next: TracingTestHooks): void {
 
 export function resetTracingTestHooks(): void {
   hooks = {};
-  pendingExports = [];
+  pendingExports = new Set();
   capturedBatches = [];
 }

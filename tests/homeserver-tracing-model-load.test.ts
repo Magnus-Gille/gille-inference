@@ -4,6 +4,7 @@ let loadModel: typeof import("../src/homeserver/llamaswap-admin.js").loadModel;
 let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 let runWithSyntheticTraceForTests: typeof import("../src/homeserver/tracing.js").runWithSyntheticTraceForTests;
 let flushTracingForTests: typeof import("../src/homeserver/tracing.js").flushTracingForTests;
+let setTracingTestHooks: typeof import("../src/homeserver/tracing.js").setTracingTestHooks;
 let resetTracingTestHooks: typeof import("../src/homeserver/tracing.js").resetTracingTestHooks;
 
 beforeEach(async () => {
@@ -13,6 +14,7 @@ beforeEach(async () => {
   resetConfig = cfg.resetConfig;
   runWithSyntheticTraceForTests = tracing.runWithSyntheticTraceForTests;
   flushTracingForTests = tracing.flushTracingForTests;
+  setTracingTestHooks = tracing.setTracingTestHooks;
   resetTracingTestHooks = tracing.resetTracingTestHooks;
   resetConfig();
   resetTracingTestHooks();
@@ -27,6 +29,7 @@ afterEach(() => {
 
 describe("model-load tracing", () => {
   it("emits model-load failure and readiness records without exposing upstream detail", async () => {
+    setTracingTestHooks({ captureExports: true });
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {

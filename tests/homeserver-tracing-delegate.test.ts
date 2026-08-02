@@ -86,6 +86,7 @@ afterEach(() => {
 describe("delegate tracing", () => {
   it("records retry ordinals, verification, and a stable model identity token without leaking prompt/error text", async () => {
     setTracingTestHooks({
+      captureExports: true,
       nextSpanId: vi
         .fn<() => string>()
         .mockReturnValueOnce("b9c7c989f97918e2")

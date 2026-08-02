@@ -52,6 +52,7 @@ afterEach(() => {
 describe("content-blind tracing core", () => {
   it("joins the Hugin fixture, propagates W3C headers, and serializes only allowlisted fields", async () => {
     setTracingTestHooks({
+      captureExports: true,
       now: vi
         .fn<() => number>()
         .mockReturnValueOnce(Date.parse("2026-08-01T12:00:00Z"))
@@ -149,6 +150,7 @@ describe("content-blind tracing core", () => {
 
   it("treats malformed trace context as a safe new trace and never serializes private strings", async () => {
     setTracingTestHooks({
+      captureExports: true,
       now: vi
         .fn<() => number>()
         .mockReturnValueOnce(Date.parse("2026-08-01T13:00:00Z"))
@@ -201,5 +203,109 @@ describe("content-blind tracing core", () => {
     expect(joined).not.toContain("stack");
     expect(joined).not.toContain("message");
     expect(joined).toContain("upstream_timeout");
+  });
+
+  it("captures export batches only when a test hook explicitly requests them", async () => {
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+        taskType: fixture.task_type,
+        lane: fixture.lane,
+        exportEnabled: true,
+      },
+      async () => {},
+      { outcome: "ok" },
+    );
+
+    await expect(flushTracingForTests()).resolves.toEqual([]);
+
+    setTracingTestHooks({ captureExports: true });
+
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+        taskType: fixture.task_type,
+        lane: fixture.lane,
+        exportEnabled: true,
+      },
+      async () => {},
+      { outcome: "ok" },
+    );
+
+    await expect(flushTracingForTests()).resolves.not.toEqual([]);
+  });
+
+  it("bounds long-running stuck exports and drops excess batches once the in-flight cap is reached", async () => {
+    const exporter = vi.fn(() => new Promise<void>(() => {}));
+    setTracingTestHooks({ exporter, maxPendingExports: 4 });
+
+    for (let i = 0; i < 12; i += 1) {
+      await runWithSyntheticTraceForTests(
+        {
+          traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+          taskType: fixture.task_type,
+          lane: fixture.lane,
+          exportEnabled: true,
+        },
+        async () => {},
+        { outcome: "ok" },
+      );
+    }
+
+    expect(exporter).toHaveBeenCalledTimes(4);
+  });
+
+  it("frees an export slot after settled work so later batches can still ship", async () => {
+    let releaseFirst: (() => void) | null = null;
+    const exporter = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+          }),
+      )
+      .mockResolvedValue(undefined);
+    setTracingTestHooks({ exporter, maxPendingExports: 1 });
+
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+        taskType: fixture.task_type,
+        lane: fixture.lane,
+        exportEnabled: true,
+      },
+      async () => {},
+      { outcome: "ok" },
+    );
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+        taskType: fixture.task_type,
+        lane: fixture.lane,
+        exportEnabled: true,
+      },
+      async () => {},
+      { outcome: "ok" },
+    );
+
+    expect(exporter).toHaveBeenCalledTimes(1);
+
+    releaseFirst?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: `${fixture.version}-${fixture.trace_id}-${fixture.gateway_parent_span_id}-${fixture.flags}`,
+        taskType: fixture.task_type,
+        lane: fixture.lane,
+        exportEnabled: true,
+      },
+      async () => {},
+      { outcome: "ok" },
+    );
+
+    expect(exporter).toHaveBeenCalledTimes(2);
   });
 });
