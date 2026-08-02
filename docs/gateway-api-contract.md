@@ -60,7 +60,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 401 | `invalid_api_key` | Missing/unknown Bearer key |
 | 403 | `route_not_allowed` (guest → `/delegate`; non-admin scope → `/admin/*` or `/ledger`), `model_not_allowed` (a key's model allow-list on chat) | Scope/tier/route or model not permitted |
 | 404 | `not_found` | Unknown route / no such resource |
-| 409 | `learning_task_conflict`, `reviewer_usefulness_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity; OR a reviewer-usefulness write failed closed because the row is the wrong task type, lacks a verifier, or is already recorded differently |
+| 409 | `learning_task_conflict`, `reviewer_usefulness_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity; OR a reviewer-usefulness write failed closed because the row is the wrong task type, shadow/current-ineligible, lacks a verifier, or is already recorded differently |
 | 413 | `payload_too_large` | Request body exceeds the size cap |
 | 429 | quota codes | RPM/TPM/daily budget exceeded |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
@@ -467,7 +467,7 @@ preserves the original timestamp. A different write against the same row returns
 }
 ```
 
-`kind` is one of `wrong_task_type`, `missing_verifier`, or `already_recorded`. Unknown `ledgerId`
+`kind` is one of `wrong_task_type`, `shadow`, `superseded`, `missing_verifier`, or `already_recorded`. Unknown `ledgerId`
 lookups return a bare `404 not_found` without reflecting the requested id. The actual atomic
 boundary is the ledger row mutation itself: `recordReviewerUsefulness()` runs the
 read/validate/conditional-update sequence inside one SQLite immediate transaction, so a race cannot
@@ -476,8 +476,8 @@ partially overwrite or double-record the reviewer-usefulness columns. The conten
 
 **Errors:** unknown `id` → `404 not_found`; guest / monitor / owner-agent / static admin /
 implicit-admin → `403 route_not_allowed`; bad content type, JSON, enum, notes, or extra field →
-`400 invalid_request_error`; oversized body → `413 payload_too_large`; wrong task type, missing
-verifier, or differing overwrite → `409 reviewer_usefulness_conflict`.
+`400 invalid_request_error`; oversized body → `413 payload_too_large`; wrong task type, shadow,
+superseded, missing verifier, or differing overwrite → `409 reviewer_usefulness_conflict`.
 
 ### POST `/v1/chat/completions`
 

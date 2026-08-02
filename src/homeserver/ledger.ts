@@ -709,6 +709,7 @@ function reviewerUsefulnessVisibleRecord(row: ReviewerUsefulnessRow): {
   if (usefulness === null || judgedBy === "" || row.reviewerUsefulnessTs === null) return null;
   if (row.taskType !== REVIEW_BOUNDED_TASK_TYPE) return null;
   if (row.shadow === 1) return null;
+  if (row.supersededAt !== null) return null;
   if (!isQualityBearingVerifier(row.verifier)) return null;
   return {
     usefulness,

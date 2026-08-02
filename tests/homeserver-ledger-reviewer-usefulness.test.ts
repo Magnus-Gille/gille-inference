@@ -362,6 +362,44 @@ describe("recordReviewerUsefulness (#74)", () => {
     });
   });
 
+  it("hides previously recorded reviewer usefulness once the row is superseded", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    expect(recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "pass",
+      notes: "ref:gille-inference#112 check:manual",
+      judgedBy: "grimnir-session-2026-07-24",
+    })).toMatchObject({
+      kind: "recorded",
+      record: {
+        reviewerUsefulness: "pass",
+        notesPresent: true,
+      },
+    });
+
+    initDb(dbPath).prepare(`
+      UPDATE delegations
+         SET superseded_at = '2026-08-01T10:00:00.000Z'
+       WHERE id = ?
+    `).run(id);
+
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: "ref:gille-inference#112 check:manual".length,
+    });
+  });
+
   it("does not treat legacy partially populated reviewer-usefulness columns as a current recorded verdict", () => {
     const id = recordDelegation({
       taskType: "review-bounded",

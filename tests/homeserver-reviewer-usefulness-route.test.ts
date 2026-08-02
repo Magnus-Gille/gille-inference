@@ -602,4 +602,57 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     });
     expect(monitor.text).not.toContain(NOTES);
   });
+
+  it("hides stale recorded reviewer-usefulness state on GET /ledger/:id after the row is superseded", async () => {
+    const ledgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" })
+    );
+    const write = await putReviewerUsefulness(ledgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(write.status).toBe(201);
+
+    getDb().prepare(`
+      UPDATE delegations
+         SET superseded_at = '2026-08-01T10:00:00.000Z'
+       WHERE id = ?
+    `).run(ledgerId);
+
+    const admin = await harness.invoke({
+      method: "GET",
+      path: `/ledger/${ledgerId}`,
+      token: adminKey,
+    });
+    expect(admin.status).toBe(200);
+    expect(admin.json as Record<string, unknown>).toMatchObject({
+      id: ledgerId,
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: NOTES.length,
+    });
+    expect(admin.text).not.toContain(NOTES);
+
+    const monitor = await harness.invoke({
+      method: "GET",
+      path: `/ledger/${ledgerId}`,
+      token: ownerMonitorKey,
+    });
+    expect(monitor.status).toBe(200);
+    expect(monitor.json as Record<string, unknown>).toMatchObject({
+      id: ledgerId,
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: NOTES.length,
+    });
+    expect(monitor.text).not.toContain(NOTES);
+  });
 });
