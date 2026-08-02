@@ -383,6 +383,66 @@ describe("recordReviewerUsefulness (#74)", () => {
     });
   });
 
+  it.each([
+    ["none+NONE(ungraded)", "conflict"],
+    ["nonEmpty+jsonValid", "conflict"],
+    ["nonEmpty+predicate", "recorded"],
+  ] as const)("applies the shared quality predicate to combined verifier %s", (verifier, expectedKind) => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 combined verifier",
+      outcome: "pass",
+      verifier,
+    });
+
+    const result = recordReviewerUsefulness({
+      ledgerId: id,
+      usefulness: "pass",
+      judgedBy: "grimnir-session-2026-07-24",
+    });
+    expect(result.kind).toBe(expectedKind);
+    if (expectedKind === "conflict") {
+      expect(result).toMatchObject({ conflict: { kind: "missing_verifier" } });
+      expect(getDelegationById(id)?.reviewerUsefulness).toBeNull();
+    } else {
+      expect(getDelegationById(id)?.reviewerUsefulness).toBe("pass");
+    }
+  });
+
+  it.each(["none+NONE(ungraded)", "nonEmpty+jsonValid"] as const)(
+    "hides pre-existing usefulness for ineligible combined verifier %s",
+    (verifier) => {
+      const id = recordDelegation({
+        taskType: "review-bounded",
+        modelId: "qwen3-coder-next-80b",
+        prompt: "gille review-bounded contract v1 hidden combined verifier",
+        outcome: "pass",
+        verifier,
+      });
+      const db = initDb(dbPath);
+      const notes = "ref:gille-inference#112 hidden:combined-verifier";
+      db.prepare(`
+        UPDATE delegations
+           SET reviewer_usefulness = 'wrong',
+               reviewer_usefulness_notes = @notes,
+               reviewer_usefulness_by = 'grimnir-session-2026-07-24-hidden-combined',
+               reviewer_usefulness_ts = '2026-08-01T10:00:00.000Z'
+         WHERE id = @id
+      `).run({ id, notes });
+
+      expect(getDelegationById(id)).toMatchObject({
+        reviewerUsefulness: null,
+        reviewerUsefulnessNotes: null,
+        reviewerUsefulnessBy: null,
+        reviewerUsefulnessTs: null,
+        reviewerUsefulnessHidden: true,
+        reviewerUsefulnessNotesPresent: true,
+        reviewerUsefulnessNoteChars: notes.length,
+      });
+    },
+  );
+
   it("rejects imported free-text sentinel and structural verifier variants", () => {
     const noneImported = {
       ts: "2026-07-30T09:00:00.000Z",

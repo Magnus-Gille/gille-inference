@@ -579,6 +579,30 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     });
   });
 
+  it.each([
+    ["none+NONE(ungraded)", 409],
+    ["nonEmpty+jsonValid", 409],
+    ["nonEmpty+predicate", 201],
+  ] as const)("applies combined verifier eligibility for %s", async (verifier, expectedStatus) => {
+    const ledgerId = makeReviewBoundedRowWithVerifier(verifier);
+    const res = await putReviewerUsefulness(ledgerId, {
+      usefulness: "pass",
+      notes: NOTES,
+    }, adminKey);
+    expect(res.status).toBe(expectedStatus);
+    if (expectedStatus === 409) {
+      expect(res.json as ReviewerUsefulnessConflictResponse).toMatchObject({
+        conflict: { kind: "missing_verifier" },
+      });
+    } else {
+      expect(res.json as ReviewerUsefulnessWriteResponse).toMatchObject({
+        ledgerId,
+        reviewerUsefulness: "pass",
+        writeState: "recorded",
+      });
+    }
+  });
+
   it("stays minted-owner-admin only: unauthenticated, guest, monitor, owner-monitor, and owner-agent callers cannot write", async () => {
     const ledgerId = makeReviewBoundedRow();
 
@@ -720,5 +744,39 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
       reviewerUsefulnessNoteChars: NOTES.length,
     });
     expect(monitor.text).not.toContain(NOTES);
+  });
+
+  it.each([
+    ["none+NONE(ungraded)", false],
+    ["nonEmpty+jsonValid", false],
+    ["nonEmpty+predicate", true],
+  ] as const)("applies combined verifier visibility for %s", async (verifier, visible) => {
+    const ledgerId = makeReviewBoundedRowWithVerifier(verifier);
+    getDb().prepare(`
+      UPDATE delegations
+         SET reviewer_usefulness = 'pass',
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = 'reviewer-admin-combined',
+             reviewer_usefulness_ts = '2026-08-01T10:00:00.000Z'
+       WHERE id = @id
+    `).run({ id: ledgerId, notes: NOTES });
+
+    const read = await harness.invoke({
+      method: "GET",
+      path: `/ledger/${ledgerId}`,
+      token: adminKey,
+    });
+    expect(read.status).toBe(200);
+    expect(read.json as Record<string, unknown>).toMatchObject({
+      id: ledgerId,
+      reviewerUsefulness: visible ? "pass" : null,
+      reviewerUsefulnessNotes: visible ? NOTES : null,
+      reviewerUsefulnessBy: visible ? "reviewer-admin-combined" : null,
+      reviewerUsefulnessTs: visible ? "2026-08-01T10:00:00.000Z" : null,
+      reviewerUsefulnessHidden: !visible,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: NOTES.length,
+    });
+    if (!visible) expect(read.text).not.toContain(NOTES);
   });
 });

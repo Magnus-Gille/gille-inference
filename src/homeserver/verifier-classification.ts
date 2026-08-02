@@ -56,6 +56,41 @@ export function verifierBaseName(name: string): string {
   return (paren >= 0 ? name.slice(0, paren) : name).trim();
 }
 
+/**
+ * Return canonical verifier bases from a possibly `+`-combined label. A plus is a component
+ * separator only at parenthesis depth zero, so parameter payloads such as `exact(a+b)` remain one
+ * verifier. Empty components and ungraded sentinels are discarded here so every classifier shares
+ * the same definition of a real verifier component.
+ */
+export function parseVerifierComponents(name: string | null | undefined): string[] {
+  if (name == null) return [];
+
+  const components: string[] = [];
+  let componentStart = 0;
+  let parenthesisDepth = 0;
+
+  const appendComponent = (end: number): void => {
+    const base = canonicalVerifierBase(name.slice(componentStart, end));
+    if (base.length > 0 && !UNGRADED_VERIFIER_SENTINEL_KEYS.has(base)) {
+      components.push(base);
+    }
+  };
+
+  for (let index = 0; index < name.length; index += 1) {
+    const char = name[index];
+    if (char === "(") {
+      parenthesisDepth += 1;
+    } else if (char === ")") {
+      if (parenthesisDepth > 0) parenthesisDepth -= 1;
+    } else if (char === "+" && parenthesisDepth === 0) {
+      appendComponent(index);
+      componentStart = index + 1;
+    }
+  }
+  appendComponent(name.length);
+  return components;
+}
+
 /** True iff `name` is a known structural (shape/presence-only) verifier. Null/empty → false. */
 export function isStructuralVerifier(name: string | null | undefined): boolean {
   if (name == null) return false;
@@ -64,18 +99,15 @@ export function isStructuralVerifier(name: string | null | undefined): boolean {
 }
 
 /**
- * True iff a row graded by `name` is admissible as evidence of ANSWER QUALITY: a NAMED, NON-
- * structural verifier. A structural verifier (shape/presence only), an ungraded row (null / empty
- * verifier), or the orchestrator's `"none"` ungraded sentinel is NOT quality-bearing — for a
- * judgment-quality task type it must not count toward the verdict in EITHER direction. Any other
- * named verifier is treated as quality-bearing (the conservative default above).
+ * True iff a row graded by `name` is admissible as evidence of ANSWER QUALITY: at least one named,
+ * non-structural component remains after parsing a combined label. A structural verifier
+ * (shape/presence only), an ungraded row (null / empty verifier), or the orchestrator's `"none"`
+ * ungraded sentinel is NOT quality-bearing — for a judgment-quality task type it must not count
+ * toward the verdict in EITHER direction. Any other named verifier is treated as quality-bearing
+ * (the conservative default above).
  */
 export function isQualityBearingVerifier(name: string | null | undefined): boolean {
-  if (name == null) return false;
-  const base = canonicalVerifierBase(name);
-  if (base.length === 0) return false;
-  if (UNGRADED_VERIFIER_SENTINEL_KEYS.has(base)) return false; // ungraded sentinel — no verifier ran
-  return !STRUCTURAL_VERIFIER_KEYS.has(base);
+  return parseVerifierComponents(name).some((base) => !STRUCTURAL_VERIFIER_KEYS.has(base));
 }
 
 /**
@@ -165,12 +197,7 @@ function classifyVerifierComponentKind(base: string): "mechanical-format" | "tru
 
 /** Classify a (possibly `+`-combined) verifier name into a {@link VerifierKind}. */
 export function classifyVerifierKind(name: string | null | undefined): VerifierKind {
-  const trimmed = name?.trim();
-  if (!trimmed) return "ungraded";
-  const components = trimmed
-    .split("+")
-    .map((part) => canonicalVerifierBase(part.trim()))
-    .filter((base) => base.length > 0 && !UNGRADED_VERIFIER_SENTINEL_KEYS.has(base));
+  const components = parseVerifierComponents(name);
   if (components.length === 0) return "ungraded";
   return components.some((base) => classifyVerifierComponentKind(base) === "truth-oriented")
     ? "truth-oriented"

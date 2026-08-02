@@ -81,6 +81,24 @@ describe("isQualityBearingVerifier", () => {
     // orchestrator.ts writes verifier:"custom" when an unnamed but REAL verifier fn graded the row.
     expect(isQualityBearingVerifier("custom")).toBe(true);
   });
+
+  it.each([
+    ["none+NONE(ungraded)", false],
+    ["nonEmpty+jsonValid", false],
+    ["nonEmpty+predicate", true],
+    ["none+exact", true],
+    [" NONE + JSONVALID ", false],
+    [" NONE + NonEmpty + Predicate ", true],
+  ] as const)("evaluates combined verifier quality from real components: %s", (verifier, expected) => {
+    expect(isQualityBearingVerifier(verifier)).toBe(expected);
+  });
+
+  it("does not split plus signs inside parameter payloads", () => {
+    expect(isQualityBearingVerifier("maxLength(10+20)")).toBe(false);
+    expect(classifyVerifierKind("maxLength(10+20)")).toBe("mechanical-format");
+    expect(isQualityBearingVerifier("futureCheck(a+b)")).toBe(true);
+    expect(classifyVerifierKind("futureCheck(a+b)")).toBe("truth-oriented");
+  });
 });
 
 // #168: the WHITELIST counterpart — admissible for a judgment-quality type IFF positively trusted.
@@ -177,5 +195,12 @@ describe("classifyVerifierKind", () => {
     // mechanical-format component — a real judgment ran as part of the pass.
     expect(classifyVerifierKind("maxLength+predicate")).toBe("truth-oriented");
     expect(classifyVerifierKind("nonEmpty+predicate")).toBe("truth-oriented");
+  });
+
+  it("removes ungraded components before classifying a combined name", () => {
+    expect(classifyVerifierKind("none+NONE(ungraded)")).toBe("ungraded");
+    expect(classifyVerifierKind("nonEmpty+jsonValid")).toBe("mechanical-format");
+    expect(classifyVerifierKind("nonEmpty+predicate")).toBe("truth-oriented");
+    expect(classifyVerifierKind("none+exact")).toBe("mechanical-format");
   });
 });
