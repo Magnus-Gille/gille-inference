@@ -3,7 +3,7 @@ import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import { listModels, loadModel, unloadModel, downloadModel } from "./model-admin.js";
-import { delegate, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
+import { delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
@@ -47,8 +47,8 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import { recordRequestLog, cachedRequestLogTotals } from "./request-log.js";
-import { canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
-import { isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
+import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
+import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
@@ -1037,9 +1037,9 @@ async function admitAndMeterLogged(
  * (M3 — so the Prometheus token + credit counters actually increment for real traffic) and the
  * credits charged for this request (the reconciled real usage, or 0 for an errored call).
  *
- * canonicalModel is the model string SAFE to use as a metrics/log label (C3): it is null when no
- * recognised model was served, so the record site maps it to "unknown" rather than leaking the
- * raw, user-controlled `model` field into Prometheus labels / the access log.
+ * canonicalModel is a model string SAFE to use as a metrics/log label (C3). A null value means the
+ * handler has no safer served-model override, so the spine preserves the route's already-
+ * canonicalized label rather than leaking the raw, user-controlled `model` field.
  */
 export interface MeteredResult {
   totalTokens: number;
@@ -2252,15 +2252,18 @@ async function handleDelegate(
     ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
     : undefined;
   lctx.node = result.nodeId;
-  lctx.model = result.modelId;
+  // C3/#179: the orchestrator bound one server-computed safe identity to this exact result before
+  // emitting delegate_decision. Reuse it verbatim so cache/config changes cannot make the gateway
+  // disagree, while response, routing, ledger, and accounting retain result.modelId unchanged.
+  lctx.model = getDelegateTelemetryModel(result);
   const m = result.metrics;
   if (m) {
     return {
       totalTokens: m.promptTokens + m.completionTokens,
       promptTokens: m.promptTokens,
       completionTokens: m.completionTokens,
-      // /delegate lets the orchestrator pick ANY model; that id is not a user-controlled label
-      // but it is also not allow-list-canonicalized here, so keep it out of metrics → null.
+      // lctx.model now carries the catalogue/config-canonicalized served identity. Returning null
+      // tells the metering spine to preserve that safe label rather than overwrite it.
       canonicalModel: null,
       ttftMs: null,
       afterRelease,
@@ -4458,6 +4461,13 @@ export async function handleRequest(
         sendError(res, makeError("invalid_request_error", { param: parsed.param, message: parsed.message }));
         return;
       }
+      // C3/#179: carry the caller's model override into request telemetry only after validation
+      // against server-owned identity. Principal allow-lists remain admission policy and cannot
+      // establish telemetry trust. The raw value continues unchanged through routing/response.
+      lctx.model = canonicalizeModelFromTrustedCatalogue(
+        parsed.params.modelId ?? null,
+        configuredDelegateModelIds(cfg),
+      );
       setTraceDefaults({
         taskType: "delegation",
         lane: "default",
@@ -4555,7 +4565,7 @@ export async function handleRequest(
           principal.tier === "owner" && principal.keyHash !== null,
           cfg,
           controller,
-          lctx
+          lctx,
         )
       );
       return;

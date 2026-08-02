@@ -7,11 +7,12 @@ import { getLoaded, getRunningCmd } from "./model-admin.js";
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
-import { orinAllowsTask, runOrinInference, type ComputeNodeId } from "./nodes.js";
+import { configuredDelegateModelIds, orinAllowsTask, runOrinInference, type ComputeNodeId } from "./nodes.js";
 import type { LocalInferenceResult } from "../runner/local-client.js";
 import { runInference, type ResponseFormat } from "../runner/openrouter-client.js";
 import { randomUUID } from "node:crypto";
 import { defaultLogger } from "./access-log.js";
+import { canonicalizeModelFromTrustedCatalogue } from "./catalogue.js";
 import {
   buildDelegationCostTrace,
   tryRecordDelegationCost,
@@ -185,6 +186,52 @@ export interface DelegationOutcome {
   costTrace?: DelegationCostTrace;
   /** Content-blind production delegation gate result, present when HOMESERVER_DELEGATE_POLICY != off. */
   delegatePolicy?: DelegatePolicyDecision;
+}
+
+// The safe telemetry identity is server-computed and intentionally kept outside the serializable
+// outcome. Callers cannot populate it, and spreading the outcome into an API response cannot expose
+// this internal binding.
+const delegateTelemetryModels = new WeakMap<DelegationOutcome, string | null>();
+
+function bindDelegateTelemetryModel(
+  task: DelegationTask,
+  outcome: DelegationOutcome,
+  cfg: HomeserverConfig,
+): string | null {
+  let safeModel: string | null = "unknown";
+  try {
+    // Orin substitutes its configured model into every outcome, including pre-inference policy
+    // rejections. Only trust that identity after the existing exact-model/task gates passed and
+    // the server-owned outcome confirms the Orin inference path was actually entered. Caller task
+    // fields can therefore only force this projection closed; they never establish model trust.
+    if (
+      outcome.nodeId === "orin" &&
+      (
+        !outcome.delegated ||
+        task.nodeId !== "orin" ||
+        task.modelId !== cfg.orin.model ||
+        !orinAllowsTask(outcome.taskType, cfg)
+      )
+    ) {
+      delegateTelemetryModels.set(outcome, safeModel);
+      return safeModel;
+    }
+    safeModel = canonicalizeModelFromTrustedCatalogue(
+      outcome.modelId,
+      configuredDelegateModelIds(cfg),
+    );
+  } catch {
+    // Telemetry must never mask a completed delegation or fall back to caller-controlled identity.
+  }
+  delegateTelemetryModels.set(outcome, safeModel);
+  return safeModel;
+}
+
+/** Read the server-bound safe identity for gateway telemetry; unbound outcomes fail closed. */
+export function getDelegateTelemetryModel(outcome: DelegationOutcome): string | null {
+  return delegateTelemetryModels.has(outcome)
+    ? delegateTelemetryModels.get(outcome)!
+    : "unknown";
 }
 
 const TIMEOUT_SENTINEL = "__hs_timeout__";
@@ -654,7 +701,9 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
 
   try {
     setTraceDefaults({ taskType: "delegation", lane: "default", retryOrdinal: 0 });
-    finalOutcome = await delegateImpl(task);
+    const cfg = loadConfig();
+    finalOutcome = await delegateImpl(task, cfg);
+    bindDelegateTelemetryModel(task, finalOutcome, cfg);
     return finalOutcome;
   } finally {
     activeDelegations--;
@@ -666,7 +715,9 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
     defaultLogger.log({
       event: "delegate_decision",
       requestId,
-      model: fo?.modelId ?? null,
+      // C3/#179: the outcome retains the exact model id for routing, ledger, accounting, and
+      // response behavior; only this metadata projection is catalogue-canonicalized.
+      model: fo === undefined ? null : getDelegateTelemetryModel(fo),
       taskType: fo?.taskType ?? null,
       decision,
       outcome: summaryOutcome,
@@ -688,8 +739,10 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
 /**
  * Internal implementation — called by delegate() which wraps it with access logging.
  */
-async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
-  const cfg = loadConfig();
+async function delegateImpl(
+  task: DelegationTask,
+  cfg: HomeserverConfig,
+): Promise<DelegationOutcome> {
   // Preserve an explicit caller-supplied taskType verbatim; classify only when absent/blank (#155).
   const taskType = resolveTaskType(task);
   const nodeId = task.nodeId ?? "m5";

@@ -20,6 +20,11 @@ export function orinEnabled(cfg: HomeserverConfig = loadConfig()): boolean {
   return cfg.orin.url !== "";
 }
 
+/** Finite server-owned model identities available to delegate telemetry beyond the M5 catalogue. */
+export function configuredDelegateModelIds(cfg: HomeserverConfig = loadConfig()): readonly string[] {
+  return orinEnabled(cfg) ? [cfg.orin.model] : [];
+}
+
 export function orinAllowsTask(taskType: string, cfg: HomeserverConfig = loadConfig()): boolean {
   const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
   return (

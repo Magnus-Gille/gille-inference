@@ -29,23 +29,29 @@ const CATALOGUE_TTL_MS = 10_000;
 let cache: Set<string> = new Set();
 let cacheAt = 0;
 let refreshing = false;
+let cacheGeneration = 0;
 
 /** Kick a background refresh if the cache is stale and one is not already in flight. Never awaits. */
 function maybeRefresh(): void {
   const now = Date.now();
   if (refreshing || now - cacheAt < CATALOGUE_TTL_MS) return;
+  const refreshGeneration = cacheGeneration;
   refreshing = true;
   void (async () => {
     try {
       const models = await listModels();
+      if (cacheGeneration !== refreshGeneration) return;
       cache = new Set(models.map((m) => m.key));
       cacheAt = Date.now();
     } catch {
+      if (cacheGeneration !== refreshGeneration) return;
       // Backend unreachable: keep the previous cache (don't wipe a good set on a transient blip).
       // Bump cacheAt so we don't hammer a down backend every request.
       cacheAt = Date.now();
     } finally {
-      refreshing = false;
+      // A reset may already have started a new-generation refresh; an obsolete completion must
+      // neither repopulate its cache nor clear the newer refresh's in-flight guard.
+      if (cacheGeneration === refreshGeneration) refreshing = false;
     }
   })();
 }
@@ -55,13 +61,16 @@ function maybeRefresh(): void {
  * first request, and by tests. Resolves to the (possibly empty) resident set; never throws.
  */
 export async function warmCatalogue(): Promise<Set<string>> {
+  const refreshGeneration = cacheGeneration;
   try {
     const models = await listModels();
-    cache = new Set(models.map((m) => m.key));
+    if (cacheGeneration === refreshGeneration) {
+      cache = new Set(models.map((m) => m.key));
+    }
   } catch {
     // Leave the prior cache in place.
   }
-  cacheAt = Date.now();
+  if (cacheGeneration === refreshGeneration) cacheAt = Date.now();
   return cache;
 }
 
@@ -69,6 +78,26 @@ export async function warmCatalogue(): Promise<Set<string>> {
 export function getTrustedCatalogue(): Set<string> {
   maybeRefresh();
   return cache;
+}
+
+/**
+ * Canonicalize telemetry that must trust only server-owned model identity.
+ *
+ * `configuredModelIds` is reserved for a finite set read from server configuration (currently the
+ * enabled Orin model). Caller/principal allow-lists must never be passed here: they are admission
+ * policy, not evidence that a label is safe or current. The resident cache remains synchronous and
+ * fail-closed, so a cold or unavailable catalogue yields the single bounded "unknown" sentinel.
+ */
+export function canonicalizeModelFromTrustedCatalogue(
+  requested: string | null,
+  configuredModelIds: readonly string[] = [],
+): string | null {
+  if (requested === null) return null;
+  if (requested.trim() === "") return "unknown";
+
+  return getTrustedCatalogue().has(requested) || configuredModelIds.includes(requested)
+    ? requested
+    : "unknown";
 }
 
 /**
@@ -92,11 +121,12 @@ export function canonicalizeModelTrusted(requested: string | null, allowList: st
   }
 
   // Empty allow-list (owner/admin): validate against the current cache (sync), refresh in bg.
-  return getTrustedCatalogue().has(requested) ? requested : "unknown";
+  return canonicalizeModelFromTrustedCatalogue(requested);
 }
 
 /** Reset the cache. FOR TESTS ONLY. */
 export function resetCatalogueCache(): void {
+  cacheGeneration++;
   cache = new Set();
   cacheAt = 0;
   refreshing = false;
