@@ -80,19 +80,13 @@ describe("canonicalizeModelTrusted — empty allow-list (owner/admin)", () => {
     expect(result).not.toBe(secret);
   });
 
-  it("a null / empty model → null (non-inference route, mapped to 'none' downstream)", async () => {
+  it("keeps non-delegate null / empty behavior unchanged", async () => {
     listModelsMock.mockResolvedValue([{ key: "qwen3-coder-80b" }]);
     await warmCatalogue();
     expect(canonicalizeModelTrusted(null, [])).toBeNull();
     expect(canonicalizeModelTrusted("   ", [])).toBeNull();
   });
 
-  it("a cold cache (no warm yet) yields 'unknown' and never the raw string — content-blind", () => {
-    // No warmCatalogue() call: the cache is empty. canonicalizeModelTrusted must NOT block and
-    // must NOT echo the raw string — it returns "unknown" and kicks a background refresh.
-    const result = canonicalizeModelTrusted("some-real-model", []);
-    expect(result).toBe("unknown");
-  });
 });
 
 describe("canonicalizeModelTrusted — non-empty allow-list (scoped key)", () => {
@@ -113,6 +107,26 @@ describe("canonicalizeModelTrusted — non-empty allow-list (scoped key)", () =>
 });
 
 describe("canonicalizeModelFromTrustedCatalogue — delegate telemetry", () => {
+  it("maps present-but-blank caller values to the bounded sentinel, never null", () => {
+    expect(canonicalizeModelFromTrustedCatalogue(null)).toBeNull();
+    expect(canonicalizeModelFromTrustedCatalogue("")).toBe("unknown");
+    expect(canonicalizeModelFromTrustedCatalogue("   ")).toBe("unknown");
+  });
+
+  it("fails closed for a known resident id until a controlled warm completes", async () => {
+    const knownResident = "m1";
+    const secret = "sk-cold-catalogue-secret";
+    listModelsMock.mockResolvedValue([{ key: knownResident }]);
+
+    // Both synchronous reads happen before the mocked background promise can settle.
+    expect(canonicalizeModelFromTrustedCatalogue(knownResident)).toBe("unknown");
+    expect(canonicalizeModelFromTrustedCatalogue(secret)).toBe("unknown");
+
+    await warmCatalogue();
+    expect(canonicalizeModelFromTrustedCatalogue(knownResident)).toBe(knownResident);
+    expect(canonicalizeModelFromTrustedCatalogue(secret)).toBe("unknown");
+  });
+
   it("ignores principal trust and keeps a resident served model excluded by that list", async () => {
     const principalAllowList = ["stale-caller-controlled-model"];
     listModelsMock.mockResolvedValue([{ key: "m1" }]);
@@ -129,5 +143,25 @@ describe("canonicalizeModelFromTrustedCatalogue — delegate telemetry", () => {
       configuredOrinModel,
     );
     expect(canonicalizeModelFromTrustedCatalogue("caller-model", [configuredOrinModel])).toBe("unknown");
+  });
+
+  it("reset invalidates an in-flight background refresh before it can repopulate stale state", async () => {
+    let resolveRefresh!: (models: Array<{ key: string }>) => void;
+    const pendingRefresh = new Promise<Array<{ key: string }>>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    listModelsMock.mockReturnValueOnce(pendingRefresh);
+
+    expect(canonicalizeModelFromTrustedCatalogue("late-model")).toBe("unknown");
+    expect(listModelsMock).toHaveBeenCalledTimes(1);
+    resetCatalogueCache();
+
+    resolveRefresh([{ key: "late-model" }]);
+    await pendingRefresh;
+    await Promise.resolve();
+
+    // A synchronous read may start a fresh refresh, but it must see the reset cache immediately.
+    listModelsMock.mockReturnValueOnce(new Promise(() => {}));
+    expect(getTrustedCatalogue().has("late-model")).toBe(false);
   });
 });

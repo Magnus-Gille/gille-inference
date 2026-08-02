@@ -19,8 +19,9 @@ import { getDb, initDb } from "../src/db.js";
 import {
   createAccessLogger,
   setDefaultLogger,
-  defaultLogger as originalDefaultLogger,
+  defaultLogger,
   type AccessLogRecord,
+  type AccessLogger,
 } from "../src/homeserver/access-log.js";
 import { renderMetrics, resetMetrics } from "../src/homeserver/metrics.js";
 
@@ -30,6 +31,7 @@ let captured: string[] = [];
 let upstream: Server;
 let upstreamPort = 0;
 let upstreamModelRequests: string[] = [];
+let originalDefaultLogger: AccessLogger;
 
 const MUTATED_ENV_KEYS = [
   "LMSTUDIO_BASE_URL",
@@ -67,10 +69,22 @@ function startUpstream(): Promise<void> {
       }));
       return;
     }
+    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unexpected mock route" }));
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown };
+      let body: { model?: unknown };
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown };
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid mock request JSON" }));
+        return;
+      }
       if (typeof body.model === "string") upstreamModelRequests.push(body.model);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -100,6 +114,8 @@ let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
 beforeAll(async () => {
+  // Capture the object value before startGateway or any test replaces the live ESM binding.
+  originalDefaultLogger = defaultLogger;
   originalEnv = new Map(MUTATED_ENV_KEYS.map((key) => [key, process.env[key]]));
 
   // Isolate DB
@@ -142,6 +158,8 @@ afterAll(async () => {
   } finally {
     // Restore every process-global value this suite mutates, including absent values.
     setDefaultLogger(originalDefaultLogger);
+    resetMetrics();
+    resetCatalogueCache();
     restoreEnvironment();
     resetConfig();
   }
@@ -155,12 +173,17 @@ beforeEach(() => {
 afterEach(() => {
   // Restore the original logger after each test so other test files aren't affected
   setDefaultLogger(originalDefaultLogger);
+  resetMetrics();
+  resetCatalogueCache();
   captured = [];
 });
 
-function installCapturingLogger(): void {
+function installCapturingLogger(onRecord?: (record: AccessLogRecord) => void): void {
   captured = [];
-  setDefaultLogger(createAccessLogger((line) => captured.push(line)));
+  setDefaultLogger(createAccessLogger((line) => {
+    captured.push(line);
+    onRecord?.(JSON.parse(line) as AccessLogRecord);
+  }));
 }
 
 function url(path: string): string {
@@ -408,5 +431,141 @@ describe("gateway access-log integration", () => {
       'homeserver_requests_total{model="unknown",outcome="forbidden",tier="owner"} 1',
     );
     expect(JSON.stringify({ records, requestRows, metrics })).not.toContain(staleAllowedModel);
+  });
+
+  it("(j) /delegate reuses one trusted served-model snapshot across decision and gateway telemetry", async () => {
+    await warmCatalogue();
+    let invalidatedAfterDecision = false;
+    installCapturingLogger((record) => {
+      if (record.event === "delegate_decision") {
+        invalidatedAfterDecision = true;
+        resetCatalogueCache();
+      }
+    });
+    const owner = mintKey({
+      alias: "alog-delegate-one-snapshot",
+      tier: "owner",
+      scope: "admin",
+    }, DEFAULTS);
+
+    const response = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({ prompt: "snapshot consistency probe", taskType: "extract", modelId: "m1" }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.modelId).toBe("m1");
+    expect(body).not.toHaveProperty("telemetryModel");
+    expect(invalidatedAfterDecision).toBe(true);
+    expect(upstreamModelRequests).toEqual(["m1"]);
+
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    expect(records.filter((record) => record.event === "delegate_decision").map((record) => record.model)).toEqual(["m1"]);
+    expect(records.filter((record) => record.event === "gateway_request").map((record) => record.model)).toEqual(["m1"]);
+    const requestRow = getDb()
+      .prepare("SELECT model FROM request_log WHERE alias = ? ORDER BY rowid DESC LIMIT 1")
+      .get(owner.record.alias) as { model: string };
+    expect(requestRow.model).toBe("m1");
+    expect(renderMetrics()).toContain(
+      'homeserver_requests_total{model="m1",outcome="ok",tier="owner"} 1',
+    );
+  });
+
+  it("(k) /delegate keeps existing empty/whitespace execution while telemetry never emits none", async () => {
+    installCapturingLogger();
+    await warmCatalogue();
+    const owner = mintKey({
+      alias: "alog-delegate-blank-success",
+      tier: "owner",
+      scope: "admin",
+    }, DEFAULTS);
+    const callerModelIds = ["", "   "];
+    const expectedOutcomeModelIds = ["(none)", "   "];
+    const ledgerModelIds: string[] = [];
+    const responseBodies: Array<{
+      modelId: string;
+      ledgerId?: string;
+      delegated: boolean;
+      escalate: boolean;
+    }> = [];
+
+    for (let index = 0; index < callerModelIds.length; index++) {
+      const response = await fetch(url("/delegate"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: JSON.stringify({ prompt: "blank model execution probe", taskType: "extract", modelId: callerModelIds[index] }),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as typeof responseBodies[number];
+      responseBodies.push(body);
+      expect(body.modelId).toBe(expectedOutcomeModelIds[index]);
+      if (body.ledgerId !== undefined) {
+        const ledgerRow = getDb()
+          .prepare("SELECT model_id FROM delegations WHERE id = ?")
+          .get(body.ledgerId) as { model_id: string };
+        ledgerModelIds.push(ledgerRow.model_id);
+      }
+    }
+
+    // Existing execution semantics: empty reaches the no-loaded-model escalation with no ledger
+    // write; whitespace is routed and persisted verbatim. Telemetry alone normalizes both.
+    expect(responseBodies[0]).toMatchObject({ modelId: "(none)", delegated: false, escalate: true });
+    expect(responseBodies[0]!.ledgerId).toBeUndefined();
+    expect(responseBodies[1]).toMatchObject({ modelId: "   ", delegated: true, escalate: true });
+    expect(upstreamModelRequests).toEqual(["   "]);
+    expect(ledgerModelIds).toEqual(["   "]);
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    expect(records.filter((record) => record.event === "delegate_decision").map((record) => record.model)).toEqual(["unknown", "unknown"]);
+    expect(records.filter((record) => record.event === "gateway_request").map((record) => record.model)).toEqual(["unknown", "unknown"]);
+    expect(records.every((record) => record.model !== null && record.model !== "none")).toBe(true);
+    const requestRows = getDb()
+      .prepare("SELECT model FROM request_log WHERE alias = ? ORDER BY rowid ASC")
+      .all(owner.record.alias) as Array<{ model: string }>;
+    expect(requestRows.map((row) => row.model)).toEqual(["unknown", "unknown"]);
+    const metrics = renderMetrics();
+    expect(metrics).toContain('homeserver_requests_total{model="unknown",outcome="ok",tier="owner"} 2');
+    expect(metrics).not.toContain('model="none"');
+  });
+
+  it("(l) /delegate maps empty/whitespace IDs to unknown on the existing early-failure path", async () => {
+    installCapturingLogger();
+    await warmCatalogue();
+    const owner = mintKey({
+      alias: "alog-delegate-blank-early",
+      tier: "owner",
+      scope: "admin",
+      modelAllowList: ["m1"],
+    }, DEFAULTS);
+    const responseBodies: string[] = [];
+
+    for (const modelId of ["", "   "]) {
+      const response = await fetch(url("/delegate"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: JSON.stringify({ prompt: "blank early failure probe", taskType: "extract", modelId }),
+      });
+      expect(response.status).toBe(403);
+      responseBodies.push(await response.text());
+    }
+
+    // Existing policy rejects both values identically before orchestration or upstream execution.
+    expect(new Set(responseBodies).size).toBe(1);
+    expect(JSON.parse(responseBodies[0]!) as unknown).toMatchObject({
+      error: { code: "model_not_allowed" },
+    });
+    expect(upstreamModelRequests).toEqual([]);
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    expect(records.filter((record) => record.event === "delegate_decision")).toHaveLength(0);
+    expect(records.filter((record) => record.event === "gateway_request").map((record) => record.model)).toEqual(["unknown", "unknown"]);
+    const requestRows = getDb()
+      .prepare("SELECT model FROM request_log WHERE alias = ? ORDER BY rowid ASC")
+      .all(owner.record.alias) as Array<{ model: string }>;
+    expect(requestRows.map((row) => row.model)).toEqual(["unknown", "unknown"]);
+    const metrics = renderMetrics();
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="unknown",outcome="forbidden",tier="owner"} 2',
+    );
+    expect(metrics).not.toContain('model="none"');
   });
 });

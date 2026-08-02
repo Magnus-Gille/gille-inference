@@ -3,7 +3,7 @@ import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import { listModels, loadModel, unloadModel, downloadModel } from "./model-admin.js";
-import { delegate, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
+import { delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
@@ -2252,14 +2252,10 @@ async function handleDelegate(
     ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
     : undefined;
   lctx.node = result.nodeId;
-  // C3/#179: retain the exact model id in the response and ledger, but expose only the resident
-  // catalogue or enabled server-configured Orin identity in gateway telemetry. Principal
-  // allow-lists are admission policy, not telemetry trust. This synchronous projection must not
-  // change the orchestrator's routing input or returned outcome.
-  lctx.model = canonicalizeModelFromTrustedCatalogue(
-    result.modelId,
-    configuredDelegateModelIds(cfg),
-  );
+  // C3/#179: the orchestrator bound one server-computed safe identity to this exact result before
+  // emitting delegate_decision. Reuse it verbatim so cache/config changes cannot make the gateway
+  // disagree, while response, routing, ledger, and accounting retain result.modelId unchanged.
+  lctx.model = getDelegateTelemetryModel(result);
   const m = result.metrics;
   if (m) {
     return {

@@ -188,6 +188,32 @@ export interface DelegationOutcome {
   delegatePolicy?: DelegatePolicyDecision;
 }
 
+// The safe telemetry identity is server-computed and intentionally kept outside the serializable
+// outcome. Callers cannot populate it, and spreading the outcome into an API response cannot expose
+// this internal binding.
+const delegateTelemetryModels = new WeakMap<DelegationOutcome, string | null>();
+
+function bindDelegateTelemetryModel(outcome: DelegationOutcome): string | null {
+  let safeModel: string | null = "unknown";
+  try {
+    safeModel = canonicalizeModelFromTrustedCatalogue(
+      outcome.modelId,
+      configuredDelegateModelIds(loadConfig()),
+    );
+  } catch {
+    // Telemetry must never mask a completed delegation or fall back to caller-controlled identity.
+  }
+  delegateTelemetryModels.set(outcome, safeModel);
+  return safeModel;
+}
+
+/** Read the server-bound safe identity for gateway telemetry; unbound outcomes fail closed. */
+export function getDelegateTelemetryModel(outcome: DelegationOutcome): string | null {
+  return delegateTelemetryModels.has(outcome)
+    ? delegateTelemetryModels.get(outcome)!
+    : "unknown";
+}
+
 const TIMEOUT_SENTINEL = "__hs_timeout__";
 
 /** delegate() calls currently in flight. Shadow work is admitted only when this reaches zero. */
@@ -656,6 +682,7 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
   try {
     setTraceDefaults({ taskType: "delegation", lane: "default", retryOrdinal: 0 });
     finalOutcome = await delegateImpl(task);
+    bindDelegateTelemetryModel(finalOutcome);
     return finalOutcome;
   } finally {
     activeDelegations--;
@@ -664,18 +691,12 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
     // Emit one delegate_decision log line covering classify→decision→outcome.
     // Uses the module-level defaultLogger (replaced by no-op when accessLog=off).
     const { decision, outcome: summaryOutcome, escalated } = summarizeDelegation(fo);
-    let configuredModelIds: readonly string[] = [];
-    try {
-      configuredModelIds = configuredDelegateModelIds(loadConfig());
-    } catch {
-      // Telemetry must not mask the request's original config failure or trust caller identity.
-    }
     defaultLogger.log({
       event: "delegate_decision",
       requestId,
       // C3/#179: the outcome retains the exact model id for routing, ledger, accounting, and
       // response behavior; only this metadata projection is catalogue-canonicalized.
-      model: canonicalizeModelFromTrustedCatalogue(fo?.modelId ?? null, configuredModelIds),
+      model: fo === undefined ? null : getDelegateTelemetryModel(fo),
       taskType: fo?.taskType ?? null,
       decision,
       outcome: summaryOutcome,
