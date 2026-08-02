@@ -325,6 +325,7 @@ interface DelegationById extends RecentDelegation {
   taskInstanceId: string | null;
   attemptId: string | null;
   reviewerUsefulness: "pass" | "partial" | "redo" | "wrong" | null;
+  reviewerUsefulnessHidden: boolean;
   reviewerUsefulnessNotes: string | null; // forced null for monitor readers
   reviewerUsefulnessNotesPresent: boolean;
   reviewerUsefulnessNoteChars: number;
@@ -338,7 +339,10 @@ interface DelegationById extends RecentDelegation {
 `jsonValid`, `nonEmpty`, `matches`, `containsAll`, `containsNone`, `exact`, `answerIs`, `numeric`,
 `maxLength`) or `truth-oriented` (execution-based ground truth or model-judge checks: `tsGate`,
 `sqlExec`, `llm-judge:<model>`, and any unrecognised verifier by conservative default) or `ungraded`
-(no verifier ran). A high `formatOnlyShare` on a judgment-flavored task type (classify, qa-factual,
+(no verifier ran). Base-name matching is case-insensitive for this kind/admissibility decision, so
+mixed-case known verifiers still classify into the same kind, while a fully ungraded combination
+such as `none+NONE(ungraded)` collapses to `ungraded` rather than manufacturing evidence. A high
+`formatOnlyShare` on a judgment-flavored task type (classify, qa-factual,
 triage, claim-verify) means the headline pass rate is weaker evidence than it looks — the row only
 proved the output had the right SHAPE, not that it was correct. `PolicyConfig.discountFormatOnlyEvidence`
 (env `HOMESERVER_DISCOUNT_FORMAT_ONLY_EVIDENCE=on`, default off) discounts format-only passes/partials
@@ -378,8 +382,11 @@ evidence identity, or evidence fields inconsistent with the admitted stamp befor
 ledger row. Reviewer-usefulness note bytes follow the same content-blind rule: admin reads may
 include the raw `reviewerUsefulnessNotes` string, while monitor reads force
 `reviewerUsefulnessNotes:null` but still expose `reviewerUsefulnessNotesPresent` and
-`reviewerUsefulnessNoteChars`. Unknown ids return the same bare `404 not_found` without reflecting
-the supplied `ledgerId`.
+`reviewerUsefulnessNoteChars`. If legacy/ineligible reviewer-usefulness columns are populated but no
+longer eligible to surface as the current verdict, the row reports `reviewerUsefulnessHidden:true`
+while keeping the verdict/identity/note fields themselves null and preserving only the bounded
+presence/count summaries. Unknown ids return the same bare `404 not_found` without reflecting the
+supplied `ledgerId`.
 
 **Errors:** unknown `id` → bare `404 not_found` (no enumeration oracle); non-admin/non-monitor key
 → `403 route_not_allowed`; malformed percent-encoding in `{id}` (e.g. a bare `%`) →

@@ -980,7 +980,12 @@ export interface LaneEvidence {
 
 const EXCLUDED_LANE_EVIDENCE_SOURCES: ReadonlySet<string> = new Set(["harvest-shadow"]);
 
-function normalizedVerifierName(name: string | null | undefined): string | null {
+/**
+ * Shared evidence-reader normalization: trim transport noise, collapse a fully-ungraded verifier
+ * label (including `+`-combined sentinel variants) to null, and otherwise preserve the caller's
+ * original spelling so bucket matching does not silently merge historical case variants.
+ */
+export function normalizedVerifierName(name: string | null | undefined): string | null {
   const trimmed = name?.trim();
   if (!trimmed || classifyVerifierKind(trimmed) === "ungraded") return null;
   return trimmed;
@@ -1698,7 +1703,11 @@ export interface DelegationById extends RecentDelegation {
   attemptId: string | null;
   /** #74: NULL until a reviewer judges this row (see recordReviewerUsefulness). */
   reviewerUsefulness: ReviewerUsefulness | null;
+  /** True when reviewer-usefulness columns are populated but hidden because the row is malformed or now ineligible. */
+  reviewerUsefulnessHidden: boolean;
   reviewerUsefulnessNotes: string | null;
+  reviewerUsefulnessNotesPresent: boolean;
+  reviewerUsefulnessNoteChars: number;
   reviewerUsefulnessBy: string | null;
   reviewerUsefulnessTs: string | null;
 }
@@ -1791,7 +1800,7 @@ export function getDelegationById(id: string): DelegationById | null {
     : bindingValues.every((value) => value !== null) && row.evidenceIdentityHash !== null
       ? "bound"
       : "invalid";
-  const visibleReviewerRecord = reviewerUsefulnessVisibleRecord({
+  const reviewerProjectionRow = {
     taskType: row.taskType,
     verifier: row.verifier,
     shadow: row.shadow,
@@ -1800,7 +1809,9 @@ export function getDelegationById(id: string): DelegationById | null {
     reviewerUsefulnessNotes: row.reviewerUsefulnessNotes,
     reviewerUsefulnessBy: row.reviewerUsefulnessBy,
     reviewerUsefulnessTs: row.reviewerUsefulnessTs,
-  });
+  };
+  const visibleReviewerRecord = reviewerUsefulnessVisibleRecord(reviewerProjectionRow);
+  const reviewerUsefulnessHidden = reviewerUsefulnessLiveState(reviewerProjectionRow) === "legacy";
   return {
     ...row,
     learningTaskBinding,
@@ -1808,7 +1819,10 @@ export function getDelegationById(id: string): DelegationById | null {
     verifierKind: classifyVerifierKind(row.verifier),
     shadow: row.shadow === 1,
     reviewerUsefulness: visibleReviewerRecord?.usefulness ?? null,
+    reviewerUsefulnessHidden,
     reviewerUsefulnessNotes: visibleReviewerRecord?.notes ?? null,
+    reviewerUsefulnessNotesPresent: row.reviewerUsefulnessNotes !== null,
+    reviewerUsefulnessNoteChars: row.reviewerUsefulnessNotes?.length ?? 0,
     reviewerUsefulnessBy: visibleReviewerRecord?.judgedBy ?? null,
     reviewerUsefulnessTs: visibleReviewerRecord?.ts ?? null,
   };

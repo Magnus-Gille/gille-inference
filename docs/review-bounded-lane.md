@@ -159,8 +159,10 @@ Pre-#112 malformed or ineligible live reviewer-usefulness columns are handled ad
 than destructively. On read they no longer surface as a current reviewer verdict, and on the first
 later valid write the old live values are moved into the dedicated legacy quarantine columns
 (`reviewer_usefulness_legacy_json`, `reviewer_usefulness_legacy_reason`,
-`reviewer_usefulness_legacy_quarantined_at`) before the new verdict is recorded. Valid historical
-rows remain unchanged.
+`reviewer_usefulness_legacy_quarantined_at`) before the new verdict is recorded. Readers surface a
+bounded `reviewerUsefulnessHidden:true` marker plus note presence/count summaries so populated
+legacy/ineligible state does not disappear silently, but they still keep verdict/identity/note
+bytes hidden until a later valid write replaces it. Valid historical rows remain unchanged.
 
 ## Preflight / capability discovery
 

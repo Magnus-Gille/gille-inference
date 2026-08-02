@@ -545,4 +545,61 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     });
     expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
   });
+
+  it("surfaces hidden reviewer-usefulness state on GET /ledger/:id without leaking note bytes", async () => {
+    const ledgerId = makeReviewBoundedRowWithVerifier(
+      gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" })
+    );
+    getDb().prepare(`
+      UPDATE delegations
+         SET shadow = 1,
+             reviewer_usefulness = @usefulness,
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = @judgedBy,
+             reviewer_usefulness_ts = @ts
+       WHERE id = @id
+    `).run({
+      usefulness: "pass",
+      notes: NOTES,
+      judgedBy: "grimnir-session-2026-08-01-hidden",
+      ts: "2026-08-01T10:00:00.000Z",
+      id: ledgerId,
+    });
+
+    const admin = await harness.invoke({
+      method: "GET",
+      path: `/ledger/${ledgerId}`,
+      token: adminKey,
+    });
+    expect(admin.status).toBe(200);
+    expect(admin.json as Record<string, unknown>).toMatchObject({
+      id: ledgerId,
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: NOTES.length,
+    });
+    expect(admin.text).not.toContain(NOTES);
+
+    const monitor = await harness.invoke({
+      method: "GET",
+      path: `/ledger/${ledgerId}`,
+      token: ownerMonitorKey,
+    });
+    expect(monitor.status).toBe(200);
+    expect(monitor.json as Record<string, unknown>).toMatchObject({
+      id: ledgerId,
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: NOTES.length,
+    });
+    expect(monitor.text).not.toContain(NOTES);
+  });
 });

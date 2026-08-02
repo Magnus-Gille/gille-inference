@@ -162,6 +162,12 @@ describe("classifyVerifierKind", () => {
     expect(classifyVerifierKind("none")).toBe("ungraded");
     expect(classifyVerifierKind(" None ")).toBe("ungraded");
     expect(classifyVerifierKind("NONE(ungraded)")).toBe("ungraded");
+    expect(classifyVerifierKind(" none + NONE(ungraded) ")).toBe("ungraded");
+  });
+
+  it("classifies mixed-case known mechanical verifier bases without silently treating them as truth-oriented", () => {
+    expect(classifyVerifierKind(" JSONVALID + Exact({\"ok\":true}) ")).toBe("mechanical-format");
+    expect(classifyVerifierKind(" MaxLength(40) + containsALL ")).toBe("mechanical-format");
   });
 
   it("classifies a probe-native '+'-combined name as mechanical-format only if EVERY component is", () => {

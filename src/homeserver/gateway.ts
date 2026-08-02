@@ -491,13 +491,9 @@ function projectLedgerRowForRead(
   principal: PrincipalContext,
   row: NonNullable<ReturnType<typeof getDelegationById>>,
 ): Record<string, unknown> {
-  const notesPresent = row.reviewerUsefulnessNotes !== null;
-  const noteChars = row.reviewerUsefulnessNotes?.length ?? 0;
   return {
     ...row,
     reviewerUsefulnessNotes: principal.isMonitor ? null : row.reviewerUsefulnessNotes,
-    reviewerUsefulnessNotesPresent: notesPresent,
-    reviewerUsefulnessNoteChars: noteChars,
   };
 }
 
@@ -3308,6 +3304,9 @@ export async function handleRequest(
   // correlation trail. Its only durable signal is the content-blind, day-level aggregate row on
   // acceptance; rejected reports leave no adoption evidence. Other MCP tools retain normal logs.
   let suppressRequestTelemetry = false;
+  // Rotation proof must come from the protected surface only. Public routes resolve principals
+  // early for logging and monitor fencing, but they never cross the canonical 401 gate below.
+  let authenticatedRouteReached = false;
 
   // Single finally block — the ONLY emit site for gateway_request events.
   try {
@@ -3673,6 +3672,7 @@ export async function handleRequest(
       sendError(res, makeError("invalid_api_key"));
       return;
     }
+    authenticatedRouteReached = true;
 
     // W5: authenticated Hugin proposal admission only. This surface persists a
     // zero-mutation armed-canary record; it cannot apply, re-arm, widen, list,
@@ -4780,18 +4780,21 @@ export async function handleRequest(
     throw err;
   } finally {
     lctx.totalMs = Date.now() - startMs;
-    // A staged-rotation preflight must mean the replacement completed an allowed gateway route,
-    // not merely that its token matched the local DB. Record only successful minted-key requests;
-    // static credentials have no keystore hash and failed/forbidden requests never advance proof.
-    if (
-      lctx.principal !== null
+    // A staged-rotation preflight must mean the replacement crossed the canonical auth gate and
+    // then completed a successful protected route, not merely that its token matched the local DB
+    // or that it hit a public 200 such as /healthz, /hs, or /portal*.
+    const rotationProofAlias =
+      authenticatedRouteReached
+      && lctx.principal !== null
       && lctx.keyHash !== null
       && lctx.status !== null
       && lctx.status >= 200
       && lctx.status < 400
-    ) {
+        ? lctx.principal
+        : null;
+    if (rotationProofAlias !== null) {
       try {
-        recordKeyUse(lctx.principal);
+        recordKeyUse(rotationProofAlias);
       } catch (err) {
         // Usage evidence strengthens a later rotation preflight, but a telemetry-store failure
         // must not turn an already completed gateway response into an unhandled request failure.

@@ -104,6 +104,7 @@ describe("recordReviewerUsefulness (#74)", () => {
     expect(row?.reviewerUsefulnessNotes).toBeNull();
     expect(row?.reviewerUsefulnessBy).toBeNull();
     expect(row?.reviewerUsefulnessTs).toBeNull();
+    expect(row?.reviewerUsefulnessHidden).toBe(false);
   });
 
   it("records a usefulness verdict and it is readable back by ledger id", () => {
@@ -389,6 +390,43 @@ describe("recordReviewerUsefulness (#74)", () => {
       reviewerUsefulnessNotes: null,
       reviewerUsefulnessBy: null,
       reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+    });
+  });
+
+  it("marks populated reviewer usefulness on a now-ineligible row as hidden instead of silently disappearing", () => {
+    const id = recordDelegation({
+      taskType: "review-bounded",
+      modelId: "qwen3-coder-next-80b",
+      prompt: "gille review-bounded contract v1 ...",
+      outcome: "pass",
+      verifier: gatewayVerifierName({ type: "exact", expected: "{\"ok\":true}" }),
+    });
+    const db = initDb(dbPath);
+    db.prepare(`
+      UPDATE delegations
+         SET task_type = 'summarize',
+             reviewer_usefulness = @usefulness,
+             reviewer_usefulness_notes = @notes,
+             reviewer_usefulness_by = @judgedBy,
+             reviewer_usefulness_ts = @ts
+       WHERE id = @id
+    `).run({
+      usefulness: "wrong",
+      notes: "ref:gille-inference#112 hidden:legacy",
+      judgedBy: "grimnir-session-2026-07-24-hidden",
+      ts: "2026-08-01T10:00:00.000Z",
+      id,
+    });
+
+    expect(getDelegationById(id)).toMatchObject({
+      reviewerUsefulness: null,
+      reviewerUsefulnessNotes: null,
+      reviewerUsefulnessBy: null,
+      reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
+      reviewerUsefulnessNotesPresent: true,
+      reviewerUsefulnessNoteChars: "ref:gille-inference#112 hidden:legacy".length,
     });
   });
 
@@ -420,6 +458,7 @@ describe("recordReviewerUsefulness (#74)", () => {
       reviewerUsefulnessNotes: null,
       reviewerUsefulnessBy: null,
       reviewerUsefulnessTs: null,
+      reviewerUsefulnessHidden: true,
     });
 
     expect(recordReviewerUsefulness({
