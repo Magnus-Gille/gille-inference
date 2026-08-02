@@ -32,6 +32,7 @@ import { recordTaskExposureBestEffort } from "./task-exposure.js";
 import type { HuginRequestStamp } from "./learning-task-contract.js";
 import {
   buildEvidenceIdentityBundle,
+  contentDigest,
   evidenceIdentityFromAdmittedStamp,
   evidenceIdentityFromServedModelCmd,
   unknownIdentity,
@@ -644,6 +645,15 @@ function classifyLocalInferenceTrace(result: LocalInferenceResult): TraceSpanFin
 }
 
 /**
+ * /delegate's modelId is a caller override, not a trusted artifact identity. Keep the trace useful
+ * for joining repeated attempts without exporting that arbitrary string; a future served-artifact
+ * observation can replace this diagnostic value at the observation seam.
+ */
+function traceModelArtifactIdentity(modelId: string): string {
+  return contentDigest(`gille.trace.model-id.v1:${modelId}`);
+}
+
+/**
  * Run one delegation through the full policy + record loop.
  */
 export async function delegate(task: DelegationTask): Promise<DelegationOutcome> {
@@ -851,7 +861,7 @@ async function delegateImpl(task: DelegationTask): Promise<DelegationOutcome> {
       const effective = timedOut ? { ok: false as const, error: TIMEOUT_SENTINEL } : r;
       updateCurrentTraceSpan({
         retryOrdinal,
-        modelArtifactIdentity: modelId,
+        modelArtifactIdentity: traceModelArtifactIdentity(modelId),
         ...(effective.ok ? {} : { errorClass: effective.truncated === true ? "truncated" : classifyError(effective.error) }),
       });
       if (effective.ok && typeof effective.ttftMs === "number") {

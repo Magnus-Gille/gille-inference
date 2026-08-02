@@ -1,3 +1,4 @@
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,6 +20,7 @@ const fixture = JSON.parse(
 ) as JoinFixture;
 
 let runWithSyntheticTraceForTests: typeof import("../src/homeserver/tracing.js").runWithSyntheticTraceForTests;
+let beginGatewayTrace: typeof import("../src/homeserver/tracing.js").beginGatewayTrace;
 let withTraceSpan: typeof import("../src/homeserver/tracing.js").withTraceSpan;
 let currentTraceHeaders: typeof import("../src/homeserver/tracing.js").currentTraceHeaders;
 let recordReadinessObservation: typeof import("../src/homeserver/tracing.js").recordReadinessObservation;
@@ -34,6 +36,7 @@ function stringifyRecords(records: readonly unknown[]): string {
 beforeEach(async () => {
   const tracing = await import("../src/homeserver/tracing.js");
   runWithSyntheticTraceForTests = tracing.runWithSyntheticTraceForTests;
+  beginGatewayTrace = tracing.beginGatewayTrace;
   withTraceSpan = tracing.withTraceSpan;
   currentTraceHeaders = tracing.currentTraceHeaders;
   recordReadinessObservation = tracing.recordReadinessObservation;
@@ -339,5 +342,67 @@ describe("content-blind tracing core", () => {
     );
 
     expect(exporter).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a headers-only collector body before releasing the pending export slot", async () => {
+    let requestCount = 0;
+    let activeResponses = 0;
+    let maxActiveResponses = 0;
+    let closedResponses = 0;
+    const openResponses = new Set<ServerResponse>();
+    const collector: Server = createServer((req, res) => {
+      req.resume();
+      requestCount += 1;
+      activeResponses += 1;
+      maxActiveResponses = Math.max(maxActiveResponses, activeResponses);
+      openResponses.add(res);
+      res.on("close", () => {
+        activeResponses -= 1;
+        closedResponses += 1;
+        openResponses.delete(res);
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      // Deliberately never finish the response body. The exporter must cancel it.
+    });
+    await new Promise<void>((resolve) => collector.listen(0, "127.0.0.1", resolve));
+    const port = (collector.address() as { port: number }).port;
+    const config = {
+      instrumentation: "on" as const,
+      export: "on" as const,
+      samplingRatePerMille: 1000,
+      exportUrl: `http://127.0.0.1:${port}/collect`,
+      exportTimeoutMs: 1_000,
+      release: "test",
+      instanceId: "test",
+    };
+    const makeTrace = async (): Promise<void> => {
+      const trace = beginGatewayTrace({}, config);
+      await trace.run(async () => {});
+      trace.finish();
+    };
+    const waitForClosed = async (expected: number): Promise<void> => {
+      const deadline = Date.now() + 1_000;
+      while (closedResponses < expected && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(closedResponses).toBeGreaterThanOrEqual(expected);
+    };
+
+    try {
+      setTracingTestHooks({ maxPendingExports: 1 });
+      await makeTrace();
+      await waitForClosed(1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      await makeTrace();
+      await waitForClosed(2);
+      expect(requestCount).toBe(2);
+      expect(maxActiveResponses).toBe(1);
+      await expect(flushTracingForTests()).resolves.toBeDefined();
+    } finally {
+      for (const response of openResponses) response.destroy();
+      await new Promise<void>((resolve) => collector.close(() => resolve()));
+    }
   });
 });

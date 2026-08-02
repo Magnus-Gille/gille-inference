@@ -878,6 +878,9 @@ export interface MeteredResult {
   ttftMs: number | null;
   /** Best-effort work that must start only once this request's lease is released. */
   afterRelease?: () => void;
+  /** Trace-only semantic classification; HTTP/access/request-log outcomes remain in lctx. */
+  traceOutcome?: string;
+  traceErrorClass?: string;
 }
 
 function gatewayTraceTaskType(route: string): string {
@@ -922,6 +925,14 @@ function estimatePromptTokens(rawBody: string): number {
 
 /** A metered result that charges nothing (errored / non-2xx upstream). */
 const ZERO_RESULT: MeteredResult = { totalTokens: 0, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
+
+function modelNotFoundResult(): MeteredResult {
+  return {
+    ...ZERO_RESULT,
+    traceOutcome: "bad_request",
+    traceErrorClass: "model_not_found",
+  };
+}
 
 /**
  * R6: outcomes a metered handler classifies ITSELF (and that the spine must NOT overwrite with
@@ -1202,8 +1213,8 @@ async function handleChatProxy(
       const text = await upstream.text();
       if (upstream.status === 404 || /model.*not.*found/i.test(text)) {
         lctx.errorClass = "model_not_found";
-        emitInferenceTrace("model_not_found");
-        emitResponseTrace("model_not_found");
+        emitInferenceTrace("bad_request");
+        emitResponseTrace("bad_request");
         sendError(
           res,
           makeError("model_not_found", {
@@ -1213,7 +1224,7 @@ async function handleChatProxy(
               : undefined,
           })
         );
-        return ZERO_RESULT;
+        return modelNotFoundResult();
       }
       // #23: any other non-2xx upstream status — DO NOT echo the upstream body verbatim. An
       // LM Studio / llama-swap error body can carry internal detail (file/model paths, host:port,
@@ -1529,8 +1540,8 @@ async function handleChatProxy(
     if (upstream.status >= 400) {
     if (upstream.status === 404 || /model.*not.*found/i.test(text)) {
       lctx.errorClass = "model_not_found";
-      emitInferenceTrace("model_not_found");
-      emitResponseTrace("model_not_found");
+      emitInferenceTrace("bad_request");
+      emitResponseTrace("bad_request");
       sendError(
         res,
         makeError("model_not_found", {
@@ -1540,7 +1551,7 @@ async function handleChatProxy(
             : undefined,
         })
       );
-      return ZERO_RESULT;
+      return modelNotFoundResult();
     }
     lctx.status = 502;
     lctx.outcome = "upstream_unavailable";
@@ -4183,9 +4194,12 @@ async function handleRequest(
       // Floor at 1, ceiling at the per-request cap.
       const effectiveMax = clampMaxTokensForModel(cfg, parsed.model, parsed.requestedMax);
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, est, lctx, () =>
-        handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal)
-      );
+      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, est, lctx, async () => {
+        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal);
+        traceOutcomeOverride = result.traceOutcome ?? null;
+        traceErrorClassOverride = result.traceErrorClass ?? null;
+        return result;
+      });
       return;
     }
     if (path === "/v1/audio/transcriptions" && method === "POST") {

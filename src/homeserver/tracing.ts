@@ -175,6 +175,8 @@ const TRACESTATE_MAX_LENGTH = 512;
 const TRACESTATE_MAX_MEMBERS = 32;
 const TRACESTATE_MAX_MEMBER_LENGTH = 256;
 const DEFAULT_MAX_PENDING_EXPORTS = 128;
+const TRACE_ID_MAX_LENGTH = 64;
+const TRACE_ID_RE = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
 const storage = new AsyncLocalStorage<TraceContext>();
 let hooks: TracingTestHooks = {};
 let pendingExports = new Set<Promise<void>>();
@@ -194,6 +196,17 @@ function nextSpanId(): string {
 
 function isoAt(ms: number): string {
   return new Date(ms).toISOString();
+}
+
+/**
+ * Sanitize deployment identities before they become repeated trace fields. The accepted grammar
+ * is a lowercase ASCII deployment token: 1–64 characters, alphanumeric at both ends, with only
+ * interior lowercase letters, digits, dots, or hyphens. Invalid values are replaced wholesale by
+ * the caller's safe default; they are never truncated into a partially exposed token.
+ */
+export function sanitizeTraceIdentity(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim() ?? "";
+  return trimmed.length <= TRACE_ID_MAX_LENGTH && TRACE_ID_RE.test(trimmed) ? trimmed : fallback;
 }
 
 function safeToken(value: string | undefined): string | undefined {
@@ -283,7 +296,7 @@ function shouldSample(config: HomeserverTracingConfig, inbound: TraceParseResult
 }
 
 function defaultConfig(overrides: Partial<HomeserverTracingConfig> = {}): HomeserverTracingConfig {
-  return {
+  const config: HomeserverTracingConfig = {
     instrumentation: "off",
     export: "off",
     samplingRatePerMille: 0,
@@ -292,6 +305,11 @@ function defaultConfig(overrides: Partial<HomeserverTracingConfig> = {}): Homese
     release: "dev",
     instanceId: "unknown",
     ...overrides,
+  };
+  return {
+    ...config,
+    release: sanitizeTraceIdentity(config.release, "dev"),
+    instanceId: sanitizeTraceIdentity(config.instanceId, "unknown"),
   };
 }
 
@@ -361,12 +379,16 @@ function exportBatch(session: TraceSession): void {
     const ctrl = new AbortController();
     const timeout = setTimeout(() => ctrl.abort(), session.config.exportTimeoutMs);
     try {
-      await fetch(url, {
+      const response = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ records: batch }),
         signal: ctrl.signal,
       });
+      // Fetch resolves after headers. Close the collector body before the pending slot is freed;
+      // otherwise a collector that never finishes its body can hold an unbounded number of sockets
+      // even while pendingExports remains under its cap.
+      await response.body?.cancel();
     } finally {
       clearTimeout(timeout);
     }
@@ -384,14 +406,19 @@ function createSession(
   config: HomeserverTracingConfig,
   defaults: TraceDefaults,
 ): TraceSession | null {
-  if (!shouldTrace(config, headers)) return null;
+  const safeConfig = {
+    ...config,
+    release: sanitizeTraceIdentity(config.release, "dev"),
+    instanceId: sanitizeTraceIdentity(config.instanceId, "unknown"),
+  };
+  if (!shouldTrace(safeConfig, headers)) return null;
   const traceparent = headers ? String(headers["traceparent"] ?? "") : undefined;
   const inbound = parseTraceparent(traceparent);
-  const sampled = shouldSample(config, inbound);
+  const sampled = shouldSample(safeConfig, inbound);
   const rootSpanId = nextSpanId();
   const traceId = inbound?.traceId ?? nextTraceId();
   return {
-    config,
+    config: safeConfig,
     traceId,
     sampled,
     rootSpanId,

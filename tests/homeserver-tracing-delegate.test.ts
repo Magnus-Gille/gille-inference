@@ -144,9 +144,41 @@ describe("delegate tracing", () => {
     expect(spans.some((span) => span.phase === "verification")).toBe(true);
     expect(spans[0]?.task_type).toBe("delegation");
     expect(spans[0]?.lane).toBe("default");
-    expect(spans.find((span) => span.phase === "inference" && span.retry_ordinal === 1)?.model_artifact_identity).toBe("gpt-oss-120b");
+    expect(spans.find((span) => span.phase === "inference" && span.retry_ordinal === 1)?.model_artifact_identity).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(JSON.stringify(records)).not.toContain("output ONLY JSON");
     expect(JSON.stringify(records)).not.toContain(PEG_ERROR);
+  });
+
+  it("never exports a caller-supplied secret-shaped model override", async () => {
+    setTracingTestHooks({ captureExports: true });
+    lmInferenceMock.mockResolvedValue(lmOk("SAFE ANSWER"));
+    const secretShapedModelId = "SECRET_TOKEN_ABC";
+
+    await runWithSyntheticTraceForTests(
+      {
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4740-b9c7c989f97918e1-01",
+        taskType: "delegation",
+        lane: "default",
+        exportEnabled: true,
+      },
+      async () =>
+        delegate({
+          prompt: "keep routing this request",
+          taskType: "extract",
+          modelId: secretShapedModelId,
+        }),
+      { outcome: "ok" },
+    );
+
+    const records = await flushTracingForTests();
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain(secretShapedModelId);
+    const inference = records.find((record) =>
+      (record as { kind?: string; phase?: string }).kind === "trace-span"
+      && (record as { phase?: string }).phase === "inference"
+    ) as { model_artifact_identity?: string } | undefined;
+    expect(inference?.model_artifact_identity).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(lmInferenceMock).toHaveBeenCalledWith(secretShapedModelId, expect.any(String), expect.anything());
   });
 
   it("keeps delegate behaviour unchanged when export drops records", async () => {

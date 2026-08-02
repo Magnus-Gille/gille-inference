@@ -20,7 +20,7 @@ const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 
 let seenTraceparents: string[] = [];
 let seenTracestates: string[] = [];
 let releaseSlow: (() => void) | null = null;
-let mode: "stream" | "slow-stream" | "abort-stream" | "degenerate-stream" = "stream";
+let mode: "stream" | "slow-stream" | "abort-stream" | "degenerate-stream" | "model-not-found" = "stream";
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -32,6 +32,11 @@ function startUpstream(): Promise<void> {
       req.on("data", (c: Buffer) => chunks.push(c));
       req.on("end", async () => {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
+        if (mode === "model-not-found") {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "model not found" } }));
+          return;
+        }
         if (body.stream !== true) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
@@ -383,6 +388,43 @@ describe("HTTP tracing", () => {
 
     const records = await flushTracingForTests();
     expect(gatewayReadiness(records).at(-1)?.outcome).toBe("unknown");
+  });
+
+  it("keeps model-not-found trace readiness unknown for streaming and non-streaming 400s", async () => {
+    const traceIds = [
+      "4bf92f3577b34da6a3ce929d0e0e4741",
+      "4bf92f3577b34da6a3ce929d0e0e4742",
+    ];
+    for (const [index, stream] of [true, false].entries()) {
+      setTracingTestHooks({ captureExports: true });
+      mode = "model-not-found";
+      const key = mintKey({ alias: `trace-model-not-found-${index}`, tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+      const traceId = traceIds[index]!;
+      const res = await fetch(gatewayUrl("/v1/chat/completions"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${key.plaintextKey}`,
+          traceparent: `00-${traceId}-b9c7c989f97918e1-01`,
+        },
+        body: JSON.stringify({ model: "m1", stream, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: { code?: string } };
+      expect(body.error?.code).toBe("model_not_found");
+
+      const records = await flushTracingForTests();
+      const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+      const inference = traceSpans(records).find((span) => span.phase === "inference" && span.trace_id === traceId);
+      const response = traceSpans(records).find((span) => span.phase === "response" && span.trace_id === traceId);
+      expect(gateway).toMatchObject({ outcome: "bad_request", error_class: "model_not_found" });
+      expect(inference).toMatchObject({ outcome: "bad_request", error_class: "model_not_found" });
+      expect(response).toMatchObject({ outcome: "bad_request", error_class: "model_not_found" });
+      expect(gatewayReadiness(records).find((record) =>
+        (record as { trace?: { trace_id?: string } }).trace?.trace_id === traceId
+      )?.outcome).toBe("unknown");
+    }
   });
 
   it("records client cancellation and a queued admission span without changing the request outcome path", async () => {

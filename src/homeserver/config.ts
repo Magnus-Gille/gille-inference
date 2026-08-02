@@ -5,6 +5,7 @@ import {
   DEFAULT_REVIEW_CASCADE_SHADOW,
   type ReviewCascadeShadowConfig,
 } from "./review-cascade-shadow.js";
+import { sanitizeTraceIdentity } from "./tracing.js";
 
 export type { ShadowLaneConfig };
 export type { ReviewCascadeShadowConfig };
@@ -786,8 +787,8 @@ export function loadConfig(): HomeserverConfig {
       ),
       exportUrl: (process.env["HOMESERVER_TRACE_EXPORT_URL"] ?? "").trim(),
       exportTimeoutMs: Math.max(1, Math.floor(envNum("HOMESERVER_TRACE_EXPORT_TIMEOUT_MS", 2_000))),
-      release: (process.env["HOMESERVER_TRACE_RELEASE"] ?? "dev").trim() || "dev",
-      instanceId: (process.env["HOMESERVER_TRACE_INSTANCE_ID"] ?? "unknown").trim() || "unknown",
+      release: sanitizeTraceIdentity(process.env["HOMESERVER_TRACE_RELEASE"], "dev"),
+      instanceId: sanitizeTraceIdentity(process.env["HOMESERVER_TRACE_INSTANCE_ID"], "unknown"),
     },
     accessLog: (process.env["HOMESERVER_ACCESS_LOG"] ?? "on") === "off" ? "off" : "on",
     ownerRequestLog:
