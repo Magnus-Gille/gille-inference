@@ -105,7 +105,7 @@ const ASK_DESCRIPTION =
   "summarization, extraction, and short reasoning where you would otherwise spend frontier tokens. " +
   "Pick a model from list_models; pass the full prompt (and an optional system instruction). " +
   "Returns the model's text. Use this liberally for bounded work to save cost and keep data local. " +
-  "Call list_models for the fresh, content-blind ask.files capability state before using file " +
+  "Call list_models for the live, content-blind ask.files capability state before using file " +
   "attachments. " +
   "OWNER-TIER KEYS ONLY: an optional `files` array of absolute paths on the box is expanded " +
   "SERVER-SIDE into the prompt as local context, so this tool can orchestrate over local data it " +
@@ -357,7 +357,7 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
       name: "list_models",
       description:
         "List the local models THIS key is permitted to use, each with a one-line strength hint, " +
-        "plus the fresh call-time ask.files capability state for this request.",
+        "plus the live call-time ask.files capability state for this request.",
       inputSchema: { type: "object", properties: {}, required: [] },
       outputSchema: LIST_MODELS_OUTPUT_SCHEMA,
     },

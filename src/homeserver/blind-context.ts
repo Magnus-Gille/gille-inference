@@ -86,7 +86,12 @@ import { isAbsolute } from "node:path";
  */
 export const MAX_FILES_PER_REQUEST = 64;
 export const MAX_BLIND_CONTEXT_ROOTS = 128;
-export const BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS = 5_000;
+export const BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS = 5_000;
+/**
+ * @deprecated Discovery is live on every call; this legacy name now controls only repeated
+ * content-blind operator-signal deduping for the same dropped-root observation.
+ */
+export const BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS = BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
 
 /** Explicit, DI-friendly config — never read from env/global config inside this module. */
 export interface BlindContextConfig {
@@ -168,6 +173,15 @@ export interface BlindContextOperatorSignal {
 }
 
 export interface BlindContextAvailabilityOptions {
+  /**
+   * Optional TTL for deduping repeated content-blind operator signals about the same dropped-root
+   * observation. Discovery itself always re-inspects the filesystem on every call.
+   */
+  signalTtlMs?: number;
+  /**
+   * @deprecated Discovery is live on every call; retained only as a compatibility alias for
+   * `signalTtlMs`.
+   */
   cacheTtlMs?: number;
   fsOps?: BlindContextFsOps;
   now?: () => number;
@@ -219,12 +233,55 @@ function defaultBlindContextSignal(signal: BlindContextOperatorSignal): void {
   );
 }
 
-interface BlindContextAvailabilityCacheEntry {
-  cachedAtMs: number;
-  summary: BlindContextAvailability;
+interface BlindContextOperatorSignalCacheEntry {
+  observedAtMs: number;
+  signal: BlindContextOperatorSignal;
 }
 
-const discoveryCache = new Map<string, BlindContextAvailabilityCacheEntry>();
+const discoverySignalCache = new Map<string, BlindContextOperatorSignalCacheEntry>();
+
+function sameDropReasons(
+  left: Partial<Record<BlindContextRootDropReason, number>>,
+  right: Partial<Record<BlindContextRootDropReason, number>>
+): boolean {
+  return (
+    (left.not_absolute ?? 0) === (right.not_absolute ?? 0)
+    && (left.not_found ?? 0) === (right.not_found ?? 0)
+    && (left.not_directory ?? 0) === (right.not_directory ?? 0)
+    && (left.unreadable ?? 0) === (right.unreadable ?? 0)
+  );
+}
+
+function sameOperatorSignal(left: BlindContextOperatorSignal, right: BlindContextOperatorSignal): boolean {
+  return (
+    left.configured_root_count === right.configured_root_count
+    && left.resolved_root_count === right.resolved_root_count
+    && left.dropped_root_count === right.dropped_root_count
+    && sameDropReasons(left.dropped_root_reasons, right.dropped_root_reasons)
+  );
+}
+
+function shouldEmitOperatorSignal(
+  cacheKey: string,
+  signal: BlindContextOperatorSignal,
+  nowMs: number,
+  signalTtlMs: number
+): boolean {
+  const cached = discoverySignalCache.get(cacheKey);
+  if (!cached) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal });
+    return true;
+  }
+  if (!sameOperatorSignal(cached.signal, signal)) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal });
+    return true;
+  }
+  if (nowMs - cached.observedAtMs >= signalTtlMs) {
+    discoverySignalCache.set(cacheKey, { observedAtMs: nowMs, signal });
+    return true;
+  }
+  return false;
+}
 
 /**
  * Resolve every configured root to one canonical (symlink-free) DIRECTORY path. A root that fails
@@ -270,37 +327,34 @@ function resolveRoots(
 }
 
 /**
- * Content-blind availability summary for discovery surfaces: tell callers whether the feature is
- * truly usable without exposing any root locators or mutating the configured root list.
+ * Live, content-blind availability summary for discovery surfaces: request-facing callers get the
+ * current usable state on every call without exposing any root locators or mutating the configured
+ * root list. Any optional TTL applies only to duplicate operator-signal suppression, never to the
+ * returned availability snapshot.
  */
 export function describeBlindContextAvailability(
   roots: readonly string[],
   options: BlindContextAvailabilityOptions = {}
 ): BlindContextAvailability {
-  const now = options.now ?? Date.now;
-  const cacheTtlMs = options.cacheTtlMs ?? BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS;
-  const cacheKey = roots.join("\u0000");
-  const cached = discoveryCache.get(cacheKey);
-  const nowMs = now();
-  if (cached && nowMs - cached.cachedAtMs < cacheTtlMs) {
-    return cached.summary;
-  }
   const inspection = inspectBlindContextAvailability(roots, options);
   if (inspection.droppedRootCount > 0) {
-    (options.signal ?? defaultBlindContextSignal)({
+    const operatorSignal = {
       configured_root_count: inspection.configuredRootCount,
       resolved_root_count: inspection.resolvedRootCount,
       dropped_root_count: inspection.droppedRootCount,
       dropped_root_reasons: nonZeroDropReasons(inspection.droppedRootCounts),
-    });
+    };
+    const nowMs = (options.now ?? Date.now)();
+    const signalTtlMs = options.signalTtlMs ?? options.cacheTtlMs ?? BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
+    if (shouldEmitOperatorSignal(roots.join("\u0000"), operatorSignal, nowMs, signalTtlMs)) {
+      (options.signal ?? defaultBlindContextSignal)(operatorSignal);
+    }
   }
-  const summary = {
+  return {
     enabled: inspection.enabled,
     reason: inspection.reason,
     resolvedRootCount: inspection.resolvedRootCount,
   };
-  discoveryCache.set(cacheKey, { cachedAtMs: nowMs, summary });
-  return summary;
 }
 
 /**

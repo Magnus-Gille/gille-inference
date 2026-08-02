@@ -1,9 +1,9 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { mkdtempSync, mkdirSync, realpathSync, statSync, writeFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
-  BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+  BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
   describeBlindContextAvailability,
   expandBlindContext,
   MAX_FILES_PER_REQUEST,
@@ -127,15 +127,16 @@ describe("describeBlindContextAvailability", () => {
   });
 });
 
-describe("describeBlindContextAvailability discovery cache", () => {
+describe("describeBlindContextAvailability live discovery", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("caches repeated discovery within the TTL and refreshes after expiry", () => {
-    const root = makeTmpRoot("bc-cache-");
+  it("re-inspects the filesystem on every call so root removal and re-creation show up immediately", () => {
+    const base = makeTmpRoot("bc-live-");
+    const root = join(base, "allowed");
+    mkdirSync(root);
     const counts = { realpath: 0, stat: 0 };
-    let nowMs = 10_000;
     const fsOps = {
       realpathSync(path: Parameters<typeof realpathSync>[0]) {
         counts.realpath += 1;
@@ -149,32 +150,31 @@ describe("describeBlindContextAvailability discovery cache", () => {
 
     expect(describeBlindContextAvailability([root], {
       fsOps,
-      now: () => nowMs,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
       signal: () => {},
     })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
     expect(counts).toEqual({ realpath: 1, stat: 1 });
 
-    expect(describeBlindContextAvailability([root], {
-      fsOps,
-      now: () => nowMs,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
-      signal: () => {},
-    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
-    expect(counts).toEqual({ realpath: 1, stat: 1 });
-
-    nowMs += BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS;
+    rmSync(root, { recursive: true, force: true });
 
     expect(describeBlindContextAvailability([root], {
       fsOps,
-      now: () => nowMs,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 });
+    expect(counts).toEqual({ realpath: 2, stat: 1 });
+
+    mkdirSync(root);
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
       signal: () => {},
     })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
-    expect(counts).toEqual({ realpath: 2, stat: 2 });
+    expect(counts).toEqual({ realpath: 3, stat: 2 });
   });
 
-  it("invalidates the cache when the configured root list changes", () => {
+  it("inspects each configured root list independently", () => {
     const rootA = makeTmpRoot("bc-cache-a-");
     const rootB = makeTmpRoot("bc-cache-b-");
     const counts = { realpath: 0, stat: 0 };
@@ -192,19 +192,19 @@ describe("describeBlindContextAvailability discovery cache", () => {
     expect(describeBlindContextAvailability([rootA], {
       fsOps,
       now: () => 20_000,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
       signal: () => {},
     })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
     expect(describeBlindContextAvailability([rootB], {
       fsOps,
       now: () => 20_000,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
       signal: () => {},
     })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
     expect(counts).toEqual({ realpath: 2, stat: 2 });
   });
 
-  it("emits a content-blind operator signal once per stable config and cache window", () => {
+  it("emits a content-blind operator signal once per stable dropped-root observation and signal window", () => {
     const base = makeTmpRoot("bc-signal-");
     const regularFileRoot = join(base, "root-secret.txt");
     const missingRoot = join(base, "missing-secret-root");
@@ -214,11 +214,11 @@ describe("describeBlindContextAvailability discovery cache", () => {
 
     describeBlindContextAvailability([missingRoot, regularFileRoot], {
       now: () => nowMs,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
     });
     describeBlindContextAvailability([missingRoot, regularFileRoot], {
       now: () => nowMs,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
     });
 
     expect(warn).toHaveBeenCalledTimes(1);
@@ -228,10 +228,10 @@ describe("describeBlindContextAvailability discovery cache", () => {
     expect(firstMessage).not.toContain(missingRoot);
     expect(firstMessage).not.toContain(regularFileRoot);
 
-    nowMs += BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS;
+    nowMs += BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS;
     describeBlindContextAvailability([missingRoot, regularFileRoot], {
       now: () => nowMs,
-      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signalTtlMs: BLIND_CONTEXT_DISCOVERY_SIGNAL_TTL_MS,
     });
     expect(warn).toHaveBeenCalledTimes(2);
   });

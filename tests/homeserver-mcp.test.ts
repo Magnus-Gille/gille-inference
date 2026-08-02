@@ -241,7 +241,7 @@ describe("MCP tools/list", () => {
       files_reason: "unconfigured",
       resolved_root_count: 0,
     });
-    expect(ask.description).toContain("Call list_models for the fresh, content-blind ask.files capability state before using file attachments.");
+    expect(ask.description).toContain("Call list_models for the live, content-blind ask.files capability state before using file attachments.");
     expect(ask.description).not.toMatch(/currently disabled/i);
     const list = j.result.tools.find((t) => t.name === "list_models")!;
     expect(list.inputSchema.type).toBe("object");

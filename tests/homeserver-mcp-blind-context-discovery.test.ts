@@ -232,7 +232,7 @@ describe("MCP blind-context discovery", () => {
         files_reason: "unconfigured",
         resolved_root_count: 0,
       });
-      expect(askDef.description).toContain("Call list_models for the fresh, content-blind ask.files capability state before using file attachments.");
+      expect(askDef.description).toContain("Call list_models for the live, content-blind ask.files capability state before using file attachments.");
       expect(askDef.description).not.toMatch(/currently disabled/i);
 
       const models = await listModels(harness.gatewayPort, harness.ownerKey);
@@ -336,11 +336,12 @@ describe("MCP blind-context discovery", () => {
     }
   });
 
-  it("keeps ask(files) live-revalidated even if discovery was cached earlier", async () => {
+  it("reflects root removal and re-creation on the next discovery call while ask(files) still revalidates live", async () => {
     const base = mkdtempSync(join(tmpdir(), "hs-mcp-bc-discovery-live-"));
     const allowedRoot = join(base, "allowed");
+    const notePath = join(allowedRoot, "notes.txt");
     mkdirSync(allowedRoot);
-    writeFileSync(join(allowedRoot, "notes.txt"), "hello");
+    writeFileSync(notePath, "hello");
     const harness = await createHarness(allowedRoot);
     try {
       const before = [...loadConfig().blindContextRoots];
@@ -353,14 +354,48 @@ describe("MCP blind-context discovery", () => {
 
       rmSync(allowedRoot, { recursive: true, force: true });
 
-      const result = await ask(harness.gatewayPort, harness.ownerKey, {
+      const afterRemovalAskDef = askTool(await listTools(harness.gatewayPort, harness.ownerKey));
+      expect(askCapability(afterRemovalAskDef)).toEqual({
+        files_enabled: false,
+        files_reason: "no_resolved_roots",
+        resolved_root_count: 0,
+      });
+
+      const afterRemovalModels = await listModels(harness.gatewayPort, harness.ownerKey);
+      expect(afterRemovalModels.structuredContent?.ask_capabilities).toEqual({
+        files_enabled: false,
+        files_reason: "no_resolved_roots",
+        resolved_root_count: 0,
+      });
+      expectCapabilityText(afterRemovalModels.text, {
+        files_enabled: false,
+        files_reason: "no_resolved_roots",
+        resolved_root_count: 0,
+      });
+
+      const failedAsk = await ask(harness.gatewayPort, harness.ownerKey, {
         model: "any-model",
         prompt: "hi",
-        files: [join(allowedRoot, "notes.txt")],
+        files: [notePath],
       });
-      expect(result.isError).toBe(true);
-      expect(result.text).toMatch(/configured.*roots resolve to a real director/i);
+      expect(failedAsk.isError).toBe(true);
+      expect(failedAsk.text).toMatch(/configured.*roots resolve to a real director/i);
       expect(harness.upstreamHits()).toBe(0);
+
+      mkdirSync(allowedRoot);
+      writeFileSync(notePath, "hello again");
+
+      const afterRestoreModels = await listModels(harness.gatewayPort, harness.ownerKey);
+      expect(afterRestoreModels.structuredContent?.ask_capabilities).toEqual({
+        files_enabled: true,
+        files_reason: "enabled",
+        resolved_root_count: 1,
+      });
+      expectCapabilityText(afterRestoreModels.text, {
+        files_enabled: true,
+        files_reason: "enabled",
+        resolved_root_count: 1,
+      });
       expect(loadConfig().blindContextRoots).toEqual(before);
     } finally {
       await harness.stop();
