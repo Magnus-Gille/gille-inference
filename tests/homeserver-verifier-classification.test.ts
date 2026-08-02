@@ -7,6 +7,7 @@ import {
   isQualityBearingVerifier,
   isTrustedJudgmentVerifier,
   classifyVerifierKind,
+  parseVerifierLabel,
 } from "../src/homeserver/verifier-classification.js";
 
 // #156 (proposal 1): structural vs quality-bearing verifier classification. STRUCTURAL verifiers
@@ -38,6 +39,11 @@ describe("isStructuralVerifier", () => {
     expect(isStructuralVerifier(null)).toBe(false);
     expect(isStructuralVerifier(undefined)).toBe(false);
     expect(isStructuralVerifier("")).toBe(false);
+  });
+  it("does not admit malformed structural labels", () => {
+    expect(isStructuralVerifier("nonEmpty(")).toBe(false);
+    expect(isStructuralVerifier("nonEmpty)")).toBe(false);
+    expect(isStructuralVerifier("nonEmpty(foo+predicate")).toBe(false);
   });
 });
 
@@ -99,6 +105,29 @@ describe("isQualityBearingVerifier", () => {
     expect(isQualityBearingVerifier("futureCheck(a+b)")).toBe(true);
     expect(classifyVerifierKind("futureCheck(a+b)")).toBe("truth-oriented");
   });
+
+  it.each([
+    ["none)", "unmatched-closing-parenthesis"],
+    ["nonEmpty)", "unmatched-closing-parenthesis"],
+    ["none(", "unclosed-parenthesis"],
+    ["nonEmpty(", "unclosed-parenthesis"],
+    ["exact)+none", "unmatched-closing-parenthesis"],
+    ["exact(foo+predicate", "unclosed-parenthesis"],
+  ] as const)("reports malformed syntax in %s", (label, error) => {
+    expect(parseVerifierLabel(label)).toEqual({ components: [], valid: false, error });
+  });
+
+  it.each([
+    "none)",
+    "nonEmpty)",
+    "none(",
+    "nonEmpty(",
+    "exact)+none",
+    "exact(foo+predicate",
+  ] as const)("fails closed for malformed quality-bearing label %s", (label) => {
+    expect(isQualityBearingVerifier(label)).toBe(false);
+    expect(classifyVerifierKind(label)).toBe("ungraded");
+  });
 });
 
 // #168: the WHITELIST counterpart — admissible for a judgment-quality type IFF positively trusted.
@@ -128,6 +157,13 @@ describe("isTrustedJudgmentVerifier", () => {
     for (const v of ["predicate", "matches", "nonEmpty(1)", "answerIs", "custom", "gtReview"]) {
       expect(isTrustedJudgmentVerifier(v, empty)).toBe(false);
     }
+  });
+
+  it("does not trust a malformed label even when its base is whitelisted", () => {
+    const trusted = new Set(["gtReview", "exact"]);
+    expect(isTrustedJudgmentVerifier("gtReview(", trusted)).toBe(false);
+    expect(isTrustedJudgmentVerifier("exact(foo+predicate", trusted)).toBe(false);
+    expect(isTrustedJudgmentVerifier("exact)+none", trusted)).toBe(false);
   });
 });
 
@@ -202,5 +238,16 @@ describe("classifyVerifierKind", () => {
     expect(classifyVerifierKind("nonEmpty+jsonValid")).toBe("mechanical-format");
     expect(classifyVerifierKind("nonEmpty+predicate")).toBe("truth-oriented");
     expect(classifyVerifierKind("none+exact")).toBe("mechanical-format");
+  });
+
+  it.each([
+    "none)",
+    "nonEmpty)",
+    "none(",
+    "nonEmpty(",
+    "exact)+none",
+    "exact(foo+predicate",
+  ] as const)("classifies malformed labels as ungraded: %s", (label) => {
+    expect(classifyVerifierKind(label)).toBe("ungraded");
   });
 });

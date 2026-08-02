@@ -56,14 +56,21 @@ export function verifierBaseName(name: string): string {
   return (paren >= 0 ? name.slice(0, paren) : name).trim();
 }
 
+export type VerifierSyntaxError = "unmatched-closing-parenthesis" | "unclosed-parenthesis";
+
+export interface ParsedVerifierLabel {
+  components: string[];
+  valid: boolean;
+  error: VerifierSyntaxError | null;
+}
+
 /**
- * Return canonical verifier bases from a possibly `+`-combined label. A plus is a component
- * separator only at parenthesis depth zero, so parameter payloads such as `exact(a+b)` remain one
- * verifier. Empty components and ungraded sentinels are discarded here so every classifier shares
- * the same definition of a real verifier component.
+ * Parse a verifier label while validating the parenthesis structure used to protect `+` signs
+ * inside parameter payloads. Invalid labels return no components so every caller fails closed;
+ * the explicit error keeps syntax failure distinguishable from a valid ungraded label.
  */
-export function parseVerifierComponents(name: string | null | undefined): string[] {
-  if (name == null) return [];
+export function parseVerifierLabel(name: string | null | undefined): ParsedVerifierLabel {
+  if (name == null) return { components: [], valid: true, error: null };
 
   const components: string[] = [];
   let componentStart = 0;
@@ -81,19 +88,38 @@ export function parseVerifierComponents(name: string | null | undefined): string
     if (char === "(") {
       parenthesisDepth += 1;
     } else if (char === ")") {
-      if (parenthesisDepth > 0) parenthesisDepth -= 1;
+      if (parenthesisDepth === 0) {
+        return { components: [], valid: false, error: "unmatched-closing-parenthesis" };
+      }
+      parenthesisDepth -= 1;
     } else if (char === "+" && parenthesisDepth === 0) {
       appendComponent(index);
       componentStart = index + 1;
     }
   }
+
+  if (parenthesisDepth !== 0) {
+    return { components: [], valid: false, error: "unclosed-parenthesis" };
+  }
+
   appendComponent(name.length);
-  return components;
+  return { components, valid: true, error: null };
+}
+
+/**
+ * Return canonical verifier bases from a possibly `+`-combined label. A plus is a component
+ * separator only at parenthesis depth zero, so parameter payloads such as `exact(a+b)` remain one
+ * verifier. Empty components and ungraded sentinels are discarded here so every classifier shares
+ * the same definition of a real verifier component.
+ */
+export function parseVerifierComponents(name: string | null | undefined): string[] {
+  return parseVerifierLabel(name).components;
 }
 
 /** True iff `name` is a known structural (shape/presence-only) verifier. Null/empty → false. */
 export function isStructuralVerifier(name: string | null | undefined): boolean {
   if (name == null) return false;
+  if (!parseVerifierLabel(name).valid) return false;
   const base = canonicalVerifierBase(name);
   return base.length > 0 && STRUCTURAL_VERIFIER_KEYS.has(base);
 }
@@ -107,7 +133,8 @@ export function isStructuralVerifier(name: string | null | undefined): boolean {
  * (the conservative default above).
  */
 export function isQualityBearingVerifier(name: string | null | undefined): boolean {
-  return parseVerifierComponents(name).some((base) => !STRUCTURAL_VERIFIER_KEYS.has(base));
+  const parsed = parseVerifierLabel(name);
+  return parsed.valid && parsed.components.some((base) => !STRUCTURAL_VERIFIER_KEYS.has(base));
 }
 
 /**
@@ -128,6 +155,7 @@ export function isTrustedJudgmentVerifier(
   trusted: ReadonlySet<string>
 ): boolean {
   if (name == null) return false;
+  if (!parseVerifierLabel(name).valid) return false;
   const base = verifierBaseName(name);
   const canonicalBase = base.toLowerCase();
   if (canonicalBase.length === 0) return false;
@@ -197,9 +225,9 @@ function classifyVerifierComponentKind(base: string): "mechanical-format" | "tru
 
 /** Classify a (possibly `+`-combined) verifier name into a {@link VerifierKind}. */
 export function classifyVerifierKind(name: string | null | undefined): VerifierKind {
-  const components = parseVerifierComponents(name);
-  if (components.length === 0) return "ungraded";
-  return components.some((base) => classifyVerifierComponentKind(base) === "truth-oriented")
+  const parsed = parseVerifierLabel(name);
+  if (!parsed.valid || parsed.components.length === 0) return "ungraded";
+  return parsed.components.some((base) => classifyVerifierComponentKind(base) === "truth-oriented")
     ? "truth-oriented"
     : "mechanical-format";
 }

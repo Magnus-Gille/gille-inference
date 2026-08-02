@@ -387,6 +387,15 @@ describe("recordReviewerUsefulness (#74)", () => {
     ["none+NONE(ungraded)", "conflict"],
     ["nonEmpty+jsonValid", "conflict"],
     ["nonEmpty+predicate", "recorded"],
+    ["none+exact", "recorded"],
+    ["maxLength(10+20)", "conflict"],
+    ["futureCheck(a+b)", "recorded"],
+    ["none)", "conflict"],
+    ["nonEmpty)", "conflict"],
+    ["none(", "conflict"],
+    ["nonEmpty(", "conflict"],
+    ["exact)+none", "conflict"],
+    ["exact(foo+predicate", "conflict"],
   ] as const)("applies the shared quality predicate to combined verifier %s", (verifier, expectedKind) => {
     const id = recordDelegation({
       taskType: "review-bounded",
@@ -410,7 +419,16 @@ describe("recordReviewerUsefulness (#74)", () => {
     }
   });
 
-  it.each(["none+NONE(ungraded)", "nonEmpty+jsonValid"] as const)(
+  it.each([
+    "none+NONE(ungraded)",
+    "nonEmpty+jsonValid",
+    "none)",
+    "nonEmpty)",
+    "none(",
+    "nonEmpty(",
+    "exact)+none",
+    "exact(foo+predicate",
+  ] as const)(
     "hides pre-existing usefulness for ineligible combined verifier %s",
     (verifier) => {
       const id = recordDelegation({

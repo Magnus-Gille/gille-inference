@@ -583,6 +583,15 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     ["none+NONE(ungraded)", 409],
     ["nonEmpty+jsonValid", 409],
     ["nonEmpty+predicate", 201],
+    ["none+exact", 201],
+    ["maxLength(10+20)", 409],
+    ["futureCheck(a+b)", 201],
+    ["none)", 409],
+    ["nonEmpty)", 409],
+    ["none(", 409],
+    ["nonEmpty(", 409],
+    ["exact)+none", 409],
+    ["exact(foo+predicate", 409],
   ] as const)("applies combined verifier eligibility for %s", async (verifier, expectedStatus) => {
     const ledgerId = makeReviewBoundedRowWithVerifier(verifier);
     const res = await putReviewerUsefulness(ledgerId, {
@@ -594,6 +603,7 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
       expect(res.json as ReviewerUsefulnessConflictResponse).toMatchObject({
         conflict: { kind: "missing_verifier" },
       });
+      expect(getDelegationById(ledgerId)?.reviewerUsefulness).toBeNull();
     } else {
       expect(res.json as ReviewerUsefulnessWriteResponse).toMatchObject({
         ledgerId,
@@ -750,6 +760,15 @@ describe("PUT /ledger/:id/reviewer-usefulness", () => {
     ["none+NONE(ungraded)", false],
     ["nonEmpty+jsonValid", false],
     ["nonEmpty+predicate", true],
+    ["none+exact", true],
+    ["maxLength(10+20)", false],
+    ["futureCheck(a+b)", true],
+    ["none)", false],
+    ["nonEmpty)", false],
+    ["none(", false],
+    ["nonEmpty(", false],
+    ["exact)+none", false],
+    ["exact(foo+predicate", false],
   ] as const)("applies combined verifier visibility for %s", async (verifier, visible) => {
     const ledgerId = makeReviewBoundedRowWithVerifier(verifier);
     getDb().prepare(`
