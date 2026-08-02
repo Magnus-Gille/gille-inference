@@ -896,6 +896,7 @@ function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" |
     || outcome === "degenerate"
     || outcome === "upstream_timeout"
     || outcome === "upstream_unavailable"
+    || outcome === "error"
   ) {
     return "failed";
   }

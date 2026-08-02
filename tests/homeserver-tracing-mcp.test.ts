@@ -18,7 +18,7 @@ let resetTracingTestHooks: typeof import("../src/homeserver/tracing.js").resetTr
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
 let releaseStall: (() => void) | null = null;
-let mode: "ok" | "stall" | "reset" | "hang" = "ok";
+let mode: "ok" | "stall" | "reset" | "hang" | "http-5xx" = "ok";
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -33,6 +33,11 @@ function startUpstream(): Promise<void> {
         }
         if (mode === "hang") {
           await new Promise<void>(() => {});
+          return;
+        }
+        if (mode === "http-5xx") {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "UPSTREAM_ONLY_BODY" } }));
           return;
         }
         if (mode === "stall") {
@@ -236,6 +241,25 @@ describe("MCP ask tracing", () => {
     const exhausted = await askOutcomeForTrace(exhaustedTraceId);
     expect(exhausted.gateway).toMatchObject({ outcome: "credits_exhausted", error_class: "credits_exhausted" });
     expect(exhausted.readiness.outcome).toBe("unknown");
+  });
+
+  it("keeps a generic upstream HTTP 5xx at transport 200 but marks semantic tracing failure", async () => {
+    setTracingTestHooks({ captureExports: true });
+    mode = "http-5xx";
+    const key = mintKey({ alias: "trace-mcp-http-5xx", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4709";
+
+    const res = await mcpAsk(key.plaintextKey, { model: "m1", prompt: "hi" }, traceId, 209);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { result: { isError: boolean } };
+    expect(body.result.isError).toBe(true);
+
+    const records = await flushTracingForTests();
+    expect(JSON.stringify(records)).not.toContain("UPSTREAM_ONLY_BODY");
+    const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+    const readiness = gatewayReadiness(records).find((record) => record.trace?.trace_id === traceId);
+    expect(gateway).toMatchObject({ outcome: "error", error_class: "upstream_error" });
+    expect(readiness).toMatchObject({ outcome: "failed", error_class: "upstream_error" });
   });
 
   it("maps a rate-limited ask tool error to degraded readiness and a rate_limited gateway span", async () => {
