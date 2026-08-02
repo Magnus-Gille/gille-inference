@@ -31,7 +31,10 @@ let captured: string[] = [];
 let upstream: Server;
 let upstreamPort = 0;
 let upstreamModelRequests: string[] = [];
+let orinModelRequests: string[] = [];
 let originalDefaultLogger: AccessLogger;
+
+const ORIN_MODEL = "qwen2.5-coder:3b";
 
 const MUTATED_ENV_KEYS = [
   "LMSTUDIO_BASE_URL",
@@ -44,6 +47,9 @@ const MUTATED_ENV_KEYS = [
   "HOMESERVER_KEY_DEFAULT_TPM",
   "HOMESERVER_ADMIN_API_KEYS",
   "HOMESERVER_ACCESS_LOG_HEALTHZ",
+  "HOMESERVER_ORIN_URL",
+  "HOMESERVER_ORIN_MODEL",
+  "HOMESERVER_ORIN_ELIGIBLE_TASK_TYPES",
 ] as const;
 let originalEnv = new Map<string, string | undefined>();
 
@@ -67,6 +73,28 @@ function startUpstream(): Promise<void> {
           loaded_instances: [],
         }],
       }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/api/chat") {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        let body: { model?: unknown };
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown };
+        } catch {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid Orin mock request JSON" }));
+          return;
+        }
+        if (typeof body.model === "string") orinModelRequests.push(body.model);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          message: { content: "orin ok" },
+          prompt_eval_count: 4,
+          eval_count: 2,
+        }));
+      });
       return;
     }
     if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
@@ -134,6 +162,9 @@ beforeAll(async () => {
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_ADMIN_API_KEYS"] = "alog-admin-key";
+  process.env["HOMESERVER_ORIN_URL"] = `http://127.0.0.1:${upstreamPort}`;
+  process.env["HOMESERVER_ORIN_MODEL"] = ORIN_MODEL;
+  process.env["HOMESERVER_ORIN_ELIGIBLE_TASK_TYPES"] = "extract";
   // Default: accessLogHealthz NOT set (= off)
   delete process.env["HOMESERVER_ACCESS_LOG_HEALTHZ"];
 
@@ -168,6 +199,7 @@ afterAll(async () => {
 beforeEach(() => {
   resetMetrics();
   upstreamModelRequests = [];
+  orinModelRequests = [];
 });
 
 afterEach(() => {
@@ -567,5 +599,88 @@ describe("gateway access-log integration", () => {
       'homeserver_requests_total{model="unknown",outcome="forbidden",tier="owner"} 2',
     );
     expect(metrics).not.toContain('model="none"');
+  });
+
+  it("(m) /delegate attributes configured Orin only after an eligible inference attempt", async () => {
+    installCapturingLogger();
+    const owner = mintKey({
+      alias: "alog-delegate-orin-attempt",
+      tier: "owner",
+      scope: "admin",
+    }, DEFAULTS);
+    const mismatchedModel = "caller-controlled-orin-mismatch";
+    const requests = [
+      { modelId: "", taskType: "extract", expectedDelegated: false },
+      { modelId: "   ", taskType: "extract", expectedDelegated: false },
+      { modelId: mismatchedModel, taskType: "extract", expectedDelegated: false },
+      { modelId: ORIN_MODEL, taskType: "sql", expectedDelegated: false },
+      { modelId: ORIN_MODEL, taskType: "extract", expectedDelegated: true },
+    ] as const;
+    const responses: Array<{
+      modelId: string;
+      nodeId: string;
+      delegated: boolean;
+      escalate: boolean;
+      ledgerId?: string;
+    }> = [];
+
+    for (const request of requests) {
+      const response = await fetch(url("/delegate"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: JSON.stringify({
+          prompt: "enabled Orin telemetry probe",
+          nodeId: "orin",
+          modelId: request.modelId,
+          taskType: request.taskType,
+        }),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as typeof responses[number];
+      responses.push(body);
+      expect(body).toMatchObject({
+        modelId: ORIN_MODEL,
+        nodeId: "orin",
+        delegated: request.expectedDelegated,
+      });
+      expect(body).not.toHaveProperty("telemetryModel");
+    }
+
+    expect(responses.slice(0, 4).every((body) => body.escalate)).toBe(true);
+    expect(responses.slice(0, 4).every((body) => body.ledgerId === undefined)).toBe(true);
+    expect(responses[4]).toMatchObject({ delegated: true, escalate: false, ledgerId: expect.any(String) });
+    expect(orinModelRequests).toEqual([ORIN_MODEL]);
+    expect(upstreamModelRequests).toEqual([]);
+
+    const ledgerRow = getDb()
+      .prepare("SELECT node_id, model_id FROM delegations WHERE id = ?")
+      .get(responses[4]!.ledgerId) as { node_id: string; model_id: string };
+    expect(ledgerRow).toEqual({ node_id: "orin", model_id: ORIN_MODEL });
+
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    const decisions = records.filter((record) => record.event === "delegate_decision");
+    const gateways = records.filter((record) => record.event === "gateway_request");
+    expect(decisions.map((record) => record.model)).toEqual([
+      "unknown", "unknown", "unknown", "unknown", ORIN_MODEL,
+    ]);
+    expect(gateways.map((record) => record.model)).toEqual([
+      "unknown", "unknown", "unknown", "unknown", ORIN_MODEL,
+    ]);
+
+    const requestRows = getDb()
+      .prepare("SELECT model FROM request_log WHERE alias = ? ORDER BY rowid ASC")
+      .all(owner.record.alias) as Array<{ model: string }>;
+    expect(requestRows.map((row) => row.model)).toEqual([
+      "unknown", "unknown", "unknown", "unknown", ORIN_MODEL,
+    ]);
+
+    const metrics = renderMetrics();
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="unknown",outcome="ok",tier="owner"} 4',
+    );
+    expect(metrics).toContain(
+      `homeserver_requests_total{model="${ORIN_MODEL}",outcome="ok",tier="owner"} 1`,
+    );
+    expect(JSON.stringify({ records, requestRows, metrics })).not.toContain(mismatchedModel);
   });
 });
