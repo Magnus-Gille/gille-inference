@@ -220,10 +220,14 @@ describe("HTTP tracing", () => {
     const gateway = spans.find((span) => span.phase === "gateway");
     const inference = spans.find((span) => span.phase === "inference");
     const ttft = spans.find((span) => span.phase === "ttft");
+    const response = spans.find((span) => span.phase === "response");
     expect(seenTraceparents[0]).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${inference?.span_id}-01`);
     expect(gateway).toBeDefined();
     expect(inference).toBeDefined();
     expect(ttft?.parent_span_id).toBe(inference?.span_id);
+    expect(response?.parent_span_id).toBe(inference?.parent_span_id);
+    expect(response?.parent_span_id).not.toBe(inference?.span_id);
+    expect(Date.parse(response?.started_at ?? "")).toBeLessThanOrEqual(Date.parse(inference?.started_at ?? ""));
     expect(joined).toContain("\"phase\":\"response\"");
     expect(joined).not.toContain("\"content\":\"hi\"");
     expect(gatewayReadiness(records).at(-1)?.outcome).toBe("ok");
@@ -258,9 +262,12 @@ describe("HTTP tracing", () => {
     const spans = traceSpans(records);
     const gateway = spans.find((span) => span.phase === "gateway");
     const inference = spans.find((span) => span.phase === "inference");
+    const response = spans.find((span) => span.phase === "response");
     expect(seenTraceparents[0]).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${inference?.span_id}-01`);
     expect(gateway).toBeDefined();
     expect(inference).toBeDefined();
+    expect(response?.parent_span_id).toBe(inference?.parent_span_id);
+    expect(response?.parent_span_id).not.toBe(inference?.span_id);
     expect(spans.some((span) => span.phase === "ttft")).toBe(false);
     expect(gatewayReadiness(records).at(-1)?.outcome).toBe("ok");
   });

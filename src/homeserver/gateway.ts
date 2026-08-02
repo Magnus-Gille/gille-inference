@@ -928,9 +928,16 @@ async function handleChatProxy(
     : [];
   const chatStart = Date.now();
   const responseTraceStart = chatStart;
+  // Create the response span in the handler's enclosing request-phase context.
+  // Finishing it from inside the inference callback must not re-parent it
+  // beneath inference: response covers the whole handler and can start before
+  // the upstream call.
+  const responseTrace = beginTraceSpan("response", {}, {
+    surface: "gateway",
+    startedAtMs: responseTraceStart,
+  });
   const emitResponseTrace = (outcome: string): void => {
-    recordCompletedSpan("response", {
-      startedAtMs: responseTraceStart,
+    responseTrace.finish({
       endedAtMs: Date.now(),
       outcome,
       errorClass: lctx.errorClass ?? undefined,
