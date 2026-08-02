@@ -1345,7 +1345,7 @@ async function callTool(
     return { ...out, structuredContent: JSON.parse(out.text) };
   }
 
-  return { text: `Unknown tool '${name}'.`, isError: true };
+  return { text: `Unknown tool '${name}'.`, isError: true, trace: badRequestTrace() };
 }
 
 // ─── HTTP dispatch (one JSON-RPC message per POST body) ────────────────────────────────

@@ -274,6 +274,35 @@ describe("MCP ask tracing", () => {
     expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
   });
 
+  it("marks an unknown tools/call name as a bad request without exposing it in tracing", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-mcp-unknown-tool", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4746";
+    const secretToolName = "SECRET_UNKNOWN_TOOL";
+
+    const res = await mcpRaw(
+      key.plaintextKey,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 303,
+        method: "tools/call",
+        params: { name: secretToolName, arguments: {} },
+      }),
+      traceId,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(
+      `{"jsonrpc":"2.0","id":303,"result":{"content":[{"type":"text","text":"Unknown tool '${secretToolName}'."}],"isError":true}}`,
+    );
+
+    const records = await flushTracingForTests();
+    expect(JSON.stringify(records)).not.toContain(secretToolName);
+    const gateway = traceSpans(records).find((span) => span.phase === "gateway" && span.trace_id === traceId);
+    const readiness = gatewayReadiness(records).find((record) => record.trace?.trace_id === traceId);
+    expect(gateway).toMatchObject({ outcome: "bad_request", error_class: "invalid_request_error" });
+    expect(readiness).toMatchObject({ outcome: "unknown", error_class: "invalid_request_error" });
+  });
+
   it("does not classify a valid notification as a bad request", async () => {
     setTracingTestHooks({ captureExports: true });
     const key = mintKey({ alias: "trace-mcp-notification", tier: "guest", modelAllowList: ["m1"] }, DEFAULTS);
