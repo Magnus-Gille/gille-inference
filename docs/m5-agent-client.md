@@ -13,18 +13,23 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`, starting with client package version
-`1.2.0`:
+The `m5` executable ships in the same npm package as `hs`. The currently accepted pinned version
+is `1.2.1`:
 
 ```bash
-npm install --global gille-inference@1.2.0
+npm install --global gille-inference@1.2.1
 m5 --version
 ```
 
 `gille-inference@1.0.0` is the existing public `hs`-only package. The initial M5 client was
-prepared as `1.1.0` but was never published; `1.2.0` adds the required content-free adoption
-reporting contract. Publish `1.2.0` as the first public M5-capable version rather than releasing
-the superseded intermediate version.
+prepared as `1.1.0` but was never published; `1.2.0` added the required content-free adoption
+reporting contract as the first public M5-capable version. `1.2.1` keeps that surface and adds
+the structured `list_models` blind-context discovery contract without reusing the published
+`1.2.0` version string for a different client behavior.
+
+Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
+`m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
+`m5 1.2.1+` and other MCP callers may receive the structured object.
 
 `m5 --version` emits structured JSON. `claude-config` integrations must:
 
@@ -148,10 +153,12 @@ Its top-level `status` distinguishes:
 
 No token or endpoint locator is included in the result.
 
-`m5 1.2.0` adds the direct, content-free `adoption report` command and requires the reporting tool
+`m5 1.2.0` added the direct, content-free `adoption report` command and requires the reporting tool
 for a healthy doctor result. A generic `1.1.0` stdio bridge can still pass an MCP tool call through
 when a compatible server exposes it, but it does not provide the direct report command or this
-doctor parity check; integrations that use adoption measurement must pin `1.2.0`.
+doctor parity check. `m5 1.2.1` keeps that requirement and additionally expects the structured
+`list_models` discovery contract when the gateway identifies it as a `1.2.1+` client;
+integrations that use adoption measurement or blind-context discovery should pin `1.2.1`.
 
 ## Transport and redaction behavior
 

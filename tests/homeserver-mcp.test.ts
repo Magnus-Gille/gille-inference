@@ -8,7 +8,6 @@ import { classifyTask } from "../src/homeserver/taxonomy.js";
 import { ensureLedgerSchema, getVerdict } from "../src/homeserver/ledger.js";
 import { ensureDelegationCostSchema } from "../src/homeserver/delegation-cost.js";
 import { DEFAULT_POLICY } from "../src/homeserver/config.js";
-import { parseAskFilesCapabilityMeta } from "../src/homeserver/mcp.js";
 import {
   TASK_FINGERPRINT_VERSION,
   lookupTaskExposures,
@@ -78,6 +77,7 @@ let stopGateway: (() => Promise<void>) | null = null;
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 const ASK_FILES_META_KEY = "gille-inference/ask_capabilities";
+const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 // Two keys: an open key (empty allow-list = all models visible) and a scoped key (one model).
 let openKey = "";
@@ -138,9 +138,33 @@ function askCapability(tool: {
   _meta?: Record<string, unknown>;
 }): { files_enabled: boolean; files_reason: string; resolved_root_count: number | null } {
   expect(tool.annotations).toBeUndefined();
-  const capability = parseAskFilesCapabilityMeta(tool._meta?.[ASK_FILES_META_KEY]);
-  expect(capability).not.toBeNull();
-  return capability!;
+  const capability = tool._meta?.[ASK_FILES_META_KEY] as Record<string, unknown> | undefined;
+  expect(capability).toBeDefined();
+  expect(Object.keys(capability!).sort()).toEqual([
+    "files_enabled",
+    "files_reason",
+    "resolved_root_count",
+  ]);
+  expect(typeof capability!.files_enabled).toBe("boolean");
+  expect([
+    "enabled",
+    "owner_tier_required",
+    "unconfigured",
+    "no_resolved_roots",
+  ]).toContain(capability!.files_reason);
+  const count = capability!.resolved_root_count;
+  expect(
+    count === null || (
+      Number.isSafeInteger(count) &&
+      count >= 0 &&
+      count <= MAX_BLIND_CONTEXT_ROOTS
+    )
+  ).toBe(true);
+  return capability! as {
+    files_enabled: boolean;
+    files_reason: string;
+    resolved_root_count: number | null;
+  };
 }
 
 // ─── initialize ─────────────────────────────────────────────────────────────────────
@@ -255,7 +279,7 @@ describe("MCP tools/list", () => {
 // ─── tools/call list_models ─────────────────────────────────────────────────────────
 
 describe("MCP tools/call list_models", () => {
-  it("returns structured blind-context discovery for an owner when the feature is unset/default-disabled", async () => {
+  it("returns structured blind-context discovery for structured-capable callers when the feature is unset/default-disabled", async () => {
     const res = await rpc(
       { jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "list_models", arguments: {} } },
       openKey
@@ -277,6 +301,35 @@ describe("MCP tools/call list_models", () => {
     expect(j.result.content[0]!.text).toContain("Current ask.files capability:");
     expect(j.result.content[0]!.text).toContain("files_reason: unconfigured");
     expect(j.result.content[0]!.text).not.toContain("- files_reason: unconfigured");
+  });
+
+  it("keeps the published m5-cli/1.2.0 wire contract text-only", async () => {
+    const res = await fetch(mcpUrl(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${openKey}`,
+        "user-agent": "m5-cli/1.2.0",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 302,
+        method: "tools/call",
+        params: { name: "list_models", arguments: {} },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const j = (await res.json()) as {
+      result: {
+        content: Array<{ type: string; text: string }>;
+        isError: boolean;
+        structuredContent?: unknown;
+      };
+    };
+    expect(j.result.isError).toBe(false);
+    expect(j.result.structuredContent).toBeUndefined();
+    expect(j.result.content[0]!.text).toContain("Current ask.files capability:");
+    expect(j.result.content[0]!.text).toContain("files_reason: unconfigured");
   });
 
   it("a scoped key sees only its allow-listed model", async () => {
@@ -314,80 +367,6 @@ describe("MCP tools/call list_models", () => {
     expect(j.result.content[0]!.text).toContain(
       "vibethinker-3b — verifiable math, code, and STEM reasoning"
     );
-  });
-});
-
-describe("parseAskFilesCapabilityMeta", () => {
-  const validCases = [
-    {
-      name: "enabled owner capability",
-      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: 2 },
-    },
-    {
-      name: "guest-safe owner-tier gate",
-      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: null },
-    },
-    {
-      name: "unconfigured root state",
-      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: 0 },
-    },
-    {
-      name: "configured but unresolved roots",
-      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: 0 },
-    },
-  ] as const;
-
-  it.each(validCases)("accepts coherent optional capability metadata: $name", ({ value }) => {
-    expect(parseAskFilesCapabilityMeta(value)).toEqual(value);
-  });
-
-  const invalidCases: Array<{ name: string; value: unknown }> = [
-    { name: "missing object", value: undefined },
-    { name: "wrong files_enabled type", value: { files_enabled: "true" } },
-    {
-      name: "unknown reason string",
-      value: { files_enabled: false, files_reason: "disabled", resolved_root_count: null },
-    },
-    {
-      name: "unsafe integer count",
-      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: Number.MAX_SAFE_INTEGER + 1 },
-    },
-    {
-      name: "negative count",
-      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: -1 },
-    },
-    {
-      name: "enabled with zero roots",
-      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: 0 },
-    },
-    {
-      name: "enabled with disabled reason",
-      value: { files_enabled: true, files_reason: "unconfigured", resolved_root_count: 1 },
-    },
-    {
-      name: "disabled with enabled reason and zero roots",
-      value: { files_enabled: false, files_reason: "enabled", resolved_root_count: 0 },
-    },
-    {
-      name: "owner-tier-required with disclosed count",
-      value: { files_enabled: false, files_reason: "owner_tier_required", resolved_root_count: 0 },
-    },
-    {
-      name: "unconfigured with null count",
-      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: null },
-    },
-    {
-      name: "no_resolved_roots with null count",
-      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: null },
-    },
-    {
-      name: "no_resolved_roots with positive count",
-      value: { files_enabled: false, files_reason: "no_resolved_roots", resolved_root_count: 1 },
-    },
-  ];
-
-  it.each(invalidCases)("returns null for malformed optional capability metadata: $name", ({ value }) => {
-    expect(parseAskFilesCapabilityMeta(value)).toBeNull();
   });
 });
 

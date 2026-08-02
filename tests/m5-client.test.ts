@@ -14,6 +14,7 @@ const PROFILE = {
   publicGatewayUrl: "https://public.invalid",
   privateGatewayUrl: "http://private.invalid:8080",
 };
+const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -426,7 +427,7 @@ describe("secret-safe M5 client", () => {
     },
     {
       name: "unsafe integer count",
-      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: Number.MAX_SAFE_INTEGER + 1 },
+      value: { files_enabled: true, files_reason: "enabled", resolved_root_count: MAX_BLIND_CONTEXT_ROOTS + 1 },
     },
     {
       name: "negative root count",
@@ -460,10 +461,14 @@ describe("secret-safe M5 client", () => {
       name: "missing reason field",
       value: { files_enabled: false, resolved_root_count: null },
     },
+    {
+      name: "unexpected extra key",
+      value: { files_enabled: false, files_reason: "unconfigured", resolved_root_count: 0, extra: true },
+    },
   ];
 
   it.each(malformedCapabilities)(
-    "ignores malformed optional ask_capabilities structured metadata when models stay valid: $name",
+    "rejects malformed ask_capabilities structured metadata instead of silently ignoring it: $name",
     async ({ value }) => {
       const client = await createM5Client({
         gatewayUrl: "https://gateway.invalid",
@@ -488,8 +493,72 @@ describe("secret-safe M5 client", () => {
         },
       });
 
-      await expect(client.models()).resolves.toEqual({
+      await expect(client.models()).rejects.toMatchObject({
+        code: "malformed_mcp",
+      });
+    },
+  );
+
+  const malformedStructuredPayloads: Array<{ name: string; value: unknown }> = [
+    {
+      name: "non-object structured payload",
+      value: "nope",
+    },
+    {
+      name: "models is not an array",
+      value: {
+        models: "nope",
+        ask_capabilities: validCapabilities[0].value,
+      },
+    },
+    {
+      name: "model entry has an unexpected key",
+      value: {
+        models: [{ id: "mellum", description: "fast", extra: true }],
+        ask_capabilities: validCapabilities[0].value,
+      },
+    },
+    {
+      name: "top-level payload has an unexpected key",
+      value: {
         models: [{ id: "mellum", description: "fast" }],
+        ask_capabilities: validCapabilities[0].value,
+        extra: true,
+      },
+    },
+    {
+      name: "structured payload omits ask_capabilities",
+      value: {
+        models: [{ id: "mellum", description: "fast" }],
+      },
+    },
+  ];
+
+  it.each(malformedStructuredPayloads)(
+    "fails closed when structuredContent is present but malformed: $name",
+    async ({ value }) => {
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        fetch: async (_input, init) => {
+          const request = JSON.parse(String(init?.body)) as {
+            id: number;
+            params?: { name?: string };
+          };
+          if (request.params?.name !== "list_models") {
+            throw new Error("unexpected tool");
+          }
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "Models available to you:\n- mellum — fast" }],
+            isError: false,
+            structuredContent: value,
+          });
+        },
+      });
+
+      await expect(client.models()).rejects.toMatchObject({
+        code: "malformed_mcp",
       });
     },
   );

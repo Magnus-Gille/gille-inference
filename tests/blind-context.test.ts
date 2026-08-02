@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { mkdtempSync, mkdirSync, realpathSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
+  BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
   describeBlindContextAvailability,
   expandBlindContext,
   MAX_FILES_PER_REQUEST,
@@ -121,8 +122,118 @@ describe("describeBlindContextAvailability", () => {
 
   it.each(cases)("$name", ({ roots, expected }) => {
     const snapshot = [...roots];
-    expect(describeBlindContextAvailability(roots)).toEqual(expected);
+    expect(describeBlindContextAvailability(roots, { signal: () => {} })).toEqual(expected);
     expect(roots).toEqual(snapshot);
+  });
+});
+
+describe("describeBlindContextAvailability discovery cache", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("caches repeated discovery within the TTL and refreshes after expiry", () => {
+    const root = makeTmpRoot("bc-cache-");
+    const counts = { realpath: 0, stat: 0 };
+    let nowMs = 10_000;
+    const fsOps = {
+      realpathSync(path: Parameters<typeof realpathSync>[0]) {
+        counts.realpath += 1;
+        return realpathSync(path);
+      },
+      statSync(path: Parameters<typeof statSync>[0]) {
+        counts.stat += 1;
+        return statSync(path);
+      },
+    };
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      now: () => nowMs,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 1, stat: 1 });
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      now: () => nowMs,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 1, stat: 1 });
+
+    nowMs += BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS;
+
+    expect(describeBlindContextAvailability([root], {
+      fsOps,
+      now: () => nowMs,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 2, stat: 2 });
+  });
+
+  it("invalidates the cache when the configured root list changes", () => {
+    const rootA = makeTmpRoot("bc-cache-a-");
+    const rootB = makeTmpRoot("bc-cache-b-");
+    const counts = { realpath: 0, stat: 0 };
+    const fsOps = {
+      realpathSync(path: Parameters<typeof realpathSync>[0]) {
+        counts.realpath += 1;
+        return realpathSync(path);
+      },
+      statSync(path: Parameters<typeof statSync>[0]) {
+        counts.stat += 1;
+        return statSync(path);
+      },
+    };
+
+    expect(describeBlindContextAvailability([rootA], {
+      fsOps,
+      now: () => 20_000,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(describeBlindContextAvailability([rootB], {
+      fsOps,
+      now: () => 20_000,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+      signal: () => {},
+    })).toEqual({ enabled: true, reason: "enabled", resolvedRootCount: 1 });
+    expect(counts).toEqual({ realpath: 2, stat: 2 });
+  });
+
+  it("emits a content-blind operator signal once per stable config and cache window", () => {
+    const base = makeTmpRoot("bc-signal-");
+    const regularFileRoot = join(base, "root-secret.txt");
+    const missingRoot = join(base, "missing-secret-root");
+    writeFileSync(regularFileRoot, "not a directory");
+    let nowMs = 30_000;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    describeBlindContextAvailability([missingRoot, regularFileRoot], {
+      now: () => nowMs,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+    });
+    describeBlindContextAvailability([missingRoot, regularFileRoot], {
+      now: () => nowMs,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+    });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const firstMessage = warn.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(firstMessage).toContain("configured_root_count");
+    expect(firstMessage).toContain("dropped_root_reasons");
+    expect(firstMessage).not.toContain(missingRoot);
+    expect(firstMessage).not.toContain(regularFileRoot);
+
+    nowMs += BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS;
+    describeBlindContextAvailability([missingRoot, regularFileRoot], {
+      now: () => nowMs,
+      cacheTtlMs: BLIND_CONTEXT_DISCOVERY_CACHE_TTL_MS,
+    });
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 });
 

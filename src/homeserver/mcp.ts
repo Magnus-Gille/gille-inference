@@ -14,7 +14,12 @@ import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
 import { canonicalizeModelTrusted } from "./catalogue.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
-import { describeBlindContextAvailability, expandBlindContext, type BlindContextConfig } from "./blind-context.js";
+import {
+  describeBlindContextAvailability,
+  expandBlindContext,
+  MAX_BLIND_CONTEXT_ROOTS,
+  type BlindContextConfig,
+} from "./blind-context.js";
 import { codeLoopToolDefs, isCodeLoopToolName } from "./code-loop.js";
 import { handleCodeLoopTool } from "./code-loop-runtime.js";
 import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
@@ -109,7 +114,8 @@ const ASK_DESCRIPTION =
   "`files` is always rejected, never silently ignored.";
 
 const ASK_FILES_REASON_VALUES = ["enabled", "owner_tier_required", "unconfigured", "no_resolved_roots"] as const;
-const MAX_SAFE_ROOT_COUNT = Number.MAX_SAFE_INTEGER;
+const MAX_SAFE_ROOT_COUNT = MAX_BLIND_CONTEXT_ROOTS;
+const STRUCTURED_LIST_MODELS_MIN_M5_CLIENT_VERSION = [1, 2, 1] as const;
 
 type AskFilesReason = (typeof ASK_FILES_REASON_VALUES)[number];
 
@@ -246,56 +252,37 @@ function askFilesCapability(principal: McpPrincipal, cfg: HomeserverConfig): Ask
   };
 }
 
-export function parseAskFilesCapabilityMeta(value: unknown): AskFilesCapability | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const candidate = value as Record<string, unknown>;
-  const filesEnabled = candidate["files_enabled"];
-  const filesReason = candidate["files_reason"];
-  const resolvedRootCount = candidate["resolved_root_count"];
-  if (typeof filesEnabled !== "boolean" || !isAskFilesReason(filesReason)) return null;
-  if (resolvedRootCount !== null && !isSafeNonNegativeRootCount(resolvedRootCount)) return null;
-  if (filesEnabled) {
-    if (filesReason !== "enabled" || typeof resolvedRootCount !== "number" || resolvedRootCount < 1) return null;
-    return {
-      files_enabled: filesEnabled,
-      files_reason: filesReason,
-      resolved_root_count: resolvedRootCount,
-    };
-  }
-  if (filesReason === "owner_tier_required") {
-    if (resolvedRootCount !== null) return null;
-    return {
-      files_enabled: filesEnabled,
-      files_reason: filesReason,
-      resolved_root_count: resolvedRootCount,
-    };
-  }
-  if (
-    (filesReason === "unconfigured" || filesReason === "no_resolved_roots")
-    && resolvedRootCount === 0
-  ) {
-    return {
-      files_enabled: filesEnabled,
-      files_reason: filesReason,
-      resolved_root_count: resolvedRootCount,
-    };
-  }
-  return null;
-}
-
-function isAskFilesReason(value: unknown): value is AskFilesReason {
-  return typeof value === "string" && ASK_FILES_REASON_VALUES.includes(value as AskFilesReason);
-}
-
-function isSafeNonNegativeRootCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
 function buildListModelsStructuredContent(models: readonly string[], capability: AskFilesCapability): ListModelsStructuredContent {
   return {
     models: models.map((id) => ({ id, description: strengthHint(id) })),
     ask_capabilities: capability,
   };
+}
+
+function parseSemverTriplet(raw: string): [number, number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(raw);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function compareSemverTriplets(
+  left: readonly [number, number, number],
+  right: readonly [number, number, number]
+): number {
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] === right[i]) continue;
+    return left[i]! < right[i]! ? -1 : 1;
+  }
+  return 0;
+}
+
+function supportsStructuredListModelsContent(userAgent: string | null | undefined): boolean {
+  if (!userAgent) return true;
+  const match = /\bm5-cli\/([^\s]+)/.exec(userAgent);
+  if (!match) return true;
+  const version = parseSemverTriplet(match[1]!);
+  if (!version) return false;
+  return compareSemverTriplets(version, STRUCTURED_LIST_MODELS_MIN_M5_CLIENT_VERSION) >= 0;
 }
 
 function renderListModelsText(content: ListModelsStructuredContent): string {
@@ -923,6 +910,7 @@ interface ToolCallContext {
   cfg: HomeserverConfig;
   controller: AdmissionController;
   gatewayRequestId: string;
+  userAgent: string | null;
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch;
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
 }
@@ -935,7 +923,11 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       models,
       askFilesCapability(ctx.principal, ctx.cfg)
     );
-    return { text: renderListModelsText(structuredContent), isError: false, structuredContent };
+    return {
+      text: renderListModelsText(structuredContent),
+      isError: false,
+      ...(supportsStructuredListModelsContent(ctx.userAgent) ? { structuredContent } : {}),
+    };
   }
 
   if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {

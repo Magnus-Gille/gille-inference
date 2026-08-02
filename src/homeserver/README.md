@@ -261,10 +261,12 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 
 **Tools** (both scoped to the key's allow-list):
 
-- `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. Its
-  `structuredContent.ask_capabilities` is the **fresh call-time** blind-context discovery state
-  for `ask.files`, mirrored in backward-compatible text and described by an exact `outputSchema`:
-  `files_enabled`, stable `files_reason`, and `resolved_root_count` (guest-safe `null`).
+- `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. For
+  structured-capable callers it returns `structuredContent.ask_capabilities`, the **fresh
+  call-time** blind-context discovery state for `ask.files`, mirrored in backward-compatible text
+  and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
+  `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
+  text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
 - `ask` — `{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
   local model and returns the text. A model outside the key's allow-list, an exhausted credit
   budget, a quota hit, or a busy box all map to `isError:true` with a clear message (never a
@@ -289,8 +291,8 @@ sees only the model's answer text.
   message. There is no way for an unset env var to silently widen into "everything is allowed."
 - **Truthful discovery before `ask`.** `tools/list` advertises the current `ask` blind-context
   capability in content-blind `ask._meta["gille-inference/ask_capabilities"]`, and
-  `list_models` mirrors the same **fresh call-time** fields in `structuredContent.ask_capabilities`:
-  `files_enabled`, stable `files_reason`
+  `list_models` mirrors the same **fresh call-time** fields in text plus, for structured-capable
+  callers, `structuredContent.ask_capabilities`: `files_enabled`, stable `files_reason`
   (`enabled`, `owner_tier_required`, `unconfigured`, `no_resolved_roots`), and
   `resolved_root_count`. Discovery never leaks actual root paths; guest keys receive
   `resolved_root_count: null`.

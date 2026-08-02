@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.js";
+import { createM5Client } from "../client/m5-client.mjs";
 import { resetConfig, loadConfig } from "../src/homeserver/config.js";
 import { mintKey } from "../src/homeserver/keystore.js";
 import { startGateway } from "../src/homeserver/gateway.js";
@@ -335,7 +336,7 @@ describe("MCP blind-context discovery", () => {
     }
   });
 
-  it("re-checks live root availability instead of caching a stale enabled state", async () => {
+  it("keeps ask(files) live-revalidated even if discovery was cached earlier", async () => {
     const base = mkdtempSync(join(tmpdir(), "hs-mcp-bc-discovery-live-"));
     const allowedRoot = join(base, "allowed");
     mkdirSync(allowedRoot);
@@ -352,19 +353,6 @@ describe("MCP blind-context discovery", () => {
 
       rmSync(allowedRoot, { recursive: true, force: true });
 
-      const askDef = askTool(await listTools(harness.gatewayPort, harness.ownerKey));
-      const capability = askCapability(askDef);
-      expect(capability).toEqual({
-        files_enabled: false,
-        files_reason: "no_resolved_roots",
-        resolved_root_count: 0,
-      });
-
-      const models = await listModels(harness.gatewayPort, harness.ownerKey);
-      expect(models.structuredContent?.ask_capabilities).toEqual(capability);
-      expectCapabilityText(models.text, capability);
-      expect(loadConfig().blindContextRoots).toEqual(before);
-
       const result = await ask(harness.gatewayPort, harness.ownerKey, {
         model: "any-model",
         prompt: "hi",
@@ -373,6 +361,7 @@ describe("MCP blind-context discovery", () => {
       expect(result.isError).toBe(true);
       expect(result.text).toMatch(/configured.*roots resolve to a real director/i);
       expect(harness.upstreamHits()).toBe(0);
+      expect(loadConfig().blindContextRoots).toEqual(before);
     } finally {
       await harness.stop();
     }
@@ -400,6 +389,33 @@ describe("MCP blind-context discovery", () => {
       expect(models.structuredContent?.ask_capabilities).toEqual(capability);
       expectCapabilityText(models.text, capability);
       expect(JSON.stringify(models)).not.toContain(allowedRoot);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("feeds the real gateway list_models result to the packaged m5 client end-to-end", async () => {
+    const base = mkdtempSync(join(tmpdir(), "hs-mcp-bc-discovery-client-"));
+    const allowedRoot = join(base, "allowed");
+    mkdirSync(allowedRoot);
+    writeFileSync(join(allowedRoot, "notes.txt"), "hello");
+    const harness = await createHarness(allowedRoot);
+    try {
+      const client = await createM5Client({
+        gatewayUrl: `http://127.0.0.1:${harness.gatewayPort}`,
+        endpoint: "private",
+        profile: "codex",
+        credentialStore: { resolve: async () => harness.ownerKey },
+      });
+
+      await expect(client.models()).resolves.toEqual({
+        models: [{ id: "any-model", description: "general" }],
+        ask_capabilities: {
+          files_enabled: true,
+          files_reason: "enabled",
+          resolved_root_count: 1,
+        },
+      });
     } finally {
       await harness.stop();
     }

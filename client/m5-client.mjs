@@ -1,6 +1,6 @@
 import { execFile as nodeExecFile } from "node:child_process";
 
-export const M5_CLIENT_VERSION = "1.2.0";
+export const M5_CLIENT_VERSION = "1.2.1";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
@@ -29,6 +29,7 @@ const ADOPTION_USEFULNESS = new Set(["pass", "partial", "redo", "wrong", "not_re
 const ADOPTION_FALLBACKS = new Set([
   "none", "m5_tool_missing", "m5_auth_unavailable", "m5_unreachable", "m5_busy", "m5_refused", "local_result_unusable", "other_known",
 ]);
+const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 const TOKEN_PATTERNS = [
   /\bBearer\s+[^\s"',}]+/gi,
@@ -253,6 +254,12 @@ function rpcErrorMessage(response) {
   return message;
 }
 
+function hasOnlyKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expectedKeys.length && expectedKeys.every((key) => keys.includes(key));
+}
+
 function toolPayload(result) {
   if (!result || typeof result !== "object") {
     throw new M5ClientError("malformed_mcp", "The MCP tool result is malformed.");
@@ -298,7 +305,7 @@ function parseModels(text) {
 }
 
 function parseAskCapabilities(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!hasOnlyKeys(value, ["files_enabled", "files_reason", "resolved_root_count"])) {
     return null;
   }
   const { files_enabled, files_reason, resolved_root_count } = value;
@@ -312,7 +319,7 @@ function parseAskCapabilities(value) {
     !validReason ||
     !(
       resolved_root_count === null ||
-      (Number.isSafeInteger(resolved_root_count) && resolved_root_count >= 0)
+      (Number.isSafeInteger(resolved_root_count) && resolved_root_count >= 0 && resolved_root_count <= MAX_BLIND_CONTEXT_ROOTS)
     )
   ) {
     return null;
@@ -335,12 +342,24 @@ function parseAskCapabilities(value) {
 }
 
 function parseStructuredModelsPayload(payload) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-  if (!Array.isArray(payload.models)) return null;
+  if (!hasOnlyKeys(payload, ["models", "ask_capabilities"])) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The model catalogue response is malformed.",
+    );
+  }
+  if (!Array.isArray(payload.models)) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The model catalogue response is malformed.",
+    );
+  }
   const models = payload.models.map((entry) => {
     if (
       !entry ||
       typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      !hasOnlyKeys(entry, ["id", "description"]) ||
       typeof entry.id !== "string" ||
       typeof entry.description !== "string"
     ) {
@@ -351,13 +370,14 @@ function parseStructuredModelsPayload(payload) {
     }
     return { id: entry.id, description: entry.description };
   });
-  const askCapabilities = Object.prototype.hasOwnProperty.call(payload, "ask_capabilities")
-    ? parseAskCapabilities(payload.ask_capabilities)
-    : null;
-  return {
-    models,
-    ...(askCapabilities === null ? {} : { ask_capabilities: askCapabilities }),
-  };
+  const askCapabilities = parseAskCapabilities(payload.ask_capabilities);
+  if (askCapabilities === null) {
+    throw new M5ClientError(
+      "malformed_mcp",
+      "The model catalogue response is malformed.",
+    );
+  }
+  return { models, ask_capabilities: askCapabilities };
 }
 
 function validateWorkId(workId) {
@@ -649,8 +669,9 @@ export async function createM5Client({
           );
         }
 
-        const structured = parseStructuredModelsPayload(result.structuredContent);
-        if (structured) return structured;
+        if (Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
+          return parseStructuredModelsPayload(result.structuredContent);
+        }
 
         const text = toolText(result);
         const models = parseModels(text);
