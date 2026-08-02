@@ -99,12 +99,47 @@ const ASK_DESCRIPTION =
   "no data leaves the box). Ideal for code generation/refactoring, drafting, classification, " +
   "summarization, extraction, and short reasoning where you would otherwise spend frontier tokens. " +
   "Pick a model from list_models; pass the full prompt (and an optional system instruction). " +
-  "Returns the model's text. Use this liberally for bounded work to save cost and keep data local. " +
+  "Successful calls return the model text plus structuredContent {model,text,finish_reason,truncated,metered,usage}. " +
+  "A token-limit finish (finish_reason=length) returns isError:true while preserving the partial text in content and the same structuredContent; the truncated call is already metered and any retry is a new billable call. " +
+  "Use this liberally for bounded work to save cost and keep data local. " +
   "OWNER-TIER KEYS ONLY: an optional `files` array of absolute paths on the box is expanded " +
   "SERVER-SIDE into the prompt as local context, so this tool can orchestrate over local data it " +
   "never ingests — only the box reads the file and the local model sees its content. Requires " +
   "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); a guest key supplying " +
   "`files` is always rejected, never silently ignored.";
+
+const ASK_USAGE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    prompt_tokens: { type: ["integer", "null"], minimum: 0 },
+    completion_tokens: { type: ["integer", "null"], minimum: 0 },
+    total_tokens: { type: ["integer", "null"], minimum: 0 },
+    reasoning_tokens: { type: ["integer", "null"], minimum: 0 },
+    cache_creation_input_tokens: { type: ["integer", "null"], minimum: 0 },
+    cache_read_input_tokens: { type: ["integer", "null"], minimum: 0 },
+  },
+  required: [
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "reasoning_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+  ],
+} as const;
+
+const ASK_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    model: { type: "string" },
+    text: { type: "string" },
+    finish_reason: { type: ["string", "null"] },
+    truncated: { type: ["boolean", "null"] },
+    metered: { const: true },
+    usage: ASK_USAGE_OUTPUT_SCHEMA,
+  },
+  required: ["model", "text", "finish_reason", "truncated", "metered", "usage"],
+} as const;
 
 const CODE_LOOP_OWNER_INSTRUCTIONS =
   "code_loop is OWNER-AGENT ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
@@ -220,6 +255,7 @@ function toolDefs(principal: McpPrincipal): unknown[] {
         },
         required: ["model", "prompt"],
       },
+      outputSchema: ASK_OUTPUT_SCHEMA,
     },
   ];
   if (isAdoptionReporter(principal)) {
@@ -305,9 +341,143 @@ export interface RunChatArgs {
   learningTaskStamp?: HuginRequestStamp;
 }
 
+interface AskUsageMetadata {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  reasoningTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  cacheReadInputTokens: number | null;
+}
+
 export type RunChatResult =
-  | { ok: true; text: string; totalTokens: number }
+  | {
+      ok: true;
+      text: string;
+      totalTokens: number;
+      finishReason: string | null;
+      truncated: boolean | null;
+      usage: AskUsageMetadata;
+    }
   | { ok: false; code: "credits_exhausted" | "rate_limited" | "server_busy" | "model_not_allowed" | "upstream_error"; message: string };
+
+const ASK_TRUNCATION_FINISH_REASON = "length";
+
+function emptyAskUsageMetadata(): AskUsageMetadata {
+  return {
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    reasoningTokens: null,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+  };
+}
+
+function nonNegativeIntegerOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function askTruncatedOfFinishReason(finishReason: string | null): boolean | null {
+  return finishReason === null ? null : finishReason === ASK_TRUNCATION_FINISH_REASON;
+}
+
+function isAskTokenLimitTruncation(result: Extract<RunChatResult, { ok: true }>): boolean {
+  return result.truncated === true && result.finishReason === ASK_TRUNCATION_FINISH_REASON;
+}
+
+function askTruncationWarningText(partialText: string): string {
+  const prefix = [
+    `WARNING: The model response was truncated at the token limit (finish_reason=${ASK_TRUNCATION_FINISH_REASON}).`,
+    "This partial response was metered, and any retry is a new billable call.",
+    "",
+    "Partial response follows:",
+  ].join("\n");
+  return partialText.length > 0 ? `${prefix}\n\n${partialText}` : prefix;
+}
+
+function parseAskUsageMetadata(rawUsage: unknown): AskUsageMetadata {
+  if (rawUsage === null || rawUsage === undefined) {
+    return emptyAskUsageMetadata();
+  }
+  if (typeof rawUsage !== "object" || Array.isArray(rawUsage)) {
+    return emptyAskUsageMetadata();
+  }
+  const usage = rawUsage as {
+    prompt_tokens?: unknown;
+    input_tokens?: unknown;
+    completion_tokens?: unknown;
+    output_tokens?: unknown;
+    total_tokens?: unknown;
+    reasoning_tokens?: unknown;
+    cache_creation_input_tokens?: unknown;
+    cache_read_input_tokens?: unknown;
+    prompt_tokens_details?: {
+      cached_tokens?: unknown;
+      cache_read_input_tokens?: unknown;
+      cache_creation_input_tokens?: unknown;
+    };
+    completion_tokens_details?: {
+      reasoning_tokens?: unknown;
+    };
+  };
+  const promptTokens =
+    nonNegativeIntegerOrNull(usage.prompt_tokens) ?? nonNegativeIntegerOrNull(usage.input_tokens);
+  const completionTokens =
+    nonNegativeIntegerOrNull(usage.completion_tokens) ?? nonNegativeIntegerOrNull(usage.output_tokens);
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens:
+      nonNegativeIntegerOrNull(usage.total_tokens) ??
+      (promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null),
+    reasoningTokens:
+      nonNegativeIntegerOrNull(usage.reasoning_tokens) ??
+      nonNegativeIntegerOrNull(usage.completion_tokens_details?.reasoning_tokens),
+    cacheCreationInputTokens:
+      nonNegativeIntegerOrNull(usage.cache_creation_input_tokens) ??
+      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cache_creation_input_tokens),
+    cacheReadInputTokens:
+      nonNegativeIntegerOrNull(usage.cache_read_input_tokens) ??
+      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cache_read_input_tokens) ??
+      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cached_tokens),
+  };
+}
+
+function toAskStructuredContent(
+  model: string,
+  result: Extract<RunChatResult, { ok: true }>
+): {
+  model: string;
+  text: string;
+  finish_reason: string | null;
+  truncated: boolean | null;
+  metered: true;
+  usage: {
+    prompt_tokens: number | null;
+    completion_tokens: number | null;
+    total_tokens: number | null;
+    reasoning_tokens: number | null;
+    cache_creation_input_tokens: number | null;
+    cache_read_input_tokens: number | null;
+  };
+} {
+  return {
+    model,
+    text: result.text,
+    finish_reason: result.finishReason,
+    truncated: result.truncated,
+    metered: true,
+    usage: {
+      prompt_tokens: result.usage.promptTokens,
+      completion_tokens: result.usage.completionTokens,
+      total_tokens: result.usage.totalTokens,
+      reasoning_tokens: result.usage.reasoningTokens,
+      cache_creation_input_tokens: result.usage.cacheCreationInputTokens,
+      cache_read_input_tokens: result.usage.cacheReadInputTokens,
+    },
+  };
+}
 
 /**
  * Run a non-streaming chat completion through the SAME metered spine as
@@ -521,15 +691,25 @@ export async function runChatCompletion(
     let content = "";
     let promptTokens: number | null = null;
     let completionTokens: number | null = null;
+    let usageMetadata = emptyAskUsageMetadata();
+    let finishReason: string | null = null;
+    let truncated: boolean | null = null;
     try {
       const json = JSON.parse(text) as {
-        choices?: Array<{ message?: { content?: string } }>;
-        usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string | null }>;
+        usage?: unknown;
       };
       content = json.choices?.[0]?.message?.content ?? "";
-      actualTokens = json.usage?.total_tokens ?? Math.ceil(promptChars / 4);
-      promptTokens = json.usage?.prompt_tokens ?? null;
-      completionTokens = json.usage?.completion_tokens ?? null;
+      usageMetadata = parseAskUsageMetadata(json.usage);
+      promptTokens = usageMetadata.promptTokens;
+      completionTokens = usageMetadata.completionTokens;
+      finishReason = typeof json.choices?.[0]?.finish_reason === "string" ? json.choices[0].finish_reason : null;
+      truncated = askTruncatedOfFinishReason(finishReason);
+      actualTokens =
+        usageMetadata.totalTokens ??
+        (promptTokens !== null && completionTokens !== null
+          ? promptTokens + completionTokens
+          : Math.ceil(promptChars / 4));
     } catch {
       // 2xx non-JSON: surface the raw body, charge only the prompt estimate.
       content = text;
@@ -557,7 +737,14 @@ export async function runChatCompletion(
         outcome: "ok",
       });
     }
-    return { ok: true, text: content, totalTokens: actualTokens };
+    return {
+      ok: true,
+      text: content,
+      totalTokens: actualTokens,
+      finishReason,
+      truncated,
+      usage: usageMetadata,
+    };
   } catch (err) {
     // R6 (graceful degradation): the upstream fetch threw — connection refused/reset (backend
     // down) or the AbortSignal timeout fired (slow / cold-loading backend). Map it to a structured
@@ -870,7 +1057,17 @@ async function callTool(name: string, args: Record<string, unknown>, ctx: ToolCa
       topK: args["top_k"] as number | undefined,
       minP: args["min_p"] as number | undefined,
     });
-    if (r.ok) return { text: r.text, isError: false };
+    if (r.ok) {
+      const structuredContent = toAskStructuredContent(model, r);
+      if (isAskTokenLimitTruncation(r)) {
+        return {
+          text: askTruncationWarningText(r.text),
+          isError: true,
+          structuredContent,
+        };
+      }
+      return { text: r.text, isError: false, structuredContent };
+    }
     return { text: r.message, isError: true };
   }
 

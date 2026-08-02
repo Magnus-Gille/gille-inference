@@ -117,6 +117,35 @@ m5 --profile codex code status cl-example
 m5 --profile codex code result cl-example
 ```
 
+`m5 ask` returns structured JSON:
+
+```json
+{
+  "model": "mellum",
+  "text": "answer text",
+  "finish_reason": "stop",
+  "truncated": false,
+  "metered": true,
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 34,
+    "total_tokens": 46,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+  }
+}
+```
+
+If the backend ends with `finish_reason:"length"`, `m5 ask` still returns the same JSON shape,
+but with `truncated:true` and `metered:true`, so automation can retry with a higher `max_tokens`
+instead of treating an empty or partial answer as a normal completion. The CLI preserves its
+current exit semantics: truncation still exits `0` with structured JSON, while ordinary tool
+errors still exit `1` with a redacted stderr JSON envelope. Truncation is already billable on the
+first call, and any retry is a new metered request. Usage fields remain content-blind; the client
+accepts `null` usage, derives `total_tokens` only when prompt+completion counts are both valid,
+and nulls malformed negative or fractional counters instead of trusting them.
+
 `code run` starts the server-side async job, polls it, and returns the terminal structured result,
 including the unified diff and verification evidence. It can use `"wait": false` to return the
 start response for later `status`/`result` calls. It never applies the diff, writes into a live

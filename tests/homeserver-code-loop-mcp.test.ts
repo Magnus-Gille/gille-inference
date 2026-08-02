@@ -209,7 +209,7 @@ describe("code_loop_* visibility in tools/list", () => {
     const tools = await listedTools(ownerKey);
     const toolsWithOutputSchemas = tools.filter((tool) => tool.outputSchema !== undefined);
 
-    expect(toolsWithOutputSchemas.map((tool) => tool.name)).toEqual(CODE_LOOP_TOOLS);
+    expect(toolsWithOutputSchemas.map((tool) => tool.name)).toEqual(["ask", ...CODE_LOOP_TOOLS]);
     for (const tool of toolsWithOutputSchemas) {
       expect(tool.outputSchema).toMatchObject({ type: "object" });
     }
