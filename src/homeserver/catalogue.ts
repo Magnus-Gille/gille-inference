@@ -72,6 +72,25 @@ export function getTrustedCatalogue(): Set<string> {
 }
 
 /**
+ * Canonicalize telemetry that must trust only server-owned model identity.
+ *
+ * `configuredModelIds` is reserved for a finite set read from server configuration (currently the
+ * enabled Orin model). Caller/principal allow-lists must never be passed here: they are admission
+ * policy, not evidence that a label is safe or current. The resident cache remains synchronous and
+ * fail-closed, so a cold or unavailable catalogue yields the single bounded "unknown" sentinel.
+ */
+export function canonicalizeModelFromTrustedCatalogue(
+  requested: string | null,
+  configuredModelIds: readonly string[] = [],
+): string | null {
+  if (requested === null || requested.trim() === "") return null;
+
+  return getTrustedCatalogue().has(requested) || configuredModelIds.includes(requested)
+    ? requested
+    : "unknown";
+}
+
+/**
  * Canonicalize a user-supplied model string into a label SAFE for Prometheus + the request_log.
  * SYNCHRONOUS — never a network round-trip in the request hot path.
  *
@@ -92,7 +111,7 @@ export function canonicalizeModelTrusted(requested: string | null, allowList: st
   }
 
   // Empty allow-list (owner/admin): validate against the current cache (sync), refresh in bg.
-  return getTrustedCatalogue().has(requested) ? requested : "unknown";
+  return canonicalizeModelFromTrustedCatalogue(requested);
 }
 
 /** Reset the cache. FOR TESTS ONLY. */

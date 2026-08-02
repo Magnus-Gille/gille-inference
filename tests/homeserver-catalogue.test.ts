@@ -18,6 +18,7 @@ vi.mock("../src/homeserver/model-admin.js", () => ({
 }));
 
 let canonicalizeModelTrusted: typeof import("../src/homeserver/catalogue.js").canonicalizeModelTrusted;
+let canonicalizeModelFromTrustedCatalogue: typeof import("../src/homeserver/catalogue.js").canonicalizeModelFromTrustedCatalogue;
 let warmCatalogue: typeof import("../src/homeserver/catalogue.js").warmCatalogue;
 let getTrustedCatalogue: typeof import("../src/homeserver/catalogue.js").getTrustedCatalogue;
 let resetCatalogueCache: typeof import("../src/homeserver/catalogue.js").resetCatalogueCache;
@@ -26,6 +27,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   const mod = await import("../src/homeserver/catalogue.js");
   canonicalizeModelTrusted = mod.canonicalizeModelTrusted;
+  canonicalizeModelFromTrustedCatalogue = mod.canonicalizeModelFromTrustedCatalogue;
   warmCatalogue = mod.warmCatalogue;
   getTrustedCatalogue = mod.getTrustedCatalogue;
   resetCatalogueCache = mod.resetCatalogueCache;
@@ -107,5 +109,25 @@ describe("canonicalizeModelTrusted — non-empty allow-list (scoped key)", () =>
     const result = canonicalizeModelTrusted("secret-resident", ["m1"]);
     // Not on the key's allow-list → must not be labelled with its id.
     expect(result).toBe("unknown");
+  });
+});
+
+describe("canonicalizeModelFromTrustedCatalogue — delegate telemetry", () => {
+  it("ignores principal trust and keeps a resident served model excluded by that list", async () => {
+    const principalAllowList = ["stale-caller-controlled-model"];
+    listModelsMock.mockResolvedValue([{ key: "m1" }]);
+    await warmCatalogue();
+
+    expect(principalAllowList).not.toContain("m1");
+    expect(canonicalizeModelFromTrustedCatalogue("m1")).toBe("m1");
+    expect(canonicalizeModelFromTrustedCatalogue(principalAllowList[0]!)).toBe("unknown");
+  });
+
+  it("accepts only explicitly server-configured extra identities when the resident cache is cold", () => {
+    const configuredOrinModel = "orin-configured-model";
+    expect(canonicalizeModelFromTrustedCatalogue(configuredOrinModel, [configuredOrinModel])).toBe(
+      configuredOrinModel,
+    );
+    expect(canonicalizeModelFromTrustedCatalogue("caller-model", [configuredOrinModel])).toBe("unknown");
   });
 });

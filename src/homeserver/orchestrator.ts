@@ -7,12 +7,12 @@ import { getLoaded, getRunningCmd } from "./model-admin.js";
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
-import { orinAllowsTask, runOrinInference, type ComputeNodeId } from "./nodes.js";
+import { configuredDelegateModelIds, orinAllowsTask, runOrinInference, type ComputeNodeId } from "./nodes.js";
 import type { LocalInferenceResult } from "../runner/local-client.js";
 import { runInference, type ResponseFormat } from "../runner/openrouter-client.js";
 import { randomUUID } from "node:crypto";
 import { defaultLogger } from "./access-log.js";
-import { canonicalizeModelTrusted } from "./catalogue.js";
+import { canonicalizeModelFromTrustedCatalogue } from "./catalogue.js";
 import {
   buildDelegationCostTrace,
   tryRecordDelegationCost,
@@ -664,12 +664,18 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
     // Emit one delegate_decision log line covering classify→decision→outcome.
     // Uses the module-level defaultLogger (replaced by no-op when accessLog=off).
     const { decision, outcome: summaryOutcome, escalated } = summarizeDelegation(fo);
+    let configuredModelIds: readonly string[] = [];
+    try {
+      configuredModelIds = configuredDelegateModelIds(loadConfig());
+    } catch {
+      // Telemetry must not mask the request's original config failure or trust caller identity.
+    }
     defaultLogger.log({
       event: "delegate_decision",
       requestId,
       // C3/#179: the outcome retains the exact model id for routing, ledger, accounting, and
       // response behavior; only this metadata projection is catalogue-canonicalized.
-      model: canonicalizeModelTrusted(fo?.modelId ?? null, []),
+      model: canonicalizeModelFromTrustedCatalogue(fo?.modelId ?? null, configuredModelIds),
       taskType: fo?.taskType ?? null,
       decision,
       outcome: summaryOutcome,

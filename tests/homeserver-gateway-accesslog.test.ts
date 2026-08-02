@@ -10,7 +10,7 @@
  * Restores the default logger after each test.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,13 +22,36 @@ import {
   defaultLogger as originalDefaultLogger,
   type AccessLogRecord,
 } from "../src/homeserver/access-log.js";
-import { renderMetrics } from "../src/homeserver/metrics.js";
+import { renderMetrics, resetMetrics } from "../src/homeserver/metrics.js";
 
 // Captured log lines per test (reset in afterEach)
 let captured: string[] = [];
 
 let upstream: Server;
 let upstreamPort = 0;
+let upstreamModelRequests: string[] = [];
+
+const MUTATED_ENV_KEYS = [
+  "LMSTUDIO_BASE_URL",
+  "HOMESERVER_BACKEND",
+  "HOMESERVER_HOST",
+  "HOMESERVER_PORT",
+  "HOMESERVER_MAX_INFLIGHT",
+  "HOMESERVER_PER_REQUEST_MAX_TOKENS",
+  "HOMESERVER_KEY_DEFAULT_RPM",
+  "HOMESERVER_KEY_DEFAULT_TPM",
+  "HOMESERVER_ADMIN_API_KEYS",
+  "HOMESERVER_ACCESS_LOG_HEALTHZ",
+] as const;
+let originalEnv = new Map<string, string | undefined>();
+
+function restoreEnvironment(): void {
+  for (const key of MUTATED_ENV_KEYS) {
+    const value = originalEnv.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -44,14 +67,20 @@ function startUpstream(): Promise<void> {
       }));
       return;
     }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        id: "cmpl-1",
-        choices: [{ message: { role: "assistant", content: "ok" } }],
-        usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
-      })
-    );
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown };
+      if (typeof body.model === "string") upstreamModelRequests.push(body.model);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "cmpl-1",
+          choices: [{ message: { role: "assistant", content: "ok" } }],
+          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+        })
+      );
+    });
   });
   return new Promise((resolve) =>
     upstream.listen(0, "127.0.0.1", () => {
@@ -65,10 +94,14 @@ let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let warmCatalogue: typeof import("../src/homeserver/catalogue.js").warmCatalogue;
+let resetCatalogueCache: typeof import("../src/homeserver/catalogue.js").resetCatalogueCache;
+let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
 beforeAll(async () => {
+  originalEnv = new Map(MUTATED_ENV_KEYS.map((key) => [key, process.env[key]]));
+
   // Isolate DB
   const dir = mkdtempSync(join(tmpdir(), "hs-accesslog-test-"));
   initDb(join(dir, "test.db"));
@@ -91,8 +124,11 @@ beforeAll(async () => {
   const gw = await import("../src/homeserver/gateway.js");
   const ks = await import("../src/homeserver/keystore.js");
   const catalogue = await import("../src/homeserver/catalogue.js");
+  const config = await import("../src/homeserver/config.js");
   mintKey = ks.mintKey;
   warmCatalogue = catalogue.warmCatalogue;
+  resetCatalogueCache = catalogue.resetCatalogueCache;
+  resetConfig = config.resetConfig;
 
   const handle = await gw.startGateway();
   gatewayPort = handle.port;
@@ -100,10 +136,20 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (stopGateway) await stopGateway();
-  await new Promise<void>((r) => upstream.close(() => r()));
-  // Restore the original logger at the end of the suite
-  setDefaultLogger(originalDefaultLogger);
+  try {
+    if (stopGateway) await stopGateway();
+    await new Promise<void>((r) => upstream.close(() => r()));
+  } finally {
+    // Restore every process-global value this suite mutates, including absent values.
+    setDefaultLogger(originalDefaultLogger);
+    restoreEnvironment();
+    resetConfig();
+  }
+});
+
+beforeEach(() => {
+  resetMetrics();
+  upstreamModelRequests = [];
 });
 
 afterEach(() => {
@@ -218,7 +264,9 @@ describe("gateway access-log integration", () => {
 
   it("(g) /delegate preserves the caller model for the response and ledger but canonicalizes every access/request record", async () => {
     installCapturingLogger();
-    await warmCatalogue();
+    // Exercise the cold-catalogue fail-closed path explicitly. The background refresh may finish
+    // during the call, but an arbitrary caller id must remain absent from every telemetry sink.
+    resetCatalogueCache();
     const owner = mintKey({
       alias: "alog-delegate-secret",
       tier: "owner",
@@ -236,6 +284,7 @@ describe("gateway access-log integration", () => {
     const body = await response.json() as { modelId: string; ledgerId: string };
     expect(body.modelId).toBe(secretModelId);
     expect(body.ledgerId).toEqual(expect.any(String));
+    expect(upstreamModelRequests).toEqual([secretModelId]);
 
     const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
     const decision = records.find((record) => record.event === "delegate_decision");
@@ -259,9 +308,14 @@ describe("gateway access-log integration", () => {
     const serializedTelemetry = JSON.stringify({ records, requestRow });
     expect(serializedTelemetry).not.toContain(secretModelId);
     expect(serializedTelemetry).not.toContain(prompt);
+    const metrics = renderMetrics();
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="unknown",outcome="ok",tier="owner"} 1',
+    );
+    expect(metrics).not.toContain(secretModelId);
   });
 
-  it("(h) /delegate exports a trusted configured model and collapses arbitrary IDs to one bounded sentinel", async () => {
+  it("(h) /delegate exports a trusted resident model and collapses arbitrary IDs to one bounded sentinel", async () => {
     installCapturingLogger();
     await warmCatalogue();
     const owner = mintKey({
@@ -280,6 +334,7 @@ describe("gateway access-log integration", () => {
       expect(response.status).toBe(200);
       expect((await response.json() as { modelId: string }).modelId).toBe(modelId);
     }
+    expect(upstreamModelRequests).toEqual(requestedModelIds);
 
     const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
     const decisions = records.filter((record) => record.event === "delegate_decision");
@@ -296,9 +351,62 @@ describe("gateway access-log integration", () => {
     expect(serializedTelemetry).not.toContain("caller-model-a");
     expect(serializedTelemetry).not.toContain("caller-model-b");
     const metrics = renderMetrics();
-    expect(metrics).toContain('model="m1"');
-    expect(metrics).toContain('model="unknown"');
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="m1",outcome="ok",tier="owner"} 1',
+    );
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="unknown",outcome="ok",tier="owner"} 2',
+    );
     expect(metrics).not.toContain("caller-model-a");
     expect(metrics).not.toContain("caller-model-b");
+  });
+
+  it("(i) /delegate telemetry ignores a principal allow-list and fails closed before orchestration", async () => {
+    installCapturingLogger();
+    await warmCatalogue();
+    const staleAllowedModel = "stale-allow-listed-secret-41c9";
+    const owner = mintKey({
+      alias: "alog-delegate-scoped",
+      tier: "owner",
+      scope: "admin",
+      modelAllowList: [staleAllowedModel],
+    }, DEFAULTS);
+
+    // Existing policy rejects scoped /delegate keys before orchestration. Even on that early path,
+    // a resident model excluded by the principal list remains useful telemetry, while a stale id
+    // present only in that list must collapse to the bounded sentinel.
+    for (const modelId of ["m1", staleAllowedModel]) {
+      const response = await fetch(url("/delegate"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: JSON.stringify({ prompt: "early failure probe", taskType: "extract", modelId }),
+      });
+      expect(response.status).toBe(403);
+    }
+
+    expect(upstreamModelRequests).toEqual([]);
+    const records = captured.map((line) => JSON.parse(line) as AccessLogRecord);
+    expect(records.filter((record) => record.event === "delegate_decision")).toHaveLength(0);
+    const gateways = records.filter((record) => record.event === "gateway_request");
+    expect(gateways).toHaveLength(2);
+    expect(gateways.map((record) => record.model)).toEqual(["m1", "unknown"]);
+    expect(gateways.map((record) => record.outcome)).toEqual(["forbidden", "forbidden"]);
+
+    const requestRows = getDb()
+      .prepare("SELECT model, outcome FROM request_log WHERE alias = ? ORDER BY rowid ASC")
+      .all(owner.record.alias) as Array<{ model: string; outcome: string }>;
+    expect(requestRows).toEqual([
+      { model: "m1", outcome: "forbidden" },
+      { model: "unknown", outcome: "forbidden" },
+    ]);
+
+    const metrics = renderMetrics();
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="m1",outcome="forbidden",tier="owner"} 1',
+    );
+    expect(metrics).toContain(
+      'homeserver_requests_total{model="unknown",outcome="forbidden",tier="owner"} 1',
+    );
+    expect(JSON.stringify({ records, requestRows, metrics })).not.toContain(staleAllowedModel);
   });
 });

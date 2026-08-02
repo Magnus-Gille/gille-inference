@@ -47,6 +47,7 @@ let setConfig: typeof import("../src/homeserver/config.js").setConfig;
 let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 let setDefaultLogger: typeof import("../src/homeserver/access-log.js").setDefaultLogger;
 let originalDefaultLogger: typeof import("../src/homeserver/access-log.js").defaultLogger;
+let resetCatalogueCache: typeof import("../src/homeserver/catalogue.js").resetCatalogueCache;
 
 const PEG_ERROR =
   "LM Studio error: 500 status code (no body) Value does not match the expected peg-native format";
@@ -72,6 +73,7 @@ beforeEach(async () => {
   const orch = await import("../src/homeserver/orchestrator.js");
   const tracing = await import("../src/homeserver/tracing.js");
   const cfg = await import("../src/homeserver/config.js");
+  const catalogue = await import("../src/homeserver/catalogue.js");
   delegate = orch.delegate;
   runWithSyntheticTraceForTests = tracing.runWithSyntheticTraceForTests;
   flushTracingForTests = tracing.flushTracingForTests;
@@ -79,6 +81,7 @@ beforeEach(async () => {
   resetTracingTestHooks = tracing.resetTracingTestHooks;
   setConfig = cfg.setConfig;
   resetConfig = cfg.resetConfig;
+  resetCatalogueCache = catalogue.resetCatalogueCache;
   resetConfig();
   setConfig({ useRoutingTable: "off", disagreementGate: "off", accessLog: "off", delegationCostLog: "off" });
   frontierMock.mockResolvedValue({ ok: true, response: "FRONTIER" });
@@ -156,8 +159,9 @@ describe("delegate tracing", () => {
     expect(JSON.stringify(records)).not.toContain(PEG_ERROR);
   });
 
-  it("never exports a caller-supplied secret-shaped model override", async () => {
+  it("never exports a caller-supplied secret-shaped model override with a cold catalogue", async () => {
     setTracingTestHooks({ captureExports: true });
+    resetCatalogueCache();
     lmInferenceMock.mockResolvedValue(lmOk("SAFE ANSWER"));
     const secretShapedModelId = "SECRET_TOKEN_ABC";
 

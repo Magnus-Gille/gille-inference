@@ -7,6 +7,7 @@ import { initDb, getDb } from "../src/db.js";
 let probeOrin: typeof import("../src/homeserver/nodes.js").probeOrin;
 let runOrinInference: typeof import("../src/homeserver/nodes.js").runOrinInference;
 let orinAllowsTask: typeof import("../src/homeserver/nodes.js").orinAllowsTask;
+let configuredDelegateModelIds: typeof import("../src/homeserver/nodes.js").configuredDelegateModelIds;
 let setConfig: typeof import("../src/homeserver/config.js").setConfig;
 let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 let recordDelegation: typeof import("../src/homeserver/ledger.js").recordDelegation;
@@ -29,6 +30,7 @@ beforeAll(async () => {
   const ledger = await import("../src/homeserver/ledger.js");
   setConfig = cfg.setConfig; resetConfig = cfg.resetConfig;
   probeOrin = nodes.probeOrin; runOrinInference = nodes.runOrinInference; orinAllowsTask = nodes.orinAllowsTask;
+  configuredDelegateModelIds = nodes.configuredDelegateModelIds;
   recordDelegation = ledger.recordDelegation; getVerdict = ledger.getVerdict; ensureLedgerSchema = ledger.ensureLedgerSchema;
 });
 
@@ -45,6 +47,7 @@ beforeEach(() => {
 describe("Orin backend contract", () => {
   it("discovers the configured inventory and runs only the configured small model", async () => {
     await expect(probeOrin()).resolves.toMatchObject({ id: "orin", configured: true, ok: true, modelAvailable: true });
+    expect(configuredDelegateModelIds()).toEqual(["qwen2.5-coder:3b"]);
     expect(orinAllowsTask("extract")).toBe(true);
     expect(orinAllowsTask("sql")).toBe(false);
     await expect(runOrinInference("qwen2.5-coder:3b", "reply", { maxTokens: 16, temperature: 0 })).resolves.toMatchObject({ ok: true, response: "OK", promptTokens: 3, completionTokens: 1 });

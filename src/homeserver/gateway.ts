@@ -47,8 +47,8 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import { recordRequestLog, cachedRequestLogTotals } from "./request-log.js";
-import { canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
-import { isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
+import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
+import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
@@ -1037,9 +1037,9 @@ async function admitAndMeterLogged(
  * (M3 — so the Prometheus token + credit counters actually increment for real traffic) and the
  * credits charged for this request (the reconciled real usage, or 0 for an errored call).
  *
- * canonicalModel is the model string SAFE to use as a metrics/log label (C3): it is null when no
- * recognised model was served, so the record site maps it to "unknown" rather than leaking the
- * raw, user-controlled `model` field into Prometheus labels / the access log.
+ * canonicalModel is a model string SAFE to use as a metrics/log label (C3). A null value means the
+ * handler has no safer served-model override, so the spine preserves the route's already-
+ * canonicalized label rather than leaking the raw, user-controlled `model` field.
  */
 export interface MeteredResult {
   totalTokens: number;
@@ -2158,7 +2158,6 @@ async function handleDelegate(
   cfg: HomeserverConfig,
   controller: AdmissionController,
   lctx: LogCtx,
-  telemetryModelAllowList: string[],
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
   let learningTaskAdmissionId: string | undefined;
@@ -2253,18 +2252,22 @@ async function handleDelegate(
     ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
     : undefined;
   lctx.node = result.nodeId;
-  // C3/#179: retain the exact model id in the response and ledger, but expose only the
-  // server-trusted catalogue/allow-list identity in gateway telemetry. This is synchronous and
-  // log-only; it must not change the orchestrator's routing input or returned outcome.
-  lctx.model = canonicalizeModelTrusted(result.modelId, telemetryModelAllowList);
+  // C3/#179: retain the exact model id in the response and ledger, but expose only the resident
+  // catalogue or enabled server-configured Orin identity in gateway telemetry. Principal
+  // allow-lists are admission policy, not telemetry trust. This synchronous projection must not
+  // change the orchestrator's routing input or returned outcome.
+  lctx.model = canonicalizeModelFromTrustedCatalogue(
+    result.modelId,
+    configuredDelegateModelIds(cfg),
+  );
   const m = result.metrics;
   if (m) {
     return {
       totalTokens: m.promptTokens + m.completionTokens,
       promptTokens: m.promptTokens,
       completionTokens: m.completionTokens,
-      // /delegate lets the orchestrator pick ANY model; that id is not a user-controlled label
-      // but it is also not allow-list-canonicalized here, so keep it out of metrics → null.
+      // lctx.model now carries the catalogue/config-canonicalized served identity. Returning null
+      // tells the metering spine to preserve that safe label rather than overwrite it.
       canonicalModel: null,
       ttftMs: null,
       afterRelease,
@@ -4462,9 +4465,13 @@ export async function handleRequest(
         sendError(res, makeError("invalid_request_error", { param: parsed.param, message: parsed.message }));
         return;
       }
-      // C3/#179: carry the caller's model override into the request telemetry context only after
-      // canonicalization. The raw value continues unchanged through parse, routing, and response.
-      lctx.model = canonicalizeModelTrusted(parsed.params.modelId ?? null, principal.modelAllowList);
+      // C3/#179: carry the caller's model override into request telemetry only after validation
+      // against server-owned identity. Principal allow-lists remain admission policy and cannot
+      // establish telemetry trust. The raw value continues unchanged through routing/response.
+      lctx.model = canonicalizeModelFromTrustedCatalogue(
+        parsed.params.modelId ?? null,
+        configuredDelegateModelIds(cfg),
+      );
       setTraceDefaults({
         taskType: "delegation",
         lane: "default",
@@ -4563,7 +4570,6 @@ export async function handleRequest(
           cfg,
           controller,
           lctx,
-          principal.modelAllowList,
         )
       );
       return;
