@@ -118,10 +118,12 @@ export function parseVerifierComponents(name: string | null | undefined): string
 
 /** True iff `name` is a known structural (shape/presence-only) verifier. Null/empty → false. */
 export function isStructuralVerifier(name: string | null | undefined): boolean {
-  if (name == null) return false;
-  if (!parseVerifierLabel(name).valid) return false;
-  const base = canonicalVerifierBase(name);
-  return base.length > 0 && STRUCTURAL_VERIFIER_KEYS.has(base);
+  const parsed = parseVerifierLabel(name);
+  return (
+    parsed.valid
+    && parsed.components.length > 0
+    && parsed.components.every((base) => STRUCTURAL_VERIFIER_KEYS.has(base))
+  );
 }
 
 /**
@@ -139,10 +141,10 @@ export function isQualityBearingVerifier(name: string | null | undefined): boole
 
 /**
  * True iff a row graded by `name` is admissible as evidence of JUDGMENT-QUALITY output (issue #168):
- * its base verifier name is in the caller's TRUSTED whitelist. This is the whitelist counterpart to
- * isQualityBearingVerifier's blacklist, and for a judgment-quality task type it is the RULE (see
- * ledger.getVerdict + config.trustedVerifiersForJudgment) — a whitelist is strictly stronger than
- * the blacklist and subsumes it, so the two are never run redundantly.
+ * at least one parsed component is in the caller's TRUSTED whitelist. This is the whitelist
+ * counterpart to isQualityBearingVerifier's blacklist, and for a judgment-quality task type it is
+ * the RULE (see ledger.getVerdict + config.trustedVerifiersForJudgment) — a whitelist is strictly
+ * stronger than the blacklist and subsumes it, so the two are never run redundantly.
  *
  * Why stronger: the blacklist could only exclude KNOWN-structural verifiers; it still admitted
  * opaque/non-adversarial checks (`predicate`, `matches`) that a model passes while finding ~6% of
@@ -154,16 +156,19 @@ export function isTrustedJudgmentVerifier(
   name: string | null | undefined,
   trusted: ReadonlySet<string>
 ): boolean {
-  if (name == null) return false;
-  if (!parseVerifierLabel(name).valid) return false;
-  const base = verifierBaseName(name);
-  const canonicalBase = base.toLowerCase();
-  if (canonicalBase.length === 0) return false;
-  if (trusted.has(base) || trusted.has(canonicalBase)) return true;
+  const parsed = parseVerifierLabel(name);
+  if (!parsed.valid || parsed.components.length === 0) return false;
+
+  const trustedComponents = new Set<string>();
   for (const candidate of trusted) {
-    if (candidate.toLowerCase() === canonicalBase) return true;
+    const parsedCandidate = parseVerifierLabel(candidate);
+    if (!parsedCandidate.valid) continue;
+    for (const component of parsedCandidate.components) {
+      trustedComponents.add(component);
+    }
   }
-  return false;
+
+  return parsed.components.some((component) => trustedComponents.has(component));
 }
 
 /**

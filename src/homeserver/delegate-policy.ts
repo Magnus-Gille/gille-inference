@@ -3,8 +3,12 @@ import {
   type DelegatePolicyConfig,
   type PolicyConfig,
 } from "./config.js";
-import { getLaneEvidence, type LaneEvidence } from "./ledger.js";
-import { isTrustedJudgmentVerifier, verifierBaseName } from "./verifier-classification.js";
+import {
+  getLaneEvidence,
+  normalizedVerifierName as normalizedLedgerVerifierName,
+  type LaneEvidence,
+} from "./ledger.js";
+import { isTrustedJudgmentVerifier, parseVerifierComponents } from "./verifier-classification.js";
 import { isPromotedAdvisoryTaskType, normalizeTaskType, policyTaskTypeIdentity } from "./task-type-identity.js";
 import { isKnownTaskType } from "./taxonomy.js";
 
@@ -91,10 +95,16 @@ function emptyEvidence(taskType: string, modelId: string, verifierName: string |
 }
 
 function normalizeVerifierName(name: string | null | undefined): string | null {
-  const trimmed = name?.trim();
-  const baseName = trimmed ? verifierBaseName(trimmed) : null;
-  if (!trimmed || baseName === "none" || baseName === "custom") return null;
-  return trimmed;
+  const normalized = normalizedLedgerVerifierName(name);
+  if (normalized === null) return null;
+
+  // `custom` is the orchestrator's policy-generic marker for an unnamed verifier. Keep the
+  // existing policy behavior for a custom-only lane, while allowing it alongside a real named
+  // verifier in a valid combined label. The ledger helper above has already rejected malformed,
+  // empty, plus-only, and all-sentinel labels using the shared parser.
+  const components = parseVerifierComponents(normalized);
+  if (components.length === 0 || components.every((component) => component === "custom")) return null;
+  return normalized;
 }
 
 export function isLearningSource(source: string | null | undefined): boolean {

@@ -131,6 +131,36 @@ describe("delegate policy decisions", () => {
     expect(d.reason).toContain("no verifier");
   });
 
+  it.each([
+    "exact)",
+    "none(",
+    "none+NONE(ungraded)",
+    "+",
+    "custom+none",
+    "CUSTOM",
+  ] as const)("shadows invalid or component-free production verifier label %j before evidence can allow", (verifierName) => {
+    const d = decideDelegatePolicy({
+      ...input({ verifierName, hasVerifier: true }),
+      evidence: evidence({ verifier: "exact", attempts: 20, passes: 20, successRate: 1, p90LatencyMs: 800 }),
+    });
+    expect(d.action).toBe("shadow");
+    expect(d.reason).toContain("no verifier");
+  });
+
+  it("keeps a valid exact verifier on the normal sample and quality thresholds", () => {
+    const allowed = decideDelegatePolicy({
+      ...input({ verifierName: "exact" }),
+      evidence: evidence({ verifier: "exact", attempts: 20, passes: 20, successRate: 1, p90LatencyMs: 800 }),
+    });
+    expect(allowed.action).toBe("allow");
+
+    const insufficient = decideDelegatePolicy({
+      ...input({ verifierName: "exact" }),
+      evidence: evidence({ verifier: "exact", attempts: 9, passes: 9, successRate: 1, p90LatencyMs: 800 }),
+    });
+    expect(insufficient.action).toBe("shadow");
+  });
+
   it("denies judgment-quality lanes unless the verifier is trusted", () => {
     const d = decideDelegatePolicy({
       ...input({ taskType: "code-review", verifierName: "predicate" }),
@@ -229,5 +259,37 @@ describe("delegate policy lane evidence", () => {
     });
     expect(d.action).toBe("allow");
     expect(d.evidence.attempts).toBe(10);
+  });
+
+  it("uses the same validated verifier normalization for lane evidence and policy decisions", () => {
+    const t = uniqueType();
+    for (let i = 0; i < 12; i++) {
+      recordDelegation({
+        taskType: t,
+        modelId: MODEL,
+        prompt: `normalization-fixture-${i}`,
+        outcome: "pass",
+        latencyMs: 800,
+        verifier: "exact",
+        source: "gateway",
+      });
+    }
+
+    const validEvidence = getLaneEvidence(t, MODEL, "exact", DEFAULT_POLICY);
+    const validDecision = evaluateDelegatePolicy({
+      ...input({ taskType: t, verifierName: "exact" }),
+    });
+    expect(validDecision.evidence.verifier).toBe(validEvidence.verifier);
+    expect(validDecision.evidence.attempts).toBe(validEvidence.attempts);
+    expect(validDecision.action).toBe("allow");
+
+    const malformedEvidence = getLaneEvidence(t, MODEL, "exact)", DEFAULT_POLICY);
+    const malformedDecision = evaluateDelegatePolicy({
+      ...input({ taskType: t, verifierName: "exact)" }),
+    });
+    expect(malformedEvidence.verifier).toBeNull();
+    expect(malformedDecision.evidence.verifier).toBe(malformedEvidence.verifier);
+    expect(malformedDecision.evidence.attempts).toBe(malformedEvidence.attempts);
+    expect(malformedDecision.action).toBe("shadow");
   });
 });

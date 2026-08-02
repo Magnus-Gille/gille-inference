@@ -45,6 +45,15 @@ describe("isStructuralVerifier", () => {
     expect(isStructuralVerifier("nonEmpty)")).toBe(false);
     expect(isStructuralVerifier("nonEmpty(foo+predicate")).toBe(false);
   });
+  it.each([
+    ["nonEmpty+jsonValid", true],
+    ["none+nonEmpty(1)+NONE(ungraded)", true],
+    ["nonEmpty+predicate", false],
+    ["none+none", false],
+    ["+", false],
+  ] as const)("classifies combined components coherently: %s", (label, expected) => {
+    expect(isStructuralVerifier(label)).toBe(expected);
+  });
 });
 
 describe("isQualityBearingVerifier", () => {
@@ -164,6 +173,28 @@ describe("isTrustedJudgmentVerifier", () => {
     expect(isTrustedJudgmentVerifier("gtReview(", trusted)).toBe(false);
     expect(isTrustedJudgmentVerifier("exact(foo+predicate", trusted)).toBe(false);
     expect(isTrustedJudgmentVerifier("exact)+none", trusted)).toBe(false);
+  });
+
+  it("does not let a sentinel whitelist entry trust an ungraded label or variant", () => {
+    const trusted = new Set(["none"]);
+    for (const label of ["none", "NONE(ungraded)", "none+NONE(ungraded)", "+"]) {
+      expect(isTrustedJudgmentVerifier(label, trusted)).toBe(false);
+    }
+  });
+
+  it("matches canonical parsed components in well-formed combined labels", () => {
+    const trusted = new Set(["gtReview"]);
+    expect(isTrustedJudgmentVerifier("gtReview(strict)", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("none+gtReview(strict)", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("gtReview(strict)+none", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("predicate+gtReview", trusted)).toBe(true);
+    expect(isTrustedJudgmentVerifier("none+predicate", trusted)).toBe(false);
+  });
+
+  it("ignores empty, sentinel, and malformed whitelist entries", () => {
+    const trusted = new Set(["", "none", "gtReview)", "gtReview("]);
+    expect(isTrustedJudgmentVerifier("gtReview", trusted)).toBe(false);
+    expect(isTrustedJudgmentVerifier("none", trusted)).toBe(false);
   });
 });
 
