@@ -180,7 +180,7 @@ function journalAuthority(phase: "prepare" | "unknown" | "revert" | "commit" = "
   };
 }
 
-function route(initial: string) {
+function route(initial: string, nowMs: () => number = Date.now) {
   let current = initial;
   let writes = 0;
   let currentFence = { epoch: fence.fenceEpoch, token: fence.fenceToken };
@@ -194,12 +194,12 @@ function route(initial: string) {
         token: `${String(currentFence.epoch + 1).padStart(8, "0")}-0000-4000-8000-000000000000`,
       };
       const owned = { ...currentFence };
-      const expiresAt = Date.now() + (options?.durationMs ?? 45_000);
+      const expiresAt = nowMs() + (options?.durationMs ?? 45_000);
       let released = false;
       return {
         ...owned,
         isCurrent: () => !released
-          && Date.now() < expiresAt
+          && nowMs() < expiresAt
           && currentFence.epoch === owned.epoch
           && currentFence.token === owned.token,
         release: () => { released = true; },
@@ -729,7 +729,8 @@ describe("permission-separated AF_UNIX recovery service", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-recovery-sockets-"));
     const registrationSocketPath = join(root, "register.sock");
     const actionSocketPath = join(root, "action.sock");
-    const live = route(baseline);
+    let nowMs = 0;
+    const live = route(baseline, () => nowMs);
     const journal = journalAuthority();
     const service = await startRecoveryService({
       registrationSocketPath,
@@ -775,7 +776,7 @@ describe("permission-separated AF_UNIX recovery service", () => {
       const acquired = await post(actionSocketPath, "/fence/acquire", {});
       expect(acquired).toMatchObject({ status: 200, body: { epoch: expect.any(Number), token: expect.any(String) } });
       expect((await post(actionSocketPath, "/fence/acquire", {})).status).toBe(400);
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      nowMs += 120;
       const superseding = await post(actionSocketPath, "/fence/acquire", {});
       expect(superseding.status).toBe(200);
       expect(superseding.body.epoch).toBeGreaterThan(acquired.body.epoch);
