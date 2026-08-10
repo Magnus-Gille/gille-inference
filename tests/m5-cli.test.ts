@@ -32,6 +32,32 @@ function configLoader() {
 }
 
 describe("m5 command surface", () => {
+  it("runs provision through an injected secret-safe provisioner and prints only doctor output", async () => {
+    const output = sink();
+    const error = sink();
+    const provisionerCalls: unknown[] = [];
+    const exitCode = await main([
+      "--profile", "pi", "--public-gateway-url", "https://public.private-locator.invalid", "--m5-host", "magnus@m5", "provision",
+    ], {
+      input: Readable.from([]), output: output.stream, error: error.stream,
+      provisioner: async (options: unknown) => {
+        provisionerCalls.push(options);
+        return { profileConfig: { publicGatewayUrl: PUBLIC_URL } };
+      },
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/portal/me")) return new Response(JSON.stringify({ alias: "pi-agent", tier: "owner", scope: "agent" }));
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name, inputSchema: { type: "object" } })) } }));
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(provisionerCalls).toHaveLength(1);
+    expect(JSON.parse(output.text())).toMatchObject({ status: "healthy", profile: "pi" });
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
   it("requires an explicit profile before credential lookup", async () => {
     let keychainCalls = 0;
     const output = sink();
@@ -55,6 +81,16 @@ describe("m5 command surface", () => {
       error: { code: "profile_required" },
     });
     expect(output.text()).toBe("");
+  });
+
+  it("rejects provisioning-only flags on ordinary client commands", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "--m5-host", "m5", "models"], {
+      input: Readable.from([]), output: output.stream, error: error.stream, configLoader,
+    });
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(error.text())).toMatchObject({ error: { code: "invalid_args" } });
   });
 
   it("prints structured models JSON and never the internally resolved credential", async () => {

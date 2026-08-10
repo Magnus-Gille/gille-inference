@@ -13,19 +13,19 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`. The currently accepted pinned version
-is `1.2.1`:
+The `m5` executable ships in the same npm package as `hs`, starting with client package version
+`1.3.0`:
 
 ```bash
-npm install --global gille-inference@1.2.1
+npm install --global gille-inference@1.3.0
 m5 --version
 ```
 
 `gille-inference@1.0.0` is the existing public `hs`-only package. The initial M5 client was
 prepared as `1.1.0` but was never published; `1.2.0` added the required content-free adoption
-reporting contract as the first public M5-capable version. `1.2.1` keeps that surface and adds
-the structured `list_models` blind-context discovery contract without reusing the published
-`1.2.0` version string for a different client behavior.
+reporting contract as the first public M5-capable version. `1.2.1` kept that surface and added
+the structured `list_models` blind-context discovery contract. Version `1.3.0` adds guided
+owner-agent profile provisioning.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
@@ -92,6 +92,31 @@ derived mechanically from the selected profile:
 This makes the two least-privilege credentials independently revocable. Provisioning and rotation
 are operator actions after the agent-scope gateway change is accepted and deployed; this client
 does not create credentials and the repository must not contain their values.
+
+### Guided provisioning
+
+Client version 1.3.0 adds a macOS owner-attended provisioning command for a new
+profile:
+
+```bash
+m5 --profile pi \
+  --public-gateway-url https://inference.example.com \
+  --m5-host magnus@m5 \
+  provision
+```
+
+It validates and writes only the profile's public HTTPS URL, checks that the
+profile-specific Keychain item is absent, and then calls the fixed SSH operator
+path that enters the live `home-gateway.service` mount namespace before minting
+an `owner` / `agent` credential. The bearer travels only from that process's
+stdout to the local Keychain prompt over stdin; it is neither returned by the
+CLI nor accepted in command arguments, environment variables, or config.
+
+The command refuses an existing Keychain item or a public-URL mismatch; it does
+not guess whether the corresponding remote credential should be rotated or
+revoked. If Keychain persistence fails after a mint, it makes a bounded attempt
+to revoke that exact new alias and emits a redacted failure result. A completed
+command emits only the structured `m5 doctor` outcome.
 
 `--profile` is mandatory. There is no implicit shared/default account, bearer environment
 variable, bearer argv flag, or credential field in client config.
