@@ -159,7 +159,7 @@ async function liveKeyCommand(run, sshTarget, alias, args) {
 
 async function revokeBestEffort(run, sshTarget, alias) {
   try {
-    await liveKeyCommand(run, sshTarget, alias, ["keys", "revoke", "--alias", alias]);
+    await liveKeyCommand(run, sshTarget, alias, ["revoke", "--alias", alias]);
     return true;
   } catch {
     return false;
@@ -189,7 +189,7 @@ export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, c
     throw new M5ClientError("keychain_item_exists", `Keychain already has the credential for profile '${profile}'. Refuse provisioning until its ownership is reconciled.`);
   }
   const alias = timestampAlias(profile, now);
-  const minted = await liveKeyCommand(run, sshTarget, alias, ["keys", "mint", "--alias", alias, "--tier", "owner", "--scope", "agent"]);
+  const minted = await liveKeyCommand(run, sshTarget, alias, ["mint", "--alias", alias, "--tier", "owner", "--scope", "agent"]);
   let token;
   try {
     token = onlyMintedKey(minted);

@@ -72,7 +72,10 @@ describe("m5 provisioning credential ceremony", () => {
     expect(JSON.stringify(result)).not.toContain(SECRET);
     const ssh = calls.find((call) => call.command === "ssh")!;
     expect(ssh.input).toContain("nsenter -t");
-    expect(ssh.args).toContain("agent");
+    const remoteArgs = ssh.args.slice(ssh.args.indexOf("sudo -n /bin/sh -s --") + 2);
+    expect(["keys", ...remoteArgs]).toEqual([
+      "keys", "mint", "--alias", "agent-pi-20260810T215900", "--tier", "owner", "--scope", "agent",
+    ]);
     expect(ssh.args).not.toContain(SECRET);
     const store = calls.find((call) => call.command === "script")!;
     expect(store.args).toEqual([
@@ -120,7 +123,10 @@ describe("m5 provisioning credential ceremony", () => {
       now: new Date("2026-08-10T22:00:00Z"),
     })).rejects.toMatchObject({ code: "keychain_store_failed_revoked" });
     expect(sshCalls).toHaveLength(2);
-    expect(sshCalls[1]).toContain("revoke");
+    const revokeArgs = sshCalls[1].slice(sshCalls[1].indexOf("sudo -n /bin/sh -s --") + 2);
+    expect(["keys", ...revokeArgs]).toEqual([
+      "keys", "revoke", "--alias", "agent-pi-20260810T220000",
+    ]);
     expect(JSON.stringify(sshCalls)).not.toContain(SECRET);
   });
 
