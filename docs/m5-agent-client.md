@@ -90,8 +90,9 @@ derived mechanically from the selected profile:
 | `codex` | `gateway-agent-codex` |
 
 This makes the two least-privilege credentials independently revocable. Provisioning and rotation
-are operator actions after the agent-scope gateway change is accepted and deployed; this client
-does not create credentials and the repository must not contain their values.
+remain owner-attended operator actions. This client's guided provisioning command mints a fresh
+`owner` / `agent` credential only through the fixed live gateway path described below; the
+repository and client configuration never contain bearer values.
 
 ### Guided provisioning
 
