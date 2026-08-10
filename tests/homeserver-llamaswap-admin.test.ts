@@ -15,7 +15,9 @@ let mockServer: Server;
 let mockPort = 0;
 let lastUnloadPath = "";
 let chatShouldFail = false;
-let runningModels: Array<{ model: string; state: string; cmd?: string }> = [];
+let runningStatus = 200;
+let runningModels: Array<{ model: string; state: string; cmd?: string; proxy?: string; ttl?: number }> = [];
+let runningPayloadOverride: unknown | undefined;
 
 function startMock(): Promise<void> {
   mockServer = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -40,8 +42,11 @@ function startMock(): Promise<void> {
       }
 
       if (url === "/running" && method === "GET") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ running: runningModels }));
+        res.writeHead(runningStatus, { "content-type": "application/json" });
+        const payload = runningPayloadOverride === undefined
+          ? { running: runningModels }
+          : runningPayloadOverride;
+        res.end(runningStatus === 200 ? JSON.stringify(payload) : "unavailable");
         return;
       }
 
@@ -114,7 +119,9 @@ afterAll(() => {
 beforeEach(() => {
   lastUnloadPath = "";
   chatShouldFail = false;
+  runningStatus = 200;
   runningModels = [];
+  runningPayloadOverride = undefined;
   // Reset to llamaswap backend before each test
   setConfig({ backend: "llamaswap" });
 });
@@ -204,6 +211,77 @@ describe("getLoaded", () => {
     runningModels = [];
     const loaded = await llamaswap.getLoaded();
     expect(loaded).toHaveLength(0);
+  });
+});
+
+// ─── getRunningSnapshot ─────────────────────────────────────────────────────
+
+describe("getRunningSnapshot", () => {
+  it("passes through model/state/TTL while omitting raw cmd and proxy fields", async () => {
+    runningModels = [
+      {
+        model: "llama3.2:8b",
+        state: "ready",
+        ttl: 900,
+        cmd: "llama-server --api-key secret",
+        proxy: "http://127.0.0.1:9000",
+      },
+      { model: "qwen2.5:7b", state: "loading", cmd: "private command" },
+    ];
+
+    const snapshot = await llamaswap.getRunningSnapshot();
+
+    expect(snapshot).toEqual([
+      { model: "llama3.2:8b", state: "ready", ttlSeconds: 900 },
+      { model: "qwen2.5:7b", state: "loading", ttlSeconds: null },
+    ]);
+    expect(snapshot[0]).not.toHaveProperty("cmd");
+    expect(snapshot[0]).not.toHaveProperty("proxy");
+  });
+
+  it("reports /running as unavailable when it is non-OK", async () => {
+    runningStatus = 503;
+    runningModels = [{ model: "llama3.2:8b", state: "ready", ttl: 900 }];
+
+    await expect(llamaswap.getRunningSnapshot()).rejects.toMatchObject({
+      name: "RunningSnapshotUnavailableError",
+      status: 503,
+    });
+  });
+
+  it.each([{}, null])("reports malformed successful /running payload %j as unavailable", async (payload) => {
+    runningPayloadOverride = payload;
+
+    await expect(llamaswap.getRunningSnapshot()).rejects.toMatchObject({
+      name: "RunningSnapshotUnavailableError",
+    });
+  });
+
+  it.each([[null], [{}]])("reports malformed /running entries %j as unavailable", async (running) => {
+    runningPayloadOverride = { running };
+
+    await expect(llamaswap.getRunningSnapshot()).rejects.toMatchObject({
+      name: "RunningSnapshotUnavailableError",
+    });
+  });
+
+  it("is exposed through the facade for llama-swap", async () => {
+    runningModels = [{ model: "qwen2.5:7b", state: "ready", ttl: 120 }];
+
+    await expect(modelAdmin.getRunningSnapshot()).resolves.toEqual([
+      { model: "qwen2.5:7b", state: "ready", ttlSeconds: 120 },
+    ]);
+  });
+
+  it("reports the deprecated LM Studio backend as unavailable", async () => {
+    setConfig({ backend: "lmstudio" });
+
+    await expect(modelAdmin.getRunningSnapshot()).rejects.toMatchObject({
+      name: "RunningSnapshotUnavailableError",
+    });
+    await expect(lmstudioAdmin.getRunningSnapshot()).rejects.toMatchObject({
+      name: "RunningSnapshotUnavailableError",
+    });
   });
 });
 

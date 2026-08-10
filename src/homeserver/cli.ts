@@ -1,5 +1,13 @@
 import { loadConfig } from "./config.js";
+import * as modelAdmin from "./model-admin.js";
 import { listModels, loadModel, unloadModel, downloadModel, ensureLoaded, getLoaded } from "./model-admin.js";
+import { getLatestSuccessfulModelUse, type LatestSuccessfulModelUse } from "./request-log.js";
+import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
+import {
+  diagnoseModelResidency,
+  type ModelResidencyDiagnostic,
+  type ModelResidencyFacts,
+} from "./model-residency.js";
 import { delegate } from "./orchestrator.js";
 import { ledgerReport, recentDelegations } from "./ledger.js";
 import { findUnpricedDelegatorModels, type UnpricedDelegatorModel } from "./delegation-cost.js";
@@ -48,6 +56,7 @@ import { pathToFileURL } from "node:url";
  *   probe [--all|--id X|--type T] Run the experiment battery through the orchestrator
  *   delegate --prompt "..."       One-off delegation (--type T, --model local-id, --delegator cloud-id)
  *   ledger                        Print the learning report (verdicts per task type × model)
+ *   residency [--json]            Show read-only model residency diagnostics
  */
 
 /**
@@ -330,6 +339,74 @@ export function formatUnpricedDelegatorWarnings(rows: readonly UnpricedDelegator
     "PRICING WARNINGS — savings remain $0 until first-party pricing is refreshed:",
     ...rows.map((row) => `  ${row.modelId}: ${row.reason} (${row.rows} ledger row${row.rows === 1 ? "" : "s"}; last ${row.lastSeenAt})`),
   ];
+}
+
+export interface ResidencyOutputRow {
+  model: string;
+  state: string;
+  ttl: number | null;
+  classification: ModelResidencyDiagnostic["classification"];
+  lastUse: Pick<LatestSuccessfulModelUse, "ts" | "route" | "outcome"> | null;
+}
+
+/** Extract the CLI's deliberately narrow, content-blind output contract. */
+export function extractResidencyOutput(
+  diagnostics: readonly ModelResidencyDiagnostic[],
+  lastUseByModel: Readonly<Record<string, LatestSuccessfulModelUse | null>>
+): ResidencyOutputRow[] {
+  return diagnostics.map((diagnostic) => {
+    const use = lastUseByModel[diagnostic.model];
+    return {
+      model: diagnostic.model,
+      state: diagnostic.state,
+      ttl: diagnostic.ttlSeconds,
+      classification: diagnostic.classification,
+      lastUse:
+        use === undefined || use === null
+          ? null
+          : { ts: use.ts, route: use.route, outcome: use.outcome },
+    };
+  });
+}
+
+/** Format residency rows without exposing diagnostic facts outside the CLI contract. */
+export function formatResidencyOutput(rows: readonly ResidencyOutputRow[], json = false): string {
+  if (json) return JSON.stringify(rows, null, 2);
+  if (rows.length === 0) return "No running models.";
+
+  const header = "MODEL\tSTATE\tTTL\tCLASSIFICATION\tLAST_USE_TS\tLAST_USE_ROUTE\tLAST_USE_OUTCOME";
+  const lines = rows.map((row) => {
+    const lastUse = row.lastUse;
+    return [
+      row.model,
+      row.state,
+      row.ttl === null ? "null" : String(row.ttl),
+      row.classification,
+      lastUse === null ? "null" : String(lastUse.ts),
+      lastUse === null ? "null" : lastUse.route,
+      lastUse === null ? "null" : lastUse.outcome,
+    ].join("\t");
+  });
+  return [header, ...lines].join("\n");
+}
+
+async function cmdResidency(args: ParsedArgs): Promise<void> {
+  const running = await modelAdmin.getRunningSnapshot();
+  const models = [...new Set(running.map((entry) => entry.model))];
+  const uses = await Promise.all(
+    models.map(async (model) => [model, getLatestSuccessfulModelUse("m5", model)] as const)
+  );
+  const lastUseByModel = Object.fromEntries(uses) as Record<string, LatestSuccessfulModelUse | null>;
+  const facts: ModelResidencyFacts = {
+    lastUseAtMsByModel: Object.fromEntries(
+      uses.flatMap(([model, use]) => (use === null ? [] : [[model, use.ts]]))
+    ),
+    lifecycleStartAtMsByModel: getCurrentModelLifecycleStartAtMsByModel(models),
+    // No request-log row can establish current activity; absence is intentionally unknown.
+    activeCountByModel: {},
+  };
+  const diagnostics = diagnoseModelResidency({ running, facts, nowMs: Date.now() });
+  console.log(formatResidencyOutput(extractResidencyOutput(diagnostics, lastUseByModel), args.flags["json"] === true));
 }
 
 export function cmdLedger(): void {
@@ -930,6 +1007,9 @@ async function main(): Promise<void> {
     case "ledger":
       cmdLedger();
       break;
+    case "residency":
+      await cmdResidency(args);
+      break;
     case "keys":
       cmdKeys(args);
       break;
@@ -945,12 +1025,13 @@ async function main(): Promise<void> {
       break;
     default:
       console.log(
-        "Commands: serve | models | load | unload | ensure-ctx | download | probe | delegate | ledger | keys | deep-research | gpu | code-loop\n" +
+        "Commands: serve | models | load | unload | ensure-ctx | download | probe | delegate | ledger | residency | keys | deep-research | gpu | code-loop\n" +
           "Examples:\n" +
           "  tsx src/homeserver/cli.ts ensure-ctx --ctx 32768\n" +
           "  tsx src/homeserver/cli.ts probe --all\n" +
           '  tsx src/homeserver/cli.ts delegate --prompt "Return OK" --model mellum --delegator openai/gpt-5.5   # local model + cloud brain\n' +
           "  tsx src/homeserver/cli.ts ledger\n" +
+          "  tsx src/homeserver/cli.ts residency [--json]\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner   # defaults to agent + 90d\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +

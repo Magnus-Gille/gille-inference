@@ -79,6 +79,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
 | POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. The truncated call is already metered, and any retry is a new billable call. |
+| GET | `/models/residency` | admin or monitor | Read-only, content-blind residency diagnostic |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |
 | GET | `/v1/roster-proposals/:proposalId` | authenticated owner | Read only that principal's durable proposal |
@@ -122,6 +123,37 @@ interface ModelInfo {
 { "models": [ { "key": "qwen3-coder", "type": "llm", "displayName": "Qwen3-Coder 7B",
   "quantization": "Q4_K_M", "bitsPerWeight": 4.5, "sizeBytes": 4831838208, "paramsString": "7B",
   "maxContextLength": 131072, "vision": false, "toolUse": true, "loaded": true, "loadedContext": 32768 } ] }
+```
+
+### GET `/models/residency`
+
+Read-only, content-blind operator diagnostics. Requires an admin key or a read-only monitor
+key. A monitor response omits `lastUse.alias`; an admin response may include that safe alias
+field. The endpoint returns only the fields shown below: model identity and state, the observed
+TTL, a coarse residency classification, and safe last-use metadata. It never returns prompts,
+responses, tokens, keys, key hashes, raw backend commands, backend addresses/IPs, or other
+content-bearing or credential-bearing fields.
+
+**Response 200:** `{ "models": ResidencyModel[] }` when the snapshot is available.
+
+**Response 503:** `{ "status": "unavailable" }` when the backend snapshot cannot be obtained.
+The unavailable response deliberately has no `models` array, so callers cannot interpret an empty
+array as evidence that no models are resident.
+
+```ts
+interface ResidencyModel {
+  model: string;
+  state: string;
+  ttl: number | null;
+  classification: "serving" | "ttl_retained" | "unexpected" | "unknown";
+  lastUse: {
+    ts: number;
+    route: string;
+    outcome: string;
+    // Admin only; omitted for monitor responses.
+    alias?: string | null;
+  } | null;
+}
 ```
 
 ### GET `/v1/capabilities/learning-task`
