@@ -1,8 +1,9 @@
+import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { ensureProvisionProfile, provisionProfile } from "../client/m5-provision.mjs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createCommandRunner, ensureProvisionProfile, provisionProfile } from "../client/m5-provision.mjs";
 
 const SECRET = "hs_owner_provision-never-print";
 const tempDirs: string[] = [];
@@ -14,7 +15,50 @@ function tempConfig() {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   while (tempDirs.length) rmSync(tempDirs.pop()!, { recursive: true, force: true });
+});
+
+function fakeChild() {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter & { setEncoding: (encoding: string) => void };
+    stderr: EventEmitter & { setEncoding: (encoding: string) => void };
+    stdin: { end: ReturnType<typeof vi.fn> };
+    kill: ReturnType<typeof vi.fn>;
+  };
+  child.stdout = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+  child.stderr = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+  child.stdin = { end: vi.fn() };
+  child.kill = vi.fn();
+  return child;
+}
+
+describe("m5 provisioning command runner", () => {
+  it("rejects a timed-out command even when it later closes cleanly", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    const run = createCommandRunner({ spawn: () => child });
+    const pending = expect(run("ssh", ["m5"], { timeoutMs: 100 })).rejects.toMatchObject({ code: "provision_command_timeout" });
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    child.emit("close", 0, null);
+
+    await pending;
+  });
+
+  it("escalates an unresponsive timed-out command to SIGKILL", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    const run = createCommandRunner({ spawn: () => child });
+    const pending = expect(run("ssh", ["m5"], { timeoutMs: 100 })).rejects.toMatchObject({ code: "provision_command_timeout" });
+
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    await pending;
+  });
 });
 
 describe("m5 provisioning profile configuration", () => {
@@ -147,5 +191,65 @@ describe("m5 provisioning credential ceremony", () => {
     })).rejects.toMatchObject({ code: "mint_output_invalid_revoked" });
     expect(sshCalls).toHaveLength(2);
     expect(sshCalls[1]).toContain("revoke");
+  });
+
+  it("revokes the exact alias after an uncertain nonzero mint failure", async () => {
+    const configPath = tempConfig();
+    const sshCalls: string[][] = [];
+    const alias = "agent-pi-20260810T220100";
+    const run = async (command: string, args: string[]) => {
+      if (command === "security") return { code: 44, stdout: "", stderr: "" };
+      if (command === "ssh") {
+        sshCalls.push(args);
+        if (args.includes("mint")) return { code: 255, stdout: "", stderr: `disconnect after ${alias} ${SECRET}` };
+        if (args.includes("revoke")) return { code: 0, stdout: "revoked", stderr: "" };
+      }
+      throw new Error(`unexpected ${command}`);
+    };
+
+    const failure = provisionProfile({
+      profile: "pi",
+      publicGatewayUrl: "https://inference.example.test",
+      sshTarget: "m5",
+      configPath,
+      run,
+      now: new Date("2026-08-10T22:01:00Z"),
+    });
+    await expect(failure).rejects.toMatchObject({ code: "mint_failed_revoked" });
+    await expect(failure).rejects.not.toThrow(alias);
+    await expect(failure).rejects.not.toThrow(SECRET);
+    expect(sshCalls).toHaveLength(2);
+    const revokeArgs = sshCalls[1].slice(sshCalls[1].indexOf("sudo -n /bin/sh -s --") + 2);
+    expect(["keys", ...revokeArgs]).toEqual(["keys", "revoke", "--alias", alias]);
+    expect(sshCalls.join(" ")).not.toContain(SECRET);
+  });
+
+  it("reports revocation uncertainty after a mint disconnect and failed revoke", async () => {
+    const configPath = tempConfig();
+    const sshCalls: string[][] = [];
+    const alias = "agent-pi-20260810T220200";
+    const run = async (command: string, args: string[]) => {
+      if (command === "security") return { code: 44, stdout: "", stderr: "" };
+      if (command === "ssh") {
+        sshCalls.push(args);
+        if (args.includes("mint")) throw new Error(`connection lost after ${alias} ${SECRET}`);
+        if (args.includes("revoke")) throw new Error(`revoke unavailable ${SECRET}`);
+      }
+      throw new Error(`unexpected ${command}`);
+    };
+
+    const result = provisionProfile({
+      profile: "pi",
+      publicGatewayUrl: "https://inference.example.test",
+      sshTarget: "m5",
+      configPath,
+      run,
+      now: new Date("2026-08-10T22:02:00Z"),
+    });
+    await expect(result).rejects.toMatchObject({ code: "mint_failed_revocation_unknown" });
+    await expect(result).rejects.not.toThrow(alias);
+    await expect(result).rejects.not.toThrow(SECRET);
+    expect(sshCalls).toHaveLength(2);
+    expect(sshCalls[1]).toContain(alias);
   });
 });

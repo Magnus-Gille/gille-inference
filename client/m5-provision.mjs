@@ -6,6 +6,7 @@ import { M5ClientError, redactText, validateProfileConfig } from "./m5-client.mj
 const KEYCHAIN_SERVICE = "gille-inference";
 const KEY_PATTERN = /\bhs_owner_[A-Za-z0-9_-]+\b/g;
 const SSH_TARGET = /^(?:[A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
+const COMMAND_TIMEOUT_GRACE_MS = 1_000;
 
 // This script intentionally has no interpolation. The alias travels as $1, after validation.
 const LIVE_KEY_COMMAND = String.raw`set -eu
@@ -67,7 +68,49 @@ export function createCommandRunner({ spawn = nodeSpawn } = {}) {
       }
       let stdout = "";
       let stderr = "";
-      const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+      let settled = false;
+      let finished = false;
+      let timedOut = false;
+      let timeoutTimer;
+      let killTimer;
+      const clearTimers = () => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (killTimer) clearTimeout(killTimer);
+        timeoutTimer = undefined;
+        killTimer = undefined;
+      };
+      const settleError = (error, { preserveKillTimer = false } = {}) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+        if (!preserveKillTimer && killTimer) clearTimeout(killTimer);
+        if (!preserveKillTimer) killTimer = undefined;
+        reject(error);
+      };
+      const timeoutError = () => new M5ClientError("provision_command_timeout", `${command} did not finish within the bounded timeout.`);
+      const onTimeout = () => {
+        if (settled || finished) return;
+        timedOut = true;
+        timeoutTimer = undefined;
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // The bounded timeout result remains deterministic even if the child is already gone.
+        }
+        settleError(timeoutError(), { preserveKillTimer: !finished });
+        if (!finished) {
+          killTimer = setTimeout(() => {
+            if (finished) return;
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // The timeout has already been reported; there is no safe detail to add here.
+            }
+          }, COMMAND_TIMEOUT_GRACE_MS);
+        }
+      };
+      timeoutTimer = setTimeout(onTimeout, timeoutMs);
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => {
@@ -75,16 +118,20 @@ export function createCommandRunner({ spawn = nodeSpawn } = {}) {
       });
       child.stderr.on("data", (chunk) => { stderr += chunk; });
       child.on("error", (error) => {
-        clearTimeout(timer);
-        reject(new M5ClientError("provision_command_unavailable", redactText(error.message)));
+        finished = true;
+        clearTimers();
+        if (!timedOut) settleError(new M5ClientError("provision_command_unavailable", redactText(error.message)));
       });
       child.on("close", (code, signal) => {
-        clearTimeout(timer);
-        if (signal === "SIGTERM") {
-          reject(new M5ClientError("provision_command_timeout", `${command} did not finish within the bounded timeout.`));
+        finished = true;
+        clearTimers();
+        if (timedOut) {
           return;
         }
-        resolve({ code: code ?? 1, stdout, stderr });
+        if (!settled) {
+          settled = true;
+          resolve({ code: code ?? 1, stdout, stderr });
+        }
       });
       child.stdin.end(input);
     });
@@ -189,7 +236,18 @@ export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, c
     throw new M5ClientError("keychain_item_exists", `Keychain already has the credential for profile '${profile}'. Refuse provisioning until its ownership is reconciled.`);
   }
   const alias = timestampAlias(profile, now);
-  const minted = await liveKeyCommand(run, sshTarget, alias, ["mint", "--alias", alias, "--tier", "owner", "--scope", "agent"]);
+  let minted;
+  try {
+    minted = await liveKeyCommand(run, sshTarget, alias, ["mint", "--alias", alias, "--tier", "owner", "--scope", "agent"]);
+  } catch {
+    const revoked = await revokeBestEffort(run, sshTarget, alias);
+    throw new M5ClientError(
+      revoked ? "mint_failed_revoked" : "mint_failed_revocation_unknown",
+      revoked
+        ? "The live mint command failed; the newly minted credential was revoked."
+        : "The live mint command failed and the newly minted credential could not be confirmed revoked; reconcile the live alias privately.",
+    );
+  }
   let token;
   try {
     token = onlyMintedKey(minted);
