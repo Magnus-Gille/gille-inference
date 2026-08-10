@@ -7,6 +7,9 @@ const KEYCHAIN_SERVICE = "gille-inference";
 const KEY_PATTERN = /\bhs_owner_[A-Za-z0-9_-]+\b/g;
 const SSH_TARGET = /^(?:[A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
 const COMMAND_TIMEOUT_GRACE_MS = 1_000;
+const COMMAND_TIMEOUT_FINAL_GRACE_MS = 250;
+const REVOCATION_ATTEMPTS = 3;
+const REVOCATION_RETRY_DELAY_MS = 100;
 
 // This script intentionally has no interpolation. The alias travels as $1, after validation.
 const LIVE_KEY_COMMAND = String.raw`set -eu
@@ -73,19 +76,19 @@ export function createCommandRunner({ spawn = nodeSpawn } = {}) {
       let timedOut = false;
       let timeoutTimer;
       let killTimer;
+      let finalGraceTimer;
       const clearTimers = () => {
         if (timeoutTimer) clearTimeout(timeoutTimer);
         if (killTimer) clearTimeout(killTimer);
+        if (finalGraceTimer) clearTimeout(finalGraceTimer);
         timeoutTimer = undefined;
         killTimer = undefined;
+        finalGraceTimer = undefined;
       };
-      const settleError = (error, { preserveKillTimer = false } = {}) => {
+      const settleError = (error) => {
         if (settled) return;
         settled = true;
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        timeoutTimer = undefined;
-        if (!preserveKillTimer && killTimer) clearTimeout(killTimer);
-        if (!preserveKillTimer) killTimer = undefined;
+        clearTimers();
         reject(error);
       };
       const timeoutError = () => new M5ClientError("provision_command_timeout", `${command} did not finish within the bounded timeout.`);
@@ -96,19 +99,24 @@ export function createCommandRunner({ spawn = nodeSpawn } = {}) {
         try {
           child.kill("SIGTERM");
         } catch {
-          // The bounded timeout result remains deterministic even if the child is already gone.
+          // Continue waiting for close or the bounded SIGKILL/final grace path.
         }
-        settleError(timeoutError(), { preserveKillTimer: !finished });
-        if (!finished) {
-          killTimer = setTimeout(() => {
-            if (finished) return;
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // The timeout has already been reported; there is no safe detail to add here.
-            }
-          }, COMMAND_TIMEOUT_GRACE_MS);
-        }
+        if (finished || settled) return;
+        killTimer = setTimeout(() => {
+          killTimer = undefined;
+          if (finished || settled) return;
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // Continue to the bounded final grace path even if the child is already gone.
+          }
+          if (finished || settled) return;
+          finalGraceTimer = setTimeout(() => {
+            finalGraceTimer = undefined;
+            if (finished || settled) return;
+            settleError(timeoutError());
+          }, COMMAND_TIMEOUT_FINAL_GRACE_MS);
+        }, COMMAND_TIMEOUT_GRACE_MS);
       };
       timeoutTimer = setTimeout(onTimeout, timeoutMs);
       child.stdout.setEncoding("utf8");
@@ -118,16 +126,16 @@ export function createCommandRunner({ spawn = nodeSpawn } = {}) {
       });
       child.stderr.on("data", (chunk) => { stderr += chunk; });
       child.on("error", (error) => {
-        finished = true;
-        clearTimers();
+        if (finished) return;
         if (!timedOut) settleError(new M5ClientError("provision_command_unavailable", redactText(error.message)));
       });
       child.on("close", (code, signal) => {
         finished = true;
-        clearTimers();
         if (timedOut) {
+          settleError(timeoutError());
           return;
         }
+        clearTimers();
         if (!settled) {
           settled = true;
           resolve({ code: code ?? 1, stdout, stderr });
@@ -206,11 +214,27 @@ async function liveKeyCommand(run, sshTarget, alias, args) {
 
 async function revokeBestEffort(run, sshTarget, alias) {
   try {
-    await liveKeyCommand(run, sshTarget, alias, ["revoke", "--alias", alias]);
-    return true;
+    const stdout = await liveKeyCommand(run, sshTarget, alias, ["revoke", "--alias", alias]);
+    return stdout.includes(`✓ revoked '${alias}'`);
   } catch {
     return false;
   }
+}
+
+const defaultWait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
+
+async function revokeWithRetries(run, sshTarget, alias, { wait = defaultWait } = {}) {
+  for (let attempt = 0; attempt < REVOCATION_ATTEMPTS; attempt += 1) {
+    if (await revokeBestEffort(run, sshTarget, alias)) return true;
+    if (attempt < REVOCATION_ATTEMPTS - 1) {
+      try {
+        await wait(REVOCATION_RETRY_DELAY_MS);
+      } catch {
+        // A failed delay must not prevent the remaining bounded cleanup attempts.
+      }
+    }
+  }
+  return false;
 }
 
 async function storeKeychainCredential(run, account, token) {
@@ -227,7 +251,7 @@ async function storeKeychainCredential(run, account, token) {
 /**
  * Provision a fresh owner-agent profile. Returns no bearer or alias so normal CLI output stays secret-safe.
  */
-export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, configPath, run = createCommandRunner(), now } = {}) {
+export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, configPath, run = createCommandRunner(), now, wait = defaultWait } = {}) {
   assertProfile(profile);
   assertSshTarget(sshTarget);
   const profileConfig = ensureProvisionProfile({ configPath, profile, publicGatewayUrl });
@@ -240,7 +264,7 @@ export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, c
   try {
     minted = await liveKeyCommand(run, sshTarget, alias, ["mint", "--alias", alias, "--tier", "owner", "--scope", "agent"]);
   } catch {
-    const revoked = await revokeBestEffort(run, sshTarget, alias);
+    const revoked = await revokeWithRetries(run, sshTarget, alias, { wait });
     throw new M5ClientError(
       revoked ? "mint_failed_revoked" : "mint_failed_revocation_unknown",
       revoked
@@ -252,7 +276,7 @@ export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, c
   try {
     token = onlyMintedKey(minted);
   } catch {
-    const revoked = await revokeBestEffort(run, sshTarget, alias);
+    const revoked = await revokeWithRetries(run, sshTarget, alias, { wait });
     throw new M5ClientError(
       revoked ? "mint_output_invalid_revoked" : "mint_output_invalid_revocation_unknown",
       revoked
@@ -263,7 +287,7 @@ export async function provisionProfile({ profile, publicGatewayUrl, sshTarget, c
   try {
     await storeKeychainCredential(run, account, token);
   } catch (error) {
-    const revoked = await revokeBestEffort(run, sshTarget, alias);
+    const revoked = await revokeWithRetries(run, sshTarget, alias, { wait });
     throw new M5ClientError(
       revoked ? "keychain_store_failed_revoked" : "keychain_store_failed_revocation_unknown",
       revoked

@@ -8,6 +8,16 @@ import { createCommandRunner, ensureProvisionProfile, provisionProfile } from ".
 const SECRET = "hs_owner_provision-never-print";
 const tempDirs: string[] = [];
 
+function revocationMarker(args: string[]) {
+  const alias = args[args.indexOf("--alias") + 1];
+  return `✓ revoked '${alias}'`;
+}
+
+function noSuchActiveKeyMarker(args: string[]) {
+  const alias = args[args.indexOf("--alias") + 1];
+  return `✗ no such active key '${alias}'`;
+}
+
 function tempConfig() {
   const dir = mkdtempSync(join(tmpdir(), "m5-provision-test-"));
   tempDirs.push(dir);
@@ -38,26 +48,36 @@ describe("m5 provisioning command runner", () => {
     vi.useFakeTimers();
     const child = fakeChild();
     const run = createCommandRunner({ spawn: () => child });
-    const pending = expect(run("ssh", ["m5"], { timeoutMs: 100 })).rejects.toMatchObject({ code: "provision_command_timeout" });
+    let rejection;
+    const pending = run("ssh", ["m5"], { timeoutMs: 100 });
+    pending.catch((error) => { rejection = error; });
 
     await vi.advanceTimersByTimeAsync(100);
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(rejection).toBeUndefined();
     child.emit("close", 0, null);
 
-    await pending;
+    await pending.catch(() => {});
+    expect(rejection).toMatchObject({ code: "provision_command_timeout" });
   });
 
-  it("escalates an unresponsive timed-out command to SIGKILL", async () => {
+  it("waits through SIGKILL before rejecting an unresponsive timed-out command", async () => {
     vi.useFakeTimers();
     const child = fakeChild();
     const run = createCommandRunner({ spawn: () => child });
-    const pending = expect(run("ssh", ["m5"], { timeoutMs: 100 })).rejects.toMatchObject({ code: "provision_command_timeout" });
+    let rejection;
+    const pending = run("ssh", ["m5"], { timeoutMs: 100 });
+    pending.catch((error) => { rejection = error; });
 
     await vi.advanceTimersByTimeAsync(100);
+    expect(rejection).toBeUndefined();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
     expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
-    await pending;
+    expect(rejection).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(250);
+    await pending.catch(() => {});
+    expect(rejection).toMatchObject({ code: "provision_command_timeout" });
   });
 });
 
@@ -153,7 +173,7 @@ describe("m5 provisioning credential ceremony", () => {
       if (command === "ssh") {
         sshCalls.push(args);
         if (args.includes("mint")) return { code: 0, stdout: SECRET, stderr: "" };
-        if (args.includes("revoke")) return { code: 0, stdout: "revoked", stderr: "" };
+        if (args.includes("revoke")) return { code: 0, stdout: revocationMarker(args), stderr: "" };
       }
       if (command === "script") return { code: 1, stdout: "", stderr: "Keychain rejected input" };
       throw new Error(`unexpected ${command}`);
@@ -174,6 +194,62 @@ describe("m5 provisioning credential ceremony", () => {
     expect(JSON.stringify(sshCalls)).not.toContain(SECRET);
   });
 
+  it("does not treat exit zero plus no-such output as confirmed revocation", async () => {
+    const configPath = tempConfig();
+    const sshCalls: string[][] = [];
+    const run = async (command: string, args: string[]) => {
+      if (command === "security") return { code: 44, stdout: "", stderr: "" };
+      if (command === "ssh") {
+        sshCalls.push(args);
+        if (args.includes("mint")) return { code: 0, stdout: `${SECRET}\n${SECRET}`, stderr: "" };
+        if (args.includes("revoke")) return { code: 0, stdout: noSuchActiveKeyMarker(args), stderr: "" };
+      }
+      throw new Error(`unexpected ${command}`);
+    };
+    await expect(provisionProfile({
+      profile: "pi",
+      publicGatewayUrl: "https://inference.example.test",
+      sshTarget: "m5",
+      configPath,
+      run,
+      wait: async () => {},
+    })).rejects.toMatchObject({ code: "mint_output_invalid_revocation_unknown" });
+    expect(sshCalls).toHaveLength(4);
+  });
+
+  it("retries no-such output until the exact revocation marker confirms cleanup", async () => {
+    const configPath = tempConfig();
+    const sshCalls: string[][] = [];
+    let revokeAttempts = 0;
+    const run = async (command: string, args: string[]) => {
+      if (command === "security") return { code: 44, stdout: "", stderr: "" };
+      if (command === "ssh") {
+        sshCalls.push(args);
+        if (args.includes("mint")) return { code: 0, stdout: SECRET, stderr: "" };
+        if (args.includes("revoke")) {
+          revokeAttempts += 1;
+          return {
+            code: 0,
+            stdout: revokeAttempts === 1 ? noSuchActiveKeyMarker(args) : revocationMarker(args),
+            stderr: "",
+          };
+        }
+      }
+      if (command === "script") return { code: 1, stdout: "", stderr: "Keychain rejected input" };
+      throw new Error(`unexpected ${command}`);
+    };
+    await expect(provisionProfile({
+      profile: "pi",
+      publicGatewayUrl: "https://inference.example.test",
+      sshTarget: "m5",
+      configPath,
+      run,
+      wait: async () => {},
+    })).rejects.toMatchObject({ code: "keychain_store_failed_revoked" });
+    expect(revokeAttempts).toBe(2);
+    expect(sshCalls).toHaveLength(3);
+  });
+
   it("revokes the fresh alias if mint output is malformed rather than leaving an orphaned credential", async () => {
     const configPath = tempConfig();
     const sshCalls: string[][] = [];
@@ -182,7 +258,7 @@ describe("m5 provisioning credential ceremony", () => {
       if (command === "ssh") {
         sshCalls.push(args);
         if (args.includes("mint")) return { code: 0, stdout: `${SECRET}\n${SECRET}`, stderr: "" };
-        if (args.includes("revoke")) return { code: 0, stdout: "revoked", stderr: "" };
+        if (args.includes("revoke")) return { code: 0, stdout: revocationMarker(args), stderr: "" };
       }
       throw new Error(`unexpected ${command}`);
     };
@@ -202,7 +278,7 @@ describe("m5 provisioning credential ceremony", () => {
       if (command === "ssh") {
         sshCalls.push(args);
         if (args.includes("mint")) return { code: 255, stdout: "", stderr: `disconnect after ${alias} ${SECRET}` };
-        if (args.includes("revoke")) return { code: 0, stdout: "revoked", stderr: "" };
+        if (args.includes("revoke")) return { code: 0, stdout: revocationMarker(args), stderr: "" };
       }
       throw new Error(`unexpected ${command}`);
     };
@@ -245,11 +321,12 @@ describe("m5 provisioning credential ceremony", () => {
       configPath,
       run,
       now: new Date("2026-08-10T22:02:00Z"),
+      wait: async () => {},
     });
     await expect(result).rejects.toMatchObject({ code: "mint_failed_revocation_unknown" });
     await expect(result).rejects.not.toThrow(alias);
     await expect(result).rejects.not.toThrow(SECRET);
-    expect(sshCalls).toHaveLength(2);
+    expect(sshCalls).toHaveLength(4);
     expect(sshCalls[1]).toContain(alias);
   });
 });
