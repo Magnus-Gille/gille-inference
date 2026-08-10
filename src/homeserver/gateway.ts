@@ -2,7 +2,14 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
-import { listModels, loadModel, unloadModel, downloadModel } from "./model-admin.js";
+import {
+  listModels,
+  loadModel,
+  unloadModel,
+  downloadModel,
+  getRunningSnapshot,
+  RunningSnapshotUnavailableError,
+} from "./model-admin.js";
 import { delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
@@ -46,7 +53,15 @@ import { DegeneracyWatchdog } from "./degeneracy-watchdog.js";
 import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
-import { recordRequestLog, cachedRequestLogTotals } from "./request-log.js";
+import {
+  recordRequestLog,
+  cachedRequestLogTotals,
+  getLatestSuccessfulModelUse,
+  type LatestSuccessfulModelUse,
+} from "./request-log.js";
+import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
+import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
+import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
 import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
@@ -130,7 +145,7 @@ import {
  *   • a uniform OpenAI-shaped error envelope on every auth / inference failure
  *   • OpenAI-compatible /v1/chat/completions proxy + /delegate orchestrated path
  *   • /admin/models/* + /admin/keys* (mint / list / revoke)
- *   • /ledger, /healthz, /models (read-only)
+ *   • /ledger, /healthz, /models, /models/residency (read-only)
  *
  * Safety default: it refuses to bind a non-loopback host with no API keys configured —
  * you cannot accidentally expose an unauthenticated endpoint to the LAN.
@@ -146,7 +161,7 @@ interface PrincipalContext {
   tier: Tier;
   scope: KeyScope;
   isAdmin: boolean;
-  /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models. */
+  /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models*. */
   isMonitor?: boolean;
   modelAllowList: string[];
   limits: QuotaLimits;
@@ -507,6 +522,67 @@ function projectLedgerRowForRead(
   };
 }
 
+
+interface ModelResidencyResponseRow {
+  model: string;
+  state: string;
+  ttl: number | null;
+  classification: ModelResidencyDiagnostic["classification"];
+  lastUse:
+    | Pick<LatestSuccessfulModelUse, "ts" | "route" | "outcome"> & { alias?: string | null }
+    | null;
+}
+
+type ModelResidencyResponse =
+  | { models: ModelResidencyResponseRow[]; status?: never }
+  | { status: "unavailable"; models?: never };
+
+/** Read and narrow the content-blind model-residency diagnostic for the HTTP surface. */
+async function readModelResidency(includeAlias: boolean): Promise<ModelResidencyResponse> {
+  let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
+  try {
+    running = await getRunningSnapshot();
+  } catch (error) {
+    if (error instanceof RunningSnapshotUnavailableError) {
+      // An unavailable observation is not an idle backend. Keep the response safe and
+      // explicit so consumers do not infer that no models are resident.
+      return { status: "unavailable" };
+    }
+    throw error;
+  }
+  const models = [...new Set(running.map((entry) => entry.model))];
+  const lastUseByModel = Object.fromEntries(
+    models.map((model) => [model, getLatestSuccessfulModelUse("m5", model)] as const)
+  ) as Record<string, LatestSuccessfulModelUse | null>;
+  const lifecycleStartAtMsByModel = getCurrentModelLifecycleStartAtMsByModel(models);
+  const facts: ModelResidencyFacts = {
+    lastUseAtMsByModel: Object.fromEntries(
+      models.flatMap((model) => {
+        const use = lastUseByModel[model];
+        return use === null ? [] : [[model, use.ts]];
+      })
+    ),
+    lifecycleStartAtMsByModel,
+    // A request-log row cannot establish current activity; absence is intentionally unknown.
+    activeCountByModel: {},
+  };
+  const modelsOutput = diagnoseModelResidency({ running, facts, nowMs: Date.now() }).map((diagnostic) => {
+    const use = lastUseByModel[diagnostic.model];
+    return {
+      model: diagnostic.model,
+      state: diagnostic.state,
+      ttl: diagnostic.ttlSeconds,
+      classification: diagnostic.classification,
+      lastUse:
+        use === undefined || use === null
+          ? null
+          : includeAlias
+            ? { ts: use.ts, alias: use.alias, route: use.route, outcome: use.outcome }
+            : { ts: use.ts, route: use.route, outcome: use.outcome },
+    };
+  });
+  return { models: modelsOutput };
+}
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
 
@@ -3351,6 +3427,7 @@ export function startGateway(
     }
   }, 1_000);
   rosterProposalExpiryTimer.unref();
+  const modelLifecycleObserver = startModelLifecycleObserver();
 
   const server: Server = createServer((req, res) => {
     void handleRequest(
@@ -3387,6 +3464,7 @@ export function startGateway(
             if (imageWorker) imageWorker.stop();
             if (codeLoopSweepTimer !== null) clearInterval(codeLoopSweepTimer);
             clearInterval(rosterProposalExpiryTimer);
+            modelLifecycleObserver.stop();
             server.close(() => r());
           }),
       });
@@ -3522,7 +3600,7 @@ export async function handleRequest(
     if (principal?.isMonitor) {
       const monitorOk =
         method === "GET" &&
-        (path === "/ledger" || path.startsWith("/ledger/") || path === "/healthz" || path === "/metrics" || path === "/models");
+        (path === "/ledger" || path.startsWith("/ledger/") || path === "/healthz" || path === "/metrics" || path === "/models" || path === "/models/residency");
       if (!monitorOk) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
@@ -3531,7 +3609,7 @@ export async function handleRequest(
           res,
           makeError("route_not_allowed", {
             param: null,
-            message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models).",
+            message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models and /models/residency).",
           })
         );
         return;
@@ -4595,6 +4673,28 @@ export async function handleRequest(
       sendJson(res, 200, { models: await listModels() });
       lctx.status = 200;
       lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/models/residency" && method === "GET") {
+      if (!principal.isAdmin && !principal.isMonitor) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "Model residency requires an owner/admin or monitor key.",
+          })
+        );
+        return;
+      }
+      const residency = await readModelResidency(principal.isAdmin);
+      const status = residency.status === "unavailable" ? 503 : 200;
+      sendJson(res, status, residency);
+      lctx.status = status;
+      lctx.outcome = residency.status === "unavailable" ? "unavailable" : "ok";
       lctx.admission = "n/a";
       return;
     }

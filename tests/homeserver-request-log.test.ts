@@ -18,6 +18,8 @@ let requestLogColumns: typeof import("../src/homeserver/request-log.js").request
 let requestLogTotals: typeof import("../src/homeserver/request-log.js").requestLogTotals;
 let cachedRequestLogTotals: typeof import("../src/homeserver/request-log.js").cachedRequestLogTotals;
 let bustStatsCache: typeof import("../src/homeserver/request-log.js").bustStatsCache;
+let getLatestSuccessfulModelUse: typeof import("../src/homeserver/request-log.js").getLatestSuccessfulModelUse;
+let ensureRequestLogSchema: typeof import("../src/homeserver/request-log.js").ensureRequestLogSchema;
 
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), "hs-reqlog-unit-"));
@@ -28,6 +30,8 @@ beforeAll(async () => {
   requestLogTotals = mod.requestLogTotals;
   cachedRequestLogTotals = mod.cachedRequestLogTotals;
   bustStatsCache = mod.bustStatsCache;
+  getLatestSuccessfulModelUse = mod.getLatestSuccessfulModelUse;
+  ensureRequestLogSchema = mod.ensureRequestLogSchema;
   // Create the table eagerly so beforeEach's DELETE has something to clear.
   mod.ensureRequestLogSchema();
 });
@@ -78,6 +82,45 @@ describe("request_log — content-blind schema", () => {
     for (const expected of ["id", "ts", "alias", "tier", "key_hash", "model", "route", "status", "outcome", "ttft_ms", "total_ms"]) {
       expect(cols).toContain(expected);
     }
+  });
+
+  it("migrates the composite index used by the latest-node-and-model lookup", () => {
+    getDb().exec(`
+      DROP INDEX IF EXISTS idx_request_log_node_model_ts_id;
+      CREATE INDEX idx_request_log_model_ts_id
+        ON request_log(model, ts DESC, id DESC);
+    `);
+    ensureRequestLogSchema();
+
+    const index = getDb()
+      .prepare(
+        `SELECT sql
+           FROM sqlite_master
+          WHERE type = 'index' AND name = 'idx_request_log_node_model_ts_id'`
+      )
+      .get() as { sql?: string } | undefined;
+    expect(index?.sql).toMatch(
+      /CREATE INDEX(?: IF NOT EXISTS)? idx_request_log_node_model_ts_id\s+ON request_log\s*\(\s*node\s*,\s*model\s*,\s*ts DESC\s*,\s*id DESC\s*\)/i,
+    );
+
+    const columns = getDb()
+      .prepare("PRAGMA index_info('idx_request_log_node_model_ts_id')")
+      .all() as Array<{ seq: number; name: string }>;
+    expect(columns.sort((a, b) => a.seq - b.seq).map((column) => column.name)).toEqual([
+      "node",
+      "model",
+      "ts",
+      "id",
+    ]);
+    expect(
+      getDb()
+        .prepare(
+          `SELECT 1 AS present
+             FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_request_log_model_ts_id'`,
+        )
+        .get(),
+    ).toBeUndefined();
   });
 
   it("writes exactly one row with the correct content-blind fields", () => {
@@ -232,6 +275,93 @@ describe("requestLogTotals — content-blind grand aggregate (powers the PUBLIC 
     // The earliest ts must not be in the future and must be a real epoch-ms value.
     expect(t.since!).toBeGreaterThan(0);
     expect(t.since!).toBeLessThanOrEqual(Date.now());
+  });
+});
+
+describe("getLatestSuccessfulModelUse — narrow residency reader", () => {
+  function insert(
+    id: string,
+    ts: number,
+    over: {
+      model?: string;
+      node?: "m5" | "orin";
+      alias?: string | null;
+      route?: string;
+      status?: number;
+      outcome?: string;
+    } = {}
+  ): void {
+    getDb()
+      .prepare(
+        `INSERT INTO request_log (id, ts, alias, model, node, route, status, outcome, total_ms)
+         VALUES (@id, @ts, @alias, @model, @node, @route, @status, @outcome, 1)`
+      )
+      .run({
+        id,
+        ts,
+        alias: over.alias ?? "operator",
+        model: over.model ?? "m1",
+        node: over.node ?? "m5",
+        route: over.route ?? "/v1/chat/completions",
+        status: over.status ?? 500,
+        outcome: over.outcome ?? "error",
+      });
+  }
+
+  it("returns only the newest row qualifying by outcome or 2xx status", () => {
+    insert("qualifies-by-outcome", 100, { outcome: "ok", status: 500 });
+    insert("qualifies-by-status", 200, { outcome: "error", status: 204, alias: "safe-alias", route: "/healthz" });
+    insert("not-newer-but-qualifying", 300, { outcome: "ok", status: 500, alias: "newest-alias" });
+
+    expect(getLatestSuccessfulModelUse("m5", "m1")).toEqual({
+      ts: 300,
+      alias: "newest-alias",
+      route: "/v1/chat/completions",
+      outcome: "ok",
+    });
+  });
+
+  it("does not use a newer successful row for the same model on another node", () => {
+    insert("m5-use", 100, { node: "m5", outcome: "ok", status: 200, alias: "m5-owner" });
+    insert("orin-use", 200, { node: "orin", outcome: "ok", status: 200, alias: "orin-owner" });
+
+    expect(getLatestSuccessfulModelUse("m5", "m1")).toEqual({
+      ts: 100,
+      alias: "m5-owner",
+      route: "/v1/chat/completions",
+      outcome: "ok",
+    });
+    expect(getLatestSuccessfulModelUse("orin", "m1")).toEqual({
+      ts: 200,
+      alias: "orin-owner",
+      route: "/v1/chat/completions",
+      outcome: "ok",
+    });
+  });
+
+  it("returns null when no row is successful, absent, or the read fails", () => {
+    insert("failed", 100, { outcome: "error", status: 500 });
+    expect(getLatestSuccessfulModelUse("m5", "m1")).toBeNull();
+    expect(getLatestSuccessfulModelUse("m5", "missing-model")).toBeNull();
+
+    getDb().exec("ALTER TABLE request_log RENAME TO request_log_unavailable");
+    try {
+      expect(getLatestSuccessfulModelUse("m5", "m1")).toBeNull();
+    } finally {
+      getDb().exec("ALTER TABLE request_log_unavailable RENAME TO request_log");
+    }
+  });
+
+  it("has an exact safe public shape with no sensitive fields", () => {
+    insert("safe-shape", 100, {
+      outcome: "ok",
+      status: 200,
+      alias: "alias-only",
+      route: "/v1/chat/completions",
+    });
+    const use = getLatestSuccessfulModelUse("m5", "m1");
+    expect(Object.keys(use ?? {}).sort()).toEqual(["alias", "outcome", "route", "ts"]);
+    expect(JSON.stringify(use)).not.toMatch(/id|key|hash|token|prompt|response|content|command|proxy|ip|secret/i);
   });
 });
 

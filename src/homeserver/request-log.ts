@@ -131,7 +131,12 @@ function ensureSchema(db: Database.Database): void {
   `);
   const cols = db.prepare(`PRAGMA table_info(request_log)`).all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "node")) db.exec(`ALTER TABLE request_log ADD COLUMN node TEXT NOT NULL DEFAULT 'm5'`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_request_log_node ON request_log(node)`);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_request_log_node ON request_log(node);
+    DROP INDEX IF EXISTS idx_request_log_model_ts_id;
+    CREATE INDEX IF NOT EXISTS idx_request_log_node_model_ts_id
+      ON request_log(node, model, ts DESC, id DESC);
+  `);
   initializedDbs.add(db);
 }
 
@@ -214,6 +219,62 @@ interface RequestLogDbRow {
   ttft_ms: number | null;
   total_ms: number;
   admission: string | null;
+}
+
+/** The content-blind request-log facts safe for model-residency diagnostics. */
+export interface LatestSuccessfulModelUse {
+  ts: number;
+  alias: string | null;
+  route: string;
+  outcome: string;
+}
+
+/**
+ * Read the latest successful use of one canonical model on one compute node without creating or
+ * migrating storage. `null` is returned for an absent row, an invalid argument, or any read error;
+ * no field is inferred from the model's current state or from a failed request.
+ */
+export function getLatestSuccessfulModelUse(
+  node: "m5" | "orin",
+  model: string,
+): LatestSuccessfulModelUse | null {
+  if ((node !== "m5" && node !== "orin") || typeof model !== "string" || model.length === 0) return null;
+
+  try {
+    const row = getDb()
+      .prepare(
+        `SELECT ts, alias, route, outcome
+           FROM request_log
+          WHERE node = @node
+            AND model = @model
+            AND (outcome = 'ok' OR (status >= 200 AND status < 300))
+          ORDER BY ts DESC, id DESC
+          LIMIT 1`
+      )
+      .get({ node, model }) as
+      | { ts: number; alias: string | null; route: string; outcome: string }
+      | undefined;
+
+    if (
+      row === undefined ||
+      typeof row.ts !== "number" ||
+      !Number.isFinite(row.ts) ||
+      (row.alias !== null && typeof row.alias !== "string") ||
+      typeof row.route !== "string" ||
+      typeof row.outcome !== "string"
+    ) {
+      return null;
+    }
+
+    return {
+      ts: row.ts,
+      alias: row.alias,
+      route: row.route,
+      outcome: row.outcome,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**

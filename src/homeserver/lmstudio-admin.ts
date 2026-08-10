@@ -92,6 +92,24 @@ export interface LoadResult {
   message: string;
 }
 
+/** Sanitized read-only observation of a backend's currently running entries. */
+export interface RunningSnapshotEntry {
+  model: string;
+  state: string;
+  ttlSeconds: number | null;
+}
+
+/** A running-model observation could not be obtained; an empty list is never equivalent. */
+export class RunningSnapshotUnavailableError extends Error {
+  readonly status: number | null;
+
+  constructor(message: string, status: number | null = null) {
+    super(message);
+    this.name = "RunningSnapshotUnavailableError";
+    this.status = status;
+  }
+}
+
 // ─── REST introspection ────────────────────────────────────────────────────────
 
 interface RestModel {
@@ -160,6 +178,11 @@ export async function getLoaded(): Promise<Array<{ key: string; contextLength: n
  */
 export async function getRunningCmd(_modelId: string): Promise<string | null> {
   return null;
+}
+
+/** LM Studio has no equivalent running-entry endpoint, so report no observation explicitly. */
+export async function getRunningSnapshot(): Promise<RunningSnapshotEntry[]> {
+  throw new RunningSnapshotUnavailableError("LM Studio running-model observation unavailable");
 }
 
 // ─── CLI management ────────────────────────────────────────────────────────────

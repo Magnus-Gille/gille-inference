@@ -21,6 +21,8 @@ import {
   type ModelInfo,
   type LoadOptions,
   type LoadResult,
+  type RunningSnapshotEntry,
+  RunningSnapshotUnavailableError,
 } from "./lmstudio-admin.js";
 import {
   currentTraceHeaders,
@@ -31,7 +33,7 @@ import {
   type TraceSpanFinish,
 } from "./tracing.js";
 
-export type { ModelInfo, LoadOptions, LoadResult };
+export type { ModelInfo, LoadOptions, LoadResult, RunningSnapshotEntry };
 // Re-export validators so the facade shape matches typeof lmstudio-admin
 export { assertModelKey, assertGpu };
 
@@ -83,20 +85,52 @@ interface LlamaSwapRunningEntry {
 
 type RunningProbeResult =
   | { ok: true; entries: LlamaSwapRunningEntry[] }
-  | { ok: false };
+  | { ok: false; status: number };
+
+function isRunningEntry(value: unknown): value is LlamaSwapRunningEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.model === "string" &&
+    entry.model.trim().length > 0 &&
+    typeof entry.state === "string" &&
+    entry.state.trim().length > 0 &&
+    (entry.ttl === undefined || typeof entry.ttl === "number")
+  );
+}
 
 /** Fetch /running, distinguishing an HTTP failure from a valid empty running list. */
 async function fetchRunningProbe(origin: string): Promise<RunningProbeResult> {
   const res = await fetchWithTimeout(`${origin}/running`, {}, 5000);
-  if (!res.ok) return { ok: false };
-  const data = (await res.json()) as { running?: LlamaSwapRunningEntry[] };
-  return { ok: true, entries: data.running ?? [] };
+  if (!res.ok) return { ok: false, status: res.status };
+  const data = (await res.json()) as unknown;
+  const running =
+    typeof data === "object" && data !== null
+      ? (data as { running?: unknown }).running
+      : undefined;
+  if (!Array.isArray(running) || !running.every(isRunningEntry)) {
+    throw new RunningSnapshotUnavailableError(
+      "llama-swap GET /running returned a malformed snapshot",
+    );
+  }
+  return { ok: true, entries: running };
 }
 
-/** Fetch /running and retain the established empty-list fallback for read-only callers. */
+/** Fetch /running; failures are unavailable, never an idle empty snapshot. */
 async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
-  const probe = await fetchRunningProbe(origin);
-  return probe.ok ? probe.entries : [];
+  try {
+    const probe = await fetchRunningProbe(origin);
+    if (!probe.ok) {
+      throw new RunningSnapshotUnavailableError(
+        `llama-swap GET /running returned ${probe.status}`,
+        probe.status,
+      );
+    }
+    return probe.entries;
+  } catch (error) {
+    if (error instanceof RunningSnapshotUnavailableError) throw error;
+    throw new RunningSnapshotUnavailableError("llama-swap running-model observation unavailable");
+  }
 }
 
 function classifyLoadTrace(result: LoadResult): TraceSpanFinish | undefined {
@@ -151,6 +185,17 @@ export async function getRunningCmd(modelId: string): Promise<string | null> {
   const running = await fetchRunning(origin);
   const entry = running.find((r) => r.model === modelId && r.state === "ready");
   return entry?.cmd ?? null;
+}
+
+/** Return a sanitized read-only observation of all entries reported by /running. */
+export async function getRunningSnapshot(): Promise<RunningSnapshotEntry[]> {
+  const origin = getOrigin();
+  const running = await fetchRunning(origin);
+  return running.map(({ model, state, ttl }) => ({
+    model,
+    state,
+    ttlSeconds: typeof ttl === "number" ? ttl : null,
+  }));
 }
 
 /** Unload a model by key (POST /api/models/unload/:id), or unload all (POST /api/models/unload). */

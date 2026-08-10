@@ -13,9 +13,22 @@ import { loadConfig } from "./config.js";
 import * as lmStudio from "./lmstudio-admin.js";
 import * as llamaSwap from "./llamaswap-admin.js";
 
-export type { ModelInfo, LoadResult, LoadOptions } from "./lmstudio-admin.js";
+export type { ModelInfo, LoadResult, LoadOptions, RunningSnapshotEntry } from "./lmstudio-admin.js";
+export { RunningSnapshotUnavailableError } from "./lmstudio-admin.js";
 
-function backend(): typeof lmStudio {
+type ModelAdminBackend = Pick<
+  typeof lmStudio,
+  | "listModels"
+  | "getLoaded"
+  | "getRunningCmd"
+  | "getRunningSnapshot"
+  | "loadModel"
+  | "unloadModel"
+  | "ensureLoaded"
+  | "downloadModel"
+>;
+
+function backend(): ModelAdminBackend {
   return loadConfig().backend === "llamaswap" ? llamaSwap : lmStudio;
 }
 
@@ -34,6 +47,11 @@ export function getLoaded(): Promise<Array<{ key: string; contextLength: number 
  */
 export function getRunningCmd(modelId: string): Promise<string | null> {
   return backend().getRunningCmd(modelId);
+}
+
+/** Return the active backend's sanitized read-only running observation. */
+export function getRunningSnapshot(): Promise<import("./lmstudio-admin.js").RunningSnapshotEntry[]> {
+  return backend().getRunningSnapshot();
 }
 
 export function loadModel(
