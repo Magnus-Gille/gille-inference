@@ -88,6 +88,24 @@ describe("secret-safe credential inventory (#152)", () => {
 });
 
 describe("staged credential rotation (#152)", () => {
+  it("rejects a predecessor that expires during the overlap before minting a replacement", () => {
+    const now = new Date("2026-08-01T10:00:00.000Z");
+    mintKey({ alias: "expiring", tier: "owner", scope: "agent" }, DEFAULTS);
+    getDb().prepare("UPDATE api_keys SET expires_at = ? WHERE alias = ?")
+      .run("2026-08-01T11:00:00.000Z", "expiring");
+
+    expect(() => stageKeyRotation("expiring", {}, DEFAULTS, { now, overlapSeconds: 3_600 }))
+      .toThrow(/active predecessor.*overlap/i);
+    expect(listKeyRotations()).toEqual([]);
+
+    getDb().prepare("UPDATE api_keys SET expires_at = ? WHERE alias = ?")
+      .run("2026-08-01T11:00:00.001Z", "expiring");
+    const staged = stageKeyRotation("expiring", {}, DEFAULTS, { now, overlapSeconds: 3_600 });
+
+    expect(staged.plan.overlapExpiresAt).toBe("2026-08-01T11:00:00.000Z");
+    expect(listKeyRotations()).toHaveLength(1);
+  });
+
   it("keeps an overlap window, then atomically retires the old key after preflight", () => {
     const old = mintKey({ alias: "codex", tier: "owner", scope: "agent" }, DEFAULTS);
     const staged = stageKeyRotation("codex", {}, DEFAULTS, {

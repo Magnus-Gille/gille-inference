@@ -717,6 +717,7 @@ export function stageKeyRotation(
   if (overlapSeconds < 60 || overlapSeconds > 24 * 60 * 60) {
     throw new InvalidParamError("overlapSeconds", overlapSeconds);
   }
+  const overlapDeadline = new Date(now.getTime() + overlapSeconds * 1_000);
 
   return db.transaction((): StageKeyRotationResult => {
     const existingPlan = db
@@ -736,6 +737,14 @@ export function stageKeyRotation(
     const current = active[0]?.rec;
     if (!current) {
       throw new Error(`rotation: '${logicalAlias}' has no active key; mint a new credential instead`);
+    }
+    const expiringPredecessor = active.find(({ rec }) =>
+      rec.expiresAt !== null && Date.parse(rec.expiresAt) <= overlapDeadline.getTime()
+    )?.rec;
+    if (expiringPredecessor) {
+      throw new Error(
+        `rotation: active predecessor '${expiringPredecessor.alias}' expires before the overlap window ends`
+      );
     }
 
     const tier = opts.tier ?? current.tier;
@@ -771,7 +780,7 @@ export function stageKeyRotation(
       replacementAlias: newAlias,
       previousAliases: active.map(({ rec }) => rec.alias),
       stagedAt: now.toISOString(),
-      overlapExpiresAt: new Date(now.getTime() + overlapSeconds * 1_000).toISOString(),
+      overlapExpiresAt: overlapDeadline.toISOString(),
       status: "staged",
       baselineUseCount: minted.record.useCount,
       preflightAt: null,
