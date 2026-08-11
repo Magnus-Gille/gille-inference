@@ -30,7 +30,7 @@ set -euo pipefail
 
 KEYCHAIN_SERVICE="${GILLE_KEYCHAIN_SERVICE:-gille-inference}"
 KEYCHAIN_ACCOUNT="${GILLE_KEYCHAIN_ACCOUNT:-gateway-owner}"
-TAILSCALE_HOST="${GILLE_TAILSCALE_HOST:-inference-node}"
+TAILSCALE_HOST="${GILLE_TAILSCALE_HOST:-m5}"
 
 usage() {
   cat >&2 <<'USAGE'

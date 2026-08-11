@@ -1,4 +1,8 @@
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { main } from "../client/m5.mjs";
 
@@ -32,6 +36,165 @@ function configLoader() {
 }
 
 describe("m5 command surface", () => {
+  it("prints deploy environment shell without resolving the profile credential", async () => {
+    const output = sink();
+    const error = sink();
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const exitCode = await main(["--profile", "codex", "deploy-env"], {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("deploy-env must not perform network I/O");
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(output.text()).toBe([
+      "unset M5_API_KEY HOMESERVER_OWNER_KEY \\",
+      "  DEPLOY_HEALTH_TAILNET_URL DEPLOY_CAPABILITY_URL \\",
+      "  DEPLOY_PUBLIC_HTTP_URL DEPLOY_PUBLIC_HTTPS_URL &&",
+      'eval "$(m5-auth --env --tailnet)" &&',
+      'test -n "${M5_API_KEY:-}" &&',
+      'export HOMESERVER_OWNER_KEY="$M5_API_KEY" &&',
+      "unset M5_API_KEY &&",
+      'export DEPLOY_HEALTH_TAILNET_URL="${M5_GATEWAY_URL%/}/healthz" &&',
+      'export DEPLOY_CAPABILITY_URL="${M5_GATEWAY_URL%/}/v1/capabilities/learning-task" &&',
+      `export DEPLOY_PUBLIC_HTTP_URL='http://public.private-locator.invalid' &&`,
+      `export DEPLOY_PUBLIC_HTTPS_URL='${PUBLIC_URL}'`,
+      "",
+    ].join("\n"));
+    expect(error.text()).toBe("");
+    expect(output.text()).not.toContain(SECRET);
+  });
+
+  it("fails closed and clears stale deploy state when m5-auth cannot emit a credential", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "deploy-env"], {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+    });
+    expect(exitCode).toBe(0);
+
+    const fakeBin = mkdtempSync(join(tmpdir(), "m5-deploy-env-"));
+    const fakeAuth = join(fakeBin, "m5-auth");
+    writeFileSync(fakeAuth, "#!/usr/bin/env bash\nexit 1\n", { mode: 0o700 });
+    chmodSync(fakeAuth, 0o700);
+    try {
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          [
+            "set +e",
+            output.text(),
+            "source_status=$?",
+            '[ "$source_status" -ne 0 ]',
+            '[ -z "${M5_API_KEY+x}" ]',
+            '[ -z "${HOMESERVER_OWNER_KEY+x}" ]',
+            '[ -z "${DEPLOY_HEALTH_TAILNET_URL+x}" ]',
+            '[ -z "${DEPLOY_CAPABILITY_URL+x}" ]',
+            '[ -z "${DEPLOY_PUBLIC_HTTP_URL+x}" ]',
+            '[ -z "${DEPLOY_PUBLIC_HTTPS_URL+x}" ]',
+          ].join("\n"),
+        ],
+        {
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+            M5_API_KEY: "stale-m5-key",
+            HOMESERVER_OWNER_KEY: "stale-owner-key",
+            DEPLOY_HEALTH_TAILNET_URL: "http://stale.invalid/healthz",
+            DEPLOY_CAPABILITY_URL: "http://stale.invalid/capability",
+            DEPLOY_PUBLIC_HTTP_URL: "http://stale.invalid",
+            DEPLOY_PUBLIC_HTTPS_URL: "https://stale.invalid",
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+    } finally {
+      rmSync(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it("emits only shell-quoted validated public origins for deploy-env", async () => {
+    const output = sink();
+    const error = sink();
+    const injection = `path'$(printf unsafe)`;
+    const exitCode = await main(["--profile", "codex", "deploy-env"], {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader: () => ({
+        version: 1,
+        profiles: {
+          codex: {
+            publicGatewayUrl: `https://[2001:db8::1]:8443/${injection}`,
+          },
+        },
+      }),
+      credentialStore: {
+        resolve: async () => {
+          throw new Error(SECRET);
+        },
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(output.text()).toContain(
+      "export DEPLOY_PUBLIC_HTTP_URL='http://[2001:db8::1]:8443'",
+    );
+    expect(output.text()).toContain(
+      "export DEPLOY_PUBLIC_HTTPS_URL='https://[2001:db8::1]:8443'",
+    );
+    expect(`${output.text()}${error.text()}`).not.toContain(injection);
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("rejects --private for deploy-env before credential lookup", async () => {
+    const output = sink();
+    const error = sink();
+    let credentialLookups = 0;
+    const exitCode = await main(
+      ["--profile", "codex", "--private", "--public", "deploy-env"],
+      {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: {
+          resolve: async () => {
+            credentialLookups += 1;
+            return SECRET;
+          },
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(credentialLookups).toBe(0);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringContaining("--private") },
+    });
+    expect(error.text()).not.toContain(SECRET);
+  });
+
   it("runs provision through an injected secret-safe provisioner and prints only doctor output", async () => {
     const output = sink();
     const error = sink();

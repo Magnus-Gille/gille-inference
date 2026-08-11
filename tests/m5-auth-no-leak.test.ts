@@ -48,7 +48,7 @@ beforeAll(() => {
   writeMock(
     binDir,
     "tailscale",
-    `#!/usr/bin/env bash\nif [ "$*" != "ip -4 inference-node" ]; then echo "fake-tailscale: unexpected argv: $*" >&2; exit 64; fi\nprintf '%s\\n' '192.0.2.10'\n`
+    `#!/usr/bin/env bash\nif [ "$*" != "ip -4 m5" ]; then echo "fake-tailscale: unexpected argv: $*" >&2; exit 64; fi\nprintf '%s\\n' '192.0.2.10'\n`
   );
   writeMock(
     binDir,
@@ -57,7 +57,7 @@ beforeAll(() => {
   );
 
   // A second mock dir whose `tailscale` FAILS (non-zero, no stdout) — so resolve_m5_host
-  // must fall back to the MagicDNS name `m5` cleanly under `set -euo pipefail`.
+  // must fall back to the generic MagicDNS name `m5` cleanly under `set -euo pipefail`.
   binDirNoTs = mkdtempSync(join(tmpdir(), "m5-auth-noTS-"));
   writeMock(binDirNoTs, "security", securityMock);
   writeMock(binDirNoTs, "tailscale", `#!/usr/bin/env bash\nexit 1\n`);
@@ -151,9 +151,9 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     const { code, stdout } = run(["--env", "--tailnet"], binDirNoTs);
     expect(code).toBe(0);
     expect(stdout).toContain(SENTINEL);
-    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*\bhttp:\/\/inference-node:8080\/v1/);
-    expect(stdout).toMatch(/export M5_BASE_URL=.*\bhttp:\/\/inference-node:8080\/v1/);
-    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*\bhttp:\/\/inference-node:8080(?:['"])?\n/);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*\bhttp:\/\/m5:8080\/v1/);
+    expect(stdout).toMatch(/export M5_BASE_URL=.*\bhttp:\/\/m5:8080\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*\bhttp:\/\/m5:8080(?:['"])?\n/);
     expect(stdout).not.toContain("inference.example.com");
   });
 

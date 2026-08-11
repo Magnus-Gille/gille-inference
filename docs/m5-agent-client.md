@@ -122,10 +122,36 @@ command emits only the structured `m5 doctor` outcome.
 `--profile` is mandatory. There is no implicit shared/default account, bearer environment
 variable, bearer argv flag, or credential field in client config.
 
+### Deployment environment
+
+For an owner-attended gateway deployment, load the deploy script's environment into the current
+shell with this exact invocation:
+
+```bash
+eval "$(m5 --profile codex deploy-env)"
+```
+
+`deploy-env` emits shell source specifically for that outer `eval`; do not run it merely to print
+the source. The source first evaluates `m5-auth --env --tailnet`, copies its `M5_API_KEY` into the
+deploy script's `HOMESERVER_OWNER_KEY`, and immediately unsets `M5_API_KEY`. It derives
+`DEPLOY_HEALTH_TAILNET_URL` and `DEPLOY_CAPABILITY_URL` from the authenticated helper's
+`M5_GATEWAY_URL`. It also exports `DEPLOY_PUBLIC_HTTP_URL` and `DEPLOY_PUBLIC_HTTPS_URL` from the
+selected profile's validated `publicGatewayUrl`, so neither a live public hostname nor a private
+tailnet locator needs to be committed or hardcoded in the client.
+
+The command reads and validates the selected non-secret profile but does not resolve its Keychain
+credential and never emits a bearer. `--private` is rejected: the tailnet endpoint and credential
+belong to `m5-auth --env --tailnet`, while the profile supplies only the public verification
+origin. Generated literal origins are shell-quoted before emission. The source clears prior values
+for every variable it owns and stops before exporting a partial environment when `m5-auth` cannot
+produce a non-empty credential. Treat the output as executable shell source: never print or save
+it, and do not enable shell tracing while evaluating it.
+
 ## Commands
 
-Every automation command writes one JSON value to stdout. Errors are JSON on stderr. Prompts and
-inline seed files are supplied as bounded JSON on stdin so they do not require shell quoting.
+Except for the `deploy-env` shell-source command above, every automation command writes one JSON
+value to stdout. Errors are JSON on stderr. Prompts and inline seed files are supplied as bounded
+JSON on stdin so they do not require shell quoting.
 
 ```bash
 m5 --profile codex doctor
