@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createM5Client } from "../client/m5-client.mjs";
+import { createM5Client, M5ClientError } from "../client/m5-client.mjs";
 import { createMcpStdioBridge } from "../client/m5-stdio-bridge.mjs";
 
 const SECRET = "hs_bridge_secret-never-print";
@@ -220,6 +220,39 @@ describe("m5 stdio MCP conformance", () => {
     expect(response).not.toContain(SECRET);
     expect(response).toContain("[REDACTED]");
   });
+
+  it.each(["missing_credential", "rejected_credential"])(
+    "preserves the M5 %s category and canonical redacted remediation",
+    async (code) => {
+      const bridge = createMcpStdioBridge({
+        client: {
+          rpc: async () => {
+            throw new M5ClientError(
+              code,
+              `gateway rejected Bearer ${SECRET}`,
+            );
+          },
+        },
+      });
+
+      const response = await bridge.handleLine(
+        '{"jsonrpc":"2.0","id":14,"method":"tools/list"}',
+      );
+      const parsed = JSON.parse(response!);
+      expect(parsed).toMatchObject({
+        id: 14,
+        error: {
+          code: -32603,
+          data: {
+            m5_code: code,
+            remediation: expect.stringContaining("Keychain recovery/rotation"),
+          },
+        },
+      });
+      expect(parsed.error.message).toContain("m5 doctor");
+      expect(response).not.toContain(SECRET);
+    },
+  );
 
   it("rejects a mismatched upstream response id as malformed JSON-RPC", async () => {
     const bridge = await makeBridge(async () => rpcResponse(999, { tools: [] }));

@@ -10,6 +10,14 @@ export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "record_adoption_evidence",
 ]);
 
+const CREDENTIAL_FAILURE_CODES = new Set(["missing_credential", "rejected_credential"]);
+
+/** The standalone client cannot inspect an interactive host connector session. */
+const UNSUPPORTED_CONNECTOR_DIAGNOSTIC = Object.freeze({
+  status: "unsupported",
+  reason: "Host connector session state is not inspectable by the standalone m5 client.",
+});
+
 const ADOPTION_REPORT_FIELDS = Object.freeze([
   "harness",
   "execution_mode",
@@ -46,6 +54,7 @@ export class M5ClientError extends Error {
     this.code = code;
     if (options.httpStatus !== undefined) this.httpStatus = options.httpStatus;
     if (options.workId !== undefined) this.workId = options.workId;
+    if (options.remediation !== undefined) this.remediation = redactText(options.remediation);
   }
 
   toJSON() {
@@ -55,9 +64,36 @@ export class M5ClientError extends Error {
         message: this.message,
         ...(this.httpStatus === undefined ? {} : { http_status: this.httpStatus }),
         ...(this.workId === undefined ? {} : { work_id: this.workId }),
+        ...(this.remediation === undefined ? {} : { remediation: this.remediation }),
       },
     };
   }
+}
+
+function safeProfileForDiagnostic(profile) {
+  return typeof profile === "string" && /^[a-z][a-z0-9_-]{0,31}$/i.test(profile)
+    ? profile
+    : "selected";
+}
+
+/** One redacted recovery action shared by doctor, direct CLI errors, and the stdio bridge. */
+export function credentialRemediation(profile) {
+  const selected = safeProfileForDiagnostic(profile);
+  const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
+  return `Restore the selected profile credential through the owner-attended Keychain recovery/rotation procedure, then rerun: ${command}.`;
+}
+
+function credentialFailureMessage(code, profile) {
+  const reason = code === "missing_credential"
+    ? "The selected profile has no usable Keychain credential."
+    : "The gateway rejected the selected profile credential.";
+  return `${reason} ${credentialRemediation(profile)}`;
+}
+
+function credentialErrorOptions(code, profile, options = {}) {
+  return CREDENTIAL_FAILURE_CODES.has(code)
+    ? { ...options, remediation: options.remediation ?? credentialRemediation(profile) }
+    : options;
 }
 
 export function redactText(value, secrets = []) {
@@ -82,12 +118,16 @@ function redactValue(value, secrets) {
   return value;
 }
 
-function safeError(error, secrets) {
+function safeError(error, secrets, profile) {
   if (error instanceof M5ClientError) {
-    return new M5ClientError(error.code, redactText(error.message, secrets), {
+    const message = CREDENTIAL_FAILURE_CODES.has(error.code)
+      ? credentialFailureMessage(error.code, profile)
+      : redactText(error.message, secrets);
+    return new M5ClientError(error.code, message, credentialErrorOptions(error.code, profile, {
       httpStatus: error.httpStatus,
       workId: error.workId,
-    });
+      remediation: error.remediation,
+    }));
   }
   return new M5ClientError(
     "client_error",
@@ -636,8 +676,8 @@ export async function createM5Client({
       if (response.status === 401 || response.status === 403) {
         throw new M5ClientError(
           "rejected_credential",
-          "The gateway rejected the selected credential.",
-          { httpStatus: response.status },
+          credentialFailureMessage("rejected_credential", profile),
+          credentialErrorOptions("rejected_credential", profile, { httpStatus: response.status }),
         );
       }
       if (response.status >= 400) {
@@ -724,7 +764,7 @@ export async function createM5Client({
       try {
         return await request(message);
       } catch (error) {
-        throw safeError(error, secrets);
+        throw safeError(error, secrets, profile);
       }
     },
 
@@ -745,7 +785,7 @@ export async function createM5Client({
       try {
         return redactValue(toolPayload(response?.result), secrets);
       } catch (error) {
-        throw safeError(error, secrets);
+        throw safeError(error, secrets, profile);
       }
     },
 
@@ -796,7 +836,7 @@ export async function createM5Client({
         }
         return { models };
       } catch (error) {
-        throw safeError(error, secrets);
+        throw safeError(error, secrets, profile);
       }
     },
 
@@ -951,10 +991,13 @@ export async function createM5Client({
 }
 
 function safeDoctorResult(result) {
-  return redactValue(result, []);
+  return redactValue({
+    connector: { ...UNSUPPORTED_CONNECTOR_DIAGNOSTIC },
+    ...result,
+  }, []);
 }
 
-async function identityRequest(baseUrl, token, fetchImpl, timeoutMs) {
+async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -969,13 +1012,15 @@ async function identityRequest(baseUrl, token, fetchImpl, timeoutMs) {
     if (response.status === 401 || response.status === 403) {
       throw new M5ClientError(
         "rejected_credential",
-        "The gateway rejected the selected credential.",
+        credentialFailureMessage("rejected_credential", profile),
+        credentialErrorOptions("rejected_credential", profile),
       );
     }
     if (!response.ok) {
       throw new M5ClientError(
-        "network_failure",
+        "upstream_http_error",
         `The gateway identity check returned HTTP ${response.status}.`,
+        { httpStatus: response.status },
       );
     }
     try {
@@ -988,9 +1033,10 @@ async function identityRequest(baseUrl, token, fetchImpl, timeoutMs) {
     }
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new M5ClientError("network_failure", "The gateway identity check timed out.");
+      throw new M5ClientError("timeout", "The gateway identity check timed out.");
     }
-    throw error;
+    if (error instanceof M5ClientError) throw error;
+    throw new M5ClientError("network_failure", "The gateway identity check is unavailable.");
   } finally {
     clearTimeout(timer);
   }
@@ -1005,7 +1051,7 @@ async function endpointDoctor({
   fetchImpl,
   timeoutMs,
 }) {
-  const identity = await identityRequest(baseUrl, token, fetchImpl, timeoutMs);
+  const identity = await identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs);
   const client = await createM5Client({
     gatewayUrl: baseUrl,
     endpoint,
@@ -1026,17 +1072,64 @@ async function endpointDoctor({
       "The MCP tools catalogue response is malformed.",
     );
   }
+  const tools = response.result.tools
+    .map((tool) => tool?.name)
+    .filter((name) => typeof name === "string")
+    .sort();
+  // tools/list only advertises the capability. Probe the real list_models tool as the final
+  // readiness check so a gateway with a healthy catalogue route but a broken model backend is
+  // reported distinctly by doctor.
+  const models = tools.includes("list_models") ? await client.models() : null;
   return {
     identity: {
       alias: identity?.alias,
       tier: identity?.tier,
       scope: identity?.scope,
     },
-    tools: response.result.tools
-      .map((tool) => tool?.name)
-      .filter((name) => typeof name === "string")
-      .sort(),
+    tools,
+    ...(models === null ? {} : { models: models.models }),
   };
+}
+
+function doctorEndpointFailure(error, profile, secrets) {
+  const safe = safeError(error, secrets, profile);
+  let status = "unavailable";
+  if (safe.code === "rejected_credential") {
+    status = "rejected_credential";
+  } else if (safe.code === "timeout") {
+    status = "timeout";
+  } else if (safe.code === "upstream_http_error") {
+    if (safe.httpStatus === 503) status = "busy";
+    else if (safe.httpStatus === 504 || safe.httpStatus === 408) status = "timeout";
+    else if (safe.httpStatus >= 500) status = "backend_failure";
+    else status = "backend_failure";
+  } else if (safe.code === "tool_error" || safe.code === "mcp_error") {
+    if (/\b(?:server\s+)?busy\b/i.test(safe.message)) status = "busy";
+    else if (/\b(?:timed?\s*out|timeout)\b/i.test(safe.message)) status = "timeout";
+    else status = "backend_failure";
+  } else if (safe.code === "network_failure") {
+    status = "unavailable";
+  } else if (safe.code === "malformed_mcp" || safe.code === "malformed_identity") {
+    status = "backend_failure";
+  }
+  return {
+    safe,
+    status,
+    ...(safe.httpStatus === undefined ? {} : { http_status: safe.httpStatus }),
+  };
+}
+
+function doctorCredentialResult({ profile, status, credential, endpoints }) {
+  return safeDoctorResult({
+    status,
+    profile,
+    credential,
+    auth_layer: "profile_keychain",
+    ...(status === "missing_credential" || status === "rejected_credential"
+      ? { remediation: credentialRemediation(profile) }
+      : {}),
+    endpoints,
+  });
 }
 
 export async function diagnoseProfile({
@@ -1052,7 +1145,7 @@ export async function diagnoseProfile({
     token = await credentialStore.resolve(profile);
   } catch (error) {
     if (error instanceof M5ClientError && error.code === "missing_credential") {
-      return safeDoctorResult({
+      return doctorCredentialResult({
         status: "missing_credential",
         profile,
         credential: "missing",
@@ -1064,10 +1157,18 @@ export async function diagnoseProfile({
       ["credential_timeout", "credential_unavailable"].includes(error.code)
         ? error.code
         : "credential_unavailable";
-    return safeDoctorResult({
+    return doctorCredentialResult({
       status,
       profile,
       credential: "unavailable",
+      endpoints: { public: "not_checked", private: "not_checked" },
+    });
+  }
+  if (typeof token !== "string" || token.length === 0) {
+    return doctorCredentialResult({
+      profile,
+      status: "missing_credential",
+      credential: "missing",
       endpoints: { public: "not_checked", private: "not_checked" },
     });
   }
@@ -1085,13 +1186,17 @@ export async function diagnoseProfile({
       timeoutMs,
     });
   } catch (error) {
-    const safe = safeError(error, [token]);
-    const status =
-      safe.code === "rejected_credential" ? "rejected_credential" : "network_failure";
+    const failure = doctorEndpointFailure(error, profile, [token]);
+    const status = failure.status;
     return safeDoctorResult({
       status,
       profile,
       credential: "present",
+      ...(status === "rejected_credential"
+        ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
+        : {}),
+      ...(failure.safe.code === "rejected_credential" ? {} : { diagnostic_code: failure.safe.code }),
+      ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
       endpoints: { public: status, private: "not_checked" },
     });
   }
@@ -1143,13 +1248,17 @@ export async function diagnoseProfile({
       timeoutMs,
     });
   } catch (error) {
-    const safe = safeError(error, [token]);
-    const status =
-      safe.code === "rejected_credential" ? "rejected_credential" : "network_failure";
+    const failure = doctorEndpointFailure(error, profile, [token]);
+    const status = failure.status;
     return safeDoctorResult({
       status,
       profile,
       credential: "present",
+      ...(status === "rejected_credential"
+        ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
+        : {}),
+      ...(failure.safe.code === "rejected_credential" ? {} : { diagnostic_code: failure.safe.code }),
+      ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
       endpoints: { public: "healthy", private: status },
     });
   }

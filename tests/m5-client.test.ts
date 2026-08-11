@@ -124,6 +124,31 @@ describe("profile-based Keychain resolution", () => {
     });
   });
 
+  it("reports the switched profile account as missing with a canonical doctor remediation", async () => {
+    let account: string | undefined;
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: PROFILE,
+      credentialStore: createKeychainCredentialStore({
+        execFile: (_file, args, _options, callback) => {
+          account = args[4];
+          callback(Object.assign(new Error(`missing ${SECRET}`), { code: 44 }), "", "");
+        },
+      }),
+      fetch: async () => {
+        throw new Error("doctor must not probe without a profile credential");
+      },
+    });
+    expect(account).toBe("gateway-agent-codex");
+    expect(result).toMatchObject({
+      status: "missing_credential",
+      auth_layer: "profile_keychain",
+      remediation: expect.stringContaining("m5 --profile codex doctor"),
+      endpoints: { public: "not_checked", private: "not_checked" },
+    });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+  });
+
   it("rejects credential material in client configuration", () => {
     for (const unsafe of [
       { ...PROFILE, key: SECRET },
@@ -939,15 +964,28 @@ describe("m5 doctor diagnostic distinctions", () => {
           return jsonResponse(isPrivate ? privateIdentity : publicIdentity);
         }
         const request = JSON.parse(String(init?.body)) as { id: number };
+        if ((request as { params?: { name?: string } }).params?.name === "list_models") {
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }],
+            isError: false,
+          });
+        }
         return rpcResult(request.id, tools(isPrivate ? privateTools : publicTools));
       },
     });
   }
 
   it("distinguishes missing credential", async () => {
-    await expect(diagnose({ credential: null })).resolves.toMatchObject({
+    const result = await diagnose({ credential: null });
+    expect(result).toMatchObject({
       status: "missing_credential",
+      auth_layer: "profile_keychain",
+      connector: {
+        status: "unsupported",
+      },
+      remediation: expect.stringContaining("m5 --profile codex doctor"),
     });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
   it.each([
@@ -973,16 +1011,49 @@ describe("m5 doctor diagnostic distinctions", () => {
   it("distinguishes a rejected credential", async () => {
     await expect(diagnose({ rejectStatus: 401 })).resolves.toMatchObject({
       status: "rejected_credential",
+      auth_layer: "gateway_credential",
+      remediation: expect.stringContaining("Keychain recovery/rotation"),
     });
   });
 
-  it("distinguishes DNS/network failure without exposing locator values", async () => {
+  it.each([
+    ["busy", "busy", 503],
+    ["timeout", "timeout", undefined],
+    ["unavailable", "unavailable", undefined],
+    ["backend failure", "backend_failure", undefined],
+  ])("classifies list_models %s separately from authentication", async (_label, expected, httpStatus) => {
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: PROFILE,
+      credentialStore: { resolve: async () => SECRET },
+      timeoutMs: 20,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/portal/me")) return jsonResponse({ alias: "codex-agent", tier: "owner", scope: "agent" });
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "list_models") {
+          if (httpStatus !== undefined) return new Response("", { status: httpStatus });
+          if (expected === "timeout") throw new M5ClientError("timeout", "timed out");
+          if (expected === "unavailable") throw new Error("connection refused");
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "backend unavailable" }],
+            isError: true,
+          });
+        }
+        return rpcResult(request.id, tools(REQUIRED_TOOLS));
+      },
+    });
+    expect(result).toMatchObject({ status: expected, endpoints: { public: expected } });
+    expect(result).not.toMatchObject({ status: "rejected_credential" });
+  });
+
+  it("distinguishes endpoint unavailability without exposing locator values", async () => {
     const result = await diagnose({
       networkError: Object.assign(new Error(`getaddrinfo ENOTFOUND ${SECRET}`), {
         code: "ENOTFOUND",
       }),
     });
-    expect(result).toMatchObject({ status: "network_failure" });
+    expect(result).toMatchObject({ status: "unavailable", diagnostic_code: "network_failure" });
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(JSON.stringify(result)).not.toContain(PROFILE.privateGatewayUrl);
   });

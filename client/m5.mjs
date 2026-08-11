@@ -282,7 +282,7 @@ export async function main(
     });
 
     if (command === "mcp") {
-      const bridge = createMcpStdioBridge({ client });
+      const bridge = createMcpStdioBridge({ client, profile });
       await bridgeRunner({ bridge, input, output });
       return 0;
     }
