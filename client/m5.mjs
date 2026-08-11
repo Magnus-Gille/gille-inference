@@ -198,6 +198,7 @@ export async function main(
     provisioner = provisionProfile,
   } = {},
 ) {
+  let selectedProfileName;
   try {
     const {
       profile,
@@ -207,6 +208,7 @@ export async function main(
       publicGatewayUrl,
       sshTarget,
     } = parseGlobalArgs(argv);
+    selectedProfileName = profile;
     const command = positional[0];
     if (!command || command === "help") {
       writeJson(output, help());
@@ -329,7 +331,7 @@ export async function main(
             "client_error",
             redactText(caught instanceof Error ? caught.message : "m5 failed."),
           );
-    writeJson(error, safe.toJSON());
+    writeJson(error, safe.toJSON(selectedProfileName));
     return 1;
   }
 }

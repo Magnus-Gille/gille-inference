@@ -26,13 +26,14 @@ function bridgeError(error, profile) {
     return { message: "The MCP bridge request failed." };
   }
   const credentialFailure = error.code === "missing_credential" || error.code === "rejected_credential";
+  const remediation = credentialFailure ? credentialRemediation(profile) : undefined;
   return {
     message: credentialFailure
-      ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${error.remediation ?? credentialRemediation(profile)}`
+      ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
       : error.message,
     data: {
       m5_code: error.code,
-      ...(credentialFailure ? { remediation: error.remediation ?? credentialRemediation(profile) } : {}),
+      ...(credentialFailure ? { remediation } : {}),
     },
   };
 }

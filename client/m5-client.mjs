@@ -54,17 +54,27 @@ export class M5ClientError extends Error {
     this.code = code;
     if (options.httpStatus !== undefined) this.httpStatus = options.httpStatus;
     if (options.workId !== undefined) this.workId = options.workId;
-    if (options.remediation !== undefined) this.remediation = redactText(options.remediation);
+    if (CREDENTIAL_FAILURE_CODES.has(code)) {
+      // Credential failures have one owner-attended recovery action. Do not retain a
+      // gateway- or caller-supplied remediation: it may contain a locator, credential, or
+      // an unsafe command, and both the CLI and bridge serialize this object directly.
+      this.remediation = credentialRemediation(options.profile);
+    } else if (options.remediation !== undefined) {
+      this.remediation = redactText(options.remediation);
+    }
   }
 
-  toJSON() {
+  toJSON(profile) {
+    const remediation = CREDENTIAL_FAILURE_CODES.has(this.code)
+      ? credentialRemediation(profile)
+      : this.remediation;
     return {
       error: {
         code: this.code,
         message: this.message,
         ...(this.httpStatus === undefined ? {} : { http_status: this.httpStatus }),
         ...(this.workId === undefined ? {} : { work_id: this.workId }),
-        ...(this.remediation === undefined ? {} : { remediation: this.remediation }),
+        ...(remediation === undefined ? {} : { remediation }),
       },
     };
   }
@@ -92,7 +102,7 @@ function credentialFailureMessage(code, profile) {
 
 function credentialErrorOptions(code, profile, options = {}) {
   return CREDENTIAL_FAILURE_CODES.has(code)
-    ? { ...options, remediation: options.remediation ?? credentialRemediation(profile) }
+    ? { ...options, remediation: credentialRemediation(profile), profile }
     : options;
 }
 
@@ -1076,10 +1086,28 @@ async function endpointDoctor({
     .map((tool) => tool?.name)
     .filter((name) => typeof name === "string")
     .sort();
-  // tools/list only advertises the capability. Probe the real list_models tool as the final
-  // readiness check so a gateway with a healthy catalogue route but a broken model backend is
-  // reported distinctly by doctor.
-  const models = tools.includes("list_models") ? await client.models() : null;
+  // list_models is a content-free catalogue/discovery check. It does not exercise the model
+  // backend: ask is metered and doctor deliberately never issues an inference probe.
+  let modelDiscovery = { status: "not_advertised", model_count: null };
+  if (tools.includes("list_models")) {
+    let models;
+    try {
+      models = await client.models();
+    } catch (error) {
+      // Preserve authentication failures so the doctor keeps its auth-layer diagnosis and
+      // canonical remediation. Other failures are explicitly scoped to model discovery.
+      if (error instanceof M5ClientError && CREDENTIAL_FAILURE_CODES.has(error.code)) throw error;
+      throw new M5ClientError(
+        "model_discovery_unavailable",
+        "The gateway model catalogue is unavailable.",
+        { httpStatus: error instanceof M5ClientError ? error.httpStatus : undefined },
+      );
+    }
+    modelDiscovery = {
+      status: "available",
+      model_count: models.models.length,
+    };
+  }
   return {
     identity: {
       alias: identity?.alias,
@@ -1087,7 +1115,7 @@ async function endpointDoctor({
       scope: identity?.scope,
     },
     tools,
-    ...(models === null ? {} : { models: models.models }),
+    model_discovery: modelDiscovery,
   };
 }
 
@@ -1111,6 +1139,8 @@ function doctorEndpointFailure(error, profile, secrets) {
     status = "unavailable";
   } else if (safe.code === "malformed_mcp" || safe.code === "malformed_identity") {
     status = "backend_failure";
+  } else if (safe.code === "model_discovery_unavailable") {
+    status = "model_discovery_unavailable";
   }
   return {
     safe,
@@ -1128,8 +1158,27 @@ function doctorCredentialResult({ profile, status, credential, endpoints }) {
     ...(status === "missing_credential" || status === "rejected_credential"
       ? { remediation: credentialRemediation(profile) }
       : {}),
+    model_discovery: { public: "not_checked", private: "not_checked" },
+    inference: { public: "not_checked", private: "not_checked" },
     endpoints,
   });
+}
+
+function doctorCapabilityFields(
+  publicProbe,
+  privateProbe,
+  { publicStatus = "not_checked", privateStatus = "not_checked" } = {},
+) {
+  return {
+    // `available` means only that the content-free model catalogue was returned. It is not
+    // an inference/readiness claim.
+    model_discovery: {
+      public: publicProbe?.model_discovery?.status ?? publicStatus,
+      private: privateProbe?.model_discovery?.status ?? privateStatus,
+    },
+    // Doctor never calls `ask`: that path is metered, so readiness remains explicitly unknown.
+    inference: { public: "not_checked", private: "not_checked" },
+  };
 }
 
 export async function diagnoseProfile({
@@ -1197,6 +1246,9 @@ export async function diagnoseProfile({
         : {}),
       ...(failure.safe.code === "rejected_credential" ? {} : { diagnostic_code: failure.safe.code }),
       ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
+      ...doctorCapabilityFields(null, null, {
+        publicStatus: failure.safe.code === "model_discovery_unavailable" ? "unavailable" : "not_checked",
+      }),
       endpoints: { public: status, private: "not_checked" },
     });
   }
@@ -1210,6 +1262,7 @@ export async function diagnoseProfile({
         tier: publicProbe.identity.tier ?? "unknown",
         scope: publicProbe.identity.scope ?? "unknown",
       },
+      ...doctorCapabilityFields(publicProbe, null),
       endpoints: { public: "healthy", private: "not_checked" },
     });
   }
@@ -1223,6 +1276,7 @@ export async function diagnoseProfile({
       profile,
       credential: "present",
       missing_tools: publicMissing,
+      ...doctorCapabilityFields(publicProbe, null),
       endpoints: { public: "missing_tools", private: "not_checked" },
     });
   }
@@ -1232,6 +1286,7 @@ export async function diagnoseProfile({
       status: "healthy",
       profile,
       credential: "present",
+      ...doctorCapabilityFields(publicProbe, null),
       endpoints: { public: "healthy", private: "not_configured" },
     });
   }
@@ -1259,6 +1314,9 @@ export async function diagnoseProfile({
         : {}),
       ...(failure.safe.code === "rejected_credential" ? {} : { diagnostic_code: failure.safe.code }),
       ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
+      ...doctorCapabilityFields(publicProbe, null, {
+        privateStatus: failure.safe.code === "model_discovery_unavailable" ? "unavailable" : "not_checked",
+      }),
       endpoints: { public: "healthy", private: status },
     });
   }
@@ -1272,18 +1330,21 @@ export async function diagnoseProfile({
       profile,
       credential: "present",
       missing_tools: privateMissing,
+      ...doctorCapabilityFields(publicProbe, privateProbe),
       endpoints: { public: "healthy", private: "missing_tools" },
     });
   }
 
   if (
     JSON.stringify(publicProbe.identity) !== JSON.stringify(privateProbe.identity) ||
-    JSON.stringify(publicProbe.tools) !== JSON.stringify(privateProbe.tools)
+    JSON.stringify(publicProbe.tools) !== JSON.stringify(privateProbe.tools) ||
+    JSON.stringify(publicProbe.model_discovery) !== JSON.stringify(privateProbe.model_discovery)
   ) {
     return safeDoctorResult({
       status: "path_parity_failed",
       profile,
       credential: "present",
+      ...doctorCapabilityFields(publicProbe, privateProbe),
       endpoints: { public: "healthy", private: "drift" },
     });
   }
@@ -1297,6 +1358,7 @@ export async function diagnoseProfile({
       scope: publicProbe.identity.scope,
     },
     tools: REQUIRED_AGENT_TOOLS,
+    ...doctorCapabilityFields(publicProbe, privateProbe),
     endpoints: { public: "healthy", private: "healthy" },
   });
 }
