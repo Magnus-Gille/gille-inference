@@ -1,6 +1,6 @@
 # Roadmap
 
-**Last updated:** 2026-07-11
+**Last updated:** 2026-08-11
 
 **Architecture:** [`architecture.md`](./architecture.md)
 
@@ -27,7 +27,7 @@ available model in the human-facing Conductor seat.
 | 5. Learning from real work | Owner-only harvest, shadow policy, cost traces, trustworthy promotion | **In progress/shadow** |
 | 6. Durable fleet delegation | Hugin task lifecycle, node/provider routing, bounded agentic leaves | **Deployed, adoption under validation** |
 | 7. Trust-aware resilience | End-to-end sensitivity and tested local/controlled/general-external fallback | **Partial** |
-| 8. Self-maintaining capability substrate | Scout, guarded promotion, regression detection, actionable observability | **Partial/deployed** |
+| 8. Evidence-maintained capability substrate | Manual model evaluation, guarded roster decisions, regression detection, actionable observability | **Partial/deployed** |
 
 Hugin's current validation window and pre-registered keep/reduce/remove thresholds are in
 [`hugin-role-validation.md`](./hugin-role-validation.md).

@@ -23,7 +23,7 @@ Statuses use the vocabulary in [`architecture.md`](./architecture.md).
 | Owner use can feed deliberate local learning | Owner-only request log and local harvest judge | **deployed/shadow** | Retention policy and sensitivity propagation need continued discipline |
 | Privacy-aware routing spans local, Berget, and OpenRouter | Hugin trust/sensitivity filters and provider registry | **partly deployed** | Trust-zone semantics and end-to-end data classification are incomplete |
 | The system survives a frontier-provider outage | Multiple local/external runtime types | **aspirational/partly deployed** | No canonical tested fallback-Conductor runbook or recurring outage drill |
-| The fleet improves its model roster automatically | Weekly scout, probe, gate flags, transactional promotion | **deployed** | Promotion quality is bounded by probes; human review remains appropriate |
+| Model-roster decisions are evidence-gated | Manual evaluation, probe, gate flags, owner-reviewed roster workflow | **deployed/shadow** | No scheduled discovery or autonomous roster promotion; fresh evidence and review remain required |
 | Hugin can run a bounded agentic leaf without becoming L1 | Harness runtime support plus task boundary | **partly deployed** | Authority/budget fields are not fully encoded in the task schema |
 | One capability truth guides routing | M5 ledger and ADR-004 | **architecturally settled** | Hugin verdict-like storage must remain operational, not become a competing capability ledger |
 

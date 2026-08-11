@@ -1,5 +1,5 @@
 /**
- * probe-runner.ts — reusable probe-execution core for the weekly model scout.
+ * probe-runner.ts — reusable probe-execution core for explicit model evaluations.
  *
  * Extracted from the proven loop in scripts/m5-cartography.ts. Parameterised on
  * endpoint + apiKey so it works equally against:

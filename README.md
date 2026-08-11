@@ -91,7 +91,8 @@ Munin Memory, Mimir, and Heimdall are optional consumers or peers.
 - pi-harness drives an accepted read/edit/run loop inside a tested cage.
 - The deep-research harness uses code-defined stages, pluggable search/read adapters, and a
   deterministic citation verifier.
-- Weekly model scouting evaluates new local candidates without disturbing the live runtime.
+- Explicit model evaluation records evidence for already-staged local candidates without changing
+  the live runtime; there is no scheduled discovery or automatic roster promotion.
 
 ### Evaluation framework
 

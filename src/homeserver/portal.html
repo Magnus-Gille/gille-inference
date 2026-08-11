@@ -287,25 +287,26 @@
     </p>
   </div>
 
-  <!-- NEW MODEL EVALUATIONS — populated client-side from GET /portal/model-evals.json (the
-       weekly Model Scout's content-blind registry). Hidden until the fetch returns ≥1 row, so the
-       page degrades cleanly before the first scout run. Data-driven: NO gateway restart needed to
-       refresh (unlike the hand-maintained "What's running" table above). -->
+  <!-- NEW MODEL EVALUATIONS — populated client-side from the content-blind manual evaluation
+       registry. Hidden until the fetch returns ≥1 row, so the page degrades cleanly when no
+       operator evaluation has been recorded. Data-driven: NO gateway restart needed to refresh
+       (unlike the hand-maintained "What's running" table above). -->
   <div id="evals-card" class="info-card hide">
     <h2>New model evaluations</h2>
     <p style="margin-bottom:8px">
-      Every week the box looks at trending new models on Hugging&nbsp;Face, downloads the ones that
-      fit, and benchmarks them against a fixed battery of tasks. Clear winners get auto-added to the
-      line-up above. Latest results (<span class="badge mono">pass%</span> = share of probe tasks
-      passed; higher is better):
+      Operators can explicitly evaluate an already-staged local model against a fixed battery of
+      tasks. Evaluations are evidence only; changing the served line-up remains a separate,
+      owner-reviewed operation. Latest results (<span class="badge mono">pass%</span> = share of
+      probe tasks passed; higher is better):
     </p>
     <table>
       <tr><th>Model</th><th>Quant</th><th>Size</th><th>pass%</th><th>~tok/s</th><th>Verdict</th></tr>
       <tbody id="evals-rows"></tbody>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
-      Each candidate is tested on a throwaway server, isolated from the live model line-up and run
-      off-peak. A &#8220;winner&#8221; beats or complements the current line-up and is promoted automatically.
+      Each candidate is tested on a throwaway server under the GPU lease and maintenance guard,
+      isolated from the live model line-up. A &#8220;winner&#8221; is a measured result for operator review,
+      never an automatic roster change.
     </p>
   </div>
 
@@ -749,7 +750,7 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
     .then(function (s) { if (s) renderStats(s); })
     .catch(function () { /* leave the card hidden on any error */ });
 
-  // ── New model evaluations (weekly scout) ───────────────────────────────────────────
+  // ── New model evaluations (manual registry) ───────────────────────────────────────
   function renderEvals(payload) {
     var models = (payload && payload.models) || [];
     if (!models.length) return; // keep the card hidden until there's something to show
@@ -757,8 +758,8 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
     var rows = models.map(function (m) {
       var pct = Math.round((m.passRate || 0) * 1000) / 10;
       var tok = (m.tokPerSec == null) ? "—" : Math.round(m.tokPerSec);
-      var verdict = m.served ? "served ✓" : esc(m.verdict || "");
-      var vcolor = m.served ? "var(--ok)" : (m.verdict === "winner" ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)"));
+      var verdict = m.served ? "served ✓" : (m.verdict === "winner" ? "winner · manual review" : esc(m.verdict || ""));
+      var vcolor = m.served ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)");
       return "<tr><td><span class=\"badge mono\">" + esc(m.id) + "</span></td>"
         + "<td>" + esc(m.quant || "—") + "</td>"
         + "<td>" + (m.sizeGB || "—") + "&nbsp;GB</td>"

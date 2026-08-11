@@ -301,7 +301,7 @@ export interface CodeLoopDeps {
   cageSelfTest: () => Promise<{ ok: boolean; failures: string[] }>;
   /** Verify the deterministic transient service is stopped before publishing a terminal result. */
   cleanupUnit?: (unit: string) => Promise<void>;
-  /** Live maintenance-mode flag (the model-scout window). */
+  /** Live maintenance-mode flag (an explicit evaluation window). */
   maintenanceMode: () => boolean;
   /** Acquire the GPU lease (60 s budget); null ⇒ refuse the job (lease-unavailable). */
   acquireLease: (opts: {

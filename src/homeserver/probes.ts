@@ -118,7 +118,7 @@ interface TriageCase {
 export const TRIAGE_CASES: readonly TriageCase[] = [
   { id: "triage-ready-hugin-issue", message: "Solve hugin #190 and open a draft PR", context: "Hugin is active at repo:hugin. Issue #190 is pending-task starvation.", action: "ready" },
   { id: "triage-ready-current-pr", message: "Run the tests and fix the failing check on the current PR", context: "Current project is repo:gille-inference, PR #242 has one failing Vitest check.", action: "ready" },
-  { id: "triage-ready-swedish", message: "Lägg till ett regressionstest för tomma modellsvar", context: "Active project repo:gille-inference; weekly scout work is in progress.", action: "ready" },
+  { id: "triage-ready-swedish", message: "Lägg till ett regressionstest för tomma modellsvar", context: "Active project repo:gille-inference; a manual model evaluation is in progress.", action: "ready" },
   { id: "triage-ready-research", message: "Compare the three local models on this benchmark and write a short report", context: "No repository changes requested. M5 benchmark endpoints are available.", action: "ready" },
   { id: "triage-ready-reply", message: "run this again", context: "No Hugin task is currently running.", replyContext: "The user is replying to the result for task \"mcp-m5-123\". That message said: \"Rebuild the Hugin service completed.\"", action: "ready" },
   { id: "triage-ready-terse", message: "fix the pagination boundary bug", context: "Only active bug is Hugin #190: Munin inclusive-until pagination boundary.", action: "ready" },
@@ -131,7 +131,7 @@ export const TRIAGE_CASES: readonly TriageCase[] = [
   { id: "triage-answer-status", message: "what is running right now?", context: "No Hugin tasks are running. The queue is empty.", action: "answer" },
   { id: "triage-answer-greeting", message: "hej", context: "No task context is needed.", action: "answer" },
   { id: "triage-answer-merged", message: "did #190 merge?", context: "Hugin #190 is open and draft PR #193 is not merged.", action: "answer" },
-  { id: "triage-answer-schedule", message: "when does the model scout run?", context: "Weekly model scout runs Sundays at 04:00 UTC.", action: "answer" },
+  { id: "triage-answer-evaluation-policy", message: "how are new models evaluated?", context: "New models are evaluated only through an explicit operator-requested, maintenance-protected run; there is no discovery schedule.", action: "answer" },
   { id: "triage-answer-swedish", message: "vilken modell kör triage?", context: "Ratatoskr triage currently uses mellum.", action: "answer" },
   { id: "triage-answer-quick-fact", message: "what port is Hugin on?", context: "Hugin health endpoint uses port 3032.", action: "answer" },
 ] as const;
@@ -150,7 +150,7 @@ interface ReviewCase {
 
 /**
  * 12 mutant diffs (34 seeded defects) + 6 clean controls. Findings are stable line ids, which lets
- * the scout compute recall/precision/confabulation locally without an LLM judge.
+ * the evaluation battery compute recall/precision/confabulation locally without an LLM judge.
  */
 export const REVIEW_CASES: readonly ReviewCase[] = [
   {

@@ -14,9 +14,9 @@
  *   2. Cartography JSONL runs — data/cartography-*.jsonl (+ extra-probes-results.jsonl): read for
  *      PROVENANCE (row counts, latest ts). The verdicts themselves come from the ledger the
  *      cartography wrote into, so we don't double-count — we record where they came from.
- *   3. Model-Scout registry — data/model-scout-registry.jsonl: fills a model's overall pass-rate
- *      when the ledger is too thin to assert one (e.g. the qwen36-a3b overallPass hole, which the
- *      Sunday scout cron fills — this script CONSUMES that, it does not race a GPU job).
+ *   3. Manual model-evaluation registry — data/model-scout-registry.jsonl: fills a model's overall
+ *      pass-rate when the ledger is too thin to assert one. Operators may add explicit evaluations;
+ *      this script consumes that evidence and never schedules, downloads, or promotes models.
  *
  * USAGE
  *   tsx scripts/generate-routing-table.ts --dry-run          # print the would-be table, write nothing
@@ -256,7 +256,7 @@ async function main(): Promise<void> {
   const carto = scanJsonl(args.dataDir, (n) => /^cartography-.*\.jsonl$/.test(n));
   const extra = scanJsonl(args.dataDir, (n) => n === "extra-probes-results.jsonl");
 
-  // 3. Model-Scout registry.
+  // 3. Manual model-evaluation registry.
   const registry = readRegistry(DEFAULT_REGISTRY_PATH);
   const registryLatest = registry.reduce<string | null>(
     (acc, e) => (acc === null || e.evaluatedAt > acc ? e.evaluatedAt : acc),
@@ -299,12 +299,12 @@ async function main(): Promise<void> {
       latest: extra.latest,
     },
     {
-      source: "model-scout registry (JSONL)",
+      source: "manual model-evaluation registry (JSONL)",
       path: DEFAULT_REGISTRY_PATH,
       present: existsSync(DEFAULT_REGISTRY_PATH),
       records: registry.length,
       latest: registryLatest,
-      note: "fills a model's overallPass when the ledger is too thin (consume, don't race the scout)",
+      note: "fills a model's overallPass when the ledger is too thin; operator-requested evidence only",
     },
     {
       source: "incumbent served-model audits (JSONL)", path: auditPath, present: existsSync(auditPath),

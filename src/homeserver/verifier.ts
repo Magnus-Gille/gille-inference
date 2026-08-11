@@ -210,7 +210,7 @@ export function triageGroundTruth(expected: "ready" | "clarify" | "answer"): Ver
 }
 
 /**
- * Deterministic seeded-bug grader for the weekly scout (#158).
+ * Deterministic seeded-bug grader for model-evaluation evidence (#158).
  *
  * The prompt gives every reviewable line a stable id (for example `L4`). The model returns
  * `{ "findings": ["L4"] }`; this verifier compares those ids with the closed-over manifest and

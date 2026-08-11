@@ -1,5 +1,5 @@
 /**
- * corpus-version.test.ts — pins the weekly-scout probe battery's version + content fingerprint
+ * corpus-version.test.ts — pins the model-evaluation probe battery's version + content fingerprint
  * (#12 AC: "the corpus and exact evaluation configuration are versioned and reproducible").
  *
  * The pinned CURRENT_FINGERPRINT mirrors the gate-d/verify-fixtures.sh GATE_D_STRICT_PIN pattern:
@@ -14,7 +14,7 @@ import type { Probe } from "../src/homeserver/probes.js";
 
 // Pinned golden value for the CURRENT corpus. Recompute deliberately (never copy blindly) when
 // PROBES intentionally changes, and bump PROBE_BATTERY_VERSION in the same change.
-const CURRENT_FINGERPRINT = "f4284272894602b1";
+const CURRENT_FINGERPRINT = "41c41e7c57105a27";
 
 describe("PROBE_BATTERY_VERSION + CORPUS_FINGERPRINT — reproducibility pin", () => {
   it("is a non-empty version string", () => {

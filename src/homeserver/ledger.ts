@@ -1079,7 +1079,8 @@ function accumulateOutcomeRows(rows: OutcomeRow[], taskType: string, policy: Pol
   // (code-review at minimum) a row is admissible as evidence ONLY IF its verifier is one we
   // positively TRUST to grade that quality (policy.trustedVerifiersForJudgment). A whitelist is
   // strictly stronger than #156's structural blacklist and subsumes it — the blacklist could exclude
-  // KNOWN-structural verifiers but still admitted opaque/non-adversarial checks (the scout's own
+  // KNOWN-structural verifiers but still admitted opaque/non-adversarial checks (the evaluation
+  // battery's own
   // `predicate` probe, `matches`) that pass while finding ~6% of real seeded bugs (2026-07-05 sweep),
   // so a nonEmpty pass — or a `predicate` pass — must not manufacture a verdict in EITHER direction.
   // Only the whitelist runs for judgment types (never both, redundantly). The default whitelist is

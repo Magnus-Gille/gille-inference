@@ -730,7 +730,7 @@ describe("hs.mjs User-Agent constant", () => {
   });
 });
 
-// ─── GET /portal/model-evals.json (PUBLIC, content-blind model-scout feed) ──────────
+// ─── GET /portal/model-evals.json (PUBLIC, content-blind manual-evaluation feed) ───
 
 describe("GET /portal/model-evals.json", () => {
   it("is reachable UNAUTHENTICATED and returns only content-blind eval fields", async () => {

@@ -48,7 +48,7 @@ afterEach(() => {
 // ── DEFAULT_REGISTRY_PATH ────────────────────────────────────────────────────
 
 describe("DEFAULT_REGISTRY_PATH", () => {
-  it("is an absolute path ending in model-scout-registry.jsonl", () => {
+  it("retains the historical model-scout-registry.jsonl path for compatibility", () => {
     expect(DEFAULT_REGISTRY_PATH).toMatch(/model-scout-registry\.jsonl$/);
     expect(DEFAULT_REGISTRY_PATH.startsWith("/")).toBe(true);
   });

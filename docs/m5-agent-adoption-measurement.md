@@ -53,9 +53,11 @@ leaves no evidence. This prevents a report from being joined back to a principal
 The tradeoff is that this narrow tool cannot be used for per-request debugging or auditing. It is
 rate-limited in memory per authenticated key and capped at 25 accepted rows per server day; either
 limit produces only a stable content-free reason code rather than a durable identity-bearing
-diagnostic. Rejections return one of `invalid_report`, `principal_rate_limited`,
-`daily_capacity_reached`, or `storage_unavailable`; they never echo input or expose database,
-credential, principal, request, or path details.
+diagnostic. `daily_capacity_reached` is a non-fatal telemetry outcome: the report is dropped,
+the M5 inference result is unaffected, and callers must not retry it until the next UTC day.
+Other rejections return one of `invalid_report`, `principal_rate_limited`, or
+`storage_unavailable`; they never echo input or expose database, credential, principal, request,
+or path details.
 
 ## Predeclared review
 

@@ -739,7 +739,7 @@ export async function startCodeLoop(
   }
 
   if (deps.maintenanceMode()) {
-    return { ok: false, refusal: "maintenance", message: "The box is in maintenance mode (a model-scout window is engaged). Try again shortly." };
+    return { ok: false, refusal: "maintenance", message: "The box is in maintenance mode for an explicit evaluation window. Try again shortly." };
   }
   if (runningWorkId !== null) {
     return { ok: false, refusal: "busy", message: "A code_loop run is already in progress (single-flight). Retry when it finishes." };

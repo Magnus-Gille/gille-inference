@@ -1,7 +1,9 @@
 /**
- * model-registry.ts — durable JSONL registry for the weekly Model Scout.
+ * model-registry.ts — durable JSONL registry for explicitly requested model evaluations.
  *
- * Append-only log at data/model-scout-registry.jsonl (one RegistryEntry JSON per line).
+ * Append-only log at the historical data/model-scout-registry.jsonl path (one RegistryEntry JSON
+ * per line). The filename is retained so existing evidence, including Muse Glimmer, remains
+ * readable after the weekly discovery job is retired.
  * All filesystem functions take an optional path parameter (default = DEFAULT_REGISTRY_PATH)
  * so tests can use a temp file. Pure helpers have no filesystem side-effects.
  */
@@ -104,7 +106,7 @@ export function isRegistryEntry(x: unknown): x is RegistryEntry {
     (e["corpusFingerprint"] === undefined || typeof e["corpusFingerprint"] === "string") &&
     (e["evalServingConfig"] === undefined || isEvalServingConfig(e["evalServingConfig"])) &&
     // #176 gateFlags is optional, but when present it must be a string[] — a malformed value would
-    // otherwise reach promote-model and throw on `.join`. Reject the row (fail closed) instead.
+    // otherwise reach a roster consumer and throw on `.join`. Reject the row (fail closed) instead.
     (e["gateFlags"] === undefined ||
       (Array.isArray(e["gateFlags"]) && e["gateFlags"].every((f) => typeof f === "string")))
   );
