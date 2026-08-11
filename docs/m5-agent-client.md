@@ -214,25 +214,61 @@ validation, protected paths, caps, and diff-only result remain authoritative.
 `m5 doctor` checks, in order:
 
 1. profile-specific Keychain presence;
-2. gateway reachability;
-3. authenticated identity;
-4. `owner` plus `agent|admin` route scope;
-5. visibility of `list_models`, `ask`, all three `code_loop_*` tools, and `record_adoption_evidence`;
-6. identity and tool parity between configured public and private paths.
+2. gateway reachability and authenticated identity;
+3. `owner` plus `agent|admin` route scope;
+4. visibility of `list_models`, `ask`, all three `code_loop_*` tools, and `record_adoption_evidence`;
+5. a content-free `list_models` call for **model discovery only**; and
+6. identity, tool, and discovery parity between configured public and private paths.
 
-Its top-level `status` distinguishes:
+Scope and required-tool validation are reported independently of model discovery. For example, a
+route with the wrong scope or an incomplete tool surface remains `wrong_scope` or `missing_tools`
+even when its `list_models` call is unavailable; `model_discovery` still records that catalogue
+failure.
+
+The discovery call does not run `ask`, load a model, or establish inference readiness. `ask` is a
+metered inference operation, so doctor never issues a paid probe. A successful doctor result means
+that the authenticated gateway and required agent surface are healthy—not that a subsequent
+inference will succeed.
+
+The result makes that boundary explicit:
+
+```json
+{
+  "status": "healthy",
+  "model_discovery": { "public": "available", "private": "available" },
+  "inference": { "public": "not_checked", "private": "not_checked" },
+  "endpoints": { "public": "healthy", "private": "healthy" }
+}
+```
+
+`model_discovery` is `available`, `unavailable`, `not_advertised`, or `not_checked`; it describes
+only the catalogue route. Public/private parity compares a SHA-256 digest of each route's sorted
+allowed model IDs internally; the IDs and digest are not returned by doctor. `inference` is
+deliberately `not_checked` in every doctor result. A `model_discovery_unavailable` status identifies
+a failed catalogue check and must not be read as a failed or successful inference result.
+
+Its top-level `status` also distinguishes:
 
 - `missing_credential`
 - `credential_timeout`
 - `credential_unavailable`
 - `rejected_credential`
-- `network_failure`
+- `network_failure` (the backwards-compatible status for transport failures)
+- `unavailable`
+- `timeout`
+- `busy`
+- `backend_failure`
+- `model_discovery_unavailable`
 - `wrong_scope`
 - `missing_tools`
 - `path_parity_failed`
 - `healthy`
 
-No token or endpoint locator is included in the result.
+`diagnostic_code` and `http_status`, when present, are content-free transport/catalogue details.
+No token or endpoint locator is included in the result. For `missing_credential` and
+`rejected_credential`, `remediation` is always replaced with the canonical, redacted
+owner-attended Keychain recovery action before either CLI JSON or bridge JSON-RPC serialization;
+arbitrary upstream remediation text is never forwarded.
 
 `m5 1.2.0` added the direct, content-free `adoption report` command and requires the reporting tool
 for a healthy doctor result. A generic `1.1.0` stdio bridge can still pass an MCP tool call through

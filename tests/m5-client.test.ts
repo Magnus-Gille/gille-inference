@@ -44,6 +44,41 @@ const REQUIRED_TOOLS = [
 ];
 
 describe("profile-based Keychain resolution", () => {
+  it.each(["missing_credential", "rejected_credential"])(
+    "forces canonical remediation for %s before JSON serialization",
+    (code) => {
+      const error = new M5ClientError(code, `credential failure ${SECRET}`, {
+        remediation: `Use this unsafe locator and bearer: https://evil.invalid/${SECRET}`,
+      });
+      expect(error.toJSON()).toEqual({
+        error: {
+          code,
+          message: "credential failure [REDACTED]",
+          remediation: expect.stringContaining("m5 doctor"),
+        },
+      });
+      expect(JSON.stringify(error.toJSON())).not.toContain("evil.invalid");
+      expect(JSON.stringify(error.toJSON())).not.toContain(SECRET);
+    },
+  );
+
+  it.each(["missing_credential", "rejected_credential"])(
+    "keeps the constructor profile when JSON.stringify supplies a property key for %s",
+    (code) => {
+      const error = new M5ClientError(code, "credential failure", { profile: "codex" });
+      const serialized = JSON.parse(JSON.stringify(error));
+      expect(serialized).toMatchObject({
+        error: {
+          code,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      });
+      expect(error.toJSON("ignored-property-key")).toMatchObject({
+        error: { remediation: expect.stringContaining("m5 --profile codex doctor") },
+      });
+    },
+  );
+
   it("uses independently revocable profile accounts and never puts the bearer in argv or env", async () => {
     const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
     const execFile = vi.fn(
@@ -122,6 +157,31 @@ describe("profile-based Keychain resolution", () => {
     await expect(unavailable.resolve("codex")).rejects.toMatchObject({
       code: "credential_unavailable",
     });
+  });
+
+  it("reports the switched profile account as missing with a canonical doctor remediation", async () => {
+    let account: string | undefined;
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: PROFILE,
+      credentialStore: createKeychainCredentialStore({
+        execFile: (_file, args, _options, callback) => {
+          account = args[4];
+          callback(Object.assign(new Error(`missing ${SECRET}`), { code: 44 }), "", "");
+        },
+      }),
+      fetch: async () => {
+        throw new Error("doctor must not probe without a profile credential");
+      },
+    });
+    expect(account).toBe("gateway-agent-codex");
+    expect(result).toMatchObject({
+      status: "missing_credential",
+      auth_layer: "profile_keychain",
+      remediation: expect.stringContaining("m5 --profile codex doctor"),
+      endpoints: { public: "not_checked", private: "not_checked" },
+    });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
   it("rejects credential material in client configuration", () => {
@@ -908,6 +968,9 @@ describe("m5 doctor diagnostic distinctions", () => {
     privateIdentity = publicIdentity,
     publicTools = REQUIRED_TOOLS,
     privateTools = publicTools,
+    publicModels = ["mellum"],
+    privateModels = publicModels,
+    modelDiscoveryFailure,
     rejectStatus,
     networkError,
   }: {
@@ -916,6 +979,9 @@ describe("m5 doctor diagnostic distinctions", () => {
     privateIdentity?: Record<string, unknown>;
     publicTools?: string[];
     privateTools?: string[];
+    publicModels?: string[];
+    privateModels?: string[];
+    modelDiscoveryFailure?: "public" | "private";
     rejectStatus?: number;
     networkError?: Error;
   } = {}) {
@@ -939,15 +1005,35 @@ describe("m5 doctor diagnostic distinctions", () => {
           return jsonResponse(isPrivate ? privateIdentity : publicIdentity);
         }
         const request = JSON.parse(String(init?.body)) as { id: number };
+        if ((request as { params?: { name?: string } }).params?.name === "list_models") {
+          const models = isPrivate ? privateModels : publicModels;
+          if (modelDiscoveryFailure === (isPrivate ? "private" : "public")) {
+            return rpcResult(request.id, {
+              content: [{ type: "text", text: "model catalogue unavailable" }],
+              isError: true,
+            });
+          }
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: `Models available to you:\n${models.map((model) => `- ${model} — test`).join("\n")}` }],
+            isError: false,
+          });
+        }
         return rpcResult(request.id, tools(isPrivate ? privateTools : publicTools));
       },
     });
   }
 
   it("distinguishes missing credential", async () => {
-    await expect(diagnose({ credential: null })).resolves.toMatchObject({
+    const result = await diagnose({ credential: null });
+    expect(result).toMatchObject({
       status: "missing_credential",
+      auth_layer: "profile_keychain",
+      connector: {
+        status: "unsupported",
+      },
+      remediation: expect.stringContaining("m5 --profile codex doctor"),
     });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
   it.each([
@@ -973,16 +1059,93 @@ describe("m5 doctor diagnostic distinctions", () => {
   it("distinguishes a rejected credential", async () => {
     await expect(diagnose({ rejectStatus: 401 })).resolves.toMatchObject({
       status: "rejected_credential",
+      auth_layer: "gateway_credential",
+      remediation: expect.stringContaining("Keychain recovery/rotation"),
     });
   });
 
-  it("distinguishes DNS/network failure without exposing locator values", async () => {
+  it.each([
+    ["busy", 503],
+    ["timeout", undefined],
+    ["unavailable", undefined],
+    ["backend failure", undefined],
+  ])("classifies list_models %s as model discovery, not inference readiness", async (_label, httpStatus) => {
+    const expected = "model_discovery_unavailable";
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: PROFILE,
+      credentialStore: { resolve: async () => SECRET },
+      timeoutMs: 20,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/portal/me")) return jsonResponse({ alias: "codex-agent", tier: "owner", scope: "agent" });
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "list_models") {
+          if (httpStatus !== undefined) return new Response("", { status: httpStatus });
+          if (_label === "timeout") throw new M5ClientError("timeout", "timed out");
+          if (_label === "unavailable") throw new Error("connection refused");
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "backend unavailable" }],
+            isError: true,
+          });
+        }
+        return rpcResult(request.id, tools(REQUIRED_TOOLS));
+      },
+    });
+    expect(result).toMatchObject({
+      status: expected,
+      model_discovery: { public: "unavailable", private: "not_checked" },
+      inference: { public: "not_checked", private: "not_checked" },
+      endpoints: { public: expected },
+    });
+    if (httpStatus !== undefined) expect(result).toMatchObject({ http_status: httpStatus });
+    expect(result).not.toMatchObject({ status: "rejected_credential" });
+  });
+
+  it("does not claim inference readiness when a scoped key can only discover a catalogue", async () => {
+    let inferenceCalls = 0;
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: PROFILE,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/portal/me")) {
+          return jsonResponse({ alias: "scoped-agent", tier: "owner", scope: "agent" });
+        }
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "list_models") {
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }],
+            isError: false,
+          });
+        }
+        if (request.params?.name === "ask") {
+          inferenceCalls += 1;
+          return rpcResult(request.id, {
+            content: [{ type: "text", text: "backend inference failed" }],
+            isError: true,
+          });
+        }
+        return rpcResult(request.id, tools(REQUIRED_TOOLS));
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "healthy",
+      model_discovery: { public: "available", private: "available" },
+      inference: { public: "not_checked", private: "not_checked" },
+    });
+    expect(inferenceCalls).toBe(0);
+  });
+
+  it("distinguishes endpoint unavailability without exposing locator values", async () => {
     const result = await diagnose({
       networkError: Object.assign(new Error(`getaddrinfo ENOTFOUND ${SECRET}`), {
         code: "ENOTFOUND",
       }),
     });
-    expect(result).toMatchObject({ status: "network_failure" });
+    expect(result).toMatchObject({ status: "network_failure", diagnostic_code: "network_failure" });
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(JSON.stringify(result)).not.toContain(PROFILE.privateGatewayUrl);
   });
@@ -995,10 +1158,37 @@ describe("m5 doctor diagnostic distinctions", () => {
     ).resolves.toMatchObject({ status: "wrong_scope" });
   });
 
+  it("reports wrong scope even when model discovery fails", async () => {
+    await expect(
+      diagnose({
+        publicIdentity: { alias: "wrong", tier: "owner", scope: "inference" },
+        modelDiscoveryFailure: "public",
+      }),
+    ).resolves.toMatchObject({
+      status: "wrong_scope",
+      identity: { tier: "owner", scope: "inference" },
+      model_discovery: { public: "unavailable", private: "not_checked" },
+    });
+  });
+
   it("distinguishes missing MCP tools", async () => {
     await expect(diagnose({ publicTools: ["list_models", "ask"] })).resolves.toMatchObject({
       status: "missing_tools",
       missing_tools: ["code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
+    });
+  });
+
+  it("reports missing tools even when list_models fails", async () => {
+    await expect(
+      diagnose({
+        publicTools: ["list_models"],
+        modelDiscoveryFailure: "public",
+      }),
+    ).resolves.toMatchObject({
+      status: "missing_tools",
+      identity: { tier: "owner", scope: "agent" },
+      missing_tools: ["ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
+      model_discovery: { public: "unavailable", private: "not_checked" },
     });
   });
 
@@ -1010,11 +1200,27 @@ describe("m5 doctor diagnostic distinctions", () => {
     ).resolves.toMatchObject({ status: "path_parity_failed" });
   });
 
+  it("compares the model allow-list digest instead of only the model count", async () => {
+    const result = await diagnose({
+      publicModels: ["mellum"],
+      privateModels: ["qwen3-30b-instruct"],
+    });
+    expect(result).toMatchObject({
+      status: "path_parity_failed",
+      model_discovery: { public: "available", private: "available" },
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("mellum");
+    expect(serialized).not.toContain("qwen3-30b-instruct");
+  });
+
   it("reports healthy without tokens or endpoint locator values", async () => {
     const result = await diagnose();
     expect(result).toMatchObject({
       status: "healthy",
       profile: "codex",
+      model_discovery: { public: "available", private: "available" },
+      inference: { public: "not_checked", private: "not_checked" },
       endpoints: { public: "healthy", private: "healthy" },
     });
     const serialized = JSON.stringify(result);

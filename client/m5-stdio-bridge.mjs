@@ -1,11 +1,41 @@
-import { M5ClientError, redactText } from "./m5-client.mjs";
+import { M5ClientError, credentialRemediation, redactText } from "./m5-client.mjs";
 
-function rpcError(id, code, message) {
+function rpcError(id, code, message, data) {
   return JSON.stringify({
     jsonrpc: "2.0",
     id,
-    error: { code, message: redactText(message) },
+    error: {
+      code,
+      message: redactText(message),
+      ...(data === undefined ? {} : { data: redactValue(data) }),
+    },
   });
+}
+
+function redactValue(value) {
+  if (typeof value === "string") return redactText(value);
+  if (Array.isArray(value)) return value.map((entry) => redactValue(entry));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactValue(entry)]));
+  }
+  return value;
+}
+
+function bridgeError(error, profile) {
+  if (!(error instanceof M5ClientError)) {
+    return { message: "The MCP bridge request failed." };
+  }
+  const credentialFailure = error.code === "missing_credential" || error.code === "rejected_credential";
+  const remediation = credentialFailure ? credentialRemediation(profile) : undefined;
+  return {
+    message: credentialFailure
+      ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
+      : error.message,
+    data: {
+      m5_code: error.code,
+      ...(credentialFailure ? { remediation } : {}),
+    },
+  };
 }
 
 function validMessage(message) {
@@ -22,7 +52,7 @@ function validMessage(message) {
   );
 }
 
-export function createMcpStdioBridge({ client }) {
+export function createMcpStdioBridge({ client, profile }) {
   return Object.freeze({
     async handleLine(line) {
       let message;
@@ -48,11 +78,8 @@ export function createMcpStdioBridge({ client }) {
         return JSON.stringify(response);
       } catch (error) {
         if (notification) return null;
-        const messageText =
-          error instanceof M5ClientError
-            ? error.message
-            : "The MCP bridge request failed.";
-        return rpcError(message.id, -32603, messageText);
+        const failure = bridgeError(error, profile);
+        return rpcError(message.id, -32603, failure.message, failure.data);
       }
     },
   });
