@@ -54,6 +54,7 @@ export function loadM5Config(path = defaultConfigPath()) {
 function parseGlobalArgs(argv) {
   let profile;
   let endpoint = "public";
+  let privateRequested = false;
   let publicGatewayUrl;
   let sshTarget;
   const positional = [];
@@ -68,6 +69,7 @@ function parseGlobalArgs(argv) {
       index += 1;
     } else if (arg === "--private") {
       endpoint = "private";
+      privateRequested = true;
     } else if (arg === "--public") {
       endpoint = "public";
     } else if (arg === "--public-gateway-url") {
@@ -92,7 +94,7 @@ function parseGlobalArgs(argv) {
       positional.push(arg);
     }
   }
-  return { profile, endpoint, positional, publicGatewayUrl, sshTarget };
+  return { profile, endpoint, privateRequested, positional, publicGatewayUrl, sshTarget };
 }
 
 async function readBoundedInput(input) {
@@ -121,12 +123,32 @@ function writeJson(stream, value) {
   stream.write(`${JSON.stringify(value)}\n`);
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function writeDeployEnv(stream, publicGatewayUrl) {
+  const publicHttpUrl = new URL(publicGatewayUrl);
+  publicHttpUrl.protocol = "http:";
+  stream.write([
+    'eval "$(m5-auth --env --tailnet)"',
+    'export HOMESERVER_OWNER_KEY="$M5_API_KEY"',
+    "unset M5_API_KEY",
+    'export DEPLOY_HEALTH_TAILNET_URL="${M5_GATEWAY_URL%/}/healthz"',
+    'export DEPLOY_CAPABILITY_URL="${M5_GATEWAY_URL%/}/v1/capabilities/learning-task"',
+    `export DEPLOY_PUBLIC_HTTP_URL=${shellQuote(publicHttpUrl.origin)}`,
+    `export DEPLOY_PUBLIC_HTTPS_URL=${shellQuote(publicGatewayUrl)}`,
+    "",
+  ].join("\n"));
+}
+
 function help() {
   return {
     name: "m5",
     version: M5_CLIENT_VERSION,
     usage: [
       "m5 --profile <claude|codex> doctor",
+      "eval \"$(m5 --profile <name> deploy-env)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
       "printf '%s' '<json>' | m5 --profile <claude|codex> ask",
@@ -173,7 +195,14 @@ export async function main(
   } = {},
 ) {
   try {
-    const { profile, endpoint, positional, publicGatewayUrl, sshTarget } = parseGlobalArgs(argv);
+    const {
+      profile,
+      endpoint,
+      privateRequested,
+      positional,
+      publicGatewayUrl,
+      sshTarget,
+    } = parseGlobalArgs(argv);
     const command = positional[0];
     if (!command || command === "help") {
       writeJson(output, help());
@@ -209,6 +238,16 @@ export async function main(
 
     const config = configLoader();
     const profileConfig = selectedProfile(config, profile);
+    if (command === "deploy-env") {
+      if (privateRequested) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--private is not valid with deploy-env; tailnet URLs come from m5-auth.",
+        );
+      }
+      writeDeployEnv(output, profileConfig.publicGatewayUrl);
+      return 0;
+    }
     if (command === "doctor") {
       const result = await diagnoseProfile({
         profile,
