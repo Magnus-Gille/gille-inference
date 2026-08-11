@@ -131,12 +131,16 @@ function writeDeployEnv(stream, publicGatewayUrl) {
   const publicHttpUrl = new URL(publicGatewayUrl);
   publicHttpUrl.protocol = "http:";
   stream.write([
-    'eval "$(m5-auth --env --tailnet)"',
-    'export HOMESERVER_OWNER_KEY="$M5_API_KEY"',
-    "unset M5_API_KEY",
-    'export DEPLOY_HEALTH_TAILNET_URL="${M5_GATEWAY_URL%/}/healthz"',
-    'export DEPLOY_CAPABILITY_URL="${M5_GATEWAY_URL%/}/v1/capabilities/learning-task"',
-    `export DEPLOY_PUBLIC_HTTP_URL=${shellQuote(publicHttpUrl.origin)}`,
+    "unset M5_API_KEY HOMESERVER_OWNER_KEY \\",
+    "  DEPLOY_HEALTH_TAILNET_URL DEPLOY_CAPABILITY_URL \\",
+    "  DEPLOY_PUBLIC_HTTP_URL DEPLOY_PUBLIC_HTTPS_URL &&",
+    'eval "$(m5-auth --env --tailnet)" &&',
+    'test -n "${M5_API_KEY:-}" &&',
+    'export HOMESERVER_OWNER_KEY="$M5_API_KEY" &&',
+    "unset M5_API_KEY &&",
+    'export DEPLOY_HEALTH_TAILNET_URL="${M5_GATEWAY_URL%/}/healthz" &&',
+    'export DEPLOY_CAPABILITY_URL="${M5_GATEWAY_URL%/}/v1/capabilities/learning-task" &&',
+    `export DEPLOY_PUBLIC_HTTP_URL=${shellQuote(publicHttpUrl.origin)} &&`,
     `export DEPLOY_PUBLIC_HTTPS_URL=${shellQuote(publicGatewayUrl)}`,
     "",
   ].join("\n"));

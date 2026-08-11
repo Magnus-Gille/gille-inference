@@ -142,7 +142,10 @@ tailnet locator needs to be committed or hardcoded in the client.
 The command reads and validates the selected non-secret profile but does not resolve its Keychain
 credential and never emits a bearer. `--private` is rejected: the tailnet endpoint and credential
 belong to `m5-auth --env --tailnet`, while the profile supplies only the public verification
-origin. Generated literal origins are shell-quoted before emission.
+origin. Generated literal origins are shell-quoted before emission. The source clears prior values
+for every variable it owns and stops before exporting a partial environment when `m5-auth` cannot
+produce a non-empty credential. Treat the output as executable shell source: never print or save
+it, and do not enable shell tracing while evaluating it.
 
 ## Commands
 
