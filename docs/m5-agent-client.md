@@ -220,6 +220,11 @@ validation, protected paths, caps, and diff-only result remain authoritative.
 5. a content-free `list_models` call for **model discovery only**; and
 6. identity, tool, and discovery parity between configured public and private paths.
 
+Scope and required-tool validation are reported independently of model discovery. For example, a
+route with the wrong scope or an incomplete tool surface remains `wrong_scope` or `missing_tools`
+even when its `list_models` call is unavailable; `model_discovery` still records that catalogue
+failure.
+
 The discovery call does not run `ask`, load a model, or establish inference readiness. `ask` is a
 metered inference operation, so doctor never issues a paid probe. A successful doctor result means
 that the authenticated gateway and required agent surface are healthy—not that a subsequent
@@ -237,9 +242,10 @@ The result makes that boundary explicit:
 ```
 
 `model_discovery` is `available`, `unavailable`, `not_advertised`, or `not_checked`; it describes
-only the catalogue route. `inference` is deliberately `not_checked` in every doctor result. A
-`model_discovery_unavailable` status identifies a failed catalogue check and must not be read as a
-failed or successful inference result.
+only the catalogue route. Public/private parity compares a SHA-256 digest of each route's sorted
+allowed model IDs internally; the IDs and digest are not returned by doctor. `inference` is
+deliberately `not_checked` in every doctor result. A `model_discovery_unavailable` status identifies
+a failed catalogue check and must not be read as a failed or successful inference result.
 
 Its top-level `status` also distinguishes:
 
@@ -247,6 +253,7 @@ Its top-level `status` also distinguishes:
 - `credential_timeout`
 - `credential_unavailable`
 - `rejected_credential`
+- `network_failure` (the backwards-compatible status for transport failures)
 - `unavailable`
 - `timeout`
 - `busy`

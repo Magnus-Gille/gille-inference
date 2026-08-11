@@ -1,4 +1,5 @@
 import { execFile as nodeExecFile } from "node:child_process";
+import { createHash } from "node:crypto";
 
 export const M5_CLIENT_VERSION = "1.3.0";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
@@ -52,6 +53,15 @@ export class M5ClientError extends Error {
     super(redactText(message));
     this.name = "M5ClientError";
     this.code = code;
+    // JSON.stringify invokes toJSON with the containing property key, not the profile that
+    // created this error. Keep the profile out of enumerable error data while retaining it for
+    // the canonical credential remediation used by library consumers.
+    Object.defineProperty(this, "_profile", {
+      value: typeof options.profile === "string" ? options.profile : undefined,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
     if (options.httpStatus !== undefined) this.httpStatus = options.httpStatus;
     if (options.workId !== undefined) this.workId = options.workId;
     if (CREDENTIAL_FAILURE_CODES.has(code)) {
@@ -64,7 +74,12 @@ export class M5ClientError extends Error {
     }
   }
 
-  toJSON(profile) {
+  toJSON(profileOrPropertyKey) {
+    const profile = this._profile ?? (
+      typeof profileOrPropertyKey === "string" && profileOrPropertyKey.length > 0
+        ? profileOrPropertyKey
+        : undefined
+    );
     const remediation = CREDENTIAL_FAILURE_CODES.has(this.code)
       ? credentialRemediation(profile)
       : this.remediation;
@@ -1090,23 +1105,27 @@ async function endpointDoctor({
   // backend: ask is metered and doctor deliberately never issues an inference probe.
   let modelDiscovery = { status: "not_advertised", model_count: null };
   if (tools.includes("list_models")) {
-    let models;
     try {
-      models = await client.models();
+      const models = await client.models();
+      modelDiscovery = {
+        status: "available",
+        model_count: models.models.length,
+        // Keep the actual allow-list internal. Doctor only needs a stable, content-free value
+        // to compare public/private paths and must not echo model IDs to callers.
+        model_digest: modelCatalogueDigest(models.models),
+      };
     } catch (error) {
       // Preserve authentication failures so the doctor keeps its auth-layer diagnosis and
       // canonical remediation. Other failures are explicitly scoped to model discovery.
       if (error instanceof M5ClientError && CREDENTIAL_FAILURE_CODES.has(error.code)) throw error;
-      throw new M5ClientError(
-        "model_discovery_unavailable",
-        "The gateway model catalogue is unavailable.",
-        { httpStatus: error instanceof M5ClientError ? error.httpStatus : undefined },
-      );
+      modelDiscovery = {
+        status: "unavailable",
+        model_count: null,
+        model_digest: null,
+        failure_code: "model_discovery_unavailable",
+        http_status: error instanceof M5ClientError ? error.httpStatus : undefined,
+      };
     }
-    modelDiscovery = {
-      status: "available",
-      model_count: models.models.length,
-    };
   }
   return {
     identity: {
@@ -1117,6 +1136,11 @@ async function endpointDoctor({
     tools,
     model_discovery: modelDiscovery,
   };
+}
+
+function modelCatalogueDigest(models) {
+  const ids = models.map((model) => model.id).sort();
+  return createHash("sha256").update(JSON.stringify(ids)).digest("hex");
 }
 
 function doctorEndpointFailure(error, profile, secrets) {
@@ -1136,7 +1160,9 @@ function doctorEndpointFailure(error, profile, secrets) {
     else if (/\b(?:timed?\s*out|timeout)\b/i.test(safe.message)) status = "timeout";
     else status = "backend_failure";
   } else if (safe.code === "network_failure") {
-    status = "unavailable";
+    // `network_failure` was the original public doctor status. Keep it stable for callers while
+    // retaining the richer diagnostic code for newer consumers.
+    status = "network_failure";
   } else if (safe.code === "malformed_mcp" || safe.code === "malformed_identity") {
     status = "backend_failure";
   } else if (safe.code === "model_discovery_unavailable") {
@@ -1275,9 +1301,31 @@ export async function diagnoseProfile({
       status: "missing_tools",
       profile,
       credential: "present",
+      identity: {
+        tier: publicProbe.identity.tier ?? "unknown",
+        scope: publicProbe.identity.scope ?? "unknown",
+      },
       missing_tools: publicMissing,
       ...doctorCapabilityFields(publicProbe, null),
       endpoints: { public: "missing_tools", private: "not_checked" },
+    });
+  }
+
+  if (publicProbe.model_discovery.status === "unavailable") {
+    return safeDoctorResult({
+      status: "model_discovery_unavailable",
+      profile,
+      credential: "present",
+      identity: {
+        tier: publicProbe.identity.tier,
+        scope: publicProbe.identity.scope,
+      },
+      diagnostic_code: publicProbe.model_discovery.failure_code,
+      ...(publicProbe.model_discovery.http_status === undefined
+        ? {}
+        : { http_status: publicProbe.model_discovery.http_status }),
+      ...doctorCapabilityFields(publicProbe, null),
+      endpoints: { public: "model_discovery_unavailable", private: "not_checked" },
     });
   }
 
@@ -1321,6 +1369,20 @@ export async function diagnoseProfile({
     });
   }
 
+  if (privateProbe.identity.tier !== "owner" || !["agent", "admin"].includes(privateProbe.identity.scope)) {
+    return safeDoctorResult({
+      status: "wrong_scope",
+      profile,
+      credential: "present",
+      identity: {
+        tier: privateProbe.identity.tier ?? "unknown",
+        scope: privateProbe.identity.scope ?? "unknown",
+      },
+      ...doctorCapabilityFields(publicProbe, privateProbe),
+      endpoints: { public: "healthy", private: "wrong_scope" },
+    });
+  }
+
   const privateMissing = REQUIRED_AGENT_TOOLS.filter(
     (tool) => !privateProbe.tools.includes(tool),
   );
@@ -1329,9 +1391,31 @@ export async function diagnoseProfile({
       status: "missing_tools",
       profile,
       credential: "present",
+      identity: {
+        tier: privateProbe.identity.tier ?? "unknown",
+        scope: privateProbe.identity.scope ?? "unknown",
+      },
       missing_tools: privateMissing,
       ...doctorCapabilityFields(publicProbe, privateProbe),
       endpoints: { public: "healthy", private: "missing_tools" },
+    });
+  }
+
+  if (privateProbe.model_discovery.status === "unavailable") {
+    return safeDoctorResult({
+      status: "model_discovery_unavailable",
+      profile,
+      credential: "present",
+      identity: {
+        tier: privateProbe.identity.tier,
+        scope: privateProbe.identity.scope,
+      },
+      diagnostic_code: privateProbe.model_discovery.failure_code,
+      ...(privateProbe.model_discovery.http_status === undefined
+        ? {}
+        : { http_status: privateProbe.model_discovery.http_status }),
+      ...doctorCapabilityFields(publicProbe, privateProbe),
+      endpoints: { public: "healthy", private: "model_discovery_unavailable" },
     });
   }
 

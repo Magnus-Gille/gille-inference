@@ -62,6 +62,23 @@ describe("profile-based Keychain resolution", () => {
     },
   );
 
+  it.each(["missing_credential", "rejected_credential"])(
+    "keeps the constructor profile when JSON.stringify supplies a property key for %s",
+    (code) => {
+      const error = new M5ClientError(code, "credential failure", { profile: "codex" });
+      const serialized = JSON.parse(JSON.stringify(error));
+      expect(serialized).toMatchObject({
+        error: {
+          code,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      });
+      expect(error.toJSON("ignored-property-key")).toMatchObject({
+        error: { remediation: expect.stringContaining("m5 --profile codex doctor") },
+      });
+    },
+  );
+
   it("uses independently revocable profile accounts and never puts the bearer in argv or env", async () => {
     const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
     const execFile = vi.fn(
@@ -951,6 +968,9 @@ describe("m5 doctor diagnostic distinctions", () => {
     privateIdentity = publicIdentity,
     publicTools = REQUIRED_TOOLS,
     privateTools = publicTools,
+    publicModels = ["mellum"],
+    privateModels = publicModels,
+    modelDiscoveryFailure,
     rejectStatus,
     networkError,
   }: {
@@ -959,6 +979,9 @@ describe("m5 doctor diagnostic distinctions", () => {
     privateIdentity?: Record<string, unknown>;
     publicTools?: string[];
     privateTools?: string[];
+    publicModels?: string[];
+    privateModels?: string[];
+    modelDiscoveryFailure?: "public" | "private";
     rejectStatus?: number;
     networkError?: Error;
   } = {}) {
@@ -983,8 +1006,15 @@ describe("m5 doctor diagnostic distinctions", () => {
         }
         const request = JSON.parse(String(init?.body)) as { id: number };
         if ((request as { params?: { name?: string } }).params?.name === "list_models") {
+          const models = isPrivate ? privateModels : publicModels;
+          if (modelDiscoveryFailure === (isPrivate ? "private" : "public")) {
+            return rpcResult(request.id, {
+              content: [{ type: "text", text: "model catalogue unavailable" }],
+              isError: true,
+            });
+          }
           return rpcResult(request.id, {
-            content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }],
+            content: [{ type: "text", text: `Models available to you:\n${models.map((model) => `- ${model} — test`).join("\n")}` }],
             isError: false,
           });
         }
@@ -1115,7 +1145,7 @@ describe("m5 doctor diagnostic distinctions", () => {
         code: "ENOTFOUND",
       }),
     });
-    expect(result).toMatchObject({ status: "unavailable", diagnostic_code: "network_failure" });
+    expect(result).toMatchObject({ status: "network_failure", diagnostic_code: "network_failure" });
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(JSON.stringify(result)).not.toContain(PROFILE.privateGatewayUrl);
   });
@@ -1128,10 +1158,37 @@ describe("m5 doctor diagnostic distinctions", () => {
     ).resolves.toMatchObject({ status: "wrong_scope" });
   });
 
+  it("reports wrong scope even when model discovery fails", async () => {
+    await expect(
+      diagnose({
+        publicIdentity: { alias: "wrong", tier: "owner", scope: "inference" },
+        modelDiscoveryFailure: "public",
+      }),
+    ).resolves.toMatchObject({
+      status: "wrong_scope",
+      identity: { tier: "owner", scope: "inference" },
+      model_discovery: { public: "unavailable", private: "not_checked" },
+    });
+  });
+
   it("distinguishes missing MCP tools", async () => {
     await expect(diagnose({ publicTools: ["list_models", "ask"] })).resolves.toMatchObject({
       status: "missing_tools",
       missing_tools: ["code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
+    });
+  });
+
+  it("reports missing tools even when list_models fails", async () => {
+    await expect(
+      diagnose({
+        publicTools: ["list_models"],
+        modelDiscoveryFailure: "public",
+      }),
+    ).resolves.toMatchObject({
+      status: "missing_tools",
+      identity: { tier: "owner", scope: "agent" },
+      missing_tools: ["ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
+      model_discovery: { public: "unavailable", private: "not_checked" },
     });
   });
 
@@ -1141,6 +1198,20 @@ describe("m5 doctor diagnostic distinctions", () => {
         privateIdentity: { alias: "other", tier: "owner", scope: "agent" },
       }),
     ).resolves.toMatchObject({ status: "path_parity_failed" });
+  });
+
+  it("compares the model allow-list digest instead of only the model count", async () => {
+    const result = await diagnose({
+      publicModels: ["mellum"],
+      privateModels: ["qwen3-30b-instruct"],
+    });
+    expect(result).toMatchObject({
+      status: "path_parity_failed",
+      model_discovery: { public: "available", private: "available" },
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("mellum");
+    expect(serialized).not.toContain("qwen3-30b-instruct");
   });
 
   it("reports healthy without tokens or endpoint locator values", async () => {
