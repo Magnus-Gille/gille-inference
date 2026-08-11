@@ -1,6 +1,6 @@
 import { execFile as nodeExecFile } from "node:child_process";
 
-export const M5_CLIENT_VERSION = "1.2.1";
+export const M5_CLIENT_VERSION = "1.3.0";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",

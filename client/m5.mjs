@@ -17,6 +17,7 @@ import {
   redactText,
   validateProfileConfig,
 } from "./m5-client.mjs";
+import { provisionProfile } from "./m5-provision.mjs";
 import { createMcpStdioBridge, runMcpStdioBridge } from "./m5-stdio-bridge.mjs";
 
 const MAX_STDIN_BYTES = 3 * 1024 * 1024;
@@ -53,6 +54,8 @@ export function loadM5Config(path = defaultConfigPath()) {
 function parseGlobalArgs(argv) {
   let profile;
   let endpoint = "public";
+  let publicGatewayUrl;
+  let sshTarget;
   const positional = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -67,6 +70,20 @@ function parseGlobalArgs(argv) {
       endpoint = "private";
     } else if (arg === "--public") {
       endpoint = "public";
+    } else if (arg === "--public-gateway-url") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError("invalid_args", "--public-gateway-url requires an HTTPS URL.");
+      }
+      publicGatewayUrl = value;
+      index += 1;
+    } else if (arg === "--m5-host") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError("invalid_args", "--m5-host requires an SSH host or user@host value.");
+      }
+      sshTarget = value;
+      index += 1;
     } else if (arg === "--help" || arg === "-h") {
       positional.push("help");
     } else if (arg === "--version" || arg === "-v") {
@@ -75,7 +92,7 @@ function parseGlobalArgs(argv) {
       positional.push(arg);
     }
   }
-  return { profile, endpoint, positional };
+  return { profile, endpoint, positional, publicGatewayUrl, sshTarget };
 }
 
 async function readBoundedInput(input) {
@@ -117,6 +134,7 @@ function help() {
       "printf '%s' '<json>' | m5 --profile <claude|codex> code run",
       "m5 --profile <claude|codex> code status <work_id>",
       "m5 --profile <claude|codex> code result <work_id>",
+      "m5 --profile <name> --public-gateway-url <https-url> --m5-host <user@host> provision",
     ],
     credential_source: "macOS Keychain profile account (internal only)",
     security_boundary:
@@ -151,10 +169,11 @@ export async function main(
     credentialStore = createKeychainCredentialStore(),
     fetch: fetchImpl = globalThis.fetch,
     bridgeRunner = runMcpStdioBridge,
+    provisioner = provisionProfile,
   } = {},
 ) {
   try {
-    const { profile, endpoint, positional } = parseGlobalArgs(argv);
+    const { profile, endpoint, positional, publicGatewayUrl, sshTarget } = parseGlobalArgs(argv);
     const command = positional[0];
     if (!command || command === "help") {
       writeJson(output, help());
@@ -163,6 +182,29 @@ export async function main(
     if (command === "version") {
       writeJson(output, { name: "m5", version: M5_CLIENT_VERSION });
       return 0;
+    }
+
+    if (command === "provision") {
+      if (!profile) {
+        throw new M5ClientError("profile_required", "--profile is required for provisioning.");
+      }
+      const provisioned = await provisioner({
+        profile,
+        publicGatewayUrl,
+        sshTarget,
+        configPath: defaultConfigPath(),
+      });
+      const result = await diagnoseProfile({
+        profile,
+        profileConfig: provisioned.profileConfig,
+        credentialStore,
+        fetch: fetchImpl,
+      });
+      writeJson(output, result);
+      return result.status === "healthy" ? 0 : 1;
+    }
+    if (publicGatewayUrl !== undefined || sshTarget !== undefined) {
+      throw new M5ClientError("invalid_args", "--public-gateway-url and --m5-host are only valid with provision.");
     }
 
     const config = configLoader();

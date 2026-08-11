@@ -74,6 +74,25 @@ m5 --profile codex mcp
 `usage`. A token-limit finish returns `truncated:true` so scripts can retry with a higher
 `max_tokens` instead of mistaking an empty or partial answer for a clean completion.
 
+### Provisioning a new owner-agent profile
+
+`m5 provision` is an owner-attended macOS operator ceremony. It creates the
+non-secret profile, invokes the fixed live-gateway mint path over SSH, stores
+the one-time bearer through the macOS Keychain prompt path, and finishes with a
+redacted `doctor` result:
+
+```bash
+m5 --profile pi \
+  --public-gateway-url https://inference.example.com \
+  --m5-host magnus@m5 \
+  provision
+```
+
+The command requires a non-interactive, owner-authorized SSH path to the M5
+host. It rejects an existing profile URL mismatch or Keychain item rather than
+silently replacing either; reconcile an existing credential through the normal
+rotation procedure first. It never accepts or prints bearer data.
+
 See the
 [`m5` agent client guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-agent-client.md)
 for the profile schema, Keychain account mapping, structured code commands, `claude-config`
