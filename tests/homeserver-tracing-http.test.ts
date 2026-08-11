@@ -1,9 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 
 let upstream: Server;
 let upstreamPort = 0;
@@ -16,6 +16,19 @@ let setTracingTestHooks: typeof import("../src/homeserver/tracing.js").setTracin
 let resetTracingTestHooks: typeof import("../src/homeserver/tracing.js").resetTracingTestHooks;
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+
+const JOIN_FIXTURE = JSON.parse(
+  readFileSync(join(process.cwd(), "tests/fixtures/tracing/hugin-gateway-join-tuple.json"), "utf8"),
+) as {
+  trace_id: string;
+  gateway_parent_span_id: string;
+  gateway_span_id: string;
+  version: string;
+  flags: string;
+  task_type: string;
+  lane: string;
+  retry_ordinal: number;
+};
 
 let seenTraceparents: string[] = [];
 let seenTracestates: string[] = [];
@@ -178,6 +191,8 @@ function traceSpans(records: readonly unknown[]): Array<{
   outcome: string;
   error_class?: string;
   started_at?: string;
+  ended_at?: string;
+  duration_ms?: number;
 }> {
   return records.filter((record) => (record as { kind?: string }).kind === "trace-span") as Array<{
     phase: string;
@@ -187,6 +202,8 @@ function traceSpans(records: readonly unknown[]): Array<{
     outcome: string;
     error_class?: string;
     started_at?: string;
+    ended_at?: string;
+    duration_ms?: number;
   }>;
 }
 
@@ -198,6 +215,79 @@ function gatewayReadiness(records: readonly unknown[]): Array<{ outcome: string 
 }
 
 describe("HTTP tracing", () => {
+  it("joins the Hugin fixture across a real /delegate request and survives a throwing exporter", async () => {
+    setTracingTestHooks({
+      captureExports: true,
+      exporter: async () => {
+        throw new Error("exporter offline SECRET_EXPORTER_DO_NOT_LEAK");
+      },
+      nextSpanId: vi
+        .fn<() => string>()
+        .mockReturnValueOnce(JOIN_FIXTURE.gateway_span_id)
+        .mockReturnValueOnce("1111111111111111")
+        .mockReturnValueOnce("2222222222222222")
+        .mockReturnValueOnce("3333333333333333")
+        .mockReturnValueOnce("4444444444444444"),
+    });
+    const key = mintKey({
+      alias: "trace-http-delegate",
+      tier: "owner",
+      scope: "admin",
+    }, DEFAULTS);
+    const res = await fetch(gatewayUrl("/delegate"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintextKey}`,
+        traceparent: `${JOIN_FIXTURE.version}-${JOIN_FIXTURE.trace_id}-${JOIN_FIXTURE.gateway_parent_span_id}-${JOIN_FIXTURE.flags}`,
+      },
+      body: JSON.stringify({
+        prompt: "PROMPT_SECRET_DO_NOT_LEAK",
+        taskType: JOIN_FIXTURE.task_type,
+        modelId: "m1",
+        verifier: { type: "answerIs", expected: "Hello" },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { outcome?: string; taskType?: string; ledgerId?: string };
+    expect(body).toMatchObject({ outcome: "pass", taskType: JOIN_FIXTURE.task_type });
+    expect(body.ledgerId).toEqual(expect.any(String));
+    expect(res.headers.get("traceparent")).toBe(
+      `${JOIN_FIXTURE.version}-${JOIN_FIXTURE.trace_id}-${JOIN_FIXTURE.gateway_span_id}-${JOIN_FIXTURE.flags}`,
+    );
+
+    const records = await flushTracingForTests();
+    const spans = traceSpans(records);
+    const gateway = spans.find((span) => span.phase === "gateway");
+    const verification = spans.find((span) => span.phase === "verification");
+    expect(gateway).toMatchObject({
+      trace_id: JOIN_FIXTURE.trace_id,
+      span_id: JOIN_FIXTURE.gateway_span_id,
+      parent_span_id: JOIN_FIXTURE.gateway_parent_span_id,
+      phase: "gateway",
+      outcome: "ok",
+    });
+    expect(gateway).toMatchObject({
+      task_type: JOIN_FIXTURE.task_type,
+      lane: JOIN_FIXTURE.lane,
+      retry_ordinal: JOIN_FIXTURE.retry_ordinal,
+    });
+    expect(verification).toMatchObject({ trace_id: JOIN_FIXTURE.trace_id, phase: "verification", outcome: "ok" });
+
+    const upstreamTraceparent = seenTraceparents.find((value) => value !== "");
+    expect(upstreamTraceparent).toMatch(new RegExp(`^${JOIN_FIXTURE.version}-${JOIN_FIXTURE.trace_id}-[0-9a-f]{16}-${JOIN_FIXTURE.flags}$`));
+    const joined = JSON.stringify(records);
+    expect(joined).not.toContain("PROMPT_SECRET_DO_NOT_LEAK");
+    expect(joined).not.toContain("trace-http-delegate");
+    expect(joined).not.toContain("SECRET_EXPORTER_DO_NOT_LEAK");
+
+    const row = getDb()
+      .prepare("SELECT outcome, task_type FROM delegations WHERE id = ?")
+      .get(body.ledgerId) as { outcome: string; task_type: string } | undefined;
+    expect(row).toEqual({ outcome: "pass", task_type: JOIN_FIXTURE.task_type });
+  });
+
   it("propagates W3C trace context through streaming chat and records TTFT/response spans", async () => {
     setTracingTestHooks({
       captureExports: true,
@@ -470,7 +560,11 @@ describe("HTTP tracing", () => {
         authorization: `Bearer ${key.plaintextKey}`,
         traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-b9c7c989f97918e1-01",
       },
-      body: JSON.stringify({ model: "m1", stream: true, messages: [{ role: "user", content: "cancel" }] }),
+      body: JSON.stringify({
+        model: "m1",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SECRET_CANCEL_DO_NOT_LEAK" }],
+      }),
       signal: ac.signal,
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -491,11 +585,84 @@ describe("HTTP tracing", () => {
     const spans = records.filter((record) => (record as { kind?: string }).kind === "trace-span") as Array<{
       phase: string;
       outcome: string;
+      error_class?: string;
       duration_ms?: number;
     }>;
     expect(spans.some((span) => span.phase === "queue")).toBe(true);
-    expect(spans.some((span) => span.outcome === "client_closed")).toBe(true);
+    expect(spans.some((span) => span.outcome === "client_closed" && span.error_class === "client_closed")).toBe(true);
     expect(gatewayReadiness(records).some((record) => record.outcome === "unknown")).toBe(true);
+    const joined = JSON.stringify(records);
+    expect(joined).not.toContain("PROMPT_SECRET_CANCEL_DO_NOT_LEAK");
+    expect(joined).not.toContain("client disconnected mid-stream");
+  });
+
+  it("records all phases for a successful queued owner request with nonnegative temporal ordering", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const heldKey = mintKey({
+      alias: "trace-http-owner-held",
+      tier: "owner",
+      scope: "admin",
+      modelAllowList: ["m1"],
+    }, DEFAULTS);
+    const queuedKey = mintKey({
+      alias: "trace-http-owner-queue",
+      tier: "owner",
+      scope: "admin",
+      modelAllowList: ["m1"],
+    }, DEFAULTS);
+    mode = "slow-stream";
+
+    const first = fetch(gatewayUrl("/v1/chat/completions"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${heldKey.plaintextKey}`,
+      },
+      body: JSON.stringify({ model: "m1", stream: true, messages: [{ role: "user", content: "held" }] }),
+    });
+    for (let attempt = 0; attempt < 30 && releaseSlow === null; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(releaseSlow).not.toBeNull();
+
+    const second = fetch(gatewayUrl("/v1/chat/completions"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${queuedKey.plaintextKey}`,
+        traceparent: `${JOIN_FIXTURE.version}-${JOIN_FIXTURE.trace_id}-${JOIN_FIXTURE.gateway_parent_span_id}-${JOIN_FIXTURE.flags}`,
+      },
+      body: JSON.stringify({ model: "m1", stream: true, messages: [{ role: "user", content: "queued" }] }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    mode = "stream";
+    releaseSlow?.();
+
+    const firstRes = await first;
+    expect(firstRes.status).toBe(200);
+    await firstRes.text();
+    const secondRes = await second;
+    expect(secondRes.status).toBe(200);
+    await secondRes.text();
+
+    const records = await flushTracingForTests();
+    const spans = traceSpans(records).filter((span) => span.trace_id === JOIN_FIXTURE.trace_id);
+    expect(spans.map((span) => span.phase)).toEqual(
+      expect.arrayContaining(["queue", "admission", "inference", "ttft", "response"]),
+    );
+    for (const span of spans) {
+      expect(Date.parse(span.started_at ?? "")).toBeLessThanOrEqual(Date.parse(span.ended_at ?? ""));
+      expect(span.duration_ms).toBeGreaterThanOrEqual(0);
+    }
+    const byPhase = new Map(spans.map((span) => [span.phase, span]));
+    const queue = byPhase.get("queue")!;
+    const admission = byPhase.get("admission")!;
+    const inference = byPhase.get("inference")!;
+    const ttft = byPhase.get("ttft")!;
+    const response = byPhase.get("response")!;
+    expect(Date.parse(queue.ended_at ?? "")).toBeLessThanOrEqual(Date.parse(admission.ended_at ?? ""));
+    expect(Date.parse(inference.started_at ?? "")).toBeLessThanOrEqual(Date.parse(ttft.started_at ?? ""));
+    expect(Date.parse(ttft.ended_at ?? "")).toBeLessThanOrEqual(Date.parse(response.ended_at ?? ""));
   });
 
   it("finishes a busy admission span without creating response or inference spans for the rejected request", async () => {
