@@ -31,6 +31,16 @@ let lastUpstreamBody = "";
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.method === "GET" && req.url === "/running") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ running: [] }));
+      return;
+    }
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: "mellum", object: "model" }] }));
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
