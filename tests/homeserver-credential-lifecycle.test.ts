@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
@@ -8,6 +8,7 @@ import {
   abortKeyRotation,
   commitKeyRotation,
   credentialInventory,
+  credentialInventoryReadOnly,
   listKeyRotations,
   lookupKey,
   mintKey,
@@ -84,6 +85,20 @@ describe("secret-safe credential inventory (#152)", () => {
     expect(serialized).not.toContain(secret);
     expect(serialized).not.toMatch(/keyHash|key_hash/i);
     expect(Object.keys(legacy ?? {})).not.toContain("keyHash");
+  });
+
+  it("uses a read-only connection without schema setup or database mutation", () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "hs-credential-readonly-")), "inventory.db");
+    initDb(dbPath);
+    const minted = mintKey({ alias: "read-only", tier: "owner", scope: "agent" }, DEFAULTS);
+    getDb().close();
+    chmodSync(dbPath, 0o444);
+
+    const report = credentialInventoryReadOnly({ dbPath });
+
+    expect(report.summary).toMatchObject({ total: 1, active: 1 });
+    expect(report.keys).toMatchObject([{ alias: "read-only", scope: "agent" }]);
+    expect(JSON.stringify(report)).not.toContain(minted.plaintextKey);
   });
 });
 

@@ -21,7 +21,7 @@ import {
   commitKeyRotation,
   abortKeyRotation,
   listKeyRotations,
-  credentialInventory,
+  credentialInventoryReadOnly,
   listKeys,
   revokeKey,
   KeyAliasExistsError,
@@ -441,6 +441,37 @@ export function cmdLedger(): void {
 
 export function cmdKeys(args: ParsedArgs): void {
   const sub = args.positional[0];
+
+  // Inventory is deliberately separate from every mutating command: it must remain usable when
+  // the production database is mounted read-only, and it must not load static fallback values.
+  if (sub === "inventory") {
+    const allowed = new Set(["all", "stale-days", "json"]);
+    for (const name of Object.keys(args.flags)) {
+      if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
+    }
+    const report = credentialInventoryReadOnly({
+      includeRevoked: args.flags["all"] === true,
+      staleAfterDays: strictNumFlag(args.flags, "stale-days"),
+    });
+    if (args.flags["json"] === true) {
+      console.log(JSON.stringify({ ...report, legacyStaticCredentialCounts: "not_inspected" }, null, 2));
+      return;
+    }
+    console.log(
+      `${"ALIAS".padEnd(20)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ` +
+      `${"STATUS".padEnd(9)} ${"LAST USED".padEnd(24)} FINDINGS`
+    );
+    for (const key of report.keys) {
+      console.log(
+        `${key.alias.slice(0, 19).padEnd(20)} ${key.tier.padEnd(6)} ${key.scope.padEnd(10)} ` +
+        `${key.status.padEnd(9)} ${(key.lastUsedAt ?? "never").padEnd(24)} ${key.findings.join(",") || "none"}`
+      );
+    }
+    console.log(`summary: ${JSON.stringify(report.summary)}`);
+    console.log("legacy static credential counts: not inspected by read-only inventory");
+    return;
+  }
+
   const cfg = loadConfig();
 
   if (sub === "mint") {
@@ -630,39 +661,6 @@ export function cmdKeys(args: ParsedArgs): void {
         `${plan.preflightAt ?? "pending"}`
       );
     }
-    return;
-  }
-
-  if (sub === "inventory") {
-    const allowed = new Set(["all", "stale-days", "json"]);
-    for (const name of Object.keys(args.flags)) {
-      if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
-    }
-    const report = credentialInventory({
-      includeRevoked: args.flags["all"] === true,
-      staleAfterDays: strictNumFlag(args.flags, "stale-days"),
-    });
-    const staticCounts = {
-      admin: cfg.adminApiKeys.length,
-      inference: cfg.apiKeys.length,
-      monitor: cfg.monitorApiKeys.length,
-    };
-    if (args.flags["json"] === true) {
-      console.log(JSON.stringify({ ...report, legacyStaticCounts: staticCounts }, null, 2));
-      return;
-    }
-    console.log(
-      `${"ALIAS".padEnd(20)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ` +
-      `${"STATUS".padEnd(9)} ${"LAST USED".padEnd(24)} FINDINGS`
-    );
-    for (const key of report.keys) {
-      console.log(
-        `${key.alias.slice(0, 19).padEnd(20)} ${key.tier.padEnd(6)} ${key.scope.padEnd(10)} ` +
-        `${key.status.padEnd(9)} ${(key.lastUsedAt ?? "never").padEnd(24)} ${key.findings.join(",") || "none"}`
-      );
-    }
-    console.log(`summary: ${JSON.stringify(report.summary)}`);
-    console.log(`legacy static credential counts (values never read): ${JSON.stringify(staticCounts)}`);
     return;
   }
 
