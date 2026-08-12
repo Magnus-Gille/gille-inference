@@ -32,12 +32,14 @@ npx tsx src/homeserver/cli.ts keys inventory --stale-days 30
 npx tsx src/homeserver/cli.ts keys inventory --stale-days 30 --all --json
 ```
 
-The report contains aliases, lifecycle timestamps, use counts, and findings, but no plaintext or
-hash. `unused` means the running gateway has never completed an allowed request for that minted
-key; `stale` means its last successful request is older than the threshold. `over_scoped` is a
-conservative review flag on active admin keys. Static fallback credentials cannot carry lifecycle
-metadata, so the CLI reports only their counts. Migrate them to minted scoped keys, then remove the
-static values from runtime configuration through the normal backed-up deployment procedure.
+The command opens the existing SQLite store read-only: it does not create directories, initialise
+schema, run migrations, or inspect `.env`/static fallback values. The report contains aliases,
+lifecycle timestamps, use counts, and findings, but no plaintext or hash. `unused` means the
+running gateway has never completed an allowed request for that minted key; `stale` means its last
+successful request is older than the threshold. `over_scoped` is a conservative review flag on
+active admin keys. Static fallback credentials cannot carry lifecycle metadata and are deliberately
+reported as `not_inspected`; migrate them to minted scoped keys through the normal backed-up
+deployment procedure without copying their values into an inventory command.
 
 ## Staged consumer migration
 

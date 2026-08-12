@@ -112,6 +112,20 @@ export function initDb(dbPath?: string): Database.Database {
 }
 
 /**
+ * Open an existing database strictly for observation.
+ *
+ * This deliberately does not create its parent directory, initialise schema, run migrations, or
+ * set connection pragmas: operational diagnostics must work against a database mounted read-only
+ * and must never turn a failed inspection into a production mutation.
+ */
+export function openReadOnlyDb(dbPath?: string): Database.Database {
+  const resolvedPath = resolve(
+    dbPath ?? process.env["EVAL_DB_PATH"] ?? "./data/eval.db"
+  );
+  return new Database(resolvedPath, { readonly: true, fileMustExist: true });
+}
+
+/**
  * Return the existing singleton database instance.
  * Calls initDb() with default settings if not yet initialised.
  */

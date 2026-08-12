@@ -1,6 +1,6 @@
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import type Database from "better-sqlite3";
-import { getDb } from "../db.js";
+import { getDb, openReadOnlyDb } from "../db.js";
 
 /**
  * Per-key auth store.
@@ -1007,21 +1007,24 @@ export interface CredentialInventoryReport {
   keys: CredentialInventoryEntry[];
 }
 
-/**
- * Build a conservative, secret-safe inventory. Admin credentials are deliberately reported as
- * over-scoped review candidates: the operator must prove an owner-only administrative purpose;
- * service and harness consumers should migrate to agent, monitor, or inference scope.
- */
-export function credentialInventory(opts: {
+export interface CredentialInventoryOptions {
   now?: Date;
   staleAfterDays?: number;
   includeRevoked?: boolean;
-} = {}): CredentialInventoryReport {
+}
+
+function credentialInventoryFromDb(
+  db: Database.Database,
+  opts: CredentialInventoryOptions = {}
+): CredentialInventoryReport {
   const now = opts.now ?? new Date();
   const staleAfterDays = opts.staleAfterDays ?? 30;
   assertNonNegativeInt("staleAfterDays", staleAfterDays);
   const staleCutoffMs = now.getTime() - staleAfterDays * 24 * 60 * 60 * 1000;
-  const source = listKeys({ includeRevoked: true });
+  const sql = opts.includeRevoked
+    ? `SELECT * FROM api_keys ORDER BY created_at`
+    : `SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`;
+  const source = (db.prepare(sql).all() as KeyRow[]).map(rowToRecord);
 
   const all = source.map((key): CredentialInventoryEntry => {
     const expired = key.expiresAt !== null && Date.parse(key.expiresAt) <= now.getTime();
@@ -1038,7 +1041,7 @@ export function credentialInventory(opts: {
         findings.push("stale");
       }
     }
-    return { ...key, status, findings };
+    return { ...toPublic(key), status, findings };
   });
   const keys = opts.includeRevoked ? all : all.filter((key) => key.status !== "revoked");
   const findingNames: CredentialFinding[] = [
@@ -1058,6 +1061,30 @@ export function credentialInventory(opts: {
     },
     keys,
   };
+}
+
+/**
+ * Build a conservative, secret-safe inventory. Admin credentials are deliberately reported as
+ * over-scoped review candidates: the operator must prove an owner-only administrative purpose;
+ * service and harness consumers should migrate to agent, monitor, or inference scope.
+ */
+export function credentialInventory(opts: CredentialInventoryOptions = {}): CredentialInventoryReport {
+  return credentialInventoryFromDb(ksDb(), opts);
+}
+
+/**
+ * Build the same inventory through a temporary SQLite connection that cannot mutate the source.
+ * The database must already contain the credential schema; schema setup is intentionally forbidden.
+ */
+export function credentialInventoryReadOnly(
+  opts: CredentialInventoryOptions & { dbPath?: string } = {}
+): CredentialInventoryReport {
+  const db = openReadOnlyDb(opts.dbPath);
+  try {
+    return credentialInventoryFromDb(db, opts);
+  } finally {
+    db.close();
+  }
 }
 
 // ─── Credit accounting (lifetime, non-resetting) ────────────────────────────────────
