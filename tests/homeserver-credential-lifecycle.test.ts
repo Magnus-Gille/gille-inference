@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import {
   MAX_KEY_LIFETIME_SECONDS,
@@ -92,13 +92,34 @@ describe("secret-safe credential inventory (#152)", () => {
     initDb(dbPath);
     const minted = mintKey({ alias: "read-only", tier: "owner", scope: "agent" }, DEFAULTS);
     getDb().close();
+    // The production database stays in WAL mode, but its sidecars may be absent from a
+    // read-only snapshot. SQLite otherwise tries to create -shm while starting the SELECT.
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
     chmodSync(dbPath, 0o444);
+    chmodSync(dirname(dbPath), 0o555);
 
-    const report = credentialInventoryReadOnly({ dbPath });
+    try {
+      const report = credentialInventoryReadOnly({ dbPath });
 
-    expect(report.summary).toMatchObject({ total: 1, active: 1 });
-    expect(report.keys).toMatchObject([{ alias: "read-only", scope: "agent" }]);
-    expect(JSON.stringify(report)).not.toContain(minted.plaintextKey);
+      expect(report.summary).toMatchObject({ total: 1, active: 1 });
+      expect(report.keys).toMatchObject([{ alias: "read-only", scope: "agent" }]);
+      expect(JSON.stringify(report)).not.toContain(minted.plaintextKey);
+      expect(existsSync(`${dbPath}-wal`)).toBe(false);
+      expect(existsSync(`${dbPath}-shm`)).toBe(false);
+    } finally {
+      chmodSync(dirname(dbPath), 0o755);
+    }
+  });
+
+  it("refuses an active WAL snapshot instead of omitting pending frames", () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "hs-credential-wal-")), "inventory.db");
+    initDb(dbPath);
+    mintKey({ alias: "wal-pending", tier: "owner", scope: "agent" }, DEFAULTS);
+
+    expect(statSync(`${dbPath}-wal`).size).toBeGreaterThan(0);
+    expect(() => credentialInventoryReadOnly({ dbPath })).toThrow(/active WAL sidecar/i);
+    getDb().close();
   });
 });
 
