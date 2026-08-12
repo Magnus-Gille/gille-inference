@@ -1,6 +1,6 @@
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import type Database from "better-sqlite3";
-import { getDb, openReadOnlyDb } from "../db.js";
+import { closeReadOnlyDb, getDb, openReadOnlyDb } from "../db.js";
 
 /**
  * Per-key auth store.
@@ -1083,7 +1083,7 @@ export function credentialInventoryReadOnly(
   try {
     return credentialInventoryFromDb(db, opts);
   } finally {
-    db.close();
+    closeReadOnlyDb(db);
   }
 }
 
