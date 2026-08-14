@@ -16,6 +16,7 @@
  */
 
 export type Lane = "owner" | "guest";
+export type MaintenanceScope = "guest" | "exclusive";
 
 export interface AdmissionState {
   maxInflight: number;
@@ -29,6 +30,8 @@ export interface AdmissionState {
    * guest session crashing into it. Optional → undefined is treated as false (off).
    */
   maintenanceMode?: boolean;
+  /** Which lanes the maintenance fence covers. Omitted keeps legacy guest-only behavior. */
+  maintenanceScope?: MaintenanceScope;
 }
 
 export type AdmissionResult =
@@ -80,8 +83,13 @@ export function admit(
     state.activeModel !== null &&
     req.requestedModel !== state.activeModel;
 
-  // Rule 0 — maintenance/bench mode turns guests away outright; owners are never blocked by it.
-  if (state.maintenanceMode === true && req.lane === "guest") {
+  // Rule 0 — guest maintenance turns guests away; an explicitly owner-approved exclusive
+  // window turns every inference lane away. The latter is intentionally a distinct state so a
+  // benchmark can prove that owner traffic cannot change model residency underneath it.
+  if (
+    state.maintenanceMode === true &&
+    (req.lane === "guest" || state.maintenanceScope === "exclusive")
+  ) {
     return {
       decision: "reject",
       status: 503,
@@ -143,6 +151,7 @@ export class AdmissionController {
   private inflight = 0;
   private activeModel: string | null = null;
   private maintenanceMode: boolean;
+  private maintenanceScope: MaintenanceScope = "guest";
   /**
    * Auto-expiry safety net (#105 follow-up): if a batch job that engaged maintenance mode dies
    * uncleanly (crash, OOM, SIGKILL) before turning it back off, a plain boolean would stay stuck
@@ -183,6 +192,10 @@ export class AdmissionController {
       return false;
     }
     return true;
+  }
+
+  private effectiveMaintenanceScope(): MaintenanceScope | "off" {
+    return this.effectiveMaintenanceMode() ? this.maintenanceScope : "off";
   }
 
   /**
@@ -268,6 +281,10 @@ export class AdmissionController {
   }
 
   private drainQueue(): void {
+    // Owner waiters that pre-date an exclusive window must not slip through when the current
+    // holder releases. They remain queued until the window is explicitly restored or their
+    // ordinary bounded queue deadline expires.
+    if (this.effectiveMaintenanceScope() === "exclusive") return;
     // Iterate rather than shift-first: a waiter may be capped at its per-key limit
     // even when a global slot is free (M2 fix).  Skip over still-capped waiters and
     // admit the next one that fits, preserving FIFO within the same key.
@@ -297,6 +314,7 @@ export class AdmissionController {
       ownerQueued: this.ownerWaiters.length,
       activeModel: this.activeModel,
       maintenanceMode: this.effectiveMaintenanceMode(),
+      maintenanceScope: this.effectiveMaintenanceScope() === "off" ? undefined : this.maintenanceScope,
     };
   }
 
@@ -310,9 +328,15 @@ export class AdmissionController {
    * the original unlimited-duration behavior (a human/script is expected to turn it back off).
    * Each call replaces any previous TTL rather than stacking; turning off always clears it.
    */
-  setMaintenanceMode(on: boolean, ttlMs?: number): boolean {
+  setMaintenanceMode(
+    on: boolean,
+    ttlMs?: number,
+    scope: MaintenanceScope = "guest"
+  ): boolean {
     this.maintenanceMode = on;
+    this.maintenanceScope = on ? scope : "guest";
     this.maintenanceExpiresAtMs = on && ttlMs !== undefined ? this.now() + ttlMs : null;
+    if (!on) this.drainQueue();
     return this.effectiveMaintenanceMode();
   }
 

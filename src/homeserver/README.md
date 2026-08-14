@@ -37,6 +37,7 @@ accumulates a verdict per `(node, task_type, model)` — `viable` / `marginal` /
 | `cli.ts` + `probes.ts` | Driver + the verifier-backed experiment battery. |
 | ~~`improve-loop.ts` + `improve-proposer.ts` + `vcs.ts`~~ | **RETIRED (#146)** — the overnight propose→apply→score→keep/revert loop and its `improve` CLI command. Zero production runs ever; `code-loop.ts` (see below) is the shipped, accepted self-improvement mechanism. |
 | `gpu-lease.ts` | **GPU lease** (issue #88): concurrent heavy batch jobs SEQUENCE against the serial GPU instead of thrashing it with model swaps. Mutual exclusion is enforced by an OS-atomic `mkdir` lock (`.holder/`); per-waiter ticket files provide near-FIFO fairness + a queryable "who holds / who's waiting + ETA" view (pure `selectHolder()`). Crash-safe (heartbeat + stale-reclaim; a stolen lease fires `onLeaseLost`). `acquireGpuLease`/`release`/`gpuLeaseStatus`, driven by the `gpu` CLI command. |
+| `maintenance-window.ts` + `maintenance-window-client.ts` | **Exclusive maintenance window** (issue #196): the isolated gateway identity acquires the canonical GPU lease, fences owner and guest admission, drains admitted/queued work, verifies stable llama-swap residency, and lends a bounded token to a same-authority operator command. Client failure/signals, lease loss, gateway shutdown, and TTL all restore fail-closed; credentials/tokens are excluded from child env and evidence. |
 | `deep-research-*.ts` | **Deep-research harness** (`docs/deep-research-harness-design.md`): a bounded `plan→search→read→distill→verify→gap→synth→cite` pipeline of single model calls with deterministic glue. `deep-research-types.ts` (DI ports), `deep-research-config.ts` (env), `citation-verifier.ts` (deterministic trust anchor: claim→span **and** report-sentence→cited-source verification), `search-provider.ts` (SearXNG/Brave + breaker), `reader.ts` (Trafilatura/Jina + SSRF blocklist), `deep-research.ts` (pipeline), `deep-research-cli.ts` (`run` entry). Local-first, pluggable hybrid brain. |
 
 ## The learning / back-off policy
@@ -187,8 +188,10 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). New keys are lifetime-bounded and least-scope by default: owner→`agent`, guest→`inference`; admin must be explicit. Guest keys may carry only `inference` or read-only `monitor`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
-| `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, inflight, ownerQueued, maxInflight}`. |
-| `POST /admin/maintenance` | **admin** | Toggle bench/maintenance mode: `{on: true\|false, ttlSeconds?: number}` → same status body. While **on**, guest admission is refused (`503` + `Retry-After`) and owner traffic flows unaffected. `ttlSeconds` (only meaningful with `on:true`; ignored when `on:false`) auto-expires the mode past the deadline even if nobody ever calls `{on:false}` — a crash-safety net for unattended jobs (#105). |
+| `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, mode, inflight, ownerQueued, maxInflight}`. `mode` is `off`, `guest`, or `exclusive`. |
+| `POST /admin/maintenance` | **admin** | Toggle bench/maintenance mode: `{on: true\|false, mode?: "guest"\|"exclusive", ttlSeconds?: number}` → same status body. Default `guest` mode refuses guests while owners remain unaffected. Explicit `exclusive` mode refuses both lanes and requires `ttlSeconds`. The TTL auto-expires either mode if nobody calls `{on:false}` (#105, #196). This admission fence does not itself acquire the filesystem GPU lease or prove llama-swap idle; it is one component of the reviewed maintenance-window workflow. |
+| `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
+| `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
 `GET /models/residency` returns `200 {models:[...]}` when the backend snapshot is available. Each
 row contains only `model`, `state`, `ttl`, `classification` (`serving`, `ttl_retained`,
@@ -516,6 +519,14 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    even if the job dies uncleanly (crash/OOM/SIGKILL) before it can call `{on:false}`, so guests
    can never be locked out forever with no recovery path. The weekly Model Scout uses this around
    its ephemeral candidate-evaluation window (`docs/weekly-model-scout-runbook.md`).
+6. **Exclusive maintenance window (#196)** — `npm run maintenance:run -- --base-url <actual-gateway-origin>
+   --ttl-seconds 7200 --drain-timeout-seconds 60 --evidence data/maintenance/window.json -- <command…>`.
+   The admin credential comes only from `M5_MAINTENANCE_KEY`; never place it in argv. The isolated
+   gateway process acquires the canonical filesystem lease, blocks both owner and guest inference,
+   waits for gateway drain and a stable llama-swap snapshot, and returns an opaque in-memory release
+   token. The client runs the supplied command with the caller's unchanged authority, restores in a
+   `finally` path, forwards `SIGINT`, `SIGTERM`, and `SIGHUP`, verifies the window is closed, and emits
+   content-blind evidence. Server TTL remains the recovery backstop for `SIGKILL` or a lost client.
 
 Every auth / inference error uses a uniform OpenAI-shaped envelope:
 `{ error: { message, type, code, param } }` with the right status (401/403/400/429/503)

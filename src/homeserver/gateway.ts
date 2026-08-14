@@ -40,6 +40,14 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
+import { acquireGpuLease } from "./gpu-lease.js";
+import {
+  ExclusiveMaintenanceWindow,
+  MaintenanceWindowBusyError,
+  MaintenanceWindowDrainError,
+  MaintenanceWindowTokenError,
+  type MaintenanceWindowDependencies,
+} from "./maintenance-window.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
@@ -3292,6 +3300,8 @@ export interface GatewayComposition {
    * a private adapter without putting locators or registry material in source.
    */
   rosterAdmissionDependencies?: RosterAdmissionDependencies;
+  /** Injectable only for deterministic maintenance-window tests. Production uses the canonical lease. */
+  maintenanceWindowDependencies?: MaintenanceWindowDependencies;
 }
 
 export interface GatewayRegistryInitializers {
@@ -3372,6 +3382,20 @@ export function startGateway(
     maintenanceRetryAfterSeconds: cfg.maintenanceRetryAfterSeconds,
     maintenanceMode: cfg.maintenanceModeAtStart,
   });
+  const maintenanceWindow = new ExclusiveMaintenanceWindow(
+    controller,
+    composition.maintenanceWindowDependencies ?? {
+      acquireLease: (options) =>
+        acquireGpuLease({
+          ...options,
+          dir: cfg.gpuLeaseDir,
+          staleMs: cfg.gpuLeaseStaleMs,
+          signal: options.signal,
+          onLeaseLost: options.onLeaseLost,
+        }),
+      observeRunning: getRunningSnapshot,
+    },
+  );
   if (cfg.maintenanceModeAtStart) {
     console.warn("⚠  bench/maintenance mode ENGAGED at startup — guest admission is refused (#108).");
   }
@@ -3438,6 +3462,7 @@ export function startGateway(
       implicitAdminAllowed,
       learningTaskCapabilityEpoch,
       composition.rosterAdmissionDependencies,
+      maintenanceWindow,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -3459,14 +3484,15 @@ export function startGateway(
       console.log(`   proxying LM Studio at ${cfg.lmStudioBaseUrl}`);
       resolve({
         port,
-        stop: () =>
-          new Promise<void>((r) => {
+        stop: async () => {
             if (imageWorker) imageWorker.stop();
             if (codeLoopSweepTimer !== null) clearInterval(codeLoopSweepTimer);
             clearInterval(rosterProposalExpiryTimer);
             modelLifecycleObserver.stop();
-            server.close(() => r());
-          }),
+            const stopped = new Promise<void>((r) => server.close(() => r()));
+            await maintenanceWindow.shutdown();
+            await stopped;
+          },
       });
     });
   });
@@ -3540,6 +3566,7 @@ export async function handleRequest(
   implicitAdminAllowed: boolean,
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch,
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
+  maintenanceWindow?: ExclusiveMaintenanceWindow,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -4993,6 +5020,125 @@ export async function handleRequest(
       return;
     }
 
+    // Exclusive maintenance window (#196). The gateway service owns the canonical filesystem
+    // lease after service isolation, so an authenticated operator need not receive write access
+    // to the lease directory. The opaque release token is returned only to this admin caller and
+    // is never included in logs or the status response.
+    if (path === "/admin/maintenance/window" && method === "GET") {
+      if (!requireAdmin()) return;
+      const evidence = maintenanceWindow?.status() ?? null;
+      sendJson(res, 200, { active: maintenanceWindow?.isBusy() ?? false, evidence });
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/maintenance/window" && method === "POST") {
+      if (!requireAdmin()) return;
+      if (maintenanceWindow === undefined) {
+        sendError(res, makeError("internal_error"));
+        lctx.status = 500;
+        lctx.outcome = "error";
+        lctx.errorClass = "internal_error";
+        lctx.admission = "n/a";
+        return;
+      }
+      const parsedBody = JSON.parse(await readBody(req, 16 * 1024)) as unknown;
+      const body =
+        typeof parsedBody === "object" && parsedBody !== null && !Array.isArray(parsedBody)
+          ? parsedBody as Record<string, unknown>
+          : null;
+      const action = body?.["action"];
+      if (action !== "open" && action !== "close") {
+        sendError(res, makeError("invalid_request_error", {
+          param: "action",
+          message: "Field 'action' must be 'open' or 'close'.",
+        }));
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        lctx.admission = "n/a";
+        return;
+      }
+      try {
+        if (action === "open") {
+          const ttlSeconds = body?.["ttlSeconds"];
+          const drainTimeoutSeconds = body?.["drainTimeoutSeconds"] ?? 60;
+          if (
+            typeof ttlSeconds !== "number" || !Number.isFinite(ttlSeconds) ||
+            ttlSeconds <= 0 || ttlSeconds > 86_400
+          ) {
+            throw new RangeError("ttlSeconds must be finite, greater than zero, and at most 86400");
+          }
+          if (
+            typeof drainTimeoutSeconds !== "number" || !Number.isFinite(drainTimeoutSeconds) ||
+            drainTimeoutSeconds <= 0 || drainTimeoutSeconds > 600
+          ) {
+            throw new RangeError("drainTimeoutSeconds must be finite, greater than zero, and at most 600");
+          }
+          const disconnect = new AbortController();
+          const abortOnDisconnect = (): void => {
+            if (!res.writableEnded) disconnect.abort();
+          };
+          req.once("aborted", abortOnDisconnect);
+          res.once("close", abortOnDisconnect);
+          let opened;
+          try {
+            opened = await maintenanceWindow.open({
+              ttlMs: ttlSeconds * 1_000,
+              drainTimeoutMs: drainTimeoutSeconds * 1_000,
+              model: "maintenance-window",
+              purpose: "exclusive benchmark window",
+              signal: disconnect.signal,
+            });
+          } finally {
+            req.removeListener("aborted", abortOnDisconnect);
+            res.removeListener("close", abortOnDisconnect);
+          }
+          sendJson(res, 201, opened);
+          lctx.status = 201;
+          lctx.outcome = "ok";
+        } else {
+          const token = body?.["token"];
+          if (typeof token !== "string" || token.length < 1 || token.length > 256) {
+            throw new MaintenanceWindowTokenError("maintenance window token is missing");
+          }
+          await maintenanceWindow.close(token);
+          sendJson(res, 200, { restored: true });
+          lctx.status = 200;
+          lctx.outcome = "ok";
+        }
+      } catch (error) {
+        if (error instanceof RangeError) {
+          sendError(res, makeError("invalid_request_error", { message: error.message }));
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "invalid_request_error";
+        } else if (error instanceof MaintenanceWindowTokenError) {
+          sendError(res, makeError("route_not_allowed", { message: "The maintenance window token is invalid or expired." }));
+          lctx.status = 403;
+          lctx.outcome = "forbidden";
+          lctx.errorClass = "route_not_allowed";
+        } else if (error instanceof MaintenanceWindowBusyError || error instanceof MaintenanceWindowDrainError) {
+          sendError(res, makeError("server_busy", { message: error.message, retryAfterSeconds: 5 }));
+          lctx.status = 503;
+          lctx.outcome = "busy";
+          lctx.errorClass = "server_busy";
+        } else {
+          console.error("[maintenance-window] could not establish or restore window:", error);
+          sendError(res, makeError("server_busy", {
+            message: "The exclusive maintenance window could not establish its required GPU lease and fence.",
+            retryAfterSeconds: 5,
+          }));
+          lctx.status = 503;
+          lctx.outcome = "busy";
+          lctx.errorClass = "server_busy";
+        }
+      }
+      lctx.admission = "n/a";
+      return;
+    }
+
     // Bench / maintenance mode (#108) — owner/admin toggle. When ON, guests are refused (503)
     // while owner traffic flows, so a heavy batch/benchmark job can reserve the box. Content-blind.
     if (path === "/admin/maintenance" && method === "GET") {
@@ -5000,6 +5146,7 @@ export async function handleRequest(
       const s = controller.snapshot();
       sendJson(res, 200, {
         maintenance: s.maintenanceMode === true,
+        mode: s.maintenanceMode === true ? (s.maintenanceScope ?? "guest") : "off",
         inflight: s.inflight,
         ownerQueued: s.ownerQueued,
         maxInflight: s.maxInflight,
@@ -5011,6 +5158,17 @@ export async function handleRequest(
     }
     if (path === "/admin/maintenance" && method === "POST") {
       if (!requireAdmin()) return;
+      if (maintenanceWindow?.isBusy() === true) {
+        sendError(res, makeError("server_busy", {
+          message: "The server-owned exclusive maintenance window controls admission until it is restored.",
+          retryAfterSeconds: 5,
+        }));
+        lctx.status = 503;
+        lctx.outcome = "busy";
+        lctx.errorClass = "server_busy";
+        lctx.admission = "n/a";
+        return;
+      }
       // Parse to unknown and validate the container before reading `on`: a bare `null` (or a
       // JSON array/scalar) is valid JSON, so dereferencing it directly would throw a TypeError
       // and surface as a 500 instead of the documented 400.
@@ -5038,6 +5196,36 @@ export async function handleRequest(
       // caller that mirrors the same body shape for both calls must not get spuriously 400'd.
       const ttlSecondsRaw =
         on && isPlainObject ? (parsedBody as { ttlSeconds?: unknown }).ttlSeconds : undefined;
+      const modeRaw = on && isPlainObject ? (parsedBody as { mode?: unknown }).mode : undefined;
+      const mode = modeRaw ?? "guest";
+      if (mode !== "guest" && mode !== "exclusive") {
+        sendError(
+          res,
+          makeError("invalid_request_error", {
+            param: "mode",
+            message: "Field 'mode', if present, must be 'guest' or 'exclusive'.",
+          })
+        );
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        lctx.admission = "n/a";
+        return;
+      }
+      if (on && mode === "exclusive" && ttlSecondsRaw === undefined) {
+        sendError(
+          res,
+          makeError("invalid_request_error", {
+            param: "ttlSeconds",
+            message: "Exclusive maintenance requires a bounded 'ttlSeconds' recovery backstop.",
+          })
+        );
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        lctx.admission = "n/a";
+        return;
+      }
       let ttlMs: number | undefined;
       if (ttlSecondsRaw !== undefined) {
         if (typeof ttlSecondsRaw !== "number" || !Number.isFinite(ttlSecondsRaw) || ttlSecondsRaw <= 0) {
@@ -5056,10 +5244,11 @@ export async function handleRequest(
         }
         ttlMs = ttlSecondsRaw * 1000;
       }
-      const newState = controller.setMaintenanceMode(on, ttlMs);
+      const newState = controller.setMaintenanceMode(on, ttlMs, mode);
       const s = controller.snapshot();
       sendJson(res, 200, {
         maintenance: newState,
+        mode: newState ? (s.maintenanceScope ?? "guest") : "off",
         inflight: s.inflight,
         ownerQueued: s.ownerQueued,
         maxInflight: s.maxInflight,

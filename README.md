@@ -179,6 +179,8 @@ See [`SECURITY.md`](./SECURITY.md),
   retain the frontier Conductor and localize leaf work.
 - [`docs/strix-halo-release-benchmark-runbook.md`](./docs/strix-halo-release-benchmark-runbook.md) —
   immutable model-release inspection and reproducible Strix Halo PP/TG benchmarking.
+- [`docs/strix-halo-backlog-status-2026-08-14.md`](./docs/strix-halo-backlog-status-2026-08-14.md) —
+  ticket-by-ticket execution state and proof blockers for the 25-item optimization handoff.
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) — current phases and open proof obligations.
 - [`RESULTS.md`](./RESULTS.md) — original hosted-proxy benchmark and hardware economics.
 

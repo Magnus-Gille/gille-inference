@@ -61,16 +61,18 @@ If the official config or model card does not prove a field, `release.json` and 
 
 ## Reproducible direct benchmark
 
-Use a reviewed, already-built llama.cpp binary and an already-staged GGUF. Run the command on M5
-under the durable GPU lease; the lease sequences batch jobs but does not stop ordinary live
-gateway traffic, so use an approved maintenance window when uncontaminated measurements require
-it.
+Use a reviewed, already-built llama.cpp binary and an already-staged GGUF. For an uncontaminated
+run, use the repository-owned exclusive window. It makes the isolated gateway identity acquire
+the canonical lease, fences owner and guest inference, drains admitted work, and verifies stable
+llama-swap residency before it runs the supplied command. `M5_MAINTENANCE_KEY` must come from the
+approved private operator credential source and is never accepted in argv.
 
 ```bash
-npx tsx src/homeserver/cli.ts gpu run \
-  --model qwen3-coder-30b-a3b \
-  --eta 120m \
-  --purpose strix-repro-benchmark \
+npm run maintenance:run -- \
+  --base-url http://127.0.0.1:8080 \
+  --ttl-seconds 7200 \
+  --drain-timeout-seconds 60 \
+  --evidence data/strix-benchmarks/qwen3-coder-window.json \
   -- npm run benchmark:strix -- \
     --llama-bench /home/magnus/llama.cpp/build/bin/llama-bench \
     --model /home/magnus/models/qwen3-coder-30b-a3b/model-Q4_K_S.gguf \
@@ -85,6 +87,10 @@ npx tsx src/homeserver/cli.ts gpu run \
     --contexts 8192,32768,65536,131072 \
     --out data/strix-benchmarks/qwen3-coder-q4ks-vulkan
 ```
+
+The base URL above is an example, not a listener assumption: supply the gateway origin verified by
+the live deployment runbook. The evidence file is mode/timestamps/exit/restoration/residency only;
+it contains neither the admin credential, release token, command argv, prompt, nor model output.
 
 The harness:
 
@@ -103,6 +109,63 @@ It writes `<out>.json` and `<out>.md` atomically. `llama-bench` explicitly exclu
 and sampling time, so this direct mode records TTFT as unmeasured. Speculation is disabled and
 acceptance is therefore not applicable. Use the streaming server/agent benchmark for TTFT,
 acceptance rate, prefix-cache benefit, and completed useful tasks per minute.
+
+## Streaming server and agent-shaped matrix
+
+The streaming runner complements `llama-bench`; it does not replace the direct PP/TG control. It
+uses deterministic public fixtures from `benchmarks/strix-agent-fixtures.json`, stores output
+SHA-256 rather than model text, and exercises code, reasoning, JSON, native tool-call, and prose
+responses at 1, 2, 4, and 8 concurrent requests.
+
+First capture the already-running server's immutable provenance. The process id and every serving
+field must be explicit; the command hashes the model artifact, running executable, and raw process
+argv but stores neither paths nor argv contents:
+
+```bash
+npm run benchmark:strix-provenance -- \
+  --pid 12345 \
+  --model-artifact /srv/models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  --runtime-commit 0123456789012345678901234567890123456789 \
+  --backend vulkan --quant Q4_K_M --context 131072 \
+  --kv-k q8_0 --kv-v q8_0 --fa on --batch 2048 --ubatch 512 \
+  --parallelism 1 --speculation none --draft-depth none \
+  --out data/strix-benchmarks/qwen36-direct-provenance.json
+```
+
+Then run against an already-reviewed OpenAI-compatible endpoint. Loopback llama-server exposes its
+content-blind speculative counters at `/metrics` when started with `--metrics`; remote metrics are
+disabled by default unless `--metrics-url` is supplied explicitly. Credentials are accepted only
+through a named environment variable, never argv.
+
+```bash
+npm run benchmark:strix-server -- \
+  --base-url http://127.0.0.1:8091/v1 \
+  --model qwen36-a3b \
+  --fixtures benchmarks/strix-agent-fixtures.json \
+  --provenance data/strix-benchmarks/qwen36-direct-provenance.json \
+  --concurrency 1,2,4,8 --repetitions 3 --max-tokens 128 \
+  --out data/strix-benchmarks/qwen36-direct-server
+```
+
+The JSON/Markdown pair records measured TTFT, total latency, internal llama.cpp PP/TG rates when
+returned, prompt-cache hits, speculative accepted/draft token deltas, aggregate throughput,
+deterministic oracle pass rate, and useful completions per minute. A transport-complete run with
+any failed request exits `2`; malformed setup exits `1`.
+
+Compare exactly one declared axis. The comparator rejects changed control fields and unequal
+fixture/concurrency cells before calculating deltas:
+
+```bash
+npm run benchmark:strix-compare -- \
+  --control data/strix-benchmarks/qwen36-direct-server.json \
+  --candidate data/strix-benchmarks/qwen36-mtp2-server.json \
+  --axis speculation \
+  --out data/strix-benchmarks/qwen36-direct-vs-mtp2
+```
+
+Supported axes are `backend`, `quant`, `kv`, `speculation`, `runtime`, and `parallelism`. The
+comparator deliberately declares no automatic winner: the relevant issue's preregistered quality,
+short/long-context, soak, memory, and stability gates still decide adoption.
 
 For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended revision, keep
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output
@@ -126,5 +189,7 @@ decision remains completed correct coding work per minute against the same repos
 
 - [Qwen3.8 flagship model and immutable control files](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B)
 - [Official llama-bench syntax and JSON output](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench)
+- [Official llama-server timings, cache, metrics, and speculative options](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
+- [Official llama.cpp speculative-decoding guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)
 - [AMD Strix Halo system optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html)
 - [Existing Vulkan/HIP experiment contract, issue #129](https://github.com/Magnus-Gille/gille-inference/issues/129)

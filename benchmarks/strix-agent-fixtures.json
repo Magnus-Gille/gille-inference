@@ -1,0 +1,133 @@
+[
+  {
+    "id": "code-null-guard",
+    "taskType": "code",
+    "request": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Return only the requested TypeScript expression without Markdown fences."
+        },
+        {
+          "role": "user",
+          "content": "Write one TypeScript expression that returns an empty string when value is null or undefined, otherwise returns value.trim()."
+        }
+      ]
+    },
+    "oracle": {
+      "kind": "contains_all",
+      "values": ["value", "trim"]
+    }
+  },
+  {
+    "id": "reasoning-arithmetic",
+    "taskType": "reasoning",
+    "request": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer with only the final integer."
+        },
+        {
+          "role": "user",
+          "content": "A service processes 18 jobs per minute for 7 minutes and then 12 jobs per minute for 3 minutes. How many jobs does it process?"
+        }
+      ]
+    },
+    "oracle": {
+      "kind": "exact",
+      "value": "162"
+    }
+  },
+  {
+    "id": "json-routing",
+    "taskType": "json",
+    "request": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Return one JSON object and no surrounding prose."
+        },
+        {
+          "role": "user",
+          "content": "Classify a straightforward single-file typo fix. Return {\"route\":\"fast\",\"vision\":false}."
+        }
+      ],
+      "response_format": {
+        "type": "json_object"
+      }
+    },
+    "oracle": {
+      "kind": "json_fields",
+      "fields": {
+        "route": "fast",
+        "vision": false
+      }
+    }
+  },
+  {
+    "id": "tool-lookup",
+    "taskType": "tool",
+    "request": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Use the supplied tool when current repository state is required."
+        },
+        {
+          "role": "user",
+          "content": "Look up the current test status for project alpha."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup_status",
+            "description": "Look up current project status.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "project": {
+                  "type": "string"
+                }
+              },
+              "required": ["project"],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "lookup_status"
+        }
+      }
+    },
+    "oracle": {
+      "kind": "tool_name",
+      "name": "lookup_status"
+    }
+  },
+  {
+    "id": "prose-constraints",
+    "taskType": "prose",
+    "request": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer in one short sentence."
+        },
+        {
+          "role": "user",
+          "content": "State why a benchmark should pin both model bytes and runtime revision. Include the words reproducible and comparison."
+        }
+      ]
+    },
+    "oracle": {
+      "kind": "contains_all",
+      "values": ["reproducible", "comparison"]
+    }
+  }
+]

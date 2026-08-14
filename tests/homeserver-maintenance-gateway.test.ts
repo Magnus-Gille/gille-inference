@@ -45,6 +45,7 @@ let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 let ownerKey = "";
 let guestKey = "";
+let windowLeaseReleases = 0;
 
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), "hs-maint-test-"));
@@ -71,7 +72,12 @@ beforeAll(async () => {
   guestKey = ks.mintKey({ alias: "maint-guest", tier: "guest", modelAllowList: ["m1"] }, defs).plaintextKey;
 
   const gw = await import("../src/homeserver/gateway.js");
-  const handle = await gw.startGateway();
+  const handle = await gw.startGateway({
+    maintenanceWindowDependencies: {
+      acquireLease: async () => ({ release: async () => { windowLeaseReleases++; } }),
+      observeRunning: async () => [{ model: "m1", state: "ready", ttlSeconds: 30 }],
+    },
+  });
   gatewayPort = handle.port;
   stopGateway = handle.stop;
 });
@@ -178,6 +184,99 @@ describe("maintenance mode gates guest traffic on the live route (#108)", () => 
     await setMaintenance(ownerKey, false);
     const again = await chat(guestKey);
     expect(again.status).toBe(200); // toggling off restores guest service
+  });
+});
+
+describe("exclusive maintenance fences every inference lane (#196)", () => {
+  afterAll(async () => {
+    await setMaintenance(ownerKey, false);
+  });
+
+  it("requires a bounded TTL for exclusive mode", async () => {
+    const res = await fetch(url("/admin/maintenance"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ on: true, mode: "exclusive" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("blocks owner and guest, reports the actual mode, then restores both", async () => {
+    const engaged = await fetch(url("/admin/maintenance"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ on: true, mode: "exclusive", ttlSeconds: 60 }),
+    });
+    expect(engaged.status).toBe(200);
+    expect(await engaged.json()).toMatchObject({ maintenance: true, mode: "exclusive" });
+
+    expect((await chat(ownerKey)).status).toBe(503);
+    expect((await chat(guestKey)).status).toBe(503);
+
+    const restored = await setMaintenance(ownerKey, false);
+    expect(restored.status).toBe(200);
+    expect(await restored.json()).toMatchObject({ maintenance: false, mode: "off" });
+    expect((await chat(ownerKey)).status).toBe(200);
+    expect((await chat(guestKey)).status).toBe(200);
+  });
+});
+
+describe("repository-owned exclusive window API couples the fence to the GPU lease (#196)", () => {
+  it("opens only after lease + stable residency and closes with the opaque token", async () => {
+    const opened = await fetch(url("/admin/maintenance/window"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ action: "open", ttlSeconds: 60, drainTimeoutSeconds: 2 }),
+    });
+    expect(opened.status).toBe(201);
+    const body = await opened.json() as { token: string; evidence: { mode: string } };
+    expect(body.token.length).toBeGreaterThan(0);
+    expect(body.evidence.mode).toBe("exclusive");
+    expect((await chat(ownerKey)).status).toBe(503);
+    expect((await chat(guestKey)).status).toBe(503);
+
+    const bypass = await setMaintenance(ownerKey, false);
+    expect(bypass.status).toBe(503);
+    expect((await chat(ownerKey)).status).toBe(503);
+
+    const status = await fetch(url("/admin/maintenance/window"), {
+      method: "GET",
+      headers: auth(ownerKey),
+    });
+    const statusBody = await status.json() as Record<string, unknown>;
+    expect(statusBody.active).toBe(true);
+    expect(JSON.stringify(statusBody)).not.toContain(body.token);
+
+    const closed = await fetch(url("/admin/maintenance/window"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ action: "close", token: body.token }),
+    });
+    expect(closed.status).toBe(200);
+    expect(windowLeaseReleases).toBeGreaterThan(0);
+    expect((await chat(ownerKey)).status).toBe(200);
+    expect((await chat(guestKey)).status).toBe(200);
+  });
+
+  it("fails closed for a wrong release token", async () => {
+    const opened = await fetch(url("/admin/maintenance/window"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ action: "open", ttlSeconds: 60, drainTimeoutSeconds: 2 }),
+    });
+    const body = await opened.json() as { token: string };
+    const refused = await fetch(url("/admin/maintenance/window"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ action: "close", token: "wrong" }),
+    });
+    expect(refused.status).toBe(403);
+    expect((await chat(ownerKey)).status).toBe(503);
+    await fetch(url("/admin/maintenance/window"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: JSON.stringify({ action: "close", token: body.token }),
+    });
   });
 });
 
