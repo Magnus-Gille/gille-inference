@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import net from "node:net";
 import http from "node:http";
 import { join, sep } from "node:path";
@@ -368,16 +369,24 @@ export async function runCageSelfTest(o: CageSelfTestOptions): Promise<CageSelfT
  * `systemd-run --user` must reach the USER manager's bus. A systemd SYSTEM service env lacks
  * XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS even when the user manager is running (lingering
  * enabled) — observed live 2026-07-02: the gateway's in-process cage self-test fail-closed on
- * first production start while the same test passed from an interactive shell. Default both
- * pointers from the uid; never override caller-provided values.
+ * first production start while the same test passed from an interactive shell. Default the
+ * runtime directory from the uid. Set the session-bus address only when that socket is actually
+ * visible; otherwise leave it unset so systemd-run uses the user manager's native
+ * `<runtime>/systemd/private` transport. Never override caller-provided values.
  */
-export function withUserBusEnv(base: NodeJS.ProcessEnv | Record<string, string>): Record<string, string> {
+export function withUserBusEnv(
+  base: NodeJS.ProcessEnv | Record<string, string>,
+  deps: { uid?: number | null; socketExists?: (path: string) => boolean } = {},
+): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(base)) if (v !== undefined) out[k] = v;
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const uid = deps.uid !== undefined ? deps.uid : (typeof process.getuid === "function" ? process.getuid() : null);
   if (uid !== null) {
     out["XDG_RUNTIME_DIR"] ??= `/run/user/${uid}`;
-    out["DBUS_SESSION_BUS_ADDRESS"] ??= `unix:path=/run/user/${uid}/bus`;
+    const busPath = `/run/user/${uid}/bus`;
+    if (out["DBUS_SESSION_BUS_ADDRESS"] === undefined && (deps.socketExists ?? existsSync)(busPath)) {
+      out["DBUS_SESSION_BUS_ADDRESS"] = `unix:path=${busPath}`;
+    }
   }
   return out;
 }

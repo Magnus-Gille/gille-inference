@@ -423,6 +423,24 @@ available even if the restart or verification fails. Record in the private opera
   restart interrupted MCP traffic; and
 - a result of `verify` plus the public-edge verifier for a gateway change.
 
+If an already-isolated gateway predates the reviewed user-manager ordering (issue #197), deploy
+the accepted source revision first, then refresh only its isolation drop-in:
+
+```bash
+sudo scripts/service-isolation.sh refresh-isolation --service gateway --ack-service-restart
+sudo scripts/service-isolation.sh verify --service gateway
+```
+
+The refresh requires the dedicated lingered user manager to be healthy before mutation, backs up
+the exact prior drop-in, orders `home-gateway.service` after and requires the resolved
+`user@<gille-gateway-uid>.service`, restarts once, and verifies that a user-manager transport is
+visible inside the gateway's mount namespace. If restart or verification fails, it restores the
+prior drop-in and verifies the recovered gateway before returning failure. This fixes the boot race
+without weakening the code-loop cage or treating a host-visible bus as proof that the service
+namespace can reach it. Complete recovery with one harmless owner-agent `ask` and one harmless
+seed-file `code_loop` smoke from a supported client; the latter must still prove every cage marker
+before inference begins.
+
 Rollback is likewise one service at a time and explicit:
 
 ```bash
