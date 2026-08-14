@@ -1,6 +1,6 @@
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import type { HomeserverConfig } from "./config.js";
 import type { CodeLoopDeps, CodeLoopRequest } from "./code-loop-types.js";
 import { startCodeLoop, getJobStatus, getJobResult, type CodeLoopStartConfig } from "./code-loop.js";
@@ -11,6 +11,7 @@ import {
   runCageSelfTest,
   execCageCommand,
   startGatewayRelay,
+  stopTransientCodeLoopUnit,
   type CageRunnabilityProbe,
   type GatewayRelay,
 } from "./code-loop-cage.js";
@@ -33,6 +34,14 @@ const RETENTION_TTL_MS = 24 * 60 * 60 * 1000;
 /** Deploy root (for example `/srv/gille-inference`); node_modules + .env live here. */
 function deployRoot(): string {
   return process.cwd();
+}
+
+/** The exact secret path the live self-test must prove unreadable. */
+export function codeLoopSecretPath(
+  root: string,
+  env: NodeJS.ProcessEnv | Record<string, string> = process.env,
+): string {
+  return env["GILLE_AUTONOMY_ENV_FILE"] || join(root, ".env");
 }
 
 function nodeModulesDir(): string | null {
@@ -114,7 +123,7 @@ export function buildCodeLoopRuntime(
   const confinement = cfg.codeLoopConfinement;
   const home = homedir();
   const nm = nodeModulesDir();
-  const secretPath = join(deployRoot(), ".env");
+  const secretPath = codeLoopSecretPath(deployRoot());
   const forwardPort = cfg.codeLoopForwardPort;
   // The gateway the per-run relay bridges to (the caged pi's ONLY reachable destination).
   const gatewayHost = cfg.gatewayHost;
@@ -135,22 +144,27 @@ export function buildCodeLoopRuntime(
       forwardPort,
       nodeModulesDir: nm,
       unitName,
+      piAgentDir: cfg.codeLoopPiAgentDir,
+      innerPath: process.env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin",
+      runtimeMaxSec: Math.max(150, cfg.codeLoopCaps.wallSMax + 30),
       extraRoBinds,
     });
 
-  const basePiEngine = makePiEngine(
+  const engineDeps = {
+    spawnPi: realSpawnPi,
+    readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
+    pollMs: 5_000,
+  };
+  const piEngine = (clientApiKey: string): AgentEngine => makePiEngine(
     {
       piBin: cfg.codeLoopPiBin,
       provider: "inference-local",
       piAgentDir: cfg.codeLoopPiAgentDir,
-      apiKey: cfg.codeLoopApiKey,
+      // Per-run capability for the loopback relay — never the real gateway bearer.
+      apiKey: clientApiKey,
       degeneracyRunThreshold: cfg.degeneracyRunThreshold,
     },
-    {
-      spawnPi: realSpawnPi,
-      readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
-      pollMs: 5_000,
-    }
+    engineDeps,
   );
 
   // Wrap the engine so the host-side gateway relay (127.0.0.1:forwardPort → gateway) is up for the
@@ -159,15 +173,12 @@ export function buildCodeLoopRuntime(
   const engine: AgentEngine = {
     run: async (opts) => {
       let relay: GatewayRelay | null = null;
-      if (confinement !== "off") {
-        try {
-          relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort);
-        } catch {
-          relay = null; // pi will simply fail to reach the gateway → the run surfaces the error
-        }
-      }
       try {
-        return await basePiEngine.run(opts);
+        if (confinement === "off") return await piEngine(cfg.codeLoopApiKey).run(opts);
+        // A fresh high-entropy client capability prevents this loopback listener from becoming
+        // an unauthenticated local proxy for the real gateway key.
+        relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort, cfg.codeLoopApiKey);
+        return await piEngine(relay.clientApiKey).run(opts);
       } finally {
         if (relay !== null) await relay.close();
       }
@@ -190,6 +201,9 @@ export function buildCodeLoopRuntime(
           },
         }),
     readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
+    cleanupUnit: confinement === "off"
+      ? async () => {}
+      : (unit: string) => stopTransientCodeLoopUnit(unit),
     maintenanceMode,
     growthCapBytes: GROWTH_CAP_BYTES,
     pollMs: 5_000,
@@ -218,7 +232,16 @@ export function buildCodeLoopRuntime(
     // unreadable, ro-mount writes denied, external egress blocked, gateway reachable (200) — at
     // EVERY job start when confinement=required. Starts the same gateway relay so the gateway arm
     // is genuinely tested end-to-end.
-    cageSelfTest: () => runCageSelfTestWithRelay(cageBuildArgv, secretPath, forwardPort, gatewayHost, gatewayPort, confinement, runnability),
+    cageSelfTest: () => runCageSelfTestWithRelay(
+      cageBuildArgv,
+      secretPath,
+      forwardPort,
+      gatewayHost,
+      gatewayPort,
+      cfg.codeLoopApiKey,
+      confinement,
+      runnability,
+    ),
   };
 
   const startConfig: CodeLoopStartConfig = {
@@ -248,10 +271,18 @@ export async function runCageSelfTestWithRelay(
   forwardPort: number,
   gatewayHost: string,
   gatewayPort: number,
+  gatewayApiKey: string,
   confinement: "required" | "off",
   runnability?: CageRunnabilityProbe
 ): Promise<{ ok: boolean; failures: string[] }> {
   if (confinement === "off") return { ok: true, failures: [] };
+  // A missing source would make `cat` fail and could masquerade as successful concealment. Prove
+  // the exact production secret exists and is readable OUTSIDE the cage before testing denial.
+  try {
+    accessSync(secretPath, fsConstants.R_OK);
+  } catch {
+    return { ok: false, failures: [`secret source is not readable outside the cage: ${secretPath}`] };
+  }
   let probeDir: string;
   try {
     probeDir = mkdtempSync(join(tmpdir(), "code-loop-cage-probe-"));
@@ -260,7 +291,7 @@ export async function runCageSelfTestWithRelay(
   }
   let relay: GatewayRelay | null = null;
   try {
-    relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort);
+    relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort, gatewayApiKey);
   } catch (err) {
     try { rmSync(probeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     return { ok: false, failures: [`could not start gateway relay on 127.0.0.1:${forwardPort}: ${(err as Error).message}`] };
@@ -275,7 +306,14 @@ export async function runCageSelfTestWithRelay(
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: forwardPort,
       userManagerSocketPath: `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/systemd/private`,
-      exec: execCageCommand,
+      exec: (argv, timeoutMs) => execCageCommand(argv, timeoutMs, {
+        env: {
+          PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+          // The probe only calls unauthenticated /healthz; this non-secret value satisfies the
+          // transient service's environment-copy contract without exposing the real key.
+          HS_API_KEY: "code-loop-cage-probe-no-upstream",
+        },
+      }),
       runnability,
     });
     return { ok: r.ok, failures: r.failures };

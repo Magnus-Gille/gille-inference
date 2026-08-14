@@ -309,7 +309,7 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"');
   });
 
-  it("allows the isolated gateway the netlink family required by pasta", () => {
+  it("keeps the isolated gateway off AF_NETLINK because pasta is manager-spawned", () => {
     const unit = execFileSync(
       "bash",
       [
@@ -320,9 +320,10 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK");
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(unit).not.toContain("AF_NETLINK");
     const source = readFileSync(script, "utf8");
-    expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6 AF_NETLINK');
+    expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6');
   });
 
   it("requires an explicit restart acknowledgement and traps every post-mutation refresh failure", () => {
@@ -336,7 +337,9 @@ describe("service-isolation migration contract (#151)", () => {
     const source = readFileSync(script, "utf8");
     expect(source).toContain('atomic_render_dropin "$service" "$dropin"');
     expect(source).toContain("trap 'refresh_exit_handler \"$?\"' EXIT");
-    expect(source).toContain("( verify gateway 1 0 0 )");
+    expect(source).toContain("restore_gateway_netlink=0");
+    expect(source).toContain("restore_gateway_user_manager_order=0");
+    expect(source).toContain('( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" )');
   });
 
   it("restores and verifies a pre-netlink gateway drop-in after refresh failure", () => {
@@ -363,6 +366,42 @@ describe("service-isolation migration contract (#151)", () => {
     expect(output).toContain("verify:gateway 1 0 0");
     expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
     expect(output).not.toContain("AF_NETLINK");
+  });
+
+  it("can restore and exactly verify the superseded netlink drop-in after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-netlink-dropin-"));
+    const backup = join(work, "backup");
+    const dropin = join(work, "50-service-isolation.conf");
+    execFileSync("mkdir", ["-p", backup]);
+    writeFileSync(
+      join(backup, "dropin.before.conf"),
+      [
+        "[Unit]",
+        "Requires=user@991.service",
+        "After=user@991.service",
+        "[Service]",
+        "BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd",
+        "ExecStartPre=/usr/bin/test -S /run/user/991/systemd/private",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        "",
+      ].join("\n"),
+    );
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 1' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "--",
+        script,
+        backup,
+        dropin,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain("verify:gateway 1 1 1");
+    expect(output).toContain("AF_NETLINK");
+    expect(output).toContain("BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd");
+    expect(output).toContain("Requires=user@991.service");
   });
 
   it("runs the refresh restoration hook and preserves the failing exit status", () => {
@@ -620,7 +659,6 @@ describe("service-isolation migration contract (#151)", () => {
     expect(normalized.trim().split("\n")).toEqual(["/a", "/b", "/c"]);
     const source = readFileSync(script, "utf8");
     expect(source).toContain('require_show_exact_set "$unit" BindPaths "$ROOT/gateway/data:$GATEWAY_DATA"');
-    expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6 AF_NETLINK');
     expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6');
     expect(source).toContain('require_show_empty "$unit" BindReadOnlyPaths');
     expect(source).toContain('require_show_empty "$unit" BindPaths');

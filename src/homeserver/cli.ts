@@ -34,7 +34,7 @@ import {
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
 import { buildCageArgv } from "./code-loop-cage.js";
-import { runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
+import { codeLoopSecretPath, runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -944,14 +944,25 @@ async function cmdCodeLoop(rawArgs: string[]): Promise<void> {
     piAgentDir: cfg.codeLoopPiAgentDir !== "" ? cfg.codeLoopPiAgentDir : null,
   };
   const cageBuildArgv = (sandboxDir: string, unitName: string): string[] =>
-    buildCageArgv({ sandboxDir, homeDir: home, forwardPort: cfg.codeLoopForwardPort, nodeModulesDir: nm, unitName, extraRoBinds });
+    buildCageArgv({
+      sandboxDir,
+      homeDir: home,
+      forwardPort: cfg.codeLoopForwardPort,
+      nodeModulesDir: nm,
+      unitName,
+      piAgentDir: cfg.codeLoopPiAgentDir,
+      innerPath: process.env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin",
+      runtimeMaxSec: Math.max(150, cfg.codeLoopCaps.wallSMax + 30),
+      extraRoBinds,
+    });
 
   const r = await runCageSelfTestWithRelay(
     cageBuildArgv,
-    join(process.cwd(), ".env"),
+    codeLoopSecretPath(process.cwd()),
     cfg.codeLoopForwardPort,
     gwHost,
     gwPort,
+    cfg.codeLoopApiKey,
     "required",
     runnability
   );

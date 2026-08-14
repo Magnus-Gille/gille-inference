@@ -785,7 +785,7 @@ describe("makePiEngine — monitored runs", () => {
     expect(r.detail).toContain("No such file or directory");
   });
 
-  it("arm-error detail REDACTS the service API key (HS_API_KEY is in pi's env; the tail is forwarded raw)", async () => {
+  it("arm-error detail REDACTS the per-run relay capability (HS_API_KEY is in pi's env; the tail is forwarded raw)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
     const key = "hs_owner_sekret999abc";
     const spawn: SpawnPiFn = () =>

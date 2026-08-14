@@ -299,6 +299,8 @@ export interface CodeLoopDeps {
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */
   cageSelfTest: () => Promise<{ ok: boolean; failures: string[] }>;
+  /** Verify the deterministic transient service is stopped before publishing a terminal result. */
+  cleanupUnit?: (unit: string) => Promise<void>;
   /** Live maintenance-mode flag (the model-scout window). */
   maintenanceMode: () => boolean;
   /** Acquire the GPU lease (60 s budget); null ⇒ refuse the job (lease-unavailable). */

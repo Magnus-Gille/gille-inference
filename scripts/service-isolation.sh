@@ -191,9 +191,9 @@ InaccessiblePaths=-$GATEWAY_TREE/.ssh
 InaccessiblePaths=-$GATEWAY_TREE/.git
 InaccessiblePaths=-$GATEWAY_TREE/.pi-code-loop
 ReadWritePaths=$ROOT/gateway/data
-# pasta needs an unprivileged route-netlink socket to construct the code-loop
-# network namespace. The inner bwrap cage still receives no host /run mounts.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# pasta is spawned by the dedicated user manager, not inside this outer service namespace.
+# Keep the gateway itself on the narrow reviewed socket-family allowlist.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 PrivateDevices=true
 EOF
       render_common
@@ -854,11 +854,25 @@ atomic_render_dropin() {
 }
 
 restore_isolation_refresh() {
+  local restore_gateway_netlink=0 restore_gateway_user_manager_order=0
   [ -n "$REFRESH_BACKUP" ] && [ -n "$REFRESH_DROPIN" ] && [ -n "$REFRESH_UNIT" ] || return 1
+  # One superseded issue-197 candidate briefly added AF_NETLINK. Automatic restoration must
+  # verify either exact prior shape without weakening the new default.
+  if grep -Eq '^RestrictAddressFamilies=.*(^|[[:space:]])AF_NETLINK([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_netlink=1
+  fi
+  # Preserve the exact prior issue-197 user-manager transport shape too. The AF_NETLINK candidate
+  # already carried this bind/order contract; verifying it as legacy would reject a successful
+  # byte-for-byte restore and obscure the original refresh failure.
+  if grep -Eq '^BindReadOnlyPaths=.*/run/user/.*/systemd([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf" \
+    && grep -Eq '^Requires=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf" \
+    && grep -Eq '^After=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_user_manager_order=1
+  fi
   atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
   systemctl daemon-reload || return 1
   systemctl restart "$REFRESH_UNIT" || return 1
-  ( verify gateway 1 0 0 ) || return 1
+  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" ) || return 1
 }
 
 refresh_exit_handler() {
@@ -910,7 +924,7 @@ refresh_isolation() {
 }
 
 verify() {
-  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-1}" unit user actual_user
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" unit user actual_user
   need systemctl; need ss
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"

@@ -43,6 +43,8 @@ export interface DurableCodeLoopRun {
   owner_instance_id?: string;
   /** OS process owner used to avoid orphaning a run owned by an overlapping live gateway. */
   owner_pid?: number;
+  /** True until the deterministic transient service has been verified stopped. */
+  cleanup_pending?: boolean;
 }
 
 export type ClaimCodeLoopRun =
@@ -151,6 +153,7 @@ function readRecord(path: string): DurableCodeLoopRun | null {
       typeof parsed.work_id !== "string" ||
       !["running", "completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"].includes(parsed.status) ||
       typeof parsed.started_at_ms !== "number" ||
+      (parsed.cleanup_pending !== undefined && typeof parsed.cleanup_pending !== "boolean") ||
       parsed.usage === null ||
       typeof parsed.usage !== "object" ||
       typeof parsed.usage.turns !== "number" ||
@@ -640,6 +643,23 @@ export function compactExpiredDurableCodeLoopRuns(workroot: string, nowMs: numbe
     compacted++;
   }
   return compacted;
+}
+
+/** Trusted cleanup obligations, enumerated independently of the agent-writable sandbox tree. */
+export function listDurableCodeLoopRunsPendingCleanup(workroot: string): DurableCodeLoopRun[] {
+  let names: string[];
+  try {
+    names = readdirSync(stateDir(workroot));
+  } catch {
+    return [];
+  }
+  const records: DurableCodeLoopRun[] = [];
+  for (const name of names) {
+    if (!name.startsWith("client-") || !name.endsWith(".json")) continue;
+    const record = readRecord(join(stateDir(workroot), name));
+    if (record?.cleanup_pending === true) records.push(record);
+  }
+  return records;
 }
 
 /** Reconcile bindings created before a crash could create sandbox metadata. */

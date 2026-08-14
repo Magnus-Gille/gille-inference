@@ -437,27 +437,33 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
 source — RCE by construction) run as the gateway uid, which owns `.env` + `data/eval.db`. Both
 run inside a cage composed of THREE mechanisms, each **verified enforced on the box** (2026-07-02):
 
-- `systemd-run --user --scope` — **resource** caps only: `MemoryMax=8G` + `TasksMax=256` bound
-  the subprocess tree (the OOM lesson). **NOTE:** systemd `IPAddressDeny` is a **no-op in a
-  `--user` scope on this box** (the unprivileged user manager can't install the cgroup BPF egress
-  firewall — it's silently accepted but not enforced; a `/bin/true` primitive test can't reveal
-  this). So egress is **not** enforced by systemd here.
+- `systemd-run --user --wait --pipe` — a transient **service** spawned by the dedicated user
+  manager, so pasta does not inherit the outer gateway's `NoNewPrivileges` or private `/dev`
+  namespace. `MemoryMax=8G`, `TasksMax=256`, `RuntimeMaxSec`, whole-cgroup kill semantics, and an
+  explicit validated-unit stop bound the tree across caps, retries, timeouts, and restarts.
+  **NOTE:** systemd `IPAddressDeny` remains a **no-op in this unprivileged user manager**, so egress
+  is not attributed to systemd.
 - `pasta -T <forwardPort>` (passt) — **network**: runs the child in a fresh user+net namespace
   with **no general outbound route** (all egress blocked) and forwards **only one loopback port**
   to the host loopback, where a per-run relay bridges to the real gateway. The caged pi's *only*
   reachable destination is the gateway callback. The relay is a **path-allowlisted HTTP forwarder**
-  (not a raw byte-pipe): since the service key is owner-tier, it forwards **only**
+  (not a raw byte-pipe): a fresh 256-bit per-run capability is required on authenticated routes,
+  caller auth is stripped, and the real gateway bearer is injected only on the upstream hop. It
+  forwards **only**
   `POST /v1/chat/completions`, `GET /v1/models`, and `GET /healthz` — every other path (incl.
   `/admin/*`) → `403 code_loop relay: path not allowed` without contacting the gateway
   (`homeserver_code_loop_relay_denied_total`), so a prompt-injected pi can't reach an admin route.
-- `bwrap --share-net` — **filesystem**: shares pasta's restricted netns (never `--unshare-net`),
-  a tmpfs over `$HOME` (hides all secrets/eval.db/ssh), read-only toolchain + `node_modules`,
-  read-write bind of the sandbox only.
+- `bwrap --share-net` — **filesystem/environment**: shares pasta's restricted netns (never
+  `--unshare-net`), clears the inherited environment, overlays tmpfs on `$HOME` and
+  `/etc/gille-inference` (hiding owner data and the migrated gateway env), exposes a read-only
+  toolchain + `node_modules`, and read-write binds only the sandbox.
 
 The design never *claims* confinement — it **tests** it: the cage self-test runs the confinement
 probe inside the exact cage argv (with the relay up) at provisioning **and every job start**, and
-asserts secrets unreadable, a write to the read-only toolchain denied, external egress blocked,
-and the gateway reachable (HTTP 200). With `HOMESERVER_CODE_LOOP_CONFINEMENT=required` (default) a
+first proves the exact host secret exists/readable, then asserts it is unreadable inside, a write
+to the read-only toolchain is denied, external egress is blocked, the user-manager socket is
+hidden, and the gateway is reachable (HTTP 200). With
+`HOMESERVER_CODE_LOOP_CONFINEMENT=required` (default) a
 failing probe refuses the job with `cage-unavailable`.
 
 **Box provisioning runbook** (one-time; details in `docs/agentic-code-tool-design.md` §3):

@@ -5,8 +5,11 @@ import {
   buildCageArgv,
   buildCageProbeScript,
   parseCageProbeOutput,
+  requestTransientCodeLoopUnitStop,
   runCageSelfTest,
   startGatewayRelay,
+  stopTransientCodeLoopUnit,
+  transientCodeLoopUnitFromArgv,
   type CageArgvOptions,
 } from "../src/homeserver/code-loop-cage.js";
 
@@ -27,7 +30,8 @@ const OPTS: CageArgvOptions = {
   homeDir: "/home/inference",
   forwardPort: 18080,
   nodeModulesDir: "/srv/gille-inference/node_modules",
-  unitName: "code-loop-cl-x",
+  unitName: "code-loop-cl-20260815-abcdef12",
+  piAgentDir: "/home/inference/.pi-code-loop",
 };
 
 function pairIndex(argv: string[], a: string, b: string): number {
@@ -37,14 +41,20 @@ function pairIndex(argv: string[], a: string, b: string): number {
   return -1;
 }
 
-describe("buildCageArgv — systemd scope (resource confinement ONLY)", () => {
-  it("runs a transient user scope with --collect and the job unit name", () => {
+describe("buildCageArgv — manager-spawned transient service (resource confinement ONLY)", () => {
+  it("runs a synchronous transient user service with exact startup and cleanup controls", () => {
     const argv = buildCageArgv(OPTS);
     expect(argv[0]).toBe("systemd-run");
     expect(argv).toContain("--user");
-    expect(argv).toContain("--scope");
+    expect(argv).not.toContain("--scope");
+    expect(argv).toContain("--wait");
+    expect(argv).toContain("--pipe");
+    expect(argv).toContain("--service-type=exec");
+    expect(argv).toContain("--expand-environment=no");
     expect(argv).toContain("--collect");
     expect(argv).toContain(`--unit=${OPTS.unitName}`);
+    expect(pairIndex(argv, "-p", "RuntimeMaxSec=150")).toBeGreaterThan(-1);
+    expect(pairIndex(argv, "-p", "KillMode=control-group")).toBeGreaterThan(-1);
   });
 
   it("bounds the subprocess tree: MemoryMax=8G and TasksMax=256 by default", () => {
@@ -58,10 +68,55 @@ describe("buildCageArgv — systemd scope (resource confinement ONLY)", () => {
     expect(argv).not.toContain("IPAddressDeny");
     expect(argv).not.toContain("IPAddressAllow");
   });
+
+  it("only extracts exact code-loop job/probe units for bounded cleanup", () => {
+    expect(transientCodeLoopUnitFromArgv(buildCageArgv(OPTS))).toBe(OPTS.unitName);
+    expect(transientCodeLoopUnitFromArgv(buildCageArgv({ ...OPTS, unitName: "code-loop-cage-probe-4242" }))).toBe("code-loop-cage-probe-4242");
+    expect(transientCodeLoopUnitFromArgv(["systemd-run", "--unit=home-gateway.service", "--", "true"])).toBeNull();
+  });
+
+  it("stops only a validated transient unit through the native user-manager transport", async () => {
+    const calls: Array<{ args: string[]; env: Record<string, string> }> = [];
+    await stopTransientCodeLoopUnit("code-loop-cl-20260815-abcdef12", { PATH: "/usr/bin", HS_API_KEY: "ephemeral-secret" }, async (args, env) => {
+      calls.push({ args, env });
+      return { code: 0, stdout: "", stderr: "" };
+    }, { uid: 4242, socketExists: () => false });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(["--user", "stop", "code-loop-cl-20260815-abcdef12"]);
+    expect(calls[0]!.env["XDG_RUNTIME_DIR"]).toBe("/run/user/4242");
+    expect(calls[0]!.env).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
+    expect(calls[0]!.env).not.toHaveProperty("HS_API_KEY");
+    await expect(stopTransientCodeLoopUnit("home-gateway.service", {}, async () => {
+      throw new Error("must not run");
+    })).rejects.toThrow(/refusing/);
+  });
+
+  it("routes an engine kill to the exact manager-spawned service, never an argv-chosen unit", async () => {
+    const stopped: string[] = [];
+    const env = { PATH: "/usr/bin" };
+    await requestTransientCodeLoopUnitStop(buildCageArgv(OPTS), env, async (unit, seenEnv) => {
+      stopped.push(unit);
+      expect(seenEnv).toBe(env);
+    });
+    expect(stopped).toEqual([OPTS.unitName]);
+    expect(requestTransientCodeLoopUnitStop(["systemd-run", "--unit=ssh.service"], env, async () => {
+      throw new Error("must not run");
+    })).toBeNull();
+  });
+
+  it("copies the per-run relay capability from the client environment without putting it in argv", () => {
+    const argv = buildCageArgv(OPTS);
+    const capability = "ephemeral-client-capability-0123456789abcdef";
+    expect(argv).not.toContain(capability);
+    expect(argv).toContain("--setenv=HS_API_KEY");
+    const shim = argv[argv.indexOf("/bin/sh") + 2]!;
+    expect(shim).toContain("/usr/bin/env -i");
+    expect(shim).toContain('HS_API_KEY="$HS_API_KEY"');
+  });
 });
 
 describe("buildCageArgv — pasta (network confinement)", () => {
-  it("chains pasta after the scope, forwarding ONLY the loopback port (no --config-net)", () => {
+  it("chains pasta after the transient service wrapper, forwarding ONLY the loopback port (no --config-net)", () => {
     const argv = buildCageArgv(OPTS);
     const pasta = argv.indexOf("pasta");
     expect(pasta).toBeGreaterThan(argv.indexOf("systemd-run"));
@@ -100,6 +155,14 @@ describe("buildCageArgv — bwrap (filesystem confinement)", () => {
     expect(rw).toEqual([OPTS.sandboxDir]);
   });
 
+  it("masks the migrated gateway secret directory after the broad /etc bind", () => {
+    const argv = buildCageArgv(OPTS);
+    const etcBind = pairIndex(argv, "--ro-bind-try", "/etc");
+    const secretMask = pairIndex(argv, "--tmpfs", "/etc/gille-inference");
+    expect(etcBind).toBeGreaterThan(-1);
+    expect(secretMask).toBeGreaterThan(etcBind);
+  });
+
   it("mount ORDER: tmpfs over $HOME first, then ro node_modules, then the rw sandbox bind", () => {
     const argv = buildCageArgv(OPTS);
     const tmpfsHome = pairIndex(argv, "--tmpfs", OPTS.homeDir);
@@ -110,11 +173,18 @@ describe("buildCageArgv — bwrap (filesystem confinement)", () => {
     expect(sandbox).toBeGreaterThan(nm);
   });
 
-  it("sets cwd + HOME to the sandbox inside the cage", () => {
+  it("uses a static env -i shim so only the reviewed environment reaches the model process", () => {
     const argv = buildCageArgv(OPTS);
     expect(pairIndex(argv, "--chdir", OPTS.sandboxDir)).toBeGreaterThan(-1);
-    const i = argv.indexOf("--setenv");
-    expect(argv.slice(i, i + 3)).toEqual(["--setenv", "HOME", OPTS.sandboxDir]);
+    const bw = argv.indexOf("bwrap");
+    const shell = argv.indexOf("/bin/sh");
+    expect(shell).toBeGreaterThan(bw);
+    const shim = argv[shell + 2]!;
+    expect(shim).toContain("/usr/bin/env -i");
+    expect(shim).toContain(`HOME='${OPTS.sandboxDir}'`);
+    expect(shim).toContain(`PI_CODING_AGENT_DIR='${OPTS.piAgentDir}'`);
+    expect(shim).toContain('HS_API_KEY="$HS_API_KEY"');
+    expect(argv.join(" ")).not.toContain("gateway-owner-key");
   });
 
   it("omits the node_modules bind when none is configured", () => {
@@ -244,7 +314,7 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     "cage-probe:user-manager=denied",
   ].join("\n");
 
-  it("all four probes passing → ok", () => {
+  it("all five base probes passing → ok", () => {
     const r = parseCageProbeOutput(PASS);
     expect(r.ok).toBe(true);
     expect(r.failures).toEqual([]);
@@ -356,7 +426,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
       })
     );
     expect(r.ok).toBe(true);
-    expect(seen.slice(0, 3)).toEqual(["systemd-run", "--user", "--scope"]);
+    expect(seen.slice(0, 3)).toEqual(["systemd-run", "--user", "--wait"]);
     expect(seen).toContain("pasta");
     expect(seen).toContain("bwrap");
     const bash = seen.indexOf("bash");
@@ -403,7 +473,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   // at the relay WITHOUT any upstream connection.
   interface Stub {
     port: number;
-    hits: Array<{ method: string; url: string; body: string }>;
+    hits: Array<{ method: string; url: string; body: string; authorization: string | undefined }>;
     close: () => Promise<void>;
   }
   async function startStub(): Promise<Stub> {
@@ -412,7 +482,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c as Buffer));
       req.on("end", () => {
-        hits.push({ method: req.method ?? "", url: req.url ?? "", body: Buffer.concat(chunks).toString() });
+        hits.push({ method: req.method ?? "", url: req.url ?? "", body: Buffer.concat(chunks).toString(), authorization: req.headers.authorization });
         if ((req.url ?? "").startsWith("/v1/chat/completions")) {
           // Stream two SSE-ish frames to exercise streaming passthrough.
           res.writeHead(200, { "content-type": "text/event-stream", "x-stub": "chat" });
@@ -436,10 +506,11 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
     port: number,
     method: string,
     path: string,
-    body?: string
+    body?: string,
+    authorization?: string,
   ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
     return new Promise((resolve, reject) => {
-      const req = http.request({ host: "127.0.0.1", port, method, path }, (res) => {
+      const req = http.request({ host: "127.0.0.1", port, method, path, headers: authorization === undefined ? {} : { authorization } }, (res) => {
         let buf = "";
         res.on("data", (d) => (buf += d.toString()));
         res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: buf }));
@@ -453,14 +524,15 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("forwards POST /v1/chat/completions verbatim, streaming the body and the SSE response", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "POST", "/v1/chat/completions", JSON.stringify({ model: "m", messages: [] }));
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "POST", "/v1/chat/completions", JSON.stringify({ model: "m", messages: [] }), `Bearer ${relay.clientApiKey}`);
     expect(r.status).toBe(200);
     expect(r.headers["x-stub"]).toBe("chat");
     expect(r.body).toBe("data: one\n\ndata: two\n\n");
     expect(stub.hits).toHaveLength(1);
     expect(stub.hits[0]!.method).toBe("POST");
     expect(stub.hits[0]!.body).toContain('"model":"m"'); // request body streamed through
+    expect(stub.hits[0]!.authorization).toBe("Bearer upstream-test-key");
     await relay.close();
     await stub.close();
   });
@@ -468,8 +540,8 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("forwards GET /v1/models (read-only, content-blind)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "GET", "/v1/models");
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "GET", "/v1/models", undefined, `Bearer ${relay.clientApiKey}`);
     expect(r.status).toBe(200);
     expect(stub.hits.map((h) => h.url)).toContain("/v1/models");
     await relay.close();
@@ -479,10 +551,22 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("forwards GET /healthz (the cage self-test reachability arm)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "GET", "/healthz");
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "GET", "/healthz", undefined, "Bearer forged-health-header");
     expect(r.status).toBe(200);
     expect(stub.hits.map((h) => h.url)).toContain("/healthz");
+    expect(stub.hits[0]!.authorization).toBeUndefined();
+    await relay.close();
+    await stub.close();
+  });
+
+  it("requires the per-run capability on authenticated routes and never forwards a forged bearer", async () => {
+    const stub = await startStub();
+    const fwd = await freePort();
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    expect((await request(fwd, "GET", "/v1/models")).status).toBe(401);
+    expect((await request(fwd, "GET", "/v1/models", undefined, "Bearer forged-local-token")).status).toBe(401);
+    expect(stub.hits).toHaveLength(0);
     await relay.close();
     await stub.close();
   });
@@ -490,7 +574,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("REFUSES POST /admin/keys with 403 and NEVER forwards upstream (the escalated finding)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     const r = await request(fwd, "POST", "/admin/keys", JSON.stringify({ alias: "x", tier: "owner" }));
     expect(r.status).toBe(403);
     expect(r.body).toContain("code_loop relay: path not allowed");
@@ -502,7 +586,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("REFUSES a method mismatch (GET /v1/chat/completions) with 403, no upstream hit", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     const r = await request(fwd, "GET", "/v1/chat/completions");
     expect(r.status).toBe(403);
     expect(stub.hits).toHaveLength(0);
@@ -513,7 +597,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("REFUSES other admin/model-management routes (unload, maintenance, revoke)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     for (const [m, p] of [["POST", "/admin/unload"], ["POST", "/admin/maintenance"], ["POST", "/admin/keys/revoke"]] as const) {
       const r = await request(fwd, m, p);
       expect(r.status).toBe(403);
@@ -526,8 +610,8 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("path-allowlist matches the PATHNAME, ignoring query strings", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "GET", "/v1/models?verbose=1");
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "GET", "/v1/models?verbose=1", undefined, `Bearer ${relay.clientApiKey}`);
     expect(r.status).toBe(200);
     const r2 = await request(fwd, "POST", "/admin/keys?x=/v1/chat/completions");
     expect(r2.status).toBe(403);
@@ -539,7 +623,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("closes the connection on non-HTTP / garbage traffic (never forwards)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     await new Promise<void>((resolve) => {
       const c = net.connect(fwd, "127.0.0.1", () => c.write("this is not valid http\r\n\r\n"));
       c.on("close", () => resolve());

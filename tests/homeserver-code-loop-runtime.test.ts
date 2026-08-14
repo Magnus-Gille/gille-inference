@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { piVisibilityBinds } from "../src/homeserver/code-loop-runtime.js";
+import { codeLoopSecretPath, piVisibilityBinds, runCageSelfTestWithRelay } from "../src/homeserver/code-loop-runtime.js";
 
 /**
  * piVisibilityBinds — derives the narrow ro-binds that make the pi install visible inside the
@@ -93,5 +93,30 @@ describe("piVisibilityBinds", () => {
   it("empty piBin / piAgentDir contribute nothing (unprovisioned box)", () => {
     expect(piVisibilityBinds("", "")).toEqual([]);
     expect(piVisibilityBinds("", join(base, ".pi-code-loop"))).toEqual([join(base, ".pi-code-loop", "models.json")]);
+  });
+});
+
+describe("codeLoopSecretPath", () => {
+  it("probes the migrated root-owned environment file when the isolated service declares it", () => {
+    expect(codeLoopSecretPath("/deploy", { GILLE_AUTONOMY_ENV_FILE: "/etc/gille-inference/gateway/gateway.env" }))
+      .toBe("/etc/gille-inference/gateway/gateway.env");
+  });
+
+  it("falls back to the legacy deploy .env outside isolated production", () => {
+    expect(codeLoopSecretPath("/deploy", {})).toBe("/deploy/.env");
+  });
+
+  it("fails before the cage when the outside secret source is absent", async () => {
+    const result = await runCageSelfTestWithRelay(
+      () => [],
+      join(base, "missing-gateway.env"),
+      18080,
+      "127.0.0.1",
+      8080,
+      "upstream-test-key",
+      "required",
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failures.join(" ")).toContain("not readable outside the cage");
   });
 });

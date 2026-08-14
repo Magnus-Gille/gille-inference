@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
-import { withUserBusEnv } from "./code-loop-cage.js";
+import {
+  requestTransientCodeLoopUnitStop,
+  stopTransientCodeLoopUnit,
+  transientCodeLoopUnitFromArgv,
+  withUserBusEnv,
+} from "./code-loop-cage.js";
 import { createInterface } from "node:readline";
 import { statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -335,21 +340,40 @@ export function buildPiEnv(cfg: Pick<PiEngineConfig, "piAgentDir" | "apiKey">, s
 // ─── The real spawn (process-group kill so the whole tree dies) ─────────────────────────
 
 export const realSpawnPi: SpawnPiFn = (argv, opts) => {
+  const transientUnit = transientCodeLoopUnitFromArgv(argv);
   const child = spawn(argv[0]!, argv.slice(1), {
     cwd: opts.cwd,
     env: opts.env,
     stdio: ["ignore", "pipe", "pipe"],
     detached: true, // own process group → group kill reaches bash grandchildren
   });
-  const exited = new Promise<number | null>((resolve) => {
+  const childExited = new Promise<number | null>((resolve) => {
     child.on("exit", (code) => resolve(code));
     child.on("error", () => resolve(null));
+  });
+  // systemd-run --wait exits only after the transient service deactivates. Still issue and verify
+  // the idempotent stop before exposing completion so retries/finalization cannot overlap a
+  // residual pasta/bwrap tree. A cleanup failure is an infrastructure failure, never success.
+  const exited = childExited.then(async (code) => {
+    if (transientUnit === null) return code;
+    try {
+      await stopTransientCodeLoopUnit(transientUnit, opts.env);
+      return code;
+    } catch (err) {
+      console.error(`[code-loop] final transient cleanup failed for ${transientUnit}: ${(err as Error).message}`);
+      return null;
+    }
   });
   return {
     stdout: child.stdout,
     stderr: child.stderr,
     pid: child.pid,
     kill(signal) {
+      // A manager-spawned service is not a descendant of this systemd-run client. Request the
+      // validated unit stop immediately; process-group kill alone would leave the cage running.
+      void requestTransientCodeLoopUnitStop(argv, opts.env)?.catch((err) => {
+        console.error(`[code-loop] immediate transient cleanup failed for ${transientUnit ?? "unknown"}: ${(err as Error).message}`);
+      });
       if (child.pid === undefined) return;
       try {
         process.kill(-child.pid, signal); // negative pid = the whole group
@@ -644,9 +668,9 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
       const first = await attempt(opts.instruction, 0, 0);
 
       // Defensive redaction: detail can carry a raw stdout/stderr tail, and HS_API_KEY (the
-      // owner-tier bearer) is in pi's env — pi 0.70.2 doesn't echo it today, but the detail
+      // per-run relay capability) is in pi's env — pi 0.70.2 doesn't echo it today, but the detail
       // leaves the engine for the MCP caller's result JSON, so never rely on that. Skipped for
-      // degenerate short keys (< 8 chars — real keys are hs_owner_<long>): redacting a 1-char
+      // degenerate short keys (< 8 chars in unit tests): redacting a 1-char
       // dev/test key would mangle every occurrence of that character in the diagnostics.
       const redact = (s: string): string =>
         cfg.apiKey.length >= 8 ? s.split(cfg.apiKey).join("[redacted]") : s;
