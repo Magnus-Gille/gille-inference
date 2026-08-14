@@ -66,6 +66,10 @@ describe("parseStrixServerBenchmarkArgs", () => {
       parallelism: 1,
       speculation: "none",
       draftDepth: null,
+      cacheRamMiB: 8192,
+      contextCheckpoints: 32,
+      checkpointMinStep: 8192,
+      cacheIdleSlots: "on",
     });
     expect(provenance.backend).toBe("vulkan");
     expect(() => validateServerProvenance({ ...provenance, runtimeCommit: "main" })).toThrow(/full Git revision/);

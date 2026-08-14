@@ -26,6 +26,10 @@ const provenance = {
   parallelism: 1,
   speculation: "none",
   draftDepth: null,
+  cacheRamMiB: 8192,
+  contextCheckpoints: 32,
+  checkpointMinStep: 8192,
+  cacheIdleSlots: "on" as const,
 };
 
 function report(overrides: Record<string, unknown> = {}) {
@@ -56,6 +60,22 @@ describe("Strix benchmark comparison", () => {
   it("fails closed when a supposedly controlled field changes", () => {
     const candidate = report({ provenance: { ...provenance, backend: "hip", quant: "Q5_K_M" } });
     expect(() => compareStrixServerReports(report(), candidate, "backend")).toThrow(/quant/);
+  });
+
+  it("permits only declared prompt-cache settings on the cache axis", () => {
+    const candidate = report({
+      provenance: {
+        ...provenance,
+        cacheRamMiB: 4096,
+        contextCheckpoints: 16,
+        serverArgsSha256: "1".repeat(64),
+      },
+    });
+    expect(compareStrixServerReports(report(), candidate, "cache").axis).toBe("cache");
+    expect(() => compareStrixServerReports(report(), {
+      ...candidate,
+      provenance: { ...candidate.provenance, kvTypeK: "f16" },
+    }, "cache")).toThrow(/kvTypeK/);
   });
 
   it("compares identical workload cells and preserves quality as a separate gate", () => {

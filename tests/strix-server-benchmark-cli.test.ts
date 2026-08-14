@@ -41,6 +41,10 @@ const PROVENANCE = JSON.stringify({
   parallelism: 1,
   speculation: "draft-mtp",
   draftDepth: 2,
+  cacheRamMiB: 8192,
+  contextCheckpoints: 32,
+  checkpointMinStep: 8192,
+  cacheIdleSlots: "on",
 });
 
 function sse(content = "42"): Response {

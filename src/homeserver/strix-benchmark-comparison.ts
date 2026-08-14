@@ -5,7 +5,7 @@ import {
 } from "./strix-server-benchmark.js";
 
 type JsonObject = Record<string, unknown>;
-export type StrixComparisonAxis = "backend" | "quant" | "kv" | "speculation" | "runtime" | "parallelism";
+export type StrixComparisonAxis = "backend" | "quant" | "kv" | "cache" | "speculation" | "runtime" | "parallelism";
 
 export interface StrixComparisonArgs {
   controlPath: string;
@@ -49,7 +49,7 @@ export interface StrixComparisonReport {
   limitations: string[];
 }
 
-const AXES = new Set<StrixComparisonAxis>(["backend", "quant", "kv", "speculation", "runtime", "parallelism"]);
+const AXES = new Set<StrixComparisonAxis>(["backend", "quant", "kv", "cache", "speculation", "runtime", "parallelism"]);
 
 function nextValue(argv: string[], index: number, flag: string): string {
   const value = argv[index + 1];
@@ -148,6 +148,7 @@ const ALLOWED_PROVENANCE_FIELDS: Record<StrixComparisonAxis, Set<keyof StrixServ
   backend: new Set(["backend", "runtimeBinarySha256", "serverArgsSha256", "mesaVersion", "rocmVersion"]),
   quant: new Set(["quant", "modelArtifactSha256", "serverArgsSha256"]),
   kv: new Set(["kvTypeK", "kvTypeV", "serverArgsSha256"]),
+  cache: new Set(["cacheRamMiB", "contextCheckpoints", "checkpointMinStep", "cacheIdleSlots", "serverArgsSha256"]),
   speculation: new Set(["speculation", "draftDepth", "serverArgsSha256"]),
   runtime: new Set(["runtimeCommit", "runtimeBinarySha256", "serverArgsSha256"]),
   parallelism: new Set(["parallelism", "serverArgsSha256"]),

@@ -56,6 +56,10 @@ export interface StrixServerProvenance {
   parallelism: number;
   speculation: string;
   draftDepth: number | null;
+  cacheRamMiB: number;
+  contextCheckpoints: number;
+  checkpointMinStep: number;
+  cacheIdleSlots: "on" | "off";
 }
 
 export interface SpeculationSnapshot {
@@ -239,8 +243,15 @@ export function validateServerProvenance(value: unknown): StrixServerProvenance 
     if (!Number.isInteger(item) || (item as number) <= 0) throw new Error(`provenance.${key} must be a positive integer`);
     return item as number;
   };
+  const nonNegative = (key: string): number => {
+    const item = record[key];
+    if (!Number.isInteger(item) || (item as number) < 0) throw new Error(`provenance.${key} must be a non-negative integer`);
+    return item as number;
+  };
   const draftDepth = record["draftDepth"];
   if (draftDepth !== null && (!Number.isInteger(draftDepth) || (draftDepth as number) <= 0)) throw new Error("provenance.draftDepth must be null or a positive integer");
+  const cacheIdleSlots = record["cacheIdleSlots"];
+  if (cacheIdleSlots !== "on" && cacheIdleSlots !== "off") throw new Error("provenance.cacheIdleSlots must be on or off");
   return {
     schemaVersion: 1,
     modelArtifactSha256: requiredString(record, "modelArtifactSha256"),
@@ -261,6 +272,10 @@ export function validateServerProvenance(value: unknown): StrixServerProvenance 
     parallelism: positive("parallelism"),
     speculation: requiredString(record, "speculation"),
     draftDepth: draftDepth as number | null,
+    cacheRamMiB: nonNegative("cacheRamMiB"),
+    contextCheckpoints: nonNegative("contextCheckpoints"),
+    checkpointMinStep: nonNegative("checkpointMinStep"),
+    cacheIdleSlots,
   };
 }
 

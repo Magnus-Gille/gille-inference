@@ -129,6 +129,8 @@ npm run benchmark:strix-provenance -- \
   --backend vulkan --quant Q4_K_M --context 131072 \
   --kv-k q8_0 --kv-v q8_0 --fa on --batch 2048 --ubatch 512 \
   --parallelism 1 --speculation none --draft-depth none \
+  --cache-ram-mib 8192 --ctx-checkpoints 32 --checkpoint-min-step 8192 \
+  --cache-idle-slots on \
   --out data/strix-benchmarks/qwen36-direct-provenance.json
 ```
 
@@ -163,7 +165,10 @@ npm run benchmark:strix-compare -- \
   --out data/strix-benchmarks/qwen36-direct-vs-mtp2
 ```
 
-Supported axes are `backend`, `quant`, `kv`, `speculation`, `runtime`, and `parallelism`. The
+Supported axes are `backend`, `quant`, `kv`, `cache`, `speculation`, `runtime`, and `parallelism`.
+The `cache` axis permits only RAM-cache size, checkpoint count/minimum step, idle-slot caching, and
+the resulting argv hash to change. Set all four cache fields explicitly, including zero/off control
+arms, so server defaults cannot silently invalidate the experiment. The
 comparator deliberately declares no automatic winner: the relevant issue's preregistered quality,
 short/long-context, soak, memory, and stability gates still decide adoption.
 

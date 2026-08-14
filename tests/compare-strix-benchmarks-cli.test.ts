@@ -9,6 +9,7 @@ const provenance = {
   backend: "vulkan", quant: "Q4_K_M", kernel: "6.14", mesaVersion: "25.2", rocmVersion: null,
   contextSize: 65536, kvTypeK: "q8_0", kvTypeV: "q8_0", flashAttention: "on",
   batch: 2048, ubatch: 512, parallelism: 1, speculation: "none", draftDepth: null,
+  cacheRamMiB: 8192, contextCheckpoints: 32, checkpointMinStep: 8192, cacheIdleSlots: "on",
 };
 const summary = {
   fixtureId: "code", taskType: "code", concurrency: 1, batches: 1, requests: 1,

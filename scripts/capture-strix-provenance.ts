@@ -23,6 +23,10 @@ interface CaptureArgs {
   parallelism: number;
   speculation: string;
   draftDepth: number | null;
+  cacheRamMiB: number;
+  contextCheckpoints: number;
+  checkpointMinStep: number;
+  cacheIdleSlots: "on" | "off";
   outPath: string;
 }
 
@@ -50,6 +54,12 @@ function positive(raw: string, flag: string): number {
   return value;
 }
 
+function nonNegative(raw: string, flag: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`${flag} must be a non-negative integer`);
+  return value;
+}
+
 export function parseCaptureArgs(argv: string[]): CaptureArgs {
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index++) {
@@ -70,6 +80,8 @@ export function parseCaptureArgs(argv: string[]): CaptureArgs {
   if (flashAttention !== "on" && flashAttention !== "off" && flashAttention !== "auto") throw new Error("--fa must be on, off, or auto");
   const draftRaw = required("--draft-depth");
   const draftDepth = draftRaw === "none" ? null : positive(draftRaw, "--draft-depth");
+  const cacheIdleSlots = required("--cache-idle-slots");
+  if (cacheIdleSlots !== "on" && cacheIdleSlots !== "off") throw new Error("--cache-idle-slots must be on or off");
   return {
     pid: positive(required("--pid"), "--pid"),
     modelArtifact: required("--model-artifact"),
@@ -85,6 +97,10 @@ export function parseCaptureArgs(argv: string[]): CaptureArgs {
     parallelism: positive(required("--parallelism"), "--parallelism"),
     speculation: required("--speculation"),
     draftDepth,
+    cacheRamMiB: nonNegative(required("--cache-ram-mib"), "--cache-ram-mib"),
+    contextCheckpoints: nonNegative(required("--ctx-checkpoints"), "--ctx-checkpoints"),
+    checkpointMinStep: nonNegative(required("--checkpoint-min-step"), "--checkpoint-min-step"),
+    cacheIdleSlots,
     outPath: required("--out"),
   };
 }
@@ -164,6 +180,10 @@ export async function runCaptureStrixProvenance(argv: string[], deps: Dependenci
       parallelism: args.parallelism,
       speculation: args.speculation,
       draftDepth: args.draftDepth,
+      cacheRamMiB: args.cacheRamMiB,
+      contextCheckpoints: args.contextCheckpoints,
+      checkpointMinStep: args.checkpointMinStep,
+      cacheIdleSlots: args.cacheIdleSlots,
     });
     deps.write(args.outPath, `${JSON.stringify(provenance, null, 2)}\n`);
     deps.stdout(JSON.stringify({ status: "complete", outPath: resolve(args.outPath), pid: args.pid }));
