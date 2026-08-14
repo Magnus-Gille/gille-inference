@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { PassThrough } from "node:stream";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -128,20 +128,20 @@ describe("pi argv + scrubbed env", () => {
   });
   it("scrubs the env — PATH/HOME/PI_CODING_AGENT_DIR/HS_API_KEY + user-bus pointers, no OPENROUTER leak", () => {
     const env = buildPiEnv({ piAgentDir: "/agent", apiKey: "svc-key" }, "/sandbox");
-    expect(Object.keys(env).sort()).toEqual([
-      "DBUS_SESSION_BUS_ADDRESS", "HOME", "HS_API_KEY", "PATH", "PI_CODING_AGENT_DIR", "XDG_RUNTIME_DIR",
-    ]);
+    const expectedKeys = ["HOME", "HS_API_KEY", "PATH", "PI_CODING_AGENT_DIR", "XDG_RUNTIME_DIR"];
+    if (env["DBUS_SESSION_BUS_ADDRESS"] !== undefined) expectedKeys.push("DBUS_SESSION_BUS_ADDRESS");
+    expect(Object.keys(env).sort()).toEqual(expectedKeys.sort());
     expect(env["HOME"]).toBe("/sandbox");
     expect(env["HS_API_KEY"]).toBe("svc-key");
     expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
   });
-  it("buildPiEnv carries the user-bus pointers so the OUTER systemd-run can reach the user manager from a system service", () => {
+  it("buildPiEnv uses the visible user-manager transport for the OUTER systemd-run", () => {
     const env = buildPiEnv({ piAgentDir: "/agent", apiKey: "svc-key" }, "/sandbox");
     const uid = process.getuid!();
     expect(env["XDG_RUNTIME_DIR"]).toBe(process.env["XDG_RUNTIME_DIR"] ?? `/run/user/${uid}`);
-    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe(
-      process.env["DBUS_SESSION_BUS_ADDRESS"] ?? `unix:path=/run/user/${uid}/bus`
-    );
+    const busPath = `/run/user/${uid}/bus`;
+    const expectedBus = process.env["DBUS_SESSION_BUS_ADDRESS"] ?? (existsSync(busPath) ? `unix:path=${busPath}` : undefined);
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe(expectedBus);
   });
 });
 

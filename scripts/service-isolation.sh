@@ -21,11 +21,15 @@ readonly GATEWAY_ISOLATION_MARKER="$ROOT/gateway/isolation-marker"
 APPLY_BACKUP=""
 APPLY_SERVICE=""
 APPLY_BACKUP_REPORTED=0
+REFRESH_BACKUP=""
+REFRESH_DROPIN=""
+REFRESH_UNIT=""
+REFRESH_ACTIVE=0
 gateway_home() { printf '%s\n' "$ROOT/$GATEWAY_USER"; }
 
 usage() {
   cat <<'EOF'
-Usage: scripts/service-isolation.sh <render|preflight|apply|verify|rollback|refresh-autonomy> --service <gateway|cloudflared|llama-swap> [options]
+Usage: scripts/service-isolation.sh <render|preflight|apply|verify|rollback|refresh-isolation|refresh-autonomy> --service <gateway|cloudflared|llama-swap> [options]
 
 No command accepts "all": migrate, verify, and roll back exactly one service
 at a time. `apply` and `rollback` require root and an explicit acknowledgement.
@@ -37,6 +41,8 @@ Commands:
              restart it, and verify its local contract. Requires --ack-service-restart.
   verify     Read-only post-migration identity, sandbox, path, and listener checks.
   rollback   Restore the most recent recorded backup for one service. Requires --ack-rollback.
+  refresh-isolation  Re-render an already-isolated gateway drop-in, restart, and verify it.
+                     Restores the prior drop-in automatically on failure. Requires --ack-service-restart.
   refresh-autonomy  Re-render the isolated gateway autonomy hook/unit after a source deploy (root-only).
 
 Options:
@@ -154,13 +160,19 @@ EOF
 }
 
 render_dropin() {
-  local service="$1"
-  printf '[Service]\n'
+  local service="$1" gateway_uid
   case "$service" in
     gateway)
+      gateway_uid="$(id -u "$GATEWAY_USER")" || die "cannot render gateway ordering without the $GATEWAY_USER UID"
       cat <<EOF
+[Unit]
+Requires=user@$gateway_uid.service
+After=user@$gateway_uid.service
+
+[Service]
 User=$GATEWAY_USER
 Group=$GATEWAY_USER
+ExecStartPre=/usr/bin/test -S /run/user/$gateway_uid/systemd/private
 EnvironmentFile=$ETC/gateway/gateway.env
 Environment=AUTONOMY_NOTIFY_CMD=$ROOT/gateway/bin/autonomy-notify.sh
 Environment=GILLE_AUTONOMY_ENV_FILE=$ETC/gateway/gateway.env
@@ -168,6 +180,9 @@ Environment=HOMESERVER_CODE_LOOP_WORKROOT=$ROOT/gateway/data/code-loop-work
 Environment=HOMESERVER_CODE_LOOP_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
 Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
 BindReadOnlyPaths=$GATEWAY_TREE
+# Bind the containing directory so a restarted user manager can replace its
+# private socket without leaving the gateway namespace pinned to a stale inode.
+BindReadOnlyPaths=/run/user/$gateway_uid/systemd
 BindPaths=$ROOT/gateway/data:$GATEWAY_DATA
 ReadOnlyPaths=$GATEWAY_TREE
 InaccessiblePaths=-$GATEWAY_TREE/.claude
@@ -183,6 +198,7 @@ EOF
       ;;
     cloudflared)
       cat <<EOF
+[Service]
 User=$TUNNEL_USER
 Group=$TUNNEL_USER
 ExecStart=
@@ -196,6 +212,7 @@ EOF
       ;;
     llama-swap)
       cat <<EOF
+[Service]
 User=$LLAMA_USER
 Group=$LLAMA_USER
 SupplementaryGroups=render video
@@ -540,7 +557,16 @@ restore_transaction_dependents() {
 }
 
 gateway_user_bus_ready() {
-  [ -S "/run/user/$1/bus" ]
+  [ -S "/run/user/$1/bus" ] || [ -S "/run/user/$1/systemd/private" ]
+}
+
+gateway_user_default_target_active() {
+  local uid="$1"
+  if [ -S "/run/user/$uid/bus" ]; then
+    runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null
+  else
+    runuser -u "$GATEWAY_USER" -- env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active default.target >/dev/null
+  fi
 }
 
 prepare_gateway_user_manager() {
@@ -553,12 +579,12 @@ prepare_gateway_user_manager() {
   # its runtime bus rather than racing logind's asynchronous startup.
   systemctl start "user@$uid.service" || die "could not start user@$uid.service for gille-gateway"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if gateway_user_bus_ready "$uid" && runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null; then
+    if gateway_user_bus_ready "$uid" && gateway_user_default_target_active "$uid"; then
       return 0
     fi
     sleep 1
   done
-  die "gille-gateway user manager did not become ready after 10s (user@$uid.service and /run/user/$uid/bus); inspect journalctl -u user@$uid.service before retrying"
+  die "gille-gateway user manager did not become ready after 10s (user@$uid.service and its runtime transport); inspect journalctl -u user@$uid.service before retrying"
 }
 
 provision_gateway_codeloop_runtime() {
@@ -801,8 +827,88 @@ install_dropin() {
   systemctl daemon-reload
 }
 
+atomic_install_file() {
+  local source="$1" destination="$2" dir tmp
+  dir="${destination%/*}"
+  tmp="$(mktemp "$dir/.${destination##*/}.XXXXXX")" || return 1
+  if ! install -m 0644 -o root -g root "$source" "$tmp" || ! mv "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+atomic_render_dropin() {
+  local service="$1" destination="$2" dir tmp
+  dir="${destination%/*}"
+  tmp="$(mktemp "$dir/.${destination##*/}.XXXXXX")" || return 1
+  if ! render_dropin "$service" >"$tmp" \
+    || ! chown root:root "$tmp" \
+    || ! chmod 0644 "$tmp" \
+    || ! mv "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  systemctl daemon-reload
+}
+
+restore_isolation_refresh() {
+  [ -n "$REFRESH_BACKUP" ] && [ -n "$REFRESH_DROPIN" ] && [ -n "$REFRESH_UNIT" ] || return 1
+  atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
+  systemctl daemon-reload || return 1
+  systemctl restart "$REFRESH_UNIT" || return 1
+  ( verify gateway 1 0 ) || return 1
+}
+
+refresh_exit_handler() {
+  local status="$1"
+  if [ "$REFRESH_ACTIVE" = 1 ]; then
+    REFRESH_ACTIVE=0
+    if restore_isolation_refresh; then
+      note "Refresh failed; the prior gateway drop-in was restored and verified. Backup: $REFRESH_BACKUP"
+    else
+      note "CRITICAL: refresh failed and automatic gateway restoration did not verify. Backup: $REFRESH_BACKUP"
+    fi
+  fi
+  exit "$status"
+}
+
+refresh_isolation() {
+  local service="$1" backup_root="$2" unit dropin stamp backup
+  root_only; need systemctl; need install; need mktemp; need loginctl; need runuser; need mv; need rm; need chown; need chmod
+  [ "$service" = gateway ] || die "refresh-isolation currently applies only to gateway"
+  unit="$(unit_for "$service")"
+  [ "$(show_value "$unit" User)" = "$GATEWAY_USER" ] || die "$unit is not already isolated; use apply instead"
+  [ -f "$GATEWAY_ISOLATION_MARKER" ] && [ ! -L "$GATEWAY_ISOLATION_MARKER" ] || die "gateway isolation marker is absent or unsafe"
+  dropin="/etc/systemd/system/$unit.d/50-service-isolation.conf"
+  [ -f "$dropin" ] && [ ! -L "$dropin" ] || die "gateway isolation drop-in is absent or unsafe"
+
+  # Ensure the dependency target is healthy before changing the gateway unit. The refreshed
+  # drop-in then orders every future start (including boot) after this exact user manager.
+  prepare_gateway_user_manager
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  umask 077
+  mkdir -p "$backup_root"
+  backup="$(mktemp -d "$backup_root/$stamp-$service-refresh.XXXXXX")"
+  install -m 0644 -o root -g root "$dropin" "$backup/dropin.before.conf"
+  systemctl show "$unit" -p User -p ActiveState -p SubState -p MainPID -p Requires -p After --no-pager >"$backup/unit.before.show"
+
+  REFRESH_BACKUP="$backup"
+  REFRESH_DROPIN="$dropin"
+  REFRESH_UNIT="$unit"
+  REFRESH_ACTIVE=1
+  trap 'refresh_exit_handler "$?"' EXIT
+  atomic_render_dropin "$service" "$dropin" || die "could not atomically install refreshed gateway isolation drop-in"
+  systemctl restart "$unit" || die "refreshed gateway unit did not restart"
+  ( verify "$service" ) || die "refreshed gateway unit did not verify"
+  printf 'service=%s\nunit=%s\nbackup=%s\nverified_at=%s\n' "$service" "$unit" "$backup" "$(date -u +%FT%TZ)" >"$backup/refresh-receipt" \
+    || die "could not write gateway isolation refresh receipt"
+  REFRESH_ACTIVE=0
+  trap - EXIT
+  note "REFRESHED: $service isolation. Prior drop-in: $backup/dropin.before.conf"
+}
+
 verify() {
-  local service="$1" require_marker="${2:-1}" unit user actual_user
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" unit user actual_user
   need systemctl; need ss
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"
@@ -843,15 +949,27 @@ verify() {
       require_mode "$ROOT/gateway/bin/autonomy-notify.sh" 750
       require_owner_group "$ROOT/gateway/bin/autonomy-notify.sh" root "$GATEWAY_USER"
       [ "$(show_value "$unit" PrivateDevices)" = yes ] || die "$unit PrivateDevices is not enabled"
-      require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE"
+      local gateway_uid
+      gateway_uid="$(id -u "$GATEWAY_USER")"
+      if [ "$require_user_manager_order" = 1 ]; then
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"
+      else
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE"
+      fi
       require_show_exact_set "$unit" BindPaths "$ROOT/gateway/data:$GATEWAY_DATA"
       require_show_exact_set "$unit" ReadWritePaths "$ROOT/gateway/data"
       require_show_exact_set "$unit" InaccessiblePaths "-$GATEWAY_TREE/.claude" "-$GATEWAY_TREE/.codex" "-$GATEWAY_TREE/.ssh" "-$GATEWAY_TREE/.git" "-$GATEWAY_TREE/.pi-code-loop"
       if gateway_codeloop_enabled; then
-        local home uid
-        home="$(gateway_home)"; uid="$(id -u "$GATEWAY_USER")"
+        local home uid user_unit
+        home="$(gateway_home)"; uid="$gateway_uid"
+        user_unit="user@$uid.service"
         [ "$(loginctl show-user "$GATEWAY_USER" -p Linger --value)" = yes ] || die "gille-gateway lingering is disabled"
-        [ -S "/run/user/$uid/bus" ] || die "gille-gateway user bus is absent"
+        gateway_user_bus_ready "$uid" || die "gille-gateway user-manager transport is absent"
+        if [ "$require_user_manager_order" = 1 ]; then
+          require_show_contains "$unit" Requires "$user_unit"
+          require_show_contains "$unit" After "$user_unit"
+          require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"
+        fi
         [ -x "$home/.local/bin/pi" ] || die "dedicated Pi binary is absent"
         [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json is absent"
         [ ! -e "$home/.pi-code-loop/auth.json" ] || die "dedicated Pi runtime must not hold auth.json"
@@ -1103,6 +1221,7 @@ main() {
     apply) [ "$ack_restart" = 1 ] || die "apply requires --ack-service-restart"; apply "$service" "$backup_dir" ;;
     verify) verify "$service" ;;
     rollback) [ "$ack_rollback" = 1 ] || die "rollback requires --ack-rollback"; rollback "$service" "$backup_dir" ;;
+    refresh-isolation) [ "$ack_restart" = 1 ] || die "refresh-isolation requires --ack-service-restart"; refresh_isolation "$service" "$backup_dir" ;;
     refresh-autonomy) [ "$service" = gateway ] || die "refresh-autonomy only applies to gateway"; root_only; install_gateway_autonomy_timer ;;
     *) usage >&2; die "unknown command: $command" ;;
   esac

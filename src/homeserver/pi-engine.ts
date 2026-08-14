@@ -316,9 +316,10 @@ export function buildPiArgv(cfg: Pick<PiEngineConfig, "piBin" | "provider">, mod
  * HOME points into the sandbox so any dotfile writes stay contained even without the cage.
  */
 export function buildPiEnv(cfg: Pick<PiEngineConfig, "piAgentDir" | "apiKey">, sandboxDir: string): Record<string, string> {
-  // Scrubbed on purpose (no OPENROUTER etc.); withUserBusEnv adds ONLY the user-manager bus
-  // pointers the OUTER systemd-run needs — inside the cage, bwrap re-sets HOME and hides
-  // /run/user anyway.
+  // Scrubbed on purpose (no OPENROUTER etc.); withUserBusEnv adds only the user-manager runtime
+  // pointer the OUTER systemd-run needs, plus DBUS_SESSION_BUS_ADDRESS only when its socket exists.
+  // The system service exposes only `<runtime>/systemd/private`; bwrap later hides /run/user from
+  // the model-driven inner process.
   return withUserBusEnv({
     PATH: process.env["PATH"] ?? "/usr/bin:/bin",
     HOME: sandboxDir,

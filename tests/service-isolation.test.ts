@@ -9,10 +9,24 @@ const script = join(root, "scripts", "service-isolation.sh");
 
 function render(service: string): string {
   const out = mkdtempSync(join(tmpdir(), "gille-isolation-render-"));
-  execFileSync("bash", [script, "render", "--service", service, "--output-dir", out], {
-    cwd: root,
-    encoding: "utf8",
-  });
+  if (service === "gateway") {
+    execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render \"$2\" gateway",
+        "--",
+        script,
+        out,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+  } else {
+    execFileSync("bash", [script, "render", "--service", service, "--output-dir", out], {
+      cwd: root,
+      encoding: "utf8",
+    });
+  }
   return readFileSync(join(out, `${service}.conf`), "utf8");
 }
 
@@ -262,6 +276,76 @@ esac
 }
 
 describe("service-isolation migration contract (#151)", () => {
+  it("orders the isolated gateway after its dedicated user manager", () => {
+    const unit = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render_dropin gateway",
+        "--",
+        script,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(unit).toContain("[Unit]\nRequires=user@4242.service\nAfter=user@4242.service\n");
+    expect(unit.indexOf("[Unit]")).toBeLessThan(unit.indexOf("[Service]"));
+  });
+
+  it("fails gateway startup unless the user-manager transport is visible inside its mount namespace", () => {
+    const unit = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render_dropin gateway",
+        "--",
+        script,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/systemd/private");
+    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/systemd");
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"');
+    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"');
+  });
+
+  it("requires an explicit restart acknowledgement and traps every post-mutation refresh failure", () => {
+    expect(() =>
+      execFileSync("bash", [script, "refresh-isolation", "--service", "gateway"], {
+        cwd: root,
+        encoding: "utf8",
+        stderr: "pipe",
+      }),
+    ).toThrow(/refresh-isolation requires --ack-service-restart/);
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('atomic_render_dropin "$service" "$dropin"');
+    expect(source).toContain("trap 'refresh_exit_handler \"$?\"' EXIT");
+    expect(source).toContain("( verify gateway 1 0 )");
+  });
+
+  it("runs the refresh restoration hook and preserves the failing exit status", () => {
+    let status: number | null = null;
+    let output = "";
+    try {
+      execFileSync(
+        "bash",
+        [
+          "-c",
+          "source \"$1\"; REFRESH_ACTIVE=1; REFRESH_BACKUP=/safe/backup; REFRESH_DROPIN=/safe/dropin; REFRESH_UNIT=home-gateway.service; restore_isolation_refresh() { printf 'restore-called\\n'; }; refresh_exit_handler 23",
+          "--",
+          script,
+        ],
+        { cwd: root, encoding: "utf8", stderr: "pipe" },
+      );
+    } catch (error: any) {
+      status = error.status ?? null;
+      output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+    }
+    expect(status).toBe(23);
+    expect(output).toContain("restore-called");
+    expect(output).toContain("prior gateway drop-in was restored and verified");
+  });
+
   it("waits for delayed gateway health but times out fail-closed without printing its locator", () => {
     const delayed = execFileSync("bash", ["-c", `source "$1"; count=0; systemctl(){ return 0; }; gateway_health_url(){ printf 'private-locator'; }; curl(){ count=$((count+1)); [ "$count" -ge 3 ]; }; sleep(){ :; }; wait_for_gateway_health home-gateway.service; printf '%s' "$count"`, "--", script], { encoding: "utf8" });
     expect(delayed).toBe("3");
@@ -280,6 +364,12 @@ describe("service-isolation migration contract (#151)", () => {
     const result = runUserManagerHarness(3);
     expect(result.status).toBe(0);
     expect(result.output).toContain("started:user@4242.service");
+  });
+
+  it("uses the private systemd transport when the session-bus socket is absent", () => {
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active default.target');
+    expect(source).toContain('if [ -S "/run/user/$uid/bus" ]');
   });
 
   it("fails closed with actionable user-manager context when the bus never becomes ready", () => {

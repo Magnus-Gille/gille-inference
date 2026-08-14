@@ -192,6 +192,7 @@ describe("buildCageProbeScript — gateway arm does a real HTTP GET requiring a 
       readonlyProbePath: "/usr/.cage-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
     });
     expect(s).toContain("/dev/tcp/127.0.0.1/18080");
     expect(s).toContain("GET /healthz");
@@ -207,6 +208,7 @@ describe("buildCageProbeScript — optional pi runnability arm (job-runnability,
     readonlyProbePath: "/usr/.cage-probe",
     externalProbe: { host: "1.1.1.1", port: 443 },
     gatewayForwardPort: 18080,
+    userManagerSocketPath: "/run/user/4242/systemd/private",
   };
 
   it("asserts piBin exists (-e) and the agent dir's models.json FILE exists (-e), each with its own marker", () => {
@@ -239,6 +241,7 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     "cage-probe:outside-write=denied",
     "cage-probe:egress=blocked",
     "cage-probe:gateway=ok",
+    "cage-probe:user-manager=denied",
   ].join("\n");
 
   it("all four probes passing → ok", () => {
@@ -269,6 +272,12 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     const r = parseCageProbeOutput(PASS.replace("gateway=ok", "gateway=unreachable"));
     expect(r.ok).toBe(false);
     expect(r.failures.join(" ")).toContain("gateway");
+  });
+
+  it("a visible user-manager control socket fails the cage", () => {
+    const r = parseCageProbeOutput(PASS.replace("user-manager=denied", "user-manager=VISIBLE"));
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain("user-manager");
   });
 
   it("a MISSING marker is a failure, never a silent pass (fail-closed)", () => {
@@ -323,6 +332,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     "cage-probe:outside-write=denied",
     "cage-probe:egress=blocked",
     "cage-probe:gateway=ok",
+    "cage-probe:user-manager=denied",
   ].join("\n");
 
   function opts(exec: (argv: string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>) {
@@ -332,6 +342,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
       readonlyProbePath: "/usr/.cage-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
       exec,
     };
   }
@@ -351,6 +362,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     const bash = seen.indexOf("bash");
     expect(bash).toBeGreaterThan(-1);
     expect(seen[bash + 1]).toBe("-c");
+    expect(seen[bash + 2]).toContain("cage-probe:user-manager=denied");
   });
 
   it("a failing probe yields ok=false with the failures listed", async () => {
@@ -558,15 +570,22 @@ function freePort(): Promise<number> {
 import { withUserBusEnv } from "../src/homeserver/code-loop-cage.js";
 
 describe("withUserBusEnv", () => {
-  it("defaults both bus pointers from the uid when missing", () => {
-    const uid = process.getuid!();
-    const out = withUserBusEnv({ PATH: "/usr/bin" });
+  it("uses the native private transport when the session-bus socket is absent", () => {
+    const uid = 4242;
+    const out = withUserBusEnv({ PATH: "/usr/bin" }, { uid, socketExists: () => false });
     expect(out["XDG_RUNTIME_DIR"]).toBe(`/run/user/${uid}`);
-    expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe(`unix:path=/run/user/${uid}/bus`);
+    expect(out).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
     expect(out["PATH"]).toBe("/usr/bin");
   });
+  it("sets the session-bus address only when its socket exists", () => {
+    const out = withUserBusEnv({}, { uid: 4242, socketExists: (path) => path === "/run/user/4242/bus" });
+    expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/4242/bus");
+  });
   it("preserves caller-provided values over the defaults", () => {
-    const out = withUserBusEnv({ XDG_RUNTIME_DIR: "/run/user/999", DBUS_SESSION_BUS_ADDRESS: "unix:path=/x" });
+    const out = withUserBusEnv(
+      { XDG_RUNTIME_DIR: "/run/user/999", DBUS_SESSION_BUS_ADDRESS: "unix:path=/x" },
+      { uid: 4242, socketExists: () => false },
+    );
     expect(out["XDG_RUNTIME_DIR"]).toBe("/run/user/999");
     expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/x");
   });
