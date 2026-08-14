@@ -180,7 +180,9 @@ Environment=HOMESERVER_CODE_LOOP_WORKROOT=$ROOT/gateway/data/code-loop-work
 Environment=HOMESERVER_CODE_LOOP_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
 Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
 BindReadOnlyPaths=$GATEWAY_TREE
-BindReadOnlyPaths=/run/user/$gateway_uid/systemd/private
+# Bind the containing directory so a restarted user manager can replace its
+# private socket without leaving the gateway namespace pinned to a stale inode.
+BindReadOnlyPaths=/run/user/$gateway_uid/systemd
 BindPaths=$ROOT/gateway/data:$GATEWAY_DATA
 ReadOnlyPaths=$GATEWAY_TREE
 InaccessiblePaths=-$GATEWAY_TREE/.claude
@@ -558,6 +560,15 @@ gateway_user_bus_ready() {
   [ -S "/run/user/$1/bus" ] || [ -S "/run/user/$1/systemd/private" ]
 }
 
+gateway_user_default_target_active() {
+  local uid="$1"
+  if [ -S "/run/user/$uid/bus" ]; then
+    runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null
+  else
+    runuser -u "$GATEWAY_USER" -- env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active default.target >/dev/null
+  fi
+}
+
 prepare_gateway_user_manager() {
   local uid
   uid="$(id -u "$GATEWAY_USER")"
@@ -568,7 +579,7 @@ prepare_gateway_user_manager() {
   # its runtime bus rather than racing logind's asynchronous startup.
   systemctl start "user@$uid.service" || die "could not start user@$uid.service for gille-gateway"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if gateway_user_bus_ready "$uid" && runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null; then
+    if gateway_user_bus_ready "$uid" && gateway_user_default_target_active "$uid"; then
       return 0
     fi
     sleep 1
@@ -941,7 +952,7 @@ verify() {
       local gateway_uid
       gateway_uid="$(id -u "$GATEWAY_USER")"
       if [ "$require_user_manager_order" = 1 ]; then
-        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd/private"
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"
       else
         require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE"
       fi

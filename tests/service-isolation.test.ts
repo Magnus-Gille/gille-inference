@@ -303,10 +303,10 @@ describe("service-isolation migration contract (#151)", () => {
       { cwd: root, encoding: "utf8" },
     );
     expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/systemd/private");
-    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/systemd/private");
+    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/systemd");
     const source = readFileSync(script, "utf8");
     expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"');
-    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd/private"');
+    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"');
   });
 
   it("requires an explicit restart acknowledgement and traps every post-mutation refresh failure", () => {
@@ -364,6 +364,12 @@ describe("service-isolation migration contract (#151)", () => {
     const result = runUserManagerHarness(3);
     expect(result.status).toBe(0);
     expect(result.output).toContain("started:user@4242.service");
+  });
+
+  it("uses the private systemd transport when the session-bus socket is absent", () => {
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active default.target');
+    expect(source).toContain('if [ -S "/run/user/$uid/bus" ]');
   });
 
   it("fails closed with actionable user-manager context when the bus never becomes ready", () => {

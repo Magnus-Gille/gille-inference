@@ -274,6 +274,7 @@ export async function runCageSelfTestWithRelay(
       readonlyProbePath: "/usr/.code-loop-cage-write-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: forwardPort,
+      userManagerSocketPath: `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/systemd/private`,
       exec: execCageCommand,
       runnability,
     });

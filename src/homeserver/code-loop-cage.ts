@@ -233,7 +233,7 @@ export function startGatewayRelay(forwardPort: number, gatewayHost: string, gate
 
 // ─── Self-test (fail-closed) ────────────────────────────────────────────────────────────
 
-const PROBES = ["secret", "outside-write", "egress", "gateway"] as const;
+const PROBES = ["secret", "outside-write", "egress", "gateway", "user-manager"] as const;
 type ProbeName = (typeof PROBES)[number];
 
 /** Expected marker value per probe when the cage HOLDS. */
@@ -242,6 +242,7 @@ const EXPECTED: Record<ProbeName, string> = {
   "outside-write": "denied",
   egress: "blocked",
   gateway: "ok",
+  "user-manager": "denied",
 };
 
 export interface CageSelfTestResult {
@@ -312,6 +313,8 @@ export interface CageSelfTestOptions {
   externalProbe: { host: string; port: number };
   /** The IN-NAMESPACE loopback port pasta forwards to the gateway; HTTP GET /healthz must be 200. */
   gatewayForwardPort: number;
+  /** Outer gateway control socket that MUST remain absent from the model-driven inner cage. */
+  userManagerSocketPath: string;
   /** Command executor (DI; the real one is execCageCommand below). */
   exec: (argv: string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>;
   timeoutMs?: number;
@@ -321,7 +324,7 @@ export interface CageSelfTestOptions {
 
 /** Build the bash probe script. Uses bash builtins only (/dev/tcp — no curl dependency). */
 export function buildCageProbeScript(
-  o: Pick<CageSelfTestOptions, "secretPath" | "readonlyProbePath" | "externalProbe" | "gatewayForwardPort" | "runnability">
+  o: Pick<CageSelfTestOptions, "secretPath" | "readonlyProbePath" | "externalProbe" | "gatewayForwardPort" | "userManagerSocketPath" | "runnability">
 ): string {
   // Runs INSIDE the cage. Every probe prints exactly one marker; the parser is fail-closed on a
   // missing marker. The gateway probe does a real HTTP GET /healthz and requires a 200 — a bare
@@ -333,6 +336,7 @@ export function buildCageProbeScript(
     `if timeout 6 bash -c ${shq(
       `exec 3<>/dev/tcp/127.0.0.1/${o.gatewayForwardPort}; printf 'GET /healthz HTTP/1.0\\r\\nHost: gw\\r\\n\\r\\n' >&3; head -1 <&3`
     )} 2>/dev/null | grep -q " 200 "; then echo "cage-probe:gateway=ok"; else echo "cage-probe:gateway=unreachable"; fi`,
+    `if [ -S ${shq(o.userManagerSocketPath)} ]; then echo "cage-probe:user-manager=VISIBLE"; else echo "cage-probe:user-manager=denied"; fi`,
     // Runnability arm (when configured): the tmpfs-over-$HOME must not hide the pi install.
     ...runnabilityChecks(o.runnability).map(
       (c) => `if [ ${c.test} ${shq(c.path)} ]; then echo "cage-probe:${c.name}=ok"; else echo "cage-probe:${c.name}=MISSING"; fi`

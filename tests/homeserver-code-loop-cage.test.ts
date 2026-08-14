@@ -192,6 +192,7 @@ describe("buildCageProbeScript — gateway arm does a real HTTP GET requiring a 
       readonlyProbePath: "/usr/.cage-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
     });
     expect(s).toContain("/dev/tcp/127.0.0.1/18080");
     expect(s).toContain("GET /healthz");
@@ -207,6 +208,7 @@ describe("buildCageProbeScript — optional pi runnability arm (job-runnability,
     readonlyProbePath: "/usr/.cage-probe",
     externalProbe: { host: "1.1.1.1", port: 443 },
     gatewayForwardPort: 18080,
+    userManagerSocketPath: "/run/user/4242/systemd/private",
   };
 
   it("asserts piBin exists (-e) and the agent dir's models.json FILE exists (-e), each with its own marker", () => {
@@ -239,6 +241,7 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     "cage-probe:outside-write=denied",
     "cage-probe:egress=blocked",
     "cage-probe:gateway=ok",
+    "cage-probe:user-manager=denied",
   ].join("\n");
 
   it("all four probes passing → ok", () => {
@@ -269,6 +272,12 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     const r = parseCageProbeOutput(PASS.replace("gateway=ok", "gateway=unreachable"));
     expect(r.ok).toBe(false);
     expect(r.failures.join(" ")).toContain("gateway");
+  });
+
+  it("a visible user-manager control socket fails the cage", () => {
+    const r = parseCageProbeOutput(PASS.replace("user-manager=denied", "user-manager=VISIBLE"));
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain("user-manager");
   });
 
   it("a MISSING marker is a failure, never a silent pass (fail-closed)", () => {
@@ -323,6 +332,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     "cage-probe:outside-write=denied",
     "cage-probe:egress=blocked",
     "cage-probe:gateway=ok",
+    "cage-probe:user-manager=denied",
   ].join("\n");
 
   function opts(exec: (argv: string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>) {
@@ -332,6 +342,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
       readonlyProbePath: "/usr/.cage-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
       exec,
     };
   }
@@ -351,6 +362,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     const bash = seen.indexOf("bash");
     expect(bash).toBeGreaterThan(-1);
     expect(seen[bash + 1]).toBe("-c");
+    expect(seen[bash + 2]).toContain("cage-probe:user-manager=denied");
   });
 
   it("a failing probe yields ok=false with the failures listed", async () => {
