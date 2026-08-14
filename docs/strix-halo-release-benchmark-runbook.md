@@ -3,13 +3,15 @@
 This runbook owns the reproducible, non-deploying first steps for new model releases on the
 128 GB Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) node:
 
-1. archive and inspect an official public model release without downloading weights; and
-2. run a pinned, single-stream `llama-bench` PP/TG matrix that emits machine-readable JSON plus a
+1. archive and inspect an official public model release without downloading weights;
+2. stage the exact source-weight revision with size, hash, disk-reserve, and atomic-publication
+   checks without changing the live roster; and
+3. run a pinned, single-stream `llama-bench` PP/TG matrix that emits machine-readable JSON plus a
    human-readable Markdown report.
 
-It does **not** download or convert weights, replace a runtime, alter llama-swap, restart the
-gateway, or publish a performance conclusion. Conversion, reference-inference parity, live
-serving, and deployment remain separate reviewed steps.
+It does **not** convert weights, replace a runtime, alter llama-swap, restart the gateway, or
+publish a performance conclusion. Reference-inference parity, conversion, live serving, and
+deployment remain separate reviewed steps.
 
 ## Qwen3.8 release ingestion
 
@@ -58,6 +60,35 @@ model fits or should run on one Strix Halo.
 
 If the official config or model card does not prove a field, `release.json` and `REPORT.md` retain
 `unknown`. They do not infer a pre-release architecture from the model name.
+
+## Source-weight staging (no live mutation)
+
+After ingestion records the exact public revision, stage that revision into an explicitly chosen
+non-live root on M5:
+
+```bash
+npm run release:stage-model -- \
+  --model Qwen/Qwen3.8-27B \
+  --revision <40-character-revision-from-release.json> \
+  --out-root <non-live-staging-root>
+```
+
+The staging command rechecks that the official repository is explicitly public and ungated and
+that its current immutable revision equals the requested revision. It follows only same-origin,
+same-model, same-revision Hub tree pagination; rejects unsafe paths, unknown remote-code files,
+missing index shards, malformed LFS metadata, and ambiguous weight layouts; and selects only
+recognized config/tokenizer/processor controls plus the exact safetensors files named by the
+official index.
+
+Downloads are resumable under `.incoming-<revision>`. Every LFS artifact must match both the Hub
+size and SHA-256 OID; controls receive recorded SHA-256 values. The completed deterministic
+`stage-manifest.json` and artifacts become visible at the final revision path through one atomic
+rename. Existing final directories are accepted only after every file is rehashed against their
+manifest. The default disk guard preserves at least 128 GiB after the worst-case download; use
+`--min-free-after-gib` only with an explicitly reviewed alternative reserve.
+
+This command does not select a transformers/llama.cpp revision, run reference inference, convert
+to GGUF, quantize, edit llama-swap, or restart the gateway. Those remain subsequent proof gates.
 
 ## Reproducible direct benchmark
 

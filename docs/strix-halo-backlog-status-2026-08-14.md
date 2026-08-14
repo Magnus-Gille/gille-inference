@@ -11,8 +11,10 @@ needed, the exclusive maintenance fence tracked in issue #196.
 
 1. `Qwen/Qwen3.8-27B` is not publicly available through the anonymous official Hub API, so T17–T20
    cannot start from immutable official bytes.
-2. This Codex session's M5 client reports `missing_credential`; no authenticated M5 call or remote
-   benchmark is possible from this session without restoring the canonical profile.
+2. The canonical Codex M5 profile is restored and `doctor` reports both public and private paths
+   healthy. A bounded review call encountered `busy` and then timed out, so no local-review result
+   was used; read-only M5 inventory remains available. Hardware experiments still require the
+   canonical GPU lease and verified exclusive maintenance path.
 3. Issue #196 is implemented and deterministically tested on this branch: the isolated gateway
    identity acquires the canonical GPU lease, explicit exclusive admission blocks both lanes,
    admitted/queued work drains, llama-swap residency must be stable and non-starting, and the
@@ -41,8 +43,8 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | T13 gfx1151 verification kernel | **Not started** | Only justified after T11/T12 profiling proves target verification is the bottleneck. Premature kernel work is explicitly deferred. |
 | T14 HIP launch gaps | **Not started** | Requires paired rocprof/kernel-wall traces from isolated HIP build under issue #129. |
 | T15 BF16 Flash Attention | **Not measured** | Runtime/feature revision must be pinned and compared through the KV/context matrix. |
-| T16 Qwen3.8 ingest | **Implemented; target unavailable** | Public-only immutable ingestion archives control files, hashes them, and reports architecture without fetching weights or guessing unknowns. |
-| T17 Qwen3.8 conversion | **Blocked** | No official 27B source bytes/config. Conversion also requires transformers/llama.cpp architecture support and reference parity. |
+| T16 Qwen3.8 ingest | **Implemented; target unavailable** | Public-only immutable ingestion archives control files, hashes them, and reports architecture without fetching weights or guessing unknowns. A separate fail-closed source staging command follows bounded pinned pagination, verifies exact indexed LFS size/SHA-256, preserves a disk reserve, resumes interrupted downloads, and atomically publishes only complete revisions without touching the live roster. |
+| T17 Qwen3.8 conversion | **Source staging implemented; release blocked** | No official 27B source bytes/config. Once public, the exact source revision can be staged and hash-verified; conversion still requires a pinned transformers/llama.cpp architecture path and reference parity. |
 | T18 first Qwen3.8 benchmark | **Blocked** | Depends on T17 and an uncontaminated M5 window. Both direct and streaming runners are ready. |
 | T19 Qwen3.8 speculation | **Blocked** | Depends on official architecture and T17. Current runner supports MTP/DFlash/DSpark measurements without assuming availability. |
 | T20 Qwen3.8 vs Qwen3.6 | **Blocked** | Gate D already supplies deterministic coding tasks; the new server comparator supplies latency/throughput controls. Requires actual Qwen3.8 artifact. |

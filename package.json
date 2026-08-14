@@ -15,6 +15,7 @@
     "homeserver:ledger": "tsx src/homeserver/cli.ts ledger",
     "release:check-client": "node scripts/verify-client-package.mjs",
     "release:ingest-model": "tsx scripts/ingest-model-release.ts",
+    "release:stage-model": "tsx scripts/stage-model-release.ts",
     "benchmark:strix": "tsx scripts/strix-benchmark.ts",
     "benchmark:strix-server": "tsx scripts/strix-server-benchmark.ts",
     "benchmark:strix-compare": "tsx scripts/compare-strix-benchmarks.ts",
