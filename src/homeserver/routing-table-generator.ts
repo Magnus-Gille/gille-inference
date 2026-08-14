@@ -70,6 +70,11 @@ export const MODEL_META: Record<string, ModelMeta> = {
     role: "large precision specialist: stable review/triage with low clean-control confabulation.",
     unsafeFor: [],
   },
+  "qwen38-27b": {
+    thinking: true,
+    role: "dense multimodal release candidate with native MTP; explicit use until task evidence qualifies routing.",
+    unsafeFor: [],
+  },
 };
 
 // ── Model family map (issue #48) ──────────────────────────────────────────────────
@@ -94,6 +99,7 @@ export const MODEL_FAMILY: Record<string, string> = {
   "qwen3-coder-next-80b": "qwen",
   "qwen36-a3b": "qwen",
   "qwen35-122b-a10b": "qwen",
+  "qwen38-27b": "qwen",
   gemma4: "gemma",
   "gpt-oss-120b": "gpt-oss",
 };

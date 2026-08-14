@@ -136,6 +136,14 @@ describe("generateRoutingTable — per-task-type selection", () => {
     expect(doc.routing["reason-hard"]?.model).toBe("qwen3-coder-next-80b");
   });
 
+  it("classifies Qwen3.8 as a thinking multimodal candidate without promoting it", () => {
+    expect(MODEL_META["qwen38-27b"]).toMatchObject({
+      thinking: true,
+      unsafeFor: [],
+    });
+    expect(MODEL_META["qwen38-27b"]?.role).toContain("multimodal");
+  });
+
   it("does not route to a model with stale evidence when it is not currently servable", () => {
     const inputs = baseInputs([
       row("reason-math", "qwen35-a3b", {

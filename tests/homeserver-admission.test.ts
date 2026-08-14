@@ -230,6 +230,17 @@ describe("AdmissionController", () => {
 // (503 + Retry-After) while owner traffic is never blocked by it.
 describe("bench/maintenance mode (#108)", () => {
   describe("admit() pure rule", () => {
+    it("exclusive maintenance rejects both owner and guest even when slots are free", () => {
+      for (const lane of ["owner", "guest"] as const) {
+        const r = admit(
+          state({ maintenanceMode: true, maintenanceScope: "exclusive", inflight: 0, maxInflight: 4 }),
+          reqFor(lane),
+          CFG
+        );
+        expect(r.decision).toBe("reject");
+      }
+    });
+
     it("maintenance + guest → reject 503 with the maintenance retry-after", () => {
       const r = admit(state({ maintenanceMode: true }), reqFor("guest"), {
         ...CFG,
@@ -306,6 +317,34 @@ describe("bench/maintenance mode (#108)", () => {
         maintenanceMode: true,
       });
       await expect(ctrl.acquire(reqFor("guest"))).rejects.toMatchObject({ retryAfterSeconds: 42 });
+    });
+
+    it("keeps guest-only and exclusive maintenance behavior distinct", async () => {
+      const ctrl = new AdmissionController(baseCfg);
+      ctrl.setMaintenanceMode(true, 60_000, "guest");
+      expect(ctrl.snapshot().maintenanceScope).toBe("guest");
+      const ownerRelease = await ctrl.acquire(reqFor("owner"));
+      ownerRelease();
+
+      ctrl.setMaintenanceMode(true, 60_000, "exclusive");
+      expect(ctrl.snapshot().maintenanceScope).toBe("exclusive");
+      await expect(ctrl.acquire(reqFor("owner"))).rejects.toBeInstanceOf(AdmissionRejected);
+      await expect(ctrl.acquire(reqFor("guest"))).rejects.toBeInstanceOf(AdmissionRejected);
+    });
+
+    it("does not admit an already queued owner after exclusive mode engages", async () => {
+      const ctrl = new AdmissionController({
+        maxInflight: 1,
+        ownerQueueMaxMs: 25,
+        retryAfterAtCapSeconds: 2,
+      });
+      const firstRelease = await ctrl.acquire(reqFor("owner"));
+      const queued = ctrl.acquire(reqFor("owner"));
+      expect(ctrl.snapshot().ownerQueued).toBe(1);
+      ctrl.setMaintenanceMode(true, 60_000, "exclusive");
+      firstRelease();
+      expect(ctrl.snapshot().inflight).toBe(0);
+      await expect(queued).rejects.toBeInstanceOf(AdmissionRejected);
     });
   });
 

@@ -639,7 +639,8 @@ describe("portal page content", () => {
     expect(body).toContain("vibethinker-3b");
     expect(body).toContain("qwen3-coder-next-80b");
     expect(body).toContain("gpt-oss-120b");
-    expect(body).toContain("qwen35-122b-a10b");
+    expect(body).toContain("qwen38-27b");
+    expect(body).not.toContain("qwen35-122b-a10b");
     // Quant and context facts
     expect(body).toContain("Q4_K_M");
     expect(body).toContain("Q8_0");
@@ -647,6 +648,7 @@ describe("portal page content", () => {
     expect(body).toContain("40&#8211;70s");
     expect(body).toContain("131,072");
     expect(body).toContain("65,536");
+    expect(body).toContain("native MTP");
     // External-user examples document VibeThinker's full sampler profile and higher explicit cap.
     expect(body).toContain('extra_body={"top_k": 0, "min_p": 0}');
     expect(body).toContain("Ordinary models cap");

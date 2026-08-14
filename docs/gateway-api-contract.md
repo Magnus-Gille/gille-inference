@@ -87,7 +87,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |
 | PUT | `/ledger/{id}/reviewer-usefulness` | minted owner-admin | Record reviewer usefulness for one validated `review-bounded` ledger row by exact `ledgerId`; requires a non-empty authenticated logical alias, exact retries are idempotent, differing overwrites 409 |
-| POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio) |
+| POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio/llama.cpp). The gateway forces ordinary exact-prefix prompt caching and strips client-directed `id_slot`/`n_cache_reuse`; slot/cache lifecycle remains server-owned. |
 | POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
 | POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
 | POST | `/admin/models/unload` | admin scope | Unload one/all models |

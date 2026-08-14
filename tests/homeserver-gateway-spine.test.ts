@@ -1269,6 +1269,20 @@ describe("gateway spine — HTTP integration", () => {
     expect(sent.n).toBe(1);
   });
 
+  it("keeps prompt caching server-owned and strips client-directed slot/cache-reuse controls", async () => {
+    const minted = mintKey({ alias: "cache-policy", tier: "guest" }, DEFAULTS);
+    const res = await chat(minted.plaintextKey, {
+      cache_prompt: false,
+      id_slot: 0,
+      n_cache_reuse: 1,
+    });
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(lastUpstreamBody) as Record<string, unknown>;
+    expect(sent["cache_prompt"]).toBe(true);
+    expect(sent).not.toHaveProperty("id_slot");
+    expect(sent).not.toHaveProperty("n_cache_reuse");
+  });
+
   // ─── #7 — GET /ledger is admin-gated (no guest data exposure) ─────────────────────────
   it("#7: a guest key gets 403 on GET /ledger", async () => {
     const guest = mintKey({ alias: "ledger-guest", tier: "guest" }, DEFAULTS);
