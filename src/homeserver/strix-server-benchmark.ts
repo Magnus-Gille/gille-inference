@@ -248,6 +248,10 @@ export function validateServerProvenance(value: unknown): StrixServerProvenance 
     if (!Number.isInteger(item) || (item as number) < 0) throw new Error(`provenance.${key} must be a non-negative integer`);
     return item as number;
   };
+  const cacheRamMiB = record["cacheRamMiB"];
+  if (!Number.isInteger(cacheRamMiB) || (cacheRamMiB as number) < -1) {
+    throw new Error("provenance.cacheRamMiB must be -1 or a non-negative integer");
+  }
   const draftDepth = record["draftDepth"];
   if (draftDepth !== null && (!Number.isInteger(draftDepth) || (draftDepth as number) <= 0)) throw new Error("provenance.draftDepth must be null or a positive integer");
   const cacheIdleSlots = record["cacheIdleSlots"];
@@ -272,7 +276,7 @@ export function validateServerProvenance(value: unknown): StrixServerProvenance 
     parallelism: positive("parallelism"),
     speculation: requiredString(record, "speculation"),
     draftDepth: draftDepth as number | null,
-    cacheRamMiB: nonNegative("cacheRamMiB"),
+    cacheRamMiB: cacheRamMiB as number,
     contextCheckpoints: nonNegative("contextCheckpoints"),
     checkpointMinStep: nonNegative("checkpointMinStep"),
     cacheIdleSlots,

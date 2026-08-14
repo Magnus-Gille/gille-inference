@@ -1284,6 +1284,16 @@ async function handleChatProxy(
   delete body["maxTokens"];
   delete body["node"];
 
+  // Prompt caching is shared server policy, not a caller-controlled slot primitive. llama-server
+  // safely reuses only the exact common token prefix, so changed repository content diverges and
+  // is re-evaluated without the gateway retaining paths, file manifests, or prompt content.
+  // Never forward `id_slot`: pinning a public request to a shared slot would let one principal
+  // interfere with another principal's cache/residency. Keep cache-reuse chunk policy on the
+  // reviewed server argv for the same reason, and make the ordinary exact-prefix cache explicit.
+  body["cache_prompt"] = true;
+  delete body["id_slot"];
+  delete body["n_cache_reuse"];
+
   if (parsed.stream) {
     // Ask LM Studio to emit a terminal usage frame so we can reconcile real token cost.
     body["stream_options"] = { include_usage: true };

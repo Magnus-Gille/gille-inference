@@ -72,6 +72,8 @@ describe("parseStrixServerBenchmarkArgs", () => {
       cacheIdleSlots: "on",
     });
     expect(provenance.backend).toBe("vulkan");
+    expect(validateServerProvenance({ ...provenance, cacheRamMiB: -1 }).cacheRamMiB).toBe(-1);
+    expect(() => validateServerProvenance({ ...provenance, cacheRamMiB: -2 })).toThrow(/cacheRamMiB/);
     expect(() => validateServerProvenance({ ...provenance, runtimeCommit: "main" })).toThrow(/full Git revision/);
   });
 });

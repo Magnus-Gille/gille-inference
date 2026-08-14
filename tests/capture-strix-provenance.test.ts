@@ -24,6 +24,10 @@ describe("capture Strix provenance", () => {
       cacheIdleSlots: "on",
     });
     expect(() => parseCaptureArgs([...ARGV, "--pid", "456"])).toThrow(/duplicate/);
+    const unlimited = ARGV.map((value, index) => ARGV[index - 1] === "--cache-ram-mib" ? "-1" : value);
+    expect(parseCaptureArgs(unlimited).cacheRamMiB).toBe(-1);
+    const invalid = ARGV.map((value, index) => ARGV[index - 1] === "--cache-ram-mib" ? "-2" : value);
+    expect(() => parseCaptureArgs(invalid)).toThrow(/cache-ram-mib/);
   });
 
   it("hashes process inputs without storing paths or raw command arguments", async () => {

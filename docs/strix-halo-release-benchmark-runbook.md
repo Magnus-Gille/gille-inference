@@ -168,13 +168,37 @@ npm run benchmark:strix-compare -- \
 Supported axes are `backend`, `quant`, `kv`, `cache`, `speculation`, `runtime`, and `parallelism`.
 The `cache` axis permits only RAM-cache size, checkpoint count/minimum step, idle-slot caching, and
 the resulting argv hash to change. Set all four cache fields explicitly, including zero/off control
-arms, so server defaults cannot silently invalidate the experiment. The
+arms, so server defaults cannot silently invalidate the experiment. `--cache-ram-mib -1` records
+llama-server's documented unlimited mode; values below `-1` are rejected. The
 comparator deliberately declares no automatic winner: the relevant issue's preregistered quality,
 short/long-context, soak, memory, and stability gates still decide adoption.
 
 For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended revision, keep
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output
 prefix. A backend claim requires repeated identical workloads; the label alone is not evidence.
+
+## Read-only host reproducibility snapshot
+
+Capture the host state beside every benchmark series. The firmware UMA setting is not reliably
+observable from Linux, so it must be supplied from the operator's BIOS observation (use `unknown`
+when it was not checked):
+
+```bash
+npm run benchmark:strix-host -- \
+  --bios-uma 64G \
+  --out data/strix-benchmarks/host-profile-before
+```
+
+The command performs no tuning and writes mode-0600 JSON plus Markdown. It records kernel,
+Mesa/ROCm, memory and swap, CPU/platform power policy, DRM VRAM/GTT/clocks, and available hwmon
+temperature/power observations. Only explicitly allow-listed AMD/TTM memory parameters are copied
+from the kernel command line; the raw command line is never stored. Missing or unreadable values
+remain `null` rather than being reported as zero. Hwmon power is a point observation, not wall
+energy, so publish wall-meter evidence for efficiency claims.
+
+Use issue #195's one-variable A/B contract for any BIOS, kernel, memory, clock, or power change.
+The snapshot does not authorize those mutations and does not make a non-Strix capture a hardware
+result.
 
 ## Qwen3.8 progression gate
 

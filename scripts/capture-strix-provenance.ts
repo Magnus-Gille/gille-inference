@@ -60,6 +60,12 @@ function nonNegative(raw: string, flag: string): number {
   return value;
 }
 
+function cacheRamMiB(raw: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < -1) throw new Error("--cache-ram-mib must be -1 or a non-negative integer");
+  return value;
+}
+
 export function parseCaptureArgs(argv: string[]): CaptureArgs {
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index++) {
@@ -97,7 +103,7 @@ export function parseCaptureArgs(argv: string[]): CaptureArgs {
     parallelism: positive(required("--parallelism"), "--parallelism"),
     speculation: required("--speculation"),
     draftDepth,
-    cacheRamMiB: nonNegative(required("--cache-ram-mib"), "--cache-ram-mib"),
+    cacheRamMiB: cacheRamMiB(required("--cache-ram-mib")),
     contextCheckpoints: nonNegative(required("--ctx-checkpoints"), "--ctx-checkpoints"),
     checkpointMinStep: nonNegative(required("--checkpoint-min-step"), "--checkpoint-min-step"),
     cacheIdleSlots,
