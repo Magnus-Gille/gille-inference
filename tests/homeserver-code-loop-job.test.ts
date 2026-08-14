@@ -45,6 +45,7 @@ import {
   claimDurableCodeLoopRun,
   codeLoopRequestFingerprint,
   isDurableCodeLoopWorkLive,
+  readDurableCodeLoopRunByWork,
 } from "../src/homeserver/code-loop-store.js";
 import {
   TASK_FINGERPRINT_VERSION,
@@ -105,6 +106,7 @@ function fakeDeps(over: {
   now?: () => number;
   learningTaskAdmission?: CodeLoopDeps["learningTaskAdmission"];
   keyAlias?: string;
+  cleanupUnit?: (unit: string) => Promise<void>;
 } = {}): CodeLoopDeps {
   const okRun = async (): Promise<EngineRunResult> => ({
     outcome: "completed",
@@ -129,6 +131,7 @@ function fakeDeps(over: {
     runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env }),
     acquireLease: async () => (over.lease === "unavailable" ? null : { release: async () => {} }),
     cageSelfTest: async () => ({ ok: over.cageOk !== false, failures: over.cageOk === false ? ["forced fail"] : [] }),
+    cleanupUnit: over.cleanupUnit ?? (async () => {}),
   };
 }
 
@@ -223,6 +226,42 @@ describe("startCodeLoop — refusals", () => {
 // ─── full lifecycle + real diff harvest ─────────────────────────────────────────────────
 
 describe("startCodeLoop — lifecycle + git diff harvest", () => {
+  it("persists a failed transient cleanup and the sweep retries it after terminal arm-error", async () => {
+    const start = await startCodeLoop(
+      { instruction: "no-op", files: [{ path: "a.ts", content: "export {};\n" }] },
+      startCfg(),
+      fakeDeps({ cleanupUnit: async () => { throw new Error("user bus unavailable"); } }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind === "result") {
+      expect(result.result.status).toBe("arm-error");
+      expect(result.result.detail).toContain("transient cleanup pending");
+    }
+    expect(readDurableCodeLoopRunByWork(workroot, start.work_id)?.cleanup_pending).toBe(true);
+    const sandboxName = readdirSync(workroot).find((name) => name.startsWith(`${start.work_id}-`));
+    expect(sandboxName).toBeDefined();
+    rmSync(join(workroot, sandboxName!), { recursive: true, force: true });
+
+    await expect(sweepCodeLoopSandboxes(
+      { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+      { now: () => Date.now(), stopUnit: async () => { throw new Error("bus still unavailable"); } },
+    )).rejects.toThrow("bus still unavailable");
+    expect(readDurableCodeLoopRunByWork(workroot, start.work_id)?.cleanup_pending).toBe(true);
+
+    const stopped: string[] = [];
+    await sweepCodeLoopSandboxes(
+      { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+      { now: () => Date.now(), stopUnit: async (unit) => { stopped.push(unit); } },
+    );
+    expect(stopped).toEqual([`code-loop-${start.work_id}`]);
+    expect(readDurableCodeLoopRunByWork(workroot, start.work_id)?.cleanup_pending).toBe(false);
+  });
+
   it("completed run harvests the diff, changed files, and pi summary; result re-fetchable", async () => {
     const engineRun = async (sandboxDir: string): Promise<EngineRunResult> => {
       writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n"); // modify the seed
@@ -1800,6 +1839,25 @@ describe("sweepCodeLoopSandboxes", () => {
     expect(stopped).toEqual(["code-loop-cl-20260702-abcdef12"]);
     const meta = JSON.parse(readFileSync(join(dir, ".meta.json"), "utf8")) as { status: string };
     expect(meta.status).toBe("orphaned");
+  });
+
+  it("does not mark a stale run orphaned when its transient service cannot be stopped", async () => {
+    const workroot = mkdtempSync(join(tmpdir(), "cl-sweep-stop-fail-"));
+    const workId = "cl-20260815-abcdef12";
+    const dir = join(workroot, `${workId}-sandbox`);
+    mkdirSync(dir);
+    writeFileSync(join(dir, ".meta.json"), JSON.stringify({
+      work_id: workId,
+      status: "running",
+      scope_unit: `code-loop-${workId}`,
+      model: "m",
+      started_at_ms: Date.now() - 60_000,
+    }));
+    await expect(sweepCodeLoopSandboxes(
+      { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+      { now: () => Date.now(), stopUnit: async () => { throw new Error("user bus unavailable"); } },
+    )).rejects.toThrow("user bus unavailable");
+    expect(JSON.parse(readFileSync(join(dir, ".meta.json"), "utf8")).status).toBe("running");
   });
 
   it("does NOT hand systemctl an attacker-chosen scope_unit from a tampered .meta.json", async () => {

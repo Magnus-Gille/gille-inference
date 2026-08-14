@@ -22,6 +22,7 @@ import {
   compactDurableCodeLoopRunResult,
   codeLoopRequestFingerprint,
   isDurableCodeLoopWorkLive,
+  listDurableCodeLoopRunsPendingCleanup,
   markDurableCodeLoopRunOrphaned,
   markUnownedDurableCodeLoopRunsOrphaned,
   persistDurableCodeLoopRun,
@@ -441,6 +442,8 @@ interface Job {
   durableClientRunId: string;
   durableRequestFingerprint: string;
   learningTaskGatewayEcho: LearningTaskGatewayEcho | null;
+  /** Durable fail-closed marker cleared only after the transient service is verified absent. */
+  cleanupPending: boolean;
   /**
    * The full ADMITTED stamp (#33), carried alongside the gateway echo above. The echo is what's
    * persisted/returned to the caller; this is what `writeLedger` needs to derive evidence identity
@@ -473,6 +476,7 @@ interface MetaRecord {
   scope_unit: string;
   model: string;
   started_at_ms: number;
+  cleanup_pending?: boolean;
 }
 
 function writeMeta(sandboxDir: string, m: MetaRecord, writer: (path: string, content: string) => void = writeFileSync): void {
@@ -484,7 +488,7 @@ function writeMeta(sandboxDir: string, m: MetaRecord, writer: (path: string, con
 }
 
 /**
- * The transient scope unit a run creates is DETERMINISTICALLY `code-loop-<workId>`, and workId is
+ * The transient service unit a run creates is DETERMINISTICALLY `code-loop-<workId>`, and workId is
  * `cl-YYYYMMDD-<8 hex>` (newWorkId). The orphan sweep reads `scope_unit` from an in-sandbox
  * `.meta.json` that a hostile pi CAN overwrite (the sandbox is its only writable path), so the
  * sweep must only ever hand `systemctl --user stop` a name matching this exact shape — never an
@@ -918,6 +922,7 @@ export async function startCodeLoop(
       usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
       result: null,
       started_at_ms: acceptedAt,
+      cleanup_pending: true,
       ...(learningTaskGatewayEcho !== null ? { learning_task_gateway_echo: learningTaskGatewayEcho } : {}),
     };
     try {
@@ -975,6 +980,7 @@ export async function startCodeLoop(
     durableClientRunId,
     durableRequestFingerprint,
     learningTaskGatewayEcho,
+    cleanupPending: true,
     learningTaskStamp: validatedLearningStamp,
   };
   jobs.set(workId, job);
@@ -992,7 +998,7 @@ export async function startCodeLoop(
   // from being scheduled (the durable record drives recovery/retention).
   writeMeta(
     sandboxDir,
-    { work_id: workId, status: "running", scope_unit: unitName, model: cfg.model, started_at_ms: acceptedAt },
+    { work_id: workId, status: "running", scope_unit: unitName, model: cfg.model, started_at_ms: acceptedAt, cleanup_pending: true },
     deps.writeMeta ?? writeFileSync
   );
 
@@ -1082,6 +1088,19 @@ async function runJob(
     job.summary = "";
   }
 
+  // A manager-spawned service is not a child of the gateway. Publish a terminal result only after
+  // an explicit stop/absence check; if the user bus is unavailable, preserve a durable retry bit
+  // so the periodic/startup sweep cannot forget a residual pasta/bwrap tree.
+  try {
+    if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
+    job.cleanupPending = false;
+  } catch (err) {
+    job.cleanupPending = true;
+    outcome = "arm-error";
+    detail = `transient cleanup pending: ${(err as Error).message}`;
+    job.summary = "";
+  }
+
   // Harvest the diff from git (ground truth), on ALL terminal statuses (best-effort).
   const harvest = await gitHarvest(job.sandboxDir, seedSha, deps);
   const protectedViolations = harvest.changedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
@@ -1093,6 +1112,15 @@ async function runJob(
     const checkStartedAt = deps.now();
     check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
     checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
+    try {
+      if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
+      job.cleanupPending = false;
+    } catch (err) {
+      job.cleanupPending = true;
+      outcome = "arm-error";
+      detail = `transient check cleanup pending: ${(err as Error).message}`;
+      job.summary = "";
+    }
   }
 
   const telemetry = buildResultTelemetry(job, harvest.changedFiles.length > 0, checkDurationMs);
@@ -1219,8 +1247,13 @@ async function runCheck(
   cageArgv: string[],
   deps: CodeLoopDeps
 ): Promise<{ ran: boolean; exit_code: number | null; output_tail: string }> {
-  // check_cmd runs INSIDE the same cage with a minimal env (PATH/HOME only — not even HS_API_KEY).
-  const env = { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: sandboxDir };
+  // check_cmd runs INSIDE the same cage with a minimal env. The fixed non-secret HS_API_KEY value
+  // only satisfies systemd-run's environment-copy contract; the relay is already closed.
+  const env = {
+    PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+    HOME: sandboxDir,
+    HS_API_KEY: "code-loop-check-no-upstream",
+  };
   const argv = [...cageArgv, "bash", "-c", checkCmd];
   const r = await deps.runCommand(argv, { cwd: sandboxDir, env, timeoutMs: CHECK_TIMEOUT_MS });
   const combined = `${r.stdout}\n${r.stderr}`;
@@ -1251,6 +1284,7 @@ async function finalizeJobWithResult(
     scope_unit: unitName,
     model: job.model,
     started_at_ms: job.startedAtMs,
+    cleanup_pending: job.cleanupPending,
   });
   persistJobDurable(job);
   recordCodeLoopRun(result.status);
@@ -1300,6 +1334,7 @@ function persistJobDurable(job: Job): void {
       usage: job.usage,
       result: job.result,
       started_at_ms: job.startedAtMs,
+      cleanup_pending: job.cleanupPending,
       ...(job.learningTaskGatewayEcho !== null
         ? { learning_task_gateway_echo: job.learningTaskGatewayEcho }
         : {}),
@@ -1382,8 +1417,8 @@ export function getJobResult(workId: string, workroot?: string): GetResultOutcom
 
 /**
  * Scan the workroot at gateway startup. Any sandbox with a `.meta.json` status "running" and no
- * live in-memory job is orphaned (a restart killed its process) → best-effort stop its transient
- * scope unit, mark it orphaned. Any sandbox older than the TTL is reclaimed (rm -rf).
+ * live in-memory job is orphaned (a restart killed its process) → stop its transient service and
+ * only then mark it orphaned. Any sandbox older than the TTL is reclaimed (rm -rf).
  */
 export async function sweepCodeLoopSandboxes(
   cfg: { workroot: string; retentionTtlMs: number },
@@ -1392,6 +1427,20 @@ export async function sweepCodeLoopSandboxes(
   let orphaned = 0;
   let reclaimed = 0;
   const now = deps.now();
+  const cleanupVerifiedWorkIds = new Set<string>();
+  // Reap trusted cleanup obligations from the durable index first. A caged process owns and may
+  // delete its sandbox, so directory enumeration must never be the only path to a residual unit.
+  for (const record of listDurableCodeLoopRunsPendingCleanup(cfg.workroot)) {
+    if (
+      record.status === "running" &&
+      (jobs.has(record.work_id) || isDurableCodeLoopWorkLive(cfg.workroot, record.work_id))
+    ) continue;
+    const unitName = `code-loop-${record.work_id}`;
+    if (!isCodeLoopUnitName(unitName)) continue;
+    await deps.stopUnit(unitName);
+    persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+    cleanupVerifiedWorkIds.add(record.work_id);
+  }
   // Enforce source retention from the trusted caller record even when the sandbox or its
   // agent-writable metadata was deleted/corrupted. This is idempotent and safe to run periodically.
   compactExpiredDurableCodeLoopRuns(cfg.workroot, now, cfg.retentionTtlMs);
@@ -1458,17 +1507,34 @@ export async function sweepCodeLoopSandboxes(
       }
     }
     const startedAtMs = durable?.started_at_ms ?? meta?.started_at_ms ?? filesystemStartedAtMs;
+    const unitName = `code-loop-${workId}`;
+    let unitCleanupVerified = cleanupVerifiedWorkIds.has(workId);
+
+    // A terminal run may still carry a trusted durable cleanup obligation when the final user-bus
+    // stop failed. Retry it even though the public result is already arm-error. For a running run,
+    // only take ownership after its durable process identity is dead; never stop a rolling peer.
+    if (
+      durable?.cleanup_pending === true &&
+      isCodeLoopUnitName(unitName) &&
+      (status !== "running" || (!jobs.has(workId) && !isDurableCodeLoopWorkLive(cfg.workroot, workId)))
+    ) {
+      await deps.stopUnit(unitName);
+      unitCleanupVerified = true;
+      durable = { ...durable, cleanup_pending: false };
+      persistDurableCodeLoopRun(cfg.workroot, durable);
+      if (meta !== null) {
+        meta = { ...meta, work_id: workId, cleanup_pending: false };
+        writeMeta(dir, meta);
+      }
+    }
 
     // Orphan detection is anchored to the deterministic work id + durable process identity, not
     // the mutable metadata. A valid live lease survives rolling gateway overlap.
     if (status === "running" && !jobs.has(workId) && !isDurableCodeLoopWorkLive(cfg.workroot, workId)) {
-      const unitName = `code-loop-${workId}`;
       if (isCodeLoopUnitName(unitName)) {
-        try {
-          await deps.stopUnit(unitName);
-        } catch {
-          /* unit already gone */
-        }
+        // Propagate a real user-bus/stop failure. Marking the run orphaned while its manager-
+        // spawned pasta/bwrap tree is still active would permit a second concurrent run.
+        if (!unitCleanupVerified) await deps.stopUnit(unitName);
       }
       if (meta !== null) writeMeta(dir, { ...meta, work_id: workId, status: "orphaned" });
       markDurableCodeLoopRunOrphaned(cfg.workroot, workId);

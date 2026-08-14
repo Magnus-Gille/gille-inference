@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import net from "node:net";
 import http from "node:http";
@@ -18,8 +19,10 @@ import { recordCodeLoopRelayDenied } from "./metrics.js";
  * `/bin/true` primitive test passes but real egress stays OPEN. So egress is NOT enforced by
  * systemd here. The cage instead composes THREE mechanisms, each verified enforced on the box:
  *
- *   • `systemd-run --user --scope` — RESOURCE caps only: MemoryMax / TasksMax bound the whole
- *     subprocess TREE (the 2026-07-01 OOM lesson). (IP properties are NOT used — they are no-ops.)
+ *   • `systemd-run --user` transient SERVICE — the dedicated user manager spawns the cage outside
+ *     the gateway service's inherited NoNewPrivileges/private-device namespace. `--wait --pipe`
+ *     preserves synchronous output, while RuntimeMaxSec + explicit validated-unit cleanup bound
+ *     every detached tree. MemoryMax / TasksMax still cap the whole subprocess tree.
  *   • `pasta -T <port>` (passt) — NETWORK: runs the child in a fresh user+net namespace with NO
  *     general outbound route (all egress BLOCKED) and forwards ONLY the one loopback port to the
  *     host's loopback, where a per-run relay bridges to the gateway. So the ONLY reachable
@@ -59,12 +62,28 @@ export interface CageArgvOptions {
    * directly under $HOME derives $HOME itself as its bin dir).
    */
   extraRoBinds?: string[];
-  /** Transient scope unit name (addressable for the orphan sweep's best-effort stop). */
+  /** Dedicated Pi provider-config directory; exposed to pi as an environment value only. */
+  piAgentDir: string;
+  /** Scrubbed PATH for the inner process. */
+  innerPath?: string;
+  /** Transient service unit name (addressable for bounded cleanup and the orphan sweep). */
   unitName: string;
   /** systemd MemoryMax for the subprocess tree. Default "8G". */
   memoryMax?: string;
   /** systemd TasksMax for the subprocess tree. Default 256. */
   tasksMax?: number;
+  /** systemd RuntimeMaxSec backstop. Default 150 seconds. */
+  runtimeMaxSec?: number;
+}
+
+const TRANSIENT_CODE_LOOP_UNIT_RE = /^(?:code-loop-cl-\d{8}-[0-9a-f]{8}|code-loop-cage-probe-\d+)$/;
+
+/** Extract only the exact transient units this module is authorized to stop. */
+export function transientCodeLoopUnitFromArgv(argv: string[]): string | null {
+  const units = argv
+    .filter((arg) => arg.startsWith("--unit="))
+    .map((arg) => arg.slice("--unit=".length));
+  return units.length === 1 && TRANSIENT_CODE_LOOP_UNIT_RE.test(units[0]!) ? units[0]! : null;
 }
 
 /**
@@ -85,19 +104,37 @@ function bindExposesHome(p: string, homeDir: string): boolean {
 export function buildCageArgv(o: CageArgvOptions): string[] {
   const memoryMax = o.memoryMax ?? "8G";
   const tasksMax = o.tasksMax ?? 256;
+  const runtimeMaxSec = o.runtimeMaxSec ?? 150;
+  const innerPath = o.innerPath ?? "/usr/local/bin:/usr/bin:/bin";
+  // The capability itself stays in the systemd-run CLIENT environment (not argv). The manager
+  // copies it into the transient service, then this trusted static shim constructs the exact
+  // model-visible allowlist without ever interpolating the value into /proc/*/cmdline.
+  const innerEnvShim =
+    `exec /usr/bin/env -i PATH=${shq(innerPath)} HOME=${shq(o.sandboxDir)} ` +
+    `PI_CODING_AGENT_DIR=${shq(o.piAgentDir)} HS_API_KEY="$HS_API_KEY" "$@"`;
   const safeRoBinds = (o.extraRoBinds ?? []).filter((p) => !bindExposesHome(p, o.homeDir));
   return [
-    // systemd transient scope: RESOURCE caps for the whole tree (MemoryMax/TasksMax DO work in a
-    // --user scope; IP filtering does NOT and is deliberately absent — see the module header).
+    // The user manager creates the service in its own execution context, rather than inheriting
+    // the gateway's NoNewPrivileges/private-device namespace as --scope did. Output remains
+    // synchronous, and both systemd and the caller own bounded whole-cgroup cleanup.
     "systemd-run",
     "--user",
-    "--scope",
+    "--wait",
+    "--pipe",
     "--collect",
     "--quiet",
+    "--service-type=exec",
+    "--expand-environment=no",
+    // NAME without '=VALUE' copies from the client environment without putting the per-run
+    // capability in argv (other local users may be able to read process command lines).
+    "--setenv=HS_API_KEY",
     `--unit=${o.unitName}`,
     "-p", `MemoryMax=${memoryMax}`,
     "-p", `TasksMax=${tasksMax}`,
     "-p", "CPUWeight=50",
+    "-p", `RuntimeMaxSec=${runtimeMaxSec}`,
+    "-p", "TimeoutStopSec=10s",
+    "-p", "KillMode=control-group",
     "--",
     // pasta: fresh user+net namespace, NO general outbound (all egress blocked), forwarding ONLY
     // the one loopback port to the host loopback. No --config-net (which would give general NAT
@@ -122,6 +159,9 @@ export function buildCageArgv(o: CageArgvOptions): string[] {
     "--ro-bind-try", "/bin", "/bin",
     "--ro-bind-try", "/sbin", "/sbin",
     "--ro-bind-try", "/etc", "/etc",
+    // The isolated service's real gateway.env lives below this broad /etc mount. Mask the entire
+    // application directory after the bind so neither the current nor future secret files leak.
+    "--tmpfs", "/etc/gille-inference",
     "--proc", "/proc",
     "--dev", "/dev",
     "--tmpfs", "/tmp",
@@ -136,8 +176,8 @@ export function buildCageArgv(o: CageArgvOptions): string[] {
     // The ONE read-write surface: the job sandbox.
     "--bind", o.sandboxDir, o.sandboxDir,
     "--chdir", o.sandboxDir,
-    "--setenv", "HOME", o.sandboxDir,
     "--",
+    "/bin/sh", "-c", innerEnvShim, "code-loop-env",
   ];
 }
 
@@ -145,13 +185,15 @@ export function buildCageArgv(o: CageArgvOptions): string[] {
 
 export interface GatewayRelay {
   port: number;
+  /** High-entropy capability required from the one caged client; valid only for this relay. */
+  clientApiKey: string;
   close: () => Promise<void>;
 }
 
 /**
  * The gateway paths the caged pi is allowed to reach through the relay — the SECURITY BOUNDARY
- * of the one egress hole. The service key is owner-tier and should carry agent scope; the relay
- * still treats a legacy/admin-scoped key as possible during migration. A RAW byte-pipe could let
+ * of the one egress hole. The upstream key should carry agent scope; the relay still treats a
+ * legacy/admin-scoped key as possible during migration. A RAW byte-pipe could let
  * a prompt-injected pi POST /admin/keys (persist a key), unload models, toggle
  * maintenance, revoke keys — nullifying the cage's egress win. This allowlist restricts the relay
  * to the two routes pi legitimately needs plus the unauthenticated liveness probe the cage
@@ -177,11 +219,23 @@ function relayPathAllowed(method: string | undefined, url: string | undefined): 
  * it is a minimal HTTP forwarder that ONLY relays the allowlisted method+path (RELAY_ALLOW),
  * streaming request and response both ways (SSE-safe, with backpressure). A non-allowlisted request
  * is answered `403 code_loop relay: path not allowed` WITHOUT any upstream connection; non-HTTP /
- * garbage traffic closes the socket. Dependency-free (node:http). The bearer header pi already
- * sends is forwarded unchanged — no auth changes here.
+ * garbage traffic closes the socket. Dependency-free (node:http). Authenticated routes require a
+ * fresh 256-bit per-run client capability; the relay strips every caller bearer and injects the
+ * configured gateway key only on the upstream hop. Thus the loopback port is not a bearer proxy
+ * for unrelated local processes, and the real key never enters the cage.
  */
-export function startGatewayRelay(forwardPort: number, gatewayHost: string, gatewayPort: number): Promise<GatewayRelay> {
+export function startGatewayRelay(
+  forwardPort: number,
+  gatewayHost: string,
+  gatewayPort: number,
+  gatewayApiKey: string,
+): Promise<GatewayRelay> {
   return new Promise((resolve, reject) => {
+    if (gatewayApiKey === "") {
+      reject(new Error("code_loop relay requires a configured upstream gateway key"));
+      return;
+    }
+    const clientApiKey = randomBytes(32).toString("base64url");
     const sockets = new Set<net.Socket>();
     const server = http.createServer((req, res) => {
       if (!relayPathAllowed(req.method, req.url)) {
@@ -192,9 +246,27 @@ export function startGatewayRelay(forwardPort: number, gatewayHost: string, gate
         res.end(JSON.stringify({ error: { message: "code_loop relay: path not allowed", type: "forbidden" } }));
         return;
       }
-      // Forward verbatim to the gateway, streaming both ways.
+      const pathname = (req.url ?? "").split("?")[0];
+      if (pathname !== "/healthz") {
+        const supplied = req.headers.authorization ?? "";
+        const expected = `Bearer ${clientApiKey}`;
+        const suppliedBytes = Buffer.from(supplied);
+        const expectedBytes = Buffer.from(expected);
+        if (suppliedBytes.length !== expectedBytes.length || !timingSafeEqual(suppliedBytes, expectedBytes)) {
+          req.resume();
+          try { recordCodeLoopRelayDenied(); } catch { /* metrics best-effort */ }
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "code_loop relay: invalid run capability", type: "unauthorized" } }));
+          return;
+        }
+      }
+      // Never forward caller-chosen auth. The ephemeral local capability is checked above, then
+      // replaced only on authenticated inference routes with the real upstream gateway bearer.
+      const headers = { ...req.headers };
+      delete headers.authorization;
+      if (pathname !== "/healthz") headers.authorization = `Bearer ${gatewayApiKey}`;
       const upstream = http.request(
-        { host: gatewayHost, port: gatewayPort, method: req.method, path: req.url, headers: req.headers },
+        { host: gatewayHost, port: gatewayPort, method: req.method, path: req.url, headers },
         (upRes) => {
           res.writeHead(upRes.statusCode ?? 502, upRes.headers);
           upRes.pipe(res);
@@ -220,6 +292,7 @@ export function startGatewayRelay(forwardPort: number, gatewayHost: string, gate
       server.removeListener("error", reject);
       resolve({
         port: forwardPort,
+        clientApiKey,
         close: () =>
           new Promise<void>((res) => {
             // Destroy any lingering (e.g. long-lived SSE) sockets so close() can't hang.
@@ -252,7 +325,7 @@ export interface CageSelfTestResult {
 }
 
 /**
- * Optional job-RUNNABILITY arm of the self-test. The four base probes prove CONFINEMENT but not
+ * Optional job-RUNNABILITY arm of the self-test. The five base probes prove CONFINEMENT but not
  * that a job can actually run — the 2026-07-02 live smoke passed the cage test yet pi was ENOENT
  * in-cage (the home tmpfs hid ~/.local/bin/pi and the provider config). When provided, the probe
  * also asserts these paths are visible inside the exact cage argv the jobs use. The agent-dir
@@ -395,6 +468,72 @@ export function withUserBusEnv(
   return out;
 }
 
+export type UserSystemctlRunner = (
+  args: string[],
+  env: Record<string, string>,
+) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+
+const runUserSystemctl: UserSystemctlRunner = (args, env) =>
+  new Promise((resolve) => {
+    execFile(
+      "systemctl",
+      args,
+      { env, timeout: 10_000, maxBuffer: 64 * 1024, killSignal: "SIGKILL" },
+      (err, stdout, stderr) => {
+        const rawCode = err ? (err as { code?: number }).code : 0;
+        resolve({
+          code: typeof rawCode === "number" ? rawCode : null,
+          stdout: String(stdout),
+          stderr: String(stderr),
+        });
+      },
+    );
+  });
+
+/**
+ * Stop one exact code-loop transient service through its native user-manager transport. Unknown
+ * (already collected) units are success; a bus/permission/active-unit failure propagates so a
+ * sweep never marks a still-running tree orphaned. The runner seam keeps the security contract
+ * deterministic in unit tests.
+ */
+export async function stopTransientCodeLoopUnit(
+  unit: string,
+  baseEnv: NodeJS.ProcessEnv | Record<string, string> = process.env,
+  run: UserSystemctlRunner = runUserSystemctl,
+  busDeps: { uid?: number | null; socketExists?: (path: string) => boolean } = {},
+): Promise<void> {
+  if (!TRANSIENT_CODE_LOOP_UNIT_RE.test(unit)) {
+    throw new Error(`refusing to stop non-code-loop transient unit '${unit}'`);
+  }
+  const env = withUserBusEnv({
+    PATH: baseEnv["PATH"] ?? "/usr/bin:/bin",
+    ...(baseEnv["XDG_RUNTIME_DIR"] ? { XDG_RUNTIME_DIR: baseEnv["XDG_RUNTIME_DIR"] } : {}),
+    ...(baseEnv["DBUS_SESSION_BUS_ADDRESS"]
+      ? { DBUS_SESSION_BUS_ADDRESS: baseEnv["DBUS_SESSION_BUS_ADDRESS"] }
+      : {}),
+  }, busDeps);
+  const stopped = await run(["--user", "stop", unit], env);
+  if (stopped.code === 0) return;
+
+  // CollectMode aggressively unloads a naturally completed service. Prove it is genuinely absent
+  // before accepting a nonzero stop; never reinterpret a user-bus failure as successful cleanup.
+  const shown = await run(["--user", "show", unit, "--property=LoadState", "--value"], env);
+  if (shown.code === 0 && shown.stdout.trim() === "not-found") return;
+  const detail = (stopped.stderr || shown.stderr || "unknown systemctl failure").trim().slice(0, 300);
+  throw new Error(`could not stop transient code-loop unit '${unit}': ${detail}`);
+}
+
+/** Immediate best-effort stop used at the instant an engine cap is breached. */
+export function requestTransientCodeLoopUnitStop(
+  argv: string[],
+  baseEnv: NodeJS.ProcessEnv | Record<string, string>,
+  stop: (unit: string, env: NodeJS.ProcessEnv | Record<string, string>) => Promise<void> = stopTransientCodeLoopUnit,
+): Promise<void> | null {
+  const unit = transientCodeLoopUnitFromArgv(argv);
+  if (unit === null) return null;
+  return stop(unit, baseEnv);
+}
+
 /**
  * The real executor: execFile without a shell, bounded output, never throws on nonzero exit.
  * Optional cwd/env for host-side commands (git harvest, uncaged check_cmd) — the CAGED path
@@ -406,18 +545,32 @@ export function execCageCommand(
   opts: { cwd?: string; env?: Record<string, string> } = {}
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
+    const env = withUserBusEnv(opts.env ?? process.env);
+    const unit = transientCodeLoopUnitFromArgv(argv);
     execFile(
       argv[0]!,
       argv.slice(1),
-      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, killSignal: "SIGKILL", cwd: opts.cwd, env: withUserBusEnv(opts.env ?? process.env) },
-      (err, stdout, stderr) => {
+      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, killSignal: "SIGKILL", cwd: opts.cwd, env },
+      async (err, stdout, stderr) => {
+        let cleanupError = "";
+        if (unit !== null) {
+          try {
+            await stopTransientCodeLoopUnit(unit, env);
+          } catch (stopErr) {
+            cleanupError = `\ntransient cleanup failed: ${(stopErr as Error).message}`;
+          }
+        }
         if (err && typeof (err as NodeJS.ErrnoException).code === "string") {
           // ENOENT etc. — the tool itself is missing; surface as a rejected exec.
-          resolve({ code: null, stdout: String(stdout), stderr: `${(err as NodeJS.ErrnoException).code}: ${err.message}` });
+          resolve({ code: null, stdout: String(stdout), stderr: `${(err as NodeJS.ErrnoException).code}: ${err.message}${cleanupError}` });
           return;
         }
         const code = err ? ((err as { code?: number }).code ?? null) : 0;
-        resolve({ code: typeof code === "number" ? code : null, stdout: String(stdout), stderr: String(stderr) });
+        resolve({
+          code: cleanupError === "" && typeof code === "number" ? code : null,
+          stdout: String(stdout),
+          stderr: `${String(stderr)}${cleanupError}`,
+        });
       }
     );
   });

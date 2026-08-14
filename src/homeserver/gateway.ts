@@ -53,6 +53,7 @@ import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-lo
 import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
+import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
 import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
@@ -3433,10 +3434,9 @@ export function startGateway(
     const sweepCfg = { workroot: resolve(cfg.codeLoopWorkroot), retentionTtlMs: 24 * 60 * 60 * 1000 };
     const sweepDeps = {
       now: Date.now,
-      stopUnit: (unit: string) =>
-        new Promise<void>((done) => {
-          execFile("systemctl", ["--user", "stop", unit], () => done());
-        }),
+      // The helper derives the native user-manager transport and propagates real stop failures;
+      // a sweep must never mark a still-running detached cage orphaned.
+      stopUnit: (unit: string) => stopTransientCodeLoopUnit(unit),
     };
     let sweepInFlight = false;
     const sweepOnce = (): void => {
