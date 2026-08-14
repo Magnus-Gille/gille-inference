@@ -90,6 +90,36 @@ manifest. The default disk guard preserves at least 128 GiB after the worst-case
 This command does not select a transformers/llama.cpp revision, run reference inference, convert
 to GGUF, quantize, edit llama-swap, or restart the gateway. Those remain subsequent proof gates.
 
+## Pinned llama.cpp source-compatibility gate
+
+Before installing dependencies or starting a build, prove that an explicitly pinned llama.cpp
+checkout contains both conversion and runtime wiring for the architecture in archived
+`release.json`:
+
+```bash
+npm run release:check-runtime -- \
+  --release-json <archive>/release.json \
+  --llama-dir <separate-pinned-llama.cpp-checkout> \
+  --runtime-revision <exact-40-character-llama.cpp-commit> \
+  --out-dir <compatibility-report-directory>
+```
+
+The command verifies that checkout `HEAD` equals the requested commit and hashes the bounded source
+files used as evidence. For supported dense or MoE `Qwen3_5*ForCausalLM` configs it independently
+requires the converter registry/class, GGUF architecture mapping, runtime architecture/factory,
+model implementation, and—when the official release declares it—the native MTP driver and graph.
+Unknown, ambiguous, converter-only, runtime-only, commit-mismatched, or missing-MTP configurations
+produce a machine-readable `compatibility.json`, a human-readable `REPORT.md`, and exit status `2`.
+Malformed input produces exit `1`; only a fully proven source path exits `0`.
+
+The live smoke test used official flagship release revision
+`207bd685a7e3696cfaff12ded7c6a7ea0f88c996` and pinned llama.cpp revision
+`4c1a0af40d88c7fbb3b15c85bf2e8016d1d5b64c`. It proved source-level
+`Qwen3_5MoeForCausalLM` plus native-MTP wiring. This does not qualify the 4.89 TB source model for
+M5 and does not prove compilation, tensor compatibility, reference parity, backend correctness,
+performance, or deployment readiness. The 27B release must be checked independently against its
+own immutable config and the runtime revision selected after release.
+
 ## Reproducible direct benchmark
 
 Use a reviewed, already-built llama.cpp binary and an already-staged GGUF. For an uncontaminated
@@ -238,7 +268,9 @@ Proceed from ingestion to conversion and hardware benchmarking only when all of 
 1. the official target is public and has an immutable revision;
 2. `REPORT.md` resolves topology, attention, context, tokenizer, modality, and MTP from official
    artifacts, leaving unsupported facts explicit;
-3. the selected transformers and llama.cpp revisions explicitly support the observed architecture;
+3. `release:check-runtime` passes for the selected exact llama.cpp revision, followed by a clean
+   build of that separate checkout; the selected exact transformers revision supports the same
+   observed architecture;
 4. converted output matches saved reference transformers inference before speed measurement; and
 5. the GGUF, runtime binary, backend, and system state can be named by hash/version in the report.
 
