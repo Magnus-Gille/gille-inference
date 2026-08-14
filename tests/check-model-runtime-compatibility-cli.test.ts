@@ -1,6 +1,11 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  collectRuntimeCompatibilityInput,
   parseRuntimeCompatibilityArgs,
   runRuntimeCompatibilityCheck,
 } from "../scripts/check-model-runtime-compatibility.js";
@@ -44,6 +49,43 @@ describe("parseRuntimeCompatibilityArgs", () => {
       runtimeRevision: RUNTIME_REVISION,
       outDir: "/tmp/report",
     });
+  });
+});
+
+describe("collectRuntimeCompatibilityInput", () => {
+  it("does not accept an untracked working-tree source as evidence for the pinned commit", () => {
+    const root = mkdtempSync(join(tmpdir(), "runtime-compatibility-"));
+    execFileSync("git", ["init", "-q", root]);
+    writeFileSync(join(root, "README.md"), "pinned checkout\n");
+    execFileSync("git", ["-C", root, "add", "README.md"]);
+    execFileSync("git", [
+      "-C", root,
+      "-c", "user.name=Runtime Test",
+      "-c", "user.email=runtime@example.invalid",
+      "commit", "-qm", "fixture",
+    ]);
+    const revision = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    mkdirSync(join(root, "src", "models"), { recursive: true });
+    writeFileSync(
+      join(root, "src", "models", "qwen35.cpp"),
+      "llama_model_qwen35::load_arch_hparams llama_model_qwen35::build_arch_graph\n",
+    );
+    const releaseJson = join(root, "release.json");
+    writeFileSync(releaseJson, JSON.stringify({
+      schemaVersion: 1,
+      model: { id: "Qwen/Qwen3.8-27B", revision: MODEL_REVISION },
+      architecture: { architectures: ["Qwen3_5ForCausalLM"] },
+      speculation: { nativeMtp: false },
+    }));
+
+    const collected = collectRuntimeCompatibilityInput({
+      releaseJson,
+      llamaDir: root,
+      runtimeRevision: revision,
+      outDir: join(root, "out"),
+    });
+
+    expect(collected.sources["src/models/qwen35.cpp"]).toBeUndefined();
   });
 });
 

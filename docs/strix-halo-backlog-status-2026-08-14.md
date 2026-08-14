@@ -29,7 +29,7 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | Ticket | State | Repository evidence / remaining proof |
 |---:|---|---|
 | T01 benchmark harness | **Implemented; not yet measured** | Direct `llama-bench` plus streaming server runners emit JSON/Markdown and cover PP, TG, TTFT, cache, speculation, concurrency, hashes, system/runtime fields, and useful completions/minute. Real power should come from a wall meter; hwmon is labelled explicitly. |
-| T02 Qwen3-Coder baseline | **Blocked for measurement** | Harness ready. Exact 30B-A3B GGUFs/builds are not staged or verified in this session; M5 access and live verification of #196 are missing. |
+| T02 Qwen3-Coder baseline | **Blocked for measurement** | Harness ready. Exact 30B-A3B GGUFs/builds are not staged or verified in this session; live verification of #196 is still missing. |
 | T03 Qwen3.6 direct baseline | **Blocked for measurement** | `qwen36-a3b` exists in the tracked roster at Q4_K_M, but the requested ROCmFP4 variants are not staged. Requires immutable build/model provenance and #196. |
 | T04 native MTP | **Runner implemented; experiment blocked** | Server runner records acceptance from official llama.cpp metrics and supports speculation comparisons. Target/MTP artifact and reviewed runtime must be built under issue #130. |
 | T05 adaptive MTP | **Not implemented** | Requires measured cost/acceptance traces from T04 before a policy can satisfy “never materially slower.” Static guesswork is rejected. |
@@ -56,7 +56,7 @@ needed, the exclusive maintenance fence tracked in issue #196.
 
 ## Work order from this state
 
-1. Restore the canonical Codex M5 credential, review/deploy this branch, and verify issue #196's
+1. Use the healthy canonical Codex M5 profile, review/deploy this branch, and verify issue #196's
    exclusive maintenance path against the actual post-isolation listener and lease directory.
 2. Stage reviewed, hashed target/runtime artifacts without changing the live roster.
 3. Run T02/T03/T06/T09 controls, then T04 and T10; publish raw reports before conclusions.

@@ -3,7 +3,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -83,7 +82,30 @@ function boundedRegularFile(path: string, maximumBytes: number): string {
   return readFileSync(path, "utf8");
 }
 
-function collectInput(args: CompatibilityArgs): RuntimeCompatibilityInput {
+function committedSource(
+  checkoutRoot: string,
+  commit: string,
+  relativePath: string,
+): string | undefined {
+  try {
+    return execFileSync(
+      "git",
+      ["-C", checkoutRoot, "show", `${commit}:${relativePath}`],
+      {
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: MAX_SOURCE_BYTES + 1,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+  } catch {
+    // Missing, oversized, or unreadable commit objects are all absence of proof. The inspector
+    // records the required path as missing and fails closed instead of consulting mutable files.
+    return undefined;
+  }
+}
+
+export function collectRuntimeCompatibilityInput(args: CompatibilityArgs): RuntimeCompatibilityInput {
   const release = JSON.parse(boundedRegularFile(resolve(args.releaseJson), MAX_RELEASE_BYTES)) as RuntimeCompatibilityInput["release"];
   const checkoutRoot = realpathSync(args.llamaDir);
   const checkoutRuntimeCommit = execFileSync("git", ["-C", checkoutRoot, "rev-parse", "HEAD"], {
@@ -96,7 +118,8 @@ function collectInput(args: CompatibilityArgs): RuntimeCompatibilityInput {
   for (const relativePath of sourcePaths) {
     const path = resolve(checkoutRoot, relativePath);
     if (!path.startsWith(`${checkoutRoot}${sep}`)) throw new Error(`unsafe runtime source path: ${relativePath}`);
-    if (existsSync(path)) sources[relativePath] = boundedRegularFile(path, MAX_SOURCE_BYTES);
+    const source = committedSource(checkoutRoot, args.runtimeRevision, relativePath);
+    if (source !== undefined) sources[relativePath] = source;
   }
   const checkoutSourceClean =
     execFileSync(
@@ -144,7 +167,7 @@ function writeReport(outDir: string, report: ModelRuntimeCompatibilityReport): s
 }
 
 const DEFAULT_DEPS: CliDependencies = {
-  collect: collectInput,
+  collect: collectRuntimeCompatibilityInput,
   inspect: inspectModelRuntimeCompatibility,
   write: writeReport,
   stdout: (line) => console.log(line),

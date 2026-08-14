@@ -104,8 +104,9 @@ npm run release:check-runtime -- \
   --out-dir <compatibility-report-directory>
 ```
 
-The command verifies that checkout `HEAD` equals the requested commit and hashes the bounded source
-files used as evidence. For supported dense or MoE `Qwen3_5*ForCausalLM` configs it independently
+The command verifies that checkout `HEAD` equals the requested commit and reads and hashes the
+bounded source files directly from that immutable commit object, never from mutable or untracked
+working-tree files. For supported dense or MoE `Qwen3_5*ForCausalLM` configs it independently
 requires the converter registry/class, GGUF architecture mapping, runtime architecture/factory,
 model implementation, and—when the official release declares it—the native MTP driver and graph.
 Unknown, ambiguous, converter-only, runtime-only, commit-mismatched, or missing-MTP configurations
