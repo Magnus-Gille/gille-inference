@@ -309,6 +309,22 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"');
   });
 
+  it("allows the isolated gateway the netlink family required by pasta", () => {
+    const unit = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render_dropin gateway",
+        "--",
+        script,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK");
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6 AF_NETLINK');
+  });
+
   it("requires an explicit restart acknowledgement and traps every post-mutation refresh failure", () => {
     expect(() =>
       execFileSync("bash", [script, "refresh-isolation", "--service", "gateway"], {
@@ -320,7 +336,33 @@ describe("service-isolation migration contract (#151)", () => {
     const source = readFileSync(script, "utf8");
     expect(source).toContain('atomic_render_dropin "$service" "$dropin"');
     expect(source).toContain("trap 'refresh_exit_handler \"$?\"' EXIT");
-    expect(source).toContain("( verify gateway 1 0 )");
+    expect(source).toContain("( verify gateway 1 0 0 )");
+  });
+
+  it("restores and verifies a pre-netlink gateway drop-in after refresh failure", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-legacy-dropin-"));
+    const backup = join(work, "backup");
+    const dropin = join(work, "50-service-isolation.conf");
+    execFileSync("mkdir", ["-p", backup]);
+    writeFileSync(
+      join(backup, "dropin.before.conf"),
+      "[Service]\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n",
+    );
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "--",
+        script,
+        backup,
+        dropin,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain("verify:gateway 1 0 0");
+    expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
+    expect(output).not.toContain("AF_NETLINK");
   });
 
   it("runs the refresh restoration hook and preserves the failing exit status", () => {
@@ -426,6 +468,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("ExecStart=/usr/bin/cloudflared --config /etc/gille-inference/cloudflared/config.yml --no-autoupdate tunnel run m5-inference");
     expect(unit).toContain("ReadOnlyPaths=/etc/gille-inference/cloudflared");
     expect(unit).toContain("MemoryDenyWriteExecute=true");
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(unit).not.toContain("AF_NETLINK");
   });
 
   it("keeps llama-swap loopback-only and explicitly grants the render device group", () => {
@@ -440,6 +484,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("IPAddressDeny=any");
     expect(unit).toContain("IPAddressAllow=127.0.0.0/8");
     expect(unit).toContain("IPAddressAllow=::1/128");
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(unit).not.toContain("AF_NETLINK");
     expect(unit.indexOf("DeviceAllow=\n")).toBeLessThan(unit.indexOf("DeviceAllow=/dev/null rw"));
   });
 
@@ -574,6 +620,7 @@ describe("service-isolation migration contract (#151)", () => {
     expect(normalized.trim().split("\n")).toEqual(["/a", "/b", "/c"]);
     const source = readFileSync(script, "utf8");
     expect(source).toContain('require_show_exact_set "$unit" BindPaths "$ROOT/gateway/data:$GATEWAY_DATA"');
+    expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6 AF_NETLINK');
     expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6');
     expect(source).toContain('require_show_empty "$unit" BindReadOnlyPaths');
     expect(source).toContain('require_show_empty "$unit" BindPaths');

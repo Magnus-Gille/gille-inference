@@ -191,7 +191,9 @@ InaccessiblePaths=-$GATEWAY_TREE/.ssh
 InaccessiblePaths=-$GATEWAY_TREE/.git
 InaccessiblePaths=-$GATEWAY_TREE/.pi-code-loop
 ReadWritePaths=$ROOT/gateway/data
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# pasta needs an unprivileged route-netlink socket to construct the code-loop
+# network namespace. The inner bwrap cage still receives no host /run mounts.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 PrivateDevices=true
 EOF
       render_common
@@ -856,7 +858,7 @@ restore_isolation_refresh() {
   atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
   systemctl daemon-reload || return 1
   systemctl restart "$REFRESH_UNIT" || return 1
-  ( verify gateway 1 0 ) || return 1
+  ( verify gateway 1 0 0 ) || return 1
 }
 
 refresh_exit_handler() {
@@ -908,7 +910,7 @@ refresh_isolation() {
 }
 
 verify() {
-  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" unit user actual_user
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-1}" unit user actual_user
   need systemctl; need ss
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"
@@ -920,7 +922,11 @@ verify() {
   [ "$(show_value "$unit" UMask)" = 0077 ] || die "$unit UMask is not 0077"
   require_show_empty "$unit" CapabilityBoundingSet
   require_show_empty "$unit" AmbientCapabilities
-  require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6
+  if [ "$service" = gateway ] && [ "$require_gateway_netlink" = 1 ]; then
+    require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6 AF_NETLINK
+  else
+    require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6
+  fi
   case "$service" in
     gateway)
       require_mode "$ROOT/gateway" 750
