@@ -182,6 +182,16 @@ The origin-relative production rebuild's `llama-server` SHA-256 is
 dependencies must all resolve inside the rendered
 `<runtime-root>/releases/9a3bf2b84/bin`.
 
+The 2026-08-14 `qwen38-27b` release candidate uses official model revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and pinned llama.cpp
+`9b05354ec6fb58b4e665e9a39ebc40285c015638`. Its reviewed serving contract is 64K context,
+Q4_K_M weights plus the BF16 multimodal projector, Q8 KV, one slot, a 2 GiB prompt cache,
+Flash Attention, native MTP depth 2, and per-request thinking control. The release measurements,
+artifact identities, and limitations are in
+[`docs/qwen38-27b-release-decision-2026-08-14.md`](../docs/qwen38-27b-release-decision-2026-08-14.md).
+This candidate supersedes the stale public roster claim for `qwen35-122b-a10b`; it does not erase
+the historical Qwen3.5 comparison or create an automatic Qwen route.
+
 ### Deploying
 
 ```bash

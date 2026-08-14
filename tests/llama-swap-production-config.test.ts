@@ -24,9 +24,9 @@ describe("tracked llama-swap production contract", () => {
     );
   });
 
-  it("serves Qwen as a pinned 32K reasoning-off precision specialist", () => {
+  it("serves Qwen3.8 as a pinned 64K multimodal native-MTP model", () => {
     expect(roster).toMatch(
-      /"qwen35-122b-a10b":[\s\S]*?releases\/9a3bf2b84\/bin\/llama-server[\s\S]*?-c 32768 -np 1 --jinja -fa on[\s\S]*?--reasoning-format auto --reasoning off[\s\S]*?--cache-ram 2048 -ctk f16 -ctv f16/
+      /"qwen38-27b":[\s\S]*?releases\/9b05354ec\/bin\/llama-server[\s\S]*?Qwen3\.8-27B-Q4_K_M\.gguf[\s\S]*?-mm [^\n]*mmproj-Qwen3\.8-27B-BF16\.gguf[\s\S]*?--image-min-tokens 1024[\s\S]*?-c 65536 -np 1 --jinja -fa on[\s\S]*?--spec-type draft-mtp --spec-draft-n-max 2[\s\S]*?--reasoning-format auto --reasoning auto[\s\S]*?--cache-ram 2048 -ctk q8_0 -ctv q8_0/
     );
   });
 

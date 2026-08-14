@@ -244,31 +244,31 @@
         <td>~30</td>
       </tr>
       <tr>
-        <td><span class="badge mono">qwen35-122b-a10b</span></td>
-        <td>Qwen3.5-122B-A10B — large MoE served reasoning-off (Q4_K_M)</td>
-        <td>High-precision review and triage where stable direct answers matter more than latency</td>
-        <td>~26</td>
+        <td><span class="badge mono">qwen38-27b</span></td>
+        <td>Qwen3.8-27B — dense Q4_K_M, multimodal, thinking-capable, native MTP</td>
+        <td>New-generation coding, reasoning, image understanding and release evaluation</td>
+        <td>~21&#8211;25 MTP<br><span style="font-size:11px;color:var(--muted)">~13 direct</span></td>
       </tr>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
       Models load on first use and unload after 30&nbsp;min idle. Cold loads are roughly 6&#8211;15s
-      for Mellum and 40&#8211;70s for the largest models; Qwen3.5-122B measured 67.5s in its
-      production-config soak.
+      for Mellum and up to roughly 40&#8211;70s for the largest models.
     </p>
     <p style="margin-top:4px;font-size:12.5px">
       Context window: 131,072 tokens for <span class="badge mono">mellum</span>,
       <span class="badge mono">gemma4</span>, <span class="badge mono">qwen36-a3b</span>,
       <span class="badge mono">qwen3-30b-instruct</span>, and
       <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>
-      and <span class="badge mono">gpt-oss-120b</span> provide 65,536 per request;
-      <span class="badge mono">qwen35-122b-a10b</span> provides 32,768 and is an explicit
-      precision/shadow specialist rather than the general default. Prompt and completion
+      <span class="badge mono">gpt-oss-120b</span>, and <span class="badge mono">qwen38-27b</span>
+      provide 65,536 per request. Prompt and completion
       tokens share that window; the output limits documented below still apply. VibeThinker works best on
       answer-verifiable reasoning with sampling enabled: <span class="badge mono">temperature: 1.0</span>,
       <span class="badge mono">top_p: 0.95</span>, <span class="badge mono">top_k: 0</span>, and
       <span class="badge mono">min_p: 0</span>. Explicit VibeThinker requests may ask for up to
       32,768 completion tokens; omitted <span class="badge mono">max_tokens</span> keeps the safer fleet default.
+      Qwen3.8 thinking is on by default; callers can request a direct answer with
+      <span class="badge mono">chat_template_kwargs: {"enable_thinking": false}</span>.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       <strong>Speech-to-text:</strong> <span class="badge mono">whisper-1</span>
