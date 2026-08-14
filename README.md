@@ -177,6 +177,8 @@ See [`SECURITY.md`](./SECURITY.md),
 - [`docs/observability.md`](./docs/observability.md) — content and telemetry boundaries.
 - [`docs/migration-go-no-go-verdict.md`](./docs/migration-go-no-go-verdict.md) — measured decision to
   retain the frontier Conductor and localize leaf work.
+- [`docs/strix-halo-release-benchmark-runbook.md`](./docs/strix-halo-release-benchmark-runbook.md) —
+  immutable model-release inspection and reproducible Strix Halo PP/TG benchmarking.
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) — current phases and open proof obligations.
 - [`RESULTS.md`](./RESULTS.md) — original hosted-proxy benchmark and hardware economics.
 
