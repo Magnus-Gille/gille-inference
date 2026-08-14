@@ -54,6 +54,29 @@ describe("inspectModelRuntimeCompatibility", () => {
     expect(result.reasons).toEqual([]);
   });
 
+  it.each([
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+  ])("proves the official multimodal wrapper architecture %s through its text runtime", (architecture) => {
+    const result = inspectModelRuntimeCompatibility(
+      input({
+        release: {
+          ...input().release,
+          architecture: { architectures: [architecture] },
+        },
+        sources: sources(architecture),
+      })
+    );
+
+    expect(result.supported).toBe(true);
+    expect(result.selectedArchitecture).toBe(architecture);
+    expect(result.nativeMtpRequired).toBe(true);
+    expect(result.evidence.every((file) => file.passed)).toBe(true);
+    expect(result.evidence.map((item) => item.path)).toContain(
+      architecture.includes("Moe") ? "src/models/qwen35moe.cpp" : "src/models/qwen35.cpp"
+    );
+  });
+
   it("proves the separate MoE implementation when the official config names it", () => {
     const architecture = "Qwen3_5MoeForCausalLM";
     const result = inspectModelRuntimeCompatibility(

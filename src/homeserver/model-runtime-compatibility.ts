@@ -112,6 +112,18 @@ function requirements(
 
 const SUPPORT = new Map<string, ArchitectureSupport>([
   [
+    "Qwen3_5ForConditionalGeneration",
+    requirements(
+      "Qwen3_5ForConditionalGeneration",
+      "QWEN35",
+      "QWEN35",
+      "qwen35",
+      "Qwen3_5TextModel",
+      "llama_model_qwen35",
+      "src/models/qwen35.cpp"
+    ),
+  ],
+  [
     "Qwen3_5ForCausalLM",
     requirements(
       "Qwen3_5ForCausalLM",
@@ -121,6 +133,18 @@ const SUPPORT = new Map<string, ArchitectureSupport>([
       "Qwen3_5TextModel",
       "llama_model_qwen35",
       "src/models/qwen35.cpp"
+    ),
+  ],
+  [
+    "Qwen3_5MoeForConditionalGeneration",
+    requirements(
+      "Qwen3_5MoeForConditionalGeneration",
+      "QWEN35MOE",
+      "QWEN35MOE",
+      "qwen35moe",
+      "Qwen3_5MoeTextModel",
+      "llama_model_qwen35moe",
+      "src/models/qwen35moe.cpp"
     ),
   ],
   [

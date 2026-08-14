@@ -44,9 +44,12 @@ Exit status is deliberately automation-friendly:
 - `3`: not publicly available yet (`401`, `403`, or `404`); and
 - `1`: malformed input or inconsistent/unsafe public metadata.
 
-On 14 August 2026, implementation validation found `Qwen/Qwen3.8-27B` not yet publicly available
-(HTTP `401`). The public `Qwen/Qwen3.8-2.4T-A95B` control files were successfully pinned to Hub
-revision `207bd685a7e3696cfaff12ded7c6a7ea0f88c996` and used as the live smoke test:
+On 14 August 2026, `Qwen/Qwen3.8-27B` became publicly available and was pinned to Hub revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. Its official config identifies a dense,
+multimodal `Qwen3_5ForConditionalGeneration` model with hybrid linear/full attention, one native
+MTP hidden layer, 262,144-token native context, and 27,781,427,952 BF16 parameters. The public
+`Qwen/Qwen3.8-2.4T-A95B` control files remain the earlier pipeline smoke test at revision
+`207bd685a7e3696cfaff12ded7c6a7ea0f88c996`:
 
 ```bash
 npm run release:ingest-model -- --model Qwen/Qwen3.8-2.4T-A95B
@@ -106,8 +109,8 @@ npm run release:check-runtime -- \
 
 The command verifies that checkout `HEAD` equals the requested commit and reads and hashes the
 bounded source files directly from that immutable commit object, never from mutable or untracked
-working-tree files. For supported dense or MoE `Qwen3_5*ForCausalLM` configs it independently
-requires the converter registry/class, GGUF architecture mapping, runtime architecture/factory,
+working-tree files. For supported dense or MoE Qwen3.5 text and multimodal wrapper configs it
+independently requires the converter registry/class, GGUF architecture mapping, runtime architecture/factory,
 model implementation, and—when the official release declares it—the native MTP driver and graph.
 Unknown, ambiguous, converter-only, runtime-only, commit-mismatched, or missing-MTP configurations
 produce a machine-readable `compatibility.json`, a human-readable `REPORT.md`, and exit status `2`.
@@ -118,8 +121,11 @@ The live smoke test used official flagship release revision
 `4c1a0af40d88c7fbb3b15c85bf2e8016d1d5b64c`. It proved source-level
 `Qwen3_5MoeForCausalLM` plus native-MTP wiring. This does not qualify the 4.89 TB source model for
 M5 and does not prove compilation, tensor compatibility, reference parity, backend correctness,
-performance, or deployment readiness. The 27B release must be checked independently against its
-own immutable config and the runtime revision selected after release.
+performance, or deployment readiness. The 27B release was checked independently against its own
+immutable config and upstream llama.cpp revision `9b05354ec6fb58b4e665e9a39ebc40285c015638`.
+The gate proved the exact `Qwen3_5ForConditionalGeneration` wrapper registration, dense Qwen3.5
+converter/GGUF/runtime path, and native-MTP wiring. Build, tensor conversion, reference parity,
+backend correctness, performance, and deployment remain separate proof gates.
 
 ## Reproducible direct benchmark
 

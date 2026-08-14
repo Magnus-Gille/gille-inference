@@ -9,8 +9,9 @@ needed, the exclusive maintenance fence tracked in issue #196.
 
 ## Current blockers
 
-1. `Qwen/Qwen3.8-27B` is not publicly available through the anonymous official Hub API, so T17–T20
-   cannot start from immutable official bytes.
+1. `Qwen/Qwen3.8-27B` is public at immutable Hub revision
+   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. T17–T20 now require verified source staging,
+   conversion/reference parity, an isolated runtime build, and controlled M5 measurements.
 2. The canonical Codex M5 profile is restored and `doctor` reports both public and private paths
    healthy. A bounded review call encountered `busy` and then timed out, so no local-review result
    was used; read-only M5 inventory remains available. Hardware experiments still require the
@@ -43,11 +44,11 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | T13 gfx1151 verification kernel | **Not started** | Only justified after T11/T12 profiling proves target verification is the bottleneck. Premature kernel work is explicitly deferred. |
 | T14 HIP launch gaps | **Not started** | Requires paired rocprof/kernel-wall traces from isolated HIP build under issue #129. |
 | T15 BF16 Flash Attention | **Not measured** | Runtime/feature revision must be pinned and compared through the KV/context matrix. |
-| T16 Qwen3.8 ingest | **Implemented; target unavailable** | Public-only immutable ingestion archives control files, hashes them, and reports architecture without fetching weights or guessing unknowns. A separate fail-closed source staging command follows bounded pinned pagination, verifies exact indexed LFS size/SHA-256, preserves a disk reserve, resumes interrupted downloads, and atomically publishes only complete revisions without touching the live roster. |
-| T17 Qwen3.8 conversion | **Source/runtime preflight implemented; release blocked** | No official 27B source bytes/config. Once public, the exact source revision can be staged and hash-verified. A fail-closed compatibility gate now proves checkout commit equality and separately hashed converter, GGUF, runtime, model, and native-MTP source wiring; it passed against the official flagship config and fresh pinned upstream but must be rerun for 27B. A clean build, pinned transformers reference, conversion and numerical/token parity remain. |
-| T18 first Qwen3.8 benchmark | **Blocked** | Depends on T17 and an uncontaminated M5 window. Both direct and streaming runners are ready. |
-| T19 Qwen3.8 speculation | **Blocked** | Depends on official architecture and T17. Current runner supports MTP/DFlash/DSpark measurements without assuming availability. |
-| T20 Qwen3.8 vs Qwen3.6 | **Blocked** | Gate D already supplies deterministic coding tasks; the new server comparator supplies latency/throughput controls. Requires actual Qwen3.8 artifact. |
+| T16 Qwen3.8 ingest | **Implemented; release archived** | Official revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` is public and ungated. Archived controls identify a dense multimodal `Qwen3_5ForConditionalGeneration` model with 27,781,427,952 BF16 parameters, hybrid linear/full attention, native MTP, and 262K context. The staging command remains fail-closed and non-live. |
+| T17 Qwen3.8 conversion | **Runtime source gate passed; artifacts pending** | The exact 27B release passes converter, GGUF, dense Qwen3.5 runtime, and native-MTP source checks against upstream llama.cpp `9b05354ec6fb58b4e665e9a39ebc40285c015638`. Source weights must still be staged and hash-verified; then a clean build, pinned Transformers reference, conversion, mmproj handling, and numerical/token parity remain. |
+| T18 first Qwen3.8 benchmark | **Artifact/window blocked** | Depends on T17 and an uncontaminated M5 window. Both direct and streaming runners are ready. |
+| T19 Qwen3.8 speculation | **Artifact/window blocked** | Official config declares native MTP and the pinned runtime source gate passes. Direct-versus-MTP measurements remain after the artifact/runtime build. |
+| T20 Qwen3.8 vs Qwen3.6 | **Artifact blocked** | Gate D already supplies deterministic coding tasks; the new server comparator supplies latency/throughput controls. Requires the verified Qwen3.8 GGUF/runtime. |
 | T21 Glimmer specialist | **Candidate only** | Existing gateway already passes multimodal `image_url` content and serves Gemma4+mmproj. Glimmer qualification/discovery remains issue #181; roster promotion is not authorized. |
 | T22 model router | **Implemented as evidence-gated routing; profile qualification blocked** | The gateway/orchestrator already performs task-aware routing through the generated capability table and fails safe to the frontier for unsupported lanes. FAST/BALANCED/DEEP/VISION/MAX remain descriptive product tiers rather than static aliases: assigning them before the issue #124 model/profile experiments would bypass the repository's evidence-before-autonomy invariant. Glimmer/MAX qualification remains separate roster work. |
 | T23 coding-agent suite | **Existing and verified** | Gate D has 14 isolated real-edit fixtures with deterministic compile/test/structural oracles and resumable model/harness runs. New models must run the same pinned corpus; no replacement suite is needed. |
@@ -61,5 +62,6 @@ needed, the exclusive maintenance fence tracked in issue #196.
 2. Stage reviewed, hashed target/runtime artifacts without changing the live roster.
 3. Run T02/T03/T06/T09 controls, then T04 and T10; publish raw reports before conclusions.
 4. Use those traces to decide whether T05/T13/T14 kernel/runtime work is justified.
-5. Poll T16; start T17–T20 only after the official 27B revision is public.
+5. Complete T17 source staging, conversion, reference parity, and isolated runtime build; then run
+   T18–T20 without changing the production route until the evidence is accepted.
 6. Qualify Glimmer through issue #181 before any T21/T22 production route change.
