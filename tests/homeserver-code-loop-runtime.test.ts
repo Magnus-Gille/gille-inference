@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { codeLoopSecretPath, piVisibilityBinds, resolveNodeModulesDir, runCageSelfTestWithRelay } from "../src/homeserver/code-loop-runtime.js";
+import { codeLoopSecretPath, createCageProbeDir, piVisibilityBinds, resolveNodeModulesDir, runCageSelfTestWithRelay } from "../src/homeserver/code-loop-runtime.js";
 
 /**
  * piVisibilityBinds — derives the narrow ro-binds that make the pi install visible inside the
@@ -115,9 +115,21 @@ describe("codeLoopSecretPath", () => {
       8080,
       "upstream-test-key",
       "required",
+      base,
     );
     expect(result.ok).toBe(false);
     expect(result.failures.join(" ")).toContain("not readable outside the cage");
+  });
+});
+
+describe("createCageProbeDir", () => {
+  it("creates the probe inside the shared code-loop workroot", () => {
+    const workroot = join(base, "code-loop-work");
+
+    const probeDir = createCageProbeDir(workroot);
+
+    expect(dirname(probeDir)).toBe(workroot);
+    expect(probeDir).toContain(`${workroot}/code-loop-cage-probe-`);
   });
 });
 

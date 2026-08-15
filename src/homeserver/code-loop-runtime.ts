@@ -1,6 +1,6 @@
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { accessSync, constants as fsConstants, existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import type { HomeserverConfig } from "./config.js";
 import type { CodeLoopDeps, CodeLoopRequest } from "./code-loop-types.js";
 import { startCodeLoop, getJobStatus, getJobResult, type CodeLoopStartConfig } from "./code-loop.js";
@@ -132,6 +132,7 @@ export function buildCodeLoopRuntime(
   // The gateway the per-run relay bridges to (the caged pi's ONLY reachable destination).
   const gatewayHost = cfg.gatewayHost;
   const gatewayPort = cfg.gatewayPort;
+  const workroot = resolve(cfg.codeLoopWorkroot);
 
   // pi lives under $HOME (hidden by the cage tmpfs) — punch narrow ro holes for it, and have
   // the self-test PROVE runnability (not just confinement) at every job start.
@@ -244,6 +245,7 @@ export function buildCodeLoopRuntime(
       gatewayPort,
       cfg.codeLoopApiKey,
       confinement,
+      workroot,
       runnability,
     ),
   };
@@ -252,7 +254,7 @@ export function buildCodeLoopRuntime(
     enabled: cfg.codeLoop === "on",
     // Absolutize: the default is the RELATIVE ./data/code-loop-work, but sandbox paths flow into
     // startsWith containment checks and bwrap --bind args, both of which need absolute paths.
-    workroot: resolve(cfg.codeLoopWorkroot),
+    workroot,
     model: cfg.codeLoopModel,
     caps: cfg.codeLoopCaps,
     confinement,
@@ -277,6 +279,7 @@ export async function runCageSelfTestWithRelay(
   gatewayPort: number,
   gatewayApiKey: string,
   confinement: "required" | "off",
+  probeRoot: string,
   runnability?: CageRunnabilityProbe
 ): Promise<{ ok: boolean; failures: string[] }> {
   if (confinement === "off") return { ok: true, failures: [] };
@@ -289,7 +292,7 @@ export async function runCageSelfTestWithRelay(
   }
   let probeDir: string;
   try {
-    probeDir = mkdtempSync(join(tmpdir(), "code-loop-cage-probe-"));
+    probeDir = createCageProbeDir(probeRoot);
   } catch (err) {
     return { ok: false, failures: [`could not create probe sandbox: ${(err as Error).message}`] };
   }
@@ -325,6 +328,12 @@ export async function runCageSelfTestWithRelay(
     if (relay !== null) await relay.close();
     try { rmSync(probeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
+}
+
+/** Create the self-test sandbox where both the gateway and transient user unit can see it. */
+export function createCageProbeDir(probeRoot: string): string {
+  mkdirSync(probeRoot, { recursive: true });
+  return mkdtempSync(join(probeRoot, "code-loop-cage-probe-"));
 }
 
 // ─── MCP dispatch (owner-agent-gated; called from mcp.ts callTool) ──────────────────────
