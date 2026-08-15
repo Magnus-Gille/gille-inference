@@ -98,9 +98,13 @@ then:
    ready state; and
 7. emits mode-0600 aggregate JSON/Markdown without model content.
 
-The model is hashed again after restoration and before the aggregate receipt is accepted. A
-catchable signal aborts the active backend or llama-bench child, then follows the same required
-restoration path; the maintenance credential is never inherited by either child.
+The model is hashed again after restoration and before the aggregate receipt is accepted. The
+required `--max-runtime-seconds` deadline sends a catchable termination signal, as does operator
+interruption; either aborts the active mmap/backend/llama-bench child and then follows the same
+required restoration path. The reviewed command uses a 6,300-second child bound inside a
+7,200-second maintenance TTL, reserving 900 seconds for restoration and fence closure. The
+maintenance credential is never inherited by either child. Both success and failure receipts
+record the child bound and whether it fired.
 
 The automatic microbenchmark decision is either `advance-to-agent-gate` or `reject`. Advancement
 requires at least 10% candidate-over-stock-Q8 PP gain at both 32K and 64K, no PP/TG cell more than

@@ -3,9 +3,13 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { preflightArtifacts, runBackendCorrectness } from "../scripts/strix-combined-experiment.js";
+import {
+  armStrixRuntimeDeadline,
+  preflightArtifacts,
+  runBackendCorrectness,
+} from "../scripts/strix-combined-experiment.js";
 import { validateStrixKvCandidateConfig } from "../src/homeserver/strix-combined-experiment.js";
 
 function sha256(path: string): string {
@@ -13,6 +17,19 @@ function sha256(path: string): string {
 }
 
 describe("Strix combined experiment preflight", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("arms the fail-closed runtime deadline at the requested bound", () => {
+    vi.useFakeTimers();
+    const onDeadline = vi.fn();
+    const timer = armStrixRuntimeDeadline(6300, onDeadline);
+    vi.advanceTimersByTime(6_299_999);
+    expect(onDeadline).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onDeadline).toHaveBeenCalledOnce();
+    clearTimeout(timer);
+  });
+
   it("hashes every used artifact and rejects cross-config or version drift before mutation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "strix-combined-preflight-"));
     const executable = join(directory, "fake-bin");

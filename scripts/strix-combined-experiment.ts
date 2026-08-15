@@ -51,6 +51,10 @@ export interface BackendEvidence {
   outputWithinLimit: boolean;
 }
 
+export function armStrixRuntimeDeadline(maxRuntimeSeconds: number, onDeadline: () => void): NodeJS.Timeout {
+  return setTimeout(onDeadline, maxRuntimeSeconds * 1_000);
+}
+
 function readBoundedJson(path: string, limit = MAX_REPORT_BYTES): unknown {
   const stat = statSync(path);
   if (!stat.isFile() || stat.size <= 0 || stat.size > limit) throw new Error(`invalid bounded JSON artifact: ${path}`);
@@ -247,6 +251,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
   // Every expensive artifact is hashed before executeStrixCombinedExperiment can unload anything.
   const preflight = await preflightArtifacts(config, args.mmapConfigPath);
   let interruptedBy: NodeJS.Signals | null = null;
+  let deadlineExceeded = false;
   const benchmarkAbort = new AbortController();
   const onSignal = (signal: NodeJS.Signals): void => {
     interruptedBy ??= signal;
@@ -255,6 +260,12 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
   };
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
   for (const signal of signals) process.on(signal, onSignal);
+  const deadlineTimer = armStrixRuntimeDeadline(args.maxRuntimeSeconds, () => {
+    deadlineExceeded = true;
+    // Deliver the same catchable signal to this module and the nested mmap runner. Both runners
+    // terminate their active child and execute their required residency-restoration path.
+    process.kill(process.pid, "SIGTERM");
+  });
   const startedAt = new Date().toISOString();
   let backendEvidence: BackendEvidence | null = null;
   const reports: Array<{ evidence: StrixCombinedRunEvidence; report: StrixBenchmarkReport }> = [];
@@ -308,6 +319,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
       startedAt,
       finishedAt,
       candidateId: config.candidateId,
+      runtimeBound: { maxRuntimeSeconds: args.maxRuntimeSeconds, deadlineExceeded },
       preflight: { artifactSha256: preflight.hashes, runtimeVersions: preflight.versions },
       postflight: { modelArtifactSha256: postflightModelSha256 },
       mmap: { exitCode: result.mmapExitCode, reportPath: `${resolve(args.outDir)}/mmap-ab.json` },
@@ -351,6 +363,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
       startedAt,
       failedAt: new Date().toISOString(),
       candidateId: config.candidateId,
+      runtimeBound: { maxRuntimeSeconds: args.maxRuntimeSeconds, deadlineExceeded },
       error: error instanceof Error ? { name: error.name, message: error.message } : { name: "Error", message: String(error) },
       interruptedBy,
       preflight: { artifactSha256: preflight.hashes, runtimeVersions: preflight.versions },
@@ -367,6 +380,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
     console.error(JSON.stringify({ status: "failed", failurePath, deployed: false }));
     throw error;
   } finally {
+    clearTimeout(deadlineTimer);
     for (const signal of signals) process.removeListener(signal, onSignal);
   }
 }

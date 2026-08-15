@@ -69,6 +69,7 @@ export interface StrixCombinedArgs {
   outDir: string;
   llamaSwapOrigin: string;
   expectedResidentModel: string | null;
+  maxRuntimeSeconds: number;
   ackExclusiveWindow: true;
 }
 
@@ -313,6 +314,7 @@ export function parseStrixCombinedArgs(argv: string[]): StrixCombinedArgs {
   let outDir: string | null = null;
   let llamaSwapOrigin = "http://127.0.0.1:8091";
   let expectedResidentModel: string | null | undefined;
+  let maxRuntimeSeconds: number | null = null;
   let ackExclusiveWindow = false;
   const seen = new Set<string>();
   for (let index = 0; index < argv.length; index++) {
@@ -329,14 +331,28 @@ export function parseStrixCombinedArgs(argv: string[]): StrixCombinedArgs {
     else if (flag === "--expected-resident-model") {
       expectedResidentModel = value === "none" ? null : value;
       if (expectedResidentModel !== null && !SAFE_ID_RE.test(expectedResidentModel)) throw new Error("unsafe expected resident model");
+    } else if (flag === "--max-runtime-seconds") {
+      maxRuntimeSeconds = Number(value);
+      if (!Number.isInteger(maxRuntimeSeconds) || maxRuntimeSeconds < 600 || maxRuntimeSeconds > 86_400) {
+        throw new Error("--max-runtime-seconds must be an integer from 600 through 86400");
+      }
     } else throw new Error(`unrecognized argument: ${flag}`);
   }
   if (!configPath) throw new Error("--config is required");
   if (!mmapConfigPath) throw new Error("--mmap-config is required");
   if (!outDir) throw new Error("--out-dir is required");
   if (expectedResidentModel === undefined) throw new Error("--expected-resident-model is required");
+  if (maxRuntimeSeconds === null) throw new Error("--max-runtime-seconds is required");
   if (!ackExclusiveWindow) throw new Error("--ack-exclusive-window is required; run only inside maintenance:run");
-  return { configPath, mmapConfigPath, outDir, llamaSwapOrigin, expectedResidentModel, ackExclusiveWindow: true };
+  return {
+    configPath,
+    mmapConfigPath,
+    outDir,
+    llamaSwapOrigin,
+    expectedResidentModel,
+    maxRuntimeSeconds,
+    ackExclusiveWindow: true,
+  };
 }
 
 export function buildStrixKvRunPlans(config: StrixKvCandidateConfig, outDir: string): StrixKvRunPlan[] {
@@ -423,6 +439,10 @@ export async function executeStrixCombinedExperiment(
 
   let restoreError: unknown;
   try { await dependencies.restore(initialResidency); } catch (error) { restoreError = error; }
+  const afterRestoreSignal = dependencies.interruptedBy();
+  if (operationError === undefined && afterRestoreSignal !== null) {
+    operationError = new Error(`combined experiment interrupted by ${afterRestoreSignal}`);
+  }
   if (operationError !== undefined && restoreError !== undefined) {
     throw new AggregateError([operationError, restoreError], "combined experiment and required residency restoration both failed");
   }

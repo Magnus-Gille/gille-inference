@@ -59,20 +59,27 @@ describe("Strix combined experiment contract", () => {
       "--mmap-config", "mmap.json",
       "--out-dir", "/evidence",
       "--expected-resident-model", "resident",
+      "--max-runtime-seconds", "6300",
       "--ack-exclusive-window",
     ];
-    expect(parseStrixCombinedArgs(argv)).toMatchObject({ expectedResidentModel: "resident", ackExclusiveWindow: true });
+    expect(parseStrixCombinedArgs(argv)).toMatchObject({
+      expectedResidentModel: "resident",
+      maxRuntimeSeconds: 6300,
+      ackExclusiveWindow: true,
+    });
     expect(() => parseStrixCombinedArgs(argv.filter((item) => item !== "--ack-exclusive-window"))).toThrow(/ack-exclusive/);
     expect(() => parseStrixCombinedArgs([...argv, "--config", "other.json"])).toThrow(/duplicate/);
     expect(() => parseStrixCombinedArgs(argv.flatMap((item) => item === "resident" ? ["none"] : [item]))).not.toThrow();
     expect(() => parseStrixCombinedArgs(argv.flatMap((item) => item === "resident" ? ["bad value"] : [item]))).toThrow(/unsafe/);
+    expect(() => parseStrixCombinedArgs(argv.filter((item, index) => argv[index - 1] !== "--max-runtime-seconds" && item !== "--max-runtime-seconds"))).toThrow(/max-runtime/);
+    expect(() => parseStrixCombinedArgs(argv.map((item, index) => argv[index - 1] === "--max-runtime-seconds" ? "0" : item))).toThrow(/max-runtime/);
   });
 
   it("keeps mmap outcome separate, runs correctness first, and restores exact residency", async () => {
     const config = validateStrixKvCandidateConfig(fixture());
     const args = parseStrixCombinedArgs([
       "--config", "candidate.json", "--mmap-config", "mmap.json", "--out-dir", "/evidence",
-      "--expected-resident-model", "resident", "--ack-exclusive-window",
+      "--expected-resident-model", "resident", "--max-runtime-seconds", "6300", "--ack-exclusive-window",
     ]);
     const events: string[] = [];
     const result = await executeStrixCombinedExperiment(config, args, {
@@ -99,7 +106,7 @@ describe("Strix combined experiment contract", () => {
     const config = validateStrixKvCandidateConfig(fixture());
     const args = parseStrixCombinedArgs([
       "--config", "candidate.json", "--mmap-config", "mmap.json", "--out-dir", "/evidence",
-      "--expected-resident-model", "resident", "--ack-exclusive-window",
+      "--expected-resident-model", "resident", "--max-runtime-seconds", "6300", "--ack-exclusive-window",
     ]);
     let restored = false;
     const dependencies = {
@@ -117,6 +124,29 @@ describe("Strix combined experiment contract", () => {
       ...dependencies,
       restore: async () => { throw new Error("restore failed"); },
     })).rejects.toThrow(/both failed/);
+  });
+
+  it("fails after restoration when the runtime deadline arrives during restoration", async () => {
+    const config = validateStrixKvCandidateConfig(fixture());
+    const args = parseStrixCombinedArgs([
+      "--config", "candidate.json", "--mmap-config", "mmap.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "resident", "--max-runtime-seconds", "6300", "--ack-exclusive-window",
+    ]);
+    let interruptedBy: string | null = null;
+    await expect(executeStrixCombinedExperiment(config, args, {
+      snapshot: async () => [{ model: "resident", state: "ready" }],
+      runMmap: async () => 0,
+      unload: async () => {},
+      runBackendCorrectness: async () => {},
+      runBenchmark: async (plan) => ({
+        cycle: plan.cycle,
+        sequence: plan.sequence,
+        armId: plan.arm.id,
+        reportPath: `${plan.outPrefix}.json`,
+      }),
+      restore: async () => { interruptedBy = "SIGTERM"; },
+      interruptedBy: () => interruptedBy,
+    })).rejects.toThrow(/interrupted by SIGTERM/);
   });
 
   it("advances only a complete two-cycle result with long-context PP gains and no regressions", () => {

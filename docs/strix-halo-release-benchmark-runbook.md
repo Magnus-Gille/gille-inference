@@ -196,6 +196,7 @@ npm run maintenance:run -- \
     --out-dir <private-evidence-root>/combined \
     --llama-swap-origin http://127.0.0.1:8091 \
     --expected-resident-model <freshly-resolved-approved-model> \
+    --max-runtime-seconds 6300 \
     --ack-exclusive-window
 ```
 
@@ -203,6 +204,11 @@ The placeholders are intentional and are not an authorization object. Immediatel
 confirmation, resolve the live gateway origin, resident model, service health, artifact hashes,
 source revision, exact command, maximum outage, verification, and rollback. If any one changes,
 request new confirmation.
+
+The 7,200-second maintenance TTL is the hard outage ceiling. The child runtime deadline fires at
+6,300 seconds, sends the same catchable termination signal used for operator interruption, and
+leaves 900 seconds for exact residency restoration and fence closure. Do not reduce that reserve
+or claim a smaller maximum outage without a newly reviewed bound.
 
 The child never receives `M5_MAINTENANCE_KEY`. It changes no live config, roster, service, driver,
 kernel, cache policy, or power setting. It may unload and reload the approved resident model only
