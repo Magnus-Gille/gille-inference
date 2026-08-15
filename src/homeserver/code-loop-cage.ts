@@ -447,9 +447,10 @@ export async function runCageSelfTest(o: CageSelfTestOptions): Promise<CageSelfT
  * XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS even when the user manager is running (lingering
  * enabled) — observed live 2026-07-02: the gateway's in-process cage self-test fail-closed on
  * first production start while the same test passed from an interactive shell. Default the
- * runtime directory from the uid. Set the session-bus address only when that socket is actually
- * visible; otherwise leave it unset so systemd-run uses the user manager's native
- * `<runtime>/systemd/private` transport. Never override caller-provided values.
+ * runtime directory from the uid. Prefer the ordinary session bus when visible; otherwise select
+ * the user manager's private socket explicitly when that reviewed transport is visible. Live
+ * issue-197 verification showed systemctl can use the private socket while systemd-run does not
+ * auto-select it when the session bus is masked. Never override caller-provided values.
  */
 export function withUserBusEnv(
   base: NodeJS.ProcessEnv | Record<string, string>,
@@ -461,8 +462,11 @@ export function withUserBusEnv(
   if (uid !== null) {
     out["XDG_RUNTIME_DIR"] ??= `/run/user/${uid}`;
     const busPath = `/run/user/${uid}/bus`;
-    if (out["DBUS_SESSION_BUS_ADDRESS"] === undefined && (deps.socketExists ?? existsSync)(busPath)) {
-      out["DBUS_SESSION_BUS_ADDRESS"] = `unix:path=${busPath}`;
+    const privatePath = `/run/user/${uid}/systemd/private`;
+    const socketExists = deps.socketExists ?? existsSync;
+    if (out["DBUS_SESSION_BUS_ADDRESS"] === undefined) {
+      if (socketExists(busPath)) out["DBUS_SESSION_BUS_ADDRESS"] = `unix:path=${busPath}`;
+      else if (socketExists(privatePath)) out["DBUS_SESSION_BUS_ADDRESS"] = `unix:path=${privatePath}`;
     }
   }
   return out;
