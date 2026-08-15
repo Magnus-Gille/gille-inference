@@ -515,6 +515,8 @@ export interface HomeserverConfig {
   codeLoop: "on" | "off";
   /** Absolute path to the pinned pi binary (vendor install OUTSIDE the rsync root). "" = unprovisioned. */
   codeLoopPiBin: string;
+  /** Optional read-only toolchain mirror for caged checks. Empty retains the deploy-root fallback. */
+  codeLoopNodeModulesDir: string;
   /** The dedicated owner-tier, agent-scope service key pi calls the gateway back with (real
    *  keystore key — owner_request_log fires per turn without admin authority). Never logged. */
   codeLoopApiKey: string;
@@ -858,8 +860,11 @@ export function loadConfig(): HomeserverConfig {
     codeLoopPiBin: process.env["HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN"]
       ?? process.env["HOMESERVER_CODE_LOOP_PI_BIN"]
       ?? "",
+    codeLoopNodeModulesDir: process.env["HOMESERVER_CODE_LOOP_RUNTIME_NODE_MODULES_DIR"] ?? "",
     codeLoopApiKey: process.env["HOMESERVER_CODE_LOOP_API_KEY"] ?? "",
-    codeLoopWorkroot: process.env["HOMESERVER_CODE_LOOP_WORKROOT"] ?? "./data/code-loop-work",
+    codeLoopWorkroot: process.env["HOMESERVER_CODE_LOOP_RUNTIME_WORKROOT"]
+      ?? process.env["HOMESERVER_CODE_LOOP_WORKROOT"]
+      ?? "./data/code-loop-work",
     codeLoopModel: process.env["HOMESERVER_CODE_LOOP_MODEL"] ?? "qwen3-coder-next-80b",
     codeLoopPiAgentDir: process.env["HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR"]
       ?? process.env["HOMESERVER_CODE_LOOP_PI_AGENT_DIR"]

@@ -451,7 +451,11 @@ construct its namespace without granting `AF_NETLINK`, TUN, or weaker
 `NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
 receives no host `/run` mounts or session-bus access. Isolation-only runtime variables also take
 precedence over legacy owner-home Pi paths retained in the migrated secret file, so rollback does
-not require rewriting that file and the cage binds only the dedicated service-account runtime. If restart or
+not require rewriting that file and the cage binds only the dedicated service-account runtime.
+The refresh also copies the deployed check toolchain into a root-owned, lockfile-addressed mirror
+under `/var/lib/gille-inference/gateway`; the cage binds its stable `node_modules` pointer read-only
+directly above the dedicated workroot, preserving normal Node/npx parent lookup without requiring
+any traversal of the owner home. Existing versions remain immutable for already-running jobs. If restart or
 verification fails, it restores the prior drop-in and verifies the recovered gateway before
 returning failure. This fixes the boot race
 without weakening the code-loop cage or treating a host-visible bus as proof that the service

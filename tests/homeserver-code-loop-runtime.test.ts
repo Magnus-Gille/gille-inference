@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { codeLoopSecretPath, piVisibilityBinds, runCageSelfTestWithRelay } from "../src/homeserver/code-loop-runtime.js";
+import { codeLoopSecretPath, piVisibilityBinds, resolveNodeModulesDir, runCageSelfTestWithRelay } from "../src/homeserver/code-loop-runtime.js";
 
 /**
  * piVisibilityBinds — derives the narrow ro-binds that make the pi install visible inside the
@@ -118,5 +118,35 @@ describe("codeLoopSecretPath", () => {
     );
     expect(result.ok).toBe(false);
     expect(result.failures.join(" ")).toContain("not readable outside the cage");
+  });
+});
+
+describe("resolveNodeModulesDir", () => {
+  it("keeps the root-owned stable mount path so Node can find it by workroot parent walk-up", () => {
+    const version = join(base, "toolchain", "versions", "abc", "node_modules");
+    mkdirSync(version, { recursive: true });
+    const current = join(base, "gateway", "node_modules");
+    mkdirSync(join(base, "gateway"), { recursive: true });
+    symlinkSync(version, current);
+
+    expect(resolveNodeModulesDir(current, "/unused")).toBe(current);
+  });
+
+  it("keeps an explicit missing runtime path fail-closed for bwrap instead of silently omitting it", () => {
+    const missing = join(base, "missing-toolchain", "node_modules");
+    expect(resolveNodeModulesDir(missing, "/unused")).toBe(missing);
+  });
+
+  it("retains the legacy deploy-root fallback when no runtime mirror is configured", () => {
+    const root = join(base, "deploy");
+    mkdirSync(join(root, "node_modules"), { recursive: true });
+    expect(resolveNodeModulesDir("", root)).toBe(join(root, "node_modules"));
+    expect(resolveNodeModulesDir("", join(base, "unprovisioned"))).toBeNull();
+  });
+
+  it("is also used by the administrative cage test instead of process.cwd()", () => {
+    const cli = readFileSync(new URL("../src/homeserver/cli.ts", import.meta.url), "utf8");
+    expect(cli).toContain("resolveNodeModulesDir(cfg.codeLoopNodeModulesDir)");
+    expect(cli).not.toContain('join(process.cwd(), "node_modules")');
   });
 });
