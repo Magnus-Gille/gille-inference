@@ -656,10 +656,17 @@ import { withUserBusEnv } from "../src/homeserver/code-loop-cage.js";
 describe("withUserBusEnv", () => {
   it("uses the native private transport when the session-bus socket is absent", () => {
     const uid = 4242;
-    const out = withUserBusEnv({ PATH: "/usr/bin" }, { uid, socketExists: () => false });
+    const out = withUserBusEnv(
+      { PATH: "/usr/bin" },
+      { uid, socketExists: (path) => path === `/run/user/${uid}/systemd/private` },
+    );
     expect(out["XDG_RUNTIME_DIR"]).toBe(`/run/user/${uid}`);
-    expect(out).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
+    expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe(`unix:path=/run/user/${uid}/systemd/private`);
     expect(out["PATH"]).toBe("/usr/bin");
+  });
+  it("leaves the bus address unset when neither reviewed transport is visible", () => {
+    const out = withUserBusEnv({}, { uid: 4242, socketExists: () => false });
+    expect(out).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
   });
   it("sets the session-bus address only when its socket exists", () => {
     const out = withUserBusEnv({}, { uid: 4242, socketExists: (path) => path === "/run/user/4242/bus" });
