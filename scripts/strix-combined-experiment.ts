@@ -10,6 +10,7 @@ import {
   createReadStream, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { createServer } from "node:net";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 
@@ -31,6 +32,11 @@ import {
 } from "../src/homeserver/strix-combined-experiment.js";
 import { validateStrixMmapAbConfig } from "../src/homeserver/strix-mmap-ab.js";
 import {
+  buildLongGenerationServerArgs,
+  evaluateLongGenerationEquivalence,
+  type StrixLongGenerationSample,
+} from "../src/homeserver/strix-long-generation.js";
+import {
   buildStrixChildEnvironment,
   restoreResidency,
   runningSnapshot,
@@ -40,6 +46,15 @@ import {
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_REPORT_BYTES = 8 * 1024 * 1024;
 const MAX_CHILD_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_LONG_RESPONSE_BYTES = 64 * 1024 * 1024;
+const LONG_READY_TIMEOUT_MS = 600_000;
+const LONG_REQUEST_TIMEOUT_MS = 600_000;
+const LONG_GENERATION_PROMPT = [
+  "Create one continuous synthetic TypeScript source file for a deterministic test fixture.",
+  "Define many small pure functions named fixture0001, fixture0002, and so on in ascending order.",
+  "Each function must return its own four-digit number as an integer. Do not use prose or Markdown.",
+  "Continue the source without summarizing; the caller deliberately measures a long deterministic generation.",
+].join(" ");
 let activeChild: ChildProcess | null = null;
 
 export interface BackendEvidence {
@@ -54,6 +69,18 @@ export interface BackendEvidence {
   stdoutBytes: number;
   stderrBytes: number;
   outputWithinLimit: boolean;
+}
+
+export interface LongGenerationEvidence {
+  promptSha256: string;
+  modelId: string;
+  kvK: "q8_0";
+  kvV: "q8_0";
+  maxTokens: number;
+  minimumCompletionTokens: number;
+  production: StrixLongGenerationSample;
+  candidate: StrixLongGenerationSample;
+  evaluation: ReturnType<typeof evaluateLongGenerationEquivalence>;
 }
 
 export function armStrixRuntimeDeadline(maxRuntimeSeconds: number, onDeadline: () => void): NodeJS.Timeout {
@@ -207,6 +234,270 @@ export async function runBackendCorrectness(config: StrixKvCandidateConfig): Pro
   return evidence;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+async function portIsFree(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolvePromise) => {
+    const server = createServer();
+    server.unref();
+    server.once("error", () => resolvePromise(false));
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      server.close(() => resolvePromise(true));
+    });
+  });
+}
+
+async function waitLongServerHealthy(child: ChildProcess, port: number, abortSignal: AbortSignal): Promise<void> {
+  const deadline = Date.now() + LONG_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error("long-generation llama-server exited before ready");
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.any([abortSignal, AbortSignal.timeout(2_000)]),
+      });
+      if (response.ok) {
+        await response.body?.cancel();
+        return;
+      }
+    } catch { /* model is still loading */ }
+    if (abortSignal.aborted) throw new Error("long-generation correctness was interrupted");
+    await sleep(250);
+  }
+  throw new Error("long-generation llama-server did not become ready before timeout");
+}
+
+async function stopLongServer(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  const exited = await Promise.race([
+    new Promise<boolean>((resolvePromise) => child.once("exit", () => resolvePromise(true))),
+    sleep(30_000).then(() => false),
+  ]);
+  if (!exited && child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise()));
+  }
+}
+
+function finite(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+async function streamLongGeneration(input: {
+  runtime: "production" | "candidate";
+  port: number;
+  model: string;
+  maxTokens: number;
+  temperature: 0;
+  seed: number;
+  serverArgsSha256: string;
+  abortSignal: AbortSignal;
+}): Promise<StrixLongGenerationSample> {
+  const started = performance.now();
+  const response = await fetch(`http://127.0.0.1:${input.port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    signal: AbortSignal.any([input.abortSignal, AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS)]),
+    body: JSON.stringify({
+      model: input.model,
+      messages: [{ role: "user", content: LONG_GENERATION_PROMPT }],
+      max_tokens: input.maxTokens,
+      temperature: input.temperature,
+      seed: input.seed,
+      ignore_eos: true,
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+  });
+  if (!response.ok || response.body === null) {
+    await response.body?.cancel();
+    return {
+      runtime: input.runtime, ok: false, finishReason: null, promptTokens: null,
+      completionTokens: null, outputSha256: null, outputBytes: 0, responseBytes: 0,
+      ttftMs: null, totalMs: performance.now() - started, predictedTokensPerSecond: null,
+      serverArgsSha256: input.serverArgsSha256,
+      serverLogSha256: "", serverLogBytes: 0,
+    };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const outputHash = createHash("sha256");
+  let buffer = "";
+  let responseBytes = 0;
+  let outputBytes = 0;
+  let parseErrors = 0;
+  let ttftMs: number | null = null;
+  let finishReason: string | null = null;
+  let promptTokens: number | null = null;
+  let completionTokens: number | null = null;
+  let predictedTokensPerSecond: number | null = null;
+  const consumeLine = (line: string): void => {
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (data === "" || data === "[DONE]") return;
+    try {
+      const chunk = JSON.parse(data) as Record<string, unknown>;
+      const choice = Array.isArray(chunk["choices"]) ? chunk["choices"][0] : null;
+      if (choice !== null && typeof choice === "object") {
+        const delta = (choice as Record<string, unknown>)["delta"];
+        if (delta !== null && typeof delta === "object") {
+          for (const key of ["reasoning_content", "content"] as const) {
+            const part = (delta as Record<string, unknown>)[key];
+            if (typeof part !== "string" || part.length === 0) continue;
+            if (ttftMs === null) ttftMs = performance.now() - started;
+            outputHash.update(part);
+            outputBytes += Buffer.byteLength(part);
+          }
+        }
+        const finish = (choice as Record<string, unknown>)["finish_reason"];
+        if (typeof finish === "string") finishReason = finish;
+      }
+      const usage = chunk["usage"];
+      if (usage !== null && typeof usage === "object") {
+        promptTokens = finite((usage as Record<string, unknown>)["prompt_tokens"]);
+        completionTokens = finite((usage as Record<string, unknown>)["completion_tokens"]);
+      }
+      const timings = chunk["timings"];
+      if (timings !== null && typeof timings === "object") {
+        const values = timings as Record<string, unknown>;
+        promptTokens ??= finite(values["prompt_n"]);
+        completionTokens ??= finite(values["predicted_n"]);
+        predictedTokensPerSecond = finite(values["predicted_per_second"]);
+      }
+    } catch { parseErrors++; }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    responseBytes += value.byteLength;
+    if (responseBytes > MAX_LONG_RESPONSE_BYTES) {
+      await reader.cancel();
+      parseErrors++;
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) consumeLine(line);
+  }
+  buffer += decoder.decode();
+  if (buffer.trim() !== "") consumeLine(buffer);
+  return {
+    runtime: input.runtime,
+    ok: parseErrors === 0 && outputBytes > 0 && finishReason !== null,
+    finishReason,
+    promptTokens,
+    completionTokens,
+    outputSha256: outputBytes > 0 ? outputHash.digest("hex") : null,
+    outputBytes,
+    responseBytes,
+    ttftMs,
+    totalMs: performance.now() - started,
+    predictedTokensPerSecond,
+    serverArgsSha256: input.serverArgsSha256,
+    serverLogSha256: "",
+    serverLogBytes: 0,
+  };
+}
+
+async function runLongGenerationArm(input: {
+  runtime: "production" | "candidate";
+  binaryPath: string;
+  port: number;
+  modelPath: string;
+  modelId: string;
+  commonArgs: string[];
+  maxTokens: number;
+  temperature: 0;
+  seed: number;
+  kvK: "q8_0";
+  kvV: "q8_0";
+  abortSignal: AbortSignal;
+}): Promise<StrixLongGenerationSample> {
+  if (!(await portIsFree(input.port))) throw new Error(`long-generation port ${input.port} is already occupied`);
+  const argv = buildLongGenerationServerArgs(input);
+  const argvSha256 = createHash("sha256").update(JSON.stringify(argv)).digest("hex");
+  const logHash = createHash("sha256");
+  let logBytes = 0;
+  const child = spawn(input.binaryPath, argv, {
+    shell: false,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: buildStrixChildEnvironment(process.env, {
+      GGML_VK_VISIBLE_DEVICES: "0",
+      LD_LIBRARY_PATH: [dirname(input.binaryPath), process.env["LD_LIBRARY_PATH"]].filter(Boolean).join(":"),
+    }),
+  });
+  activeChild = child;
+  child.stderr?.on("data", (chunk: Buffer) => {
+    logBytes += chunk.length;
+    logHash.update(chunk);
+    if (logBytes > MAX_CHILD_OUTPUT_BYTES) child.kill("SIGTERM");
+  });
+  let sample: StrixLongGenerationSample | null = null;
+  try {
+    await waitLongServerHealthy(child, input.port, input.abortSignal);
+    sample = await streamLongGeneration({
+      runtime: input.runtime,
+      port: input.port,
+      model: input.modelId,
+      maxTokens: input.maxTokens,
+      temperature: input.temperature,
+      seed: input.seed,
+      serverArgsSha256: argvSha256,
+      abortSignal: input.abortSignal,
+    });
+  } finally {
+    await stopLongServer(child);
+    if (activeChild === child) activeChild = null;
+  }
+  if (logBytes > MAX_CHILD_OUTPUT_BYTES) throw new Error(`${input.runtime} long-generation server log exceeded its bound`);
+  if (sample === null) throw new Error(`${input.runtime} long-generation sample is missing`);
+  return { ...sample, serverLogSha256: logHash.digest("hex"), serverLogBytes: logBytes };
+}
+
+export async function runLongGenerationCorrectness(
+  config: StrixKvCandidateConfig,
+  mmapConfig: ReturnType<typeof validateStrixMmapAbConfig>,
+  abortSignal: AbortSignal,
+): Promise<LongGenerationEvidence> {
+  const gate = config.localExperiment.longGenerationGate;
+  const shared = {
+    port: mmapConfig.port,
+    modelPath: config.model.path,
+    modelId: mmapConfig.modelId,
+    commonArgs: mmapConfig.commonArgs,
+    maxTokens: gate.maxTokens,
+    temperature: gate.temperature,
+    seed: gate.seed,
+    kvK: gate.kvK,
+    kvV: gate.kvV,
+    abortSignal,
+  } as const;
+  if (abortSignal.aborted) throw new Error("long-generation correctness was interrupted before production arm");
+  const production = await runLongGenerationArm({
+    ...shared, runtime: "production", binaryPath: mmapConfig.binaryPath,
+  });
+  await sleep(2_000);
+  if (abortSignal.aborted) throw new Error("long-generation correctness was interrupted before candidate arm");
+  const candidate = await runLongGenerationArm({
+    ...shared, runtime: "candidate", binaryPath: config.candidateRuntime.llamaServerPath,
+  });
+  return {
+    promptSha256: createHash("sha256").update(LONG_GENERATION_PROMPT).digest("hex"),
+    modelId: mmapConfig.modelId,
+    kvK: gate.kvK,
+    kvV: gate.kvV,
+    maxTokens: gate.maxTokens,
+    minimumCompletionTokens: gate.minimumCompletionTokens,
+    production,
+    candidate,
+    evaluation: evaluateLongGenerationEquivalence(production, candidate, gate.minimumCompletionTokens),
+  };
+}
+
 function validateBenchmarkReport(
   value: unknown,
   config: StrixKvCandidateConfig,
@@ -234,6 +525,7 @@ function markdownSummary(input: {
   runs: StrixCombinedRunEvidence[];
   restored: boolean;
   kvDecision: "advance-to-agent-gate" | "reject";
+  longGenerationDecision: "pass";
 }): string {
   return [
     "# Strix combined maintenance experiment",
@@ -241,6 +533,7 @@ function markdownSummary(input: {
     `Started: ${input.startedAt}`,
     `Finished: ${input.finishedAt}`,
     `mmap decision exit: ${input.mmapExitCode === 0 ? "promote" : "reject"}`,
+    `Long-generation equivalence: ${input.longGenerationDecision}`,
     `KV runs with complete direct coverage: ${input.runs.length}`,
     `KV microbenchmark decision: ${input.kvDecision}`,
     `Residency restored: ${input.restored ? "yes" : "no"}`,
@@ -278,6 +571,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
   });
   const startedAt = new Date().toISOString();
   let backendEvidence: BackendEvidence | null = null;
+  let longGenerationEvidence: LongGenerationEvidence | null = null;
   const reports: Array<{ evidence: StrixCombinedRunEvidence; report: StrixBenchmarkReport }> = [];
   try {
     const result = await executeStrixCombinedExperiment(config, args, {
@@ -296,6 +590,12 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
         if (!backendEvidence.outputWithinLimit) throw new Error("backend correctness output exceeded its bound");
         if (backendEvidence.exitCode !== 0) {
           throw new Error(`focused Vulkan backend correctness failed with exit code ${backendEvidence.exitCode}`);
+        }
+      },
+      runLongGenerationCorrectness: async () => {
+        longGenerationEvidence = await runLongGenerationCorrectness(config, preflight.mmapConfig, benchmarkAbort.signal);
+        if (longGenerationEvidence.evaluation.decision !== "pass") {
+          throw new Error(`long-generation equivalence rejected: ${longGenerationEvidence.evaluation.reasons.join("; ")}`);
         }
       },
       runBenchmark: async (plan) => {
@@ -334,6 +634,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
       postflight: { modelArtifactSha256: postflightModelSha256 },
       mmap: { exitCode: result.mmapExitCode, reportPath: `${resolve(args.outDir)}/mmap-ab.json` },
       backendCorrectness: backendEvidence,
+      longGenerationCorrectness: longGenerationEvidence,
       kvEvaluation: evaluateStrixKvMicrobenchmarks(config, reports.map(({ evidence, report }) => ({
         cycle: evidence.cycle,
         armId: evidence.armId,
@@ -362,6 +663,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
     atomicWrite(markdownPath, markdownSummary({
       startedAt, finishedAt, mmapExitCode: result.mmapExitCode, runs: result.runs, restored: result.restored,
       kvDecision: receipt.kvEvaluation.decision,
+      longGenerationDecision: "pass",
     }));
     console.log(JSON.stringify({ status: receipt.kvEvaluation.decision, receiptPath, markdownPath, restored: true, deployed: false }));
     return 0;
@@ -378,6 +680,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
       interruptedBy,
       preflight: { artifactSha256: preflight.hashes, runtimeVersions: preflight.versions },
       backendCorrectness: backendEvidence,
+      longGenerationCorrectness: longGenerationEvidence,
       completedKvRuns: reports.map(({ evidence, report }) => ({
         ...evidence,
         runtimeCommit: report.runtime.commit,

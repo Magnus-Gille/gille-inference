@@ -55,6 +55,13 @@ depths. The repository `benchmark:strix` runner records PP/TG separately, runtim
 actual depth, RSS/available RAM, kernel/Mesa/ROCm, and readable temperature/power telemetry.
 
 Before model execution, the candidate must pass focused Vulkan `FLASH_ATTN_EXT` backend tests.
+It must then run the stock and patched servers sequentially with the same Q8 K/V, direct
+single-stream controls, deterministic synthetic prompt, seed, and temperature zero. Each arm must
+reach the preregistered 3,072-token minimum of a 4,096-token request, report complete usage, and
+produce the same output hash. Only prompt/output/server-log hashes, counts, and timings are kept;
+generated content is discarded. This deliberately covers late-generation failure modes that a
+16-token arithmetic smoke cannot observe.
+
 The complete matrix runs twice before promotion. It must improve populated-context PP materially
 over stock Q8 without a meaningful TG, output, stability, memory-pressure, or thermal regression.
 Q8 must remain acceptable against the production F16 control, and a representative agent workload
@@ -91,12 +98,14 @@ then:
 1. runs two mmap ABBA cycles and restores the starting resident model;
 2. treats mmap promote/reject as complete independent evidence, not as a KV gate;
 3. unloads residency and runs focused serial Vulkan `FLASH_ATTN_EXT` correctness;
-4. runs production-F16, production-Q8, candidate-Q8 and then the mirrored order in cycle two;
-5. requires PP/TG cells at short, 8K, 32K, 64K, and 128K actual depth with exact runtime/model/KV
+4. runs stock and patched Q8-KV servers through the content-blind 4K deterministic generation
+   equivalence gate;
+5. runs production-F16, production-Q8, candidate-Q8 and then the mirrored order in cycle two;
+6. requires PP/TG cells at short, 8K, 32K, 64K, and 128K actual depth with exact runtime/model/KV
    provenance;
-6. restores the exact starting model and requires a deterministic `OK` inference before accepting
+7. restores the exact starting model and requires a deterministic `OK` inference before accepting
    ready state; and
-7. emits mode-0600 aggregate JSON/Markdown without model content.
+8. emits mode-0600 aggregate JSON/Markdown without model content.
 
 The model is hashed again after restoration and before the aggregate receipt is accepted. The
 required `--max-runtime-seconds` deadline sends a catchable termination signal, as does operator
@@ -105,6 +114,11 @@ required restoration path. The reviewed command uses a 6,300-second child bound 
 7,200-second maintenance TTL, reserving 900 seconds for restoration and fence closure. The
 maintenance credential is never inherited by either child. Both success and failure receipts
 record the child bound and whether it fired.
+
+The long-generation pair rejects the experiment before performance work if transport, token
+counts, finish reason, prompt tokenization, or output hashes differ. This is a conservative
+candidate-equivalence screen, not a claim that all llama.cpp backends or speculative/direct paths
+must always be byte-identical.
 
 The automatic microbenchmark decision is either `advance-to-agent-gate` or `reject`. Advancement
 requires at least 10% candidate-over-stock-Q8 PP gain at both 32K and 64K, no PP/TG cell more than

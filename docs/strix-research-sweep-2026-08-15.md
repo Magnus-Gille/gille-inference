@@ -107,7 +107,10 @@ time.
 
 | Candidate | Evidence | Exact-hardware relevance | Decision |
 |---|---|---|---|
-| Vulkan coopmat1 Q8 KV dequantize-once path ([#25491](https://github.com/ggml-org/llama.cpp/issues/25491)) | **EXTERNAL-MEASURED:** exact Strix/RADV report shows pp512 +41% at 32K and +68% at 64K actual depth with Q8 K/V; TG unchanged | High for prompt-heavy agents and long populated contexts; narrow eight-commit patch backports cleanly onto production revision | Highest-value runtime candidate; isolated M5 build and fail-closed two-cycle combined runner pass deterministic checks, GPU A/B pending exact maintenance confirmation |
+| Vulkan coopmat1 Q8 KV dequantize-once path ([#25494](https://github.com/ggml-org/llama.cpp/pull/25494)) | **EXTERNAL-MEASURED:** exact Strix/RADV report shows pp512 +41% at 32K and +68% at 64K actual depth with Q8 K/V; TG unchanged | High for prompt-heavy agents and long populated contexts; the current eight-commit upstream head still matches the pinned backport | Highest-value runtime candidate; isolated M5 build and fail-closed two-cycle combined runner pass deterministic checks, GPU A/B pending exact maintenance confirmation |
+| Long-generation corruption signal ([community report](https://www.reddit.com/r/StrixHalo/comments/1vjopen/psa_llamacpp_currently_broken_on_strix_halo/)) | **REPORTED:** Qwen3.6-27B output reportedly degrades after roughly 1–2K generated tokens; the evolving report mixes MTP, mmap, HIP launch ordering, sampling, and Vulkan observations | Exact hardware but not an isolated reproduction or upstream bug report | Do not change production from this report. Add a stock-versus-candidate 4K deterministic generation gate so short smoke tests cannot advance a corrupt runtime |
+| HIP unsafe-math determinism fix ([#26696](https://github.com/ggml-org/llama.cpp/pull/26696)) | **UPSTREAM/EXTERNAL-MEASURED:** merged 13 August after gfx1151 MTP greedy divergence was reproduced with unsafe FP reassociation; maintainers note other batch/numeric causes can also diverge | Relevant correctness precedent, but the pinned production revision predates the unsafe-math regression and this candidate is Vulkan/direct | No production change. Preserve direct same-batch long-generation comparison as a candidate-specific fail-closed gate |
+| backend split scheduler race ([#26040](https://github.com/ggml-org/llama.cpp/pull/26040)) | **UPSTREAM:** open fix for asynchronous backend split reuse/overwrite, including Vulkan-sensitive scheduling | A plausible class of late-output corruption, but no evidence ties it to the pinned single-GPU profile | Track; do not backport without a local red reproducer and one-variable A/B |
 | llama.cpp iGPU automatic no-mmap load policy ([#26081](https://github.com/ggml-org/llama.cpp/pull/26081)) | **REPORTED/upstream:** merged capability change targets iGPUs that copy weights into device-visible shared memory | High for Strix cold model swaps and peak memory; deployed runtime supports an exact-flag mechanism A/B | Selected next; ABBA runner implemented and locally tested, hardware mutation pending exact maintenance confirmation |
 | llama.cpp many-expert Vulkan threshold patch ([#25356](https://github.com/ggml-org/llama.cpp/issues/25356)) | **EXTERNAL-MEASURED:** exact 128 GB Strix/RADV report shows no change through batch 8, then +56% at batch 9, +34% at 16, +20% at 32 | High only for nine or more simultaneous sequences | Reject for current one-slot / practical two-user production workload; revisit if concurrency policy changes |
 | llama.cpp DFlash on quantized MoE HIP ([#25117](https://github.com/ggml-org/llama.cpp/issues/25117)) | **EXTERNAL-MEASURED:** exact Strix report shows 19.5 tok/s direct versus 9.4 DFlash | Exact hardware, but a clear regression in the reported arm | Do not implement this HIP path; require a different drafter/backend or new upstream evidence |
@@ -117,9 +120,10 @@ time.
 | ROCm 7.2.3 ([release page](https://github.com/ROCm/ROCm/releases)) | **UPSTREAM:** current line includes gfx1151 support | Support does not prove batch-one decode parity | No backend promotion without local decode, prompt, concurrency, and correctness A/B |
 
 No exact-hardware development discovered in this sweep has yet cleared the bar for a reversible
-production runtime change. The Q8 KV dequantize-once path is now the strongest test candidate: it
+production runtime change. The Q8 KV dequantize-once path remains the strongest test candidate: it
 has a narrow mechanism, exact-hardware evidence, a clean exact-production backport, and a passing
-M5 build, but no local GPU correctness or A/B result. See
+M5 build, but no local GPU correctness or A/B result. Its combined experiment now requires a
+content-blind 4K-token production/candidate equivalence check before performance measurements. See
 [`strix-kv-dequant-candidate-2026-08-15.md`](strix-kv-dequant-candidate-2026-08-15.md).
 
 ## Local A/B result
@@ -159,9 +163,9 @@ result schema; there is no production state to restore.
 
 ## Verification
 
-- focused telemetry tests: 3/3 passed;
+- focused telemetry and Strix experiment tests: 30/30 passed;
 - TypeScript and constitutional typechecks: passed;
-- full repository suite outside the restricted sandbox: 273 files, 4,237 tests passed;
+- full repository suite: 284 files, 4,282 tests passed;
 - Bash syntax and `git diff --check`: passed;
 - direct recorder CLI smoke: passed with mode-0600 raw and summary files.
 
