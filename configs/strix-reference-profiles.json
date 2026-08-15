@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-15",
+  "purpose": "Reference targets for repeatable Strix Halo qualification; reported targets are discovery hypotheses until locally reproduced with immutable provenance.",
+  "profiles": [
+    {
+      "id": "fast-coding",
+      "modelFamily": "Qwen3-Coder 30B-A3B",
+      "architecture": "sparse MoE",
+      "quant": null,
+      "backend": "llama.cpp Vulkan/RADV reference",
+      "configuredContextTokens": null,
+      "actualPopulatedContextTokens": null,
+      "kv": null,
+      "flashAttention": null,
+      "speculation": "direct",
+      "generationTokensPerSecondRange": [97, 101],
+      "evidenceLabel": "REPORTED",
+      "qualification": "needs immutable model/runtime provenance and local coding-agent reproduction"
+    },
+    {
+      "id": "fast-general-agent",
+      "modelFamily": "Qwen3.6-35B-A3B",
+      "architecture": "sparse MoE, approximately 3B active",
+      "quant": "Q4_K_M production family",
+      "backend": "llama.cpp Vulkan/RADV reference",
+      "configuredContextTokens": 131072,
+      "actualPopulatedContextTokens": null,
+      "kv": null,
+      "flashAttention": true,
+      "speculation": "direct or native MTP",
+      "directGenerationTokensPerSecondRange": [72, 77],
+      "mtpGenerationTokensPerSecondRange": [100, 118],
+      "strongReportedMtpMedianTokensPerSecond": 116,
+      "evidenceLabel": "REPORTED",
+      "qualification": "deployed profile has local agent-quality evidence, but these throughput targets need immutable local reproduction"
+    },
+    {
+      "id": "qwen38-capability",
+      "modelFamily": "Qwen3.8-27B",
+      "architecture": "dense multimodal, 27.78B parameters, hybrid attention, one native MTP layer",
+      "quant": "Q4_K_M plus BF16 multimodal projector",
+      "backend": "llama.cpp Vulkan/Mesa RADV",
+      "configuredContextTokens": 65536,
+      "actualPopulatedContextTokens": null,
+      "kv": "Q8_0 K/V",
+      "flashAttention": true,
+      "speculation": "native MTP depth 2",
+      "directGenerationTokensPerSecond": 12.83,
+      "mtpGenerationTokensPerSecond": 23.21,
+      "mtpAcceptanceRate": 0.661,
+      "evidenceLabel": "LOCAL-MEASURED",
+      "source": "docs/qwen38-27b-release-decision-2026-08-14.md"
+    },
+    {
+      "id": "large-capability",
+      "modelFamily": "gpt-oss-120B",
+      "architecture": "sparse MoE, approximately 5.1B active",
+      "quant": "MXFP4",
+      "backend": "pinned llama.cpp production-candidate runtime; backend not restamped in the decision artifact",
+      "configuredContextTokens": 65536,
+      "actualPopulatedContextTokens": {
+        "matrix": "80% and 92% of each tested window",
+        "maxApproxTokens": 60293
+      },
+      "kv": "F16",
+      "flashAttention": true,
+      "speculation": "none recorded",
+      "generationTokensPerSecond": 52.2,
+      "longContext64KGenerationTokensPerSecond": 35.1,
+      "evidenceLabel": "LOCAL-MEASURED",
+      "source": "docs/gpt-oss-qwen35-production-decision-2026-07-28.md"
+    },
+    {
+      "id": "vision-specialist",
+      "modelFamily": "Muse Glimmer 30B",
+      "architecture": "dense multimodal",
+      "quant": null,
+      "backend": null,
+      "configuredContextTokens": null,
+      "actualPopulatedContextTokens": null,
+      "kv": null,
+      "flashAttention": null,
+      "speculation": null,
+      "generationTokensPerSecondRange": [11, 14],
+      "evidenceLabel": "REPORTED",
+      "qualification": "candidate only; needs immutable artifact, clean direct/spec A/B, and repeatable VLM task scoring"
+    }
+  ]
+}

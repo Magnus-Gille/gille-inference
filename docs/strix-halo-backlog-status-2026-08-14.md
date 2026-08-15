@@ -1,6 +1,6 @@
 # Strix Halo 128 GB backlog execution status
 
-**Status date:** 14 August 2026
+**Status date:** 15 August 2026
 
 This is the execution ledger for the 25-ticket handoff. `Implemented` means the repository-owned
 tooling is present and deterministically tested. It does **not** mean the hardware experiment has
@@ -9,14 +9,15 @@ needed, the exclusive maintenance fence tracked in issue #196.
 
 ## Current blockers
 
-1. Qwen3.8 source staging, conversion, reference parity, the isolated Vulkan runtime, direct
-   benchmarks, native-MTP canaries, Q8-KV selection, and multimodal serving have passed. The exact
-   evidence and hashes are in `docs/qwen38-27b-release-decision-2026-08-14.md`.
-2. Production promotion remains a separate reviewed mutation: copy the complete runtime and
-   selected artifacts from staging to stable paths, verify hashes/runpaths/dependencies, back up
-   and update the private roster, restart services, and run authenticated private/public canaries.
-3. T20 still needs the common coding-agent suite before Qwen3.8 can become an automatic route.
-   Explicit authenticated availability does not imply quality superiority or route promotion.
+1. Qwen3.8 source staging, conversion, reference parity, isolated Vulkan runtime, direct
+   benchmarks, native-MTP canaries, Q8-KV selection, multimodal serving, and explicit authenticated
+   production promotion have passed. The immutable release evidence is in
+   `docs/qwen38-27b-release-decision-2026-08-14.md`.
+2. T20's matched Gate D comparison is complete. Qwen3.6 remains the fast coding default at 1.73
+   correct runs/minute; Qwen3.8 is the quality/broad-edit escalation at 30/30 correctness and 0.86
+   correct runs/minute. No automatic route changed.
+3. The next quality study needs fresh real-repository tasks and the newly added content-blind
+   turns/tokens/tool-calls/model-message-time telemetry.
 
 ## Ticket matrix
 
@@ -41,19 +42,17 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | T17 Qwen3.8 conversion | **Complete for release artifacts** | All official source files were staged and hash-verified twice. BF16, Q8_0, Q6_K, Q5_K_M, Q4_K_M, and the separate BF16 mmproj were produced from the immutable revision with a pinned runtime. Transformers/BF16/Q4 parity produced the same deterministic final text; Q4_K_M and mmproj hashes are recorded in the release decision. |
 | T18 first Qwen3.8 benchmark | **Measured** | Vulkan/RADV Q4_K_M produced 361.40 pp512 and 12.87 tg128 tok/s with F16 KV; Q8 produced 357.48/12.83. pp8192 measured 308.76 tok/s. The exact 64K server profile passed text, image, thinking, and non-thinking API canaries. |
 | T19 Qwen3.8 speculation | **Native MTP measured and selected** | Native MTP depth 2 produced 21.68–23.21 tok/s in short text canaries and 21.33–23.68 tok/s in the final 64K text/vision profile, with 57.6–71.2% draft acceptance. It is selected for explicit production qualification; workload-aware/adaptive policy remains T05. |
-| T20 Qwen3.8 vs Qwen3.6 | **Runtime evidence ready; quality A/B pending** | The verified Qwen3.8 artifact/runtime now exists and Gate D supplies deterministic coding tasks. Completed coding work per minute must still be compared before any automatic route change. Dense Qwen3.8's ~13 direct / ~21–25 MTP tok/s is much slower than the sparse Qwen3.6 throughput tier. |
+| T20 Qwen3.8 vs Qwen3.6 | **Measured; routed recommendation recorded** | The matched Gate D r1 comparison ran ten tasks × three seeds per live profile. Qwen3.6 passed 26/30 at 1.73 correct runs/minute; Qwen3.8 passed 30/30 at 0.86/minute and uniquely closed the broad four-file rename. Keep Qwen3.6 fast/default and Qwen3.8 quality/escalation; no automatic route promotion. See `docs/qwen38-vs-qwen36-gate-d-2026-08-15.md`. |
 | T21 Glimmer specialist | **Candidate only** | Existing gateway already passes multimodal `image_url` content and serves Gemma4+mmproj. Glimmer qualification/discovery remains issue #181; roster promotion is not authorized. |
 | T22 model router | **Implemented as evidence-gated routing; profile qualification blocked** | The gateway/orchestrator already performs task-aware routing through the generated capability table and fails safe to the frontier for unsupported lanes. FAST/BALANCED/DEEP/VISION/MAX remain descriptive product tiers rather than static aliases: assigning them before the issue #124 model/profile experiments would bypass the repository's evidence-before-autonomy invariant. Glimmer/MAX qualification remains separate roster work. |
-| T23 coding-agent suite | **Existing and verified** | Gate D has 14 isolated real-edit fixtures with deterministic compile/test/structural oracles and resumable model/harness runs. New models must run the same pinned corpus; no replacement suite is needed. |
+| T23 coding-agent suite | **Existing, verified, and telemetry-instrumented** | Gate D has 14 isolated real-edit fixtures with deterministic compile/test/structural oracles and resumable model/harness runs. Pi rows now add content-blind turns, tool calls, prompt/completion tokens, and observed model-message time without retaining task content. New models must run the same pinned corpus; no replacement suite is needed. |
 | T24 concurrent agents | **Runner implemented; measurement blocked** | Streaming runner covers 1/2/4/8 and useful work/minute. Existing Gate C remains the admission/preemption/soak control. Requires M5 access/window. |
 | T25 OS/power/memory profile | **Read-only capture implemented; Strix A/B blocked** | `npm run benchmark:strix-host` emits mode-0600 JSON/Markdown with the operator-observed BIOS UMA setting, kernel/Mesa/ROCm, memory, allow-listed AMD/TTM parameters, power profile, governor, DRM memory/clocks, and labelled hwmon observations. Missing sensors remain `null`, and raw kernel argv is never retained. A local non-Strix smoke test and deterministic tests prove the capture path; issue #195 still owns the one-variable M5 A/B after #196 is deployed and verified. BIOS/kernel/driver changes remain explicitly outside this branch. |
 
 ## Work order from this state
 
-1. Review the Qwen3.8 release commit and exact production mutation object; after owner approval,
-   promote the complete hashed runtime/model bundle to stable paths, update the private roster,
-   restart, and run authenticated private/public rollback-aware canaries.
-2. Run the common Gate D coding suite for T20 before considering an automatic Qwen3.8 route.
-3. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
-4. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
-5. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.
+1. Run fresh, preregistered real-repository Qwen3.6/Qwen3.8 tasks with the expanded Gate D
+   turns/tokens/tool/model-time telemetry before considering any automatic route change.
+2. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
+3. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
+4. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.
