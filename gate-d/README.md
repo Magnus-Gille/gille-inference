@@ -123,8 +123,11 @@ GATE_D_OUT="$PWD/data/gate-d-ornith-20260707.jsonl" MODEL=ornith SEEDS=3 ARMS=pi
 ```
 
 For the Pi arm, each JSONL result also records content-blind agent telemetry: turns, tool calls,
-prompt tokens, completion/generated tokens, unparseable event lines, and observed assistant-message
-inference time. `modelInferenceMs` remains `null` when the pinned Pi event stream does not expose
-`message_start`/`message_end` spans; `wallS` is never relabelled as model-only time. Raw Pi events,
-stderr, and tool/model content stay inside the throwaway work directory and are deleted after the
-deterministic grader unless `KEEP_WORK=1` is set for bounded diagnosis.
+prompt tokens, completion/generated tokens, unparseable event lines, observed model-turn time, and
+post-first-event assistant stream time. `modelTurnMs` runs from Pi's `turn_start` through the
+assistant `message_end`, so it includes client/gateway/queue/prefill/decode latency but excludes
+subsequent tool execution. `assistantStreamMs` begins only at Pi's first assistant event and must
+not be called TTFT or total inference time. Either field remains `null` when its event pair is not
+observable; `wallS` is never relabelled as model-only time. Raw Pi events, stderr, and tool/model
+content stay inside the throwaway work directory and are deleted after the deterministic grader
+unless `KEEP_WORK=1` is set for bounded diagnosis.

@@ -8,9 +8,9 @@ production runtime or model deployment in this checkpoint.
 ## What changed
 
 Gate D's Pi arm now records content-blind turns, tool calls, prompt tokens, completion tokens,
-observed assistant-message inference time, timed-message count, and unparseable event lines. It
-keeps raw model/tool events inside the throwaway task directory and deletes them after grading
-unless bounded diagnosis is explicitly requested.
+observed model-turn time, post-first-event assistant stream time, timing coverage counts, and
+unparseable event lines. It keeps raw model/tool events inside the throwaway task directory and
+deletes them after grading unless bounded diagnosis is explicitly requested.
 
 The matched Qwen3.6/Qwen3.8 result and raw content-blind evidence are now carried with this branch,
 and the current leaderboard is recorded in both JSON and Markdown.
@@ -22,8 +22,11 @@ and wall time, so it could not separate model inference, prompt growth, tool-loo
 extra turns. That gap would make an adaptive-speculation or routing experiment hard to explain and
 easy to overclaim.
 
-The recorder deliberately leaves `modelInferenceMs` null when Pi does not emit observable
-assistant `message_start`/`message_end` spans. Total wall time is never relabelled as model-only
+The recorder deliberately separates Pi's `turn_start`→assistant `message_end` span
+(`modelTurnMs`) from its first-assistant-event→assistant `message_end` span
+(`assistantStreamMs`). The former includes gateway/queue/prefill/decode latency plus small client
+overhead and excludes tool execution; the latter excludes TTFT. Missing spans stay null. Neither is
+mislabelled as pure on-device inference time, and total wall time is never relabelled as model-only
 time.
 
 ## Research triage
@@ -62,7 +65,7 @@ retroactively inferred.
 
 | | Before | After |
 |---|---|---|
-| Gate D result row | pass, exit class, total wall time | same fields plus turns, tool calls, prompt/completion tokens, observed model-message time, timing coverage, parse gaps |
+| Gate D result row | pass, exit class, total wall time | same fields plus turns, tool calls, prompt/completion tokens, model-turn time, assistant-stream time, timing coverage, parse gaps |
 | Model-only time when unavailable | absent | explicit `null` |
 | Raw Pi content | temporary mixed stdout/stderr log | temporary mode-0600 NDJSON and separate stderr, deleted after grading by default |
 | Routing decision | Qwen comparison stranded on an unpublished branch | reproducible report/evidence carried with this optimization branch |
@@ -88,5 +91,6 @@ result schema; there is no production state to restore.
 
 Run fresh, preregistered real-repository coding tasks through Qwen3.6 and Qwen3.8 using the new
 telemetry. Capture deterministic success, wall time, turns, tool calls, prompt/completion tokens,
-model-message time, retries, and test outcomes. This directly tests H8: whether dense Qwen3.8's
-extra correctness reduces total iterations enough to beat the faster MoE on realistic work.
+model-turn time, assistant-stream time, retries, and test outcomes. This directly tests H8: whether
+dense Qwen3.8's extra correctness reduces total iterations enough to beat the faster MoE on
+realistic work.

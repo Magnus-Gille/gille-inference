@@ -25,8 +25,10 @@ export interface PiBenchmarkTelemetrySummary {
   toolCalls: number;
   promptTokens: number;
   completionTokens: number;
-  modelInferenceMs: number | null;
-  timedModelMessages: number;
+  modelTurnMs: number | null;
+  timedModelTurns: number;
+  assistantStreamMs: number | null;
+  timedAssistantMessages: number;
   unparseableLines: number;
 }
 
@@ -57,15 +59,21 @@ export function createPiBenchmarkTelemetry(): PiBenchmarkTelemetry {
   let toolCalls = 0;
   let promptTokens = 0;
   let completionTokens = 0;
-  let modelInferenceMs = 0;
-  let timedModelMessages = 0;
+  let modelTurnMs = 0;
+  let timedModelTurns = 0;
+  let assistantStreamMs = 0;
+  let timedAssistantMessages = 0;
   let unparseableLines = 0;
+  let modelTurnStartedMs: number | null = null;
   let assistantMessageStartedMs: number | null = null;
 
   return {
     observe(event, observedMs) {
       const type = event["type"];
-      if (type === "turn_start") turns++;
+      if (type === "turn_start") {
+        turns++;
+        modelTurnStartedMs = observedMs;
+      }
       if (type === "tool_execution_start" && typeof event["toolCallId"] === "string" && typeof event["toolName"] === "string") {
         toolCalls++;
       }
@@ -79,13 +87,23 @@ export function createPiBenchmarkTelemetry(): PiBenchmarkTelemetry {
       if (type === "message_start" && roleOf(event) === "assistant") {
         assistantMessageStartedMs = observedMs;
       }
-      if (type === "message_end" && roleOf(event) === "assistant" && assistantMessageStartedMs !== null) {
-        const elapsed = observedMs - assistantMessageStartedMs;
-        if (Number.isFinite(elapsed) && elapsed >= 0) {
-          modelInferenceMs += elapsed;
-          timedModelMessages++;
+      if (type === "message_end" && roleOf(event) === "assistant") {
+        if (modelTurnStartedMs !== null) {
+          const elapsed = observedMs - modelTurnStartedMs;
+          if (Number.isFinite(elapsed) && elapsed >= 0) {
+            modelTurnMs += elapsed;
+            timedModelTurns++;
+          }
+          modelTurnStartedMs = null;
         }
-        assistantMessageStartedMs = null;
+        if (assistantMessageStartedMs !== null) {
+          const elapsed = observedMs - assistantMessageStartedMs;
+          if (Number.isFinite(elapsed) && elapsed >= 0) {
+            assistantStreamMs += elapsed;
+            timedAssistantMessages++;
+          }
+          assistantMessageStartedMs = null;
+        }
       }
     },
     unparseable() {
@@ -97,8 +115,10 @@ export function createPiBenchmarkTelemetry(): PiBenchmarkTelemetry {
         toolCalls,
         promptTokens,
         completionTokens,
-        modelInferenceMs: timedModelMessages > 0 ? Math.round(modelInferenceMs) : null,
-        timedModelMessages,
+        modelTurnMs: timedModelTurns > 0 ? Math.round(modelTurnMs) : null,
+        timedModelTurns,
+        assistantStreamMs: timedAssistantMessages > 0 ? Math.round(assistantStreamMs) : null,
+        timedAssistantMessages,
         unparseableLines,
       };
     },

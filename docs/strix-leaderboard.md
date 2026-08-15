@@ -45,5 +45,5 @@ scope used for each winner.
 - Qwen3.8's 64K serving contract is configured capacity, not a 64K-populated agent benchmark.
 
 The next useful update is a preregistered fresh real-repository coding study using the instrumented
-Pi runner, with turns, tool calls, prompt/completion tokens, observed model-message time, total wall
-time, and deterministic test outcomes.
+Pi runner, with turns, tool calls, prompt/completion tokens, model-turn time, assistant-stream time,
+total wall time, and deterministic test outcomes.

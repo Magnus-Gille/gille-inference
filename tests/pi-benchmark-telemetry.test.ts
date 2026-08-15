@@ -6,10 +6,12 @@ import {
 } from "../scripts/pi-benchmark-telemetry.js";
 
 describe("Pi benchmark telemetry", () => {
-  it("extracts content-blind agent metrics and assistant inference time", () => {
+  it("separates model-turn time from post-first-event assistant stream time", () => {
     const state = createPiBenchmarkTelemetry();
     const events: Array<[number, object]> = [
       [0, { type: "turn_start" }],
+      [1, { type: "message_start", message: { role: "user", content: "private prompt" } }],
+      [2, { type: "message_end", message: { role: "user", content: "private prompt" } }],
       [5, { type: "message_start", message: { role: "assistant", content: [{ type: "text", text: "secret" }] } }],
       [15, { type: "message_update", delta: "secret" }],
       [35, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "secret" }] } }],
@@ -30,8 +32,10 @@ describe("Pi benchmark telemetry", () => {
       toolCalls: 1,
       promptTokens: 270,
       completionTokens: 70,
-      modelInferenceMs: 55,
-      timedModelMessages: 2,
+      modelTurnMs: 70,
+      timedModelTurns: 2,
+      assistantStreamMs: 55,
+      timedAssistantMessages: 2,
       unparseableLines: 0,
     });
     expect(JSON.stringify(state.summary())).not.toContain("secret");
@@ -57,19 +61,37 @@ describe("Pi benchmark telemetry", () => {
       toolCalls: 1,
       promptTokens: 10,
       completionTokens: 4,
-      modelInferenceMs: null,
-      timedModelMessages: 0,
+      modelTurnMs: null,
+      timedModelTurns: 0,
+      assistantStreamMs: null,
+      timedAssistantMessages: 0,
       unparseableLines: 1,
     });
   });
 
   it("does not count incomplete or non-assistant message spans as model time", () => {
     const state = createPiBenchmarkTelemetry();
+    observePiBenchmarkLine(state, JSON.stringify({ type: "turn_start" }), 5);
     observePiBenchmarkLine(state, JSON.stringify({ type: "message_start", message: { role: "user" } }), 10);
     observePiBenchmarkLine(state, JSON.stringify({ type: "message_end", message: { role: "user" } }), 20);
     observePiBenchmarkLine(state, JSON.stringify({ type: "message_start", message: { role: "assistant" } }), 30);
 
-    expect(state.summary().modelInferenceMs).toBeNull();
-    expect(state.summary().timedModelMessages).toBe(0);
+    expect(state.summary().modelTurnMs).toBeNull();
+    expect(state.summary().timedModelTurns).toBe(0);
+    expect(state.summary().assistantStreamMs).toBeNull();
+    expect(state.summary().timedAssistantMessages).toBe(0);
+  });
+
+  it("retains model-turn timing when a Pi stream omits assistant message_start", () => {
+    const state = createPiBenchmarkTelemetry();
+    observePiBenchmarkLine(state, JSON.stringify({ type: "turn_start" }), 10);
+    observePiBenchmarkLine(state, JSON.stringify({ type: "message_end", message: { role: "assistant" } }), 45);
+
+    expect(state.summary()).toMatchObject({
+      modelTurnMs: 35,
+      timedModelTurns: 1,
+      assistantStreamMs: null,
+      timedAssistantMessages: 0,
+    });
   });
 });
