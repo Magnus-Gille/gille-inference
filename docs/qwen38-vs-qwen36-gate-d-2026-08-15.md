@@ -84,6 +84,14 @@ The next promotion-quality study should use fresh real-repository tasks with pre
 scoring and should capture turns, generated tokens, and model-only inference time. A separately
 declared holdout run may use Gate D r2; this run intentionally preserved it.
 
+## Independent review
+
+After a 15-minute idle interval, `qwen3-coder-next-80b` independently reviewed this report and
+the complete raw JSONL through the M5 review path. It recalculated the headline arithmetic,
+checked the per-task outcomes and timings, and returned `READY` with no blocking errors. Its only
+material caveat was the already documented deployed-profile confound: the result supports routing
+between the live profiles, not an architecture-isolated claim about the base models.
+
 ## Evidence integrity
 
 The content-blind raw rows are preserved in
