@@ -852,11 +852,18 @@ export function loadConfig(): HomeserverConfig {
     blindContextMaxTotalBytes: envNum("HOMESERVER_BLIND_CONTEXT_MAX_TOTAL_BYTES", 1_048_576),
     // code_loop (#116). Default off → the surface is visible to owners but inert until provisioned.
     codeLoop: (process.env["HOMESERVER_CODE_LOOP"] ?? "off") === "on" ? "on" : "off",
-    codeLoopPiBin: process.env["HOMESERVER_CODE_LOOP_PI_BIN"] ?? "",
+    // Isolation-only names deliberately differ from the public settings. systemd reads
+    // EnvironmentFile after Environment= and would otherwise let legacy owner-home paths in the
+    // migrated secret file override the dedicated service-account runtime paths.
+    codeLoopPiBin: process.env["HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN"]
+      ?? process.env["HOMESERVER_CODE_LOOP_PI_BIN"]
+      ?? "",
     codeLoopApiKey: process.env["HOMESERVER_CODE_LOOP_API_KEY"] ?? "",
     codeLoopWorkroot: process.env["HOMESERVER_CODE_LOOP_WORKROOT"] ?? "./data/code-loop-work",
     codeLoopModel: process.env["HOMESERVER_CODE_LOOP_MODEL"] ?? "qwen3-coder-next-80b",
-    codeLoopPiAgentDir: process.env["HOMESERVER_CODE_LOOP_PI_AGENT_DIR"] ?? "",
+    codeLoopPiAgentDir: process.env["HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR"]
+      ?? process.env["HOMESERVER_CODE_LOOP_PI_AGENT_DIR"]
+      ?? "",
     // "off" only when explicitly set — anything else (incl. unset) is the safe "required".
     codeLoopConfinement: process.env["HOMESERVER_CODE_LOOP_CONFINEMENT"] === "off" ? "off" : "required",
     codeLoopForwardPort: envNum("HOMESERVER_CODE_LOOP_FORWARD_PORT", 18080),

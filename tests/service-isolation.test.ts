@@ -536,8 +536,10 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).not.toContain("BindReadOnlyPaths=/home/magnus\n");
     expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_WORKROOT=/var/lib/gille-inference/gateway/data/code-loop-work");
     expect(unit).not.toContain("/var/lib/gille-inference/gateway/code-loop-work");
-    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_PI_BIN=/var/lib/gille-inference/gille-gateway/.local/bin/pi");
-    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=/var/lib/gille-inference/gille-gateway/.pi-code-loop");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN=/var/lib/gille-inference/gille-gateway/.local/bin/pi");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR=/var/lib/gille-inference/gille-gateway/.pi-code-loop");
+    expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_PI_BIN=");
+    expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=");
   });
 
   it("allows cloudflared only the network and files it requires", () => {
