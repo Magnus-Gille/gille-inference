@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifyChangedPaths,
+  resolveGatewayKey,
   sha256Text,
   validateRealAgentCorpus,
 } from "../scripts/real-agent-benchmark.js";
@@ -53,5 +54,12 @@ describe("real-agent benchmark preregistration", () => {
       changed: ["docs/unplanned.md", "scripts/a.ts", "tests/a.test.ts"],
       disallowed: ["docs/unplanned.md"],
     });
+  });
+
+  it("accepts the canonical m5-auth environment without weakening legacy key precedence", () => {
+    expect(resolveGatewayKey({ M5_API_KEY: "m5" })).toBe("m5");
+    expect(resolveGatewayKey({ GW_KEY: "gateway", M5_API_KEY: "m5" })).toBe("gateway");
+    expect(resolveGatewayKey({ HS_API_KEY: "home", GW_KEY: "gateway", M5_API_KEY: "m5" })).toBe("home");
+    expect(resolveGatewayKey({})).toBeNull();
   });
 });

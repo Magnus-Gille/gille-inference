@@ -218,6 +218,11 @@ export function sha256Text(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+export function resolveGatewayKey(env: Readonly<Record<string, string | undefined>>): string | null {
+  const key = env["HS_API_KEY"] ?? env["GW_KEY"] ?? env["M5_API_KEY"];
+  return key === undefined || key === "" ? null : key;
+}
+
 function loadCorpus(path: string): RealAgentCorpus {
   return validateRealAgentCorpus(JSON.parse(readFileSync(path, "utf8")) as unknown);
 }
@@ -331,8 +336,8 @@ async function closeWritable(stream: ReturnType<typeof createWriteStream>): Prom
 }
 
 async function runPi(input: { workDir: string; logDir: string; task: RealAgentTaskSpec; model: string; provider: string; capSeconds: number }): Promise<PiRunResult> {
-  const key = process.env["HS_API_KEY"] ?? process.env["GW_KEY"];
-  if (key === undefined || key === "") throw new Error("HS_API_KEY or GW_KEY is required for a live run");
+  const key = resolveGatewayKey(process.env);
+  if (key === null) throw new Error("HS_API_KEY, GW_KEY, or canonical M5_API_KEY is required for a live run");
   // Keep harness artifacts outside the scored Git tree so they can never be mistaken for model
   // edits. The parent temp root is still mode-private and removed with the worktree by default.
   const rawPath = join(input.logDir, "pi-events.ndjson");
