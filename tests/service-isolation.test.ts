@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -52,7 +52,7 @@ function runGatewayApplyFailureHarness(): string {
 LOG="$2"; BACKUP_ROOT="$3"; source "$1"
 record() { printf '%s\\n' "$1" >> "$LOG"; }
 root_only() { :; }; need() { :; }; show_value() { printf 'magnus\\n'; }
-preflight() { :; }; create_service_user() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; install() { :; }; stat() { printf '1\\n'; }
+preflight() { :; }; create_service_user() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; provision_gateway_codeloop_toolchain() { :; }; install() { :; }; stat() { printf '1\\n'; }
 backup_unit() { mkdir -p "$3"; printf 'enabled\\n' > "$3/legacy-timer.enabled"; printf 'active\\n' > "$3/legacy-timer.active"; }
 disable_legacy_autonomy_timer() { record disable; }
 migrate_gateway_state() { record migrate; false; }
@@ -343,7 +343,50 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain("restore_gateway_netlink=0");
     expect(source).toContain("restore_gateway_user_manager_order=0");
     expect(source).toContain("restore_gateway_session_bus=0");
-    expect(source).toContain('( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" )');
+    expect(source).toContain('( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 )');
+    const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
+    expect(refresh.indexOf('readlink "$REFRESH_TOOLCHAIN_CURRENT"')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
+    expect(refresh.indexOf('verify_gateway_codeloop_toolchain "$prior_digest"')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
+    expect(refresh.indexOf("REFRESH_ACTIVE=1")).toBeLessThan(refresh.indexOf("provision_gateway_codeloop_toolchain"));
+  });
+
+  it("atomically restores the exact prior toolchain pointer recorded before refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-toolchain-pointer-"));
+    const fakeRoot = join(work, "var-lib");
+    const backup = join(work, "backup");
+    const digestBefore = "a".repeat(64);
+    const digestAfter = "b".repeat(64);
+    const before = join(fakeRoot, "gateway", "code-loop-toolchain", "versions", digestBefore, "node_modules");
+    const after = join(fakeRoot, "gateway", "code-loop-toolchain", "versions", digestAfter, "node_modules");
+    const current = join(fakeRoot, "gateway", "node_modules");
+    mkdirSync(before, { recursive: true });
+    mkdirSync(after, { recursive: true });
+    mkdirSync(backup);
+    symlinkSync(after, current);
+    writeFileSync(join(backup, "toolchain-current.before"), `${before}\n`);
+    const harness = join(work, "service-isolation-harness.sh");
+    writeFileSync(
+      harness,
+      readFileSync(script, "utf8").replace(
+        'readonly ROOT="/var/lib/gille-inference"',
+        `readonly ROOT="${fakeRoot}"`,
+      ),
+    );
+
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_TOOLCHAIN_CURRENT=\"$3\"; chown() { :; }; mv() { if [ \"$(uname -s)\" = Darwin ]; then command mv -fh \"$2\" \"$3\"; else command mv -Tf \"$2\" \"$3\"; fi; }; verify_gateway_codeloop_toolchain() { printf 'toolchain-verify:%s\\n' \"$1\"; }; restore_gateway_codeloop_toolchain_pointer",
+        "--",
+        harness,
+        backup,
+        current,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain(`toolchain-verify:${digestBefore}`);
+    expect(readlinkSync(current)).toBe(before);
   });
 
   it("restores and verifies a pre-netlink gateway drop-in after refresh failure", () => {
@@ -359,7 +402,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 0 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
         "--",
         script,
         backup,
@@ -367,7 +410,7 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(output).toContain("verify:gateway 1 0 0 0");
+    expect(output).toContain("verify:gateway 1 0 0 0 0");
     expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
     expect(output).not.toContain("AF_NETLINK");
   });
@@ -394,7 +437,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 1 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 1 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
         "--",
         script,
         backup,
@@ -402,7 +445,7 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(output).toContain("verify:gateway 1 1 1 0");
+    expect(output).toContain("verify:gateway 1 1 1 0 0");
     expect(output).toContain("AF_NETLINK");
     expect(output).toContain("BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd");
     expect(output).toContain("Requires=user@991.service");
@@ -431,7 +474,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 0 1' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 0 1 0' ]; }; restore_isolation_refresh; cat \"$3\"",
         "--",
         script,
         backup,
@@ -439,7 +482,7 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(output).toContain("verify:gateway 1 1 0 1");
+    expect(output).toContain("verify:gateway 1 1 0 1 0");
     expect(output).toContain("/run/user/991/bus");
   });
 
@@ -534,12 +577,22 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("InaccessiblePaths=-/home/magnus/home-server-eval/.claude");
     expect(unit).toContain("InaccessiblePaths=-/home/magnus/home-server-eval/.ssh");
     expect(unit).not.toContain("BindReadOnlyPaths=/home/magnus\n");
-    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_WORKROOT=/var/lib/gille-inference/gateway/data/code-loop-work");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_WORKROOT=/var/lib/gille-inference/gateway/data/code-loop-work");
+    expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_WORKROOT=");
     expect(unit).not.toContain("/var/lib/gille-inference/gateway/code-loop-work");
     expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN=/var/lib/gille-inference/gille-gateway/.local/bin/pi");
     expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR=/var/lib/gille-inference/gille-gateway/.pi-code-loop");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_NODE_MODULES_DIR=/var/lib/gille-inference/gateway/node_modules");
     expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_PI_BIN=");
     expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=");
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain("provision_gateway_codeloop_toolchain");
+    expect(source).toContain('digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"');
+    expect(source).toContain('runuser -u "$GATEWAY_USER" -- test ! -w "$current"');
+    expect(source).toContain('validate_gateway_codeloop_toolchain_links "$resolved"');
+    const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
+    expect(refresh.indexOf("provision_gateway_codeloop_toolchain")).toBeGreaterThan(-1);
+    expect(refresh.indexOf("provision_gateway_codeloop_toolchain")).toBeLessThan(refresh.indexOf('atomic_render_dropin "$service" "$dropin"'));
   });
 
   it("allows cloudflared only the network and files it requires", () => {

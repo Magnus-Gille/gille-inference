@@ -24,6 +24,7 @@ APPLY_BACKUP_REPORTED=0
 REFRESH_BACKUP=""
 REFRESH_DROPIN=""
 REFRESH_UNIT=""
+REFRESH_TOOLCHAIN_CURRENT=""
 REFRESH_ACTIVE=0
 gateway_home() { printf '%s\n' "$ROOT/$GATEWAY_USER"; }
 
@@ -177,9 +178,10 @@ ExecStartPre=/usr/bin/test -S /run/user/$gateway_uid/bus
 EnvironmentFile=$ETC/gateway/gateway.env
 Environment=AUTONOMY_NOTIFY_CMD=$ROOT/gateway/bin/autonomy-notify.sh
 Environment=GILLE_AUTONOMY_ENV_FILE=$ETC/gateway/gateway.env
-Environment=HOMESERVER_CODE_LOOP_WORKROOT=$ROOT/gateway/data/code-loop-work
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_WORKROOT=$ROOT/gateway/data/code-loop-work
 Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
 Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_NODE_MODULES_DIR=$ROOT/gateway/node_modules
 BindReadOnlyPaths=$GATEWAY_TREE
 # Bind the containing directory so a restarted user manager can replace its
 # private socket without leaving the gateway namespace pinned to a stale inode.
@@ -616,6 +618,140 @@ provision_gateway_codeloop_runtime() {
   [ ! -e "$home/.pi-code-loop/auth.json" ] || die "refusing to proceed: dedicated Pi runtime contains auth.json"
 }
 
+verify_gateway_codeloop_toolchain() {
+  local expected_digest="${1:-}" base versions current digest resolved version marker marker_value
+  base="$ROOT/gateway/code-loop-toolchain"
+  versions="$base/versions"
+  current="$ROOT/gateway/node_modules"
+  [ -L "$current" ] || die "code_loop toolchain current pointer is absent or unsafe"
+  resolved="$(readlink -f "$current")" || die "could not resolve code_loop toolchain current pointer"
+  if [ -n "$expected_digest" ]; then
+    digest="$expected_digest"
+  else
+    digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"
+    digest="${digest%% *}"
+  fi
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || die "could not derive code_loop toolchain identity"
+  version="$versions/$digest"
+  [ "$resolved" = "$version/node_modules" ] || die "code_loop toolchain does not match the deployed lockfile"
+  [ -f "$version/package-lock.sha256" ] && [ ! -L "$version/package-lock.sha256" ] \
+    || die "code_loop toolchain identity marker is absent or unsafe"
+  marker="$version/package-lock.sha256"
+  marker_value="$(cat "$marker")"
+  [ "$marker_value" = "$digest" ] || die "code_loop toolchain identity marker does not match"
+  [ -d "$current" ] || die "code_loop toolchain node_modules is absent or unsafe"
+  [ "$(stat -c '%U:%G:%a' "$base")" = "root:$GATEWAY_USER:750" ] \
+    || die "code_loop toolchain root ownership or mode drifted"
+  [ -d "$versions" ] && [ ! -L "$versions" ] \
+    && [ "$(stat -c '%U:%G:%a' "$versions")" = "root:$GATEWAY_USER:750" ] \
+    || die "code_loop toolchain versions ownership or mode drifted"
+  [ -d "$version" ] && [ ! -L "$version" ] \
+    && [ "$(stat -c '%U:%G:%a' "$version")" = "root:$GATEWAY_USER:750" ] \
+    || die "code_loop toolchain version ownership or mode drifted"
+  [ "$(stat -c '%U:%G:%a' "$marker")" = "root:$GATEWAY_USER:440" ] \
+    || die "code_loop toolchain identity marker ownership or mode drifted"
+  [ "$(stat -c '%U:%G' "$current")" = "root:$GATEWAY_USER" ] \
+    || die "code_loop toolchain current pointer ownership drifted"
+  if find "$resolved" \( -type d -o -type f \) \( ! -user root -o ! -group "$GATEWAY_USER" -o -perm /022 \) -print -quit | grep -q .; then
+    die "code_loop toolchain contains writable or foreign-owned entries"
+  fi
+  if find "$resolved" -type l \( ! -user root -o ! -group "$GATEWAY_USER" \) -print -quit | grep -q .; then
+    die "code_loop toolchain contains foreign-owned links"
+  fi
+  validate_gateway_codeloop_toolchain_links "$resolved" \
+    || die "code_loop toolchain contains an escaping or broken link"
+  runuser -u "$GATEWAY_USER" -- test -r "$current" \
+    || die "code_loop toolchain is not readable by the gateway account"
+  runuser -u "$GATEWAY_USER" -- test ! -w "$current" \
+    || die "code_loop toolchain is writable by the gateway account"
+}
+
+validate_gateway_codeloop_toolchain_links() {
+  local root="$1" link resolved
+  while IFS= read -r -d '' link; do
+    resolved="$(readlink -f "$link")" || return 1
+    case "$resolved" in "$root"/*) ;; *) return 1 ;; esac
+  done < <(find "$root" -type l -print0)
+}
+
+provision_gateway_codeloop_toolchain() {
+  local base versions digest version staging current temp_link
+  gateway_codeloop_enabled || return 0
+  [ -d "$GATEWAY_TREE/node_modules" ] && [ ! -L "$GATEWAY_TREE/node_modules" ] \
+    || die "code_loop toolchain source is absent or unsafe"
+  [ -f "$GATEWAY_TREE/package-lock.json" ] && [ ! -L "$GATEWAY_TREE/package-lock.json" ] \
+    || die "code_loop package lock is absent or unsafe"
+  digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || die "could not derive code_loop toolchain identity"
+  base="$ROOT/gateway/code-loop-toolchain"
+  versions="$base/versions"
+  version="$versions/$digest"
+  install -d -m 0750 -o root -g "$GATEWAY_USER" "$ROOT/gateway" "$base" "$versions"
+  if [ ! -e "$version" ]; then
+    staging="$(mktemp -d "$versions/.${digest}.XXXXXX")" || die "could not stage code_loop toolchain"
+    if ! cp -a "$GATEWAY_TREE/node_modules" "$staging/node_modules"; then
+      rm -rf -- "$staging"
+      die "could not copy code_loop toolchain"
+    fi
+    if ! validate_gateway_codeloop_toolchain_links "$staging"; then
+      rm -rf -- "$staging"
+      die "code_loop toolchain copy contains an escaping or broken link"
+    fi
+    chown -R root:"$GATEWAY_USER" "$staging" || { rm -rf -- "$staging"; die "could not own code_loop toolchain"; }
+    find "$staging" -type d -exec chmod 0750 {} + || { rm -rf -- "$staging"; die "could not restrict code_loop toolchain directories"; }
+    find "$staging" -type f -perm /111 -exec chmod 0550 {} + || { rm -rf -- "$staging"; die "could not restrict code_loop toolchain executables"; }
+    find "$staging" -type f ! -perm /111 -exec chmod 0440 {} + || { rm -rf -- "$staging"; die "could not restrict code_loop toolchain files"; }
+    install -m 0440 -o root -g "$GATEWAY_USER" /dev/stdin "$staging/package-lock.sha256" <<<"$digest"
+    if ! mv -T "$staging" "$version"; then
+      rm -rf -- "$staging"
+      die "could not publish code_loop toolchain"
+    fi
+  fi
+  [ -d "$version" ] && [ ! -L "$version" ] || die "code_loop toolchain version is unsafe"
+  current="$ROOT/gateway/node_modules"
+  [ ! -e "$current" ] || [ -L "$current" ] || die "code_loop toolchain current pointer is unsafe"
+  temp_link="$base/.current.$$.tmp"
+  [ ! -e "$temp_link" ] && [ ! -L "$temp_link" ] || die "code_loop toolchain temporary pointer already exists"
+  ln -s "$version/node_modules" "$temp_link" || die "could not stage code_loop toolchain pointer"
+  chown -h root:"$GATEWAY_USER" "$temp_link" || { rm -f -- "$temp_link"; die "could not own code_loop toolchain pointer"; }
+  if ! mv -Tf "$temp_link" "$current"; then
+    rm -f -- "$temp_link"
+    die "could not publish code_loop toolchain pointer"
+  fi
+  verify_gateway_codeloop_toolchain
+}
+
+restore_gateway_codeloop_toolchain_pointer() {
+  local prior_target expected_digest temp_link
+  [ -n "$REFRESH_TOOLCHAIN_CURRENT" ] || return 0
+  if [ -f "$REFRESH_BACKUP/toolchain-current.before" ] \
+    && [ ! -L "$REFRESH_BACKUP/toolchain-current.before" ]; then
+    prior_target="$(cat "$REFRESH_BACKUP/toolchain-current.before")" || return 1
+    if [[ ! "$prior_target" =~ ^$ROOT/gateway/code-loop-toolchain/versions/([a-f0-9]{64})/node_modules$ ]]; then
+      return 1
+    fi
+    expected_digest="${BASH_REMATCH[1]}"
+    [ -d "$prior_target" ] && [ ! -L "${prior_target%/node_modules}" ] || return 1
+    temp_link="$ROOT/gateway/code-loop-toolchain/.restore-current.$$.tmp"
+    [ ! -e "$temp_link" ] && [ ! -L "$temp_link" ] || return 1
+    ln -s "$prior_target" "$temp_link" || return 1
+    chown -h root:"$GATEWAY_USER" "$temp_link" || { rm -f -- "$temp_link"; return 1; }
+    if ! mv -Tf "$temp_link" "$REFRESH_TOOLCHAIN_CURRENT"; then
+      rm -f -- "$temp_link"
+      return 1
+    fi
+    verify_gateway_codeloop_toolchain "$expected_digest" || return 1
+  elif [ -f "$REFRESH_BACKUP/toolchain-current.absent" ] \
+    && [ ! -L "$REFRESH_BACKUP/toolchain-current.absent" ]; then
+    [ ! -e "$REFRESH_TOOLCHAIN_CURRENT" ] || [ -L "$REFRESH_TOOLCHAIN_CURRENT" ] || return 1
+    rm -f -- "$REFRESH_TOOLCHAIN_CURRENT" || return 1
+    [ ! -e "$REFRESH_TOOLCHAIN_CURRENT" ] && [ ! -L "$REFRESH_TOOLCHAIN_CURRENT" ] || return 1
+  else
+    return 1
+  fi
+}
+
 backup_unit() {
   local service="$1" unit="$2" backup="$3"
   mkdir -p "$backup"
@@ -880,10 +1016,11 @@ restore_isolation_refresh() {
   if grep -Eq '^BindReadOnlyPaths=.*/run/user/[0-9]+/bus([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
     restore_gateway_session_bus=1
   fi
+  restore_gateway_codeloop_toolchain_pointer || return 1
   atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
   systemctl daemon-reload || return 1
   systemctl restart "$REFRESH_UNIT" || return 1
-  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" ) || return 1
+  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 ) || return 1
 }
 
 refresh_exit_handler() {
@@ -900,8 +1037,8 @@ refresh_exit_handler() {
 }
 
 refresh_isolation() {
-  local service="$1" backup_root="$2" unit dropin stamp backup
-  root_only; need systemctl; need install; need mktemp; need loginctl; need runuser; need mv; need rm; need chown; need chmod
+  local service="$1" backup_root="$2" unit dropin stamp backup prior_target prior_digest
+  root_only; need systemctl; need install; need mktemp; need loginctl; need runuser; need mv; need rm; need chown; need chmod; need cp; need find; need sha256sum; need ln; need readlink
   [ "$service" = gateway ] || die "refresh-isolation currently applies only to gateway"
   unit="$(unit_for "$service")"
   [ "$(show_value "$unit" User)" = "$GATEWAY_USER" ] || die "$unit is not already isolated; use apply instead"
@@ -918,25 +1055,43 @@ refresh_isolation() {
   backup="$(mktemp -d "$backup_root/$stamp-$service-refresh.XXXXXX")"
   install -m 0644 -o root -g root "$dropin" "$backup/dropin.before.conf"
   systemctl show "$unit" -p User -p ActiveState -p SubState -p MainPID -p Requires -p After --no-pager >"$backup/unit.before.show"
+  REFRESH_TOOLCHAIN_CURRENT="$ROOT/gateway/node_modules"
+  if [ -L "$REFRESH_TOOLCHAIN_CURRENT" ]; then
+    prior_target="$(readlink "$REFRESH_TOOLCHAIN_CURRENT")" \
+      || die "could not read the prior code_loop toolchain pointer"
+    if [[ ! "$prior_target" =~ ^$ROOT/gateway/code-loop-toolchain/versions/([a-f0-9]{64})/node_modules$ ]]; then
+      die "prior code_loop toolchain pointer is not safely restorable"
+    fi
+    prior_digest="${BASH_REMATCH[1]}"
+    verify_gateway_codeloop_toolchain "$prior_digest"
+    printf '%s\n' "$prior_target" >"$backup/toolchain-current.before" \
+      || die "could not record the prior code_loop toolchain pointer"
+  elif [ ! -e "$REFRESH_TOOLCHAIN_CURRENT" ]; then
+    : >"$backup/toolchain-current.absent"
+  else
+    die "code_loop toolchain current pointer is unsafe"
+  fi
 
   REFRESH_BACKUP="$backup"
   REFRESH_DROPIN="$dropin"
   REFRESH_UNIT="$unit"
   REFRESH_ACTIVE=1
   trap 'refresh_exit_handler "$?"' EXIT
+  provision_gateway_codeloop_toolchain
   atomic_render_dropin "$service" "$dropin" || die "could not atomically install refreshed gateway isolation drop-in"
   systemctl restart "$unit" || die "refreshed gateway unit did not restart"
   ( verify "$service" ) || die "refreshed gateway unit did not verify"
   printf 'service=%s\nunit=%s\nbackup=%s\nverified_at=%s\n' "$service" "$unit" "$backup" "$(date -u +%FT%TZ)" >"$backup/refresh-receipt" \
     || die "could not write gateway isolation refresh receipt"
   REFRESH_ACTIVE=0
+  REFRESH_TOOLCHAIN_CURRENT=""
   trap - EXIT
   note "REFRESHED: $service isolation. Prior drop-in: $backup/dropin.before.conf"
 }
 
 verify() {
-  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" require_gateway_session_bus="${5:-1}" unit user actual_user
-  need systemctl; need ss
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" require_gateway_session_bus="${5:-1}" require_gateway_toolchain="${6:-1}" unit user actual_user
+  need systemctl; need ss; need sha256sum; need readlink; need runuser
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"
   [ "$actual_user" = "$user" ] || die "$unit still runs as '$actual_user', expected '$user'"
@@ -974,6 +1129,7 @@ verify() {
       if gateway_codeloop_enabled; then
         [ -d "$ROOT/gateway/data/code-loop-work" ] || die "gateway code-loop work state was not preserved"
         require_owner_group "$ROOT/gateway/data/code-loop-work" "$GATEWAY_USER" "$GATEWAY_USER"
+        [ "$require_gateway_toolchain" = 0 ] || verify_gateway_codeloop_toolchain
       fi
       require_mode "$ROOT/gateway/bin" 750
       require_owner_group "$ROOT/gateway/bin" root "$GATEWAY_USER"
@@ -1062,7 +1218,7 @@ verify() {
 apply() {
   local service="$1" backup_root="$2" unit stamp backup dependent_state_file
   root_only; need useradd; need install; need systemctl; need curl; need ss; need grep; need sed; need sudo; need runuser; need mktemp; need mv; need chown; need chmod; need find; need readlink
-  if [ "$service" = gateway ]; then need awk; need loginctl; need npm; fi
+  if [ "$service" = gateway ]; then need awk; need loginctl; need npm; need cp; need sha256sum; need ln; fi
   unit="$(unit_for "$service")"
   if [ "$(show_value "$unit" User)" = "$(user_for "$service")" ]; then
     verify "$service"
@@ -1074,6 +1230,7 @@ apply() {
   if [ "$service" = gateway ]; then
     prepare_gateway_user_manager
     provision_gateway_codeloop_runtime
+    provision_gateway_codeloop_toolchain
   fi
   unit="$(unit_for "$service")"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   if [ "$service" = gateway ]; then

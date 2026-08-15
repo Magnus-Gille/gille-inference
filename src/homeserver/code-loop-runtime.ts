@@ -44,9 +44,13 @@ export function codeLoopSecretPath(
   return env["GILLE_AUTONOMY_ENV_FILE"] || join(root, ".env");
 }
 
-function nodeModulesDir(): string | null {
-  const nm = join(deployRoot(), "node_modules");
-  return existsSync(nm) ? nm : null;
+export function resolveNodeModulesDir(configured: string, root: string = deployRoot()): string | null {
+  const nm = configured !== "" ? configured : join(root, "node_modules");
+  // Keep an explicit stable mount path lexical: it sits directly above the dedicated workroot,
+  // so Node/npx can find it by normal parent walk-up. The service-isolation verifier proves the
+  // alias is root-owned and content-addressed. A missing explicit path remains fail-closed because
+  // bwrap receives it as a mandatory --ro-bind rather than silently omitting the toolchain.
+  return configured !== "" || existsSync(nm) ? nm : null;
 }
 
 /** llama-swap origin (serves both /v1 and /running) derived from the configured base. */
@@ -122,7 +126,7 @@ export function buildCodeLoopRuntime(
 ): CodeLoopRuntime {
   const confinement = cfg.codeLoopConfinement;
   const home = homedir();
-  const nm = nodeModulesDir();
+  const nm = resolveNodeModulesDir(cfg.codeLoopNodeModulesDir);
   const secretPath = codeLoopSecretPath(deployRoot());
   const forwardPort = cfg.codeLoopForwardPort;
   // The gateway the per-run relay bridges to (the caged pi's ONLY reachable destination).

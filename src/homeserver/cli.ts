@@ -34,8 +34,7 @@ import {
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
 import { buildCageArgv } from "./code-loop-cage.js";
-import { codeLoopSecretPath, runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
-import { existsSync } from "node:fs";
+import { codeLoopSecretPath, resolveNodeModulesDir, runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -915,8 +914,7 @@ async function cmdCodeLoop(rawArgs: string[]): Promise<void> {
   }
   const cfg = loadConfig();
   const home = homedir();
-  const nmPath = join(process.cwd(), "node_modules");
-  const nm = existsSync(nmPath) ? nmPath : null;
+  const nm = resolveNodeModulesDir(cfg.codeLoopNodeModulesDir);
 
   // Resolve the gateway target: --gateway-url overrides HOMESERVER_HOST/PORT (the worktree has no
   // .env, so the config defaults to loopback; on the box the gateway binds the tailnet IP).
