@@ -22,13 +22,23 @@ const summary = {
 describe("runStrixSpeculationPolicySynthesis", () => {
   it("writes content-blind machine and human policy artifacts", () => {
     const direct = JSON.stringify({
-      schemaVersion: 1, model: "qwen", fixtureSha256: "e".repeat(64), provenance, summaries: [summary],
+      schemaVersion: 1, model: "qwen", fixtureSha256: "e".repeat(64), provenance,
+      batches: Array.from({ length: 3 }, (_, repetition) => ({
+        fixtureId: "code", taskType: "code", concurrency: 1, repetition, wallMs: 1_000,
+        speculation: null, requests: [{ ok: true, oraclePass: true }],
+      })),
+      summaries: [summary],
     });
     const candidate = JSON.stringify({
       schemaVersion: 1,
       model: "qwen",
       fixtureSha256: "e".repeat(64),
       provenance: { ...provenance, speculation: "draft-mtp", draftDepth: 2, serverArgsSha256: "f".repeat(64) },
+      batches: Array.from({ length: 3 }, (_, repetition) => ({
+        fixtureId: "code", taskType: "code", concurrency: 1, repetition, wallMs: 800,
+        speculation: { draftTokens: 100, acceptedTokens: 70, verificationSteps: 10, acceptanceRate: 0.7 },
+        requests: [{ ok: true, oraclePass: true }],
+      })),
       summaries: [{ ...summary, aggregateTokensPerSecond: 100, predictedTokensPerSecond: 100, usefulCompletionsPerMinute: 75, acceptanceRate: 0.7 }],
     });
     const write = vi.fn();

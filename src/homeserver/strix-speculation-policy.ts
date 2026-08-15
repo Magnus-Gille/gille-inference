@@ -25,6 +25,9 @@ export interface StrixSpeculationPolicyCell {
   directRequests: number;
   selectedBatches: number;
   selectedRequests: number;
+  pairedRepetitions: number;
+  minimumRepetitionUsefulWorkRatio: number | null;
+  repetitionUsefulWorkRatios: number[];
   usefulWorkRatio: number;
   acceptanceRate: number | null;
   reason: string;
@@ -119,6 +122,96 @@ function assertUniqueCells(report: StrixComparableServerReport, label: string): 
 
 type Summary = StrixComparableServerReport["summaries"][number];
 
+interface PolicyBatch {
+  fixtureId: string;
+  taskType: string;
+  concurrency: number;
+  repetition: number;
+  wallMs: number;
+  speculation: {
+    draftTokens: number;
+    acceptedTokens: number;
+    verificationSteps: number;
+    acceptanceRate: number | null;
+  } | null;
+  requests: Array<{ ok: boolean; oraclePass: boolean }>;
+}
+
+function object(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  return value as Record<string, unknown>;
+}
+
+function finiteNumber(value: unknown, label: string, allowZero = true): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || (!allowZero && value === 0)) {
+    throw new Error(`${label} must be a ${allowZero ? "non-negative" : "positive"} finite number`);
+  }
+  return value;
+}
+
+function integer(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`${label} must be a non-negative integer`);
+  return value;
+}
+
+function parsePolicyBatches(raw: unknown, label: string): Map<string, PolicyBatch[]> {
+  const root = object(raw, label);
+  const values = root["batches"];
+  if (!Array.isArray(values) || values.length === 0) throw new Error(`${label}.batches must be a non-empty array`);
+  const grouped = new Map<string, PolicyBatch[]>();
+  const fullKeys = new Set<string>();
+  for (let index = 0; index < values.length; index++) {
+    const row = object(values[index], `${label}.batches[${index}]`);
+    const fixtureId = row["fixtureId"];
+    const taskType = row["taskType"];
+    if (typeof fixtureId !== "string" || fixtureId.length === 0) throw new Error(`${label}.batches[${index}].fixtureId is invalid`);
+    if (typeof taskType !== "string" || taskType.length === 0) throw new Error(`${label}.batches[${index}].taskType is invalid`);
+    const concurrency = integer(row["concurrency"], `${label}.batches[${index}].concurrency`);
+    const repetition = integer(row["repetition"], `${label}.batches[${index}].repetition`);
+    const wallMs = finiteNumber(row["wallMs"], `${label}.batches[${index}].wallMs`, false);
+    const rawRequests = row["requests"];
+    if (!Array.isArray(rawRequests)) throw new Error(`${label}.batches[${index}].requests must be an array`);
+    const requests = rawRequests.map((rawRequest, requestIndex) => {
+      const request = object(rawRequest, `${label}.batches[${index}].requests[${requestIndex}]`);
+      if (typeof request["ok"] !== "boolean" || typeof request["oraclePass"] !== "boolean") {
+        throw new Error(`${label}.batches[${index}].requests[${requestIndex}] must contain boolean ok/oraclePass`);
+      }
+      return { ok: request["ok"], oraclePass: request["oraclePass"] };
+    });
+    let speculation: PolicyBatch["speculation"] = null;
+    if (row["speculation"] !== null) {
+      const spec = object(row["speculation"], `${label}.batches[${index}].speculation`);
+      const acceptanceRate = spec["acceptanceRate"];
+      if (acceptanceRate !== null && (typeof acceptanceRate !== "number" || !Number.isFinite(acceptanceRate))) {
+        throw new Error(`${label}.batches[${index}].speculation.acceptanceRate must be finite or null`);
+      }
+      speculation = {
+        draftTokens: finiteNumber(spec["draftTokens"], `${label}.batches[${index}].speculation.draftTokens`),
+        acceptedTokens: finiteNumber(spec["acceptedTokens"], `${label}.batches[${index}].speculation.acceptedTokens`),
+        verificationSteps: finiteNumber(spec["verificationSteps"], `${label}.batches[${index}].speculation.verificationSteps`),
+        acceptanceRate,
+      };
+    }
+    const batch = { fixtureId, taskType, concurrency, repetition, wallMs, speculation, requests };
+    const key = cellKey(batch);
+    const fullKey = `${key}\u0000${repetition}`;
+    if (fullKeys.has(fullKey)) throw new Error(`${label} contains a duplicate repetition batch: ${fixtureId}/${taskType}/n=${concurrency}/r=${repetition}`);
+    fullKeys.add(fullKey);
+    grouped.set(key, [...(grouped.get(key) ?? []), batch]);
+  }
+  for (const batches of grouped.values()) batches.sort((left, right) => left.repetition - right.repetition);
+  return grouped;
+}
+
+function assertNoExtraBatchCells(report: StrixComparableServerReport, groups: Map<string, PolicyBatch[]>, label: string): void {
+  const expected = new Set(report.summaries.map((summary) => cellKey(summary)));
+  for (const [key, batches] of groups) {
+    if (expected.has(key)) continue;
+    const batch = batches[0]!;
+    throw new Error(`${label} contains a raw batch cell without a matching summary: ${batch.fixtureId}/${batch.taskType}/n=${batch.concurrency}`);
+  }
+}
+
 function countRateIssue(summary: Summary, count: number, rate: number, label: string): string | null {
   if (!Number.isSafeInteger(count) || count < 0 || count > summary.requests) {
     return `${label} count must be an integer between 0 and requests`;
@@ -150,6 +243,76 @@ function summaryEvidenceIssue(summary: Summary, minimumBatches: number, direct?:
   return null;
 }
 
+function closeEnough(left: number, right: number): boolean {
+  return Math.abs(left - right) <= 1e-9 * Math.max(1, Math.abs(left), Math.abs(right));
+}
+
+function batchEvidenceIssue(summary: Summary, batches: PolicyBatch[] | undefined, requireSpeculation: boolean): string | null {
+  if (batches === undefined) return "raw repetition batches are missing";
+  if (batches.length !== summary.batches) return `raw batch count ${batches.length} does not match summary ${summary.batches}`;
+  let successful = 0;
+  let oraclePasses = 0;
+  let wallMs = 0;
+  let draftTokens = 0;
+  let acceptedTokens = 0;
+  for (let index = 0; index < batches.length; index++) {
+    const batch = batches[index]!;
+    if (batch.repetition !== index) return `repetition indices must be contiguous from zero; observed ${batch.repetition} at index ${index}`;
+    if (batch.requests.length !== summary.concurrency) return `repetition ${batch.repetition} request count must equal concurrency ${summary.concurrency}`;
+    for (const request of batch.requests) {
+      if (request.oraclePass && !request.ok) return `repetition ${batch.repetition} contains an oracle pass for an unsuccessful request`;
+      if (request.ok) successful++;
+      if (request.oraclePass) oraclePasses++;
+    }
+    wallMs += batch.wallMs;
+    if (batch.speculation !== null) {
+      const spec = batch.speculation;
+      if (spec.acceptedTokens > spec.draftTokens) return `repetition ${batch.repetition} accepted tokens exceed drafted tokens`;
+      const expectedAcceptance = spec.draftTokens === 0 ? null : spec.acceptedTokens / spec.draftTokens;
+      if (expectedAcceptance === null ? spec.acceptanceRate !== null : spec.acceptanceRate === null || !closeEnough(spec.acceptanceRate, expectedAcceptance)) {
+        return `repetition ${batch.repetition} draft acceptance does not match accepted/drafted tokens`;
+      }
+      draftTokens += spec.draftTokens;
+      acceptedTokens += spec.acceptedTokens;
+    }
+    if (requireSpeculation && (batch.speculation === null || batch.speculation.draftTokens === 0 || batch.speculation.acceptanceRate === null)) {
+      return `repetition ${batch.repetition} draft acceptance was not observable`;
+    }
+  }
+  if (successful !== summary.successfulRequests || oraclePasses !== summary.oraclePasses) {
+    return `raw success/oracle counts ${successful}/${oraclePasses} do not match summary ${summary.successfulRequests}/${summary.oraclePasses}`;
+  }
+  const useful = oraclePasses / (wallMs / 60_000);
+  if (!closeEnough(useful, summary.usefulCompletionsPerMinute)) return `raw useful completions/minute ${useful} does not match summary ${summary.usefulCompletionsPerMinute}`;
+  const aggregateAcceptance = draftTokens === 0 ? null : acceptedTokens / draftTokens;
+  if (aggregateAcceptance === null ? summary.acceptanceRate !== null : summary.acceptanceRate === null || !closeEnough(aggregateAcceptance, summary.acceptanceRate)) {
+    return "raw aggregate draft acceptance does not match summary";
+  }
+  return null;
+}
+
+function repetitionRatios(direct: PolicyBatch[], candidate: PolicyBatch[]): { ratios: number[]; issue: string | null } {
+  const ratios: number[] = [];
+  for (let index = 0; index < direct.length; index++) {
+    const control = direct[index]!;
+    const arm = candidate[index]!;
+    const controlSuccessful = control.requests.filter((request) => request.ok).length;
+    const candidateSuccessful = arm.requests.filter((request) => request.ok).length;
+    const controlPasses = control.requests.filter((request) => request.oraclePass).length;
+    const candidatePasses = arm.requests.filter((request) => request.oraclePass).length;
+    if (candidateSuccessful < controlSuccessful || candidatePasses < controlPasses) {
+      return { ratios, issue: `repetition ${index} quality was inferior to direct` };
+    }
+    const controlUseful = controlPasses / (control.wallMs / 60_000);
+    const candidateUseful = candidatePasses / (arm.wallMs / 60_000);
+    if (controlUseful === 0) return { ratios, issue: `repetition ${index} direct useful work was zero, so stability is unobservable` };
+    const ratio = candidateUseful / controlUseful;
+    ratios.push(ratio);
+    if (ratio < 1 && !closeEnough(ratio, 1)) return { ratios, issue: `repetition ${index} was slower than direct (${ratio.toFixed(3)}x useful work)` };
+  }
+  return { ratios, issue: null };
+}
+
 export function synthesizeStrixSpeculationPolicy(
   rawDirect: unknown,
   rawCandidates: unknown[],
@@ -171,6 +334,12 @@ export function synthesizeStrixSpeculationPolicy(
     assertUniqueCells(report, `candidate[${index}]`);
     return report;
   });
+  const directBatchGroups = parsePolicyBatches(rawDirect, "direct");
+  const candidateBatchGroups = rawCandidates.map((raw, index) => parsePolicyBatches(raw, `candidate[${index}]`));
+  assertNoExtraBatchCells(direct, directBatchGroups, "direct");
+  for (let index = 0; index < candidates.length; index++) {
+    assertNoExtraBatchCells(candidates[index]!, candidateBatchGroups[index]!, `candidate[${index}]`);
+  }
   const comparisons = rawCandidates.map((candidate) => compareStrixServerReports(rawDirect, candidate, "speculation"));
   const summariesByCandidate = candidates.map((candidate) => new Map(candidate.summaries.map((row) => [cellKey(row), row])));
   const comparisonRowsByCandidate = comparisons.map((comparison) => new Map(comparison.rows.map((row) => [cellKey(row), row])));
@@ -183,9 +352,11 @@ export function synthesizeStrixSpeculationPolicy(
       summary: Summary;
       usefulWorkRatio: number;
       acceptanceRate: number;
+      repetitionUsefulWorkRatios: number[];
     }> = [];
 
-    const directIssue = summaryEvidenceIssue(directSummary, minimumBatches);
+    const directBatches = directBatchGroups.get(key);
+    const directIssue = summaryEvidenceIssue(directSummary, minimumBatches) ?? batchEvidenceIssue(directSummary, directBatches, false);
     if (directIssue !== null) {
       return {
         fixtureId: directSummary.fixtureId,
@@ -200,6 +371,9 @@ export function synthesizeStrixSpeculationPolicy(
         directRequests: directSummary.requests,
         selectedBatches: directSummary.batches,
         selectedRequests: directSummary.requests,
+        pairedRepetitions: directBatches?.length ?? 0,
+        minimumRepetitionUsefulWorkRatio: null,
+        repetitionUsefulWorkRatios: [],
         usefulWorkRatio: 1,
         acceptanceRate: null,
         reason: `direct evidence is insufficient: ${directIssue}`,
@@ -212,7 +386,8 @@ export function synthesizeStrixSpeculationPolicy(
       const summary = summariesByCandidate[index]!.get(key)!;
       const comparison = comparisonRowsByCandidate[index]!.get(key)!;
       const label = `${candidate.provenance.speculation} depth ${candidate.provenance.draftDepth}`;
-      const evidenceIssue = summaryEvidenceIssue(summary, minimumBatches, directSummary);
+      const candidateBatches = candidateBatchGroups[index]!.get(key);
+      const evidenceIssue = summaryEvidenceIssue(summary, minimumBatches, directSummary) ?? batchEvidenceIssue(summary, candidateBatches, true);
       if (evidenceIssue !== null) {
         rejections.push(`${label}: ${evidenceIssue}`);
         continue;
@@ -233,7 +408,18 @@ export function synthesizeStrixSpeculationPolicy(
         rejections.push(`${label}: did not beat direct by more than ${(minimumUsefulWorkGain * 100).toFixed(1)}%`);
         continue;
       }
-      eligible.push({ candidate, summary, usefulWorkRatio: comparison.usefulWorkRatio, acceptanceRate: summary.acceptanceRate });
+      const stability = repetitionRatios(directBatches!, candidateBatches!);
+      if (stability.issue !== null) {
+        rejections.push(`${label}: ${stability.issue}`);
+        continue;
+      }
+      eligible.push({
+        candidate,
+        summary,
+        usefulWorkRatio: comparison.usefulWorkRatio,
+        acceptanceRate: summary.acceptanceRate,
+        repetitionUsefulWorkRatios: stability.ratios,
+      });
     }
 
     eligible.sort((left, right) =>
@@ -254,6 +440,9 @@ export function synthesizeStrixSpeculationPolicy(
         directRequests: directSummary.requests,
         selectedBatches: directSummary.batches,
         selectedRequests: directSummary.requests,
+        pairedRepetitions: directBatches!.length,
+        minimumRepetitionUsefulWorkRatio: null,
+        repetitionUsefulWorkRatios: [],
         usefulWorkRatio: 1,
         acceptanceRate: null,
         reason: rejections.length === 1 ? rejections[0]! : "no eligible speculative arm beat the direct quality/useful-work gate",
@@ -273,9 +462,12 @@ export function synthesizeStrixSpeculationPolicy(
       directRequests: directSummary.requests,
       selectedBatches: winner.summary.batches,
       selectedRequests: winner.summary.requests,
+      pairedRepetitions: winner.repetitionUsefulWorkRatios.length,
+      minimumRepetitionUsefulWorkRatio: Math.min(...winner.repetitionUsefulWorkRatios),
+      repetitionUsefulWorkRatios: winner.repetitionUsefulWorkRatios,
       usefulWorkRatio: winner.usefulWorkRatio,
       acceptanceRate: winner.acceptanceRate,
-      reason: "highest measured useful completions/minute among quality-non-inferior observable arms",
+      reason: "highest aggregate useful completions/minute among quality-non-inferior arms with no slower paired repetition",
       rejections,
     };
   });
@@ -293,6 +485,7 @@ export function synthesizeStrixSpeculationPolicy(
       "This is an offline policy synthesized from repeated benchmark summaries, not an online rolling controller.",
       "A speculative arm is selected only when quality is non-inferior, acceptance is observable, and useful completions/minute clears the explicit margin.",
       "Every selected arm must meet the minimum repeated-batch count, internally consistent counters, and exposure balanced with direct; this is not a confidence interval or an interleaved A/B design.",
+      "Raw repetition batches are paired exactly; no selected speculative arm may lose successful/oracle-passing requests or useful completions/minute in any repetition.",
       "Unmeasured workload/concurrency cells must use direct decoding; do not extrapolate this policy.",
       "Promotion still requires correctness, long-generation equivalence, soak, memory, and production verification gates.",
     ],
@@ -307,11 +500,11 @@ export function renderStrixSpeculationPolicyMarkdown(policy: StrixSpeculationPol
     `Minimum useful-work gain: ${(policy.minimumUsefulWorkGain * 100).toFixed(1)}%`,
     `Minimum repeated batches per cell: ${policy.minimumBatches}`,
     "",
-    "| Fixture | Task | N | Evidence | Selection | Method | Depth | Batches / requests | Useful-work ratio | Acceptance | Reason |",
-    "|---|---|---:|:---:|---|---|---:|---:|---:|---:|---|",
+    "| Fixture | Task | N | Evidence | Selection | Method | Depth | Batches / requests | Aggregate useful ratio | Min repetition ratio | Acceptance | Reason |",
+    "|---|---|---:|:---:|---|---|---:|---:|---:|---:|---:|---|",
   ];
   for (const cell of policy.cells) {
-    lines.push(`| ${cell.fixtureId} | ${cell.taskType} | ${cell.concurrency} | ${cell.evidenceSufficient ? "sufficient" : "insufficient"} | ${cell.selection} | ${cell.speculation} | ${cell.draftDepth ?? "n/a"} | ${cell.selectedBatches} / ${cell.selectedRequests} | ${cell.usefulWorkRatio.toFixed(3)} | ${cell.acceptanceRate === null ? "n/a" : `${(cell.acceptanceRate * 100).toFixed(1)}%`} | ${cell.reason} |`);
+    lines.push(`| ${cell.fixtureId} | ${cell.taskType} | ${cell.concurrency} | ${cell.evidenceSufficient ? "sufficient" : "insufficient"} | ${cell.selection} | ${cell.speculation} | ${cell.draftDepth ?? "n/a"} | ${cell.selectedBatches} / ${cell.selectedRequests} | ${cell.usefulWorkRatio.toFixed(3)} | ${cell.minimumRepetitionUsefulWorkRatio === null ? "n/a" : cell.minimumRepetitionUsefulWorkRatio.toFixed(3)} | ${cell.acceptanceRate === null ? "n/a" : `${(cell.acceptanceRate * 100).toFixed(1)}%`} | ${cell.reason} |`);
   }
   lines.push("", "## Limits", "", ...policy.limitations.map((limit) => `- ${limit}`));
   return `${lines.join("\n")}\n`;

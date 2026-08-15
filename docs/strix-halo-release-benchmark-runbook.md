@@ -304,6 +304,14 @@ interleaved or mirrored A/B where drift matters. Do not extrapolate the policy t
 or concurrency levels. Promotion still requires the long-generation equivalence, correctness,
 soak, memory, representative-agent, and live verification gates.
 
+The synthesizer also validates the raw content-blind `batches` behind every summary and pairs them
+by fixture, task type, concurrency, and zero-based repetition index. Every selected speculative
+arm must preserve successful and oracle-passing request counts and must equal or beat direct useful
+completions/minute in every paired repetition, while the aggregate still clears
+`--min-gain-percent`. Missing batches, duplicate/hidden cells, non-contiguous repetitions,
+summary/raw mismatches, or unobservable per-batch acceptance fail closed. Output text is neither
+read nor copied into the policy artifact.
+
 For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended revision, keep
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output
 prefix. A backend claim requires repeated identical workloads; the label alone is not evidence.

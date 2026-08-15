@@ -63,6 +63,22 @@ function report(
   usefulByConcurrency: number[],
   acceptanceRate: number | null = 0.7,
 ) {
+  const summaries = usefulByConcurrency.map((useful, index) =>
+    summary(index === 0 ? 1 : 16, useful, speculation === "none" ? null : acceptanceRate));
+  const batches = summaries.flatMap((item) => Array.from({ length: item.batches }, (_, repetition) => ({
+    fixtureId: item.fixtureId,
+    taskType: item.taskType,
+    concurrency: item.concurrency,
+    repetition,
+    wallMs: item.concurrency / (item.usefulCompletionsPerMinute / 60_000),
+    speculation: speculation === "none" || acceptanceRate === null ? null : {
+      draftTokens: 100,
+      acceptedTokens: acceptanceRate * 100,
+      verificationSteps: 10,
+      acceptanceRate,
+    },
+    requests: Array.from({ length: item.concurrency }, () => ({ ok: true, oraclePass: true })),
+  })));
   return {
     schemaVersion: 1,
     model: "qwen38-27b",
@@ -73,9 +89,27 @@ function report(
       speculation,
       draftDepth,
     },
-    summaries: usefulByConcurrency.map((useful, index) =>
-      summary(index === 0 ? 1 : 16, useful, speculation === "none" ? null : acceptanceRate)),
+    batches,
+    summaries,
   };
+}
+
+function recomputeSummaryFromBatches(value: ReturnType<typeof report>): void {
+  for (const item of value.summaries) {
+    const batches = value.batches.filter((batch) =>
+      batch.fixtureId === item.fixtureId && batch.taskType === item.taskType && batch.concurrency === item.concurrency);
+    const requests = batches.flatMap((batch) => batch.requests);
+    const successful = requests.filter((request) => request.ok).length;
+    const oraclePasses = requests.filter((request) => request.oraclePass).length;
+    const wallMs = batches.reduce((sum, batch) => sum + batch.wallMs, 0);
+    item.batches = batches.length;
+    item.requests = requests.length;
+    item.successfulRequests = successful;
+    item.oraclePasses = oraclePasses;
+    item.successRate = requests.length === 0 ? 0 : successful / requests.length;
+    item.oraclePassRate = requests.length === 0 ? 0 : oraclePasses / requests.length;
+    item.usefulCompletionsPerMinute = wallMs === 0 ? 0 : oraclePasses / (wallMs / 60_000);
+  }
 }
 
 describe("Strix speculation policy synthesis", () => {
@@ -107,8 +141,8 @@ describe("Strix speculation policy synthesis", () => {
     );
 
     expect(policy.cells).toMatchObject([
-      { concurrency: 1, selection: "speculative", speculation: "draft-mtp", draftDepth: 2, serverArgsSha256: "f".repeat(63) + "2", usefulWorkRatio: 1.5 },
-      { concurrency: 16, selection: "speculative", speculation: "draft-mtp", draftDepth: 1, serverArgsSha256: "f".repeat(63) + "1", usefulWorkRatio: 1.3 },
+      { concurrency: 1, selection: "speculative", speculation: "draft-mtp", draftDepth: 2, serverArgsSha256: "f".repeat(63) + "2", usefulWorkRatio: 1.5, minimumRepetitionUsefulWorkRatio: 1.5 },
+      { concurrency: 16, selection: "speculative", speculation: "draft-mtp", draftDepth: 1, serverArgsSha256: "f".repeat(63) + "1", usefulWorkRatio: 1.3, minimumRepetitionUsefulWorkRatio: 1.3 },
     ]);
 
     const slower = synthesizeStrixSpeculationPolicy(
@@ -122,8 +156,10 @@ describe("Strix speculation policy synthesis", () => {
 
   it("fails closed when quality regresses or acceptance is unobservable", () => {
     const qualityRegression = report("draft-mtp", 2, [150]);
-    qualityRegression.summaries[0]!.oraclePassRate = 0;
-    qualityRegression.summaries[0]!.oraclePasses = 0;
+    for (const batch of qualityRegression.batches) {
+      for (const request of batch.requests) request.oraclePass = false;
+    }
+    recomputeSummaryFromBatches(qualityRegression);
 
     const policy = synthesizeStrixSpeculationPolicy(
       report("none", null, [100]),
@@ -142,25 +178,36 @@ describe("Strix speculation policy synthesis", () => {
   it("fails closed for under-sampled, unbalanced, or internally inconsistent evidence", () => {
     const direct = report("none", null, [100]);
     const oneBatch = report("draft-mtp", 1, [200]);
-    oneBatch.summaries[0]!.batches = 1;
-    oneBatch.summaries[0]!.requests = 1;
-    oneBatch.summaries[0]!.successfulRequests = 1;
-    oneBatch.summaries[0]!.oraclePasses = 1;
+    oneBatch.batches = oneBatch.batches.slice(0, 1);
+    recomputeSummaryFromBatches(oneBatch);
     const underSampled = synthesizeStrixSpeculationPolicy(direct, [oneBatch], 0.03, 3);
     expect(underSampled.cells[0]).toMatchObject({ selection: "direct", evidenceSufficient: true });
     expect(underSampled.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/minimum 3 batches/i)]));
 
     const unbalanced = report("draft-mtp", 1, [200]);
-    unbalanced.summaries[0]!.batches = 4;
-    unbalanced.summaries[0]!.requests = 4;
-    unbalanced.summaries[0]!.successfulRequests = 4;
-    unbalanced.summaries[0]!.oraclePasses = 4;
+    unbalanced.batches.push({ ...unbalanced.batches[0]!, repetition: 3, requests: [{ ok: true, oraclePass: true }] });
+    recomputeSummaryFromBatches(unbalanced);
     const unbalancedPolicy = synthesizeStrixSpeculationPolicy(direct, [unbalanced], 0.03, 3);
     expect(unbalancedPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/balanced exposure/i)]));
 
     const impossibleAcceptance = report("draft-mtp", 1, [200], 1.1);
     const inconsistentPolicy = synthesizeStrixSpeculationPolicy(direct, [impossibleAcceptance], 0.03, 3);
     expect(inconsistentPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/acceptance.*between 0 and 1/i)]));
+  });
+
+  it("rejects an aggregate winner when any paired repetition is slower than direct", () => {
+    const direct = report("none", null, [100]);
+    const unstable = report("draft-mtp", 2, [120]);
+    const directWall = direct.batches[0]!.wallMs;
+    unstable.batches[0]!.wallMs = directWall / 1.5;
+    unstable.batches[1]!.wallMs = directWall / 0.9;
+    unstable.batches[2]!.wallMs = directWall / 1.5;
+    recomputeSummaryFromBatches(unstable);
+    expect(unstable.summaries[0]!.usefulCompletionsPerMinute).toBeGreaterThan(103);
+
+    const policy = synthesizeStrixSpeculationPolicy(direct, [unstable], 0.03, 3);
+    expect(policy.cells[0]).toMatchObject({ selection: "direct", minimumRepetitionUsefulWorkRatio: null });
+    expect(policy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/repetition 1.*slower/i)]));
   });
 
   it("marks the policy evidence insufficient when the direct control is malformed", () => {
@@ -200,5 +247,15 @@ describe("Strix speculation policy synthesis", () => {
       [report("draft-mtp", 1, [120])],
       0.03,
     )).toThrow(/duplicate.*cell/i);
+  });
+
+  it("rejects raw repetition cells that have no matching summary", () => {
+    const candidate = report("draft-mtp", 1, [120]);
+    candidate.batches.push({ ...candidate.batches[0]!, fixtureId: "hidden", requests: [{ ok: true, oraclePass: true }] });
+    expect(() => synthesizeStrixSpeculationPolicy(
+      report("none", null, [100]),
+      [candidate],
+      0.03,
+    )).toThrow(/raw batch cell.*matching summary/i);
   });
 });

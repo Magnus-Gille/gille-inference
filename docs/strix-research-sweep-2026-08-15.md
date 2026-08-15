@@ -97,6 +97,13 @@ candidate is rejected while direct remains selected. This closes the possibility
 a one-batch speed spike, but it deliberately does not claim statistical confidence or immunity to
 thermal/runtime drift; the hardware design still needs mirrored cycles.
 
+The selector now validates and pairs the raw content-blind repetition batches as well. Aggregate
+useful-work gain is insufficient when any individual candidate repetition loses successful or
+oracle-passing requests or falls below direct useful completions/minute. It rejects missing,
+duplicate, hidden, non-contiguous, and summary-inconsistent repetition evidence, and requires draft
+acceptance in every speculative batch. This is a deterministic “no observed repetition slower”
+gate, not a statistical claim about unobserved workloads.
+
 This is repository-local enforcement of the evaluation rule “speculation must not remain selected
 when it is slower”; it is **not** an online rolling controller and does not complete T05. The next
 hardware run must capture direct, depth-1, depth-2, and any deeper supported arm against the same
@@ -208,9 +215,9 @@ result schema; there is no production state to restore.
 
 ## Verification
 
-- focused server-benchmark, comparator, and speculation-policy tests: 23/23 passed;
+- focused server-benchmark, comparator, and speculation-policy tests: 39/39 passed;
 - TypeScript and constitutional typechecks: passed;
-- full repository suite: 286 files, 4,291 tests passed (including the long-generation gate);
+- full repository suite: 286 files, 4,293 tests passed (including the long-generation gate);
 - Bash syntax and `git diff --check`: passed;
 - direct recorder CLI smoke: passed with mode-0600 raw and summary files.
 
