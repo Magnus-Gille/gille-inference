@@ -107,6 +107,7 @@ time.
 
 | Candidate | Evidence | Exact-hardware relevance | Decision |
 |---|---|---|---|
+| Vulkan coopmat1 Q8 KV dequantize-once path ([#25491](https://github.com/ggml-org/llama.cpp/issues/25491)) | **EXTERNAL-MEASURED:** exact Strix/RADV report shows pp512 +41% at 32K and +68% at 64K actual depth with Q8 K/V; TG unchanged | High for prompt-heavy agents and long populated contexts; narrow eight-commit patch backports cleanly onto production revision | Highest-value runtime candidate; isolated M5 build passed, three-arm F16/Q8/patched-Q8 GPU A/B pending exact maintenance confirmation |
 | llama.cpp iGPU automatic no-mmap load policy ([#26081](https://github.com/ggml-org/llama.cpp/pull/26081)) | **REPORTED/upstream:** merged capability change targets iGPUs that copy weights into device-visible shared memory | High for Strix cold model swaps and peak memory; deployed runtime supports an exact-flag mechanism A/B | Selected next; ABBA runner implemented and locally tested, hardware mutation pending exact maintenance confirmation |
 | llama.cpp many-expert Vulkan threshold patch ([#25356](https://github.com/ggml-org/llama.cpp/issues/25356)) | **EXTERNAL-MEASURED:** exact 128 GB Strix/RADV report shows no change through batch 8, then +56% at batch 9, +34% at 16, +20% at 32 | High only for nine or more simultaneous sequences | Reject for current one-slot / practical two-user production workload; revisit if concurrency policy changes |
 | llama.cpp DFlash on quantized MoE HIP ([#25117](https://github.com/ggml-org/llama.cpp/issues/25117)) | **EXTERNAL-MEASURED:** exact Strix report shows 19.5 tok/s direct versus 9.4 DFlash | Exact hardware, but a clear regression in the reported arm | Do not implement this HIP path; require a different drafter/backend or new upstream evidence |
@@ -115,9 +116,11 @@ time.
 | Mesa 26.2.0 ([release notes](https://docs.mesa3d.org/relnotes/26.2.0.html)) | **UPSTREAM:** new RADV work, but the release is marked development and advises stability users to wait for 26.2.1 | Potentially relevant, no cited llama.cpp/gfx1151 win | Do not upgrade production for novelty; wait for stable point release plus a one-variable A/B candidate |
 | ROCm 7.2.3 ([release page](https://github.com/ROCm/ROCm/releases)) | **UPSTREAM:** current line includes gfx1151 support | Support does not prove batch-one decode parity | No backend promotion without local decode, prompt, concurrency, and correctness A/B |
 
-No exact-hardware development discovered in this sweep cleared the bar for a reversible production
-runtime change. The batch-nine Vulkan patch is the largest reported gain, but it optimizes a load
-shape the current serialized GPU policy does not serve.
+No exact-hardware development discovered in this sweep has yet cleared the bar for a reversible
+production runtime change. The Q8 KV dequantize-once path is now the strongest test candidate: it
+has a narrow mechanism, exact-hardware evidence, a clean exact-production backport, and a passing
+M5 build, but no local GPU correctness or A/B result. See
+[`strix-kv-dequant-candidate-2026-08-15.md`](strix-kv-dequant-candidate-2026-08-15.md).
 
 ## Local A/B result
 

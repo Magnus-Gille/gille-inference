@@ -32,7 +32,7 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | T06 Vulkan vs HIP | **Comparison implemented; experiment blocked** | One-axis comparator enforces controlled provenance. Actual bake-off belongs to issue #129 and requires isolated builds plus deployed/verified #196. |
 | T07 ROCmFPX | **Not integrated** | Requires reviewing/pinning the current external fork, compatible artifacts, and isolated Vulkan/HIP builds. No live runtime change is authorized. |
 | T08 quant matrix | **Runner/comparator implemented; artifacts blocked** | `quant` is a controlled comparison axis; real Pareto evidence needs identical source revision, converted quants, and Gate D quality runs. |
-| T09 KV matrix | **First Qwen3.8 F16/Q8 arm measured** | Q8 direct TG was within measurement noise of F16 (12.83 vs 12.87 tok/s), with similar pp512 (357.48 vs 361.40 tok/s), and won the sampled MTP canary (23.21 vs 21.68 tok/s). Q8 is selected for the 64K release profile. BF16/Q4 and broader model/context arms remain. |
+| T09 KV matrix | **First Qwen3.8 F16/Q8 arm measured; Qwen3.6 optimization prepared** | Q8 direct TG was within measurement noise of F16 (12.83 vs 12.87 tok/s), with similar pp512 (357.48 vs 361.40 tok/s), and won the sampled MTP canary (23.21 vs 21.68 tok/s). Q8 is selected for the 64K release profile. An exact-production backport of the Strix-reported Vulkan Q8 KV dequantize-once patch now builds on M5; its causal F16 / stock-Q8 / patched-Q8 context matrix and focused backend tests await exact maintenance confirmation. BF16/Q4 and broader model/context arms remain. |
 | T10 persistent prefix cache | **Production-shaped short and checkpoint-stress measurements complete** | The short control measured 304–305× cold-to-exact-warm server-prefill improvement at 26.8–27.2K actual tokens. The stronger control ran sixteen tool cycles and 7,786 generated tokens (16/16 crossed the 256-token interval); its final 18,466-token exact prompt cached 18,419 tokens and evaluated only 47 in 219 ms. No progressive invalidation reproduced, so unreviewed upstream #24891 is rejected for this profile absent a future red organic/exact control. Cache survival across process replacement remains intentionally unclaimed. |
 | T11 DFlash | **Upstream path verified; experiment blocked** | Current llama.cpp documents `draft-dflash`; runner can capture workload acceptance and speed. Exact target-specific drafter and M5 run remain. Glimmer tracking: issue #181. |
 | T12 DSpark/DeepSpec | **Research premise updated; prototype not run** | Current llama.cpp already documents `draft-dspark`, so a new line-for-line CUDA port is no longer the first step. Benchmark the upstream backend path before writing AMD kernels. |
@@ -58,5 +58,7 @@ needed, the exclusive maintenance fence tracked in issue #196.
 2. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
 3. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
 4. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.
-5. Run the exact-runtime mmap/no-mmap ABBA selected from post-`8086439` llama.cpp PR #26081. Only
-   if the mechanism passes locally should a newer runtime build enter a separate controlled A/B.
+5. In one explicitly approved exclusive window, run the exact-runtime mmap/no-mmap ABBA and the
+   focused Vulkan backend test plus F16 / stock-Q8 / patched-Q8 matrix. Keep their evidence and
+   promotion decisions separate; neither candidate may advance without two positive cycles and
+   representative agent-workload evidence.
