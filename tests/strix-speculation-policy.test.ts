@@ -77,7 +77,11 @@ function report(
       verificationSteps: 10,
       acceptanceRate,
     },
-    requests: Array.from({ length: item.concurrency }, () => ({ ok: true, oraclePass: true })),
+    requests: Array.from({ length: item.concurrency }, () => ({
+      ok: true,
+      oraclePass: true,
+      outputSha256: "a".repeat(64) as string | null,
+    })),
   })));
   return {
     schemaVersion: 1,
@@ -185,7 +189,11 @@ describe("Strix speculation policy synthesis", () => {
     expect(underSampled.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/minimum 3 batches/i)]));
 
     const unbalanced = report("draft-mtp", 1, [200]);
-    unbalanced.batches.push({ ...unbalanced.batches[0]!, repetition: 3, requests: [{ ok: true, oraclePass: true }] });
+    unbalanced.batches.push({
+      ...unbalanced.batches[0]!,
+      repetition: 3,
+      requests: [{ ok: true, oraclePass: true, outputSha256: "a".repeat(64) }],
+    });
     recomputeSummaryFromBatches(unbalanced);
     const unbalancedPolicy = synthesizeStrixSpeculationPolicy(direct, [unbalanced], 0.03, 3);
     expect(unbalancedPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/balanced exposure/i)]));
@@ -208,6 +216,46 @@ describe("Strix speculation policy synthesis", () => {
     const policy = synthesizeStrixSpeculationPolicy(direct, [unstable], 0.03, 3);
     expect(policy.cells[0]).toMatchObject({ selection: "direct", minimumRepetitionUsefulWorkRatio: null });
     expect(policy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/repetition 1.*slower/i)]));
+  });
+
+  it("rejects a faster arm when any paired greedy output hash differs from direct", () => {
+    const candidate = report("draft-mtp", 2, [150]);
+    candidate.batches[1]!.requests[0]!.outputSha256 = "b".repeat(64);
+
+    const policy = synthesizeStrixSpeculationPolicy(
+      report("none", null, [100]),
+      [candidate],
+      0.03,
+    );
+
+    expect(policy.cells[0]).toMatchObject({ selection: "direct", evidenceSufficient: true });
+    expect(policy.cells[0]?.rejections).toEqual(expect.arrayContaining([
+      expect.stringMatching(/repetition 1.*request 0.*output hash.*direct/i),
+    ]));
+  });
+
+  it("rejects successful requests whose output equivalence is unobservable", () => {
+    const candidate = report("draft-mtp", 2, [150]);
+    candidate.batches[0]!.requests[0]!.outputSha256 = null;
+
+    const policy = synthesizeStrixSpeculationPolicy(
+      report("none", null, [100]),
+      [candidate],
+      0.03,
+    );
+
+    expect(policy.cells[0]).toMatchObject({ selection: "direct", evidenceSufficient: true });
+    expect(policy.cells[0]?.rejections).toEqual(expect.arrayContaining([
+      expect.stringMatching(/successful.*no output hash/i),
+    ]));
+
+    const malformed = report("draft-mtp", 2, [150]);
+    malformed.batches[0]!.requests[0]!.outputSha256 = "NOT-A-SHA256";
+    expect(() => synthesizeStrixSpeculationPolicy(
+      report("none", null, [100]),
+      [malformed],
+      0.03,
+    )).toThrow(/lowercase SHA-256 or null/i);
   });
 
   it("marks the policy evidence insufficient when the direct control is malformed", () => {
@@ -251,7 +299,11 @@ describe("Strix speculation policy synthesis", () => {
 
   it("rejects raw repetition cells that have no matching summary", () => {
     const candidate = report("draft-mtp", 1, [120]);
-    candidate.batches.push({ ...candidate.batches[0]!, fixtureId: "hidden", requests: [{ ok: true, oraclePass: true }] });
+    candidate.batches.push({
+      ...candidate.batches[0]!,
+      fixtureId: "hidden",
+      requests: [{ ok: true, oraclePass: true, outputSha256: "a".repeat(64) }],
+    });
     expect(() => synthesizeStrixSpeculationPolicy(
       report("none", null, [100]),
       [candidate],

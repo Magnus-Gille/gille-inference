@@ -134,7 +134,7 @@ interface PolicyBatch {
     verificationSteps: number;
     acceptanceRate: number | null;
   } | null;
-  requests: Array<{ ok: boolean; oraclePass: boolean }>;
+  requests: Array<{ ok: boolean; oraclePass: boolean; outputSha256: string | null }>;
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -176,7 +176,11 @@ function parsePolicyBatches(raw: unknown, label: string): Map<string, PolicyBatc
       if (typeof request["ok"] !== "boolean" || typeof request["oraclePass"] !== "boolean") {
         throw new Error(`${label}.batches[${index}].requests[${requestIndex}] must contain boolean ok/oraclePass`);
       }
-      return { ok: request["ok"], oraclePass: request["oraclePass"] };
+      const outputSha256 = request["outputSha256"];
+      if (outputSha256 !== null && (typeof outputSha256 !== "string" || !/^[a-f0-9]{64}$/.test(outputSha256))) {
+        throw new Error(`${label}.batches[${index}].requests[${requestIndex}].outputSha256 must be a lowercase SHA-256 or null`);
+      }
+      return { ok: request["ok"], oraclePass: request["oraclePass"], outputSha256 };
     });
     let speculation: PolicyBatch["speculation"] = null;
     if (row["speculation"] !== null) {
@@ -259,8 +263,12 @@ function batchEvidenceIssue(summary: Summary, batches: PolicyBatch[] | undefined
     const batch = batches[index]!;
     if (batch.repetition !== index) return `repetition indices must be contiguous from zero; observed ${batch.repetition} at index ${index}`;
     if (batch.requests.length !== summary.concurrency) return `repetition ${batch.repetition} request count must equal concurrency ${summary.concurrency}`;
-    for (const request of batch.requests) {
+    for (let requestIndex = 0; requestIndex < batch.requests.length; requestIndex++) {
+      const request = batch.requests[requestIndex]!;
       if (request.oraclePass && !request.ok) return `repetition ${batch.repetition} contains an oracle pass for an unsuccessful request`;
+      if (request.ok && request.outputSha256 === null) {
+        return `repetition ${batch.repetition} request ${requestIndex} is successful but has no output hash`;
+      }
       if (request.ok) successful++;
       if (request.oraclePass) oraclePasses++;
     }
@@ -302,6 +310,13 @@ function repetitionRatios(direct: PolicyBatch[], candidate: PolicyBatch[]): { ra
     const candidatePasses = arm.requests.filter((request) => request.oraclePass).length;
     if (candidateSuccessful < controlSuccessful || candidatePasses < controlPasses) {
       return { ratios, issue: `repetition ${index} quality was inferior to direct` };
+    }
+    for (let requestIndex = 0; requestIndex < control.requests.length; requestIndex++) {
+      const controlHash = control.requests[requestIndex]!.outputSha256;
+      const candidateHash = arm.requests[requestIndex]!.outputSha256;
+      if (controlHash !== candidateHash) {
+        return { ratios, issue: `repetition ${index} request ${requestIndex} output hash differed from direct` };
+      }
     }
     const controlUseful = controlPasses / (control.wallMs / 60_000);
     const candidateUseful = candidatePasses / (arm.wallMs / 60_000);
@@ -467,7 +482,7 @@ export function synthesizeStrixSpeculationPolicy(
       repetitionUsefulWorkRatios: winner.repetitionUsefulWorkRatios,
       usefulWorkRatio: winner.usefulWorkRatio,
       acceptanceRate: winner.acceptanceRate,
-      reason: "highest aggregate useful completions/minute among quality-non-inferior arms with no slower paired repetition",
+      reason: "highest aggregate useful completions/minute among exact-output-equivalent, quality-non-inferior arms with no slower paired repetition",
       rejections,
     };
   });
@@ -485,7 +500,7 @@ export function synthesizeStrixSpeculationPolicy(
       "This is an offline policy synthesized from repeated benchmark summaries, not an online rolling controller.",
       "A speculative arm is selected only when quality is non-inferior, acceptance is observable, and useful completions/minute clears the explicit margin.",
       "Every selected arm must meet the minimum repeated-batch count, internally consistent counters, and exposure balanced with direct; this is not a confidence interval or an interleaved A/B design.",
-      "Raw repetition batches are paired exactly; no selected speculative arm may lose successful/oracle-passing requests or useful completions/minute in any repetition.",
+      "Raw repetition batches are paired exactly; no selected speculative arm may change a greedy output hash, lose successful/oracle-passing requests, or lose useful completions/minute in any repetition.",
       "Unmeasured workload/concurrency cells must use direct decoding; do not extrapolate this policy.",
       "Promotion still requires correctness, long-generation equivalence, soak, memory, and production verification gates.",
     ],

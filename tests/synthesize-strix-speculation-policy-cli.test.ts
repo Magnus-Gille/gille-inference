@@ -25,7 +25,7 @@ describe("runStrixSpeculationPolicySynthesis", () => {
       schemaVersion: 1, model: "qwen", fixtureSha256: "e".repeat(64), provenance,
       batches: Array.from({ length: 3 }, (_, repetition) => ({
         fixtureId: "code", taskType: "code", concurrency: 1, repetition, wallMs: 1_000,
-        speculation: null, requests: [{ ok: true, oraclePass: true }],
+        speculation: null, requests: [{ ok: true, oraclePass: true, outputSha256: "a".repeat(64) }],
       })),
       summaries: [summary],
     });
@@ -37,7 +37,7 @@ describe("runStrixSpeculationPolicySynthesis", () => {
       batches: Array.from({ length: 3 }, (_, repetition) => ({
         fixtureId: "code", taskType: "code", concurrency: 1, repetition, wallMs: 800,
         speculation: { draftTokens: 100, acceptedTokens: 70, verificationSteps: 10, acceptanceRate: 0.7 },
-        requests: [{ ok: true, oraclePass: true }],
+        requests: [{ ok: true, oraclePass: true, outputSha256: "a".repeat(64) }],
       })),
       summaries: [{ ...summary, aggregateTokensPerSecond: 100, predictedTokensPerSecond: 100, usefulCompletionsPerMinute: 75, acceptanceRate: 0.7 }],
     });
@@ -56,6 +56,7 @@ describe("runStrixSpeculationPolicySynthesis", () => {
     expect(write).toHaveBeenCalledTimes(2);
     expect(write.mock.calls[0]![1]).toContain('"selection": "speculative"');
     expect(write.mock.calls[1]![1]).toContain("offline policy");
+    expect(write.mock.calls.map((call) => call[1]).join("\n")).not.toContain("a".repeat(64));
     expect(stdout).toHaveBeenCalledWith(expect.stringContaining('"speculativeCells":1'));
   });
 });

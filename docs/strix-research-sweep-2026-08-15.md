@@ -104,6 +104,15 @@ duplicate, hidden, non-contiguous, and summary-inconsistent repetition evidence,
 acceptance in every speculative batch. This is a deterministic “no observed repetition slower”
 gate, not a statistical claim about unobserved workloads.
 
+An **REPORTED/upstream correctness signal** now makes exact paired output equivalence mandatory as
+well. llama.cpp issue [#25618](https://github.com/ggml-org/llama.cpp/issues/25618) remains open and
+reports greedy `draft-mtp`/`draft-dspark` output divergence from direct decoding on quantized
+Vulkan targets, reproduced on Strix Halo-class hardware. The recorder already emits a SHA-256 over
+exact response content and tool names. The selector now rejects a candidate when any
+successful request lacks that hash or when any paired candidate hash differs from direct. It does
+not retain output text or copy raw hashes into the policy artifact. This is repository enforcement,
+not a local reproduction of the upstream bug; the live depth matrix still has to exercise the gate.
+
 This is repository-local enforcement of the evaluation rule “speculation must not remain selected
 when it is slower”; it is **not** an online rolling controller and does not complete T05. The next
 hardware run must capture direct, depth-1, depth-2, and any deeper supported arm against the same
@@ -215,9 +224,9 @@ result schema; there is no production state to restore.
 
 ## Verification
 
-- focused server-benchmark, comparator, and speculation-policy tests: 39/39 passed;
+- focused Strix benchmark, comparator, integrity, and policy tests: 82/82 passed;
 - TypeScript and constitutional typechecks: passed;
-- full repository suite: 286 files, 4,293 tests passed (including the long-generation gate);
+- full repository suite: 286 files, 4,295 tests passed (including the long-generation and paired-output gates);
 - Bash syntax and `git diff --check`: passed;
 - direct recorder CLI smoke: passed with mode-0600 raw and summary files.
 
