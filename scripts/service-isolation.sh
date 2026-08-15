@@ -178,8 +178,8 @@ EnvironmentFile=$ETC/gateway/gateway.env
 Environment=AUTONOMY_NOTIFY_CMD=$ROOT/gateway/bin/autonomy-notify.sh
 Environment=GILLE_AUTONOMY_ENV_FILE=$ETC/gateway/gateway.env
 Environment=HOMESERVER_CODE_LOOP_WORKROOT=$ROOT/gateway/data/code-loop-work
-Environment=HOMESERVER_CODE_LOOP_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
-Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
 BindReadOnlyPaths=$GATEWAY_TREE
 # Bind the containing directory so a restarted user manager can replace its
 # private socket without leaving the gateway namespace pinned to a stale inode.

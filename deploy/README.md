@@ -449,7 +449,9 @@ ordinary session-bus socket read-only; `systemd-run --pipe` needs the latter to 
 descriptors. The dedicated user manager spawns each transient code-loop service, so `pasta` can
 construct its namespace without granting `AF_NETLINK`, TUN, or weaker
 `NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
-receives no host `/run` mounts or session-bus access. If restart or
+receives no host `/run` mounts or session-bus access. Isolation-only runtime variables also take
+precedence over legacy owner-home Pi paths retained in the migrated secret file, so rollback does
+not require rewriting that file and the cage binds only the dedicated service-account runtime. If restart or
 verification fails, it restores the prior drop-in and verifies the recovered gateway before
 returning failure. This fixes the boot race
 without weakening the code-loop cage or treating a host-visible bus as proof that the service
