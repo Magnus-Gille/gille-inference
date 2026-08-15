@@ -278,6 +278,27 @@ llama-server's documented unlimited mode; values below `-1` are rejected. The
 comparator deliberately declares no automatic winner: the relevant issue's preregistered quality,
 short/long-context, soak, memory, and stability gates still decide adoption.
 
+For speculation, synthesize a fail-closed workload/concurrency policy only after capturing one
+direct report and every candidate depth against the identical fixture matrix. The policy requires
+quality non-inferiority, observable draft acceptance, and a measured useful-completions/minute gain
+above the explicit margin. It selects the best qualifying depth independently per measured cell and
+uses direct decoding everywhere else:
+
+```bash
+npm run benchmark:strix-spec-policy -- \
+  --direct data/strix-benchmarks/qwen38-direct-server.json \
+  --candidate data/strix-benchmarks/qwen38-mtp1-server.json \
+  --candidate data/strix-benchmarks/qwen38-mtp2-server.json \
+  --min-gain-percent 3 \
+  --out data/strix-benchmarks/qwen38-speculation-policy
+```
+
+This emits a content-blind JSON/Markdown recommendation artifact. It is an offline policy derived
+from the captured benchmark window, not an online rolling controller and not deployment authority.
+Do not extrapolate it to omitted workloads or concurrency levels. Promotion still requires the
+long-generation equivalence, correctness, soak, memory, representative-agent, and live verification
+gates.
+
 For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended revision, keep
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output
 prefix. A backend claim requires repeated identical workloads; the label alone is not evidence.
