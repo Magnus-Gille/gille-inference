@@ -10,6 +10,8 @@ replace them.
   owner-authored instruction, exact writable paths, hidden oracle files, and deterministic checks.
 - The runner creates a new temp Git root from `git archive` of the base commit. Benchmark/oracle
   files from the current checkout are therefore absent while the model works.
+- `pi-models.json` pins the comparison models and provider compatibility in a throwaway Pi config;
+  a mutable user-level Pi catalogue cannot change the scored environment.
 - Changed paths are captured before the hidden oracle is installed. Any non-preregistered path
   makes the run fail.
 - Raw Pi NDJSON and stderr are mode 0600 inside the throwaway directory and are deleted by default.

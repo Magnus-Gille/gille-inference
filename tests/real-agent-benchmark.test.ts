@@ -10,6 +10,7 @@ import {
 } from "../scripts/real-agent-benchmark.js";
 
 const corpusPath = new URL("../benchmarks/real-agent/corpus.json", import.meta.url);
+const piModelsPath = new URL("../benchmarks/real-agent/pi-models.json", import.meta.url);
 
 describe("real-agent benchmark preregistration", () => {
   it("loads the pinned real-history task and keeps the hidden oracle out of the seed", () => {
@@ -61,5 +62,14 @@ describe("real-agent benchmark preregistration", () => {
     expect(resolveGatewayKey({ GW_KEY: "gateway", M5_API_KEY: "m5" })).toBe("gateway");
     expect(resolveGatewayKey({ HS_API_KEY: "home", GW_KEY: "gateway", M5_API_KEY: "m5" })).toBe("home");
     expect(resolveGatewayKey({})).toBeNull();
+  });
+
+  it("pins both live comparison models in a benchmark-owned Pi catalogue", () => {
+    const config = JSON.parse(readFileSync(piModelsPath, "utf8")) as {
+      providers: Record<string, { apiKey: string; models: Array<{ id: string }> }>;
+    };
+    const provider = config.providers["inference-gille"];
+    expect(provider.apiKey).toBe("HS_API_KEY");
+    expect(provider.models.map((model) => model.id)).toEqual(["qwen36-a3b", "qwen38-27b"]);
   });
 });

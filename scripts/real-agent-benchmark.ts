@@ -280,6 +280,7 @@ function requireCommittedBenchmarkSources(
     manifestRelative,
     "package.json",
     "package-lock.json",
+    "benchmarks/real-agent/pi-models.json",
     "scripts/real-agent-benchmark.ts",
     "scripts/pi-benchmark-telemetry.ts",
     ...tasks.flatMap((task) => task.oracleFiles.map((oracle) => oracle.source)),
@@ -335,13 +336,17 @@ async function closeWritable(stream: ReturnType<typeof createWriteStream>): Prom
   });
 }
 
-async function runPi(input: { workDir: string; logDir: string; task: RealAgentTaskSpec; model: string; provider: string; capSeconds: number }): Promise<PiRunResult> {
+async function runPi(input: { workDir: string; logDir: string; piModelsPath: string; task: RealAgentTaskSpec; model: string; provider: string; capSeconds: number }): Promise<PiRunResult> {
   const key = resolveGatewayKey(process.env);
   if (key === null) throw new Error("HS_API_KEY, GW_KEY, or canonical M5_API_KEY is required for a live run");
   // Keep harness artifacts outside the scored Git tree so they can never be mistaken for model
   // edits. The parent temp root is still mode-private and removed with the worktree by default.
   const rawPath = join(input.logDir, "pi-events.ndjson");
   const stderrPath = join(input.logDir, "pi-stderr.log");
+  const piAgentDir = join(input.logDir, "pi-agent");
+  mkdirSync(piAgentDir, { mode: 0o700 });
+  copyFileSync(input.piModelsPath, join(piAgentDir, "models.json"));
+  chmodSync(join(piAgentDir, "models.json"), 0o600);
   const raw = createWriteStream(rawPath, { flags: "wx", mode: 0o600, encoding: "utf8" });
   const stderr = createWriteStream(stderrPath, { flags: "wx", mode: 0o600, encoding: "utf8" });
   const telemetry = createPiBenchmarkTelemetry();
@@ -358,6 +363,7 @@ async function runPi(input: { workDir: string; logDir: string; task: RealAgentTa
       ...process.env,
       HS_API_KEY: key,
       GIT_CEILING_DIRECTORIES: dirname(input.workDir),
+      PI_CODING_AGENT_DIR: piAgentDir,
     },
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
@@ -503,6 +509,7 @@ export async function runRealAgentBenchmark(argv: string[]): Promise<number> {
     const pi = await runPi({
       workDir: prepared.workDir,
       logDir: prepared.root,
+      piModelsPath: join(repoRoot, "benchmarks", "real-agent", "pi-models.json"),
       task,
       model: plan.model!,
       provider: plan.provider,
