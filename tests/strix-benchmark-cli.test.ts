@@ -124,4 +124,28 @@ describe("runStrixBenchmark", () => {
     expect(report.model.artifactSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(readFileSync(`${out}.md`, "utf8")).toContain("| 131,072 | 1,200.0 | 100.0 |");
   });
+
+  it("terminates the active benchmark when the maintenance orchestrator aborts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "strix-benchmark-abort-"));
+    tempRoots.push(root);
+    const binary = join(root, "llama-bench");
+    const model = join(root, "model.gguf");
+    writeFileSync(model, "small deterministic GGUF fixture");
+    writeFileSync(binary, "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n");
+    chmodSync(binary, 0o755);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const abort = new AbortController();
+    setTimeout(() => abort.abort(), 50);
+    const started = Date.now();
+    await expect(runStrixBenchmark([
+      "--llama-bench", binary,
+      "--model", model,
+      "--model-id", "Qwen/Qwen3-Coder-30B-A3B",
+      "--quant", "Q4_K_S",
+      "--backend", "vulkan",
+      "--out", join(root, "result"),
+    ], undefined, abort.signal)).resolves.toBe(1);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
 });

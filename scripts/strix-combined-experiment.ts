@@ -247,8 +247,10 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
   // Every expensive artifact is hashed before executeStrixCombinedExperiment can unload anything.
   const preflight = await preflightArtifacts(config, args.mmapConfigPath);
   let interruptedBy: NodeJS.Signals | null = null;
+  const benchmarkAbort = new AbortController();
   const onSignal = (signal: NodeJS.Signals): void => {
     interruptedBy ??= signal;
+    benchmarkAbort.abort();
     activeChild?.kill("SIGTERM");
   };
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
@@ -284,7 +286,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
           },
           stdout: () => {},
           stderr: (line) => console.error(line),
-        });
+        }, benchmarkAbort.signal);
         if (exitCode !== 0) throw new Error(`benchmark runner failed for ${plan.arm.id} in cycle ${plan.cycle + 1}`);
         const reportPath = `${resolve(plan.outPrefix)}.json`;
         const report = validateBenchmarkReport(readBoundedJson(reportPath), config, plan);
@@ -295,6 +297,10 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
       restore: async (initial) => await restoreResidency(args.llamaSwapOrigin, initial),
       interruptedBy: () => interruptedBy,
     });
+    const postflightModelSha256 = await sha256File(config.model.path);
+    if (postflightModelSha256 !== config.model.artifactSha256) {
+      throw new Error("model artifact hash changed across the combined experiment");
+    }
     const finishedAt = new Date().toISOString();
     const receipt = {
       schemaVersion: 1,
@@ -303,6 +309,7 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
       finishedAt,
       candidateId: config.candidateId,
       preflight: { artifactSha256: preflight.hashes, runtimeVersions: preflight.versions },
+      postflight: { modelArtifactSha256: postflightModelSha256 },
       mmap: { exitCode: result.mmapExitCode, reportPath: `${resolve(args.outDir)}/mmap-ab.json` },
       backendCorrectness: backendEvidence,
       kvEvaluation: evaluateStrixKvMicrobenchmarks(config, reports.map(({ evidence, report }) => ({

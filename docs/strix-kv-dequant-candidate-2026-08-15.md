@@ -98,6 +98,10 @@ then:
    ready state; and
 7. emits mode-0600 aggregate JSON/Markdown without model content.
 
+The model is hashed again after restoration and before the aggregate receipt is accepted. A
+catchable signal aborts the active backend or llama-bench child, then follows the same required
+restoration path; the maintenance credential is never inherited by either child.
+
 The automatic microbenchmark decision is either `advance-to-agent-gate` or `reject`. Advancement
 requires at least 10% candidate-over-stock-Q8 PP gain at both 32K and 64K, no PP/TG cell more than
 5% behind stock Q8 or production F16, and no candidate peak-RSS increase above stock Q8 beyond 5%.
