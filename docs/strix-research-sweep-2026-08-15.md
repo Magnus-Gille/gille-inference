@@ -5,6 +5,46 @@
 **Decision:** improve agent-benchmark telemetry and retain the current runtime profiles; no
 production runtime or model deployment in this checkpoint.
 
+## Live prefix-cache follow-up
+
+A committed content-blind probe now exercises cold and warm plain prompts, cold and warm tool
+turns, and an exact repeat after extending the tool conversation. It refuses live execution when
+its source files are dirty, binds every result to the probe commit plus immutable server/model
+provenance, separates declared quota waits from request latency, and retains neither prompts nor
+model output. Raw private operational evidence remains mode 0600 under the gitignored
+`data/strix-benchmarks/` tree.
+
+The first live run is **LOCAL-MEASURED** on Qwen3.6-35B-A3B Q4_K_M, Vulkan/RADV, 131072
+configured context, F16 KV, Flash Attention, one slot, no speculation, kernel 7.0.0-28, Mesa
+26.0.3, and llama.cpp `8086439a4cea94c71a5dfb8fe4ad1546aebd640f`:
+
+| Phase | Actual prompt | Cached | Evaluated | Server prefill |
+|---|---:|---:|---:|---:|
+| plain cold | 26,835 | 0 | 26,835 | 33,495 ms |
+| plain exact warm | 26,835 | 26,819 | 16 | 110 ms |
+| tool cold | 27,153 | 0 | 27,153 | 33,881 ms |
+| tool exact warm | 27,153 | 27,137 | 16 | 111 ms |
+| extended tool turn, first | 27,227 | 27,137 | 90 | 339 ms |
+| extended tool turn, exact repeat | 27,227 | 27,137 | 90 | 338 ms |
+
+The plain and tool warm controls are roughly 304–305 times faster in server prefill time than
+their cold controls. The extended request pays a reproducible 74-token / roughly 228 ms tail over
+the warm control, but this is inside the runtime's measured 256-token checkpoint-minimum policy.
+The checkpoint-aware oracle therefore reports **healthy**, not a cache-invalidation regression.
+Configured context is reported separately from the actually populated 26.8–27.2K tokens.
+
+Upstream llama.cpp PR [#24891](https://github.com/ggml-org/llama.cpp/pull/24891) claims a distinct
+multi-tool-turn checkpoint invalidation fix and reports large external prefill reductions. It is
+open, review-required, and has no substantive CI beyond the labeler at this checkpoint. The short
+local probe does not reproduce invalidation beyond the configured checkpoint window, so applying
+that unreviewed patch now would lack a red local baseline. The next proof is a bounded
+long-generation/multiple-tool-cycle reproducer that crosses the 256-token checkpoint interval;
+only a red result should trigger an isolated patch A/B.
+
+**Deployment decision: no.** No model, runtime, driver, route, or live configuration changed. The
+rollback for the new probe is a normal Git revert; the benchmark itself is read-only apart from
+ordinary prompt-cache state.
+
 ## What changed
 
 Gate D's Pi arm now records content-blind turns, tool calls, prompt tokens, completion tokens,
@@ -99,3 +139,7 @@ The next experiment is therefore to add an allow-listed, evidence-stamped model 
 existing OS cage, subject to explicit approval for the security-boundary change and independent
 review. Then run the preregistered task sequentially on both live profiles. This directly tests H8
 without trading credential safety for measurement speed.
+
+Until that security-boundary work is approved, the highest-value safe runtime experiment is the
+checkpoint-crossing tool-cycle reproducer described above. It can falsify or justify PR #24891
+without changing credential authority or production configuration.

@@ -245,6 +245,30 @@ For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended r
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output
 prefix. A backend claim requires repeated identical workloads; the label alone is not evidence.
 
+### Tool-turn prefix-cache regression probe
+
+Use the same immutable server-provenance artifact to measure cold/warm plain prompts, cold/warm
+tool turns, and an exact repeat after extending a tool conversation. The runner refuses dirty
+probe sources, accepts credentials only through a named environment variable, honors bounded
+`Retry-After`, and writes no prompt or completion content:
+
+```bash
+npm run benchmark:strix-prefix-cache -- \
+  --base-url http://127.0.0.1:8091/v1 \
+  --model qwen36-a3b \
+  --provenance data/strix-benchmarks/qwen36-direct-provenance.json \
+  --out data/strix-benchmarks/qwen36-prefix-cache \
+  --api-key-env M5_API_KEY \
+  --stable-items 1800 --max-tokens 1
+```
+
+Exit `0` means the exact extended repeat stayed inside the warm-control tail plus the captured
+runtime's checkpoint-minimum window. Exit `1` means it exceeded that checkpoint-aware bound; exit
+`2` means the result was unobservable or setup failed. The JSON/Markdown pair is mode 0600 and
+separates gateway quota wait from the successful request and server prefill timings. This short
+probe does not replace a checkpoint-crossing, long-generation multi-tool test when evaluating a
+generation-checkpoint patch.
+
 ## Read-only host reproducibility snapshot
 
 Capture the host state beside every benchmark series. The firmware UMA setting is not reliably
