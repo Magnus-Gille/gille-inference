@@ -28,7 +28,12 @@ import {
   type StrixMmapTrial,
   type StrixMmapVariant,
 } from "../src/homeserver/strix-mmap-ab.js";
-import { restoreResidency, runningSnapshot, unloadAll } from "../src/homeserver/strix-residency.js";
+import {
+  buildStrixChildEnvironment,
+  restoreResidency,
+  runningSnapshot,
+  unloadAll,
+} from "../src/homeserver/strix-residency.js";
 
 interface HostSample { rssBytes: number; memAvailableBytes: number; swapFreeBytes: number; temperatureC: number | null }
 interface SamplerResult { peakRssBytes: number; minMemAvailableBytes: number; minSwapFreeBytes: number; maxTemperatureC: number | null }
@@ -295,7 +300,9 @@ async function runTrial(config: StrixMmapAbConfig, variant: StrixMmapVariant, se
   const logHash = createHash("sha256");
   const child = spawn(config.binaryPath, buildMmapServerArgs(config, variant), {
     stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, GGML_VK_VISIBLE_DEVICES: config.backend === "vulkan" ? "0" : process.env["GGML_VK_VISIBLE_DEVICES"] },
+    env: buildStrixChildEnvironment(process.env, {
+      GGML_VK_VISIBLE_DEVICES: config.backend === "vulkan" ? "0" : process.env["GGML_VK_VISIBLE_DEVICES"],
+    }),
   });
   activeEphemeralChild = child;
   child.stderr?.on("data", (chunk: Buffer) => logHash.update(chunk));
@@ -316,7 +323,12 @@ async function runTrial(config: StrixMmapAbConfig, variant: StrixMmapVariant, se
 }
 
 function commandOutput(command: string, args: string[]): string | null {
-  const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024 });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 256 * 1024,
+    env: buildStrixChildEnvironment(),
+  });
   if (result.error || result.status !== 0) return null;
   const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim().replace(/\0/g, "");
   return text.length === 0 ? null : text.slice(0, 8_192);

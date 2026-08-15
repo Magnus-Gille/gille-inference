@@ -3,6 +3,15 @@ import type { StrixResidentEntry } from "./strix-combined-experiment.js";
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const RESTORE_TIMEOUT_MS = 600_000;
 
+export function buildStrixChildEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+  overrides: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  const childEnvironment = { ...environment, ...overrides };
+  delete childEnvironment["M5_MAINTENANCE_KEY"];
+  return childEnvironment;
+}
+
 export interface StrixResidencyDependencies {
   fetch: typeof fetch;
   sleep(milliseconds: number): Promise<void>;

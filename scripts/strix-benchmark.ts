@@ -37,6 +37,7 @@ import {
   type StrixSystemSnapshot,
   type StrixTelemetry,
 } from "../src/homeserver/strix-benchmark.js";
+import { buildStrixChildEnvironment } from "../src/homeserver/strix-residency.js";
 
 export interface ExecutionResult {
   rows: LlamaBenchRow[];
@@ -147,13 +148,10 @@ async function executeLlamaBench(plan: StrixBenchmarkPlan, signal?: AbortSignal)
   let stderr = "";
   let stdoutBytes = 0;
   let stdoutExceeded = false;
-  const childEnvironment = { ...process.env };
-  delete childEnvironment["M5_MAINTENANCE_KEY"];
-
   const child = spawn(plan.llamaBenchPath, buildLlamaBenchArgs(plan), {
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
-    env: childEnvironment,
+    env: buildStrixChildEnvironment(),
   });
   const abort = (): void => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); };
   if (signal?.aborted) abort();

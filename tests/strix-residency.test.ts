@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildStrixChildEnvironment,
   restoreResidency,
   runningSnapshot,
   unloadAll,
@@ -12,6 +13,16 @@ function json(body: unknown, status = 200): Response {
 }
 
 describe("Strix llama-swap residency helpers", () => {
+  it("never passes the exclusive maintenance credential to benchmark children", () => {
+    expect(buildStrixChildEnvironment({
+      PATH: "/usr/bin",
+      M5_MAINTENANCE_KEY: "must-not-cross-process-boundary",
+    }, { GGML_VK_VISIBLE_DEVICES: "0" })).toEqual({
+      PATH: "/usr/bin",
+      GGML_VK_VISIBLE_DEVICES: "0",
+    });
+  });
+
   it("validates content-blind residency evidence", async () => {
     const dependencies: StrixResidencyDependencies = {
       fetch: async () => json({ running: [{ model: "resident", state: "ready", ttl: 7 }] }),

@@ -30,7 +30,12 @@ import {
   type StrixKvRunPlan,
 } from "../src/homeserver/strix-combined-experiment.js";
 import { validateStrixMmapAbConfig } from "../src/homeserver/strix-mmap-ab.js";
-import { restoreResidency, runningSnapshot, unloadAll } from "../src/homeserver/strix-residency.js";
+import {
+  buildStrixChildEnvironment,
+  restoreResidency,
+  runningSnapshot,
+  unloadAll,
+} from "../src/homeserver/strix-residency.js";
 
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_REPORT_BYTES = 8 * 1024 * 1024;
@@ -91,7 +96,12 @@ function atomicWrite(path: string, content: string): void {
 }
 
 function commandVersion(path: string): string | null {
-  const result = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024 });
+  const result = spawnSync(path, ["--version"], {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 256 * 1024,
+    env: buildStrixChildEnvironment(),
+  });
   if (result.error) return null;
   const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim().replace(/\0/g, "");
   return output.length === 0 ? null : output.slice(0, 8_192);
@@ -164,7 +174,7 @@ export async function runBackendCorrectness(config: StrixKvCandidateConfig): Pro
   const child = spawn(config.candidateRuntime.backendOpsPath, argv, {
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, GGML_VK_VISIBLE_DEVICES: "0" },
+    env: buildStrixChildEnvironment(process.env, { GGML_VK_VISIBLE_DEVICES: "0" }),
   });
   activeChild = child;
   child.stdout.on("data", (chunk: Buffer) => {
