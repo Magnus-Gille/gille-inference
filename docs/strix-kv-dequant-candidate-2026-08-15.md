@@ -75,3 +75,35 @@ Rollback before deployment is deletion of the isolated candidate build. If it la
 gate and is promoted, rollback is replacement with the retained production binaries at revision
 `8086439a4cea94c71a5dfb8fe4ad1546aebd640f`, restoration of the previous F16 profile, and the
 standard gateway/runtime verification sequence.
+
+## Combined maintenance runner
+
+`npm run benchmark:strix-combined` now binds this candidate to the existing mmap ABBA and direct
+Strix benchmark runners. It is deliberately not a standalone production command: invoke it only as
+the child of `maintenance:run`, after resolving and receiving exact approval for the current
+resident model and immutable artifacts.
+
+Before the first unload it validates both configs, hashes the model, source archive, production
+server/benchmark/Vulkan library, candidate server/benchmark/backend-test/Vulkan library, checks
+executable file types, and requires both server version strings to name their pinned commits. It
+then:
+
+1. runs two mmap ABBA cycles and restores the starting resident model;
+2. treats mmap promote/reject as complete independent evidence, not as a KV gate;
+3. unloads residency and runs focused serial Vulkan `FLASH_ATTN_EXT` correctness;
+4. runs production-F16, production-Q8, candidate-Q8 and then the mirrored order in cycle two;
+5. requires PP/TG cells at short, 8K, 32K, 64K, and 128K actual depth with exact runtime/model/KV
+   provenance;
+6. restores the exact starting model and requires a deterministic `OK` inference before accepting
+   ready state; and
+7. emits mode-0600 aggregate JSON/Markdown without model content.
+
+The automatic microbenchmark decision is either `advance-to-agent-gate` or `reject`. Advancement
+requires at least 10% candidate-over-stock-Q8 PP gain at both 32K and 64K, no PP/TG cell more than
+5% behind stock Q8 or production F16, and no candidate peak-RSS increase above stock Q8 beyond 5%.
+It never authorizes deployment. A representative agent workload remains mandatory.
+
+On any infrastructure, correctness, benchmark, provenance, or interruption failure, the runner
+attempts required residency restoration and writes `combined-failure.json`. If both the operation
+and restoration fail, it preserves both errors. The outer maintenance runner independently closes
+the exclusive fence; operators must inspect live residency before further action.

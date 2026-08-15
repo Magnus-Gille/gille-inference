@@ -178,6 +178,37 @@ and sampling time, so this direct mode records TTFT as unmeasured. Speculation i
 acceptance is therefore not applicable. Use the streaming server/agent benchmark for TTFT,
 acceptance rate, prefix-cache benefit, and completed useful tasks per minute.
 
+### Combined mmap and Q8 KV candidate window
+
+When both prepared candidates are in scope for one explicitly approved outage, use the combined
+runner so provenance checks, causal ordering, failure evidence, and residency restoration are not
+recreated manually:
+
+```bash
+npm run maintenance:run -- \
+  --base-url <verified-gateway-origin> \
+  --ttl-seconds 7200 \
+  --drain-timeout-seconds 60 \
+  --evidence <private-evidence-root>/combined-window.json \
+  -- npm run benchmark:strix-combined -- \
+    --config configs/strix-kv-dequant-qwen36.json \
+    --mmap-config configs/strix-mmap-qwen36.json \
+    --out-dir <private-evidence-root>/combined \
+    --llama-swap-origin http://127.0.0.1:8091 \
+    --expected-resident-model <freshly-resolved-approved-model> \
+    --ack-exclusive-window
+```
+
+The placeholders are intentional and are not an authorization object. Immediately before seeking
+confirmation, resolve the live gateway origin, resident model, service health, artifact hashes,
+source revision, exact command, maximum outage, verification, and rollback. If any one changes,
+request new confirmation.
+
+The child never receives `M5_MAINTENANCE_KEY`. It changes no live config, roster, service, driver,
+kernel, cache policy, or power setting. It may unload and reload the approved resident model only
+inside the exclusive fence. The aggregate decision can advance the KV candidate to an agent-work
+gate; it cannot deploy it.
+
 ## Streaming server and agent-shaped matrix
 
 The streaming runner complements `llama-bench`; it does not replace the direct PP/TG control. It

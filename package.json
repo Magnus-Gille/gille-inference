@@ -24,6 +24,7 @@
     "benchmark:strix-host": "tsx scripts/capture-strix-host-profile.ts",
     "benchmark:strix-prefix-cache": "tsx scripts/strix-prefix-cache-probe.ts",
     "benchmark:strix-mmap-ab": "tsx scripts/strix-mmap-ab.ts",
+    "benchmark:strix-combined": "tsx scripts/strix-combined-experiment.ts",
     "benchmark:real-agent": "tsx scripts/real-agent-benchmark.ts",
     "maintenance:run": "tsx scripts/maintenance-window.ts",
     "check:m5-contexts": "node scripts/check-m5-delegated-contexts.mjs",

@@ -38,12 +38,12 @@ import {
   type StrixTelemetry,
 } from "../src/homeserver/strix-benchmark.js";
 
-interface ExecutionResult {
+export interface ExecutionResult {
   rows: LlamaBenchRow[];
   telemetry: StrixTelemetry;
 }
 
-interface CliDependencies {
+export interface CliDependencies {
   hashModel: (path: string) => Promise<string>;
   execute: (plan: StrixBenchmarkPlan) => Promise<ExecutionResult>;
   systemSnapshot: () => StrixSystemSnapshot;
@@ -245,7 +245,7 @@ function writeReport(prefix: string, report: StrixBenchmarkReport): { jsonPath: 
   return { jsonPath, markdownPath };
 }
 
-const DEFAULT_DEPS: CliDependencies = {
+export const DEFAULT_DEPS: CliDependencies = {
   hashModel: sha256File,
   execute: executeLlamaBench,
   systemSnapshot,

@@ -28,8 +28,8 @@ import {
   type StrixMmapTrial,
   type StrixMmapVariant,
 } from "../src/homeserver/strix-mmap-ab.js";
+import { restoreResidency, runningSnapshot, unloadAll } from "../src/homeserver/strix-residency.js";
 
-interface RunningEntry { model: string; state: string; ttl?: number }
 interface HostSample { rssBytes: number; memAvailableBytes: number; swapFreeBytes: number; temperatureC: number | null }
 interface SamplerResult { peakRssBytes: number; minMemAvailableBytes: number; minSwapFreeBytes: number; maxTemperatureC: number | null }
 
@@ -37,7 +37,6 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const READY_TIMEOUT_MS = 600_000;
 const REQUEST_TIMEOUT_MS = 180_000;
-const RESTORE_TIMEOUT_MS = 600_000;
 let activeEphemeralChild: ChildProcess | null = null;
 
 function sleep(ms: number): Promise<void> {
@@ -141,65 +140,6 @@ async function readBounded(response: Response, limit = MAX_RESPONSE_BYTES): Prom
     text += decoder.decode(value, { stream: true });
   }
   return text + decoder.decode();
-}
-
-async function runningSnapshot(origin: string): Promise<RunningEntry[]> {
-  const response = await fetch(`${origin}/running`, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`llama-swap /running returned ${response.status}`);
-  const parsed = JSON.parse(await readBounded(response)) as unknown;
-  if (parsed === null || typeof parsed !== "object" || !Array.isArray((parsed as { running?: unknown }).running)) {
-    throw new Error("llama-swap returned malformed residency evidence");
-  }
-  const entries = (parsed as { running: unknown[] }).running;
-  if (!entries.every((entry) => entry !== null && typeof entry === "object" &&
-    typeof (entry as RunningEntry).model === "string" && typeof (entry as RunningEntry).state === "string")) {
-    throw new Error("llama-swap returned malformed residency entries");
-  }
-  return entries as RunningEntry[];
-}
-
-async function unloadAll(origin: string): Promise<void> {
-  const response = await fetch(`${origin}/api/models/unload`, {
-    method: "POST", signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`llama-swap unload returned ${response.status}`);
-  await readBounded(response, 4_096);
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    if ((await runningSnapshot(origin)).length === 0) return;
-    await sleep(250);
-  }
-  throw new Error("llama-swap did not become empty after unload");
-}
-
-async function restoreResidency(origin: string, initial: RunningEntry[]): Promise<void> {
-  await unloadAll(origin);
-  const ready = initial.filter((entry) => entry.state === "ready");
-  if (ready.length === 0) return;
-  if (ready.length !== 1) throw new Error("cannot restore more than one initially ready model on the serial GPU");
-  const model = ready[0]!.model;
-  const response = await fetch(`${origin}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    signal: AbortSignal.timeout(RESTORE_TIMEOUT_MS),
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: "Reply with exactly OK." }],
-      max_tokens: 8,
-      temperature: 0,
-      seed: 1,
-      stream: false,
-    }),
-  });
-  if (!response.ok) throw new Error(`restoring ${model} returned ${response.status}`);
-  await readBounded(response);
-  const deadline = Date.now() + RESTORE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const current = await runningSnapshot(origin);
-    if (current.length === 1 && current[0]!.model === model && current[0]!.state === "ready") return;
-    await sleep(500);
-  }
-  throw new Error(`restored model ${model} did not reach the ready state`);
 }
 
 async function portIsFree(port: number): Promise<boolean> {

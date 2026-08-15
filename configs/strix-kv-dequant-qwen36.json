@@ -33,12 +33,18 @@
   },
   "productionRuntime": {
     "commit": "8086439a4cea94c71a5dfb8fe4ad1546aebd640f",
+    "llamaBenchPath": "/home/magnus/llama.cpp/build/bin/llama-bench",
     "llamaBenchSha256": "25efdfb18fc99bb1e6ff99f276a030399a7810890ddc8ed9dc0c6ad79fda6fa5",
+    "vulkanLibraryPath": "/home/magnus/llama.cpp/build/bin/libggml-vulkan.so",
     "vulkanLibrarySha256": "aa7ea82b8bc108ac33cef8aff8f65fa4c81b4784984bf72980b56dd22f8c094f"
   },
   "candidateRuntime": {
     "backportCommit": "300d1192718c6746f108afcab893d208d43ea94e",
+    "sourceArchivePath": "/tmp/llama-kv-dequant-8086439-300d119.tar",
     "sourceArchiveSha256": "2c539a286fd52cdece5e162b693fbf3ae788fd8ce9a90c52591d6cd4fbe3e0ba",
+    "llamaBenchPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/llama-bench",
+    "llamaServerPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/llama-server",
+    "backendOpsPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/test-backend-ops",
     "compiler": "GCC 15.2",
     "cmakeVersion": "4.2.3",
     "vulkanSdkVersion": "1.4.341",
@@ -52,6 +58,7 @@
     "llamaBenchSha256": "c12b8a94ed732b7c57153c5130daae733035defeb78bc2f5fd81df6cfbb7b370",
     "llamaServerSha256": "222e21ca93b984bb2e4f6c010af0e87680d98958c6024375b13e749e261b9171",
     "backendOpsSha256": "981e59bda5bcc24871bcca54448dcc7731fefd2310ec2570f33948d9cf47129d",
+    "vulkanLibraryPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/libggml-vulkan.so",
     "vulkanLibrarySha256": "f8af1d058cd4551fddd92b408f81284b7d0a7846267ac6128acc0a12b9fd644e"
   },
   "model": {
