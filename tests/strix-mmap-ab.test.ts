@@ -73,17 +73,19 @@ describe("Strix mmap A/B contract", () => {
     expect(parseStrixMmapAbArgs([
       "--config", "configs/strix-mmap.json",
       "--out", "data/strix/mmap",
+      "--expected-resident-model", "qwen3-coder-next-80b",
       "--ack-exclusive-window",
     ])).toEqual({
       configPath: "configs/strix-mmap.json",
       outPrefix: "data/strix/mmap",
       llamaSwapOrigin: "http://127.0.0.1:8091",
       cycles: 1,
+      expectedResidentModel: "qwen3-coder-next-80b",
       ackExclusiveWindow: true,
     });
-    expect(() => parseStrixMmapAbArgs(["--config", "x", "--out", "y"])).toThrow(/exclusive/);
+    expect(() => parseStrixMmapAbArgs(["--config", "x", "--out", "y", "--ack-exclusive-window"])).toThrow(/expected-resident/);
     expect(() => parseStrixMmapAbArgs([
-      "--config", "x", "--out", "y", "--ack-exclusive-window",
+      "--config", "x", "--out", "y", "--expected-resident-model", "none", "--ack-exclusive-window",
       "--llama-swap-origin", "https://example.com",
     ])).toThrow(/loopback/);
   });

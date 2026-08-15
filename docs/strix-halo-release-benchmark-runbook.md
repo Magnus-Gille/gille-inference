@@ -295,8 +295,13 @@ npm run maintenance:run -- \
   -- npm run benchmark:strix-mmap-ab -- \
     --config configs/strix-mmap-qwen36.json \
     --out data/strix-benchmarks/qwen36-mmap-ab \
+    --expected-resident-model qwen3-coder-next-80b \
     --ack-exclusive-window
 ```
+
+Replace the example resident id with the exact `ready` model observed immediately before the
+approved window, or use `none` only when the verified snapshot is empty. A mismatch fails before
+the first unload, binding the just-in-time mutation approval to a concrete rollback target.
 
 The fixed order is mmap/no-mmap/no-mmap/mmap. Before the trials, the model is SHA-256-read both
 for immutable provenance and to give every arm a warm filesystem cache; startup remains a cold

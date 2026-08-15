@@ -441,7 +441,12 @@ export async function runStrixMmapAb(argv: string[]): Promise<number> {
   }
   const initialResidency = await runningSnapshot(plan.llamaSwapOrigin);
   if (initialResidency.some((entry) => entry.state === "starting")) throw new Error("llama-swap residency is not stable");
-  if (initialResidency.filter((entry) => entry.state === "ready").length > 1) throw new Error("more than one ready model violates the serial-GPU restore contract");
+  const initialReady = initialResidency.filter((entry) => entry.state === "ready");
+  if (initialReady.length > 1) throw new Error("more than one ready model violates the serial-GPU restore contract");
+  const observedResident = initialReady[0]?.model ?? null;
+  if (observedResident !== plan.expectedResidentModel) {
+    throw new Error(`resident model changed: expected ${plan.expectedResidentModel ?? "none"}, observed ${observedResident ?? "none"}`);
+  }
 
   const startedAt = new Date().toISOString();
   // Hashing is provenance and a deliberate identical page-cache prime for all ABBA trials.

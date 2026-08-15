@@ -5,6 +5,7 @@ export interface StrixMmapAbArgs {
   outPrefix: string;
   llamaSwapOrigin: string;
   cycles: number;
+  expectedResidentModel: string | null;
   ackExclusiveWindow: true;
 }
 
@@ -109,6 +110,7 @@ export function parseStrixMmapAbArgs(argv: string[]): StrixMmapAbArgs {
   let outPrefix: string | null = null;
   let llamaSwapOrigin = "http://127.0.0.1:8091";
   let cycles = 1;
+  let expectedResidentModel: string | null | undefined;
   let ackExclusiveWindow = false;
   const seen = new Set<string>();
   for (let index = 0; index < argv.length; index++) {
@@ -124,6 +126,12 @@ export function parseStrixMmapAbArgs(argv: string[]): StrixMmapAbArgs {
     if (flag === "--config") configPath = value;
     else if (flag === "--out") outPrefix = value;
     else if (flag === "--llama-swap-origin") llamaSwapOrigin = parseLoopbackOrigin(value);
+    else if (flag === "--expected-resident-model") {
+      expectedResidentModel = value === "none" ? null : value;
+      if (expectedResidentModel !== null && !MODEL_RE.test(expectedResidentModel)) {
+        throw new Error("--expected-resident-model must be a safe model identifier or 'none'");
+      }
+    }
     else if (flag === "--cycles") {
       cycles = Number(value);
       if (!Number.isInteger(cycles) || cycles < 1 || cycles > 4) throw new Error("--cycles must be an integer from 1 to 4");
@@ -131,8 +139,9 @@ export function parseStrixMmapAbArgs(argv: string[]): StrixMmapAbArgs {
   }
   if (configPath === null || configPath.trim() === "") throw new Error("--config is required");
   if (outPrefix === null || outPrefix.trim() === "") throw new Error("--out is required");
+  if (expectedResidentModel === undefined) throw new Error("--expected-resident-model is required");
   if (!ackExclusiveWindow) throw new Error("--ack-exclusive-window is required; run only inside maintenance:run");
-  return { configPath, outPrefix, llamaSwapOrigin, cycles, ackExclusiveWindow: true };
+  return { configPath, outPrefix, llamaSwapOrigin, cycles, expectedResidentModel, ackExclusiveWindow: true };
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {
