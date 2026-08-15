@@ -42,8 +42,10 @@ scope used for each winner.
 - No candidate has a qualified repeatable VLM task score.
 - The fresh Qwen3.6/Qwen3.8 Gate D result lacks turns, tokens, and model-only time because the old
   runner recorded wall time only. New Pi runs now capture those content-blind fields.
+- The preregistered `strix-real-r1` real-history task is ready, but no live row exists: direct Pi
+  failed closed at the credential/OS-cage boundary. Do not infer a score from harness readiness.
 - Qwen3.8's 64K serving contract is configured capacity, not a 64K-populated agent benchmark.
 
-The next useful update is a preregistered fresh real-repository coding study using the instrumented
-Pi runner, with turns, tool calls, prompt/completion tokens, model-turn time, assistant-stream time,
-total wall time, and deterministic test outcomes.
+The next useful update is the same preregistered real-repository study through an approved,
+model-selectable OS-caged executor, preserving the instrumented runner's turns, tools, tokens,
+timing spans, total wall time, and deterministic outcomes.

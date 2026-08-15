@@ -16,8 +16,9 @@ needed, the exclusive maintenance fence tracked in issue #196.
 2. T20's matched Gate D comparison is complete. Qwen3.6 remains the fast coding default at 1.73
    correct runs/minute; Qwen3.8 is the quality/broad-edit escalation at 30/30 correctness and 0.86
    correct runs/minute. No automatic route changed.
-3. The next quality study needs fresh real-repository tasks and the newly added content-blind
-   turns/tokens/tool-calls/model-turn/assistant-stream telemetry.
+3. The first fresh real-history task and content-blind runner are implemented. Live comparison is
+   blocked safely: direct Pi would inherit the bearer credential without an OS cage, and the caged
+   code-loop contract cannot select Qwen3.6 versus Qwen3.8 per run.
 
 ## Ticket matrix
 
@@ -45,14 +46,15 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | T20 Qwen3.8 vs Qwen3.6 | **Measured; routed recommendation recorded** | The matched Gate D r1 comparison ran ten tasks × three seeds per live profile. Qwen3.6 passed 26/30 at 1.73 correct runs/minute; Qwen3.8 passed 30/30 at 0.86/minute and uniquely closed the broad four-file rename. Keep Qwen3.6 fast/default and Qwen3.8 quality/escalation; no automatic route promotion. See `docs/qwen38-vs-qwen36-gate-d-2026-08-15.md`. |
 | T21 Glimmer specialist | **Candidate only** | Existing gateway already passes multimodal `image_url` content and serves Gemma4+mmproj. Glimmer qualification/discovery remains issue #181; roster promotion is not authorized. |
 | T22 model router | **Implemented as evidence-gated routing; profile qualification blocked** | The gateway/orchestrator already performs task-aware routing through the generated capability table and fails safe to the frontier for unsupported lanes. FAST/BALANCED/DEEP/VISION/MAX remain descriptive product tiers rather than static aliases: assigning them before the issue #124 model/profile experiments would bypass the repository's evidence-before-autonomy invariant. Glimmer/MAX qualification remains separate roster work. |
-| T23 coding-agent suite | **Existing, verified, and telemetry-instrumented** | Gate D has 14 isolated real-edit fixtures with deterministic compile/test/structural oracles and resumable model/harness runs. Pi rows now add content-blind turns, tool calls, prompt/completion tokens, model-turn time, and assistant-stream time without retaining task content. New models must run the same pinned corpus; no replacement suite is needed. |
+| T23 coding-agent suite | **Real-history runner implemented; live A/B safety-blocked** | Gate D has 14 isolated fixtures, and `strix-real-r1` adds a preregistered real-history seed/reference/hidden-oracle task with committed Pi model configuration. The runner captures content-blind turns, tools, tokens, timing spans, hashes, and provenance. A fake-Pi end-to-end smoke and 4,246-test full suite pass. Direct live Pi was rejected before execution because the bearer would reach an uncaged shell-capable agent; the existing cage has no allow-listed per-run model selector. |
 | T24 concurrent agents | **Runner implemented; measurement blocked** | Streaming runner covers 1/2/4/8 and useful work/minute. Existing Gate C remains the admission/preemption/soak control. Requires M5 access/window. |
 | T25 OS/power/memory profile | **Read-only capture implemented; Strix A/B blocked** | `npm run benchmark:strix-host` emits mode-0600 JSON/Markdown with the operator-observed BIOS UMA setting, kernel/Mesa/ROCm, memory, allow-listed AMD/TTM parameters, power profile, governor, DRM memory/clocks, and labelled hwmon observations. Missing sensors remain `null`, and raw kernel argv is never retained. A local non-Strix smoke test and deterministic tests prove the capture path; issue #195 still owns the one-variable M5 A/B after #196 is deployed and verified. BIOS/kernel/driver changes remain explicitly outside this branch. |
 
 ## Work order from this state
 
-1. Run fresh, preregistered real-repository Qwen3.6/Qwen3.8 tasks with the expanded Gate D
-   turns/tokens/tool/model-turn/stream telemetry before considering any automatic route change.
+1. With explicit approval, add and independently review an allow-listed per-run model selector for
+   the OS-caged code-loop path; then run `strix-real-r1` on Qwen3.6 and Qwen3.8 before considering
+   any automatic route change.
 2. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
 3. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
 4. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.

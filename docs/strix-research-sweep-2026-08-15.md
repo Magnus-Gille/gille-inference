@@ -89,8 +89,13 @@ result schema; there is no production state to restore.
 
 ## Next most valuable experiment
 
-Run fresh, preregistered real-repository coding tasks through Qwen3.6 and Qwen3.8 using the new
-telemetry. Capture deterministic success, wall time, turns, tool calls, prompt/completion tokens,
-model-turn time, assistant-stream time, retries, and test outcomes. This directly tests H8: whether
-dense Qwen3.8's extra correctness reduces total iterations enough to beat the faster MoE on
-realistic work.
+The fresh `strix-real-r1` real-history corpus and content-blind runner are now implemented and
+verified. Its first live arm did not execute: direct Pi would expose the bearer credential to an
+uncaged shell-capable agent, while the safe OS-caged code-loop path is fixed to one configured
+model and cannot perform the Qwen3.6/Qwen3.8 A/B. See
+[`real-agent-pilot-2026-08-15.md`](real-agent-pilot-2026-08-15.md).
+
+The next experiment is therefore to add an allow-listed, evidence-stamped model selector to the
+existing OS cage, subject to explicit approval for the security-boundary change and independent
+review. Then run the preregistered task sequentially on both live profiles. This directly tests H8
+without trading credential safety for measurement speed.
