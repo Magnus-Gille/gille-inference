@@ -273,6 +273,47 @@ another preregistered pair that makes every generation exceed the captured check
 Stress mode accumulates the generated text only in memory across valid tool cycles, performs no
 intermediate audit that could perturb the checkpoint table, and writes only one exact final audit.
 
+### iGPU mmap/no-mmap load experiment
+
+llama.cpp PR [#26081](https://github.com/ggml-org/llama.cpp/pull/26081) changed the default model
+load policy so backends can disable mmap automatically on iGPUs that copy model bytes into
+device-visible shared memory. The deployed `8086439` Qwen3.6 binary predates that policy but already
+supports explicit `--mmap` and `--no-mmap`, so test the mechanism on the exact production runtime
+before considering a broad runtime upgrade.
+
+The runner unloads llama-swap residency, starts a throwaway llama-server, and restores the model
+that was resident before the run. It therefore belongs only inside the repository-owned exclusive
+window. The child requires `--ack-exclusive-window`, but that flag is an operator assertion rather
+than a second fence; the outer `maintenance:run` command is authoritative.
+
+```bash
+npm run maintenance:run -- \
+  --base-url http://127.0.0.1:8080 \
+  --ttl-seconds 3600 \
+  --drain-timeout-seconds 60 \
+  --evidence data/strix-benchmarks/qwen36-mmap-window.json \
+  -- npm run benchmark:strix-mmap-ab -- \
+    --config configs/strix-mmap-qwen36.json \
+    --out data/strix-benchmarks/qwen36-mmap-ab \
+    --ack-exclusive-window
+```
+
+The fixed order is mmap/no-mmap/no-mmap/mmap. Before the trials, the model is SHA-256-read both
+for immutable provenance and to give every arm a warm filesystem cache; startup remains a cold
+process/model load. The report records startup-to-ready, first and exact-warm TTFT/latency, PP/TG,
+actual prompt/completion/cache tokens, peak RSS, minimum MemAvailable/swap-free, temperature,
+runtime/model/argv hashes, kernel, Mesa/ROCm observations, configured context, backend, quant, and
+restored residency. Model output is retained only as an exact-oracle boolean and SHA-256.
+
+Four trials are an exploratory gate, not a statistical claim. Promote only when no-mmap improves
+startup by at least 5% or peak RSS by at least 10%, remains directionally consistent inside the
+ABBA pairs, preserves exact output, and stays inside the preregistered 3–5% PP/TG/TTFT/latency
+tolerances. A positive screen should be repeated with `--cycles 2` before changing llama-swap's
+tracked command. A failed trial still runs mandatory restoration; a restoration failure exits red
+and takes precedence over the benchmark result. `SIGINT`, `SIGTERM`, and `SIGHUP` stop the
+ephemeral server and retain the restoration path. `SIGKILL` cannot be caught; the outer exclusive
+window's TTL restores admission, but an operator must then verify/reload the prior residency.
+
 ## Read-only host reproducibility snapshot
 
 Capture the host state beside every benchmark series. The firmware UMA setting is not reliably
@@ -318,5 +359,6 @@ decision remains completed correct coding work per minute against the same repos
 - [Official llama-bench syntax and JSON output](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench)
 - [Official llama-server timings, cache, metrics, and speculative options](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
 - [Official llama.cpp speculative-decoding guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)
+- [llama.cpp iGPU auto-load-mode change (#26081)](https://github.com/ggml-org/llama.cpp/pull/26081)
 - [AMD Strix Halo system optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html)
 - [Existing Vulkan/HIP experiment contract, issue #129](https://github.com/Magnus-Gille/gille-inference/issues/129)

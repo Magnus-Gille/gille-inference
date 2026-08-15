@@ -26,7 +26,7 @@ needed, the exclusive maintenance fence tracked in issue #196.
 |---:|---|---|
 | T01 benchmark harness | **Implemented; first release measurements complete** | Direct `llama-bench` plus streaming server runners emit JSON/Markdown and cover PP, TG, TTFT, cache, speculation, concurrency, hashes, system/runtime fields, and useful completions/minute. Qwen3.8 pp512/tg128, pp8192, direct/MTP, and server canaries now provide the first controlled release evidence. Real power should come from a wall meter; hwmon is labelled explicitly. |
 | T02 Qwen3-Coder baseline | **Blocked for measurement** | Harness ready. Exact 30B-A3B GGUFs/builds are not staged or verified in this session; live verification of #196 is still missing. |
-| T03 Qwen3.6 direct baseline | **Prefix-cache profile measured; throughput matrix blocked** | The live Q4_K_M Vulkan profile now has immutable model/binary/argv provenance and a 26.8–27.2K populated-context cache measurement on llama.cpp `8086439`: cold prefill was 33.5–33.9 s, exact warm controls 110–111 ms. Direct PP/TG, context, KV, and requested ROCmFP4 arms still require the controlled window. |
+| T03 Qwen3.6 direct baseline | **Prefix-cache measured; mmap A/B prepared** | The live Q4_K_M Vulkan profile now has immutable model/binary/argv provenance and a 26.8–27.2K populated-context cache measurement on llama.cpp `8086439`: cold prefill was 33.5–33.9 s, exact warm controls 110–111 ms. A fail-closed ABBA runner now compares explicit mmap/no-mmap on that same runtime and restores pre-run llama-swap residency; the hardware run requires a fresh exact maintenance confirmation. Direct context/KV/ROCmFP4 arms remain. |
 | T04 native MTP | **Measured for Qwen3.8** | Native MTP depth 2 passed in the pinned Vulkan runtime: 21.68 tok/s with F16 KV and 23.21 tok/s with Q8 KV versus 12.84 tok/s direct in the matched short server workload. Draft acceptance was workload-dependent (57.6–66.1%). Broader adaptive-depth evidence remains T05. |
 | T05 adaptive MTP | **Not implemented** | Requires measured cost/acceptance traces from T04 before a policy can satisfy “never materially slower.” Static guesswork is rejected. |
 | T06 Vulkan vs HIP | **Comparison implemented; experiment blocked** | One-axis comparator enforces controlled provenance. Actual bake-off belongs to issue #129 and requires isolated builds plus deployed/verified #196. |
@@ -58,5 +58,5 @@ needed, the exclusive maintenance fence tracked in issue #196.
 2. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
 3. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
 4. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.
-5. Triage post-`8086439` llama.cpp Vulkan changes into one pinned, mechanism-specific runtime
-   candidate; build it separately before requesting a controlled hardware A/B.
+5. Run the exact-runtime mmap/no-mmap ABBA selected from post-`8086439` llama.cpp PR #26081. Only
+   if the mechanism passes locally should a newer runtime build enter a separate controlled A/B.

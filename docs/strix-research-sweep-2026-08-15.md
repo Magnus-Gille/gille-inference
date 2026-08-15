@@ -61,6 +61,24 @@ reproducer turns the control red.
 rollback for the new probe is a normal Git revert; the benchmark itself is read-only apart from
 ordinary prompt-cache state.
 
+## Next selected mechanism: iGPU mmap policy
+
+llama.cpp PR [#26081](https://github.com/ggml-org/llama.cpp/pull/26081), merged 11 August 2026,
+adds a backend capability and makes automatic model loading avoid mmap on iGPUs where weights are
+copied into device-visible shared memory. This is **REPORTED/upstream mechanism evidence**, not a
+local performance result. It is directly relevant to Strix Halo model swaps and routing because
+duplicated host/device-visible residency can increase peak memory and cold-load time.
+
+The current Qwen3.6 runtime predates the automatic policy but already exposes explicit `--mmap`
+and `--no-mmap`. A repository-owned ABBA harness now tests those flags on the same pinned binary,
+model, Vulkan backend, 131K context, and serving arguments; it records startup, memory pressure,
+first/warm TTFT, PP/TG, exact output hashes, and automatic llama-swap residency restoration. This
+isolates the mechanism from the much larger confound of upgrading two months of llama.cpp changes.
+
+**Local A/B result: not run yet.** The experiment unloads the currently resident production model
+inside a bounded all-traffic maintenance window, so its exact mutation object requires a fresh
+operator confirmation. No config or service was changed while preparing the harness.
+
 ## What changed
 
 Gate D's Pi arm now records content-blind turns, tool calls, prompt tokens, completion tokens,
@@ -89,6 +107,7 @@ time.
 
 | Candidate | Evidence | Exact-hardware relevance | Decision |
 |---|---|---|---|
+| llama.cpp iGPU automatic no-mmap load policy ([#26081](https://github.com/ggml-org/llama.cpp/pull/26081)) | **REPORTED/upstream:** merged capability change targets iGPUs that copy weights into device-visible shared memory | High for Strix cold model swaps and peak memory; deployed runtime supports an exact-flag mechanism A/B | Selected next; ABBA runner implemented and locally tested, hardware mutation pending exact maintenance confirmation |
 | llama.cpp many-expert Vulkan threshold patch ([#25356](https://github.com/ggml-org/llama.cpp/issues/25356)) | **EXTERNAL-MEASURED:** exact 128 GB Strix/RADV report shows no change through batch 8, then +56% at batch 9, +34% at 16, +20% at 32 | High only for nine or more simultaneous sequences | Reject for current one-slot / practical two-user production workload; revisit if concurrency policy changes |
 | llama.cpp DFlash on quantized MoE HIP ([#25117](https://github.com/ggml-org/llama.cpp/issues/25117)) | **EXTERNAL-MEASURED:** exact Strix report shows 19.5 tok/s direct versus 9.4 DFlash | Exact hardware, but a clear regression in the reported arm | Do not implement this HIP path; require a different drafter/backend or new upstream evidence |
 | Vulkan versus HIP and MTP Strix observations ([discussion #20856](https://github.com/ggml-org/llama.cpp/discussions/20856)) | **REPORTED/EXTERNAL-MEASURED:** recent builds show Vulkan ahead for batch-one decode, HIP ahead for prompt processing, and workload-sensitive MTP gains | Matches hypotheses H1, H2, H4 but is not our immutable local A/B | Retain Vulkan as the interactive reference; keep a controlled HIP prompt-heavy bake-off on the backlog |
