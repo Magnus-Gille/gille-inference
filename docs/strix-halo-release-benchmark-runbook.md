@@ -259,7 +259,8 @@ npm run benchmark:strix-prefix-cache -- \
   --provenance data/strix-benchmarks/qwen36-direct-provenance.json \
   --out data/strix-benchmarks/qwen36-prefix-cache \
   --api-key-env M5_API_KEY \
-  --stable-items 1800 --max-tokens 1
+  --stable-items 1800 --max-tokens 1 \
+  --stress-cycles 0
 ```
 
 Exit `0` means the exact extended repeat stayed inside the warm-control tail plus the captured
@@ -267,7 +268,10 @@ runtime's checkpoint-minimum window. Exit `1` means it exceeded that checkpoint-
 `2` means the result was unobservable or setup failed. The JSON/Markdown pair is mode 0600 and
 separates gateway quota wait from the successful request and server prefill timings. This short
 probe does not replace a checkpoint-crossing, long-generation multi-tool test when evaluating a
-generation-checkpoint patch.
+generation-checkpoint patch. For that case, add `--stress-cycles 16 --stress-max-tokens 512` (or
+another preregistered pair that makes every generation exceed the captured checkpoint minimum).
+Stress mode accumulates the generated text only in memory across valid tool cycles, performs no
+intermediate audit that could perturb the checkpoint table, and writes only one exact final audit.
 
 ## Read-only host reproducibility snapshot
 

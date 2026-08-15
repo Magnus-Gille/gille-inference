@@ -33,7 +33,7 @@ needed, the exclusive maintenance fence tracked in issue #196.
 | T07 ROCmFPX | **Not integrated** | Requires reviewing/pinning the current external fork, compatible artifacts, and isolated Vulkan/HIP builds. No live runtime change is authorized. |
 | T08 quant matrix | **Runner/comparator implemented; artifacts blocked** | `quant` is a controlled comparison axis; real Pareto evidence needs identical source revision, converted quants, and Gate D quality runs. |
 | T09 KV matrix | **First Qwen3.8 F16/Q8 arm measured** | Q8 direct TG was within measurement noise of F16 (12.83 vs 12.87 tok/s), with similar pp512 (357.48 vs 361.40 tok/s), and won the sampled MTP canary (23.21 vs 21.68 tok/s). Q8 is selected for the 64K release profile. BF16/Q4 and broader model/context arms remain. |
-| T10 persistent prefix cache | **First production-shaped measurement complete** | A committed content-blind probe measured 304–305× cold-to-exact-warm server-prefill improvement at 26.8–27.2K actual tokens. An extended exact tool-turn repeat evaluated a stable 90-token tail in 338 ms versus the 16-token/111 ms warm control; this is healthy under the live 256-token checkpoint minimum, not evidence of invalidation. The next arm must cross that interval over multiple tool/generation cycles before testing upstream #24891. Cache survival across process replacement remains intentionally unclaimed. |
+| T10 persistent prefix cache | **Production-shaped short and checkpoint-stress measurements complete** | The short control measured 304–305× cold-to-exact-warm server-prefill improvement at 26.8–27.2K actual tokens. The stronger control ran sixteen tool cycles and 7,786 generated tokens (16/16 crossed the 256-token interval); its final 18,466-token exact prompt cached 18,419 tokens and evaluated only 47 in 219 ms. No progressive invalidation reproduced, so unreviewed upstream #24891 is rejected for this profile absent a future red organic/exact control. Cache survival across process replacement remains intentionally unclaimed. |
 | T11 DFlash | **Upstream path verified; experiment blocked** | Current llama.cpp documents `draft-dflash`; runner can capture workload acceptance and speed. Exact target-specific drafter and M5 run remain. Glimmer tracking: issue #181. |
 | T12 DSpark/DeepSpec | **Research premise updated; prototype not run** | Current llama.cpp already documents `draft-dspark`, so a new line-for-line CUDA port is no longer the first step. Benchmark the upstream backend path before writing AMD kernels. |
 | T13 gfx1151 verification kernel | **Not started** | Only justified after T11/T12 profiling proves target verification is the bottleneck. Premature kernel work is explicitly deferred. |
@@ -58,6 +58,5 @@ needed, the exclusive maintenance fence tracked in issue #196.
 2. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
 3. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
 4. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.
-5. Run the checkpoint-crossing, multiple-tool-cycle cache reproducer; test llama.cpp #24891 in an
-   isolated exact-runtime A/B only if the deployed control is red beyond its configured checkpoint
-   bound.
+5. Triage post-`8086439` llama.cpp Vulkan changes into one pinned, mechanism-specific runtime
+   candidate; build it separately before requesting a controlled hardware A/B.

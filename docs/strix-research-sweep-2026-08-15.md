@@ -35,11 +35,27 @@ Configured context is reported separately from the actually populated 26.8–27.
 
 Upstream llama.cpp PR [#24891](https://github.com/ggml-org/llama.cpp/pull/24891) claims a distinct
 multi-tool-turn checkpoint invalidation fix and reports large external prefill reductions. It is
-open, review-required, and has no substantive CI beyond the labeler at this checkpoint. The short
-local probe does not reproduce invalidation beyond the configured checkpoint window, so applying
-that unreviewed patch now would lack a red local baseline. The next proof is a bounded
-long-generation/multiple-tool-cycle reproducer that crosses the 256-token checkpoint interval;
-only a red result should trigger an isolated patch A/B.
+open, review-required, and has no substantive CI beyond the labeler at this checkpoint.
+
+The stronger local control is now complete. Sixteen sequential tool cycles generated 7,786 tokens;
+all sixteen generations crossed the 256-token interval. The 8,955-token initial prompt already
+spanned more than 32 checkpoint intervals, and the long generations added roughly 30 more:
+
+| Stress result | LOCAL-MEASURED |
+|---|---:|
+| Final actual prompt | 18,466 tokens |
+| Final cached prefix | 18,419 tokens |
+| Final exact-audit evaluation | **47 tokens / 219 ms** |
+| Checkpoint-aware failure bound | 280 tokens |
+| Crossing generations | 16/16 |
+
+Each full-size cycle extended the input by 624 tokens while the next request cached 624 additional
+tokens and evaluated a stable 671-token suffix; the 47-token difference is exactly what the final
+audit retained as its uncached tail. No progressive invalidation appeared as the conversation grew.
+This does not disprove #24891 for every template/runtime/workload, but it falsifies the deployment
+premise for this exact Qwen3.6 production profile and synthetic multi-tool control. **Decision: do
+not patch or build #24891 for promotion.** Revisit only if an organic trace or a stronger exact
+reproducer turns the control red.
 
 **Deployment decision: no.** No model, runtime, driver, route, or live configuration changed. The
 rollback for the new probe is a normal Git revert; the benchmark itself is read-only apart from
@@ -140,6 +156,7 @@ existing OS cage, subject to explicit approval for the security-boundary change 
 review. Then run the preregistered task sequentially on both live profiles. This directly tests H8
 without trading credential safety for measurement speed.
 
-Until that security-boundary work is approved, the highest-value safe runtime experiment is the
-checkpoint-crossing tool-cycle reproducer described above. It can falsify or justify PR #24891
-without changing credential authority or production configuration.
+Until that security-boundary work is approved, the next high-value safe runtime step is to compare
+the deployed June llama.cpp revision against recent upstream changes, select one pinned Vulkan
+candidate with an explicit relevant mechanism, and build it in isolation. A hardware A/B still
+needs the repository-owned controlled GPU window; no broad “latest is better” promotion is allowed.
