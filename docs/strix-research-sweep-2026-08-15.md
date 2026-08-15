@@ -118,6 +118,21 @@ when it is slower”; it is **not** an online rolling controller and does not co
 hardware run must capture direct, depth-1, depth-2, and any deeper supported arm against the same
 agent fixtures and concurrency matrix before a policy can be synthesized for production review.
 
+That capture path is now executable rather than an operator assembly exercise. A fail-closed
+maintenance child validates the exact runtime/Vulkan/model/mmproj/fixture hashes before unload,
+requires the configured binary's `--version` to prove the pinned commit, and Latin-rotates direct
+plus every declared MTP depth across all execution positions. It records one raw report per
+arm/cycle, restores exact prior llama-swap residency even on failure, merges cycles into paired
+repetitions, and synthesizes the lossless policy automatically. Signals and a bounded runtime stop
+the active server without bypassing restoration. The output remains
+`not-authorized-by-evidence`; no production route or runtime is mutated.
+
+**Local A/B result: not run.** No raw direct/MTP report for the exact Qwen3.8 production artifact
+exists in the repository or private benchmark tree inspected in this checkpoint. Running nine
+GPU-resident arms would disturb current residency and still requires the exact maintenance
+mutation object. The new harness removes experiment-order and hand-merge ambiguity but is not
+hardware evidence by itself.
+
 ## What changed
 
 Gate D's Pi arm now records content-blind turns, tool calls, prompt tokens, completion tokens,
@@ -241,10 +256,11 @@ already builds, and the combined correctness/long-generation/ABBA runner is read
 under the repository-owned exclusive window and exact mutation confirmation; the current Tailscale
 SSH session requires an interactive owner check, so no hardware result is claimed here.
 
-When live access is restored, capture a separate direct/depth-1/depth-2 speculation matrix across
-the intended workload/concurrency cells and feed it to the new fail-closed policy tool. This is the
-smallest evidence path toward T05 and directly tests the fresh gfx1151 concurrency failure instead
-of assuming that the current depth-2 profile generalizes.
+When live access is restored, run the exact-artifact Latin-rotated direct/depth-1/depth-2
+maintenance experiment across the intended workload/concurrency cells. Its merged output feeds
+the fail-closed policy automatically. This is the smallest evidence path toward T05 and directly
+tests the fresh gfx1151 concurrency failure instead of assuming that the current depth-2 profile
+generalizes.
 
 The BF16 Flash-Attention PR is the next isolated HIP/KV build candidate after Q8-KV. The fresh
 `strix-real-r1` comparison still needs an allow-listed model selector in the OS cage; that
