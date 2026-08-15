@@ -32,14 +32,16 @@ const baseProvenance = {
 };
 
 function summary(concurrency: number, useful: number, acceptanceRate: number | null = null) {
+  const batches = 3;
+  const requests = batches * concurrency;
   return {
     fixtureId: "code",
     taskType: "code",
     concurrency,
-    batches: 3,
-    requests: 3,
-    successfulRequests: 3,
-    oraclePasses: 3,
+    batches,
+    requests,
+    successfulRequests: requests,
+    oraclePasses: requests,
     successRate: 1,
     oraclePassRate: 1,
     p50TtftMs: 100,
@@ -83,11 +85,13 @@ describe("Strix speculation policy synthesis", () => {
       "--candidate", "mtp1.json",
       "--candidate", "mtp2.json",
       "--min-gain-percent", "3",
+      "--min-batches", "4",
       "--out", "policy",
     ])).toEqual({
       directPath: "direct.json",
       candidatePaths: ["mtp1.json", "mtp2.json"],
       minimumUsefulWorkGain: 0.03,
+      minimumBatches: 4,
       outPrefix: "policy",
     });
   });
@@ -118,8 +122,8 @@ describe("Strix speculation policy synthesis", () => {
 
   it("fails closed when quality regresses or acceptance is unobservable", () => {
     const qualityRegression = report("draft-mtp", 2, [150]);
-    qualityRegression.summaries[0]!.oraclePassRate = 0.5;
-    qualityRegression.summaries[0]!.oraclePasses = 1;
+    qualityRegression.summaries[0]!.oraclePassRate = 0;
+    qualityRegression.summaries[0]!.oraclePasses = 0;
 
     const policy = synthesizeStrixSpeculationPolicy(
       report("none", null, [100]),
@@ -133,6 +137,43 @@ describe("Strix speculation policy synthesis", () => {
       expect.stringMatching(/quality/i),
       expect.stringMatching(/acceptance/i),
     ]));
+  });
+
+  it("fails closed for under-sampled, unbalanced, or internally inconsistent evidence", () => {
+    const direct = report("none", null, [100]);
+    const oneBatch = report("draft-mtp", 1, [200]);
+    oneBatch.summaries[0]!.batches = 1;
+    oneBatch.summaries[0]!.requests = 1;
+    oneBatch.summaries[0]!.successfulRequests = 1;
+    oneBatch.summaries[0]!.oraclePasses = 1;
+    const underSampled = synthesizeStrixSpeculationPolicy(direct, [oneBatch], 0.03, 3);
+    expect(underSampled.cells[0]).toMatchObject({ selection: "direct", evidenceSufficient: true });
+    expect(underSampled.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/minimum 3 batches/i)]));
+
+    const unbalanced = report("draft-mtp", 1, [200]);
+    unbalanced.summaries[0]!.batches = 4;
+    unbalanced.summaries[0]!.requests = 4;
+    unbalanced.summaries[0]!.successfulRequests = 4;
+    unbalanced.summaries[0]!.oraclePasses = 4;
+    const unbalancedPolicy = synthesizeStrixSpeculationPolicy(direct, [unbalanced], 0.03, 3);
+    expect(unbalancedPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/balanced exposure/i)]));
+
+    const impossibleAcceptance = report("draft-mtp", 1, [200], 1.1);
+    const inconsistentPolicy = synthesizeStrixSpeculationPolicy(direct, [impossibleAcceptance], 0.03, 3);
+    expect(inconsistentPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/acceptance.*between 0 and 1/i)]));
+  });
+
+  it("marks the policy evidence insufficient when the direct control is malformed", () => {
+    const direct = report("none", null, [100]);
+    direct.summaries[0]!.requests = 2;
+    const policy = synthesizeStrixSpeculationPolicy(direct, [report("draft-mtp", 1, [200])], 0.03, 3);
+    expect(policy.cells[0]).toMatchObject({
+      selection: "direct",
+      evidenceSufficient: false,
+      directBatches: 3,
+      directRequests: 2,
+    });
+    expect(policy.cells[0]?.reason).toMatch(/direct evidence is insufficient/i);
   });
 
   it("rejects a non-direct control and uncontrolled candidate changes", () => {
@@ -149,5 +190,15 @@ describe("Strix speculation policy synthesis", () => {
       [changedBackend],
       0.03,
     )).toThrow(/backend/i);
+  });
+
+  it("rejects duplicate workload cells instead of silently collapsing evidence", () => {
+    const duplicated = report("none", null, [100]);
+    duplicated.summaries.push({ ...duplicated.summaries[0]! });
+    expect(() => synthesizeStrixSpeculationPolicy(
+      duplicated,
+      [report("draft-mtp", 1, [120])],
+      0.03,
+    )).toThrow(/duplicate.*cell/i);
   });
 });

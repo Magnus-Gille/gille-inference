@@ -34,7 +34,7 @@ describe("runStrixSpeculationPolicySynthesis", () => {
     const write = vi.fn();
     const stdout = vi.fn();
     const exit = runStrixSpeculationPolicySynthesis([
-      "--direct", "direct.json", "--candidate", "mtp2.json", "--out", "/tmp/policy",
+      "--direct", "direct.json", "--candidate", "mtp2.json", "--min-batches", "3", "--out", "/tmp/policy",
     ], {
       readFile: (path) => path === "direct.json" ? direct : candidate,
       write,

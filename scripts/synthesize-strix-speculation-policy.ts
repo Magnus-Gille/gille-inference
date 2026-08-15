@@ -41,7 +41,7 @@ export function runStrixSpeculationPolicySynthesis(argv: string[], deps: Depende
     const args = parseStrixSpeculationPolicyArgs(argv);
     const direct = JSON.parse(deps.readFile(args.directPath)) as unknown;
     const candidates = args.candidatePaths.map((path) => JSON.parse(deps.readFile(path)) as unknown);
-    const policy = synthesizeStrixSpeculationPolicy(direct, candidates, args.minimumUsefulWorkGain);
+    const policy = synthesizeStrixSpeculationPolicy(direct, candidates, args.minimumUsefulWorkGain, args.minimumBatches);
     const prefix = resolve(args.outPrefix);
     const jsonPath = `${prefix}.json`;
     const markdownPath = `${prefix}.md`;

@@ -290,14 +290,19 @@ npm run benchmark:strix-spec-policy -- \
   --candidate data/strix-benchmarks/qwen38-mtp1-server.json \
   --candidate data/strix-benchmarks/qwen38-mtp2-server.json \
   --min-gain-percent 3 \
+  --min-batches 3 \
   --out data/strix-benchmarks/qwen38-speculation-policy
 ```
 
 This emits a content-blind JSON/Markdown recommendation artifact. It is an offline policy derived
 from the captured benchmark window, not an online rolling controller and not deployment authority.
-Do not extrapolate it to omitted workloads or concurrency levels. Promotion still requires the
-long-generation equivalence, correctness, soak, memory, representative-agent, and live verification
-gates.
+The default evidence floor is three repeated batches per cell. A speculative arm must also have
+exactly the same batch/request exposure as direct, with request count equal to batches times
+concurrency and internally consistent success/oracle counters. These checks reject obvious
+under-sampling and malformed summaries; they are not confidence intervals and do not replace an
+interleaved or mirrored A/B where drift matters. Do not extrapolate the policy to omitted workloads
+or concurrency levels. Promotion still requires the long-generation equivalence, correctness,
+soak, memory, representative-agent, and live verification gates.
 
 For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended revision, keep
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output

@@ -89,6 +89,14 @@ concurrency cell, it selects the highest useful-work arm only when quality is no
 acceptance is observable, and the arm clears an explicit useful-work margin. Missing evidence,
 inferior quality, and slower speculation all select direct decoding.
 
+The promotion artifact now also requires at least three repeated batches per cell by default,
+request count equal to batches times concurrency, internally consistent success/oracle counters,
+acceptance bounded to zero through one, and exactly balanced direct/candidate exposure. A malformed
+or under-sampled direct arm marks the cell's evidence insufficient; a malformed or under-sampled
+candidate is rejected while direct remains selected. This closes the possibility of promoting from
+a one-batch speed spike, but it deliberately does not claim statistical confidence or immunity to
+thermal/runtime drift; the hardware design still needs mirrored cycles.
+
 This is repository-local enforcement of the evaluation rule “speculation must not remain selected
 when it is slower”; it is **not** an online rolling controller and does not complete T05. The next
 hardware run must capture direct, depth-1, depth-2, and any deeper supported arm against the same
@@ -200,9 +208,9 @@ result schema; there is no production state to restore.
 
 ## Verification
 
-- focused benchmark, speculation-policy, and long-generation tests: 34/34 passed;
+- focused server-benchmark, comparator, and speculation-policy tests: 23/23 passed;
 - TypeScript and constitutional typechecks: passed;
-- full repository suite: 286 files, 4,288 tests passed;
+- full repository suite: 286 files, 4,291 tests passed (including the long-generation gate);
 - Bash syntax and `git diff --check`: passed;
 - direct recorder CLI smoke: passed with mode-0600 raw and summary files.
 
