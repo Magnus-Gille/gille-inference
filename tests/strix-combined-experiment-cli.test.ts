@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { preflightArtifacts } from "../scripts/strix-combined-experiment.js";
+import { preflightArtifacts, runBackendCorrectness } from "../scripts/strix-combined-experiment.js";
 import { validateStrixKvCandidateConfig } from "../src/homeserver/strix-combined-experiment.js";
 
 function sha256(path: string): string {
@@ -65,6 +65,18 @@ describe("Strix combined experiment preflight", () => {
       : "unexpected";
     await expect(preflightArtifacts(config, mmapPath, versions)).resolves.toMatchObject({
       hashes: { model: dataSha, candidateBackendOps: executableSha },
+    });
+    const failingExecutable = join(directory, "failing-backend");
+    writeFileSync(failingExecutable, "#!/bin/sh\nprintf 'backend diagnostics'\nprintf 'backend warning' >&2\nexit 7\n");
+    chmodSync(failingExecutable, 0o700);
+    const failingConfig = structuredClone(config);
+    failingConfig.candidateRuntime.backendOpsPath = failingExecutable;
+    failingConfig.candidateRuntime.backendOpsSha256 = sha256(failingExecutable);
+    await expect(runBackendCorrectness(failingConfig)).resolves.toMatchObject({
+      exitCode: 7,
+      stdoutBytes: 19,
+      stderrBytes: 15,
+      outputWithinLimit: true,
     });
     writeMmap("wrong-quant");
     await expect(preflightArtifacts(config, mmapPath, versions)).rejects.toThrow(/do not bind/);

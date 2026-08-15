@@ -37,7 +37,7 @@ const MAX_REPORT_BYTES = 8 * 1024 * 1024;
 const MAX_CHILD_OUTPUT_BYTES = 8 * 1024 * 1024;
 let activeChild: ChildProcess | null = null;
 
-interface BackendEvidence {
+export interface BackendEvidence {
   pathSha256: string;
   argvSha256: string;
   startedAt: string;
@@ -48,6 +48,7 @@ interface BackendEvidence {
   stderrSha256: string;
   stdoutBytes: number;
   stderrBytes: number;
+  outputWithinLimit: boolean;
 }
 
 function readBoundedJson(path: string, limit = MAX_REPORT_BYTES): unknown {
@@ -148,7 +149,7 @@ export async function preflightArtifacts(
   };
 }
 
-async function runBackendCorrectness(config: StrixKvCandidateConfig): Promise<BackendEvidence> {
+export async function runBackendCorrectness(config: StrixKvCandidateConfig): Promise<BackendEvidence> {
   const argv = config.localExperiment.backendCorrectnessCommand.slice(1);
   const startedAt = new Date().toISOString();
   const started = performance.now();
@@ -187,9 +188,8 @@ async function runBackendCorrectness(config: StrixKvCandidateConfig): Promise<Ba
     stderrSha256: stderrHash.digest("hex"),
     stdoutBytes,
     stderrBytes,
+    outputWithinLimit: stdoutBytes <= MAX_CHILD_OUTPUT_BYTES && stderrBytes <= MAX_CHILD_OUTPUT_BYTES,
   };
-  if (stdoutBytes > MAX_CHILD_OUTPUT_BYTES || stderrBytes > MAX_CHILD_OUTPUT_BYTES) throw new Error("backend correctness output exceeded its bound");
-  if (exitCode !== 0) throw new Error(`focused Vulkan backend correctness failed with exit code ${exitCode}`);
   return evidence;
 }
 
@@ -268,7 +268,13 @@ export async function runStrixCombined(argv: string[]): Promise<number> {
         "--ack-exclusive-window",
       ]),
       unload: async () => await unloadAll(args.llamaSwapOrigin),
-      runBackendCorrectness: async () => { backendEvidence = await runBackendCorrectness(config); },
+      runBackendCorrectness: async () => {
+        backendEvidence = await runBackendCorrectness(config);
+        if (!backendEvidence.outputWithinLimit) throw new Error("backend correctness output exceeded its bound");
+        if (backendEvidence.exitCode !== 0) {
+          throw new Error(`focused Vulkan backend correctness failed with exit code ${backendEvidence.exitCode}`);
+        }
+      },
       runBenchmark: async (plan) => {
         const exitCode = await runStrixBenchmark(buildStrixBenchmarkArgv(config, plan), {
           ...DEFAULT_DEPS,
