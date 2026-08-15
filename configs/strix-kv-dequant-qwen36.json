@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "status": "build-passed-gpu-validation-pending",
+  "candidateId": "llama-cpp-vulkan-q8-kv-dequant-once",
+  "evidenceClass": "EXTERNAL-MEASURED",
+  "source": {
+    "issueUrl": "https://github.com/ggml-org/llama.cpp/issues/25491",
+    "repositoryUrl": "https://github.com/Nathanw1014/llama.cpp",
+    "branch": "vulkan-coopmat1-fa-dequant-transpose",
+    "upstreamBaseCommit": "5c3a586860360394524d83f963a4a88ea08cce2d",
+    "upstreamHeadCommit": "500c88769bbc1ff444a64393c0f0d5e7aa73512e",
+    "patchCommits": [
+      "484ad9ba068ad946a835b6097558c5b15603aae3",
+      "b80583438da20022963b317432e8bff34afd1f00",
+      "d7f6bce02ab5b6fd635942878e463fdb764aff26",
+      "643e95e733060413b5261c899b65cda8a1695d9d",
+      "c3b3bb98dc001aaf9be20a0c1a38b78e706166d6",
+      "dd39addb73694b084941e622da723b359a8cc922",
+      "f9f99bf199d05b2a3a443e37d2873192f3e5b54b",
+      "500c88769bbc1ff444a64393c0f0d5e7aa73512e"
+    ],
+    "changedFiles": [
+      "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+      "ggml/src/ggml-vulkan/vulkan-shaders/dequant_q8_0.comp",
+      "ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp",
+      "tests/test-backend-ops.cpp"
+    ],
+    "diffStat": {
+      "files": 4,
+      "insertions": 98,
+      "deletions": 10
+    }
+  },
+  "productionRuntime": {
+    "commit": "8086439a4cea94c71a5dfb8fe4ad1546aebd640f",
+    "llamaBenchPath": "/home/magnus/llama.cpp/build/bin/llama-bench",
+    "llamaBenchSha256": "25efdfb18fc99bb1e6ff99f276a030399a7810890ddc8ed9dc0c6ad79fda6fa5",
+    "vulkanLibraryPath": "/home/magnus/llama.cpp/build/bin/libggml-vulkan.so",
+    "vulkanLibrarySha256": "aa7ea82b8bc108ac33cef8aff8f65fa4c81b4784984bf72980b56dd22f8c094f"
+  },
+  "candidateRuntime": {
+    "backportCommit": "300d1192718c6746f108afcab893d208d43ea94e",
+    "sourceArchivePath": "/tmp/llama-kv-dequant-8086439-300d119.tar",
+    "sourceArchiveSha256": "2c539a286fd52cdece5e162b693fbf3ae788fd8ce9a90c52591d6cd4fbe3e0ba",
+    "llamaBenchPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/llama-bench",
+    "llamaServerPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/llama-server",
+    "backendOpsPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/test-backend-ops",
+    "compiler": "GCC 15.2",
+    "cmakeVersion": "4.2.3",
+    "vulkanSdkVersion": "1.4.341",
+    "cmakeOptions": [
+      "-DGGML_VULKAN=ON",
+      "-DGGML_NATIVE=ON",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DLLAMA_BUILD_COMMIT=300d1192718c6746f108afcab893d208d43ea94e",
+      "-DLLAMA_BUILD_NUMBER=1"
+    ],
+    "llamaBenchSha256": "c12b8a94ed732b7c57153c5130daae733035defeb78bc2f5fd81df6cfbb7b370",
+    "llamaServerSha256": "222e21ca93b984bb2e4f6c010af0e87680d98958c6024375b13e749e261b9171",
+    "backendOpsSha256": "981e59bda5bcc24871bcca54448dcc7731fefd2310ec2570f33948d9cf47129d",
+    "vulkanLibraryPath": "/tmp/llama-kv-dequant-8086439-300d119/build/bin/libggml-vulkan.so",
+    "vulkanLibrarySha256": "f8af1d058cd4551fddd92b408f81284b7d0a7846267ac6128acc0a12b9fd644e"
+  },
+  "model": {
+    "path": "/home/magnus/models/Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "id": "Qwen/Qwen3.6-35B-A3B",
+    "quant": "Q4_K_M",
+    "artifactSha256": "b46fedd33e0bfb0cae308aa3c158d0a4b2c4a1d2185a1ed6f093cdaf39064772"
+  },
+  "externalReference": {
+    "hardware": "AMD Ryzen AI Max+ 395 / Radeon 8060S / RADV STRIX_HALO",
+    "model": "Qwen3-Coder-30B-A3B Q6_K",
+    "kv": "Q8_0",
+    "flashAttention": true,
+    "pp512TokensPerSecond": {
+      "32768": { "before": 200.17, "after": 281.99 },
+      "65536": { "before": 99.08, "after": 166.17 }
+    },
+    "generationClaim": "No material change reported"
+  },
+  "localExperiment": {
+    "backend": "vulkan",
+    "gpu": "Radeon 8060S Graphics (RADV STRIX_HALO)",
+    "flashAttention": "on",
+    "batch": 2048,
+    "ubatch": 512,
+    "parallelism": 1,
+    "speculation": "none",
+    "contexts": [8192, 32768, 65536, 131072],
+    "ppTokens": 512,
+    "tgTokens": 128,
+    "repetitions": 5,
+    "arms": [
+      {
+        "id": "production-f16-kv",
+        "runtime": "production",
+        "kvK": "f16",
+        "kvV": "f16",
+        "purpose": "Production semantic and performance baseline"
+      },
+      {
+        "id": "production-q8-kv",
+        "runtime": "production",
+        "kvK": "q8_0",
+        "kvV": "q8_0",
+        "purpose": "Isolate the effect of changing KV precision"
+      },
+      {
+        "id": "candidate-q8-kv",
+        "runtime": "candidate",
+        "kvK": "q8_0",
+        "kvV": "q8_0",
+        "purpose": "Isolate the Q8 KV dequantization patch"
+      }
+    ],
+    "backendCorrectnessCommand": [
+      "test-backend-ops",
+      "test",
+      "-b",
+      "Vulkan",
+      "-o",
+      "FLASH_ATTN_EXT",
+      "-j",
+      "1"
+    ],
+    "executionPolicy": "Run only under an explicitly approved exclusive maintenance window and the canonical GPU lease",
+    "residencyPolicy": "Bind the pre-run llama-swap target by immutable model artifact and restore it on success, failure, or catchable signal"
+  },
+  "promotionGate": {
+    "minimumCycles": 2,
+    "required": [
+      "backend correctness passes",
+      "all required PP and TG context cells are present",
+      "candidate Q8 materially improves populated-context PP over production Q8",
+      "candidate Q8 does not materially regress TG, correctness, stability, memory pressure, or temperature",
+      "Q8 remains acceptable against the production F16 semantic baseline",
+      "representative agent workload does not regress completed useful work per minute"
+    ],
+    "deploymentStatus": "not-authorized-by-evidence"
+  }
+}

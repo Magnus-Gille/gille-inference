@@ -11,6 +11,7 @@
 # Required env: GW (gateway /v1 base), GW_KEY (a REAL per-key gateway token — the box 401s on a
 # dummy). Optional: MODEL (default qwen3-coder-next-80b), CAP_S (wall-clock cap, default 600).
 set -u
+set -o pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 
@@ -119,7 +120,9 @@ run_one() {
           && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
-             --no-session --print --mode json "$instr" >"$W/.arm.log" 2>&1 ) || status="arm-error"
+             --no-session --print --mode json "$instr" 2>"$W/.arm.stderr.log" \
+             | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
+                 --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
       ;;
     aider)
       ( cd "$W" \
@@ -171,9 +174,10 @@ run_one() {
   # form injected the bash bareword `true`/`false` as a Python name → NameError, dropping the row.
   GD_ARM="$ARM" GD_MODEL="$MODEL" GD_TASK="$id" GD_PASS="$pass" GD_EXIT="$exitclass" GD_WALL="$((t1-t0))" \
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
-    python3 -c "import json,os; print(json.dumps({'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}))" >>"$OUT"
+    GD_TELEMETRY="$W/.arm-telemetry.json" \
+    python3 -c "import json,os; row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}; telemetry={'turns':None,'toolCalls':None,'promptTokens':None,'completionTokens':None,'modelTurnMs':None,'timedModelTurns':None,'assistantStreamMs':None,'timedAssistantMessages':None,'unparseableLines':None}; p=os.environ['GD_TELEMETRY']; telemetry.update(json.load(open(p)) if os.path.isfile(p) else {}); row.update(telemetry); print(json.dumps(row))" >>"$OUT"
   echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
-  # KEEP_WORK=1 preserves the work dir (+ .arm.log / .check.log) for diagnosis instead of deleting.
+  # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, and .check.log) for diagnosis.
   if [ -n "${KEEP_WORK:-}" ]; then echo "  [kept] $W"; else rm -rf "$W"; fi
 }
 

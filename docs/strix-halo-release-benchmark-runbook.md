@@ -178,6 +178,43 @@ and sampling time, so this direct mode records TTFT as unmeasured. Speculation i
 acceptance is therefore not applicable. Use the streaming server/agent benchmark for TTFT,
 acceptance rate, prefix-cache benefit, and completed useful tasks per minute.
 
+### Combined mmap and Q8 KV candidate window
+
+When both prepared candidates are in scope for one explicitly approved outage, use the combined
+runner so provenance checks, causal ordering, failure evidence, and residency restoration are not
+recreated manually:
+
+```bash
+npm run maintenance:run -- \
+  --base-url <verified-gateway-origin> \
+  --ttl-seconds 7200 \
+  --drain-timeout-seconds 60 \
+  --evidence <private-evidence-root>/combined-window.json \
+  -- npm run benchmark:strix-combined -- \
+    --config configs/strix-kv-dequant-qwen36.json \
+    --mmap-config configs/strix-mmap-qwen36.json \
+    --out-dir <private-evidence-root>/combined \
+    --llama-swap-origin http://127.0.0.1:8091 \
+    --expected-resident-model <freshly-resolved-approved-model> \
+    --max-runtime-seconds 6300 \
+    --ack-exclusive-window
+```
+
+The placeholders are intentional and are not an authorization object. Immediately before seeking
+confirmation, resolve the live gateway origin, resident model, service health, artifact hashes,
+source revision, exact command, maximum outage, verification, and rollback. If any one changes,
+request new confirmation.
+
+The 7,200-second maintenance TTL is the hard outage ceiling. The child runtime deadline fires at
+6,300 seconds, sends the same catchable termination signal used for operator interruption, and
+leaves 900 seconds for exact residency restoration and fence closure. Do not reduce that reserve
+or claim a smaller maximum outage without a newly reviewed bound.
+
+The child never receives `M5_MAINTENANCE_KEY`. It changes no live config, roster, service, driver,
+kernel, cache policy, or power setting. It may unload and reload the approved resident model only
+inside the exclusive fence. The aggregate decision can advance the KV candidate to an agent-work
+gate; it cannot deploy it.
+
 ## Streaming server and agent-shaped matrix
 
 The streaming runner complements `llama-bench`; it does not replace the direct PP/TG control. It
@@ -245,6 +282,80 @@ For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended r
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output
 prefix. A backend claim requires repeated identical workloads; the label alone is not evidence.
 
+### Tool-turn prefix-cache regression probe
+
+Use the same immutable server-provenance artifact to measure cold/warm plain prompts, cold/warm
+tool turns, and an exact repeat after extending a tool conversation. The runner refuses dirty
+probe sources, accepts credentials only through a named environment variable, honors bounded
+`Retry-After`, and writes no prompt or completion content:
+
+```bash
+npm run benchmark:strix-prefix-cache -- \
+  --base-url http://127.0.0.1:8091/v1 \
+  --model qwen36-a3b \
+  --provenance data/strix-benchmarks/qwen36-direct-provenance.json \
+  --out data/strix-benchmarks/qwen36-prefix-cache \
+  --api-key-env M5_API_KEY \
+  --stable-items 1800 --max-tokens 1 \
+  --stress-cycles 0
+```
+
+Exit `0` means the exact extended repeat stayed inside the warm-control tail plus the captured
+runtime's checkpoint-minimum window. Exit `1` means it exceeded that checkpoint-aware bound; exit
+`2` means the result was unobservable or setup failed. The JSON/Markdown pair is mode 0600 and
+separates gateway quota wait from the successful request and server prefill timings. This short
+probe does not replace a checkpoint-crossing, long-generation multi-tool test when evaluating a
+generation-checkpoint patch. For that case, add `--stress-cycles 16 --stress-max-tokens 512` (or
+another preregistered pair that makes every generation exceed the captured checkpoint minimum).
+Stress mode accumulates the generated text only in memory across valid tool cycles, performs no
+intermediate audit that could perturb the checkpoint table, and writes only one exact final audit.
+
+### iGPU mmap/no-mmap load experiment
+
+llama.cpp PR [#26081](https://github.com/ggml-org/llama.cpp/pull/26081) changed the default model
+load policy so backends can disable mmap automatically on iGPUs that copy model bytes into
+device-visible shared memory. The deployed `8086439` Qwen3.6 binary predates that policy but already
+supports explicit `--mmap` and `--no-mmap`, so test the mechanism on the exact production runtime
+before considering a broad runtime upgrade.
+
+The runner unloads llama-swap residency, starts a throwaway llama-server, and restores the model
+that was resident before the run. It therefore belongs only inside the repository-owned exclusive
+window. The child requires `--ack-exclusive-window`, but that flag is an operator assertion rather
+than a second fence; the outer `maintenance:run` command is authoritative.
+
+```bash
+npm run maintenance:run -- \
+  --base-url http://127.0.0.1:8080 \
+  --ttl-seconds 3600 \
+  --drain-timeout-seconds 60 \
+  --evidence data/strix-benchmarks/qwen36-mmap-window.json \
+  -- npm run benchmark:strix-mmap-ab -- \
+    --config configs/strix-mmap-qwen36.json \
+    --out data/strix-benchmarks/qwen36-mmap-ab \
+    --expected-resident-model qwen3-coder-next-80b \
+    --ack-exclusive-window
+```
+
+Replace the example resident id with the exact `ready` model observed immediately before the
+approved window, or use `none` only when the verified snapshot is empty. A mismatch fails before
+the first unload, binding the just-in-time mutation approval to a concrete rollback target.
+
+The fixed order is mmap/no-mmap/no-mmap/mmap. Before the trials, the model is SHA-256-read both
+for immutable provenance and to give every arm a warm filesystem cache; startup remains a cold
+process/model load. The report records startup-to-ready, first and exact-warm TTFT/latency, PP/TG,
+actual prompt/completion/cache tokens, peak RSS, minimum MemAvailable/swap-free, temperature,
+runtime/model/argv hashes, kernel, Mesa/ROCm observations, configured context, backend, quant, and
+restored residency. Model output is retained only as an exact-oracle boolean and SHA-256.
+
+Four trials are an exploratory gate, not a statistical claim. Promote only when no-mmap improves
+startup by at least 5% or peak RSS by at least 10%, remains directionally consistent inside the
+ABBA pairs, preserves exact output, and stays inside the preregistered 3–5% PP/TG/TTFT/latency
+tolerances. A positive screen should be repeated with `--cycles 2` before changing llama-swap's
+tracked command. A failed trial still runs mandatory restoration; a restoration failure exits red
+and takes precedence over the benchmark result. `SIGINT`, `SIGTERM`, and `SIGHUP` stop the
+ephemeral server and retain the restoration path. `SIGKILL` cannot be caught; the outer exclusive
+window's TTL restores admission, but an operator must then verify/reload the prior residency.
+
 ## Read-only host reproducibility snapshot
 
 Capture the host state beside every benchmark series. The firmware UMA setting is not reliably
@@ -290,5 +401,6 @@ decision remains completed correct coding work per minute against the same repos
 - [Official llama-bench syntax and JSON output](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench)
 - [Official llama-server timings, cache, metrics, and speculative options](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
 - [Official llama.cpp speculative-decoding guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)
+- [llama.cpp iGPU auto-load-mode change (#26081)](https://github.com/ggml-org/llama.cpp/pull/26081)
 - [AMD Strix Halo system optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html)
 - [Existing Vulkan/HIP experiment contract, issue #129](https://github.com/Magnus-Gille/gille-inference/issues/129)

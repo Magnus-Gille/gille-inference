@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "binaryPath": "/home/magnus/llama.cpp/build/bin/llama-server",
+  "modelPath": "/home/magnus/models/Qwen3.6-35B-A3B-Q4_K_M.gguf",
+  "modelId": "qwen36-a3b",
+  "runtimeCommit": "8086439a4cea94c71a5dfb8fe4ad1546aebd640f",
+  "runtimeBinarySha256": "f331e9e2ae78fc88f322139b66cab0b30682b1375d943d805b06f08bacdf2d4d",
+  "modelArtifactSha256": "b46fedd33e0bfb0cae308aa3c158d0a4b2c4a1d2185a1ed6f093cdaf39064772",
+  "backend": "vulkan",
+  "quant": "Q4_K_M",
+  "biosUma": "512 MiB fixed UMA + 100 GiB dynamic TTM (operator-tracked setting)",
+  "powerMode": "DRM DPM auto; ACPI platform_profile unavailable",
+  "port": 5818,
+  "commonArgs": [
+    "-ngl", "99",
+    "-b", "2048",
+    "-ub", "512",
+    "-c", "131072",
+    "-np", "1",
+    "--jinja",
+    "-fa", "on",
+    "--chat-template-kwargs", "{\"enable_thinking\":false}"
+  ]
+}

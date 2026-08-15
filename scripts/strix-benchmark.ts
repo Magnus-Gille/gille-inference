@@ -37,15 +37,16 @@ import {
   type StrixSystemSnapshot,
   type StrixTelemetry,
 } from "../src/homeserver/strix-benchmark.js";
+import { buildStrixChildEnvironment } from "../src/homeserver/strix-residency.js";
 
-interface ExecutionResult {
+export interface ExecutionResult {
   rows: LlamaBenchRow[];
   telemetry: StrixTelemetry;
 }
 
-interface CliDependencies {
+export interface CliDependencies {
   hashModel: (path: string) => Promise<string>;
-  execute: (plan: StrixBenchmarkPlan) => Promise<ExecutionResult>;
+  execute: (plan: StrixBenchmarkPlan, signal?: AbortSignal) => Promise<ExecutionResult>;
   systemSnapshot: () => StrixSystemSnapshot;
   writeReport: (prefix: string, report: StrixBenchmarkReport) => { jsonPath: string; markdownPath: string };
   now: () => string;
@@ -135,7 +136,7 @@ function validateRows(value: unknown): LlamaBenchRow[] {
   });
 }
 
-async function executeLlamaBench(plan: StrixBenchmarkPlan): Promise<ExecutionResult> {
+async function executeLlamaBench(plan: StrixBenchmarkPlan, signal?: AbortSignal): Promise<ExecutionResult> {
   if (!existsSync(plan.llamaBenchPath)) throw new Error(`llama-bench binary does not exist: ${plan.llamaBenchPath}`);
   const availableBefore = memAvailableBytes();
   const temperatureFiles = hwmonFiles(/^temp\d+_input$/);
@@ -145,11 +146,16 @@ async function executeLlamaBench(plan: StrixBenchmarkPlan): Promise<ExecutionRes
   let peakRssBytes: number | null = null;
   let stdout = "";
   let stderr = "";
-
+  let stdoutBytes = 0;
+  let stdoutExceeded = false;
   const child = spawn(plan.llamaBenchPath, buildLlamaBenchArgs(plan), {
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
+    env: buildStrixChildEnvironment(),
   });
+  const abort = (): void => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); };
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
   const sample = (): void => {
     if (child.pid !== undefined) {
       const rss = processRssBytes(child.pid);
@@ -165,8 +171,15 @@ async function executeLlamaBench(plan: StrixBenchmarkPlan): Promise<ExecutionRes
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk: string) => {
+    if (stdoutExceeded) return;
+    const chunkBytes = Buffer.byteLength(chunk);
+    if (stdoutBytes + chunkBytes > MAX_OUTPUT_BYTES) {
+      stdoutExceeded = true;
+      abort();
+      return;
+    }
+    stdoutBytes += chunkBytes;
     stdout += chunk;
-    if (Buffer.byteLength(stdout) > MAX_OUTPUT_BYTES) child.kill("SIGTERM");
   });
   child.stderr.on("data", (chunk: string) => {
     stderr = `${stderr}${chunk}`.slice(-1_000_000);
@@ -175,9 +188,12 @@ async function executeLlamaBench(plan: StrixBenchmarkPlan): Promise<ExecutionRes
     child.on("error", reject);
     child.on("close", (code) => resolveExit(code ?? 1));
   }).finally(() => {
+    signal?.removeEventListener("abort", abort);
     clearInterval(sampler);
     sample();
   });
+  if (stdoutExceeded) throw new Error(`llama-bench stdout exceeds ${MAX_OUTPUT_BYTES} bytes`);
+  if (signal?.aborted) throw new Error("llama-bench aborted by the maintenance orchestrator");
   if (exitCode !== 0) throw new Error(`llama-bench exited ${exitCode}: ${stderr.trim().slice(-2000)}`);
   let parsed: unknown;
   try {
@@ -245,7 +261,7 @@ function writeReport(prefix: string, report: StrixBenchmarkReport): { jsonPath: 
   return { jsonPath, markdownPath };
 }
 
-const DEFAULT_DEPS: CliDependencies = {
+export const DEFAULT_DEPS: CliDependencies = {
   hashModel: sha256File,
   execute: executeLlamaBench,
   systemSnapshot,
@@ -255,12 +271,16 @@ const DEFAULT_DEPS: CliDependencies = {
   stderr: (line) => console.error(line),
 };
 
-export async function runStrixBenchmark(argv: string[], dependencies: CliDependencies = DEFAULT_DEPS): Promise<number> {
+export async function runStrixBenchmark(
+  argv: string[],
+  dependencies: CliDependencies = DEFAULT_DEPS,
+  signal?: AbortSignal,
+): Promise<number> {
   try {
     const plan = parseStrixBenchmarkArgs(argv);
     const startedAt = dependencies.now();
     const modelSha256 = await dependencies.hashModel(plan.modelPath);
-    const execution = await dependencies.execute(plan);
+    const execution = await dependencies.execute(plan, signal);
     const report = makeStrixBenchmarkReport({
       plan,
       modelSha256,
