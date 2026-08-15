@@ -590,6 +590,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain('digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"');
     expect(source).toContain('runuser -u "$GATEWAY_USER" -- test ! -w "$current"');
     expect(source).toContain('validate_gateway_codeloop_toolchain_links "$resolved"');
+    expect(source).toContain('[ "$(stat -c \'%U\' "$current")" = root ]');
+    expect(source).not.toContain('stat -c \'%U:%G\' "$current"');
     const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
     expect(refresh.indexOf("provision_gateway_codeloop_toolchain")).toBeGreaterThan(-1);
     expect(refresh.indexOf("provision_gateway_codeloop_toolchain")).toBeLessThan(refresh.indexOf('atomic_render_dropin "$service" "$dropin"'));

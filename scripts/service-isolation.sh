@@ -650,7 +650,7 @@ verify_gateway_codeloop_toolchain() {
     || die "code_loop toolchain version ownership or mode drifted"
   [ "$(stat -c '%U:%G:%a' "$marker")" = "root:$GATEWAY_USER:440" ] \
     || die "code_loop toolchain identity marker ownership or mode drifted"
-  [ "$(stat -c '%U:%G' "$current")" = "root:$GATEWAY_USER" ] \
+  [ "$(stat -c '%U' "$current")" = root ] \
     || die "code_loop toolchain current pointer ownership drifted"
   if find "$resolved" \( -type d -o -type f \) \( ! -user root -o ! -group "$GATEWAY_USER" -o -perm /022 \) -print -quit | grep -q .; then
     die "code_loop toolchain contains writable or foreign-owned entries"
@@ -714,7 +714,6 @@ provision_gateway_codeloop_toolchain() {
   temp_link="$base/.current.$$.tmp"
   [ ! -e "$temp_link" ] && [ ! -L "$temp_link" ] || die "code_loop toolchain temporary pointer already exists"
   ln -s "$version/node_modules" "$temp_link" || die "could not stage code_loop toolchain pointer"
-  chown -h root:"$GATEWAY_USER" "$temp_link" || { rm -f -- "$temp_link"; die "could not own code_loop toolchain pointer"; }
   if ! mv -Tf "$temp_link" "$current"; then
     rm -f -- "$temp_link"
     die "could not publish code_loop toolchain pointer"
@@ -736,7 +735,6 @@ restore_gateway_codeloop_toolchain_pointer() {
     temp_link="$ROOT/gateway/code-loop-toolchain/.restore-current.$$.tmp"
     [ ! -e "$temp_link" ] && [ ! -L "$temp_link" ] || return 1
     ln -s "$prior_target" "$temp_link" || return 1
-    chown -h root:"$GATEWAY_USER" "$temp_link" || { rm -f -- "$temp_link"; return 1; }
     if ! mv -Tf "$temp_link" "$REFRESH_TOOLCHAIN_CURRENT"; then
       rm -f -- "$temp_link"
       return 1
