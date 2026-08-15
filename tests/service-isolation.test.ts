@@ -377,7 +377,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_TOOLCHAIN_CURRENT=\"$3\"; chown() { :; }; mv() { command mv -fh \"$2\" \"$3\"; }; verify_gateway_codeloop_toolchain() { printf 'toolchain-verify:%s\\n' \"$1\"; }; restore_gateway_codeloop_toolchain_pointer",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_TOOLCHAIN_CURRENT=\"$3\"; chown() { :; }; mv() { if [ \"$(uname -s)\" = Darwin ]; then command mv -fh \"$2\" \"$3\"; else command mv -Tf \"$2\" \"$3\"; fi; }; verify_gateway_codeloop_toolchain() { printf 'toolchain-verify:%s\\n' \"$1\"; }; restore_gateway_codeloop_toolchain_pointer",
         "--",
         harness,
         backup,
