@@ -37,7 +37,7 @@ const PROVENANCE = JSON.stringify({
   draftDepth: null,
   cacheRamMiB: 8192,
   contextCheckpoints: 32,
-  checkpointMinStep: 8192,
+  checkpointMinStep: 256,
   cacheIdleSlots: "on",
 });
 
@@ -65,7 +65,7 @@ describe("Strix prefix-cache probe CLI", () => {
       completion(27_153, 0),
       completion(16, 27_137),
       completion(90, 27_137),
-      completion(90, 27_137),
+      completion(500, 26_727),
     ];
     const fetchImpl = vi.fn(async () => responses.shift()!);
     const sleep = vi.fn(async () => undefined);

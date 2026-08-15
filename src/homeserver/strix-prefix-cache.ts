@@ -28,6 +28,7 @@ export interface PrefixCacheAnalysis {
   extendedRepeatEvalTokens: number | null;
   extendedRepeatPenaltyTokens: number | null;
   extendedCacheGrowthTokens: number | null;
+  configuredCheckpointMinStepTokens: number;
   maxHealthyRepeatEvalTokens: number | null;
   reason: string;
 }
@@ -43,8 +44,12 @@ const REQUIRED_PHASES: PrefixCachePhase[] = [
 
 export function analyzePrefixCacheObservations(
   observations: PrefixCacheObservation[],
+  checkpointMinStepTokens: number,
   repeatToleranceTokens = 8,
 ): PrefixCacheAnalysis {
+  if (!Number.isInteger(checkpointMinStepTokens) || checkpointMinStepTokens < 0) {
+    throw new Error("checkpointMinStepTokens must be a non-negative integer");
+  }
   const byLabel = new Map(observations.map((row) => [row.label, row]));
   const missing = REQUIRED_PHASES.filter((label) => !byLabel.has(label));
   const baselineWarm = byLabel.get("baseline-warm");
@@ -63,6 +68,7 @@ export function analyzePrefixCacheObservations(
       extendedRepeatEvalTokens: extendedRepeat?.promptN ?? null,
       extendedRepeatPenaltyTokens: null,
       extendedCacheGrowthTokens: null,
+      configuredCheckpointMinStepTokens: checkpointMinStepTokens,
       maxHealthyRepeatEvalTokens: null,
       reason: missing.length > 0
         ? `missing required phases: ${missing.join(", ")}`
@@ -71,7 +77,7 @@ export function analyzePrefixCacheObservations(
   }
 
   const warmControlEvalTokens = Math.max(baselineWarm.promptN, toolWarm.promptN);
-  const maxHealthyRepeatEvalTokens = warmControlEvalTokens + repeatToleranceTokens;
+  const maxHealthyRepeatEvalTokens = warmControlEvalTokens + checkpointMinStepTokens + repeatToleranceTokens;
   const extendedRepeatPenaltyTokens = Math.max(0, extendedRepeat.promptN - warmControlEvalTokens);
   const extendedCacheGrowthTokens = extendedRepeat.cachedTokens - extendedFirst.cachedTokens;
   const healthy = extendedRepeat.promptN <= maxHealthyRepeatEvalTokens;
@@ -83,9 +89,10 @@ export function analyzePrefixCacheObservations(
     extendedRepeatEvalTokens: extendedRepeat.promptN,
     extendedRepeatPenaltyTokens,
     extendedCacheGrowthTokens,
+    configuredCheckpointMinStepTokens: checkpointMinStepTokens,
     maxHealthyRepeatEvalTokens,
     reason: healthy
-      ? `exact extended repeat evaluated ${extendedRepeat.promptN} tokens within ${maxHealthyRepeatEvalTokens}-token control bound`
-      : `exact extended repeat re-evaluated ${extendedRepeat.promptN} tokens; warm controls require ${warmControlEvalTokens} and tolerance is ${repeatToleranceTokens}`,
+      ? `exact extended repeat evaluated ${extendedRepeat.promptN} tokens within the ${maxHealthyRepeatEvalTokens}-token checkpoint-aware bound`
+      : `exact extended repeat re-evaluated ${extendedRepeat.promptN} tokens; warm controls require ${warmControlEvalTokens}, checkpoint minimum is ${checkpointMinStepTokens}, and tolerance is ${repeatToleranceTokens}`,
   };
 }

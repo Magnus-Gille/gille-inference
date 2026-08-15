@@ -333,6 +333,7 @@ function markdownReport(input: {
     `- Warm-control evaluated tail: ${input.analysis.warmControlEvalTokens ?? "unobservable"} tokens.`,
     `- Exact extended-repeat penalty: ${input.analysis.extendedRepeatPenaltyTokens ?? "unobservable"} tokens.`,
     `- Extended cached-boundary growth: ${input.analysis.extendedCacheGrowthTokens ?? "unobservable"} tokens.`,
+    `- Configured checkpoint minimum: ${input.analysis.configuredCheckpointMinStepTokens} tokens.`,
     "- Request wall time excludes declared quota wait; server prompt_ms is the authoritative prefill span.",
     "- Synthetic prompts and model text are never written to the artifact.",
   );
@@ -411,7 +412,7 @@ export async function runStrixPrefixCacheProbe(
     await run("extended-tool-turn-first", phaseTwo, true);
     await run("extended-tool-turn-repeat", phaseTwo, true);
 
-    const analysis = analyzePrefixCacheObservations(observations);
+    const analysis = analyzePrefixCacheObservations(observations, provenance.checkpointMinStep);
     const syntheticPlanSha256 = createHash("sha256").update(JSON.stringify({
       stableItems: plan.stableItems,
       baseline,
