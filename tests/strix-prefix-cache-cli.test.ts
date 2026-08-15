@@ -41,11 +41,12 @@ const PROVENANCE = JSON.stringify({
   cacheIdleSlots: "on",
 });
 
-function completion(promptN: number, cacheN: number): Response {
+function completion(promptN: number, cacheN: number, completionTokens = 1): Response {
   return Response.json({
     choices: [{ finish_reason: "length", message: { content: "private-model-text" } }],
     usage: {
       prompt_tokens: promptN + cacheN,
+      completion_tokens: completionTokens,
       prompt_tokens_details: { cached_tokens: cacheN },
     },
     timings: {
@@ -113,5 +114,56 @@ describe("Strix prefix-cache probe CLI", () => {
     });
     expect(exit).toBe(2);
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("runs checkpoint-crossing generations before one exact final audit", async () => {
+    const responses = [
+      completion(26_835, 0),
+      completion(16, 26_819),
+      completion(27_153, 0),
+      completion(16, 27_137),
+      completion(90, 27_137),
+      completion(90, 27_137),
+      completion(27_400, 0, 384),
+      completion(460, 27_400, 384),
+      completion(120, 27_740),
+    ];
+    const fetchImpl = vi.fn(async () => responses.shift()!);
+    const writePair = vi.fn(() => ({ jsonPath: "result.json", markdownPath: "result.md" }));
+
+    const exit = await runStrixPrefixCacheProbe([
+      ...ARGV,
+      "--stress-cycles", "2",
+      "--stress-max-tokens", "384",
+    ], {
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+      now: () => "2026-08-15T19:00:00.000Z",
+      monotonicMs: (() => { let value = 0; return () => value += 10; })(),
+      env: { TEST_KEY: "secret" },
+      readFile: () => PROVENANCE,
+      writePair,
+      sourceRevision: () => "e".repeat(40),
+      stdout: vi.fn(),
+      stderr: vi.fn(),
+    });
+
+    expect(exit).toBe(0);
+    expect(fetchImpl).toHaveBeenCalledTimes(9);
+    const generationOne = JSON.parse(fetchImpl.mock.calls[6]![1]!.body as string);
+    const generationTwo = JSON.parse(fetchImpl.mock.calls[7]![1]!.body as string);
+    const finalAudit = JSON.parse(fetchImpl.mock.calls[8]![1]!.body as string);
+    expect(generationOne).toMatchObject({ max_tokens: 384, tool_choice: "none" });
+    expect(generationTwo).toMatchObject({ max_tokens: 384, tool_choice: "none" });
+    expect(finalAudit).toMatchObject({ max_tokens: 1, tool_choice: "none" });
+    expect(finalAudit.messages).toEqual(generationTwo.messages);
+    const [, json, markdown] = writePair.mock.calls[0]!;
+    expect(JSON.parse(json).stressAnalysis).toMatchObject({
+      state: "healthy",
+      checkpointCrossingCycles: 2,
+      finalAuditEvalTokens: 120,
+    });
+    expect(json).not.toContain("private-model-text");
+    expect(markdown).toContain("Checkpoint-crossing generations: 2/2");
   });
 });

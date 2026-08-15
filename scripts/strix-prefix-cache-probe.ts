@@ -15,8 +15,10 @@ import { pathToFileURL } from "node:url";
 
 import {
   analyzePrefixCacheObservations,
+  analyzePrefixCacheStressObservations,
   type PrefixCacheObservation,
   type PrefixCachePhase,
+  type PrefixCacheStressAnalysis,
 } from "../src/homeserver/strix-prefix-cache.js";
 import {
   validateServerProvenance,
@@ -34,6 +36,8 @@ interface ProbePlan {
   timeoutMs: number;
   maxQuotaRetries: number;
   maxRetryAfterSeconds: number;
+  stressCycles: number;
+  stressMaxTokens: number;
 }
 
 interface ProbeDependencies {
@@ -67,6 +71,7 @@ const PROBE_SOURCE_PATHS = [
   "scripts/strix-prefix-cache-probe.ts",
   "src/homeserver/strix-prefix-cache.ts",
 ];
+const STRESS_INSTRUCTION = "Emit the decimal integers from 1 through 1000 in ascending order, separated by single spaces. Continue until the response limit. Do not explain or summarize.";
 
 function committedProbeRevision(): string {
   const root = spawnSync("git", ["rev-parse", "--show-toplevel"], {
@@ -120,6 +125,7 @@ export function parseStrixPrefixCacheArgs(argv: string[]): ProbePlan {
     const allowed = new Set([
       "--base-url", "--model", "--provenance", "--out", "--api-key-env", "--stable-items",
       "--max-tokens", "--timeout-ms", "--max-quota-retries", "--max-retry-after-s",
+      "--stress-cycles", "--stress-max-tokens",
     ]);
     if (!allowed.has(flag)) throw new Error(`unrecognized argument: ${flag}`);
     const value = requiredValue(argv, index, flag);
@@ -146,6 +152,8 @@ export function parseStrixPrefixCacheArgs(argv: string[]): ProbePlan {
     timeoutMs: integer(values.get("--timeout-ms") ?? "180000", "--timeout-ms", 1_000, 600_000),
     maxQuotaRetries: integer(values.get("--max-quota-retries") ?? "5", "--max-quota-retries", 0, 10),
     maxRetryAfterSeconds: integer(values.get("--max-retry-after-s") ?? "60", "--max-retry-after-s", 1, 60),
+    stressCycles: integer(values.get("--stress-cycles") ?? "0", "--stress-cycles", 0, 16),
+    stressMaxTokens: integer(values.get("--stress-max-tokens") ?? "384", "--stress-max-tokens", 64, 4_096),
   };
 }
 
@@ -191,6 +199,7 @@ function parseCompletion(
   const details = object(usage["prompt_tokens_details"], "usage.prompt_tokens_details");
   const timings = object(body["timings"], "timings");
   const promptTokens = nonNegative(usage, "prompt_tokens", "usage");
+  const completionTokens = nonNegative(usage, "completion_tokens", "usage");
   const cachedTokens = nonNegative(details, "cached_tokens", "usage.prompt_tokens_details");
   const promptN = nonNegative(timings, "prompt_n", "timings");
   const cacheN = nonNegative(timings, "cache_n", "timings");
@@ -216,6 +225,7 @@ function parseCompletion(
       quotaRetries,
       finishReason: typeof first["finish_reason"] === "string" ? first["finish_reason"] : null,
       responseContentPresent: content.length > 0,
+      completionTokens,
     },
   };
 }
@@ -256,6 +266,8 @@ async function oneCompletion(input: {
   plan: ProbePlan;
   key: string;
   deps: ProbeDependencies;
+  maxTokens: number;
+  toolChoiceNone?: boolean;
 }): Promise<CompletionMetadata> {
   let quotaRetries = 0;
   let quotaWaitMs = 0;
@@ -272,7 +284,8 @@ async function oneCompletion(input: {
         model: input.plan.model,
         messages: input.messages,
         ...(input.tools ? { tools: [TOOL] } : {}),
-        max_tokens: input.plan.maxTokens,
+        max_tokens: input.maxTokens,
+        ...(input.toolChoiceNone ? { tool_choice: "none" } : {}),
         temperature: 0,
         seed: 1,
         chat_template_kwargs: { enable_thinking: false },
@@ -311,20 +324,25 @@ function markdownReport(input: {
   runtimeCommit: string;
   observations: PrefixCacheObservation[];
   analysis: ReturnType<typeof analyzePrefixCacheObservations>;
+  stressAnalysis: PrefixCacheStressAnalysis | null;
+  status: "healthy" | "regression" | "unobservable";
 }): string {
+  const decisionReason = input.analysis.state === "healthy"
+    ? input.stressAnalysis?.reason ?? input.analysis.reason
+    : input.analysis.reason;
   const lines = [
     `# Strix tool-turn prefix-cache probe — ${input.model}`,
     "",
     `Started: ${input.startedAt}`,
     `Probe commit: \`${input.probeCommit}\``,
     `Runtime commit: \`${input.runtimeCommit}\``,
-    `Decision: **${input.analysis.state}** — ${input.analysis.reason}`,
+    `Decision: **${input.status}** — ${decisionReason}`,
     "",
-    "| Phase | Prompt | Cached | Evaluated | Prompt ms | Request ms | Quota wait ms | Retries |",
-    "|---|---:|---:|---:|---:|---:|---:|---:|",
+    "| Phase | Prompt | Cached | Evaluated | Generated | Prompt ms | Request ms | Quota wait ms | Retries |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
   ];
   for (const row of input.observations) {
-    lines.push(`| ${row.label} | ${row.promptTokens} | ${row.cachedTokens} | ${row.promptN} | ${row.promptMs.toFixed(1)} | ${row.requestWallMs.toFixed(1)} | ${row.quotaWaitMs} | ${row.quotaRetries} |`);
+    lines.push(`| ${row.label} | ${row.promptTokens} | ${row.cachedTokens} | ${row.promptN} | ${row.completionTokens} | ${row.promptMs.toFixed(1)} | ${row.requestWallMs.toFixed(1)} | ${row.quotaWaitMs} | ${row.quotaRetries} |`);
   }
   lines.push(
     "",
@@ -334,6 +352,11 @@ function markdownReport(input: {
     `- Exact extended-repeat penalty: ${input.analysis.extendedRepeatPenaltyTokens ?? "unobservable"} tokens.`,
     `- Extended cached-boundary growth: ${input.analysis.extendedCacheGrowthTokens ?? "unobservable"} tokens.`,
     `- Configured checkpoint minimum: ${input.analysis.configuredCheckpointMinStepTokens} tokens.`,
+    ...(input.stressAnalysis === null ? [] : [
+      `- Checkpoint-crossing generations: ${input.stressAnalysis.checkpointCrossingCycles}/${input.stressAnalysis.expectedCycles}.`,
+      `- Final stress audit evaluated: ${input.stressAnalysis.finalAuditEvalTokens ?? "unobservable"} tokens.`,
+      `- Final stress audit bound: ${input.stressAnalysis.maxHealthyAuditEvalTokens ?? "unobservable"} tokens.`,
+    ]),
     "- Request wall time excludes declared quota wait; server prompt_ms is the authoritative prefill span.",
     "- Synthetic prompts and model text are never written to the artifact.",
   );
@@ -379,15 +402,24 @@ export async function runStrixPrefixCacheProbe(
     const key = deps.env[plan.apiKeyEnv];
     if (key === undefined || key === "") throw new Error(`credential environment variable is absent: ${plan.apiKeyEnv}`);
     const provenance = validateServerProvenance(JSON.parse(deps.readFile(plan.provenancePath)) as unknown);
+    if (plan.stressCycles > 0 && plan.stressMaxTokens < provenance.checkpointMinStep) {
+      throw new Error(`--stress-max-tokens must be at least the captured checkpoint minimum (${provenance.checkpointMinStep})`);
+    }
     const probeCommit = deps.sourceRevision();
     const startedAt = deps.now();
     const system = { role: "system", content: stablePrefix(plan.stableItems) };
     const baseline = [system, { role: "user", content: "Return one letter." }];
     const observations: PrefixCacheObservation[] = [];
-    const run = async (label: PrefixCachePhase, messages: JsonObject[], tools: boolean): Promise<string> => {
-      const result = await oneCompletion({ label, messages, tools, plan, key, deps });
+    const run = async (
+      label: PrefixCachePhase,
+      messages: JsonObject[],
+      tools: boolean,
+      maxTokens = plan.maxTokens,
+      toolChoiceNone = false,
+    ): Promise<CompletionMetadata> => {
+      const result = await oneCompletion({ label, messages, tools, plan, key, deps, maxTokens, toolChoiceNone });
       observations.push(result.observation);
-      return result.content;
+      return result;
     };
 
     await run("baseline-cold", baseline, false);
@@ -399,7 +431,7 @@ export async function runStrixPrefixCacheProbe(
       { role: "tool", tool_call_id: "cache_probe_call_1", content: "public_phase_1_ok" },
       { role: "user", content: "Return one letter." },
     ];
-    const phaseOneOutput = await run("tool-turn-cold", phaseOne, true);
+    const phaseOneOutput = (await run("tool-turn-cold", phaseOne, true)).content;
     await run("tool-turn-warm", phaseOne, true);
     const phaseTwo = [
       ...phaseOne,
@@ -412,17 +444,61 @@ export async function runStrixPrefixCacheProbe(
     await run("extended-tool-turn-first", phaseTwo, true);
     await run("extended-tool-turn-repeat", phaseTwo, true);
 
+    if (plan.stressCycles > 0) {
+      let stressTranscript: JsonObject[] = [
+        system,
+        { role: "user", content: "Begin the public synthetic checkpoint stress cycle." },
+        { role: "assistant", content: null, tool_calls: [toolCall(100)] },
+        { role: "tool", tool_call_id: "cache_probe_call_100", content: "public_stress_phase_100_ok" },
+        { role: "user", content: STRESS_INSTRUCTION },
+      ];
+      for (let cycle = 1; cycle <= plan.stressCycles; cycle++) {
+        const generated = await run(
+          `stress-cycle-${cycle}-generate`,
+          stressTranscript,
+          true,
+          plan.stressMaxTokens,
+          true,
+        );
+        if (cycle < plan.stressCycles) {
+          const phase = 100 + cycle;
+          stressTranscript = [
+            ...stressTranscript,
+            { role: "assistant", content: generated.content },
+            { role: "user", content: `Continue with public synthetic checkpoint stress phase ${phase}.` },
+            { role: "assistant", content: null, tool_calls: [toolCall(phase)] },
+            { role: "tool", tool_call_id: `cache_probe_call_${phase}`, content: `public_stress_phase_${phase}_ok` },
+            { role: "user", content: STRESS_INSTRUCTION },
+          ];
+        }
+      }
+      await run("stress-final-audit", stressTranscript, true, plan.maxTokens, true);
+    }
+
     const analysis = analyzePrefixCacheObservations(observations, provenance.checkpointMinStep);
+    const stressAnalysis = plan.stressCycles === 0
+      ? null
+      : analyzePrefixCacheStressObservations(observations, provenance.checkpointMinStep, plan.stressCycles);
+    const states = [analysis.state, stressAnalysis?.state].filter((state): state is NonNullable<typeof state> => state !== undefined);
+    const status = states.includes("regression") ? "regression"
+      : states.includes("unobservable") ? "unobservable"
+        : "healthy";
     const syntheticPlanSha256 = createHash("sha256").update(JSON.stringify({
       stableItems: plan.stableItems,
       baseline,
       phaseOne,
       phaseTwo: [...phaseOne, { role: "assistant", content: "<MODEL_OUTPUT_NOT_RETAINED>" }, ...phaseTwo.slice(phaseOne.length + 1)],
+      stress: {
+        cycles: plan.stressCycles,
+        maxTokens: plan.stressMaxTokens,
+        instruction: STRESS_INSTRUCTION,
+        modelOutputPlaceholder: "<MODEL_OUTPUT_NOT_RETAINED>",
+      },
       tools: [TOOL],
     })).digest("hex");
     const endpointOrigin = new URL(plan.baseUrl).origin;
     const artifact = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind: "strix-tool-turn-prefix-cache",
       startedAt,
       probeCommit,
@@ -431,16 +507,28 @@ export async function runStrixPrefixCacheProbe(
       syntheticPlanSha256,
       stableItems: plan.stableItems,
       maxTokens: plan.maxTokens,
+      stressCycles: plan.stressCycles,
+      stressMaxTokens: plan.stressMaxTokens,
       provenance,
       observations,
       analysis,
+      stressAnalysis,
       contentRetention: "none",
     };
     const json = `${JSON.stringify(artifact, null, 2)}\n`;
-    const markdown = markdownReport({ model: plan.model, startedAt, probeCommit, runtimeCommit: provenance.runtimeCommit, observations, analysis });
+    const markdown = markdownReport({
+      model: plan.model,
+      startedAt,
+      probeCommit,
+      runtimeCommit: provenance.runtimeCommit,
+      observations,
+      analysis,
+      stressAnalysis,
+      status,
+    });
     const paths = deps.writePair(plan.outPrefix, json, markdown);
-    deps.stdout(JSON.stringify({ status: analysis.state, ...paths }));
-    return analysis.state === "healthy" ? 0 : analysis.state === "regression" ? 1 : 2;
+    deps.stdout(JSON.stringify({ status, ...paths }));
+    return status === "healthy" ? 0 : status === "regression" ? 1 : 2;
   } catch (error) {
     deps.stderr(error instanceof Error ? error.message : String(error));
     return 2;

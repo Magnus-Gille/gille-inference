@@ -1,10 +1,13 @@
-export type PrefixCachePhase =
+export type PrefixCacheBasePhase =
   | "baseline-cold"
   | "baseline-warm"
   | "tool-turn-cold"
   | "tool-turn-warm"
   | "extended-tool-turn-first"
   | "extended-tool-turn-repeat";
+
+export type PrefixCacheStressPhase = `stress-cycle-${number}-generate` | "stress-final-audit";
+export type PrefixCachePhase = PrefixCacheBasePhase | PrefixCacheStressPhase;
 
 export interface PrefixCacheObservation {
   label: PrefixCachePhase;
@@ -18,6 +21,20 @@ export interface PrefixCacheObservation {
   quotaRetries: number;
   finishReason: string | null;
   responseContentPresent: boolean;
+  completionTokens: number;
+}
+
+export interface PrefixCacheStressAnalysis {
+  state: "healthy" | "regression" | "unobservable";
+  expectedCycles: number;
+  checkpointCrossingCycles: number;
+  generatedTokens: number[];
+  finalPromptTokens: number | null;
+  finalAuditEvalTokens: number | null;
+  finalAuditCachedTokens: number | null;
+  warmControlEvalTokens: number | null;
+  maxHealthyAuditEvalTokens: number | null;
+  reason: string;
 }
 
 export interface PrefixCacheAnalysis {
@@ -33,7 +50,7 @@ export interface PrefixCacheAnalysis {
   reason: string;
 }
 
-const REQUIRED_PHASES: PrefixCachePhase[] = [
+const REQUIRED_PHASES: PrefixCacheBasePhase[] = [
   "baseline-cold",
   "baseline-warm",
   "tool-turn-cold",
@@ -94,5 +111,91 @@ export function analyzePrefixCacheObservations(
     reason: healthy
       ? `exact extended repeat evaluated ${extendedRepeat.promptN} tokens within the ${maxHealthyRepeatEvalTokens}-token checkpoint-aware bound`
       : `exact extended repeat re-evaluated ${extendedRepeat.promptN} tokens; warm controls require ${warmControlEvalTokens}, checkpoint minimum is ${checkpointMinStepTokens}, and tolerance is ${repeatToleranceTokens}`,
+  };
+}
+
+export function analyzePrefixCacheStressObservations(
+  observations: PrefixCacheObservation[],
+  checkpointMinStepTokens: number,
+  expectedCycles: number,
+  repeatToleranceTokens = 8,
+): PrefixCacheStressAnalysis {
+  if (!Number.isInteger(checkpointMinStepTokens) || checkpointMinStepTokens <= 0) {
+    throw new Error("checkpointMinStepTokens must be a positive integer for a stress analysis");
+  }
+  if (!Number.isInteger(expectedCycles) || expectedCycles <= 0) {
+    throw new Error("expectedCycles must be a positive integer");
+  }
+  const byLabel = new Map(observations.map((row) => [row.label, row]));
+  const baselineWarm = byLabel.get("baseline-warm");
+  const toolWarm = byLabel.get("tool-turn-warm");
+  const cycleRows = Array.from({ length: expectedCycles }, (_, index) =>
+    byLabel.get(`stress-cycle-${index + 1}-generate`));
+  const finalAudit = byLabel.get("stress-final-audit");
+  const generatedTokens = cycleRows.flatMap((row) => row === undefined ? [] : [row.completionTokens]);
+  const checkpointCrossingCycles = cycleRows.filter((row) =>
+    row !== undefined && row.responseContentPresent && row.completionTokens >= checkpointMinStepTokens).length;
+  const cacheActive = (baselineWarm?.cachedTokens ?? 0) > 0 && (toolWarm?.cachedTokens ?? 0) > 0;
+  const warmControlEvalTokens = baselineWarm === undefined || toolWarm === undefined
+    ? null
+    : Math.max(baselineWarm.promptN, toolWarm.promptN);
+  const missingCycle = cycleRows.findIndex((row) => row === undefined);
+
+  if (!cacheActive || warmControlEvalTokens === null || missingCycle >= 0 || finalAudit === undefined ||
+      checkpointCrossingCycles !== expectedCycles) {
+    const reason = !cacheActive
+      ? "warm controls did not expose active prompt-cache reuse"
+      : missingCycle >= 0
+        ? `missing stress generation cycle ${missingCycle + 1}`
+        : finalAudit === undefined
+          ? "missing final exact stress audit"
+          : `only ${checkpointCrossingCycles}/${expectedCycles} generations crossed the ${checkpointMinStepTokens}-token checkpoint interval`;
+    return {
+      state: "unobservable",
+      expectedCycles,
+      checkpointCrossingCycles,
+      generatedTokens,
+      finalPromptTokens: finalAudit?.promptTokens ?? null,
+      finalAuditEvalTokens: finalAudit?.promptN ?? null,
+      finalAuditCachedTokens: finalAudit?.cachedTokens ?? null,
+      warmControlEvalTokens,
+      maxHealthyAuditEvalTokens: warmControlEvalTokens === null
+        ? null
+        : warmControlEvalTokens + checkpointMinStepTokens + repeatToleranceTokens,
+      reason,
+    };
+  }
+
+  const finalGenerate = cycleRows[cycleRows.length - 1]!;
+  if (finalAudit.promptTokens !== finalGenerate.promptTokens) {
+    return {
+      state: "unobservable",
+      expectedCycles,
+      checkpointCrossingCycles,
+      generatedTokens,
+      finalPromptTokens: finalAudit.promptTokens,
+      finalAuditEvalTokens: finalAudit.promptN,
+      finalAuditCachedTokens: finalAudit.cachedTokens,
+      warmControlEvalTokens,
+      maxHealthyAuditEvalTokens: warmControlEvalTokens + checkpointMinStepTokens + repeatToleranceTokens,
+      reason: `final audit prompt token count ${finalAudit.promptTokens} does not match final generation input ${finalGenerate.promptTokens}`,
+    };
+  }
+
+  const maxHealthyAuditEvalTokens = warmControlEvalTokens + checkpointMinStepTokens + repeatToleranceTokens;
+  const healthy = finalAudit.promptN <= maxHealthyAuditEvalTokens;
+  return {
+    state: healthy ? "healthy" : "regression",
+    expectedCycles,
+    checkpointCrossingCycles,
+    generatedTokens,
+    finalPromptTokens: finalAudit.promptTokens,
+    finalAuditEvalTokens: finalAudit.promptN,
+    finalAuditCachedTokens: finalAudit.cachedTokens,
+    warmControlEvalTokens,
+    maxHealthyAuditEvalTokens,
+    reason: healthy
+      ? `final exact audit evaluated ${finalAudit.promptN} tokens within the ${maxHealthyAuditEvalTokens}-token checkpoint-aware bound after ${expectedCycles} crossing cycles`
+      : `final exact audit re-evaluated ${finalAudit.promptN} tokens beyond the ${maxHealthyAuditEvalTokens}-token checkpoint-aware bound after ${expectedCycles} crossing cycles`,
   };
 }
