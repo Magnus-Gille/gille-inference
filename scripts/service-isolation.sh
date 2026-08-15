@@ -173,6 +173,7 @@ After=user@$gateway_uid.service
 User=$GATEWAY_USER
 Group=$GATEWAY_USER
 ExecStartPre=/usr/bin/test -S /run/user/$gateway_uid/systemd/private
+ExecStartPre=/usr/bin/test -S /run/user/$gateway_uid/bus
 EnvironmentFile=$ETC/gateway/gateway.env
 Environment=AUTONOMY_NOTIFY_CMD=$ROOT/gateway/bin/autonomy-notify.sh
 Environment=GILLE_AUTONOMY_ENV_FILE=$ETC/gateway/gateway.env
@@ -183,6 +184,11 @@ BindReadOnlyPaths=$GATEWAY_TREE
 # Bind the containing directory so a restarted user manager can replace its
 # private socket without leaving the gateway namespace pinned to a stale inode.
 BindReadOnlyPaths=/run/user/$gateway_uid/systemd
+# systemd-run --pipe passes stdio file descriptors over the ordinary session
+# bus. Expose that one read-only socket to the gateway; the inner model cage
+# still receives no host /run mount. A replaced socket fails closed until the
+# gateway is restarted and this bind is recreated.
+BindReadOnlyPaths=/run/user/$gateway_uid/bus
 BindPaths=$ROOT/gateway/data:$GATEWAY_DATA
 ReadOnlyPaths=$GATEWAY_TREE
 InaccessiblePaths=-$GATEWAY_TREE/.claude
@@ -854,7 +860,7 @@ atomic_render_dropin() {
 }
 
 restore_isolation_refresh() {
-  local restore_gateway_netlink=0 restore_gateway_user_manager_order=0
+  local restore_gateway_netlink=0 restore_gateway_user_manager_order=0 restore_gateway_session_bus=0
   [ -n "$REFRESH_BACKUP" ] && [ -n "$REFRESH_DROPIN" ] && [ -n "$REFRESH_UNIT" ] || return 1
   # One superseded issue-197 candidate briefly added AF_NETLINK. Automatic restoration must
   # verify either exact prior shape without weakening the new default.
@@ -869,10 +875,15 @@ restore_isolation_refresh() {
     && grep -Eq '^After=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
     restore_gateway_user_manager_order=1
   fi
+  # The ordinary session bus was added after the private manager transport. Preserve whether
+  # the backed-up drop-in exposed that exact socket so automatic rollback can verify both shapes.
+  if grep -Eq '^BindReadOnlyPaths=.*/run/user/[0-9]+/bus([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_session_bus=1
+  fi
   atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
   systemctl daemon-reload || return 1
   systemctl restart "$REFRESH_UNIT" || return 1
-  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" ) || return 1
+  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" ) || return 1
 }
 
 refresh_exit_handler() {
@@ -924,7 +935,7 @@ refresh_isolation() {
 }
 
 verify() {
-  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" unit user actual_user
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" require_gateway_session_bus="${5:-1}" unit user actual_user
   need systemctl; need ss
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"
@@ -971,7 +982,9 @@ verify() {
       [ "$(show_value "$unit" PrivateDevices)" = yes ] || die "$unit PrivateDevices is not enabled"
       local gateway_uid
       gateway_uid="$(id -u "$GATEWAY_USER")"
-      if [ "$require_user_manager_order" = 1 ]; then
+      if [ "$require_user_manager_order" = 1 ] && [ "$require_gateway_session_bus" = 1 ]; then
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd" "/run/user/$gateway_uid/bus"
+      elif [ "$require_user_manager_order" = 1 ]; then
         require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"
       else
         require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE"
@@ -989,6 +1002,9 @@ verify() {
           require_show_contains "$unit" Requires "$user_unit"
           require_show_contains "$unit" After "$user_unit"
           require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"
+          if [ "$require_gateway_session_bus" = 1 ]; then
+            require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/bus"
+          fi
         fi
         [ -x "$home/.local/bin/pi" ] || die "dedicated Pi binary is absent"
         [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json is absent"

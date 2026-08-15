@@ -444,10 +444,12 @@ sudo scripts/service-isolation.sh verify --service gateway
 The refresh requires the dedicated lingered user manager to be healthy before mutation, backs up
 the exact prior drop-in, orders `home-gateway.service` after and requires the resolved
 `user@<gille-gateway-uid>.service`, restarts once, and verifies that a user-manager transport is
-visible inside the gateway's mount namespace. The dedicated user manager spawns each transient
-code-loop service, so `pasta` can construct its namespace without granting `AF_NETLINK`, TUN, or
-weaker `NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
-receives no host `/run` mounts. If restart or
+visible inside the gateway's mount namespace. It binds only the private manager directory and the
+ordinary session-bus socket read-only; `systemd-run --pipe` needs the latter to pass stdio file
+descriptors. The dedicated user manager spawns each transient code-loop service, so `pasta` can
+construct its namespace without granting `AF_NETLINK`, TUN, or weaker
+`NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
+receives no host `/run` mounts or session-bus access. If restart or
 verification fails, it restores the prior drop-in and verifies the recovered gateway before
 returning failure. This fixes the boot race
 without weakening the code-loop cage or treating a host-visible bus as proof that the service
