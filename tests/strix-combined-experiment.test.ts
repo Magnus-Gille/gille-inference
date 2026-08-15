@@ -49,6 +49,8 @@ describe("Strix combined experiment contract", () => {
     };
     expect(() => validateStrixKvCandidateConfig(mutate((copy) => copy.localExperiment.arms.reverse()))).toThrow(/causal arms/);
     expect(() => validateStrixKvCandidateConfig(mutate((copy) => copy.localExperiment.contexts.push(65536)))).toThrow(/duplicates/);
+    expect(() => validateStrixKvCandidateConfig(mutate((copy) => { copy.localExperiment.longGenerationGate.maxTokens = 2048; }))).toThrow(/at most 2048|4096/);
+    expect(() => validateStrixKvCandidateConfig(mutate((copy) => { copy.localExperiment.longGenerationGate.kvK = "f16"; }))).toThrow(/deterministic/);
     expect(() => validateStrixKvCandidateConfig(mutate((copy) => { copy.promotionGate.minimumCycles = 1; }))).toThrow(/at least 2/);
     expect(() => validateStrixKvCandidateConfig(mutate((copy) => { copy.promotionGate.deploymentStatus = "authorized"; }))).toThrow(/must not claim/);
   });
@@ -87,6 +89,7 @@ describe("Strix combined experiment contract", () => {
       runMmap: async () => { events.push("mmap-reject"); return 2; },
       unload: async () => { events.push("unload"); },
       runBackendCorrectness: async () => { events.push("backend"); },
+      runLongGenerationCorrectness: async () => { events.push("long-generation"); },
       runBenchmark: async (plan) => {
         events.push(plan.arm.id);
         return { cycle: plan.cycle, sequence: plan.sequence, armId: plan.arm.id, reportPath: `${plan.outPrefix}.json` };
@@ -95,7 +98,7 @@ describe("Strix combined experiment contract", () => {
       interruptedBy: () => null,
     });
     expect(events).toEqual([
-      "mmap-reject", "unload", "backend",
+      "mmap-reject", "unload", "backend", "long-generation",
       "production-f16-kv", "production-q8-kv", "candidate-q8-kv",
       "candidate-q8-kv", "production-q8-kv", "production-f16-kv", "restore",
     ]);
@@ -114,6 +117,7 @@ describe("Strix combined experiment contract", () => {
       runMmap: async () => 0,
       unload: async () => {},
       runBackendCorrectness: async () => {},
+      runLongGenerationCorrectness: async () => {},
       runBenchmark: async () => { throw new Error("benchmark failed"); },
       restore: async () => { restored = true; },
       interruptedBy: () => null,
@@ -124,6 +128,31 @@ describe("Strix combined experiment contract", () => {
       ...dependencies,
       restore: async () => { throw new Error("restore failed"); },
     })).rejects.toThrow(/both failed/);
+  });
+
+  it("restores immediately when long-generation correctness rejects", async () => {
+    const config = validateStrixKvCandidateConfig(fixture());
+    const args = parseStrixCombinedArgs([
+      "--config", "candidate.json", "--mmap-config", "mmap.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "resident", "--max-runtime-seconds", "6300", "--ack-exclusive-window",
+    ]);
+    let restored = false;
+    let benchmarkStarted = false;
+    await expect(executeStrixCombinedExperiment(config, args, {
+      snapshot: async () => [{ model: "resident", state: "ready" }],
+      runMmap: async () => 0,
+      unload: async () => {},
+      runBackendCorrectness: async () => {},
+      runLongGenerationCorrectness: async () => { throw new Error("long generation rejected"); },
+      runBenchmark: async () => {
+        benchmarkStarted = true;
+        throw new Error("benchmark must not start");
+      },
+      restore: async () => { restored = true; },
+      interruptedBy: () => null,
+    })).rejects.toThrow(/long generation rejected/);
+    expect(restored).toBe(true);
+    expect(benchmarkStarted).toBe(false);
   });
 
   it("fails after restoration when the runtime deadline arrives during restoration", async () => {
@@ -138,6 +167,7 @@ describe("Strix combined experiment contract", () => {
       runMmap: async () => 0,
       unload: async () => {},
       runBackendCorrectness: async () => {},
+      runLongGenerationCorrectness: async () => {},
       runBenchmark: async (plan) => ({
         cycle: plan.cycle,
         sequence: plan.sequence,

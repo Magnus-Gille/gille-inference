@@ -54,6 +54,14 @@ export interface StrixKvCandidateConfig {
     repetitions: number;
     arms: StrixKvArm[];
     backendCorrectnessCommand: string[];
+    longGenerationGate: {
+      maxTokens: number;
+      minimumCompletionTokens: number;
+      temperature: 0;
+      seed: number;
+      kvK: "q8_0";
+      kvV: "q8_0";
+    };
     executionPolicy: string;
     residencyPolicy: string;
   };
@@ -109,6 +117,7 @@ export interface StrixCombinedExecutionDependencies {
   runMmap(): Promise<number>;
   unload(): Promise<void>;
   runBackendCorrectness(): Promise<void>;
+  runLongGenerationCorrectness(): Promise<void>;
   runBenchmark(plan: StrixKvRunPlan): Promise<StrixCombinedRunEvidence>;
   restore(initial: StrixResidentEntry[]): Promise<void>;
   interruptedBy(): string | null;
@@ -243,6 +252,16 @@ export function validateStrixKvCandidateConfig(value: unknown): StrixKvCandidate
       JSON.stringify(backendCorrectnessCommand.slice(1)) !== JSON.stringify(["test", "-b", "Vulkan", "-o", "FLASH_ATTN_EXT", "-j", "1"])) {
     throw new Error("backend correctness command must be the focused serial Vulkan FLASH_ATTN_EXT test");
   }
+  const longGeneration = object(experiment["longGenerationGate"], "longGenerationGate");
+  const longMaxTokens = positiveInteger(longGeneration, "maxTokens", 8_192);
+  const longMinimumTokens = positiveInteger(longGeneration, "minimumCompletionTokens", longMaxTokens);
+  if (longMaxTokens !== 4_096 || longMinimumTokens !== 3_072) {
+    throw new Error("long-generation gate must request 4096 tokens and require at least 3072");
+  }
+  if (longGeneration["temperature"] !== 0 || longGeneration["seed"] !== 1 ||
+      longGeneration["kvK"] !== "q8_0" || longGeneration["kvV"] !== "q8_0") {
+    throw new Error("long-generation gate must remain deterministic with Q8_0 K/V");
+  }
   const minimumCycles = positiveInteger(gate, "minimumCycles", 4);
   if (minimumCycles < 2) throw new Error("minimumCycles must be at least 2");
   if (gate["deploymentStatus"] !== "not-authorized-by-evidence") throw new Error("candidate must not claim deployment authorization");
@@ -286,6 +305,14 @@ export function validateStrixKvCandidateConfig(value: unknown): StrixKvCandidate
       tgTokens: positiveInteger(experiment, "tgTokens", 1_000_000),
       repetitions: positiveInteger(experiment, "repetitions", 100),
       arms, backendCorrectnessCommand,
+      longGenerationGate: {
+        maxTokens: longMaxTokens,
+        minimumCompletionTokens: longMinimumTokens,
+        temperature: 0,
+        seed: 1,
+        kvK: "q8_0",
+        kvV: "q8_0",
+      },
       executionPolicy: boundedString(experiment, "executionPolicy", 500),
       residencyPolicy: boundedString(experiment, "residencyPolicy", 500),
     },
@@ -426,6 +453,9 @@ export async function executeStrixCombinedExperiment(
     const beforeBackend = dependencies.interruptedBy();
     if (beforeBackend !== null) throw new Error(`combined experiment interrupted by ${beforeBackend}`);
     await dependencies.runBackendCorrectness();
+    const beforeLongGeneration = dependencies.interruptedBy();
+    if (beforeLongGeneration !== null) throw new Error(`combined experiment interrupted by ${beforeLongGeneration}`);
+    await dependencies.runLongGenerationCorrectness();
     for (const plan of plans) {
       const signal = dependencies.interruptedBy();
       if (signal !== null) throw new Error(`combined experiment interrupted by ${signal}`);

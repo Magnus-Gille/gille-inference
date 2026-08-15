@@ -123,6 +123,14 @@
       "-j",
       "1"
     ],
+    "longGenerationGate": {
+      "maxTokens": 4096,
+      "minimumCompletionTokens": 3072,
+      "temperature": 0,
+      "seed": 1,
+      "kvK": "q8_0",
+      "kvV": "q8_0"
+    },
     "executionPolicy": "Run only under an explicitly approved exclusive maintenance window and the canonical GPU lease",
     "residencyPolicy": "Bind the pre-run llama-swap target by immutable model artifact and restore it on success, failure, or catchable signal"
   },
