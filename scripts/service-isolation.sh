@@ -25,6 +25,7 @@ REFRESH_BACKUP=""
 REFRESH_DROPIN=""
 REFRESH_UNIT=""
 REFRESH_TOOLCHAIN_CURRENT=""
+REFRESH_CODELOOP_CONFIG=""
 REFRESH_ACTIVE=0
 gateway_home() { printf '%s\n' "$ROOT/$GATEWAY_USER"; }
 
@@ -459,12 +460,6 @@ gateway_codeloop_enabled() {
   awk -F= '$1 == "HOMESERVER_CODE_LOOP" { v=$2 } END { exit !(v == "on") }' "$(gateway_env_file)"
 }
 
-gateway_codeloop_source_dir() {
-  # The path is operational metadata, not emitted. The ownership/mode checks below are the only
-  # observable result. A missing explicit setting is fail-closed while code_loop is enabled.
-  awk -F= '$1 == "HOMESERVER_CODE_LOOP_PI_AGENT_DIR" { print substr($0, index($0, "=") + 1); exit }' "$(gateway_env_file)"
-}
-
 gateway_codeloop_source_pi() {
   awk -F= '$1 == "HOMESERVER_CODE_LOOP_PI_BIN" { print substr($0, index($0, "=") + 1); exit }' "$(gateway_env_file)"
 }
@@ -597,14 +592,61 @@ prepare_gateway_user_manager() {
   die "gille-gateway user manager did not become ready after 10s (user@$uid.service and its runtime transport); inspect journalctl -u user@$uid.service before retrying"
 }
 
+gateway_codeloop_config_template() {
+  printf '%s\n' "$GATEWAY_TREE/deploy/pi-models.json.example"
+}
+
+atomic_install_gateway_codeloop_config() {
+  local source="$1" destination="$2" dir tmp
+  dir="${destination%/*}"
+  tmp="$(mktemp "$dir/.${destination##*/}.XXXXXX")" || return 1
+  if ! install -m 0600 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$source" "$tmp" \
+    || ! mv "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+provision_gateway_codeloop_config() {
+  local home template destination
+  gateway_codeloop_enabled || return 0
+  home="$(gateway_home)"
+  template="$(gateway_codeloop_config_template)"
+  destination="$home/.pi-code-loop/models.json"
+  [ -f "$template" ] && [ ! -L "$template" ] || die "reviewed code_loop Pi config template is absent or unsafe"
+  install -d -m 0700 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$home/.pi-code-loop"
+  atomic_install_gateway_codeloop_config "$template" "$destination" \
+    || die "could not atomically install the reviewed code_loop Pi config"
+}
+
+verify_gateway_codeloop_config() {
+  local home template destination
+  home="$(gateway_home)"
+  template="$(gateway_codeloop_config_template)"
+  destination="$home/.pi-code-loop/models.json"
+  [ -f "$template" ] && [ ! -L "$template" ] || die "reviewed code_loop Pi config template is absent or unsafe"
+  [ -f "$destination" ] && [ ! -L "$destination" ] || die "dedicated Pi models.json is absent or unsafe"
+  require_mode "$destination" 600
+  require_owner_group "$destination" "$GATEWAY_USER" "$GATEWAY_USER"
+  cmp -s "$template" "$destination" || die "dedicated Pi models.json differs from the reviewed template"
+  [ ! -e "$home/.pi-code-loop/auth.json" ] || die "dedicated Pi runtime must not hold auth.json"
+}
+
+restore_gateway_codeloop_config() {
+  local backup
+  [ -n "$REFRESH_CODELOOP_CONFIG" ] || return 0
+  backup="$REFRESH_BACKUP/models.json.before"
+  [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+  atomic_install_gateway_codeloop_config "$backup" "$REFRESH_CODELOOP_CONFIG" || return 1
+  cmp -s "$backup" "$REFRESH_CODELOOP_CONFIG" || return 1
+}
+
 provision_gateway_codeloop_runtime() {
-  local home source_pi source_agent resolved_pi package version
+  local home source_pi resolved_pi package version
   gateway_codeloop_enabled || return 0
   home="$(gateway_home)"
   source_pi="$(gateway_codeloop_source_pi)"
-  source_agent="$(gateway_codeloop_source_dir)"
   [ -n "$source_pi" ] && [ -x "$source_pi" ] || die "code_loop is enabled but HOMESERVER_CODE_LOOP_PI_BIN is not an executable"
-  [ -n "$source_agent" ] && [ -f "$source_agent/models.json" ] || die "code_loop is enabled but its models.json is absent"
   resolved_pi="$(readlink -f "$source_pi")" || die "could not resolve code_loop Pi binary"
   package="$(gateway_codeloop_package_from_resolved_path "$resolved_pi")"
   version="$($source_pi --version 2>/dev/null | head -n 1 | tr -cd '0-9.')"
@@ -612,7 +654,7 @@ provision_gateway_codeloop_runtime() {
   install -d -m 0700 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$home/.pi-code-loop"
   # A dedicated pinned Pi runtime; do not copy the owner's ~/.local tree or auth.json.
   runuser -u "$GATEWAY_USER" -- env HOME="$home" NPM_CONFIG_PREFIX="$home/.local" npm install --global "$package@$version" >/dev/null
-  install -m 0600 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$source_agent/models.json" "$home/.pi-code-loop/models.json"
+  provision_gateway_codeloop_config
   [ -x "$home/.local/bin/pi" ] || die "dedicated Pi runtime was not installed"
   [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json was not installed"
   [ ! -e "$home/.pi-code-loop/auth.json" ] || die "refusing to proceed: dedicated Pi runtime contains auth.json"
@@ -1014,11 +1056,12 @@ restore_isolation_refresh() {
   if grep -Eq '^BindReadOnlyPaths=.*/run/user/[0-9]+/bus([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
     restore_gateway_session_bus=1
   fi
+  restore_gateway_codeloop_config || return 1
   restore_gateway_codeloop_toolchain_pointer || return 1
   atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
   systemctl daemon-reload || return 1
   systemctl restart "$REFRESH_UNIT" || return 1
-  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 ) || return 1
+  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 0 ) || return 1
 }
 
 refresh_exit_handler() {
@@ -1035,8 +1078,8 @@ refresh_exit_handler() {
 }
 
 refresh_isolation() {
-  local service="$1" backup_root="$2" unit dropin stamp backup prior_target prior_digest
-  root_only; need systemctl; need install; need mktemp; need loginctl; need runuser; need mv; need rm; need chown; need chmod; need cp; need find; need sha256sum; need ln; need readlink
+  local service="$1" backup_root="$2" unit dropin stamp backup prior_target prior_digest home
+  root_only; need systemctl; need install; need mktemp; need loginctl; need runuser; need mv; need rm; need chown; need chmod; need cp; need find; need sha256sum; need ln; need readlink; need cmp
   [ "$service" = gateway ] || die "refresh-isolation currently applies only to gateway"
   unit="$(unit_for "$service")"
   [ "$(show_value "$unit" User)" = "$GATEWAY_USER" ] || die "$unit is not already isolated; use apply instead"
@@ -1053,6 +1096,15 @@ refresh_isolation() {
   backup="$(mktemp -d "$backup_root/$stamp-$service-refresh.XXXXXX")"
   install -m 0644 -o root -g root "$dropin" "$backup/dropin.before.conf"
   systemctl show "$unit" -p User -p ActiveState -p SubState -p MainPID -p Requires -p After --no-pager >"$backup/unit.before.show"
+  if gateway_codeloop_enabled; then
+    home="$(gateway_home)"
+    REFRESH_CODELOOP_CONFIG="$home/.pi-code-loop/models.json"
+    [ -f "$REFRESH_CODELOOP_CONFIG" ] && [ ! -L "$REFRESH_CODELOOP_CONFIG" ] \
+      || die "dedicated Pi models.json is absent or unsafe"
+    install -m 0600 -o root -g root "$REFRESH_CODELOOP_CONFIG" "$backup/models.json.before"
+    cmp -s "$REFRESH_CODELOOP_CONFIG" "$backup/models.json.before" \
+      || die "could not record the prior dedicated Pi config exactly"
+  fi
   REFRESH_TOOLCHAIN_CURRENT="$ROOT/gateway/node_modules"
   if [ -L "$REFRESH_TOOLCHAIN_CURRENT" ]; then
     prior_target="$(readlink "$REFRESH_TOOLCHAIN_CURRENT")" \
@@ -1075,6 +1127,7 @@ refresh_isolation() {
   REFRESH_UNIT="$unit"
   REFRESH_ACTIVE=1
   trap 'refresh_exit_handler "$?"' EXIT
+  provision_gateway_codeloop_config
   provision_gateway_codeloop_toolchain
   atomic_render_dropin "$service" "$dropin" || die "could not atomically install refreshed gateway isolation drop-in"
   systemctl restart "$unit" || die "refreshed gateway unit did not restart"
@@ -1083,13 +1136,14 @@ refresh_isolation() {
     || die "could not write gateway isolation refresh receipt"
   REFRESH_ACTIVE=0
   REFRESH_TOOLCHAIN_CURRENT=""
+  REFRESH_CODELOOP_CONFIG=""
   trap - EXIT
   note "REFRESHED: $service isolation. Prior drop-in: $backup/dropin.before.conf"
 }
 
 verify() {
-  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" require_gateway_session_bus="${5:-1}" require_gateway_toolchain="${6:-1}" unit user actual_user
-  need systemctl; need ss; need sha256sum; need readlink; need runuser
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" require_gateway_session_bus="${5:-1}" require_gateway_toolchain="${6:-1}" require_gateway_codeloop_config="${7:-1}" unit user actual_user
+  need systemctl; need ss; need sha256sum; need readlink; need runuser; need cmp
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"
   [ "$actual_user" = "$user" ] || die "$unit still runs as '$actual_user', expected '$user'"
@@ -1163,6 +1217,7 @@ verify() {
         [ -x "$home/.local/bin/pi" ] || die "dedicated Pi binary is absent"
         [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json is absent"
         [ ! -e "$home/.pi-code-loop/auth.json" ] || die "dedicated Pi runtime must not hold auth.json"
+        [ "$require_gateway_codeloop_config" = 0 ] || verify_gateway_codeloop_config
       fi
       wait_for_gateway_health "$unit"
       systemctl is-active --quiet gille-autonomy-tick.timer || die "isolated autonomy timer is not active"

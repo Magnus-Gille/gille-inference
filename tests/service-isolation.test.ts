@@ -90,6 +90,34 @@ prepare_gateway_user_manager
   }
 }
 
+function runGatewayCodeLoopConfigHarness(actualContent: string): { status: number; output: string } {
+  const work = mkdtempSync(join(tmpdir(), "gille-code-loop-config-harness-"));
+  const fakeRoot = join(work, "var-lib");
+  const fakeTree = join(work, "gateway-tree");
+  const template = readFileSync(join(root, "deploy", "pi-models.json.example"), "utf8");
+  mkdirSync(join(fakeRoot, "gille-gateway", ".pi-code-loop"), { recursive: true });
+  mkdirSync(join(fakeTree, "deploy"), { recursive: true });
+  writeFileSync(join(fakeTree, "deploy", "pi-models.json.example"), template);
+  writeFileSync(join(fakeRoot, "gille-gateway", ".pi-code-loop", "models.json"), actualContent);
+  const harness = join(work, "service-isolation-harness.sh");
+  writeFileSync(
+    harness,
+    readFileSync(script, "utf8")
+      .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+      .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`),
+  );
+  try {
+    const output = execFileSync(
+      "bash",
+      ["-c", "source \"$1\"; require_mode() { :; }; require_owner_group() { :; }; verify_gateway_codeloop_config", "--", harness],
+      { cwd: root, encoding: "utf8", stderr: "pipe" },
+    );
+    return { status: 0, output };
+  } catch (error: any) {
+    return { status: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
+  }
+}
+
 function runAutonomyRefreshHarness(failChown = false): { status: number; log: string[]; work: string; output: string } {
   const work = mkdtempSync(join(tmpdir(), "gille-autonomy-refresh-harness-"));
   const harness = join(work, "harness.sh");
@@ -343,11 +371,55 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain("restore_gateway_netlink=0");
     expect(source).toContain("restore_gateway_user_manager_order=0");
     expect(source).toContain("restore_gateway_session_bus=0");
-    expect(source).toContain('( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 )');
+    expect(source).toContain('( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 0 )');
     const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
     expect(refresh.indexOf('readlink "$REFRESH_TOOLCHAIN_CURRENT"')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
     expect(refresh.indexOf('verify_gateway_codeloop_toolchain "$prior_digest"')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
     expect(refresh.indexOf("REFRESH_ACTIVE=1")).toBeLessThan(refresh.indexOf("provision_gateway_codeloop_toolchain"));
+  });
+
+  it("accepts only the reviewed Pi provider config in the dedicated runtime", () => {
+    const canonical = readFileSync(join(root, "deploy", "pi-models.json.example"), "utf8");
+    const legacy = canonical
+      .replace('"apiKey": "$HS_API_KEY"', '"apiKey": "HS_API_KEY"')
+      .replace('      "authHeader": true,\n', "");
+
+    expect(runGatewayCodeLoopConfigHarness(canonical)).toEqual({ status: 0, output: "" });
+    const stale = runGatewayCodeLoopConfigHarness(legacy);
+    expect(stale.status).not.toBe(0);
+    expect(stale.output).toContain("differs from the reviewed template");
+  });
+
+  it("backs up, canonicalizes, and restores the Pi provider config within refresh-isolation", () => {
+    const source = readFileSync(script, "utf8");
+    const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
+    expect(refresh).toContain('models.json.before');
+    expect(refresh.indexOf('models.json.before')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
+    expect(refresh.indexOf("REFRESH_ACTIVE=1")).toBeLessThan(refresh.indexOf("provision_gateway_codeloop_config"));
+    expect(source).toContain("restore_gateway_codeloop_config || return 1");
+  });
+
+  it("restores the exact prior Pi provider config after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-pi-config-"));
+    const backup = join(work, "backup");
+    const destination = join(work, "models.json");
+    mkdirSync(backup);
+    writeFileSync(join(backup, "models.json.before"), "legacy-provider-config\n");
+    writeFileSync(destination, "reviewed-provider-config\n");
+
+    execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_CODELOOP_CONFIG=\"$3\"; atomic_install_gateway_codeloop_config() { cp \"$1\" \"$2\"; }; restore_gateway_codeloop_config",
+        "--",
+        script,
+        backup,
+        destination,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(readFileSync(destination, "utf8")).toBe("legacy-provider-config\n");
   });
 
   it("atomically restores the exact prior toolchain pointer recorded before refresh", () => {
@@ -402,7 +474,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 0 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 0 0 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
         "--",
         script,
         backup,
@@ -410,7 +482,7 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(output).toContain("verify:gateway 1 0 0 0 0");
+    expect(output).toContain("verify:gateway 1 0 0 0 0 0");
     expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
     expect(output).not.toContain("AF_NETLINK");
   });
@@ -437,7 +509,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 1 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 1 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
         "--",
         script,
         backup,
@@ -445,7 +517,7 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(output).toContain("verify:gateway 1 1 1 0 0");
+    expect(output).toContain("verify:gateway 1 1 1 0 0 0");
     expect(output).toContain("AF_NETLINK");
     expect(output).toContain("BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd");
     expect(output).toContain("Requires=user@991.service");
@@ -474,7 +546,7 @@ describe("service-isolation migration contract (#151)", () => {
       "bash",
       [
         "-c",
-        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 0 1 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 0 1 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
         "--",
         script,
         backup,
@@ -482,7 +554,7 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(output).toContain("verify:gateway 1 1 0 1 0");
+    expect(output).toContain("verify:gateway 1 1 0 1 0 0");
     expect(output).toContain("/run/user/991/bus");
   });
 
@@ -659,6 +731,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain("loginctl enable-linger");
     expect(source).toContain("DBUS_SESSION_BUS_ADDRESS");
     expect(source).toContain("dedicated Pi runtime contains auth.json");
+    expect(source).toContain('$GATEWAY_TREE/deploy/pi-models.json.example');
+    expect(source).not.toContain("gateway_codeloop_source_dir");
     expect(source).toContain("[ ! -e \"$home/.pi-code-loop/auth.json\" ]");
     expect(source).not.toContain("BindReadOnlyPaths=/home/magnus\n");
     expect(source).toContain("InaccessiblePaths=-$GATEWAY_TREE/.claude");

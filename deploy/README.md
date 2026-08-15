@@ -455,7 +455,11 @@ not require rewriting that file and the cage binds only the dedicated service-ac
 The refresh also copies the deployed check toolchain into a root-owned, lockfile-addressed mirror
 under `/var/lib/gille-inference/gateway`; the cage binds its stable `node_modules` pointer read-only
 directly above the dedicated workroot, preserving normal Node/npx parent lookup without requiring
-any traversal of the owner home. Existing versions remain immutable for already-running jobs. If restart or
+any traversal of the owner home. It also replaces the dedicated Pi provider file with the reviewed
+committed template, verifies it byte-for-byte, and transactionally restores the prior file if the
+refresh fails. This prevents a legacy literal `HS_API_KEY` value or missing `authHeader:true` from
+bypassing the ephemeral per-run relay capability. Existing toolchain versions remain immutable for
+already-running jobs. If restart or
 verification fails, it restores the prior drop-in and verifies the recovered gateway before
 returning failure. This fixes the boot race
 without weakening the code-loop cage or treating a host-visible bus as proof that the service
