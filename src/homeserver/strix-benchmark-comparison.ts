@@ -156,7 +156,22 @@ const ALLOWED_PROVENANCE_FIELDS: Record<StrixComparisonAxis, Set<keyof StrixServ
 
 function assertControlledProvenance(control: StrixServerProvenance, candidate: StrixServerProvenance, axis: StrixComparisonAxis): void {
   const allowed = ALLOWED_PROVENANCE_FIELDS[axis];
-  for (const key of Object.keys(control) as Array<keyof StrixServerProvenance>) {
+  if (axis === "speculation") {
+    if (control.serverArgsSha256 === candidate.serverArgsSha256) {
+      throw new Error("speculation server arguments did not change");
+    }
+    if (control.serverArgsInvariantSha256 === undefined || candidate.serverArgsInvariantSha256 === undefined) {
+      throw new Error("speculation comparison requires a non-speculation server-argument invariant hash");
+    }
+    if (control.serverArgsInvariantSha256 !== candidate.serverArgsInvariantSha256) {
+      throw new Error("server arguments changed outside the permitted speculation flags");
+    }
+  }
+  const keys = new Set<keyof StrixServerProvenance>([
+    ...(Object.keys(control) as Array<keyof StrixServerProvenance>),
+    ...(Object.keys(candidate) as Array<keyof StrixServerProvenance>),
+  ]);
+  for (const key of keys) {
     if (allowed.has(key)) continue;
     if (JSON.stringify(control[key]) !== JSON.stringify(candidate[key])) {
       throw new Error(`comparison axis ${axis} does not permit provenance field ${key} to change`);

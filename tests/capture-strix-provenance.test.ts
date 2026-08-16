@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { parseCaptureArgs, runCaptureStrixProvenance } from "../scripts/capture-strix-provenance.js";
+import {
+  hashServerArgsInvariant,
+  parseCaptureArgs,
+  runCaptureStrixProvenance,
+} from "../scripts/capture-strix-provenance.js";
 
 const ARGV = [
   "--pid", "123", "--model-artifact", "/models/model.gguf", "--runtime-commit", "b".repeat(40),
@@ -12,6 +16,18 @@ const ARGV = [
 ];
 
 describe("capture Strix provenance", () => {
+  it("hashes only non-speculation server arguments and rejects unknown speculation flags", () => {
+    const direct = Buffer.from(["llama-server", "-m", "model.gguf", "-c", "65536", ""].join("\0"));
+    const mtp = Buffer.from([
+      "llama-server", "-m", "model.gguf", "-c", "65536",
+      "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "",
+    ].join("\0"));
+    expect(hashServerArgsInvariant(direct)).toBe(hashServerArgsInvariant(mtp));
+    expect(() => hashServerArgsInvariant(
+      Buffer.from(["llama-server", "--spec-unknown", "value", ""].join("\0"))
+    )).toThrow(/unsupported speculation argument/i);
+  });
+
   it("parses an explicit process/config contract", () => {
     expect(parseCaptureArgs(ARGV)).toMatchObject({
       pid: 123,
@@ -47,7 +63,34 @@ describe("capture Strix provenance", () => {
     const json = write.mock.calls[0]![1] as string;
     expect(json).toContain('"modelArtifactSha256": "' + "a".repeat(64));
     expect(json).toContain('"cacheRamMiB": 8192');
+    expect(json).toContain('"serverArgsInvariantSha256"');
     expect(json).not.toContain("/private/model.gguf");
     expect(json).not.toContain("/opt/llama-server");
+  });
+
+  it("rejects operator speculation labels that do not match the captured process argv", async () => {
+    const candidateArgv = ARGV.map((value, index) => {
+      if (ARGV[index - 1] === "--speculation") return "draft-mtp";
+      if (ARGV[index - 1] === "--draft-depth") return "2";
+      return value;
+    });
+    const write = vi.fn();
+    const stderr = vi.fn();
+    const exit = await runCaptureStrixProvenance(candidateArgv, {
+      hashFile: async (path) => path.includes("models") ? "a".repeat(64) : "c".repeat(64),
+      readProcExe: () => "/opt/llama-server",
+      readProcArgs: () => Buffer.from([
+        "llama-server", "--spec-type", "draft-mtp", "--spec-draft-n-max", "15", "",
+      ].join("\0")),
+      kernel: () => "6.14.0", mesa: () => "25.2.0", rocm: () => null,
+      write, stdout: vi.fn(), stderr,
+    });
+    expect(exit).toBe(1);
+    expect(write).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/draft depth.*captured process argv/i));
+
+    expect(() => hashServerArgsInvariant(Buffer.from([
+      "llama-server", "--spec-type", "draft-mtp", "--spec-type", "draft-dflash", "",
+    ].join("\0")))).toThrow(/duplicate speculation argument/i);
   });
 });

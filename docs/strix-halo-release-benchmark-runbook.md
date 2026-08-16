@@ -224,7 +224,9 @@ responses at 1, 2, 4, and 8 concurrent requests.
 
 First capture the already-running server's immutable provenance. The process id and every serving
 field must be explicit; the command hashes the model artifact, running executable, and raw process
-argv but stores neither paths nor argv contents:
+argv but stores neither paths nor argv contents. It also records a second argv hash after removing
+only the allow-listed native-speculation flags. Speculation comparisons require this invariant hash
+to match, so an unrelated server-argument change fails closed:
 
 ```bash
 npm run benchmark:strix-provenance -- \
@@ -277,6 +279,44 @@ arms, so server defaults cannot silently invalidate the experiment. `--cache-ram
 llama-server's documented unlimited mode; values below `-1` are rejected. The
 comparator deliberately declares no automatic winner: the relevant issue's preregistered quality,
 short/long-context, soak, memory, and stability gates still decide adoption.
+
+For speculation, synthesize a fail-closed workload/concurrency policy only after capturing one
+direct report and every candidate depth against the identical fixture matrix. The policy requires
+quality non-inferiority, observable draft acceptance, and a measured useful-completions/minute gain
+above the explicit margin. It selects the best qualifying depth independently per measured cell and
+uses direct decoding everywhere else. Policy output paths are canonicalized so they cannot alias an
+input report. If either JSON/Markdown publication step fails, the writer restores and verifies the
+previous pair; an incomplete rollback is surfaced as a separate hard failure:
+
+```bash
+npm run benchmark:strix-spec-policy -- \
+  --direct data/strix-benchmarks/qwen38-direct-server.json \
+  --candidate data/strix-benchmarks/qwen38-mtp1-server.json \
+  --candidate data/strix-benchmarks/qwen38-mtp2-server.json \
+  --min-gain-percent 3 \
+  --min-batches 3 \
+  --out data/strix-benchmarks/qwen38-speculation-policy
+```
+
+This emits a content-blind JSON/Markdown recommendation artifact. It is an offline policy derived
+from the captured benchmark window, not an online rolling controller and not deployment authority.
+The default evidence floor is three repeated batches per cell. A speculative arm must also have
+exactly the same batch/request exposure as direct, with request count equal to batches times
+concurrency and internally consistent success/oracle counters. These checks reject obvious
+under-sampling and malformed summaries; they are not confidence intervals and do not replace an
+interleaved or mirrored A/B where drift matters. Do not extrapolate the policy to omitted workloads
+or concurrency levels. Promotion still requires the long-generation equivalence, correctness,
+soak, memory, representative-agent, and live verification gates.
+
+The synthesizer also validates the raw content-blind `batches` behind every summary and pairs them
+by fixture, task type, concurrency, and zero-based repetition index. Every selected speculative
+arm must reproduce direct's exact per-request greedy output SHA-256, preserve successful and
+oracle-passing request counts, and equal or beat direct useful completions/minute in every paired
+repetition, while the aggregate still clears
+`--min-gain-percent`. Missing batches, duplicate/hidden cells, non-contiguous repetitions,
+summary/raw mismatches, missing successful-request hashes, hash divergence, or unobservable
+per-batch acceptance fail closed. The raw hash is already emitted by the benchmark recorder; output
+text is not read, and the compared hashes are not copied into the synthesized policy artifact.
 
 For a Vulkan/HIP A/B, use separately reviewed binaries built from the intended revision, keep
 model bytes and all flags identical, and change only `--llama-bench`, `--backend`, and the output

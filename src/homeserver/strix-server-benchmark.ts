@@ -42,6 +42,7 @@ export interface StrixServerProvenance {
   runtimeCommit: string;
   runtimeBinarySha256: string;
   serverArgsSha256: string;
+  serverArgsInvariantSha256?: string;
   backend: "vulkan" | "hip";
   quant: string;
   kernel: string;
@@ -256,12 +257,18 @@ export function validateServerProvenance(value: unknown): StrixServerProvenance 
   if (draftDepth !== null && (!Number.isInteger(draftDepth) || (draftDepth as number) <= 0)) throw new Error("provenance.draftDepth must be null or a positive integer");
   const cacheIdleSlots = record["cacheIdleSlots"];
   if (cacheIdleSlots !== "on" && cacheIdleSlots !== "off") throw new Error("provenance.cacheIdleSlots must be on or off");
+  const serverArgsInvariantSha256 = record["serverArgsInvariantSha256"];
+  if (serverArgsInvariantSha256 !== undefined &&
+      (typeof serverArgsInvariantSha256 !== "string" || !/^[a-f0-9]{64}$/.test(serverArgsInvariantSha256))) {
+    throw new Error("provenance.serverArgsInvariantSha256 must be a lowercase SHA-256 when present");
+  }
   return {
     schemaVersion: 1,
     modelArtifactSha256: requiredString(record, "modelArtifactSha256"),
     runtimeCommit,
     runtimeBinarySha256: requiredString(record, "runtimeBinarySha256"),
     serverArgsSha256: requiredString(record, "serverArgsSha256"),
+    ...(serverArgsInvariantSha256 === undefined ? {} : { serverArgsInvariantSha256 }),
     backend,
     quant: requiredString(record, "quant"),
     kernel: requiredString(record, "kernel"),

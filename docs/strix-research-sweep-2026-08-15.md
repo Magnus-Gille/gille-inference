@@ -79,6 +79,45 @@ isolates the mechanism from the much larger confound of upgrading two months of 
 inside a bounded all-traffic maintenance window, so its exact mutation object requires a fresh
 operator confirmation. No config or service was changed while preparing the harness.
 
+## Adaptive speculation preparation
+
+The server benchmark already captured useful completions/minute, quality-oracle results, draft
+acceptance, and per-concurrency cells, but its pairwise comparator deliberately stopped short of a
+promotion decision. A new offline policy synthesizer now consumes one direct report plus any number
+of speculative-depth reports. It changes no runtime configuration. Per measured workload and
+concurrency cell, it selects the highest useful-work arm only when quality is non-inferior, draft
+acceptance is observable, and the arm clears an explicit useful-work margin. Missing evidence,
+inferior quality, and slower speculation all select direct decoding.
+
+The promotion artifact now also requires at least three repeated batches per cell by default,
+request count equal to batches times concurrency, internally consistent success/oracle counters,
+acceptance bounded to zero through one, and exactly balanced direct/candidate exposure. A malformed
+or under-sampled direct arm marks the cell's evidence insufficient; a malformed or under-sampled
+candidate is rejected while direct remains selected. This closes the possibility of promoting from
+a one-batch speed spike, but it deliberately does not claim statistical confidence or immunity to
+thermal/runtime drift; the hardware design still needs mirrored cycles.
+
+The selector now validates and pairs the raw content-blind repetition batches as well. Aggregate
+useful-work gain is insufficient when any individual candidate repetition loses successful or
+oracle-passing requests or falls below direct useful completions/minute. It rejects missing,
+duplicate, hidden, non-contiguous, and summary-inconsistent repetition evidence, and requires draft
+acceptance in every speculative batch. This is a deterministic “no observed repetition slower”
+gate, not a statistical claim about unobserved workloads.
+
+An **REPORTED/upstream correctness signal** now makes exact paired output equivalence mandatory as
+well. llama.cpp issue [#25618](https://github.com/ggml-org/llama.cpp/issues/25618) remains open and
+reports greedy `draft-mtp`/`draft-dspark` output divergence from direct decoding on quantized
+Vulkan targets, reproduced on Strix Halo-class hardware. The recorder already emits a SHA-256 over
+exact response content and tool names. The selector now rejects a candidate when any
+successful request lacks that hash or when any paired candidate hash differs from direct. It does
+not retain output text or copy raw hashes into the policy artifact. This is repository enforcement,
+not a local reproduction of the upstream bug; the live depth matrix still has to exercise the gate.
+
+This is repository-local enforcement of the evaluation rule “speculation must not remain selected
+when it is slower”; it is **not** an online rolling controller and does not complete T05. The next
+hardware run must capture direct, depth-1, depth-2, and any deeper supported arm against the same
+agent fixtures and concurrency matrix before a policy can be synthesized for production review.
+
 ## What changed
 
 Gate D's Pi arm now records content-blind turns, tool calls, prompt tokens, completion tokens,
@@ -114,10 +153,30 @@ time.
 | llama.cpp iGPU automatic no-mmap load policy ([#26081](https://github.com/ggml-org/llama.cpp/pull/26081)) | **REPORTED/upstream:** merged capability change targets iGPUs that copy weights into device-visible shared memory | High for Strix cold model swaps and peak memory; deployed runtime supports an exact-flag mechanism A/B | Selected next; ABBA runner implemented and locally tested, hardware mutation pending exact maintenance confirmation |
 | llama.cpp many-expert Vulkan threshold patch ([#25356](https://github.com/ggml-org/llama.cpp/issues/25356)) | **EXTERNAL-MEASURED:** exact 128 GB Strix/RADV report shows no change through batch 8, then +56% at batch 9, +34% at 16, +20% at 32 | High only for nine or more simultaneous sequences | Reject for current one-slot / practical two-user production workload; revisit if concurrency policy changes |
 | llama.cpp DFlash on quantized MoE HIP ([#25117](https://github.com/ggml-org/llama.cpp/issues/25117)) | **EXTERNAL-MEASURED:** exact Strix report shows 19.5 tok/s direct versus 9.4 DFlash | Exact hardware, but a clear regression in the reported arm | Do not implement this HIP path; require a different drafter/backend or new upstream evidence |
+| DFlash concurrency corruption ([#27117](https://github.com/ggml-org/llama.cpp/issues/27117)) | **EXTERNAL-MEASURED:** exact gfx1151/ROCm report on current master shows acceptance collapsing at 16 active sequences; depth 15 delivered roughly 17–21 tok/s versus 37 direct, while depth 1 recovered to roughly 80 tok/s | Direct evidence that method/depth must be workload- and concurrency-specific on Strix | Do not promote a static deep-DFlash profile. Add depth 1 and all intended concurrency cells to the controlled policy matrix; direct is the fail-closed fallback |
+| MTP acceptance regression after b10430 ([#27106](https://github.com/ggml-org/llama.cpp/issues/27106)) | **REPORTED/upstream issue:** CUDA and SYCL users report Qwen3.6/Qwen3.8 MTP acceptance falling from roughly 0.7 to roughly 0.5 | Not reproduced on gfx1151, but relevant to any future llama.cpp runtime uplift | Require direct/MTP acceptance and useful-work A/B on the exact candidate commit; do not carry the existing depth-2 assumption across runtime upgrades |
+| Native BF16 Flash-Attention tiles ([#26856](https://github.com/ggml-org/llama.cpp/pull/26856)) | **EXTERNAL-MEASURED:** exact Strix Qwen3.5-4B report shows +13.5% pp1024 at 8K and +11.4% at 16K versus F16 KV, generation parity; gfx1151-specific BF16 instructions are used | Strong prompt-heavy HIP candidate with a precision benefit at depth, but open and not measured on the production models | Rank behind the already-built Q8-Vulkan candidate; pin and test as the next HIP/KV matrix arm rather than assuming backend-wide superiority |
+| Shared target/drafter thread pools ([#27143](https://github.com/ggml-org/llama.cpp/pull/27143)) | **UPSTREAM mechanism only:** draft PR removes separate pools because target and drafter do not compute concurrently; no performance data supplied | Could reduce speculative setup/resource overhead, but the current patch touches only the example and depends on another open PR | Track; do not build until the common server path lands and an exact-hardware benchmark claim exists |
+| HIP APU memory accounting ([#27083](https://github.com/ggml-org/llama.cpp/pull/27083)) | **UPSTREAM correctness:** open PR keeps HIP APUs on `hipMemGetInfo` instead of a DGX-oriented UMA override that can over-promise memory | Exact topology relevance; protects residency/admission rather than inference speed | Carry into any future HIP uplift review; not a standalone performance candidate |
 | Vulkan versus HIP and MTP Strix observations ([discussion #20856](https://github.com/ggml-org/llama.cpp/discussions/20856)) | **REPORTED/EXTERNAL-MEASURED:** recent builds show Vulkan ahead for batch-one decode, HIP ahead for prompt processing, and workload-sensitive MTP gains | Matches hypotheses H1, H2, H4 but is not our immutable local A/B | Retain Vulkan as the interactive reference; keep a controlled HIP prompt-heavy bake-off on the backlog |
 | large-context Vulkan decay ([#24483](https://github.com/ggml-org/llama.cpp/issues/24483)) | **EXTERNAL-MEASURED:** generation falls materially as actual context fills; Q8 KV remains close to F16 in the cited arm | Directly challenges configured-context shorthand | Require actual populated context in every leaderboard and promotion record |
 | Mesa 26.2.0 ([release notes](https://docs.mesa3d.org/relnotes/26.2.0.html)) | **UPSTREAM:** new RADV work, but the release is marked development and advises stability users to wait for 26.2.1 | Potentially relevant, no cited llama.cpp/gfx1151 win | Do not upgrade production for novelty; wait for stable point release plus a one-variable A/B candidate |
 | ROCm 7.2.3 ([release page](https://github.com/ROCm/ROCm/releases)) | **UPSTREAM:** current line includes gfx1151 support | Support does not prove batch-one decode parity | No backend promotion without local decode, prompt, concurrency, and correctness A/B |
+
+### Model-release triage
+
+The official Hugging Face metadata/config sweep found several new or freshly updated artifacts, but
+none is a single-128-GB candidate:
+
+| Artifact | Immutable metadata | Architecture / active path | Strix fit decision |
+|---|---|---|---|
+| [Qwen3.8-2.4T-A95B](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) | **UPSTREAM:** `207bd685...`; 2.446T BF16 parameters; updated 12 August | 512 experts, 10 routed/token, one shared expert, 92 layers, one MTP layer, 262K context | Reject for this node. Even an idealized uniform 2-bit weight image is roughly 612 GB before runtime/KV overhead; active bytes/token do not remove the total-residency requirement |
+| [DeepSeek-V4-Pro-0813](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813) / [NVIDIA NVFP4 DSpark](https://huggingface.co/nvidia/DeepSeek-V4-Pro-nvfp4-DSpark) | **UPSTREAM:** official model has 1.650T parameters; NVIDIA artifact updated 15 August and reports roughly 944 GB repository storage | 384 routed experts, 6/token, one shared expert, one next-token layer, DSpark metadata, 1M context | Monitor the DSpark mechanism, not this artifact. It is NVIDIA NVFP4 and cannot reside on 128 GB |
+| [Kimi-K3 NVFP4](https://huggingface.co/nvidia/Kimi-K3-NVFP4) | **UPSTREAM:** `1ec10fa...`; 1.419T parameters; updated 15 August | multimodal linear-attention/MoE, 896 experts, 16/token, 93 layers, 1M context; NVIDIA mixed NVFP4/FP8 | Reject artifact for this node: wrong backend format and far beyond residency. Revisit only if an AMD/llama-compatible protected quant demonstrates a sub-128-GB image, which current parameter accounting makes implausible |
+| [Nemotron Labs Teacher STEM](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-Teacher-STEM) | **UPSTREAM:** `cf8545f...`; 560.5B BF16 parameters; created 14 August | latent MoE/Mamba hybrid, 512 experts, 22/token, one MTP layer, 262K context | Reject for deployment. The idealized 2-bit weights alone are roughly 140 GB, leaving no runtime or KV headroom |
+
+These are discovery signals, not leaderboard entrants. Their sparse active paths remain technically
+interesting, but total model residency is the first eligibility gate on this machine.
 
 No exact-hardware development discovered in this sweep has yet cleared the bar for a reversible
 production runtime change. The Q8 KV dequantize-once path remains the strongest test candidate: it
@@ -152,37 +211,42 @@ retroactively inferred.
 | Raw Pi content | temporary mixed stdout/stderr log | temporary mode-0600 NDJSON and separate stderr, deleted after grading by default |
 | Routing decision | Qwen comparison stranded on an unpublished branch | reproducible report/evidence carried with this optimization branch |
 | Leaderboard | no single current Strix artifact | machine-readable JSON plus scoped human-readable categories |
+| Speculation A/B | pairwise metrics with no fail-closed selection artifact | content-blind per-workload/concurrency policy selects only quality-safe useful-work winners; all other cells use direct |
 
 ## Deployment and rollback
 
 **Deployed? No.** No live model, backend, driver, kernel, service, route, or production
-configuration changed. The telemetry affects only future benchmark runs.
+configuration changed. The telemetry and offline speculation policy affect only future benchmark
+and review workflows.
 
 Rollback is a normal Git revert of the telemetry commit. It restores the old Pi redirection and
 result schema; there is no production state to restore.
 
 ## Verification
 
-- focused telemetry and Strix experiment tests: 30/30 passed;
+- focused final speculation-policy, provenance, comparator, and publication tests: 23/23 passed;
 - TypeScript and constitutional typechecks: passed;
-- full repository suite: 284 files, 4,282 tests passed;
+- last clean repository-wide run before the final review hardening: 286 files, 4,298 tests passed;
+- final hardening delta: 23/23 focused tests and both typechecks passed; the three unrelated
+  process-heavy files that hit five-second timeouts under parallel load passed strictly isolated
+  (15/15, 42/42, and 17/17);
 - Bash syntax and `git diff --check`: passed;
 - direct recorder CLI smoke: passed with mode-0600 raw and summary files.
 
 ## Next most valuable experiment
 
-The fresh `strix-real-r1` real-history corpus and content-blind runner are now implemented and
-verified. Its first live arm did not execute: direct Pi would expose the bearer credential to an
-uncaged shell-capable agent, while the safe OS-caged code-loop path is fixed to one configured
-model and cannot perform the Qwen3.6/Qwen3.8 A/B. See
-[`real-agent-pilot-2026-08-15.md`](real-agent-pilot-2026-08-15.md).
+The pinned Vulkan Q8-KV dequantize-once candidate remains first: its exact-Strix external result is
+the largest narrow prompt-processing gain in the current queue, the exact-production backport
+already builds, and the combined correctness/long-generation/ABBA runner is ready. Execute it only
+under the repository-owned exclusive window and exact mutation confirmation; the current Tailscale
+SSH session requires an interactive owner check, so no hardware result is claimed here.
 
-The next experiment is therefore to add an allow-listed, evidence-stamped model selector to the
-existing OS cage, subject to explicit approval for the security-boundary change and independent
-review. Then run the preregistered task sequentially on both live profiles. This directly tests H8
-without trading credential safety for measurement speed.
+When live access is restored, capture a separate direct/depth-1/depth-2 speculation matrix across
+the intended workload/concurrency cells and feed it to the new fail-closed policy tool. This is the
+smallest evidence path toward T05 and directly tests the fresh gfx1151 concurrency failure instead
+of assuming that the current depth-2 profile generalizes.
 
-Until that security-boundary work is approved, the next high-value safe runtime step is to compare
-the deployed June llama.cpp revision against recent upstream changes, select one pinned Vulkan
-candidate with an explicit relevant mechanism, and build it in isolation. A hardware A/B still
-needs the repository-owned controlled GPU window; no broad “latest is better” promotion is allowed.
+The BF16 Flash-Attention PR is the next isolated HIP/KV build candidate after Q8-KV. The fresh
+`strix-real-r1` comparison still needs an allow-listed model selector in the OS cage; that
+security-boundary change remains approval- and independent-review-gated. No broad “latest is
+better” runtime or model promotion is allowed.
