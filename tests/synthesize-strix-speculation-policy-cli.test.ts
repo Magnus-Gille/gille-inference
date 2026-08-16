@@ -86,6 +86,11 @@ describe("runStrixSpeculationPolicySynthesis", () => {
     let failJsonPublish = true;
     const ops = {
       exists: (path: string) => files.has(path),
+      read: (path: string) => {
+        const value = files.get(path);
+        if (value === undefined) throw new Error(`missing file: ${path}`);
+        return value;
+      },
       mkdir: vi.fn(),
       writeExclusive: (path: string, content: string) => {
         if (files.has(path)) throw new Error("exists");
@@ -112,5 +117,20 @@ describe("runStrixSpeculationPolicySynthesis", () => {
     expect(files.get("/out/policy.json")).toBe("old-json");
     expect(files.get("/out/policy.md")).toBe("old-md");
     expect([...files.keys()].filter((path) => path.endsWith(".tmp") || path.endsWith(".bak"))).toEqual([]);
+
+    files.clear();
+    files.set("/out/policy.json", "old-json");
+    files.set("/out/policy.md", "old-md");
+    failJsonPublish = true;
+    const successfulRename = ops.rename;
+    ops.rename = (from: string, to: string) => {
+      if (from.endsWith(".bak") && from.includes("policy.json") && to === "/out/policy.json") {
+        throw new Error("simulated rollback failure");
+      }
+      successfulRename(from, to);
+    };
+    expect(() => writeArtifactPair(
+      "/out/policy.json", "new-json", "/out/policy.md", "new-md", ops
+    )).toThrow(/rollback was incomplete/i);
   });
 });

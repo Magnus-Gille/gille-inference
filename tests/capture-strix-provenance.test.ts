@@ -67,4 +67,30 @@ describe("capture Strix provenance", () => {
     expect(json).not.toContain("/private/model.gguf");
     expect(json).not.toContain("/opt/llama-server");
   });
+
+  it("rejects operator speculation labels that do not match the captured process argv", async () => {
+    const candidateArgv = ARGV.map((value, index) => {
+      if (ARGV[index - 1] === "--speculation") return "draft-mtp";
+      if (ARGV[index - 1] === "--draft-depth") return "2";
+      return value;
+    });
+    const write = vi.fn();
+    const stderr = vi.fn();
+    const exit = await runCaptureStrixProvenance(candidateArgv, {
+      hashFile: async (path) => path.includes("models") ? "a".repeat(64) : "c".repeat(64),
+      readProcExe: () => "/opt/llama-server",
+      readProcArgs: () => Buffer.from([
+        "llama-server", "--spec-type", "draft-mtp", "--spec-draft-n-max", "15", "",
+      ].join("\0")),
+      kernel: () => "6.14.0", mesa: () => "25.2.0", rocm: () => null,
+      write, stdout: vi.fn(), stderr,
+    });
+    expect(exit).toBe(1);
+    expect(write).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/draft depth.*captured process argv/i));
+
+    expect(() => hashServerArgsInvariant(Buffer.from([
+      "llama-server", "--spec-type", "draft-mtp", "--spec-type", "draft-dflash", "",
+    ].join("\0")))).toThrow(/duplicate speculation argument/i);
+  });
 });

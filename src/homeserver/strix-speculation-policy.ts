@@ -280,6 +280,10 @@ function batchEvidenceIssue(summary: Summary, batches: PolicyBatch[] | undefined
     wallMs += batch.wallMs;
     if (batch.speculation !== null) {
       const spec = batch.speculation;
+      if (!requireSpeculation &&
+          (spec.draftTokens > 0 || spec.acceptedTokens > 0 || spec.verificationSteps > 0 || spec.acceptanceRate !== null)) {
+        return `repetition ${batch.repetition} direct control recorded speculative activity`;
+      }
       if (spec.acceptedTokens > spec.draftTokens) return `repetition ${batch.repetition} accepted tokens exceed drafted tokens`;
       const expectedAcceptance = spec.draftTokens === 0 ? null : spec.acceptedTokens / spec.draftTokens;
       if (expectedAcceptance === null ? spec.acceptanceRate !== null : spec.acceptanceRate === null || !closeEnough(spec.acceptanceRate, expectedAcceptance)) {

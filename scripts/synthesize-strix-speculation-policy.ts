@@ -20,6 +20,7 @@ interface Dependencies {
 
 export interface ArtifactPairFileOps {
   exists: (path: string) => boolean;
+  read: (path: string) => string;
   mkdir: (path: string) => void;
   writeExclusive: (path: string, content: string) => void;
   rename: (from: string, to: string) => void;
@@ -28,6 +29,7 @@ export interface ArtifactPairFileOps {
 
 const DEFAULT_PAIR_OPS: ArtifactPairFileOps = {
   exists: existsSync,
+  read: (path) => readFileSync(path, "utf8"),
   mkdir: (path) => mkdirSync(path, { recursive: true }),
   writeExclusive: (path, content) => writeFileSync(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 }),
   rename: renameSync,
@@ -57,6 +59,8 @@ export function writeArtifactPair(
   let backedUpMarkdown = false;
   let publishedJson = false;
   let publishedMarkdown = false;
+  const originalJson = ops.exists(jsonPath) ? ops.read(jsonPath) : null;
+  const originalMarkdown = ops.exists(markdownPath) ? ops.read(markdownPath) : null;
   try {
     temporaryJson = stagedWrite(jsonPath, json, ops);
     temporaryMarkdown = stagedWrite(markdownPath, markdown, ops);
@@ -75,21 +79,35 @@ export function writeArtifactPair(
     temporaryJson = null;
     publishedJson = true;
   } catch (error) {
+    const rollbackErrors: unknown[] = [];
     for (const path of [temporaryJson, temporaryMarkdown]) {
       if (path === null) continue;
-      try { ops.unlink(path); } catch { /* Best-effort rollback. */ }
+      try { ops.unlink(path); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (publishedJson) {
-      try { ops.unlink(jsonPath); } catch { /* Best-effort rollback. */ }
+      try { ops.unlink(jsonPath); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (publishedMarkdown) {
-      try { ops.unlink(markdownPath); } catch { /* Best-effort rollback. */ }
+      try { ops.unlink(markdownPath); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (backedUpJson) {
-      try { ops.rename(backupJson, jsonPath); } catch { /* Preserve original failure. */ }
+      try { ops.rename(backupJson, jsonPath); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (backedUpMarkdown) {
-      try { ops.rename(backupMarkdown, markdownPath); } catch { /* Preserve original failure. */ }
+      try { ops.rename(backupMarkdown, markdownPath); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    for (const [path, expected] of [[jsonPath, originalJson], [markdownPath, originalMarkdown]] as const) {
+      try {
+        const present = ops.exists(path);
+        if (expected === null ? present : !present || ops.read(path) !== expected) {
+          rollbackErrors.push(new Error(`rollback verification failed for ${path}`));
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError([error, ...rollbackErrors], "policy artifact publication failed and rollback was incomplete");
     }
     throw error;
   }

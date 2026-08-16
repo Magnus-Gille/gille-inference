@@ -132,25 +132,50 @@ const SPECULATION_VALUE_FLAGS = new Set([
   "--spec-draft-p-split",
 ]);
 
-export function hashServerArgsInvariant(procArgs: Buffer): string {
+interface ObservedSpeculationArgs {
+  invariantSha256: string;
+  speculation: string | null;
+  draftDepth: number | null;
+}
+
+function analyzeServerArgs(procArgs: Buffer): ObservedSpeculationArgs {
   const argv = procArgs.toString("utf8").split("\0");
   if (argv.at(-1) === "") argv.pop();
   const invariant: string[] = [];
+  const speculationValues = new Map<string, string>();
   for (let index = 0; index < argv.length; index++) {
     const token = argv[index]!;
     const inlineFlag = [...SPECULATION_VALUE_FLAGS].find((flag) => token.startsWith(`${flag}=`));
-    if (inlineFlag !== undefined) continue;
-    if (SPECULATION_VALUE_FLAGS.has(token)) {
-      if (argv[index + 1] === undefined || argv[index + 1]!.startsWith("--")) {
-        throw new Error(`speculation argument requires a value: ${token}`);
+    const flag = inlineFlag ?? (SPECULATION_VALUE_FLAGS.has(token) ? token : null);
+    if (flag !== null) {
+      if (speculationValues.has(flag)) throw new Error(`duplicate speculation argument: ${flag}`);
+      const value = inlineFlag === undefined ? argv[index + 1] : token.slice(flag.length + 1);
+      if (value === undefined || value === "" || (inlineFlag === undefined && value.startsWith("--"))) {
+        throw new Error(`speculation argument requires a value: ${flag}`);
       }
-      index++;
+      speculationValues.set(flag, value);
+      if (inlineFlag === undefined) index++;
       continue;
     }
     if (token.startsWith("--spec-")) throw new Error(`unsupported speculation argument: ${token}`);
     invariant.push(token);
   }
-  return createHash("sha256").update(JSON.stringify(invariant)).digest("hex");
+  const depthFlags = ["--spec-draft-n", "--spec-draft-n-max"].filter((flag) => speculationValues.has(flag));
+  if (depthFlags.length > 1) throw new Error(`ambiguous speculation draft depth flags: ${depthFlags.join(", ")}`);
+  const rawDepth = depthFlags.length === 0 ? null : speculationValues.get(depthFlags[0]!)!;
+  const draftDepth = rawDepth === null ? null : Number(rawDepth);
+  if (draftDepth !== null && (!Number.isSafeInteger(draftDepth) || draftDepth <= 0)) {
+    throw new Error("captured speculation draft depth must be a positive integer");
+  }
+  return {
+    invariantSha256: createHash("sha256").update(JSON.stringify(invariant)).digest("hex"),
+    speculation: speculationValues.get("--spec-type") ?? null,
+    draftDepth,
+  };
+}
+
+export function hashServerArgsInvariant(procArgs: Buffer): string {
+  return analyzeServerArgs(procArgs).invariantSha256;
 }
 
 function commandVersion(command: string, args: string[], pattern: RegExp): string | null {
@@ -196,13 +221,23 @@ export async function runCaptureStrixProvenance(argv: string[], deps: Dependenci
     const runtimeBinary = deps.readProcExe(args.pid);
     const procArgs = deps.readProcArgs(args.pid);
     if (procArgs.byteLength === 0) throw new Error("server process has an empty command line");
+    const observedSpeculation = analyzeServerArgs(procArgs);
+    const declaredDirect = args.speculation === "none" && args.draftDepth === null;
+    const observedDirect = (observedSpeculation.speculation === null || observedSpeculation.speculation === "none") &&
+      observedSpeculation.draftDepth === null;
+    if (declaredDirect !== observedDirect || (!declaredDirect && args.speculation !== observedSpeculation.speculation)) {
+      throw new Error("declared speculation mode does not match the captured process argv");
+    }
+    if (args.draftDepth !== observedSpeculation.draftDepth) {
+      throw new Error("declared draft depth does not match the captured process argv");
+    }
     const provenance: StrixServerProvenance = validateServerProvenance({
       schemaVersion: 1,
       modelArtifactSha256: await deps.hashFile(args.modelArtifact),
       runtimeCommit: args.runtimeCommit,
       runtimeBinarySha256: await deps.hashFile(runtimeBinary),
       serverArgsSha256: createHash("sha256").update(procArgs).digest("hex"),
-      serverArgsInvariantSha256: hashServerArgsInvariant(procArgs),
+      serverArgsInvariantSha256: observedSpeculation.invariantSha256,
       backend: args.backend,
       quant: args.quant,
       kernel: deps.kernel(),

@@ -224,9 +224,12 @@ result schema; there is no production state to restore.
 
 ## Verification
 
-- focused Strix benchmark, comparator, integrity, and policy tests: 82/82 passed;
+- focused final speculation-policy, provenance, comparator, and publication tests: 23/23 passed;
 - TypeScript and constitutional typechecks: passed;
-- full repository suite: 286 files, 4,295 tests passed (including the long-generation and paired-output gates);
+- last clean repository-wide run before the final review hardening: 286 files, 4,298 tests passed;
+- final hardening delta: 23/23 focused tests and both typechecks passed; the three unrelated
+  process-heavy files that hit five-second timeouts under parallel load passed strictly isolated
+  (15/15, 42/42, and 17/17);
 - Bash syntax and `git diff --check`: passed;
 - direct recorder CLI smoke: passed with mode-0600 raw and summary files.
 

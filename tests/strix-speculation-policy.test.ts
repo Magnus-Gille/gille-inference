@@ -282,6 +282,18 @@ describe("Strix speculation policy synthesis", () => {
       directRequests: 2,
     });
     expect(policy.cells[0]?.reason).toMatch(/direct evidence is insufficient/i);
+
+    const speculativeDirect = report("none", null, [100]);
+    speculativeDirect.batches[0]!.speculation = {
+      draftTokens: 10, acceptedTokens: 5, verificationSteps: 1, acceptanceRate: 0.5,
+    };
+    const speculativeDirectPolicy = synthesizeStrixSpeculationPolicy(
+      speculativeDirect,
+      [report("draft-mtp", 1, [120])],
+      0.03,
+    );
+    expect(speculativeDirectPolicy.cells[0]).toMatchObject({ selection: "direct", evidenceSufficient: false });
+    expect(speculativeDirectPolicy.cells[0]?.reason).toMatch(/direct.*speculative activity/i);
   });
 
   it("rejects a non-direct control and uncontrolled candidate changes", () => {

@@ -285,8 +285,8 @@ direct report and every candidate depth against the identical fixture matrix. Th
 quality non-inferiority, observable draft acceptance, and a measured useful-completions/minute gain
 above the explicit margin. It selects the best qualifying depth independently per measured cell and
 uses direct decoding everywhere else. Policy output paths are canonicalized so they cannot alias an
-input report, and the JSON/Markdown pair rolls back to its previous pair if either publication step
-fails:
+input report. If either JSON/Markdown publication step fails, the writer restores and verifies the
+previous pair; an incomplete rollback is surfaced as a separate hard failure:
 
 ```bash
 npm run benchmark:strix-spec-policy -- \
