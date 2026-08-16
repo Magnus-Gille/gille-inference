@@ -119,12 +119,16 @@ hardware run must capture direct, depth-1, depth-2, and any deeper supported arm
 agent fixtures and concurrency matrix before a policy can be synthesized for production review.
 
 That capture path is now executable rather than an operator assembly exercise. A fail-closed
-maintenance child validates the exact runtime/Vulkan/model/mmproj/fixture hashes before unload,
+maintenance child validates the exact runtime/Vulkan/model/mmproj/fixture hashes before unload and
+again after restoration before complete evidence can be published,
 requires the configured binary's `--version` to prove the pinned commit, and Latin-rotates direct
 plus every declared MTP depth across all execution positions. It records one raw report per
-arm/cycle, restores exact prior llama-swap residency even on failure, merges cycles into paired
-repetitions, and synthesizes the lossless policy automatically. Signals and a bounded runtime stop
-the active server without bypassing restoration. The output remains
+arm/cycle, restores and verifies the prior ready model identity even on failure (without claiming
+TTL preservation), merges cycles into paired repetitions, and synthesizes the lossless policy
+automatically. Signals and the bounded runtime abort in-flight requests and escalate a stuck server
+from SIGTERM to SIGKILL without bypassing restoration. A fresh output directory and explicit
+incomplete receipt prevent stale partial runs from masquerading as complete evidence. The output
+remains
 `not-authorized-by-evidence`; no production route or runtime is mutated.
 
 **Local A/B result: not run.** No raw direct/MTP report for the exact Qwen3.8 production artifact

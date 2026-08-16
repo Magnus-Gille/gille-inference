@@ -5,7 +5,10 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { preflightStrixSpeculationArtifacts } from "../scripts/strix-speculation-experiment.js";
+import {
+  preflightStrixSpeculationArtifacts,
+  prepareFreshStrixOutputDirectory,
+} from "../scripts/strix-speculation-experiment.js";
 
 import {
   buildStrixSpeculationRunPlans,
@@ -37,6 +40,8 @@ function fixture(): Record<string, unknown> {
     server: {
       port: 5919,
       backend: "vulkan",
+      device: "Vulkan0",
+      gpuLayers: 999,
       contextSize: 65_536,
       kvTypeK: "q8_0",
       kvTypeV: "q8_0",
@@ -47,8 +52,8 @@ function fixture(): Record<string, unknown> {
       cacheRamMiB: 2_048,
       contextCheckpoints: 32,
       checkpointMinStep: 8_192,
-      cacheIdleSlots: "off",
-      commonArgs: ["-ngl", "999", "--jinja", "--reasoning-format", "auto", "--reasoning", "auto"],
+      cacheIdleSlots: "on",
+      commonArgs: ["--jinja", "--reasoning-format", "auto", "--reasoning", "auto"],
     },
     benchmark: {
       fixturesPath: "/experiment/strix-agent-fixtures.json",
@@ -86,7 +91,7 @@ function cycleReport(serverArgsSha256: string, speculation: "none" | "draft-mtp"
       kernel: "test", mesaVersion: "test", rocmVersion: null, contextSize: 65_536,
       kvTypeK: "q8_0", kvTypeV: "q8_0", flashAttention: "on", batch: 2_048,
       ubatch: 512, parallelism: 1, speculation, draftDepth, cacheRamMiB: 2_048,
-      contextCheckpoints: 32, checkpointMinStep: 8_192, cacheIdleSlots: "off",
+      contextCheckpoints: 32, checkpointMinStep: 8_192, cacheIdleSlots: "on",
     },
     configuration: { concurrency: [1], repetitions: 1, maxTokens: 128, timeoutMs: 300_000, metricsEnabled: true },
     batches: [batch],
@@ -120,14 +125,40 @@ describe("Strix speculation experiment contract", () => {
       raw.benchmark.fixturesPath = files.fixtures; raw.benchmark.fixturesSha256 = digest("fixtures");
       const config = validateStrixSpeculationExperimentConfig(raw);
       await expect(preflightStrixSpeculationArtifacts(config, {
-        version: () => `llama.cpp ${config.runtime.commit.slice(0, 8)}`,
+        version: () => `llama.cpp ${config.runtime.commit}`,
+        devices: () => "Vulkan0: AMD Radeon 8060S (Vulkan)",
         kernel: () => "test-kernel", mesa: () => "test-mesa", rocm: () => null,
       })).resolves.toMatchObject({ hashes: { model: digest("model"), fixtures: digest("fixtures") }, kernel: "test-kernel" });
       raw.model.artifactSha256 = "0".repeat(64);
       await expect(preflightStrixSpeculationArtifacts(validateStrixSpeculationExperimentConfig(raw), {
-        version: () => `llama.cpp ${config.runtime.commit.slice(0, 8)}`,
+        version: () => `llama.cpp ${config.runtime.commit}`,
+        devices: () => "Vulkan0: AMD Radeon 8060S (Vulkan)",
         kernel: () => "test", mesa: () => null, rocm: () => null,
       })).rejects.toThrow(/model hash differs/i);
+      raw.model.artifactSha256 = digest("model");
+      await expect(preflightStrixSpeculationArtifacts(validateStrixSpeculationExperimentConfig(raw), {
+        version: () => `llama.cpp ${config.runtime.commit.slice(0, 8)}`,
+        devices: () => "Vulkan0: AMD Radeon 8060S (Vulkan)",
+        kernel: () => "test", mesa: () => null, rocm: () => null,
+      })).rejects.toThrow(/immutable commit/i);
+      await expect(preflightStrixSpeculationArtifacts(validateStrixSpeculationExperimentConfig(raw), {
+        version: () => `llama.cpp ${config.runtime.commit}`,
+        devices: () => "CPU",
+        kernel: () => "test", mesa: () => null, rocm: () => null,
+      })).rejects.toThrow(/Vulkan device/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires a fresh output directory so stale arm artifacts cannot be reused", () => {
+    const root = mkdtempSync(join(tmpdir(), "strix-spec-output-"));
+    try {
+      const fresh = join(root, "fresh");
+      expect(prepareFreshStrixOutputDirectory(fresh)).toBe(fresh);
+      expect(() => prepareFreshStrixOutputDirectory(fresh)).not.toThrow();
+      writeFileSync(join(fresh, "stale.json"), "{}\n");
+      expect(() => prepareFreshStrixOutputDirectory(fresh)).toThrow(/must be empty/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -163,6 +194,7 @@ describe("Strix speculation experiment contract", () => {
     expect(depthOne.serverArgv.slice(depthOne.serverArgv.indexOf("--spec-draft-n-max"))).toEqual(["--spec-draft-n-max", "1"]);
     expect(depthOne.serverArgv).toEqual(expect.arrayContaining([
       "--host", "127.0.0.1", "--port", "5919", "-m", config.model.path,
+      "--device", "Vulkan0", "-ngl", "999",
       "-mm", config.model.mmprojPath!, "-c", "65536", "-ctk", "q8_0", "-ctv", "q8_0",
       "-fa", "on", "-b", "2048", "-ub", "512", "-np", "1", "--cache-ram", "2048", "--metrics",
     ]));
@@ -177,6 +209,10 @@ describe("Strix speculation experiment contract", () => {
       return copy;
     };
     expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => copy.server.commonArgs.push("--spec-type", "draft-mtp")))).toThrow(/controlled.*spec-type/i);
+    expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => copy.server.commonArgs.push("--device", "CPU")))).toThrow(/controlled.*device/i);
+    expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => { copy.server.device = "CPU"; }))).toThrow(/Vulkan0/i);
+    expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => { copy.server.device = "Vulkan1"; }))).toThrow(/Vulkan0/i);
+    expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => { copy.server.cacheIdleSlots = "off"; }))).toThrow(/cacheIdleSlots must be on/i);
     expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => { copy.benchmark.speculativeDepths = [2, 1]; }))).toThrow(/strictly increasing/i);
     expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => { copy.benchmark.speculativeDepths = [1]; }))).toThrow(/at least two/i);
     expect(() => validateStrixSpeculationExperimentConfig(mutate((copy) => { copy.model.path = "relative.gguf"; }))).toThrow(/absolute/i);
@@ -200,7 +236,7 @@ describe("Strix speculation experiment contract", () => {
     expect(() => parseStrixSpeculationExperimentArgs(argv.map((value) => value === "7200" ? "0" : value))).toThrow(/max-runtime/i);
   });
 
-  it("runs every balanced arm, restores exact residency, and never authorizes deployment", async () => {
+  it("runs every balanced arm, restores the ready model identity, and never authorizes deployment", async () => {
     const config = validateStrixSpeculationExperimentConfig(fixture());
     const args = parseStrixSpeculationExperimentArgs([
       "--config", "config.json", "--out-dir", "/evidence",
@@ -260,6 +296,11 @@ describe("Strix speculation experiment contract", () => {
     expect(() => mergeStrixSpeculationCycleReports(config, arm, [
       { cycle: 0, armId: arm.id, report }, { cycle: 1, armId: arm.id, report: bad }, { cycle: 2, armId: arm.id, report },
     ])).toThrow(/controlled.*provenance/i);
+    const wrongFixture = structuredClone(report) as any;
+    wrongFixture.fixtureSha256 = "7".repeat(64);
+    expect(() => mergeStrixSpeculationCycleReports(config, arm, [0, 1, 2].map((cycle) => ({
+      cycle, armId: arm.id, report: wrongFixture,
+    })))).toThrow(/fixture digest/i);
   });
 
   it("restores on an arm failure and reports a simultaneous restoration failure", async () => {
@@ -283,5 +324,46 @@ describe("Strix speculation experiment contract", () => {
       ...dependencies,
       restore: async () => { throw new Error("restore failed"); },
     })).rejects.toThrow(/both failed/i);
+  });
+
+  it("rejects non-ready residency instead of claiming it can be restored exactly", async () => {
+    const config = validateStrixSpeculationExperimentConfig(fixture());
+    const args = parseStrixSpeculationExperimentArgs([
+      "--config", "config.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "qwen38-27b", "--max-runtime-seconds", "7200",
+      "--ack-exclusive-window",
+    ]);
+    await expect(executeStrixSpeculationExperiment(config, args, {
+      snapshot: async () => [{ model: "qwen38-27b", state: "loading", ttl: 1800 }],
+      unload: async () => {},
+      runArm: async () => { throw new Error("must not run"); },
+      restore: async () => {},
+      interruptedBy: () => null,
+    })).rejects.toThrow(/ready-only/i);
+  });
+
+  it("fails closed when a deadline lands during final residency verification", async () => {
+    const config = validateStrixSpeculationExperimentConfig(fixture());
+    const args = parseStrixSpeculationExperimentArgs([
+      "--config", "config.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "qwen38-27b", "--max-runtime-seconds", "7200",
+      "--ack-exclusive-window",
+    ]);
+    let snapshots = 0;
+    let interrupted: string | null = null;
+    await expect(executeStrixSpeculationExperiment(config, args, {
+      snapshot: async () => {
+        snapshots++;
+        if (snapshots === 2) interrupted = "deadline";
+        return [{ model: "qwen38-27b", state: "ready", ttl: 1800 }];
+      },
+      unload: async () => {},
+      runArm: async (plan) => ({
+        cycle: plan.cycle, position: plan.position, sequence: plan.sequence,
+        armId: plan.arm.id, reportPath: `${plan.outPrefix}.json`,
+      }),
+      restore: async () => {},
+      interruptedBy: () => interrupted,
+    })).rejects.toThrow(/interrupted by deadline/i);
   });
 });

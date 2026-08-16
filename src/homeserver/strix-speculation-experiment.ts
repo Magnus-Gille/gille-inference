@@ -45,6 +45,8 @@ export interface StrixSpeculationExperimentConfig {
   server: {
     port: number;
     backend: "vulkan";
+    device: "Vulkan0";
+    gpuLayers: number;
     contextSize: number;
     kvTypeK: string;
     kvTypeV: string;
@@ -130,6 +132,8 @@ const COMMIT_RE = /^[a-f0-9]{40}$/;
 const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._+:/-]*$/;
 const CONTROLLED_FLAGS = new Set([
   "-m", "--model", "-mm", "--mmproj", "--host", "--port", "--metrics",
+  "--device", "-ngl", "--gpu-layers", "--n-gpu-layers", "--main-gpu",
+  "--split-mode", "--tensor-split", "--no-kv-offload", "--rpc", "--rpc-server-host",
   "-c", "--ctx-size", "-ctk", "--cache-type-k", "-ctv", "--cache-type-v",
   "-fa", "--flash-attn", "-b", "--batch-size", "-ub", "--ubatch-size",
   "-np", "--parallel", "--cache-ram", "--spec-type", "--spec-draft-n-max",
@@ -165,6 +169,14 @@ function positiveInteger(record: Record<string, unknown>, key: string, label: st
   const value = record[key];
   if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > maximum) {
     throw new Error(`${label}.${key} must be a positive integer at most ${maximum}`);
+  }
+  return value as number;
+}
+
+function nonNegativeInteger(record: Record<string, unknown>, key: string, label: string, maximum: number): number {
+  const value = record[key];
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > maximum) {
+    throw new Error(`${label}.${key} must be a non-negative integer at most ${maximum}`);
   }
   return value as number;
 }
@@ -245,14 +257,20 @@ export function validateStrixSpeculationExperimentConfig(value: unknown): StrixS
   const port = positiveInteger(server, "port", "server", 65_535);
   if (port < 1_024) throw new Error("server.port must be at least 1024");
   if (server["backend"] !== "vulkan") throw new Error("server.backend must be vulkan for this Strix reference experiment");
+  const device = boundedString(server, "device", "server", 32);
+  if (device !== "Vulkan0") throw new Error("server.device must be Vulkan0 to match the isolated child visibility");
   if (server["flashAttention"] !== "on") throw new Error("server.flashAttention must be on");
   if (server["parallelism"] !== 1) throw new Error("server.parallelism must be exactly 1 for native MTP qualification");
-  const rawCacheIdleSlots = server["cacheIdleSlots"];
-  if (rawCacheIdleSlots !== "on" && rawCacheIdleSlots !== "off") throw new Error("server.cacheIdleSlots must be on or off");
-  const cacheIdleSlots: "on" | "off" = rawCacheIdleSlots;
+  const cacheRamMiB = nonNegativeInteger(server, "cacheRamMiB", "server", 1_048_576);
+  const cacheIdleSlots = cacheRamMiB === 0 ? "off" as const : "on" as const;
+  if (server["cacheIdleSlots"] !== cacheIdleSlots) {
+    throw new Error(`server.cacheIdleSlots must be ${cacheIdleSlots} when server.cacheRamMiB is ${cacheRamMiB}`);
+  }
   const parsedServer = {
     port,
     backend: "vulkan" as const,
+    device: "Vulkan0" as const,
+    gpuLayers: positiveInteger(server, "gpuLayers", "server", 100_000),
     contextSize: positiveInteger(server, "contextSize", "server", 1_048_576),
     kvTypeK: boundedString(server, "kvTypeK", "server", 40),
     kvTypeV: boundedString(server, "kvTypeV", "server", 40),
@@ -260,7 +278,7 @@ export function validateStrixSpeculationExperimentConfig(value: unknown): StrixS
     batch: positiveInteger(server, "batch", "server", 65_536),
     ubatch: positiveInteger(server, "ubatch", "server", 65_536),
     parallelism: 1 as const,
-    cacheRamMiB: positiveInteger(server, "cacheRamMiB", "server", 1_048_576),
+    cacheRamMiB,
     contextCheckpoints: positiveInteger(server, "contextCheckpoints", "server", 1_024),
     checkpointMinStep: positiveInteger(server, "checkpointMinStep", "server", 1_048_576),
     cacheIdleSlots,
@@ -382,6 +400,8 @@ function serverArgv(config: StrixSpeculationExperimentConfig, arm: StrixSpeculat
   ];
   if (config.model.mmprojPath !== null) argv.push("-mm", config.model.mmprojPath);
   argv.push(
+    "--device", config.server.device,
+    "-ngl", String(config.server.gpuLayers),
     "-c", String(config.server.contextSize),
     "-ctk", config.server.kvTypeK, "-ctv", config.server.kvTypeV,
     "-fa", config.server.flashAttention,
@@ -444,10 +464,11 @@ export function mergeStrixSpeculationCycleReports(
     if (item.armId !== arm.id) throw new Error(`${arm.id} report contains evidence for ${item.armId}`);
     const raw = reportObject(item.report, `${arm.id}[${cycle}]`);
     const comparable = validateComparableServerReport(raw, `${arm.id}[${cycle}]`);
-    if (comparable.provenance.serverArgsSha256 !== expectedArgvSha ||
+    if (comparable.fixtureSha256 !== config.benchmark.fixturesSha256 ||
+        comparable.provenance.serverArgsSha256 !== expectedArgvSha ||
         comparable.provenance.speculation !== arm.speculation ||
         comparable.provenance.draftDepth !== arm.draftDepth) {
-      throw new Error(`${arm.id} report provenance does not match its reviewed arm`);
+      throw new Error(`${arm.id} report provenance or fixture digest does not match its reviewed arm`);
     }
     if (canonical !== null && (
       comparable.model !== canonical.model || comparable.fixtureSha256 !== canonical.fixtureSha256 ||
@@ -495,7 +516,7 @@ export function mergeStrixSpeculationCycleReports(
 }
 
 function assertExpectedResidency(snapshot: StrixResidentEntry[], expected: string | null): void {
-  if (snapshot.some((entry) => entry.state === "starting")) throw new Error("llama-swap residency is not stable");
+  if (snapshot.some((entry) => entry.state !== "ready")) throw new Error("llama-swap residency is not stable and ready-only");
   const ready = snapshot.filter((entry) => entry.state === "ready");
   if (ready.length > 1) throw new Error("more than one ready model violates the serial-GPU restore contract");
   const observed = ready[0]?.model ?? null;
@@ -539,6 +560,8 @@ export async function executeStrixSpeculationExperiment(
 
   const finalResidency = await dependencies.snapshot();
   assertExpectedResidency(finalResidency, args.expectedResidentModel);
+  const finalSignal = dependencies.interruptedBy();
+  if (finalSignal !== null) throw new Error(`speculation experiment interrupted by ${finalSignal}`);
   return {
     runs,
     initialResidency,
