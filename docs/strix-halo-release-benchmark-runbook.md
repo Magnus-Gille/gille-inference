@@ -224,7 +224,9 @@ responses at 1, 2, 4, and 8 concurrent requests.
 
 First capture the already-running server's immutable provenance. The process id and every serving
 field must be explicit; the command hashes the model artifact, running executable, and raw process
-argv but stores neither paths nor argv contents:
+argv but stores neither paths nor argv contents. It also records a second argv hash after removing
+only the allow-listed native-speculation flags. Speculation comparisons require this invariant hash
+to match, so an unrelated server-argument change fails closed:
 
 ```bash
 npm run benchmark:strix-provenance -- \
@@ -282,7 +284,9 @@ For speculation, synthesize a fail-closed workload/concurrency policy only after
 direct report and every candidate depth against the identical fixture matrix. The policy requires
 quality non-inferiority, observable draft acceptance, and a measured useful-completions/minute gain
 above the explicit margin. It selects the best qualifying depth independently per measured cell and
-uses direct decoding everywhere else:
+uses direct decoding everywhere else. Policy output paths are canonicalized so they cannot alias an
+input report, and the JSON/Markdown pair rolls back to its previous pair if either publication step
+fails:
 
 ```bash
 npm run benchmark:strix-spec-policy -- \

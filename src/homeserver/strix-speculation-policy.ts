@@ -72,6 +72,7 @@ export function parseStrixSpeculationPolicyArgs(argv: string[]): StrixSpeculatio
   let minimumUsefulWorkGain = 0.03;
   let minimumBatches = 3;
   let outPrefix: string | null = null;
+  const scalarFlags = new Set<string>();
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index]!;
     const next = (): string => {
@@ -79,6 +80,10 @@ export function parseStrixSpeculationPolicyArgs(argv: string[]): StrixSpeculatio
       index++;
       return value;
     };
+    if (flag !== "--candidate") {
+      if (scalarFlags.has(flag)) throw new Error(`duplicate argument: ${flag}`);
+      scalarFlags.add(flag);
+    }
     if (flag === "--direct") directPath = next();
     else if (flag === "--candidate") candidatePaths.push(next());
     else if (flag === "--min-gain-percent") minimumUsefulWorkGain = percentage(next());
@@ -190,9 +195,9 @@ function parsePolicyBatches(raw: unknown, label: string): Map<string, PolicyBatc
         throw new Error(`${label}.batches[${index}].speculation.acceptanceRate must be finite or null`);
       }
       speculation = {
-        draftTokens: finiteNumber(spec["draftTokens"], `${label}.batches[${index}].speculation.draftTokens`),
-        acceptedTokens: finiteNumber(spec["acceptedTokens"], `${label}.batches[${index}].speculation.acceptedTokens`),
-        verificationSteps: finiteNumber(spec["verificationSteps"], `${label}.batches[${index}].speculation.verificationSteps`),
+        draftTokens: integer(spec["draftTokens"], `${label}.batches[${index}].speculation.draftTokens`),
+        acceptedTokens: integer(spec["acceptedTokens"], `${label}.batches[${index}].speculation.acceptedTokens`),
+        verificationSteps: integer(spec["verificationSteps"], `${label}.batches[${index}].speculation.verificationSteps`),
         acceptanceRate,
       };
     }

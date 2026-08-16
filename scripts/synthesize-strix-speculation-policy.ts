@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -12,26 +12,113 @@ import {
 
 interface Dependencies {
   readFile: (path: string) => string;
-  write: (path: string, content: string) => void;
+  writePair: (jsonPath: string, json: string, markdownPath: string, markdown: string) => void;
+  canonicalPath: (path: string) => string;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
 }
 
-function atomicWrite(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true });
+export interface ArtifactPairFileOps {
+  exists: (path: string) => boolean;
+  mkdir: (path: string) => void;
+  writeExclusive: (path: string, content: string) => void;
+  rename: (from: string, to: string) => void;
+  unlink: (path: string) => void;
+}
+
+const DEFAULT_PAIR_OPS: ArtifactPairFileOps = {
+  exists: existsSync,
+  mkdir: (path) => mkdirSync(path, { recursive: true }),
+  writeExclusive: (path, content) => writeFileSync(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 }),
+  rename: renameSync,
+  unlink: unlinkSync,
+};
+
+function stagedWrite(path: string, content: string, ops: ArtifactPairFileOps): string {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  ops.writeExclusive(temporary, content);
+  return temporary;
+}
+
+export function writeArtifactPair(
+  jsonPath: string,
+  json: string,
+  markdownPath: string,
+  markdown: string,
+  ops: ArtifactPairFileOps = DEFAULT_PAIR_OPS
+): void {
+  if (dirname(jsonPath) !== dirname(markdownPath)) throw new Error("policy artifacts must share a directory");
+  ops.mkdir(dirname(jsonPath));
+  let temporaryJson: string | null = null;
+  let temporaryMarkdown: string | null = null;
+  const backupJson = `${jsonPath}.${process.pid}.${randomUUID()}.bak`;
+  const backupMarkdown = `${markdownPath}.${process.pid}.${randomUUID()}.bak`;
+  let backedUpJson = false;
+  let backedUpMarkdown = false;
+  let publishedJson = false;
+  let publishedMarkdown = false;
   try {
-    writeFileSync(temporary, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    renameSync(temporary, path);
+    temporaryJson = stagedWrite(jsonPath, json, ops);
+    temporaryMarkdown = stagedWrite(markdownPath, markdown, ops);
+    if (ops.exists(jsonPath)) {
+      ops.rename(jsonPath, backupJson);
+      backedUpJson = true;
+    }
+    if (ops.exists(markdownPath)) {
+      ops.rename(markdownPath, backupMarkdown);
+      backedUpMarkdown = true;
+    }
+    ops.rename(temporaryMarkdown, markdownPath);
+    temporaryMarkdown = null;
+    publishedMarkdown = true;
+    ops.rename(temporaryJson, jsonPath);
+    temporaryJson = null;
+    publishedJson = true;
   } catch (error) {
-    try { unlinkSync(temporary); } catch { /* Preserve original failure. */ }
+    for (const path of [temporaryJson, temporaryMarkdown]) {
+      if (path === null) continue;
+      try { ops.unlink(path); } catch { /* Best-effort rollback. */ }
+    }
+    if (publishedJson) {
+      try { ops.unlink(jsonPath); } catch { /* Best-effort rollback. */ }
+    }
+    if (publishedMarkdown) {
+      try { ops.unlink(markdownPath); } catch { /* Best-effort rollback. */ }
+    }
+    if (backedUpJson) {
+      try { ops.rename(backupJson, jsonPath); } catch { /* Preserve original failure. */ }
+    }
+    if (backedUpMarkdown) {
+      try { ops.rename(backupMarkdown, markdownPath); } catch { /* Preserve original failure. */ }
+    }
     throw error;
   }
+  if (backedUpJson) {
+    try { ops.unlink(backupJson); } catch { /* The published pair is authoritative. */ }
+  }
+  if (backedUpMarkdown) {
+    try { ops.unlink(backupMarkdown); } catch { /* The published pair is authoritative. */ }
+  }
+}
+
+export function canonicalProspectivePath(path: string): string {
+  const resolved = resolve(path);
+  if (existsSync(resolved)) return realpathSync.native(resolved);
+  const suffix = [basename(resolved)];
+  let ancestor = dirname(resolved);
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) throw new Error(`cannot resolve output path: ${path}`);
+    suffix.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  return join(realpathSync.native(ancestor), ...suffix);
 }
 
 const DEFAULT_DEPS: Dependencies = {
   readFile: (path) => readFileSync(path, "utf8"),
-  write: atomicWrite,
+  writePair: writeArtifactPair,
+  canonicalPath: canonicalProspectivePath,
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
 };
@@ -39,14 +126,22 @@ const DEFAULT_DEPS: Dependencies = {
 export function runStrixSpeculationPolicySynthesis(argv: string[], deps: Dependencies = DEFAULT_DEPS): number {
   try {
     const args = parseStrixSpeculationPolicyArgs(argv);
-    const direct = JSON.parse(deps.readFile(args.directPath)) as unknown;
-    const candidates = args.candidatePaths.map((path) => JSON.parse(deps.readFile(path)) as unknown);
-    const policy = synthesizeStrixSpeculationPolicy(direct, candidates, args.minimumUsefulWorkGain, args.minimumBatches);
     const prefix = resolve(args.outPrefix);
     const jsonPath = `${prefix}.json`;
     const markdownPath = `${prefix}.md`;
-    deps.write(jsonPath, `${JSON.stringify(policy, null, 2)}\n`);
-    deps.write(markdownPath, renderStrixSpeculationPolicyMarkdown(policy));
+    const inputPaths = [args.directPath, ...args.candidatePaths].map(deps.canonicalPath);
+    if ([jsonPath, markdownPath].map(deps.canonicalPath).some((path) => inputPaths.includes(path))) {
+      throw new Error("output artifacts must not overwrite input evidence");
+    }
+    const direct = JSON.parse(deps.readFile(args.directPath)) as unknown;
+    const candidates = args.candidatePaths.map((path) => JSON.parse(deps.readFile(path)) as unknown);
+    const policy = synthesizeStrixSpeculationPolicy(direct, candidates, args.minimumUsefulWorkGain, args.minimumBatches);
+    deps.writePair(
+      jsonPath,
+      `${JSON.stringify(policy, null, 2)}\n`,
+      markdownPath,
+      renderStrixSpeculationPolicyMarkdown(policy)
+    );
     deps.stdout(JSON.stringify({
       status: "complete",
       jsonPath,

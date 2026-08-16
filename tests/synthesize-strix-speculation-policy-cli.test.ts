@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { runStrixSpeculationPolicySynthesis } from "../scripts/synthesize-strix-speculation-policy.js";
+import {
+  runStrixSpeculationPolicySynthesis,
+  writeArtifactPair,
+} from "../scripts/synthesize-strix-speculation-policy.js";
 
 const provenance = {
   schemaVersion: 1,
   modelArtifactSha256: "a".repeat(64), runtimeCommit: "b".repeat(40),
   runtimeBinarySha256: "c".repeat(64), serverArgsSha256: "d".repeat(64),
+  serverArgsInvariantSha256: "9".repeat(64),
   backend: "vulkan", quant: "Q4_K_M", kernel: "6.14", mesaVersion: "25.2", rocmVersion: null,
   contextSize: 65536, kvTypeK: "q8_0", kvTypeV: "q8_0", flashAttention: "on",
   batch: 2048, ubatch: 512, parallelism: 1, speculation: "none", draftDepth: null,
@@ -41,22 +45,72 @@ describe("runStrixSpeculationPolicySynthesis", () => {
       })),
       summaries: [{ ...summary, aggregateTokensPerSecond: 100, predictedTokensPerSecond: 100, usefulCompletionsPerMinute: 75, acceptanceRate: 0.7 }],
     });
-    const write = vi.fn();
+    const writePair = vi.fn();
     const stdout = vi.fn();
     const exit = runStrixSpeculationPolicySynthesis([
       "--direct", "direct.json", "--candidate", "mtp2.json", "--min-batches", "3", "--out", "/tmp/policy",
     ], {
       readFile: (path) => path === "direct.json" ? direct : candidate,
-      write,
+      writePair,
+      canonicalPath: (path) => path,
       stdout,
       stderr: vi.fn(),
     });
 
     expect(exit).toBe(0);
-    expect(write).toHaveBeenCalledTimes(2);
-    expect(write.mock.calls[0]![1]).toContain('"selection": "speculative"');
-    expect(write.mock.calls[1]![1]).toContain("offline policy");
-    expect(write.mock.calls.map((call) => call[1]).join("\n")).not.toContain("a".repeat(64));
+    expect(writePair).toHaveBeenCalledTimes(1);
+    expect(writePair.mock.calls[0]![1]).toContain('"selection": "speculative"');
+    expect(writePair.mock.calls[0]![3]).toContain("offline policy");
+    expect(writePair.mock.calls[0]!.join("\n")).not.toContain("a".repeat(64));
     expect(stdout).toHaveBeenCalledWith(expect.stringContaining('"speculativeCells":1'));
+  });
+
+  it("refuses to overwrite input evidence through an output alias", () => {
+    const stderr = vi.fn();
+    const exit = runStrixSpeculationPolicySynthesis([
+      "--direct", "/evidence/direct.json", "--candidate", "/evidence/mtp.json", "--out", "/alias/direct",
+    ], {
+      readFile: vi.fn(),
+      writePair: vi.fn(),
+      canonicalPath: (path) => path.replace("/alias/", "/evidence/"),
+      stdout: vi.fn(),
+      stderr,
+    });
+
+    expect(exit).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/overwrite.*input evidence/i));
+  });
+
+  it("restores the prior JSON/Markdown pair when the second publication fails", () => {
+    const files = new Map<string, string>([["/out/policy.json", "old-json"], ["/out/policy.md", "old-md"]]);
+    let failJsonPublish = true;
+    const ops = {
+      exists: (path: string) => files.has(path),
+      mkdir: vi.fn(),
+      writeExclusive: (path: string, content: string) => {
+        if (files.has(path)) throw new Error("exists");
+        files.set(path, content);
+      },
+      rename: (from: string, to: string) => {
+        if (failJsonPublish && from.includes("policy.json") && from.endsWith(".tmp") && to === "/out/policy.json") {
+          failJsonPublish = false;
+          throw new Error("simulated second publication failure");
+        }
+        const value = files.get(from);
+        if (value === undefined) throw new Error(`missing source: ${from}`);
+        files.delete(from);
+        files.set(to, value);
+      },
+      unlink: (path: string) => {
+        if (!files.delete(path)) throw new Error(`missing file: ${path}`);
+      },
+    };
+
+    expect(() => writeArtifactPair(
+      "/out/policy.json", "new-json", "/out/policy.md", "new-md", ops
+    )).toThrow(/simulated second publication failure/i);
+    expect(files.get("/out/policy.json")).toBe("old-json");
+    expect(files.get("/out/policy.md")).toBe("old-md");
+    expect([...files.keys()].filter((path) => path.endsWith(".tmp") || path.endsWith(".bak"))).toEqual([]);
   });
 });

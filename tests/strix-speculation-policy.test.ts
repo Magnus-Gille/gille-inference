@@ -11,6 +11,7 @@ const baseProvenance = {
   runtimeCommit: "b".repeat(40),
   runtimeBinarySha256: "c".repeat(64),
   serverArgsSha256: "d".repeat(64),
+  serverArgsInvariantSha256: "9".repeat(64),
   backend: "vulkan" as const,
   quant: "Q4_K_M",
   kernel: "6.14.0",
@@ -132,6 +133,14 @@ describe("Strix speculation policy synthesis", () => {
       minimumBatches: 4,
       outPrefix: "policy",
     });
+
+    for (const duplicate of ["--direct", "--min-gain-percent", "--min-batches", "--out"]) {
+      const value = duplicate === "--min-gain-percent" ? "4" : duplicate === "--min-batches" ? "5" : "other";
+      const args = ["--direct", "direct.json", "--candidate", "mtp1.json", "--out", "policy"];
+      if (duplicate === "--direct" || duplicate === "--out") args.push(duplicate, value);
+      else args.push(duplicate, value, duplicate, value);
+      expect(() => parseStrixSpeculationPolicyArgs(args)).toThrow(/duplicate/i);
+    }
   });
 
   it("selects depth per workload cell and disables speculation when it loses", () => {
@@ -198,9 +207,13 @@ describe("Strix speculation policy synthesis", () => {
     const unbalancedPolicy = synthesizeStrixSpeculationPolicy(direct, [unbalanced], 0.03, 3);
     expect(unbalancedPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/balanced exposure/i)]));
 
-    const impossibleAcceptance = report("draft-mtp", 1, [200], 1.1);
+    const impossibleAcceptance = report("draft-mtp", 1, [200], 1.5);
     const inconsistentPolicy = synthesizeStrixSpeculationPolicy(direct, [impossibleAcceptance], 0.03, 3);
     expect(inconsistentPolicy.cells[0]?.rejections).toEqual(expect.arrayContaining([expect.stringMatching(/acceptance.*between 0 and 1/i)]));
+
+    const fractionalCounters = report("draft-mtp", 1, [200]);
+    fractionalCounters.batches[0]!.speculation!.draftTokens = 100.5;
+    expect(() => synthesizeStrixSpeculationPolicy(direct, [fractionalCounters], 0.03, 3)).toThrow(/draftTokens.*integer/i);
   });
 
   it("rejects an aggregate winner when any paired repetition is slower than direct", () => {
@@ -285,6 +298,22 @@ describe("Strix speculation policy synthesis", () => {
       [changedBackend],
       0.03,
     )).toThrow(/backend/i);
+
+    const changedInvariantArgs = report("draft-mtp", 1, [120]);
+    changedInvariantArgs.provenance.serverArgsInvariantSha256 = "8".repeat(64);
+    expect(() => synthesizeStrixSpeculationPolicy(
+      report("none", null, [100]),
+      [changedInvariantArgs],
+      0.03,
+    )).toThrow(/server arguments.*outside.*speculation/i);
+
+    const unchangedFullArgs = report("draft-mtp", 1, [120]);
+    unchangedFullArgs.provenance.serverArgsSha256 = "d".repeat(64);
+    expect(() => synthesizeStrixSpeculationPolicy(
+      report("none", null, [100]),
+      [unchangedFullArgs],
+      0.03,
+    )).toThrow(/server arguments.*did not change/i);
   });
 
   it("rejects duplicate workload cells instead of silently collapsing evidence", () => {

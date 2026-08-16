@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { parseCaptureArgs, runCaptureStrixProvenance } from "../scripts/capture-strix-provenance.js";
+import {
+  hashServerArgsInvariant,
+  parseCaptureArgs,
+  runCaptureStrixProvenance,
+} from "../scripts/capture-strix-provenance.js";
 
 const ARGV = [
   "--pid", "123", "--model-artifact", "/models/model.gguf", "--runtime-commit", "b".repeat(40),
@@ -12,6 +16,18 @@ const ARGV = [
 ];
 
 describe("capture Strix provenance", () => {
+  it("hashes only non-speculation server arguments and rejects unknown speculation flags", () => {
+    const direct = Buffer.from(["llama-server", "-m", "model.gguf", "-c", "65536", ""].join("\0"));
+    const mtp = Buffer.from([
+      "llama-server", "-m", "model.gguf", "-c", "65536",
+      "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "",
+    ].join("\0"));
+    expect(hashServerArgsInvariant(direct)).toBe(hashServerArgsInvariant(mtp));
+    expect(() => hashServerArgsInvariant(
+      Buffer.from(["llama-server", "--spec-unknown", "value", ""].join("\0"))
+    )).toThrow(/unsupported speculation argument/i);
+  });
+
   it("parses an explicit process/config contract", () => {
     expect(parseCaptureArgs(ARGV)).toMatchObject({
       pid: 123,
@@ -47,6 +63,7 @@ describe("capture Strix provenance", () => {
     const json = write.mock.calls[0]![1] as string;
     expect(json).toContain('"modelArtifactSha256": "' + "a".repeat(64));
     expect(json).toContain('"cacheRamMiB": 8192');
+    expect(json).toContain('"serverArgsInvariantSha256"');
     expect(json).not.toContain("/private/model.gguf");
     expect(json).not.toContain("/opt/llama-server");
   });

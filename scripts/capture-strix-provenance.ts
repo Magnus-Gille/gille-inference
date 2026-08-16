@@ -123,6 +123,36 @@ async function hashFile(path: string): Promise<string> {
   });
 }
 
+const SPECULATION_VALUE_FLAGS = new Set([
+  "--spec-type",
+  "--spec-draft-n",
+  "--spec-draft-n-min",
+  "--spec-draft-n-max",
+  "--spec-draft-p-min",
+  "--spec-draft-p-split",
+]);
+
+export function hashServerArgsInvariant(procArgs: Buffer): string {
+  const argv = procArgs.toString("utf8").split("\0");
+  if (argv.at(-1) === "") argv.pop();
+  const invariant: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const token = argv[index]!;
+    const inlineFlag = [...SPECULATION_VALUE_FLAGS].find((flag) => token.startsWith(`${flag}=`));
+    if (inlineFlag !== undefined) continue;
+    if (SPECULATION_VALUE_FLAGS.has(token)) {
+      if (argv[index + 1] === undefined || argv[index + 1]!.startsWith("--")) {
+        throw new Error(`speculation argument requires a value: ${token}`);
+      }
+      index++;
+      continue;
+    }
+    if (token.startsWith("--spec-")) throw new Error(`unsupported speculation argument: ${token}`);
+    invariant.push(token);
+  }
+  return createHash("sha256").update(JSON.stringify(invariant)).digest("hex");
+}
+
 function commandVersion(command: string, args: string[], pattern: RegExp): string | null {
   try {
     const output = execFileSync(command, args, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
@@ -172,6 +202,7 @@ export async function runCaptureStrixProvenance(argv: string[], deps: Dependenci
       runtimeCommit: args.runtimeCommit,
       runtimeBinarySha256: await deps.hashFile(runtimeBinary),
       serverArgsSha256: createHash("sha256").update(procArgs).digest("hex"),
+      serverArgsInvariantSha256: hashServerArgsInvariant(procArgs),
       backend: args.backend,
       quant: args.quant,
       kernel: deps.kernel(),
