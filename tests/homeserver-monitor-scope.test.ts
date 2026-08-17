@@ -299,6 +299,23 @@ describe("read-only monitor scope (#35)", () => {
     expect(Array.isArray(body.models)).toBe(true);
   });
 
+  it("monitor key CAN read the content-blind M5 usage summary", async () => {
+    const res = await fetch(url("/ops/summary"), { headers: auth(MONITOR_KEY) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toHaveProperty("generatedAt");
+    expect(body).toHaveProperty("activeRequests");
+    expect(body).toHaveProperty("last24Hours");
+    expect(body).toHaveProperty("last7Days");
+    expect(body).toHaveProperty("daily");
+    expect(JSON.stringify(body)).not.toMatch(/alias|key_hash|prompt|response|content/i);
+  });
+
+  it("guest/user and anonymous callers cannot read the usage summary", async () => {
+    expect((await fetch(url("/ops/summary"), { headers: auth(USER_KEY) })).status).toBe(403);
+    expect((await fetch(url("/ops/summary"))).status).toBe(401);
+  });
+
   it("monitor key still CANNOT hit a non-allowed route — GET /admin/keys stays 403", async () => {
     const res = await fetch(url("/admin/keys"), { headers: auth(MONITOR_KEY) });
     await expectMonitorRouteDenied(res);

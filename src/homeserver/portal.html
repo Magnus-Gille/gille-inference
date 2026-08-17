@@ -195,7 +195,8 @@
       <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) serving each model via
       llama-server, hot-swapped by llama-swap, behind an authenticating &amp; metering gateway,
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
-      content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation.
+      content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
+      monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
     </p>
     <p style="margin-bottom:8px"><strong>Models</strong> (mostly Q4_K_M; VibeThinker uses Q8_0;
       gpt-oss uses MXFP4):</p>
@@ -408,6 +409,15 @@
           <span class="badge mono">{total_tokens, total_requests, since}</span> — summed across
           everything the box has ever served (survives restarts). No per-user, per-key, or
           per-model detail is exposed. This powers the &#8220;Served so far&#8221; card above.
+        </p>
+
+        <p><strong>Operator M5 usage summary (monitor/admin key):</strong></p>
+        <pre>curl https://inference.example.com/ops/summary \
+  -H "Authorization: Bearer $HS_MONITOR_KEY"</pre>
+        <p>
+          Returns current M5 request activity plus a content-blind, newest-first seven-day history.
+          It includes no content, identity, key, token, or per-model fields. Reported request time is
+          gateway wall-clock time, not a claim about GPU utilization.
         </p>
 
         <p><strong>Chat completions (streaming — recommended):</strong></p>

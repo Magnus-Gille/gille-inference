@@ -54,7 +54,7 @@ import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
-import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, renderMetrics } from "./metrics.js";
+import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
@@ -68,6 +68,8 @@ import {
   getLatestSuccessfulModelUse,
   type LatestSuccessfulModelUse,
 } from "./request-log.js";
+import { queryM5UsageSummary } from "./usage-summary.js";
+import { getDb } from "../db.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
 import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
@@ -1050,7 +1052,7 @@ async function admitAndMeterLogged(
 
   incInflight(principal.alias);
   // Content-blind concurrency gauge: increment on admission acquire, decrement on release (below).
-  inflightInc(principal.tier);
+  inflightInc(principal.tier, lctx.node === "orin" ? "orin" : "m5");
   // C2 (HIGH): start at 0, NOT estTokens. The real usage is assigned only after handler()
   // RESOLVES successfully; if the upstream throws (timeout / connection reset / stream error)
   // actualTokens stays 0, so the finally block reconciles the credit reservation and the quota
@@ -1092,7 +1094,7 @@ async function admitAndMeterLogged(
   } finally {
     release();
     decInflight(principal.alias);
-    inflightDec(principal.tier);
+    inflightDec(principal.tier, lctx.node === "orin" ? "orin" : "m5");
     // M1: reconcile the EXACT admitted quota event + daily delta via the reservation handle.
     recordUsage(principal.alias, actualTokens, Date.now(), reservation);
     // Settle the lifetime credit ledger for minted store keys (keyHash present). Legacy
@@ -3637,7 +3639,7 @@ export async function handleRequest(
     if (principal?.isMonitor) {
       const monitorOk =
         method === "GET" &&
-        (path === "/ledger" || path.startsWith("/ledger/") || path === "/healthz" || path === "/metrics" || path === "/models" || path === "/models/residency");
+        (path === "/ledger" || path.startsWith("/ledger/") || path === "/healthz" || path === "/metrics" || path === "/models" || path === "/models/residency" || path === "/ops/summary");
       if (!monitorOk) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
@@ -3646,7 +3648,7 @@ export async function handleRequest(
           res,
           makeError("route_not_allowed", {
             param: null,
-            message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models and /models/residency).",
+            message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models, /models/residency and /ops/summary).",
           })
         );
         return;
@@ -4793,6 +4795,31 @@ export async function handleRequest(
         recent: recentDelegations(20),
         includeShadow,
       });
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/ops/summary" && method === "GET") {
+      if (!principal.isAdmin && !principal.isMonitor) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        lctx.admission = "n/a";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "The operations summary requires an owner/admin or monitor key.",
+          }),
+        );
+        return;
+      }
+      const summary = queryM5UsageSummary(getDb(), {
+        activeRequests: currentM5InflightRequests(),
+      });
+      res.setHeader("cache-control", "private, no-store");
+      sendJson(res, 200, summary);
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";

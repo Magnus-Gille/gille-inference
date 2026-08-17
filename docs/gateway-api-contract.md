@@ -35,7 +35,7 @@ privacy/admission tier, route scope, and model allow-list:
 | Scope | `admin` | Operator routes plus agent/inference surfaces. Explicit for new keys; legacy null-scope owner rows retain it compatibly. |
 | Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
 | Scope | `inference` | Ordinary inference only. Legacy guest-key default. |
-| Scope | `monitor` | Read-only `GET /healthz`, `/models`, `/metrics`, and `/ledger*`; no inference or mutation. |
+| Scope | `monitor` | Read-only `GET /healthz`, `/models*`, `/metrics`, `/ledger*`, and `/ops/summary`; no inference or mutation. |
 
 Tier does not imply admin authority. New owner credentials default to `agent`; admin must be
 explicit. New credentials are lifetime-bounded (admin 30 days, agent 90 days, inference/monitor
@@ -80,6 +80,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
 | POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. The truncated call is already metered, and any retry is a new billable call. |
 | GET | `/models/residency` | admin or monitor | Read-only, content-blind residency diagnostic |
+| GET | `/ops/summary` | admin or monitor | Durable, content-blind M5 activity summary for Heimdall |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |
 | GET | `/v1/roster-proposals/:proposalId` | authenticated owner | Read only that principal's durable proposal |
