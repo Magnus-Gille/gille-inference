@@ -15,7 +15,7 @@ they can authenticate during a staged migration, but `keys inventory` flags them
 |---|---|---:|---|
 | Human owner break-glass or an operator route that genuinely requires admin | `owner/admin` | 30 days | Admin is explicit and exceptional; a new owner key defaults to `agent`. |
 | Claude, Codex, Pi, code-loop, or another bounded owner harness | `owner/agent` | 90 days | Preserves owner privacy/admission while denying `/admin/*`, `/delegate`, and `/ledger`. |
-| Heimdall or another read-only observer | `guest/monitor` | 365 days | Only successful `GET /healthz`, `/models`, `/metrics`, and `/ledger*` requests are allowed. |
+| Heimdall or another read-only observer | `guest/monitor` | 365 days | Only successful `GET /healthz`, `/models*`, `/metrics`, `/ledger*`, and `/ops/summary` requests are allowed. |
 | Ordinary inference client | `guest/inference` | 365 days | No operator or evidence-reading authority. |
 
 A service that temporarily needs an existing admin-only API is still `owner/admin`, limited to 30
