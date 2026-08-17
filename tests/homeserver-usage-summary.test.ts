@@ -43,6 +43,7 @@ function insert(over: Partial<{
   id: string;
   ts: number;
   alias: string | null;
+  tier: string | null;
   node: string;
   route: string;
   status: number;
@@ -54,6 +55,7 @@ function insert(over: Partial<{
     id: `r-${Math.random().toString(36).slice(2)}`,
     ts: NOW,
     alias: "owner",
+    tier: "owner",
     node: "m5",
     route: "/v1/chat/completions",
     status: 200,
@@ -64,9 +66,9 @@ function insert(over: Partial<{
   };
   db.prepare(`
     INSERT INTO request_log
-      (id, ts, alias, model, node, route, status, outcome, total_ms, admission)
+      (id, ts, alias, tier, model, node, route, status, outcome, total_ms, admission)
     VALUES
-      (@id, @ts, @alias, 'mellum', @node, @route, @status, @outcome, @totalMs, @admission)
+      (@id, @ts, @alias, @tier, 'mellum', @node, @route, @status, @outcome, @totalMs, @admission)
   `).run(row);
 }
 
@@ -110,6 +112,28 @@ describe("queryM5UsageSummary", () => {
     expect(summary.lastUsedAt).toBe(new Date(NOW - 2 * 60 * 60 * 1000).toISOString());
   });
 
+  it("splits the last 24 hours into owner, guest, and other without exposing identities", () => {
+    insert({ tier: "owner", alias: "private-owner", totalMs: 600 });
+    insert({ tier: "owner", alias: "private-owner-two", totalMs: 400 });
+    insert({ tier: "guest", alias: "private-guest", totalMs: 2_000 });
+    insert({ tier: null, alias: "legacy-caller", totalMs: 250 });
+    insert({ tier: "guest", ts: NOW - 2 * DAY_MS, totalMs: 9_000 });
+
+    const summary = queryM5UsageSummary(db, { now: NOW });
+
+    expect(summary.last24HoursByTier).toEqual({
+      owner: { requests: 2, requestTimeMs: 1_000 },
+      guest: { requests: 1, requestTimeMs: 2_000 },
+      other: { requests: 1, requestTimeMs: 250 },
+    });
+    expect(
+      summary.last24HoursByTier.owner.requests
+      + summary.last24HoursByTier.guest.requests
+      + summary.last24HoursByTier.other.requests,
+    ).toBe(summary.last24Hours.requests);
+    expect(JSON.stringify(summary)).not.toMatch(/private-owner|private-guest|legacy-caller/);
+  });
+
   it("has a deliberately small content-blind response shape", () => {
     insert({ alias: "private-operator-alias" });
     const summary = queryM5UsageSummary(db, { now: NOW });
@@ -120,6 +144,7 @@ describe("queryM5UsageSummary", () => {
       "daily",
       "generatedAt",
       "last24Hours",
+      "last24HoursByTier",
       "last7Days",
       "lastUsedAt",
     ]);
