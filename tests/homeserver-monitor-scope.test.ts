@@ -306,6 +306,7 @@ describe("read-only monitor scope (#35)", () => {
     expect(body).toHaveProperty("generatedAt");
     expect(body).toHaveProperty("activeRequests");
     expect(body).toHaveProperty("last24Hours");
+    expect(body).toHaveProperty("last24HoursByTier");
     expect(body).toHaveProperty("last7Days");
     expect(body).toHaveProperty("daily");
     expect(JSON.stringify(body)).not.toMatch(/alias|key_hash|prompt|response|content/i);

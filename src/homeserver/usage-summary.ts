@@ -32,11 +32,20 @@ export interface DailyM5Usage extends UsageWindow {
   date: string;
 }
 
+export interface M5UsageByTier {
+  owner: UsageWindow;
+  guest: UsageWindow;
+  /** Legacy or otherwise unclassified admitted compute calls. */
+  other: UsageWindow;
+}
+
 export interface M5UsageSummary {
   generatedAt: string;
   activeRequests: number;
   lastUsedAt: string | null;
   last24Hours: UsageWindow;
+  /** Content-blind aggregate split for the same trailing 24-hour window. */
+  last24HoursByTier: M5UsageByTier;
   last7Days: UsageWindow;
   /** Newest day first. Zero-activity days are present explicitly. */
   daily: DailyM5Usage[];
@@ -45,6 +54,15 @@ export interface M5UsageSummary {
 interface DbUsageWindow {
   requests: number;
   request_time_ms: number | null;
+}
+
+interface DbUsageByTier extends DbUsageWindow {
+  owner_requests: number;
+  owner_request_time_ms: number | null;
+  guest_requests: number;
+  guest_request_time_ms: number | null;
+  other_requests: number;
+  other_request_time_ms: number | null;
 }
 
 function utcDayStart(ms: number): number {
@@ -103,12 +121,24 @@ export function queryM5UsageSummary(
   const last24Row = db.prepare(`
     SELECT
       COUNT(*) AS requests,
-      COALESCE(SUM(CASE WHEN total_ms > 0 THEN total_ms ELSE 0 END), 0) AS request_time_ms
+      COALESCE(SUM(CASE WHEN total_ms > 0 THEN total_ms ELSE 0 END), 0) AS request_time_ms,
+      SUM(CASE WHEN tier = 'owner' THEN 1 ELSE 0 END) AS owner_requests,
+      COALESCE(SUM(CASE WHEN tier = 'owner' AND total_ms > 0 THEN total_ms ELSE 0 END), 0)
+        AS owner_request_time_ms,
+      SUM(CASE WHEN tier = 'guest' THEN 1 ELSE 0 END) AS guest_requests,
+      COALESCE(SUM(CASE WHEN tier = 'guest' AND total_ms > 0 THEN total_ms ELSE 0 END), 0)
+        AS guest_request_time_ms,
+      SUM(CASE WHEN tier IS NULL OR tier NOT IN ('owner', 'guest') THEN 1 ELSE 0 END)
+        AS other_requests,
+      COALESCE(SUM(CASE
+        WHEN (tier IS NULL OR tier NOT IN ('owner', 'guest')) AND total_ms > 0 THEN total_ms
+        ELSE 0
+      END), 0) AS other_request_time_ms
     FROM request_log
     WHERE ${COMPUTE_FILTER}
       AND ts >= @since
       AND ts <= @now
-  `).get({ since: now - DAY_MS, now }) as DbUsageWindow;
+  `).get({ since: now - DAY_MS, now }) as DbUsageByTier;
 
   const latest = db.prepare(`
     SELECT MAX(ts) AS last_used_at
@@ -135,6 +165,20 @@ export function queryM5UsageSummary(
     activeRequests,
     lastUsedAt: latest.last_used_at === null ? null : new Date(latest.last_used_at).toISOString(),
     last24Hours: windowOf(last24Row),
+    last24HoursByTier: {
+      owner: {
+        requests: last24Row.owner_requests,
+        requestTimeMs: last24Row.owner_request_time_ms ?? 0,
+      },
+      guest: {
+        requests: last24Row.guest_requests,
+        requestTimeMs: last24Row.guest_request_time_ms ?? 0,
+      },
+      other: {
+        requests: last24Row.other_requests,
+        requestTimeMs: last24Row.other_request_time_ms ?? 0,
+      },
+    },
     last7Days,
     daily,
   };
