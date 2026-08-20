@@ -150,17 +150,21 @@ Post-deploy verification:
 | Regression: `qwen38-27b` still serves | yes — returned `OK`, model swap clean |
 | Gateway `/healthz` (tailnet) | 200 |
 | Gateway `/v1/models` unauthenticated | 401 — auth spine intact |
-| **Authenticated gateway completion** | **NOT RUN** — see below |
+| **Authenticated gateway completion** | **PASS** (2026-08-20) — see below |
 
-The authenticated end-to-end probe was **not** performed. `HOMESERVER_OWNER_KEY` is supplied from
-the operator's own environment at deploy time and is deliberately not stored on the box (the
-production keystore reports no minted keys), so this session had no owner credential and did not
-attempt to obtain one. The model is therefore verified working on the serving backend and behind a
-healthy, correctly-authenticating gateway, but the owner-key → gateway → model path has not been
-exercised end to end. To close it:
+At deploy time the authenticated end-to-end probe was **not** performed: `HOMESERVER_OWNER_KEY` is
+supplied from the operator's own environment and is deliberately not stored on the box, so that
+session had no owner credential and did not attempt to obtain one.
+
+**Closed on 2026-08-20** over the owner-authenticated M5 MCP path (`m5.list_models` / `m5.ask`,
+which carries an owner-tier key to the gateway). `list_models` returned 12 models including
+`ornith-1.5-35b`, and a temperature-0 `ask` returned a correct linked-list reversal
+(26 prompt / 156 completion tokens, `finish_reason: stop`, `metered: true`). The owner-key →
+gateway → model path is therefore exercised end to end. The equivalent raw-curl form:
 
 ```bash
-HOMESERVER_OWNER_KEY=… curl -sS http://100.76.72.59:8080/v1/chat/completions \
+« replace 100.64.0.10 with the M5's real tailnet address »
+HOMESERVER_OWNER_KEY=… curl -sS http://100.64.0.10:8080/v1/chat/completions \
   -H "Authorization: Bearer $HOMESERVER_OWNER_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"ornith-1.5-35b","messages":[{"role":"user","content":"ping"}],"max_tokens":16}'
 ```
@@ -230,6 +234,6 @@ incumbent:
 - Multimodal: the projector is wired into the live stanza but **no image request was ever sent**,
   either in staging or post-deploy. Vision is configured-but-unverified.
 - Per-request `enable_thinking: false` override — assumed by template convention, still untested.
-- The authenticated gateway probe recorded above.
+- ~~The authenticated gateway probe recorded above.~~ Closed 2026-08-20 (see the deployment record).
 - A private `grimnir-ops` entry recording this deployment, its backup path, and rollback recipe as
   durable operational state.
