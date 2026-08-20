@@ -222,9 +222,22 @@ capability signal? Audited all three sinks. **None was contaminated.**
 
 | Sink | Verdict | Basis |
 |---|---|---|
-| Capability ledger (`delegations`) | **clean** | 4,520 rows; zero contain `gate-d` or `g0-files` in `verifier`, `task_type`, `model_id`, `source`, `notes`, or `error_class`. Every row since 2026-08-14 has `source` of `mcp-ask` or `code-loop`. The 6 `ornith` rows are `mcp-ask` with `verifier` NULL and `outcome='unverified'` — structurally incapable of carrying a pass/fail verdict |
+| Capability ledger (`delegations`) | **clean** | 4,520 rows at audit time; zero contain `gate-d` or `g0-files` in `verifier`, `task_type`, `model_id`, `source`, `notes`, or `error_class`. Every row since 2026-08-14 has `source` of `mcp-ask` or `code-loop` — no Gate-D-shaped source exists. See the `ornith` breakdown below |
 | `docs/m5-routing.json` | **clean** | Committed exactly once (initial public release) with `generatedAt` 2026-07-07 — five weeks before the regression — and never modified since. Independently, Gate-D is not among its four declared `sources` |
 | Model-Scout registry | **clean** | 8 entries, newest 2026-07-27, all predating the regression. Verdicts derive from `probe-runner` pass rates, never from Gate-D |
+
+The `ornith` rows specifically — the ones most likely to have absorbed a bad Gate-D grade — are
+all `outcome='unverified'`, so none carries a pass/fail capability signal:
+
+| When | Count | Source | Verifier |
+|---|---:|---|---|
+| 2026-07-05 | 4 | `harvest-shadow` | `harvest-shadow:llm-judge:gpt-oss-120b` |
+| 2026-08-19 | 2 | `mcp-ask` | none |
+| 2026-08-20 | 1 | `mcp-ask` | none (this session's gateway probe) |
+
+The only verifier-bearing `ornith` rows are the four harvest-shadow rows from **2026-07-05** — six
+weeks before the regression window opened, and from the Ornith-**1.0** evaluation era rather than
+this release. Nothing verifier-bearing was written for this model during the affected period at all.
 
 The structural reason is stronger than the row counts: **Gate-D has no write path into any of them.**
 The `pi` arm calls the plain OpenAI-compatible chat-completions endpoint, while `recordDelegation()`
