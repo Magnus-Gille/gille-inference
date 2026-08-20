@@ -216,9 +216,11 @@ The model is now reachable by name, but its *quality* is barely characterized. S
 evidence that it should be used. Outstanding before any route change or displacement of an
 incumbent:
 
-- **The 8-vs-9 Gate-D tie from #141 is still unbroken.** No head-to-head was run for 1.5 at all;
-  the only quality signal in this document is a single deterministic coding prompt. A 3-seed
-  Gate-D run against `qwen36-a3b` (the incumbent peer) is the specific missing measurement.
+- **The 8-vs-9 Gate-D tie from #141 is still unbroken**, and the 3-seed rerun recorded above is
+  why: both arms sit at the r1 ceiling (ornith 23/23 loopback, qwen36 29/30), so more r1 seeds
+  cannot separate them. The specific missing measurement is a **harder corpus** — the r2 holdout
+  set (`GATE_D_INCLUDE_HOLDOUT=1`) — not additional r1 repetitions. Beyond that battery the only
+  quality signal for 1.5 is a single deterministic coding prompt.
 - A broader comparison against the current production tiers (`gpt-oss-120b`, `qwen38-27b`) on the
   common coding-agent suite.
 - KV-quant A/B (Q8_0 vs F16) — not measured here, unlike `qwen38-27b`'s explicit comparison. Q8_0
