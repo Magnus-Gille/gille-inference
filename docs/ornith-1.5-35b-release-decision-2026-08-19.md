@@ -214,26 +214,126 @@ gateway rows. So `23/23` is not full-battery coverage and is not directly compar
 
 Raw rows: `data/gate-d-{ornith-1.5-35b,qwen36-a3b}-20260819.jsonl`.
 
+### Contamination audit of the #218 regression window (2026-08-20)
+
+PR #219 flagged an open question: every pi-arm Gate-D run between 2026-08-15 and the fix failed
+`G0-files` on the harness's own output, so did any of those invalid rows get ingested as model
+capability signal? Audited all three sinks. **None was contaminated.**
+
+| Sink | Verdict | Basis |
+|---|---|---|
+| Capability ledger (`delegations`) | **clean** | 4,520 rows; zero contain `gate-d` or `g0-files` in `verifier`, `task_type`, `model_id`, `source`, `notes`, or `error_class`. Every row since 2026-08-14 has `source` of `mcp-ask` or `code-loop`. The 6 `ornith` rows are `mcp-ask` with `verifier` NULL and `outcome='unverified'` — structurally incapable of carrying a pass/fail verdict |
+| `docs/m5-routing.json` | **clean** | Committed exactly once (initial public release) with `generatedAt` 2026-07-07 — five weeks before the regression — and never modified since. Independently, Gate-D is not among its four declared `sources` |
+| Model-Scout registry | **clean** | 8 entries, newest 2026-07-27, all predating the regression. Verdicts derive from `probe-runner` pass rates, never from Gate-D |
+
+The structural reason is stronger than the row counts: **Gate-D has no write path into any of them.**
+The `pi` arm calls the plain OpenAI-compatible chat-completions endpoint, while `recordDelegation()`
+is reachable only from the orchestrator's `/delegate`, `code-loop`, MCP, deep-research, and
+cartography. `check.sh`'s verdict is written to a local JSONL row and never returns to the gateway,
+so a Gate-D grade — correct or spurious — cannot become capability evidence by any route.
+
+Two incidental findings surfaced during the audit and are **not** fixed here:
+
+- **`EVAL_DB_PATH` is an operator trap.** The gateway unit sets
+  `EVAL_DB_PATH=/home/magnus/home-server-eval/data/eval.db`, but systemd
+  `BindPaths=/var/lib/gille-inference/gateway/data:/home/magnus/home-server-eval/data:rbind`
+  rebinds that directory inside the service namespace. Outside the namespace the documented path
+  resolves to an unrelated 122 KB stub with 6 tables and no `delegations` table at all, while the
+  live ledger (22 tables, 4,520 delegations) is at `/var/lib/gille-inference/gateway/data/eval.db`.
+  Anyone auditing via the documented variable silently reads the wrong database.
+- **`docs/m5-routing.json`'s provenance manifest is unresolvable.** All four `sources` cite
+  `/srv/gille-inference/data/...`, a path `AGENTS.md` already records as non-existent on the box.
+  The table is also six weeks stale relative to a ledger that has since roughly tripled.
+
+## r2 holdout tie-break (2026-08-20)
+
+The section above named the r2 holdout corpus as the specific missing measurement. It was run:
+4 fresh model-unseen holdouts (tasks 11–14) × 3 repetitions × 2 models, `ARMS=pi`, box loopback
+throughout, under `GATE_D_INCLUDE_HOLDOUT=1` and the post-#218 `check.sh`. Every row carries
+`corpusRevision: gate-d-r2` and `holdout: true`.
+
+| Arm | Pass | Median | Mean |
+|---|---|---|---|
+| ornith-1.5-35b | 8/12 (66.7 %) | 56 s | 59 s |
+| qwen36-a3b | **9/12 (75.0 %)** | 36 s | 46 s |
+
+Per task (pass/3):
+
+| Task | ornith-1.5-35b | qwen36-a3b |
+|---|---|---|
+| 11-node-path-containment | 2/3 (1 × `G4-oracle`) | 3/3 |
+| 12-add-csv-cli-format | 3/3 | 2/3 (1 × `G5-structural`) |
+| 13-type-safe-slug-tests | 3/3 | 3/3 |
+| 14-shared-handle-validation | **0/3** (3 × `G5-structural`) | 1/3 (`G4-oracle`, `G5-structural`) |
+
+**The tie is still not broken.** Fisher's exact test on 8/12 vs 9/12 gives **p = 1.000** — a
+one-run difference across twelve trials is indistinguishable from noise. The attempt reproduced
+the *same* 8-vs-9 non-result as #141, for a different reason: r1 could not separate the models
+because both sat at the ceiling; r2 has genuine headroom (neither model is near 12/12) but the two
+land on top of each other inside it. The models also trade wins — ornith takes task 12, qwen36
+takes 11 and 14 — which is what comparable capability with per-task variance looks like, not a
+latent ordering waiting for more samples.
+
+What r2 *did* buy is a real capability signal r1 never surfaced:
+
+- **Cross-file wiring is a shared weakness.** Task 14 asks the model to strengthen
+  `src/validate.ts` and wire it through `src/normalize.ts`; combined, the two models passed
+  **1 of 6** attempts, almost all failing `G5-structural`. This is not an under-specified task —
+  the required `assertValidHandle` symbol is already exported by the seed, so the contract is
+  discoverable. Both models tend to strengthen the validator without importing it into the
+  normalizer.
+- qwen36-a3b remains meaningfully faster on the same transport (36 s vs 56 s median).
+
+Consumption note: holdouts 11–14 are now **spent** for `ornith-1.5-35b` and `qwen36-a3b`. They are
+no longer model-unseen for this pair and must not be reused as fresh evidence for either. Breaking
+this tie now requires either a new holdout revision or a different discriminator — a suite that
+weights multi-file wiring, where the two models are most likely to actually diverge, would be the
+higher-information choice over more repetitions of anything they both already pass.
+
+Raw rows: `data/gate-d-r2-{ornith-1.5-35b,qwen36-a3b}-20260820.jsonl` (local, gitignored).
+
 ## Remaining proof
 
 The model is now reachable by name, but its *quality* is barely characterized. Serving it is not
 evidence that it should be used. Outstanding before any route change or displacement of an
 incumbent:
 
-- **The 8-vs-9 Gate-D tie from #141 is still unbroken**, and the 3-seed rerun recorded above is
-  why: both arms sit at the r1 ceiling (ornith 23/23 loopback, qwen36 29/30), so more r1 seeds
-  cannot separate them. The specific missing measurement is a **harder corpus** — the r2 holdout
-  set (`GATE_D_INCLUDE_HOLDOUT=1`) — not additional r1 repetitions. Beyond that battery the only
-  quality signal for 1.5 is a single deterministic coding prompt.
+- **The 8-vs-9 Gate-D tie from #141 is still unbroken**, now on two independent batteries: r1
+  cannot separate the models because both sit at its ceiling, and r2 — run 2026-08-20, the
+  measurement previously named as missing — returned 8/12 vs 9/12 at **p = 1.000**. Both corpora
+  are now exhausted as discriminators for this pair (r2's holdouts are spent). The next useful
+  measurement is a *different* discriminator, not a further repetition: multi-file wiring is the
+  axis where these two models are most likely to actually diverge.
 - A broader comparison against the current production tiers (`gpt-oss-120b`, `qwen38-27b`) on the
   common coding-agent suite.
 - KV-quant A/B (Q8_0 vs F16) — not measured here, unlike `qwen38-27b`'s explicit comparison. Q8_0
   was chosen by analogy to that release, not by measurement on this model.
-- Long-context behaviour: served at 65,536 against a 262,144-token native window, never tested
-  above a few hundred tokens.
-- Multimodal: the projector is wired into the live stanza but **no image request was ever sent**,
-  either in staging or post-deploy. Vision is configured-but-unverified.
-- Per-request `enable_thinking: false` override — assumed by template convention, still untested.
-- ~~The authenticated gateway probe recorded above.~~ Closed 2026-08-20 (see the deployment record).
-- A private `grimnir-ops` entry recording this deployment, its backup path, and rollback recipe as
-  durable operational state.
+- ~~Long-context behaviour~~ / ~~Multimodal~~ / ~~`enable_thinking: false`~~ / ~~authenticated
+  gateway probe~~ — all four closed 2026-08-20; see **Serving-contract verification** below.
+- ~~A private `grimnir-ops` entry recording this deployment, its backup path, and rollback
+  recipe.~~ Filed 2026-08-20 as `grimnir-ops#4` (private tracker).
+
+## Serving-contract verification (2026-08-20)
+
+Every item below was an explicitly configured-but-unverified assumption in the 2026-08-19 record.
+All four now have direct evidence. Requests went to `llama-swap` on the box (`:8091`) except the
+gateway probe, which deliberately exercised the authenticated remote path.
+
+| Assumption | Result | Evidence |
+|---|---|---|
+| Owner-key → gateway → model works | **PASS** | Owner-authenticated M5 MCP path: `list_models` returned 12 models incl. `ornith-1.5-35b`; a temperature-0 `ask` returned correct code (26 prompt / 156 completion tokens, `finish_reason: stop`, `metered: true`) |
+| Vision (BF16 projector actually wired) | **PASS** | A synthetic 724×276 PNG of the four-digit number `7341` returned exactly `7341` |
+| Long context above a few hundred tokens | **PASS** | Needle-in-haystack at **54,681 prompt tokens** (83 % of the served 65,536 window), needle at 62 % depth, retrieved verbatim; 108 s wall |
+| Context ceiling fails closed | **PASS** | An 83,601-token request was refused with `exceed_context_size_error`, not silently truncated |
+| `chat_template_kwargs: {"enable_thinking": false}` | **PASS** | Honoured. Same prompt, same correct answer: 84 completion tokens + a 171-char `reasoning_content` by default, vs **4 completion tokens and no `reasoning_content`** with the override — ~21× cheaper. Also honoured inside a multimodal request |
+
+Two methodological notes, because both change how much the results are worth:
+
+1. **The vision ground truth was verified before use.** The test image was rendered by a hand-coded
+   5×7 bitmap font (no PIL/ImageMagick on the box) and then *looked at* before being sent — a
+   buggy renderer would otherwise have scored a harness defect as a model failure.
+2. **The image demonstrably reached the projector.** `prompt_tokens` was 1,070, above the
+   `--image-min-tokens 1024` floor. A silently-dropped image would have produced a ~20-token
+   prompt, so the token count — not just the correct answer — is what rules out a lucky guess.
+
+Still open from this section: the KV-quant A/B (Q8_0 vs F16) remains unmeasured on this model.
