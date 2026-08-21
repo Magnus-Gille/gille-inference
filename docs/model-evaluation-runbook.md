@@ -25,7 +25,9 @@ The real run acquires the repository-owned exclusive maintenance window: the iso
 identity takes the shared GPU lease, fences owner and guest inference, drains admitted work, and
 captures stable llama-swap residency before the evaluator can unload or launch anything. The
 opaque release token remains in memory and only this run can close its window. Missing or rejected
-maintenance authorization fails before evaluation.
+maintenance authorization fails before evaluation. The evaluator reserves the final 320 seconds
+of the server-owned TTL for cancellation and residency restoration; probe work is aborted before
+that deadline rather than being allowed to outlive the lease.
 
 ```bash
 # Resolve M5_MAINTENANCE_KEY from the approved private operator credential source first.
@@ -35,11 +37,13 @@ npx tsx scripts/evaluate-model.ts \
   --quant KQ_DYNAMIC
 ```
 
-The evaluator starts a loopback-only ephemeral llama-server, runs the deterministic probe battery
+The evaluator requires llama-swap's unload request to succeed and `/running` to prove empty before
+it starts a loopback-only ephemeral llama-server. It runs the deterministic probe battery
 sequentially, appends one content-blind registry row, restores the pre-run resident model when one
-was ready, and only then releases the exclusive window. The maintenance credential is stripped
-from the llama-server child environment. The evaluator does not move, delete, register, or promote
-the artifact. A `winner` is evidence for review, not a roster command.
+was ready, and only then releases the exclusive window. Spawn failures, termination signals, and
+TTL cancellation follow the same cleanup path. The maintenance credential is stripped from the
+llama-server child environment. The evaluator does not move, delete, register, or promote the
+artifact. A `winner` is evidence for review, not a roster command.
 
 ## Evidence and routing
 

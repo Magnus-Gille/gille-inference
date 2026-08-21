@@ -69,6 +69,32 @@ import {
 } from "../src/homeserver/routing-table-diff.js";
 import { pushPanel } from "../src/homeserver/heimdall-push.js";
 
+export interface LedgerEvidenceSnapshot {
+  verdicts: ReturnType<typeof ledgerReportFromDb>;
+  records: number;
+  latest: string | null;
+}
+
+/** Keep verdict rows and provenance counts on one SQLite WAL snapshot. */
+export function readLedgerEvidenceSnapshot(
+  db: Database.Database,
+  policy: Parameters<typeof ledgerReportFromDb>[1],
+  afterVerdicts?: () => void,
+): LedgerEvidenceSnapshot {
+  return db.transaction(() => {
+    const table = db
+      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'delegations'`)
+      .get() as { present: number } | undefined;
+    if (!table) throw new Error("required delegations table is absent");
+    const verdicts = ledgerReportFromDb(db, policy);
+    afterVerdicts?.();
+    const row = db
+      .prepare(`SELECT COUNT(*) AS c, MAX(ts) AS latest FROM delegations`)
+      .get() as { c: number; latest: string | null };
+    return { verdicts, records: row.c, latest: row.latest };
+  })();
+}
+
 // ── Arg parsing ──────────────────────────────────────────────────────────────────
 
 function parseArgs(argv: string[]): {
@@ -255,18 +281,10 @@ async function main(): Promise<void> {
   const snapshot = new Database(dbPath, { readonly: true, fileMustExist: true });
   snapshot.pragma("query_only = ON");
   try {
-    const table = snapshot
-      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'delegations'`)
-      .get() as { present: number } | undefined;
-    if (!table) {
-      throw new Error("required delegations table is absent");
-    }
-    verdicts = ledgerReportFromDb(snapshot, config.policy);
-    const row = snapshot
-      .prepare(`SELECT COUNT(*) AS c, MAX(ts) AS latest FROM delegations`)
-      .get() as { c: number; latest: string | null };
-    ledgerRecords = row.c;
-    ledgerLatest = row.latest;
+    const evidenceSnapshot = readLedgerEvidenceSnapshot(snapshot, config.policy);
+    verdicts = evidenceSnapshot.verdicts;
+    ledgerRecords = evidenceSnapshot.records;
+    ledgerLatest = evidenceSnapshot.latest;
   } catch (error) {
     throw new Error(
       `authoritative capability ledger is incompatible at ${dbPath}; check --db/EVAL_DB_PATH ` +

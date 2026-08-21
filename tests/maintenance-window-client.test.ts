@@ -18,8 +18,9 @@ describe("maintenance window client", () => {
       {
         apiKey: "secret-admin-key",
         now: () => 2_000,
-        runChild: async (_command, opened) => {
+        runChild: async (_command, opened, signal) => {
           observedRunningModels = opened?.runningModels;
+          expect(signal.aborted).toBe(false);
           return 0;
         },
         fetch: async (_input, init) => {
@@ -29,7 +30,7 @@ describe("maintenance window client", () => {
           if (body.action === "open") {
             return json(201, {
               token: "opaque-release-token",
-              evidence: { mode: "exclusive", startedAt: "1970-01-01T00:00:01.000Z", runningModels: [] },
+              evidence: { mode: "exclusive", startedAt: "1970-01-01T00:00:01.000Z", expiresAt: "1970-01-01T00:01:00.000Z", runningModels: [] },
             });
           }
           return json(200, { restored: true });
@@ -54,7 +55,7 @@ describe("maintenance window client", () => {
           if (init?.method === "GET") return json(200, { active: false });
           const body = JSON.parse(String(init?.body)) as { action: string };
           if (body.action === "close") { restored = true; return json(200, { restored: true }); }
-          return json(201, { token: "token", evidence: { mode: "exclusive", startedAt: "x", runningModels: [] } });
+          return json(201, { token: "token", evidence: { mode: "exclusive", startedAt: "x", expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] } });
         },
       },
     )).rejects.toThrow("spawn failed");
@@ -98,5 +99,74 @@ describe("maintenance window client", () => {
       M5_MAINTENANCE_KEY: "do-not-inherit",
       PATH: "/usr/bin",
     })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("aborts child work before the server-owned TTL can release exclusion", async () => {
+    let observedAbort = false;
+    const evidence = await runMaintenanceWindowCommand(
+      {
+        baseUrl: "http://m5",
+        ttlSeconds: 60,
+        drainTimeoutSeconds: 5,
+        abortBeforeExpirySeconds: 0.04,
+        command: ["long-job"],
+      },
+      {
+        apiKey: "key",
+        now: () => 0,
+        runChild: async (_command, _opened, signal) => new Promise<number>((resolve) => {
+          signal.addEventListener("abort", () => { observedAbort = true; resolve(143); }, { once: true });
+        }),
+        fetch: async (_input, init) => {
+          if (init?.method === "GET") return json(200, { active: false });
+          const body = JSON.parse(String(init?.body)) as { action: string };
+          if (body.action === "close") return json(200, { restored: true });
+          return json(201, {
+            token: "token",
+            evidence: {
+              mode: "exclusive",
+              startedAt: "1970-01-01T00:00:00.000Z",
+              expiresAt: "1970-01-01T00:00:00.050Z",
+              runningModels: [],
+            },
+          });
+        },
+      },
+    );
+    expect(observedAbort).toBe(true);
+    expect(evidence.childExitCode).toBe(143);
+    expect(evidence.restored).toBe(true);
+  });
+
+  it("rejects a cleanup reserve that could extend child work past the TTL", async () => {
+    await expect(runMaintenanceWindowCommand(
+      {
+        baseUrl: "http://m5",
+        ttlSeconds: 60,
+        drainTimeoutSeconds: 5,
+        abortBeforeExpirySeconds: -1,
+        command: ["job"],
+      },
+      { apiKey: "key", fetch, runChild: async () => 0 },
+    )).rejects.toThrow(/abortBeforeExpirySeconds/);
+  });
+
+  it("aborts a hung opening request before a maintenance token exists", async () => {
+    const termination = new AbortController();
+    let childRan = false;
+    const opening = runMaintenanceWindowCommand(
+      { baseUrl: "http://m5", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["job"] },
+      {
+        apiKey: "key",
+        signal: termination.signal,
+        runChild: async () => { childRan = true; return 0; },
+        fetch: async (_input, init) => new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        }),
+      },
+    );
+    termination.abort(new Error("model evaluation interrupted by SIGTERM"));
+    await expect(opening).rejects.toThrow(/interrupted by SIGTERM/);
+    expect(childRan).toBe(false);
   });
 });

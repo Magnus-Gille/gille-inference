@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import type { ChildProcess } from "node:child_process";
 import type { ProbeRunSummary } from "../src/homeserver/scout-types.js";
 import {
   buildRegistryEntry,
   decideVerdict,
   manualCandidateForArtifact,
+  quiesceLlamaSwapForEvaluation,
   runProtectedEvaluation,
+  waitForChildSpawn,
 } from "../scripts/evaluate-model.js";
 
 const summary = (passRate: number, tokPerSec: number | null): ProbeRunSummary => ({
@@ -84,7 +88,7 @@ describe("manual model evaluation", () => {
     const entry = await runProtectedEvaluation(candidate, {
       apiKey: "maintenance-key",
       baseUrl: "http://127.0.0.1:8080",
-      ttlSeconds: 120,
+      ttlSeconds: 600,
       drainTimeoutSeconds: 5,
       evaluate: async () => {
         events.push("evaluate");
@@ -94,20 +98,26 @@ describe("manual model evaluation", () => {
         expect(record).toBe(expectedEntry);
         events.push("append");
       },
-      restore: async (runningModels) => {
+      restore: async (runningModels, signal) => {
         expect(runningModels).toEqual([{ model: "qwen36-a3b", state: "ready", ttlSeconds: 120 }]);
+        expect(signal.aborted).toBe(false);
         events.push("restore");
       },
       runWindow: async (_plan, deps) => {
+        expect(_plan.ttlSeconds).toBeGreaterThan(320);
+        expect(_plan.abortBeforeExpirySeconds).toBe(320);
         expect(deps.apiKey).toBe("maintenance-key");
+        expect(deps.signal?.aborted).toBe(false);
         events.push("open");
         const childExitCode = await deps.runChild(
           ["manual-model-evaluation"],
           {
             mode: "exclusive",
             startedAt: "2026-08-22T00:00:00.000Z",
+            expiresAt: "2026-08-22T02:00:00.000Z",
             runningModels: [{ model: "qwen36-a3b", state: "ready", ttlSeconds: 120 }],
           },
+          new AbortController().signal,
         );
         events.push("close");
         return {
@@ -136,7 +146,7 @@ describe("manual model evaluation", () => {
     await expect(runProtectedEvaluation(candidate, {
       apiKey: "",
       baseUrl: "http://127.0.0.1:8080",
-      ttlSeconds: 120,
+      ttlSeconds: 600,
       drainTimeoutSeconds: 5,
       evaluate: async () => { throw new Error("must not run"); },
       append: () => { throw new Error("must not append"); },
@@ -155,7 +165,7 @@ describe("manual model evaluation", () => {
     await expect(runProtectedEvaluation(candidate, {
       apiKey: "maintenance-key",
       baseUrl: "http://127.0.0.1:8080",
-      ttlSeconds: 120,
+      ttlSeconds: 600,
       drainTimeoutSeconds: 5,
       evaluate: async () => {
         events.push("evaluate-failed");
@@ -168,7 +178,8 @@ describe("manual model evaluation", () => {
         try {
           await deps.runChild(
             ["manual-model-evaluation"],
-            { mode: "exclusive", startedAt: "now", runningModels: [] },
+            { mode: "exclusive", startedAt: "now", expiresAt: "later", runningModels: [] },
+            new AbortController().signal,
           );
         } finally {
           events.push("close");
@@ -177,5 +188,97 @@ describe("manual model evaluation", () => {
       },
     })).rejects.toThrow("probe failure");
     expect(events).toEqual(["open", "evaluate-failed", "restore", "close"]);
+  });
+
+  it("keeps signal ownership through restoration and closes before surfacing interruption", async () => {
+    const candidate = manualCandidateForArtifact({
+      modelId: "manual/model",
+      quant: "Q4_K_M",
+      artifactPath: "/home/magnus/models/manual/model.gguf",
+      modelsDir: "/home/magnus/models",
+      sizeBytes: 1024,
+    });
+    const events: string[] = [];
+    const expectedEntry = buildRegistryEntry(candidate, "winner", summary(0.8, 30));
+    const termination = new AbortController();
+    let finishRestore!: () => void;
+    const restoreGate = new Promise<void>((resolve) => { finishRestore = resolve; });
+    const running = runProtectedEvaluation(candidate, {
+      apiKey: "maintenance-key",
+      baseUrl: "http://127.0.0.1:8080",
+      ttlSeconds: 600,
+      drainTimeoutSeconds: 5,
+      evaluate: async () => expectedEntry,
+      append: () => events.push("append"),
+      terminationSignal: termination.signal,
+      restore: async () => {
+        events.push("restore-start");
+        termination.abort(new Error("model evaluation interrupted by SIGTERM"));
+        await restoreGate;
+        events.push("restore-finish");
+      },
+      runWindow: async (_plan, deps) => {
+        events.push("open");
+        try {
+          await deps.runChild(
+            ["manual-model-evaluation"],
+            {
+              mode: "exclusive",
+              startedAt: "now",
+              expiresAt: "later",
+              runningModels: [{ model: "qwen36-a3b", state: "ready", ttlSeconds: 120 }],
+            },
+            new AbortController().signal,
+          );
+        } finally {
+          events.push("close");
+        }
+        throw new Error("unreachable");
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    finishRestore();
+    await expect(running).rejects.toThrow(/interrupted by SIGTERM/);
+    expect(events).toEqual(["open", "append", "restore-start", "restore-finish", "close"]);
+  });
+
+  it("refuses a failed llama-swap unload instead of starting a competing evaluator", async () => {
+    const controller = new AbortController();
+    await expect(quiesceLlamaSwapForEvaluation(controller.signal, {
+      baseUrl: "http://llama-swap",
+      fetch: async () => new Response("busy", { status: 503 }),
+    })).rejects.toThrow(/unload failed: HTTP 503/);
+  });
+
+  it("waits until llama-swap proves residency is empty", async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const running = [
+      { running: [{ model: "qwen36-a3b", state: "ready" }] },
+      { running: [] },
+    ];
+    await quiesceLlamaSwapForEvaluation(controller.signal, {
+      baseUrl: "http://llama-swap",
+      sleep: async () => undefined,
+      fetch: async (input, init) => {
+        calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+        if (init?.method === "POST") return new Response("OK");
+        return new Response(JSON.stringify(running.shift()), {
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    expect(calls).toEqual([
+      "POST http://llama-swap/api/models/unload",
+      "GET http://llama-swap/running",
+      "GET http://llama-swap/running",
+    ]);
+  });
+
+  it("turns a missing llama-server binary spawn error into a caught failure", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const waiting = waitForChildSpawn(child);
+    child.emit("error", new Error("spawn ENOENT"));
+    await expect(waiting).rejects.toThrow("spawn ENOENT");
   });
 });
