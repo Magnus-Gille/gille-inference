@@ -14,19 +14,21 @@ export interface MaintenanceWindowClientEvidence {
   runningModels: Array<{ model: string; state: string; ttlSeconds: number | null }>;
 }
 
+export interface MaintenanceWindowOpeningEvidence {
+  mode: "exclusive";
+  startedAt: string;
+  runningModels: Array<{ model: string; state: string; ttlSeconds: number | null }>;
+}
+
 interface OpenResponse {
   token: string;
-  evidence: {
-    mode: "exclusive";
-    startedAt: string;
-    runningModels: Array<{ model: string; state: string; ttlSeconds: number | null }>;
-  };
+  evidence: MaintenanceWindowOpeningEvidence;
 }
 
 export interface MaintenanceWindowClientDependencies {
   fetch: typeof fetch;
   apiKey: string;
-  runChild(command: string[]): Promise<number>;
+  runChild(command: string[], opened: MaintenanceWindowOpeningEvidence): Promise<number>;
   now?: () => number;
 }
 
@@ -94,7 +96,7 @@ export async function runMaintenanceWindowCommand(
     if (openedBody.evidence?.mode !== "exclusive" || !Array.isArray(openedBody.evidence.runningModels)) {
       throw new Error("gateway returned malformed maintenance-window evidence");
     }
-    childExitCode = await deps.runChild(plan.command);
+    childExitCode = await deps.runChild(plan.command, openedBody.evidence);
   } catch (error) {
     childError = error;
   } finally {

@@ -12,12 +12,16 @@ function json(status: number, body: unknown): Response {
 describe("maintenance window client", () => {
   it("always restores and never returns the opaque token as evidence", async () => {
     const requests: Array<Record<string, unknown>> = [];
+    let observedRunningModels: unknown;
     const evidence = await runMaintenanceWindowCommand(
       { baseUrl: "http://127.0.0.1:8080", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["true"] },
       {
         apiKey: "secret-admin-key",
         now: () => 2_000,
-        runChild: async () => 0,
+        runChild: async (_command, opened) => {
+          observedRunningModels = opened?.runningModels;
+          return 0;
+        },
         fetch: async (_input, init) => {
           if (init?.method === "GET") return json(200, { active: false, evidence: null });
           const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -36,6 +40,7 @@ describe("maintenance window client", () => {
     expect(JSON.stringify(evidence)).not.toContain("opaque-release-token");
     expect(JSON.stringify(evidence)).not.toContain("secret-admin-key");
     expect(evidence).toMatchObject({ mode: "exclusive", childExitCode: 0, restored: true });
+    expect(observedRunningModels).toEqual([]);
   });
 
   it("restores even when the child fails", async () => {

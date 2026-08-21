@@ -1138,10 +1138,20 @@ export function getVerdict(
   nodeId: "m5" | "orin" = "m5",
   opts?: EvidenceReadOpts
 ): VerdictResult {
+  return getVerdictFromDb(ledgerDb(), taskType, modelId, policy, nodeId, opts);
+}
+
+function getVerdictFromDb(
+  db: Database.Database,
+  taskType: string,
+  modelId: string,
+  policy: PolicyConfig,
+  nodeId: "m5" | "orin" = "m5",
+  opts?: EvidenceReadOpts
+): VerdictResult {
   // Policy/evidence lookups share the #91 identity rule. Keep `taskType` itself for the returned
   // audit attribution; only the decision key is canonicalized when this is a known taxonomy lane.
   const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
-  const db = ledgerDb();
   const rows = db
     .prepare(
       `SELECT outcome, error_class, verifier FROM delegations
@@ -1529,7 +1539,19 @@ export interface LedgerReportRow extends VerdictResult {
 }
 
 export function ledgerReport(policy: PolicyConfig, opts?: EvidenceReadOpts): LedgerReportRow[] {
-  const db = ledgerDb();
+  return ledgerReportFromDb(ledgerDb(), policy, opts);
+}
+
+/**
+ * Build the report from an already-open database without initialising or migrating it.
+ * Operational generators use this with a query-only snapshot so evidence inspection cannot
+ * mutate the authoritative ledger or manufacture schema in a misbound stub database.
+ */
+export function ledgerReportFromDb(
+  db: Database.Database,
+  policy: PolicyConfig,
+  opts?: EvidenceReadOpts
+): LedgerReportRow[] {
   // The shadow filter applies to the CELL ENUMERATION too, not just the per-cell verdict: a task
   // type whose ONLY rows are shadow rows must not surface as a cell at all in the default report
   // (it would read as a real, zero-attempt lane and quietly imply the router has looked at it).
@@ -1555,7 +1577,7 @@ export function ledgerReport(policy: PolicyConfig, opts?: EvidenceReadOpts): Led
   }>;
 
   return pairs.map((p) => {
-    const v = getVerdict(p.taskType, p.modelId, policy, p.nodeId, opts);
+    const v = getVerdictFromDb(db, p.taskType, p.modelId, policy, p.nodeId, opts);
     let recommendation: LedgerReportRow["recommendation"];
     if (v.verdict === "viable") recommendation = "delegate-local";
     else if (v.frozen && (v.verdict === "not_viable" || v.verdict === "marginal"))

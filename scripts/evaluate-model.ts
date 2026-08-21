@@ -21,10 +21,10 @@
  *   LLAMA_SERVER_BIN            /home/magnus/llama.cpp/build/bin/llama-server
  *   LLAMASWAP_URL               http://127.0.0.1:8091
  *   EVAL_MODEL_UNLOAD_FIRST     1
- *   EVAL_MODEL_MAINTENANCE_KEY  owner/admin gateway key
+ *   M5_MAINTENANCE_KEY           owner/admin gateway key (never inherited by llama-server)
  *   EVAL_MODEL_GATEWAY_URL      gateway admin URL
- *   EVAL_MODEL_REQUIRE_MAINTENANCE 1
  *   EVAL_MODEL_MAINTENANCE_TTL_S 7200
+ *   EVAL_MODEL_MAINTENANCE_DRAIN_TIMEOUT_S 60
  */
 import { spawn } from "node:child_process";
 import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
@@ -42,6 +42,14 @@ import {
   reviewQualityFlags,
   servingConfigFlags,
 } from "../src/homeserver/scout-gate.js";
+import {
+  childEnvironmentWithoutMaintenanceKey,
+  runMaintenanceWindowCommand,
+  type MaintenanceWindowClientDependencies,
+  type MaintenanceWindowClientEvidence,
+  type MaintenanceWindowOpeningEvidence,
+  type MaintenanceWindowClientPlan,
+} from "../src/homeserver/maintenance-window-client.js";
 
 const DEFAULT_MODELS_DIR = "/home/magnus/models";
 const DEFAULT_LLAMA_SERVER_BIN = "/home/magnus/llama.cpp/build/bin/llama-server";
@@ -50,7 +58,7 @@ const DEFAULT_PORT = 9099;
 const DEFAULT_CTX = 8192;
 const DEFAULT_REPEATS = 1;
 const DEFAULT_MAINTENANCE_TTL_S = 7200;
-const MAINTENANCE_TTL_FALLBACK_S = 7200;
+const DEFAULT_MAINTENANCE_DRAIN_TIMEOUT_S = 60;
 
 const PORT = Number(process.env["EVAL_MODEL_PORT"] ?? DEFAULT_PORT);
 const CTX = Number(process.env["EVAL_MODEL_CTX"] ?? DEFAULT_CTX);
@@ -59,10 +67,12 @@ const BIN = process.env["LLAMA_SERVER_BIN"] ?? DEFAULT_LLAMA_SERVER_BIN;
 const LLAMASWAP_URL = (process.env["LLAMASWAP_URL"] ?? "http://127.0.0.1:8091").replace(/\/$/, "");
 const REGISTRY = process.env["EVAL_MODEL_REGISTRY"] ?? DEFAULT_REGISTRY_PATH;
 const UNLOAD_FIRST = process.env["EVAL_MODEL_UNLOAD_FIRST"] !== "0";
-const MAINTENANCE_KEY = process.env["EVAL_MODEL_MAINTENANCE_KEY"] ?? "";
+const MAINTENANCE_KEY = process.env["M5_MAINTENANCE_KEY"] ?? "";
 const GATEWAY_URL = (process.env["EVAL_MODEL_GATEWAY_URL"] ?? DEFAULT_GATEWAY_URL).replace(/\/$/, "");
-const REQUIRE_MAINTENANCE = process.env["EVAL_MODEL_REQUIRE_MAINTENANCE"] !== "0";
 const MAINTENANCE_TTL_S = Number(process.env["EVAL_MODEL_MAINTENANCE_TTL_S"] ?? DEFAULT_MAINTENANCE_TTL_S);
+const MAINTENANCE_DRAIN_TIMEOUT_S = Number(
+  process.env["EVAL_MODEL_MAINTENANCE_DRAIN_TIMEOUT_S"] ?? DEFAULT_MAINTENANCE_DRAIN_TIMEOUT_S,
+);
 const EVALUATION_ENDPOINT = `http://127.0.0.1:${PORT}/v1`;
 const EVAL_GATE_CONFIG = loadScoutGateConfig();
 
@@ -217,6 +227,30 @@ async function unloadLlamaSwap(): Promise<void> {
   }
 }
 
+async function restoreRunningModels(
+  runningModels: MaintenanceWindowOpeningEvidence["runningModels"],
+): Promise<void> {
+  const readyModels = runningModels.filter((entry) => entry.state === "ready");
+  if (readyModels.length === 0) return;
+  if (readyModels.length > 1) {
+    throw new Error(`cannot restore ambiguous serial-GPU residency (${readyModels.length} ready models)`);
+  }
+  const model = readyModels[0]!.model;
+  const response = await fetch(`${LLAMASWAP_URL}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: "Reply with exactly OK." }],
+      max_tokens: 2,
+      temperature: 0,
+    }),
+    signal: AbortSignal.timeout(300_000),
+  });
+  if (!response.ok) throw new Error(`failed to restore resident model ${model}: HTTP ${response.status}`);
+  log(`restored pre-evaluation resident model ${model}`);
+}
+
 async function waitHealthy(timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -230,37 +264,6 @@ async function waitHealthy(timeoutMs: number): Promise<boolean> {
   return false;
 }
 
-async function setMaintenance(on: boolean): Promise<boolean> {
-  if (!MAINTENANCE_KEY) {
-    log("maintenance mode not engaged: EVAL_MODEL_MAINTENANCE_KEY is absent");
-    return false;
-  }
-  const requestedTtl = MAINTENANCE_TTL_S;
-  const ttlSeconds = Number.isFinite(requestedTtl) && requestedTtl > 0 ? requestedTtl : MAINTENANCE_TTL_FALLBACK_S;
-  try {
-    const response = await fetch(`${GATEWAY_URL}/admin/maintenance`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${MAINTENANCE_KEY}`, "content-type": "application/json" },
-      body: JSON.stringify(on ? { on: true, ttlSeconds } : { on: false }),
-    });
-    if (!response.ok) {
-      log(`maintenance mode ${on ? "ON" : "OFF"} failed: HTTP ${response.status}`);
-      return false;
-    }
-    log(`maintenance mode ${on ? "ON" : "OFF"}${on ? ` (${ttlSeconds}s auto-expiry)` : ""}`);
-    return true;
-  } catch (error) {
-    log(`maintenance mode ${on ? "ON" : "OFF"} failed: ${error instanceof Error ? error.message : String(error)}`);
-    return false;
-  }
-}
-
-export function assertMaintenanceEngaged(engaged: boolean, required: boolean): void {
-  if (required && !engaged) {
-    throw new Error("EVAL_MODEL_REQUIRE_MAINTENANCE=1 but gateway maintenance mode did not engage; refusing evaluation");
-  }
-}
-
 async function evaluate(candidate: ManualEvaluationCandidate): Promise<RegistryEntry> {
   if (await portInUse()) throw new Error(`evaluation port ${PORT} is already in use`);
   if (UNLOAD_FIRST) await unloadLlamaSwap();
@@ -269,8 +272,12 @@ async function evaluate(candidate: ManualEvaluationCandidate): Promise<RegistryE
   const child = spawn(
     BIN,
     ["--host", "127.0.0.1", "--port", String(PORT), "-m", candidate.artifactPath, "-ngl", "99", "-ub", "512", "-c", String(CTX), "--jinja", "-fa", "on"],
-    { stdio: "ignore" }
+    { stdio: "ignore", env: childEnvironmentWithoutMaintenanceKey(process.env) }
   );
+  const forwardSignal = (signal: NodeJS.Signals): void => {
+    if (!child.killed) child.kill(signal);
+  };
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, forwardSignal);
   try {
     if (!(await waitHealthy(300_000))) {
       log("ephemeral server did not become healthy");
@@ -289,6 +296,9 @@ async function evaluate(candidate: ManualEvaluationCandidate): Promise<RegistryE
     log(`verdict: ${verdict} (pass ${(summary.passRate * 100).toFixed(0)}%, ${summary.avgTokPerSec ?? "—"} tok/s); registry only, no roster mutation`);
     return entry;
   } finally {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+      process.removeListener(signal, forwardSignal);
+    }
     child.kill("SIGTERM");
     await new Promise<void>((resolvePromise) => {
       if (child.exitCode !== null || child.signalCode !== null) {
@@ -305,6 +315,74 @@ async function evaluate(candidate: ManualEvaluationCandidate): Promise<RegistryE
       });
     });
   }
+}
+
+type RunWindow = (
+  plan: MaintenanceWindowClientPlan,
+  deps: MaintenanceWindowClientDependencies,
+) => Promise<MaintenanceWindowClientEvidence>;
+
+export interface ProtectedEvaluationDependencies {
+  apiKey: string;
+  baseUrl: string;
+  ttlSeconds: number;
+  drainTimeoutSeconds: number;
+  evaluate?: (candidate: ManualEvaluationCandidate) => Promise<RegistryEntry>;
+  append?: (entry: RegistryEntry) => void;
+  restore?: (runningModels: MaintenanceWindowOpeningEvidence["runningModels"]) => Promise<void>;
+  runWindow?: RunWindow;
+}
+
+/** Hold the server-owned exclusive lease until both evaluation and durable evidence append finish. */
+export async function runProtectedEvaluation(
+  candidate: ManualEvaluationCandidate,
+  deps: ProtectedEvaluationDependencies,
+): Promise<RegistryEntry> {
+  const evaluateCandidate = deps.evaluate ?? evaluate;
+  const append = deps.append ?? ((entry: RegistryEntry) => appendEntry(entry, REGISTRY));
+  const restore = deps.restore ?? restoreRunningModels;
+  const runWindow = deps.runWindow ?? runMaintenanceWindowCommand;
+  let entry: RegistryEntry | undefined;
+
+  const evidence = await runWindow(
+    {
+      baseUrl: deps.baseUrl,
+      ttlSeconds: deps.ttlSeconds,
+      drainTimeoutSeconds: deps.drainTimeoutSeconds,
+      // The shared window client requires a non-empty command label. This callback runs in-process
+      // so the opaque release token never enters argv, env, or the llama-server child.
+      command: ["manual-model-evaluation"],
+    },
+    {
+      fetch,
+      apiKey: deps.apiKey,
+      runChild: async (_command, opened) => {
+        let evaluationError: unknown;
+        try {
+          entry = await evaluateCandidate(candidate);
+          append(entry);
+        } catch (error) {
+          evaluationError = error;
+        }
+        let restoreError: unknown;
+        try {
+          await restore(opened.runningModels);
+        } catch (error) {
+          restoreError = error;
+        }
+        if (evaluationError !== undefined && restoreError !== undefined) {
+          throw new AggregateError([evaluationError, restoreError], "model evaluation and required residency restoration both failed");
+        }
+        if (evaluationError !== undefined) throw evaluationError;
+        if (restoreError !== undefined) throw restoreError;
+        return 0;
+      },
+    },
+  );
+  if (evidence.childExitCode !== 0 || entry === undefined) {
+    throw new Error(`manual model evaluation did not complete inside the exclusive window (exit ${evidence.childExitCode})`);
+  }
+  return entry;
 }
 
 function resolveCandidate(args: string[]): ManualEvaluationCandidate {
@@ -328,19 +406,21 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const candidate = resolveCandidate(args);
   if (args.includes("--dry-run")) {
-    console.log(JSON.stringify({ dryRun: true, candidate, maintenanceRequired: REQUIRE_MAINTENANCE, mutation: "registry append only" }, null, 2));
+    console.log(JSON.stringify({ dryRun: true, candidate, maintenanceRequired: true, mutation: "registry append only" }, null, 2));
     return;
   }
 
-  const engaged = await setMaintenance(true);
-  try {
-    assertMaintenanceEngaged(engaged, REQUIRE_MAINTENANCE);
-    const entry = await evaluate(candidate);
-    appendEntry(entry, REGISTRY);
-    console.log(JSON.stringify({ model: entry.id, verdict: entry.verdict, registry: REGISTRY, served: false, gateFlags: entry.gateFlags }, null, 2));
-  } finally {
-    await setMaintenance(false);
-  }
+  const entry = await runProtectedEvaluation(candidate, {
+    apiKey: MAINTENANCE_KEY,
+    baseUrl: GATEWAY_URL,
+    ttlSeconds: Number.isFinite(MAINTENANCE_TTL_S) && MAINTENANCE_TTL_S > 0
+      ? MAINTENANCE_TTL_S
+      : DEFAULT_MAINTENANCE_TTL_S,
+    drainTimeoutSeconds: Number.isFinite(MAINTENANCE_DRAIN_TIMEOUT_S) && MAINTENANCE_DRAIN_TIMEOUT_S > 0
+      ? MAINTENANCE_DRAIN_TIMEOUT_S
+      : DEFAULT_MAINTENANCE_DRAIN_TIMEOUT_S,
+  });
+  console.log(JSON.stringify({ model: entry.id, verdict: entry.verdict, registry: REGISTRY, served: false, gateFlags: entry.gateFlags }, null, 2));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

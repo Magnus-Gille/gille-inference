@@ -49,10 +49,10 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import Database from "better-sqlite3";
 
 import { loadConfig } from "../src/homeserver/config.js";
-import { ledgerReport } from "../src/homeserver/ledger.js";
-import { getDb } from "../src/db.js";
+import { ledgerReportFromDb } from "../src/homeserver/ledger.js";
 import { listModels, getRunningCmd } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
 import { eligibleIncumbents, parseIncumbentAuditMaxAgeMs, readIncumbentAudits } from "../src/homeserver/incumbent-audit-registry.js";
@@ -237,19 +237,43 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const dbPath = resolve(args.db ?? process.env["EVAL_DB_PATH"] ?? "./data/eval.db");
 
-  // 1. Ledger verdicts (also ensures the delegations schema exists).
-  const dbPresent = existsSync(dbPath);
-  const verdicts = ledgerReport(config.policy);
-  let ledgerRecords = 0;
-  let ledgerLatest: string | null = null;
+  // 1. Ledger verdicts. Read a private query-only snapshot: generation must never create or
+  // migrate schema in the authoritative database, and a misbound EVAL_DB_PATH must fail closed
+  // instead of being mistaken for a legitimate empty ledger.
+  if (!existsSync(dbPath)) {
+    throw new Error(
+      `authoritative capability ledger is missing at ${dbPath}; check --db/EVAL_DB_PATH and the service mount namespace`
+    );
+  }
+  const dbPresent = true;
+  let verdicts: ReturnType<typeof ledgerReportFromDb>;
+  let ledgerRecords: number;
+  let ledgerLatest: string | null;
+  // Use SQLite's own read-only connection here rather than copying the main file: a live WAL may
+  // contain the newest committed evidence, and copying only the main file would be stale. readonly
+  // + query_only forbids content/schema writes while still giving SQLite a coherent WAL snapshot.
+  const snapshot = new Database(dbPath, { readonly: true, fileMustExist: true });
+  snapshot.pragma("query_only = ON");
   try {
-    const row = getDb()
+    const table = snapshot
+      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'delegations'`)
+      .get() as { present: number } | undefined;
+    if (!table) {
+      throw new Error("required delegations table is absent");
+    }
+    verdicts = ledgerReportFromDb(snapshot, config.policy);
+    const row = snapshot
       .prepare(`SELECT COUNT(*) AS c, MAX(ts) AS latest FROM delegations`)
       .get() as { c: number; latest: string | null };
     ledgerRecords = row.c;
     ledgerLatest = row.latest;
-  } catch {
-    /* delegations table absent — leave zeroed */
+  } catch (error) {
+    throw new Error(
+      `authoritative capability ledger is incompatible at ${dbPath}; check --db/EVAL_DB_PATH ` +
+        `and the service mount namespace (${error instanceof Error ? error.message : String(error)})`
+    );
+  } finally {
+    snapshot.close();
   }
 
   // 2. Cartography provenance.

@@ -21,23 +21,25 @@ download step.
 
 ## Protected evaluation
 
-The real run must use the shared GPU lease and an owner/admin gateway key that can engage
-maintenance mode. The script fails closed before unloading or launching the ephemeral server when
-`EVAL_MODEL_REQUIRE_MAINTENANCE=1` (the default) and maintenance cannot be confirmed.
+The real run acquires the repository-owned exclusive maintenance window: the isolated gateway
+identity takes the shared GPU lease, fences owner and guest inference, drains admitted work, and
+captures stable llama-swap residency before the evaluator can unload or launch anything. The
+opaque release token remains in memory and only this run can close its window. Missing or rejected
+maintenance authorization fails before evaluation.
 
 ```bash
-export EVAL_MODEL_MAINTENANCE_KEY="$(m5-auth)"
-npx tsx src/homeserver/cli.ts gpu run --model manual-model-evaluation --eta 90m \
-  --purpose manual-model-evaluation -- \
-  npx tsx scripts/evaluate-model.ts \
-    --model-id meta-models/Muse-Glimmer-30B-GGUF \
-    --gguf /home/magnus/models/muse-glimmer-30b/muse-glimmer-30B-kquant-dynamic.gguf \
-    --quant KQ_DYNAMIC
+# Resolve M5_MAINTENANCE_KEY from the approved private operator credential source first.
+npx tsx scripts/evaluate-model.ts \
+  --model-id meta-models/Muse-Glimmer-30B-GGUF \
+  --gguf /home/magnus/models/muse-glimmer-30b/muse-glimmer-30B-kquant-dynamic.gguf \
+  --quant KQ_DYNAMIC
 ```
 
 The evaluator starts a loopback-only ephemeral llama-server, runs the deterministic probe battery
-sequentially, and appends one content-blind registry row. It does not move, delete, register, load,
-reload, or promote the artifact. A `winner` is evidence for review, not a roster command.
+sequentially, appends one content-blind registry row, restores the pre-run resident model when one
+was ready, and only then releases the exclusive window. The maintenance credential is stripped
+from the llama-server child environment. The evaluator does not move, delete, register, or promote
+the artifact. A `winner` is evidence for review, not a roster command.
 
 ## Evidence and routing
 

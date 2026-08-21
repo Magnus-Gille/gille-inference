@@ -17,7 +17,8 @@ it against the incumbents.
 ### Prior-family history (issue #141)
 
 Ornith-**1.0**-35B was evaluated on this box on 2026-07-05 and deliberately left
-downloaded-but-unserved. The weekly Scout auto-eval returned verdict "winner" (probe passRate 1.0,
+downloaded-but-unserved. The now-retired weekly Scout's historical auto-eval returned verdict
+"winner" (probe passRate 1.0,
 ~68 tok/s), and a Gate-D head-to-head scored **Ornith-1.0-35B 8/10 vs qwen3.6-35B-A3B 9/10** on a
 single seed — a statistical tie, with Ornith ~25% faster. The recorded conclusion was "validated
 peer, don't displace qwen3.6 on 1-seed evidence," and promotion was explicitly reserved as the

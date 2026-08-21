@@ -574,13 +574,19 @@ profile configuration, diagnostics, and transport behavior.
 
 ### Production text roster
 
-llama-swap serves one of eight text models at a time. `gpt-oss-120b` remains the standard large
-reasoning model and a preferred 64K tier. `qwen38-27b` is a 64K dense, multimodal Q4_K_M model
-served with Q8 KV and native MTP; thinking is on by default and can be disabled per request with
-`chat_template_kwargs.enable_thinking=false`. Adding it to the roster does not make it a default
-or an enforced route. The other served IDs are `mellum`,
-`qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`, and
-`qwen3-coder-next-80b`.
+llama-swap serves one of twelve text models at a time. The roster IDs are `mellum`,
+`qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`,
+`qwen3-coder-next-80b`, `gpt-oss-120b`, `qwen35-122b-a10b`, `muse-glimmer-30b`,
+`nemotron-3.5-lightning-30b-a3b`, `qwen38-27b`, and `ornith-1.5-35b`.
+
+`gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
+`qwen38-27b` and `ornith-1.5-35b` are 64K multimodal Q4_K_M models served with Q8 KV and native
+MTP; thinking is on by default and can be disabled per request with
+`chat_template_kwargs.enable_thinking=false`. `qwen35-122b-a10b` is a 32K reasoning-off precision
+specialist. `muse-glimmer-30b` and `nemotron-3.5-lightning-30b-a3b` remain reversible canaries;
+Glimmer delegation requires a grounded task plus an explicit deterministic verifier, and Nemotron
+is served reasoning-off. A model being present in this roster does not make it a default or an
+enforced route.
 
 ## Coordinating heavy GPU jobs — `gpu` (issue #88)
 

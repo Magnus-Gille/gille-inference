@@ -80,7 +80,7 @@ export const DEFAULT_SCOUT_GATE_CONFIG: ScoutGateConfig = {
   maxReviewCleanConfabulationRate: 0.25,
 };
 
-/** Env-driven override of the gate config (used by the scout + promoter scripts). */
+/** Env-driven override of the gate config used by the explicit evaluator and registry consumers. */
 export function loadScoutGateConfig(env: NodeJS.ProcessEnv = process.env): ScoutGateConfig {
   const hard = env["SCOUT_HARD_TASK_TYPES"];
   const hardTaskTypes = hard

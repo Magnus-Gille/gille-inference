@@ -631,7 +631,7 @@ describe("portal page content", () => {
     // Hardware facts
     expect(body).toContain("Strix Halo");
     expect(body).toContain("128");
-    // All eight publicly advertised chat-model IDs
+    // All twelve publicly advertised chat-model IDs
     expect(body).toContain("mellum");
     expect(body).toContain("gemma4");
     expect(body).toContain("qwen36-a3b");
@@ -639,8 +639,11 @@ describe("portal page content", () => {
     expect(body).toContain("vibethinker-3b");
     expect(body).toContain("qwen3-coder-next-80b");
     expect(body).toContain("gpt-oss-120b");
+    expect(body).toContain("qwen35-122b-a10b");
+    expect(body).toContain("muse-glimmer-30b");
+    expect(body).toContain("nemotron-3.5-lightning-30b-a3b");
     expect(body).toContain("qwen38-27b");
-    expect(body).not.toContain("qwen35-122b-a10b");
+    expect(body).toContain("ornith-1.5-35b");
     // Quant and context facts
     expect(body).toContain("Q4_K_M");
     expect(body).toContain("Q8_0");

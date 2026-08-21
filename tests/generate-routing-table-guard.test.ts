@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { initDb } from "../src/db.js";
 import { recordDelegation } from "../src/homeserver/ledger.js";
+import Database from "better-sqlite3";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const SCRIPT = join(REPO_ROOT, "scripts", "generate-routing-table.ts");
@@ -52,11 +53,20 @@ function adoptedTable(): string {
   );
 }
 
-function runScript(args: string[], outPath: string): { status: number | null; stdout: string; stderr: string } {
+function runScript(
+  args: string[],
+  outPath: string,
+  selectedDbPath: string = dbPath
+): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(
     process.execPath,
-    [TSX, SCRIPT, "--db", dbPath, "--data-dir", dataDir, "--out", outPath, ...args],
-    { cwd: REPO_ROOT, encoding: "utf8", timeout: 120_000, env: { ...process.env, EVAL_DB_PATH: dbPath } }
+    [TSX, SCRIPT, "--db", selectedDbPath, "--data-dir", dataDir, "--out", outPath, ...args],
+    {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: 120_000,
+      env: { ...process.env, TMPDIR: dir, EVAL_DB_PATH: selectedDbPath },
+    }
   );
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -181,5 +191,40 @@ describe("generate-routing-table — capability-regression guard (issue #151)", 
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/corrupt|parse|unreadable/i);
     expect(readFileSync(out, "utf8")).toBe("{ not json");
+  });
+
+  it("fails closed on a misbound SQLite stub without creating ledger schema or output", () => {
+    const stubPath = join(dir, "wrong-mounted-stub.db");
+    const stub = new Database(stubPath);
+    stub.exec("CREATE TABLE unrelated_state (id TEXT PRIMARY KEY)");
+    stub.close();
+    const before = readFileSync(stubPath);
+    const out = join(dir, "m5-routing-from-stub.json");
+
+    const r = runScript([], out, stubPath);
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/authoritative capability ledger/i);
+    expect(r.stderr).toMatch(/delegations|EVAL_DB_PATH/i);
+    expect(existsSync(out)).toBe(false);
+    expect(readFileSync(stubPath)).toEqual(before);
+    const reopened = new Database(stubPath, { readonly: true });
+    const manufactured = reopened
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'delegations'")
+      .get();
+    reopened.close();
+    expect(manufactured).toBeUndefined();
+  });
+
+  it("fails closed when the configured capability ledger file does not exist", () => {
+    const missingPath = join(dir, "missing-ledger.db");
+    const out = join(dir, "m5-routing-from-missing.json");
+
+    const r = runScript([], out, missingPath);
+
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/authoritative capability ledger is missing/i);
+    expect(existsSync(missingPath)).toBe(false);
+    expect(existsSync(out)).toBe(false);
   });
 });
