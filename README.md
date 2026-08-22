@@ -175,6 +175,8 @@ See [`SECURITY.md`](./SECURITY.md),
 - [`docs/hugin-role-validation.md`](./docs/hugin-role-validation.md) — dated trial that decides
   whether Hugin's implementation earns its maintenance surface.
 - [`docs/gateway-api-contract.md`](./docs/gateway-api-contract.md) — concrete gateway surfaces.
+- [`docs/ox-alpha-pi.md`](./docs/ox-alpha-pi.md) — secret-safe headless Pi launcher for the external
+  Nous `stealth/ox-alpha` agent and isolated subagents.
 - [`docs/observability.md`](./docs/observability.md) — content and telemetry boundaries.
 - [`docs/migration-go-no-go-verdict.md`](./docs/migration-go-no-go-verdict.md) — measured decision to
   retain the frontier Conductor and localize leaf work.
