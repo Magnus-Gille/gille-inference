@@ -186,12 +186,16 @@ run_one() {
   : >"$TRANSCRIPT"
   [ -f "$W/.arm.log" ] && cat "$W/.arm.log" >>"$TRANSCRIPT" 2>/dev/null
   [ -f "$W/.arm.stderr.log" ] && cat "$W/.arm.stderr.log" >>"$TRANSCRIPT" 2>/dev/null
-  # Scanning is delegated to gate-d/peek-scan.py, which reads distinctive lines from the PRISTINE
-  # task dir (never the work dir) and additionally checks the two signals that actually matter:
-  # whether HIDDEN-oracle content (staged at grade time, physically absent from the work dir) or
-  # REFERENCE-SOLUTION content ever reached the transcript. Both should be impossible — a hit means
-  # staging leaked. Visible-oracle/oracleCmd hits are NORMAL on most r1 tasks (the harness is meant
-  # to read and satisfy the oracle) and are retained only for cross-arm comparability.
+  # Scanning is delegated to gate-d/peek-scan.py, which reads from the PRISTINE task dir (never the
+  # work dir). `solution/` and `oracle/` live outside $W, so the thing worth detecting is ACCESS,
+  # not similarity — an early version matched reference-solution *code* and fired on 30/30
+  # legitimate passing runs, because a correct implementation IS the reference solution at this task
+  # scale. The leak signals are now graderPathInTranscript (a protected path was referenced),
+  # hiddenOracleMarkerInTranscript (arbitrary author-chosen literals, two-hit + high-specificity
+  # threshold), and solutionMarkerInTranscript (the "REFERENCE SOLUTION" banner). Discriminating
+  # power is pinned by positive AND negative controls in tests/gate-d-peek-scan.test.ts.
+  # oracleContent/oracleCmd hits are NORMAL on visible-oracle tasks (the harness is meant to read
+  # and satisfy the oracle) and are retained only for cross-arm comparability.
   # Fails OPEN: any scanner error yields '{}' so a graded run is never broken by observation.
   local PEEK_JSON
   PEEK_JSON="$(python3 "$ROOT/peek-scan.py" "$T" "$TRANSCRIPT" 2>/dev/null)" || PEEK_JSON=""
