@@ -1,18 +1,33 @@
 # Harness research spike — OSS coding harnesses for local models on the M5
 
 **Date:** 2026-08-22
-**Status:** IN PROGRESS — research complete, experiments partially executed
+**Status:** COMPLETE — research done; E2/E3/E4 executed, E1 killed on capability grounds
 **Scope:** which OSS coding harness to run against M5-served local models, and what evidence
 supports that choice.
 
 ## Summary
 
-The project's incumbent harness (`pi`) is **independently corroborated as the best available
-local-model coding harness**, so the spike's operational recommendation is *do not switch*. The
-value delivered here is not a new harness — it is (a) external corroboration of an
-existing single-site result, (b) two harness candidates evaluated and one killed on capability
-grounds, and (c) a **latent harness bug that silently invalidates unattended Gate-D pi-arm runs**,
-found while building the experiments rather than by running them.
+The most valuable artifact of this spike is **not** a harness recommendation — it is a latent
+harness defect that silently invalidates unattended Gate-D pi-arm runs (§3), found while building
+the experiments rather than by running them.
+
+Ranked findings:
+
+1. **`pi --print` hangs on inherited stdin** → any background/cron/CI Gate-D pi run yields
+   uniformly `arm-error` rows that are indistinguishable from model failure. Fixed and verified
+   red/green. (`measured`)
+2. **qwen-code is a viable second local driver**, at least on par with pi on r1/80b (10/10 vs 9/10,
+   n=1 seed, not significant). pi's Gate-D standing is not unique to pi. (`measured`)
+3. **Gate-D r1 is saturated** for current models — `ornith-1.5-35b` scores 30/30 — so r1 cannot
+   discriminate between serving configurations. The KV-quantization question is therefore
+   **unresolved**, not answered. (`measured`)
+4. **Octofriend cannot be benchmarked as shipped** — no headless agentic mode. (`measured`)
+5. `pi` remains the recommended primary driver; nothing evaluated displaces it, and the
+   external corroboration in §1.1 stands.
+
+Two claims from the preceding day's research draft did **not** survive verification and are
+corrected in place: the alleged Gate-D exposure to grader-peeking (§2/E4) and Octofriend's
+"free" repair layer (§2/E1).
 
 ## 1. External evidence
 
@@ -101,7 +116,7 @@ Two further findings weaken the original pitch:
 **Status:** the repair-layer hypothesis is **untested**, not disproven. A cheaper successor design
 (E1′) is recorded in §4.
 
-### E2 — qwen-code as a second local driver → **ARM BUILT, RUN PENDING**
+### E2 — qwen-code as a second local driver → **RUN; see §5**
 
 **Hypothesis.** qwen-code lands within noise of pi (harness-bench: 75.0 vs 76.9), giving a second
 independent local driver and de-confounding "pi" from "local agentic capability".
@@ -113,7 +128,7 @@ positional one-shot prompt, `--yolo`, `-m`, `OPENAI_BASE_URL`/`OPENAI_API_KEY`/`
 
 Implemented as a `qwen-code` arm in `gate-d/run.sh`.
 
-### E3 — KV-cache quantization vs tool-calling accuracy → **RUNNING**
+### E3 — KV-cache quantization vs tool-calling accuracy → **RUN; null with no power, see §5**
 
 **Why this exists.** Recon of the live llama-swap config found that `ornith-1.5-35b` **and**
 `qwen38-27b` are served with `-ctk q8_0 -ctv q8_0`, while `qwen36-a3b` runs default **f16**. Both of
@@ -139,7 +154,7 @@ restart, no deploy.**
   stayed healthy at **53–62 tok/s**, so contention is not believed to distort pass/fail; **wall
   times are nonetheless treated as secondary evidence.**
 
-### E4 — Grader-leak detection → **INSTRUMENTED; FRAMING CORRECTED**
+### E4 — Grader-leak detection → **INSTRUMENTED; FRAMING CORRECTED; one field retired**
 
 **Origin.** harness-bench reports OpenCode reading or executing hidden test scripts in 14 task
 instances, 13 of which passed (~14% of its passes), with no such behaviour from the other four
@@ -197,10 +212,18 @@ same model, same background invocation went from `arm-error` / 0 turns / 300 s t
 
 ## 4. Recommendations
 
-1. **Keep pi as the primary local driver.** Corroborated by independent benchmark; no candidate
-   evaluated here displaces it.
-2. **Land the stdin fix regardless of the experiments' outcome.** It is the highest-value artifact
-   of this spike.
+1. **Land the stdin fix.** Highest-value artifact of this spike; independent of every experimental
+   outcome. Consider auditing any Gate-D evidence collected non-interactively since the pi arm was
+   added, for rows with `arm-error` + zero telemetry.
+2. **Keep pi as the primary local driver, but keep the qwen-code arm.** Nothing displaces pi, and
+   a second independent driver removes a standing confound from every "local agentic capability"
+   claim in this repo.
+3. **Retire Gate-D r1 as a serving-configuration instrument.** It is saturated (30/30). Any study
+   comparing quantization, KV settings, or runtime flags needs the harder holdout set or new tasks —
+   otherwise it will keep producing powerless nulls.
+4. **Decide explicitly about the KV confound.** `ornith-1.5-35b` and `qwen38-27b` run `q8_0` KV
+   while `qwen36-a3b` runs `f16`, and both recorded head-to-heads inherit that asymmetry. Resolving
+   it needs the r2 holdouts (consume-once). That is an owner decision, deliberately not taken here.
 3. **E1′ (successor to the killed E1):** test the *mechanism*, not the harness — capture real
    malformed tool-call payloads from a pi × `gpt-oss-120b` run and replay them through a
    `fix-json`-class repairer. Cheap, and it answers the original question without needing an
@@ -214,7 +237,98 @@ same model, same background invocation went from `arm-error` / 0 turns / 300 s t
 
 ## 5. Results
 
-*(pending — E3 f16/q8_0 arms and E2 qwen-code arm)*
+### E3 — KV quantization: **measured null, with no power** (`measured`)
+
+Gate-D r1, 10 tasks × 3 seeds per arm, pi arm, `ornith-1.5-35b`, standalone `llama-server` under
+the cooperative GPU lease. Only `-ctk`/`-ctv` differ between arms.
+
+| Arm | pass | median wall | median toolCalls | median completion tokens |
+|---|---|---|---|---|
+| `-ctk f16 -ctv f16` | **30/30** | 22 s | 7.0 | 853 |
+| `-ctk q8_0 -ctv q8_0` | **30/30** | 20 s | 6.0 | 808 |
+
+Every one of the 10 tasks passed 3/3 in **both** arms.
+
+**Interpretation — read this before citing the null.** Both arms saturate at 100%, so this design
+has **essentially zero power to detect degradation**. The correct statement is *"no effect is
+detectable at r1 difficulty,"* **not** *"KV quantization is harmless."* The hypothesis is neither
+confirmed nor refuted.
+
+The ceiling is itself informative: `ornith-1.5-35b` scores **30/30 on r1** against its recorded
+**8/12 on the r2 holdouts**, confirming r1 is far easier than the holdout set and is the wrong
+instrument for this question.
+
+**Consequently the confound identified in §2/E3 remains OPEN.** Both the #141 r2 tie-break and the
+qwen38-vs-qwen36 study still compare a q8_0-KV model against an f16-KV model, and nothing here
+resolves that. Resolving it requires the **r2 holdouts**, which are consume-once; that consumption
+was explicitly out of scope for this spike and needs a deliberate decision (see §4).
+
+Descriptively, q8_0 was marginally *faster* with marginally fewer tool calls and tokens — directionally
+opposite to the "KV quantization degrades tool calling" claim, but well within noise at this sample
+size and outcome-invariant, so **no directional claim is made**.
+
+**Contention note.** Live gateway traffic kept `qwen3-30b-instruct` resident throughout both arms
+(cooperative lease does not fence the gateway). Measured generation throughput held at 53–62 tok/s.
+Pass/fail is outcome-saturated and therefore robust; wall times are reported as descriptive only.
+
+### E4 — leak detection: **detector calibrated, one field retired** (`measured`)
+
+Across all 60 E3 rows:
+
+| Field | f16 | q8_0 | Verdict |
+|---|---|---|---|
+| `hiddenOracleInTranscript` | 0/30 | 0/30 | **Sound.** No hidden-oracle content ever reached a transcript — staging holds. |
+| `solutionInTranscript` | 30/30 | 30/30 | **Retired.** Fires on every legitimate passing run; non-discriminative. |
+
+`solutionInTranscript` firing 30/30 on known-good runs is a decisive negative result for that
+signal: on Gate-D-scale tasks a correct implementation is textually the reference solution, so the
+field carries no information. It is kept as a recorded observation with this caveat, and must not be
+used as a gate or cited as evidence of peeking.
+
+The OpenCode-peeking replication that motivated E4 was **not run** — the reframing in §2/E4 removed
+its premise, since Gate-D's hidden oracles are absent from the work dir by construction.
+
+### E2 — qwen-code vs pi: **qwen-code at least on par; single seed** (`measured`)
+
+Gate-D r1, 10 tasks, **1 seed**, `qwen3-coder-next-80b` via the authenticated gateway (ordinary
+owner traffic; the GPU lease governs jobs that bypass the gateway, so none was taken).
+`CAP_S=420`.
+
+| Arm | pass | mean wall | median wall | runs at cap |
+|---|---|---|---|---|
+| **qwen-code** | **10/10** | 286 s | 269 s | 0 |
+| pi | 9/10 | 328 s | 316 s | 4 |
+
+**Cap confound, identified and removed.** pi hit the 420 s cap on exactly 4 tasks, so the raw
+comparison measured a time budget rather than capability. All four were re-run at `CAP_S=900`:
+
+| Task | pi @420 s | pi @900 s | Verdict |
+|---|---|---|---|
+| 02-fix-bug-test-catches | 420 s (cap) | **pass, 198 s** | cap artifact |
+| 04-add-cli-flag | 420 s (cap) | **pass, 484 s** | cap artifact |
+| 05-tdd-write-test-then-impl | 420 s (cap) | **pass, 304 s** | cap artifact |
+| 09-rename-across-files | 420 s **fail** | **fail, 360 s — `G5-structural`** | **genuine capability failure** |
+
+Task 09 terminated at 360 s with 900 s available and failed the structural gate, so pi's single miss
+is real, not a timeout. qwen-code passed task 09 in 395 s.
+
+**Interpretation.** qwen-code is **at least on par with pi** on r1 against the 80b, and completed
+every task inside a budget where pi did not. But 10/10 vs 9/10 is a **one-task difference at n=1
+seed** (Fisher exact p = 1.0) — this is *directional only* and **does not** establish that qwen-code
+beats pi. It is sufficient to answer the question E2 was posed to answer: pi's Gate-D standing is
+**not** unique to pi, and a second independent local driver now exists.
+
+Note this runs *opposite* to harness-bench's ordering (pi 76.9% / 163 s vs Qwen Code 75.0% / 191 s).
+Both differences are within noise in their respective samples; the useful conclusion is that the two
+harnesses are close, not that either leads.
+
+**Wall-time caveat — the 80b is far slower than the June baseline.** `docs/gate-d-execution-findings-2026-06-24.md`
+records r1 runs of 5–93 s on this model; both arms here ran 240–420 s, and pi's per-task times varied
+widely across repeats (task 02: 420 s then 198 s). Whatever the cause — gateway path, concurrent
+live traffic, runtime or model changes since June — **wall times in this section are not comparable
+to the June figures** and no throughput conclusion is drawn from them.
+
+`hiddenOracleInTranscript` = 0 across all 20 rows.
 
 ## Provenance
 
