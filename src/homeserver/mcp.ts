@@ -348,7 +348,7 @@ function renderListModelsText(content: ListModelsStructuredContent): string {
 const ADOPTION_REPORT_DESCRIPTION =
   "Record one content-free M5 adoption observation for the private operator dashboard. " +
   "Use this when an eligible task was completed, refused, failed, or could not even attempt M5; " +
-  "report missing M5 tool and missing/auth-unavailable credentials distinctly. Never include task text, output, paths, repositories, or identifiers.";
+  "report missing M5 tool and missing/auth-unavailable credentials distinctly. A full daily telemetry cap is non-fatal and does not affect the inference result; do not retry until the next UTC day. Never include task text, output, paths, repositories, or identifiers.";
 
 type AdoptionReportRejectionReason =
   | "invalid_report"
@@ -358,12 +358,18 @@ type AdoptionReportRejectionReason =
 
 function rejectAdoptionReport(reason: AdoptionReportRejectionReason): {
   text: string;
-  isError: true;
+  isError: boolean;
   structuredContent: { accepted: false; reason: AdoptionReportRejectionReason };
 } {
+  // Adoption evidence is optional telemetry, not part of the inference result. A full bounded
+  // aggregate must therefore never turn a successful M5 call into a hard MCP failure; callers can
+  // inspect `accepted:false` without retrying until the next UTC day.
+  const nonFatal = reason === "daily_capacity_reached";
   return {
-    text: `Adoption report was not accepted (${reason}).`,
-    isError: true,
+    text: nonFatal
+      ? `Adoption report not recorded (${reason}); M5 inference result is unaffected.`
+      : `Adoption report was not accepted (${reason}).`,
+    isError: !nonFatal,
     structuredContent: { accepted: false, reason },
   };
 }
@@ -1332,7 +1338,7 @@ async function callTool(
   // Owner-only code_loop_* tools (#116). The gate is re-checked here (not just at tools/list): a
   // NON-owner calling one falls THROUGH to the byte-identical unknown-tool error below — the tool
   // is invisible, never "forbidden" (which would leak its existence). Maintenance mode is read
-  // from the live admission snapshot so a scout window refuses a start.
+  // from the live admission snapshot so an explicit evaluation window refuses a start.
   if (isCodeLoopToolName(name) && isCodeLoopOwner(ctx.principal)) {
     const out = await handleCodeLoopTool(
       name,

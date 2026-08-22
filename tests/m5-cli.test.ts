@@ -810,7 +810,7 @@ describe("m5 command surface", () => {
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 
-  it("surfaces a stable redacted gateway rejection reason for a valid completed ask", async () => {
+  it("returns a non-fatal adoption-capacity result after a valid completed ask", async () => {
     const output = sink();
     const error = sink();
     const exitCode = await main(["--profile", "codex", "adoption", "report"], {
@@ -825,22 +825,17 @@ describe("m5 command surface", () => {
           jsonrpc: "2.0",
           id: request.id,
           result: {
-            content: [{ type: "text", text: "Adoption report was not accepted (daily_capacity_reached)." }],
-            isError: true,
+            content: [{ type: "text", text: "Adoption report not recorded (daily_capacity_reached); M5 inference result is unaffected." }],
+            isError: false,
             structuredContent: { accepted: false, reason: "daily_capacity_reached" },
           },
         }), { status: 200 });
       },
     });
 
-    expect(exitCode).toBe(1);
-    expect(output.text()).toBe("");
-    expect(JSON.parse(error.text())).toMatchObject({
-      error: {
-        code: "tool_error",
-        message: expect.stringContaining("daily_capacity_reached"),
-      },
-    });
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({ accepted: false, reason: "daily_capacity_reached" });
+    expect(error.text()).toBe("");
     expect(error.text()).not.toContain(SECRET);
   });
 

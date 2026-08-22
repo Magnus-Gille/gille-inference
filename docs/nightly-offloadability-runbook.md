@@ -1,7 +1,7 @@
 # Nightly offloadability gate — runbook (Job C)
 
-The third box-side self-improvement cron job (alongside Job A / Model Scout and Job B /
-Research Sweep — see `docs/weekly-model-scout-runbook.md`), and the oldest one — live since
+The box-side self-improvement cron job for offloadability, alongside the Research Sweep, and the
+oldest one — live since
 2026-06-26 — but the only one that was never given its own runbook or a CLAUDE.md mention as
 "scheduled infra." This closes that gap; no code or cron behavior changes.
 

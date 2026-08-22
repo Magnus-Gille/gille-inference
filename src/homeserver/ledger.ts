@@ -1079,7 +1079,8 @@ function accumulateOutcomeRows(rows: OutcomeRow[], taskType: string, policy: Pol
   // (code-review at minimum) a row is admissible as evidence ONLY IF its verifier is one we
   // positively TRUST to grade that quality (policy.trustedVerifiersForJudgment). A whitelist is
   // strictly stronger than #156's structural blacklist and subsumes it — the blacklist could exclude
-  // KNOWN-structural verifiers but still admitted opaque/non-adversarial checks (the scout's own
+  // KNOWN-structural verifiers but still admitted opaque/non-adversarial checks (the evaluation
+  // battery's own
   // `predicate` probe, `matches`) that pass while finding ~6% of real seeded bugs (2026-07-05 sweep),
   // so a nonEmpty pass — or a `predicate` pass — must not manufacture a verdict in EITHER direction.
   // Only the whitelist runs for judgment types (never both, redundantly). The default whitelist is
@@ -1137,10 +1138,20 @@ export function getVerdict(
   nodeId: "m5" | "orin" = "m5",
   opts?: EvidenceReadOpts
 ): VerdictResult {
+  return getVerdictFromDb(ledgerDb(), taskType, modelId, policy, nodeId, opts);
+}
+
+function getVerdictFromDb(
+  db: Database.Database,
+  taskType: string,
+  modelId: string,
+  policy: PolicyConfig,
+  nodeId: "m5" | "orin" = "m5",
+  opts?: EvidenceReadOpts
+): VerdictResult {
   // Policy/evidence lookups share the #91 identity rule. Keep `taskType` itself for the returned
   // audit attribution; only the decision key is canonicalized when this is a known taxonomy lane.
   const policyTaskType = policyTaskTypeIdentity(taskType, isKnownTaskType);
-  const db = ledgerDb();
   const rows = db
     .prepare(
       `SELECT outcome, error_class, verifier FROM delegations
@@ -1528,7 +1539,19 @@ export interface LedgerReportRow extends VerdictResult {
 }
 
 export function ledgerReport(policy: PolicyConfig, opts?: EvidenceReadOpts): LedgerReportRow[] {
-  const db = ledgerDb();
+  return ledgerReportFromDb(ledgerDb(), policy, opts);
+}
+
+/**
+ * Build the report from an already-open database without initialising or migrating it.
+ * Operational generators use this with a query-only snapshot so evidence inspection cannot
+ * mutate the authoritative ledger or manufacture schema in a misbound stub database.
+ */
+export function ledgerReportFromDb(
+  db: Database.Database,
+  policy: PolicyConfig,
+  opts?: EvidenceReadOpts
+): LedgerReportRow[] {
   // The shadow filter applies to the CELL ENUMERATION too, not just the per-cell verdict: a task
   // type whose ONLY rows are shadow rows must not surface as a cell at all in the default report
   // (it would read as a real, zero-attempt lane and quietly imply the router has looked at it).
@@ -1554,7 +1577,7 @@ export function ledgerReport(policy: PolicyConfig, opts?: EvidenceReadOpts): Led
   }>;
 
   return pairs.map((p) => {
-    const v = getVerdict(p.taskType, p.modelId, policy, p.nodeId, opts);
+    const v = getVerdictFromDb(db, p.taskType, p.modelId, policy, p.nodeId, opts);
     let recommendation: LedgerReportRow["recommendation"];
     if (v.verdict === "viable") recommendation = "delegate-local";
     else if (v.frozen && (v.verdict === "not_viable" || v.verdict === "marginal"))

@@ -151,9 +151,10 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     const response = JSON.parse(raw) as { result: { isError: boolean } };
 
     expect(response.result).toMatchObject({
-      isError: true,
+      isError: false,
       structuredContent: { accepted: false, reason: "daily_capacity_reached" },
     });
+    expect(raw).toContain("M5 inference result is unaffected");
     expect(raw).not.toContain("adoption-capacity-agent");
     expect(raw).not.toMatch(/prompt|response|path|alias/i);
     expect(tableCount("request_log")).toBe(0);

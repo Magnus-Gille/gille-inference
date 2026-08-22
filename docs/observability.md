@@ -116,7 +116,10 @@ or an exact transport time. This makes the reporting tool a deliberate narrow au
 it is bounded by a transient per-key rate limit and a 25-row server-day cap. Rejections expose only
 the stable content-free reason codes `invalid_report`, `principal_rate_limited`,
 `daily_capacity_reached`, or `storage_unavailable`; they never echo input or expose a credential,
-principal, request, database, or path detail.
+principal, request, database, or path detail. `daily_capacity_reached` is an expected non-fatal
+outcome: the inference result remains valid, the telemetry row is dropped, and callers should not
+retry until the next UTC day. Other rejection reasons remain hard tool errors so malformed or
+unavailable telemetry is visible.
 
 The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
 

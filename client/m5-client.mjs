@@ -935,10 +935,19 @@ export async function createM5Client({
         );
       }
       const result = await client.tool("record_adoption_evidence", input);
-      if (!result || typeof result !== "object" || result.accepted !== true) {
+      if (!result || typeof result !== "object" || typeof result.accepted !== "boolean") {
         throw new M5ClientError(
           "invalid_adoption_report",
           "The gateway returned a malformed adoption-report acknowledgement.",
+        );
+      }
+      if (result.accepted === false && result.reason === "daily_capacity_reached") {
+        return { accepted: false, reason: result.reason };
+      }
+      if (result.accepted !== true) {
+        throw new M5ClientError(
+          "invalid_adoption_report",
+          "The gateway returned an unsupported adoption-report rejection.",
         );
       }
       return { accepted: true };

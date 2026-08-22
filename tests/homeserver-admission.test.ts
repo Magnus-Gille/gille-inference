@@ -348,7 +348,7 @@ describe("bench/maintenance mode (#108)", () => {
     });
   });
 
-  // #105 follow-up: an unattended batch job (weekly Model Scout) engages maintenance mode around
+  // #105 follow-up: an unattended evaluation job may engage maintenance mode around
   // an ephemeral GPU test window. If that job dies uncleanly (OOM, SIGKILL, crash) before it can
   // call setMaintenanceMode(false), a plain boolean toggle would stay stuck ON forever — silently
   // 503ing every guest with no auto-recovery. A TTL closes that hole: the mode self-expires even

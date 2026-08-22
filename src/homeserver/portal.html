@@ -245,10 +245,34 @@
         <td>~30</td>
       </tr>
       <tr>
+        <td><span class="badge mono">qwen35-122b-a10b</span></td>
+        <td>Qwen3.5-122B-A10B — large MoE served reasoning-off (Q4_K_M)</td>
+        <td>High-precision review and triage where stable direct answers matter more than latency</td>
+        <td>~26</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">muse-glimmer-30b</span></td>
+        <td>Meta Muse Glimmer 30B — reasoning model with DFlash draft decoding</td>
+        <td>Grounded code/data canary with an explicit verifier; not a broad chat default</td>
+        <td>~25<br><span style="font-size:11px;color:var(--muted)">short canary</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">nemotron-3.5-lightning-30b-a3b</span></td>
+        <td>NVIDIA Nemotron 3.5 Lightning 30B-A3B — reasoning-off Q4_K_M canary</td>
+        <td>Fast direct answers and structured work; begin with moderate context on Strix Halo</td>
+        <td>~52<br><span style="font-size:11px;color:var(--muted)">sustained decode</span></td>
+      </tr>
+      <tr>
         <td><span class="badge mono">qwen38-27b</span></td>
         <td>Qwen3.8-27B — dense Q4_K_M, multimodal, thinking-capable, native MTP</td>
         <td>New-generation coding, reasoning, image understanding and release evaluation</td>
         <td>~21&#8211;25 MTP<br><span style="font-size:11px;color:var(--muted)">~13 direct</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">ornith-1.5-35b</span></td>
+        <td>Ornith-1.5-35B — multimodal Q4_K_M MoE, thinking-capable, native MTP</td>
+        <td>Fast explicit coding, reasoning and image work; still evaluation-only for routing</td>
+        <td>~75<br><span style="font-size:11px;color:var(--muted)">served canary</span></td>
       </tr>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
@@ -260,9 +284,10 @@
       Context window: 131,072 tokens for <span class="badge mono">mellum</span>,
       <span class="badge mono">gemma4</span>, <span class="badge mono">qwen36-a3b</span>,
       <span class="badge mono">qwen3-30b-instruct</span>, and
-      <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>
-      <span class="badge mono">gpt-oss-120b</span>, and <span class="badge mono">qwen38-27b</span>
-      provide 65,536 per request. Prompt and completion
+      <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>,
+      <span class="badge mono">gpt-oss-120b</span>, <span class="badge mono">qwen38-27b</span>, and
+      <span class="badge mono">ornith-1.5-35b</span> provide 65,536 per request;
+      <span class="badge mono">qwen35-122b-a10b</span> provides 32,768. Prompt and completion
       tokens share that window; the output limits documented below still apply. VibeThinker works best on
       answer-verifiable reasoning with sampling enabled: <span class="badge mono">temperature: 1.0</span>,
       <span class="badge mono">top_p: 0.95</span>, <span class="badge mono">top_k: 0</span>, and
@@ -270,6 +295,14 @@
       32,768 completion tokens; omitted <span class="badge mono">max_tokens</span> keeps the safer fleet default.
       Qwen3.8 thinking is on by default; callers can request a direct answer with
       <span class="badge mono">chat_template_kwargs: {"enable_thinking": false}</span>.
+    </p>
+    <p style="margin-top:4px;font-size:12.5px">
+      <span class="badge mono">muse-glimmer-30b</span> and
+      <span class="badge mono">nemotron-3.5-lightning-30b-a3b</span> are reversible canaries;
+      Glimmer production delegation requires a grounded task and explicit deterministic verifier,
+      while Nemotron is served reasoning-off. <span class="badge mono">ornith-1.5-35b</span> and
+      <span class="badge mono">qwen35-122b-a10b</span> are explicit authenticated choices, not
+      automatic routes. Canary speeds above are directional measurements rather than a capacity guarantee.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       <strong>Speech-to-text:</strong> <span class="badge mono">whisper-1</span>
@@ -287,25 +320,26 @@
     </p>
   </div>
 
-  <!-- NEW MODEL EVALUATIONS — populated client-side from GET /portal/model-evals.json (the
-       weekly Model Scout's content-blind registry). Hidden until the fetch returns ≥1 row, so the
-       page degrades cleanly before the first scout run. Data-driven: NO gateway restart needed to
-       refresh (unlike the hand-maintained "What's running" table above). -->
+  <!-- NEW MODEL EVALUATIONS — populated client-side from the content-blind manual evaluation
+       registry. Hidden until the fetch returns ≥1 row, so the page degrades cleanly when no
+       operator evaluation has been recorded. Data-driven: NO gateway restart needed to refresh
+       (unlike the hand-maintained "What's running" table above). -->
   <div id="evals-card" class="info-card hide">
     <h2>New model evaluations</h2>
     <p style="margin-bottom:8px">
-      Every week the box looks at trending new models on Hugging&nbsp;Face, downloads the ones that
-      fit, and benchmarks them against a fixed battery of tasks. Clear winners get auto-added to the
-      line-up above. Latest results (<span class="badge mono">pass%</span> = share of probe tasks
-      passed; higher is better):
+      Operators can explicitly evaluate an already-staged local model against a fixed battery of
+      tasks. Evaluations are evidence only; changing the served line-up remains a separate,
+      owner-reviewed operation. Latest results (<span class="badge mono">pass%</span> = share of
+      probe tasks passed; higher is better):
     </p>
     <table>
       <tr><th>Model</th><th>Quant</th><th>Size</th><th>pass%</th><th>~tok/s</th><th>Verdict</th></tr>
       <tbody id="evals-rows"></tbody>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
-      Each candidate is tested on a throwaway server, isolated from the live model line-up and run
-      off-peak. A &#8220;winner&#8221; beats or complements the current line-up and is promoted automatically.
+      Each candidate is tested on a throwaway server under the GPU lease and maintenance guard,
+      isolated from the live model line-up. A &#8220;winner&#8221; is a measured result for operator review,
+      never an automatic roster change.
     </p>
   </div>
 
@@ -749,7 +783,7 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
     .then(function (s) { if (s) renderStats(s); })
     .catch(function () { /* leave the card hidden on any error */ });
 
-  // ── New model evaluations (weekly scout) ───────────────────────────────────────────
+  // ── New model evaluations (manual registry) ───────────────────────────────────────
   function renderEvals(payload) {
     var models = (payload && payload.models) || [];
     if (!models.length) return; // keep the card hidden until there's something to show
@@ -757,8 +791,8 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
     var rows = models.map(function (m) {
       var pct = Math.round((m.passRate || 0) * 1000) / 10;
       var tok = (m.tokPerSec == null) ? "—" : Math.round(m.tokPerSec);
-      var verdict = m.served ? "served ✓" : esc(m.verdict || "");
-      var vcolor = m.served ? "var(--ok)" : (m.verdict === "winner" ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)"));
+      var verdict = m.served ? "served ✓" : (m.verdict === "winner" ? "winner · manual review" : esc(m.verdict || ""));
+      var vcolor = m.served ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)");
       return "<tr><td><span class=\"badge mono\">" + esc(m.id) + "</span></td>"
         + "<td>" + esc(m.quant || "—") + "</td>"
         + "<td>" + (m.sizeGB || "—") + "&nbsp;GB</td>"

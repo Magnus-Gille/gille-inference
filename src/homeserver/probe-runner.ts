@@ -1,5 +1,5 @@
 /**
- * probe-runner.ts — reusable probe-execution core for the weekly model scout.
+ * probe-runner.ts — reusable probe-execution core for explicit model evaluations.
  *
  * Extracted from the proven loop in scripts/m5-cartography.ts. Parameterised on
  * endpoint + apiKey so it works equally against:
@@ -68,6 +68,7 @@ export function makeChatFn(opts: {
   endpoint: string;
   apiKey?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): ChatFn {
   const base = opts.endpoint.replace(/\/+$/, "");
   const timeoutMs = opts.timeoutMs ?? 180_000;
@@ -106,7 +107,7 @@ export function makeChatFn(opts: {
         method: "POST",
         headers,
         body,
-        signal: controller.signal,
+        signal: opts.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal,
       });
     } finally {
       clearTimeout(timer);
@@ -273,6 +274,8 @@ export interface RunProbesOpts {
   repeats?: number;
   apiKey?: string;
   timeoutMs?: number;
+  /** Cancels the battery; cancellation is fatal rather than recorded as model evidence. */
+  signal?: AbortSignal;
   /** Override the chat function (used in tests and for custom backends). */
   chat?: ChatFn;
   /** Called after each probe×repeat result is built. */
@@ -286,12 +289,18 @@ export interface RunProbesOpts {
  */
 export async function runProbes(opts: RunProbesOpts): Promise<ProbeRunSummary> {
   const repeats = opts.repeats ?? 1;
-  const chat: ChatFn = opts.chat ?? makeChatFn({ endpoint: opts.endpoint, apiKey: opts.apiKey, timeoutMs: opts.timeoutMs });
+  const chat: ChatFn = opts.chat ?? makeChatFn({
+    endpoint: opts.endpoint,
+    apiKey: opts.apiKey,
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+  });
 
   const results: ProbeRunResult[] = [];
 
   for (const probe of opts.probes) {
     for (let rep = 1; rep <= repeats; rep++) {
+      opts.signal?.throwIfAborted();
       let r: ProbeRunResult;
       try {
         const call = await chat(opts.model, probe);
@@ -318,6 +327,7 @@ export async function runProbes(opts: RunProbesOpts): Promise<ProbeRunSummary> {
           ...(reviewMetrics ? { reviewMetrics } : {}),
         };
       } catch (err: unknown) {
+        opts.signal?.throwIfAborted();
         const msg = (err instanceof Error ? err.message : String(err)).slice(0, 300);
         const reviewMetrics = failedReviewMetrics(probe);
         r = {

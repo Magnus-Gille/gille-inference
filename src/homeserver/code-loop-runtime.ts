@@ -109,7 +109,7 @@ export interface CodeLoopRuntime {
 
 /**
  * Build the live runtime. `maintenanceMode` is injected (the gateway reads it from the admission
- * controller snapshot) so code_loop refuses during a model-scout window without importing the
+ * controller snapshot) so code_loop refuses during an explicit evaluation window without importing the
  * controller.
  */
 export interface CodeLoopGatewayContext {

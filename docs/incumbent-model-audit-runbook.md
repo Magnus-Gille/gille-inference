@@ -1,7 +1,8 @@
 # Incumbent model audit — runbook (issue #11)
 
-This is a separate, advisory lane for models that are already served. Weekly Model Scout remains
-candidate discovery only. An incumbent audit never loads, unloads, adopts, culls, or edits a route.
+This is a separate, advisory lane for models that are already served. Manual candidate evaluation
+is a separate operator-requested path. An incumbent audit never loads, unloads, adopts, culls, or
+edits a route.
 
 Run it when the probe corpus/version, a route role, observed artifact/configuration, or the
 evidence-age policy changes. The M5 inference operator owns the weekly Sunday 02:00 UTC cadence

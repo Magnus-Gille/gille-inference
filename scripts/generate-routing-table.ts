@@ -14,9 +14,9 @@
  *   2. Cartography JSONL runs — data/cartography-*.jsonl (+ extra-probes-results.jsonl): read for
  *      PROVENANCE (row counts, latest ts). The verdicts themselves come from the ledger the
  *      cartography wrote into, so we don't double-count — we record where they came from.
- *   3. Model-Scout registry — data/model-scout-registry.jsonl: fills a model's overall pass-rate
- *      when the ledger is too thin to assert one (e.g. the qwen36-a3b overallPass hole, which the
- *      Sunday scout cron fills — this script CONSUMES that, it does not race a GPU job).
+ *   3. Manual model-evaluation registry — data/model-scout-registry.jsonl: fills a model's overall
+ *      pass-rate when the ledger is too thin to assert one. Operators may add explicit evaluations;
+ *      this script consumes that evidence and never schedules, downloads, or promotes models.
  *
  * USAGE
  *   tsx scripts/generate-routing-table.ts --dry-run          # print the would-be table, write nothing
@@ -49,10 +49,10 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import Database from "better-sqlite3";
 
 import { loadConfig } from "../src/homeserver/config.js";
-import { ledgerReport } from "../src/homeserver/ledger.js";
-import { getDb } from "../src/db.js";
+import { ledgerReportFromDb } from "../src/homeserver/ledger.js";
 import { listModels, getRunningCmd } from "../src/homeserver/model-admin.js";
 import { readRegistry, DEFAULT_REGISTRY_PATH } from "../src/homeserver/model-registry.js";
 import { eligibleIncumbents, parseIncumbentAuditMaxAgeMs, readIncumbentAudits } from "../src/homeserver/incumbent-audit-registry.js";
@@ -68,6 +68,32 @@ import {
   type RoutingTableDiff,
 } from "../src/homeserver/routing-table-diff.js";
 import { pushPanel } from "../src/homeserver/heimdall-push.js";
+
+export interface LedgerEvidenceSnapshot {
+  verdicts: ReturnType<typeof ledgerReportFromDb>;
+  records: number;
+  latest: string | null;
+}
+
+/** Keep verdict rows and provenance counts on one SQLite WAL snapshot. */
+export function readLedgerEvidenceSnapshot(
+  db: Database.Database,
+  policy: Parameters<typeof ledgerReportFromDb>[1],
+  afterVerdicts?: () => void,
+): LedgerEvidenceSnapshot {
+  return db.transaction(() => {
+    const table = db
+      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'delegations'`)
+      .get() as { present: number } | undefined;
+    if (!table) throw new Error("required delegations table is absent");
+    const verdicts = ledgerReportFromDb(db, policy);
+    afterVerdicts?.();
+    const row = db
+      .prepare(`SELECT COUNT(*) AS c, MAX(ts) AS latest FROM delegations`)
+      .get() as { c: number; latest: string | null };
+    return { verdicts, records: row.c, latest: row.latest };
+  })();
+}
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────────
 
@@ -237,26 +263,42 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const dbPath = resolve(args.db ?? process.env["EVAL_DB_PATH"] ?? "./data/eval.db");
 
-  // 1. Ledger verdicts (also ensures the delegations schema exists).
-  const dbPresent = existsSync(dbPath);
-  const verdicts = ledgerReport(config.policy);
-  let ledgerRecords = 0;
-  let ledgerLatest: string | null = null;
+  // 1. Ledger verdicts. Read a private query-only snapshot: generation must never create or
+  // migrate schema in the authoritative database, and a misbound EVAL_DB_PATH must fail closed
+  // instead of being mistaken for a legitimate empty ledger.
+  if (!existsSync(dbPath)) {
+    throw new Error(
+      `authoritative capability ledger is missing at ${dbPath}; check --db/EVAL_DB_PATH and the service mount namespace`
+    );
+  }
+  const dbPresent = true;
+  let verdicts: ReturnType<typeof ledgerReportFromDb>;
+  let ledgerRecords: number;
+  let ledgerLatest: string | null;
+  // Use SQLite's own read-only connection here rather than copying the main file: a live WAL may
+  // contain the newest committed evidence, and copying only the main file would be stale. readonly
+  // + query_only forbids content/schema writes while still giving SQLite a coherent WAL snapshot.
+  const snapshot = new Database(dbPath, { readonly: true, fileMustExist: true });
+  snapshot.pragma("query_only = ON");
   try {
-    const row = getDb()
-      .prepare(`SELECT COUNT(*) AS c, MAX(ts) AS latest FROM delegations`)
-      .get() as { c: number; latest: string | null };
-    ledgerRecords = row.c;
-    ledgerLatest = row.latest;
-  } catch {
-    /* delegations table absent — leave zeroed */
+    const evidenceSnapshot = readLedgerEvidenceSnapshot(snapshot, config.policy);
+    verdicts = evidenceSnapshot.verdicts;
+    ledgerRecords = evidenceSnapshot.records;
+    ledgerLatest = evidenceSnapshot.latest;
+  } catch (error) {
+    throw new Error(
+      `authoritative capability ledger is incompatible at ${dbPath}; check --db/EVAL_DB_PATH ` +
+        `and the service mount namespace (${error instanceof Error ? error.message : String(error)})`
+    );
+  } finally {
+    snapshot.close();
   }
 
   // 2. Cartography provenance.
   const carto = scanJsonl(args.dataDir, (n) => /^cartography-.*\.jsonl$/.test(n));
   const extra = scanJsonl(args.dataDir, (n) => n === "extra-probes-results.jsonl");
 
-  // 3. Model-Scout registry.
+  // 3. Manual model-evaluation registry.
   const registry = readRegistry(DEFAULT_REGISTRY_PATH);
   const registryLatest = registry.reduce<string | null>(
     (acc, e) => (acc === null || e.evaluatedAt > acc ? e.evaluatedAt : acc),
@@ -299,12 +341,12 @@ async function main(): Promise<void> {
       latest: extra.latest,
     },
     {
-      source: "model-scout registry (JSONL)",
+      source: "manual model-evaluation registry (JSONL)",
       path: DEFAULT_REGISTRY_PATH,
       present: existsSync(DEFAULT_REGISTRY_PATH),
       records: registry.length,
       latest: registryLatest,
-      note: "fills a model's overallPass when the ledger is too thin (consume, don't race the scout)",
+      note: "fills a model's overallPass when the ledger is too thin; operator-requested evidence only",
     },
     {
       source: "incumbent served-model audits (JSONL)", path: auditPath, present: existsSync(auditPath),

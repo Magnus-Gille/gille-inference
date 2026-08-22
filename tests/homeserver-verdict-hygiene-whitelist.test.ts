@@ -9,7 +9,7 @@ import { importDelegations, recordDelegation, getVerdict, type Outcome } from ".
 // #168 (verdict hygiene — WHITELIST): tighten #156's structural blacklist into a whitelist for
 // JUDGMENT-QUALITY task types. A row is admissible as verdict evidence for such a type IFF its
 // verifier is in policy.trustedVerifiersForJudgment. Default whitelist is EMPTY, so `code-review`
-// survives on NOTHING — not on the model-scout's opaque `predicate` probe, not on `matches`, not on
+// survives on NOTHING — not on an opaque `predicate` probe, not on `matches`, not on
 // structural `nonEmpty` — and resolves to `unknown` → escalate-frontier (the honest state), never a
 // fabricated `viable`. #156 could not know an opaque `predicate`/`matches` is non-adversarial
 // (mellum passes it while finding ~6% of real seeded bugs — 2026-07-05 sweep); positive trust does.

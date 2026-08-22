@@ -62,7 +62,7 @@ export interface PolicyConfig {
    * #156's structural blacklist). For a judgment-quality task type, a ledger row is admissible as
    * verdict evidence IFF its (base-named) verifier is in this set. A whitelist is strictly stronger
    * than #156's blacklist and subsumes it: #156 could exclude KNOWN-structural verifiers, but it
-   * still admitted opaque/non-adversarial checks (the model-scout's own `predicate` code-review
+   * still admitted opaque/non-adversarial checks (the historical evaluation `predicate` code-review
    * probe, `matches`) that pass while finding ~6% of real seeded bugs (2026-07-05 ground-truth
    * sweep). Only positively-trusted evidence should be able to move a judgment verdict.
    *

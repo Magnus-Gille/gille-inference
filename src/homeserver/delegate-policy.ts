@@ -68,7 +68,9 @@ const ADVISORY_ONLY_TASK_TYPES: ReadonlySet<string> = new Set(["review-bounded"]
 export function isAdvisoryOnlyTaskType(taskType: string): boolean {
   return ADVISORY_ONLY_TASK_TYPES.has(normalizeTaskType(taskType));
 }
-const LEARNING_SOURCE_PREFIXES = ["probe", "cartography", "harvest", "backfill", "model-scout", "gate-"];
+// Keep the historical model-scout prefix so old evidence remains classifiable; new evaluation
+// producers should use model-evaluation or the more specific evidence-source names.
+const LEARNING_SOURCE_PREFIXES = ["probe", "cartography", "harvest", "backfill", "model-evaluation", "model-scout", "gate-"];
 const LEARNING_SOURCES: ReadonlySet<string> = new Set([
   "extra-probes",
   "probe-import",
