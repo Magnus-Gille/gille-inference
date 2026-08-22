@@ -1,5 +1,3 @@
-#!/usr/bin/env -S node --import tsx
-
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import {

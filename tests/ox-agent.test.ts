@@ -10,6 +10,7 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -22,6 +23,8 @@ import {
   runPi,
   startCredentialProxy,
 } from "../scripts/ox-agent.js";
+
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 describe("ox-agent argument contract", () => {
   it("defaults to a bounded read-only max-effort run", () => {
@@ -181,7 +184,7 @@ describe("ox-agent credential boundary", () => {
   it("kills a stubborn descendant when the top-level Pi process exits on timeout", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "ox-process-tree-"));
     const pidFile = path.join(root, "descendant.pid");
-    const fixture = path.resolve(import.meta.dirname, "fixtures", "ox-agent-process-tree.mjs");
+    const fixture = path.resolve(testDirectory, "fixtures", "ox-agent-process-tree.mjs");
     const code = await runPi({
       piBinary: process.execPath,
       args: [fixture, pidFile],
@@ -209,7 +212,7 @@ describe("ox-agent credential boundary", () => {
 
 describe("ox-agent Pi contract", () => {
   it("commits only the native effort map and keeps the worker out of read-only discovery", () => {
-    const repository = path.resolve(import.meta.dirname, "..");
+    const repository = path.resolve(testDirectory, "..");
     const readonly = path.join(repository, "config", "ox-alpha-pi", "readonly");
     const write = path.join(repository, "config", "ox-alpha-pi", "write");
     const readonlyModels = JSON.parse(readFileSync(path.join(readonly, "models.json"), "utf8"));

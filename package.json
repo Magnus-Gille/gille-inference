@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "agent:ox": "node --import tsx scripts/ox-agent.ts",
+    "agent:ox": "tsx scripts/ox-agent.ts",
     "run:eval": "tsx src/runner/index.ts",
     "run:judge": "tsx src/judge/index.ts",
     "run:analysis": "tsx src/analysis/index.ts",
