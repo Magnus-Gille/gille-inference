@@ -16,13 +16,19 @@ Ranked findings:
 1. **`pi --print` hangs on inherited stdin** → any background/cron/CI Gate-D pi run yields
    uniformly `arm-error` rows that are indistinguishable from model failure. Fixed and verified
    red/green. (`measured`)
-2. **qwen-code is a viable second local driver**, at least on par with pi on r1/80b (10/10 vs 9/10,
-   n=1 seed, not significant). pi's Gate-D standing is not unique to pi. (`measured`)
-3. **Gate-D r1 is saturated** for current models — `ornith-1.5-35b` scores 30/30 — so r1 cannot
+2. **qwen-code and pi are statistically indistinguishable** on r1/80b — 29/30 vs 27/30 over 60 runs,
+   Fisher exact **p = 0.61**. pi's Gate-D standing is not unique to pi, and a second independent
+   local driver now exists. (`measured`)
+3. **Single-seed Gate-D comparisons are not trustworthy at small margins.** The n=1 pilot drew a bad
+   sample and showed "qwen-code 10/10 vs pi 9/10" — a harness difference that replication showed
+   does not exist. Two task cells (05, 09) are genuinely flaky; task 09 fails ~50% of attempts
+   regardless of harness. Any future Gate-D head-to-head should carry seeds and a significance
+   test. (`measured`)
+4. **Gate-D r1 is saturated** for current models — `ornith-1.5-35b` scores 30/30 — so r1 cannot
    discriminate between serving configurations. The KV-quantization question is therefore
    **unresolved**, not answered. (`measured`)
-4. **Octofriend cannot be benchmarked as shipped** — no headless agentic mode. (`measured`)
-5. `pi` remains the recommended primary driver; nothing evaluated displaces it, and the
+5. **Octofriend cannot be benchmarked as shipped** — no headless agentic mode. (`measured`)
+6. `pi` remains the recommended primary driver; nothing evaluated displaces it, and the
    external corroboration in §1.1 stands.
 
 Two claims from the preceding day's research draft did **not** survive verification and are
@@ -116,7 +122,7 @@ Two further findings weaken the original pitch:
 **Status:** the repair-layer hypothesis is **untested**, not disproven. A cheaper successor design
 (E1′) is recorded in §4.
 
-### E2 — qwen-code as a second local driver → **RUN; see §5**
+### E2 — qwen-code as a second local driver → **RUN (3 seeds); see §5**
 
 **Hypothesis.** qwen-code lands within noise of pi (harness-bench: 75.0 vs 76.9), giving a second
 independent local driver and de-confounding "pi" from "local agentic capability".
@@ -215,22 +221,26 @@ same model, same background invocation went from `arm-error` / 0 turns / 300 s t
 1. **Land the stdin fix.** Highest-value artifact of this spike; independent of every experimental
    outcome. Consider auditing any Gate-D evidence collected non-interactively since the pi arm was
    added, for rows with `arm-error` + zero telemetry.
-2. **Keep pi as the primary local driver, but keep the qwen-code arm.** Nothing displaces pi, and
-   a second independent driver removes a standing confound from every "local agentic capability"
-   claim in this repo.
-3. **Retire Gate-D r1 as a serving-configuration instrument.** It is saturated (30/30). Any study
+2. **Keep pi as the primary local driver, but keep the qwen-code arm.** The two are
+   indistinguishable (p = 0.61), so there is no performance reason to switch — but a second
+   independent driver removes a standing confound from every "local agentic capability" claim in
+   this repo.
+3. **Require seeds + a significance test for any Gate-D head-to-head.** The n=1 pilot produced a
+   harness difference that replication erased. Consider marking tasks 05 and 09 as known-flaky in
+   `CORPUS.md`.
+4. **Retire Gate-D r1 as a serving-configuration instrument.** It is saturated (30/30). Any study
    comparing quantization, KV settings, or runtime flags needs the harder holdout set or new tasks —
    otherwise it will keep producing powerless nulls.
-4. **Decide explicitly about the KV confound.** `ornith-1.5-35b` and `qwen38-27b` run `q8_0` KV
+5. **Decide explicitly about the KV confound.** `ornith-1.5-35b` and `qwen38-27b` run `q8_0` KV
    while `qwen36-a3b` runs `f16`, and both recorded head-to-heads inherit that asymmetry. Resolving
    it needs the r2 holdouts (consume-once). That is an owner decision, deliberately not taken here.
-3. **E1′ (successor to the killed E1):** test the *mechanism*, not the harness — capture real
+6. **E1′ (successor to the killed E1):** test the *mechanism*, not the harness — capture real
    malformed tool-call payloads from a pi × `gpt-oss-120b` run and replay them through a
    `fix-json`-class repairer. Cheap, and it answers the original question without needing an
    agentic Octofriend.
-4. **Do not adopt `solutionInTranscript` as a gate.** Keep it as an observation field with the
+7. **Do not adopt `solutionInTranscript` as a gate.** Keep it as an observation field with the
    documented false-positive behaviour.
-5. Steal, don't adopt: [Reasonix](https://github.com/esengine/deepseek-reasonix) is built around
+8. Steal, don't adopt: [Reasonix](https://github.com/esengine/deepseek-reasonix) is built around
    prefix-cache stability (stable environment preamble, stale tool output pruned before compaction,
    versioned tool-schema contracts). On a serial leased GPU that is a serving-economics concern.
    Measuring prefix-cache hit rate across a Gate-D sweep would show whether headroom exists.
@@ -288,47 +298,53 @@ used as a gate or cited as evidence of peeking.
 The OpenCode-peeking replication that motivated E4 was **not run** — the reframing in §2/E4 removed
 its premise, since Gate-D's hidden oracles are absent from the work dir by construction.
 
-### E2 — qwen-code vs pi: **qwen-code at least on par; single seed** (`measured`)
+### E2 — qwen-code vs pi: **statistically indistinguishable** (`measured`)
 
-Gate-D r1, 10 tasks, **1 seed**, `qwen3-coder-next-80b` via the authenticated gateway (ordinary
-owner traffic; the GPU lease governs jobs that bypass the gateway, so none was taken).
-`CAP_S=420`.
+Gate-D r1, 10 tasks × **3 seeds** per arm (60 runs), `qwen3-coder-next-80b` via the authenticated
+gateway (ordinary owner traffic; the GPU lease governs jobs that bypass the gateway, so none was
+taken). `CAP_S=900`.
 
-| Arm | pass | mean wall | median wall | runs at cap |
+| Arm | pass | median wall | mean wall | runs at cap |
 |---|---|---|---|---|
-| **qwen-code** | **10/10** | 286 s | 269 s | 0 |
-| pi | 9/10 | 328 s | 316 s | 4 |
+| qwen-code | **29/30** | 271 s | 347 s | 1 |
+| pi | **27/30** | 361 s | 399 s | 1 |
 
-**Cap confound, identified and removed.** pi hit the 420 s cap on exactly 4 tasks, so the raw
-comparison measured a time budget rather than capability. All four were re-run at `CAP_S=900`:
+**Fisher exact, two-sided: p = 0.61.** The two harnesses are **statistically indistinguishable** on
+this battery. The n=1 pilot's apparent qwen-code lead did not survive replication.
 
-| Task | pi @420 s | pi @900 s | Verdict |
-|---|---|---|---|
-| 02-fix-bug-test-catches | 420 s (cap) | **pass, 198 s** | cap artifact |
-| 04-add-cli-flag | 420 s (cap) | **pass, 484 s** | cap artifact |
-| 05-tdd-write-test-then-impl | 420 s (cap) | **pass, 304 s** | cap artifact |
-| 09-rename-across-files | 420 s **fail** | **fail, 360 s — `G5-structural`** | **genuine capability failure** |
+Per-task, 8 of 10 tasks are 3/3 for **both** arms. Every failure is `G5-structural`:
 
-Task 09 terminated at 360 s with 900 s available and failed the structural gate, so pi's single miss
-is real, not a timeout. qwen-code passed task 09 in 395 s.
+| Task | qwen-code | pi |
+|---|---|---|
+| 05-tdd-write-test-then-impl | 3/3 | 2/3 |
+| 09-rename-across-files | 2/3 | 1/3 |
+| *(other 8 tasks)* | 3/3 | 3/3 |
 
-**Interpretation.** qwen-code is **at least on par with pi** on r1 against the 80b, and completed
-every task inside a budget where pi did not. But 10/10 vs 9/10 is a **one-task difference at n=1
-seed** (Fisher exact p = 1.0) — this is *directional only* and **does not** establish that qwen-code
-beats pi. It is sufficient to answer the question E2 was posed to answer: pi's Gate-D standing is
-**not** unique to pi, and a second independent local driver now exists.
+**The binding constraint is the model, not the harness.** Task 09 (difficulty H — rename a symbol
+across 4 files) failed **3 of 6 attempts across both arms**, a ~50% flake rate independent of
+harness. No failure was a timeout: the four failures completed in 192 s, 273 s, 540 s and 667 s with
+900 s available, and all four tripped the structural gate.
 
-Note this runs *opposite* to harness-bench's ordering (pi 76.9% / 163 s vs Qwen Code 75.0% / 191 s).
-Both differences are within noise in their respective samples; the useful conclusion is that the two
-harnesses are close, not that either leads.
+This also vindicates running to 3 seeds. The **n=1 pilot drew a bad sample for pi** and would have
+been reported as "qwen-code 10/10 vs pi 9/10" — a harness difference that does not exist. Both cells
+are flaky, and single-seed Gate-D comparisons on this battery are not trustworthy at this margin.
 
-**Wall-time caveat — the 80b is far slower than the June baseline.** `docs/gate-d-execution-findings-2026-06-24.md`
-records r1 runs of 5–93 s on this model; both arms here ran 240–420 s, and pi's per-task times varied
-widely across repeats (task 02: 420 s then 198 s). Whatever the cause — gateway path, concurrent
-live traffic, runtime or model changes since June — **wall times in this section are not comparable
-to the June figures** and no throughput conclusion is drawn from them.
+Directionally qwen-code was faster (median 271 s vs 361 s), but with outcomes this close and n=30
+per arm, no throughput claim is made.
 
-`hiddenOracleInTranscript` = 0 across all 20 rows.
+**Wall-time caveat — the 80b is far slower than the June baseline.**
+`docs/gate-d-execution-findings-2026-06-24.md` records r1 runs of 5–93 s on this model; both arms
+here ran 190–900 s, and pi's per-task time varied widely across repeats of the same task. Whatever
+the cause — gateway path, concurrent live traffic, runtime or model changes since June — **wall
+times here are not comparable to the June figures** and no throughput conclusion is drawn from them.
+
+`hiddenOracleInTranscript` = 0 across all 60 rows.
+
+An earlier `CAP_S=420` single-seed pilot is archived at `data/e2/ARCHIVE-pilot-cap420.jsonl`, with
+the targeted cap-900 re-runs that diagnosed its cap confound at
+`data/e2/ARCHIVE-pi-cap900-targeted.jsonl`. Neither feeds the result above: the final dataset was
+collected fresh at a uniform cap, and the targeted re-runs were deliberately excluded because their
+tasks had been selected on a performance-correlated criterion (pi having been slow on them).
 
 ## Provenance
 
