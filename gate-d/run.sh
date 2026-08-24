@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Gate D arm runner — drives a harness arm against the box model on one task, then grades it.
-# Usage: run.sh <arm> <task-id|all>     arm ∈ { pi | aider | opencode }
+# Usage: run.sh <arm> <task-id|all>     arm ∈ { pi | aider | opencode | qwen-code }
 #        run.sh --print-workroot        (debug: print WORKROOT and exit — no box/model needed)
 #        run.sh --list-tasks            (default r1; set GATE_D_INCLUDE_HOLDOUT=1 for r2)
 #
 # Per run: copy the task seed → an isolated work dir → invoke the arm (with a wall-clock cap)
 # → check.sh grades deterministically → append a JSONL row to data/gate-d-results.jsonl.
 #
-# NEEDS THE BOX (drives pi/aider/opencode against qwen3-coder-next-80b on inference.example.com).
+# NEEDS THE BOX (drives pi/aider/opencode/qwen-code against a served model, e.g.
+# qwen3-coder-next-80b, over the gateway at inference.example.com).
 # Required env: GW (gateway /v1 base), GW_KEY (a REAL per-key gateway token — the box 401s on a
 # dummy). Optional: MODEL (default qwen3-coder-next-80b), CAP_S (wall-clock cap, default 600).
 set -u
@@ -44,8 +45,8 @@ if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
 CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
 TASK_IDS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
 
-ARM="${1:?usage: run.sh <pi|aider|opencode> <task-id|all>}"
-SEL="${2:?usage: run.sh <pi|aider|opencode> <task-id|all>}"
+ARM="${1:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
+SEL="${2:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 if [ "$SEL" != "all" ] && ! python3 "$CORPUS_TOOL" contains "$SEL"; then
   if [ -f "$ROOT/tasks/$SEL/meta.json" ]; then
     echo "error: task '$SEL' is not in $CORPUS_REVISION; holdouts require GATE_D_INCLUDE_HOLDOUT=1" >&2
@@ -120,7 +121,7 @@ run_one() {
           && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
-             --no-session --print --mode json "$instr" 2>"$W/.arm.stderr.log" \
+             --no-session --print --mode json "$instr" </dev/null 2>"$W/.arm.stderr.log" \
              | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
                  --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
       ;;
@@ -134,7 +135,7 @@ run_one() {
              --model-metadata-file "$ROOT/aider-model-metadata.json" \
              --no-auto-commit --yes --no-gitignore \
              $fileargs $readargs \
-             --message "$instr" >"$W/.arm.log" 2>&1 ) || status="arm-error"
+             --message "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"
       ;;
     opencode)
       # provider 'homebox' must exist in opencode.json (see docs/gate-de-evaluation-plan.md)
@@ -142,7 +143,19 @@ run_one() {
           && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HOMEBOX_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" opencode run -m "homebox/$MODEL" \
-             --dir "$W" --format json "$instr" >"$W/.arm.log" 2>&1 ) || status="arm-error"
+             --dir "$W" --format json "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"
+      ;;
+    qwen-code)
+      # qwen (v0.21.15+) has no --dir/--cwd flag — it operates on process.cwd(), so cd into $W
+      # exactly like the pi arm. --yolo auto-approves edits/shell; never combine it with
+      # --approval-mode (mutually exclusive, the CLI errors). Custom OpenAI-compatible endpoint via
+      # OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL, plus -m explicitly. --max-tool-calls is a
+      # defensive inner bound only — the outer `timeout`/CAP_S remains the real wall-clock cap.
+      ( cd "$W" \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
+          && OPENAI_API_KEY="$GW_KEY" OPENAI_BASE_URL="$GW" OPENAI_MODEL="$MODEL" "$TIMEOUT_BIN" "$CAP_S" \
+             qwen -m "$MODEL" --yolo --max-tool-calls 100 "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"
       ;;
     *) echo "unknown arm: $ARM"; rm -rf "$W"; exit 2;;
   esac
@@ -161,6 +174,41 @@ run_one() {
     fi
   fi
   t1=$(date +%s)
+  # Oracle-peek transcript + detection (pure observation — never affects pass/fail or any
+  # check.sh gate, and never touches gate-d/tasks). Every arm already captures its own combined
+  # stdout+stderr into $W/.arm.log (pi additionally splits stderr into $W/.arm.stderr.log because
+  # its stdout is a live NDJSON stream consumed by the telemetry parser — mixing streams there
+  # would corrupt that parse). Concatenating those already-captured files after the run gives the
+  # same "combined stdout+stderr" content the telemetry piping already relies on, without adding a
+  # live tee to the pi pipe (the one arm where that would risk breaking telemetry parsing).
+  # $TRANSCRIPT lives in $WORKROOT — the WORK DIR'S PARENT, never inside $W. Note that being
+  # outside $W is NOT by itself sufficient: see the unpredictable-name requirement below.
+  # The transcript path MUST NOT be predictable from inside $W. An earlier revision used the
+  # sibling path "$W.transcript", which the arm can compute from its own cwd: planting a symlink
+  # (or FIFO) there turns the `: >` truncation below into an out-of-work-dir clobber primitive —
+  # and it fires AFTER the fixture dirty-check above has already declared the tree clean, so it
+  # evades exactly the isolation guarantee #172 exists to enforce. `mktemp` creates the file
+  # O_EXCL with an unguessable suffix, so a pre-planted path is never followed.
+  local TRANSCRIPT=""
+  TRANSCRIPT="$(mktemp "$WORKROOT/transcript-XXXXXXXX" 2>/dev/null)" || TRANSCRIPT=""
+  if [ -n "$TRANSCRIPT" ]; then
+    [ -f "$W/.arm.log" ] && cat "$W/.arm.log" >>"$TRANSCRIPT" 2>/dev/null
+    [ -f "$W/.arm.stderr.log" ] && cat "$W/.arm.stderr.log" >>"$TRANSCRIPT" 2>/dev/null
+  fi
+  # Scanning is delegated to gate-d/peek-scan.py, which reads from the PRISTINE task dir (never the
+  # work dir). `solution/` and `oracle/` live outside $W, so the thing worth detecting is ACCESS,
+  # not similarity — an early version matched reference-solution *code* and fired on 30/30
+  # legitimate passing runs, because a correct implementation IS the reference solution at this task
+  # scale. The leak signals are now graderPathInTranscript (a protected path was referenced),
+  # hiddenOracleMarkerInTranscript (arbitrary author-chosen literals, two-hit + high-specificity
+  # threshold), and solutionMarkerInTranscript (the "REFERENCE SOLUTION" banner). Discriminating
+  # power is pinned by positive AND negative controls in tests/gate-d-peek-scan.test.ts.
+  # oracleContent/oracleCmd hits are NORMAL on visible-oracle tasks (the harness is meant to read
+  # and satisfy the oracle) and are retained only for cross-arm comparability.
+  # Fails OPEN: any scanner error yields '{}' so a graded run is never broken by observation.
+  local PEEK_JSON
+  PEEK_JSON="$(python3 "$ROOT/peek-scan.py" "$T" "$TRANSCRIPT" 2>/dev/null)" || PEEK_JSON=""
+  [ -n "$PEEK_JSON" ] || PEEK_JSON="{}"
   local pass="false" exitclass="$status"
   if bash "$ROOT/check.sh" "$T" "$W" >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
   elif [ "$status" = "arm-error" ]; then exitclass="arm-error"
@@ -175,10 +223,17 @@ run_one() {
   GD_ARM="$ARM" GD_MODEL="$MODEL" GD_TASK="$id" GD_PASS="$pass" GD_EXIT="$exitclass" GD_WALL="$((t1-t0))" \
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
     GD_TELEMETRY="$W/.arm-telemetry.json" \
-    python3 -c "import json,os; row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}; telemetry={'turns':None,'toolCalls':None,'promptTokens':None,'completionTokens':None,'modelTurnMs':None,'timedModelTurns':None,'assistantStreamMs':None,'timedAssistantMessages':None,'unparseableLines':None}; p=os.environ['GD_TELEMETRY']; telemetry.update(json.load(open(p)) if os.path.isfile(p) else {}); row.update(telemetry); print(json.dumps(row))" >>"$OUT"
+    GD_PEEK="$PEEK_JSON" \
+    python3 -c "import json,os; row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}; telemetry={'turns':None,'toolCalls':None,'promptTokens':None,'completionTokens':None,'modelTurnMs':None,'timedModelTurns':None,'assistantStreamMs':None,'timedAssistantMessages':None,'unparseableLines':None}; p=os.environ['GD_TELEMETRY']; telemetry.update(json.load(open(p)) if os.path.isfile(p) else {}); row.update(telemetry); peek=json.loads(os.environ.get('GD_PEEK') or '{}'); row.update({k:bool(v) for k,v in peek.items()}); print(json.dumps(row))" >>"$OUT"
   echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
-  # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, and .check.log) for diagnosis.
-  if [ -n "${KEEP_WORK:-}" ]; then echo "  [kept] $W"; else rm -rf "$W"; fi
+  # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, .check.log, and the oracle-peek
+  # transcript) for diagnosis.
+  if [ -n "${KEEP_WORK:-}" ]; then
+    echo "  [kept] $W${TRANSCRIPT:+ (+ transcript: $TRANSCRIPT)}"
+  else
+    rm -rf "$W"
+    [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"
+  fi
 }
 
 if [ "$SEL" = "all" ]; then
