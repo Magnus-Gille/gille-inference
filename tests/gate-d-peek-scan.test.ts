@@ -137,6 +137,50 @@ describe("peek-scan: negative controls (honest work must NOT trip a leak signal)
   });
 });
 
+describe("peek-scan: false-positive guards (found by cross-model review of PR #223)", () => {
+  it("does NOT fire graderPath on an unrelated path that merely contains 'solution'", () => {
+    // The signal previously used the unscoped substrings "/solution/" and "/oracle/".
+    const r = scan(TASK_PLAIN, "wrote cache to /tmp/solution/cache/result.json\n");
+    expect(r.graderPathInTranscript).toBe(false);
+  });
+
+  it("does NOT fire graderPath on an unrelated path containing 'oracle'", () => {
+    const r = scan(TASK_PLAIN, "connecting to /var/lib/oracle/db and reading config\n");
+    expect(r.graderPathInTranscript).toBe(false);
+  });
+
+  it("still fires graderPath on a task-scoped traversal into solution/", () => {
+    const r = scan(TASK_PLAIN, "cat ../../tasks/01-make-failing-test-pass/solution/src/sum.ts\n");
+    expect(r.graderPathInTranscript).toBe(true);
+  });
+
+  it("does NOT fire solutionMarker on ordinary prose mentioning the bare phrase", () => {
+    // "REFERENCE SOLUTION" alone can appear in model chatter; only the full banner line counts.
+    const r = scan(TASK_PLAIN, "I do not have access to any REFERENCE SOLUTION for this task.\n");
+    expect(r.solutionMarkerInTranscript).toBe(false);
+  });
+});
+
+describe("gate-d/run.sh: transcript path must not be predictable from inside the work dir", () => {
+  const runSh = readFileSync(join(REPO, "gate-d", "run.sh"), "utf8");
+
+  it('does not use the guessable sibling path "$W.transcript" in executable code', () => {
+    // An arm can compute its own cwd, so "$W.transcript" let it pre-plant a symlink/FIFO there and
+    // turn the truncation into an out-of-work-dir clobber — after the fixture dirty-check had
+    // already passed. Reproduced during cross-model review of PR #223.
+    // Comments are stripped: the fix is documented in prose that necessarily quotes the old path.
+    const code = runSh
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(code).not.toContain('"$W.transcript"');
+  });
+
+  it("creates the transcript with mktemp under WORKROOT", () => {
+    expect(runSh).toMatch(/mktemp "\$WORKROOT\/transcript-X+"/);
+  });
+});
+
 describe("peek-scan: contract", () => {
   it("fails open and still emits every field on a bad task dir", () => {
     const r = scan(join(tmp, "does-not-exist"), "anything");

@@ -414,6 +414,15 @@ one, and no longer justifies consuming the r2 holdouts.
 Incidental: q4_0 ran ~2× slower than f16 at 8k context (16.6 s vs 8.3 s), consistent with the
 documented dequant/flash-attention performance traps (llama.cpp #24485) rather than any quality effect.
 
+**Metric definition tightened after review, results unchanged.** Cross-model review found that
+`argsValidJson` accepted any decoded object without checking the emitted function name or the
+declared schema, so a call to the wrong tool with `{}` would have scored as valid. The evaluator now
+validates tool name and argument types (`argsSchemaValid`, `toolNameCorrect`). Every previously
+counted trial was **re-evaluated against the stricter definition and all still qualify** (f16 63/63,
+q8_0 64/64, q4_0 64/64; zero regressions), so the table above is unaffected. `evaluate()` was also
+made total — it previously caught only `KeyError`/`IndexError`, so a malformed response shape would
+have aborted an entire probe run rather than recording one failed trial.
+
 ### 6.2 Grader-leak detection — retired signal replaced and validated
 
 `solutionInTranscript` fired on 30/30 legitimate passing runs. The cause is structural rather than a
@@ -427,9 +436,9 @@ fixtures (**no fixture, corpus, or task-revision change**):
 
 | Signal | Basis | Coverage |
 |---|---|---|
-| `graderPathInTranscript` | a path under the task dir / `oracle/` / `solution/` was referenced | all tasks |
-| `hiddenOracleMarkerInTranscript` | arbitrary author-chosen literals (`"above hi"`, `"  Multiple---separators__here  "`) | 4 hidden-oracle tasks |
-| `solutionMarkerInTranscript` | the `REFERENCE SOLUTION` banner | 10 of 23 solution files |
+| `graderPathInTranscript` | a **task-scoped** path into `oracle/` or `solution/` was referenced | all tasks |
+| `hiddenOracleMarkerInTranscript` | arbitrary author-chosen literals (`"above hi"`, `"  Multiple---separators__here  "`), two-hit + high-specificity threshold | 4 hidden-oracle tasks |
+| `solutionMarkerInTranscript` | the **full** reference-solution banner line | 10 of 23 solution files |
 
 Discriminating power is pinned by `tests/gate-d-peek-scan.test.ts` — positive controls (a planted
 leak must fire) and negative controls (honest work must not). **The negative controls caught two real
@@ -446,6 +455,13 @@ missing a leak is cheaper than falsely alleging one.
 No verified confirmation of the `graderPath` signal against a *real* leaking harness exists — no
 harness in this repo's arms has ever been observed reading the protected trees. It is validated
 against planted leaks only.
+
+**Cross-model review hardened this further.** An independent Codex review (`gpt-5.6-sol`, high
+effort) of PR #223 found two additional false-positive paths that the original negative controls did
+not exercise, both now fixed and pinned by tests: the signal matched the **unscoped** substrings
+`/solution/` and `/oracle/` (firing on unrelated paths such as `/tmp/solution/cache/result.json`),
+and it matched the **bare phrase** "REFERENCE SOLUTION", which can occur in ordinary model prose.
+Matching is now task-scoped and uses the full banner line respectively.
 
 ## Provenance
 

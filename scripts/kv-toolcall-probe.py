@@ -11,11 +11,13 @@ since KV quantization error accumulates over cached tokens.
 DESIGN
 ------
 Each trial embeds a unique "needle" (an activation code) at a known depth inside filler text of a
-target token length, then asks the model to report it *via a tool call*. That yields three
-independent, deterministic measurements per trial:
+target token length, then asks the model to report it *via a tool call*. That yields independent,
+deterministic measurements per trial:
 
-  toolCallEmitted  did the model emit a well-formed tool call at all?
-  argsValidJson    were the arguments parseable JSON conforming to the schema?
+  toolCallEmitted  did the model emit a tool call at all?
+  toolNameCorrect  was it the declared function, rather than some other tool?
+  argsValidJson    were the arguments parseable JSON?
+  argsSchemaValid  did they conform to the declared schema (right tool, int sector, string code)?
   valueCorrect     did it recover the exact needle (retrieval fidelity through the KV cache)?
 
 Sampling is greedy (temperature 0, fixed seed) so differences are attributable to the serving
@@ -108,37 +110,61 @@ def post(url: str, payload: dict, api_key: str, timeout: int) -> dict:
 
 
 def evaluate(body: dict, sector: int, code: str) -> dict:
-    """Extract the three fidelity measurements from a chat-completion response."""
+    """Extract the fidelity measurements from a chat-completion response.
+
+    TOTAL by construction: every layer is isinstance-checked rather than assumed, so a malformed
+    response (null choices, non-object message, non-string arguments) records a failed trial instead
+    of raising and aborting the whole run.
+    """
     out = {
         "toolCallEmitted": False,
+        "toolNameCorrect": False,
         "argsValidJson": False,
+        "argsSchemaValid": False,
         "valueCorrect": False,
         "sectorCorrect": False,
         "raw": None,
     }
-    try:
-        msg = body["choices"][0]["message"]
-    except (KeyError, IndexError):
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if not isinstance(choices, list) or not choices:
         return out
-    calls = msg.get("tool_calls") or []
-    if not calls:
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(msg, dict):
+        return out
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
         # Some runtimes emit the call in content when the template misfires — record the text so a
         # malformed-but-present call is distinguishable from no attempt at all.
-        out["raw"] = (msg.get("content") or "")[:400]
+        content = msg.get("content")
+        out["raw"] = content[:400] if isinstance(content, str) else None
         return out
     out["toolCallEmitted"] = True
-    fn = calls[0].get("function") or {}
+    fn = calls[0].get("function") if isinstance(calls[0], dict) else None
+    if not isinstance(fn, dict):
+        return out
+    out["toolNameCorrect"] = fn.get("name") == "report_activation_code"
     args_raw = fn.get("arguments")
-    out["raw"] = (args_raw or "")[:400]
-    try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-    except (json.JSONDecodeError, TypeError):
+    out["raw"] = args_raw[:400] if isinstance(args_raw, str) else None
+    if isinstance(args_raw, str):
+        try:
+            args = json.loads(args_raw)
+        except (json.JSONDecodeError, ValueError):
+            return out
+    elif isinstance(args_raw, dict):
+        args = args_raw
+    else:
         return out
     if not isinstance(args, dict):
         return out
     out["argsValidJson"] = True
-    got_code = str(args.get("code", "")).strip().upper()
-    out["valueCorrect"] = got_code == code.upper()
+    # Schema conformance: the declared tool requires an integer `sector` and a string `code`.
+    # Without this, a call to the wrong function with `{}` scored as "valid" and inflated the
+    # tool-call-fidelity metric relative to its documented meaning.
+    got_code_raw = args.get("code")
+    sector_ok_type = isinstance(args.get("sector"), int) and not isinstance(args.get("sector"), bool)
+    out["argsSchemaValid"] = bool(out["toolNameCorrect"] and sector_ok_type and isinstance(got_code_raw, str))
+    got_code = str(got_code_raw).strip().upper() if got_code_raw is not None else ""
+    out["valueCorrect"] = bool(out["argsSchemaValid"] and got_code == code.upper())
     try:
         out["sectorCorrect"] = int(args.get("sector")) == sector
     except (TypeError, ValueError):
@@ -196,10 +222,7 @@ def main() -> int:
                     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
                         body, err = {}, f"{type(e).__name__}: {e}"[:200]
                     dt = time.time() - t0
-                    res = evaluate(body, sector, code) if body else {
-                        "toolCallEmitted": False, "argsValidJson": False,
-                        "valueCorrect": False, "sectorCorrect": False, "raw": None,
-                    }
+                    res = evaluate(body if isinstance(body, dict) else {}, sector, code)
                     usage = (body or {}).get("usage") or {}
                     row = {
                         "label": args.label,

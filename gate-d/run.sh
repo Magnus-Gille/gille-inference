@@ -7,7 +7,8 @@
 # Per run: copy the task seed → an isolated work dir → invoke the arm (with a wall-clock cap)
 # → check.sh grades deterministically → append a JSONL row to data/gate-d-results.jsonl.
 #
-# NEEDS THE BOX (drives pi/aider/opencode against qwen3-coder-next-80b on inference.example.com).
+# NEEDS THE BOX (drives pi/aider/opencode/qwen-code against a served model, e.g.
+# qwen3-coder-next-80b, over the gateway at inference.example.com).
 # Required env: GW (gateway /v1 base), GW_KEY (a REAL per-key gateway token — the box 401s on a
 # dummy). Optional: MODEL (default qwen3-coder-next-80b), CAP_S (wall-clock cap, default 600).
 set -u
@@ -180,12 +181,20 @@ run_one() {
   # would corrupt that parse). Concatenating those already-captured files after the run gives the
   # same "combined stdout+stderr" content the telemetry piping already relies on, without adding a
   # live tee to the pi pipe (the one arm where that would risk breaking telemetry parsing).
-  # $TRANSCRIPT itself lives in $WORKROOT — the WORK DIR'S PARENT, never inside $W — so a harness
-  # cd'd into $W never sees or can edit the copy of its own output being inspected.
-  local TRANSCRIPT="$W.transcript"
-  : >"$TRANSCRIPT"
-  [ -f "$W/.arm.log" ] && cat "$W/.arm.log" >>"$TRANSCRIPT" 2>/dev/null
-  [ -f "$W/.arm.stderr.log" ] && cat "$W/.arm.stderr.log" >>"$TRANSCRIPT" 2>/dev/null
+  # $TRANSCRIPT lives in $WORKROOT — the WORK DIR'S PARENT, never inside $W. Note that being
+  # outside $W is NOT by itself sufficient: see the unpredictable-name requirement below.
+  # The transcript path MUST NOT be predictable from inside $W. An earlier revision used the
+  # sibling path "$W.transcript", which the arm can compute from its own cwd: planting a symlink
+  # (or FIFO) there turns the `: >` truncation below into an out-of-work-dir clobber primitive —
+  # and it fires AFTER the fixture dirty-check above has already declared the tree clean, so it
+  # evades exactly the isolation guarantee #172 exists to enforce. `mktemp` creates the file
+  # O_EXCL with an unguessable suffix, so a pre-planted path is never followed.
+  local TRANSCRIPT=""
+  TRANSCRIPT="$(mktemp "$WORKROOT/transcript-XXXXXXXX" 2>/dev/null)" || TRANSCRIPT=""
+  if [ -n "$TRANSCRIPT" ]; then
+    [ -f "$W/.arm.log" ] && cat "$W/.arm.log" >>"$TRANSCRIPT" 2>/dev/null
+    [ -f "$W/.arm.stderr.log" ] && cat "$W/.arm.stderr.log" >>"$TRANSCRIPT" 2>/dev/null
+  fi
   # Scanning is delegated to gate-d/peek-scan.py, which reads from the PRISTINE task dir (never the
   # work dir). `solution/` and `oracle/` live outside $W, so the thing worth detecting is ACCESS,
   # not similarity — an early version matched reference-solution *code* and fired on 30/30
@@ -219,7 +228,12 @@ run_one() {
   echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
   # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, .check.log, and the oracle-peek
   # transcript) for diagnosis.
-  if [ -n "${KEEP_WORK:-}" ]; then echo "  [kept] $W (+ transcript: $TRANSCRIPT)"; else rm -rf "$W" "$TRANSCRIPT"; fi
+  if [ -n "${KEEP_WORK:-}" ]; then
+    echo "  [kept] $W${TRANSCRIPT:+ (+ transcript: $TRANSCRIPT)}"
+  else
+    rm -rf "$W"
+    [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"
+  fi
 }
 
 if [ "$SEL" = "all" ]; then
