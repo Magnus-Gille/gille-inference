@@ -1,7 +1,8 @@
 # Harness research spike — OSS coding harnesses for local models on the M5
 
 **Date:** 2026-08-22
-**Status:** COMPLETE — research done; E2/E3/E4 executed, E1 killed on capability grounds
+**Status:** COMPLETE — research done; E2/E3/E4 executed, E1 killed on capability grounds;
+follow-up in §6 closes the KV question and replaces the retired leak signal
 **Scope:** which OSS coding harness to run against M5-served local models, and what evidence
 supports that choice.
 
@@ -25,8 +26,10 @@ Ranked findings:
    regardless of harness. Any future Gate-D head-to-head should carry seeds and a significance
    test. (`measured`)
 4. **Gate-D r1 is saturated** for current models — `ornith-1.5-35b` scores 30/30 — so r1 cannot
-   discriminate between serving configurations. The KV-quantization question is therefore
-   **unresolved**, not answered. (`measured`)
+   discriminate between serving configurations. A purpose-built probe (§6.1) then found **no
+   degradation even at q4_0**, and the claim that motivated the whole question turned out to be
+   **false**: llama.cpp publishes no such warning, and primary sources measure q8_0 as
+   near-lossless. **Recommended action: none.** (`measured`)
 5. **Octofriend cannot be benchmarked as shipped** — no headless agentic mode. (`measured`)
 6. `pi` remains the recommended primary driver; nothing evaluated displaces it, and the
    external corroboration in §1.1 stands.
@@ -139,9 +142,14 @@ Implemented as a `qwen-code` arm in `gate-d/run.sh`.
 **Why this exists.** Recon of the live llama-swap config found that `ornith-1.5-35b` **and**
 `qwen38-27b` are served with `-ctk q8_0 -ctv q8_0`, while `qwen36-a3b` runs default **f16**. Both of
 this repo's recorded head-to-heads (the #141 r2 tie-break, and the qwen38-vs-qwen36 Gate-D study)
-therefore compare a q8_0-KV model against an f16-KV model. If KV quantization affects tool-calling —
-as secondary sources claim llama.cpp's own documentation warns for agent workloads — that is a live
-confound in already-published conclusions.
+therefore compare a q8_0-KV model against an f16-KV model — an asymmetry worth understanding.
+
+**Correction (2026-08-24).** This experiment was originally motivated by a claim, taken from a
+secondary source, that llama.cpp's own documentation warns against KV quantization for agent
+workloads. **That claim is false.** Verified directly against `tools/server/README.md` on master:
+the docs describe `-ctk`/`-ctv` and their allowed values and contain no such warning. (Upstream
+issue #10373 is an open complaint that the flag values are not documented at all.) Primary evidence
+points the other way — see §5.
 
 **Method.** A standalone `llama-server` on a spare loopback port, launched under the repository's
 sanctioned cooperative GPU lease (`homeserver gpu run`). The launch line is **byte-identical to the
@@ -231,15 +239,17 @@ same model, same background invocation went from `arm-error` / 0 turns / 300 s t
 4. **Retire Gate-D r1 as a serving-configuration instrument.** It is saturated (30/30). Any study
    comparing quantization, KV settings, or runtime flags needs the harder holdout set or new tasks —
    otherwise it will keep producing powerless nulls.
-5. **Decide explicitly about the KV confound.** `ornith-1.5-35b` and `qwen38-27b` run `q8_0` KV
-   while `qwen36-a3b` runs `f16`, and both recorded head-to-heads inherit that asymmetry. Resolving
-   it needs the r2 holdouts (consume-once). That is an owner decision, deliberately not taken here.
+5. **KV confound — closed, no action.** Resolved in §6.1 without consuming any r2 holdout. The
+   motivating claim was false; primary evidence measures q8_0 as near-lossless; and a direct probe
+   found no degradation on this box even at q4_0 across 54.5k-token contexts. The roster's
+   `q8_0`/`f16` asymmetry is a tidiness issue, not a correctness one.
 6. **E1′ (successor to the killed E1):** test the *mechanism*, not the harness — capture real
    malformed tool-call payloads from a pi × `gpt-oss-120b` run and replay them through a
    `fix-json`-class repairer. Cheap, and it answers the original question without needing an
    agentic Octofriend.
-7. **Do not adopt `solutionInTranscript` as a gate.** Keep it as an observation field with the
-   documented false-positive behaviour.
+7. **`solutionInTranscript` is removed, not merely caveated.** It fired on 30/30 known-good runs.
+   Replaced by three access-based signals validated against positive *and* negative controls
+   (§6.2). None of them should ever be promoted to a gate without a confirmed real-leak observation.
 8. Steal, don't adopt: [Reasonix](https://github.com/esengine/deepseek-reasonix) is built around
    prefix-cache stability (stable environment preamble, stale tool output pruned before compaction,
    versioned tool-schema contracts). On a serial leased GPU that is a serving-economics concern.
@@ -345,6 +355,97 @@ the targeted cap-900 re-runs that diagnosed its cap confound at
 `data/e2/ARCHIVE-pi-cap900-targeted.jsonl`. Neither feeds the result above: the final dataset was
 collected fresh at a uniform cap, and the targeted re-runs were deliberately excluded because their
 tasks had been selected on a performance-correlated criterion (pi having been slow on them).
+
+## 6. Follow-up (2026-08-24): resolving the two open items
+
+### 6.1 KV quantization — primary evidence, plus a direct probe
+
+**The motivating claim was false.** llama.cpp's documentation contains no warning against KV
+quantization for agent workloads (verified against `tools/server/README.md` on master). What primary
+sources actually show:
+
+| Source | Finding |
+|---|---|
+| llama.cpp PR #7412 (original KV-quant PR) | ΔPPL **0.0046 for q8_0** vs f16; 0.022 for q4_0 |
+| llama.cpp discussion #23470 | q8_0/q8_0 KLD **0.0018** (98.0% token match); q4_0/q4_0 KLD **5.51** (11.6%) |
+| #23470, community test | q4_0/q4_0 under grammar-constrained decoding: **375/500** ARC answers lost on Qwen2.5-7B; isolating the variable showed **K-side quantization alone reproduces the collapse** |
+| discussion #20969 | a reported long-context degradation traced to a **dequant performance bug**, not accuracy; "flat 98.7–99.5% through 32K" once fixed |
+
+So the risk is specific to **q4_0**, and specifically the **K** side. q8_0 is measured as
+near-lossless. Context-length accumulation for q8_0 is **not** an established llama.cpp finding.
+
+**Direct probe on this box.** Because Gate-D r1 saturates, `scripts/kv-toolcall-probe.py` measures
+the alleged mechanism directly: a high-entropy needle is planted in filler text and must be returned
+*through a tool call*. Paired design (identical prompts per arm), greedy decoding, `ornith-1.5-35b`,
+64 trials per arm across ~5.8k / 22k / **54.5k**-token contexts.
+
+| Arm | tool call emitted | args valid JSON | **needle correct** |
+|---|---|---|---|
+| `-ctk f16 -ctv f16` | 63/63 | 63/63 | **63/63** |
+| `-ctk q8_0 -ctv q8_0` | 64/64 | 64/64 | **64/64** |
+| `-ctk q4_0 -ctv q4_0` (positive control) | 64/64 | 64/64 | **64/64** |
+
+(One f16 trial is excluded: a `RemoteDisconnected` transport error at 7 s on a prompt requiring
+~110 s — infrastructure noise, not a model failure. 64 paired cells, 1 discordant, that one.)
+
+**Honest interpretation — the positive control did NOT validate the instrument.** q4_0 was included
+precisely so that a null for q8_0 would be interpretable, on the reasoning that a probe which cannot
+detect the known-bad configuration cannot certify the good one. **q4_0 scored a perfect 64/64**, so
+that validation failed. Two readings remain open:
+
+1. this model/task combination is genuinely insensitive to KV quantization — plausible, since the
+   published collapse was measured on a *dense* Qwen2.5-7B under grammar-constrained decoding,
+   whereas `ornith-1.5-35b` is a hybrid-attention MoE (full attention only every 4th layer, so far
+   less of the computation depends on the quantized cache); or
+2. needle-retrieval-via-tool-call is too easy a task to expose KV noise.
+
+A further caveat: the server logs for this build do not print an explicit KV-cache allocation, so
+the flags could not be confirmed to take effect at tensor level. Prompt-cache entries do differ
+systematically by arm (f16 growing to ~1706 MiB against q8_0's ~410 MiB), which is consistent with
+the setting being honoured, but that is indirect.
+
+**Conclusion.** Not "q8_0 is proven safe here." The defensible statement is: **no degradation was
+detectable on this box even at q4_0**, and strong primary evidence independently shows q8_0 is
+near-lossless. **Recommended action: none.** Do not change the serving configuration of
+`ornith-1.5-35b` or `qwen38-27b` on the strength of the original concern, which rested on a false
+premise. The `q8_0`-vs-`f16` asymmetry across the roster remains a tidiness issue, not a correctness
+one, and no longer justifies consuming the r2 holdouts.
+
+Incidental: q4_0 ran ~2× slower than f16 at 8k context (16.6 s vs 8.3 s), consistent with the
+documented dequant/flash-attention performance traps (llama.cpp #24485) rather than any quality effect.
+
+### 6.2 Grader-leak detection — retired signal replaced and validated
+
+`solutionInTranscript` fired on 30/30 legitimate passing runs. The cause is structural rather than a
+threshold problem: `solution/` and `oracle/` live outside the work dir, so the detectable event is
+**access**, not similarity — and at Gate-D task scale a *correct* implementation is textually the
+reference solution. Filesystem `atime` was tested as an alternative access signal and rejected: APFS
+here does not update it on read.
+
+Replaced with three signals that honest work cannot produce, using canaries already present in the
+fixtures (**no fixture, corpus, or task-revision change**):
+
+| Signal | Basis | Coverage |
+|---|---|---|
+| `graderPathInTranscript` | a path under the task dir / `oracle/` / `solution/` was referenced | all tasks |
+| `hiddenOracleMarkerInTranscript` | arbitrary author-chosen literals (`"above hi"`, `"  Multiple---separators__here  "`) | 4 hidden-oracle tasks |
+| `solutionMarkerInTranscript` | the `REFERENCE SOLUTION` banner | 10 of 23 solution files |
+
+Discriminating power is pinned by `tests/gate-d-peek-scan.test.ts` — positive controls (a planted
+leak must fire) and negative controls (honest work must not). **The negative controls caught two real
+false positives during development**, both of which would have shipped otherwise:
+
+1. the hidden oracle's own `"node:assert/strict"` import matched every honest test file;
+2. task 13's canaries include `"Hello World"` / `"hello-world"` — exactly the data an honest slugify
+   test emits.
+
+Hence the import-line exclusion and the **two-distinct-hits + at-least-one-high-specificity**
+threshold. This is an accusation-grade signal, so it is deliberately biased toward false negatives:
+missing a leak is cheaper than falsely alleging one.
+
+No verified confirmation of the `graderPath` signal against a *real* leaking harness exists — no
+harness in this repo's arms has ever been observed reading the protected trees. It is validated
+against planted leaks only.
 
 ## Provenance
 
