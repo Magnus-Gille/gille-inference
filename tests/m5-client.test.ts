@@ -1145,7 +1145,7 @@ describe("m5 doctor diagnostic distinctions", () => {
         code: "ENOTFOUND",
       }),
     });
-    expect(result).toMatchObject({ status: "network_failure", diagnostic_code: "network_failure" });
+    expect(result).toMatchObject({ status: "network_failure", diagnostic_code: "dns_failure" });
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(JSON.stringify(result)).not.toContain(PROFILE.privateGatewayUrl);
   });

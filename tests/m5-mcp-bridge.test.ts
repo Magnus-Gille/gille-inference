@@ -21,7 +21,7 @@ function makeBridge(
     credentialStore: { resolve: async () => SECRET },
     fetch,
     timeoutMs: options.timeoutMs,
-  }).then((client) => createMcpStdioBridge({ client }));
+  }).then((client) => createMcpStdioBridge({ client, profile: "codex" }));
 }
 
 describe("m5 stdio MCP conformance", () => {
@@ -161,12 +161,134 @@ describe("m5 stdio MCP conformance", () => {
 
     expect(JSON.parse(failed!)).toMatchObject({
       id: 10,
-      error: { code: -32603, message: expect.stringMatching(/timed out/i) },
+      error: {
+        code: -32603,
+        message: expect.stringMatching(/timed out/i),
+        data: {
+          m5_code: "timeout",
+          diagnostic_code: "connect_timeout",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      },
     });
     expect(failed).not.toContain(SECRET);
     expect(JSON.parse(recovered!)).toMatchObject({
       id: 11,
       result: { tools: [] },
+    });
+  });
+
+  it.each([
+    ["dns_failure", "ENOTFOUND"],
+    ["dns_failure", "EAI_AGAIN"],
+    ["connection_refused", "ECONNREFUSED"],
+    ["route_unreachable", "ENETUNREACH"],
+    ["tls_failure", "CERT_HAS_EXPIRED"],
+  ])("returns a redacted connector-layer %s diagnostic", async (diagnosticCode, causeCode) => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError(`fetch failed ${SECRET}`), {
+        cause: Object.assign(new Error(`transport failed at https://private.invalid/${SECRET}`), {
+          code: causeCode,
+        }),
+      });
+    });
+
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"ask","arguments":{"model":"mellum","prompt":"bounded"}}}',
+    );
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 15,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: diagnosticCode,
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      },
+    });
+    expect(response).not.toContain(SECRET);
+    expect(response).not.toContain("private.invalid");
+  });
+
+  it("bounds malformed cyclic cause traversal and returns the residual category", async () => {
+    const cyclic = Object.assign(new TypeError("fetch failed"), { code: "UNKNOWN_TRANSPORT" }) as Error & {
+      cause?: unknown;
+    };
+    cyclic.cause = cyclic;
+    const bridge = await makeBridge(async () => { throw cyclic; });
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":18,"method":"tools/list"}',
+    );
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "network_failure",
+          failure_layer: "connector_transport",
+        },
+      },
+    });
+  });
+
+  it("makes an adoption-report outage explicitly recoverable without echoing its payload", async () => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    });
+    const report = {
+      harness: "codex_app",
+      execution_mode: "ask",
+      traffic_purpose: "organic",
+      result: "failed",
+      deterministic_check: "not_run",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_unreachable",
+      eligible_opportunities: 7,
+    };
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 16,
+      method: "tools/call",
+      params: { name: "record_adoption_evidence", arguments: report },
+    }));
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "route_unreachable",
+          failure_layer: "connector_transport",
+          retryable: true,
+          evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" },
+        },
+      },
+    });
+    expect(response).not.toContain("codex_app");
+    expect(response).not.toContain("eligible_opportunities");
+  });
+
+  it("distinguishes gateway health failures from connector transport failures", async () => {
+    const bridge = await makeBridge(async () => new Response("", { status: 503 }));
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":17,"method":"tools/list"}',
+    );
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "upstream_http_error",
+          diagnostic_code: "gateway_http_error",
+          failure_layer: "gateway_health",
+          http_status: 503,
+          retryable: true,
+        },
+      },
     });
   });
 

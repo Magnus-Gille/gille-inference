@@ -74,6 +74,11 @@ m5 --profile codex mcp
 `usage`. A token-limit finish returns `truncated:true` so scripts can retry with a higher
 `max_tokens` instead of mistaking an empty or partial answer for a clean completion.
 
+The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
+`diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,
+gateway-health, and authentication failures. A failed `record_adoption_evidence` call is marked
+`not_recorded` with `retry_same_tool_call`; no report payload is echoed or silently persisted.
+
 ### Provisioning a new owner-agent profile
 
 `m5 provision` is an owner-attended macOS operator ceremony. It creates the
