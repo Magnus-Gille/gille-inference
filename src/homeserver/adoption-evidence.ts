@@ -61,9 +61,30 @@ export interface AdoptionEvidenceReport {
   eligibleOpportunities: number;
 }
 
+export type AdoptionEvidenceWireField =
+  | "harness"
+  | "execution_mode"
+  | "traffic_purpose"
+  | "result"
+  | "deterministic_check"
+  | "reviewer_usefulness"
+  | "fallback_reason"
+  | "eligible_opportunities";
+
+export type AdoptionEvidenceInvariant =
+  | "completed_requires_no_fallback"
+  | "noncompleted_requires_fallback"
+  | "unobserved_result_requires_unobserved_assessment";
+
+export type AdoptionEvidenceParseError =
+  | { code: "invalid_shape" }
+  | { code: "unknown_field" }
+  | { code: "invalid_field"; field: AdoptionEvidenceWireField }
+  | { code: "invalid_invariant"; invariant: AdoptionEvidenceInvariant };
+
 export type ParseAdoptionEvidenceResult =
   | { ok: true; value: AdoptionEvidenceReport }
-  | { ok: false };
+  | { ok: false; error: AdoptionEvidenceParseError };
 
 export const ADOPTION_EVIDENCE_COLUMNS = [
   "recorded_day",
@@ -130,6 +151,20 @@ function ownEnum<T extends readonly string[]>(raw: Record<string, unknown>, key:
  * (or a future internal import), so this repeats the closed-schema and outcome invariants after
  * MCP parsing rather than relying on a caller's `as` assertion.
  */
+function invalidInvariant(report: AdoptionEvidenceReport): AdoptionEvidenceInvariant | null {
+  if (report.result === "completed") {
+    return report.fallbackReason === "none" ? null : "completed_requires_no_fallback";
+  }
+  if (report.fallbackReason === "none") return "noncompleted_requires_fallback";
+  if (
+    (report.result === "refused" || report.result === "not_attempted") &&
+    (report.deterministicCheck !== "not_run" || report.reviewerUsefulness !== "not_reported")
+  ) {
+    return "unobserved_result_requires_unobserved_assessment";
+  }
+  return null;
+}
+
 function isValidAdoptionEvidenceReport(report: AdoptionEvidenceReport): boolean {
   if (
     !(ADOPTION_HARNESSES as readonly string[]).includes(report.harness) ||
@@ -146,11 +181,7 @@ function isValidAdoptionEvidenceReport(report: AdoptionEvidenceReport): boolean 
     return false;
   }
 
-  return report.result === "completed"
-    ? report.fallbackReason === "none"
-    : report.deterministicCheck === "not_run" &&
-      report.reviewerUsefulness === "not_reported" &&
-      report.fallbackReason !== "none";
+  return invalidInvariant(report) === null;
 }
 
 /**
@@ -158,9 +189,11 @@ function isValidAdoptionEvidenceReport(report: AdoptionEvidenceReport): boolean 
  * malformed callers must not turn their instruction or path into an access log or MCP response.
  */
 export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: { code: "invalid_shape" } };
+  }
   const value = raw as Record<string, unknown>;
-  const allowed = new Set([
+  const allowed = new Set<AdoptionEvidenceWireField>([
     "harness",
     "execution_mode",
     "traffic_purpose",
@@ -170,30 +203,37 @@ export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult
     "fallback_reason",
     "eligible_opportunities",
   ]);
-  if (Object.keys(value).some((key) => !allowed.has(key))) return { ok: false };
+  // Never echo an unknown key: it may itself contain a path, identity, or task content.
+  if (Object.keys(value).some((key) => !allowed.has(key as AdoptionEvidenceWireField))) {
+    return { ok: false, error: { code: "unknown_field" } };
+  }
 
   const harness = ownEnum(value, "harness", ADOPTION_HARNESSES);
+  if (!harness) return { ok: false, error: { code: "invalid_field", field: "harness" } };
   const executionMode = ownEnum(value, "execution_mode", ADOPTION_EXECUTION_MODES);
+  if (!executionMode) return { ok: false, error: { code: "invalid_field", field: "execution_mode" } };
   const trafficPurpose = ownEnum(value, "traffic_purpose", ADOPTION_TRAFFIC_PURPOSES);
+  if (!trafficPurpose) return { ok: false, error: { code: "invalid_field", field: "traffic_purpose" } };
   const result = ownEnum(value, "result", ADOPTION_RESULTS);
+  if (!result) return { ok: false, error: { code: "invalid_field", field: "result" } };
   const deterministicCheck = ownEnum(value, "deterministic_check", ADOPTION_CHECK_OUTCOMES);
+  if (!deterministicCheck) {
+    return { ok: false, error: { code: "invalid_field", field: "deterministic_check" } };
+  }
   const reviewerUsefulness = ownEnum(value, "reviewer_usefulness", ADOPTION_USEFULNESS);
+  if (!reviewerUsefulness) {
+    return { ok: false, error: { code: "invalid_field", field: "reviewer_usefulness" } };
+  }
   const fallbackReason = ownEnum(value, "fallback_reason", ADOPTION_FALLBACK_REASONS);
+  if (!fallbackReason) return { ok: false, error: { code: "invalid_field", field: "fallback_reason" } };
   const eligibleOpportunities = value["eligible_opportunities"];
   if (
-    !harness ||
-    !executionMode ||
-    !trafficPurpose ||
-    !result ||
-    !deterministicCheck ||
-    !reviewerUsefulness ||
-    !fallbackReason ||
     typeof eligibleOpportunities !== "number" ||
     !Number.isInteger(eligibleOpportunities) ||
     eligibleOpportunities < 0 ||
     eligibleOpportunities > 10_000
   ) {
-    return { ok: false };
+    return { ok: false, error: { code: "invalid_field", field: "eligible_opportunities" } };
   }
 
   const report: AdoptionEvidenceReport = {
@@ -206,7 +246,8 @@ export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult
     fallbackReason,
     eligibleOpportunities,
   };
-  if (!isValidAdoptionEvidenceReport(report)) return { ok: false };
+  const invariant = invalidInvariant(report);
+  if (invariant) return { ok: false, error: { code: "invalid_invariant", invariant } };
 
   return {
     ok: true,
