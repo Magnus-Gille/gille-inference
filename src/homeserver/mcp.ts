@@ -116,6 +116,7 @@ const ASK_DESCRIPTION =
   "Pick a model from list_models; pass the full prompt (and an optional system instruction). " +
   "Successful calls return the model text plus structuredContent {model,text,finish_reason,truncated,metered,usage}. " +
   "A token-limit finish (finish_reason=length) returns isError:true while preserving the partial text in content and the same structuredContent; the truncated call is already metered and any retry is a new billable call. " +
+  "For multi-section work that must finish inside max_tokens, opt into output_profile='complete-within-budget'; it prioritizes structural completion and uses low reasoning effort on gpt-oss. " +
   "Use this liberally for bounded work to save cost and keep data local. " +
   "Call list_models for the live, content-blind ask.files capability state before using file " +
   "attachments. " +
@@ -126,6 +127,16 @@ const ASK_DESCRIPTION =
   "`files` is always rejected, never silently ignored.";
 
 const ASK_FILES_REASON_VALUES = ["enabled", "owner_tier_required", "unconfigured", "no_resolved_roots"] as const;
+const COMPLETE_WITHIN_BUDGET_PROFILE = "complete-within-budget" as const;
+const COMPLETE_WITHIN_BUDGET_SYSTEM =
+  "Output contract: complete every explicitly requested section within the available completion-token budget. " +
+  "Allocate space across all required sections before writing and treat explicit section counts and word limits as hard. " +
+  "Prefer concise, structurally complete sections over extra detail. If space is tight, compress every remaining section; " +
+  "never omit a required section or stop mid-sentence. Answer directly without a preamble.";
+
+function supportsReasoningEffort(model: string): boolean {
+  return /^gpt-oss(?:-|$)/i.test(model);
+}
 const MAX_SAFE_ROOT_COUNT = MAX_BLIND_CONTEXT_ROOTS;
 const STRUCTURED_LIST_MODELS_MIN_M5_CLIENT_VERSION = [1, 2, 1] as const;
 
@@ -423,6 +434,12 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
           prompt: { type: "string", description: "the task / question for the model" },
           system: { type: "string", description: "optional system instruction" },
           max_tokens: { type: "number", description: "optional cap on the completion length" },
+          output_profile: {
+            type: "string",
+            enum: [COMPLETE_WITHIN_BUDGET_PROFILE],
+            description:
+              "optional bounded-output profile that prioritizes completing every requested section/structure within max_tokens",
+          },
           temperature: { type: "number", minimum: 0, maximum: 2, description: "sampling temperature" },
           top_p: { type: "number", minimum: 0, maximum: 1, description: "nucleus sampling probability" },
           top_k: { type: "integer", minimum: 0, description: "top-k cutoff; 0 disables it in llama.cpp" },
@@ -514,6 +531,7 @@ export interface RunChatArgs {
   topP?: number;
   topK?: number;
   minP?: number;
+  reasoningEffort?: "low";
   /**
    * #33: an already-ADMITTED LearningTaskContract Hugin request stamp, when the caller has one —
    * threaded straight through to the ledger write's evidence-identity derivation (lane "mcp-ask"),
@@ -897,6 +915,7 @@ export async function runChatCompletion(
         ...(args.topP !== undefined ? { top_p: args.topP } : {}),
         ...(args.topK !== undefined ? { top_k: args.topK } : {}),
         ...(args.minP !== undefined ? { min_p: args.minP } : {}),
+        ...(args.reasoningEffort !== undefined ? { reasoning_effort: args.reasoningEffort } : {}),
       }),
       signal: AbortSignal.timeout(cfg.callTimeoutMs),
     });
@@ -1212,6 +1231,17 @@ async function callTool(
     const model = typeof args["model"] === "string" ? (args["model"] as string) : "";
     const prompt = typeof args["prompt"] === "string" ? (args["prompt"] as string) : "";
     const system = typeof args["system"] === "string" ? (args["system"] as string) : undefined;
+    const rawOutputProfile = args["output_profile"];
+    if (rawOutputProfile !== undefined && rawOutputProfile !== COMPLETE_WITHIN_BUDGET_PROFILE) {
+      return {
+        text: `'output_profile' must be '${COMPLETE_WITHIN_BUDGET_PROFILE}' when supplied.`,
+        isError: true,
+        trace: badRequestTrace(),
+      };
+    }
+    const outputProfile = rawOutputProfile === COMPLETE_WITHIN_BUDGET_PROFILE
+      ? COMPLETE_WITHIN_BUDGET_PROFILE
+      : undefined;
     const rawDelegatorModelId = args["delegator_model_id"] ?? args["delegatorModelId"];
     if (
       rawDelegatorModelId !== undefined &&
@@ -1303,7 +1333,12 @@ async function callTool(
     }
 
     const messages: Array<{ role: string; content: string }> = [];
-    if (system !== undefined && system !== "") messages.push({ role: "system", content: system });
+    const effectiveSystem = outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE
+      ? [system, COMPLETE_WITHIN_BUDGET_SYSTEM].filter((part): part is string => part !== undefined && part !== "").join("\n\n")
+      : system;
+    if (effectiveSystem !== undefined && effectiveSystem !== "") {
+      messages.push({ role: "system", content: effectiveSystem });
+    }
     messages.push({ role: "user", content: promptWithContext });
 
     const r = await runChatCompletion(ctx.principal, ctx.cfg, ctx.controller, ctx.inflight, {
@@ -1316,6 +1351,10 @@ async function callTool(
       topP: args["top_p"] as number | undefined,
       topK: args["top_k"] as number | undefined,
       minP: args["min_p"] as number | undefined,
+      reasoningEffort:
+        outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE && supportsReasoningEffort(model)
+          ? "low"
+          : undefined,
     });
     if (r.ok) {
       const structuredContent = toAskStructuredContent(model, r);
