@@ -132,7 +132,8 @@ const COMPLETE_WITHIN_BUDGET_SYSTEM =
   "Output contract: complete every explicitly requested section within the available completion-token budget. " +
   "Allocate space across all required sections before writing and treat explicit section counts and word limits as hard. " +
   "Prefer concise, structurally complete sections over extra detail. If space is tight, compress every remaining section; " +
-  "never omit a required section or stop mid-sentence. Answer directly without a preamble.";
+  "never omit a required section or stop mid-sentence. Once all requested sections or the requested verdict are present, " +
+  "stop immediately; do not re-evaluate, restate, or reopen resolved points. Answer directly without a preamble.";
 
 function supportsReasoningEffort(model: string): boolean {
   return /^gpt-oss(?:-|$)/i.test(model);

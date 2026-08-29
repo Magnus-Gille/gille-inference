@@ -494,6 +494,7 @@ describe("MCP tools/call ask", () => {
     expect(sent.messages[0]!.content).toContain("Use plain text.");
     expect(sent.messages[0]!.content).toMatch(/complete every explicitly requested section/i);
     expect(sent.messages[0]!.content).toMatch(/compress/i);
+    expect(sent.messages[0]!.content).toMatch(/stop immediately.*do not re-evaluate/i);
     expect(sent.messages[0]!.content.indexOf("Use plain text.")).toBeLessThan(
       sent.messages[0]!.content.indexOf("Output contract:")
     );

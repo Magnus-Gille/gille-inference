@@ -298,7 +298,8 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   `gpt-oss` so required sections retain output budget. Other models receive only the completion
   instruction, appended after any caller-supplied system text. The profile never hides
   `finish_reason="length"`: truncation still returns `isError:true` with the paid partial content,
-  and it never retries a metered call.
+  and it never retries a metered call. For bounded reviews it also requires the model to emit the
+  requested verdict and stop, rather than repeatedly reopening a candidate it already resolved.
   `delegator_model_id` is optional telemetry:
   owner/cloud-agent callers should set it to the cloud brain that delegated the task so the
   content-blind savings ledger can estimate actual cloud spend avoided. It is not forwarded to the
