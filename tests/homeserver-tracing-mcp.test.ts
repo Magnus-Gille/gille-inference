@@ -411,7 +411,11 @@ describe("MCP ask tracing", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { result: { isError: boolean; structuredContent: unknown } };
     expect(body.result.isError).toBe(true);
-    expect(body.result.structuredContent).toEqual({ accepted: false, reason: "invalid_report" });
+    expect(body.result.structuredContent).toEqual({
+      accepted: false,
+      reason: "invalid_report",
+      diagnostic: { code: "unknown_field" },
+    });
 
     const records = await flushTracingForTests();
     expect(JSON.stringify(records)).not.toContain(secretReportContent);

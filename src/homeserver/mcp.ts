@@ -27,6 +27,7 @@ import {
   allowAdoptionEvidenceReportForPrincipal,
   parseAdoptionEvidence,
   recordAdoptionEvidence,
+  type AdoptionEvidenceParseError,
 } from "./adoption-evidence.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
 import type { KeyScope } from "./keystore.js";
@@ -367,10 +368,14 @@ type AdoptionReportRejectionReason =
   | "daily_capacity_reached"
   | "storage_unavailable";
 
-function rejectAdoptionReport(reason: AdoptionReportRejectionReason): {
+function rejectAdoptionReport(reason: AdoptionReportRejectionReason, diagnostic?: AdoptionEvidenceParseError): {
   text: string;
   isError: boolean;
-  structuredContent: { accepted: false; reason: AdoptionReportRejectionReason };
+  structuredContent: {
+    accepted: false;
+    reason: AdoptionReportRejectionReason;
+    diagnostic?: AdoptionEvidenceParseError;
+  };
 } {
   // Adoption evidence is optional telemetry, not part of the inference result. A full bounded
   // aggregate must therefore never turn a successful M5 call into a hard MCP failure; callers can
@@ -381,7 +386,7 @@ function rejectAdoptionReport(reason: AdoptionReportRejectionReason): {
       ? `Adoption report not recorded (${reason}); M5 inference result is unaffected.`
       : `Adoption report was not accepted (${reason}).`,
     isError: !nonFatal,
-    structuredContent: { accepted: false, reason },
+    structuredContent: { accepted: false, reason, ...(diagnostic ? { diagnostic } : {}) },
   };
 }
 
@@ -1214,7 +1219,7 @@ async function callTool(
     }
     const parsed = parseAdoptionEvidence(args);
     if (!parsed.ok) {
-      return rejectAdoptionReport("invalid_report");
+      return rejectAdoptionReport("invalid_report", parsed.error);
     }
     try {
       if (!recordAdoptionEvidence(parsed.value)) {

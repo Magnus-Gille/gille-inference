@@ -100,7 +100,7 @@ describe("M5 adoption evidence (#136)", () => {
       { ...organicPass, reporter_id: "session-2026-07-31-abc" },
       { ...organicPass, harness: "a dynamically generated harness" },
     ]) {
-      expect(parseAdoptionEvidence(forbidden)).toEqual({ ok: false });
+      expect(parseAdoptionEvidence(forbidden)).toMatchObject({ ok: false });
     }
   });
 
@@ -132,11 +132,72 @@ describe("M5 adoption evidence (#136)", () => {
     expect(attemptedFailure).toMatchObject({ ok: true, value: { result: "failed", fallbackReason: "m5_unreachable" } });
   });
 
-  it("requires content-free usefulness and check fields to agree with the execution result", () => {
-    expect(parseAdoptionEvidence({ ...organicPass, result: "failed", reviewer_usefulness: "wrong" })).toEqual({ ok: false });
-    expect(parseAdoptionEvidence({ ...organicPass, result: "failed", deterministic_check: "fail", reviewer_usefulness: "not_reported", fallback_reason: "m5_unreachable" })).toEqual({ ok: false });
-    expect(parseAdoptionEvidence({ ...organicPass, result: "completed", fallback_reason: "m5_busy" })).toEqual({ ok: false });
-    expect(parseAdoptionEvidence({ ...organicPass, result: "not_attempted", deterministic_check: "not_run", reviewer_usefulness: "not_reported", fallback_reason: "none" })).toEqual({ ok: false });
+  it("accepts failed attempts with observed checks and unusable partial-review outcomes", () => {
+    expect(parseAdoptionEvidence({
+      ...organicPass,
+      execution_mode: "ask",
+      result: "failed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_unreachable",
+    })).toMatchObject({ ok: true, value: { result: "failed", fallbackReason: "m5_unreachable" } });
+    expect(parseAdoptionEvidence({
+      ...organicPass,
+      execution_mode: "ask",
+      result: "failed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "redo",
+      fallback_reason: "local_result_unusable",
+    })).toMatchObject({ ok: true, value: { result: "failed", reviewerUsefulness: "redo" } });
+  });
+
+  it("returns stable content-blind field and invariant diagnostics", () => {
+    expect(parseAdoptionEvidence({ ...organicPass, prompt: "never echo this" })).toEqual({
+      ok: false,
+      error: { code: "unknown_field" },
+    });
+    expect(parseAdoptionEvidence({ ...organicPass, harness: "invalid" })).toEqual({
+      ok: false,
+      error: { code: "invalid_field", field: "harness" },
+    });
+    expect(parseAdoptionEvidence({ ...organicPass, result: "completed", fallback_reason: "m5_busy" })).toEqual({
+      ok: false,
+      error: { code: "invalid_invariant", invariant: "completed_requires_no_fallback" },
+    });
+  });
+
+  it("keeps fallback and unobserved-result assessments internally consistent", () => {
+    expect(parseAdoptionEvidence({
+      ...organicPass,
+      result: "failed",
+      deterministic_check: "fail",
+      reviewer_usefulness: "wrong",
+      fallback_reason: "local_result_unusable",
+    })).toMatchObject({ ok: true });
+    expect(parseAdoptionEvidence({
+      ...organicPass,
+      result: "refused",
+      deterministic_check: "pass",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_refused",
+    })).toEqual({
+      ok: false,
+      error: { code: "invalid_invariant", invariant: "unobserved_result_requires_unobserved_assessment" },
+    });
+    expect(parseAdoptionEvidence({ ...organicPass, result: "completed", fallback_reason: "m5_busy" })).toEqual({
+      ok: false,
+      error: { code: "invalid_invariant", invariant: "completed_requires_no_fallback" },
+    });
+    expect(parseAdoptionEvidence({
+      ...organicPass,
+      result: "not_attempted",
+      deterministic_check: "not_run",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "none",
+    })).toEqual({
+      ok: false,
+      error: { code: "invalid_invariant", invariant: "noncompleted_requires_fallback" },
+    });
   });
 
   it("persists only the approved low-cardinality fields", () => {

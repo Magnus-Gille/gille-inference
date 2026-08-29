@@ -107,6 +107,16 @@ Every report has only these closed, low-cardinality fields:
 | `fallback_reason` | closed reason enum, including **separate** `m5_tool_missing` and `m5_auth_unavailable` |
 | `eligible_opportunities` | non-negative L1-declared count; `0` means the denominator was unknown, never inferred from raw call volume |
 
+The closed cross-field contract is:
+
+- `completed` uses `fallback_reason=none`.
+- `failed` uses a non-`none` fallback and may retain an observed deterministic-check or reviewer
+  outcome. This is how an unreachable attempt with a separately verified fallback, or a metered
+  but unusable partial review, remains visible.
+- `refused` and `not_attempted` use a non-`none` fallback with
+  `deterministic_check=not_run` and `reviewer_usefulness=not_reported`, because no local result was
+  available to assess.
+
 **Never stored or accepted:** prompt/output text, file paths, repository names, aliases, key hashes,
 user/session IDs, free-text notes, or caller-provided timestamps. The writer rejects unknown fields
 before storage. It has no event ID or precise timestamp: the server derives only a UTC calendar day
@@ -120,6 +130,11 @@ principal, request, database, or path detail. `daily_capacity_reached` is an exp
 outcome: the inference result remains valid, the telemetry row is dropped, and callers should not
 retry until the next UTC day. Other rejection reasons remain hard tool errors so malformed or
 unavailable telemetry is visible.
+
+An `invalid_report` response also carries one fixed content-blind diagnostic: `invalid_shape`,
+`unknown_field`, `invalid_field` plus a known schema field, or `invalid_invariant` plus one of the
+documented fixed invariant codes. Unknown caller keys are never returned, because a key could
+itself contain a path, identity, or task text.
 
 The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
 
