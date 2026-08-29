@@ -59,6 +59,13 @@ Other rejections return one of `invalid_report`, `principal_rate_limited`, or
 `storage_unavailable`; they never echo input or expose database, credential, principal, request,
 or path details.
 
+`completed` reports use `fallback_reason=none`. `failed` reports use a non-`none` fallback and may
+retain an observed deterministic-check or reviewer outcome, including `redo` for a metered but
+unusable partial result. `refused` and `not_attempted` have no assessable local result, so they use
+`deterministic_check=not_run`, `reviewer_usefulness=not_reported`, and a non-`none` fallback.
+Rejected `invalid_report` calls include only a fixed diagnostic code and, when safe, a known schema
+field or fixed invariant code; unknown caller keys are never echoed.
+
 ## Predeclared review
 
 On **2026-08-28**, assess the initial trial against both conditions:

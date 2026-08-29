@@ -286,6 +286,27 @@ stdout, rejects malformed input and upstream envelopes locally, bounds each HTTP
 response-body consumption, and continues serving later messages after a failed request. A stale
 HTTP MCP session (`404`/`410`) is retried once without the session identifier.
 
+Connector failures are returned as redacted JSON-RPC error data rather than a bare `fetch failed`:
+
+- `failure_layer` distinguishes `connector_transport`, `gateway_health`, and `authentication`.
+- `diagnostic_code` distinguishes `dns_failure`, `connection_refused`, `route_unreachable`,
+  `connection_reset`, `connect_timeout`, `tls_failure`, the residual `network_failure`, and
+  `gateway_http_error`.
+- `retryable` and a fixed locator-free `remediation` tell the caller whether to retry the same
+  operation and then run the selected profile's `m5 doctor` check.
+
+The standalone doctor exercises the configured public/private profile paths; it cannot inspect an
+interactive host connector session and continues to report that boundary explicitly as
+`connector.status=unsupported`. Connector error data therefore names the connector layer while the
+doctor independently distinguishes profile credential, gateway health, tool-surface, and path
+parity failures. Neither surface returns an endpoint locator or transport exception text.
+
+If `record_adoption_evidence` itself fails at the connector/transport layer, its error includes
+`evidence_recovery: {status:"not_recorded", action:"retry_same_tool_call"}`. The bridge does not
+echo or silently spool the report payload; the caller retains its already content-free request and
+can replay that exact tool call after recovery. This makes the lost observation explicit and
+recoverable without creating a new local identity/timestamp store.
+
 The Keychain value is captured inside the client process and used only to construct the outbound
 HTTP `Authorization` header. It is never exported, passed to a subprocess, accepted from client
 config/argv, printed, logged, or persisted as an artifact. Error paths discard upstream bodies and

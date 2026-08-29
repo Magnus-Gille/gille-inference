@@ -12,6 +12,22 @@ export const REQUIRED_AGENT_TOOLS = Object.freeze([
 ]);
 
 const CREDENTIAL_FAILURE_CODES = new Set(["missing_credential", "rejected_credential"]);
+const NETWORK_DIAGNOSTIC_CODES = new Set([
+  "dns_failure",
+  "connection_refused",
+  "route_unreachable",
+  "connection_reset",
+  "connect_timeout",
+  "tls_failure",
+  "network_failure",
+  "gateway_http_error",
+]);
+const FAILURE_LAYERS = new Set([
+  "authentication",
+  "gateway_transport",
+  "gateway_health",
+  "gateway_protocol",
+]);
 
 /** The standalone client cannot inspect an interactive host connector session. */
 const UNSUPPORTED_CONNECTOR_DIAGNOSTIC = Object.freeze({
@@ -64,6 +80,11 @@ export class M5ClientError extends Error {
     });
     if (options.httpStatus !== undefined) this.httpStatus = options.httpStatus;
     if (options.workId !== undefined) this.workId = options.workId;
+    if (NETWORK_DIAGNOSTIC_CODES.has(options.diagnosticCode)) {
+      this.diagnosticCode = options.diagnosticCode;
+    }
+    if (FAILURE_LAYERS.has(options.failureLayer)) this.failureLayer = options.failureLayer;
+    if (typeof options.retryable === "boolean") this.retryable = options.retryable;
     if (CREDENTIAL_FAILURE_CODES.has(code)) {
       // Credential failures have one owner-attended recovery action. Do not retain a
       // gateway- or caller-supplied remediation: it may contain a locator, credential, or
@@ -89,6 +110,9 @@ export class M5ClientError extends Error {
         message: this.message,
         ...(this.httpStatus === undefined ? {} : { http_status: this.httpStatus }),
         ...(this.workId === undefined ? {} : { work_id: this.workId }),
+        ...(this.diagnosticCode === undefined ? {} : { diagnostic_code: this.diagnosticCode }),
+        ...(this.failureLayer === undefined ? {} : { failure_layer: this.failureLayer }),
+        ...(this.retryable === undefined ? {} : { retryable: this.retryable }),
         ...(remediation === undefined ? {} : { remediation }),
       },
     };
@@ -106,6 +130,42 @@ export function credentialRemediation(profile) {
   const selected = safeProfileForDiagnostic(profile);
   const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
   return `Restore the selected profile credential through the owner-attended Keychain recovery/rotation procedure, then rerun: ${command}.`;
+}
+
+/** Fixed, locator-free recovery text shared by direct and connector transport failures. */
+export function transportRemediation(profile) {
+  const selected = safeProfileForDiagnostic(profile);
+  const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
+  return `Retry the same operation once. If it still fails, run ${command}; the standalone doctor tests the configured profile path and explicitly reports that it cannot inspect the host connector session itself.`;
+}
+
+function networkDiagnosticCode(error) {
+  const codes = [];
+  let current = error;
+  // Fetch/undici normally use one or two cause links. Keep traversal bounded so a hostile or
+  // malformed Error with a self-referential cause cannot hang the long-lived stdio bridge.
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+    if (typeof current.code === "string") codes.push(current.code.toUpperCase());
+    current = current.cause;
+  }
+  if (codes.some((code) => code === "ENOTFOUND" || code === "EAI_AGAIN")) return "dns_failure";
+  if (codes.includes("ECONNREFUSED")) return "connection_refused";
+  if (codes.some((code) => code === "ENETUNREACH" || code === "EHOSTUNREACH")) return "route_unreachable";
+  if (codes.some((code) => code === "ECONNRESET" || code === "EPIPE" || code === "UND_ERR_SOCKET")) {
+    return "connection_reset";
+  }
+  if (codes.some((code) => code === "ETIMEDOUT" || code === "UND_ERR_CONNECT_TIMEOUT")) {
+    return "connect_timeout";
+  }
+  if (codes.some((code) =>
+    code.startsWith("ERR_TLS_") ||
+    code.startsWith("CERT_") ||
+    code === "DEPTH_ZERO_SELF_SIGNED_CERT" ||
+    code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+  )) {
+    return "tls_failure";
+  }
+  return "network_failure";
 }
 
 function credentialFailureMessage(code, profile) {
@@ -151,6 +211,9 @@ function safeError(error, secrets, profile) {
     return new M5ClientError(error.code, message, credentialErrorOptions(error.code, profile, {
       httpStatus: error.httpStatus,
       workId: error.workId,
+      diagnosticCode: error.diagnosticCode,
+      failureLayer: error.failureLayer,
+      retryable: error.retryable,
       remediation: error.remediation,
     }));
   }
@@ -702,14 +765,24 @@ export async function createM5Client({
         throw new M5ClientError(
           "rejected_credential",
           credentialFailureMessage("rejected_credential", profile),
-          credentialErrorOptions("rejected_credential", profile, { httpStatus: response.status }),
+          credentialErrorOptions("rejected_credential", profile, {
+            httpStatus: response.status,
+            failureLayer: "authentication",
+            retryable: false,
+          }),
         );
       }
       if (response.status >= 400) {
         throw new M5ClientError(
           "upstream_http_error",
           `The MCP gateway returned HTTP ${response.status}.`,
-          { httpStatus: response.status },
+          {
+            httpStatus: response.status,
+            diagnosticCode: "gateway_http_error",
+            failureLayer: "gateway_health",
+            retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+            remediation: transportRemediation(profile),
+          },
         );
       }
 
@@ -769,15 +842,24 @@ export async function createM5Client({
       return redactValue(parsed, secrets);
     } catch (error) {
       if (controller.signal.aborted) {
-        throw new M5ClientError("timeout", "The M5 gateway request timed out.");
+        throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+          diagnosticCode: "connect_timeout",
+          failureLayer: "gateway_transport",
+          retryable: true,
+          remediation: transportRemediation(profile),
+        });
       }
       if (error instanceof M5ClientError) throw error;
+      const diagnosticCode = networkDiagnosticCode(error);
       throw new M5ClientError(
         "network_failure",
-        redactText(
-          error instanceof Error ? error.message : "The M5 gateway is unreachable.",
-          secrets,
-        ),
+        `The M5 gateway transport failed (${diagnosticCode}).`,
+        {
+          diagnosticCode,
+          failureLayer: "gateway_transport",
+          retryable: true,
+          remediation: transportRemediation(profile),
+        },
       );
     } finally {
       clearTimeout(timer);
@@ -1047,14 +1129,23 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs) {
       throw new M5ClientError(
         "rejected_credential",
         credentialFailureMessage("rejected_credential", profile),
-        credentialErrorOptions("rejected_credential", profile),
+        credentialErrorOptions("rejected_credential", profile, {
+          failureLayer: "authentication",
+          retryable: false,
+        }),
       );
     }
     if (!response.ok) {
       throw new M5ClientError(
         "upstream_http_error",
         `The gateway identity check returned HTTP ${response.status}.`,
-        { httpStatus: response.status },
+        {
+          httpStatus: response.status,
+          diagnosticCode: "gateway_http_error",
+          failureLayer: "gateway_health",
+          retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+          remediation: transportRemediation(profile),
+        },
       );
     }
     try {
@@ -1067,10 +1158,25 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs) {
     }
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new M5ClientError("timeout", "The gateway identity check timed out.");
+      throw new M5ClientError("timeout", "The gateway identity check timed out.", {
+        diagnosticCode: "connect_timeout",
+        failureLayer: "gateway_transport",
+        retryable: true,
+        remediation: transportRemediation(profile),
+      });
     }
     if (error instanceof M5ClientError) throw error;
-    throw new M5ClientError("network_failure", "The gateway identity check is unavailable.");
+    const diagnosticCode = networkDiagnosticCode(error);
+    throw new M5ClientError(
+      "network_failure",
+      `The gateway identity check transport failed (${diagnosticCode}).`,
+      {
+        diagnosticCode,
+        failureLayer: "gateway_transport",
+        retryable: true,
+        remediation: transportRemediation(profile),
+      },
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -1279,7 +1385,9 @@ export async function diagnoseProfile({
       ...(status === "rejected_credential"
         ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
         : {}),
-      ...(failure.safe.code === "rejected_credential" ? {} : { diagnostic_code: failure.safe.code }),
+      ...(failure.safe.code === "rejected_credential"
+        ? {}
+        : { diagnostic_code: failure.safe.diagnosticCode ?? failure.safe.code }),
       ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
       ...doctorCapabilityFields(null, null, {
         publicStatus: failure.safe.code === "model_discovery_unavailable" ? "unavailable" : "not_checked",
@@ -1369,7 +1477,9 @@ export async function diagnoseProfile({
       ...(status === "rejected_credential"
         ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
         : {}),
-      ...(failure.safe.code === "rejected_credential" ? {} : { diagnostic_code: failure.safe.code }),
+      ...(failure.safe.code === "rejected_credential"
+        ? {}
+        : { diagnostic_code: failure.safe.diagnosticCode ?? failure.safe.code }),
       ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
       ...doctorCapabilityFields(publicProbe, null, {
         privateStatus: failure.safe.code === "model_discovery_unavailable" ? "unavailable" : "not_checked",

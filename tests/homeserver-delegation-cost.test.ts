@@ -166,7 +166,7 @@ describe("delegation cost trace", () => {
       expect.objectContaining({ modelId: "qwen3-30b-instruct", reason: "unavailable", rows: 1 }),
       expect.objectContaining({ modelId: "unlisted-model", reason: "missing", rows: 1 }),
     ]);
-    expect(findUnpricedDelegatorModels(new Date("2026-08-26T00:00:00.000Z"))).toEqual([
+    expect(findUnpricedDelegatorModels(new Date("2026-09-29T00:00:00.000Z"))).toEqual([
       expect.objectContaining({ modelId: "anthropic/claude-opus-5", reason: "stale", rows: 1 }),
       expect.objectContaining({ modelId: "qwen3-30b-instruct", reason: "unavailable", rows: 1 }),
       expect.objectContaining({ modelId: "unlisted-model", reason: "missing", rows: 1 }),

@@ -1,4 +1,9 @@
-import { M5ClientError, credentialRemediation, redactText } from "./m5-client.mjs";
+import {
+  M5ClientError,
+  credentialRemediation,
+  redactText,
+  transportRemediation,
+} from "./m5-client.mjs";
 
 function rpcError(id, code, message, data) {
   return JSON.stringify({
@@ -21,19 +26,40 @@ function redactValue(value) {
   return value;
 }
 
-function bridgeError(error, profile) {
+function isAdoptionReport(message) {
+  return message?.method === "tools/call" &&
+    message?.params?.name === "record_adoption_evidence";
+}
+
+function bridgeError(error, profile, message) {
   if (!(error instanceof M5ClientError)) {
     return { message: "The MCP bridge request failed." };
   }
   const credentialFailure = error.code === "missing_credential" || error.code === "rejected_credential";
-  const remediation = credentialFailure ? credentialRemediation(profile) : undefined;
+  const gatewayTransportFailure = error.code === "network_failure" || error.code === "timeout";
+  const transportFailure = gatewayTransportFailure || error.code === "upstream_http_error";
+  const remediation = credentialFailure
+    ? credentialRemediation(profile)
+    : transportFailure
+      ? transportRemediation(profile)
+      : error.remediation;
+  const failureLayer = gatewayTransportFailure
+    ? "connector_transport"
+    : error.failureLayer;
   return {
     message: credentialFailure
       ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
       : error.message,
     data: {
       m5_code: error.code,
-      ...(credentialFailure ? { remediation } : {}),
+      ...(error.diagnosticCode === undefined ? {} : { diagnostic_code: error.diagnosticCode }),
+      ...(failureLayer === undefined ? {} : { failure_layer: failureLayer }),
+      ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
+      ...(error.retryable === undefined ? {} : { retryable: error.retryable }),
+      ...(remediation === undefined ? {} : { remediation }),
+      ...(isAdoptionReport(message) && transportFailure
+        ? { evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" } }
+        : {}),
     },
   };
 }
@@ -78,7 +104,7 @@ export function createMcpStdioBridge({ client, profile }) {
         return JSON.stringify(response);
       } catch (error) {
         if (notification) return null;
-        const failure = bridgeError(error, profile);
+        const failure = bridgeError(error, profile, message);
         return rpcError(message.id, -32603, failure.message, failure.data);
       }
     },

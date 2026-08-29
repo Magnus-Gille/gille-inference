@@ -113,11 +113,49 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     const parsed = JSON.parse(raw) as { result: { isError: boolean } };
     expect(parsed.result.isError).toBe(true);
     expect(parsed.result).toMatchObject({
-      structuredContent: { accepted: false, reason: "invalid_report" },
+      structuredContent: {
+        accepted: false,
+        reason: "invalid_report",
+        diagnostic: { code: "unknown_field" },
+      },
     });
     expect(raw).toContain("invalid_report");
     expect(raw).not.toContain("never accept content");
     expect(tableCount("adoption_evidence")).toBe(0);
+    expect(tableCount("request_log")).toBe(0);
+    expect(tableCount("owner_request_log")).toBe(0);
+    expect(accessLines).toEqual([]);
+  });
+
+  it("accepts schema-valid failed call and unusable partial-result observations", async () => {
+    const unreachable = {
+      ...report,
+      execution_mode: "ask",
+      result: "failed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_unreachable",
+      eligible_opportunities: 1,
+    };
+    const unusable = {
+      ...unreachable,
+      reviewer_usefulness: "redo",
+      fallback_reason: "local_result_unusable",
+    };
+
+    for (const [id, observation] of [[4, unreachable], [5, unusable]] as const) {
+      const response = JSON.parse(await rpc(callBody(id, "record_adoption_evidence", observation), agentKey)) as {
+        result: { isError: boolean; structuredContent: unknown };
+      };
+      expect(response.result).toMatchObject({ isError: false, structuredContent: { accepted: true } });
+    }
+
+    expect(getDb().prepare(
+      "SELECT result, deterministic_check, reviewer_usefulness, fallback_reason FROM adoption_evidence ORDER BY rowid"
+    ).all()).toEqual([
+      { result: "failed", deterministic_check: "pass", reviewer_usefulness: "not_reported", fallback_reason: "m5_unreachable" },
+      { result: "failed", deterministic_check: "pass", reviewer_usefulness: "redo", fallback_reason: "local_result_unusable" },
+    ]);
     expect(tableCount("request_log")).toBe(0);
     expect(tableCount("owner_request_log")).toBe(0);
     expect(accessLines).toEqual([]);
