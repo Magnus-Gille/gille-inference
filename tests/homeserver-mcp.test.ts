@@ -453,6 +453,99 @@ describe("MCP tools/call list_models", () => {
 // ─── tools/call ask (valid model) ────────────────────────────────────────────────────
 
 describe("MCP tools/call ask", () => {
+  it("advertises and applies the complete-within-budget profile for gpt-oss", async () => {
+    const listed = await rpc({ jsonrpc: "2.0", id: 39, method: "tools/list" });
+    const listedJson = (await listed.json()) as {
+      result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> };
+    };
+    const ask = listedJson.result.tools.find((tool) => tool.name === "ask")!;
+    expect(ask.inputSchema.properties["output_profile"]).toEqual({
+      type: "string",
+      enum: ["complete-within-budget"],
+      description: expect.stringMatching(/section|structure|budget/i),
+    });
+
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 39.1,
+        method: "tools/call",
+        params: {
+          name: "ask",
+          arguments: {
+            model: "gpt-oss-120b",
+            prompt: "Return exactly three compact sections within 700 words.",
+            system: "Use plain text.",
+            max_tokens: 1200,
+            output_profile: "complete-within-budget",
+          },
+        },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(lastUpstreamBody) as {
+      reasoning_effort?: string;
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(sent.reasoning_effort).toBe("low");
+    expect(sent.messages).toHaveLength(2);
+    expect(sent.messages[0]).toMatchObject({ role: "system" });
+    expect(sent.messages[0]!.content).toContain("Use plain text.");
+    expect(sent.messages[0]!.content).toMatch(/complete every explicitly requested section/i);
+    expect(sent.messages[0]!.content).toMatch(/compress/i);
+    expect(sent.messages[0]!.content.indexOf("Use plain text.")).toBeLessThan(
+      sent.messages[0]!.content.indexOf("Output contract:")
+    );
+    expect(sent.messages[1]).toEqual({
+      role: "user",
+      content: "Return exactly three compact sections within 700 words.",
+    });
+  });
+
+  it("rejects unknown output profiles before admission or upstream work", async () => {
+    const before = upstreamHits;
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 39.2,
+        method: "tools/call",
+        params: {
+          name: "ask",
+          arguments: { model: "any-model", prompt: "hello", output_profile: "verbose" },
+        },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { result: { isError: boolean; content: Array<{ text: string }> } };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toMatch(/output_profile.*complete-within-budget/i);
+    expect(upstreamHits).toBe(before);
+  });
+
+  it("does not enable model-specific reasoning controls for misleading non-gpt-oss model ids", async () => {
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 39.3,
+        method: "tools/call",
+        params: {
+          name: "ask",
+          arguments: {
+            model: "not-gpt-oss-fake",
+            prompt: "Return both requested sections.",
+            output_profile: "complete-within-budget",
+          },
+        },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(lastUpstreamBody) as Record<string, unknown>;
+    expect(sent).not.toHaveProperty("reasoning_effort");
+  });
+
   it("forwards explicit sampler controls and the VibeThinker token allowance", async () => {
     const res = await rpc(
       {

@@ -281,7 +281,7 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
   `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
   text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
-- `ask` — `{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
+- `ask` — `{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
   local model. Successful calls keep the text in the content block and also attach
   `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always
   content-blind `true` for this tool; `usage` is content-blind prompt/input, completion/output,
@@ -293,6 +293,12 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   (`finish_reason="length"`) also returns `isError:true`, keeps the paid partial answer in the
   content block behind a loud warning, preserves the same structured payload, and means any retry
   is a new billable call. `max_tokens` uses the same fleet/per-model ceiling as raw chat.
+  `output_profile: "complete-within-budget"` is an opt-in profile for bounded multi-section work:
+  it adds a hard structural-completion instruction and requests low reasoning effort from
+  `gpt-oss` so required sections retain output budget. Other models receive only the completion
+  instruction, appended after any caller-supplied system text. The profile never hides
+  `finish_reason="length"`: truncation still returns `isError:true` with the paid partial content,
+  and it never retries a metered call.
   `delegator_model_id` is optional telemetry:
   owner/cloud-agent callers should set it to the cloud brain that delegated the task so the
   content-blind savings ledger can estimate actual cloud spend avoided. It is not forwarded to the

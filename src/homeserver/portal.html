@@ -569,7 +569,7 @@ for chunk in stream:
           </tr>
           <tr>
             <td><span class="badge mono">ask</span></td>
-            <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
+            <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. For bounded multi-section work, <span class="badge mono">output_profile: "complete-within-budget"</span> prioritizes finishing every required section within the token cap (and uses low reasoning effort on gpt-oss). A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
           </tr>
           <tr>
             <td><span class="badge mono">record_adoption_evidence</span></td>
