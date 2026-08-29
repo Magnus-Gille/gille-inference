@@ -37,27 +37,35 @@ describe("homeserver cost catalog", () => {
   it("prices each newly evidenced paid delegator from a first-party tariff", () => {
     expect(lookupModelTokenPrice("anthropic/claude-opus-5")?.outputUsdPerMTok).toBe(25);
     expect(lookupModelTokenPrice("openai/gpt-5")?.inputUsdPerMTok).toBe(1.25);
-    expect(lookupModelTokenPrice("openai/gpt-5.6-sol")?.outputUsdPerMTok).toBe(30);
+    expect(lookupModelTokenPrice("openai/gpt-5.6-sol")).toMatchObject({
+      inputUsdPerMTok: 4,
+      outputUsdPerMTok: 20,
+      checkedAt: "2026-08-29",
+      validUntil: "2026-09-28",
+    });
+    expect(lookupModelTokenPrice("openai/gpt-5.6")).toMatchObject({
+      inputUsdPerMTok: 4,
+      outputUsdPerMTok: 20,
+    });
   });
 
   it("does not substitute a reseller or local-model rate for an official vendor tariff", () => {
-    expect(inspectModelTokenPrice("openai/gpt-5.6").kind).toBe("unavailable");
     expect(inspectModelTokenPrice("qwen3-30b-instruct").kind).toBe("unavailable");
     expect(lookupModelTokenPrice("qwen/qwen3-coder-next")).toBeNull();
   });
 
   it("fails closed after a catalog entry expires", () => {
-    const status = inspectModelTokenPrice("openai/gpt-5", { now: new Date("2026-08-26T00:00:00.000Z") });
+    const status = inspectModelTokenPrice("openai/gpt-5", { now: new Date("2026-09-29T00:00:00.000Z") });
     expect(status.kind).toBe("stale");
-    expect(lookupModelTokenPrice("openai/gpt-5", new Date("2026-08-26T00:00:00.000Z"))).toBeNull();
+    expect(lookupModelTokenPrice("openai/gpt-5", new Date("2026-09-29T00:00:00.000Z"))).toBeNull();
   });
 
-  it("does not book the scheduled Sonnet standard tariff before its effective date", () => {
-    expect(inspectModelTokenPrice("claude-sonnet-5-standard", { now: new Date("2026-08-31T23:59:59.999Z") }).kind)
-      .toBe("not-yet-effective");
-    // The catalog itself expires before the future tariff takes effect, forcing a fresh check.
-    expect(inspectModelTokenPrice("claude-sonnet-5-standard", { now: new Date("2026-09-01T00:00:00.000Z") }).kind)
-      .toBe("stale");
+  it("keeps Sonnet 5 at the now-standard introductory tariff", () => {
+    expect(lookupModelTokenPrice("claude-sonnet-5")).toMatchObject({
+      inputUsdPerMTok: 2,
+      outputUsdPerMTok: 10,
+    });
+    expect(inspectModelTokenPrice("claude-sonnet-5-standard").kind).toBe("missing");
   });
 
   it("returns null for unknown or local-only models", () => {
