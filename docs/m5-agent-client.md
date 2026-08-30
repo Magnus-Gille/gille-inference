@@ -167,6 +167,7 @@ printf '%s' '{
   "instruction": "Update the supplied seed file and run its focused check.",
   "files": [{"path":"src/example.ts","content":"export const value = 1;\n"}],
   "check_cmd": "npm test",
+  "writable": ["src/**"],
   "protected": ["package-lock.json"]
 }' | m5 --profile codex code run
 
@@ -207,7 +208,9 @@ and nulls malformed negative or fractional counters instead of trusting them.
 including the unified diff and verification evidence. It can use `"wait": false` to return the
 start response for later `status`/`result` calls. It never applies the diff, writes into a live
 checkout, or treats client defaults as sandbox enforcement. The gateway's OS cage, input
-validation, protected paths, caps, and diff-only result remain authoritative.
+validation, enforceable writable scope (seeded-only when omitted), protected paths, caps, and
+diff-only result remain authoritative. Scope-rejected paths are exposed as `scope_violations` and
+are excluded from the returned diff.
 
 ## Doctor states
 

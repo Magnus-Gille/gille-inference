@@ -44,6 +44,11 @@ describe("seedSandbox — containment", () => {
     expect(readFileSync(join(sandbox, "src/a/b.ts"), "utf8")).toBe("export {};\n");
   });
 
+  it("canonicalizes harmless dot and duplicate separators inside the sandbox", () => {
+    seedSandbox(sandbox, [{ path: "src//nested/../a.ts", content: "export {};\n" }]);
+    expect(readFileSync(join(sandbox, "src/a.ts"), "utf8")).toBe("export {};\n");
+  });
+
   it("rejects a ../ traversal path", () => {
     expect(() => seedSandbox(sandbox, [{ path: "../pwned.txt", content: "x" }])).toThrow(/escap|contain|relative/i);
     expect(existsSync(join(sandbox, "..", "pwned.txt"))).toBe(false);
@@ -142,6 +147,30 @@ describe("validateCodeLoopRequest — bounds", () => {
       caps: { turns: 5, edit_deadline_turn: 6 },
     }, CAPS);
     expect(beyond.ok).toBe(false);
+  });
+
+  it("defaults the writable scope to exact seeded files and rejects generated writable scopes", () => {
+    const defaultScope = validateCodeLoopRequest({ instruction: "do it", files: okFiles }, CAPS);
+    expect(defaultScope.ok).toBe(true);
+
+    const generated = validateCodeLoopRequest({
+      instruction: "do it",
+      files: okFiles,
+      writable: ["__pycache__/**"],
+    }, CAPS);
+    expect(generated).toMatchObject({ ok: false, message: expect.stringMatching(/generated|bytecode|cache/i) });
+  });
+
+  it("rejects scope traversal and ambiguous path normalization before admission", () => {
+    for (const writable of [["../**"], ["src/../*.ts"], ["a\\b.ts"]]) {
+      const result = validateCodeLoopRequest({ instruction: "do it", files: okFiles, writable }, CAPS);
+      expect(result.ok).toBe(false);
+    }
+    const escapedSeed = validateCodeLoopRequest({
+      instruction: "do it",
+      files: [{ path: "a/../../escape.ts", content: "x" }],
+    }, CAPS);
+    expect(escapedSeed.ok).toBe(false);
   });
 });
 

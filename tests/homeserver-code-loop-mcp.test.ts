@@ -185,6 +185,8 @@ describe("code_loop_* visibility in tools/list", () => {
     expect(JSON.stringify(start?.inputSchema?.properties?.["learning_task_stamp"])).toContain(
       "LearningTaskContract v1",
     );
+    expect(start?.inputSchema?.properties).toHaveProperty("writable");
+    expect(JSON.stringify(start?.inputSchema?.properties?.["writable"])).toContain("seeded files only");
   });
 
   it("advertises the exact harness and evidence contract before a paid start", async () => {

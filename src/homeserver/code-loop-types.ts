@@ -61,6 +61,12 @@ export interface CodeLoopRequest {
   files: CodeLoopSeedFile[];
   /** Owner-authored verification command, run in the sandbox INSIDE the cage post-loop (120 s cap). */
   check_cmd?: string;
+  /**
+   * Enforceable returned-change path/glob allowlist. When omitted, only changes to the exact
+   * seeded files are admitted (seeded-only is the safe default). This is intentionally separate
+   * from `protected`, which is reporting-only.
+   */
+  writable?: string[];
   /** Globs whose modification is detected at exit and reported — never silently passed. */
   protected?: string[];
   /** Ledger task type; defaults to the classifier's verdict on the instruction. */
@@ -169,7 +175,10 @@ export interface CodeLoopResult {
   /** Unified git diff vs the seed commit, ≤200 KB (see diff_truncated). Ground truth is git. */
   diff: string;
   diff_truncated: boolean;
+  /** Only files admitted by the writable scope and safe-result filters. */
   changed_files: string[];
+  /** Changed paths rejected from the returned diff by the writable/safety boundary. */
+  scope_violations: string[];
   protected_violations: string[];
   /** pi's final assistant message (≤2 KB). */
   summary: string;

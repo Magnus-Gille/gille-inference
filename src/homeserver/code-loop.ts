@@ -1,5 +1,5 @@
 import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync } from "node:fs";
-import { dirname, join, sep, resolve, isAbsolute } from "node:path";
+import { dirname, join, sep, resolve, isAbsolute, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
 import type {
@@ -117,7 +117,8 @@ function isCurrentCodeLoopResult(result: CodeLoopResult): boolean {
     result.agent_checks?.schema_version === 3 &&
     result.agent_checks.source === "pi-bash-events" &&
     Array.isArray(result.agent_checks.attempts) &&
-    result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX;
+    result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX &&
+    Array.isArray(result.scope_violations);
 }
 
 function failClosedIncompatibleResult(workroot: string, record: DurableCodeLoopRun): DurableCodeLoopRun {
@@ -143,7 +144,7 @@ export function codeLoopToolDefs(): unknown[] {
         "Returns a work_id immediately; poll code_loop_status and fetch " +
         "code_loop_result. The deliverable is a git diff vs the seed commit — the box never touches a " +
         "live checkout. Provide the files the task needs (≤64 / ≤2MB), the instruction, and optionally " +
-        `an owner-authored check_cmd + protected globs. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
+        `an owner-authored check_cmd + writable/protected globs. Omit writable for seeded-only scope. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -173,6 +174,11 @@ export function codeLoopToolDefs(): unknown[] {
             },
           },
           check_cmd: { type: "string", description: "owner-authored verification command run in the sandbox post-loop (120s cap)" },
+          writable: {
+            type: "array",
+            items: { type: "string" },
+            description: "enforceable returned-change paths/globs; omitted means exact seeded files only",
+          },
           protected: { type: "array", items: { type: "string" }, description: "globs whose modification is reported at exit" },
           task_type: { type: "string", enum: TASK_TYPES.map((task) => task.id), description: "optional canonical task vocabulary; omit to classify from instruction" },
           caps: {
@@ -243,6 +249,86 @@ export function clampCaps(req: CodeLoopCapsRequest | undefined, c: CodeLoopCapsC
 const MAX_FILES = 64;
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024;
 
+const GENERATED_ARTIFACT_DIRS = new Set([
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".hypothesis",
+  ".tox",
+  ".nox",
+  ".cache",
+]);
+const GENERATED_ARTIFACT_EXTENSIONS = [".pyc", ".pyo", ".class", ".tsbuildinfo"] as const;
+
+/** Paths created by the harness itself are never part of the caller's deliverable. */
+function isCodeLoopInternalPath(path: string): boolean {
+  return path === ".meta.json";
+}
+
+/** Generated interpreter/build cache artifacts never enter a returned code-loop diff. */
+export function isGeneratedCodeLoopArtifact(path: string): boolean {
+  const components = path.split("/");
+  return components.some((component) => GENERATED_ARTIFACT_DIRS.has(component)) ||
+    components.some((component) => GENERATED_ARTIFACT_EXTENSIONS.some((extension) => component.endsWith(extension)));
+}
+
+function normalizeRelativeCodeLoopPath(value: string, label: string, allowGlob: boolean): string {
+  if (value.length === 0 || value.includes("\0")) {
+    throw new Error(`code-loop: ${label} must be a non-empty path without NUL bytes.`);
+  }
+  // The sandbox is POSIX. Rejecting backslashes avoids treating one spelling as a filename at
+  // seed time but as a separator in the result matcher, and also closes Windows path aliases.
+  if (value.includes("\\") || isAbsolute(value) || win32.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
+    throw new Error(`code-loop: ${label} must be a relative POSIX path.`);
+  }
+  const parts = value.split("/");
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (normalized.length === 0) throw new Error(`code-loop: ${label} escapes the sandbox.`);
+      normalized.pop();
+      continue;
+    }
+    if (!allowGlob && /[*?\[\]]/.test(part)) {
+      throw new Error(`code-loop: seed path '${value}' must name a file, not a glob.`);
+    }
+    normalized.push(part);
+  }
+  const result = normalized.join("/");
+  if (result === "") throw new Error(`code-loop: ${label} resolves to the sandbox root.`);
+  if (normalized.includes(".git")) throw new Error(`code-loop: ${label} targets a .git directory.`);
+  return result;
+}
+
+function normalizeCodeLoopScopePattern(value: string, label: string): string {
+  // Glob `..` components are rejected rather than interpreted: wildcard traversal is too easy to
+  // misread and the caller can express the same scope canonically without it.
+  if (value.split("/").some((part) => part === "..")) {
+    throw new Error(`code-loop: ${label} contains a '..' component.`);
+  }
+  return normalizeRelativeCodeLoopPath(value, label, true);
+}
+
+function generatedArtifactScopePattern(pattern: string): boolean {
+  const components = pattern.split("/");
+  return components.some((component) => GENERATED_ARTIFACT_DIRS.has(component)) ||
+    components.some((component) => GENERATED_ARTIFACT_EXTENSIONS.some((extension) => component.endsWith(extension)));
+}
+
+function effectiveWritableGlobs(req: CodeLoopRequest): string[] {
+  return req.writable === undefined
+    ? req.files.map((file) => normalizeRelativeCodeLoopPath(file.path, "seed path", false))
+    : req.writable.map((pattern) => normalizeCodeLoopScopePattern(pattern, "writable scope"));
+}
+
+function normalizedProtectedGlobs(req: CodeLoopRequest): string[] {
+  return req.protected === undefined
+    ? []
+    : req.protected.map((pattern) => normalizeCodeLoopScopePattern(pattern, "protected scope"));
+}
+
 export type ValidateResult =
   | { ok: true; caps: CodeLoopCaps }
   | { ok: false; message: string };
@@ -273,12 +359,56 @@ export function validateCodeLoopRequestStructure(req: CodeLoopRequest): Structur
     if (typeof f.path !== "string" || typeof f.content !== "string") {
       return { ok: false, message: "Each seed file needs a string `path` and string `content`." };
     }
-    if (seenPaths.has(f.path)) return { ok: false, message: `Duplicate seed path '${f.path}'.` };
-    seenPaths.add(f.path);
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRelativeCodeLoopPath(f.path, "seed path", false);
+    } catch (err) {
+      return { ok: false, message: (err as Error).message };
+    }
+    if (seenPaths.has(normalizedPath)) return { ok: false, message: `Duplicate seed path '${f.path}'.` };
+    seenPaths.add(normalizedPath);
     total += Buffer.byteLength(f.content, "utf8");
   }
   if (total > MAX_TOTAL_BYTES) {
     return { ok: false, message: `Seed content too large (${total} bytes > ${MAX_TOTAL_BYTES}).` };
+  }
+  if (req.writable !== undefined) {
+    if (!Array.isArray(req.writable)) return { ok: false, message: "`writable` must be an array of relative paths or globs." };
+    for (const pattern of req.writable) {
+      if (typeof pattern !== "string") return { ok: false, message: "Each writable scope entry must be a string." };
+      try {
+        const normalized = normalizeCodeLoopScopePattern(pattern, "writable scope");
+        // A caller cannot safely promise a writable generated artifact: it is unconditionally
+        // omitted from the returned diff. Refuse this contradictory scope before admission.
+        if (generatedArtifactScopePattern(normalized)) {
+          return { ok: false, message: `Writable scope cannot include generated cache/bytecode path '${pattern}'.` };
+        }
+      } catch (err) {
+        return { ok: false, message: (err as Error).message };
+      }
+    }
+  }
+  for (const field of ["protected"] as const) {
+    const patterns = req[field];
+    if (patterns === undefined) continue;
+    if (!Array.isArray(patterns)) return { ok: false, message: `\`${field}\` must be an array of relative paths or globs.` };
+    for (const pattern of patterns) {
+      if (typeof pattern !== "string") return { ok: false, message: `Each ${field} scope entry must be a string.` };
+      try {
+        normalizeCodeLoopScopePattern(pattern, `${field} scope`);
+      } catch (err) {
+        return { ok: false, message: (err as Error).message };
+      }
+    }
+  }
+  // The omitted writable scope is seeded-only. A seed that is itself an always-filtered artifact
+  // would make the request impossible to deliver, so reject it before any durable admission.
+  if (req.writable === undefined) {
+    for (const path of seenPaths) {
+      if (isGeneratedCodeLoopArtifact(path)) {
+        return { ok: false, message: `Seed path '${path}' is a generated cache/bytecode artifact and cannot be writable.` };
+      }
+    }
   }
   const rawDeadline = req.caps?.edit_deadline_turn;
   if (rawDeadline !== undefined) {
@@ -344,9 +474,7 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
   const baseAbs = resolve(sandboxDir);
   const baseReal = realpathSync(baseAbs);
   for (const f of files) {
-    const rel = f.path;
-    if (rel.includes("\0")) throw new Error(`code-loop: seed path contains a NUL byte — refusing.`);
-    if (isAbsolute(rel)) throw new Error(`code-loop: seed path '${rel}' is absolute — only relative paths are allowed.`);
+    const rel = normalizeRelativeCodeLoopPath(f.path, "seed path", false);
     // Lexical containment against the (non-realpath) base, mirroring resolveContained().
     const lexical = resolve(baseAbs, rel);
     if (lexical !== baseAbs && !lexical.startsWith(baseAbs + sep)) {
@@ -427,6 +555,7 @@ interface Job {
   model: string;
   taskType: string;
   checkCmd: string | null;
+  writableGlobs: string[];
   protectedGlobs: string[];
   startedAtMs: number;
   effectiveCaps: CodeLoopCaps;
@@ -565,6 +694,11 @@ export async function startCodeLoop(
 ): Promise<CodeLoopStartResult> {
   const structural = validateCodeLoopRequestStructure(req);
   if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
+  // Scope is an admission input. Snapshot the validated, canonical forms before the first await
+  // so a same-process caller cannot mutate the original arrays while leases/cage checks are in
+  // flight and thereby escape the request identity that was just validated.
+  const writableGlobs = effectiveWritableGlobs(req);
+  const protectedGlobs = normalizedProtectedGlobs(req);
   const clientRunId = validateClientRunId(req.client_run_id);
   // #80: resolve through the SAME boundary /delegate uses (orchestrator.resolveTaskType) instead of
   // re-implementing it. The old inline guard trimmed only to test for emptiness and then passed the
@@ -967,7 +1101,8 @@ export async function startCodeLoop(
     model: cfg.model,
     taskType,
     checkCmd: typeof req.check_cmd === "string" && req.check_cmd.trim() !== "" ? req.check_cmd : null,
-    protectedGlobs: Array.isArray(req.protected) ? req.protected.filter((g) => typeof g === "string") : [],
+    writableGlobs,
+    protectedGlobs,
     startedAtMs: acceptedAt,
     effectiveCaps: capPolicy.caps,
     usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
@@ -1102,13 +1237,14 @@ async function runJob(
   }
 
   // Harvest the diff from git (ground truth), on ALL terminal statuses (best-effort).
-  const harvest = await gitHarvest(job.sandboxDir, seedSha, deps);
-  const protectedViolations = harvest.changedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
+  const harvest = await gitHarvest(job.sandboxDir, seedSha, deps, job.writableGlobs);
+  const protectedViolations = harvest.allChangedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
 
   // Run check_cmd inside the SAME cage (design §6) only on a completed run.
   let check = { ran: false, exit_code: null as number | null, output_tail: "" };
   let checkDurationMs: number | undefined;
-  if (outcome === "completed" && job.checkCmd !== null && protectedViolations.length === 0) {
+  if (outcome === "completed" && job.checkCmd !== null &&
+      harvest.scopeViolations.length === 0 && protectedViolations.length === 0) {
     const checkStartedAt = deps.now();
     check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
     checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
@@ -1130,6 +1266,7 @@ async function runJob(
     diff: harvest.diff.slice(0, DIFF_MAX_BYTES),
     diff_truncated: harvest.diff.length > DIFF_MAX_BYTES,
     changed_files: harvest.changedFiles,
+    scope_violations: harvest.scopeViolations,
     protected_violations: protectedViolations,
     summary: job.summary.slice(0, 2048),
     check,
@@ -1224,15 +1361,87 @@ async function gitInitSeed(sandboxDir: string, deps: CodeLoopDeps): Promise<stri
   return rev.stdout.trim();
 }
 
-async function gitHarvest(sandboxDir: string, seedSha: string, deps: CodeLoopDeps): Promise<{ diff: string; changedFiles: string[] }> {
+interface GitHarvest {
+  /** The safe, normalized changed paths observed in git, including paths later rejected by scope. */
+  allChangedFiles: string[];
+  /** Only paths admitted by the writable scope and result safety checks. */
+  changedFiles: string[];
+  /** Paths omitted from the returned diff because the scope/safety policy rejected them. */
+  scopeViolations: string[];
+  diff: string;
+}
+
+function isSafeHarvestPath(sandboxDir: string, relativePath: string, sandboxReal: string): boolean {
+  const lexical = resolve(sandboxDir, relativePath);
+  if (lexical !== resolve(sandboxDir) && !lexical.startsWith(resolve(sandboxDir) + sep)) return false;
+  try {
+    const stat = lstatSync(lexical);
+    // A model-created symlink can point outside the sandbox even when its lexical name is safe.
+    if (stat.isSymbolicLink()) return false;
+    const actual = realpathSync(lexical);
+    return actual === sandboxReal || actual.startsWith(sandboxReal + sep);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    // A deleted seeded file has no path to realpath-check. Walk to the nearest existing parent
+    // first: if the model replaced a parent with a symlink to an outside tree, fail closed even
+    // though the deleted leaf itself returns ENOENT.
+    let parent = dirname(lexical);
+    const base = resolve(sandboxDir);
+    while (parent !== base && parent.startsWith(base + sep)) {
+      try {
+        const parentStat = lstatSync(parent);
+        if (parentStat.isSymbolicLink()) return false;
+        const parentReal = realpathSync(parent);
+        return parentReal === sandboxReal || parentReal.startsWith(sandboxReal + sep);
+      } catch (parentErr) {
+        if ((parentErr as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        parent = dirname(parent);
+      }
+    }
+    return parent === base;
+  }
+}
+
+async function gitHarvest(
+  sandboxDir: string,
+  seedSha: string,
+  deps: CodeLoopDeps,
+  writableGlobs: string[],
+): Promise<GitHarvest> {
   const env = { ...gitBaseEnv(), ...GIT_ENV };
   await deps.runCommand(["git", "add", "-A"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const diffRes = await deps.runCommand(["git", "diff", "--cached", seedSha], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const namesRes = await deps.runCommand(["git", "diff", "--cached", "--name-only", seedSha], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const changed = namesRes.stdout.split("\n").map((s) => s.trim()).filter((s) => s !== "");
-  // Re-validate changed-file paths for containment on the way out (design §5.4).
-  const contained = changed.filter((f) => !isAbsolute(f) && !f.split(/[\\/]/).includes(".."));
-  return { diff: diffRes.stdout, changedFiles: contained };
+  const namesRes = await deps.runCommand(
+    ["git", "diff", "--cached", "--name-only", "-z", seedSha],
+    { cwd: sandboxDir, env, timeoutMs: 30_000 },
+  );
+  const rawChanged = namesRes.stdout.split("\0").filter((path) => path !== "");
+  const sandboxReal = realpathSync(sandboxDir);
+  const allChangedFiles: string[] = [];
+  const changedFiles: string[] = [];
+  const scopeViolations: string[] = [];
+  for (const rawPath of rawChanged) {
+    let path: string;
+    try {
+      path = normalizeRelativeCodeLoopPath(rawPath, "harvested path", false);
+    } catch {
+      scopeViolations.push(rawPath);
+      continue;
+    }
+    if (isCodeLoopInternalPath(path)) continue;
+    allChangedFiles.push(path);
+    if (isGeneratedCodeLoopArtifact(path) || !isSafeHarvestPath(sandboxDir, path, sandboxReal) || !matchesAnyGlob(path, writableGlobs)) {
+      scopeViolations.push(path);
+      continue;
+    }
+    changedFiles.push(path);
+  }
+  const diffRes = changedFiles.length === 0
+    ? { stdout: "" }
+    : await deps.runCommand(
+      ["git", "diff", "--cached", seedSha, "--", ...changedFiles.map((path) => `:(literal)${path}`)],
+      { cwd: sandboxDir, env, timeoutMs: 30_000 },
+    );
+  return { diff: diffRes.stdout, allChangedFiles, changedFiles, scopeViolations };
 }
 
 function gitBaseEnv(): Record<string, string> {
@@ -1308,6 +1517,7 @@ async function finalizeJob(
     diff: "",
     diff_truncated: false,
     changed_files: [],
+    scope_violations: [],
     protected_violations: [],
     summary: "",
     check,

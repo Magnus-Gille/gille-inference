@@ -224,6 +224,9 @@ export function codeLoopRequestFingerprint(
     instruction: req.instruction,
     files: req.files.map((f) => ({ path: f.path, content: f.content })),
     check_cmd: req.check_cmd ?? null,
+    // Preserve the pre-#234 fingerprint for callers using the seeded-only default. Explicit
+    // writable scope is a new part of the request identity and must bind to the durable run.
+    ...(req.writable === undefined ? {} : { writable: [...req.writable] }),
     protected: req.protected === undefined ? null : [...req.protected],
     task_type: req.task_type ?? null,
     caps: req.caps === undefined
