@@ -2,29 +2,25 @@
 
 ## Resume and persistence
 
-Use `docs/ROADMAP.md` and GitHub issues for current proof obligations, and
-`docs/architecture.md` when architectural context is needed. Operators may keep a gitignored
-`STATUS.md` as a private local handoff, but it must never be committed. Keep the initial handshake
-read-only.
+Keep the initial handshake read-only. Current proof obligations live in `docs/ROADMAP.md` and
+GitHub issues; load `docs/architecture.md` only when architectural context is needed. Operators may
+keep a gitignored `STATUS.md` as a private local handoff, but it must never be committed. These
+files replace the generic `STATUS.md`/`PROGRESS.md`/`TODO.md` handoff defaults in the global
+instructions.
 
-After a substantive session, record public work in the relevant issue or pull request. Public
-tickets contain only the reusable engineering contract and sanitized evidence. Private deployment
-state and exact operator handoffs belong in a gitignored local `STATUS.md`; durable multi-session
-deployments, incidents, and maintenance are coordinated in the private GitHub repository
-`Magnus-Gille/grimnir-ops`, never in this public repository. That repository is an execution
-tracker; it does not own this service's code or architecture. Log durable decisions before
+After a substantive session, record public work in the relevant issue or pull request, containing
+only the reusable engineering contract and sanitized evidence. Private deployment state, incidents,
+and maintenance are coordinated in the private repository `Magnus-Gille/grimnir-ops`, an execution
+tracker that does not own this service's code or architecture. Log durable decisions before
 replacing mutable project status.
-
-`AGENTS.md` is the canonical cross-harness project guidance. `CLAUDE.md` only imports it for Claude
-Code. Put recurring portable behavior here and keep harness-specific additions in the relevant
-adapter. Do not maintain two substantive copies.
 
 ## Mission and architecture
 
 This repository makes personally controlled inference safely useful to replaceable AI Conductors.
-It began as a hardware/model evaluation and now owns the production M5 serving, bounded delegation,
-and capability-evidence subsystem beneath Grimnir. The steady state is a strong frontier L1 plus
-increasingly local, evidence-gated execution—not a weaker local clone for symmetry.
+It owns the production M5 serving, bounded delegation, and capability-evidence subsystem beneath
+Grimnir. The steady state is a strong frontier L1 plus increasingly local, evidence-gated
+execution—not a weaker local clone for symmetry. The research questions behind that decision are
+listed in `docs/architecture.md`.
 
 Use the house vocabulary precisely:
 
@@ -43,39 +39,13 @@ M5 capability ledger owns node/model/task/verifier evidence; Hugin owns durable 
 fleet-operational state. See `docs/architecture.md`, `docs/nomenclature.md`, and
 `docs/adr-004-m5-routing-ownership.md`.
 
-The durable research questions are: what the 128GB M5 can serve for one to five users; how
-capacity, latency, and residency constrain it; which work belongs on the laptop or smaller fleet
-nodes; which model/harness/verifier combinations are trustworthy; how much real user and agentic
-work can be offloaded economically; and how L1, Hugin, and node gateways should learn and route
-without weakening authority, privacy, availability, or evidence quality. Historical purchase
-framing and measured answers live in `RESULTS.md`, `docs/eval-spec-hardware-gate.md`, and
-`docs/migration-go-no-go-verdict.md`.
+**M5 is also the code under change here.** While the gateway is being edited, restarted, or
+deployed, the global M5 delegation default may be degraded or self-referential. Keep such work on
+L1 and say so instead of delegating into the component being modified.
 
-## Vision-to-evidence discipline
-
-When evaluating whether the Grimnir/M5 inference vision is true, blog-ready, worth claiming, or
-what would make it truer, answer from principles and evidence—not implementation volume.
-
-The goal is useful proactive work with minimal operator time and in-loop attention, at quality the
-operator accepts. The durable pillars are privacy, availability/sovereignty, cost, and a learning
-loop in which production paths create evidence that improves routing, policy, or product choices.
-
-Structure such analysis as follows:
-
-1. **Principle -> mechanism -> evidence -> gap.** Cite concrete code, docs, live config,
-   dashboards, or DB rows. Label each claim `deployed/enforced`, `deployed/shadow`, `measured`, or
-   `aspirational`.
-2. **Do not overclaim.** Shadow routes, harvest rows, projected savings, and small samples are
-   learning evidence, not proof of production autonomy or ROI.
-3. **Make the loop truer before polishing the story.** Propose the smallest measurement,
-   dashboard, verifier, instruction, or code change that closes a weak claim.
-4. **Keep boundaries explicit.** Separate owner-only learning data from content-blind guest and
-   operational telemetry.
-5. **Route gaps to their owner.** If another repo owns the correction, file it there rather than
-   editing across repository boundaries.
-
-The claim-by-claim source of truth is `docs/vision-evidence-map.md`; the measured steady-state
-decision is in `docs/migration-go-no-go-verdict.md`.
+When asked whether the Grimnir/M5 vision is true, blog-ready, or worth claiming, follow the
+principle → mechanism → evidence → gap method in `docs/vision-evidence-map.md` and label every
+claim by maturity. `docs/migration-go-no-go-verdict.md` holds the measured steady-state decision.
 
 ## Authority, privacy, and routing invariants
 
@@ -101,21 +71,18 @@ Canonical policy: `docs/trust-and-routing-policy.md`, `docs/task-delegation-cont
 `docs/task-exposure-contract.md`, `docs/observability.md`, and
 `docs/delegation-cost-accounting.md`.
 
-## Client and harness facts
+## Do not claim
 
-- Claude Code and Codex are current replaceable L1 surfaces. The planned full-stack comparison has
-  separate frontier arms: Claude Code's Opus-to-Sonnet path and Codex; do not describe Codex as an
-  Opus-to-Sonnet stack.
-- `src/homeserver/mcp.ts` exposes M5 tools to Claude Code, Codex, and other compatible MCP clients.
-  Direct authenticated API inference remains valid without MCP or Hugin.
-- `scripts/extract-prompts.ts` currently reads Claude Code transcripts under
-  `~/.claude/projects`. Codex transcript ingestion is not implemented; do not claim otherwise.
-- Economic comparisons may distinguish Claude Max from ChatGPT/Codex access. There is no product
-  called "Codex Max"; avoid the old compound label.
-- Gate-D evaluates open harness/model combinations under deterministic oracles. Read
-  `gate-d/README.md` and `docs/gate-de-evaluation-plan.md` before changing or interpreting it.
-- Codex review uses ChatGPT auth, not the OpenRouter key. An OpenRouter quota failure does not prove
-  that Codex review is unavailable; check the specific resource.
+- Codex is not an Opus-to-Sonnet stack; that path is Claude Code's. Both are replaceable L1s.
+- Codex transcript ingestion does not exist. `scripts/extract-prompts.ts` reads Claude Code
+  transcripts under `~/.claude/projects` only.
+- There is no product called "Codex Max". Distinguish Claude Max from ChatGPT/Codex access.
+- Codex review uses ChatGPT auth, not the OpenRouter key. An OpenRouter quota failure does not
+  prove Codex review is unavailable.
+- MCP (`src/homeserver/mcp.ts`) is one client surface. Direct authenticated API inference is
+  valid without MCP or Hugin.
+- Gate-D results are not interpretable without `gate-d/README.md` and
+  `docs/gate-de-evaluation-plan.md`; read both before changing or citing them.
 
 ## Authoritative map
 
@@ -123,7 +90,7 @@ Start with `README.md`, then load only the references needed for the task:
 
 - `docs/architecture.md` — canonical topology, ownership, and learning loop.
 - `docs/nomenclature.md` — L1/L2/L3/harness vocabulary.
-- `docs/vision-evidence-map.md` — maturity of public-facing claims.
+- `docs/vision-evidence-map.md` — maturity of public-facing claims and the audit method.
 - `docs/trust-and-routing-policy.md` — trust zones and routing precedence.
 - `docs/gateway-api-contract.md` and `src/homeserver/README.md` — concrete API/operator surface.
 - `docs/observability.md` — content and telemetry boundaries.
@@ -133,24 +100,9 @@ Start with `README.md`, then load only the references needed for the task:
   benchmark interpretation and hardware/migration decisions.
 - `deploy/README.md` — production configuration and deployment runbook.
 
-Source ownership is intentionally discoverable from code rather than duplicated as a volatile file
-tree here:
-
-- `src/homeserver/gateway.ts`, `config.ts`, and `model-admin.ts` — service composition and backend.
-- `src/homeserver/orchestrator.ts`, `delegate-policy.ts`, `taxonomy.ts` — delegation and routing.
-- `src/homeserver/ledger.ts`, `verifier.ts`, `verifier-classification.ts`,
-  `routing-table-generator.ts`, and `routing-table-diff.ts` — evidence and generated routes.
-- `src/homeserver/keystore.ts`, `quota.ts`, `admission.ts`, `request-log.ts`, `owner-log.ts`, and
-  `metrics.ts` — authority, capacity, and telemetry boundaries.
-- `src/homeserver/mcp.ts`, `code-loop.ts`, related `code-loop-*` modules, and `pi-engine.ts` — MCP
-  and bounded agentic execution.
-- `src/homeserver/deep-research.ts`, related `deep-research-*` modules, `citation-verifier.ts`,
-  `search-provider.ts`, and `reader.ts` — research harness.
-- `src/homeserver/scout-gate.ts`, `model-registry.ts`, and `probe-runner.ts` — model evaluation.
-
-Issue-specific internals, dated measurements, model comparisons, and historical phases belong in
-issues and focused documents under `docs/`, not in this always-loaded file. Private deployment
-handoffs may use the gitignored local `STATUS.md`.
+Source ownership is discoverable from `src/homeserver/` with `rg`; it is intentionally not
+duplicated here. Issue-specific internals, dated measurements, and historical phases belong in
+issues and focused documents under `docs/`.
 
 ## Development and validation
 
@@ -173,31 +125,14 @@ and harness loading; do not manufacture a code-suite signal. For behavioral chan
 regression test that fails before the fix and run the affected suite plus typecheck. Preserve
 idempotence and resumability in runners, importers, cron jobs, and generated-artifact writers.
 
-Essential entry points:
-
-```bash
-npm run homeserver -- --help
-npm run homeserver:serve
-npm run homeserver:probe
-npm run homeserver:ledger
-
-npm run run:eval -- --batch v1 --models all --tasks all
-npm run run:judge -- --batch v1 --judge both
-npm run run:analysis -- --batch v1
-```
-
-Prompt mining is currently Claude-only:
-
-```bash
-npx tsx scripts/extract-prompts.ts
-npx tsx scripts/classify-prompts.ts
-npx tsx scripts/analyze-prompts.ts
-```
+The gateway entry point is `npm run homeserver -- --help` (`serve`, `probe`, `ledger`). Eval,
+judge, and analysis runners are `npm run run:eval|run:judge|run:analysis`; prompt mining is
+`scripts/{extract,classify,analyze}-prompts.ts`. Use `--help` rather than memory for flags.
 
 ## Benchmark and paid-resource discipline
 
 The historical Phase-A OpenRouter results are hosted-proxy upper bounds, not local performance;
-label them accordingly. Local M5 compute is the cheap arm, while OpenRouter judges and frontier
+label them accordingly. Local M5 compute is the cheap arm; OpenRouter judges and frontier
 references consume a capped resource.
 
 - Estimate paid judge/reference calls before a study and perform irreducible credit-dependent
@@ -208,32 +143,34 @@ references consume a capped resource.
   model to avoid unnecessary cold swaps.
 - Keep raw measurements, shadow evidence, and calibrated production conclusions distinct.
 
-See `docs/mac-studio-capacity-model.md`, `docs/deep-research-harness-design.md`, and the dated
-benchmark reports under `docs/` for methodology and results.
+See `docs/mac-studio-capacity-model.md` and `docs/deep-research-harness-design.md` for method.
 
 ## Deploying the M5 gateway
 
-`deploy/README.md`'s **"Live deployment (authoritative)"** section is the single source of truth
-for the live path, systemd unit, deploy/verify commands, rollback recipe, and the MCP-restart
-caveat — read it before touching production. In short: the unit is `home-gateway.service`
-(`WorkingDirectory=/home/magnus/home-server-eval`), the live tree is a plain rsync'd copy (not a
-git checkout), and `scripts/deploy-gateway.sh {deploy <full-sha>|verify|dry-run <full-sha>}` is the
-repo-owned deploy tool (issue #23) — it fails closed on a dirty source tree, a source-identity or
-`WorkingDirectory` mismatch, or any failed health/capability probe, and stamps `.deployed-commit`
-only once every check has passed.
+Read the **"Live deployment (authoritative)"** section of `deploy/README.md` before touching
+production. It owns the live path, systemd unit, deploy/verify commands, rollback recipe, and the
+MCP-restart caveat. Facts that must not drift:
 
-`/srv/gille-inference` — this section's previously documented path — is **not** a Git checkout and
-does **not exist** on the box; do not target it. (`CONTRIBUTING.md`'s use of the same string as a
-reserved doc/test placeholder, alongside `example.com`, is intentional and unrelated.)
+- The unit is `home-gateway.service` with `WorkingDirectory=/home/magnus/home-server-eval`. The
+  live tree is a plain rsync'd copy, not a git checkout. `/srv/gille-inference` does not exist on
+  the box; do not target it.
+- Deploy only with `scripts/deploy-gateway.sh deploy <accepted-full-sha>` (`dry-run` and `verify`
+  exist). It binds the invoked checkout and the caller's worktree/HEAD to the explicit release
+  SHA, ships a `git archive` of that commit rather than worktree bytes, and fails closed on any
+  mismatch or failed probe. Preserve that outer source-identity gate and immutable-payload
+  boundary in addition to every existing check.
+- `src/homeserver/portal.html` is hand-maintained and cached in memory. Whenever served models,
+  endpoints, limits, credits/rate policy, or billing dimensions change, update its "What's
+  running" and "How to use it" sections and `src/homeserver/README.md` in the same change. A
+  portal-only deploy still requires a gateway restart.
 
-`src/homeserver/portal.html` is hand-maintained and cached in memory. Whenever served models,
-endpoints, limits, credits/rate policy, or billing dimensions change, update the portal's "What's
-running" and "How to use it" sections in the same change and keep `src/homeserver/README.md`
-consistent. A portal-only deploy still requires a gateway restart (see `deploy/README.md`'s
-MCP-restart caveat).
+### Controlled-evaluation envelope
 
-Invoke deployments as `scripts/deploy-gateway.sh deploy <accepted-full-sha>`. The entry point binds
-the invoked script's physical checkout and the caller's physical cwd/worktree/HEAD to that explicit
-release revision before any remote check or mutation, then rsyncs a temporary `git archive` of that
-commit rather than mutable worktree bytes; `dry-run` requires the same binding. Preserve this outer
-source-identity gate and immutable-payload boundary in addition to every existing deployment check.
+The owner may approve a bounded envelope for transient non-production units on the M5. It must fix
+the goal, host, paths, unit prefix, allowed mutations, model/runtime/gateway, resource and
+time/count ceilings, prior-resident set, maintenance, cleanup, restoration, OOM and
+protected-service checks, forbidden production changes, and stopping conditions. Record each exact
+unit, immutable release, and launcher before execution. Fail closed and require new confirmation if
+scope expands, safeguards weaken, production or credentials enter scope, the envelope expires, or
+restoration, OOM, or protected-service anomalies occur. A pre-mutation failure that preserves all
+invariants may be diagnosed and retried inside the remaining envelope.

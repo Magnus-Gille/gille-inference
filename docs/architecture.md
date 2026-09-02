@@ -232,6 +232,16 @@ The original seven research questions remain useful, but the decision is no long
 piece of hardware benchmarks well. The durable question is how much real agentic work the owned
 substrate can safely and measurably absorb.
 
+The durable research questions are:
+
+- what the 128GB M5 can serve for one to five users;
+- how capacity, latency, and residency constrain it;
+- which work belongs on the laptop or smaller fleet nodes;
+- which model/harness/verifier combinations are trustworthy;
+- how much real user and agentic work can be offloaded economically;
+- how L1, Hugin, and node gateways should learn and route without weakening authority, privacy,
+  availability, or evidence quality.
+
 ## Reading order
 
 1. This document — system purpose and ownership.
