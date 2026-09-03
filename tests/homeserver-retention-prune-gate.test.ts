@@ -160,6 +160,50 @@ describe("retention-prune-gate — executes ONLY when all three conditions hold 
     expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence").get()).toEqual({ count: 0 });
   });
 
+  it("includes and prunes expired adoption overflow while preserving fresh aggregates", () => {
+    const parsed = parseAdoptionEvidence({
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "pass",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    });
+    if (!parsed.ok) throw new Error("fixture must parse");
+    // Creates both adoption tables before the overflow-only fixtures are inserted.
+    expect(recordAdoptionEvidence(parsed.value)).toBe(true);
+    const insert = getDb().prepare(
+      `INSERT INTO adoption_evidence_overflow
+         (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+          fallback_reason, report_count, eligible_opportunities)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run("2026-01-01", "organic", "failed", "fail", "redo", "local_result_unusable", 2, 3);
+    insert.run("2026-07-19", "organic", "refused", "not_run", "not_reported", "m5_refused", 1, 1);
+
+    const workroot = mkdtempSync(join(tmpdir(), "hs-retention-prune-gate-wr-"));
+    const report = runRetentionDryRun(getDb(), { now: NOW, workroot });
+    expect(report.stores.find((store) => store.storeId === "adoption-evidence-overflow")).toMatchObject({
+      retentionDays: 90,
+      expiredCount: 1,
+      sampleRefs: ["2026-01-01"],
+    });
+    const token = approveRetentionPrune(report, {
+      reviewerId: "magnus", reason: "test", decisionRef: "issue-adoption-overflow", reviewedAt: NOW,
+    });
+    const result = executeRetentionPrune({
+      db: getDb(), token, confirm: RETENTION_LIVE_PRUNE_CONFIRM, now: NOW, workroot, liveEnableEnvValue: "on",
+    });
+    expect(result.status).toBe("executed");
+    if (result.status !== "executed") return;
+    expect(result.affectedCounts["adoption-evidence-overflow"]).toBe(1);
+    expect(getDb().prepare("SELECT recorded_day FROM adoption_evidence_overflow").all()).toEqual([
+      { recorded_day: "2026-07-19" },
+    ]);
+  });
+
   it("deletes exactly the expired rows and redacts exactly the expired content columns, nothing else", () => {
     seedOneExpiredRequestLogRow("req-gate-execute");
     const freshCountBefore = getDb().prepare("SELECT COUNT(*) AS n FROM request_log").get() as { n: number };

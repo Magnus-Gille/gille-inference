@@ -11,6 +11,7 @@ import {
   main,
   openReadOnlyAdoptionDb,
   parseArgs,
+  queryAdoptionEvidenceOverflow,
   queryLabAdoptionByPurpose,
   queryOrganicAdoptionByHarness,
 } from "../scripts/post-m5-adoption-panel.js";
@@ -21,7 +22,20 @@ beforeAll(() => {
   ensureAdoptionEvidenceSchema();
 });
 
-beforeEach(() => getDb().prepare("DELETE FROM adoption_evidence").run());
+beforeEach(() => {
+  getDb().prepare("DELETE FROM adoption_evidence").run();
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS adoption_evidence_overflow (
+      recorded_day TEXT NOT NULL, traffic_purpose TEXT NOT NULL, result TEXT NOT NULL,
+      deterministic_check TEXT NOT NULL, reviewer_usefulness TEXT NOT NULL,
+      fallback_reason TEXT NOT NULL, report_count INTEGER NOT NULL,
+      eligible_opportunities INTEGER NOT NULL,
+      PRIMARY KEY (recorded_day, traffic_purpose, result, deterministic_check,
+                   reviewer_usefulness, fallback_reason)
+    );
+    DELETE FROM adoption_evidence_overflow;
+  `);
+});
 
 function report(overrides: Record<string, unknown> = {}): void {
   const parsed = parseAdoptionEvidence({
@@ -124,6 +138,69 @@ describe("post-m5-adoption-panel (#136)", () => {
     const panels = buildAdoptionPanels(queryOrganicAdoptionByHarness(getDb(), 7, Date.now()), [], 7);
     expect(JSON.stringify(panels.organic.detail)).toContain("2026-08-28");
     expect(JSON.stringify(panels.organic.detail)).toContain("20");
+  });
+
+  it("shows overflow in global counts but never presents per-harness data as complete", () => {
+    report({ eligible_opportunities: 20 });
+    const day = new Date().toISOString().slice(0, 10);
+    getDb().prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      day, "organic", "failed", "fail", "redo", "local_result_unusable", 2, 3,
+    );
+    getDb().prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      day, "evaluation", "completed", "pass", "pass", "none", 1, 5,
+    );
+    const now = Date.now();
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 7, now);
+    const panels = buildAdoptionPanels(
+      queryOrganicAdoptionByHarness(getDb(), 7, now),
+      queryLabAdoptionByPurpose(getDb(), 7, now),
+      7,
+      overflow,
+    );
+    expect(panels.organic.state).toBe("warn");
+    expect(panels.organic.label).toContain("INCOMPLETE");
+    expect(panels.organic.message).toContain("INCOMPLETE");
+    expect(panels.organic.message).toContain("inference availability is unaffected");
+    expect(panels.organic.detail?.rows).toEqual(expect.arrayContaining([
+      { metric: "retained individual reports (all purposes)", value: 1 },
+      { metric: "aggregated overflow reports", value: 2 },
+      { metric: "dropped reports", value: 0 },
+      { metric: "affected days (all purposes)", value: day },
+    ]));
+    expect(panels.organicByHarness.label).toContain("per-harness attribution unavailable");
+    expect(panels.fallbacks.label).toBe("MEASURED — organic M5 fallback reasons (exact global aggregate)");
+    expect(panels.fallbacks.rows).toEqual([{ reason: "local_result_unusable", reports: 2 }]);
+    expect(panels.lab.label).toContain("INCOMPLETE LAB");
+    expect(panels.organicByHarness.rows).toHaveLength(1);
+    expect(panels.organicByHarness.rows[0]).toMatchObject({ "known eligible opportunities": 20 });
+    expect(panels.lab.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ purpose: "evaluation", reports: 1, "known eligible opportunities": 5, completed: 1 }),
+    ]));
+  });
+
+  it("uses the retained useful-completion predicate for overflow, including not_run checks", () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const insert = getDb().prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    insert.run(day, "organic", "completed", "not_run", "partial", "none", 2, 2);
+    insert.run(day, "organic", "completed", "fail", "pass", "none", 1, 1);
+    insert.run(day, "organic", "completed", "pass", "pass", "none", 1, 1);
+
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 7, Date.now());
+    expect(overflow.byPurpose.organic).toMatchObject({
+      reports: 4,
+      attemptedDelegations: 4,
+      completed: 4,
+      usefulCompletions: 3,
+    });
   });
 
   it("uses EVAL_DB_PATH and refuses an explicitly missing evidence database before publishing", async () => {

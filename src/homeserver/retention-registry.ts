@@ -174,6 +174,33 @@ export const HARVEST_STORE_REGISTRY: readonly HarvestStoreDescriptor[] = [
       "No caller identity, event id, task content, path, repository, or precise timestamp exists " +
       "in this table; retain only through the 90-day predeclared review window.",
   },
+  // ── adoption-evidence.ts — bounded post-cap aggregates. The overflow table deliberately has no
+  //    row/event identity; its low-cardinality dimensions remain content-blind and `recorded_day`
+  //    is the only safe dry-run sample reference and retention key, matching the primary store's
+  //    90-day adoption-observation window.
+  {
+    storeId: "adoption-evidence-overflow",
+    mechanism: "sqlite",
+    table: "adoption_evidence_overflow",
+    classification: "content-blind",
+    dataClass: "adoption-observation",
+    retentionDays: retentionDaysFor("adoption-observation"),
+    prunable: true,
+    pruneAction: "delete-row",
+    timestampColumn: "recorded_day",
+    timestampKind: "date",
+    primaryKeyColumn: null,
+    sampleRefColumn: "recorded_day",
+    contentColumns: [],
+    redactedContentValue: null,
+    ownerSource: "gille-inference",
+    sensitivity: "low",
+    policyEpoch: POLICY_EPOCH_2026_07_31,
+    purpose:
+      "Content-blind, day-granularity aggregates retained after the bounded adoption-evidence " +
+      "row cap. The aggregate has no caller, event id, task content, path, repository, or precise " +
+      "timestamp; retain only through the same 90-day predeclared adoption trial window.",
+  },
 
   // ── owner-log.ts — owner_request_log: the FULL prompt/response for authenticated owner keys
   //    only. Content-bearing by design; never written for a guest.

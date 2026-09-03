@@ -413,6 +413,9 @@ describe("MCP ask tracing", () => {
     expect(body.result.isError).toBe(true);
     expect(body.result.structuredContent).toEqual({
       accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
       reason: "invalid_report",
       diagnostic: { code: "unknown_field" },
     });

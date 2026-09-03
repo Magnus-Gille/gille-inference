@@ -69,7 +69,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  for (const table of ["adoption_evidence", "request_log", "owner_request_log"]) {
+  for (const table of ["adoption_evidence", "adoption_evidence_overflow", "request_log", "owner_request_log"]) {
     if (getDb().prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) {
       getDb().prepare(`DELETE FROM ${table}`).run();
     }
@@ -89,7 +89,12 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     expect(raw).not.toContain(agentKey);
     const parsed = JSON.parse(raw) as { result: { isError: boolean; structuredContent: unknown } };
     expect(parsed.result.isError).toBe(false);
-    expect(parsed.result.structuredContent).toEqual({ accepted: true });
+    expect(parsed.result.structuredContent).toEqual({
+      accepted: true,
+      telemetry_recorded: true,
+      retention: "retained",
+      inference_availability: "unaffected",
+    });
     expect(getDb().prepare("SELECT harness, execution_mode, traffic_purpose, fallback_reason, eligible_opportunities FROM adoption_evidence").get()).toEqual({
       harness: "codex_cli",
       execution_mode: "code_loop",
@@ -170,14 +175,20 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     const validAfterFlood = JSON.parse(await rpc(callBody(70, "record_adoption_evidence", report), invalidFloodKey)) as { result: { isError: boolean } };
     expect(validAfterFlood.result.isError).toBe(true);
     expect(validAfterFlood.result).toMatchObject({
-      structuredContent: { accepted: false, reason: "principal_rate_limited" },
+      structuredContent: {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "telemetry_rate_limited",
+      },
     });
     expect(tableCount("adoption_evidence")).toBe(0);
     expect(tableCount("request_log")).toBe(0);
     expect(accessLines).toEqual([]);
   });
 
-  it("returns a stable redacted reason when the daily aggregate is full", async () => {
+  it("aggregates valid reports after the retained-row cap without presenting telemetry as inference capacity", async () => {
     const parsedReport = parseAdoptionEvidence(report);
     if (!parsedReport.ok) throw new Error("fixture must parse");
     for (let i = 0; i < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY; i += 1) {
@@ -190,11 +201,21 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
 
     expect(response.result).toMatchObject({
       isError: false,
-      structuredContent: { accepted: false, reason: "daily_capacity_reached" },
+      structuredContent: {
+        accepted: true,
+        telemetry_recorded: true,
+        retention: "aggregated",
+        inference_availability: "unaffected",
+        reason: "telemetry_daily_cap",
+        retry_telemetry: "next_utc_day",
+      },
     });
-    expect(raw).toContain("M5 inference result is unaffected");
+    expect(raw).toContain("only this telemetry write should not be retried until the next UTC day");
+    expect(raw).toContain("M5 inference availability is unaffected");
+    expect(raw).toContain("ask, code_loop, model access, and owner usage continue normally");
     expect(raw).not.toContain("adoption-capacity-agent");
     expect(raw).not.toMatch(/prompt|response|path|alias/i);
+    expect(tableCount("adoption_evidence_overflow")).toBe(1);
     expect(tableCount("request_log")).toBe(0);
     expect(tableCount("owner_request_log")).toBe(0);
     expect(accessLines).toEqual([]);
@@ -220,7 +241,13 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
 
     expect(response.result).toMatchObject({
       isError: true,
-      structuredContent: { accepted: false, reason: "storage_unavailable" },
+      structuredContent: {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "storage_unavailable",
+      },
     });
     expect(raw).not.toContain("adoption-storage-agent");
     expect(raw).not.toMatch(/sqlite|readonly database|prompt|response|path|alias|principal/i);
@@ -254,5 +281,78 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     const unknownResult = JSON.parse(unknown) as { result: unknown };
     expect(JSON.stringify(directResult.result).replace("record_adoption_evidence", "unknown_tool"))
       .toBe(JSON.stringify(unknownResult.result));
+  });
+
+  it("keeps organic failed, refused, and usefulness evidence distinct from early synthetic successes", async () => {
+    const parsed = parseAdoptionEvidence(report);
+    if (!parsed.ok) throw new Error("fixture must parse");
+    for (let i = 0; i < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY; i += 1) {
+      expect(recordAdoptionEvidence({ ...parsed.value, trafficPurpose: "synthetic" })).toBe(true);
+    }
+    expect(recordAdoptionEvidence({ ...parsed.value, trafficPurpose: "synthetic" })).toBe(true);
+
+    const organicFailed = {
+      ...report,
+      result: "failed",
+      deterministic_check: "fail",
+      reviewer_usefulness: "redo",
+      fallback_reason: "local_result_unusable",
+      eligible_opportunities: 3,
+    };
+    const organicRefused = {
+      ...report,
+      result: "refused",
+      deterministic_check: "not_run",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_refused",
+      eligible_opportunities: 4,
+    };
+    const failedResponse = JSON.parse(await rpc(callBody(81, "record_adoption_evidence", organicFailed), agentKey)) as {
+      result: { isError: boolean; structuredContent: unknown };
+    };
+    const refusedResponse = JSON.parse(await rpc(callBody(82, "record_adoption_evidence", organicRefused), agentKey)) as {
+      result: { isError: boolean; structuredContent: unknown };
+    };
+    expect(failedResponse.result).toMatchObject({
+      isError: false,
+      structuredContent: { accepted: true, telemetry_recorded: true, retention: "aggregated", inference_availability: "unaffected", reason: "telemetry_daily_cap", retry_telemetry: "next_utc_day" },
+    });
+    expect(refusedResponse.result).toMatchObject({
+      isError: false,
+      structuredContent: { accepted: true, telemetry_recorded: true, retention: "aggregated", inference_availability: "unaffected", reason: "telemetry_daily_cap", retry_telemetry: "next_utc_day" },
+    });
+    expect(getDb().prepare(
+      `SELECT traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason,
+              report_count, eligible_opportunities
+       FROM adoption_evidence_overflow ORDER BY result`
+    ).all()).toEqual([
+      {
+        traffic_purpose: "organic",
+        result: "failed",
+        deterministic_check: "fail",
+        reviewer_usefulness: "redo",
+        fallback_reason: "local_result_unusable",
+        report_count: 1,
+        eligible_opportunities: 3,
+      },
+      {
+        traffic_purpose: "synthetic",
+        result: "not_attempted",
+        deterministic_check: "not_run",
+        reviewer_usefulness: "not_reported",
+        fallback_reason: "m5_auth_unavailable",
+        report_count: 1,
+        eligible_opportunities: 2,
+      },
+      {
+        traffic_purpose: "organic",
+        result: "refused",
+        deterministic_check: "not_run",
+        reviewer_usefulness: "not_reported",
+        fallback_reason: "m5_refused",
+        report_count: 1,
+        eligible_opportunities: 4,
+      },
+    ]);
   });
 });

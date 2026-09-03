@@ -98,7 +98,22 @@ export const ADOPTION_EVIDENCE_COLUMNS = [
   "eligible_opportunities",
 ] as const;
 
-/** Hard aggregate bound: enough for a small weekly trial, never an unbounded telemetry sink. */
+/** Columns retained by the bounded post-cap aggregate; identity and harness dimensions are absent. */
+export const ADOPTION_EVIDENCE_OVERFLOW_COLUMNS = [
+  "recorded_day",
+  "traffic_purpose",
+  "result",
+  "deterministic_check",
+  "reviewer_usefulness",
+  "fallback_reason",
+  "report_count",
+  "eligible_opportunities",
+  "unknown_opportunity_reports",
+] as const;
+
+export type AdoptionEvidenceRetention = "retained" | "aggregated";
+
+/** Hard retained-row bound: enough for a small weekly trial, never an unbounded telemetry sink. */
 export const MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY = 25;
 /** Transient, per-minted-key flood bound. The key hash is never written to adoption_evidence. */
 export const MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW = 8;
@@ -125,7 +140,38 @@ function ensureSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_recorded_day ON adoption_evidence(recorded_day);
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_purpose ON adoption_evidence(traffic_purpose, recorded_day);
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_harness ON adoption_evidence(harness, recorded_day);
+
+    CREATE TABLE IF NOT EXISTS adoption_evidence_overflow (
+      recorded_day           TEXT NOT NULL,
+      traffic_purpose        TEXT NOT NULL,
+      result                 TEXT NOT NULL,
+      deterministic_check    TEXT NOT NULL,
+      reviewer_usefulness    TEXT NOT NULL,
+      fallback_reason        TEXT NOT NULL,
+      report_count           INTEGER NOT NULL,
+      eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (
+        recorded_day,
+        traffic_purpose,
+        result,
+        deterministic_check,
+        reviewer_usefulness,
+        fallback_reason
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_adoption_evidence_overflow_recorded_day
+      ON adoption_evidence_overflow(recorded_day);
   `);
+  const overflowColumns = new Set(
+    (db.prepare("PRAGMA table_info(adoption_evidence_overflow)").all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!overflowColumns.has("unknown_opportunity_reports")) {
+    db.exec("ALTER TABLE adoption_evidence_overflow ADD COLUMN unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0");
+    // A legacy row with no eligible opportunities necessarily consists entirely of unknown
+    // denominators. Mixed legacy aggregates cannot be split from their old sufficient statistics.
+    db.exec("UPDATE adoption_evidence_overflow SET unknown_opportunity_reports = report_count WHERE eligible_opportunities = 0");
+  }
   initializedDb = db;
 }
 
@@ -275,9 +321,10 @@ export function allowAdoptionEvidenceReportForPrincipal(keyHash: string, nowMs =
 
 /**
  * Write one already-validated, content-free evidence report with only its server-derived UTC day.
- * Returns false when the bounded daily aggregate is full; it never generates a report/event id.
+ * The first retained-row bound is preserved verbatim; later reports are reduced into a bounded,
+ * content-free aggregate keyed only by day and low-cardinality outcome dimensions.
  */
-export function recordAdoptionEvidence(report: AdoptionEvidenceReport): boolean {
+export function recordAdoptionEvidenceWithOutcome(report: AdoptionEvidenceReport): AdoptionEvidenceRetention {
   if (!isValidAdoptionEvidenceReport(report)) {
     throw new Error("Invalid content-blind adoption report.");
   }
@@ -286,16 +333,54 @@ export function recordAdoptionEvidence(report: AdoptionEvidenceReport): boolean 
   const count = db
     .prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day = ?")
     .get(recordedDay) as { count: number };
-  if (count.count >= MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY) return false;
+  if (count.count < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY) {
+    db
+      .prepare(
+        `INSERT INTO adoption_evidence
+           (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+            reviewer_usefulness, fallback_reason, eligible_opportunities)
+         VALUES
+           (@recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
+            @reviewerUsefulness, @fallbackReason, @eligibleOpportunities)`
+      )
+      .run({ recordedDay, ...report });
+    return "retained";
+  }
+
   db
     .prepare(
-      `INSERT INTO adoption_evidence
-         (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
-          reviewer_usefulness, fallback_reason, eligible_opportunities)
+      `INSERT INTO adoption_evidence_overflow
+         (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+          fallback_reason, report_count, eligible_opportunities, unknown_opportunity_reports)
        VALUES
-         (@recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
-          @reviewerUsefulness, @fallbackReason, @eligibleOpportunities)`
+         (@recordedDay, @trafficPurpose, @result, @deterministicCheck, @reviewerUsefulness,
+          @fallbackReason, 1, @eligibleOpportunities, @unknownOpportunityReports)
+       ON CONFLICT (
+         recorded_day,
+         traffic_purpose,
+         result,
+         deterministic_check,
+         reviewer_usefulness,
+         fallback_reason
+       ) DO UPDATE SET
+         report_count = report_count + 1,
+         eligible_opportunities = eligible_opportunities + excluded.eligible_opportunities,
+         unknown_opportunity_reports = unknown_opportunity_reports + excluded.unknown_opportunity_reports`
     )
-    .run({ recordedDay, ...report });
+    .run({
+      recordedDay,
+      ...report,
+      unknownOpportunityReports: report.eligibleOpportunities === 0 ? 1 : 0,
+    });
+  return "aggregated";
+}
+
+/**
+ * Backward-compatible boolean facade for internal callers that only need to know whether the
+ * report was durably recorded. Both an individual row and an overflow aggregate are successful;
+ * the MCP surface uses the explicit outcome function above when it needs the distinction.
+ */
+export function recordAdoptionEvidence(report: AdoptionEvidenceReport): boolean {
+  recordAdoptionEvidenceWithOutcome(report);
   return true;
 }

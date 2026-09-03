@@ -1,7 +1,7 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.0";
+export const M5_CLIENT_VERSION = "1.3.1";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
@@ -53,6 +53,34 @@ const ADOPTION_CHECKS = new Set(["pass", "fail", "not_run"]);
 const ADOPTION_USEFULNESS = new Set(["pass", "partial", "redo", "wrong", "not_reported"]);
 const ADOPTION_FALLBACKS = new Set([
   "none", "m5_tool_missing", "m5_auth_unavailable", "m5_unreachable", "m5_busy", "m5_refused", "local_result_unusable", "other_known",
+]);
+const ADOPTION_ACK_FIELDS = Object.freeze([
+  "accepted",
+  "telemetry_recorded",
+  "retention",
+  "inference_availability",
+  "reason",
+  "retry_telemetry",
+  "diagnostic",
+]);
+const ADOPTION_RETENTIONS = new Set(["retained", "aggregated", "dropped"]);
+const ADOPTION_REASONS = new Set([
+  "invalid_report",
+  "telemetry_daily_cap",
+  "telemetry_rate_limited",
+  "storage_unavailable",
+]);
+const ADOPTION_DIAGNOSTIC_CODES = new Set([
+  "invalid_shape",
+  "unknown_field",
+  "invalid_field",
+  "invalid_invariant",
+]);
+const ADOPTION_DIAGNOSTIC_FIELDS = new Set(ADOPTION_REPORT_FIELDS);
+const ADOPTION_DIAGNOSTIC_INVARIANTS = new Set([
+  "completed_requires_no_fallback",
+  "noncompleted_requires_fallback",
+  "unobserved_result_requires_unobserved_assessment",
 ]);
 const MAX_BLIND_CONTEXT_ROOTS = 128;
 
@@ -648,11 +676,150 @@ function isValidAdoptionReport(input) {
   ) {
     return false;
   }
-  return input.result === "completed"
-    ? input.fallback_reason === "none"
-    : input.deterministic_check === "not_run" &&
-      input.reviewer_usefulness === "not_reported" &&
-      input.fallback_reason !== "none";
+  if (input.result === "completed") return input.fallback_reason === "none";
+  if (input.fallback_reason === "none") return false;
+  return (
+    (input.result !== "refused" && input.result !== "not_attempted") ||
+    (input.deterministic_check === "not_run" && input.reviewer_usefulness === "not_reported")
+  );
+}
+
+function isValidAdoptionDiagnostic(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object" || Array.isArray(diagnostic)) return false;
+  if (!ADOPTION_DIAGNOSTIC_CODES.has(diagnostic.code)) return false;
+  if (diagnostic.code === "invalid_shape" || diagnostic.code === "unknown_field") {
+    return hasOnlyKeys(diagnostic, ["code"]);
+  }
+  if (diagnostic.code === "invalid_field") {
+    return hasOnlyKeys(diagnostic, ["code", "field"]) && ADOPTION_DIAGNOSTIC_FIELDS.has(diagnostic.field);
+  }
+  if (diagnostic.code === "invalid_invariant") {
+    return hasOnlyKeys(diagnostic, ["code", "invariant"]) && ADOPTION_DIAGNOSTIC_INVARIANTS.has(diagnostic.invariant);
+  }
+  return false;
+}
+
+function normalizeAdoptionAcknowledgement(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new M5ClientError(
+      "invalid_adoption_report",
+      "The gateway returned a malformed adoption-report acknowledgement.",
+    );
+  }
+
+  const keys = Object.keys(result);
+  if (
+    keys.some((key) => !ADOPTION_ACK_FIELDS.includes(key)) ||
+    typeof result.accepted !== "boolean"
+  ) {
+    throw new M5ClientError(
+      "invalid_adoption_report",
+      "The gateway returned a malformed adoption-report acknowledgement.",
+    );
+  }
+
+  const hasDiagnostic = Object.prototype.hasOwnProperty.call(result, "diagnostic");
+  if (
+    (hasDiagnostic && result.reason !== "invalid_report") ||
+    (hasDiagnostic && !isValidAdoptionDiagnostic(result.diagnostic))
+  ) {
+    throw new M5ClientError(
+      "invalid_adoption_report",
+      "The gateway returned an unsupported adoption-report diagnostic.",
+    );
+  }
+
+  // During the rolling upgrade, old gateways report unscoped refusal reasons. Treat them as
+  // dropped telemetry acknowledgements at the client boundary so callers cannot mistake a
+  // telemetry write limit or storage failure for ask/code_loop/model or owner inference
+  // capacity exhaustion. Keep this mapping inside the closed acknowledgement-field contract.
+  if (result.accepted === false && result.reason === "daily_capacity_reached") {
+    return {
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "telemetry_daily_cap",
+      retry_telemetry: "next_utc_day",
+    };
+  }
+  if (result.accepted === false && result.reason === "principal_rate_limited") {
+    return {
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "telemetry_rate_limited",
+    };
+  }
+  if (result.accepted === false && result.reason === "storage_unavailable") {
+    return {
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "storage_unavailable",
+    };
+  }
+
+  // A pre-contract gateway only returned { accepted: true }. Keep that response compatible;
+  // enriched acknowledgements below are validated and returned without dropping telemetry
+  // scope or retention evidence.
+  if (keys.length === 1 && result.accepted === true) return { accepted: true };
+
+  const expected = result.retention;
+  if (!ADOPTION_RETENTIONS.has(expected)) {
+    throw new M5ClientError(
+      "invalid_adoption_report",
+      "The gateway returned an unsupported adoption-report acknowledgement.",
+    );
+  }
+
+  if (expected === "retained") {
+    if (
+      result.accepted !== true ||
+      result.telemetry_recorded !== true ||
+      result.inference_availability !== "unaffected" ||
+      Object.prototype.hasOwnProperty.call(result, "reason") ||
+      Object.prototype.hasOwnProperty.call(result, "retry_telemetry")
+    ) {
+      throw new M5ClientError(
+        "invalid_adoption_report",
+        "The gateway returned an unsupported retained adoption-report acknowledgement.",
+      );
+    }
+  } else if (expected === "aggregated") {
+    if (
+      result.accepted !== true ||
+      result.telemetry_recorded !== true ||
+      result.inference_availability !== "unaffected" ||
+      result.reason !== "telemetry_daily_cap" ||
+      result.retry_telemetry !== "next_utc_day"
+    ) {
+      throw new M5ClientError(
+        "invalid_adoption_report",
+        "The gateway returned an unsupported aggregated adoption-report acknowledgement.",
+      );
+    }
+  } else if (
+    result.accepted !== false ||
+    result.telemetry_recorded !== false ||
+    !ADOPTION_REASONS.has(result.reason) ||
+    (result.inference_availability !== undefined && result.inference_availability !== "unaffected") ||
+    (result.retry_telemetry !== undefined && result.retry_telemetry !== "next_utc_day") ||
+    (result.reason !== "invalid_report" && hasDiagnostic)
+  ) {
+    throw new M5ClientError(
+      "invalid_adoption_report",
+      "The gateway returned an unsupported dropped adoption-report acknowledgement.",
+    );
+  }
+
+  return Object.fromEntries(
+    ADOPTION_ACK_FIELDS
+      .filter((field) => Object.prototype.hasOwnProperty.call(result, field))
+      .map((field) => [field, result[field]]),
+  );
 }
 
 function validateCodeResult(result) {
@@ -1016,23 +1183,37 @@ export async function createM5Client({
           "adoption report must use the closed, content-free evidence contract.",
         );
       }
-      const result = await client.tool("record_adoption_evidence", input);
-      if (!result || typeof result !== "object" || typeof result.accepted !== "boolean") {
+      try {
+        // Adoption refusals are still useful acknowledgements. Read the structured result even
+        // when an older gateway marks a telemetry-only refusal as an MCP tool error; ask and
+        // code-loop tool errors retain their existing strict client.tool() semantics.
+        const id = nextId++;
+        const response = await client.rpc({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "record_adoption_evidence", arguments: input },
+        });
+        if (response?.error) {
+          throw new M5ClientError(
+            "mcp_error",
+            redactText(rpcErrorMessage(response), secrets),
+          );
+        }
+        const result = response?.result;
+        if (result?.structuredContent !== undefined) {
+          return normalizeAdoptionAcknowledgement(result.structuredContent);
+        }
+        if (result?.isError === true) {
+          throw new M5ClientError("tool_error", toolResultText(result));
+        }
         throw new M5ClientError(
           "invalid_adoption_report",
           "The gateway returned a malformed adoption-report acknowledgement.",
         );
+      } catch (error) {
+        throw safeError(error, secrets, profile);
       }
-      if (result.accepted === false && result.reason === "daily_capacity_reached") {
-        return { accepted: false, reason: result.reason };
-      }
-      if (result.accepted !== true) {
-        throw new M5ClientError(
-          "invalid_adoption_report",
-          "The gateway returned an unsupported adoption-report rejection.",
-        );
-      }
-      return { accepted: true };
     },
 
     async codeStatus(workId) {

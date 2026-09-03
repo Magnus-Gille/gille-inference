@@ -836,6 +836,267 @@ describe("secret-safe M5 client", () => {
     expect(fetches).toBe(0);
   });
 
+  it("accepts observed outcomes for failed reports but rejects invalid result combinations", async () => {
+    let fetches = 0;
+    const requests: Array<{ params?: { name?: string; arguments?: unknown } }> = [];
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        fetches += 1;
+        const request = JSON.parse(String(init?.body)) as {
+          id: number;
+          params?: { name?: string; arguments?: unknown };
+        };
+        requests.push(request);
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "accepted" }],
+          isError: false,
+          structuredContent: { accepted: true },
+        });
+      },
+    });
+    const validFailure = {
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "failed",
+      deterministic_check: "fail",
+      reviewer_usefulness: "redo",
+      fallback_reason: "local_result_unusable",
+      eligible_opportunities: 1,
+    };
+
+    await expect(client.reportAdoption(validFailure)).resolves.toEqual({ accepted: true });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      params: { name: "record_adoption_evidence", arguments: validFailure },
+    });
+
+    for (const invalid of [
+      { ...validFailure, result: "refused" },
+      { ...validFailure, fallback_reason: "none" },
+    ]) {
+      await expect(client.reportAdoption(invalid)).rejects.toMatchObject({ code: "invalid_adoption_report" });
+    }
+    expect(fetches).toBe(1);
+  });
+
+  it("preserves retained and aggregated telemetry acknowledgements without implying inference limits", async () => {
+    const reports = [
+      {
+        accepted: true,
+        telemetry_recorded: true,
+        retention: "retained",
+        inference_availability: "unaffected",
+      },
+      {
+        accepted: true,
+        telemetry_recorded: true,
+        retention: "aggregated",
+        inference_availability: "unaffected",
+        reason: "telemetry_daily_cap",
+        retry_telemetry: "next_utc_day",
+      },
+    ];
+    let call = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "telemetry acknowledgement" }],
+          isError: false,
+          structuredContent: reports[call++],
+        });
+      },
+    });
+    const report = {
+      harness: "codex_cli",
+      execution_mode: "ask",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "partial",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    };
+
+    await expect(client.reportAdoption(report)).resolves.toEqual(reports[0]);
+    await expect(client.reportAdoption(report)).resolves.toEqual(reports[1]);
+  });
+
+  it("preserves valid invalid-report diagnostics and rejects malformed or out-of-scope diagnostics", async () => {
+    const acknowledgements = [
+      {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "invalid_report",
+        diagnostic: { code: "invalid_field", field: "harness" },
+      },
+      {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "invalid_report",
+        diagnostic: { code: "invalid_field", field: "prompt" },
+      },
+      {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "invalid_report",
+        diagnostic: { code: "invalid_invariant", invariant: "not_a_real_invariant" },
+      },
+      {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "storage_unavailable",
+        diagnostic: { code: "unknown_field" },
+      },
+      {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        inference_availability: "unaffected",
+        reason: "invalid_report",
+        diagnostic: { code: "invalid_shape", field: "harness" },
+      },
+    ];
+    let call = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "adoption acknowledgement" }],
+          isError: true,
+          structuredContent: acknowledgements[call++],
+        });
+      },
+    });
+    const report = {
+      harness: "codex_cli",
+      execution_mode: "ask",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "partial",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    };
+
+    await expect(client.reportAdoption(report)).resolves.toEqual(acknowledgements[0]);
+    for (let index = 1; index < acknowledgements.length; index += 1) {
+      await expect(client.reportAdoption(report)).rejects.toMatchObject({ code: "invalid_adoption_report" });
+    }
+  });
+
+  it("normalizes legacy daily capacity and accepts scoped dropped telemetry acknowledgements", async () => {
+    const acknowledgements = [
+      { accepted: false, reason: "daily_capacity_reached" },
+      {
+        accepted: false,
+        telemetry_recorded: false,
+        retention: "dropped",
+        reason: "telemetry_rate_limited",
+      },
+    ];
+    let call = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "telemetry acknowledgement" }],
+          // A rolling-upgrade gateway may still mark a telemetry-only refusal as an MCP error.
+          isError: call === 1,
+          structuredContent: acknowledgements[call++],
+        });
+      },
+    });
+    const report = {
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "not_attempted",
+      deterministic_check: "not_run",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_auth_unavailable",
+      eligible_opportunities: 1,
+    };
+
+    await expect(client.reportAdoption(report)).resolves.toEqual({
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "telemetry_daily_cap",
+      retry_telemetry: "next_utc_day",
+    });
+    await expect(client.reportAdoption(report)).resolves.toEqual(acknowledgements[1]);
+  });
+
+  it("normalizes legacy rate-limit and storage refusals, including old MCP errors, to dropped telemetry", async () => {
+    const legacyAcknowledgements = [
+      { accepted: false, reason: "principal_rate_limited" },
+      { accepted: false, reason: "storage_unavailable" },
+    ];
+    let call = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "Adoption telemetry was not recorded." }],
+          // Older gateways used the MCP tool-error flag for telemetry-only refusals.
+          isError: call === 0,
+          structuredContent: legacyAcknowledgements[call++],
+        });
+      },
+    });
+    const report = {
+      harness: "codex_cli",
+      execution_mode: "ask",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "partial",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    };
+
+    await expect(client.reportAdoption(report)).resolves.toEqual({
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "telemetry_rate_limited",
+    });
+    await expect(client.reportAdoption(report)).resolves.toEqual({
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "storage_unavailable",
+    });
+  });
+
   it("retries a transient Keychain failure on the same long-lived client", async () => {
     let credentialResolutions = 0;
     let fetches = 0;
