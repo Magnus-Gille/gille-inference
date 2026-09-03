@@ -10,7 +10,8 @@
  *
  * DATA SOURCE: the content-blind, pseudonymous `request_log` table (src/homeserver/request-log.ts)
  * — READ-ONLY, on the box's live `data/eval.db`. Nothing here reads alias, key_hash, or any
- * prompt/response content; only tier/model/route/token-count/timestamp columns are touched.
+ * prompt/response content; only node/admission/tier/model/route/token-count/timestamp columns are
+ * touched.
  *
  * SCHEMA SURPRISE — `/healthz` (and the other 3 read-only monitor routes `/metrics`, `/ledger`,
  * `/models`) get a `request_log` row on EVERY hit, unconditionally, whenever `HOMESERVER_REQUEST_LOG`
@@ -22,7 +23,8 @@
  * These four are exactly the routes a "read-only MONITOR principal" is limited to (see gateway.ts),
  * i.e. they are infrastructure surfaces by construction, never a human/agent "ask". All aggregation
  * below counts only real usage via the USAGE_ROUTES include-list (they are excluded by omission,
- * along with portal/admin/other non-usage routes — see USAGE_ROUTES for the full rationale).
+ * along with portal/admin/other non-usage routes — see the shared compute-request filter for the
+ * full rationale). Filter epoch: `m5-admitted-compute-v2`; older panels are a historical break.
  *
  * Pushes TWO panels to Heimdall on service `m5-inference` (self-registering by (service, panel),
  * like every other poster — no Heimdall code change):
@@ -45,6 +47,11 @@ import Database from "better-sqlite3";
 import { pathToFileURL } from "node:url";
 
 import { pushPanel, verifyPanelLanded, verifyProblem, type TablePanel, type TimeseriesPanel } from "../src/homeserver/heimdall-push.js";
+import {
+  COMPUTE_REQUEST_FILTER_EPOCH,
+  COMPUTE_REQUEST_FILTER_SQL,
+  M5_COMPUTE_ROUTES,
+} from "../src/homeserver/compute-request-filter.js";
 
 const SERVICE = "m5-inference";
 // Read-back freshness window: the panel we just pushed must have updated within this window to
@@ -59,53 +66,8 @@ export const DEFAULT_ROLLUP_DAYS = 7;
 /** Cap on distinct model rows shown in the rollup table (defensive; usually far fewer). */
 const DEFAULT_MODEL_ROW_LIMIT = 30;
 
-/**
- * Real inference/usage routes — an INCLUDE-list, not an exclude-list. This is the only set of
- * routes counted in every aggregation below.
- *
- * WHY include, not exclude (PR #129 review, finding 1): the original implementation excluded
- * just the 4 monitor routes (see the SCHEMA SURPRISE note above) and counted everything else by
- * default. "Count by default" is the wrong failure mode for a metric whose entire point is
- * measuring real usage — it silently let non-usage traffic (portal pages, the self-service
- * dashboard, admin actions, any future route) inflate the adoption signal the moment it shipped,
- * with no code change required. An include-list fails CLOSED: a brand-new route is invisible to
- * this panel until someone deliberately adds it here.
- *
- * Each string below was verified against the ACTUAL value gateway.ts / mcp.ts write into
- * request_log.route (not guessed from the URL):
- *   - "/v1/chat/completions"      gateway.ts — lctx.route defaults to the raw pathname and is
- *                                  never overridden for this route, so it lands verbatim.
- *   - "/v1/audio/transcriptions"  gateway.ts — same; handleAudioTranscription populates lctx
- *                                  directly but does not change lctx.route.
- *   - "/v1/images/generations"    gateway.ts — same for the job-creation call. (Job-STATUS polls
- *                                  under /v1/images/generations/jobs/:id explicitly override
- *                                  lctx.route to that literal path — deliberately excluded here:
- *                                  a status poll isn't a new inference call.)
- *   - "/delegate"                 gateway.ts — owner-only orchestrator hand-off.
- *   - "/mcp"                      gateway.ts — the MCP JSON-RPC transport wrapper. Both the
- *                                  `list_models` and `ask` MCP tools flow through this row.
- *   - "/mcp/ask"                  mcp.ts's `MCP_INFERENCE_ROUTE` constant — the `ask` tool's OWN
- *                                  inference row, written directly by runChatCompletion() as a
- *                                  SECOND, distinct request_log row alongside the outer "/mcp"
- *                                  transport row. Confirmed as "/mcp/ask" (not "mcp" and not
- *                                  reusing "/mcp") — the only occurrences of the raw string in
- *                                  mcp.ts are `const MCP_INFERENCE_ROUTE = "/mcp/ask"`.
- *
- * Deliberately NOT included, despite being real routes: "/v1/models" (an OpenAI-SDK/IDE-plugin
- * discovery probe, not inference), "/portal*", "/hs", "/client/hs.mjs" (public/static pages),
- * "/portal/me" (a key looking up its OWN usage), "/admin/*" (operator actions), and the 4 monitor
- * routes from the old NOISE_ROUTES list. "/v1/completions" (legacy non-chat completions) was
- * dropped from an earlier draft of this list — it does not exist as a route in gateway.ts at all.
- */
-export const USAGE_ROUTES = [
-  "/v1/chat/completions",
-  "/v1/audio/transcriptions",
-  "/v1/images/generations",
-  "/delegate",
-  "/mcp",
-  "/mcp/ask",
-] as const;
-const USAGE_ROUTES_SQL = USAGE_ROUTES.map((r) => `'${r}'`).join(",");
+/** @deprecated Use the shared M5_COMPUTE_ROUTES source of truth. */
+export const USAGE_ROUTES = M5_COMPUTE_ROUTES;
 
 // ─── UTC calendar-day helpers ────────────────────────────────────────────────────────────
 
@@ -194,11 +156,12 @@ export function queryDailySeries(
          SUM(CASE WHEN tier = 'guest' THEN 1 ELSE 0 END) AS guest_requests,
          COALESCE(SUM(total_tokens), 0)                 AS tokens
        FROM request_log
-       WHERE ts >= @since
-         AND route IN (${USAGE_ROUTES_SQL})
+       WHERE ${COMPUTE_REQUEST_FILTER_SQL}
+         AND ts >= @since
+         AND ts <= @now
        GROUP BY date`
     )
-    .all({ since }) as DailyDbRow[];
+    .all({ since, now }) as DailyDbRow[];
 
   const byDate = new Map(rows.map((r) => [r.date, r]));
   const out: DailyUtilization[] = [];
@@ -233,12 +196,13 @@ export function queryModelRollup(
               COUNT(*)                        AS calls,
               COALESCE(SUM(completion_tokens), 0) AS output_tokens
        FROM request_log
-       WHERE ts >= @since
-         AND route IN (${USAGE_ROUTES_SQL})
+       WHERE ${COMPUTE_REQUEST_FILTER_SQL}
+         AND ts >= @since
+         AND ts <= @now
        GROUP BY model
        ORDER BY calls DESC, model ASC`
     )
-    .all({ since }) as ModelDbRow[];
+    .all({ since, now }) as ModelDbRow[];
 
   const totalCalls = rows.reduce((sum, r) => sum + r.calls, 0);
   return rows.map((r) => ({
@@ -260,10 +224,11 @@ export function queryRecentStat(
     .prepare(
       `SELECT COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS tokens
        FROM request_log
-       WHERE ts >= @since
-         AND route IN (${USAGE_ROUTES_SQL})`
+       WHERE ${COMPUTE_REQUEST_FILTER_SQL}
+         AND ts >= @since
+         AND ts <= @now`
     )
-    .get({ since }) as { calls: number; tokens: number };
+    .get({ since, now }) as { calls: number; tokens: number };
   return { calls: row.calls, tokens: row.tokens };
 }
 
@@ -299,7 +264,7 @@ export function buildUtilizationTimeseriesPanel(daily: DailyUtilization[]): Time
     service: SERVICE,
     panel: "m5-utilization",
     kind: "timeseries",
-    label: "M5 utilization — requests/day (detail: owner/guest/other split + tokens in+out per day)",
+    label: `M5 utilization — requests/day (detail: owner/guest/other split + tokens in+out per day) [filter ${COMPUTE_REQUEST_FILTER_EPOCH}]`,
     unit: "requests",
     points,
   };
@@ -331,7 +296,7 @@ export function buildModelRollupTablePanel(
     service: SERVICE,
     panel: "m5-utilization-models",
     kind: "table",
-    label: `M5 utilization — per-model rollup (last ${days}d)`,
+    label: `M5 utilization — per-model rollup (last ${days}d) [filter ${COMPUTE_REQUEST_FILTER_EPOCH}]`,
     cols: ["model", "calls", "outputTokens", "sharePct"],
     rows: rollup.slice(0, limit).map((r) => ({
       model: r.model,
@@ -392,7 +357,7 @@ async function main(): Promise<void> {
     const summaryLine = formatSummaryLine(recent);
 
     if (dryRun) {
-      console.log(JSON.stringify({ timeseries, table, summaryLine }, null, 2));
+      console.log(JSON.stringify({ filterEpoch: COMPUTE_REQUEST_FILTER_EPOCH, timeseries, table, summaryLine }, null, 2));
       return;
     }
 

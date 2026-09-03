@@ -11,6 +11,7 @@ import {
   stageKeyRotation,
   type KeyDefaults,
 } from "../src/homeserver/keystore.js";
+import { COMPUTE_REQUEST_FILTER_EPOCH } from "../src/homeserver/compute-request-filter.js";
 
 /**
  * Read-only MONITOR scope (gille-inference#35).
@@ -317,6 +318,7 @@ describe("read-only monitor scope (#35)", () => {
     expect(body).toHaveProperty("last24HoursByTier");
     expect(body).toHaveProperty("last7Days");
     expect(body).toHaveProperty("daily");
+    expect(body).toHaveProperty("filterEpoch", COMPUTE_REQUEST_FILTER_EPOCH);
     expect(JSON.stringify(body)).not.toMatch(/alias|key_hash|prompt|response|content/i);
   });
 

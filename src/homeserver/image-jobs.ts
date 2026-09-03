@@ -621,6 +621,7 @@ function logCompletion(
     alias: sub.alias,
     tier: sub.lane,
     keyHash: sub.keyHash,
+    node: "m5",
     model: sub.parsed.model,
     route: "image",
     status,

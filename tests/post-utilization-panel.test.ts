@@ -32,7 +32,9 @@ import {
   USAGE_ROUTES,
   hasRequestLogTable,
 } from "../scripts/post-utilization-panel.js";
+import { COMPUTE_REQUEST_FILTER_EPOCH } from "../src/homeserver/compute-request-filter.js";
 import { PANEL_ID_RE } from "../src/homeserver/heimdall-push.js";
+import { queryM5UsageSummary } from "../src/homeserver/usage-summary.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -45,6 +47,7 @@ const CREATE_REQUEST_LOG = `
     tier              TEXT,
     key_hash          TEXT,
     model             TEXT NOT NULL,
+    node              TEXT NOT NULL DEFAULT 'm5',
     route             TEXT NOT NULL,
     status            INTEGER NOT NULL,
     outcome           TEXT NOT NULL,
@@ -66,6 +69,7 @@ interface RowInput {
   tier: string | null;
   keyHash: string | null;
   model: string;
+  node: string;
   route: string;
   status: number;
   outcome: string;
@@ -92,6 +96,7 @@ function insertRow(over: Partial<RowInput> = {}): void {
     tier: "owner",
     keyHash: null,
     model: "qwen3-30b-instruct",
+    node: "m5",
     route: "/v1/chat/completions",
     status: 200,
     outcome: "ok",
@@ -107,10 +112,10 @@ function insertRow(over: Partial<RowInput> = {}): void {
   };
   db.prepare(
     `INSERT INTO request_log
-       (id, ts, alias, tier, key_hash, model, route, status, outcome, error_class,
+       (id, ts, alias, tier, key_hash, model, node, route, status, outcome, error_class,
         prompt_tokens, completion_tokens, total_tokens, queue_wait_ms, ttft_ms, total_ms, admission)
      VALUES
-       (@id, @ts, @alias, @tier, @keyHash, @model, @route, @status, @outcome, @errorClass,
+       (@id, @ts, @alias, @tier, @keyHash, @model, @node, @route, @status, @outcome, @errorClass,
         @promptTokens, @completionTokens, @totalTokens, @queueWaitMs, @ttftMs, @totalMs, @admission)`
   ).run(row);
 }
@@ -250,6 +255,50 @@ describe("queryDailySeries", () => {
     expect(today.tokens).toBe(USAGE_ROUTES.length);
   });
 
+  it("counts one admitted M5 MCP ask and excludes transport, refusals, Orin, and model none", () => {
+    const now = Date.UTC(2026, 5, 15, 12, 0, 0);
+    for (const route of ["/v1/chat/completions", "/delegate", "/mcp/ask"]) {
+      insertRow({ ts: now, route, model: route === "/delegate" ? "code-loop" : "qwen3-30b-instruct" });
+    }
+    insertRow({ ts: now, route: "/mcp", model: "qwen3-30b-instruct" });
+    insertRow({ ts: now, route: "/v1/models", model: "none" });
+    insertRow({ ts: now, node: "orin" });
+    insertRow({ ts: now, admission: "busy", status: 503, outcome: "busy" });
+    insertRow({ ts: now, admission: "n/a", status: 401, outcome: "auth_failed" });
+    insertRow({ ts: now, model: "none" });
+
+    const today = queryDailySeries(db, 1, now)[0]!;
+    expect(today.requests).toBe(3);
+    expect(queryRecentStat(db, 24, now).calls).toBe(3);
+    expect(queryModelRollup(db, 1, now).reduce((sum, row) => sum + row.calls, 0)).toBe(3);
+  });
+
+  it("counts exactly one row for each sync or async image request", () => {
+    const now = Date.UTC(2026, 5, 15, 12, 0, 0);
+    // Sync fast-tier image: the admitted public request row is the compute row.
+    insertRow({ ts: now, route: "/v1/images/generations", model: "image-fast" });
+    // Async balanced/high image: the public submit row is not admitted; the worker's admitted
+    // completion row uses the internal `image` route.
+    insertRow({ ts: now, route: "/v1/images/generations", model: "image-balanced", admission: "n/a", status: 202 });
+    insertRow({ ts: now, route: "image", model: "image-balanced" });
+
+    const daily = queryDailySeries(db, 1, now);
+    expect(daily[0]!.requests).toBe(2);
+    expect(queryRecentStat(db, 24, now).calls).toBe(2);
+    expect(queryModelRollup(db, 1, now)).toEqual([
+      { model: "image-balanced", calls: 1, outputTokens: 50, sharePct: 50 },
+      { model: "image-fast", calls: 1, outputTokens: 50, sharePct: 50 },
+    ]);
+  });
+
+  it("marks the shared filter epoch in Heimdall panel labels", () => {
+    const now = Date.UTC(2026, 5, 15, 12, 0, 0);
+    const timeseries = buildUtilizationTimeseriesPanel(queryDailySeries(db, 1, now));
+    const table = buildModelRollupTablePanel(queryModelRollup(db, 1, now), 1);
+    expect(timeseries.label).toContain(COMPUTE_REQUEST_FILTER_EPOCH);
+    expect(table.label).toContain(COMPUTE_REQUEST_FILTER_EPOCH);
+  });
+
   it("excludes a row exactly one day before the window and includes one at the window start boundary", () => {
     const now = Date.UTC(2026, 5, 15, 12, 0, 0);
     const days = 3; // window: 2026-06-13 .. 2026-06-15
@@ -259,6 +308,14 @@ describe("queryDailySeries", () => {
     const series = queryDailySeries(db, days, now);
     const totalRequests = series.reduce((sum, d) => sum + d.requests, 0);
     expect(totalRequests).toBe(1);
+  });
+
+  it("excludes future-dated rows consistently with the ops summary window", () => {
+    const now = Date.UTC(2026, 5, 15, 12, 0, 0);
+    insertRow({ ts: now + 1, totalTokens: 999 });
+    expect(queryDailySeries(db, 1, now)[0]!.requests).toBe(0);
+    expect(queryRecentStat(db, 24, now).calls).toBe(0);
+    expect(queryModelRollup(db, 1, now)).toEqual([]);
   });
 });
 
@@ -486,5 +543,26 @@ describe("consistency: model rollup total calls matches summed daily requests ov
     const dailyTotal = daily.reduce((s, d) => s + d.requests, 0);
     expect(rollupTotal).toBe(dailyTotal);
     expect(rollupTotal).toBe(3);
+  });
+
+  it("reconciles the ops summary, daily series, recent headline, and model rollup", () => {
+    const now = Date.UTC(2026, 5, 15, 12, 0, 0);
+    insertRow({ ts: now, route: "/mcp/ask", model: "mcp-model", totalTokens: 20 });
+    insertRow({ ts: now - DAY_MS, route: "/delegate", model: "delegate-model", totalTokens: 30 });
+    insertRow({ ts: now, route: "/mcp", model: "none", totalTokens: 999 });
+    insertRow({ ts: now, node: "orin", totalTokens: 999 });
+    insertRow({ ts: now, admission: "busy", status: 503, outcome: "busy", totalTokens: 999 });
+
+    const summary = queryM5UsageSummary(db, { now, days: DEFAULT_ROLLUP_DAYS });
+    const daily = queryDailySeries(db, DEFAULT_ROLLUP_DAYS, now);
+    const rollup = queryModelRollup(db, DEFAULT_ROLLUP_DAYS, now);
+    const dailyTotal = daily.reduce((sum, day) => sum + day.requests, 0);
+    const rollupTotal = rollup.reduce((sum, row) => sum + row.calls, 0);
+
+    expect(summary.last7Days.requests).toBe(2);
+    expect(dailyTotal).toBe(summary.last7Days.requests);
+    expect(rollupTotal).toBe(summary.last7Days.requests);
+    expect(queryRecentStat(db, 24, now).calls).toBe(summary.last24Hours.requests);
+    expect(summary.filterEpoch).toBe(COMPUTE_REQUEST_FILTER_EPOCH);
   });
 });

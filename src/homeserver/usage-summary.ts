@@ -1,25 +1,15 @@
 import type Database from "better-sqlite3";
 
+import {
+  COMPUTE_REQUEST_FILTER_EPOCH,
+  COMPUTE_REQUEST_FILTER_SQL,
+  M5_COMPUTE_ROUTES,
+} from "./compute-request-filter.js";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/**
- * Actual M5 compute surfaces. The outer `/mcp` row is deliberately absent: an MCP ask writes its
- * own `/mcp/ask` inference row, so counting both would turn one model call into two requests.
- */
-export const M5_INFERENCE_ROUTES = [
-  "/v1/chat/completions",
-  "/v1/audio/transcriptions",
-  "/v1/images/generations",
-  "/delegate",
-  "/mcp/ask",
-] as const;
-
-const ROUTES_SQL = M5_INFERENCE_ROUTES.map((route) => `'${route}'`).join(",");
-const COMPUTE_FILTER = `
-  node = 'm5'
-  AND admission = 'admitted'
-  AND route IN (${ROUTES_SQL})
-`;
+/** @deprecated Use the shared M5_COMPUTE_ROUTES source of truth. */
+export const M5_INFERENCE_ROUTES = M5_COMPUTE_ROUTES;
 
 export interface UsageWindow {
   requests: number;
@@ -41,6 +31,8 @@ export interface M5UsageByTier {
 
 export interface M5UsageSummary {
   generatedAt: string;
+  /** Shared compute-request filter epoch; historical epochs are not directly comparable. */
+  filterEpoch: typeof COMPUTE_REQUEST_FILTER_EPOCH;
   activeRequests: number;
   lastUsedAt: string | null;
   last24Hours: UsageWindow;
@@ -104,7 +96,7 @@ export function queryM5UsageSummary(
       COUNT(*) AS requests,
       COALESCE(SUM(CASE WHEN total_ms > 0 THEN total_ms ELSE 0 END), 0) AS request_time_ms
     FROM request_log
-    WHERE ${COMPUTE_FILTER}
+    WHERE ${COMPUTE_REQUEST_FILTER_SQL}
       AND ts >= @since
       AND ts <= @now
     GROUP BY date
@@ -135,7 +127,7 @@ export function queryM5UsageSummary(
         ELSE 0
       END), 0) AS other_request_time_ms
     FROM request_log
-    WHERE ${COMPUTE_FILTER}
+    WHERE ${COMPUTE_REQUEST_FILTER_SQL}
       AND ts >= @since
       AND ts <= @now
   `).get({ since: now - DAY_MS, now }) as DbUsageByTier;
@@ -143,7 +135,7 @@ export function queryM5UsageSummary(
   const latest = db.prepare(`
     SELECT MAX(ts) AS last_used_at
     FROM request_log
-    WHERE ${COMPUTE_FILTER}
+    WHERE ${COMPUTE_REQUEST_FILTER_SQL}
       AND ts <= @now
   `).get({ now }) as { last_used_at: number | null };
 
@@ -162,6 +154,7 @@ export function queryM5UsageSummary(
 
   return {
     generatedAt: new Date(now).toISOString(),
+    filterEpoch: COMPUTE_REQUEST_FILTER_EPOCH,
     activeRequests,
     lastUsedAt: latest.last_used_at === null ? null : new Date(latest.last_used_at).toISOString(),
     last24Hours: windowOf(last24Row),
