@@ -9,10 +9,11 @@ files replace the generic `STATUS.md`/`PROGRESS.md`/`TODO.md` handoff defaults i
 instructions.
 
 After a substantive session, record public work in the relevant issue or pull request, containing
-only the reusable engineering contract and sanitized evidence. Private deployment state, incidents,
-and maintenance are coordinated in the private repository `Magnus-Gille/grimnir-ops`, an execution
-tracker that does not own this service's code or architecture. Log durable decisions before
-replacing mutable project status.
+only the reusable engineering contract and sanitized evidence. Exact transient operator handoffs
+may use the gitignored local `STATUS.md`; durable or multi-session deployment state, incidents, and
+maintenance belong in the private repository `Magnus-Gille/grimnir-ops`, never in this public
+repository. That repository is an execution tracker and does not own this service's code or
+architecture. Log durable decisions before replacing mutable project status.
 
 ## Mission and architecture
 
@@ -125,9 +126,10 @@ and harness loading; do not manufacture a code-suite signal. For behavioral chan
 regression test that fails before the fix and run the affected suite plus typecheck. Preserve
 idempotence and resumability in runners, importers, cron jobs, and generated-artifact writers.
 
-The gateway entry point is `npm run homeserver -- --help` (`serve`, `probe`, `ledger`). Eval,
-judge, and analysis runners are `npm run run:eval|run:judge|run:analysis`; prompt mining is
-`scripts/{extract,classify,analyze}-prompts.ts`. Use `--help` rather than memory for flags.
+The gateway entry point is `npm run homeserver -- --help` (`serve`, `probe`, `ledger`). The
+runner entry points are `npm run run:eval`, `npm run run:judge`, and `npm run run:analysis`; each
+requires `--batch <id>` and has no `--help`, so read the script header for flags. Prompt mining is
+`scripts/extract-prompts.ts`, `scripts/classify-prompts.ts`, and `scripts/analyze-prompts.ts`.
 
 ## Benchmark and paid-resource discipline
 
