@@ -31,7 +31,18 @@ function isAdoptionReport(message) {
     message?.params?.name === "record_adoption_evidence";
 }
 
-function bridgeError(error, profile, message) {
+function isCodeLoopResult(message) {
+  return message?.method === "tools/call" &&
+    message?.params?.name === "code_loop_result";
+}
+
+function isRetryableResultTransport(error) {
+  return error instanceof M5ClientError &&
+    error.retryable === true &&
+    (error.code === "network_failure" || error.code === "timeout" || error.code === "upstream_http_error");
+}
+
+function bridgeError(error, profile, message, { resultRetryAttempted = false } = {}) {
   if (!(error instanceof M5ClientError)) {
     return { message: "The MCP bridge request failed." };
   }
@@ -59,6 +70,17 @@ function bridgeError(error, profile, message) {
       ...(remediation === undefined ? {} : { remediation }),
       ...(isAdoptionReport(message) && transportFailure
         ? { evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" } }
+        : {}),
+      ...(isCodeLoopResult(message) && resultRetryAttempted
+        ? {
+            result_recovery: {
+              status: "retry_exhausted",
+              automatic_retries: 1,
+              action: isRetryableResultTransport(error)
+                ? "retry_same_work_id"
+                : "follow_error_remediation",
+            },
+          }
         : {}),
     },
   };
@@ -91,8 +113,19 @@ export function createMcpStdioBridge({ client, profile }) {
         return rpcError(null, -32600, "Invalid Request");
       }
       const notification = message.id === undefined || message.id === null;
+      let resultRetryAttempted = false;
       try {
-        const response = await client.rpc(message);
+        let response;
+        try {
+          response = await client.rpc(message);
+        } catch (error) {
+          if (!notification && isCodeLoopResult(message) && isRetryableResultTransport(error)) {
+            resultRetryAttempted = true;
+            response = await client.rpc(message);
+          } else {
+            throw error;
+          }
+        }
         if (notification) return null;
         if (response === null) {
           return rpcError(
@@ -104,7 +137,7 @@ export function createMcpStdioBridge({ client, profile }) {
         return JSON.stringify(response);
       } catch (error) {
         if (notification) return null;
-        const failure = bridgeError(error, profile, message);
+        const failure = bridgeError(error, profile, message, { resultRetryAttempted });
         return rpcError(message.id, -32603, failure.message, failure.data);
       }
     },

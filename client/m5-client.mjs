@@ -1,7 +1,7 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.1";
+export const M5_CLIENT_VERSION = "1.3.2";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
