@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, beforeAll, vi } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -34,6 +34,7 @@ import {
   sweepCodeLoopSandboxes,
   isCodeLoopUnitName,
   _resetCodeLoopStateForTests,
+  seedSandbox,
   type CodeLoopStartConfig,
   CODE_LOOP_HARNESS_VERSION,
 } from "../src/homeserver/code-loop.js";
@@ -107,6 +108,7 @@ function fakeDeps(over: {
   learningTaskAdmission?: CodeLoopDeps["learningTaskAdmission"];
   keyAlias?: string;
   cleanupUnit?: (unit: string) => Promise<void>;
+  runCommand?: CodeLoopDeps["runCommand"];
 } = {}): CodeLoopDeps {
   const okRun = async (): Promise<EngineRunResult> => ({
     outcome: "completed",
@@ -128,7 +130,7 @@ function fakeDeps(over: {
     growthCapBytes: 50 * 1024 * 1024,
     pollMs: 10_000,
     retentionTtlMs: 24 * 60 * 60 * 1000,
-    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env }),
+    runCommand: over.runCommand ?? ((argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env })),
     acquireLease: async () => (over.lease === "unavailable" ? null : { release: async () => {} }),
     cageSelfTest: async () => ({ ok: over.cageOk !== false, failures: over.cageOk === false ? ["forced fail"] : [] }),
     cleanupUnit: over.cleanupUnit ?? (async () => {}),
@@ -226,6 +228,27 @@ describe("startCodeLoop — refusals", () => {
 // ─── full lifecycle + real diff harvest ─────────────────────────────────────────────────
 
 describe("startCodeLoop — lifecycle + git diff harvest", () => {
+  it("refuses pre-existing agent Git config and hooks before host seed commands", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "cl-preseed-git-"));
+    const marker = join(sandbox, "hook-ran");
+    const hooks = join(sandbox, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(
+      join(sandbox, ".git", "config"),
+      "[core]\n\thooksPath = " + hooks +
+      "\n[filter \"host-pwn\"]\n\tclean = /bin/sh -c 'touch " + marker + "; cat'\n\trequired = true\n",
+    );
+    writeFileSync(join(hooks, "post-commit"), "#!/bin/sh\ntouch \"" + marker + "\"\n");
+    chmodSync(join(hooks, "post-commit"), 0o755);
+
+    expect(() => seedSandbox(sandbox, [
+      { path: "a.ts", content: "export {};\n" },
+      { path: ".git/config", content: "[filter \"host-pwn\"]\n" },
+      { path: ".git/hooks/post-commit", content: "#!/bin/sh\n" },
+    ])).toThrow(/pre-existing agent Git metadata|\.git/);
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it("persists a failed transient cleanup and the sweep retries it after terminal arm-error", async () => {
     const start = await startCodeLoop(
       { instruction: "no-op", files: [{ path: "a.ts", content: "export {};\n" }] },
@@ -316,6 +339,307 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     const row = getDb().prepare("SELECT source, outcome FROM delegations WHERE source='code-loop' ORDER BY ts DESC LIMIT 1").get() as { source: string; outcome: string };
     expect(row.source).toBe("code-loop");
     expect(row.outcome).toBe("unverified"); // no check_cmd
+  });
+
+  it("preserves deleted and added paths when harvesting through trusted Git metadata", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "replace old with new",
+        files: [
+          { path: "keep.ts", content: "export const keep = true;\n" },
+          { path: "old.ts", content: "export const old = true;\n" },
+        ],
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          unlinkSync(join(sandboxDir, "old.ts"));
+          writeFileSync(join(sandboxDir, "new.ts"), "export const replacement = true;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 2, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+            finalMessage: "replaced file",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files.sort()).toEqual(["new.ts", "old.ts"]);
+    expect(result.result.diff).toContain("deleted file mode");
+    expect(result.result.diff).toContain("new file mode");
+    expect(existsSync(join(workroot, ".code-loop-host-git", start.work_id))).toBe(false);
+  });
+
+  it("never executes an agent-planted case-variant Git clean filter during host harvest", async () => {
+    const markerDir = mkdtempSync(join(tmpdir(), "cl-host-filter-marker-"));
+    const marker = join(markerDir, "executed");
+    const helper = join(markerDir, "filter.sh");
+    writeFileSync(helper, `#!/bin/sh\n/bin/cat\n/usr/bin/touch "${marker}"\n`);
+    chmodSync(helper, 0o755);
+    let caseVariantWritten = false;
+    let caseVariantHiddenDuringHostAdd = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (caseVariantWritten && argv[0] === "/usr/bin/git" && argv.includes("add") && opts.env["GIT_DIR"]?.includes(".code-loop-host-git")) {
+        caseVariantHiddenDuringHostAdd = !existsSync(join(opts.cwd, ".GITATTRIBUTES"));
+      }
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+
+    const engineRun = async (sandboxDir: string): Promise<EngineRunResult> => {
+      appendFileSync(join(sandboxDir, ".git", "config"), `\n[filter "host-pwn"]\n\tclean = ${helper}\n\trequired = true\n`);
+      writeFileSync(join(sandboxDir, ".git", "index.lock"), "agent-controlled lock\n");
+      // APFS is case-insensitive: this aliases the attributes file Git resolves as
+      // `.gitattributes` while remaining a distinct path on this Linux test host.
+      writeFileSync(join(sandboxDir, ".GITATTRIBUTES"), "*.ts filter=host-pwn\n");
+      caseVariantWritten = true;
+      writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+      return {
+        outcome: "completed",
+        usage: { turns: 2, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+        finalMessage: "done",
+        unparseableLines: 0,
+        detail: "",
+      };
+    };
+    const start = await startCodeLoop(
+      { instruction: "edit a", files: [{ path: "a.ts", content: "export const x = 1;\n" }] },
+      startCfg(),
+      fakeDeps({ engineRun, runCommand }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files).toContain("a.ts");
+    expect(existsSync(marker)).toBe(false);
+    expect(caseVariantHiddenDuringHostAdd).toBe(true);
+  });
+
+  it("fails closed when an agent creates a nested Git repository that could hide protected files", async () => {
+    let checkAttempted = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "write the protected file in a nested repository",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        protected: ["nested/protected.ts"],
+        check_cmd: "true",
+      },
+      startCfg(),
+      fakeDeps({
+        runCommand,
+        engineRun: async (sandboxDir) => {
+          mkdirSync(join(sandboxDir, "nested", ".GIT"), { recursive: true });
+          writeFileSync(join(sandboxDir, "nested", ".GIT", "config"), "[core]\n\trepositoryformatversion = 0\n");
+          writeFileSync(join(sandboxDir, "nested", "protected.ts"), "must not be hidden\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("arm-error");
+    expect(result.result.detail).toContain("agent Git metadata");
+    expect(result.result.diff).toBe("");
+    expect(result.result.changed_files).toEqual([]);
+    expect(result.result.protected_violations).toEqual([]);
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+  });
+
+  it("harvests textual changes despite agent-controlled .gitattributes diff attributes", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "edit a TypeScript file",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, ".gitattributes"), "*.ts -diff\n");
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files.sort()).toEqual([".gitattributes", "a.ts"]);
+    expect(result.result.diff).not.toContain("Binary files");
+    expect(result.result.diff).toContain("-export const x = 1;");
+    expect(result.result.diff).toContain("+export const x = 2;");
+  });
+
+  it("force-adds ignored files so protected additions are detected and check_cmd is suppressed", async () => {
+    let checkAttempted = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "write the protected file",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        protected: ["protected.ts"],
+        check_cmd: "false",
+      },
+      startCfg(),
+      fakeDeps({
+        runCommand,
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, ".gitignore"), ".gitignore\nprotected.ts\n");
+          writeFileSync(join(sandboxDir, "protected.ts"), "must not be hidden\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files.sort()).toEqual([".gitignore", "protected.ts"]);
+    expect(result.result.protected_violations).toEqual(["protected.ts"]);
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+  });
+
+  it("fails closed with no harvest when transient cleanup is still pending", async () => {
+    let checkAttempted = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "edit a",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        check_cmd: "true",
+      },
+      startCfg(),
+      fakeDeps({
+        runCommand,
+        cleanupUnit: async () => { throw new Error("user bus unavailable"); },
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("arm-error");
+    expect(result.result.detail).toContain("transient cleanup pending");
+    expect(result.result.diff).toBe("");
+    expect(result.result.changed_files).toEqual([]);
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+  });
+
+  it("fails closed and skips check_cmd when any trusted Git harvest command fails", async () => {
+    let checkAttempted = false;
+    let trustedGitDir: string | undefined;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv[0] === "/usr/bin/git" && argv.includes("diff") && argv.includes("--cached")) {
+        trustedGitDir = opts.env["GIT_DIR"];
+        return { code: 1, stdout: "", stderr: "forced harvest failure" };
+      }
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "edit a",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        check_cmd: "test -f a.ts",
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 2, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+        runCommand,
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("arm-error");
+    expect(result.result.detail).toContain("trusted Git harvest failed");
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+    expect(trustedGitDir).toMatch(/^\//);
+    expect(trustedGitDir).not.toBe(join(workroot, ".git"));
   });
 
   it("check_cmd pass → ledger pass; protected violation disqualifies the check", async () => {
@@ -790,7 +1114,9 @@ describe("code_loop_start caller idempotency (#251)", () => {
     expect(duplicate.recovered).toBe(true);
     expect(duplicate.status).toBe("running");
     expect(duplicate.request_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
-    for (let i = 0; i < 50 && executions === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    // The seed consists of several real Git subprocesses; under the full code-loop suite it can
+    // exceed the old 250 ms timing assumption even though admission already recovered correctly.
+    for (let i = 0; i < 1_000 && executions === 0; i++) await new Promise((r) => setTimeout(r, 5));
     expect(executions).toBe(1);
 
     release();
@@ -1730,6 +2056,26 @@ describe("isCodeLoopUnitName", () => {
 });
 
 describe("sweepCodeLoopSandboxes", () => {
+  it("reclaims stale trusted Git metadata but preserves a live peer's directory", async () => {
+    const staleWorkId = "cl-20260714-deadbeef";
+    const liveWorkId = "cl-20260714-cafebabe";
+    const trustedRoot = join(workroot, ".code-loop-host-git");
+    mkdirSync(join(trustedRoot, staleWorkId), { recursive: true, mode: 0o700 });
+    mkdirSync(join(trustedRoot, liveWorkId), { recursive: true, mode: 0o700 });
+    const lease = acquireDurableCodeLoopLease(workroot, liveWorkId, () => true);
+    expect(lease.kind).toBe("acquired");
+    if (lease.kind !== "acquired") return;
+
+    await sweepCodeLoopSandboxes(
+      { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+      { now: () => Date.now(), stopUnit: async () => {} },
+    );
+
+    expect(existsSync(join(trustedRoot, staleWorkId))).toBe(false);
+    expect(existsSync(join(trustedRoot, liveWorkId))).toBe(true);
+    lease.lease.release();
+  });
+
   it("does not orphan a running sandbox owned by an overlapping live gateway process", async () => {
     const workId = "cl-20260714-cafebabe";
     const lease = acquireDurableCodeLoopLease(workroot, workId, () => true);

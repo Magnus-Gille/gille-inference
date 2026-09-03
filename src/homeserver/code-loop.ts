@@ -1,4 +1,4 @@
-import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync } from "node:fs";
+import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
 import { dirname, join, sep, resolve, isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
@@ -76,6 +76,7 @@ export const CODE_LOOP_CAPABILITIES = {
   start_idempotency: "client-run-id-v1",
   agent_checks: "pi-bash-events-v3",
 } as const;
+const TRUSTED_GIT_ROOT_NAME = ".code-loop-host-git";
 export const CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT =
   `contract[harness=${CODE_LOOP_HARNESS_VERSION};agent_checks=${CODE_LOOP_CAPABILITIES.agent_checks};` +
   `schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
@@ -343,6 +344,7 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
   // refuse ALL seeds — found by the first live smoke, 2026-07-02.
   const baseAbs = resolve(sandboxDir);
   const baseReal = realpathSync(baseAbs);
+  assertNoPreexistingAgentGit(baseAbs);
   for (const f of files) {
     const rel = f.path;
     if (rel.includes("\0")) throw new Error(`code-loop: seed path contains a NUL byte — refusing.`);
@@ -353,7 +355,7 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
       throw new Error(`code-loop: seed path '${rel}' escapes the sandbox — refusing.`);
     }
     // Reject any component that is `.git` (protect the diff baseline + host git ops).
-    if (/(^|[\\/])\.git([\\/]|$)/.test(rel)) {
+    if (/(^|[\\/])\.git([\\/]|$)/i.test(rel)) {
       throw new Error(`code-loop: seed path '${rel}' targets a .git directory — refusing.`);
     }
     // Create parent dirs lexically, THEN realpath-verify the parent is still inside the sandbox.
@@ -375,6 +377,218 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
     } finally {
       closeSync(fd);
     }
+  }
+}
+
+/**
+ * The nested agent repository is compatibility state, never host authority. Refuse to run a
+ * host-side seed against a re-entered sandbox whose `.git` already exists: reading its config
+ * during `git add` could activate an agent-controlled clean filter, and `git commit` could run a
+ * post-commit hook. A fresh `mkdtemp` sandbox has no such entry; this is a fail-closed guard for
+ * recovery/re-entry and for direct callers of seedSandbox.
+ */
+function assertNoPreexistingAgentGit(sandboxDir: string): void {
+  const walk = (directory: string): void => {
+    for (const entry of readSandboxEntries(directory)) {
+      if (entry.name.toLowerCase() === ".git") {
+        throw new Error("code-loop: pre-existing agent Git metadata is not trusted — refusing to seed");
+      }
+      if (entry.stat.isSymbolicLink()) continue;
+      if (entry.stat.isDirectory()) walk(entry.absolutePath);
+    }
+  };
+  walk(sandboxDir);
+}
+
+interface AgentGitIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface WorktreeAttribute {
+  absolutePath: string;
+  relativePath: string;
+  mode: string;
+}
+
+function captureAgentGitIdentity(sandboxDir: string): AgentGitIdentity {
+  const gitPath = join(sandboxDir, ".git");
+  let stat: Stats;
+  try {
+    stat = lstatSync(gitPath);
+  } catch (err) {
+    throw new Error(`agent Git metadata is missing after seed: ${(err as Error).message}`);
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("agent Git metadata is not a real top-level directory after seed");
+  }
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function readSandboxEntries(directory: string): Array<{ name: string; absolutePath: string; stat: Stats }> {
+  let names: Dirent[];
+  try {
+    names = readdirSync(directory, { withFileTypes: true });
+  } catch (err) {
+    throw new Error(`cannot inspect sandbox path '${directory}': ${(err as Error).message}`);
+  }
+  const entries: Array<{ name: string; absolutePath: string; stat: Stats }> = [];
+  for (const entry of names) {
+    const absolutePath = join(directory, entry.name);
+    let stat: Stats;
+    try {
+      stat = lstatSync(absolutePath);
+    } catch (err) {
+      throw new Error(`cannot inspect sandbox path '${absolutePath}': ${(err as Error).message}`);
+    }
+    entries.push({ name: entry.name, absolutePath, stat });
+  }
+  return entries;
+}
+
+/**
+ * Agent Git metadata is compatibility state, but a nested repository is host-visible authority:
+ * `git add` can record it as a gitlink and thereby hide protected payloads below it. Walk the
+ * sandbox after the agent exits without following symlinks and allow only the exact top-level
+ * `.git` directory created by our seed. The inode check also rejects an agent replacing that
+ * compatibility directory in place.
+ */
+function assertNoAgentGitMetadata(sandboxDir: string, expected: AgentGitIdentity): void {
+  const topLevelGit = join(sandboxDir, ".git");
+  let topStat: Stats;
+  try {
+    topStat = lstatSync(topLevelGit);
+  } catch (err) {
+    throw new Error(`agent Git metadata is missing after run: ${(err as Error).message}`);
+  }
+  if (
+    !topStat.isDirectory() ||
+    topStat.isSymbolicLink() ||
+    topStat.dev !== expected.dev ||
+    topStat.ino !== expected.ino
+  ) {
+    throw new Error("agent replaced the known top-level Git metadata directory");
+  }
+
+  const walk = (directory: string, relativeDirectory: string): void => {
+    for (const entry of readSandboxEntries(directory)) {
+      const relativePath = relativeDirectory === "" ? entry.name : `${relativeDirectory}/${entry.name}`;
+      if (entry.name.toLowerCase() === ".git") {
+        const isKnownTopLevel = relativeDirectory === "" &&
+          entry.stat.isDirectory() &&
+          !entry.stat.isSymbolicLink() &&
+          entry.stat.dev === expected.dev &&
+          entry.stat.ino === expected.ino;
+        if (!isKnownTopLevel) {
+          throw new Error(`agent-created Git metadata at '${relativePath}' is not trusted`);
+        }
+      }
+      // lstatSync above deliberately inspects the link itself. Never recurse through a link,
+      // whose target may be outside the sandbox or may change during this validation.
+      if (entry.stat.isSymbolicLink()) continue;
+      if (entry.stat.isDirectory()) walk(entry.absolutePath, relativePath);
+    }
+  };
+  walk(sandboxDir, "");
+}
+
+function listWorktreeAttributes(sandboxDir: string): WorktreeAttribute[] {
+  const attributes: WorktreeAttribute[] = [];
+  const walk = (directory: string, relativeDirectory: string): void => {
+    for (const entry of readSandboxEntries(directory)) {
+      const relativePath = relativeDirectory === "" ? entry.name : `${relativeDirectory}/${entry.name}`;
+      if (relativeDirectory === "" && entry.name.toLowerCase() === ".git") continue;
+      if (entry.name.toLowerCase() === ".gitattributes") {
+        if (entry.stat.isSymbolicLink() || !entry.stat.isFile()) {
+          throw new Error(`sandbox .gitattributes path '${relativePath}' is not a regular file`);
+        }
+        attributes.push({
+          absolutePath: entry.absolutePath,
+          relativePath,
+          mode: (entry.stat.mode & 0o111) === 0 ? "100644" : "100755",
+        });
+      }
+      if (entry.stat.isSymbolicLink()) continue;
+      if (entry.stat.isDirectory()) walk(entry.absolutePath, relativePath);
+    }
+  };
+  walk(sandboxDir, "");
+  return attributes;
+}
+
+function pathExistsNoFollow(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+async function withWorktreeAttributesHidden<T>(
+  sandboxDir: string,
+  trustedGitDir: string,
+  fn: () => Promise<T>,
+): Promise<{ value: T; attributes: WorktreeAttribute[] }> {
+  const attributes = listWorktreeAttributes(sandboxDir);
+  if (attributes.length === 0) return { value: await fn(), attributes };
+  const temporaryRoot = mkdtempSync(join(dirname(trustedGitDir), ".code-loop-attrs-"));
+  const moved: Array<{ attribute: WorktreeAttribute; temporaryPath: string }> = [];
+  try {
+    for (const attribute of attributes) {
+      const temporaryPath = join(temporaryRoot, String(moved.length));
+      renameSync(attribute.absolutePath, temporaryPath);
+      moved.push({ attribute, temporaryPath });
+    }
+    const value = await fn();
+    return { value, attributes };
+  } finally {
+    let restoreError: unknown = null;
+    for (const { attribute, temporaryPath } of moved.reverse()) {
+      try {
+        if (pathExistsNoFollow(attribute.absolutePath)) {
+          throw new Error(`sandbox attribute path '${attribute.relativePath}' changed during Git operation`);
+        }
+        renameSync(temporaryPath, attribute.absolutePath);
+      } catch (err) {
+        restoreError ??= err;
+      }
+    }
+    try {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    } catch (err) {
+      restoreError ??= err;
+    }
+    if (restoreError !== null) throw restoreError;
+  }
+}
+
+async function stageWorktreeAttributes(
+  attributes: WorktreeAttribute[],
+  trustedOpts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+  deps: CodeLoopDeps,
+): Promise<void> {
+  for (const attribute of attributes) {
+    if (!pathExistsNoFollow(attribute.absolutePath)) continue;
+    const stat = lstatSync(attribute.absolutePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`sandbox .gitattributes path '${attribute.relativePath}' changed during Git operation`);
+    }
+    const blob = await requireGit(
+      ["hash-object", "-w", "--no-filters", "--", attribute.absolutePath],
+      trustedOpts,
+      deps,
+      "trusted Git attribute blob",
+    );
+    const oid = blob.stdout.trim();
+    if (!/^[a-f0-9]{40,64}$/.test(oid)) throw new Error("trusted Git returned an invalid attribute blob");
+    await requireGit(
+      ["update-index", "--add", "--cacheinfo", attribute.mode, oid, attribute.relativePath],
+      trustedOpts,
+      deps,
+      "trusted Git attribute index update",
+    );
   }
 }
 
@@ -1063,29 +1277,46 @@ async function runJob(
   leaseLost: () => boolean
 ): Promise<void> {
   const caps = job.effectiveCaps;
-  const seedSha = await gitInitSeed(job.sandboxDir, deps);
-
-  let outcome: CodeLoopTerminalStatus;
+  let outcome: CodeLoopTerminalStatus = "arm-error";
   let detail = "";
+  let seedSha: string | null = null;
+  let knownAgentGit: AgentGitIdentity | null = null;
+  let trustedGitCreated = false;
+  let trustedGitDir: string | null = null;
   try {
-    const run = await deps.engine.run({
-      sandboxDir: job.sandboxDir,
-      instruction: applyEditDeadlinePolicy(req.instruction, caps.edit_deadline_turn),
-      model: job.model,
-      caps,
-      cageArgv,
-      growthCapBytes,
-    });
-    job.usage = run.usage;
-    job.engineTelemetry = run.telemetry ?? null;
-    detail = run.detail;
-    outcome = leaseLost() ? "arm-error" : run.outcome;
-    if (leaseLost()) detail = "GPU lease lost mid-run (preempted).";
-    job.summary = run.finalMessage;
+    trustedGitDir = trustedGitDirPath(job.workroot, job.id);
+    createTrustedGitDir(job.workroot, job.id);
+    trustedGitCreated = true;
+    const seededSha = await gitInitSeed(job.sandboxDir, trustedGitDir, deps);
+    const seededAgentGit = captureAgentGitIdentity(job.sandboxDir);
+    seedSha = seededSha;
+    knownAgentGit = seededAgentGit;
   } catch (err) {
     outcome = "arm-error";
-    detail = `engine error: ${(err as Error).message}`;
+    detail = `trusted Git seed failed: ${(err as Error).message}`;
     job.summary = "";
+  }
+  if (seedSha !== null) {
+    try {
+      const run = await deps.engine.run({
+        sandboxDir: job.sandboxDir,
+        instruction: applyEditDeadlinePolicy(req.instruction, caps.edit_deadline_turn),
+        model: job.model,
+        caps,
+        cageArgv,
+        growthCapBytes,
+      });
+      job.usage = run.usage;
+      job.engineTelemetry = run.telemetry ?? null;
+      detail = run.detail;
+      outcome = leaseLost() ? "arm-error" : run.outcome;
+      if (leaseLost()) detail = "GPU lease lost mid-run (preempted).";
+      job.summary = run.finalMessage;
+    } catch (err) {
+      outcome = "arm-error";
+      detail = `engine error: ${(err as Error).message}`;
+      job.summary = "";
+    }
   }
 
   // A manager-spawned service is not a child of the gateway. Publish a terminal result only after
@@ -1101,14 +1332,63 @@ async function runJob(
     job.summary = "";
   }
 
-  // Harvest the diff from git (ground truth), on ALL terminal statuses (best-effort).
-  const harvest = await gitHarvest(job.sandboxDir, seedSha, deps);
+  // A failed cleanup means the manager has not proved the model process tree is absent. Never
+  // publish a completed result with an empty/untrusted harvest in that state.
+  if (job.cleanupPending) {
+    outcome = "arm-error";
+    detail = detail === ""
+      ? "transient cleanup pending; trusted Git harvest refused"
+      : `${detail}; trusted Git harvest refused while cleanup is pending`;
+    job.summary = "";
+  }
+
+  // Harvest only after the manager proves the model process tree is absent. The baseline/index
+  // live in a host-only Git directory outside the cage's one read-write bind; the agent's `.git`
+  // remains available for its own workflow but is never consumed as host authority.
+  let harvest = { diff: "", changedFiles: [] as string[] };
+  let harvestTrusted = false;
+  let agentGitValid = false;
+  // Validate immediately after cleanup proves the manager-spawned process tree is absent. A
+  // pre-cleanup scan would leave a race in which a residual process mutates the sandbox after the
+  // proof but before trusted harvest.
+  if (!job.cleanupPending && seedSha !== null && trustedGitDir !== null && knownAgentGit !== null) {
+    try {
+      assertNoAgentGitMetadata(job.sandboxDir, knownAgentGit);
+      agentGitValid = true;
+    } catch (err) {
+      outcome = "arm-error";
+      detail = `agent Git metadata validation failed: ${(err as Error).message}`;
+      job.summary = "";
+    }
+  }
+  try {
+    if (seedSha !== null && trustedGitDir !== null && agentGitValid && !job.cleanupPending) {
+      harvest = await gitHarvest(job.sandboxDir, trustedGitDir, seedSha, deps);
+      harvestTrusted = true;
+    }
+  } catch (err) {
+    outcome = "arm-error";
+    detail = `trusted Git harvest failed: ${(err as Error).message}`;
+    job.summary = "";
+  } finally {
+    if (trustedGitCreated && trustedGitDir !== null) {
+      try {
+        removeTrustedGitDir(job.workroot, job.id);
+      } catch (err) {
+        outcome = "arm-error";
+        detail = `trusted Git cleanup failed: ${(err as Error).message}`;
+        job.summary = "";
+        harvestTrusted = false;
+        harvest = { diff: "", changedFiles: [] };
+      }
+    }
+  }
   const protectedViolations = harvest.changedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
 
   // Run check_cmd inside the SAME cage (design §6) only on a completed run.
   let check = { ran: false, exit_code: null as number | null, output_tail: "" };
   let checkDurationMs: number | undefined;
-  if (outcome === "completed" && job.checkCmd !== null && protectedViolations.length === 0) {
+  if (outcome === "completed" && harvestTrusted && job.checkCmd !== null && protectedViolations.length === 0) {
     const checkStartedAt = deps.now();
     check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
     checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
@@ -1213,31 +1493,178 @@ function buildResultTelemetry(
 
 // ─── git helpers (ground truth for the diff) ────────────────────────────────────────────
 
-const GIT_ENV = { GIT_AUTHOR_NAME: "code-loop", GIT_AUTHOR_EMAIL: "code-loop@local", GIT_COMMITTER_NAME: "code-loop", GIT_COMMITTER_EMAIL: "code-loop@local" };
+const GIT = "/usr/bin/git";
+const GIT_ENV = {
+  GIT_AUTHOR_NAME: "code-loop",
+  GIT_AUTHOR_EMAIL: "code-loop@local",
+  GIT_COMMITTER_NAME: "code-loop",
+  GIT_COMMITTER_EMAIL: "code-loop@local",
+};
+const CODE_LOOP_WORK_ID_RE = /^cl-\d{8}-[0-9a-f]{8}$/;
 
-async function gitInitSeed(sandboxDir: string, deps: CodeLoopDeps): Promise<string> {
-  const env = { ...gitBaseEnv(), ...GIT_ENV };
-  await deps.runCommand(["git", "init", "-q"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  await deps.runCommand(["git", "add", "-A"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  await deps.runCommand(["git", "commit", "-q", "-m", "seed", "--allow-empty"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const rev = await deps.runCommand(["git", "rev-parse", "HEAD"], { cwd: sandboxDir, env, timeoutMs: 10_000 });
-  return rev.stdout.trim();
+function trustedGitRootPath(workroot: string): string {
+  return join(realpathSync(resolve(workroot)), TRUSTED_GIT_ROOT_NAME);
 }
 
-async function gitHarvest(sandboxDir: string, seedSha: string, deps: CodeLoopDeps): Promise<{ diff: string; changedFiles: string[] }> {
-  const env = { ...gitBaseEnv(), ...GIT_ENV };
-  await deps.runCommand(["git", "add", "-A"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const diffRes = await deps.runCommand(["git", "diff", "--cached", seedSha], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const namesRes = await deps.runCommand(["git", "diff", "--cached", "--name-only", seedSha], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const changed = namesRes.stdout.split("\n").map((s) => s.trim()).filter((s) => s !== "");
-  // Re-validate changed-file paths for containment on the way out (design §5.4).
-  const contained = changed.filter((f) => !isAbsolute(f) && !f.split(/[\\/]/).includes(".."));
-  return { diff: diffRes.stdout, changedFiles: contained };
+function trustedGitDirPath(workroot: string, workId: string): string {
+  if (!CODE_LOOP_WORK_ID_RE.test(workId)) throw new Error("invalid trusted Git work id");
+  return join(trustedGitRootPath(workroot), workId);
+}
+
+function assertPrivateOwnedDirectory(path: string, expectedPath: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("trusted Git path is not a directory");
+  if (realpathSync(path) !== expectedPath) throw new Error("trusted Git path escaped its canonical location");
+  if ((stat.mode & 0o077) !== 0) throw new Error("trusted Git path permissions are not private");
+  const uid = process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) throw new Error("trusted Git path has the wrong owner");
+}
+
+function createTrustedGitDir(workroot: string, workId: string): string {
+  const root = trustedGitRootPath(workroot);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  assertPrivateOwnedDirectory(root, root);
+  const dir = trustedGitDirPath(workroot, workId);
+  mkdirSync(dir, { mode: 0o700 });
+  assertPrivateOwnedDirectory(dir, dir);
+  return dir;
+}
+
+function removeTrustedGitDir(workroot: string, workId: string): void {
+  const dir = trustedGitDirPath(workroot, workId);
+  if (!existsSync(dir)) return;
+  assertPrivateOwnedDirectory(dir, dir);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function sweepTrustedGitDirs(workroot: string): void {
+  if (!existsSync(resolve(workroot))) return;
+  const root = trustedGitRootPath(workroot);
+  if (!existsSync(root)) return;
+  assertPrivateOwnedDirectory(root, root);
+  for (const workId of readdirSync(root)) {
+    if (!CODE_LOOP_WORK_ID_RE.test(workId)) continue;
+    if (jobs.has(workId) || isDurableCodeLoopWorkLive(workroot, workId)) continue;
+    removeTrustedGitDir(workroot, workId);
+  }
+}
+
+async function requireGit(
+  argv: string[],
+  opts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+  deps: CodeLoopDeps,
+  operation: string
+): Promise<{ stdout: string; stderr: string }> {
+  const result = await deps.runCommand([GIT, ...GIT_SAFE_CONFIG, ...argv], opts);
+  if (result.code !== 0) {
+    const diagnostic = result.stderr.trim().replace(/[\r\n]+/g, " ").slice(-200);
+    throw new Error(`${operation} exited ${result.code === null ? "without a status" : String(result.code)}${diagnostic === "" ? "" : `: ${diagnostic}`}`);
+  }
+  return result;
+}
+
+async function trustedGitAdd(
+  sandboxDir: string,
+  trustedGitDir: string,
+  trustedOpts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+  deps: CodeLoopDeps,
+  operation: string,
+): Promise<void> {
+  // Worktree attributes are agent input. Hide them while Git discovers files so clean filters,
+  // text conversion, and other attribute-driven behavior cannot affect host staging. Restore and
+  // stage the attribute files as raw blobs afterward, preserving them in the delivered diff.
+  const staged = await withWorktreeAttributesHidden(sandboxDir, trustedGitDir, async () => {
+    await requireGit(["add", "-A", "-f"], trustedOpts, deps, operation);
+    return true;
+  });
+  await stageWorktreeAttributes(staged.attributes, trustedOpts, deps);
+}
+
+async function gitInitSeed(sandboxDir: string, trustedGitDir: string, deps: CodeLoopDeps): Promise<string> {
+  assertNoPreexistingAgentGit(sandboxDir);
+  const agentEnv = { ...gitBaseEnv(), ...GIT_ENV };
+  const agentOpts = { cwd: sandboxDir, env: agentEnv, timeoutMs: 30_000 };
+  // Preserve the nested repository expected by coding harnesses. It is agent workspace state only;
+  // host harvest never reads this directory or its configuration.
+  await requireGit(["init", "-q"], agentOpts, deps, "agent Git init");
+  await requireGit(["add", "-A", "-f"], agentOpts, deps, "agent Git seed add");
+  await requireGit(["commit", "-q", "-m", "seed", "--allow-empty", "--no-verify"], agentOpts, deps, "agent Git seed commit");
+
+  await requireGit(["init", "-q", "--bare", trustedGitDir], agentOpts, deps, "trusted Git init");
+  const trustedEnv = { ...gitBaseEnv(), ...GIT_ENV, GIT_DIR: trustedGitDir, GIT_WORK_TREE: sandboxDir };
+  const trustedOpts = { cwd: sandboxDir, env: trustedEnv, timeoutMs: 30_000 };
+  await trustedGitAdd(sandboxDir, trustedGitDir, trustedOpts, deps, "trusted Git seed add");
+  await requireGit(["commit", "-q", "-m", "seed", "--allow-empty", "--no-verify"], trustedOpts, deps, "trusted Git seed commit");
+  const rev = await requireGit(["rev-parse", "HEAD"], { ...trustedOpts, timeoutMs: 10_000 }, deps, "trusted Git seed revision");
+  const seedSha = rev.stdout.trim();
+  if (!/^[a-f0-9]{40,64}$/.test(seedSha)) throw new Error("trusted Git returned an invalid seed revision");
+  return seedSha;
+}
+
+async function gitHarvest(
+  sandboxDir: string,
+  trustedGitDir: string,
+  seedSha: string,
+  deps: CodeLoopDeps
+): Promise<{ diff: string; changedFiles: string[] }> {
+  const env = { ...gitBaseEnv(), ...GIT_ENV, GIT_DIR: trustedGitDir, GIT_WORK_TREE: sandboxDir };
+  const opts = { cwd: sandboxDir, env, timeoutMs: 30_000 };
+  await trustedGitAdd(sandboxDir, trustedGitDir, opts, deps, "trusted Git harvest add");
+  const attributeFreeWorktree = mkdtempSync(join(dirname(trustedGitDir), ".code-loop-diff-"));
+  try {
+    const diffOpts = {
+      cwd: attributeFreeWorktree,
+      env: { ...env, GIT_WORK_TREE: attributeFreeWorktree },
+      timeoutMs: 30_000,
+    };
+    const diffRes = await requireGit(
+      ["diff", "--cached", "--text", "--no-ext-diff", "--no-textconv", seedSha, "--"],
+      diffOpts,
+      deps,
+      "trusted Git harvest diff"
+    );
+    const namesRes = await requireGit(
+      ["diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", seedSha, "--"],
+      diffOpts,
+      deps,
+      "trusted Git harvest names"
+    );
+    if (namesRes.stdout !== "" && !namesRes.stdout.endsWith("\0")) {
+      throw new Error("trusted Git returned malformed changed-file framing");
+    }
+    const changed = namesRes.stdout === "" ? [] : namesRes.stdout.slice(0, -1).split("\0");
+    for (const path of changed) {
+      if (path === "" || path.includes("\0") || isAbsolute(path) || path.split(/[\\/]/).includes("..")) {
+        throw new Error("trusted Git returned an unsafe changed-file path");
+      }
+    }
+    return { diff: diffRes.stdout, changedFiles: changed };
+  } finally {
+    rmSync(attributeFreeWorktree, { recursive: true, force: true });
+  }
 }
 
 function gitBaseEnv(): Record<string, string> {
-  return { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_NOSYSTEM: "1" };
+  return {
+    PATH: "/usr/bin:/bin",
+    HOME: "/nonexistent",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PAGER: "/bin/cat",
+  };
 }
+
+// Command-scoped config wins over any local repository config that may have survived a re-entry.
+// The pre-existing `.git` guard remains mandatory because arbitrary local filter names cannot be
+// neutralized generically; explicit hooks/excludes settings close the remaining Git config
+// surfaces for every host and agent seed command.
+const GIT_SAFE_CONFIG = [
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.excludesFile=/dev/null",
+] as const;
 
 const CHECK_TIMEOUT_MS = 120_000;
 
@@ -1451,6 +1878,14 @@ export async function sweepCodeLoopSandboxes(
   for (const [workId, job] of jobs) {
     if (resolve(job.workroot) === canonicalWorkroot && job.status !== "running" &&
         now - job.startedAtMs > cfg.retentionTtlMs) jobs.delete(workId);
+  }
+  // The trusted host index is intentionally outside the agent cage. A gateway crash can leave
+  // one behind, so reclaim it only after proving that neither this process nor a durable peer
+  // still owns the work id. Malformed entries are ignored rather than becoming recursive targets.
+  try {
+    sweepTrustedGitDirs(cfg.workroot);
+  } catch {
+    // A malformed/hostile trusted index must not prevent the ordinary sandbox/orphan sweep.
   }
   let entries: string[];
   try {
