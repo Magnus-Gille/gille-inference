@@ -128,11 +128,13 @@ For an owner-attended gateway deployment, load the deploy script's environment i
 shell with this exact invocation:
 
 ```bash
-eval "$(m5 --profile codex deploy-env)"
+eval "$(m5 --profile codex deploy-env --auth-helper "$HOME/.local/bin/m5-auth")"
 ```
 
 `deploy-env` emits shell source specifically for that outer `eval`; do not run it merely to print
-the source. The source first evaluates `m5-auth --env --tailnet`, copies its `M5_API_KEY` into the
+the source. The required `--auth-helper` must be an absolute path; the source shell-quotes it and
+does not inspect, execute, or attest that file until the outer shell evaluates the output. The
+source first evaluates the selected helper with `--env --tailnet`, copies its `M5_API_KEY` into the
 deploy script's `HOMESERVER_OWNER_KEY`, and immediately unsets `M5_API_KEY`. It derives
 `DEPLOY_HEALTH_TAILNET_URL` and `DEPLOY_CAPABILITY_URL` from the authenticated helper's
 `M5_GATEWAY_URL`. It also exports `DEPLOY_PUBLIC_HTTP_URL` and `DEPLOY_PUBLIC_HTTPS_URL` from the
@@ -142,10 +144,12 @@ tailnet locator needs to be committed or hardcoded in the client.
 The command reads and validates the selected non-secret profile but does not resolve its Keychain
 credential and never emits a bearer. `--private` is rejected: the tailnet endpoint and credential
 belong to `m5-auth --env --tailnet`, while the profile supplies only the public verification
-origin. Generated literal origins are shell-quoted before emission. The source clears prior values
-for every variable it owns and stops before exporting a partial environment when `m5-auth` cannot
-produce a non-empty credential. Treat the output as executable shell source: never print or save
-it, and do not enable shell tracing while evaluating it.
+origin. `--auth-helper` is valid only with `deploy-env`; relative paths are rejected. Generated
+literal origins are shell-quoted before emission. The source clears prior values for every variable
+it owns and stops before exporting a partial environment when the helper cannot produce a non-empty
+credential. Treat the output as executable shell source: never print or save it, and do not enable
+shell tracing while evaluating it. Any path integrity attestation remains the launcher's
+responsibility.
 
 ## Commands
 
