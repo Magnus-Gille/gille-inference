@@ -13,11 +13,11 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`, starting with client package version
-`1.3.0`:
+The `m5` executable ships in the same npm package as `hs`. Install the current accepted client
+package with an exact pin:
 
 ```bash
-npm install --global gille-inference@1.3.0
+npm install --global gille-inference@1.3.2
 m5 --version
 ```
 
@@ -25,7 +25,8 @@ m5 --version
 prepared as `1.1.0` but was never published; `1.2.0` added the required content-free adoption
 reporting contract as the first public M5-capable version. `1.2.1` kept that surface and added
 the structured `list_models` blind-context discovery contract. Version `1.3.0` adds guided
-owner-agent profile provisioning.
+owner-agent profile provisioning. Version `1.3.2` adds one bounded, idempotent transport retry for
+terminal `code_loop_result` retrieval.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
@@ -306,6 +307,14 @@ Connector failures are returned as redacted JSON-RPC error data rather than a ba
   `gateway_http_error`.
 - `retryable` and a fixed locator-free `remediation` tell the caller whether to retry the same
   operation and then run the selected profile's `m5 doctor` check.
+
+For `code_loop_result` only, the stdio bridge consumes the first retryable transport or
+gateway-health failure and repeats the identical read-only JSON-RPC call once with the same durable
+work id. No other tool call receives this automatic retry. If the bounded retry also fails,
+`result_recovery: {status:"retry_exhausted", automatic_retries:1,
+action:"retry_same_work_id"}` distinguishes that recoverable transport state from the gateway's
+structured `unknown work_id` and `terminal result unavailable after restart` tool results. Those
+two durable-state outcomes pass through without a transport retry.
 
 The standalone doctor exercises the configured public/private profile paths; it cannot inspect an
 interactive host connector session and continues to report that boundary explicitly as

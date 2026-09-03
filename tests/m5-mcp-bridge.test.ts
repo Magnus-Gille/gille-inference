@@ -180,6 +180,126 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
+  it("retries code_loop_result once with the same work id after a transient transport failure", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const bridge = await makeBridge(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }),
+        });
+      }
+      return rpcResponse(Number(request.id), {
+        content: [{ type: "text", text: "{}" }],
+        isError: false,
+        structuredContent: {
+          status: "cap-exceeded",
+          work_id: "cl-terminal",
+          diff: "",
+          check: { ran: false },
+        },
+      });
+    });
+    const message = {
+      jsonrpc: "2.0",
+      id: 19,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    };
+
+    const response = await bridge.handleLine(JSON.stringify(message));
+
+    expect(requests).toEqual([message, message]);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 19,
+      result: {
+        isError: false,
+        structuredContent: { status: "cap-exceeded", work_id: "cl-terminal" },
+      },
+    });
+  });
+
+  it("reports exhausted code_loop_result recovery separately from an unknown or lost result", async () => {
+    let calls = 0;
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          calls += 1;
+          throw new M5ClientError("network_failure", "temporary result fetch failure", {
+            diagnosticCode: "connection_reset",
+            failureLayer: "gateway_transport",
+            retryable: true,
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(2);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 20,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "network_failure",
+          retryable: true,
+          result_recovery: {
+            status: "retry_exhausted",
+            automatic_retries: 1,
+            action: "retry_same_work_id",
+          },
+        },
+      },
+    });
+  });
+
+  it.each([
+    {
+      label: "unknown",
+      payload: { error: "unknown work_id", work_id: "cl-terminal" },
+    },
+    {
+      label: "lost",
+      payload: {
+        status: "cap-exceeded",
+        work_id: "cl-terminal",
+        error: "terminal result unavailable after restart",
+      },
+    },
+  ])("does not transport-retry a structured $label result", async ({ payload }) => {
+    let calls = 0;
+    const bridge = await makeBridge(async (_input, init) => {
+      calls += 1;
+      const request = JSON.parse(String(init?.body)) as { id: number };
+      return rpcResponse(request.id, {
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+        isError: true,
+        structuredContent: payload,
+      });
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(1);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 21,
+      result: { isError: true, structuredContent: payload },
+    });
+  });
+
   it.each([
     ["dns_failure", "ENOTFOUND"],
     ["dns_failure", "EAI_AGAIN"],

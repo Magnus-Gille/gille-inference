@@ -84,6 +84,13 @@ inference limit: `inference_availability: "unaffected"`, and only the report sho
 the next UTC day. A connector/transport failure remains `not_recorded` with
 `retry_same_tool_call`; no report payload is echoed or silently persisted.
 
+`code_loop_result` is safe to repeat for the same durable work id. The bridge automatically retries
+that one read-only tool call once after a retryable transport or gateway-health failure, using the
+same JSON-RPC request and work id. If both attempts fail, `result_recovery` reports
+`retry_exhausted` and tells the caller to retry the same work id. Structured `unknown work_id` and
+`terminal result unavailable after restart` responses are returned unchanged and are never treated
+as transport failures.
+
 ### Provisioning a new owner-agent profile
 
 `m5 provision` is an owner-attended macOS operator ceremony. It creates the
