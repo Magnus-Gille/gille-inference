@@ -311,10 +311,12 @@ Connector failures are returned as redacted JSON-RPC error data rather than a ba
 For `code_loop_result` only, the stdio bridge consumes the first retryable transport or
 gateway-health failure and repeats the identical read-only JSON-RPC call once with the same durable
 work id. No other tool call receives this automatic retry. If the bounded retry also fails,
-`result_recovery: {status:"retry_exhausted", automatic_retries:1,
-action:"retry_same_work_id"}` distinguishes that recoverable transport state from the gateway's
-structured `unknown work_id` and `terminal result unavailable after restart` tool results. Those
-two durable-state outcomes pass through without a transport retry.
+`result_recovery` reports `status:"retry_exhausted"` and `automatic_retries:1`. Its action is
+`retry_same_work_id` when the final error remains retryable, otherwise
+`follow_error_remediation`; the final error category and remediation remain authoritative. This
+distinguishes a failed automatic recovery from the gateway's structured `unknown work_id` and
+`terminal result unavailable after restart` tool results. Those two durable-state outcomes pass
+through without a transport retry.
 
 The standalone doctor exercises the configured public/private profile paths; it cannot inspect an
 interactive host connector session and continues to report that boundary explicitly as

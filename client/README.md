@@ -87,9 +87,10 @@ the next UTC day. A connector/transport failure remains `not_recorded` with
 `code_loop_result` is safe to repeat for the same durable work id. The bridge automatically retries
 that one read-only tool call once after a retryable transport or gateway-health failure, using the
 same JSON-RPC request and work id. If both attempts fail, `result_recovery` reports
-`retry_exhausted` and tells the caller to retry the same work id. Structured `unknown work_id` and
-`terminal result unavailable after restart` responses are returned unchanged and are never treated
-as transport failures.
+`retry_exhausted`; it tells the caller to retry the same work id only when the final error remains
+retryable, otherwise to follow that error's remediation. Structured `unknown work_id` and
+`terminal result unavailable after restart` responses are returned unchanged and are never
+treated as transport failures.
 
 ### Provisioning a new owner-agent profile
 

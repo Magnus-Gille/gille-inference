@@ -261,6 +261,53 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
+  it("reports an exhausted automatic retry when the second failure changes category", async () => {
+    let calls = 0;
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          calls += 1;
+          if (calls === 1) {
+            throw new M5ClientError("network_failure", "temporary result fetch failure", {
+              diagnosticCode: "connection_reset",
+              failureLayer: "gateway_transport",
+              retryable: true,
+            });
+          }
+          throw new M5ClientError("rejected_credential", "credential rotated", {
+            failureLayer: "authentication",
+            retryable: false,
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(2);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 22,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "rejected_credential",
+          retryable: false,
+          result_recovery: {
+            status: "retry_exhausted",
+            automatic_retries: 1,
+            action: "follow_error_remediation",
+          },
+        },
+      },
+    });
+  });
+
   it.each([
     {
       label: "unknown",

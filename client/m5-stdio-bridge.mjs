@@ -71,12 +71,14 @@ function bridgeError(error, profile, message, { resultRetryAttempted = false } =
       ...(isAdoptionReport(message) && transportFailure
         ? { evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" } }
         : {}),
-      ...(isCodeLoopResult(message) && resultRetryAttempted && isRetryableResultTransport(error)
+      ...(isCodeLoopResult(message) && resultRetryAttempted
         ? {
             result_recovery: {
               status: "retry_exhausted",
               automatic_retries: 1,
-              action: "retry_same_work_id",
+              action: isRetryableResultTransport(error)
+                ? "retry_same_work_id"
+                : "follow_error_remediation",
             },
           }
         : {}),
