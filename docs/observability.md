@@ -179,6 +179,37 @@ least **20 known organic eligible opportunities** have been reported and whether
 delegations**. Reconsider the measure and the adoption path then; do not optimize the number of
 reports.
 
+### Local evidence bundle export (#245)
+
+The read-only local report
+`tsx scripts/export-m5-adoption-evidence.ts --from <UTC-day-start> --through-exclusive <UTC-day-start>`
+produces one deterministic JSON bundle for an exact half-open time window. Add `--db <path>` to
+inspect a specific `EVAL_DB_PATH`, and `--generated-at <timestamp>` when a reproducible artifact
+timestamp is required. Bounds must be full UTC calendar days because `adoption_evidence` stores
+only a server-derived UTC day; request, delegation, and cost rows use the exact same
+`[from, throughExclusive)` bounds. The command opens a private query-only snapshot through the
+existing read-only DB helper, refuses an active WAL or missing required schema, and writes only to
+stdout.
+
+The bundle carries the shared `m5-admitted-compute-v2` filter epoch plus UTC-day/tier/route/node/
+model utilization and exclusion reconciliations; closed adoption dimensions (purpose, harness, mode,
+result, usefulness, and fallback); a bounded current M5 task×model×verifier×source×outcome matrix;
+cost, delegator-attribution, token, and local-calibration coverage; content-blind identity/policy/
+LearningTask coverage plus exclusive current-M5/shadow/superseded/non-M5/invalid state counts and
+retention-window coverage; and explicit `pass`/`fail`/`unknowable` threshold states. Current-policy
+applicability is reported only as current/stale/missing counts using `HARVEST_JUDGE_POLICY`; raw
+policy stamps are never exported. Because `request_log` has no filter-epoch column, current-filter
+matches are explicitly historical-ambiguous and block promotion. Cost reconciliation separately
+reports missing links and duplicate links/rows; exactly one complete cost row per current delegation
+is required for promotion. LearningTask binding is required across the full current-M5 population.
+The promotion-readiness gate also requires complete current-M5 identity, applicable LearningTask
+binding, reviewer and cost coverage, reconciliation, and no ambiguous historical comparison. The bundle's maturity labels are evidence-only (`measured` when
+rows exist, otherwise `aspirational`); they do not infer deployment state. It never exports prompts, responses, excerpts, hashes,
+aliases, key material, IDs, notes, paths, repositories, or raw unbounded labels; unknown dimensions
+collapse to a bounded bucket and missing evidence remains unknown rather than zero. The report also
+emits one deterministic smallest next action: `improve_agent_access`, `repair_measurement`,
+`keep_routing_shadow`, or `propose_separately_reviewed_lane_promotion`.
+
 ## 4. `owner_request_log` (SQLite) — the ONLY content sink, owner-only
 
 `src/homeserver/owner-log.ts`. This is the **only** place request/response content is captured, and
