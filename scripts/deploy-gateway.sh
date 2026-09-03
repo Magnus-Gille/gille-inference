@@ -364,6 +364,37 @@ probe_health() {
   echo "  OK: $label healthy ($url)"
 }
 
+# Validate every certification input that a real deploy will need before materializing the
+# payload or touching the remote. Keep this pure: it must not probe the network, expand or print
+# the credential value, or otherwise have side effects. The local health URL is intentionally
+# absent here because that probe remains best-effort/optional (issue #30).
+validate_deploy_probe_config() {
+  local missing=0
+  local key_env="$DEPLOY_CAPABILITY_KEY_ENV"
+
+  if [ -z "$DEPLOY_HEALTH_TAILNET_URL" ]; then
+    echo "ERROR: DEPLOY_HEALTH_TAILNET_URL is not set — refusing before any remote mutation." >&2
+    missing=1
+  fi
+  if [ -z "$DEPLOY_CAPABILITY_URL" ]; then
+    echo "ERROR: DEPLOY_CAPABILITY_URL is not set — refusing before any remote mutation." >&2
+    missing=1
+  fi
+  if [[ ! "$key_env" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+    echo "ERROR: DEPLOY_CAPABILITY_KEY_ENV is not a valid environment-variable name — refusing before any remote mutation." >&2
+    missing=1
+  elif [ -z "${!key_env:-}" ]; then
+    echo "ERROR: \$$key_env is not set — refusing before any remote mutation." >&2
+    missing=1
+  fi
+  if [ -z "${DEPLOY_PUBLIC_EDGE_VERIFY_CMD:-}" ] && { [ -z "$DEPLOY_PUBLIC_HTTP_URL" ] || [ -z "$DEPLOY_PUBLIC_HTTPS_URL" ]; }; then
+    echo "ERROR: DEPLOY_PUBLIC_HTTP_URL and DEPLOY_PUBLIC_HTTPS_URL must both be set when DEPLOY_PUBLIC_EDGE_VERIFY_CMD is unset — refusing before any remote mutation." >&2
+    missing=1
+  fi
+
+  return "$missing"
+}
+
 # Validate the Cloudflare-facing view from the release operator. cloudflared intentionally
 # connects to the gateway over HTTP, so an origin-side redirect would loop for public HTTPS.
 verify_public_edge() {
@@ -724,6 +755,10 @@ cmd_deploy() (
     return 1
   fi
   echo "==> Deploy source clean at $sha"
+
+  echo "==> Validating mandatory deployment certification configuration..."
+  validate_deploy_probe_config || return 1
+  echo "  OK: mandatory deployment certification configuration is present"
 
   echo "==> Materializing immutable payload from accepted commit $sha..."
   if ! payload_parent="$(mktemp -d "${TMPDIR:-/tmp}/gille-deploy-payload.XXXXXX")"; then

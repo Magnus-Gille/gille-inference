@@ -181,6 +181,11 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     DEPLOY_LINGER_CHECK_CMD: "true",
     DEPLOY_UNITS_ENABLE_CMD: "true",
     DEPLOY_NOTIFY_INSTALL_CMD: "true",
+    // Nonempty placeholders let tests that target source/path/install/restart gates get past the
+    // deploy-only certification preflight. Tests exercising successful certification override
+    // these with real local servers; negative probe tests override the relevant value to empty.
+    DEPLOY_HEALTH_TAILNET_URL: "http://127.0.0.1:9/healthz",
+    DEPLOY_CAPABILITY_URL: "http://127.0.0.1:9/v1/capabilities/learning-task",
     // The live verifier is independently covered below. Fixture deploys must remain offline.
     DEPLOY_PUBLIC_EDGE_VERIFY_CMD: "true",
     HOMESERVER_OWNER_KEY: OWNER_KEY,
@@ -953,22 +958,76 @@ describe("scripts/deploy-gateway.sh", () => {
       expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
     });
 
-    it("still refuses when the REQUIRED tailnet probe is unset -- only the local default became optional", async () => {
-      const src = initSourceRepo();
-      const remote = tmpDir("dg-remote-");
-      const cap = await startCapabilityServer(OWNER_KEY);
-      const r = await runScript(
-        "deploy",
-        src,
-        baseEnv(remote, {
-          DEPLOY_CAPABILITY_URL: cap.url,
-          // DEPLOY_HEALTH_TAILNET_URL intentionally omitted -- still mandatory.
-        })
-      );
-      expect(r.status).not.toBe(0);
-      expect(r.stderr).toMatch(/tailnet health URL is not set/);
-      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
-    });
+    it.each([
+      [
+        "tailnet health URL",
+        { DEPLOY_HEALTH_TAILNET_URL: "" },
+        /DEPLOY_HEALTH_TAILNET_URL is not set/,
+      ],
+      [
+        "capability URL",
+        { DEPLOY_CAPABILITY_URL: "" },
+        /DEPLOY_CAPABILITY_URL is not set/,
+      ],
+      [
+        "capability credential",
+        { DEPLOY_CAPABILITY_KEY_ENV: "DEPLOY_TEST_MISSING_OWNER_KEY", DEPLOY_TEST_MISSING_OWNER_KEY: "" },
+        /\$DEPLOY_TEST_MISSING_OWNER_KEY is not set/,
+      ],
+      [
+        "invalid capability credential selector",
+        { DEPLOY_CAPABILITY_KEY_ENV: "DEPLOY-TEST-MISSING-OWNER-KEY" },
+        /DEPLOY_CAPABILITY_KEY_ENV is not a valid environment-variable name/,
+      ],
+      [
+        "public HTTP origin",
+        { DEPLOY_PUBLIC_EDGE_VERIFY_CMD: "", DEPLOY_PUBLIC_HTTP_URL: "", DEPLOY_PUBLIC_HTTPS_URL: "https://example.test" },
+        /DEPLOY_PUBLIC_HTTP_URL and DEPLOY_PUBLIC_HTTPS_URL must both be set/,
+      ],
+      [
+        "public HTTPS origin",
+        { DEPLOY_PUBLIC_EDGE_VERIFY_CMD: "", DEPLOY_PUBLIC_HTTP_URL: "http://example.test", DEPLOY_PUBLIC_HTTPS_URL: "" },
+        /DEPLOY_PUBLIC_HTTP_URL and DEPLOY_PUBLIC_HTTPS_URL must both be set/,
+      ],
+    ])(
+      "rejects missing %s before payload materialization or any remote mutation",
+      async (_label, missingConfig, expectedError) => {
+        const src = initSourceRepo();
+        const remote = tmpDir("dg-remote-");
+        const remoteAccessed = join(remote, "REMOTE_ACCESSED");
+        const rsyncCalled = join(remote, "RSYNC_CALLED");
+        const installCalled = join(remote, "INSTALL_CALLED");
+        const restartCalled = join(remote, "RESTART_CALLED");
+        const liveContent = join(remote, "live-content.txt");
+        const fakeBin = tmpDir("dg-bin-");
+        writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+        writeFileSync(liveContent, "prior-content\n");
+        const fakeRsync = join(fakeBin, "rsync");
+        writeFileSync(fakeRsync, `#!/bin/sh\ntouch '${rsyncCalled}'\nexit 1\n`);
+        chmodSync(fakeRsync, 0o755);
+
+        const r = await runScript(
+          "deploy",
+          src,
+          baseEnv(remote, {
+            ...missingConfig,
+            DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteAccessed}'; echo '${remote}'`,
+            DEPLOY_INSTALL_CMD: `touch '${installCalled}'`,
+            DEPLOY_RESTART_CMD: `touch '${restartCalled}'`,
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          })
+        );
+
+        expect(r.status).not.toBe(0);
+        expect(r.stderr).toMatch(expectedError);
+        expect(existsSync(remoteAccessed)).toBe(false);
+        expect(existsSync(rsyncCalled)).toBe(false);
+        expect(existsSync(installCalled)).toBe(false);
+        expect(existsSync(restartCalled)).toBe(false);
+        expect(readFileSync(join(remote, ".deployed-commit"), "utf8")).toBe("prior-marker\n");
+        expect(readFileSync(liveContent, "utf8")).toBe("prior-content\n");
+      }
+    );
   });
 
   describe("gi#49 autonomy-tick systemd unit render/interpreter-check/lingering-check/enable", () => {
