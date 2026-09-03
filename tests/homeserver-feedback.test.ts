@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb, getDb } from "../src/db.js";
+import { closeDb, initDb, getDb } from "../src/db.js";
 
 /**
  * Feedback endpoint suite: POST /portal/feedback
@@ -25,8 +25,10 @@ import { initDb, getDb } from "../src/db.js";
  */
 
 const FEEDBACK_LIMIT = 3; // HOMESERVER_FEEDBACK_RPM for this suite
+const ORIGINAL_FEEDBACK_FILE = process.env["HOMESERVER_FEEDBACK_FILE"];
 
 let feedbackFile: string;
+let runtimeDir: string;
 
 let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let gatewayPort = 0;
@@ -36,9 +38,9 @@ let resetRateWindows: typeof import("../src/homeserver/quota.js").resetRateWindo
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 2 };
 
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), "hs-feedback-test-"));
-  feedbackFile = join(dir, "feedback.jsonl");
-  initDb(join(dir, "test.db"));
+  runtimeDir = mkdtempSync(join(tmpdir(), "hs-feedback-test-"));
+  feedbackFile = join(runtimeDir, "feedback.jsonl");
+  initDb(join(runtimeDir, "test.db"));
 
   process.env["HOMESERVER_HOST"] = "127.0.0.1";
   process.env["HOMESERVER_PORT"] = "0";
@@ -68,6 +70,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (stopGateway) await stopGateway();
+  closeDb();
+  rmSync(runtimeDir, { recursive: true, force: true });
+  if (ORIGINAL_FEEDBACK_FILE === undefined) delete process.env["HOMESERVER_FEEDBACK_FILE"];
+  else process.env["HOMESERVER_FEEDBACK_FILE"] = ORIGINAL_FEEDBACK_FILE;
 });
 
 // Reset per-IP rate windows between tests so throttle tests don't bleed into each other.
