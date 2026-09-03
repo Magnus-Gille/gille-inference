@@ -34,6 +34,7 @@ import {
 } from "../src/homeserver/constitutional-route-database.js";
 import {
   ConstitutionalFencedLease,
+  ConstitutionalLeaseBusyError,
   readConstitutionalResource,
 } from "../src/homeserver/constitutional-fenced-lease.js";
 
@@ -342,6 +343,109 @@ const proofVerifier = {
   }),
 };
 
+const CHILD_MARKER = "AFTER-CLIENT-CHECK-BEFORE-RESOURCE-MUTATION";
+
+type ChildClose = { code: number | null; signal: NodeJS.Signals | null };
+
+function isMissingChild(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === "ESRCH";
+}
+
+async function waitForLeasesAcquirable(paths: string[], timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastBusy: ConstitutionalLeaseBusyError | undefined;
+  do {
+    try {
+      for (const path of paths) ConstitutionalFencedLease.assertAcquirable(path);
+      return;
+    } catch (error) {
+      if (!(error instanceof ConstitutionalLeaseBusyError)) throw error;
+      lastBusy = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+  } while (Date.now() < deadline);
+  throw new Error(`constitutional leases did not become acquirable within ${timeoutMs}ms: ${lastBusy?.message ?? "unknown busy state"}`);
+}
+
+async function waitForChildMarker(
+  child: ReturnType<typeof spawn>,
+  getStdout: () => string,
+  getStderr: () => string,
+  marker: string,
+  getClose: () => ChildClose | undefined,
+  getError: () => Error | undefined,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (getStdout().includes(marker)) return;
+  if (getError()) throw getError();
+  if (getClose()) throw new Error(`child closed before marker (stderr: ${getStderr()}): ${getStdout()}`);
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.off("data", onData);
+      child.off("close", onClose);
+      child.off("error", onError);
+      callback();
+    };
+    const onData = () => {
+      if (getStdout().includes(marker)) finish(resolve);
+    };
+    const onClose = () => finish(() => reject(new Error(`child closed before marker (stderr: ${getStderr()}): ${getStdout()}`)));
+    const onError = (error: Error) => finish(() => reject(error));
+    const timer = setTimeout(() => finish(() => reject(new Error(`child did not emit marker within ${timeoutMs}ms: ${getStdout()}`))), timeoutMs);
+    child.stdout?.on("data", onData);
+    child.once("close", onClose);
+    child.once("error", onError);
+    // Close the check/listen race: stdout may have received the marker after the
+    // fast-path check but before these listeners were attached.
+    onData();
+  });
+}
+
+async function waitForChildClose(
+  closed: Promise<ChildClose>,
+  getClose: () => ChildClose | undefined,
+  timeoutMs: number,
+): Promise<ChildClose | undefined> {
+  const current = getClose();
+  if (current) return current;
+  return await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), timeoutMs);
+    void closed.then((result) => {
+      clearTimeout(timer);
+      resolve(result);
+    });
+  });
+}
+
+async function cleanupChild(
+  child: ReturnType<typeof spawn>,
+  closed: Promise<ChildClose>,
+  getClose: () => ChildClose | undefined,
+  mode: "kill9" | "stop",
+): Promise<void> {
+  const send = (signal: NodeJS.Signals) => {
+    if (getClose()) return;
+    try {
+      child.kill(signal);
+    } catch (error) {
+      if (!isMissingChild(error)) throw error;
+    }
+  };
+
+  if (getClose()) return;
+  if (mode === "stop") send("SIGCONT");
+  send("SIGTERM");
+  if (await waitForChildClose(closed, getClose, 1_000)) return;
+  send("SIGKILL");
+  if (!await waitForChildClose(closed, getClose, 1_000)) {
+    throw new Error("constitutional fault-harness child did not close after SIGKILL");
+  }
+}
+
 describe("constitutional micro-routing controller", () => {
   it.each(["kill9", "stop"] as const)("recovers through the real child-process %s fault harness", async (mode) => {
     const root = mkdtempSync(join(tmpdir(), `constitutional-real-${mode}-`));
@@ -366,58 +470,81 @@ describe("constitutional micro-routing controller", () => {
       snapshotPath,
       planPath,
     ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
-    if (mode === "kill9") {
-      await new Promise<void>((resolve, reject) => {
-        child.once("exit", (_code, signal) => signal === "SIGKILL" ? resolve() : reject(new Error(`unexpected child exit ${signal}`)));
-        child.once("error", reject);
-      });
-    } else {
-      await new Promise<void>((resolve, reject) => {
-        child.stdout!.once("data", (chunk) => String(chunk).includes("AFTER-CLIENT-CHECK-BEFORE-RESOURCE-MUTATION")
-          ? resolve()
-          : reject(new Error("child did not stop after its client check")));
-        child.once("error", reject);
-      });
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    const routeDb = new ConstitutionalRouteDatabase(tablePath);
-    const parentTable = {
-      store: routeDb,
-      read: () => routeDb.read(),
-      write: (next: string) => {
-        const lease = routeDb.acquireWriterLease();
-        const fence = { epoch: lease.epoch, token: lease.token };
-        if (!routeDb.compareAndSwap(routeDb.read(), next, fence)) throw new Error("test route write failed");
-        lease.release();
-      },
-      restore: (expected: string, next: string, fence: { epoch: number; token: string }) => {
-        return routeDb.restoreExact(expected, next, fence);
-      },
-    };
-    // The watchdog must reconcile an interrupted prepare/apply immediately,
-    // not leave an unreceipted candidate active until the absolute deadline.
-    authority.setNow("2026-07-26T00:00:01Z");
-    const watchdog = new ConstitutionalRoutingWatchdog(
-      root,
-      authority.reader,
-      recoveryCapability(parentTable as ReturnType<typeof fakeStore>, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
-      () => undefined,
-      undefined,
-      { durationMs: 150 },
-    );
-    expect(watchdog.tick().outcome).toBe("reverted");
-    expect(routeDb.read()).toBe(baseline);
-    if (mode === "stop") {
-      const exited = new Promise<{ code: number | null; stderr: string }>((resolve) => {
-        let stderr = "";
-        child.stderr!.on("data", (chunk) => { stderr += String(chunk); });
-        child.once("exit", (code) => resolve({ code, stderr }));
-      });
-      process.kill(child.pid!, "SIGCONT");
-      const resumed = await exited;
-      expect(resumed.code).not.toBe(0);
-      expect(resumed.stderr).toMatch(/expired or superseded/);
+    let stdout = "";
+    let stderr = "";
+    let closeResult: ChildClose | undefined;
+    let childError: Error | undefined;
+    let resolveClosed!: (result: ChildClose) => void;
+    const closed = new Promise<ChildClose>((resolve) => { resolveClosed = resolve; });
+    child.stdout!.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr!.on("data", (chunk) => { stderr += String(chunk); });
+    child.once("error", (error) => { childError = error; });
+    child.once("close", (code, signal) => {
+      closeResult = { code, signal };
+      resolveClosed(closeResult);
+    });
+    let testFailed = false;
+    let primaryFailure: unknown;
+    try {
+      if (mode === "kill9") {
+        const result = await waitForChildClose(closed, () => closeResult, 5_000);
+        if (!result) throw new Error("kill9 fault-harness child did not close within 5000ms");
+        if (childError) throw childError;
+        expect(result.signal, `unexpected child close code=${result.code}; stderr=${stderr}`).toBe("SIGKILL");
+      } else {
+        await waitForChildMarker(child, () => stdout, () => stderr, CHILD_MARKER, () => closeResult, () => childError);
+        await waitForLeasesAcquirable([tablePath, constitutionalPaths(root).lock]);
+      }
+      const routeDb = new ConstitutionalRouteDatabase(tablePath);
+      const parentTable = {
+        store: routeDb,
+        read: () => routeDb.read(),
+        write: (next: string) => {
+          const lease = routeDb.acquireWriterLease();
+          const fence = { epoch: lease.epoch, token: lease.token };
+          if (!routeDb.compareAndSwap(routeDb.read(), next, fence)) throw new Error("test route write failed");
+          lease.release();
+        },
+        restore: (expected: string, next: string, fence: { epoch: number; token: string }) => {
+          return routeDb.restoreExact(expected, next, fence);
+        },
+      };
+      // The watchdog must reconcile an interrupted prepare/apply immediately,
+      // not leave an unreceipted candidate active until the absolute deadline.
+      authority.setNow("2026-07-26T00:00:01Z");
+      const watchdog = new ConstitutionalRoutingWatchdog(
+        root,
+        authority.reader,
+        recoveryCapability(parentTable as ReturnType<typeof fakeStore>, synthetic.recoveryPrivateKey, synthetic.authorizationDigest, synthetic.snapshot),
+        () => undefined,
+        undefined,
+        { durationMs: 150 },
+      );
+      expect(watchdog.tick().outcome).toBe("reverted");
       expect(routeDb.read()).toBe(baseline);
+      if (mode === "stop") {
+        process.kill(child.pid!, "SIGCONT");
+        const resumed = await waitForChildClose(closed, () => closeResult, 5_000);
+        if (!resumed) throw new Error("resumed fault-harness child did not close within 5000ms");
+        expect(resumed.code).not.toBe(0);
+        expect(stderr).toMatch(/expired or superseded/);
+        expect(routeDb.read()).toBe(baseline);
+      }
+    } catch (error) {
+      testFailed = true;
+      primaryFailure = error;
+      throw error;
+    } finally {
+      try {
+        await cleanupChild(child, closed, () => closeResult, mode);
+      } catch (error) {
+        if (!testFailed) throw error;
+        if (primaryFailure instanceof Error && primaryFailure.cause === undefined) {
+          // Preserve the assertion as the primary failure while retaining a
+          // cleanup diagnosis for the test runner's error output.
+          primaryFailure.cause = error;
+        }
+      }
     }
   }, 15_000);
 
