@@ -54,6 +54,20 @@ increment the matching `/metrics` counter (`homeserver_rate_limited_total{surfac
 `homeserver_admission_rejections_total{lane}`). A failed `ask` is therefore never hidden behind the
 transport's HTTP 200.
 
+### M5 compute-utilization filter epoch (#244)
+
+The Heimdall utilization poster and the authenticated `/ops/summary` use the same closed,
+content-blind predicate from `src/homeserver/compute-request-filter.ts`. Filter epoch
+`m5-admitted-compute-v2` counts exactly one row for each admitted M5 inference request:
+`/mcp/ask` and the internal async image-worker `image` route are included, while the outer
+`/mcp` transport, image-job submission row, discovery/monitor routes, `model='none'`, non-M5 rows,
+and pre-admission refusals are excluded. Daily utilization, the recent headline, and per-model
+rollups all use this predicate and therefore reconcile.
+
+This epoch creates a historical break. Panels or summaries generated before it used route-only or
+otherwise inconsistent filters and must not be compared directly with epoch-v2 values; republish
+the current panels before treating a trend as continuous.
+
 ```sql
 -- MCP inference outcomes (NOT the transport envelope)
 SELECT outcome, COUNT(*) FROM request_log WHERE route = '/mcp/ask' GROUP BY outcome;

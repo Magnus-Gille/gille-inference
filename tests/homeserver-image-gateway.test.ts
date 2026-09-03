@@ -234,6 +234,14 @@ describe("async balanced/high tiers + jobs", () => {
     expect(done["status"]).toBe("succeeded");
     expect((done["data"] as unknown[]).length).toBe(2);
     expect(credits(k.plaintextKey)).toBe(2 * BALANCED);
+
+    const rows = getRequestLog(500).filter((row) => row.alias === "img-async");
+    const submissions = rows.filter((row) => row.route === "/v1/images/generations");
+    const completions = rows.filter((row) => row.route === "image");
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]).toMatchObject({ admission: "n/a", status: 202 });
+    expect(completions).toHaveLength(1);
+    expect(completions[0]).toMatchObject({ node: "m5", admission: "admitted", status: 200, model: "image-balanced" });
   });
 
   it("#229: GET jobs/% (malformed percent-encoding) → 400 invalid_request_error, not 500", async () => {
