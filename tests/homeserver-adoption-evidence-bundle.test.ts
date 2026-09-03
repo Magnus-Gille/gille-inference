@@ -47,6 +47,20 @@ function createDb(path = ":memory:"): Database.Database {
   return db;
 }
 
+function createOverflowTable(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE adoption_evidence_overflow (
+      recorded_day TEXT NOT NULL, traffic_purpose TEXT NOT NULL, result TEXT NOT NULL,
+      deterministic_check TEXT NOT NULL, reviewer_usefulness TEXT NOT NULL,
+      fallback_reason TEXT NOT NULL, report_count INTEGER NOT NULL,
+      eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (recorded_day, traffic_purpose, result, deterministic_check,
+                   reviewer_usefulness, fallback_reason)
+    );
+  `);
+}
+
 function options(overrides: Partial<EvidenceBundleOptions> = {}): EvidenceBundleOptions {
   return { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED, ...overrides };
 }
@@ -340,6 +354,77 @@ describe("buildAdoptionEvidenceBundle", () => {
     expect(bundle.cost.reconciled).toMatchObject({ rows: 2, confidence: "partial", m5TotalUsd: null });
     expect(bundle.delegations.promotionReadiness).toMatchObject({ costCoverageComplete: false, eligible: false });
     expect(bundle.nextAction.action).toBe("repair_measurement");
+    db.close();
+  });
+
+  it("includes exact overflow totals but marks capped windows incomplete", () => {
+    const db = createDb();
+    createOverflowTable(db);
+    insertOrganic(db, { opportunities: 20 });
+    db.prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities, unknown_opportunity_reports)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      "2026-08-02", "organic", "failed", "fail", "redo", "local_result_unusable", 3, 4, 0,
+    );
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.byPurpose.organic).toMatchObject({ reports: 4, knownOpportunities: 24, attempted: 4, useful: 1 });
+    expect(bundle.adoption.breakdowns.result.filter((row) => row.reports > 0)).toEqual([
+      { bucket: "completed", reports: 1, knownOpportunities: 20, attempted: 1, useful: 1 },
+      { bucket: "failed", reports: 3, knownOpportunities: 4, attempted: 3, useful: 0 },
+    ]);
+    expect(bundle.adoption.breakdowns.usefulness.filter((row) => row.reports > 0)).toEqual([
+      { bucket: "pass", reports: 1, knownOpportunities: 20, attempted: 1, useful: 1 },
+      { bucket: "redo", reports: 3, knownOpportunities: 4, attempted: 3, useful: 0 },
+    ]);
+    expect(bundle.adoption.breakdowns.fallback.filter((row) => row.reports > 0)).toEqual([
+      { bucket: "local_result_unusable", reports: 3, knownOpportunities: 4, attempted: 3, useful: 0 },
+      { bucket: "none", reports: 1, knownOpportunities: 20, attempted: 1, useful: 1 },
+    ]);
+    expect(bundle.adoption.overflow).toMatchObject({
+      retainedIndividualCount: 1,
+      aggregatedCount: 3,
+      droppedCount: 0,
+      cappedDays: ["2026-08-02"],
+      affectedDays: ["2026-08-02"],
+      perHarnessAttribution: "unavailable",
+      complete: false,
+    });
+    expect(bundle.completeness.adoptionEvidence).toMatchObject({
+      retainedIndividualCount: 1,
+      aggregatedCount: 3,
+      droppedCount: 0,
+      cappedDays: ["2026-08-02"],
+      affectedDays: ["2026-08-02"],
+      perHarnessAttribution: "unavailable",
+      complete: false,
+    });
+    expect(bundle.delegations.promotionReadiness.eligible).toBe(false);
+    expect(bundle.nextAction).toEqual({
+      action: "repair_measurement",
+      reason: "adoption evidence retention is capped; overflow cannot support complete promotion evidence",
+    });
+    db.close();
+  });
+
+  it("preserves mixed unknown opportunity denominators in a coalesced overflow row", () => {
+    const db = createDb();
+    createOverflowTable(db);
+    insertOrganic(db, { opportunities: 20 });
+    db.prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities, unknown_opportunity_reports)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      "2026-08-02", "organic", "failed", "fail", "redo", "local_result_unusable", 2, 7, 1,
+    );
+
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.byPurpose.organic).toMatchObject({
+      reports: 3,
+      knownOpportunities: 27,
+      unknownOpportunityDenominators: 1,
+    });
+    expect(bundle.completeness.missingness.unknownOpportunityDenominators).toBe(1);
     db.close();
   });
 });

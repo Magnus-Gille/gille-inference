@@ -213,6 +213,14 @@ start response for later `status`/`result` calls. It never applies the diff, wri
 checkout, or treats client defaults as sandbox enforcement. The gateway's OS cage, input
 validation, protected paths, caps, and diff-only result remain authoritative.
 
+`adoption report` returns a content-free telemetry acknowledgement. `retention: "retained"` means
+the observation was stored; `retention: "aggregated"` means the daily telemetry cap was reached
+but the observation was preserved in a bounded aggregate; and `retention: "dropped"` means the
+telemetry write was refused. A cap acknowledgement uses `reason: "telemetry_daily_cap"`,
+`retry_telemetry: "next_utc_day"`, and `inference_availability: "unaffected"`: do not retry that
+telemetry write during the day, but continue eligible `ask` and `code` work. The client maps the
+legacy `daily_capacity_reached` response to this scoped dropped form during rolling upgrades.
+
 ## Doctor states
 
 `m5 doctor` checks, in order:

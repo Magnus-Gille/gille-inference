@@ -573,7 +573,7 @@ for chunk in stream:
           </tr>
           <tr>
             <td><span class="badge mono">record_adoption_evidence</span></td>
-            <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. It accepts no prompt, response, path, repository, or identifier; measured adoption remains shadow-only and never changes routing.</td>
+            <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. After 25 individual rows/day it coalesces later reports into bounded aggregates and marks the dashboard window incomplete. Telemetry limits never limit <span class="badge mono">ask</span>, code loops, models, credits, or owner inference. It accepts no prompt, response, path, repository, or identifier; adoption remains shadow-only and never changes routing.</td>
           </tr>
         </table>
       </div>

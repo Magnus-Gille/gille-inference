@@ -964,7 +964,7 @@ describe("m5 command surface", () => {
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 
-  it("returns a non-fatal adoption-capacity result after a valid completed ask", async () => {
+  it("scopes a legacy adoption-capacity result to telemetry after a valid completed ask", async () => {
     const output = sink();
     const error = sink();
     const exitCode = await main(["--profile", "codex", "adoption", "report"], {
@@ -988,7 +988,14 @@ describe("m5 command surface", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(JSON.parse(output.text())).toEqual({ accepted: false, reason: "daily_capacity_reached" });
+    expect(JSON.parse(output.text())).toEqual({
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "telemetry_daily_cap",
+      retry_telemetry: "next_utc_day",
+    });
     expect(error.text()).toBe("");
     expect(error.text()).not.toContain(SECRET);
   });

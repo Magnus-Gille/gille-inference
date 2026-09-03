@@ -26,8 +26,9 @@ import { recordMessageTaskExposuresBestEffort } from "./task-exposure.js";
 import {
   allowAdoptionEvidenceReportForPrincipal,
   parseAdoptionEvidence,
-  recordAdoptionEvidence,
+  recordAdoptionEvidenceWithOutcome,
   type AdoptionEvidenceParseError,
+  type AdoptionEvidenceRetention,
 } from "./adoption-evidence.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
 import type { KeyScope } from "./keystore.js";
@@ -361,34 +362,70 @@ function renderListModelsText(content: ListModelsStructuredContent): string {
 const ADOPTION_REPORT_DESCRIPTION =
   "Record one content-free M5 adoption observation for the private operator dashboard. " +
   "Use this when an eligible task was completed, refused, failed, or could not even attempt M5; " +
-  "report missing M5 tool and missing/auth-unavailable credentials distinctly. A full daily telemetry cap is non-fatal and does not affect the inference result; do not retry until the next UTC day. Never include task text, output, paths, repositories, or identifiers.";
+  "report missing M5 tool and missing/auth-unavailable credentials distinctly. After the daily retained-row cap, valid reports are aggregated as telemetry; this is non-fatal and does not affect inference availability, and only that telemetry write should not be retried until the next UTC day. Ask, code_loop, model access, and owner usage continue normally. Never include task text, output, paths, repositories, or identifiers.";
 
 type AdoptionReportRejectionReason =
   | "invalid_report"
-  | "principal_rate_limited"
-  | "daily_capacity_reached"
+  | "telemetry_rate_limited"
   | "storage_unavailable";
+
+type AdoptionReportResponse = {
+  accepted: boolean;
+  telemetry_recorded: boolean;
+  retention: AdoptionEvidenceRetention | "dropped";
+  inference_availability: "unaffected";
+  reason?: AdoptionReportRejectionReason | "telemetry_daily_cap";
+  retry_telemetry?: "next_utc_day";
+  diagnostic?: AdoptionEvidenceParseError;
+};
 
 function rejectAdoptionReport(reason: AdoptionReportRejectionReason, diagnostic?: AdoptionEvidenceParseError): {
   text: string;
-  isError: boolean;
-  structuredContent: {
-    accepted: false;
-    reason: AdoptionReportRejectionReason;
-    diagnostic?: AdoptionEvidenceParseError;
-  };
+  isError: true;
+  structuredContent: AdoptionReportResponse;
 } {
-  // Adoption evidence is optional telemetry, not part of the inference result. A full bounded
-  // aggregate must therefore never turn a successful M5 call into a hard MCP failure; callers can
-  // inspect `accepted:false` without retrying until the next UTC day.
-  const nonFatal = reason === "daily_capacity_reached";
   return {
-    text: nonFatal
-      ? `Adoption report not recorded (${reason}); M5 inference result is unaffected.`
-      : `Adoption report was not accepted (${reason}).`,
-    isError: !nonFatal,
-    structuredContent: { accepted: false, reason, ...(diagnostic ? { diagnostic } : {}) },
+    text: `Adoption telemetry was not recorded (${reason}); M5 inference availability is unaffected.`,
+    isError: true,
+    structuredContent: {
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason,
+      ...(diagnostic ? { diagnostic } : {}),
+    },
   };
+}
+
+function acceptAdoptionReport(retention: AdoptionEvidenceRetention): {
+  text: string;
+  isError: false;
+  structuredContent: AdoptionReportResponse;
+} {
+  return retention === "aggregated"
+    ? {
+        text: "Adoption telemetry aggregated after the daily retained-row cap; only this telemetry write should not be retried until the next UTC day. M5 inference availability is unaffected; ask, code_loop, model access, and owner usage continue normally.",
+        isError: false,
+        structuredContent: {
+          accepted: true,
+          telemetry_recorded: true,
+          retention,
+          inference_availability: "unaffected",
+          reason: "telemetry_daily_cap",
+          retry_telemetry: "next_utc_day",
+        },
+      }
+    : {
+        text: "Accepted.",
+        isError: false,
+        structuredContent: {
+          accepted: true,
+          telemetry_recorded: true,
+          retention,
+          inference_availability: "unaffected",
+        },
+      };
 }
 
 /**
@@ -1216,21 +1253,18 @@ async function callTool(
     // Reserve the transient slot before parsing. Invalid/content-bearing reports are deliberately
     // correlation-log-suppressed too, so they must not become an invisible unbounded flood.
     if (!allowAdoptionEvidenceReportForPrincipal(ctx.principal.keyHash!)) {
-      return rejectAdoptionReport("principal_rate_limited");
+      return rejectAdoptionReport("telemetry_rate_limited");
     }
     const parsed = parseAdoptionEvidence(args);
     if (!parsed.ok) {
       return rejectAdoptionReport("invalid_report", parsed.error);
     }
     try {
-      if (!recordAdoptionEvidence(parsed.value)) {
-        return rejectAdoptionReport("daily_capacity_reached");
-      }
+      return acceptAdoptionReport(recordAdoptionEvidenceWithOutcome(parsed.value));
     } catch {
       // Do not expose a database path, rate state, or driver diagnostic in the tool response.
       return rejectAdoptionReport("storage_unavailable");
     }
-    return { text: "Accepted.", isError: false, structuredContent: { accepted: true } };
   }
 
   if (name === "ask") {

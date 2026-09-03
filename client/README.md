@@ -76,8 +76,13 @@ m5 --profile codex mcp
 
 The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
 `diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,
-gateway-health, and authentication failures. A failed `record_adoption_evidence` call is marked
-`not_recorded` with `retry_same_tool_call`; no report payload is echoed or silently persisted.
+gateway-health, and authentication failures. Adoption reports return a scoped acknowledgement:
+`retention: "retained"` means the row was stored, `retention: "aggregated"` means the bounded
+telemetry cap was reached but the observation was folded into a safe aggregate, and
+`retention: "dropped"` identifies a telemetry-only refusal. A telemetry cap is never an M5
+inference limit: `inference_availability: "unaffected"`, and only the report should wait until
+the next UTC day. A connector/transport failure remains `not_recorded` with
+`retry_same_tool_call`; no report payload is echoed or silently persisted.
 
 ### Provisioning a new owner-agent profile
 

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getDb, initDb } from "../src/db.js";
 import {
+  ADOPTION_EVIDENCE_OVERFLOW_COLUMNS,
   ADOPTION_EVIDENCE_COLUMNS,
   ADOPTION_CHECK_OUTCOMES,
   ADOPTION_HARNESSES,
@@ -13,6 +14,7 @@ import {
   ensureAdoptionEvidenceSchema,
   parseAdoptionEvidence,
   recordAdoptionEvidence,
+  recordAdoptionEvidenceWithOutcome,
 } from "../src/homeserver/adoption-evidence.js";
 import { isAdoptionEvidenceToolCall } from "../src/homeserver/mcp.js";
 
@@ -24,6 +26,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   getDb().prepare("DELETE FROM adoption_evidence").run();
+  getDb().prepare("DELETE FROM adoption_evidence_overflow").run();
 });
 
 const organicPass = {
@@ -242,16 +245,110 @@ describe("M5 adoption evidence (#136)", () => {
     expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence").get()).toEqual({ count: 0 });
   });
 
-  it("caps the server-day aggregate before insert without introducing a per-report id", () => {
+  it("caps individual server-day rows and durably aggregates later reports without an event id", () => {
     const parsed = parseAdoptionEvidence(organicPass);
     if (!parsed.ok) throw new Error("fixture must parse");
     const accepted = Array.from({ length: MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY + 1 }, () =>
       recordAdoptionEvidence(parsed.value)
     );
-    expect(accepted.filter(Boolean)).toHaveLength(MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY);
+    expect(accepted.filter(Boolean)).toHaveLength(MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY + 1);
     expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence").get()).toEqual({
       count: MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY,
     });
+    expect(getDb().prepare("SELECT count(*) AS count FROM adoption_evidence_overflow").get()).toEqual({ count: 1 });
     expect(ADOPTION_EVIDENCE_COLUMNS).not.toContain("id");
+  });
+
+  it("aggregates post-cap outcomes without letting synthetic successes erase organic failures or usefulness", () => {
+    const parsed = parseAdoptionEvidence(organicPass);
+    if (!parsed.ok) throw new Error("fixture must parse");
+    const syntheticSuccess = { ...parsed.value, trafficPurpose: "synthetic" as const };
+    for (let i = 0; i < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY; i += 1) {
+      expect(recordAdoptionEvidenceWithOutcome(syntheticSuccess)).toBe("retained");
+    }
+    expect(recordAdoptionEvidenceWithOutcome(syntheticSuccess)).toBe("aggregated");
+
+    const organicFailure = {
+      ...parsed.value,
+      result: "failed" as const,
+      deterministicCheck: "fail" as const,
+      reviewerUsefulness: "redo" as const,
+      fallbackReason: "local_result_unusable" as const,
+    };
+    const organicRefusal = {
+      ...parsed.value,
+      result: "refused" as const,
+      deterministicCheck: "not_run" as const,
+      reviewerUsefulness: "not_reported" as const,
+      fallbackReason: "m5_refused" as const,
+    };
+    expect(recordAdoptionEvidenceWithOutcome(organicFailure)).toBe("aggregated");
+    expect(recordAdoptionEvidenceWithOutcome(organicFailure)).toBe("aggregated");
+    expect(recordAdoptionEvidenceWithOutcome(organicRefusal)).toBe("aggregated");
+
+    expect(getDb().prepare(
+      `SELECT traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason,
+              report_count, eligible_opportunities, unknown_opportunity_reports
+       FROM adoption_evidence_overflow ORDER BY result`
+    ).all()).toEqual([
+      {
+        traffic_purpose: "synthetic",
+        result: "completed",
+        deterministic_check: "pass",
+        reviewer_usefulness: "pass",
+        fallback_reason: "none",
+        report_count: 1,
+        eligible_opportunities: 1,
+        unknown_opportunity_reports: 0,
+      },
+      {
+        traffic_purpose: "organic",
+        result: "failed",
+        deterministic_check: "fail",
+        reviewer_usefulness: "redo",
+        fallback_reason: "local_result_unusable",
+        report_count: 2,
+        eligible_opportunities: 2,
+        unknown_opportunity_reports: 0,
+      },
+      {
+        traffic_purpose: "organic",
+        result: "refused",
+        deterministic_check: "not_run",
+        reviewer_usefulness: "not_reported",
+        fallback_reason: "m5_refused",
+        report_count: 1,
+        eligible_opportunities: 1,
+        unknown_opportunity_reports: 0,
+      },
+    ]);
+    expect(ADOPTION_EVIDENCE_OVERFLOW_COLUMNS).toEqual([
+      "recorded_day",
+      "traffic_purpose",
+      "result",
+      "deterministic_check",
+      "reviewer_usefulness",
+      "fallback_reason",
+      "report_count",
+      "eligible_opportunities",
+      "unknown_opportunity_reports",
+    ]);
+    const overflowColumns = getDb().prepare("PRAGMA table_info(adoption_evidence_overflow)").all() as Array<{ name: string }>;
+    expect(overflowColumns.map((column) => column.name)).toEqual([...ADOPTION_EVIDENCE_OVERFLOW_COLUMNS]);
+    expect(ADOPTION_EVIDENCE_OVERFLOW_COLUMNS.join(" ")).not.toMatch(/harness|execution_mode|prompt|response|path|repository|repo_|alias|identity|note|timestamp/i);
+  });
+
+  it("tracks unknown denominators exactly across mixed coalesced overflow reports", () => {
+    const parsed = parseAdoptionEvidence(organicPass);
+    if (!parsed.ok) throw new Error("fixture must parse");
+    for (let i = 0; i < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY; i += 1) {
+      expect(recordAdoptionEvidenceWithOutcome(parsed.value)).toBe("retained");
+    }
+    expect(recordAdoptionEvidenceWithOutcome({ ...parsed.value, eligibleOpportunities: 0 })).toBe("aggregated");
+    expect(recordAdoptionEvidenceWithOutcome({ ...parsed.value, eligibleOpportunities: 7 })).toBe("aggregated");
+    expect(getDb().prepare(
+      `SELECT report_count, eligible_opportunities, unknown_opportunity_reports
+       FROM adoption_evidence_overflow`,
+    ).get()).toEqual({ report_count: 2, eligible_opportunities: 7, unknown_opportunity_reports: 1 });
   });
 });

@@ -136,21 +136,25 @@ user/session IDs, free-text notes, or caller-provided timestamps. The writer rej
 before storage. It has no event ID or precise timestamp: the server derives only a UTC calendar day
 for the rolling-week query. Accepted and rejected authenticated report calls deliberately suppress
 the normal per-request access/request/owner logs, so this table cannot be correlated to a principal
-or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot;
-it is bounded by a transient per-key rate limit and a 25-row server-day cap. Rejections expose only
-the stable content-free reason codes `invalid_report`, `principal_rate_limited`,
-`daily_capacity_reached`, or `storage_unavailable`; they never echo input or expose a credential,
-principal, request, database, or path detail. `daily_capacity_reached` is an expected non-fatal
-outcome: the inference result remains valid, the telemetry row is dropped, and callers should not
-retry until the next UTC day. Other rejection reasons remain hard tool errors so malformed or
-unavailable telemetry is visible.
+or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot.
+It is bounded by a transient per-key telemetry rate limit and a 25-row server-day limit on
+individually attributed rows. Later valid reports are coalesced into a second content-free table
+keyed only by day, purpose, result, check, usefulness, and fallback enums; no harness, execution
+mode, principal, request, or content survives that aggregation. The acknowledgement distinguishes
+`retained`, `aggregated`, and `dropped`, scopes limit reasons to telemetry, and states that inference
+availability is unaffected. A `telemetry_daily_cap` aggregate is non-fatal and only the telemetry
+write must not be retried until the next UTC day. Invalid, transiently telemetry-rate-limited, or
+unavailable writes remain visible as dropped hard tool errors without echoing input or exposing a
+credential, principal, request, database, or path detail.
 
 An `invalid_report` response also carries one fixed content-blind diagnostic: `invalid_shape`,
 `unknown_field`, `invalid_field` plus a known schema field, or `invalid_invariant` plus one of the
 documented fixed invariant codes. Unknown caller keys are never returned, because a key could
 itself contain a path, identity, or task text.
 
-The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
+The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels. A window
+containing coalesced overflow is explicitly labelled **INCOMPLETE** because the overflow cannot be
+attributed to a harness, even though its global result/usefulness/fallback totals are retained:
 
 - **MEASURED — organic M5 agent adoption:** only `traffic_purpose=organic`, by harness.
 - **MEASURED — organic M5 agent adoption by harness:** closed, content-free per-harness rows

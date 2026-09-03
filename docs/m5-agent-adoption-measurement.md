@@ -48,16 +48,19 @@ All four panels are **SHADOW** with respect to routing: they do not enable a rou
 
 The report call itself is deliberately a privacy blind spot in the normal MCP telemetry: accepted
 and rejected reports from an authenticated owner-agent suppress per-request access, request, and
-owner logging. An accepted report leaves only its coarse `recorded_day` aggregate; a rejected one
-leaves no evidence. This prevents a report from being joined back to a principal or precise time.
-The tradeoff is that this narrow tool cannot be used for per-request debugging or auditing. It is
-rate-limited in memory per authenticated key and capped at 25 accepted rows per server day; either
-limit produces only a stable content-free reason code rather than a durable identity-bearing
-diagnostic. `daily_capacity_reached` is a non-fatal telemetry outcome: the report is dropped,
-the M5 inference result is unaffected, and callers must not retry it until the next UTC day.
-Other rejections return one of `invalid_report`, `principal_rate_limited`, or
-`storage_unavailable`; they never echo input or expose database, credential, principal, request,
-or path details.
+owner logging. A retained report leaves only its coarse `recorded_day` row. After 25 individual
+rows on a server day, later valid reports are aggregated by closed purpose/result/check/usefulness/
+fallback enums without harness, execution mode, principal, request, or content. This prevents a
+report from being joined back to a principal or precise time while ensuring early synthetic or
+successful observations cannot erase later organic failure, recovery, or usefulness evidence.
+
+The acknowledgement reports `retained`, `aggregated`, or `dropped`, whether telemetry was
+recorded, and that inference availability is unaffected. `telemetry_daily_cap` means the report was
+coalesced: do not retry only this telemetry write until the next UTC day; `ask`, `code_loop`, model
+access, and owner inference remain available. A transient `telemetry_rate_limited`, invalid report,
+or storage failure is a dropped hard error. All responses remain content-free. Dashboard windows
+with aggregates are labelled **INCOMPLETE** because the coalesced rows have no harness attribution;
+they must never be presented as complete measured adoption.
 
 `completed` reports use `fallback_reason=none`. `failed` reports use a non-`none` fallback and may
 retain an observed deterministic-check or reviewer outcome, including `redo` for a metered but

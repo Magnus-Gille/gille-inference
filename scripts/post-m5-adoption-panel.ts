@@ -13,6 +13,8 @@ import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   ADOPTION_FALLBACK_REASONS,
+  ADOPTION_TRAFFIC_PURPOSES,
+  type AdoptionTrafficPurpose,
   type AdoptionFallbackReason,
   type AdoptionHarness,
 } from "../src/homeserver/adoption-evidence.js";
@@ -58,6 +60,25 @@ export interface LabAdoptionByPurpose {
   completed: number;
 }
 
+export interface AdoptionPanelOverflow {
+  retainedIndividualCount: number;
+  aggregatedCount: number;
+  droppedCount: number;
+  cappedDays: string[];
+  affectedDays: string[];
+  perHarnessAttribution: "complete" | "unavailable";
+  byPurpose: Record<AdoptionTrafficPurpose, {
+    reports: number;
+    eligibleOpportunities: number;
+    attemptedDelegations: number;
+    completed: number;
+    usefulCompletions: number;
+    deterministicChecks: number;
+    deterministicCheckPasses: number;
+    fallbackCounts: Record<AdoptionFallbackReason, number>;
+  }>;
+}
+
 interface OrganicSummaryDbRow {
   harness: AdoptionHarness;
   reports: number;
@@ -83,6 +104,17 @@ interface LabDbRow {
   completed: number;
 }
 
+interface OverflowDbRow {
+  recorded_day: string;
+  traffic_purpose: AdoptionTrafficPurpose;
+  result: string;
+  deterministic_check: string;
+  reviewer_usefulness: string;
+  fallback_reason: AdoptionFallbackReason;
+  report_count: number;
+  eligible_opportunities: number;
+}
+
 function utcDayStart(now: number): number {
   const d = new Date(now);
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
@@ -90,6 +122,10 @@ function utcDayStart(now: number): number {
 
 function windowStartDay(now: number, days: number): string {
   return new Date(utcDayStart(now) - (days - 1) * DAY_MS).toISOString().slice(0, 10);
+}
+
+function windowThroughDay(now: number): string {
+  return new Date(utcDayStart(now) + DAY_MS).toISOString().slice(0, 10);
 }
 
 export function hasAdoptionEvidenceTable(db: Database.Database): boolean {
@@ -124,6 +160,76 @@ function emptyOrganic(harness: AdoptionHarness): OrganicAdoptionByHarness {
   };
 }
 
+function emptyOverflow(): AdoptionPanelOverflow {
+  const byPurpose = () => ({ reports: 0, eligibleOpportunities: 0, attemptedDelegations: 0, completed: 0, usefulCompletions: 0, deterministicChecks: 0, deterministicCheckPasses: 0, fallbackCounts: Object.fromEntries(ADOPTION_FALLBACK_REASONS.map((reason) => [reason, 0])) as Record<AdoptionFallbackReason, number> });
+  return {
+    retainedIndividualCount: 0,
+    aggregatedCount: 0,
+    droppedCount: 0,
+    cappedDays: [],
+    affectedDays: [],
+    perHarnessAttribution: "complete",
+    byPurpose: {
+      organic: byPurpose(),
+      evaluation: byPurpose(),
+      synthetic: byPurpose(),
+    },
+  };
+}
+
+function hasAdoptionEvidenceOverflowTable(db: Database.Database): boolean {
+  const row = db
+    .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'adoption_evidence_overflow'")
+    .get() as { present: 1 } | undefined;
+  return row?.present === 1;
+}
+
+function integerCount(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+/** Read post-cap content-free aggregates without widening the per-harness attribution surface. */
+export function queryAdoptionEvidenceOverflow(
+  db: Database.Database,
+  days: number = DEFAULT_DAYS,
+  now: number = Date.now(),
+): AdoptionPanelOverflow {
+  const result = emptyOverflow();
+  result.retainedIndividualCount = hasAdoptionEvidenceTable(db)
+    ? Number((db.prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day >= @sinceDay AND recorded_day < @throughDay").get({ sinceDay: windowStartDay(now, days), throughDay: windowThroughDay(now) }) as { count: number }).count)
+    : 0;
+  if (!hasAdoptionEvidenceOverflowTable(db)) return result;
+  const all = db.prepare("SELECT recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities FROM adoption_evidence_overflow ORDER BY rowid ASC").all() as OverflowDbRow[];
+  const cappedDays = new Set<string>();
+  const affectedDays = new Set<string>();
+  const sinceDay = windowStartDay(now, days);
+  const throughDay = windowThroughDay(now);
+  for (const row of all) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(row.recorded_day)) continue;
+    if (row.recorded_day < sinceDay || row.recorded_day >= throughDay) continue;
+    cappedDays.add(row.recorded_day);
+    affectedDays.add(row.recorded_day);
+    const reports = integerCount(row.report_count);
+    const opportunities = integerCount(row.eligible_opportunities);
+    result.aggregatedCount += reports;
+    const purpose = ADOPTION_TRAFFIC_PURPOSES.includes(row.traffic_purpose) ? row.traffic_purpose : null;
+    if (!purpose) continue;
+    const item = result.byPurpose[purpose];
+    item.reports += reports;
+    item.eligibleOpportunities += opportunities;
+    item.attemptedDelegations += ["completed", "refused", "failed"].includes(row.result) ? reports : 0;
+    item.completed += row.result === "completed" ? reports : 0;
+    item.usefulCompletions += row.result === "completed" && row.deterministic_check !== "fail" && ["pass", "partial"].includes(row.reviewer_usefulness) ? reports : 0;
+    item.deterministicChecks += row.deterministic_check !== "not_run" ? reports : 0;
+    item.deterministicCheckPasses += row.deterministic_check === "pass" ? reports : 0;
+    if (ADOPTION_FALLBACK_REASONS.includes(row.fallback_reason)) item.fallbackCounts[row.fallback_reason] += reports;
+  }
+  result.cappedDays = [...cappedDays].sort();
+  result.affectedDays = [...affectedDays].sort();
+  result.perHarnessAttribution = result.aggregatedCount > 0 ? "unavailable" : "complete";
+  return result;
+}
+
 /**
  * Query the primary panel. The WHERE clause is the enforced organic/evaluation separation: no
  * report labelled evaluation or synthetic can contribute to these adoption counts.
@@ -147,17 +253,17 @@ export function queryOrganicAdoptionByHarness(
        SUM(CASE WHEN deterministic_check <> 'not_run' THEN 1 ELSE 0 END) AS deterministic_checks,
        SUM(CASE WHEN deterministic_check = 'pass' THEN 1 ELSE 0 END) AS deterministic_check_passes
      FROM adoption_evidence
-     WHERE recorded_day >= @sinceDay AND traffic_purpose = 'organic'
+     WHERE recorded_day >= @sinceDay AND recorded_day < @throughDay AND traffic_purpose = 'organic'
      GROUP BY harness
      ORDER BY harness ASC`
-  ).all({ sinceDay: windowStartDay(now, days) }) as OrganicSummaryDbRow[];
+  ).all({ sinceDay: windowStartDay(now, days), throughDay: windowThroughDay(now) }) as OrganicSummaryDbRow[];
   const fallbackRows = db.prepare(
     `SELECT harness, fallback_reason, COUNT(*) AS fallback_reports
        FROM adoption_evidence
-      WHERE recorded_day >= @sinceDay AND traffic_purpose = 'organic'
+      WHERE recorded_day >= @sinceDay AND recorded_day < @throughDay AND traffic_purpose = 'organic'
       GROUP BY harness, fallback_reason
       ORDER BY harness ASC, fallback_reason ASC`
-  ).all({ sinceDay: windowStartDay(now, days) }) as OrganicFallbackDbRow[];
+  ).all({ sinceDay: windowStartDay(now, days), throughDay: windowThroughDay(now) }) as OrganicFallbackDbRow[];
 
   const byHarness = new Map<AdoptionHarness, OrganicAdoptionByHarness>();
   for (const row of summaries) {
@@ -195,10 +301,10 @@ export function queryLabAdoptionByPurpose(
        SUM(CASE WHEN result <> 'not_attempted' THEN 1 ELSE 0 END) AS attempted_delegations,
        SUM(CASE WHEN result = 'completed' THEN 1 ELSE 0 END) AS completed
      FROM adoption_evidence
-     WHERE recorded_day >= @sinceDay AND traffic_purpose IN ('evaluation', 'synthetic')
+     WHERE recorded_day >= @sinceDay AND recorded_day < @throughDay AND traffic_purpose IN ('evaluation', 'synthetic')
      GROUP BY traffic_purpose
      ORDER BY traffic_purpose ASC`
-  ).all({ sinceDay: windowStartDay(now, days) }) as LabDbRow[];
+  ).all({ sinceDay: windowStartDay(now, days), throughDay: windowThroughDay(now) }) as LabDbRow[];
   return rows.map((row) => ({
     purpose: row.purpose,
     reports: row.reports,
@@ -238,21 +344,59 @@ function aggregateOrganic(rows: OrganicAdoptionByHarness[]): Omit<OrganicAdoptio
   );
 }
 
+function mergeOrganicOverflow(
+  totals: Omit<OrganicAdoptionByHarness, "harness">,
+  overflow: AdoptionPanelOverflow,
+): void {
+  const item = overflow.byPurpose.organic;
+  totals.reports += item.reports;
+  totals.eligibleOpportunities += item.eligibleOpportunities;
+  totals.attemptedDelegations += item.attemptedDelegations;
+  totals.completed += item.completed;
+  totals.usefulCompletions += item.usefulCompletions;
+  totals.deterministicChecks += item.deterministicChecks;
+  totals.deterministicCheckPasses += item.deterministicCheckPasses;
+}
+
 export function buildAdoptionPanels(
   organicRows: OrganicAdoptionByHarness[],
   labRows: LabAdoptionByPurpose[],
-  days: number
+  days: number,
+  overflow: AdoptionPanelOverflow = emptyOverflow(),
 ): { organic: StatusPanel; organicByHarness: TablePanel; fallbacks: TablePanel; lab: TablePanel } {
   const totals = aggregateOrganic(organicRows);
+  mergeOrganicOverflow(totals, overflow);
+  for (const reason of ADOPTION_FALLBACK_REASONS) totals.fallbackCounts[reason] += overflow.byPurpose.organic.fallbackCounts[reason];
+  const labByPurpose = new Map(labRows.map((row) => [row.purpose, { ...row }]));
+  for (const purpose of ["evaluation", "synthetic"] as const) {
+    const item = overflow.byPurpose[purpose];
+    if (item.reports === 0) continue;
+    const row = labByPurpose.get(purpose) ?? { purpose, reports: 0, eligibleOpportunities: 0, attemptedDelegations: 0, completed: 0 };
+    row.reports += item.reports;
+    row.eligibleOpportunities += item.eligibleOpportunities;
+    row.attemptedDelegations += item.attemptedDelegations;
+    row.completed += item.completed;
+    labByPurpose.set(purpose, row);
+  }
+  const mergedLabRows = [...labByPurpose.values()].sort((a, b) => a.purpose.localeCompare(b.purpose));
+  const organicOverflowCount = overflow.byPurpose.organic.reports;
+  const organicIncomplete = organicOverflowCount > 0 || overflow.droppedCount > 0;
+  const fallbackIncomplete = overflow.droppedCount > 0;
+  const labIncomplete = overflow.byPurpose.evaluation.reports + overflow.byPurpose.synthetic.reports > 0 || overflow.droppedCount > 0;
   const organic: StatusPanel = {
     service: SERVICE,
     panel: ORGANIC_PANEL,
     kind: "status",
-    label: "MEASURED — organic M5 agent adoption",
-    state: totals.reports === 0 ? "warn" : "pass",
+    label: organicIncomplete
+      ? "INCOMPLETE — organic M5 agent adoption (overflow is unattributed)"
+      : "MEASURED — organic M5 agent adoption",
+    state: totals.reports === 0 || organicIncomplete ? "warn" : "pass",
     message:
       `MEASURED: ${totals.attemptedDelegations} attempted local delegation(s) from ${totals.eligibleOpportunities} known organic eligible opportunity/opportunities in ${days}d; ` +
       `useful completion rate ${pct(totals.usefulCompletions, totals.attemptedDelegations)}; deterministic check pass rate ${pct(totals.deterministicCheckPasses, totals.deterministicChecks)}. ` +
+      (organicIncomplete
+        ? `INCOMPLETE: ${organicOverflowCount} organic overflow observation(s) were aggregated on ${overflow.affectedDays.length} affected day(s); per-harness attribution is unavailable and inference availability is unaffected. `
+        : "") +
       "ENFORCED: evaluation and synthetic evidence are excluded from this panel. SHADOW: this measurement does not change routing or authorize frontier displacement.",
     detail: {
       kind: "table",
@@ -260,6 +404,11 @@ export function buildAdoptionPanels(
       rows: [
         { metric: "window", value: `${days}d` },
         { metric: "organic reports", value: totals.reports },
+        { metric: "retained individual reports (all purposes)", value: overflow.retainedIndividualCount },
+        { metric: "aggregated overflow reports", value: organicOverflowCount },
+        { metric: "dropped reports", value: overflow.droppedCount },
+        { metric: "capped days (all purposes)", value: overflow.cappedDays.join(", ") || "none" },
+        { metric: "affected days (all purposes)", value: overflow.affectedDays.join(", ") || "none" },
         { metric: "known eligible opportunities", value: totals.eligibleOpportunities },
         { metric: "attempted delegations", value: totals.attemptedDelegations },
         { metric: "useful completions", value: totals.usefulCompletions },
@@ -275,7 +424,9 @@ export function buildAdoptionPanels(
     service: SERVICE,
     panel: "m5-adoption-organic-by-harness",
     kind: "table",
-    label: "MEASURED — organic M5 agent adoption by harness",
+    label: organicIncomplete
+      ? "INCOMPLETE — organic M5 agent adoption by harness (per-harness attribution unavailable)"
+      : "MEASURED — organic M5 agent adoption by harness",
     cols: [
       "harness",
       "known eligible opportunities",
@@ -300,7 +451,9 @@ export function buildAdoptionPanels(
     service: SERVICE,
     panel: FALLBACKS_PANEL,
     kind: "table",
-    label: "MEASURED — organic M5 fallback reasons",
+    label: fallbackIncomplete
+      ? "INCOMPLETE — organic M5 fallback reasons (dropped reports)"
+      : "MEASURED — organic M5 fallback reasons (exact global aggregate)",
     cols: ["reason", "reports"],
     rows: ADOPTION_FALLBACK_REASONS.filter((reason) => reason !== "none")
       .map((reason) => ({ reason, reports: totals.fallbackCounts[reason] }))
@@ -311,9 +464,11 @@ export function buildAdoptionPanels(
     service: SERVICE,
     panel: LAB_PANEL,
     kind: "table",
-    label: "LAB — evaluation and synthetic M5 evidence",
+    label: labIncomplete
+      ? "INCOMPLETE LAB — evaluation and synthetic M5 evidence"
+      : "LAB — evaluation and synthetic M5 evidence",
     cols: ["purpose", "reports", "known eligible opportunities", "attempted delegations", "completed"],
-    rows: labRows.map((row) => ({
+    rows: mergedLabRows.map((row) => ({
       purpose: row.purpose,
       reports: row.reports,
       "known eligible opportunities": row.eligibleOpportunities,
@@ -365,10 +520,12 @@ export async function main(
     return 2;
   }
   try {
+    const now = Date.now();
     const panels = buildAdoptionPanels(
-      queryOrganicAdoptionByHarness(db, days),
-      queryLabAdoptionByPurpose(db, days),
-      days
+      queryOrganicAdoptionByHarness(db, days, now),
+      queryLabAdoptionByPurpose(db, days, now),
+      days,
+      queryAdoptionEvidenceOverflow(db, days, now),
     );
     if (dryRun) {
       writeStdout(`${JSON.stringify(panels, null, 2)}\n`);
