@@ -154,6 +154,11 @@ Use the maturity labels literally:
 - **SHADOW** means adoption measurement itself does not route, block, or authorize work. It cannot
   prove quality, production autonomy, cost savings, or a routing policy change.
 
+The repository's local `data/` directory is gitignored scratch space, not production evidence.
+Tests and local experiments must write to explicitly named, isolated temporary stores; files left
+under `data/` are private working artifacts and are not valid evidence until they have passed the
+applicable provenance, retention, and review gates.
+
 The initial review is deliberately not a raw-call target: by **2026-08-28**, review whether at
 least **20 known organic eligible opportunities** have been reported and whether useful completions
 (`pass` or `partial`, without a deterministic-check failure) are at least **60% of attempted

@@ -9,12 +9,12 @@
  * keep a stale model id when the catalogue is unavailable") — that is the realistic, desired
  * behavior being pinned here, not a workaround.
  */
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { initDb } from "../src/db.js";
+import { closeDb, initDb } from "../src/db.js";
 import { recordDelegation } from "../src/homeserver/ledger.js";
 import { loadConfig } from "../src/homeserver/config.js";
 import { contentDigest } from "../src/homeserver/evidence-identity.js";
@@ -25,11 +25,13 @@ const TSX = join(REPO_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
 
 let dir: string;
 let dbPath: string;
+let dataDir: string;
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "routing-lifecycle-cli-test-"));
   dbPath = join(dir, "eval.db");
-  mkdirSync(join(dir, "data"));
+  dataDir = join(dir, "data");
+  mkdirSync(dataDir);
 
   initDb(dbPath);
   for (let i = 0; i < 5; i++) {
@@ -44,8 +46,13 @@ beforeAll(() => {
   }
 });
 
+afterAll(() => {
+  closeDb();
+  rmSync(dir, { recursive: true, force: true });
+});
+
 function runReview(args: string[]): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync(process.execPath, [TSX, SCRIPT, "review", "--db", dbPath, ...args], {
+  const r = spawnSync(process.execPath, [TSX, SCRIPT, "review", "--db", dbPath, "--data-dir", dataDir, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     timeout: 120_000,
@@ -192,7 +199,7 @@ describe("routing-lifecycle-cli.ts review — live #6 calibration gate wiring (i
 
 describe("routing-lifecycle-cli.ts adopt — re-validates the #6 gate LIVE at adopt time (issue #37)", () => {
   function runAdopt(args: string[]): { status: number | null; stdout: string; stderr: string } {
-    const r = spawnSync(process.execPath, [TSX, SCRIPT, "adopt", "--db", dbPath, ...args], {
+    const r = spawnSync(process.execPath, [TSX, SCRIPT, "adopt", "--db", dbPath, "--data-dir", dataDir, ...args], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: 120_000,

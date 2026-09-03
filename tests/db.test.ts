@@ -1,16 +1,33 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { rmSync, existsSync } from "node:fs";
-import { initDb } from "../src/db.js";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { closeDb, initDb } from "../src/db.js";
 
-const TEST_DB = "./data/test-eval.db";
+let testDir: string;
+let openedDb: ReturnType<typeof initDb> | null = null;
+
+function testDbPath(): string {
+  return join(testDir, "eval.db");
+}
+
+beforeEach(() => {
+  // Every test (and every worker) gets a distinct database. Never use the repository's
+  // gitignored data/ tree for test state: it can contain private production evidence.
+  testDir = mkdtempSync(join(tmpdir(), "gille-db-test-"));
+  openedDb = null;
+});
 
 afterEach(() => {
-  if (existsSync(TEST_DB)) rmSync(TEST_DB);
+  closeDb();
+  if (openedDb?.open) openedDb.close();
+  rmSync(testDir, { recursive: true, force: true });
 });
 
 describe("initDb", () => {
   it("creates the database file and tables", () => {
-    const db = initDb(TEST_DB);
+    const db = initDb(testDbPath());
+    openedDb = db;
 
     const tables = db
       .prepare(
@@ -26,7 +43,8 @@ describe("initDb", () => {
   });
 
   it("enables WAL journal mode", () => {
-    const db = initDb(TEST_DB);
+    const db = initDb(testDbPath());
+    openedDb = db;
 
     const row = db.pragma("journal_mode") as { journal_mode: string }[];
     expect(row[0]?.journal_mode).toBe("wal");
@@ -35,7 +53,8 @@ describe("initDb", () => {
   });
 
   it("runs table has UNIQUE constraint on (batch_id, task_id, model_id)", () => {
-    const db = initDb(TEST_DB);
+    const db = initDb(testDbPath());
+    openedDb = db;
 
     const insert = db.prepare(
       `INSERT INTO runs (id, batch_id, task_id, model_id, status, prompt, created_at)
@@ -52,9 +71,11 @@ describe("initDb", () => {
   });
 
   it("is idempotent — calling twice does not throw", () => {
-    const db1 = initDb(TEST_DB);
+    const db1 = initDb(testDbPath());
+    openedDb = db1;
     db1.close();
-    const db2 = initDb(TEST_DB);
+    const db2 = initDb(testDbPath());
+    openedDb = db2;
     db2.close();
   });
 });

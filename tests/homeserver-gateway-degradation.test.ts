@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createNetServer, type Server as NetServer } from "node:net";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { closeDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { runChatCompletion } from "../src/homeserver/mcp.js";
 import { AdmissionController } from "../src/homeserver/admission.js";
@@ -169,10 +169,12 @@ let bodyResetServer: NetServer;
 let bodyResetPort = 0;
 let bodyResetGatewayPort = 0;
 let stopBodyResetGateway: (() => Promise<void>) | null = null;
+let runtimeDir = "";
+const ORIGINAL_FEEDBACK_FILE = process.env["HOMESERVER_FEEDBACK_FILE"];
 
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), "hs-degrade-test-"));
-  initDb(join(dir, "test.db"));
+  runtimeDir = mkdtempSync(join(tmpdir(), "hs-degrade-test-"));
+  initDb(join(runtimeDir, "test.db"));
   await startUpstream();
 
   // Find a dead port (bind then immediately close) for the connection-refused gateway.
@@ -189,6 +191,9 @@ beforeAll(async () => {
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
+  // Keep the public feedback route's append-only store outside the repository. The oversized
+  // body test below is rejected before writing, but the suite's route setup remains hermetic.
+  process.env["HOMESERVER_FEEDBACK_FILE"] = join(runtimeDir, "feedback.jsonl");
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   // SHORT timeout so the "hang" case trips the upstream_timeout path quickly.
@@ -255,6 +260,10 @@ afterAll(async () => {
   if (stopBodyResetGateway) await stopBodyResetGateway();
   await new Promise<void>((r) => upstream.close(() => r()));
   await new Promise<void>((r) => bodyResetServer.close(() => r()));
+  closeDb();
+  rmSync(runtimeDir, { recursive: true, force: true });
+  if (ORIGINAL_FEEDBACK_FILE === undefined) delete process.env["HOMESERVER_FEEDBACK_FILE"];
+  else process.env["HOMESERVER_FEEDBACK_FILE"] = ORIGINAL_FEEDBACK_FILE;
 });
 
 beforeEach(() => {
