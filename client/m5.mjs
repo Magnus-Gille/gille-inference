@@ -7,7 +7,7 @@
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   M5_CLIENT_VERSION,
   M5ClientError,
@@ -57,6 +57,7 @@ function parseGlobalArgs(argv) {
   let privateRequested = false;
   let publicGatewayUrl;
   let sshTarget;
+  let authHelper;
   const positional = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -86,6 +87,22 @@ function parseGlobalArgs(argv) {
       }
       sshTarget = value;
       index += 1;
+    } else if (arg === "--auth-helper") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper requires an absolute path to m5-auth.",
+        );
+      }
+      if (authHelper !== undefined) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper may be specified only once.",
+        );
+      }
+      authHelper = value;
+      index += 1;
     } else if (arg === "--help" || arg === "-h") {
       positional.push("help");
     } else if (arg === "--version" || arg === "-v") {
@@ -94,7 +111,15 @@ function parseGlobalArgs(argv) {
       positional.push(arg);
     }
   }
-  return { profile, endpoint, privateRequested, positional, publicGatewayUrl, sshTarget };
+  return {
+    profile,
+    endpoint,
+    privateRequested,
+    positional,
+    publicGatewayUrl,
+    sshTarget,
+    authHelper,
+  };
 }
 
 async function readBoundedInput(input) {
@@ -127,14 +152,15 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-function writeDeployEnv(stream, publicGatewayUrl) {
+function writeDeployEnv(stream, publicGatewayUrl, authHelper) {
   const publicHttpUrl = new URL(publicGatewayUrl);
   publicHttpUrl.protocol = "http:";
+  const authCommand = shellQuote(authHelper);
   stream.write([
     "unset M5_API_KEY HOMESERVER_OWNER_KEY \\",
     "  DEPLOY_HEALTH_TAILNET_URL DEPLOY_CAPABILITY_URL \\",
     "  DEPLOY_PUBLIC_HTTP_URL DEPLOY_PUBLIC_HTTPS_URL &&",
-    'eval "$(m5-auth --env --tailnet)" &&',
+    `eval "$(${authCommand} --env --tailnet)" &&`,
     'test -n "${M5_API_KEY:-}" &&',
     'export HOMESERVER_OWNER_KEY="$M5_API_KEY" &&',
     "unset M5_API_KEY &&",
@@ -152,7 +178,7 @@ function help() {
     version: M5_CLIENT_VERSION,
     usage: [
       "m5 --profile <claude|codex> doctor",
-      "eval \"$(m5 --profile <name> deploy-env)\"",
+      "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
       "printf '%s' '<json>' | m5 --profile <claude|codex> ask",
@@ -207,9 +233,36 @@ export async function main(
       positional,
       publicGatewayUrl,
       sshTarget,
+      authHelper,
     } = parseGlobalArgs(argv);
     selectedProfileName = profile;
     const command = positional[0];
+    if (authHelper !== undefined && command !== "deploy-env") {
+      throw new M5ClientError(
+        "invalid_args",
+        "--auth-helper is only valid with deploy-env.",
+      );
+    }
+    if (command === "deploy-env") {
+      if (positional.length !== 1) {
+        throw new M5ClientError(
+          "invalid_args",
+          "deploy-env does not accept positional arguments.",
+        );
+      }
+      if (authHelper === undefined) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper is required with deploy-env.",
+        );
+      }
+      if (!isAbsolute(authHelper)) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper requires an absolute path to m5-auth.",
+        );
+      }
+    }
     if (!command || command === "help") {
       writeJson(output, help());
       return 0;
@@ -251,7 +304,7 @@ export async function main(
           "--private is not valid with deploy-env; tailnet URLs come from m5-auth.",
         );
       }
-      writeDeployEnv(output, profileConfig.publicGatewayUrl);
+      writeDeployEnv(output, profileConfig.publicGatewayUrl, authHelper);
       return 0;
     }
     if (command === "doctor") {
