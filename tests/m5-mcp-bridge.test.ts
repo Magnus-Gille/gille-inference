@@ -308,6 +308,40 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
+  it("does not retry a non-retryable first code_loop_result failure", async () => {
+    let calls = 0;
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          calls += 1;
+          throw new M5ClientError("rejected_credential", "credential rejected", {
+            failureLayer: "authentication",
+            retryable: false,
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(1);
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 23,
+      error: {
+        code: -32603,
+        data: { m5_code: "rejected_credential", retryable: false },
+      },
+    });
+    expect(parsed.error.data).not.toHaveProperty("result_recovery");
+  });
+
   it.each([
     {
       label: "unknown",

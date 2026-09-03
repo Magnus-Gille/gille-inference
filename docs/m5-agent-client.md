@@ -289,7 +289,8 @@ when a compatible server exposes it, but it does not provide the direct report c
 doctor parity check. `m5 1.2.1` keeps that requirement and additionally expects the structured
 `list_models` discovery contract when the gateway identifies it as a `1.2.1+` client;
 `1.2.1` is therefore the minimum client version for integrations that use adoption measurement or
-blind-context discovery. Guided provisioning requires the current accepted exact `1.3.0` pin.
+blind-context discovery. Guided provisioning requires at least `1.3.0`; new exact pins should use
+the current accepted version shown above.
 
 ## Transport and redaction behavior
 
