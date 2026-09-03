@@ -7,6 +7,29 @@
 This document prevents the architecture story from outrunning implementation and organic evidence.
 Statuses use the vocabulary in [`architecture.md`](./architecture.md).
 
+## How to run a vision audit
+
+When evaluating whether the Grimnir/M5 inference vision is true, blog-ready, worth claiming, or
+what would make it truer, answer from principles and evidence, not implementation volume. The goal
+is useful proactive work with minimal operator time and in-loop attention, at quality the operator
+accepts. The durable pillars are privacy, availability/sovereignty, cost, and a learning loop in
+which production paths create evidence that improves routing, policy, or product choices.
+
+1. **Principle -> mechanism -> evidence -> gap.** Cite concrete code, docs, live config,
+   dashboards, or DB rows. Label each claim `deployed/enforced`, `deployed/shadow`, `measured`, or
+   `aspirational`.
+2. **Do not overclaim.** Shadow routes, harvest rows, projected savings, and small samples are
+   learning evidence, not proof of production autonomy or ROI.
+3. **Make the loop truer before polishing the story.** Propose the smallest measurement,
+   dashboard, verifier, instruction, or code change that closes a weak claim.
+4. **Keep boundaries explicit.** Separate owner-only learning data from content-blind guest and
+   operational telemetry.
+5. **Route gaps to their owner.** If another repo owns the correction, file it there rather than
+   editing across repository boundaries.
+
+The table below is the claim-by-claim source of truth; the measured steady-state decision is in
+[`migration-go-no-go-verdict.md`](./migration-go-no-go-verdict.md).
+
 | Vision claim | Mechanism/artifact | State | Important gap |
 |---|---|---|---|
 | The human-facing brain is replaceable | L1 contract, Munin context, house nomenclature | **deployed** across Claude Code/Codex use | Formal L1 task handoff schema is incomplete |
