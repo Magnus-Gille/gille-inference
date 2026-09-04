@@ -1,7 +1,13 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.4";
+export const M5_CLIENT_VERSION = "1.3.5";
+// Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
+// callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
+// switch or long implementation response can complete without an unbounded client wait.
+export const M5_ASK_TIMEOUT_MS_DEFAULT = 30_000;
+export const M5_ASK_TIMEOUT_MS_MIN = 1_000;
+export const M5_ASK_TIMEOUT_MS_MAX = 600_000;
 const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-04-v8";
 const CODE_LOOP_RESULT_SCOPE_CAPABILITY = "writable-v1";
 const CODE_LOOP_COMPLETION_ACCOUNTING_CAPABILITY = "bounded-turns-v1";
@@ -892,6 +898,18 @@ export async function createM5Client({
     throw new M5ClientError(
       "invalid_config",
       "The gateway endpoint kind must be public or private.",
+    );
+  }
+  // Library boundary (#154): reject out-of-range bounds before credential resolution or
+  // network access. The default above stays the exact stock 30 s for omitting callers.
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < M5_ASK_TIMEOUT_MS_MIN ||
+    timeoutMs > M5_ASK_TIMEOUT_MS_MAX
+  ) {
+    throw new M5ClientError(
+      "invalid_config",
+      "timeoutMs must be an integer number of milliseconds from 1000 to 600000.",
     );
   }
   const origin = normalizeGatewayUrl(gatewayUrl, "gatewayUrl", {

@@ -73,6 +73,15 @@ m5 --profile codex mcp
 `m5 ask` prints structured JSON including `finish_reason`, explicit `truncated`, and content-blind
 `usage`. A token-limit finish returns `truncated:true` so scripts can retry with a higher
 `max_tokens` instead of mistaking an empty or partial answer for a clean completion.
+A direct ask applies a 30,000 ms single-request timeout by default; `--timeout-ms <integer>`
+selects a bounded 1,000–600,000 ms alternative for that call only:
+
+```bash
+printf '%s' '{"model":"mellum","prompt":"Summarize this."}' \
+  | m5 --profile codex --timeout-ms 90000 ask
+```
+
+A longer client bound does not raise server caps or guarantee completion.
 
 The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
 `diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,

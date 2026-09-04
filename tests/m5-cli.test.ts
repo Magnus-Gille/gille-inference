@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../client/m5.mjs";
 import { M5ClientError } from "../client/m5-client.mjs";
 
@@ -1022,6 +1022,179 @@ describe("m5 command surface", () => {
     });
     expect(error.text()).not.toContain(SECRET);
     expect(error.text()).not.toContain(PRIVATE_URL);
+  });
+
+  it("passes --timeout-ms through to a direct ask without touching MCP arguments (#154)", async () => {
+    vi.useFakeTimers();
+    try {
+      const output = sink();
+      const error = sink();
+      const seen: Array<Record<string, unknown>> = [];
+      const exitPromise = main(["--profile", "codex", "--timeout-ms", "90000", "ask"], {
+        input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: { resolve: async () => SECRET },
+        fetch: async (_input, init) =>
+          new Promise<Response>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              const request = JSON.parse(String(init?.body)) as { id: number; params: { arguments: unknown } };
+              seen.push(request.params.arguments as Record<string, unknown>);
+              resolve(
+                new Response(
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: request.id,
+                    result: {
+                      content: [{ type: "text", text: "slow but healthy" }],
+                      isError: false,
+                      structuredContent: {
+                        model: "mellum",
+                        text: "slow but healthy",
+                        finish_reason: "stop",
+                        truncated: false,
+                        metered: true,
+                        usage: {
+                          prompt_tokens: 11,
+                          completion_tokens: 4,
+                          total_tokens: 15,
+                          reasoning_tokens: null,
+                          cache_creation_input_tokens: null,
+                          cache_read_input_tokens: null,
+                        },
+                      },
+                    },
+                  }),
+                  { status: 200 },
+                ),
+              );
+            }, 45_000);
+            init?.signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(new DOMException("request aborted", "AbortError"));
+            });
+          }),
+      });
+      // A 45 s healthy completion would abort under the stock 30 s default; reaching the
+      // 90 s bound proves the selected value arrived at the client timeout seam.
+      await vi.advanceTimersByTimeAsync(45_000);
+      await expect(exitPromise).resolves.toBe(0);
+      expect(JSON.parse(output.text())).toMatchObject({
+        model: "mellum",
+        text: "slow but healthy",
+        usage: expect.objectContaining({ prompt_tokens: 11, completion_tokens: 4 }),
+      });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).not.toHaveProperty("timeoutMs");
+      expect(seen[0]).not.toHaveProperty("timeout-ms");
+      expect(error.text()).toBe("");
+      expect(output.text()).not.toContain(SECRET);
+      expect(error.text()).not.toContain(SECRET);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["missing value", ["--profile", "codex", "--timeout-ms"]],
+    ["flag-looking value", ["--profile", "codex", "--timeout-ms", "--private", "ask"]],
+    ["duplicate", ["--profile", "codex", "--timeout-ms", "90000", "--timeout-ms", "90000", "ask"]],
+    ["fractional", ["--profile", "codex", "--timeout-ms", "90.5", "ask"]],
+    ["non-numeric", ["--profile", "codex", "--timeout-ms", "soon", "ask"]],
+    ["under minimum", ["--profile", "codex", "--timeout-ms", "999", "ask"]],
+    ["over maximum", ["--profile", "codex", "--timeout-ms", "600001", "ask"]],
+  ])("rejects %s --timeout-ms before config, credential, or network access (#154)", async (_label, argv) => {
+    const output = sink();
+    const error = sink();
+    let configLoads = 0;
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const exitCode = await main(argv, {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader: () => {
+        configLoads += 1;
+        return configLoader();
+      },
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach the network");
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringContaining("--timeout-ms") },
+    });
+    expect(configLoads).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(output.text()).toBe("");
+    expect(error.text()).not.toContain(SECRET);
+  });
+
+  it.each([
+    ["mcp", ["--profile", "codex", "--timeout-ms", "90000", "mcp"]],
+    ["doctor", ["--profile", "codex", "--timeout-ms", "90000", "doctor"]],
+    ["models", ["--profile", "codex", "--timeout-ms", "90000", "models"]],
+    ["provision", ["--profile", "codex", "--timeout-ms", "90000", "provision"]],
+    ["deploy-env", ["--profile", "codex", "--timeout-ms", "90000", "deploy-env", "--auth-helper", AUTH_HELPER]],
+    ["adoption", ["--profile", "codex", "--timeout-ms", "90000", "adoption", "report"]],
+    ["code", ["--profile", "codex", "--timeout-ms", "90000", "code", "run"]],
+  ])("rejects --timeout-ms with %s before any side effect (#154)", async (_label, argv) => {
+    const output = sink();
+    const error = sink();
+    let configLoads = 0;
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    let bridgeRuns = 0;
+    let provisions = 0;
+    const exitCode = await main(argv, {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader: () => {
+        configLoads += 1;
+        return configLoader();
+      },
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach the network");
+      },
+      bridgeRunner: async () => {
+        bridgeRuns += 1;
+      },
+      provisioner: async () => {
+        provisions += 1;
+        throw new Error("must not provision");
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringMatching(/--timeout-ms.*ask|ask.*--timeout-ms/) },
+    });
+    expect(configLoads).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(bridgeRuns).toBe(0);
+    expect(provisions).toBe(0);
+    expect(output.text()).toBe("");
+    expect(error.text()).not.toContain(SECRET);
   });
 
   it("does not claim CLI-side sandbox enforcement", async () => {
