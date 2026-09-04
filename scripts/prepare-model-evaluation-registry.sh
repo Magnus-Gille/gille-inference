@@ -39,6 +39,30 @@ fi
 
 data_dir="$root/data"
 registry="$data_dir/model-scout-registry.jsonl"
+
+chmod_nofollow() {
+  local path="$1"
+  local mode="$2"
+  local kind="$3"
+  node -e '
+    const fs = require("node:fs");
+    const [path, mode, kind] = process.argv.slice(1);
+    const expectedDirectory = kind === "directory";
+    const flags = fs.constants.O_NOFOLLOW |
+      (expectedDirectory ? fs.constants.O_RDONLY | fs.constants.O_DIRECTORY : fs.constants.O_WRONLY);
+    const fd = fs.openSync(path, flags);
+    try {
+      const stat = fs.fstatSync(fd);
+      if (expectedDirectory ? !stat.isDirectory() : !stat.isFile()) {
+        throw new Error(`refusing to chmod non-${kind}: ${path}`);
+      }
+      fs.fchmodSync(fd, Number.parseInt(mode, 8));
+    } finally {
+      fs.closeSync(fd);
+    }
+  ' "$path" "$mode" "$kind"
+}
+
 if [ ! -e "$data_dir" ]; then
   mkdir -m 0700 "$data_dir"
 fi
@@ -53,7 +77,7 @@ if [ -L "$data_dir" ] || [ ! -d "$data_dir" ] || [ ! -O "$data_dir" ]; then
   echo "ERROR: registry parent ownership transfer was not safe: $data_dir" >&2
   exit 1
 fi
-chmod 0700 "$data_dir"
+chmod_nofollow "$data_dir" 0700 directory
 
 if [ -L "$registry" ] || { [ -e "$registry" ] && [ ! -f "$registry" ]; }; then
   echo "ERROR: registry target is not a regular file: $registry" >&2
@@ -72,6 +96,6 @@ if [ -L "$registry" ] || [ ! -f "$registry" ] || [ ! -O "$registry" ]; then
   echo "ERROR: registry target ownership transfer was not safe: $registry" >&2
   exit 1
 fi
-chmod 0600 "$registry"
+chmod_nofollow "$registry" 0600 file
 
 echo "Prepared manual-evaluation registry: $registry (uid=$uid gid=$gid mode=0600; parent mode=0700)"

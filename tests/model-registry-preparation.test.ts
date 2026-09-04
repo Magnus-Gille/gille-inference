@@ -96,6 +96,9 @@ describe("model-evaluation registry preparation (#263)", () => {
     const source = readFileSync(SCRIPT, "utf8");
     expect(source).toContain('sudo chown -h "$uid:$gid"');
     expect(source).not.toMatch(/sudo\s+(chmod|install)/);
+    expect(source).toContain("fs.constants.O_NOFOLLOW");
+    expect(source).toContain("fs.fchmodSync(fd");
+    expect(source).not.toMatch(/^chmod\s/m);
     const deploy = readFileSync(join(__dirname, "..", "scripts", "deploy-gateway.sh"), "utf8");
     expect(deploy).not.toMatch(/sudo[^\n]*prepare-model-evaluation-registry\.sh/);
   });

@@ -50,8 +50,10 @@ check and reports the effective uid without touching the roster or loading a mod
 
 The atomic writer holds `model-scout-registry.jsonl.lock` only for the synchronous commit. An
 unclean process death can leave that lock behind; preflight and deploy verification then fail
-before any GPU work and name the exact lock path. After proving that no evaluator process or
-maintenance window is active, remove only that stale lock and rerun the read-only deploy verifier.
+before any GPU work and name the exact lock path. The lock contains the evaluator PID and creation
+time. Inspect that metadata, prove with `ps -p <pid> -o pid=,etime=,command=` that the owning process
+is absent, and confirm `GET /admin/maintenance/window` reports inactive. Only then remove the exact
+stale lock and rerun the read-only deploy verifier; never remove a lock held by a live evaluator.
 
 The evaluator requires llama-swap's unload request to succeed and `/running` to prove empty before
 it starts a loopback-only ephemeral llama-server. It runs the deterministic probe battery

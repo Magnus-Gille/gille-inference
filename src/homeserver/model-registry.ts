@@ -146,7 +146,7 @@ function persistenceError(operation: string, path: string, error: unknown): Erro
 function readCompleteRegistryBytes(path: string): Buffer {
   let fd: number | undefined;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     if (!fstatSync(fd).isFile()) {
       throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
     }
@@ -169,6 +169,22 @@ function assertRegistryLockAvailable(path: string): void {
   }
 }
 
+function parseRegistryBytes(raw: Buffer): RegistryEntry[] {
+  const entries: RegistryEntry[] = [];
+  for (const line of raw.toString("utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (isRegistryEntry(parsed)) entries.push(parsed);
+  }
+  return entries;
+}
+
 /** Read-only proof used by deployment verification under the evaluator's effective identity. */
 export function verifyRegistryAppendability(path: string = DEFAULT_REGISTRY_PATH): void {
   const dir = dirname(path);
@@ -182,7 +198,13 @@ export function verifyRegistryAppendability(path: string = DEFAULT_REGISTRY_PATH
     throw persistenceError("verify parent appendability", path, error);
   }
   try {
-    targetFd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW);
+    targetFd = openSync(
+      path,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    if (!fstatSync(targetFd).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
   } catch (error) {
     throw persistenceError("open target for append", path, error);
   } finally {
@@ -213,9 +235,12 @@ export function preflightRegistry(path: string = DEFAULT_REGISTRY_PATH): void {
     }
     targetFd = openSync(
       path,
-      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       0o600,
     );
+    if (!fstatSync(targetFd).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
   } catch (error) {
     throw persistenceError("open target for append", path, error);
   } finally {
@@ -265,6 +290,7 @@ export function appendEntry(
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         0o600,
       );
+      writeFileSync(lockFd, `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`);
       fsyncSync(lockFd);
     } catch (error) {
       throw new Error(`registry lock unavailable at ${lockPath} for registry ${path} (${errnoCode(error)})`);
@@ -274,7 +300,9 @@ export function appendEntry(
 
     const line = `${JSON.stringify(entry)}\n`;
     if (entry.evaluationId) {
-      const prior = readRegistry(path).find((candidate) => candidate.evaluationId === entry.evaluationId);
+      const prior = parseRegistryBytes(existing).find(
+        (candidate) => candidate.evaluationId === entry.evaluationId,
+      );
       if (prior) {
         if (`${JSON.stringify(prior)}\n` === line) return "duplicate";
         throw new Error(`evaluation identity collision for ${entry.evaluationId} in registry ${path}`);
@@ -317,22 +345,7 @@ export function appendEntry(
  */
 export function readRegistry(path: string = DEFAULT_REGISTRY_PATH): RegistryEntry[] {
   if (!existsSync(path)) return [];
-  const raw = readCompleteRegistryBytes(path).toString("utf8");
-  const entries: RegistryEntry[] = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      // skip malformed JSON
-      continue;
-    }
-    if (!isRegistryEntry(parsed)) continue;
-    entries.push(parsed);
-  }
-  return entries;
+  return parseRegistryBytes(readCompleteRegistryBytes(path));
 }
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
