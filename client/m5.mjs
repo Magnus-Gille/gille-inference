@@ -9,6 +9,9 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
+  M5_ASK_TIMEOUT_MS_DEFAULT,
+  M5_ASK_TIMEOUT_MS_MAX,
+  M5_ASK_TIMEOUT_MS_MIN,
   M5_CLIENT_VERSION,
   M5ClientError,
   createKeychainCredentialStore,
@@ -58,6 +61,7 @@ function parseGlobalArgs(argv) {
   let publicGatewayUrl;
   let sshTarget;
   let authHelper;
+  let timeoutMsRaw;
   const positional = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -103,6 +107,22 @@ function parseGlobalArgs(argv) {
       }
       authHelper = value;
       index += 1;
+    } else if (arg === "--timeout-ms") {
+      const value = argv[index + 1];
+      if (timeoutMsRaw !== undefined) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--timeout-ms may be specified only once.",
+        );
+      }
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--timeout-ms requires an integer number of milliseconds.",
+        );
+      }
+      timeoutMsRaw = value;
+      index += 1;
     } else if (arg === "--help" || arg === "-h") {
       positional.push("help");
     } else if (arg === "--version" || arg === "-v") {
@@ -119,7 +139,35 @@ function parseGlobalArgs(argv) {
     publicGatewayUrl,
     sshTarget,
     authHelper,
+    timeoutMsRaw,
   };
+}
+
+/**
+ * Direct-ask request timeout (#154): a strict integer in M5_ASK_TIMEOUT_MS_MIN..
+ * M5_ASK_TIMEOUT_MS_MAX. Fractional, non-numeric, and out-of-range values are rejected
+ * before config or credential access. The value travels only into createM5Client — never
+ * into MCP arguments, profile config, environment, logs, or telemetry.
+ */
+function parseAskTimeoutMs(raw) {
+  if (!/^\d+$/.test(raw)) {
+    throw new M5ClientError(
+      "invalid_args",
+      `--timeout-ms must be an integer number of milliseconds from ${M5_ASK_TIMEOUT_MS_MIN} to ${M5_ASK_TIMEOUT_MS_MAX}.`,
+    );
+  }
+  const parsed = Number(raw);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < M5_ASK_TIMEOUT_MS_MIN ||
+    parsed > M5_ASK_TIMEOUT_MS_MAX
+  ) {
+    throw new M5ClientError(
+      "invalid_args",
+      `--timeout-ms must be an integer number of milliseconds from ${M5_ASK_TIMEOUT_MS_MIN} to ${M5_ASK_TIMEOUT_MS_MAX}.`,
+    );
+  }
+  return parsed;
 }
 
 async function readBoundedInput(input) {
@@ -181,7 +229,7 @@ function help() {
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
-      "printf '%s' '<json>' | m5 --profile <claude|codex> ask",
+      "printf '%s' '<json>' | m5 --profile <claude|codex> [--timeout-ms <1000-600000>] ask",
       "printf '%s' '<content-free-json>' | m5 --profile <claude|codex> adoption report",
       "printf '%s' '<json>' | m5 --profile <claude|codex> code run",
       "m5 --profile <claude|codex> code status <work_id>",
@@ -234,9 +282,20 @@ export async function main(
       publicGatewayUrl,
       sshTarget,
       authHelper,
+      timeoutMsRaw,
     } = parseGlobalArgs(argv);
     selectedProfileName = profile;
     const command = positional[0];
+    // Scope before value: the flag is meaningless outside a direct ask, and both
+    // rejections must land before config loading, credential lookup, or any I/O.
+    if (timeoutMsRaw !== undefined && command !== "ask") {
+      throw new M5ClientError(
+        "invalid_args",
+        "--timeout-ms is only valid with ask.",
+      );
+    }
+    const askTimeoutMs =
+      timeoutMsRaw === undefined ? M5_ASK_TIMEOUT_MS_DEFAULT : parseAskTimeoutMs(timeoutMsRaw);
     if (authHelper !== undefined && command !== "deploy-env") {
       throw new M5ClientError(
         "invalid_args",
@@ -334,6 +393,7 @@ export async function main(
       profile,
       credentialStore,
       fetch: fetchImpl,
+      timeoutMs: askTimeoutMs,
     });
 
     if (command === "mcp") {

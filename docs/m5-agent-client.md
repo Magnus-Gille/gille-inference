@@ -17,7 +17,7 @@ The `m5` executable ships in the same npm package as `hs`. Install the current a
 package with an exact pin:
 
 ```bash
-npm install --global gille-inference@1.3.4
+npm install --global gille-inference@1.3.5
 m5 --version
 ```
 
@@ -29,6 +29,7 @@ owner-agent profile provisioning. Version `1.3.2` adds one bounded, idempotent t
 terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bounded
 `writable-v1` result contract and rejects older unscoped terminal results. Version `1.3.4`
 requires bounded global turn accounting, explicit completion state, and check skip reasons.
+Version `1.3.5` adds a bounded `--timeout-ms` option for direct `m5 ask` calls.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
@@ -167,6 +168,9 @@ m5 --profile codex models
 printf '%s' '{"model":"mellum","prompt":"Classify this bounded input."}' \
   | m5 --profile codex ask
 
+printf '%s' '{"model":"mellum","prompt":"Classify this bounded input."}' \
+  | m5 --profile codex --timeout-ms 90000 ask
+
 printf '%s' '{"harness":"codex_cli","execution_mode":"code_loop","traffic_purpose":"organic","result":"not_attempted","deterministic_check":"not_run","reviewer_usefulness":"not_reported","fallback_reason":"m5_auth_unavailable","eligible_opportunities":1}' \
   | m5 --profile codex adoption report
 
@@ -210,6 +214,15 @@ errors still exit `1` with a redacted stderr JSON envelope. Truncation is alread
 first call, and any retry is a new metered request. Usage fields remain content-blind; the client
 accepts `null` usage, derives `total_tokens` only when prompt+completion counts are both valid,
 and nulls malformed negative or fractional counters instead of trusting them.
+
+Direct `m5 ask` applies a 30,000 ms single-request timeout by default, covering response-body
+consumption. `--timeout-ms <integer>` selects a bounded alternative from 1,000 through
+600,000 ms for that one call; missing, duplicate, fractional, non-numeric, and out-of-range
+values are rejected before config or credential access, and the flag is rejected with every
+other command. The library boundary (`createM5Client({ timeoutMs })`) enforces the same range.
+A longer client bound does not raise server caps or guarantee completion — an exceeded bound
+still returns the structured `timeout` error — and the value never enters MCP arguments,
+profile config, environment, logs, or telemetry.
 
 `code run` starts the server-side async job, polls it, and returns the terminal structured result,
 including the unified diff and verification evidence. It can use `"wait": false` to return the

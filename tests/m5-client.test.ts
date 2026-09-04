@@ -291,7 +291,8 @@ describe("secret-safe M5 client", () => {
       gatewayUrl: "https://gateway.invalid",
       profile: "codex",
       credentialStore: { resolve: async () => SECRET },
-      timeoutMs: 5,
+      // #154 lower bound: the same abort-during-body path with a valid explicit timeout.
+      timeoutMs: 1_000,
       fetch: async (_input, init) => {
         attempts += 1;
         if (attempts === 1) {
@@ -317,6 +318,143 @@ describe("secret-safe M5 client", () => {
     await expect(
       client.rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
     ).resolves.toMatchObject({ id: 2, result: { tools: [] } });
+  });
+
+  // #154: bounded ask timeouts. Omission keeps the exact 30,000 ms default; an explicit
+  // 1,000–600,000 ms bound reaches the single-request AbortSignal; anything else fails at
+  // the library boundary before credential resolution or network access.
+  describe("ask timeout bounds (#154)", () => {
+    function healthyAskFetch(resolveAfterMs: number) {
+      return async (_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            resolve(
+              rpcResult(1, {
+                content: [{ type: "text", text: "slow but healthy" }],
+                isError: false,
+                structuredContent: {
+                  model: "mellum",
+                  text: "slow but healthy",
+                  finish_reason: "stop",
+                  truncated: false,
+                  metered: true,
+                  usage: {
+                    prompt_tokens: 11,
+                    completion_tokens: 4,
+                    total_tokens: 15,
+                    reasoning_tokens: null,
+                    cache_creation_input_tokens: null,
+                    cache_read_input_tokens: null,
+                  },
+                },
+              }),
+            );
+          }, resolveAfterMs);
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new DOMException("request aborted", "AbortError"));
+          });
+        });
+    }
+
+    it("omission preserves the exact 30,000 ms default", async () => {
+      vi.useFakeTimers();
+      try {
+        const client = await createM5Client({
+          gatewayUrl: "https://gateway.invalid",
+          profile: "codex",
+          credentialStore: { resolve: async () => SECRET },
+          fetch: async (_input, init) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                reject(new DOMException("request aborted", "AbortError"));
+              });
+            }),
+        });
+        let settled = false;
+        const pending = client.ask({ model: "mellum", prompt: "classify" });
+        pending.then(
+          () => { settled = true; },
+          () => { settled = true; },
+        );
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(pending).rejects.toMatchObject({ code: "timeout" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("timeoutMs 90,000 allows a healthy ask that completes past 30 seconds", async () => {
+      vi.useFakeTimers();
+      try {
+        const client = await createM5Client({
+          gatewayUrl: "https://gateway.invalid",
+          profile: "codex",
+          credentialStore: { resolve: async () => SECRET },
+          timeoutMs: 90_000,
+          fetch: healthyAskFetch(45_000),
+        });
+        const pending = client.ask({ model: "mellum", prompt: "classify" });
+        await vi.advanceTimersByTimeAsync(45_000);
+        await expect(pending).resolves.toMatchObject({
+          model: "mellum",
+          text: "slow but healthy",
+          usage: expect.objectContaining({ prompt_tokens: 11, completion_tokens: 4 }),
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the same slow ask fails with the structured timeout error at a lower bound", async () => {
+      vi.useFakeTimers();
+      try {
+        const client = await createM5Client({
+          gatewayUrl: "https://gateway.invalid",
+          profile: "codex",
+          credentialStore: { resolve: async () => SECRET },
+          timeoutMs: 1_000,
+          fetch: healthyAskFetch(2_000),
+        });
+        const pending = client.ask({ model: "mellum", prompt: "classify" });
+        // Attach the assertion before advancing: the abort rejects mid-advance, and a
+        // handler attached only afterwards would flag an unhandled rejection.
+        const assertion = expect(pending).rejects.toMatchObject({ code: "timeout" });
+        await vi.advanceTimersByTimeAsync(2_000);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([0, 999, 600_001, 1.5, Number.NaN, "90000", null])(
+      "rejects library timeoutMs %s before credential resolution or network access",
+      async (timeoutMs) => {
+        let credentialLookups = 0;
+        let networkCalls = 0;
+        await expect(
+          createM5Client({
+            gatewayUrl: "https://gateway.invalid",
+            profile: "codex",
+            credentialStore: {
+              resolve: async () => {
+                credentialLookups += 1;
+                return SECRET;
+              },
+            },
+            timeoutMs: timeoutMs as number,
+            fetch: async () => {
+              networkCalls += 1;
+              throw new Error("must not reach the network");
+            },
+          }),
+        ).rejects.toMatchObject({ name: "M5ClientError" });
+        expect(credentialLookups).toBe(0);
+        expect(networkCalls).toBe(0);
+      },
+    );
   });
 
   it("maps models and ask into structured JSON without forking MCP semantics", async () => {
@@ -1443,7 +1581,8 @@ describe("m5 doctor diagnostic distinctions", () => {
       profile: "codex",
       profileConfig: PROFILE,
       credentialStore: { resolve: async () => SECRET },
-      timeoutMs: 20,
+      // #154 lower bound: arbitrary to this test (the timeout never fires), kept valid.
+      timeoutMs: 1_000,
       fetch: async (input, init) => {
         const url = String(input);
         if (url.endsWith("/portal/me")) return jsonResponse({ alias: "codex-agent", tier: "owner", scope: "agent" });

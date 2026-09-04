@@ -149,7 +149,8 @@ describe("m5 stdio MCP conformance", () => {
         const request = JSON.parse(String(init?.body)) as { id: number };
         return rpcResponse(request.id, { tools: [] });
       },
-      { timeoutMs: 5 },
+      // #154 lower bound: the same abort-driven redaction path with a valid timeout.
+      { timeoutMs: 1_000 },
     );
 
     const failed = await bridge.handleLine(
