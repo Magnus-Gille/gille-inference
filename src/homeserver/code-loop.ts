@@ -71,19 +71,28 @@ import { TASK_TYPES } from "./taxonomy.js";
 export const CODE_LOOP_TOOL_NAMES = ["code_loop_start", "code_loop_status", "code_loop_result"] as const;
 
 /** Immutable wire/harness contract identifier reported in every #247 result. */
-export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-09-04-v7";
+export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-09-04-v8";
 export const CODE_LOOP_CAPABILITIES = {
   start_idempotency: "client-run-id-v1",
   agent_checks: "pi-bash-events-v3",
   result_scope: "writable-v1",
+  completion_accounting: "bounded-turns-v1",
 } as const;
 const TRUSTED_GIT_ROOT_NAME = ".code-loop-host-git";
 export const CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT =
   `contract[harness=${CODE_LOOP_HARNESS_VERSION};agent_checks=${CODE_LOOP_CAPABILITIES.agent_checks};` +
-  `result_scope=${CODE_LOOP_CAPABILITIES.result_scope};schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
+  `result_scope=${CODE_LOOP_CAPABILITIES.result_scope};completion_accounting=${CODE_LOOP_CAPABILITIES.completion_accounting};` +
+  `schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
 
 const CODE_LOOP_TERMINAL_STATUS_ENUM = ["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"] as const;
 const CODE_LOOP_JOB_STATUS_ENUM = ["running", ...CODE_LOOP_TERMINAL_STATUS_ENUM] as const;
+const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
+  "not-requested",
+  "harvest-untrusted",
+  "scope-violation",
+  "protected-violation",
+  "engine-failure",
+]);
 const CODE_LOOP_REFUSAL_ENUM = [
   "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery",
 ] as const;
@@ -117,11 +126,23 @@ function isCurrentCodeLoopResult(result: CodeLoopResult): boolean {
     result.execution.harness_version === CODE_LOOP_HARNESS_VERSION &&
     result.execution.capabilities?.agent_checks === CODE_LOOP_CAPABILITIES.agent_checks &&
     result.execution.capabilities?.result_scope === CODE_LOOP_CAPABILITIES.result_scope &&
+    result.execution.capabilities?.completion_accounting === CODE_LOOP_CAPABILITIES.completion_accounting &&
     result.agent_checks?.schema_version === 3 &&
     result.agent_checks.source === "pi-bash-events" &&
     Array.isArray(result.agent_checks.attempts) &&
     result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX &&
-    Array.isArray(result.scope_violations);
+    Array.isArray(result.scope_violations) &&
+    (result.completion_state === "complete" || result.completion_state === "unfinished") &&
+    result.check !== null && typeof result.check === "object" &&
+    (result.check.ran === true
+      ? result.check.skip_reason === null
+      : result.check.ran === false && CODE_LOOP_CHECK_SKIP_REASONS.has(result.check.skip_reason as string)) &&
+    (result.status === "completed"
+      ? result.completion_state === "complete"
+      : result.completion_state === "unfinished") &&
+    Number.isInteger(result.usage?.turns) && result.usage.turns >= 0 &&
+    Number.isInteger(result.execution.effective_caps?.turns) &&
+    result.usage.turns <= result.execution.effective_caps.turns;
 }
 
 function failClosedIncompatibleResult(workroot: string, record: DurableCodeLoopRun): DurableCodeLoopRun {
@@ -1511,11 +1532,28 @@ async function runJob(
   }
   const protectedViolations = harvest.allChangedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
 
-  // Run check_cmd inside the SAME cage (design §6) only on a completed run.
-  let check = { ran: false, exit_code: null as number | null, output_tail: "" };
+  // The owner check has its own bounded runtime outside the agent's turn budget. A cleanly
+  // harvested cap-exceeded patch is unfinished but still useful to verify; infra/degeneracy
+  // outcomes remain ineligible.
+  const checkSkipReason = job.checkCmd === null
+    ? "not-requested" as const
+    : !harvestTrusted
+      ? "harvest-untrusted" as const
+      : harvest.scopeViolations.length > 0
+        ? "scope-violation" as const
+        : protectedViolations.length > 0
+          ? "protected-violation" as const
+          : outcome !== "completed" && outcome !== "cap-exceeded"
+            ? "engine-failure" as const
+            : null;
+  let check: CodeLoopResult["check"] = {
+    ran: false,
+    exit_code: null,
+    output_tail: "",
+    skip_reason: checkSkipReason,
+  };
   let checkDurationMs: number | undefined;
-  if (outcome === "completed" && harvestTrusted && job.checkCmd !== null &&
-      harvest.scopeViolations.length === 0 && protectedViolations.length === 0) {
+  if (checkSkipReason === null && job.checkCmd !== null) {
     const checkStartedAt = deps.now();
     check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
     checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
@@ -1534,6 +1572,7 @@ async function runJob(
 
   const result: CodeLoopResult = {
     status: outcome,
+    completion_state: outcome === "completed" ? "complete" : "unfinished",
     diff: harvest.diff.slice(0, DIFF_MAX_BYTES),
     diff_truncated: harvest.diff.length > DIFF_MAX_BYTES,
     changed_files: harvest.changedFiles,
@@ -1904,7 +1943,7 @@ async function runCheck(
   sandboxDir: string,
   cageArgv: string[],
   deps: CodeLoopDeps
-): Promise<{ ran: boolean; exit_code: number | null; output_tail: string }> {
+): Promise<CodeLoopResult["check"]> {
   // check_cmd runs INSIDE the same cage with a minimal env. The fixed non-secret HS_API_KEY value
   // only satisfies systemd-run's environment-copy contract; the relay is already closed.
   const env = {
@@ -1915,7 +1954,7 @@ async function runCheck(
   const argv = [...cageArgv, "bash", "-c", checkCmd];
   const r = await deps.runCommand(argv, { cwd: sandboxDir, env, timeoutMs: CHECK_TIMEOUT_MS });
   const combined = `${r.stdout}\n${r.stderr}`;
-  return { ran: true, exit_code: r.code, output_tail: combined.slice(-4096) };
+  return { ran: true, exit_code: r.code, output_tail: combined.slice(-4096), skip_reason: null };
 }
 
 // ─── Finalization + ledger ──────────────────────────────────────────────────────────────
@@ -1954,7 +1993,7 @@ async function finalizeJob(
   job: Job,
   status: CodeLoopTerminalStatus,
   detail: string,
-  check: { ran: boolean; exit_code: number | null; output_tail: string },
+  check: CodeLoopResult["check"],
   req: CodeLoopRequest,
   deps: CodeLoopDeps
 ): Promise<void> {
@@ -1963,6 +2002,7 @@ async function finalizeJob(
   job.status = status;
   job.result = {
     status,
+    completion_state: "unfinished",
     diff: "",
     diff_truncated: false,
     changed_files: [],

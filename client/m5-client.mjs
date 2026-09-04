@@ -1,9 +1,18 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.3";
-const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-04-v7";
+export const M5_CLIENT_VERSION = "1.3.4";
+const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-04-v8";
 const CODE_LOOP_RESULT_SCOPE_CAPABILITY = "writable-v1";
+const CODE_LOOP_COMPLETION_ACCOUNTING_CAPABILITY = "bounded-turns-v1";
+const CODE_LOOP_TERMINAL_STATUSES = new Set(["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]);
+const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
+  "not-requested",
+  "harvest-untrusted",
+  "scope-violation",
+  "protected-violation",
+  "engine-failure",
+]);
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
@@ -830,7 +839,7 @@ function validateCodeResult(result) {
   }
   if (result.status === "running") return result;
   if (
-    typeof result.status !== "string" ||
+    !CODE_LOOP_TERMINAL_STATUSES.has(result.status) ||
     typeof result.diff !== "string" ||
     !Array.isArray(result.changed_files) ||
     !Array.isArray(result.scope_violations) ||
@@ -838,14 +847,26 @@ function validateCodeResult(result) {
     !result.check ||
     typeof result.check !== "object" ||
     typeof result.check.ran !== "boolean" ||
+    (result.check.ran
+      ? result.check.skip_reason !== null
+      : !CODE_LOOP_CHECK_SKIP_REASONS.has(result.check.skip_reason)) ||
+    (result.status === "completed" ? result.completion_state !== "complete" : result.completion_state !== "unfinished") ||
+    !result.usage ||
+    typeof result.usage !== "object" ||
+    !Number.isInteger(result.usage.turns) ||
+    result.usage.turns < 0 ||
     !result.execution ||
     typeof result.execution !== "object" ||
     result.execution.harness_version !== CODE_LOOP_RESULT_HARNESS_VERSION ||
-    result.execution.capabilities?.result_scope !== CODE_LOOP_RESULT_SCOPE_CAPABILITY
+    result.execution.capabilities?.result_scope !== CODE_LOOP_RESULT_SCOPE_CAPABILITY ||
+    result.execution.capabilities?.completion_accounting !== CODE_LOOP_COMPLETION_ACCOUNTING_CAPABILITY ||
+    !result.execution.effective_caps ||
+    !Number.isInteger(result.execution.effective_caps.turns) ||
+    result.usage.turns > result.execution.effective_caps.turns
   ) {
     throw new M5ClientError(
       "invalid_code_result",
-      "A terminal code-loop result must include the current bounded-scope contract, diff, and verification evidence.",
+      "A terminal code-loop result must include the current bounded-scope/completion contract, diff, and verification evidence.",
     );
   }
   return result;

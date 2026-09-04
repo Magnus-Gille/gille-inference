@@ -14,6 +14,7 @@ import {
   looksDegenerate,
   buildPiArgv,
   buildPiEnv,
+  applyCompletionPressurePolicy,
   makePiEngine,
 } from "../src/homeserver/pi-engine.js";
 import type { PiProcess, SpawnPiFn, EngineRunOptions } from "../src/homeserver/code-loop-types.js";
@@ -142,6 +143,29 @@ describe("pi argv + scrubbed env", () => {
     const busPath = `/run/user/${uid}/bus`;
     const expectedBus = process.env["DBUS_SESSION_BUS_ADDRESS"] ?? (existsSync(busPath) ? `unix:path=${busPath}` : undefined);
     expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe(expectedBus);
+  });
+});
+
+describe("completion-pressure policy", () => {
+  it("reserves the final two turns for convergence and an unfinished-work summary", () => {
+    const wrapped = applyCompletionPressurePolicy("fix it", 24);
+    expect(wrapped).toContain("completion-pressure policy v1");
+    expect(wrapped).toContain("24 agent turns remaining within the global cap of 24");
+    expect(wrapped).toContain("Begin wrapping up by overall agent turn 22");
+    expect(wrapped).toContain("state clearly what remains unfinished");
+    expect(wrapped.endsWith("fix it")).toBe(true);
+  });
+
+  it("uses immediate wrap-up guidance instead of a contradictory low-cap turn", () => {
+    const wrapped = applyCompletionPressurePolicy("fix it", 1);
+    expect(wrapped).toContain("1 agent turn remaining");
+    expect(wrapped).toContain("Begin wrapping up immediately");
+  });
+
+  it("reports only the actual remaining global budget on a retry", () => {
+    const wrapped = applyCompletionPressurePolicy("continue", 24, 10);
+    expect(wrapped).toContain("14 agent turns remaining within the global cap of 24");
+    expect(wrapped).toContain("overall agent turn 22");
   });
 });
 
@@ -671,7 +695,61 @@ describe("makePiEngine — monitored runs", () => {
     });
     const r = await engine.run(engineOpts(dir, { caps: { wall_s: 60, turns: 3, completion_tokens: 60_000 } }));
     expect(r.outcome).toBe("cap-exceeded");
+    expect(r.usage.turns).toBe(3);
     expect(r.detail).toContain("turns");
+    expect(r.telemetry?.failure_kind).toBe("turn-cap");
+  });
+
+  it("enforces the turn cap across a degeneracy retry instead of resetting the budget", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const degenerateFinal = JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "?".repeat(500) }] },
+    });
+    let call = 0;
+    const prompts: string[] = [];
+    const spawn: SpawnPiFn = (argv) => {
+      prompts.push(argv.at(-1) ?? "");
+      call++;
+      return call === 1
+        ? makeFakeProc([
+            JSON.stringify({ type: "turn_start" }),
+            JSON.stringify({ type: "turn_start" }),
+            degenerateFinal,
+          ], { exitCode: 1 })
+        : makeFakeProc(
+            Array.from({ length: 8 }, () => JSON.stringify({ type: "turn_start" })),
+            { waitForKill: true },
+          );
+    };
+    const engine = makePiEngine(CFG, {
+      spawnPi: spawn,
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    });
+    const r = await engine.run(engineOpts(dir, { caps: { wall_s: 60, turns: 3, completion_tokens: 60_000 } }));
+    expect(call).toBe(2);
+    expect(r.outcome).toBe("cap-exceeded");
+    expect(r.usage.turns).toBe(3);
+    expect(r.telemetry?.failure_kind).toBe("turn-cap");
+    expect(prompts[1]).toContain("1 agent turn remaining within the global cap of 3");
+    expect(prompts[1]).not.toContain("3 agent turns remaining within the global cap of 3");
+  });
+
+  it("keeps edit-deadline as the specific reason when it coincides with the turn cap", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const lines = Array.from({ length: 5 }, () => JSON.stringify({ type: "turn_start" }));
+    const engine = makePiEngine(CFG, {
+      spawnPi: fakeSpawnOf(makeFakeProc(lines, { waitForKill: true })),
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    });
+    const r = await engine.run(engineOpts(dir, {
+      caps: { wall_s: 60, turns: 3, completion_tokens: 60_000, edit_deadline_turn: 3 },
+    }));
+    expect(r.outcome).toBe("cap-exceeded");
+    expect(r.usage.turns).toBe(3);
+    expect(r.telemetry?.failure_kind).toBe("edit-deadline");
   });
 
   it("token cap breach → kill + cap-exceeded", async () => {
@@ -688,6 +766,7 @@ describe("makePiEngine — monitored runs", () => {
     const r = await engine.run(engineOpts(dir, { caps: { wall_s: 60, turns: 24, completion_tokens: 1000 } }));
     expect(r.outcome).toBe("cap-exceeded");
     expect(r.detail).toContain("tokens");
+    expect(r.telemetry?.failure_kind).toBe("token-cap");
   });
 
   it("degenerate first attempt → readiness-polled retry → recovered completed", async () => {

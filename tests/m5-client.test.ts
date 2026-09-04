@@ -1162,6 +1162,7 @@ describe("secret-safe M5 client", () => {
           isError: false,
           structuredContent: {
             status: "completed",
+            completion_state: "complete",
             work_id: "cl-1",
             diff: "diff --git a/a.ts b/a.ts\n+safe\n",
             diff_truncated: false,
@@ -1169,12 +1170,13 @@ describe("secret-safe M5 client", () => {
             scope_violations: [],
             protected_violations: [],
             execution: {
-              harness_version: "code-loop-pi-2026-09-04-v7",
-              capabilities: { result_scope: "writable-v1" },
+              harness_version: "code-loop-pi-2026-09-04-v8",
+              effective_caps: { turns: 24 },
+              capabilities: { result_scope: "writable-v1", completion_accounting: "bounded-turns-v1" },
             },
             summary: "changed",
             detail: "",
-            check: { ran: true, exit_code: 0, output_tail: "ok" },
+            check: { ran: true, exit_code: 0, output_tail: "ok", skip_reason: null },
             usage: {
               turns: 1,
               wall_ms: 2,
@@ -1255,6 +1257,75 @@ describe("secret-safe M5 client", () => {
     await expect(client.codeResult("cl-1")).rejects.toMatchObject({
       code: "invalid_code_result",
     });
+  });
+
+  it("fails closed on a v7 result without bounded completion accounting", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "{}" }],
+          isError: false,
+          structuredContent: {
+            status: "cap-exceeded",
+            completion_state: "unfinished",
+            work_id: "cl-1",
+            diff: "",
+            changed_files: [],
+            scope_violations: [],
+            protected_violations: [],
+            check: { ran: false, exit_code: null, output_tail: "", skip_reason: "engine-failure" },
+            usage: { turns: 25 },
+            execution: {
+              harness_version: "code-loop-pi-2026-09-04-v7",
+              effective_caps: { turns: 24 },
+              capabilities: { result_scope: "writable-v1" },
+            },
+          },
+        });
+      },
+    });
+
+    await expect(client.codeResult("cl-1")).rejects.toMatchObject({ code: "invalid_code_result" });
+  });
+
+  it("fails closed when v8 reports turn usage beyond its effective cap", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "{}" }],
+          isError: false,
+          structuredContent: {
+            status: "cap-exceeded",
+            completion_state: "unfinished",
+            work_id: "cl-1",
+            diff: "",
+            changed_files: [],
+            scope_violations: [],
+            protected_violations: [],
+            check: { ran: false, exit_code: null, output_tail: "", skip_reason: "engine-failure" },
+            usage: { turns: 25 },
+            execution: {
+              harness_version: "code-loop-pi-2026-09-04-v8",
+              effective_caps: { turns: 24 },
+              capabilities: {
+                result_scope: "writable-v1",
+                completion_accounting: "bounded-turns-v1",
+              },
+            },
+          },
+        });
+      },
+    });
+
+    await expect(client.codeResult("cl-1")).rejects.toMatchObject({ code: "invalid_code_result" });
   });
 });
 

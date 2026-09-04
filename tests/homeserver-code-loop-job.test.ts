@@ -311,12 +311,13 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
       schema_version: 1,
       model: "qwen3-coder-next-80b",
       engine: "pi",
-      harness_version: "code-loop-pi-2026-09-04-v7",
+      harness_version: "code-loop-pi-2026-09-04-v8",
       effective_caps: { wall_s: 480, turns: 24, completion_tokens: 60_000 },
       capabilities: {
         start_idempotency: "client-run-id-v1",
         agent_checks: "pi-bash-events-v3",
         result_scope: "writable-v1",
+        completion_accounting: "bounded-turns-v1",
       },
     });
     expect(res.result.telemetry).toEqual({
@@ -788,7 +789,7 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     expect(result.result.diff).toBe("");
     expect(result.result.diff).not.toContain("OUT_OF_SCOPE_CONTENT");
     expect(result.result.scope_violations.sort()).toEqual(["allowed.ts", "secret.ts"]);
-    expect(result.result.check.ran).toBe(false);
+    expect(result.result.check).toMatchObject({ ran: false, skip_reason: "scope-violation" });
   });
 
   it("check_cmd pass → ledger pass; protected violation disqualifies the check", async () => {
@@ -814,6 +815,45 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     const row = getDb().prepare("SELECT outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC LIMIT 1").get() as { outcome: string; verifier: string };
     expect(row.outcome).toBe("pass");
     expect(row.verifier).toBe("check-cmd");
+  });
+
+  it("runs the owner check on a scope-clean turn-cap result and marks it unfinished", async () => {
+    const engineRun = async (sandboxDir: string): Promise<EngineRunResult> => {
+      writeFileSync(join(sandboxDir, "solution.txt"), "partial but valid\n");
+      return {
+        outcome: "cap-exceeded",
+        usage: { turns: 3, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+        finalMessage: "Implemented the core change; polish remains.",
+        unparseableLines: 0,
+        detail: "cap breached: turns",
+        telemetry: {
+          phase_ms: {},
+          mutation_evidence: "tool-call",
+          observability_coverage: 1,
+          failure_kind: "turn-cap",
+        },
+      };
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "write solution",
+        files: [{ path: "seed.txt", content: "todo\n" }],
+        writable: ["solution.txt"],
+        check_cmd: "test -f solution.txt",
+        caps: { turns: 3 },
+      },
+      startCfg(),
+      fakeDeps({ engineRun }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+    const res = getJobResult(start.work_id);
+    if (res.kind !== "result") throw new Error("no result");
+    expect(res.result.status).toBe("cap-exceeded");
+    expect(res.result.completion_state).toBe("unfinished");
+    expect(res.result.telemetry.failure_kind).toBe("turn-cap");
+    expect(res.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
   });
 
   // #80: a caller-supplied `task_type` used to enter the pipeline UNTRIMMED (the old guard trimmed
@@ -1340,6 +1380,34 @@ describe("code_loop_start caller idempotency (#251)", () => {
     cached.result.execution.harness_version = "code-loop-pi-2026-07-14-v4";
     cached.result.execution.capabilities.agent_checks = "pi-bash-events-v1";
     cached.result.agent_checks.schema_version = 1;
+    writeFileSync(clientPath, JSON.stringify(cached));
+
+    _resetCodeLoopStateForTests();
+    const recovered = await startCodeLoop(request, startCfg(), fakeDeps());
+    expect(recovered).toMatchObject({ ok: true, recovered: true, status: "completed" });
+    if (!recovered.ok) return;
+    expect(recovered.result).toBeUndefined();
+    expect(getJobResult(recovered.work_id, workroot)).toEqual({
+      kind: "terminal-unavailable",
+      status: "completed",
+    });
+  });
+
+  it("fails closed when a cached v8 result reports turns beyond its effective cap", async () => {
+    const request = { ...baseRequest, client_run_id: "over-cap-terminal-result" };
+    const started = await startCodeLoop(request, startCfg(), fakeDeps());
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+
+    const clientPath = join(
+      workroot,
+      ".code-loop-state-v1",
+      `client-${createHash("sha256").update(request.client_run_id).digest("hex")}.json`,
+    );
+    const cached = JSON.parse(readFileSync(clientPath, "utf8")) as {
+      result: { usage: { turns: number }; execution: { effective_caps: { turns: number } } };
+    };
+    cached.result.usage.turns = cached.result.execution.effective_caps.turns + 1;
     writeFileSync(clientPath, JSON.stringify(cached));
 
     _resetCodeLoopStateForTests();

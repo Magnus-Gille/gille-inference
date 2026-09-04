@@ -17,7 +17,7 @@ The `m5` executable ships in the same npm package as `hs`. Install the current a
 package with an exact pin:
 
 ```bash
-npm install --global gille-inference@1.3.3
+npm install --global gille-inference@1.3.4
 m5 --version
 ```
 
@@ -27,7 +27,8 @@ reporting contract as the first public M5-capable version. `1.2.1` kept that sur
 the structured `list_models` blind-context discovery contract. Version `1.3.0` adds guided
 owner-agent profile provisioning. Version `1.3.2` adds one bounded, idempotent transport retry for
 terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bounded
-`writable-v1` result contract and rejects older unscoped terminal results.
+`writable-v1` result contract and rejects older unscoped terminal results. Version `1.3.4`
+requires bounded global turn accounting, explicit completion state, and check skip reasons.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
@@ -216,7 +217,10 @@ start response for later `status`/`result` calls. It never applies the diff, wri
 checkout, or treats client defaults as sandbox enforcement. The gateway's OS cage, input
 validation, enforceable writable scope (seeded-only when omitted), protected paths, caps, and
 diff-only result remain authoritative. Scope-rejected paths are returned as `scope_violations` and
-never contribute bytes to the delivered diff.
+never contribute bytes to the delivered diff. `completion_state` distinguishes a clean finish from
+an unfinished terminal result; `telemetry.failure_kind` identifies the cap and `check.skip_reason`
+explains a skipped owner check. A scope-clean cap-exceeded patch still receives the separately
+budgeted owner check.
 
 `adoption report` returns a content-free telemetry acknowledgement. `retention: "retained"` means
 the observation was stored; `retention: "aggregated"` means the daily telemetry cap was reached
