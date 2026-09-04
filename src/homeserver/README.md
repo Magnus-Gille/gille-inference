@@ -363,7 +363,7 @@ scope check supplies route authority; legacy static / implicit-admin are exclude
 A non-owner never sees them, and a direct `tools/call` on one returns the **byte-identical
 unknown-tool error** a nonexistent tool would (invisible, not merely forbidden). See
 *code_loop* below. The owner-visible `code_loop_start` description carries the stable pre-paid
-advertisement `contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]`.
+advertisement `contract[harness=code-loop-pi-2026-09-04-v7;agent_checks=pi-bash-events-v3;result_scope=writable-v1;schema=3;max_attempts=1000]`.
 
 ### code_loop — owner-agent sandboxed agentic coding (#116)
 
@@ -375,7 +375,7 @@ checkout. Every loop turn transits the gateway spine (admission, `owner_request_
 poison-clear, the degeneracy watchdog), so it is the Claude→local **agentic-delegation
 dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE_LOOP=off`).
 
-- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, protected?, task_type?, caps?}`
+- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, writable?, protected?, task_type?, caps?}`
   → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, capabilities}`
   immediately, or a structured refusal (`disabled` / `busy` / `maintenance` /
   `lease-unavailable` / `cage-unavailable` / `invalid-request` / `conflict` /
@@ -397,6 +397,12 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   overall agent turn and otherwise terminates as `cap-exceeded` / `failure_kind:edit-deadline`.
   Omitting it preserves the original instruction and harness behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  `writable` is an enforceable relative POSIX path/glob allowlist for returned changes; omission
+  permits exact seeded files only. The host-owned Git harvest treats rename pairs as one logical
+  change and requires every endpoint to pass scope and containment. Rejected paths appear in
+  `scope_violations` and suppress `check_cmd`; generated cache/bytecode is silently omitted without
+  suppressing verification. Harness metadata never enters the diff but remains observable to
+  `protected`, which is still reporting-only.
   A `learning_task_stamp` opts into the accepted Grimnir LearningTaskContract v1. It requires the
   exact fresh response from authenticated `GET /v1/capabilities/learning-task`, a minted-key alias
   matching `expected_transport_principal_id`, `client_run_id === idempotency_key`, and a matching
@@ -419,8 +425,9 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   defines delivery accounting and lifecycle/compaction. The actual Hugin one-shot lane is stamped
   `/delegate`; its #240 real serializer fixture is byte-pinned and consumed by this repo's tests.
 - `code_loop_status` — `{work_id}` → `{status, usage}`.
-- `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), `changed_files`,
-  `protected_violations`, pi's `summary`, the `check` result, `usage`, immutable effective
+- `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), permitted
+  `changed_files`, machine-readable `scope_violations`, `protected_violations`, pi's `summary`, the
+  `check` result, `usage`, immutable effective
   `execution`, content-blind `telemetry`, and immutable agent-side `agent_checks`. The latter is
   derived only from real pi bash tool start/end events and exposes normalized check kind, command
   fingerprint, relative timing, order, status, and observed exit code—never command text, paths,
@@ -576,7 +583,8 @@ configuration in the parent harness. Claude and Codex map to independently revoc
 accounts.
 
 The client never applies a code-loop diff and does not claim to enforce a local sandbox. The
-gateway's principal scope, OS cage, caps, protected paths, and diff-only result are authoritative.
+gateway's principal scope, OS cage, caps, writable result scope, protected paths, and diff-only
+result are authoritative.
 See [`../../docs/m5-agent-client.md`](../../docs/m5-agent-client.md) for installation, versioning,
 profile configuration, diagnostics, and transport behavior.
 

@@ -1166,7 +1166,12 @@ describe("secret-safe M5 client", () => {
             diff: "diff --git a/a.ts b/a.ts\n+safe\n",
             diff_truncated: false,
             changed_files: ["a.ts"],
+            scope_violations: [],
             protected_violations: [],
+            execution: {
+              harness_version: "code-loop-pi-2026-09-04-v7",
+              capabilities: { result_scope: "writable-v1" },
+            },
             summary: "changed",
             detail: "",
             check: { ran: true, exit_code: 0, output_tail: "ok" },
@@ -1212,6 +1217,37 @@ describe("secret-safe M5 client", () => {
           content: [{ type: "text", text: "{}" }],
           isError: false,
           structuredContent: { status: "completed", work_id: "cl-1" },
+        });
+      },
+    });
+
+    await expect(client.codeResult("cl-1")).rejects.toMatchObject({
+      code: "invalid_code_result",
+    });
+  });
+
+  it("fails closed on a pre-scope-contract terminal result even when it carries a diff", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "{}" }],
+          isError: false,
+          structuredContent: {
+            status: "completed",
+            work_id: "cl-1",
+            diff: "diff --git a/a.ts b/a.ts\n+unbounded\n",
+            changed_files: ["a.ts"],
+            protected_violations: [],
+            check: { ran: true, exit_code: 0, output_tail: "ok" },
+            execution: {
+              harness_version: "code-loop-pi-2026-07-14-v6",
+              capabilities: { agent_checks: "pi-bash-events-v3" },
+            },
+          },
         });
       },
     });

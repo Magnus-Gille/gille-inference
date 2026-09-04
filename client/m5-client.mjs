@@ -1,7 +1,9 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.2";
+export const M5_CLIENT_VERSION = "1.3.3";
+const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-04-v7";
+const CODE_LOOP_RESULT_SCOPE_CAPABILITY = "writable-v1";
 export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "list_models",
   "ask",
@@ -830,13 +832,20 @@ function validateCodeResult(result) {
   if (
     typeof result.status !== "string" ||
     typeof result.diff !== "string" ||
+    !Array.isArray(result.changed_files) ||
+    !Array.isArray(result.scope_violations) ||
+    !Array.isArray(result.protected_violations) ||
     !result.check ||
     typeof result.check !== "object" ||
-    typeof result.check.ran !== "boolean"
+    typeof result.check.ran !== "boolean" ||
+    !result.execution ||
+    typeof result.execution !== "object" ||
+    result.execution.harness_version !== CODE_LOOP_RESULT_HARNESS_VERSION ||
+    result.execution.capabilities?.result_scope !== CODE_LOOP_RESULT_SCOPE_CAPABILITY
   ) {
     throw new M5ClientError(
       "invalid_code_result",
-      "A terminal code-loop result must include a diff and verification evidence.",
+      "A terminal code-loop result must include the current bounded-scope contract, diff, and verification evidence.",
     );
   }
   return result;
