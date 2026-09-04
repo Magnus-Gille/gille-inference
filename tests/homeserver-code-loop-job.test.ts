@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, beforeAll, vi } from "vitest";
+import { PassThrough } from "node:stream";
+import { makePiEngine } from "../src/homeserver/pi-engine.js";
 import { appendFileSync, chmodSync, mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -854,6 +856,105 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     expect(res.result.completion_state).toBe("unfinished");
     expect(res.result.telemetry.failure_kind).toBe("turn-cap");
     expect(res.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+  });
+
+  // #240: the small closed five-file release-metadata repro. The worker only reads the
+  // supplied seed set and looks for more workspace files instead of editing, then exits
+  // cleanly. The conductor must get an empty-diff terminal result with an explicit
+  // machine-readable no-edit reason — never a silent "completed" with no artifact.
+  // The wander is replayed through the REAL pi engine (canned NDJSON), so this covers
+  // engine classification plus job assembly, harvest, and the conductor-visible result.
+  it("reports a wandering five-file metadata edit as an explicit no-edit terminal result (#240)", async () => {
+    const seedFiles = [
+      { path: "package.json", content: `${JSON.stringify({ name: "acme-widget", version: "1.1.2", dependencies: { "left-pad": "1.1.2", "stable-dep": "9.9.9" } }, null, 2)}\n` },
+      { path: "package-lock.json", content: `${JSON.stringify({ name: "acme-widget", version: "1.1.2", packages: { "": { version: "1.1.2" }, "node_modules/left-pad": { version: "1.1.2" } } }, null, 2)}\n` },
+      { path: "CHANGELOG.md", content: "# Changelog\n\n## 1.1.2\n\n- Previous release.\n" },
+      { path: "src/version.ts", content: "export const VERSION = \"1.1.2\";\n" },
+      { path: "README.md", content: "# acme-widget\n\n![version](https://img.shields.io/badge/version-1.1.2-blue)\n" },
+    ];
+    const wanderSummary = "still looking for additional workspace files";
+    const wanderLines = [
+      JSON.stringify({ type: "turn_start" }),
+      ...seedFiles.slice(0, 3).flatMap((f, i) => [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: `read-1-${i}`, toolName: "read", args: { path: f.path } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: `read-1-${i}`, toolName: "read", isError: false, result: { content: [{ type: "text", text: "ok" }] } }),
+      ]),
+      JSON.stringify({ type: "turn_start" }),
+      ...seedFiles.slice(3).flatMap((f, i) => [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: `read-2-${i}`, toolName: "read", args: { path: f.path } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: `read-2-${i}`, toolName: "read", isError: false, result: { content: [{ type: "text", text: "ok" }] } }),
+      ]),
+      JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: wanderSummary }] } }),
+    ];
+    const engine = makePiEngine(
+      { piBin: "/x/pi", provider: "inference-local", piAgentDir: "/agent", apiKey: "test-only-key-0123456789", degeneracyRunThreshold: 400 },
+      {
+        spawnPi: () => {
+          const stdout = new PassThrough();
+          const stderr = new PassThrough();
+          let resolveExit!: (code: number | null) => void;
+          const exited = new Promise<number | null>((r) => (resolveExit = r));
+          queueMicrotask(() => {
+            for (const l of wanderLines) stdout.write(`${l}\n`);
+            stdout.end();
+            stderr.end();
+            resolveExit(0);
+          });
+          return {
+            stdout,
+            stderr,
+            pid: 4321,
+            kill() {
+              try { stdout.end(); } catch { /* already ended */ }
+              try { stderr.end(); } catch { /* already ended */ }
+              resolveExit(null);
+            },
+            exited,
+          };
+        },
+        readinessProbe: async () => true,
+        pollMs: 10_000,
+      },
+    );
+    const start = await startCodeLoop(
+      {
+        instruction: "Bump the acme-widget project version from 1.1.2 to 1.1.3 in the five supplied seed files. Leave unrelated dependency versions untouched.",
+        files: seedFiles,
+        caps: { turns: 12, edit_deadline_turn: 5 },
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: (sandboxDir: string, instruction: string) => engine.run({
+          sandboxDir,
+          instruction,
+          model: "qwen3-coder-next-80b",
+          caps: { wall_s: 480, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 5 },
+          cageArgv: [],
+          growthCapBytes: 50 * 1024 * 1024,
+        }),
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+    const res = getJobResult(start.work_id);
+    if (res.kind !== "result") throw new Error("no result");
+    // Machine-readable no-edit reason: distinct from a patch that failed verification
+    // (which would be completed + mutation evidence + a ran check with nonzero exit).
+    expect(res.result.status).toBe("cap-exceeded");
+    expect(res.result.completion_state).toBe("unfinished");
+    expect(res.result.diff).toBe("");
+    expect(res.result.changed_files).toEqual([]);
+    expect(res.result.telemetry).toMatchObject({ mutation_evidence: "none", failure_kind: "edit-deadline" });
+    expect(res.result.detail).toMatch(/^no relevant edit attempted/);
+    expect(res.result.detail).toContain("edit-deadline");
+    // Content-blind diagnostic: counts only — no seed content, paths, or versions leak.
+    expect(res.result.detail).not.toContain("1.1.2");
+    expect(res.result.detail).not.toContain("package.json");
+    expect(res.result.detail).not.toContain("acme-widget");
+    // The useful bounded summary is preserved for the conductor.
+    expect(res.result.summary).toBe(wanderSummary);
+    expect(res.result.summary.length).toBeLessThanOrEqual(2048);
   });
 
   // #80: a caller-supplied `task_type` used to enter the pipeline UNTRIMMED (the old guard trimmed
