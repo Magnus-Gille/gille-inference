@@ -454,6 +454,13 @@ interface SingleRun {
   firstEditTurn: number | null;
   firstEditAtMs: number | null;
   mutationToolCall: boolean;
+  /**
+   * Content-blind discovery volume (#240): every in-turn `tool_execution_start` that is NOT
+   * an edit/write mutation attempt (read/search/shell baselining, …), counted by the
+   * (type, toolName) pair only — args, paths, queries, and results are never inspected.
+   * Reported solely as a count in the no-edit diagnostic; never emitted per-tool.
+   */
+  discoveryToolCalls: number;
   agentChecks: CodeLoopAgentCheckAttempt[];
   /** Count only; refused candidates and unmatched bash events never expose command content. */
   agentCheckCoverageLossEvents: number;
@@ -485,6 +492,7 @@ async function runPiOnce(
   let firstEditTurn: number | null = null;
   let firstEditAtMs: number | null = null;
   let mutationToolCall = false;
+  let discoveryToolCalls = 0;
   const mutationStarts = new Map<string, { turn: number; atMs: number }>();
   const checkStarts = new Map<string, Omit<CodeLoopAgentCheckAttempt, "ended_ms" | "status" | "exit_code"> & {
     failureAttributionAmbiguous: boolean;
@@ -557,6 +565,20 @@ async function runPiOnce(
         firstEditAtMs = start.atMs;
       }
       return;
+    }
+    // #240 non-convergence signal: non-mutation tool activity inside an observed turn,
+    // counted before any successful mutation. Deliberately type-only (no args inspection),
+    // and suppressed once killed so post-kill stream stragglers cannot inflate the count.
+    // Falls through so check attribution below still sees the same event.
+    if (
+      ev.type === "tool_execution_start" &&
+      typeof ev.toolCallId === "string" &&
+      turns > 0 &&
+      killedFor === null &&
+      !mutationToolCall &&
+      mutationToolStartOf(ev) === null
+    ) {
+      discoveryToolCalls++;
     }
     const checkStart = agentCheckStartOf(ev);
     if (checkStart !== null) {
@@ -653,6 +675,7 @@ async function runPiOnce(
     firstEditTurn,
     firstEditAtMs,
     mutationToolCall,
+    discoveryToolCalls,
     agentChecks,
     agentCheckCoverageLossEvents,
   };
@@ -729,9 +752,15 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         const firstEditAtMs = editRun?.firstEditAtMs ?? null;
         const firstEditTurn = editRun?.firstEditTurn ?? null;
         const editStartMs = firstEditAtMs === null ? undefined : Math.max(0, firstEditAtMs - run.startedAtMs);
+        const mutationToolCall = run.mutationToolCall || (extra?.mutationToolCall ?? false);
         const capReason = extra?.killedFor ?? run.killedFor;
+        // #240: the non-convergence terminal path returns cap-exceeded WITHOUT a kill (the
+        // process already exited cleanly with no mutation), so capReason is null there. Every
+        // other cap-exceeded path carries a killedFor; every non-cap outcome keeps null.
         const failureKind: CodeLoopFailureKind | null = capReason === null
-          ? null
+          ? (outcome === "cap-exceeded" && opts.caps.edit_deadline_turn !== undefined && !mutationToolCall
+            ? "edit-deadline"
+            : null)
           : ({
               turns: "turn-cap",
               tokens: "token-cap",
@@ -739,7 +768,6 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
               growth: "growth-cap",
               "edit-deadline": "edit-deadline",
             } as const)[capReason];
-        const mutationToolCall = run.mutationToolCall || (extra?.mutationToolCall ?? false);
         const combinedAgentChecks = [...run.agentChecks, ...(extra?.agentChecks ?? [])];
         const agentChecks = combinedAgentChecks.slice(0, CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX);
         const droppedAgentChecks = combinedAgentChecks.length - agentChecks.length;
@@ -774,14 +802,36 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         };
       };
 
+      // #240 explicit no-edit diagnostic: stable prefix + content-blind counts only (turn
+      // and discovery volumes are low-cardinality budgets, never paths/queries/prompts/source
+      // text). failure_kind:edit-deadline + mutation_evidence:none is the machine-readable
+      // reason distinguishing "no relevant edit attempted" from a patch that failed
+      // verification (completed + mutation evidence + a ran check with a nonzero exit).
+      const deadlineTurn = opts.caps.edit_deadline_turn;
+      const editDeadlineDetail = (observedTurns: number, discoveryCalls: number): string =>
+        `no relevant edit attempted (edit-deadline): ${discoveryCalls} discovery tool calls ` +
+        `across ${observedTurns} turns with no completed edit/write by turn ${deadlineTurn}`;
+
       if (first.killedFor !== null) {
-        return toResult(first, null, "cap-exceeded", `cap breached: ${first.killedFor}`);
+        const detail = first.killedFor === "edit-deadline" && deadlineTurn !== undefined
+          ? editDeadlineDetail(first.usage.turns, first.discoveryToolCalls)
+          : `cap breached: ${first.killedFor}`;
+        return toResult(first, null, "cap-exceeded", detail);
       }
       // Clean completion requires ALL of: zero exit, no errored turn, no degenerate char-run. The
       // erroredTurn check is the §10 must-fix: pi records a mid-stream gateway abort as a turn_end
       // with stopReason:"error" while STILL exiting 0, so exit-code + char-run alone would silently
       // accept a truncated turn as "completed" (verified live 2026-07-03).
-      if (first.exitCode === 0 && first.erroredTurn === null && !hasDegenerateRun(first.finalMessage, cfg.degeneracyRunThreshold)) {
+      const firstClean = first.exitCode === 0 && first.erroredTurn === null &&
+        !hasDegenerateRun(first.finalMessage, cfg.degeneracyRunThreshold);
+      // #240: a clean exit with a configured deadline but zero successful mutations is a
+      // non-converging run, not a completion — otherwise the conductor receives a silent
+      // "completed" with an empty diff and no signal to reclaim/re-route the leaf. Without a
+      // deadline the historical completed-without-mutation behavior is preserved byte-for-byte.
+      if (firstClean && deadlineTurn !== undefined && !first.mutationToolCall) {
+        return toResult(first, null, "cap-exceeded", editDeadlineDetail(first.usage.turns, first.discoveryToolCalls));
+      }
+      if (firstClean) {
         return toResult(first, null, "completed", "");
       }
 
@@ -817,9 +867,31 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
 
       const second = await attempt(CONTINUATION_PREFIX + opts.instruction, first.usage.turns, first.agentChecks.length);
       if (second.killedFor !== null) {
-        return toResult(first, second, "cap-exceeded", `cap breached on retry: ${second.killedFor}`);
+        const detail = second.killedFor === "edit-deadline" && deadlineTurn !== undefined
+          ? editDeadlineDetail(
+            first.usage.turns + second.usage.turns,
+            first.discoveryToolCalls + second.discoveryToolCalls,
+          )
+          : `cap breached on retry: ${second.killedFor}`;
+        return toResult(first, second, "cap-exceeded", detail);
       }
-      if (second.exitCode === 0 && second.erroredTurn === null && !hasDegenerateRun(second.finalMessage, cfg.degeneracyRunThreshold)) {
+      const secondClean = second.exitCode === 0 && second.erroredTurn === null &&
+        !hasDegenerateRun(second.finalMessage, cfg.degeneracyRunThreshold);
+      // #240: the same non-convergence rule spans the retry — a clean recovery with no
+      // successful mutation anywhere in the global budget is cap-exceeded, never a completed
+      // empty diff. A mutation in either attempt still completes normally.
+      if (secondClean && deadlineTurn !== undefined && !first.mutationToolCall && !second.mutationToolCall) {
+        return toResult(
+          first,
+          second,
+          "cap-exceeded",
+          editDeadlineDetail(
+            first.usage.turns + second.usage.turns,
+            first.discoveryToolCalls + second.discoveryToolCalls,
+          ),
+        );
+      }
+      if (secondClean) {
         return toResult(first, second, "completed", "recovered after a degeneracy retry");
       }
       return toResult(first, second, "degenerate", "second attempt after degeneracy also failed — terminal");

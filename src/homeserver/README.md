@@ -395,6 +395,11 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   `caps.edit_deadline_turn` must be a positive integer no greater than effective `turns`; when
   present, the versioned policy requires the first completed `edit`/`write` tool call by that
   overall agent turn and otherwise terminates as `cap-exceeded` / `failure_kind:edit-deadline`.
+  A clean exit with no successful mutation is the same non-converging outcome, never a
+  silent `completed` with an empty diff: the detail carries a stable `no relevant edit
+  attempted` prefix plus content-blind discovery/turn counts (never paths, queries, prompts,
+  or source text), while `failure_kind:edit-deadline` + `mutation_evidence:none` remains the
+  machine-readable reason distinguishing it from a patch that failed verification.
   Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
   The turn cap is global across a degeneracy retry, never reports the rejected over-cap start as
