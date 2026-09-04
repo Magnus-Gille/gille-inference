@@ -115,7 +115,7 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   means exact seeded files only. Admission rejects traversal, alternate separators, `.git`,
   overlong/unbounded scope lists, and ambiguous seed spellings before a durable claim.
 - `protected`: optional globs; violations detected at exit (§6), never silently passed.
-- `caps` are clamped to hard maxima `wall_s ≤ 900`, `turns ≤ 40`, `completion_tokens ≤ 120000`. Default wall-clock is 480 s (delivery-lens must-fix), sized to tolerate 1–2 mid-loop model swaps (§8). `edit_deadline_turn` is optional, strictly positive, and must be ≤ effective `turns`; omission preserves the original prompt/behavior. When present, a stable policy wrapper asks for the first edit/write by that overall turn and the monitor deterministically returns `cap-exceeded` + `failure_kind:edit-deadline` if no successful mutation event arrives.
+- `caps` are clamped to hard maxima `wall_s ≤ 900`, `turns ≤ 40`, `completion_tokens ≤ 120000`. Default wall-clock is 480 s (delivery-lens must-fix), sized to tolerate 1–2 mid-loop model swaps (§8). The turn budget is global across a serving-degeneracy retry and reported usage never includes the over-cap `turn_start` enforcement signal. A stable completion-pressure wrapper asks the agent to begin wrapping up two turns early. `edit_deadline_turn` is optional, strictly positive, and must be ≤ effective `turns`; omission preserves the edit-deadline behavior. When present, a stable policy wrapper asks for the first edit/write by that overall turn and the monitor deterministically returns `cap-exceeded` + `failure_kind:edit-deadline` if no successful mutation event arrives.
 
 Returns immediately with `work_id`, `status`, `client_run_id`, `request_fingerprint`, `recovered`,
 and versioned capabilities. A terminal idempotent retry also carries the original `result`. A new
@@ -134,20 +134,21 @@ an ambiguous retry never starts or spends twice.
 ```json
 {
   "status": "completed" | "cap-exceeded" | "degenerate" | "arm-error" | "orphaned",
+  "completion_state": "complete" | "unfinished",
   "diff": "unified git diff vs seed commit, ≤200KB (truncated flag if over)",
   "changed_files": ["src/x.ts"],
   "scope_violations": [],
   "protected_violations": [],
   "summary": "pi's final assistant message (≤2KB)",
-  "check": {"ran": true, "exit_code": 0, "output_tail": "last 4KB"} ,
+  "check": {"ran": true, "exit_code": 0, "output_tail": "last 4KB", "skip_reason": null} ,
   "usage": {"turns": 7, "wall_ms": 183000, "prompt_tokens": 41200, "completion_tokens": 21384},
   "execution": {
     "schema_version": 1,
     "model": "qwen3-coder-next-80b",
     "engine": "pi",
-    "harness_version": "code-loop-pi-2026-09-04-v7",
+    "harness_version": "code-loop-pi-2026-09-04-v8",
     "effective_caps": {"wall_s": 480, "turns": 24, "completion_tokens": 60000, "edit_deadline_turn": 6},
-    "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3", "result_scope": "writable-v1"}
+    "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3", "result_scope": "writable-v1", "completion_accounting": "bounded-turns-v1"}
   },
   "telemetry": {
     "schema_version": 1,
@@ -180,7 +181,7 @@ an ambiguous retry never starts or spends twice.
 
 Semantics:
 - The owner-visible `code_loop_start` tools/list description advertises the exact pre-paid
-  contract `contract[harness=code-loop-pi-2026-09-04-v7;agent_checks=pi-bash-events-v3;result_scope=writable-v1;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
+  contract `contract[harness=code-loop-pi-2026-09-04-v8;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
 - **The diff is the deliverable** (hard constraint 5). The caller reviews and applies it (`git apply`) to its own checkout. Nothing on the box ever touches a live repo.
 - Ground truth is the host-owned trusted Git baseline, never the agent-writable repository or pi's
   event claims. Rename pairs are parsed as one logical change and both endpoints must be writable;
@@ -276,7 +277,9 @@ pi's four tools are `read`/`write`/`edit`/`bash`; the read→edit→**run** loop
 | Subprocess memory / tasks | 8 G / 256 | — | systemd scope `MemoryMax`/`TasksMax` |
 | Concurrency | exactly 1 run | — | Module-level mutex; second `start` → `busy` (no parallel spawns — 2026-07-01 OOM lesson) |
 
-Cap breach ⇒ `cap-exceeded`, diff still harvested, sandbox retained.
+Cap breach ⇒ `cap-exceeded` + `completion_state:"unfinished"` + a machine-readable
+`telemetry.failure_kind`; the diff is still harvested and a scope-clean owner `check_cmd` still
+runs within its separate 120-second cage budget. `check.skip_reason` explains every skipped check.
 
 ---
 

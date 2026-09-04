@@ -104,6 +104,8 @@ export interface CodeLoopCheck {
   exit_code: number | null;
   /** Last 4 KB of the check command's combined output. */
   output_tail: string;
+  /** Machine-readable reason an owner check did not run; null when it ran. */
+  skip_reason: "not-requested" | "harvest-untrusted" | "scope-violation" | "protected-violation" | "engine-failure" | null;
 }
 
 export interface CodeLoopExecution {
@@ -117,6 +119,7 @@ export interface CodeLoopExecution {
     start_idempotency: "client-run-id-v1";
     agent_checks: "pi-bash-events-v3";
     result_scope: "writable-v1";
+    completion_accounting: "bounded-turns-v1";
   };
 }
 
@@ -149,6 +152,7 @@ export interface CodeLoopAgentChecks {
 }
 
 export type CodeLoopMutationEvidence = "tool-call" | "diff-only" | "none";
+export type CodeLoopFailureKind = "turn-cap" | "token-cap" | "wall-cap" | "growth-cap" | "edit-deadline";
 
 export interface CodeLoopTelemetry {
   schema_version: 1;
@@ -167,11 +171,13 @@ export interface CodeLoopTelemetry {
   mutation_evidence: CodeLoopMutationEvidence;
   /** 1 = event stream and git agree; 0.5 = git proves a diff but no trusted mutation event. */
   observability_coverage: number;
-  failure_kind?: "edit-deadline";
+  failure_kind?: CodeLoopFailureKind;
 }
 
 export interface CodeLoopResult {
   status: CodeLoopTerminalStatus;
+  /** Whether the agent reached a clean completion before a terminal limit/failure. */
+  completion_state: "complete" | "unfinished";
   /** Unified git diff vs the seed commit, ≤200 KB (see diff_truncated). Ground truth is git. */
   diff: string;
   diff_truncated: boolean;
@@ -212,6 +218,7 @@ export type CodeLoopStartResult =
         start_idempotency: "client-run-id-v1";
         agent_checks: "pi-bash-events-v3";
         result_scope: "writable-v1";
+        completion_accounting: "bounded-turns-v1";
       };
     }
   | {
@@ -254,7 +261,7 @@ export interface EngineRunResult {
     phase_ms: { inspect?: number; edit?: number };
     mutation_evidence: "tool-call" | "none";
     observability_coverage: number;
-    failure_kind?: "edit-deadline";
+    failure_kind?: CodeLoopFailureKind;
     agent_checks?: Array<{
       order: number;
       kind: CodeLoopAgentCheckKind;

@@ -20,6 +20,7 @@ import type {
   SpawnPiFn,
   CodeLoopAgentCheckAttempt,
   CodeLoopAgentCheckKind,
+  CodeLoopFailureKind,
 } from "./code-loop-types.js";
 
 /**
@@ -316,6 +317,27 @@ export function buildPiArgv(cfg: Pick<PiEngineConfig, "piBin" | "provider">, mod
   return [cfg.piBin, "--provider", cfg.provider, "--model", model, "--no-session", "--print", "--mode", "json", instruction];
 }
 
+const COMPLETION_PRESSURE_POLICY_VERSION = 1;
+const COMPLETION_RESERVE_TURNS = 2;
+
+/** Stable runtime-owned reminder that preserves the last turns for convergence and disclosure. */
+export function applyCompletionPressurePolicy(instruction: string, turnCap: number, turnOffset = 0): string {
+  const remainingTurns = Math.max(0, turnCap - turnOffset);
+  const wrapUpTurn = Math.max(turnOffset + 1, turnCap - COMPLETION_RESERVE_TURNS);
+  const wrapUpGuidance = remainingTurns <= COMPLETION_RESERVE_TURNS
+    ? "Begin wrapping up immediately."
+    : `Begin wrapping up by overall agent turn ${wrapUpTurn}.`;
+  const turnLabel = remainingTurns === 1 ? "turn" : "turns";
+  return (
+    `[code_loop completion-pressure policy v${COMPLETION_PRESSURE_POLICY_VERSION}]\n` +
+    `You have ${remainingTurns} agent ${turnLabel} remaining within the global cap of ${turnCap}. Complete core edits early. ${wrapUpGuidance} ` +
+    `Before the final turn, stop editing, run any useful focused checks, and either summarize completion or state clearly what remains unfinished. ` +
+    "The owner-authored gateway check runs separately after your process exits.\n" +
+    "[/code_loop completion-pressure policy]\n\n" +
+    instruction
+  );
+}
+
 /**
  * The scrubbed pi environment (§6): NO gateway .env inheritance, no OPENROUTER_API_KEY.
  * HOME points into the sandbox so any dotfile writes stay contained even without the cage.
@@ -502,8 +524,9 @@ async function runPiOnce(
       return;
     }
     if (isTurnStart(ev)) {
-      turns++;
-      const overallTurn = turnOffset + turns;
+      if (killedFor !== null) return;
+      const overallTurn = turnOffset + turns + 1;
+      // Preserve the more specific deadline reason when one event crosses both limits.
       if (
         opts.caps.edit_deadline_turn !== undefined &&
         !mutationToolCall &&
@@ -512,7 +535,13 @@ async function runPiOnce(
         kill("edit-deadline");
         return;
       }
-      if (turns > opts.caps.turns) kill("turns");
+      // A turn_start beyond the accepted budget is the enforcement signal, not billable/usable
+      // work. Kill before incrementing so reported usage can never exceed the caller's cap.
+      if (overallTurn > opts.caps.turns) {
+        kill("turns");
+        return;
+      }
+      turns++;
       return;
     }
     const mutationStart = mutationToolStartOf(ev);
@@ -656,7 +685,14 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
       const attempt = (instruction: string, turnOffset: number, checkOrderOffset: number) =>
         runPiOnce(
           deps.spawnPi,
-          [...opts.cageArgv, ...buildPiArgv(cfg, opts.model, instruction)],
+          [
+            ...opts.cageArgv,
+            ...buildPiArgv(
+              cfg,
+              opts.model,
+              applyCompletionPressurePolicy(instruction, opts.caps.turns, turnOffset),
+            ),
+          ],
           env,
           opts,
           deps.pollMs,
@@ -693,7 +729,16 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         const firstEditAtMs = editRun?.firstEditAtMs ?? null;
         const firstEditTurn = editRun?.firstEditTurn ?? null;
         const editStartMs = firstEditAtMs === null ? undefined : Math.max(0, firstEditAtMs - run.startedAtMs);
-        const missedDeadline = run.killedFor === "edit-deadline" || extra?.killedFor === "edit-deadline";
+        const capReason = extra?.killedFor ?? run.killedFor;
+        const failureKind: CodeLoopFailureKind | null = capReason === null
+          ? null
+          : ({
+              turns: "turn-cap",
+              tokens: "token-cap",
+              wall: "wall-cap",
+              growth: "growth-cap",
+              "edit-deadline": "edit-deadline",
+            } as const)[capReason];
         const mutationToolCall = run.mutationToolCall || (extra?.mutationToolCall ?? false);
         const combinedAgentChecks = [...run.agentChecks, ...(extra?.agentChecks ?? [])];
         const agentChecks = combinedAgentChecks.slice(0, CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX);
@@ -718,7 +763,7 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
             agent_check_unparseable_lines: run.unparseableLines + (extra?.unparseableLines ?? 0),
             agent_check_coverage_loss_events:
               run.agentCheckCoverageLossEvents + (extra?.agentCheckCoverageLossEvents ?? 0) + droppedAgentChecks,
-            ...(missedDeadline ? { failure_kind: "edit-deadline" as const } : {}),
+            ...(failureKind !== null ? { failure_kind: failureKind } : {}),
             agent_checks: agentChecks.map((attempt, index) => ({
               ...attempt,
               order: index + 1,

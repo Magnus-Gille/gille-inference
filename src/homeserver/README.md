@@ -363,7 +363,7 @@ scope check supplies route authority; legacy static / implicit-admin are exclude
 A non-owner never sees them, and a direct `tools/call` on one returns the **byte-identical
 unknown-tool error** a nonexistent tool would (invisible, not merely forbidden). See
 *code_loop* below. The owner-visible `code_loop_start` description carries the stable pre-paid
-advertisement `contract[harness=code-loop-pi-2026-09-04-v7;agent_checks=pi-bash-events-v3;result_scope=writable-v1;schema=3;max_attempts=1000]`.
+advertisement `contract[harness=code-loop-pi-2026-09-04-v8;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`.
 
 ### code_loop — owner-agent sandboxed agentic coding (#116)
 
@@ -395,8 +395,13 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   `caps.edit_deadline_turn` must be a positive integer no greater than effective `turns`; when
   present, the versioned policy requires the first completed `edit`/`write` tool call by that
   overall agent turn and otherwise terminates as `cap-exceeded` / `failure_kind:edit-deadline`.
-  Omitting it preserves the original instruction and harness behavior. `check_cmd` is owner-authored,
+  Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  The turn cap is global across a degeneracy retry, never reports the rejected over-cap start as
+  usage, and injects a stable two-turn completion-pressure reminder. A scope-clean `cap-exceeded`
+  diff still receives the separately budgeted owner check; `completion_state`,
+  `telemetry.failure_kind`, and `check.skip_reason` distinguish unfinished work and any skipped
+  verification without treating it as a completed/pass outcome.
   `writable` is an enforceable relative POSIX path/glob allowlist for returned changes; omission
   permits exact seeded files only. The host-owned Git harvest treats rename pairs as one logical
   change and requires every endpoint to pass scope and containment. Rejected paths appear in
@@ -426,8 +431,8 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   `/delegate`; its #240 real serializer fixture is byte-pinned and consumed by this repo's tests.
 - `code_loop_status` — `{work_id}` → `{status, usage}`.
 - `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), permitted
-  `changed_files`, machine-readable `scope_violations`, `protected_violations`, pi's `summary`, the
-  `check` result, `usage`, immutable effective
+  `changed_files`, machine-readable `scope_violations`, `protected_violations`, pi's `summary`,
+  `completion_state`, the `check` result (including `skip_reason`), bounded `usage`, immutable effective
   `execution`, content-blind `telemetry`, and immutable agent-side `agent_checks`. The latter is
   derived only from real pi bash tool start/end events and exposes normalized check kind, command
   fingerprint, relative timing, order, status, and observed exit code—never command text, paths,
