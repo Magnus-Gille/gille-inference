@@ -1,5 +1,5 @@
 import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
-import { dirname, join, sep, resolve, isAbsolute } from "node:path";
+import { dirname, join, sep, resolve, isAbsolute, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
 import type {
@@ -71,15 +71,16 @@ import { TASK_TYPES } from "./taxonomy.js";
 export const CODE_LOOP_TOOL_NAMES = ["code_loop_start", "code_loop_status", "code_loop_result"] as const;
 
 /** Immutable wire/harness contract identifier reported in every #247 result. */
-export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-07-14-v6";
+export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-09-04-v7";
 export const CODE_LOOP_CAPABILITIES = {
   start_idempotency: "client-run-id-v1",
   agent_checks: "pi-bash-events-v3",
+  result_scope: "writable-v1",
 } as const;
 const TRUSTED_GIT_ROOT_NAME = ".code-loop-host-git";
 export const CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT =
   `contract[harness=${CODE_LOOP_HARNESS_VERSION};agent_checks=${CODE_LOOP_CAPABILITIES.agent_checks};` +
-  `schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
+  `result_scope=${CODE_LOOP_CAPABILITIES.result_scope};schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
 
 const CODE_LOOP_TERMINAL_STATUS_ENUM = ["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"] as const;
 const CODE_LOOP_JOB_STATUS_ENUM = ["running", ...CODE_LOOP_TERMINAL_STATUS_ENUM] as const;
@@ -115,10 +116,12 @@ function isCurrentCodeLoopResult(result: CodeLoopResult): boolean {
   return result.execution?.schema_version === 1 &&
     result.execution.harness_version === CODE_LOOP_HARNESS_VERSION &&
     result.execution.capabilities?.agent_checks === CODE_LOOP_CAPABILITIES.agent_checks &&
+    result.execution.capabilities?.result_scope === CODE_LOOP_CAPABILITIES.result_scope &&
     result.agent_checks?.schema_version === 3 &&
     result.agent_checks.source === "pi-bash-events" &&
     Array.isArray(result.agent_checks.attempts) &&
-    result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX;
+    result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX &&
+    Array.isArray(result.scope_violations);
 }
 
 function failClosedIncompatibleResult(workroot: string, record: DurableCodeLoopRun): DurableCodeLoopRun {
@@ -144,7 +147,7 @@ export function codeLoopToolDefs(): unknown[] {
         "Returns a work_id immediately; poll code_loop_status and fetch " +
         "code_loop_result. The deliverable is a git diff vs the seed commit — the box never touches a " +
         "live checkout. Provide the files the task needs (≤64 / ≤2MB), the instruction, and optionally " +
-        `an owner-authored check_cmd + protected globs. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
+        `an owner-authored check_cmd + writable/protected globs. Omit writable for seeded-only scope. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -174,6 +177,11 @@ export function codeLoopToolDefs(): unknown[] {
             },
           },
           check_cmd: { type: "string", description: "owner-authored verification command run in the sandbox post-loop (120s cap)" },
+          writable: {
+            type: "array",
+            items: { type: "string" },
+            description: "enforceable returned-change paths/globs; omitted means exact seeded files only",
+          },
           protected: { type: "array", items: { type: "string" }, description: "globs whose modification is reported at exit" },
           task_type: { type: "string", enum: TASK_TYPES.map((task) => task.id), description: "optional canonical task vocabulary; omit to classify from instruction" },
           caps: {
@@ -243,6 +251,85 @@ export function clampCaps(req: CodeLoopCapsRequest | undefined, c: CodeLoopCapsC
 
 const MAX_FILES = 64;
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024;
+const MAX_SCOPE_PATTERNS = 64;
+const MAX_SCOPE_PATTERN_BYTES = 512;
+
+const GENERATED_ARTIFACT_DIRS = new Set([
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".hypothesis",
+  ".tox",
+  ".nox",
+  ".cache",
+]);
+const GENERATED_ARTIFACT_EXTENSIONS = [".pyc", ".pyo", ".class", ".tsbuildinfo"] as const;
+
+/** Harness metadata is observable to protected-glob reporting but never caller deliverable. */
+function isCodeLoopInternalPath(path: string): boolean {
+  return path === ".meta.json";
+}
+
+/** Generated interpreter/build cache artifacts never enter a returned code-loop diff. */
+export function isGeneratedCodeLoopArtifact(path: string): boolean {
+  const components = path.split("/");
+  return components.some((component) => GENERATED_ARTIFACT_DIRS.has(component)) ||
+    components.some((component) => GENERATED_ARTIFACT_EXTENSIONS.some((extension) => component.endsWith(extension)));
+}
+
+function normalizeRelativeCodeLoopPath(value: string, label: string, allowGlob: boolean): string {
+  if (value.length === 0 || value.includes("\0")) {
+    throw new Error(`code-loop: ${label} must be a non-empty path without NUL bytes.`);
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_SCOPE_PATTERN_BYTES) {
+    throw new Error(`code-loop: ${label} is too long.`);
+  }
+  // The sandbox is POSIX. Refuse alternate separator and drive-letter spellings rather than let
+  // admission, filesystem materialization, and result matching interpret the same bytes differently.
+  if (value.includes("\\") || isAbsolute(value) || win32.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
+    throw new Error(`code-loop: ${label} must be a relative POSIX path.`);
+  }
+  const normalized: string[] = [];
+  for (const part of value.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (normalized.length === 0) throw new Error(`code-loop: ${label} escapes the sandbox.`);
+      normalized.pop();
+      continue;
+    }
+    if (!allowGlob && /[*?\[\]]/.test(part)) {
+      throw new Error(`code-loop: ${label} '${value}' must name a file, not a glob.`);
+    }
+    normalized.push(part);
+  }
+  if (normalized.length === 0) throw new Error(`code-loop: ${label} resolves to the sandbox root.`);
+  if (normalized.some((part) => part.toLowerCase() === ".git")) {
+    throw new Error(`code-loop: ${label} targets a .git directory.`);
+  }
+  return normalized.join("/");
+}
+
+function normalizeCodeLoopScopePattern(value: string, label: string): string {
+  // Do not give `..` glob components normalization semantics: an allowlist should be readable
+  // byte-for-byte and never rely on traversal before matching.
+  if (value.split("/").some((part) => part === "..")) {
+    throw new Error(`code-loop: ${label} contains a '..' component.`);
+  }
+  return normalizeRelativeCodeLoopPath(value, label, true);
+}
+
+function effectiveWritableGlobs(req: CodeLoopRequest): string[] {
+  return req.writable === undefined
+    ? req.files.map((file) => normalizeRelativeCodeLoopPath(file.path, "seed path", false))
+    : req.writable.map((pattern) => normalizeCodeLoopScopePattern(pattern, "writable scope"));
+}
+
+function normalizedProtectedGlobs(req: CodeLoopRequest): string[] {
+  return req.protected === undefined
+    ? []
+    : req.protected.map((pattern) => normalizeCodeLoopScopePattern(pattern, "protected scope"));
+}
 
 export type ValidateResult =
   | { ok: true; caps: CodeLoopCaps }
@@ -274,12 +361,47 @@ export function validateCodeLoopRequestStructure(req: CodeLoopRequest): Structur
     if (typeof f.path !== "string" || typeof f.content !== "string") {
       return { ok: false, message: "Each seed file needs a string `path` and string `content`." };
     }
-    if (seenPaths.has(f.path)) return { ok: false, message: `Duplicate seed path '${f.path}'.` };
-    seenPaths.add(f.path);
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRelativeCodeLoopPath(f.path, "seed path", false);
+    } catch (err) {
+      return { ok: false, message: (err as Error).message };
+    }
+    if (seenPaths.has(normalizedPath)) return { ok: false, message: `Duplicate seed path '${f.path}'.` };
+    seenPaths.add(normalizedPath);
     total += Buffer.byteLength(f.content, "utf8");
   }
   if (total > MAX_TOTAL_BYTES) {
     return { ok: false, message: `Seed content too large (${total} bytes > ${MAX_TOTAL_BYTES}).` };
+  }
+  for (const field of ["writable", "protected"] as const) {
+    const patterns = req[field];
+    if (patterns === undefined) continue;
+    if (!Array.isArray(patterns)) {
+      return { ok: false, message: `\`${field}\` must be an array of relative paths or globs.` };
+    }
+    if (patterns.length > MAX_SCOPE_PATTERNS) {
+      return { ok: false, message: `Too many ${field} scope entries (${patterns.length} > ${MAX_SCOPE_PATTERNS}).` };
+    }
+    for (const pattern of patterns) {
+      if (typeof pattern !== "string") {
+        return { ok: false, message: `Each ${field} scope entry must be a string.` };
+      }
+      try {
+        normalizeCodeLoopScopePattern(pattern, `${field} scope`);
+      } catch (err) {
+        return { ok: false, message: (err as Error).message };
+      }
+    }
+  }
+  // With the safe default the seed is the writable contract. A seed that is unconditionally
+  // filtered from results makes that contract impossible, so refuse it before durable admission.
+  if (req.writable === undefined) {
+    for (const path of seenPaths) {
+      if (isGeneratedCodeLoopArtifact(path)) {
+        return { ok: false, message: `Seed path '${path}' is a generated cache/bytecode artifact and cannot be writable.` };
+      }
+    }
   }
   const rawDeadline = req.caps?.edit_deadline_turn;
   if (rawDeadline !== undefined) {
@@ -346,9 +468,7 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
   const baseReal = realpathSync(baseAbs);
   assertNoPreexistingAgentGit(baseAbs);
   for (const f of files) {
-    const rel = f.path;
-    if (rel.includes("\0")) throw new Error(`code-loop: seed path contains a NUL byte — refusing.`);
-    if (isAbsolute(rel)) throw new Error(`code-loop: seed path '${rel}' is absolute — only relative paths are allowed.`);
+    const rel = normalizeRelativeCodeLoopPath(f.path, "seed path", false);
     // Lexical containment against the (non-realpath) base, mirroring resolveContained().
     const lexical = resolve(baseAbs, rel);
     if (lexical !== baseAbs && !lexical.startsWith(baseAbs + sep)) {
@@ -641,6 +761,7 @@ interface Job {
   model: string;
   taskType: string;
   checkCmd: string | null;
+  writableGlobs: string[];
   protectedGlobs: string[];
   startedAtMs: number;
   effectiveCaps: CodeLoopCaps;
@@ -779,6 +900,10 @@ export async function startCodeLoop(
 ): Promise<CodeLoopStartResult> {
   const structural = validateCodeLoopRequestStructure(req);
   if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
+  // Scope is admission identity. Snapshot canonical values before the first await so an in-process
+  // caller cannot mutate request arrays after validation but before execution/harvest.
+  const writableGlobs = effectiveWritableGlobs(req);
+  const protectedGlobs = normalizedProtectedGlobs(req);
   const clientRunId = validateClientRunId(req.client_run_id);
   // #80: resolve through the SAME boundary /delegate uses (orchestrator.resolveTaskType) instead of
   // re-implementing it. The old inline guard trimmed only to test for emptiness and then passed the
@@ -1181,7 +1306,8 @@ export async function startCodeLoop(
     model: cfg.model,
     taskType,
     checkCmd: typeof req.check_cmd === "string" && req.check_cmd.trim() !== "" ? req.check_cmd : null,
-    protectedGlobs: Array.isArray(req.protected) ? req.protected.filter((g) => typeof g === "string") : [],
+    writableGlobs,
+    protectedGlobs,
     startedAtMs: acceptedAt,
     effectiveCaps: capPolicy.caps,
     usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
@@ -1345,7 +1471,7 @@ async function runJob(
   // Harvest only after the manager proves the model process tree is absent. The baseline/index
   // live in a host-only Git directory outside the cage's one read-write bind; the agent's `.git`
   // remains available for its own workflow but is never consumed as host authority.
-  let harvest = { diff: "", changedFiles: [] as string[] };
+  let harvest: GitHarvest = { diff: "", allChangedFiles: [], changedFiles: [], scopeViolations: [] };
   let harvestTrusted = false;
   let agentGitValid = false;
   // Validate immediately after cleanup proves the manager-spawned process tree is absent. A
@@ -1363,7 +1489,7 @@ async function runJob(
   }
   try {
     if (seedSha !== null && trustedGitDir !== null && agentGitValid && !job.cleanupPending) {
-      harvest = await gitHarvest(job.sandboxDir, trustedGitDir, seedSha, deps);
+      harvest = await gitHarvest(job.sandboxDir, trustedGitDir, seedSha, deps, job.writableGlobs);
       harvestTrusted = true;
     }
   } catch (err) {
@@ -1379,16 +1505,17 @@ async function runJob(
         detail = `trusted Git cleanup failed: ${(err as Error).message}`;
         job.summary = "";
         harvestTrusted = false;
-        harvest = { diff: "", changedFiles: [] };
+        harvest = { diff: "", allChangedFiles: [], changedFiles: [], scopeViolations: [] };
       }
     }
   }
-  const protectedViolations = harvest.changedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
+  const protectedViolations = harvest.allChangedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
 
   // Run check_cmd inside the SAME cage (design §6) only on a completed run.
   let check = { ran: false, exit_code: null as number | null, output_tail: "" };
   let checkDurationMs: number | undefined;
-  if (outcome === "completed" && harvestTrusted && job.checkCmd !== null && protectedViolations.length === 0) {
+  if (outcome === "completed" && harvestTrusted && job.checkCmd !== null &&
+      harvest.scopeViolations.length === 0 && protectedViolations.length === 0) {
     const checkStartedAt = deps.now();
     check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
     checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
@@ -1410,6 +1537,7 @@ async function runJob(
     diff: harvest.diff.slice(0, DIFF_MAX_BYTES),
     diff_truncated: harvest.diff.length > DIFF_MAX_BYTES,
     changed_files: harvest.changedFiles,
+    scope_violations: harvest.scopeViolations,
     protected_violations: protectedViolations,
     summary: job.summary.slice(0, 2048),
     check,
@@ -1601,12 +1729,85 @@ async function gitInitSeed(sandboxDir: string, trustedGitDir: string, deps: Code
   return seedSha;
 }
 
+interface GitHarvest {
+  /** Non-generated changed paths, including internal and later-rejected paths. */
+  allChangedFiles: string[];
+  /** Only paths whose complete logical Git change is admitted by the writable boundary. */
+  changedFiles: string[];
+  /** Non-generated paths omitted because their logical change crossed scope or safety policy. */
+  scopeViolations: string[];
+  diff: string;
+}
+
+interface GitLogicalChange {
+  status: string;
+  paths: string[];
+}
+
+function parseGitNameStatusZ(stdout: string): GitLogicalChange[] {
+  if (stdout === "") return [];
+  if (!stdout.endsWith("\0")) throw new Error("trusted Git returned malformed changed-file framing");
+  const fields = stdout.slice(0, -1).split("\0");
+  const changes: GitLogicalChange[] = [];
+  for (let cursor = 0; cursor < fields.length;) {
+    const status = fields[cursor++] ?? "";
+    if (!/^(?:[AMDTUXB]|[RC][0-9]{1,3})$/.test(status)) {
+      throw new Error("trusted Git returned an unsupported change status");
+    }
+    const pathCount = status.startsWith("R") || status.startsWith("C") ? 2 : 1;
+    if (cursor + pathCount > fields.length) {
+      throw new Error("trusted Git returned an incomplete logical change");
+    }
+    const paths = fields.slice(cursor, cursor + pathCount);
+    cursor += pathCount;
+    if (paths.some((path) => path === "" || path.includes("\0"))) {
+      throw new Error("trusted Git returned an empty changed-file path");
+    }
+    changes.push({ status, paths });
+  }
+  return changes;
+}
+
+function isSafeHarvestPath(sandboxDir: string, relativePath: string, sandboxReal: string): boolean {
+  const base = resolve(sandboxDir);
+  const lexical = resolve(base, relativePath);
+  if (lexical !== base && !lexical.startsWith(base + sep)) return false;
+  try {
+    const stat = lstatSync(lexical);
+    if (stat.isSymbolicLink()) return false;
+    const actual = realpathSync(lexical);
+    return actual === sandboxReal || actual.startsWith(sandboxReal + sep);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    // Deleted paths have no inode. Prove their nearest surviving parent still belongs to the
+    // sandbox so a deleted leaf below a replaced symlink cannot pass by lexical spelling alone.
+    let parent = dirname(lexical);
+    while (parent !== base && parent.startsWith(base + sep)) {
+      try {
+        const parentStat = lstatSync(parent);
+        if (parentStat.isSymbolicLink()) return false;
+        const parentReal = realpathSync(parent);
+        return parentReal === sandboxReal || parentReal.startsWith(sandboxReal + sep);
+      } catch (parentErr) {
+        if ((parentErr as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        parent = dirname(parent);
+      }
+    }
+    return parent === base;
+  }
+}
+
+function pushUnique(target: string[], value: string): void {
+  if (!target.includes(value)) target.push(value);
+}
+
 async function gitHarvest(
   sandboxDir: string,
   trustedGitDir: string,
   seedSha: string,
-  deps: CodeLoopDeps
-): Promise<{ diff: string; changedFiles: string[] }> {
+  deps: CodeLoopDeps,
+  writableGlobs: string[],
+): Promise<GitHarvest> {
   const env = { ...gitBaseEnv(), ...GIT_ENV, GIT_DIR: trustedGitDir, GIT_WORK_TREE: sandboxDir };
   const opts = { cwd: sandboxDir, env, timeoutMs: 30_000 };
   await trustedGitAdd(sandboxDir, trustedGitDir, opts, deps, "trusted Git harvest add");
@@ -1617,28 +1818,58 @@ async function gitHarvest(
       env: { ...env, GIT_WORK_TREE: attributeFreeWorktree },
       timeoutMs: 30_000,
     };
-    const diffRes = await requireGit(
-      ["diff", "--cached", "--text", "--no-ext-diff", "--no-textconv", seedSha, "--"],
-      diffOpts,
-      deps,
-      "trusted Git harvest diff"
-    );
     const namesRes = await requireGit(
-      ["diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", seedSha, "--"],
+      ["diff", "--cached", "--name-status", "-z", "--find-renames=50%", "--no-ext-diff", "--no-textconv", seedSha, "--"],
       diffOpts,
       deps,
       "trusted Git harvest names"
     );
-    if (namesRes.stdout !== "" && !namesRes.stdout.endsWith("\0")) {
-      throw new Error("trusted Git returned malformed changed-file framing");
-    }
-    const changed = namesRes.stdout === "" ? [] : namesRes.stdout.slice(0, -1).split("\0");
-    for (const path of changed) {
-      if (path === "" || path.includes("\0") || isAbsolute(path) || path.split(/[\\/]/).includes("..")) {
-        throw new Error("trusted Git returned an unsafe changed-file path");
+    const logicalChanges = parseGitNameStatusZ(namesRes.stdout);
+    const sandboxReal = realpathSync(sandboxDir);
+    const allChangedFiles: string[] = [];
+    const changedFiles: string[] = [];
+    const scopeViolations: string[] = [];
+    const admittedPathspecs: string[] = [];
+
+    for (const change of logicalChanges) {
+      let paths: string[];
+      try {
+        paths = change.paths.map((path) => normalizeRelativeCodeLoopPath(path, "harvested path", false));
+      } catch {
+        for (const rawPath of change.paths) pushUnique(scopeViolations, rawPath);
+        continue;
+      }
+      const visiblePaths = paths.filter((path) => !isGeneratedCodeLoopArtifact(path));
+      for (const path of visiblePaths) pushUnique(allChangedFiles, path);
+
+      // Generated-only and harness-internal changes are silent hygiene. A logical rename/copy that
+      // mixes one of those endpoints with deliverable content is rejected as a whole so content can
+      // never cross the boundary through Git's rename representation.
+      const deliverablePaths = paths.filter((path) =>
+        !isGeneratedCodeLoopArtifact(path) && !isCodeLoopInternalPath(path));
+      if (deliverablePaths.length === 0) continue;
+      const completeLogicalChangeIsDeliverable = deliverablePaths.length === paths.length &&
+        paths.every((path) =>
+          isSafeHarvestPath(sandboxDir, path, sandboxReal) && matchesAnyGlob(path, writableGlobs));
+      if (!completeLogicalChangeIsDeliverable) {
+        for (const path of deliverablePaths) pushUnique(scopeViolations, path);
+        continue;
+      }
+      for (const path of paths) {
+        pushUnique(changedFiles, path);
+        pushUnique(admittedPathspecs, `:(literal)${path}`);
       }
     }
-    return { diff: diffRes.stdout, changedFiles: changed };
+
+    const diff = admittedPathspecs.length === 0
+      ? ""
+      : (await requireGit(
+        ["diff", "--cached", "--text", "--find-renames=50%", "--no-ext-diff", "--no-textconv", seedSha, "--", ...admittedPathspecs],
+        diffOpts,
+        deps,
+        "trusted Git harvest diff",
+      )).stdout;
+    return { diff, allChangedFiles, changedFiles, scopeViolations };
   } finally {
     rmSync(attributeFreeWorktree, { recursive: true, force: true });
   }
@@ -1735,6 +1966,7 @@ async function finalizeJob(
     diff: "",
     diff_truncated: false,
     changed_files: [],
+    scope_violations: [],
     protected_violations: [],
     summary: "",
     check,

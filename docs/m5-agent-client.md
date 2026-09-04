@@ -17,7 +17,7 @@ The `m5` executable ships in the same npm package as `hs`. Install the current a
 package with an exact pin:
 
 ```bash
-npm install --global gille-inference@1.3.2
+npm install --global gille-inference@1.3.3
 m5 --version
 ```
 
@@ -26,7 +26,8 @@ prepared as `1.1.0` but was never published; `1.2.0` added the required content-
 reporting contract as the first public M5-capable version. `1.2.1` kept that surface and added
 the structured `list_models` blind-context discovery contract. Version `1.3.0` adds guided
 owner-agent profile provisioning. Version `1.3.2` adds one bounded, idempotent transport retry for
-terminal `code_loop_result` retrieval.
+terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bounded
+`writable-v1` result contract and rejects older unscoped terminal results.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
@@ -172,6 +173,7 @@ printf '%s' '{
   "instruction": "Update the supplied seed file and run its focused check.",
   "files": [{"path":"src/example.ts","content":"export const value = 1;\n"}],
   "check_cmd": "npm test",
+  "writable": ["src/**"],
   "protected": ["package-lock.json"]
 }' | m5 --profile codex code run
 
@@ -212,7 +214,9 @@ and nulls malformed negative or fractional counters instead of trusting them.
 including the unified diff and verification evidence. It can use `"wait": false` to return the
 start response for later `status`/`result` calls. It never applies the diff, writes into a live
 checkout, or treats client defaults as sandbox enforcement. The gateway's OS cage, input
-validation, protected paths, caps, and diff-only result remain authoritative.
+validation, enforceable writable scope (seeded-only when omitted), protected paths, caps, and
+diff-only result remain authoritative. Scope-rejected paths are returned as `scope_violations` and
+never contribute bytes to the delivered diff.
 
 `adoption report` returns a content-free telemetry acknowledgement. `retention: "retained"` means
 the observation was stored; `retention: "aggregated"` means the daily telemetry cap was reached

@@ -61,6 +61,11 @@ export interface CodeLoopRequest {
   files: CodeLoopSeedFile[];
   /** Owner-authored verification command, run in the sandbox INSIDE the cage post-loop (120 s cap). */
   check_cmd?: string;
+  /**
+   * Enforceable returned-change path/glob allowlist. Omission limits the result to exact seeded
+   * files. This is distinct from `protected`, which remains reporting-only.
+   */
+  writable?: string[];
   /** Globs whose modification is detected at exit and reported — never silently passed. */
   protected?: string[];
   /** Ledger task type; defaults to the classifier's verdict on the instruction. */
@@ -111,6 +116,7 @@ export interface CodeLoopExecution {
   capabilities: {
     start_idempotency: "client-run-id-v1";
     agent_checks: "pi-bash-events-v3";
+    result_scope: "writable-v1";
   };
 }
 
@@ -170,6 +176,8 @@ export interface CodeLoopResult {
   diff: string;
   diff_truncated: boolean;
   changed_files: string[];
+  /** Changed paths omitted because their logical change crossed the writable/safety boundary. */
+  scope_violations: string[];
   protected_violations: string[];
   /** pi's final assistant message (≤2 KB). */
   summary: string;
@@ -203,6 +211,7 @@ export type CodeLoopStartResult =
       capabilities: {
         start_idempotency: "client-run-id-v1";
         agent_checks: "pi-bash-events-v3";
+        result_scope: "writable-v1";
       };
     }
   | {

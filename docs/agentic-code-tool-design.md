@@ -93,6 +93,7 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   "instruction": "string (required — the task prompt)",
   "files": [{"path": "src/x.ts", "content": "..."}],
   "check_cmd": "npx --no-install tsx test/oracle.ts",
+  "writable": ["src/**"],
   "protected": ["test/**", "tsconfig.json"],
   "task_type": "code-implement",
   "caps": {"wall_s": 480, "turns": 24, "completion_tokens": 60000, "edit_deadline_turn": 6}
@@ -110,6 +111,9 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   singleton provides the separate cross-process paid-run lease: `BEGIN IMMEDIATE` makes dead-owner
   takeover atomic, and release deletes only its matching owner token/work id.
 - `check_cmd`: optional, owner-authored (never model-generated), run in the sandbox **inside the same cage** post-loop, 120 s cap.
+- `writable`: optional enforceable relative POSIX path/glob allowlist for returned changes. Omission
+  means exact seeded files only. Admission rejects traversal, alternate separators, `.git`,
+  overlong/unbounded scope lists, and ambiguous seed spellings before a durable claim.
 - `protected`: optional globs; violations detected at exit (§6), never silently passed.
 - `caps` are clamped to hard maxima `wall_s ≤ 900`, `turns ≤ 40`, `completion_tokens ≤ 120000`. Default wall-clock is 480 s (delivery-lens must-fix), sized to tolerate 1–2 mid-loop model swaps (§8). `edit_deadline_turn` is optional, strictly positive, and must be ≤ effective `turns`; omission preserves the original prompt/behavior. When present, a stable policy wrapper asks for the first edit/write by that overall turn and the monitor deterministically returns `cap-exceeded` + `failure_kind:edit-deadline` if no successful mutation event arrives.
 
@@ -132,6 +136,7 @@ an ambiguous retry never starts or spends twice.
   "status": "completed" | "cap-exceeded" | "degenerate" | "arm-error" | "orphaned",
   "diff": "unified git diff vs seed commit, ≤200KB (truncated flag if over)",
   "changed_files": ["src/x.ts"],
+  "scope_violations": [],
   "protected_violations": [],
   "summary": "pi's final assistant message (≤2KB)",
   "check": {"ran": true, "exit_code": 0, "output_tail": "last 4KB"} ,
@@ -140,9 +145,9 @@ an ambiguous retry never starts or spends twice.
     "schema_version": 1,
     "model": "qwen3-coder-next-80b",
     "engine": "pi",
-    "harness_version": "code-loop-pi-2026-07-14-v6",
+    "harness_version": "code-loop-pi-2026-09-04-v7",
     "effective_caps": {"wall_s": 480, "turns": 24, "completion_tokens": 60000, "edit_deadline_turn": 6},
-    "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3"}
+    "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3", "result_scope": "writable-v1"}
   },
   "telemetry": {
     "schema_version": 1,
@@ -175,9 +180,13 @@ an ambiguous retry never starts or spends twice.
 
 Semantics:
 - The owner-visible `code_loop_start` tools/list description advertises the exact pre-paid
-  contract `contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
+  contract `contract[harness=code-loop-pi-2026-09-04-v7;agent_checks=pi-bash-events-v3;result_scope=writable-v1;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
 - **The diff is the deliverable** (hard constraint 5). The caller reviews and applies it (`git apply`) to its own checkout. Nothing on the box ever touches a live repo.
-- Ground truth for the diff is always git (`git add -A && git diff --cached <seed-sha>` in the sandbox), never pi's event claims.
+- Ground truth is the host-owned trusted Git baseline, never the agent-writable repository or pi's
+  event claims. Rename pairs are parsed as one logical change and both endpoints must be writable;
+  a rejected logical change never contributes bytes to the returned diff.
+- Generated cache/bytecode is omitted as hygiene without becoming a scope violation or suppressing
+  `check_cmd`. Harness metadata is never returned, but remains visible to `protected` reporting.
 - First-edit timing is taken from the pinned pi NDJSON `tool_execution_start` for `edit`/`write`, but becomes trusted only when the matching `tool_execution_end` succeeds. A git diff without that pair is reported as `mutation_evidence:"diff-only"`; timing fields stay absent. Retry turns and elapsed time are aggregated from the original attempt, while `phase_ms.check` measures only the M5-side owner check.
 - `agent_checks` is immutable, content-blind **agent-side** evidence from actual pi `bash`
   `tool_execution_start`/`tool_execution_end` pairs. It records only a normalized kind, command
@@ -225,6 +234,7 @@ Sandbox lifecycle:
 | Feature flag | `HOMESERVER_CODE_LOOP=off` default — a deploy without box provisioning is inert | `config.ts` |
 | Seed containment | Hardened lexical + realpath + `wx` checks (§5) | `code-loop.ts` |
 | Runtime containment | The OS cage (below) — **not** lexical checks; pi's `write`/`edit`/`bash` are unmediated subprocess operations, so containment must be at the OS layer | `code-loop-cage.ts` |
+| Writable result scope | Independent `writable` path/glob allowlist (seeded-only when omitted); host-owned harvest returns only complete logical changes whose paths all pass scope and containment, and reports rejected paths as `scope_violations` | `code-loop.ts` |
 | Protected paths | Exit-time diff of `protected` globs against the seed commit → any touch lands in `protected_violations` and disqualifies `check` pass (native-driver's belt-and-braces, adapted: with pi we cannot mediate writes in-process, so exit verification is the honest enforcement point) | `code-loop.ts` |
 | Env scrubbing | pi is spawned with a minimal env: `PATH`, `HOME=<sandbox>`, `PI_CODING_AGENT_DIR`, `HS_API_KEY=<service key>`. No `OPENROUTER_API_KEY`, no gateway `.env` inheritance. `--no-session` ⇒ no pi session artifacts. `check_cmd` gets `PATH`/`HOME` only — not even `HS_API_KEY` | `pi-engine.ts` |
 | Key blast radius | Service and harness keys are owner-tier with `scope=agent`, model-allow-listed, quota-bounded, independently aliased, and independently revocable. They retain owner logging/priority but cannot use `/admin/*` or `/ledger`. | keystore |
