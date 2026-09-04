@@ -983,6 +983,69 @@ describe("makePiEngine — monitored runs", () => {
     expect(r.telemetry?.failure_kind).toBeUndefined();
   });
 
+  it("#240: a completed mutation before degeneracy satisfies the global deadline across retry", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const degenerateFinal = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "?".repeat(500) }] } });
+    const editStart = JSON.stringify({ type: "tool_execution_start", toolCallId: "write-1", toolName: "write" });
+    const editEnd = JSON.stringify({ type: "tool_execution_end", toolCallId: "write-1", toolName: "write", isError: false });
+    let call = 0;
+    const spawn: SpawnPiFn = () => {
+      call++;
+      return call === 1
+        ? makeFakeProc([JSON.stringify({ type: "turn_start" }), editStart, editEnd, degenerateFinal], { exitCode: 1 })
+        : makeFakeProc([
+            JSON.stringify({ type: "turn_start" }),
+            JSON.stringify({ type: "turn_start" }),
+            JSON.stringify({ type: "turn_start" }),
+            JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recovered" }] } }),
+          ], { exitCode: 0 });
+    };
+    const engine = makePiEngine(CFG, {
+      spawnPi: spawn,
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    });
+    const r = await engine.run(engineOpts(dir, {
+      caps: { wall_s: 60, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 3 },
+    }));
+    expect(call).toBe(2);
+    // The retry's 3rd turn starts overall turn 4, past the deadline — but the first
+    // attempt's completed write already satisfied it globally, so no deadline kill may fire.
+    expect(r.outcome).toBe("completed");
+    expect(r.detail).toContain("recovered");
+    expect(r.telemetry).toMatchObject({ mutation_evidence: "tool-call", first_edit_turn: 1 });
+    expect(r.telemetry?.failure_kind).toBeUndefined();
+  });
+
+  it("#240: end of the deadline turn kills a stalled no-mutation run before the wall cap", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const turnEnd = (): string =>
+      JSON.stringify({ type: "turn_end", message: { usage: { input: 10, output: 5 } } });
+    const lines = [
+      JSON.stringify({ type: "turn_start" }),
+      readStart("read-1-a"), readEnd("read-1-a"),
+      turnEnd(),
+      JSON.stringify({ type: "turn_start" }),
+      readStart("read-2-a"), readEnd("read-2-a"),
+      turnEnd(),
+      // No further events and no exit: without turn_end enforcement the run would sit
+      // here until the wall clock fires (waitForKill stalls the fake proc deliberately).
+    ];
+    const engine = makePiEngine(CFG, {
+      spawnPi: fakeSpawnOf(makeFakeProc(lines, { waitForKill: true })),
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    });
+    const r = await engine.run(engineOpts(dir, {
+      caps: { wall_s: 30, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 2 },
+    }));
+    expect(r.outcome).toBe("cap-exceeded");
+    expect(r.usage.turns).toBe(2);
+    expect(r.telemetry).toMatchObject({ mutation_evidence: "none", failure_kind: "edit-deadline" });
+    expect(r.detail).toMatch(/^no relevant edit attempted/);
+    expect(r.detail).toContain("2 discovery tool calls across 2 turns");
+  });
+
   it("#240: degeneracy retry that ends cleanly with no mutation is NOT a completion when a deadline is set", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
     const degenerateFinal = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "?".repeat(500) }] } });

@@ -477,7 +477,10 @@ async function runPiOnce(
   pollMs: number,
   now: () => number,
   turnOffset: number,
-  checkOrderOffset: number
+  checkOrderOffset: number,
+  // #240: a successful first-attempt mutation satisfies the global edit deadline, so the
+  // degeneracy retry must not re-enforce it. Defaults to false for the initial attempt.
+  priorMutationToolCall = false
 ): Promise<SingleRun> {
   const started = now();
   const proc = spawnPi(argv, { cwd: opts.sandboxDir, env });
@@ -535,8 +538,10 @@ async function runPiOnce(
       if (killedFor !== null) return;
       const overallTurn = turnOffset + turns + 1;
       // Preserve the more specific deadline reason when one event crosses both limits.
+      // A prior-attempt mutation exempts the retry: the deadline is global to the run.
       if (
         opts.caps.edit_deadline_turn !== undefined &&
+        !priorMutationToolCall &&
         !mutationToolCall &&
         overallTurn > opts.caps.edit_deadline_turn
       ) {
@@ -567,14 +572,16 @@ async function runPiOnce(
       return;
     }
     // #240 non-convergence signal: non-mutation tool activity inside an observed turn,
-    // counted before any successful mutation. Deliberately type-only (no args inspection),
-    // and suppressed once killed so post-kill stream stragglers cannot inflate the count.
+    // counted before any successful mutation (including a prior attempt's, which already
+    // satisfied the global deadline). Deliberately type-only (no args inspection), and
+    // suppressed once killed so post-kill stream stragglers cannot inflate the count.
     // Falls through so check attribution below still sees the same event.
     if (
       ev.type === "tool_execution_start" &&
       typeof ev.toolCallId === "string" &&
       turns > 0 &&
       killedFor === null &&
+      !priorMutationToolCall &&
       !mutationToolCall &&
       mutationToolStartOf(ev) === null
     ) {
@@ -635,6 +642,20 @@ async function runPiOnce(
       promptTokens += usage.prompt;
       completionTokens += usage.completion;
       if (completionTokens > opts.caps.completion_tokens) kill("tokens");
+      // #240: enforce the deadline when the deadline turn ENDS without any completed
+      // mutation, so a process that stalls afterwards cannot consume the full wall cap.
+      // Clean turn ends only — an errored turn keeps its §10 degeneracy/arm-error routing.
+      // The next-turn_start check above remains as a defensive backstop.
+      if (
+        turnErr === null &&
+        turns > 0 &&
+        opts.caps.edit_deadline_turn !== undefined &&
+        !priorMutationToolCall &&
+        !mutationToolCall &&
+        turnOffset + turns >= opts.caps.edit_deadline_turn
+      ) {
+        kill("edit-deadline");
+      }
       return;
     }
     const text = assistantTextOf(ev);
@@ -652,6 +673,7 @@ async function runPiOnce(
   if (
     killedFor === null &&
     opts.caps.edit_deadline_turn !== undefined &&
+    !priorMutationToolCall &&
     !mutationToolCall &&
     turnOffset + turns >= opts.caps.edit_deadline_turn
   ) {
@@ -705,7 +727,12 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
     async run(opts: EngineRunOptions): Promise<EngineRunResult> {
       const env = buildPiEnv(cfg, opts.sandboxDir);
 
-      const attempt = (instruction: string, turnOffset: number, checkOrderOffset: number) =>
+      const attempt = (
+        instruction: string,
+        turnOffset: number,
+        checkOrderOffset: number,
+        priorMutationToolCall = false
+      ) =>
         runPiOnce(
           deps.spawnPi,
           [
@@ -721,7 +748,8 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
           deps.pollMs,
           now,
           turnOffset,
-          checkOrderOffset
+          checkOrderOffset,
+          priorMutationToolCall
         );
 
       const first = await attempt(opts.instruction, 0, 0);
@@ -865,7 +893,9 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         return toResult(first, null, "degenerate", "degeneracy suspected; model never became ready for the retry");
       }
 
-      const second = await attempt(CONTINUATION_PREFIX + opts.instruction, first.usage.turns, first.agentChecks.length);
+      // The retry inherits the first attempt's successful mutation, if any: the edit
+      // deadline is satisfied globally and must not be re-enforced against the retry.
+      const second = await attempt(CONTINUATION_PREFIX + opts.instruction, first.usage.turns, first.agentChecks.length, first.mutationToolCall);
       if (second.killedFor !== null) {
         const detail = second.killedFor === "edit-deadline" && deadlineTurn !== undefined
           ? editDeadlineDetail(
