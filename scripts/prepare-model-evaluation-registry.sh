@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prepare only the historical manual-evaluation registry and its immediate parent. This script is
-# intended to run through sudo during deployment; it never recursively changes data/ or its other
-# live stores.
+# Prepare only the historical manual-evaluation registry and its immediate parent. This script
+# runs as the unprivileged evaluation operator and uses sudo only for no-follow ownership transfer
+# of an already-root-owned exact path. It never recursively changes data/ or its other live stores.
 
 root=""
 uid=""
@@ -28,6 +28,10 @@ fi
 case "$uid:$gid" in
   *[!0-9:]*|:*|*:) echo "ERROR: --uid and --gid must be numeric" >&2; exit 2 ;;
 esac
+if [ "$uid" != "$(id -u)" ] || [ "$gid" != "$(id -g)" ]; then
+  echo "ERROR: target uid/gid must equal the effective unprivileged evaluator identity" >&2
+  exit 2
+fi
 if [ -L "$root" ] || [ ! -d "$root" ]; then
   echo "ERROR: live WorkingDirectory is missing, not a directory, or a symlink" >&2
   exit 1
@@ -35,21 +39,39 @@ fi
 
 data_dir="$root/data"
 registry="$data_dir/model-scout-registry.jsonl"
-if [ -L "$data_dir" ] || { [ -e "$data_dir" ] && [ ! -d "$data_dir" ]; }; then
+if [ ! -e "$data_dir" ]; then
+  mkdir -m 0700 "$data_dir"
+fi
+if [ -L "$data_dir" ] || [ ! -d "$data_dir" ]; then
   echo "ERROR: registry parent is not a real directory: $data_dir" >&2
   exit 1
 fi
-install -d -m 0700 -o "$uid" -g "$gid" -- "$data_dir"
+if [ ! -O "$data_dir" ]; then
+  sudo chown -h "$uid:$gid" "$data_dir"
+fi
+if [ -L "$data_dir" ] || [ ! -d "$data_dir" ] || [ ! -O "$data_dir" ]; then
+  echo "ERROR: registry parent ownership transfer was not safe: $data_dir" >&2
+  exit 1
+fi
+chmod 0700 "$data_dir"
 
 if [ -L "$registry" ] || { [ -e "$registry" ] && [ ! -f "$registry" ]; }; then
   echo "ERROR: registry target is not a regular file: $registry" >&2
   exit 1
 fi
 if [ ! -e "$registry" ]; then
-  install -m 0600 -o "$uid" -g "$gid" -- /dev/null "$registry"
-else
-  chown "$uid:$gid" "$registry"
-  chmod 0600 "$registry"
+  umask 077
+  set -o noclobber
+  : > "$registry"
+  set +o noclobber
 fi
+if [ ! -O "$registry" ]; then
+  sudo chown -h "$uid:$gid" "$registry"
+fi
+if [ -L "$registry" ] || [ ! -f "$registry" ] || [ ! -O "$registry" ]; then
+  echo "ERROR: registry target ownership transfer was not safe: $registry" >&2
+  exit 1
+fi
+chmod 0600 "$registry"
 
 echo "Prepared manual-evaluation registry: $registry (uid=$uid gid=$gid mode=0600; parent mode=0700)"

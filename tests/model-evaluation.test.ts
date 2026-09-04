@@ -96,7 +96,10 @@ describe("manual model evaluation", () => {
       baseUrl: "http://127.0.0.1:8080",
       ttlSeconds: 600,
       drainTimeoutSeconds: 5,
-      preflight: () => events.push("preflight"),
+      preflight: () => {
+        events.push("preflight");
+        return undefined;
+      },
       evaluate: async () => {
         events.push("evaluate");
         return expectedEntry;
@@ -140,6 +143,85 @@ describe("manual model evaluation", () => {
 
     expect(entry).toBe(expectedEntry);
     expect(events).toEqual(["preflight", "open", "evaluate", "append", "restore", "close"]);
+  });
+
+  it("returns an exact durable retry before opening a window or doing GPU work", async () => {
+    const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-already-durable",
+      modelId: "manual/model",
+      quant: "Q4_K_M",
+      artifactPath: "/home/magnus/models/manual/model.gguf",
+      modelsDir: "/home/magnus/models",
+      sizeBytes: 1024,
+    });
+    const existing = buildRegistryEntry(candidate, "winner", summary(0.8, 30));
+    const events: string[] = [];
+    const result = await runProtectedEvaluation(candidate, {
+      apiKey: "maintenance-key",
+      baseUrl: "http://127.0.0.1:8080",
+      ttlSeconds: 600,
+      drainTimeoutSeconds: 5,
+      preflight: () => {
+        events.push("preflight");
+        return existing;
+      },
+      evaluate: async () => {
+        events.push("evaluate");
+        throw new Error("must not run");
+      },
+      runWindow: async () => {
+        events.push("open");
+        throw new Error("must not open");
+      },
+    });
+    expect(result).toBe(existing);
+    expect(events).toEqual(["preflight"]);
+  });
+
+  it("rejects conflicting evaluation-identity reuse before opening a window", async () => {
+    const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-collision",
+      modelId: "manual/model",
+      quant: "Q4_K_M",
+      artifactPath: "/home/magnus/models/manual/model.gguf",
+      modelsDir: "/home/magnus/models",
+      sizeBytes: 1024,
+    });
+    const conflicting = buildRegistryEntry({ ...candidate, id: "different/model" }, "winner", summary(0.8, 30));
+    const events: string[] = [];
+    await expect(runProtectedEvaluation(candidate, {
+      apiKey: "maintenance-key",
+      baseUrl: "http://127.0.0.1:8080",
+      ttlSeconds: 600,
+      drainTimeoutSeconds: 5,
+      preflight: () => conflicting,
+      runWindow: async () => {
+        events.push("open");
+        throw new Error("must not open");
+      },
+    })).rejects.toThrow(/evaluation identity collision/i);
+    expect(events).toEqual([]);
+  });
+
+  it("rejects an evaluation-identity retry under a different serving configuration", async () => {
+    const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-config-collision",
+      modelId: "manual/model",
+      quant: "Q4_K_M",
+      artifactPath: "/home/magnus/models/manual/model.gguf",
+      modelsDir: "/home/magnus/models",
+      sizeBytes: 1024,
+    });
+    const prior = buildRegistryEntry(candidate, "winner", summary(0.8, 30));
+    prior.evalServingConfig = { ...prior.evalServingConfig!, ctx: prior.evalServingConfig!.ctx / 2 };
+    await expect(runProtectedEvaluation(candidate, {
+      apiKey: "maintenance-key",
+      baseUrl: "http://127.0.0.1:8080",
+      ttlSeconds: 600,
+      drainTimeoutSeconds: 5,
+      preflight: () => prior,
+      runWindow: async () => { throw new Error("must not open"); },
+    })).rejects.toThrow(/evaluation identity collision/i);
   });
 
   it("fails before opening the maintenance window when registry preflight fails", async () => {
@@ -207,6 +289,7 @@ describe("manual model evaluation", () => {
       baseUrl: "http://127.0.0.1:8080",
       ttlSeconds: 600,
       drainTimeoutSeconds: 5,
+      preflight: () => undefined,
       evaluate: async () => {
         events.push("evaluate-failed");
         throw new Error("probe failure");
@@ -249,6 +332,7 @@ describe("manual model evaluation", () => {
       baseUrl: "http://127.0.0.1:8080",
       ttlSeconds: 600,
       drainTimeoutSeconds: 5,
+      preflight: () => undefined,
       evaluate: async () => expectedEntry,
       append: () => events.push("append"),
       terminationSignal: termination.signal,

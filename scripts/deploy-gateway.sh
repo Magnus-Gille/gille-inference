@@ -652,7 +652,7 @@ probe_capability() {
 prepare_model_evaluation_registry() {
   local remote_dir="$1"
   if ! remote_run DEPLOY_MODEL_REGISTRY_PREPARE_CMD \
-    "uid=\$(id -u) && gid=\$(id -g) && sudo '$remote_dir/scripts/prepare-model-evaluation-registry.sh' --root '$remote_dir' --uid \"\$uid\" --gid \"\$gid\""; then
+    "uid=\$(id -u) && gid=\$(id -g) && '$remote_dir/scripts/prepare-model-evaluation-registry.sh' --root '$remote_dir' --uid \"\$uid\" --gid \"\$gid\""; then
     echo "ERROR: could not prepare the manual-evaluation registry for the evaluator identity." >&2
     return 1
   fi

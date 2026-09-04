@@ -13,6 +13,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -143,14 +144,28 @@ function persistenceError(operation: string, path: string, error: unknown): Erro
 }
 
 function readCompleteRegistryBytes(path: string): Buffer {
+  let fd: number | undefined;
   try {
-    const bytes = readFileSync(path);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    if (!fstatSync(fd).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
+    const bytes = readFileSync(fd);
     if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) {
       throw Object.assign(new Error("incomplete JSONL record"), { code: "INVALID_JSONL" });
     }
     return bytes;
   } catch (error) {
     throw persistenceError("read and validate target", path, error);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function assertRegistryLockAvailable(path: string): void {
+  const lockPath = `${path}.lock`;
+  if (existsSync(lockPath)) {
+    throw new Error(`registry lock unavailable at ${lockPath} for registry ${path} (EEXIST)`);
   }
 }
 
@@ -174,6 +189,7 @@ export function verifyRegistryAppendability(path: string = DEFAULT_REGISTRY_PATH
     if (targetFd !== undefined) closeSync(targetFd);
   }
   readCompleteRegistryBytes(path);
+  assertRegistryLockAvailable(path);
 }
 
 /**
@@ -222,6 +238,7 @@ export function preflightRegistry(path: string = DEFAULT_REGISTRY_PATH): void {
     try { unlinkSync(probe); } catch { /* absent or preflight failed before creation */ }
   }
   readCompleteRegistryBytes(path);
+  assertRegistryLockAvailable(path);
 }
 
 export type RegistryAppendOutcome = "appended" | "duplicate";
@@ -250,7 +267,7 @@ export function appendEntry(
       );
       fsyncSync(lockFd);
     } catch (error) {
-      throw new Error(`registry lock unavailable for ${path} (${errnoCode(error)})`);
+      throw new Error(`registry lock unavailable at ${lockPath} for registry ${path} (${errnoCode(error)})`);
     }
 
     const existing = readCompleteRegistryBytes(path);
@@ -300,7 +317,7 @@ export function appendEntry(
  */
 export function readRegistry(path: string = DEFAULT_REGISTRY_PATH): RegistryEntry[] {
   if (!existsSync(path)) return [];
-  const raw = readFileSync(path, "utf8");
+  const raw = readCompleteRegistryBytes(path).toString("utf8");
   const entries: RegistryEntry[] = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();

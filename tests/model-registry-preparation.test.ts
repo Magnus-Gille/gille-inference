@@ -91,4 +91,12 @@ describe("model-evaluation registry preparation (#263)", () => {
     expect(() => prepare(liveRoot)).toThrow();
     expect(readFileSync(outside, "utf8")).toBe("do not touch\n");
   });
+
+  it("keeps privileged operations no-follow and limits mode changes to the unprivileged identity", () => {
+    const source = readFileSync(SCRIPT, "utf8");
+    expect(source).toContain('sudo chown -h "$uid:$gid"');
+    expect(source).not.toMatch(/sudo\s+(chmod|install)/);
+    const deploy = readFileSync(join(__dirname, "..", "scripts", "deploy-gateway.sh"), "utf8");
+    expect(deploy).not.toMatch(/sudo[^\n]*prepare-model-evaluation-registry\.sh/);
+  });
 });

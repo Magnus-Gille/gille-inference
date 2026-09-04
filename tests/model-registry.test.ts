@@ -20,6 +20,7 @@ import { join } from "node:path";
 import {
   appendEntry,
   preflightRegistry,
+  verifyRegistryAppendability,
   readRegistry,
   latestByModel,
   isEvaluated,
@@ -173,6 +174,8 @@ describe("durable append preflight and idempotence (#263)", () => {
     appendEntry(first, path);
     const before = readFileSync(path);
     writeFileSync(`${path}.lock`, "held\n", { mode: 0o600 });
+    expect(() => preflightRegistry(path)).toThrow(new RegExp(`${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.lock`));
+    expect(() => verifyRegistryAppendability(path)).toThrow(/registry lock unavailable/i);
     expect(() => appendEntry(makeEntry({ evaluationId: "manual-eval-second" }), path)).toThrow(/registry lock unavailable/i);
     expect(readFileSync(path)).toEqual(before);
     expect(readRegistry(path)).toEqual([first]);

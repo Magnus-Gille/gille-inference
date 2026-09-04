@@ -37,6 +37,7 @@ import {
   DEFAULT_REGISTRY_PATH,
   appendEntry,
   preflightRegistry,
+  readRegistry,
   verifyRegistryAppendability,
 } from "../src/homeserver/model-registry.js";
 import { PROBES, PROBE_BATTERY_VERSION, CORPUS_FINGERPRINT } from "../src/homeserver/probes.js";
@@ -154,6 +155,17 @@ export function decideVerdict(summary: ProbeRunSummary): ScoutVerdict {
 
 function evalServingConfig(): { ctx: number; repeats: number; ngl: number; flashAttn: string } {
   return { ctx: CTX, repeats: REPEATS, ngl: 99, flashAttn: "on" };
+}
+
+function sameEvalServingConfig(
+  actual: RegistryEntry["evalServingConfig"],
+  expected: ReturnType<typeof evalServingConfig>,
+): boolean {
+  return actual !== undefined &&
+    actual.ctx === expected.ctx &&
+    actual.repeats === expected.repeats &&
+    actual.ngl === expected.ngl &&
+    actual.flashAttn === expected.flashAttn;
 }
 
 /** Build the durable content-blind registry row. `served` is always false here. */
@@ -399,7 +411,7 @@ export interface ProtectedEvaluationDependencies {
   drainTimeoutSeconds: number;
   evaluate?: (candidate: ManualEvaluationCandidate, signal: AbortSignal) => Promise<RegistryEntry>;
   append?: (entry: RegistryEntry) => void;
-  preflight?: () => void;
+  preflight?: () => RegistryEntry | undefined;
   restore?: (
     runningModels: MaintenanceWindowOpeningEvidence["runningModels"],
     signal: AbortSignal,
@@ -415,8 +427,31 @@ export async function runProtectedEvaluation(
   deps: ProtectedEvaluationDependencies,
 ): Promise<RegistryEntry> {
   if (!deps.apiKey.trim()) throw new Error("M5_MAINTENANCE_KEY is required for manual model evaluation");
-  const preflight = deps.preflight ?? (() => preflightRegistry(REGISTRY));
-  preflight();
+  const preflight = deps.preflight ?? (() => {
+    preflightRegistry(REGISTRY);
+    return readRegistry(REGISTRY).find((entry) => entry.evaluationId === candidate.evaluationId);
+  });
+  const prior = preflight();
+  if (prior) {
+    const servingConfigMatches = prior.verdict === "load_failed"
+      ? prior.evalServingConfig === undefined
+      : sameEvalServingConfig(prior.evalServingConfig, evalServingConfig());
+    const sameCandidate =
+      prior.evaluationId === candidate.evaluationId &&
+      prior.id === candidate.id &&
+      prior.quant === candidate.quant &&
+      prior.sizeGB === candidate.sizeGB &&
+      prior.ggufPath === candidate.artifactPath &&
+      prior.sharded === candidate.sharded &&
+      prior.probeBatteryVersion === PROBE_BATTERY_VERSION &&
+      prior.corpusFingerprint === CORPUS_FINGERPRINT &&
+      servingConfigMatches;
+    if (!sameCandidate) {
+      throw new Error(`evaluation identity collision for ${candidate.evaluationId} during registry preflight`);
+    }
+    log(`evaluation ${candidate.evaluationId} already has a durable registry row; exact retry is a no-op`);
+    return prior;
+  }
   const evaluateCandidate = deps.evaluate ?? evaluate;
   const append = deps.append ?? ((entry: RegistryEntry) => appendEntry(entry, REGISTRY));
   const restore = deps.restore ?? restoreRunningModels;

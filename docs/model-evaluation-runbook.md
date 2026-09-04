@@ -48,6 +48,11 @@ and its immediate parent at `0700` for the unprivileged deployment/evaluation id
 recursively changes `data/`. `scripts/deploy-gateway.sh verify` repeats a read-only appendability
 check and reports the effective uid without touching the roster or loading a model.
 
+The atomic writer holds `model-scout-registry.jsonl.lock` only for the synchronous commit. An
+unclean process death can leave that lock behind; preflight and deploy verification then fail
+before any GPU work and name the exact lock path. After proving that no evaluator process or
+maintenance window is active, remove only that stale lock and rerun the read-only deploy verifier.
+
 The evaluator requires llama-swap's unload request to succeed and `/running` to prove empty before
 it starts a loopback-only ephemeral llama-server. It runs the deterministic probe battery
 sequentially, commits one content-blind registry row using lock + fsync + atomic rename, restores the pre-run resident model when one
