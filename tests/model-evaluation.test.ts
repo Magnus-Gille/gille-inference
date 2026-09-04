@@ -30,6 +30,7 @@ const summary = (passRate: number, tokPerSec: number | null): ProbeRunSummary =>
 describe("manual model evaluation", () => {
   it("keeps the explicit evaluation path bounded to an existing local artifact", () => {
     const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-muse-1",
       modelId: "meta/Muse-Glimmer-30B",
       quant: "KQ_DYNAMIC",
       artifactPath: "/home/magnus/models/muse/muse.gguf",
@@ -37,6 +38,7 @@ describe("manual model evaluation", () => {
       sizeBytes: 19_653_957_984,
     });
     expect(candidate).toMatchObject({
+      evaluationId: "manual-eval-muse-1",
       id: "meta/Muse-Glimmer-30B",
       quant: "KQ_DYNAMIC",
       sizeGB: 18.3,
@@ -46,6 +48,7 @@ describe("manual model evaluation", () => {
 
   it("rejects an artifact outside the configured model root", () => {
     expect(() => manualCandidateForArtifact({
+      evaluationId: "manual-eval-muse-1",
       modelId: "meta/Muse-Glimmer-30B",
       quant: "KQ_DYNAMIC",
       artifactPath: "/tmp/muse.gguf",
@@ -62,6 +65,7 @@ describe("manual model evaluation", () => {
 
   it("writes evidence as manual-only and never as served", () => {
     const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-muse-1",
       modelId: "meta/Muse-Glimmer-30B",
       quant: "KQ_DYNAMIC",
       artifactPath: "/home/magnus/models/muse/muse.gguf",
@@ -69,6 +73,7 @@ describe("manual model evaluation", () => {
       sizeBytes: 19_653_957_984,
     });
     const entry = buildRegistryEntry(candidate, "winner", summary(0.8, 30));
+    expect(entry.evaluationId).toBe("manual-eval-muse-1");
     expect(entry.served).toBe(false);
     expect(entry.notes).toMatch(/no automatic roster mutation/i);
     expect(entry.gateFlags).toContain("manual-evaluation-only");
@@ -76,6 +81,7 @@ describe("manual model evaluation", () => {
 
   it("holds an exclusive token-scoped window through evaluation and registry append", async () => {
     const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-protected-1",
       modelId: "manual/model",
       quant: "Q4_K_M",
       artifactPath: "/home/magnus/models/manual/model.gguf",
@@ -90,6 +96,7 @@ describe("manual model evaluation", () => {
       baseUrl: "http://127.0.0.1:8080",
       ttlSeconds: 600,
       drainTimeoutSeconds: 5,
+      preflight: () => events.push("preflight"),
       evaluate: async () => {
         events.push("evaluate");
         return expectedEntry;
@@ -132,11 +139,43 @@ describe("manual model evaluation", () => {
     });
 
     expect(entry).toBe(expectedEntry);
-    expect(events).toEqual(["open", "evaluate", "append", "restore", "close"]);
+    expect(events).toEqual(["preflight", "open", "evaluate", "append", "restore", "close"]);
+  });
+
+  it("fails before opening the maintenance window when registry preflight fails", async () => {
+    const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-preflight-failure",
+      modelId: "manual/model",
+      quant: "Q4_K_M",
+      artifactPath: "/home/magnus/models/manual/model.gguf",
+      modelsDir: "/home/magnus/models",
+      sizeBytes: 1024,
+    });
+    const events: string[] = [];
+    await expect(runProtectedEvaluation(candidate, {
+      apiKey: "maintenance-key",
+      baseUrl: "http://127.0.0.1:8080",
+      ttlSeconds: 600,
+      drainTimeoutSeconds: 5,
+      preflight: () => {
+        events.push("preflight");
+        throw new Error("registry preflight failed: cannot open target");
+      },
+      evaluate: async () => {
+        events.push("evaluate");
+        throw new Error("must not run");
+      },
+      runWindow: async () => {
+        events.push("open");
+        throw new Error("must not open");
+      },
+    })).rejects.toThrow(/registry preflight failed/i);
+    expect(events).toEqual(["preflight"]);
   });
 
   it("fails closed before evaluation when no maintenance credential is available", async () => {
     const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-no-key",
       modelId: "manual/model",
       quant: "Q4_K_M",
       artifactPath: "/home/magnus/models/manual/model.gguf",
@@ -155,6 +194,7 @@ describe("manual model evaluation", () => {
 
   it("restores prior residency before closing the window when evaluation fails", async () => {
     const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-restore",
       modelId: "manual/model",
       quant: "Q4_K_M",
       artifactPath: "/home/magnus/models/manual/model.gguf",
@@ -192,6 +232,7 @@ describe("manual model evaluation", () => {
 
   it("keeps signal ownership through restoration and closes before surfacing interruption", async () => {
     const candidate = manualCandidateForArtifact({
+      evaluationId: "manual-eval-signal",
       modelId: "manual/model",
       quant: "Q4_K_M",
       artifactPath: "/home/magnus/models/manual/model.gguf",

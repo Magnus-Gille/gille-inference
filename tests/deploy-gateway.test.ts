@@ -165,6 +165,8 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     DEPLOY_REMOTE_DIR: remoteDir,
     DEPLOY_WORKDIR_PROBE_CMD: `echo ${remoteDir}`,
     DEPLOY_INSTALL_CMD: "true",
+    DEPLOY_MODEL_REGISTRY_PREPARE_CMD: "true",
+    DEPLOY_MODEL_REGISTRY_VERIFY_CMD: "true",
     DEPLOY_RESTART_CMD: "true",
     // Benign defaults for the issue #30 interpreter preflight: a fixture ExecStart line whose
     // path is never actually stat'd because DEPLOY_INTERPRETER_CHECK_CMD is stubbed to "true".
@@ -732,6 +734,31 @@ describe("scripts/deploy-gateway.sh", () => {
     const r = await runScript("verify", src, baseEnv(remote));
     expect(r.status).not.toBe(0);
     expect(r.stdout).toMatch(/no \.deployed-commit marker present/);
+  });
+
+  it("verify fails when the effective evaluator identity cannot append the registry", async () => {
+    const src = initSourceRepo();
+    const remote = tmpDir("dg-remote-");
+    writeFileSync(join(remote, ".deployed-commit"), `${headSha(src)}\n`);
+    const r = await runScript("verify", src, baseEnv(remote, {
+      DEPLOY_MODEL_REGISTRY_VERIFY_CMD: "false",
+    }));
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/registry is not appendable by the effective evaluator identity/i);
+  });
+
+  it("deploy fails before restart when exact registry preparation fails", async () => {
+    const src = initSourceRepo();
+    const remote = tmpDir("dg-remote-");
+    const restarted = join(remote, "RESTARTED");
+    const r = await runScript("deploy", src, baseEnv(remote, {
+      DEPLOY_MODEL_REGISTRY_PREPARE_CMD: "false",
+      DEPLOY_RESTART_CMD: `touch '${restarted}'`,
+    }));
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/could not prepare the manual-evaluation registry/i);
+    expect(existsSync(restarted)).toBe(false);
+    expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
   });
 
   describe("routing-table copy-if-absent seeding (issue #44)", () => {

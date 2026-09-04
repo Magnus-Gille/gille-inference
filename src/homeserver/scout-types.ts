@@ -83,6 +83,8 @@ export type ScoutVerdict = EvaluationVerdict;
 
 /** One durable line in the historical model-evaluation registry. */
 export interface RegistryEntry {
+  /** Stable operator-supplied identity: exact retries are idempotent; conflicting reuse fails. */
+  evaluationId?: string; // absent only on historical rows
   id: string; // operator-supplied durable model id
   quant: string; // evaluated quant tag
   sizeGB: number;

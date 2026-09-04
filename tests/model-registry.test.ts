@@ -4,11 +4,22 @@
  * Run:  npx vitest run tests/model-registry.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appendEntry,
+  preflightRegistry,
   readRegistry,
   latestByModel,
   isEvaluated,
@@ -22,6 +33,13 @@ import type { RegistryEntry } from "../src/homeserver/scout-types.js";
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 const TMP = join(tmpdir(), "model-registry-test.jsonl");
+const TEMP_ROOTS: string[] = [];
+
+function tempRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "model-registry-test-"));
+  TEMP_ROOTS.push(root);
+  return root;
+}
 
 function makeEntry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
   return {
@@ -43,6 +61,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   if (existsSync(TMP)) unlinkSync(TMP);
+  while (TEMP_ROOTS.length > 0) rmSync(TEMP_ROOTS.pop()!, { recursive: true, force: true });
 });
 
 // ── DEFAULT_REGISTRY_PATH ────────────────────────────────────────────────────
@@ -80,6 +99,83 @@ describe("appendEntry + readRegistry round-trip", () => {
     const e = makeEntry({ probeErrors: 5, probeTotalRuns: 20, probeErrorRate: 0.25 });
     appendEntry(e, TMP);
     expect(readRegistry(TMP)[0]).toEqual(e);
+  });
+});
+
+describe("durable append preflight and idempotence (#263)", () => {
+  it("creates a fresh private registry target and proves it is appendable", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    preflightRegistry(path);
+    expect(readFileSync(path, "utf8")).toBe("");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(statSync(join(path, "..")).mode & 0o777).toBe(0o700);
+  });
+
+  it("accepts an existing writable registry without changing its bytes", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+    writeFileSync(path, `${JSON.stringify(makeEntry())}\n`, { mode: 0o600 });
+    const before = readFileSync(path);
+    preflightRegistry(path);
+    expect(readFileSync(path)).toEqual(before);
+  });
+
+  it("rejects an existing registry that the evaluator identity cannot write", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+    writeFileSync(path, "", { mode: 0o400 });
+    chmodSync(path, 0o400);
+    expect(() => preflightRegistry(path)).toThrow(new RegExp(`open target.*${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*EACCES`, "i"));
+  });
+
+  it("rejects unreadable or incomplete existing bytes before expensive work", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+    writeFileSync(path, "partial", { mode: 0o600 });
+    expect(() => preflightRegistry(path)).toThrow(/read and validate target.*INVALID_JSONL/i);
+    writeFileSync(path, "", { mode: 0o200 });
+    chmodSync(path, 0o200);
+    expect(() => preflightRegistry(path)).toThrow(/read and validate target.*EACCES/i);
+  });
+
+  it("rejects a non-writable parent even when the existing registry itself is writable", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    const parent = join(path, "..");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    writeFileSync(path, "", { mode: 0o600 });
+    chmodSync(parent, 0o500);
+    try {
+      expect(() => preflightRegistry(path)).toThrow(new RegExp(`atomic replace.*${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*EACCES`, "i"));
+    } finally {
+      chmodSync(parent, 0o700);
+    }
+  });
+
+  it("makes an exact evaluation retry an idempotent no-op", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    const entry = makeEntry({ evaluationId: "manual-eval-20260904-k2" });
+    expect(appendEntry(entry, path)).toBe("appended");
+    expect(appendEntry(entry, path)).toBe("duplicate");
+    expect(readRegistry(path)).toEqual([entry]);
+  });
+
+  it("fails closed on evaluation-identity reuse with different evidence", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    const first = makeEntry({ evaluationId: "manual-eval-20260904-k2" });
+    appendEntry(first, path);
+    expect(() => appendEntry({ ...first, passRate: 0.1 }, path)).toThrow(/evaluation identity collision/i);
+    expect(readRegistry(path)).toEqual([first]);
+  });
+
+  it("does not touch the durable bytes when another writer holds the registry lock", () => {
+    const path = join(tempRoot(), "data", "registry.jsonl");
+    const first = makeEntry({ evaluationId: "manual-eval-first" });
+    appendEntry(first, path);
+    const before = readFileSync(path);
+    writeFileSync(`${path}.lock`, "held\n", { mode: 0o600 });
+    expect(() => appendEntry(makeEntry({ evaluationId: "manual-eval-second" }), path)).toThrow(/registry lock unavailable/i);
+    expect(readFileSync(path)).toEqual(before);
+    expect(readRegistry(path)).toEqual([first]);
   });
 });
 
@@ -251,6 +347,11 @@ describe("isRegistryEntry", () => {
   });
   it("rejects when evaluatedAt is not a string", () => {
     expect(isRegistryEntry({ ...good, evaluatedAt: 0 })).toBe(false);
+  });
+  it("accepts a valid evaluation identity and rejects malformed identities", () => {
+    expect(isRegistryEntry({ ...good, evaluationId: "manual-eval-20260904-k2" })).toBe(true);
+    expect(isRegistryEntry({ ...good, evaluationId: "short" })).toBe(false);
+    expect(isRegistryEntry({ ...good, evaluationId: "private/path" })).toBe(false);
   });
   it("rejects when verdict is not a string", () => {
     expect(isRegistryEntry({ ...good, verdict: true })).toBe(false);
