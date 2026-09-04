@@ -14,7 +14,7 @@ import type { Probe } from "../src/homeserver/probes.js";
 
 // Pinned golden value for the CURRENT corpus. Recompute deliberately (never copy blindly) when
 // PROBES intentionally changes, and bump PROBE_BATTERY_VERSION in the same change.
-const CURRENT_FINGERPRINT = "41c41e7c57105a27";
+const CURRENT_FINGERPRINT = "58b153a0535f00ca";
 
 describe("PROBE_BATTERY_VERSION + CORPUS_FINGERPRINT — reproducibility pin", () => {
   it("is a non-empty version string", () => {

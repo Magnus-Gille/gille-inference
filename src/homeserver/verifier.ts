@@ -98,6 +98,33 @@ export function containsAll(subs: string[], opts: { ci?: boolean } = {}): Verifi
   };
 }
 
+export interface RequiredAnchor {
+  /** Stable, human-readable contract element reported when any of its needles is absent. */
+  label: string;
+  /** Exact source tokens that jointly demonstrate the candidate referenced this element. */
+  needles: readonly string[];
+}
+
+/**
+ * Require named contract anchors in generated source and report every omitted element.
+ *
+ * This is intentionally only a diagnostic/static half-gate: callers should combine it with an
+ * execution or mutation verifier so comments cannot manufacture a pass. The named misses remain
+ * useful when that behavioral verifier rejects a candidate with an otherwise opaque compile or
+ * assertion failure.
+ */
+export function requiredAnchors(anchors: readonly RequiredAnchor[]): Verifier {
+  return (out) => {
+    const source = extractCodeBlock(out);
+    const missing = anchors
+      .filter((anchor) => anchor.needles.some((needle) => !source.includes(needle)))
+      .map((anchor) => anchor.label);
+    return missing.length === 0
+      ? PASS("all contract anchors referenced")
+      : FAIL(`missing contract anchors: ${missing.join(", ")}`);
+  };
+}
+
 /** Fail if the output contains ANY of the given substrings — useful for "must-not-contain" guards. */
 export function containsNone(subs: string[], opts: { ci?: boolean } = {}): Verifier {
   return (out) => {
