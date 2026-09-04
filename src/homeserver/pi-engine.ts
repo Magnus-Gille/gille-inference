@@ -529,6 +529,9 @@ async function runPiOnce(
   const rl = createInterface({ input: proc.stdout });
   rl.on("line", (line) => {
     appendTail(line.slice(-2048) + "\n");
+    // SIGTERM cannot retract bytes already buffered by the OS/readline. Preserve those bytes in
+    // the bounded diagnostic tail, but freeze all semantic evidence at the first kill decision.
+    if (killedFor !== null) return;
     const ev = parsePiLine(line);
     if (ev === null) {
       if (line.trim() !== "") unparseable++;
@@ -641,10 +644,12 @@ async function runPiOnce(
     if (usage !== null) {
       promptTokens += usage.prompt;
       completionTokens += usage.completion;
-      if (completionTokens > opts.caps.completion_tokens) kill("tokens");
-      // #240: enforce the deadline when the deadline turn ENDS without any completed
-      // mutation, so a process that stalls afterwards cannot consume the full wall cap.
-      // Clean turn ends only — an errored turn keeps its §10 degeneracy/arm-error routing.
+    }
+    if (ev.type === "turn_end") {
+      // #240: enforce the deadline when the deadline turn ENDS without any completed mutation,
+      // even when pi omits or malforms usage, so a stalled process cannot consume the wall cap.
+      // Clean turn ends only — an errored turn keeps its §10 degeneracy/arm-error routing. The
+      // specific no-edit reason wins if the same event also crosses the completion-token cap.
       // The next-turn_start check above remains as a defensive backstop.
       if (
         turnErr === null &&
@@ -655,6 +660,8 @@ async function runPiOnce(
         turnOffset + turns >= opts.caps.edit_deadline_turn
       ) {
         kill("edit-deadline");
+      } else if (usage !== null && completionTokens > opts.caps.completion_tokens) {
+        kill("tokens");
       }
       return;
     }
