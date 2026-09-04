@@ -213,7 +213,10 @@ worktree edits cannot enter the deployed bytes. The temporary snapshot is remove
 The source-binding check is an additional outer gate. All existing checks remain: the script
 refuses a dirty or non-addressable source tree, refuses when the live unit's `WorkingDirectory`
 doesn't match what it's about to sync into, seeds `docs/m5-routing.json` copy-if-absent without ever
-overwriting a live/adopted table (issue #44), preflights the ExecStart interpreter before
+overwriting a live/adopted table (issue #44), prepares only the historical manual-evaluation
+registry and its immediate parent for the unprivileged operator identity (`0600`/`0700`, never a
+recursive `data/` permission change), verifies appendability under that effective identity without
+loading a model or touching the roster (issue #263), preflights the ExecStart interpreter before
 restarting (issue #30 — see below), restarts the unit only when the payload actually changed,
 probes local health (best-effort) and tailnet health plus an authenticated capability endpoint,
 and writes `.deployed-commit` with the exact 40-char SHA **only** after every check passes — any

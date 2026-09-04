@@ -9,8 +9,9 @@
  * or promotes a model.
  *
  * USAGE
- *   npx tsx scripts/evaluate-model.ts --model-id <org/model> --gguf <path> [--quant <label>]
- *   npx tsx scripts/evaluate-model.ts --model-id <org/model> --gguf <path> --dry-run
+ *   npx tsx scripts/evaluate-model.ts --evaluation-id <opaque-id> --model-id <org/model> --gguf <path> [--quant <label>]
+ *   npx tsx scripts/evaluate-model.ts --evaluation-id <opaque-id> --model-id <org/model> --gguf <path> --dry-run
+ *   npx tsx scripts/evaluate-model.ts --registry-verify-only
  *
  * ENV (all optional)
  *   MODELS_DIR                 /home/magnus/models
@@ -18,6 +19,7 @@
  *   EVAL_MODEL_CTX              8192
  *   EVAL_MODEL_REPEATS         1
  *   EVAL_MODEL_REGISTRY        ./data/model-scout-registry.jsonl (historic path)
+ *   EVAL_MODEL_IDENTITY        stable opaque identity reused only for an exact retry
  *   LLAMA_SERVER_BIN            /home/magnus/llama.cpp/build/bin/llama-server
  *   LLAMASWAP_URL               http://127.0.0.1:8091
  *   M5_MAINTENANCE_KEY           owner/admin gateway key (never inherited by llama-server)
@@ -31,7 +33,13 @@ import { dirname, isAbsolute, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { makeChatFn, runProbes } from "../src/homeserver/probe-runner.js";
-import { DEFAULT_REGISTRY_PATH, appendEntry } from "../src/homeserver/model-registry.js";
+import {
+  DEFAULT_REGISTRY_PATH,
+  appendEntry,
+  preflightRegistry,
+  readRegistry,
+  verifyRegistryAppendability,
+} from "../src/homeserver/model-registry.js";
 import { PROBES, PROBE_BATTERY_VERSION, CORPUS_FINGERPRINT } from "../src/homeserver/probes.js";
 import type { ProbeRunSummary, RegistryEntry, ScoutVerdict } from "../src/homeserver/scout-types.js";
 import {
@@ -97,6 +105,7 @@ function isGguf(path: string): boolean {
 }
 
 export interface ManualEvaluationCandidate {
+  evaluationId: string;
   id: string;
   quant: string;
   sizeGB: number;
@@ -107,12 +116,17 @@ export interface ManualEvaluationCandidate {
 
 /** Validate an explicitly selected artifact and keep it inside the configured model root. */
 export function manualCandidateForArtifact(input: {
+  evaluationId: string;
   modelId: string;
   quant: string;
   artifactPath: string;
   modelsDir: string;
   sizeBytes: number;
 }): ManualEvaluationCandidate {
+  const evaluationId = input.evaluationId.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(evaluationId)) {
+    throw new Error("--evaluation-id must be 8-128 characters using only letters, digits, '.', '_', ':' or '-'");
+  }
   const id = input.modelId.trim();
   if (!id) throw new Error("--model-id is required");
   const rel = relative(input.modelsDir, input.artifactPath);
@@ -123,6 +137,7 @@ export function manualCandidateForArtifact(input: {
     throw new Error(`evaluation artifact has invalid size: ${input.sizeBytes}`);
   }
   return {
+    evaluationId,
     id,
     quant: input.quant.trim() || "LOCAL",
     sizeGB: Math.round((input.sizeBytes / 1024 ** 3) * 100) / 100,
@@ -140,6 +155,17 @@ export function decideVerdict(summary: ProbeRunSummary): ScoutVerdict {
 
 function evalServingConfig(): { ctx: number; repeats: number; ngl: number; flashAttn: string } {
   return { ctx: CTX, repeats: REPEATS, ngl: 99, flashAttn: "on" };
+}
+
+function sameEvalServingConfig(
+  actual: RegistryEntry["evalServingConfig"],
+  expected: ReturnType<typeof evalServingConfig>,
+): boolean {
+  return actual !== undefined &&
+    actual.ctx === expected.ctx &&
+    actual.repeats === expected.repeats &&
+    actual.ngl === expected.ngl &&
+    actual.flashAttn === expected.flashAttn;
 }
 
 /** Build the durable content-blind registry row. `served` is always false here. */
@@ -166,6 +192,7 @@ export function buildRegistryEntry(
   const emptyOutputs = summary?.emptyOutputs ?? 0;
   const truncations = summary?.truncations ?? 0;
   return {
+    evaluationId: candidate.evaluationId,
     id: candidate.id,
     quant: candidate.quant,
     sizeGB: candidate.sizeGB,
@@ -384,6 +411,7 @@ export interface ProtectedEvaluationDependencies {
   drainTimeoutSeconds: number;
   evaluate?: (candidate: ManualEvaluationCandidate, signal: AbortSignal) => Promise<RegistryEntry>;
   append?: (entry: RegistryEntry) => void;
+  preflight?: () => RegistryEntry | undefined;
   restore?: (
     runningModels: MaintenanceWindowOpeningEvidence["runningModels"],
     signal: AbortSignal,
@@ -398,6 +426,32 @@ export async function runProtectedEvaluation(
   candidate: ManualEvaluationCandidate,
   deps: ProtectedEvaluationDependencies,
 ): Promise<RegistryEntry> {
+  if (!deps.apiKey.trim()) throw new Error("M5_MAINTENANCE_KEY is required for manual model evaluation");
+  const preflight = deps.preflight ?? (() => {
+    preflightRegistry(REGISTRY);
+    return readRegistry(REGISTRY).find((entry) => entry.evaluationId === candidate.evaluationId);
+  });
+  const prior = preflight();
+  if (prior) {
+    const servingConfigMatches = prior.verdict === "load_failed"
+      ? prior.evalServingConfig === undefined
+      : sameEvalServingConfig(prior.evalServingConfig, evalServingConfig());
+    const sameCandidate =
+      prior.evaluationId === candidate.evaluationId &&
+      prior.id === candidate.id &&
+      prior.quant === candidate.quant &&
+      prior.sizeGB === candidate.sizeGB &&
+      prior.ggufPath === candidate.artifactPath &&
+      prior.sharded === candidate.sharded &&
+      prior.probeBatteryVersion === PROBE_BATTERY_VERSION &&
+      prior.corpusFingerprint === CORPUS_FINGERPRINT &&
+      servingConfigMatches;
+    if (!sameCandidate) {
+      throw new Error(`evaluation identity collision for ${candidate.evaluationId} during registry preflight`);
+    }
+    log(`evaluation ${candidate.evaluationId} already has a durable registry row; exact retry is a no-op`);
+    return prior;
+  }
   const evaluateCandidate = deps.evaluate ?? evaluate;
   const append = deps.append ?? ((entry: RegistryEntry) => appendEntry(entry, REGISTRY));
   const restore = deps.restore ?? restoreRunningModels;
@@ -472,12 +526,14 @@ export async function runProtectedEvaluation(
 function resolveCandidate(args: string[]): ManualEvaluationCandidate {
   const configuredPath = value("--gguf", args) ?? process.env["EVAL_MODEL_GGUF"];
   const modelId = value("--model-id", args) ?? process.env["EVAL_MODEL_ID"] ?? "";
-  if (!configuredPath) throw new Error("usage: evaluate-model --model-id <org/model> --gguf <path> [--quant <label>]");
+  const evaluationId = value("--evaluation-id", args) ?? process.env["EVAL_MODEL_IDENTITY"] ?? "";
+  if (!configuredPath) throw new Error("usage: evaluate-model --evaluation-id <opaque-id> --model-id <org/model> --gguf <path> [--quant <label>]");
   const artifactPath = realpathSync(configuredPath);
   const modelsDir = realpathSync(process.env["MODELS_DIR"] ?? DEFAULT_MODELS_DIR);
   const stat = statSync(artifactPath);
   if (!stat.isFile() || !isGguf(artifactPath)) throw new Error(`--gguf is not a regular GGUF file: ${artifactPath}`);
   return manualCandidateForArtifact({
+    evaluationId,
     modelId,
     quant: value("--quant", args) ?? process.env["EVAL_MODEL_QUANT"] ?? "LOCAL",
     artifactPath,
@@ -488,6 +544,11 @@ function resolveCandidate(args: string[]): ManualEvaluationCandidate {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args.includes("--registry-verify-only")) {
+    verifyRegistryAppendability(REGISTRY);
+    console.log(JSON.stringify({ registry: REGISTRY, appendable: true, runtimeUid: process.getuid?.() ?? null }));
+    return;
+  }
   const candidate = resolveCandidate(args);
   if (args.includes("--dry-run")) {
     console.log(JSON.stringify({ dryRun: true, candidate, maintenanceRequired: true, mutation: "registry append only" }, null, 2));

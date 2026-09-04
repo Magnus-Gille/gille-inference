@@ -33,7 +33,8 @@ set -euo pipefail
 #             never fire against a gateway that is still mid-restart), then stamp
 #             .deployed-commit with the exact 40-char SHA ONLY after every check passes.
 #   verify    Read-only. Reports the marker commit plus a content spot-check against the local
-#             tree. Never touches rsync, the unit, or the marker.
+#             tree and proves registry appendability as the evaluator runtime identity. Never
+#             touches rsync, the unit, the roster, a model, or the marker.
 #   dry-run <full-expected-sha>
 #             Prints the exact plan (path check, rsync command, restart decision, probes) without
 #             running rsync, restarting the unit, or writing the marker. Still performs the
@@ -645,6 +646,31 @@ probe_capability() {
   echo "  OK: authenticated capability probe passed ($url -> 200)"
 }
 
+# Establish only data/model-scout-registry.jsonl and its immediate parent for the unprivileged
+# operator identity that launches controlled model evaluations. The reviewed helper performs no
+# recursive ownership or mode change, and preserves existing registry bytes.
+prepare_model_evaluation_registry() {
+  local remote_dir="$1"
+  if ! remote_run DEPLOY_MODEL_REGISTRY_PREPARE_CMD \
+    "uid=\$(id -u) && gid=\$(id -g) && '$remote_dir/scripts/prepare-model-evaluation-registry.sh' --root '$remote_dir' --uid \"\$uid\" --gid \"\$gid\""; then
+    echo "ERROR: could not prepare the manual-evaluation registry for the evaluator identity." >&2
+    return 1
+  fi
+  echo "  OK: manual-evaluation registry target prepared without recursive data/ changes"
+}
+
+# Read-only runtime-identity verification: evaluator code opens the existing target for append and
+# checks parent write/search permission, but does not write a row, touch the roster, or load a model.
+verify_model_evaluation_registry() {
+  local remote_dir="$1"
+  if ! remote_run DEPLOY_MODEL_REGISTRY_VERIFY_CMD \
+    "cd '$remote_dir' && EVAL_MODEL_REGISTRY='$remote_dir/data/model-scout-registry.jsonl' node_modules/.bin/tsx scripts/evaluate-model.ts --registry-verify-only"; then
+    echo "ERROR: manual-evaluation registry is not appendable by the effective evaluator identity." >&2
+    return 1
+  fi
+  echo "  OK: effective evaluator identity can append the manual-evaluation registry"
+}
+
 # ── modes ────────────────────────────────────────────────────────────────────────────────────
 
 cmd_dry_run() {
@@ -674,6 +700,7 @@ cmd_dry_run() {
   echo "PLAN: rsync -a --delete -i ${RSYNC_EXCLUDES[*]} <immutable-payload>/ $(rsync_dest)"
   echo "PLAN: seed docs/m5-routing.json copy-if-absent (rsync --ignore-existing; never overwrites an adopted table -- issue #44)"
   echo "PLAN: remote install: ${DEPLOY_INSTALL_CMD:-cd '<remote_dir>' && npm ci --omit=dev}"
+  echo "PLAN: prepare only data/model-scout-registry.jsonl + its parent for the remote evaluator uid/gid, then verify appendability as that identity without loading a model or mutating the roster"
   echo "PLAN: if restarting: preflight the ExecStart interpreter first, refuse the restart if it is missing (issue #30)"
   echo "PLAN: restart $DEPLOY_UNIT only if rsync reports changes (or DEPLOY_FORCE_RESTART=1)"
   echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
@@ -723,6 +750,8 @@ cmd_verify() {
       status=1
     fi
   done
+  echo "==> Verifying manual-evaluation registry runtime identity + appendability..."
+  verify_model_evaluation_registry "$remote_dir" || status=1
   echo "==> Verifying public HTTPS edge..."
   verify_public_edge || status=1
   return "$status"
@@ -806,6 +835,11 @@ cmd_deploy() (
   echo "==> Installing dependencies on the remote (native modules must build for its own platform)..."
   remote_run DEPLOY_INSTALL_CMD "cd '$remote_dir' && npm ci --omit=dev"
 
+  echo "==> Preparing manual-evaluation registry ownership + modes..."
+  prepare_model_evaluation_registry "$remote_dir" || return 1
+  echo "==> Verifying registry appendability as the effective evaluator identity..."
+  verify_model_evaluation_registry "$remote_dir" || return 1
+
   if [ "$payload_changed" = 1 ] || [ "$DEPLOY_FORCE_RESTART" = 1 ]; then
     echo "==> Preflighting ExecStart interpreter before restart (issue #30)..."
     preflight_interpreter || return 1
@@ -850,7 +884,8 @@ Usage:
 Modes:
   deploy    Bind this physical checkout to the explicit accepted revision, then sync + install +
             restart-if-needed + probe + stamp .deployed-commit.
-  verify    Read-only: report the currently deployed commit plus a content spot-check.
+  verify    Read-only: report the deployed commit, content spot-check, and evaluator-identity
+            registry appendability without loading a model or mutating the roster.
   dry-run   Bind this physical checkout to the explicit accepted revision, then print the plan
             without syncing, restarting, or writing the marker.
 

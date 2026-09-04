@@ -7,7 +7,22 @@
  * All filesystem functions take an optional path parameter (default = DEFAULT_REGISTRY_PATH)
  * so tests can use a temp file. Pure helpers have no filesystem side-effects.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { RegistryEntry } from "./scout-types.js";
 
@@ -65,6 +80,8 @@ export function isRegistryEntry(x: unknown): x is RegistryEntry {
     typeof e["quant"] === "string" &&
     typeof e["sizeGB"] === "number" &&
     typeof e["evaluatedAt"] === "string" &&
+    (e["evaluationId"] === undefined ||
+      (typeof e["evaluationId"] === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(e["evaluationId"]))) &&
     typeof e["verdict"] === "string" &&
     typeof e["passRate"] === "number" &&
     typeof e["served"] === "boolean" &&
@@ -114,14 +131,212 @@ export function isRegistryEntry(x: unknown): x is RegistryEntry {
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────
 
-/**
- * Append one entry as a JSON line. Creates the parent directory if it doesn't exist.
- * Throws on write errors (caller should surface them).
- */
-export function appendEntry(entry: RegistryEntry, path: string = DEFAULT_REGISTRY_PATH): void {
+function errnoCode(error: unknown): string {
+  if (error !== null && typeof error === "object" && "code" in error) {
+    const code = String((error as { code?: unknown }).code ?? "");
+    if (/^[A-Z0-9_]+$/.test(code)) return code;
+  }
+  return "IO_ERROR";
+}
+
+function persistenceError(operation: string, path: string, error: unknown): Error {
+  return new Error(`registry persistence failed during ${operation} for ${path} (${errnoCode(error)})`);
+}
+
+function readCompleteRegistryBytes(path: string): Buffer {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
+    const bytes = readFileSync(fd);
+    if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) {
+      throw Object.assign(new Error("incomplete JSONL record"), { code: "INVALID_JSONL" });
+    }
+    return bytes;
+  } catch (error) {
+    throw persistenceError("read and validate target", path, error);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function assertRegistryLockAvailable(path: string): void {
+  const lockPath = `${path}.lock`;
+  if (existsSync(lockPath)) {
+    throw new Error(`registry lock unavailable at ${lockPath} for registry ${path} (EEXIST)`);
+  }
+}
+
+function parseRegistryBytes(raw: Buffer): RegistryEntry[] {
+  const entries: RegistryEntry[] = [];
+  for (const line of raw.toString("utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (isRegistryEntry(parsed)) entries.push(parsed);
+  }
+  return entries;
+}
+
+/** Read-only proof used by deployment verification under the evaluator's effective identity. */
+export function verifyRegistryAppendability(path: string = DEFAULT_REGISTRY_PATH): void {
   const dir = dirname(path);
-  mkdirSync(dir, { recursive: true });
-  appendFileSync(path, JSON.stringify(entry) + "\n", "utf8");
+  let targetFd: number | undefined;
+  try {
+    if (!lstatSync(dir).isDirectory() || !lstatSync(path).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
+    accessSync(dir, constants.W_OK | constants.X_OK);
+  } catch (error) {
+    throw persistenceError("verify parent appendability", path, error);
+  }
+  try {
+    targetFd = openSync(
+      path,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    if (!fstatSync(targetFd).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
+  } catch (error) {
+    throw persistenceError("open target for append", path, error);
+  } finally {
+    if (targetFd !== undefined) closeSync(targetFd);
+  }
+  readCompleteRegistryBytes(path);
+  assertRegistryLockAvailable(path);
+}
+
+/**
+ * Prove the evaluator identity can both open the registry and atomically replace it in its parent.
+ * Fresh targets are created private; existing ownership/modes are deliberately not repaired here
+ * because that privileged preparation belongs to the deployment path.
+ */
+export function preflightRegistry(path: string = DEFAULT_REGISTRY_PATH): void {
+  const dir = dirname(path);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!lstatSync(dir).isDirectory()) throw Object.assign(new Error("not a directory"), { code: "ENOTDIR" });
+  } catch (error) {
+    throw persistenceError("prepare parent", path, error);
+  }
+
+  let targetFd: number | undefined;
+  try {
+    if (existsSync(path) && !lstatSync(path).isFile()) {
+      throw Object.assign(new Error("not a regular file"), { code: "EINVAL" });
+    }
+    targetFd = openSync(
+      path,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      0o600,
+    );
+    if (!fstatSync(targetFd).isFile()) {
+      throw Object.assign(new Error("not a regular registry target"), { code: "EINVAL" });
+    }
+  } catch (error) {
+    throw persistenceError("open target for append", path, error);
+  } finally {
+    if (targetFd !== undefined) closeSync(targetFd);
+  }
+
+  const probe = `${path}.${process.pid}.${randomUUID()}.preflight`;
+  let probeFd: number | undefined;
+  try {
+    probeFd = openSync(
+      probe,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    fsyncSync(probeFd);
+  } catch (error) {
+    throw persistenceError("check parent for atomic replace", path, error);
+  } finally {
+    if (probeFd !== undefined) closeSync(probeFd);
+    try { unlinkSync(probe); } catch { /* absent or preflight failed before creation */ }
+  }
+  readCompleteRegistryBytes(path);
+  assertRegistryLockAvailable(path);
+}
+
+export type RegistryAppendOutcome = "appended" | "duplicate";
+
+/**
+ * Durably add one complete JSONL row under an exclusive sibling lock. The whole next file is
+ * fsynced and atomically renamed, so a crash exposes either the old complete registry or the new
+ * complete registry. Exact evaluation retries are no-ops; identity reuse with different evidence
+ * fails closed.
+ */
+export function appendEntry(
+  entry: RegistryEntry,
+  path: string = DEFAULT_REGISTRY_PATH,
+): RegistryAppendOutcome {
+  preflightRegistry(path);
+  const dir = dirname(path);
+  const lockPath = `${path}.lock`;
+  let lockFd: number | undefined;
+  let tempPath: string | undefined;
+  try {
+    try {
+      lockFd = openSync(
+        lockPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      writeFileSync(lockFd, `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+      fsyncSync(lockFd);
+    } catch (error) {
+      throw new Error(`registry lock unavailable at ${lockPath} for registry ${path} (${errnoCode(error)})`);
+    }
+
+    const existing = readCompleteRegistryBytes(path);
+
+    const line = `${JSON.stringify(entry)}\n`;
+    if (entry.evaluationId) {
+      const prior = parseRegistryBytes(existing).find(
+        (candidate) => candidate.evaluationId === entry.evaluationId,
+      );
+      if (prior) {
+        if (`${JSON.stringify(prior)}\n` === line) return "duplicate";
+        throw new Error(`evaluation identity collision for ${entry.evaluationId} in registry ${path}`);
+      }
+    }
+
+    tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    const tempFd = openSync(
+      tempPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      writeFileSync(tempFd, Buffer.concat([existing, Buffer.from(line, "utf8")]));
+      fsyncSync(tempFd);
+    } finally {
+      closeSync(tempFd);
+    }
+    renameSync(tempPath, path);
+    tempPath = undefined;
+    const dirFd = openSync(dir, constants.O_RDONLY);
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    return "appended";
+  } finally {
+    if (tempPath) {
+      try { unlinkSync(tempPath); } catch { /* never mask the persistence failure */ }
+    }
+    if (lockFd !== undefined) {
+      try { closeSync(lockFd); }
+      finally {
+        try { unlinkSync(lockPath); } catch { /* a stale lock fails future writes closed */ }
+      }
+    }
+  }
 }
 
 /**
@@ -130,22 +345,7 @@ export function appendEntry(entry: RegistryEntry, path: string = DEFAULT_REGISTR
  */
 export function readRegistry(path: string = DEFAULT_REGISTRY_PATH): RegistryEntry[] {
   if (!existsSync(path)) return [];
-  const raw = readFileSync(path, "utf8");
-  const entries: RegistryEntry[] = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      // skip malformed JSON
-      continue;
-    }
-    if (!isRegistryEntry(parsed)) continue;
-    entries.push(parsed);
-  }
-  return entries;
+  return parseRegistryBytes(readCompleteRegistryBytes(path));
 }
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
