@@ -83,6 +83,65 @@ function insertOrganic(db: Database.Database, values: {
 }
 
 describe("buildAdoptionEvidenceBundle", () => {
+  it("separates current, missing and other compute epochs without echoing stored labels", () => {
+    const db = createDb();
+    db.exec("ALTER TABLE request_log ADD COLUMN compute_filter_epoch TEXT");
+    const insert = db.prepare(`INSERT INTO request_log
+      (id, ts, tier, model, node, route, admission, total_ms, compute_filter_epoch)
+      VALUES (?, ?, 'owner', 'mellum', 'm5', ?, 'admitted', 10, ?)`);
+    const current = "m5-admitted-compute-v2";
+    insert.run("current", Date.parse(FROM), "/mcp/ask", current);
+    insert.run("legacy", Date.parse(FROM), "/mcp/ask", null);
+    insert.run("other", Date.parse(FROM), "/mcp/ask", "private/epoch-label");
+    insert.run("transport", Date.parse(FROM), "/mcp", null);
+    insert.run("outside", Date.parse(THROUGH), "/mcp/ask", null);
+    insert.run("invalid", "not-a-timestamp", "/mcp/ask", null);
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.admittedCompute.requests).toBe(3);
+    expect(bundle.admittedCompute.filter.historicalApplicability).toMatchObject({
+      status: "mixed", ambiguousRows: 2, currentRows: 1, missingRows: 1, otherRows: 1,
+    });
+    expect(bundle.delegations.promotionReadiness.historicalMetricUnambiguous).toBe(false);
+    expect(JSON.stringify(bundle)).not.toContain("private/epoch-label");
+    expect(db.prepare("SELECT compute_filter_epoch FROM request_log WHERE id = 'legacy'").get())
+      .toEqual({ compute_filter_epoch: null });
+    db.close();
+  });
+
+  it("recognizes a current-only compute sample without clearing unrelated promotion gates", () => {
+    const db = createDb();
+    db.exec("ALTER TABLE request_log ADD COLUMN compute_filter_epoch TEXT");
+    db.prepare(`INSERT INTO request_log
+      (id, ts, tier, model, node, route, admission, total_ms, compute_filter_epoch)
+      VALUES ('current', ?, 'owner', 'mellum', 'm5', '/mcp/ask', 'admitted', 10, 'm5-admitted-compute-v2')`)
+      .run(Date.parse(FROM));
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.admittedCompute.filter.historicalApplicability).toMatchObject({
+      status: "current", ambiguousRows: 0, currentRows: 1, missingRows: 0, otherRows: 0,
+    });
+    expect(bundle.delegations.promotionReadiness.historicalMetricUnambiguous).toBe(true);
+    expect(bundle.delegations.promotionReadiness.eligible).toBe(false);
+    db.close();
+  });
+
+  it("keeps old-schema and empty samples unknown without migrating during export", () => {
+    const db = createDb();
+    const empty = buildAdoptionEvidenceBundle(db, options());
+    expect(empty.admittedCompute.filter.historicalApplicability).toMatchObject({
+      status: "no-evidence", ambiguousRows: 0, currentRows: 0, missingRows: 0, otherRows: 0,
+    });
+    expect(empty.delegations.promotionReadiness.historicalMetricUnambiguous).toBe(false);
+    db.prepare(`INSERT INTO request_log
+      (id, ts, tier, model, node, route, admission, total_ms)
+      VALUES ('legacy', ?, 'owner', 'mellum', 'm5', '/mcp/ask', 'admitted', 10)`)
+      .run(Date.parse(FROM));
+    expect(buildAdoptionEvidenceBundle(db, options()).admittedCompute.filter.historicalApplicability)
+      .toMatchObject({ status: "unknown", ambiguousRows: 1, currentRows: 0, missingRows: 1, otherRows: 0 });
+    expect((db.prepare("PRAGMA table_info(request_log)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "compute_filter_epoch")).toBe(false);
+    db.close();
+  });
+
   it("builds deterministic bounded JSON and applies the shared admitted-compute predicate", () => {
     const db = createDb();
     db.prepare(`INSERT INTO request_log (id, ts, tier, model, node, route, admission, total_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run("r1", Date.parse("2026-08-01T10:00:00Z"), "owner", "mellum", "m5", "/v1/chat/completions", "admitted", 42);

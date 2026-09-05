@@ -43,6 +43,14 @@ export interface EvidenceBundleOptions extends EvidenceBundleWindow { generatedA
 export interface EvidenceThreshold { status: EvidenceStatus; observed: number | null; required: number; reason: string; }
 export interface EvidenceBucket { bucket: string; rows: number; attempted: number; useful: number; }
 interface ComputeBucket { bucket: string; requests: number; requestTimeMs: number; }
+interface ComputeEpochCoverage {
+  status: "current" | "mixed" | "unknown" | "no-evidence";
+  currentRows: number;
+  missingRows: number;
+  otherRows: number;
+  ambiguousRows: number;
+  reason: string;
+}
 
 interface SourceWindow { rows: number; inWindow: number; malformedTimestamp: number; validMin: string | null; validMax: string | null; }
 interface BoundedFilter { from: string; throughExclusive: string; comparison: string; timestampShape: string; }
@@ -202,7 +210,7 @@ export interface AdoptionEvidenceBundle {
   generatedAt: string;
   window: EvidenceBundleWindow;
   admittedCompute: {
-    filter: { epoch: typeof COMPUTE_REQUEST_FILTER_EPOCH; sql: string; node: "m5"; admission: "admitted"; excludedModel: "none"; routes: readonly string[]; bounds: BoundedFilter; historicalApplicability: { status: "unknown"; ambiguousRows: number; reason: string } };
+    filter: { epoch: typeof COMPUTE_REQUEST_FILTER_EPOCH; sql: string; node: "m5"; admission: "admitted"; excludedModel: "none"; routes: readonly string[]; bounds: BoundedFilter; historicalApplicability: ComputeEpochCoverage };
     requests: number;
     requestTimeMs: number;
     missingRequestTime: number;
@@ -616,7 +624,11 @@ function costQuery(db: Database.Database, fromMs: number, throughMs: number, cur
 }
 
 function computeQuery(db: Database.Database, fromMs: number, throughMs: number): AdoptionEvidenceBundle["admittedCompute"] {
-  const all = db.prepare(`SELECT ts, tier, model, node, route, admission, total_ms FROM request_log ORDER BY rowid ASC`).all() as Array<Record<string, unknown>>;
+  // Export remains read-only and accepts pre-stamp schemas without migrating or relabelling them.
+  const columns = db.prepare("PRAGMA table_info(request_log)").all() as Array<{ name: string }>;
+  const epochColumn = columns.some((column) => column.name === "compute_filter_epoch")
+    ? "compute_filter_epoch" : "NULL AS compute_filter_epoch";
+  const all = db.prepare(`SELECT ts, tier, model, node, route, admission, total_ms, ${epochColumn} FROM request_log ORDER BY rowid ASC`).all() as Array<Record<string, unknown>>;
   const sourceWindow = emptySourceWindow(); sourceWindow.rows = all.length;
   const exclusions = { malformedTimestamp: 0, node: { m5: 0, nonM5: 0, missing: 0 }, admission: { admitted: 0, notAdmitted: 0, missing: 0 }, model: { none: 0, present: 0, missing: 0 }, route: { included: 0, excluded: 0, missing: 0 } };
   const rows: Array<Record<string, unknown>> = [];
@@ -664,7 +676,23 @@ function computeQuery(db: Database.Database, fromMs: number, throughMs: number):
   timeReconciliation.allMatch = missingRequestTime === 0 && [timeReconciliation.byDay, timeReconciliation.byTier, timeReconciliation.byRoute, timeReconciliation.byNode, timeReconciliation.byModel].every((v) => v === time);
   const exclusionReconciliation = { inWindow: sourceWindow.inWindow, byNode: Object.values(exclusions.node).reduce((sum, value) => sum + value, 0), byAdmission: Object.values(exclusions.admission).reduce((sum, value) => sum + value, 0), byModel: Object.values(exclusions.model).reduce((sum, value) => sum + value, 0), byRoute: Object.values(exclusions.route).reduce((sum, value) => sum + value, 0), allMatch: false };
   exclusionReconciliation.allMatch = [exclusionReconciliation.byNode, exclusionReconciliation.byAdmission, exclusionReconciliation.byModel, exclusionReconciliation.byRoute].every((value) => value === sourceWindow.inWindow);
-  return { filter: { epoch: COMPUTE_REQUEST_FILTER_EPOCH, sql: COMPUTE_REQUEST_FILTER_SQL, node: "m5", admission: "admitted", excludedModel: "none", routes: M5_COMPUTE_ROUTES, bounds: { from: canonicalIso(fromMs), throughExclusive: canonicalIso(throughMs), comparison: "ts >= from AND ts < throughExclusive after exact predicate", timestampShape: "integer epoch milliseconds; malformed values excluded and counted" }, historicalApplicability: { status: "unknown", ambiguousRows: total, reason: "request_log rows do not carry the m5-admitted-compute-v2 filter epoch; every current-filter-matched row is unversioned, so historical comparison and promotion applicability remain unknown" } }, requests: total, requestTimeMs: time, missingRequestTime, byDay: day, byTier: tier, byRoute: route, byNode: node, byModel: model, reconciliation: { count: countReconciliation, requestTimeMs: timeReconciliation }, exclusions: { ...exclusions, reconciliation: exclusionReconciliation }, sourceWindow };
+  // These counts cover only exact-window, current-predicate matches, just like the totals above.
+  // Unknown epoch strings are counted but never echoed into the content-blind export.
+  const currentRows = rows.filter((row) => row.compute_filter_epoch === COMPUTE_REQUEST_FILTER_EPOCH).length;
+  const missingRows = rows.filter((row) => row.compute_filter_epoch == null || row.compute_filter_epoch === "").length;
+  const otherRows = total - currentRows - missingRows;
+  const ambiguousRows = missingRows + otherRows;
+  const status: ComputeEpochCoverage["status"] = total === 0 ? "no-evidence"
+    : ambiguousRows === 0 ? "current" : currentRows > 0 ? "mixed" : "unknown";
+  const historicalApplicability: ComputeEpochCoverage = {
+    status, currentRows, missingRows, otherRows, ambiguousRows,
+    reason: status === "current"
+      ? "all current-filter-matched rows carry the current compute filter epoch; other promotion gates remain independent"
+      : status === "no-evidence"
+        ? "no current-filter-matched rows exist in the window; historical applicability is unestablished"
+        : "one or more current-filter-matched rows have a missing or non-current compute filter epoch; historical comparison and promotion applicability remain unknown",
+  };
+  return { filter: { epoch: COMPUTE_REQUEST_FILTER_EPOCH, sql: COMPUTE_REQUEST_FILTER_SQL, node: "m5", admission: "admitted", excludedModel: "none", routes: M5_COMPUTE_ROUTES, bounds: { from: canonicalIso(fromMs), throughExclusive: canonicalIso(throughMs), comparison: "ts >= from AND ts < throughExclusive after exact predicate", timestampShape: "integer epoch milliseconds; malformed values excluded and counted" }, historicalApplicability }, requests: total, requestTimeMs: time, missingRequestTime, byDay: day, byTier: tier, byRoute: route, byNode: node, byModel: model, reconciliation: { count: countReconciliation, requestTimeMs: timeReconciliation }, exclusions: { ...exclusions, reconciliation: exclusionReconciliation }, sourceWindow };
 }
 
 function thresholdKnown(aggregate: AdoptionAggregate): EvidenceThreshold { if (aggregate.reports === 0 || aggregate.knownOpportunities === 0) return { status: "unknowable", observed: null, required: 20, reason: "no known opportunity denominator was reported" }; return { status: aggregate.knownOpportunities >= 20 ? "pass" : "fail", observed: aggregate.knownOpportunities, required: 20, reason: aggregate.knownOpportunities >= 20 ? "minimum known opportunity sample reached" : "known opportunity sample is below the minimum" }; }
@@ -725,7 +753,7 @@ export function buildAdoptionEvidenceBundle(db: Database.Database, options: Evid
     reviewerUsefulnessComplete: delegation.currentRows > 0 && delegation.reviewerUsefulness.missing === 0,
     costCoverageComplete,
     computeReconciliationComplete: admittedCompute.reconciliation.count.allMatch && admittedCompute.reconciliation.requestTimeMs.allMatch && admittedCompute.exclusions.reconciliation.allMatch,
-    historicalMetricUnambiguous: admittedCompute.filter.historicalApplicability.status !== "unknown" && admittedCompute.filter.historicalApplicability.ambiguousRows === 0,
+    historicalMetricUnambiguous: admittedCompute.filter.historicalApplicability.status === "current" && admittedCompute.filter.historicalApplicability.ambiguousRows === 0,
     eligible: false,
   };
   promotionReadiness.eligible = adoptionRetention.complete && promotionReadiness.evidenceIdentityComplete && promotionReadiness.judgePolicyCurrent && promotionReadiness.learningTaskBindingComplete && promotionReadiness.stateUnambiguous && promotionReadiness.reviewerUsefulnessComplete && promotionReadiness.costCoverageComplete && promotionReadiness.computeReconciliationComplete && promotionReadiness.historicalMetricUnambiguous && adoptionQueryResult.aggregate.organic.knownOpportunities >= 20 && adoptionQueryResult.aggregate.organic.unassessedAttempted === 0 && adoptionQueryResult.aggregate.organic.attempted > 0 && adoptionQueryResult.aggregate.organic.useful / adoptionQueryResult.aggregate.organic.attempted >= 0.6 && delegation.matrix.length > 0;

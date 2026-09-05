@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { getDb } from "../db.js";
+import { COMPUTE_REQUEST_FILTER_EPOCH } from "./compute-request-filter.js";
 
 /**
  * DURABLE, CONTENT-BLIND, PSEUDONYMOUS request log.
@@ -85,6 +86,7 @@ const COLUMNS = [
   "ttft_ms",
   "total_ms",
   "admission",
+  "compute_filter_epoch",
 ] as const;
 
 /** Expose the column names so tests can assert no content column exists. */
@@ -123,7 +125,8 @@ function ensureSchema(db: Database.Database): void {
       queue_wait_ms     INTEGER,
       ttft_ms           INTEGER,
       total_ms          INTEGER NOT NULL,
-      admission         TEXT
+      admission         TEXT,
+      compute_filter_epoch TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_request_log_ts    ON request_log(ts);
     CREATE INDEX IF NOT EXISTS idx_request_log_alias ON request_log(alias);
@@ -131,6 +134,11 @@ function ensureSchema(db: Database.Database): void {
   `);
   const cols = db.prepare(`PRAGMA table_info(request_log)`).all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "node")) db.exec(`ALTER TABLE request_log ADD COLUMN node TEXT NOT NULL DEFAULT 'm5'`);
+  // Never backfill historical rows: the current code cannot attest which filter semantics
+  // produced them. Only recordRequestLog stamps newly observed requests.
+  if (!cols.some((c) => c.name === "compute_filter_epoch")) {
+    db.exec("ALTER TABLE request_log ADD COLUMN compute_filter_epoch TEXT");
+  }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_request_log_node ON request_log(node);
     DROP INDEX IF EXISTS idx_request_log_model_ts_id;
@@ -162,10 +170,12 @@ export function recordRequestLog(row: RequestLogRow): void {
       .prepare(
         `INSERT INTO request_log
            (id, ts, alias, tier, key_hash, model, node, route, status, outcome, error_class,
-            prompt_tokens, completion_tokens, total_tokens, queue_wait_ms, ttft_ms, total_ms, admission)
+            prompt_tokens, completion_tokens, total_tokens, queue_wait_ms, ttft_ms, total_ms, admission,
+            compute_filter_epoch)
          VALUES
            (@id, @ts, @alias, @tier, @keyHash, @model, @node, @route, @status, @outcome, @errorClass,
-            @promptTokens, @completionTokens, @totalTokens, @queueWaitMs, @ttftMs, @totalMs, @admission)`
+            @promptTokens, @completionTokens, @totalTokens, @queueWaitMs, @ttftMs, @totalMs, @admission,
+            @computeFilterEpoch)`
       )
       .run({
         id: row.requestId,
@@ -186,6 +196,7 @@ export function recordRequestLog(row: RequestLogRow): void {
         ttftMs: row.ttftMs,
         totalMs: row.totalMs,
         admission: row.admission,
+        computeFilterEpoch: COMPUTE_REQUEST_FILTER_EPOCH,
       });
   } catch (err) {
     // Never let a log write break a request. Surface the detail server-side only.
