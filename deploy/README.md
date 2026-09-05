@@ -527,7 +527,11 @@ var name is configurable via `DEPLOY_CAPABILITY_KEY_ENV`) and checks only the HT
 key is read from the environment, never placed on the command line, and never appears in the
 script's stdout/stderr (covered by a regression test in `tests/deploy-gateway.test.ts`). From a
 provisioned macOS owner workstation, use the canonical Keychain-backed check instead of composing
-a bearer-bearing `curl` command:
+a bearer-bearing `curl` command. For the public check, first configure the intended
+`M5_GATEWAY_URL` (gateway root), `M5_OPENAI_BASE_URL`, or legacy `M5_BASE_URL`
+(OpenAI bases ending in `/v1`) in the caller's environment. Without one, public mode
+exits `2` before Keychain or network access; it does not default to loopback.
+The explicit `--tailnet` check selects its own private base:
 
 ```bash
 m5-auth --check
@@ -556,18 +560,19 @@ not reuse a routing-lifecycle key, a guest key, or a different service's key. Pe
 owner-only ceremony from a private terminal with history/transcript capture disabled; record only
 sanitized aliases, timestamps, HTTP status, and deployed revision in the private operations record.
 
-Run the configured/default and tailnet path checks separately. Their messages and exit codes are
+Run the explicitly configured public and tailnet path checks separately. Their messages and exit codes are
 deliberately content-free:
 
 | Exit | State | Operator action |
 |---:|---|---|
 | `0` | credential accepted | Continue. |
 | `1` | Keychain credential missing | Restore the intended item selectors or provision the item through the prompt-only step below. |
+| `2` | Invalid arguments or missing/invalid public base configuration | Configure the intended public base or explicitly select `--tailnet`; no credential check occurred. |
 | `3` | gateway unreachable | Check transport, DNS/Tailscale, and service health; authentication was not evaluated. |
 | `4` | credential present but rejected (`401`) | Reconcile the gateway target first, then rotate if the authoritative active key is actually stale/revoked. |
 | `5` | gateway reachable but preflight inconclusive | Inspect gateway service logs; do not infer that the credential is valid or invalid. |
 
-If the configured/default check succeeds while the tailnet check returns `4` (or vice versa), do **not** rotate
+If the configured public check succeeds while the tailnet check returns `4` (or vice versa), do **not** rotate
 blindly. Production is intended to expose one gateway process on both paths, backed by one
 keystore. Verify that the Cloudflare Tunnel origin and the resolved tailnet target reach the same
 running service, deployment revision, working directory, and configured keystore. A path routed to
