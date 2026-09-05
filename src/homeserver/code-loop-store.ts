@@ -224,6 +224,7 @@ export function codeLoopRequestFingerprint(
     instruction: req.instruction,
     files: req.files.map((f) => ({ path: f.path, content: f.content })),
     check_cmd: req.check_cmd ?? null,
+    ...(req.schema_checks === undefined ? {} : { schema_checks: req.schema_checks.map(({ name, command }) => ({ name, command })) }),
     // Omission preserves the pre-scope-contract fingerprint for durable legacy retries. An
     // explicit scope is new request identity and must never recover a differently bounded run.
     ...(req.writable === undefined ? {} : { writable: [...req.writable] }),

@@ -62,9 +62,10 @@ export function runTests(extractUsage: (events: unknown[], fromIso: string) => u
 }
 `;
 
-// Sanitized representative of cl-20260903-2688c29c: it invents top-level event/info,
+// Reconstruction of the reported failure, NOT the original cl-20260903-2688c29c artifact:
+// it invents top-level event/info,
 // collapses calls by session, and asserts the nonexistent record.input_tokens field.
-const HISTORICAL_UNGROUNDED_TESTS = String.raw`
+const RECONSTRUCTED_UNGROUNDED_TESTS = String.raw`
 export function runTests(extractUsage: (events: unknown[], fromIso: string) => unknown[]): void {
   const events = [{ event: "token_count", info: { input_tokens: 100 }, session_id: "s1" }];
   const got = extractUsage(events, "2026-09-03T10:00:00.000Z") as Array<Record<string, unknown>>;
@@ -82,8 +83,8 @@ describe("unit-test-gen schema-grounding regression (#260)", () => {
     expect(probe?.verifierName).toBe("requiredAnchors+tsGate(schema-mutants-v1)");
   });
 
-  it("rejects the sanitized historical fabricated schema with named missing-contract diagnostics", async () => {
-    const result = await probe!.verifier(HISTORICAL_UNGROUNDED_TESTS);
+  it("rejects the reconstructed fabricated schema with named missing-contract diagnostics", async () => {
+    const result = await probe!.verifier(RECONSTRUCTED_UNGROUNDED_TESTS);
     expect(result.outcome).toBe("fail");
     expect(result.notes).toContain("missing contract anchors");
     expect(result.notes).toContain("payload.info.last_token_usage");

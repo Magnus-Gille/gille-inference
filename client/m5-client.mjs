@@ -8,7 +8,7 @@ export const M5_CLIENT_VERSION = "1.3.5";
 export const M5_ASK_TIMEOUT_MS_DEFAULT = 30_000;
 export const M5_ASK_TIMEOUT_MS_MIN = 1_000;
 export const M5_ASK_TIMEOUT_MS_MAX = 600_000;
-const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-04-v8";
+const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-05-v9";
 const CODE_LOOP_RESULT_SCOPE_CAPABILITY = "writable-v1";
 const CODE_LOOP_COMPLETION_ACCOUNTING_CAPABILITY = "bounded-turns-v1";
 const CODE_LOOP_TERMINAL_STATUSES = new Set(["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]);
@@ -839,6 +839,25 @@ function normalizeAdoptionAcknowledgement(result) {
   );
 }
 
+function validSchemaGrounding(result) {
+  const g = result.schema_grounding;
+  if (!g || g.schema_version !== 1 || !Array.isArray(g.checks) || g.checks.length > 8) return false;
+  if (g.state === "not-requested") return g.checks.length === 0;
+  if (!["passed", "failed", "skipped"].includes(g.state) || !g.checks.length) return false;
+  const names = new Set();
+  for (const c of g.checks) {
+    if (!c || typeof c.name !== "string" || !/^[a-z0-9][a-z0-9._:-]{0,79}$/.test(c.name) || names.has(c.name) ||
+        typeof c.ran !== "boolean" || typeof c.output_tail !== "string" || c.output_tail.length > 4096 ||
+        !(c.exit_code === null || (Number.isInteger(c.exit_code) && c.exit_code >= 0 && c.exit_code <= 255)) ||
+        (!c.ran && c.exit_code !== null)) return false;
+    names.add(c.name);
+  }
+  const allPassed = g.checks.every(c => c.ran && c.exit_code === 0);
+  if (g.state === "passed") return allPassed;
+  return !allPassed && result.diff === "" && result.summary === "" &&
+    (g.state !== "skipped" || g.checks.every(c => !c.ran));
+}
+
 function validateCodeResult(result) {
   if (!result || typeof result !== "object") {
     throw new M5ClientError("invalid_code_result", "The code-loop result is malformed.");
@@ -846,6 +865,7 @@ function validateCodeResult(result) {
   if (result.status === "running") return result;
   if (
     !CODE_LOOP_TERMINAL_STATUSES.has(result.status) ||
+    !validSchemaGrounding(result) ||
     typeof result.diff !== "string" ||
     !Array.isArray(result.changed_files) ||
     !Array.isArray(result.scope_violations) ||

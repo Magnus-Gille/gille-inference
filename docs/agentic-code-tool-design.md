@@ -111,6 +111,14 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   singleton provides the separate cross-process paid-run lease: `BEGIN IMMEDIATE` makes dead-owner
   takeover atomic, and release deletes only its matching owner token/work id.
 - `check_cmd`: optional, owner-authored (never model-generated), run in the sandbox **inside the same cage** post-loop, 120 s cap.
+- `schema_checks`: v9 requires 1–8 named owner behavioral oracles for resolved `unit-test-gen`.
+  Each `{name, command}` expects exit zero. Commands are snapshotted before async admission,
+  included in durable request identity, and run inside the same cage with a shared additional
+  120-second budget. The original check still runs independently, including eligible cap exits.
+  Failed/skipped `schema_grounding` withholds diff/summary and prevents ledger pass. Owners must
+  protect reference/oracle files and supply actual behavioral checks, including mutant rejection;
+  command presence or source keywords alone cannot prove schema grounding. Reconstructed #260
+  fixtures are labelled as such: the original historical output was unavailable after restart.
 - `writable`: optional enforceable relative POSIX path/glob allowlist for returned changes. Omission
   means exact seeded files only. Admission rejects traversal, alternate separators, `.git`,
   overlong/unbounded scope lists, and ambiguous seed spellings before a durable claim.
@@ -141,12 +149,13 @@ an ambiguous retry never starts or spends twice.
   "protected_violations": [],
   "summary": "pi's final assistant message (≤2KB)",
   "check": {"ran": true, "exit_code": 0, "output_tail": "last 4KB", "skip_reason": null} ,
+  "schema_grounding": {"schema_version": 1, "state": "not-requested", "checks": []},
   "usage": {"turns": 7, "wall_ms": 183000, "prompt_tokens": 41200, "completion_tokens": 21384},
   "execution": {
     "schema_version": 1,
     "model": "qwen3-coder-next-80b",
     "engine": "pi",
-    "harness_version": "code-loop-pi-2026-09-04-v8",
+    "harness_version": "code-loop-pi-2026-09-05-v9",
     "effective_caps": {"wall_s": 480, "turns": 24, "completion_tokens": 60000, "edit_deadline_turn": 6},
     "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3", "result_scope": "writable-v1", "completion_accounting": "bounded-turns-v1"}
   },
@@ -181,7 +190,7 @@ an ambiguous retry never starts or spends twice.
 
 Semantics:
 - The owner-visible `code_loop_start` tools/list description advertises the exact pre-paid
-  contract `contract[harness=code-loop-pi-2026-09-04-v8;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
+  contract `contract[harness=code-loop-pi-2026-09-05-v9;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
 - **The diff is the deliverable** (hard constraint 5). The caller reviews and applies it (`git apply`) to its own checkout. Nothing on the box ever touches a live repo.
 - Ground truth is the host-owned trusted Git baseline, never the agent-writable repository or pi's
   event claims. Rename pairs are parsed as one logical change and both endpoints must be writable;
@@ -204,7 +213,10 @@ Semantics:
   exposes command text, paths, source, prompt, stdout/stderr, or secrets. The gateway-owned
   post-loop `check_cmd` remains the separate `check` field.
 - On every non-`completed` terminal status the diff is still harvested best-effort — a partial diff is data and possibly still useful.
-- `status` describes the *run*; verification lives in `check`. There is deliberately no `"pass"` status: `completed` + `check.exit_code === 0` is the only pass signal, and absence of a `check_cmd` can never be reported as verified (this fixes free-choice's self-contradicting status enum).
+- `status` describes the *run*; verification lives in `check` and `schema_grounding`.
+  There is deliberately no `"pass"` status. Ledger pass requires completed + successful
+  `check_cmd` and, when requested, successful schema checks. Missing `check_cmd` remains
+  unverified; failed/skipped schema checks cannot be overridden by syntax-check success.
 
 ---
 

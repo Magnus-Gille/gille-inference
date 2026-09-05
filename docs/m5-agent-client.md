@@ -186,6 +186,22 @@ m5 --profile codex code status cl-example
 m5 --profile codex code result cl-example
 ```
 
+For `unit-test-gen`, the v9 gateway requires `schema_checks`: an array of 1–8 named,
+owner-authored behavioral commands, such as
+`[{"name":"usage-schema.reference","command":"python3 -m unittest suite.py"}]`.
+Seed the trusted reference implementation, protect it, and permit edits only to the generated
+test file. Also check that the suite rejects deliberately incorrect implementations; running
+`py_compile` alone or accepting an empty test suite is not meaningful schema verification.
+The gateway cannot infer oracle quality from a command string. Each oracle must return zero
+only when its intended behavior was verified, including treating infrastructure failures as
+failures rather than successful mutant rejection.
+
+`schema_grounding.state` is separate from `check` and run completion. Failed or skipped
+grounding withholds the diff and assistant summary, while named diagnostics remain available.
+The paired client rejects terminal results missing the v9 grounding structure, including
+failed/skipped results carrying a diff. This source change requires a coordinated client/gateway
+rollout; it does not establish that the installed client or production gateway has been updated.
+
 `m5 ask` returns structured JSON:
 
 ```json
