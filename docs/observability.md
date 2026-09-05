@@ -202,8 +202,14 @@ cost, delegator-attribution, token, and local-calibration coverage; content-blin
 LearningTask coverage plus exclusive current-M5/shadow/superseded/non-M5/invalid state counts and
 retention-window coverage; and explicit `pass`/`fail`/`unknowable` threshold states. Current-policy
 applicability is reported only as current/stale/missing counts using `HARVEST_JUDGE_POLICY`; raw
-policy stamps are never exported. Because `request_log` has no filter-epoch column, current-filter
-matches are explicitly historical-ambiguous and block promotion. Cost reconciliation separately
+policy stamps are never exported. New request-log writes stamp `compute_filter_epoch` from the
+server's shared compute-filter constant, never from caller input. The additive migration leaves
+historical rows null; exporting an older schema does not migrate it. Among exact-window,
+current-filter matches, `historicalApplicability` counts `currentRows`, `missingRows`, and
+`otherRows`, with `ambiguousRows = missingRows + otherRows`. It reports `current`, `mixed`,
+`unknown`, or `no-evidence`; arbitrary stored epoch labels are never exported. Only a nonempty,
+all-current sample clears the historical-metric gate. Mixed and legacy samples remain ambiguous;
+stamping does not repair past evidence or clear any other promotion requirement. Cost reconciliation separately
 reports missing links and duplicate links/rows; exactly one complete cost row per current delegation
 is required for promotion. LearningTask binding is required across the full current-M5 population.
 The promotion-readiness gate also requires complete current-M5 identity, applicable LearningTask
