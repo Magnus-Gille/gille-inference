@@ -3,6 +3,7 @@ import type {
   LearningTaskCapabilityEpoch,
   LearningTaskGatewayEcho,
 } from "./learning-task-contract.js";
+import type { CodeLoopSchemaCheck, CodeLoopSchemaGrounding } from "./code-loop-schema-checks.js";
 
 /**
  * code_loop — frozen type contract (issue #116, docs/agentic-code-tool-design.md).
@@ -61,6 +62,8 @@ export interface CodeLoopRequest {
   files: CodeLoopSeedFile[];
   /** Owner-authored verification command, run in the sandbox INSIDE the cage post-loop (120 s cap). */
   check_cmd?: string;
+  /** Required for unit-test-gen. Owner-authored behavioral oracles; all must exit zero. */
+  schema_checks?: CodeLoopSchemaCheck[];
   /**
    * Enforceable returned-change path/glob allowlist. Omission limits the result to exact seeded
    * files. This is distinct from `protected`, which remains reporting-only.
@@ -188,6 +191,7 @@ export interface CodeLoopResult {
   /** pi's final assistant message (≤2 KB). */
   summary: string;
   check: CodeLoopCheck;
+  schema_grounding: CodeLoopSchemaGrounding;
   usage: CodeLoopUsage;
   /** Additive #247 fields: immutable effective execution plus content-blind phase evidence. */
   execution: CodeLoopExecution;

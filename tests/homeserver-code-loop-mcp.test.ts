@@ -190,7 +190,7 @@ describe("code_loop_* visibility in tools/list", () => {
   it("advertises the exact harness and evidence contract before a paid start", async () => {
     const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
     expect(start?.description).toContain(
-      "contract[harness=code-loop-pi-2026-09-04-v8;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]"
+      "contract[harness=code-loop-pi-2026-09-05-v9;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]"
     );
     expect(start?.inputSchema?.properties).toHaveProperty("writable");
   });

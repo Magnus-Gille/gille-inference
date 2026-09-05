@@ -62,6 +62,13 @@ import {
   type HuginRequestStamp,
 } from "../src/homeserver/learning-task-contract.js";
 import { claimLearningTaskAdmission } from "../src/homeserver/learning-task-admission-store.js";
+import {
+  CODE_LOOP_SCHEMA_TASK_INSTRUCTION,
+  GROUNDED_GENERATED_PYTHON_SUITE,
+  MUTANT_IMPLEMENTATIONS,
+  REFERENCE_PYTHON_IMPLEMENTATION,
+  WRONG_GENERATED_PYTHON_SUITE,
+} from "./fixtures/code-loop-schema-grounding.js";
 
 /**
  * Job lifecycle over a REAL tmp sandbox (design §11 tests 3–6): real git diff harvest, the
@@ -149,7 +156,278 @@ async function waitForTerminal(workId: string, timeoutMs = 5000): Promise<void> 
   }
 }
 
+const ORGANIC_MUTANT_GROUPS: Array<[string, string[]]> = [
+  ["mutants.nesting", ["topLevelEventInfo", "wrongSessionNesting"]],
+  ["mutants.call-nesting", ["wrongCallNesting"]],
+  ["mutants.cardinality", ["oneOutputPerSession"]],
+  ["mutants.token-fields", ["legacyInputTokens", "freshEqualsInput"]],
+  ["mutants.filtering", ["ignoresTimestampFilter"]],
+  ["mutants.ordering", ["reverseOrder"]],
+];
+
+/**
+ * Build an owner-held behavioral oracle for the grounded suite. The reference and candidate
+ * implementations are decoded into isolated Python modules; unittest results, rather than any
+ * process failure, decide whether a mutant was rejected. Keeping the command inline means the
+ * model can change only suite.py, while the trusted implementation and mutants remain protected
+ * owner inputs.
+ */
+function organicMutantOracleCommand(mutants: Array<[string, string]>): string {
+  const encoded = (source: string): string => Buffer.from(source, "utf8").toString("base64");
+  const candidatePayload = mutants
+    .map(([name, source]) => `    (${JSON.stringify(name)}, ${JSON.stringify(encoded(source))}),`)
+    .join("\n");
+  return `python3 -I - <<'PY'
+import base64
+import importlib.util
+import sys
+import types
+import unittest
+
+CANDIDATES = [
+${candidatePayload}
+]
+
+def load_extractor(encoded_source, module_name):
+    source = base64.b64decode(encoded_source).decode("utf-8")
+    module = types.ModuleType(module_name)
+    exec(compile(source, module_name, "exec"), module.__dict__)
+    if not callable(getattr(module, "extract_usage", None)):
+        raise SystemExit(1)
+    return module
+
+def run_suite(extractor, module_name):
+    sys.modules["extractor"] = extractor
+    spec = importlib.util.spec_from_file_location(module_name, "suite.py")
+    if spec is None or spec.loader is None:
+        raise SystemExit(1)
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    tests = unittest.defaultTestLoader.loadTestsFromModule(suite)
+    result = unittest.TestResult()
+    tests.run(result)
+    return result
+
+for mutant_name, mutant_source in CANDIDATES:
+    mutant_result = run_suite(load_extractor(mutant_source, "mutant_" + mutant_name), "suite_" + mutant_name)
+    # A valid rejection is exactly a clean unittest assertion failure: tests ran, no errors,
+    # and the candidate process status would be 1. Empty/erroring suites are not rejections.
+    mutant_exit_status = 1 if mutant_result.failures and not mutant_result.errors and mutant_result.testsRun > 0 else 0
+    if mutant_exit_status != 1:
+        raise SystemExit(1)
+print("mutants rejected: " + ",".join(name for name, _ in CANDIDATES))
+PY`;
+}
+
+/** Separate positive reference oracle: unittest must execute at least one test and be clean. */
+function organicReferenceOracleCommand(): string {
+  return `python3 -I - <<'PY'
+import importlib.util
+import sys
+import types
+import unittest
+
+def load_extractor(source, module_name):
+    module = types.ModuleType(module_name)
+    exec(compile(source, module_name, "exec"), module.__dict__)
+    if not callable(getattr(module, "extract_usage", None)):
+        raise SystemExit(1)
+    return module
+
+def run_suite(extractor, module_name):
+    sys.modules["extractor"] = extractor
+    spec = importlib.util.spec_from_file_location(module_name, "suite.py")
+    if spec is None or spec.loader is None:
+        raise SystemExit(1)
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    tests = unittest.defaultTestLoader.loadTestsFromModule(suite)
+    result = unittest.TestResult()
+    tests.run(result)
+    return result
+
+with open("extractor.py", encoding="utf-8") as reference_file:
+    reference_source = reference_file.read()
+reference_result = run_suite(load_extractor(reference_source, "trusted_reference"), "trusted_suite")
+if reference_result.testsRun <= 0 or reference_result.errors or reference_result.failures:
+    raise SystemExit(1)
+print("reference passed with testsRun=" + str(reference_result.testsRun))
+PY`;
+}
+
+function organicMutantSchemaChecks(): Array<{ name: string; command: string }> {
+  const mutantMap = MUTANT_IMPLEMENTATIONS as Record<string, string>;
+  const covered = new Set<string>();
+  const checks = [
+    { name: "reference.behavior", command: organicReferenceOracleCommand() },
+    ...ORGANIC_MUTANT_GROUPS.map(([name, keys]) => {
+      const entries = keys.map((key) => {
+        const source = mutantMap[key];
+        if (source === undefined) throw new Error(`missing named organic mutant ${key}`);
+        covered.add(key);
+        return [key, source] as [string, string];
+      });
+      return { name, command: organicMutantOracleCommand(entries) };
+    }),
+  ];
+  if (covered.size !== Object.keys(mutantMap).length) throw new Error("organic mutant oracle does not cover every named mutant");
+  if (checks.some((check) => Buffer.byteLength(check.command, "utf8") > 8192)) throw new Error("organic mutant oracle exceeds per-check command bound");
+  if (checks.reduce((bytes, check) => bytes + Buffer.byteLength(check.command, "utf8"), 0) > 32768) throw new Error("organic mutant oracle exceeds aggregate command bound");
+  return checks;
+}
+
 // ─── glob matcher ───────────────────────────────────────────────────────────────────────
+
+describe("organic schema grounding (#260)", () => {
+  it("refuses unit-test-gen without owner schema checks before engine admission", async () => {
+    const engineRun = vi.fn();
+    const result = await startCodeLoop({
+      instruction: "Generate a bounded regression test.",
+      task_type: "unit-test-gen",
+      files: [{ path: "test.py", content: "" }],
+      check_cmd: "python3 -m py_compile test.py",
+    }, startCfg(), fakeDeps({ engineRun }));
+    expect(result).toMatchObject({ ok: false, refusal: "invalid-request" });
+    expect(engineRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "cap-exceeded"] as const)("withholds failed schema output after %s while retaining the syntax check", async (outcome) => {
+    const req = {
+      instruction: "Generate a bounded regression test.",
+      task_type: "unit-test-gen",
+      files: [{ path: "test.py", content: "" }],
+      check_cmd: "python3 -m py_compile test.py",
+      schema_checks: [{ name: "payload.info.last_token_usage", command: "exit 1" }],
+    };
+    const started = await startCodeLoop(req, startCfg(), fakeDeps({
+      engineRun: async (dir) => {
+        writeFileSync(join(dir, "test.py"), "assert True\n");
+        return { outcome, usage: { turns: 3, wall_ms: 1000, prompt_tokens: 10, completion_tokens: 10 }, finalMessage: "usable tests", unparseableLines: 0, detail: "" };
+      },
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+    const fetched = getJobResult(started.work_id);
+    expect(fetched?.kind).toBe("result");
+    if (fetched?.kind !== "result") return;
+    expect(fetched.result.check).toMatchObject({ ran: true, exit_code: 0 });
+    expect(fetched.result).toMatchObject({
+      status: outcome, diff: "", summary: "",
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "payload.info.last_token_usage", ran: true, exit_code: 1 }] },
+    });
+  });
+
+  it.each(["completed", "cap-exceeded"] as const)("runs the wrong reconstructed suite through both checks and withholds output after %s", async (outcome) => {
+    const checkName = "payload.info.last_token_usage";
+    const started = await startCodeLoop({
+      instruction: CODE_LOOP_SCHEMA_TASK_INSTRUCTION,
+      task_type: "unit-test-gen",
+      files: [
+        { path: "extractor.py", content: REFERENCE_PYTHON_IMPLEMENTATION },
+        { path: "suite.py", content: "" },
+      ],
+      writable: ["suite.py"],
+      protected: ["extractor.py"],
+      check_cmd: "python3 -m py_compile suite.py",
+      schema_checks: [{ name: checkName, command: "python3 -m unittest suite.py" }],
+    }, startCfg(), fakeDeps({
+      engineRun: async (sandboxDir) => {
+        writeFileSync(join(sandboxDir, "suite.py"), WRONG_GENERATED_PYTHON_SUITE);
+        return {
+          outcome,
+          usage: { turns: 3, wall_ms: 1000, prompt_tokens: 10, completion_tokens: 10 },
+          finalMessage: "wrong reconstructed suite generated",
+          unparseableLines: 0,
+          detail: "",
+        };
+      },
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const fetched = getJobResult(started.work_id);
+    expect(fetched.kind).toBe("result");
+    if (fetched.kind !== "result") return;
+    expect(fetched.result.status).toBe(outcome);
+    expect(fetched.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(fetched.result.schema_grounding).toMatchObject({
+      schema_version: 1,
+      state: "failed",
+      checks: [{ name: checkName, ran: true, exit_code: 1 }],
+    });
+    expect(fetched.result.diff).toBe("");
+    expect(fetched.result.summary).toBe("");
+    expect(fetched.result.changed_files).toEqual(["suite.py"]);
+    expect(fetched.result.diff).not.toContain("__pycache__");
+    expect(fetched.result.changed_files.some((path) => path.includes("__pycache__"))).toBe(false);
+    expect(fetched.result.protected_violations).toEqual([]);
+    const row = getDb().prepare("SELECT source, outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC, id DESC LIMIT 1").get() as { source: string; outcome: string; verifier: string };
+    expect(row).toEqual({ source: "code-loop", outcome: outcome === "completed" ? "fail" : "error", verifier: "owner-schema-checks-v1" });
+  });
+
+  it("passes the grounded reconstructed suite after syntax and behavioral checks, retaining only suite.py", async () => {
+    const checkName = "payload.info.last_token_usage";
+    const mutantChecks = organicMutantSchemaChecks();
+    const schemaChecks = [
+      { name: checkName, command: "python3 -m unittest suite.py" },
+      ...mutantChecks,
+    ];
+    expect(schemaChecks).toHaveLength(8);
+    expect(schemaChecks.every((check) => Buffer.byteLength(check.command, "utf8") <= 8192)).toBe(true);
+    expect(schemaChecks.reduce((bytes, check) => bytes + Buffer.byteLength(check.command, "utf8"), 0)).toBeLessThanOrEqual(32768);
+    const started = await startCodeLoop({
+      instruction: CODE_LOOP_SCHEMA_TASK_INSTRUCTION,
+      task_type: "unit-test-gen",
+      files: [
+        { path: "extractor.py", content: REFERENCE_PYTHON_IMPLEMENTATION },
+        { path: "suite.py", content: "" },
+      ],
+      writable: ["suite.py"],
+      protected: ["extractor.py"],
+      check_cmd: "python3 -m py_compile suite.py",
+      schema_checks: schemaChecks,
+    }, startCfg(), fakeDeps({
+      engineRun: async (sandboxDir) => {
+        writeFileSync(join(sandboxDir, "suite.py"), GROUNDED_GENERATED_PYTHON_SUITE);
+        return {
+          outcome: "completed",
+          usage: { turns: 3, wall_ms: 1000, prompt_tokens: 10, completion_tokens: 10 },
+          finalMessage: "grounded reconstructed suite generated",
+          unparseableLines: 0,
+          detail: "",
+        };
+      },
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const fetched = getJobResult(started.work_id);
+    expect(fetched.kind).toBe("result");
+    if (fetched.kind !== "result") return;
+    expect(fetched.result.status).toBe("completed");
+    expect(fetched.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(fetched.result.schema_grounding).toMatchObject({ schema_version: 1, state: "passed" });
+    expect(fetched.result.schema_grounding.checks).toHaveLength(8);
+    expect(fetched.result.schema_grounding.checks.map((check) => check.name)).toEqual([
+      checkName,
+      "reference.behavior",
+      ...ORGANIC_MUTANT_GROUPS.map(([name]) => name),
+    ]);
+    expect(fetched.result.schema_grounding.checks.every((check) => check.ran && check.exit_code === 0)).toBe(true);
+    expect(fetched.result.diff).not.toBe("");
+    expect(fetched.result.diff).toContain("GroundedGeneratedSuite");
+    expect(fetched.result.summary).toBe("grounded reconstructed suite generated");
+    expect(fetched.result.changed_files).toEqual(["suite.py"]);
+    expect(fetched.result.diff).not.toContain("__pycache__");
+    expect(fetched.result.changed_files.some((path) => path.includes("__pycache__"))).toBe(false);
+    expect(fetched.result.protected_violations).toEqual([]);
+    const row = getDb().prepare("SELECT source, outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC, id DESC LIMIT 1").get() as { source: string; outcome: string; verifier: string };
+    expect(row).toEqual({ source: "code-loop", outcome: "pass", verifier: "owner-schema-checks-v1" });
+  });
+});
 
 describe("globToRegExp / matchesAnyGlob", () => {
   it("** matches across directories", () => {
@@ -313,7 +591,7 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
       schema_version: 1,
       model: "qwen3-coder-next-80b",
       engine: "pi",
-      harness_version: "code-loop-pi-2026-09-04-v8",
+      harness_version: "code-loop-pi-2026-09-05-v9",
       effective_caps: { wall_s: 480, turns: 24, completion_tokens: 60_000 },
       capabilities: {
         start_idempotency: "client-run-id-v1",

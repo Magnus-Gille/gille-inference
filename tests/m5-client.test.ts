@@ -1268,6 +1268,111 @@ describe("secret-safe M5 client", () => {
     expect(fetches).toBe(1);
   });
 
+  function currentTerminalCodeResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      status: "completed",
+      completion_state: "complete",
+      work_id: "cl-1",
+      diff: "",
+      diff_truncated: false,
+      changed_files: [],
+      scope_violations: [],
+      protected_violations: [],
+      summary: "",
+      detail: "",
+      check: { ran: false, exit_code: null, output_tail: "", skip_reason: "not-requested" },
+      schema_grounding: { schema_version: 1, state: "not-requested", checks: [] },
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      execution: {
+        harness_version: "code-loop-pi-2026-09-05-v9",
+        effective_caps: { turns: 24 },
+        capabilities: { result_scope: "writable-v1", completion_accounting: "bounded-turns-v1" },
+      },
+      ...overrides,
+    };
+  }
+
+  async function expectClientRejectsCodeResult(result: Record<string, unknown>): Promise<void> {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "{}" }],
+          isError: false,
+          structuredContent: result,
+        });
+      },
+    });
+    await expect(client.codeResult("cl-1")).rejects.toMatchObject({ code: "invalid_code_result" });
+  }
+
+  it.each([
+    ["missing schema_grounding", () => {
+      const result = currentTerminalCodeResult();
+      delete result.schema_grounding;
+      return result;
+    }],
+    ["null schema_grounding", () => currentTerminalCodeResult({ schema_grounding: null })],
+    ["malformed schema_grounding", () => currentTerminalCodeResult({ schema_grounding: { schema_version: 1, state: "failed", checks: "bad" } })],
+    ["missing grounding checks", () => currentTerminalCodeResult({ schema_grounding: { schema_version: 1, state: "failed" } })],
+    ["empty passed checks", () => currentTerminalCodeResult({ schema_grounding: { schema_version: 1, state: "passed", checks: [] } })],
+    ["duplicate names", () => currentTerminalCodeResult({
+      schema_grounding: {
+        schema_version: 1,
+        state: "failed",
+        checks: [
+          { name: "same", ran: true, exit_code: 1, output_tail: "first" },
+          { name: "same", ran: true, exit_code: 2, output_tail: "second" },
+        ],
+      },
+    })],
+    ["invalid name", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "Upper", ran: true, exit_code: 1, output_tail: "failed" }] },
+    })],
+    ["oversized output tail", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 1, output_tail: "x".repeat(4097) }] },
+    })],
+    ["missing check output tail", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 1 }] },
+    })],
+    ["negative exit code", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: -1, output_tail: "failed" }] },
+    })],
+    ["exit code above 255", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 256, output_tail: "failed" }] },
+    })],
+    ["non-integer exit code", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 1.5, output_tail: "failed" }] },
+    })],
+    ["failed state with all checks passing", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 0, output_tail: "ok" }] },
+    })],
+    ["skipped state with a ran check", () => currentTerminalCodeResult({
+      schema_grounding: { schema_version: 1, state: "skipped", checks: [{ name: "a", ran: true, exit_code: 1, output_tail: "failed" }] },
+    })],
+    ["failed state disclosing a diff", () => currentTerminalCodeResult({
+      diff: "disclosed diff",
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 1, output_tail: "failed" }] },
+    })],
+    ["failed state disclosing a summary", () => currentTerminalCodeResult({
+      summary: "disclosed summary",
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "a", ran: true, exit_code: 1, output_tail: "failed" }] },
+    })],
+    ["skipped state disclosing a diff", () => currentTerminalCodeResult({
+      diff: "disclosed diff",
+      schema_grounding: { schema_version: 1, state: "skipped", checks: [{ name: "a", ran: false, exit_code: null, output_tail: "" }] },
+    })],
+    ["skipped state disclosing a summary", () => currentTerminalCodeResult({
+      summary: "disclosed summary",
+      schema_grounding: { schema_version: 1, state: "skipped", checks: [{ name: "a", ran: false, exit_code: null, output_tail: "" }] },
+    })],
+  ])("rejects terminal result with %s", async (_label, makeResult) => {
+    await expectClientRejectsCodeResult(makeResult());
+  });
+
   it("runs the async code path to a validated diff/result without applying it locally", async () => {
     const names: string[] = [];
     const client = await createM5Client({
@@ -1308,13 +1413,14 @@ describe("secret-safe M5 client", () => {
             scope_violations: [],
             protected_violations: [],
             execution: {
-              harness_version: "code-loop-pi-2026-09-04-v8",
+              harness_version: "code-loop-pi-2026-09-05-v9",
               effective_caps: { turns: 24 },
               capabilities: { result_scope: "writable-v1", completion_accounting: "bounded-turns-v1" },
             },
             summary: "changed",
             detail: "",
             check: { ran: true, exit_code: 0, output_tail: "ok", skip_reason: null },
+            schema_grounding: { schema_version: 1, state: "not-requested", checks: [] },
             usage: {
               turns: 1,
               wall_ms: 2,

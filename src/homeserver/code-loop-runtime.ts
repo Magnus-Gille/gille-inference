@@ -379,6 +379,8 @@ export async function handleCodeLoopTool(
       instruction: typeof args["instruction"] === "string" ? (args["instruction"] as string) : "",
       files: Array.isArray(args["files"]) ? (args["files"] as CodeLoopRequest["files"]) : [],
       check_cmd: typeof args["check_cmd"] === "string" ? (args["check_cmd"] as string) : undefined,
+      // Preserve malformed supplied values for fail-closed structural validation.
+      ...(Object.hasOwn(args, "schema_checks") ? { schema_checks: args["schema_checks"] as CodeLoopRequest["schema_checks"] } : {}),
       writable: Array.isArray(args["writable"]) ? (args["writable"] as string[]) : undefined,
       protected: Array.isArray(args["protected"]) ? (args["protected"] as string[]) : undefined,
       task_type: typeof args["task_type"] === "string" ? (args["task_type"] as string) : undefined,

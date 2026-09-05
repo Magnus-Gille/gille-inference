@@ -363,7 +363,7 @@ scope check supplies route authority; legacy static / implicit-admin are exclude
 A non-owner never sees them, and a direct `tools/call` on one returns the **byte-identical
 unknown-tool error** a nonexistent tool would (invisible, not merely forbidden). See
 *code_loop* below. The owner-visible `code_loop_start` description carries the stable pre-paid
-advertisement `contract[harness=code-loop-pi-2026-09-04-v8;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`.
+advertisement `contract[harness=code-loop-pi-2026-09-05-v9;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`.
 
 ### code_loop — owner-agent sandboxed agentic coding (#116)
 
@@ -375,7 +375,7 @@ checkout. Every loop turn transits the gateway spine (admission, `owner_request_
 poison-clear, the degeneracy watchdog), so it is the Claude→local **agentic-delegation
 dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE_LOOP=off`).
 
-- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, writable?, protected?, task_type?, caps?}`
+- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?}`
   → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, capabilities}`
   immediately, or a structured refusal (`disabled` / `busy` / `maintenance` /
   `lease-unavailable` / `cage-unavailable` / `invalid-request` / `conflict` /
@@ -404,6 +404,21 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   cap; a successful first-attempt mutation satisfies the deadline globally and exempts the
   degeneracy retry. Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  Harness v9 additionally requires `schema_checks` for the resolved `unit-test-gen` task type;
+  compile-only requests are refused before admission. Supply 1–8 owner-authored
+  `{name, command}` behavioral oracles, each expecting exit zero. Names are unique lowercase
+  identifiers (1–80 characters); commands have an 8192-byte individual and 32768-byte total
+  limit. These checks share a separate 120-second execution budget after `check_cmd`, including
+  eligible capped runs. A timeout, launch error, or nonzero result is not a pass.
+  `schema_grounding` records version 1, state (`not-requested`, `passed`, `failed`, `skipped`)
+  and named check results. Failed/skipped grounding withholds `diff` and `summary`; diagnostic
+  changed paths remain visible. Old durable results are not upgraded to v9 evidence.
+  The owner must supply a meaningful behavioral oracle (accept the reference and reject
+  contract-breaking mutants), not merely repeat compilation or search for field-name text.
+  Keep reference/verifier files protected and outside writable scope. This is enforcement of
+  owner-selected checks, not automatic understanding of arbitrary natural-language schemas or
+  proof against adversarial generated test code. A passing schema check does not turn a capped
+  run into completed work or override a failed `check_cmd`.
   The turn cap is global across a degeneracy retry, never reports the rejected over-cap start as
   usage, and injects a stable two-turn completion-pressure reminder. A scope-clean `cap-exceeded`
   diff still receives the separately budgeted owner check; `completion_state`,
@@ -439,7 +454,8 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
 - `code_loop_status` — `{work_id}` → `{status, usage}`.
 - `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), permitted
   `changed_files`, machine-readable `scope_violations`, `protected_violations`, pi's `summary`,
-  `completion_state`, the `check` result (including `skip_reason`), bounded `usage`, immutable effective
+  `completion_state`, the `check` result (including `skip_reason`), named `schema_grounding`
+  results, bounded `usage`, immutable effective
   `execution`, content-blind `telemetry`, and immutable agent-side `agent_checks`. The latter is
   derived only from real pi bash tool start/end events and exposes normalized check kind, command
   fingerprint, relative timing, order, status, and observed exit code—never command text, paths,
@@ -461,8 +477,11 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   mtime. Cached results from an older/incompatible evidence contract fail closed as
   `terminal-unavailable` instead of being stamped with current capabilities.
   `status ∈ completed | cap-exceeded | degenerate |
-  arm-error | orphaned` — there is deliberately **no** `pass` status; `completed` +
-  `check.exit_code === 0` is the only pass signal.
+  arm-error | orphaned` — there is deliberately **no** `pass` status. Ledger pass requires
+  `completed`, a run `check` with `exit_code === 0`, and `schema_grounding.state` equal to
+  `passed` or `not-requested`. Failed/skipped grounding withholds `diff` and `summary` and
+  prevents pass; named check diagnostics remain visible. The resolved `unit-test-gen` type
+  requires grounding checks at admission, so it cannot take the `not-requested` path.
 
 **The OS cage (Phase-1 ship gate).** pi's `bash` and `check_cmd` (which imports model-edited
 source — RCE by construction) run as the gateway uid, which owns `.env` + `data/eval.db`. Both

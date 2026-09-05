@@ -56,6 +56,7 @@ import {
 // served-model observation, same fail-open-to-unknown discipline.
 import { deriveEvidenceIdentity, resolveTaskType } from "./orchestrator.js";
 import { TASK_TYPES } from "./taxonomy.js";
+import { validateSchemaChecks, skippedSchemaGrounding, isSchemaGroundingResult, type CodeLoopSchemaCheck, type CodeLoopSchemaGrounding } from "./code-loop-schema-checks.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -71,7 +72,7 @@ import { TASK_TYPES } from "./taxonomy.js";
 export const CODE_LOOP_TOOL_NAMES = ["code_loop_start", "code_loop_status", "code_loop_result"] as const;
 
 /** Immutable wire/harness contract identifier reported in every #247 result. */
-export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-09-04-v8";
+export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-09-05-v9";
 export const CODE_LOOP_CAPABILITIES = {
   start_idempotency: "client-run-id-v1",
   agent_checks: "pi-bash-events-v3",
@@ -122,7 +123,8 @@ const CODE_LOOP_START_OUTPUT_SCHEMA = {
 } as const;
 
 function isCurrentCodeLoopResult(result: CodeLoopResult): boolean {
-  return result.execution?.schema_version === 1 &&
+  return isSchemaGroundingResult(result.schema_grounding, result.diff, result.summary) &&
+    result.execution?.schema_version === 1 &&
     result.execution.harness_version === CODE_LOOP_HARNESS_VERSION &&
     result.execution.capabilities?.agent_checks === CODE_LOOP_CAPABILITIES.agent_checks &&
     result.execution.capabilities?.result_scope === CODE_LOOP_CAPABILITIES.result_scope &&
@@ -198,6 +200,14 @@ export function codeLoopToolDefs(): unknown[] {
             },
           },
           check_cmd: { type: "string", description: "owner-authored verification command run in the sandbox post-loop (120s cap)" },
+          schema_checks: {
+            type: "array", minItems: 1, maxItems: 8,
+            description: "Required for unit-test-gen: owner-authored behavioral checks of the supplied schema, not syntax checks. All must exit zero; failures withhold diff and summary. Shared 120s post-check budget. Protect verifier/reference files and keep them outside writable scope.",
+            items: { type: "object", additionalProperties: false, required: ["name", "command"], properties: {
+              name: { type: "string", pattern: "^[a-z0-9][a-z0-9._:-]{0,79}$" },
+              command: { type: "string", minLength: 1, maxLength: 8192 },
+            } },
+          },
           writable: {
             type: "array",
             items: { type: "string" },
@@ -362,6 +372,8 @@ export type StructuralValidateResult =
 
 /** Immutable shape/size checks required before safely deriving the durable request identity. */
 export function validateCodeLoopRequestStructure(req: CodeLoopRequest): StructuralValidateResult {
+  const schemaError = validateSchemaChecks(req.schema_checks);
+  if (schemaError !== null) return { ok: false, message: schemaError };
   try {
     validateClientRunId(req.client_run_id);
   } catch (err) {
@@ -782,6 +794,7 @@ interface Job {
   model: string;
   taskType: string;
   checkCmd: string | null;
+  schemaChecks: CodeLoopSchemaCheck[];
   writableGlobs: string[];
   protectedGlobs: string[];
   startedAtMs: number;
@@ -860,13 +873,16 @@ export function isCodeLoopUnitName(unit: string): boolean {
 
 export function ledgerOutcome(
   status: CodeLoopTerminalStatus,
-  check: { ran: boolean; exit_code: number | null }
+  check: { ran: boolean; exit_code: number | null },
+  grounding?: CodeLoopSchemaGrounding,
 ): { outcome: Outcome; errorClass: ErrorClass | null } {
   // degeneracy = serving-layer pathology → infra (must not poison the model's capability verdict).
   if (status === "degenerate" || status === "orphaned") return { outcome: "error", errorClass: "infra" };
   if (status === "arm-error") return { outcome: "error", errorClass: "infra" };
   if (status === "cap-exceeded") return { outcome: "error", errorClass: "timeout" };
   // completed:
+  if (grounding?.state === "failed") return { outcome: "fail", errorClass: null };
+  if (grounding?.state === "skipped") return { outcome: "unverified", errorClass: null };
   if (check.ran) return check.exit_code === 0 ? { outcome: "pass", errorClass: null } : { outcome: "fail", errorClass: null };
   return { outcome: "unverified", errorClass: null };
 }
@@ -931,6 +947,10 @@ export async function startCodeLoop(
   // RAW value on, so `"review-bounded "` recorded a whitespace-variant ledger bucket and missed the
   // #74 advisory-only guardrail's exact match.
   const taskType = resolveTaskType({ taskType: req.task_type, prompt: req.instruction });
+  if (taskType === "unit-test-gen" && req.schema_checks === undefined) {
+    return { ok: false, refusal: "invalid-request", message: "unit-test-gen requires owner-authored schema_checks: syntax compilation alone does not verify the supplied contract." };
+  }
+  const schemaChecks = (req.schema_checks ?? []).map(({ name, command }) => ({ name, command }));
   const requestFingerprint = clientRunId === null
     ? null
     : codeLoopRequestFingerprint(req);
@@ -1327,6 +1347,7 @@ export async function startCodeLoop(
     model: cfg.model,
     taskType,
     checkCmd: typeof req.check_cmd === "string" && req.check_cmd.trim() !== "" ? req.check_cmd : null,
+    schemaChecks,
     writableGlobs,
     protectedGlobs,
     startedAtMs: acceptedAt,
@@ -1568,18 +1589,50 @@ async function runJob(
     }
   }
 
+  // Separate from the syntax/owner check and the exhausted agent budget. Commands are snapshotted
+  // owner input, run only inside the same cage after the relay has closed, never model assertions.
+  const schemaGrounding = skippedSchemaGrounding(job.schemaChecks);
+  if (job.schemaChecks.length && harvestTrusted && !harvest.scopeViolations.length &&
+      !protectedViolations.length && !job.cleanupPending && (outcome === "completed" || outcome === "cap-exceeded")) {
+    const deadline = performance.now() + CHECK_TIMEOUT_MS;
+    schemaGrounding.state = "failed";
+    for (let index = 0; index < job.schemaChecks.length; index++) {
+      const remaining = Math.floor(deadline - performance.now());
+      if (remaining <= 0) break;
+      const entry = job.schemaChecks[index]!;
+      try {
+        const verified = await runCheck(entry.command, job.sandboxDir, cageArgv, deps, remaining);
+        schemaGrounding.checks[index] = { name: entry.name, ran: verified.ran, exit_code: verified.exit_code, output_tail: verified.output_tail };
+      } catch (err) {
+        schemaGrounding.checks[index] = { name: entry.name, ran: true, exit_code: null, output_tail: `schema check execution failed: ${(err as Error).message}`.slice(-4096) };
+      }
+      try {
+        if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
+      } catch (err) {
+        job.cleanupPending = true;
+        outcome = "arm-error";
+        detail = `transient schema check cleanup pending: ${(err as Error).message}`;
+        schemaGrounding.checks[index]!.exit_code = null;
+        break;
+      }
+    }
+    if (!job.cleanupPending && schemaGrounding.checks.every(c => c.ran && c.exit_code === 0)) schemaGrounding.state = "passed";
+  }
+  const withhold = schemaGrounding.state === "failed" || schemaGrounding.state === "skipped";
+  if (withhold) detail = `${detail ? `${detail}; ` : ""}schema grounding ${schemaGrounding.state}: ${schemaGrounding.checks.filter(c => !c.ran || c.exit_code !== 0).map(c => c.name).join(", ")}`;
   const telemetry = buildResultTelemetry(job, harvest.changedFiles.length > 0, checkDurationMs);
 
   const result: CodeLoopResult = {
     status: outcome,
     completion_state: outcome === "completed" ? "complete" : "unfinished",
-    diff: harvest.diff.slice(0, DIFF_MAX_BYTES),
-    diff_truncated: harvest.diff.length > DIFF_MAX_BYTES,
+    diff: withhold ? "" : harvest.diff.slice(0, DIFF_MAX_BYTES),
+    diff_truncated: !withhold && harvest.diff.length > DIFF_MAX_BYTES,
     changed_files: harvest.changedFiles,
     scope_violations: harvest.scopeViolations,
     protected_violations: protectedViolations,
-    summary: job.summary.slice(0, 2048),
+    summary: withhold ? "" : job.summary.slice(0, 2048),
     check,
+    schema_grounding: schemaGrounding,
     usage: job.usage,
     execution: codeLoopExecution(job),
     telemetry,
@@ -1942,7 +1995,8 @@ async function runCheck(
   checkCmd: string,
   sandboxDir: string,
   cageArgv: string[],
-  deps: CodeLoopDeps
+  deps: CodeLoopDeps,
+  timeoutMs = CHECK_TIMEOUT_MS,
 ): Promise<CodeLoopResult["check"]> {
   // check_cmd runs INSIDE the same cage with a minimal env. The fixed non-secret HS_API_KEY value
   // only satisfies systemd-run's environment-copy contract; the relay is already closed.
@@ -1952,7 +2006,7 @@ async function runCheck(
     HS_API_KEY: "code-loop-check-no-upstream",
   };
   const argv = [...cageArgv, "bash", "-c", checkCmd];
-  const r = await deps.runCommand(argv, { cwd: sandboxDir, env, timeoutMs: CHECK_TIMEOUT_MS });
+  const r = await deps.runCommand(argv, { cwd: sandboxDir, env, timeoutMs });
   const combined = `${r.stdout}\n${r.stderr}`;
   return { ran: true, exit_code: r.code, output_tail: combined.slice(-4096), skip_reason: null };
 }
@@ -2010,6 +2064,7 @@ async function finalizeJob(
     protected_violations: [],
     summary: "",
     check,
+    schema_grounding: skippedSchemaGrounding(job.schemaChecks),
     usage: job.usage,
     execution: codeLoopExecution(job),
     telemetry: buildResultTelemetry(job, false),
@@ -2061,7 +2116,7 @@ function writeLedger(
   check: { ran: boolean; exit_code: number | null },
   evidenceIdentity: Awaited<ReturnType<typeof deriveEvidenceIdentity>>
 ): void {
-  const { outcome, errorClass } = ledgerOutcome(status, check);
+  const { outcome, errorClass } = ledgerOutcome(status, check, job.result?.schema_grounding);
   try {
     recordDelegation({
       taskType: job.taskType,
@@ -2072,7 +2127,7 @@ function writeLedger(
       latencyMs: job.usage.wall_ms,
       promptTokens: job.usage.prompt_tokens || null,
       completionTokens: job.usage.completion_tokens || null,
-      verifier: job.checkCmd !== null ? "check-cmd" : null,
+      verifier: job.schemaChecks.length ? "owner-schema-checks-v1" : job.checkCmd !== null ? "check-cmd" : null,
       source: "code-loop",
       keyAlias: deps.keyAlias ?? null,
       evidenceIdentity,
