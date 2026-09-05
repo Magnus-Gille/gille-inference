@@ -50,6 +50,7 @@ import {
   isDurableCodeLoopWorkLive,
   readDurableCodeLoopRunByWork,
 } from "../src/homeserver/code-loop-store.js";
+import * as codeLoopStore from "../src/homeserver/code-loop-store.js";
 import {
   TASK_FINGERPRINT_VERSION,
   lookupTaskExposures,
@@ -144,6 +145,71 @@ function fakeDeps(over: {
     cageSelfTest: async () => ({ ok: over.cageOk !== false, failures: over.cageOk === false ? ["forced fail"] : [] }),
     cleanupUnit: over.cleanupUnit ?? (async () => {}),
   };
+}
+
+function scriptedPiEngine(lines: string[]) {
+  return makePiEngine(
+    { piBin: "/x/pi", provider: "inference-local", piAgentDir: "/agent", apiKey: "test-only-key-0123456789", degeneracyRunThreshold: 400 },
+    {
+      spawnPi: () => {
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        let resolveExit!: (code: number | null) => void;
+        const exited = new Promise<number | null>((resolve) => (resolveExit = resolve));
+        queueMicrotask(() => {
+          for (const line of lines) stdout.write(`${line}\n`);
+          stdout.end();
+          stderr.end();
+          resolveExit(0);
+        });
+        return {
+          stdout,
+          stderr,
+          pid: 4321,
+          kill() {
+            if (!stdout.destroyed) stdout.end();
+            if (!stderr.destroyed) stderr.end();
+            resolveExit(null);
+          },
+          exited,
+        };
+      },
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    },
+  );
+}
+
+function mutationAccountingLines(kind: "bash" | "write"): string[] {
+  const mutation = kind === "bash"
+    ? [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: "bash-1", toolName: "bash", args: { command: "printf 'after\\n' > solution.txt" } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: "bash-1", toolName: "bash", isError: false }),
+      ]
+    : [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: "write-1", toolName: "write", args: { path: "solution.txt", content: "after\n" } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: "write-1", toolName: "write", isError: false }),
+      ];
+  return [
+    JSON.stringify({ type: "turn_start" }),
+    ...mutation,
+    JSON.stringify({ type: "turn_end", message: { role: "assistant", usage: { input: 1, output: 1 }, stopReason: "stop" } }),
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "wrote solution" }] } }),
+  ];
+}
+
+/** These tests target engine/job accounting; bypass the host process-identity probe so restricted
+ * CI does not need a real sysctl while the dedicated lease tests cover admission itself. */
+async function withHermeticDurableAdmission<T>(run: () => Promise<T>): Promise<T> {
+  const leaseSpy = vi.spyOn(codeLoopStore, "acquireDurableCodeLoopLease").mockReturnValue({
+    kind: "acquired",
+    lease: { work_id: "test-hermetic-admission", release: () => {} },
+  });
+  try {
+    return await run();
+  } finally {
+    leaseSpy.mockRestore();
+  }
 }
 
 async function waitForTerminal(workId: string, timeoutMs = 5000): Promise<void> {
@@ -1233,6 +1299,130 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     // The useful bounded summary is preserved for the conductor.
     expect(res.result.summary).toBe(wanderSummary);
     expect(res.result.summary.length).toBeLessThanOrEqual(2048);
+  });
+
+  it("keeps a bash-only diff unobserved and still verifies it on a clean early exit", async () => {
+    const engine = scriptedPiEngine(mutationAccountingLines("bash"));
+    const start = await withHermeticDurableAdmission(() => startCodeLoop(
+      {
+        instruction: "write solution",
+        files: [{ path: "solution.txt", content: "before\n" }],
+        writable: ["solution.txt"],
+        check_cmd: "test -f solution.txt",
+        schema_checks: [{ name: "solution.exists", command: "test -f solution.txt" }],
+        caps: { turns: 12, edit_deadline_turn: 3 },
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir, instruction) => {
+          // Synthetic reproduction: the bash event claims the mutation, while the fixture writes
+          // the same file so host-owned Git harvest sees the exact resulting diff.
+          writeFileSync(join(sandboxDir, "solution.txt"), "after\n");
+          return engine.run({
+            sandboxDir,
+            instruction,
+            model: "qwen3-coder-next-80b",
+            caps: { wall_s: 480, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 3 },
+            cageArgv: [],
+            growthCapBytes: 50 * 1024 * 1024,
+          });
+        },
+      }),
+    ));
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("cap-exceeded");
+    expect(result.result.completion_state).toBe("unfinished");
+    expect(result.result.usage.turns).toBe(1);
+    expect(result.result.changed_files).toEqual(["solution.txt"]);
+    expect(result.result.diff).toContain("-before");
+    expect(result.result.diff).toContain("+after");
+    expect(result.result.telemetry).toMatchObject({
+      mutation_evidence: "diff-only",
+      observability_coverage: 0.5,
+      failure_kind: "edit-deadline",
+    });
+    expect(result.result.telemetry.first_edit_turn).toBeUndefined();
+    expect(result.result.telemetry.edit_start_ms).toBeUndefined();
+    expect(result.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(result.result.schema_grounding).toMatchObject({
+      schema_version: 1,
+      state: "passed",
+      checks: [{ name: "solution.exists", ran: true, exit_code: 0 }],
+    });
+    expect(result.result.agent_checks).toMatchObject({
+      state: "none",
+      unparseable_lines: 0,
+      coverage_loss_events: 0,
+      attempts: [],
+    });
+  });
+
+  it("records the same diff as tool-call evidence after a matching write event", async () => {
+    const engine = scriptedPiEngine(mutationAccountingLines("write"));
+    const start = await withHermeticDurableAdmission(() => startCodeLoop(
+      {
+        instruction: "write solution",
+        files: [{ path: "solution.txt", content: "before\n" }],
+        writable: ["solution.txt"],
+        check_cmd: "test -f solution.txt",
+        schema_checks: [{ name: "solution.exists", command: "test -f solution.txt" }],
+        caps: { turns: 12, edit_deadline_turn: 3 },
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir, instruction) => {
+          // The filesystem mutation is identical to the bash-only fixture above; only the
+          // successful matching write start/end events change the evidence classification.
+          writeFileSync(join(sandboxDir, "solution.txt"), "after\n");
+          return engine.run({
+            sandboxDir,
+            instruction,
+            model: "qwen3-coder-next-80b",
+            caps: { wall_s: 480, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 3 },
+            cageArgv: [],
+            growthCapBytes: 50 * 1024 * 1024,
+          });
+        },
+      }),
+    ));
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.completion_state).toBe("complete");
+    expect(result.result.usage.turns).toBe(1);
+    expect(result.result.changed_files).toEqual(["solution.txt"]);
+    expect(result.result.diff).toContain("-before");
+    expect(result.result.diff).toContain("+after");
+    expect(result.result.telemetry).toMatchObject({
+      mutation_evidence: "tool-call",
+      observability_coverage: 1,
+    });
+    expect(result.result.telemetry.first_edit_turn).toBe(1);
+    expect(result.result.telemetry.edit_start_ms).toEqual(expect.any(Number));
+    expect(result.result.telemetry.failure_kind).toBeUndefined();
+    expect(result.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(result.result.schema_grounding).toMatchObject({
+      schema_version: 1,
+      state: "passed",
+      checks: [{ name: "solution.exists", ran: true, exit_code: 0 }],
+    });
+    expect(result.result.agent_checks).toMatchObject({
+      state: "none",
+      unparseable_lines: 0,
+      coverage_loss_events: 0,
+      attempts: [],
+    });
   });
 
   // #80: a caller-supplied `task_type` used to enter the pipeline UNTRIMMED (the old guard trimmed

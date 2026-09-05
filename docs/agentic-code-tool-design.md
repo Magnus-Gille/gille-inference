@@ -198,6 +198,14 @@ Semantics:
 - Generated cache/bytecode is omitted as hygiene without becoming a scope violation or suppressing
   `check_cmd`. Harness metadata is never returned, but remains visible to `protected` reporting.
 - First-edit timing is taken from the pinned pi NDJSON `tool_execution_start` for `edit`/`write`, but becomes trusted only when the matching `tool_execution_end` succeeds. A git diff without that pair is reported as `mutation_evidence:"diff-only"`; timing fields stay absent. Retry turns and elapsed time are aggregated from the original attempt, while `phase_ms.check` measures only the M5-side owner check.
+  A shell-created diff does **not** satisfy `edit_deadline_turn`: that policy requires a
+  successful `edit`/`write` event, not merely changed bytes at harvest. Therefore a clean early
+  exit can return `cap-exceeded` / `edit-deadline` alongside a valid diff and passed owner/schema
+  checks. This is a policy failure, not proof that the wall-clock limit elapsed. The diagnostic's
+  `no relevant edit attempted` prefix refers to observed edit/write events; it must not be read
+  as proof that the filesystem stayed unchanged. Missing events alone do not prove which tool
+  actually changed the file.
+
 - `agent_checks` is immutable, content-blind **agent-side** evidence from actual pi `bash`
   `tool_execution_start`/`tool_execution_end` pairs. It records only a normalized kind, command
   digest, relative timing, order, result status, and observed exit code. Pi 0.70.2 does not emit a
@@ -217,6 +225,24 @@ Semantics:
   There is deliberately no `"pass"` status. Ledger pass requires completed + successful
   `check_cmd` and, when requested, successful schema checks. Missing `check_cmd` remains
   unverified; failed/skipped schema checks cannot be overridden by syntax-check success.
+
+### Synthetic schema-release compatibility controls
+
+[`buildSchemaReleaseSmoke`](../tests/fixtures/code-loop-release-smoke.ts) builds local-only
+positive/negative request fixtures; it does not submit jobs or grant operational authority.
+It explicitly requests the `write` tool for an exact `smoke.txt` marker rather than the ambiguous
+instruction "append", which a model can implement using shell redirection. Both arms protect the
+same reconstructed implementation and suite paths and differ only in the deliberate oracle control
+and caller-supplied durable run ID. They retain the edit deadline, scope restrictions and bounded
+caps. A new instruction is a new request: do not reuse an old durable ID with changed bytes or
+silently retry an already accepted operational envelope.
+
+The positive control requires `completed`, the exact marker diff, and successful compile/schema
+checks. The negative control must compile but fail the behavioral oracle by assertion, withholding
+diff and summary. A cap outcome is never a positive-control pass, even if the checks pass.
+Keep the release acceptance validator strict. These controls test synthetic compatibility, not
+organic usefulness or model-generated test quality. Deterministic simulated bash/write event
+tests establish the contract but are not a reconstruction of a captured live event stream.
 
 ---
 
