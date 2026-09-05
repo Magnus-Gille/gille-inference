@@ -521,6 +521,37 @@ unnecessary MCP churn on a no-op deploy.
 
 ### Credential-safe authenticated capability smoke test
 
+Before credential preflight, a repository checkout with Node.js 20+ can inspect local
+route prerequisites without reading Keychain or contacting the gateway:
+
+```bash
+node bin/m5-network-doctor.mjs
+```
+
+This separate command emits one redacted JSON object (`schema_version: 1`). It
+checks the `m5-auth` public-base environment variables and reads only the local
+Tailscale backend state via `tailscale status --json` (three-second timeout,
+bounded output). Both observations are reported even when one fails: for example,
+`public_route: "unconfigured"` and `tailscale: "stopped"` can appear together.
+It never invokes `m5-auth`, `security`, `curl`, login, or service start/stop commands.
+It does not load named-profile configuration, credentials, or connector settings.
+
+Public configuration is `configured`, `unconfigured`, or `invalid_configuration`;
+explicit empty bases and inconsistent first-class pairs are invalid, matching
+`m5-auth`. Tailscale is `running`, `stopped`, `needs_login`, `needs_machine_auth`,
+`starting`, `unknown`, `unavailable`, or `timeout`. Only the allowlisted
+`BackendState` field determines a state; failed commands do not prove Tailscale is
+stopped. Raw status JSON, peer data, authentication URLs, locators, and stderr are
+never emitted or persisted by the diagnostic. Backend state values follow
+[Tailscale's status definition](https://github.com/tailscale/tailscale/blob/main/ipn/ipnstate/ipnstate.go).
+
+Exit `0` means the diagnostic completed, **not** that a route is usable; inspect
+both fields and the fixed `remediation` messages. Invalid arguments exit `2`.
+`gateway_reachability` and `credential` remain `not_checked`, and
+`connector_session` remains `not_inspected`. In particular, a `running` backend
+does not establish peer reachability, authentication, or inference readiness.
+This is a repository-local command, not a newly installed npm or global command.
+
 The bound deploy mode's capability probe calls
 `GET /v1/capabilities/learning-task` with `Authorization: Bearer $HOMESERVER_OWNER_KEY` (the env
 var name is configurable via `DEPLOY_CAPABILITY_KEY_ENV`) and checks only the HTTP status code. The
