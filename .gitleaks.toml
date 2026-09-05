@@ -34,6 +34,18 @@ regexTarget = "match"
 paths = ['''^src/homeserver/delegation-cost\.ts$''']
 regexes = ['''opts\.m5(?:Marginal|Amortized)UsdPerMTok''']
 
+# Historical evidence-bundle column lists put these two SQL column names next
+# to each other. The generic rule mistakes that fixed pair for a token assignment.
+# Match only the complete finding at this exact source path, not the whole file
+# or any value sharing a prefix. verify-gitleaks-config.sh tests both boundaries.
+[[allowlists]]
+description = "historical evidence-bundle SQL column pair"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+paths = ['''^src/homeserver/adoption-evidence-bundle\.ts$''']
+regexes = ['''^total_tokens", "m5_marginal_cost_usd"$''']
+
 # This fixed telemetry enum is not a credential; it distinguishes missing
 # agent authentication from other M5 fallbacks. Keep the exception exact and
 # scoped to its three enum declarations.
