@@ -281,6 +281,24 @@ allowed model IDs internally; the IDs and digest are not returned by doctor. `in
 deliberately `not_checked` in every doctor result. A `model_discovery_unavailable` status identifies
 a failed catalogue check and must not be read as a failed or successful inference result.
 
+When `list_models` fails, the profile doctor keeps top-level `status` and
+`diagnostic_code` as `model_discovery_unavailable`. An additive `discovery_failure`
+object identifies the failing `endpoint` (`public` or `private`) and retains an
+allowlisted `diagnostic_code`, plus `failure_layer`, `retryable`, and numeric
+`http_status` when available. Unknown metadata falls back to the generic discovery
+code; raw errors and upstream remediation are never forwarded. Known transport
+diagnostics include the client's fixed recovery guidance. Gateway discovery does
+not confirm inference readiness, and the standalone profile doctor still cannot
+inspect the interactive host connector session.
+
+For example, a refused private connection is reported with
+`discovery_failure: { endpoint: "private", diagnostic_code: "connection_refused",
+failure_layer: "gateway_transport", retryable: true, remediation: "..." }`, while
+the public discovery result remains `available` and inference remains `not_checked`.
+The stdio bridge labels its own transport failures `connector_transport`; this
+does not make the standalone profile probe connector-aware. Successful discovery
+and credential-recovery results do not acquire a `discovery_failure` field.
+
 Its top-level `status` also distinguishes:
 
 - `missing_credential`

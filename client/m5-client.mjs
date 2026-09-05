@@ -1411,6 +1411,25 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs) {
   }
 }
 
+function discoveryFailureDetails(error, endpoint, profile) {
+  // Never forward error messages, arbitrary codes, or upstream remediation. Even a
+  // client error is re-allowlisted here because injected transports can mutate it.
+  const known = error instanceof M5ClientError;
+  const diagnosticCode = known && NETWORK_DIAGNOSTIC_CODES.has(error.diagnosticCode)
+    ? error.diagnosticCode : "model_discovery_unavailable";
+  const httpStatus = known && Number.isInteger(error.httpStatus) &&
+    error.httpStatus >= 100 && error.httpStatus <= 599 ? error.httpStatus : undefined;
+  return {
+    endpoint,
+    diagnostic_code: diagnosticCode,
+    ...(known && FAILURE_LAYERS.has(error.failureLayer) ? { failure_layer: error.failureLayer } : {}),
+    ...(known && typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
+    ...(httpStatus === undefined ? {} : { http_status: httpStatus }),
+    ...(diagnosticCode === "model_discovery_unavailable"
+      ? {} : { remediation: transportRemediation(profile) }),
+  };
+}
+
 async function endpointDoctor({
   baseUrl,
   endpoint,
@@ -1462,12 +1481,14 @@ async function endpointDoctor({
       // Preserve authentication failures so the doctor keeps its auth-layer diagnosis and
       // canonical remediation. Other failures are explicitly scoped to model discovery.
       if (error instanceof M5ClientError && CREDENTIAL_FAILURE_CODES.has(error.code)) throw error;
+      const failureDetails = discoveryFailureDetails(error, endpoint, profile);
       modelDiscovery = {
         status: "unavailable",
         model_count: null,
         model_digest: null,
         failure_code: "model_discovery_unavailable",
-        http_status: error instanceof M5ClientError ? error.httpStatus : undefined,
+        http_status: failureDetails.http_status,
+        failure_details: failureDetails,
       };
     }
   }
@@ -1667,6 +1688,7 @@ export async function diagnoseProfile({
         scope: publicProbe.identity.scope,
       },
       diagnostic_code: publicProbe.model_discovery.failure_code,
+      discovery_failure: publicProbe.model_discovery.failure_details,
       ...(publicProbe.model_discovery.http_status === undefined
         ? {}
         : { http_status: publicProbe.model_discovery.http_status }),
@@ -1759,6 +1781,7 @@ export async function diagnoseProfile({
         scope: privateProbe.identity.scope,
       },
       diagnostic_code: privateProbe.model_discovery.failure_code,
+      discovery_failure: privateProbe.model_discovery.failure_details,
       ...(privateProbe.model_discovery.http_status === undefined
         ? {}
         : { http_status: privateProbe.model_discovery.http_status }),
