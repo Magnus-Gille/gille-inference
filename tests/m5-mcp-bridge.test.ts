@@ -181,6 +181,55 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
+  it("reports a redacted list_models connector timeout after fetch observes abort", async () => {
+    let observedAbort = false;
+    const bridge = await makeBridge(
+      async (_input, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          observedAbort = true;
+          reject(new Error(`request timed out with Bearer ${SECRET} at https://timeout.invalid/raw`));
+        });
+      }),
+      // Keep this on the supported lower bound while exercising the real AbortController path.
+      { timeoutMs: 1_000 },
+    );
+    const request = {
+      jsonrpc: "2.0",
+      id: 24,
+      method: "tools/call",
+      params: {
+        name: "list_models",
+        arguments: {
+          credential: SECRET,
+          locator: "https://timeout.invalid/raw",
+          request_tag: "raw-list-models-timeout-params",
+        },
+      },
+    };
+
+    const response = await bridge.handleLine(JSON.stringify(request));
+    const parsed = JSON.parse(response!);
+    expect(observedAbort).toBe(true);
+    expect(parsed).toMatchObject({
+      id: 24,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "timeout",
+          diagnostic_code: "connect_timeout",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation:
+            "Retry the same operation once. If it still fails, run m5 --profile codex doctor; the standalone doctor tests the configured profile path and explicitly reports that it cannot inspect the host connector session itself.",
+        },
+      },
+    });
+    expect(response).not.toContain(SECRET);
+    expect(response).not.toContain("timeout.invalid");
+    expect(response).not.toContain("raw-list-models-timeout-params");
+    expect(parsed.error.data).not.toHaveProperty("params");
+  });
+
   it("retries code_loop_result once with the same work id after a transient transport failure", async () => {
     const requests: Array<Record<string, unknown>> = [];
     const bridge = await makeBridge(async (_input, init) => {
@@ -416,6 +465,51 @@ describe("m5 stdio MCP conformance", () => {
     });
     expect(response).not.toContain(SECRET);
     expect(response).not.toContain("private.invalid");
+  });
+
+  it("reports a redacted list_models DNS cause as a connector transport failure", async () => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError(`fetch failed with Bearer ${SECRET}`), {
+        cause: Object.assign(
+          new Error(`getaddrinfo ENOTFOUND dns-only.invalid/${SECRET}`),
+          { code: "ENOTFOUND" },
+        ),
+      });
+    });
+    const request = {
+      jsonrpc: "2.0",
+      id: 25,
+      method: "tools/call",
+      params: {
+        name: "list_models",
+        arguments: {
+          credential: SECRET,
+          locator: "https://dns-only.invalid/raw",
+          request_tag: "raw-list-models-dns-params",
+        },
+      },
+    };
+
+    const response = await bridge.handleLine(JSON.stringify(request));
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 25,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "dns_failure",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation:
+            "Retry the same operation once. If it still fails, run m5 --profile codex doctor; the standalone doctor tests the configured profile path and explicitly reports that it cannot inspect the host connector session itself.",
+        },
+      },
+    });
+    expect(response).not.toContain(SECRET);
+    expect(response).not.toContain("dns-only.invalid");
+    expect(response).not.toContain("raw-list-models-dns-params");
+    expect(parsed.error.data).not.toHaveProperty("params");
   });
 
   it("bounds malformed cyclic cause traversal and returns the residual category", async () => {
