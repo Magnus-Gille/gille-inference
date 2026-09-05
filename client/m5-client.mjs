@@ -1,7 +1,7 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.5";
+export const M5_CLIENT_VERSION = "1.3.6";
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.

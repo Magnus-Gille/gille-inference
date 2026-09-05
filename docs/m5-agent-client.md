@@ -13,11 +13,11 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`. Install the current accepted client
-package with an exact pin:
+The `m5` executable ships in the same npm package as `hs`. For the coordinated v9 rollout,
+publish and verify the accepted 1.3.6 artifact before using this exact installation pin:
 
 ```bash
-npm install --global gille-inference@1.3.5
+npm install --global gille-inference@1.3.6
 m5 --version
 ```
 
@@ -30,6 +30,15 @@ terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bo
 `writable-v1` result contract and rejects older unscoped terminal results. Version `1.3.4`
 requires bounded global turn accounting, explicit completion state, and check skip reasons.
 Version `1.3.5` adds a bounded `--timeout-ms` option for direct `m5 ask` calls.
+Version `1.3.6` requires the v9 organic schema-grounding result contract and includes
+redacted discovery-failure diagnostics. Its `code_loop` client rejects v8 results; v8 clients
+likewise reject v9 results. Publish and verify the package, then coordinate the installed
+client and gateway switch while code-loop callers are idle. Existing MCP bridge processes
+must reconnect/restart to load the new client code; changing the executable on disk does
+not update a running process. A package version check alone is not a harness smoke test.
+Rollback is a paired return to the prior accepted gateway revision and client 1.3.5, with
+gateway verification and harness rechecks. Publication itself is not undone by that rollback;
+do not unpublish an accepted package as part of an operational rollback.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
