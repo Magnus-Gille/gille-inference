@@ -106,3 +106,8 @@ password-manager/Keychain item through its prompt, run both approved `m5-auth --
 checks, run `keys preflight`, and only then commit. If either transport reaches a different gateway
 or fails, abort the staged plan and restore the prior selector before investigating. Issue #98's
 retired-key `401` proof remains required after commit.
+
+The public `m5-auth --check` requires an explicitly configured `M5_GATEWAY_URL`,
+`M5_OPENAI_BASE_URL`, or legacy `M5_BASE_URL`; missing configuration exits `2`
+before credential access and must not be treated as evidence of a stale key.
+The separate `m5-auth --check --tailnet` selects the private route explicitly.

@@ -6,7 +6,7 @@
 #
 # Usage:
 #   M5_API_KEY=$(m5-auth)                 # print the token (for a harness env var)
-#   eval "$(m5-auth --env)"               # export token + OpenAI and gateway-root bases
+#   eval "$(m5-auth --env)"               # export token + explicitly configured public bases
 #   eval "$(m5-auth --env --tailnet)"     # as --env, but bases → m5 tailnet :8080 (#109)
 #   m5-auth --check [--tailnet]            # authenticate without emitting the token (#110)
 #   M5_AUTH_FILE=<(m5-auth) ./harness     # bridge for file-based harnesses (bash/zsh)
@@ -36,9 +36,9 @@ usage() {
   cat >&2 <<'USAGE'
 m5-auth — emit the home-server (M5) gateway bearer token from the macOS Keychain.
   m5-auth                      print the token   (for: M5_API_KEY=$(m5-auth))
-  m5-auth --env                print: export M5_API_KEY + M5_OPENAI_BASE_URL + M5_GATEWAY_URL
+  m5-auth --env                export key + explicitly configured public bases (no loopback fallback)
   m5-auth --env --tailnet      as --env, but bases → m5 tailnet (:8080, bypasses Cloudflare)
-  m5-auth --check              safely verify Keychain presence, reachability, and authentication
+  m5-auth --check              verify credential and reachability (requires configured public base)
   m5-auth --check --tailnet    run the same non-emitting check against the tailnet gateway
   M5_AUTH_FILE=<(m5-auth) …    bridge a file-based harness (no on-disk file)
 M5_OPENAI_BASE_URL ends in /v1 (for /chat/completions); M5_GATEWAY_URL has no /v1
@@ -71,10 +71,14 @@ prepare_env_bases() {
   elif [ "$has_openai" -eq 1 ]; then
     M5_AUTH_OPENAI_BASE_URL="${M5_OPENAI_BASE_URL%/}"
     M5_AUTH_GATEWAY_URL="${M5_AUTH_OPENAI_BASE_URL%/v1}"
-  else
-    M5_AUTH_OPENAI_BASE_URL="${M5_BASE_URL:-http://127.0.0.1:8080/v1}"
+  elif [ "$has_legacy" -eq 1 ]; then
+    M5_AUTH_OPENAI_BASE_URL="$M5_BASE_URL"
     M5_AUTH_OPENAI_BASE_URL="${M5_AUTH_OPENAI_BASE_URL%/}"
     M5_AUTH_GATEWAY_URL="${M5_AUTH_OPENAI_BASE_URL%/v1}"
+  else
+    echo "m5-auth: public gateway is not configured; set M5_GATEWAY_URL, M5_OPENAI_BASE_URL, or M5_BASE_URL." >&2
+    echo "m5-auth: use --tailnet for the explicitly selected private route." >&2
+    exit 2
   fi
   M5_AUTH_OPENAI_BASE_URL="${M5_AUTH_OPENAI_BASE_URL%/}"
   M5_AUTH_GATEWAY_URL="${M5_AUTH_GATEWAY_URL%/}"
