@@ -309,7 +309,16 @@ runs within its separate 120-second cage budget. `check.skip_reason` explains ev
 ## 9. Logging / data collection (RQ6/RQ7 — first-class goal)
 
 - **Per turn, for free (verified by two judge lenses):** every pi→gateway call lands in `request_log` (content-blind: alias/tier/model/ttft/tokens) and **`owner_request_log`** (full prompt + completion — `gateway.ts:791` fires because the service key is a real keystore owner key with `keyHash !== null`) under the `code-loop-<ts>` alias. This is the Claude→local agentic-delegation dataset the project exists to collect, cleanly separable from interactive `ask` traffic, with zero new logging code and zero drift risk.
-- **Per run:** one `recordDelegation()` row (`ledger.ts:152`): `task_type` from the request, `model_id`, `source: "code-loop"` (so `getVerdict()` learns agentic-loop capability as a separate evidence lane from single-shot), tokens/latency aggregated from NDJSON events, `verifier: "check-cmd"` when supplied. Outcome mapping: `check_cmd` exit 0 → `pass`; nonzero → `fail`; no `check_cmd` → `unverified`; cap kill → `error/timeout`; spawn/lease/cage failure → `error/infra`; **degeneracy abort → `error/infra`** (serving-layer pathology — must not poison the 80b's capability verdict).
+- **Per run:** one `recordDelegation()` row: resolved `task_type`, `model_id`,
+  `source: "code-loop"`, and aggregated tokens/latency. The verifier is
+  `owner-schema-checks-v1` when schema checks are configured; otherwise `check-cmd` when
+  an owner check is supplied, or null. Non-completed runs retain their existing outcome:
+  cap kill → `error/timeout`; spawn/lease/cage failure or degeneracy → `error/infra`.
+  For completed runs, failed grounding → `fail`, skipped grounding → `unverified`, and
+  either state withholds diff/summary. Only after grounding passes (or was not requested)
+  can a successful owner `check_cmd` produce `pass`; a nonzero check produces `fail` and
+  an absent check remains `unverified`. Schema-check diagnostics remain in the owner-only
+  result; the ledger verifier is a fixed label, not an owner-supplied name or command.
 - **Per run artifacts:** pi's NDJSON event log + `.meta.json` retained in the sandbox for the TTL window (post-mortems, fixture mining).
 - **Metrics:** `homeserver_code_loop_runs_total{status}`, `homeserver_code_loop_active`, interleaved-other-model counter (§8) — content-blind, consistent with `metrics.ts` discipline.
 - Once ≥8 verified runs exist: add the `code-implement`-agentic vs single-shot comparison to `docs/m5-routing.json` — the actual RQ7 payoff.

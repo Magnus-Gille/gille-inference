@@ -454,7 +454,8 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
 - `code_loop_status` — `{work_id}` → `{status, usage}`.
 - `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), permitted
   `changed_files`, machine-readable `scope_violations`, `protected_violations`, pi's `summary`,
-  `completion_state`, the `check` result (including `skip_reason`), bounded `usage`, immutable effective
+  `completion_state`, the `check` result (including `skip_reason`), named `schema_grounding`
+  results, bounded `usage`, immutable effective
   `execution`, content-blind `telemetry`, and immutable agent-side `agent_checks`. The latter is
   derived only from real pi bash tool start/end events and exposes normalized check kind, command
   fingerprint, relative timing, order, status, and observed exit code—never command text, paths,
@@ -476,8 +477,11 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   mtime. Cached results from an older/incompatible evidence contract fail closed as
   `terminal-unavailable` instead of being stamped with current capabilities.
   `status ∈ completed | cap-exceeded | degenerate |
-  arm-error | orphaned` — there is deliberately **no** `pass` status; `completed` +
-  `check.exit_code === 0` is the only pass signal.
+  arm-error | orphaned` — there is deliberately **no** `pass` status. Ledger pass requires
+  `completed`, a run `check` with `exit_code === 0`, and `schema_grounding.state` equal to
+  `passed` or `not-requested`. Failed/skipped grounding withholds `diff` and `summary` and
+  prevents pass; named check diagnostics remain visible. The resolved `unit-test-gen` type
+  requires grounding checks at admission, so it cannot take the `not-requested` path.
 
 **The OS cage (Phase-1 ship gate).** pi's `bash` and `check_cmd` (which imports model-edited
 source — RCE by construction) run as the gateway uid, which owns `.env` + `data/eval.db`. Both
