@@ -48,7 +48,7 @@ Current issue bodies and acceptance evidence win over historical issue titles.
 | **M2 — Auditable usefulness baseline** | Exact model/task feedback works and a reproducible organic-use report states what is proven, failed, or unknown | **Next:** Exporter shipped ([#256](https://github.com/Magnus-Gille/gille-inference/pull/256)/[#275](https://github.com/Magnus-Gille/gille-inference/pull/275)); exact feedback [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) and bounded report [#245](https://github.com/Magnus-Gille/gille-inference/issues/245) remain |
 | **M3 — One qualified automatic lane** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): select/qualify lane [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) → canary integration [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) → outcome [#288](https://github.com/Magnus-Gille/gille-inference/issues/288). Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow |
 
-#### M1 activities and acceptance
+#### M1 activities and acceptance — historical contract (completed 2026-09-06)
 
 **Accepted outcome (2026-09-06):** the
 [published receipt](https://github.com/Magnus-Gille/gille-inference/issues/285#issuecomment-5561882175)
@@ -61,9 +61,15 @@ Both jobs completed cleanup, and final health, version and source verification p
 Known-good gateway/client rollback artifacts were verified before the switch. Rollback readiness
 is artifact/baseline verification here, not a claim that rollback was newly exercised in this
 successful attempt. Idle work/bridge checks preceded the switch; disk installation was not
-treated as refreshing an already-running bridge. Exact operational evidence stays private.
+treated as refreshing an already-running bridge. The pre-switch check found no active code-loop
+units, so there was no in-flight v8 code-loop work to carry across the v9 switch; this is an
+idle-window result, not evidence that mixed-version in-flight execution is supported. Exact
+operational evidence stays private.
 
-The following is the retained acceptance contract, not an outstanding task list. Source history
+The numbered contract below is the historical M1 acceptance boundary completed on 2026-09-06,
+not a current task list. Its imperative verbs describe the requirements for that completed
+acceptance, not future instructions. The conditional rollback requirement was not triggered.
+Source history
 remains in [#277](https://github.com/Magnus-Gille/gille-inference/pull/277),
 [#278](https://github.com/Magnus-Gille/gille-inference/pull/278),
 [#282](https://github.com/Magnus-Gille/gille-inference/pull/282), and
