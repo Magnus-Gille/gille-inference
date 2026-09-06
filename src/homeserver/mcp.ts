@@ -9,6 +9,8 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
+import { bindExecutionFeedback, executionFeedbackOwner } from "./execution-feedback.js";
+import { parseExecutionTrafficPurpose, type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
 import { buildDelegationCostTrace, tryRecordDelegationCost } from "./delegation-cost.js";
 import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
@@ -262,6 +264,7 @@ const ASK_OUTPUT_SCHEMA = {
     truncated: { type: ["boolean", "null"] },
     metered: { const: true },
     usage: ASK_USAGE_OUTPUT_SCHEMA,
+    feedback_handle: { type: "string" },
   },
   required: ["model", "text", "finish_reason", "truncated", "metered", "usage"],
 } as const;
@@ -475,6 +478,7 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
         properties: {
           model: { type: "string", description: "one of the available model ids (see list_models)" },
           prompt: { type: "string", description: "the task / question for the model" },
+          traffic_purpose: { type: "string", enum: ["organic", "evaluation", "synthetic"], description: "Purpose fixed before execution; omission remains unknown." },
           system: { type: "string", description: "optional system instruction" },
           max_tokens: { type: "number", description: "optional cap on the completion length" },
           output_profile: {
@@ -588,6 +592,7 @@ export interface RunChatArgs {
    * dormant until a real caller supplies one" shape the delegate lane had between #28 and #32.
    */
   learningTaskStamp?: HuginRequestStamp;
+  trafficPurpose?: ExecutionTrafficPurpose;
 }
 
 interface AskUsageMetadata {
@@ -607,6 +612,7 @@ export type RunChatResult =
       finishReason: string | null;
       truncated: boolean | null;
       usage: AskUsageMetadata;
+      feedbackHandle?: string;
     }
   | {
       ok: false;
@@ -708,6 +714,7 @@ function toAskStructuredContent(
   finish_reason: string | null;
   truncated: boolean | null;
   metered: true;
+  feedback_handle?: string;
   usage: {
     prompt_tokens: number | null;
     completion_tokens: number | null;
@@ -723,6 +730,7 @@ function toAskStructuredContent(
     finish_reason: result.finishReason,
     truncated: result.truncated,
     metered: true,
+    ...(result.feedbackHandle ? { feedback_handle: result.feedbackHandle } : {}),
     usage: {
       prompt_tokens: result.usage.promptTokens,
       completion_tokens: result.usage.completionTokens,
@@ -937,6 +945,7 @@ export async function runChatCompletion(
   // (timeout / connection reset) the finally reconciles credits + the quota estimate to ZERO —
   // a failed request is never billed.
   let actualTokens = 0;
+  let completedResult: Extract<RunChatResult, { ok: true }> | undefined;
   // M2: carries the classified upstream failure kind so the finally / request_log row records
   // the distinct outcome + status label (upstream_unavailable → 502 / upstream_timeout → 504)
   // instead of collapsing both into the generic "error"/502. Mirrors the HTTP path's lctx.
@@ -1033,7 +1042,7 @@ export async function runChatCompletion(
         outcome: "ok",
       });
     }
-    return {
+    completedResult = {
       ok: true,
       text: content,
       totalTokens: actualTokens,
@@ -1041,6 +1050,7 @@ export async function runChatCompletion(
       truncated,
       usage: usageMetadata,
     };
+    return completedResult;
   } catch (err) {
     // R6 (graceful degradation): the upstream fetch threw — connection refused/reset (backend
     // down) or the AbortSignal timeout fired (slow / cold-loading backend). Map it to a structured
@@ -1182,6 +1192,22 @@ export async function runChatCompletion(
           keyAlias: principal.alias,
           evidenceIdentity,
         });
+        const feedbackOwner = executionFeedbackOwner(principal);
+        if (feedbackOwner && completedResult) {
+          try {
+            const handle = bindExecutionFeedback({
+              ledgerId,
+              owner: feedbackOwner,
+              surface: "ask",
+              trafficPurpose: args.trafficPurpose ?? "unknown",
+              outputAvailable: !completedResult.truncated && completedResult.text.length > 0,
+            });
+            if (handle) completedResult.feedbackHandle = handle;
+          } catch {
+            // Keep independent cost telemetry and completed output intact if this overlay fails.
+            console.error("[execution-feedback] ask binding failed; completed output preserved");
+          }
+        }
         if (cfg.delegationCostLog === "on") {
           tryRecordDelegationCost(
             buildDelegationCostTrace({
@@ -1294,6 +1320,10 @@ async function callTool(
       };
     }
     const delegatorModelId = typeof rawDelegatorModelId === "string" ? rawDelegatorModelId : undefined;
+    const trafficPurpose = parseExecutionTrafficPurpose(args["traffic_purpose"]);
+    if (!trafficPurpose.ok) {
+      return { text: "Invalid traffic_purpose.", isError: true, trace: badRequestTrace() };
+    }
     if (model === "" || prompt === "") {
       return { text: "Both 'model' and 'prompt' are required.", isError: true, trace: badRequestTrace() };
     }
@@ -1385,6 +1415,7 @@ async function callTool(
       model,
       messages,
       exposureTaskText: prompt,
+      trafficPurpose: trafficPurpose.value,
       maxTokens,
       delegatorModelId,
       temperature: args["temperature"] as number | undefined,
@@ -1426,6 +1457,7 @@ async function callTool(
       () => ctx.controller.snapshot().maintenanceMode === true,
       {
         authenticatedPrincipalId: ctx.principal.alias,
+        feedbackOwner: executionFeedbackOwner(ctx.principal),
         authentication: "gateway-owner-auth",
         gatewayRequestId: ctx.gatewayRequestId,
         capabilityEpoch: ctx.learningTaskCapabilityEpoch,

@@ -222,6 +222,7 @@ export function codeLoopRequestFingerprint(
   const canonical = {
     schema_version: 1,
     instruction: req.instruction,
+    ...(req.traffic_purpose === undefined ? {} : { traffic_purpose: req.traffic_purpose }),
     files: req.files.map((f) => ({ path: f.path, content: f.content })),
     check_cmd: req.check_cmd ?? null,
     ...(req.schema_checks === undefined ? {} : { schema_checks: req.schema_checks.map(({ name, command }) => ({ name, command })) }),

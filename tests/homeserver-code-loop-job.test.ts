@@ -117,6 +117,7 @@ function fakeDeps(over: {
   now?: () => number;
   learningTaskAdmission?: CodeLoopDeps["learningTaskAdmission"];
   keyAlias?: string;
+  feedbackOwner?: CodeLoopDeps["feedbackOwner"];
   cleanupUnit?: (unit: string) => Promise<void>;
   runCommand?: CodeLoopDeps["runCommand"];
 } = {}): CodeLoopDeps {
@@ -135,6 +136,7 @@ function fakeDeps(over: {
       ? {}
       : { learningTaskAdmission: over.learningTaskAdmission }),
     keyAlias: over.keyAlias ?? null,
+    ...(over.feedbackOwner === undefined ? {} : { feedbackOwner: over.feedbackOwner }),
     readinessProbe: async () => true,
     maintenanceMode: () => over.maintenance === true,
     growthCapBytes: 50 * 1024 * 1024,
@@ -1930,6 +1932,136 @@ describe("code_loop_start caller idempotency (#251)", () => {
 
     expect(getJobStatus(retry.work_id, workroot)?.status).toBe("completed");
     expect(getJobResult(retry.work_id, workroot).kind).toBe("result");
+  });
+
+  it("retains one exact feedback handle across terminal recovery and rejects purpose relabelling", async () => {
+    const request = { ...baseRequest, client_run_id: "exact-feedback-recovery", traffic_purpose: "organic" as const };
+    const deps = { ...fakeDeps({ keyAlias: "feedback-owner" }), feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" } };
+    const started = await startCodeLoop(request, startCfg(), deps);
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+    const initial = getJobResult(started.work_id, workroot);
+    if (initial.kind !== "result") throw new Error("result missing");
+    const handle = (initial.result as unknown as { feedback_handle?: string }).feedback_handle;
+    expect(handle).toMatch(/^[a-f0-9-]{36}$/);
+    expect(initial.result.summary).toBe("done");
+    const binding = getDb().prepare(`SELECT e.handle, e.traffic_purpose, d.model_id, d.source
+      FROM execution_feedback e JOIN delegations d ON d.id = e.ledger_id WHERE e.handle = ?`).get(handle!) as {
+        handle: string; traffic_purpose: string; model_id: string; source: string;
+      };
+    expect(binding).toMatchObject({ handle, traffic_purpose: "organic", model_id: "qwen3-coder-next-80b", source: "code-loop" });
+    expect(getDb().prepare("SELECT available FROM execution_feedback WHERE handle = ?").get(handle!)).toEqual({ available: 1 });
+    // Model output is durably retained separately from the exact feedback row. This simulates a
+    // crash after the terminal result was committed but before the availability publication.
+    getDb().prepare("UPDATE execution_feedback SET available = 0 WHERE handle = ?").run(handle!);
+    _resetCodeLoopStateForTests();
+    const recovered = await startCodeLoop(request, startCfg(), deps);
+    expect(recovered).toMatchObject({ ok: true, recovered: true, result: { feedback_handle: handle } });
+    if (recovered.ok) expect(recovered.result?.summary).toBe("done");
+    expect(getDb().prepare("SELECT COUNT(*) AS n, MIN(available) AS available FROM execution_feedback WHERE handle = ?").get(handle!)).toEqual({ n: 1, available: 1 });
+    const relabelled = await startCodeLoop({ ...request, traffic_purpose: "synthetic" as const }, startCfg(), deps);
+    expect(relabelled).toMatchObject({ ok: false, refusal: "conflict" });
+  });
+
+  it("withholds an exact feedback handle when the terminal durable result write fails", async () => {
+    const request = { ...baseRequest, client_run_id: "exact-feedback-persist-failure", traffic_purpose: "organic" as const };
+    const deps = fakeDeps({
+      keyAlias: "feedback-owner",
+      feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" },
+    });
+    const persistSpy = vi.spyOn(codeLoopStore, "persistDurableCodeLoopRun").mockImplementation(() => {
+      throw new Error("forced terminal persistence failure");
+    });
+    try {
+      const started = await startCodeLoop(request, startCfg(), deps);
+      if (!started.ok) throw new Error("start failed");
+      await waitForTerminal(started.work_id);
+      const result = getJobResult(started.work_id, workroot);
+      if (result.kind !== "result") throw new Error("result missing");
+      expect(result.result.feedback_handle).toBeUndefined();
+      const durable = readDurableCodeLoopRunByWork(workroot, started.work_id);
+      expect(durable).toMatchObject({ status: "running", result: null });
+      const pending = getDb().prepare(`SELECT e.available, e.traffic_purpose, d.source
+        FROM execution_feedback e JOIN delegations d ON d.id = e.ledger_id
+        WHERE d.source = 'code-loop' AND e.traffic_purpose = 'organic'
+        ORDER BY e.rowid DESC LIMIT 1`).get() as { available: number; traffic_purpose: string; source: string } | undefined;
+      expect(pending).toEqual({ available: 0, traffic_purpose: "organic", source: "code-loop" });
+    } finally {
+      persistSpy.mockRestore();
+    }
+  });
+
+  it("keeps omitted traffic purpose as unknown for a durable owner-bound result", async () => {
+    const request = { ...baseRequest, client_run_id: "exact-feedback-unknown-purpose" };
+    const deps = fakeDeps({
+      keyAlias: "feedback-owner",
+      feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" },
+    });
+    const started = await startCodeLoop(request, startCfg(), deps);
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+    const result = getJobResult(started.work_id, workroot);
+    if (result.kind !== "result") throw new Error("result missing");
+    const handle = result.result.feedback_handle;
+    expect(handle).toMatch(/^[a-f0-9-]{36}$/);
+    expect(getDb().prepare("SELECT traffic_purpose, available FROM execution_feedback WHERE handle = ?").get(handle!)).toEqual({ traffic_purpose: "unknown", available: 1 });
+  });
+
+  it.each([
+    {
+      name: "failed",
+      clientRunId: "exact-feedback-failed",
+      engineRun: async (): Promise<EngineRunResult> => ({
+        outcome: "arm-error",
+        usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+        finalMessage: "",
+        unparseableLines: 0,
+        detail: "forced failure",
+      }),
+    },
+    {
+      name: "truncated",
+      clientRunId: "exact-feedback-truncated",
+      engineRun: async (sandboxDir: string): Promise<EngineRunResult> => {
+        writeFileSync(join(sandboxDir, "a.ts"), `${"x".repeat(220 * 1024)}\n`);
+        return {
+          outcome: "completed",
+          usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+          finalMessage: "large diff",
+          unparseableLines: 0,
+          detail: "",
+        };
+      },
+    },
+    {
+      name: "withheld",
+      clientRunId: "exact-feedback-withheld",
+      engineRun: async (): Promise<EngineRunResult> => ({
+        outcome: "completed",
+        usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+        finalMessage: "",
+        unparseableLines: 0,
+        detail: "",
+      }),
+    },
+  ])("does not mint an exact feedback handle for $name output", async ({ clientRunId, engineRun }) => {
+    const before = getDb().prepare("SELECT COUNT(*) AS n FROM execution_feedback").get() as { n: number };
+    const request = { ...baseRequest, client_run_id: clientRunId, traffic_purpose: "organic" as const };
+    const deps = fakeDeps({
+      keyAlias: "feedback-owner",
+      feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" },
+      engineRun,
+    });
+    const started = await startCodeLoop(request, startCfg(), deps);
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+    const result = getJobResult(started.work_id, workroot);
+    if (result.kind !== "result") throw new Error("result missing");
+    expect(result.result.feedback_handle).toBeUndefined();
+    if (clientRunId === "exact-feedback-truncated") expect(result.result.diff_truncated).toBe(true);
+    if (clientRunId === "exact-feedback-withheld") expect(result.result.summary).toBe("");
+    const after = getDb().prepare("SELECT COUNT(*) AS n FROM execution_feedback").get() as { n: number };
+    expect(after.n).toBe(before.n);
   });
 
   it("fails closed when a cached terminal result predates the current harness evidence contract", async () => {

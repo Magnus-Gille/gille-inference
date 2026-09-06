@@ -52,6 +52,7 @@ export interface CodeLoopCapsConfig {
 }
 
 export interface CodeLoopRequest {
+  traffic_purpose?: "organic" | "evaluation" | "synthetic";
   /** Optional durable idempotency key. Same id + same canonical request returns the same run. */
   client_run_id?: string;
   /** Optional dual-read LearningTaskContract v1 stamp; validated before any new admission. */
@@ -178,6 +179,8 @@ export interface CodeLoopTelemetry {
 }
 
 export interface CodeLoopResult {
+  /** Exact owner-bound feedback identity; survives durable result recovery. */
+  feedback_handle?: string;
   status: CodeLoopTerminalStatus;
   /** Whether the agent reached a clean completion before a terminal limit/failure. */
   completion_state: "complete" | "unfinished";
@@ -315,6 +318,7 @@ export interface CodeLoopDeps {
   };
   /** Authenticated key alias persisted on the derived capability-ledger row. */
   keyAlias?: string | null;
+  feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
   /** Poll gateway/model readiness after a suspected degeneracy abort; resolves ready?. */
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */

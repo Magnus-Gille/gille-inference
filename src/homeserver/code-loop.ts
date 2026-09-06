@@ -2,6 +2,8 @@ import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSy
 import { dirname, join, sep, resolve, isAbsolute, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
+import { bindExecutionFeedback, publishDurableExecutionFeedback } from "./execution-feedback.js";
+import { parseExecutionTrafficPurpose } from "./execution-feedback-contract.js";
 import type {
   CodeLoopRequest,
   CodeLoopCaps,
@@ -187,6 +189,7 @@ export function codeLoopToolDefs(): unknown[] {
               "fresh authenticated preflight and is echoed only after durable admission",
           },
           instruction: { type: "string", minLength: 1, description: "the complete self-contained task prompt" },
+          traffic_purpose: { type: "string", enum: ["organic", "evaluation", "synthetic"] },
           files: {
             type: "array",
             description: "seed files (relative paths); required in Phase 1",
@@ -372,6 +375,7 @@ export type StructuralValidateResult =
 
 /** Immutable shape/size checks required before safely deriving the durable request identity. */
 export function validateCodeLoopRequestStructure(req: CodeLoopRequest): StructuralValidateResult {
+  if (!parseExecutionTrafficPurpose(req.traffic_purpose).ok) return { ok: false, message: "Invalid traffic_purpose." };
   const schemaError = validateSchemaChecks(req.schema_checks);
   if (schemaError !== null) return { ok: false, message: schemaError };
   try {
@@ -1418,6 +1422,9 @@ export async function startCodeLoop(
 }
 
 function startResultFromRecord(record: DurableCodeLoopRun, recovered: boolean): Extract<CodeLoopStartResult, { ok: true }> {
+  if (record.result?.feedback_handle && isCurrentCodeLoopResult(record.result)) {
+    publishDurableExecutionFeedback(record.result.feedback_handle);
+  }
   return {
     ok: true,
     work_id: record.work_id,
@@ -2029,6 +2036,9 @@ async function finalizeJobWithResult(
   job.status = result.status;
   job.result = result;
   job.usage = result.usage;
+  // Bind the exact ledger row before persisting the terminal result. A recovered start/result
+  // reads this same handle and never re-executes the job or appends another ledger row.
+  writeLedger(job, result.status, req, deps, result.check, evidenceIdentity);
   writeMeta(job.sandboxDir, {
     work_id: job.id,
     status: result.status,
@@ -2037,9 +2047,14 @@ async function finalizeJobWithResult(
     started_at_ms: job.startedAtMs,
     cleanup_pending: job.cleanupPending,
   });
-  persistJobDurable(job);
+  if (persistJobDurable(job)) {
+    if (result.feedback_handle) publishDurableExecutionFeedback(result.feedback_handle);
+  } else {
+    // A prepared binding is not a completed/retrievable denominator. Recovery can publish it
+    // only if the authoritative terminal file actually committed before the write failure.
+    delete result.feedback_handle;
+  }
   recordCodeLoopRun(result.status);
-  writeLedger(job, result.status, req, deps, result.check, evidenceIdentity);
 }
 
 /** Used only for the pre-run lease/spawn refusal (no engine result yet). */
@@ -2077,7 +2092,7 @@ async function finalizeJob(
   writeLedger(job, status, req, deps, check, evidenceIdentity);
 }
 
-function persistJobDurable(job: Job): void {
+function persistJobDurable(job: Job): boolean {
   try {
     persistDurableCodeLoopRun(job.workroot, {
       schema_version: 1,
@@ -2093,8 +2108,10 @@ function persistJobDurable(job: Job): void {
         ? { learning_task_gateway_echo: job.learningTaskGatewayEcho }
         : {}),
     });
+    return true;
   } catch (err) {
     console.error("[code-loop] durable idempotency update failed:", err);
+    return false;
   }
 }
 
@@ -2118,7 +2135,7 @@ function writeLedger(
 ): void {
   const { outcome, errorClass } = ledgerOutcome(status, check, job.result?.schema_grounding);
   try {
-    recordDelegation({
+    const ledgerId = recordDelegation({
       taskType: job.taskType,
       modelId: job.model,
       prompt: req.instruction,
@@ -2132,6 +2149,16 @@ function writeLedger(
       keyAlias: deps.keyAlias ?? null,
       evidenceIdentity,
     });
+    if (deps.feedbackOwner && job.result) {
+      const handle = bindExecutionFeedback({
+        ledgerId, owner: deps.feedbackOwner, surface: "code_loop",
+        trafficPurpose: req.traffic_purpose ?? "unknown",
+        deferAvailability: true,
+        outputAvailable: status === "completed" && !job.result.diff_truncated
+          && (job.result.diff.length > 0 || job.result.summary.length > 0),
+      });
+      if (handle) job.result.feedback_handle = handle;
+    }
   } catch (err) {
     // Never let a telemetry write break the run.
     console.error("[code-loop] ledger write failed (ignored):", err);
@@ -2162,7 +2189,10 @@ export function getJobResult(workId: string, workroot?: string): GetResultOutcom
   const durable = workroot === undefined ? null : readDurableCodeLoopRunByWork(workroot, workId);
   if (durable === null) return { kind: "unknown" };
   const compatible = workroot === undefined ? durable : failClosedIncompatibleResult(workroot, durable);
-  if (compatible.result !== null) return { kind: "result", result: compatible.result };
+  if (compatible.result !== null) {
+    if (compatible.result.feedback_handle) publishDurableExecutionFeedback(compatible.result.feedback_handle);
+    return { kind: "result", result: compatible.result };
+  }
   if (compatible.status === "running") return { kind: "running" };
   return { kind: "terminal-unavailable", status: compatible.status };
 }

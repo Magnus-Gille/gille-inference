@@ -2,7 +2,8 @@ import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import type { HomeserverConfig } from "./config.js";
-import type { CodeLoopDeps, CodeLoopRequest } from "./code-loop-types.js";
+import type { CodeLoopDeps, CodeLoopRequest, CodeLoopResult } from "./code-loop-types.js";
+import { ownsExecutionFeedback } from "./execution-feedback.js";
 import { startCodeLoop, getJobStatus, getJobResult, type CodeLoopStartConfig } from "./code-loop.js";
 import type { AgentEngine } from "./code-loop-types.js";
 import { makePiEngine, realSpawnPi, makeLlamaSwapReadinessProbe } from "./pi-engine.js";
@@ -113,6 +114,7 @@ export interface CodeLoopRuntime {
  * controller.
  */
 export interface CodeLoopGatewayContext {
+  feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
   authenticatedPrincipalId: string;
   authentication: "gateway-owner-auth" | "service-auth";
   gatewayRequestId: string;
@@ -195,6 +197,7 @@ export function buildCodeLoopRuntime(
     spawnPi: realSpawnPi,
     now: Date.now,
     keyAlias: gatewayContext?.authenticatedPrincipalId ?? null,
+    feedbackOwner: gatewayContext?.feedbackOwner ?? null,
     ...(gatewayContext === undefined
       ? {}
       : {
@@ -351,6 +354,11 @@ export async function handleCodeLoopTool(
   gatewayContext: CodeLoopGatewayContext,
 ): Promise<{ text: string; isError: boolean }> {
   const { startConfig, deps } = buildCodeLoopRuntime(cfg, maintenanceMode, gatewayContext);
+  const callerResult = (result: CodeLoopResult): CodeLoopResult => {
+    if (!result.feedback_handle || ownsExecutionFeedback(result.feedback_handle, gatewayContext.feedbackOwner ?? null)) return result;
+    const { feedback_handle: _privateHandle, ...rest } = result;
+    return rest;
+  };
 
   if (name === "code_loop_start") {
     if (Object.hasOwn(args, "client_run_id") && typeof args["client_run_id"] !== "string") {
@@ -374,6 +382,7 @@ export async function handleCodeLoopTool(
       }
     }
     const req: CodeLoopRequest = {
+      ...(Object.hasOwn(args, "traffic_purpose") ? { traffic_purpose: args["traffic_purpose"] as CodeLoopRequest["traffic_purpose"] } : {}),
       client_run_id: typeof args["client_run_id"] === "string" ? (args["client_run_id"] as string) : undefined,
       ...(learningTaskStamp === undefined ? {} : { learning_task_stamp: learningTaskStamp }),
       instruction: typeof args["instruction"] === "string" ? (args["instruction"] as string) : "",
@@ -398,7 +407,7 @@ export async function handleCodeLoopTool(
           ...(r.learning_task_gateway_echo !== undefined
             ? { learning_task_gateway_echo: r.learning_task_gateway_echo }
             : {}),
-          ...(r.result !== undefined ? { result: r.result } : {}),
+          ...(r.result !== undefined ? { result: callerResult(r.result) } : {}),
           capabilities: r.capabilities,
         }),
         isError: false,
@@ -435,7 +444,7 @@ export async function handleCodeLoopTool(
         isError: true,
       };
     }
-    return { text: JSON.stringify(r.result), isError: false };
+    return { text: JSON.stringify(callerResult(r.result)), isError: false };
   }
 
   // Unreachable (mcp.ts only routes the three names here) — defensive.
