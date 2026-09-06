@@ -96,6 +96,8 @@ DEPLOY_UNIT="${DEPLOY_UNIT:-home-gateway.service}"
 # always-required probe of the box's real listener is DEPLOY_HEALTH_TAILNET_URL, unchanged.
 DEPLOY_HEALTH_LOCAL_URL="${DEPLOY_HEALTH_LOCAL_URL:-}"
 DEPLOY_HEALTH_TAILNET_URL="${DEPLOY_HEALTH_TAILNET_URL:-}"
+# An explicitly empty value is invalid, not a request to use the default.
+DEPLOY_HEALTH_READY_TIMEOUT_S="${DEPLOY_HEALTH_READY_TIMEOUT_S-30}"
 DEPLOY_CAPABILITY_URL="${DEPLOY_CAPABILITY_URL:-}"
 DEPLOY_CAPABILITY_KEY_ENV="${DEPLOY_CAPABILITY_KEY_ENV:-HOMESERVER_OWNER_KEY}"
 # Cloudflare's edge, not the HTTP Tunnel origin, owns HTTPS redirects and HSTS. The public
@@ -365,6 +367,47 @@ probe_health() {
   echo "  OK: $label healthy ($url)"
 }
 
+# Only deployment listener readiness is retried. Authentication, public-edge, source and
+# marker checks remain independent gates. Never print the URL or response body here.
+probe_tailnet_readiness() {
+  local deadline remaining attempt_timeout http_code curl_status
+  deadline=$((SECONDS + DEPLOY_HEALTH_READY_TIMEOUT_S))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    remaining=$((deadline - SECONDS))
+    # Crossing a clock tick between the loop check and this read must not give curl 0
+    # (which means no timeout), or a negative timeout.
+    if [ "$remaining" -le 0 ]; then break; fi
+    attempt_timeout=3
+    if [ "$remaining" -lt "$attempt_timeout" ]; then attempt_timeout="$remaining"; fi
+    # -q must be first: a user's curlrc must not enable redirects, retries, or output files.
+    if http_code="$(curl -q -sS -o /dev/null -w '%{http_code}' \
+      --max-time "$attempt_timeout" -- "$DEPLOY_HEALTH_TAILNET_URL" 2>/dev/null)"; then
+      curl_status=0
+    else
+      curl_status=$?
+    fi
+    if [[ ! "$http_code" =~ ^[0-9]{3}$ ]]; then
+      echo "ERROR: tailnet readiness returned an invalid HTTP status; refusing certification." >&2
+      return 1
+    fi
+    if [ "$curl_status" -eq 0 ] && [ "$http_code" = 200 ] && [ "$SECONDS" -lt "$deadline" ]; then
+      echo "  OK: tailnet healthy (HTTP 200 within readiness budget)"
+      return 0
+    fi
+    case "$curl_status:$http_code" in
+      7:*|28:*|0:503) ;; # Refused/not-yet-listening, timeout, or explicit unavailable.
+      0:200) break ;; # A late response cannot certify a missed deadline.
+      *)
+        echo "ERROR: tailnet readiness failed (curl=$curl_status, HTTP=$http_code); not retryable." >&2
+        return 1
+        ;;
+    esac
+    if [ "$SECONDS" -lt "$deadline" ]; then sleep 1; fi
+  done
+  echo "ERROR: tailnet readiness budget exhausted (${DEPLOY_HEALTH_READY_TIMEOUT_S}s; last curl=${curl_status:-none}, HTTP=${http_code:-none}); refusing certification." >&2
+  return 1
+}
+
 # Validate every certification input that a real deploy will need before materializing the
 # payload or touching the remote. Keep this pure: it must not probe the network, expand or print
 # the credential value, or otherwise have side effects. The local health URL is intentionally
@@ -372,6 +415,11 @@ probe_health() {
 validate_deploy_probe_config() {
   local missing=0
   local key_env="$DEPLOY_CAPABILITY_KEY_ENV"
+
+  if [[ ! "$DEPLOY_HEALTH_READY_TIMEOUT_S" =~ ^([1-9]|[1-5][0-9]|60)$ ]]; then
+    echo "ERROR: DEPLOY_HEALTH_READY_TIMEOUT_S must be an integer from 1 through 60 — refusing before any remote mutation." >&2
+    missing=1
+  fi
 
   if [ -z "$DEPLOY_HEALTH_TAILNET_URL" ]; then
     echo "ERROR: DEPLOY_HEALTH_TAILNET_URL is not set — refusing before any remote mutation." >&2
@@ -847,7 +895,7 @@ cmd_deploy() (
     echo "    NOTE: the gateway also serves /mcp -- this drops live MCP transports (clients"
     echo "    reconnect on next call); in-flight async code_loop jobs survive via the durable"
     echo "    SQLite store, not the process."
-    remote_run DEPLOY_RESTART_CMD "sudo systemctl restart '$DEPLOY_UNIT' && sleep 2 && systemctl is-active '$DEPLOY_UNIT'"
+    remote_run DEPLOY_RESTART_CMD "sudo systemctl restart '$DEPLOY_UNIT' && systemctl is-active '$DEPLOY_UNIT'"
   else
     echo "==> Skipping restart -- rsync reported no changes and DEPLOY_FORCE_RESTART is not set."
   fi
@@ -855,7 +903,7 @@ cmd_deploy() (
   echo "==> Probing local health..."
   probe_health "$DEPLOY_HEALTH_LOCAL_URL" "local" 0 || return 1
   echo "==> Probing tailnet health..."
-  probe_health "$DEPLOY_HEALTH_TAILNET_URL" "tailnet" || return 1
+  probe_tailnet_readiness || return 1
   echo "==> Probing authenticated capability endpoint..."
   probe_capability || return 1
   echo "==> Verifying public HTTPS edge..."
@@ -899,6 +947,7 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_HEALTH_LOCAL_URL     (default: unset -- best-effort/non-blocking; the gateway binds only
                               the tailnet interface, so loopback has nothing to probe by default)
   DEPLOY_HEALTH_TAILNET_URL   Required for `deploy` (no safe default -- never hardcode the IP)
+  DEPLOY_HEALTH_READY_TIMEOUT_S  Tailnet readiness budget in seconds (default: 30; integer 1–60)
   DEPLOY_CAPABILITY_URL       Authenticated capability probe URL, required for `deploy`
   DEPLOY_CAPABILITY_KEY_ENV   Name of the env var holding the bearer key (default: HOMESERVER_OWNER_KEY)
   DEPLOY_PUBLIC_HTTP_URL      Required public HTTP origin to validate (no committed hostname default)

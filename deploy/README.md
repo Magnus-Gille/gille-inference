@@ -235,9 +235,21 @@ deployment it did not actually probe):
 `DEPLOY_HEALTH_LOCAL_URL` has **no default** (issue #30 — the gateway binds only the tailnet
 interface, so a default loopback probe could never legitimately answer); set it explicitly only if
 something in your environment actually listens on loopback. `DEPLOY_HEALTH_TAILNET_URL` above is
-the mandatory probe of the box's real listener and is unaffected. The public-edge verification is
+the mandatory probe of the box's real listener. The public-edge verification is
 also mandatory, but runs from the release operator rather than the box so it validates Cloudflare,
 not merely the Tunnel origin.
+
+During `deploy`, tailnet listener readiness requires HTTP **200** within
+`DEPLOY_HEALTH_READY_TIMEOUT_S` (default **30** seconds; integer **1–60**, validated before any
+remote mutation, including when explicitly empty). The script retries only connection refusal
+(curl 7), timeout (curl 28), and HTTP 503, with one-second spacing and each request capped at
+three seconds or the remaining budget, whichever is smaller. Bash's elapsed-second clock has
+one-second granularity; this budget covers readiness polling, not the complete deployment.
+Redirects and other HTTP/transport errors fail immediately; a late success cannot certify a
+missed deadline. Readiness diagnostics omit response bodies and private URLs. This replaces the
+fixed post-restart sleep, not the separate authenticated capability, public-edge, interpreter,
+source-identity or marker gates. On failure, no new marker is written and the later autonomy
+installation steps are not run. No model inference or load is part of readiness polling.
 
 `DEPLOY_REMOTE_HOST` defaults to the `m5` ssh alias and `DEPLOY_REMOTE_DIR` defaults to
 `/home/magnus/home-server-eval`; override either if the live topology ever changes. Run
