@@ -83,6 +83,93 @@ function startOkServer(onHit?: () => void): Promise<{ url: string; close: () => 
   });
 }
 
+/** A local health endpoint with a terminal HTTP status. The request counter lets readiness tests
+ * distinguish immediate terminal failure from an incorrect retry loop. */
+function startHealthStatusServer(
+  status: number | ((hit: number) => number),
+  onHit?: () => void
+): Promise<{ url: string; close: () => Promise<void>; hits: () => number }> {
+  return new Promise((resolvePromise) => {
+    let hitCount = 0;
+    const server = createServer((_req, res) => {
+      hitCount += 1;
+      onHit?.();
+      const responseStatus = typeof status === "function" ? status(hitCount) : status;
+      res.writeHead(
+        responseStatus,
+        responseStatus >= 300 && responseStatus < 400 ? { Location: "/healthz" } : undefined
+      );
+      res.end();
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      const close = () => new Promise<void>((r) => server.close(() => r()));
+      cleanupServers.push(close);
+      resolvePromise({ url: `http://127.0.0.1:${port}/healthz`, close, hits: () => hitCount });
+    });
+  });
+}
+
+/** A local listener that accepts /healthz and never sends a response. curl's per-request deadline
+ * must bound this case; the test remains event-loop friendly because runScript() is asynchronous.
+ */
+function startHangingHealthServer(): Promise<{ url: string; close: () => Promise<void> }> {
+  return new Promise((resolvePromise) => {
+    const server = createServer(() => {
+      // Intentionally leave the response open until curl aborts the request.
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      const close = () => new Promise<void>((r) => server.close(() => r()));
+      cleanupServers.push(close);
+      resolvePromise({ url: `http://127.0.0.1:${port}/healthz`, close });
+    });
+  });
+}
+
+/** Install a PATH-local curl shim that affects only the configured health URL and delegates every
+ * other invocation (including the authenticated capability probe) to the real curl binary. */
+function installHealthCurlStub(
+  remote: string,
+  mode: "refused-once" | "always-refused" | "timeout-once"
+): { fakeBin: string; attemptsFile: string; maxTimeFile: string; realCurl: string } {
+  const fakeBin = tmpDir("dg-curl-bin-");
+  const attemptsFile = join(remote, "TAILNET_HEALTH_ATTEMPTS");
+  const maxTimeFile = join(remote, "TAILNET_HEALTH_MAX_TIMES");
+  const fakeCurl = join(fakeBin, "curl");
+  const realCurl = execFileSync("sh", ["-c", "command -v curl"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    fakeCurl,
+    "#!/bin/sh\n" +
+      "set -eu\n" +
+      "url=\n" +
+      "max_time=\n" +
+      "want_max_time=0\n" +
+      "for arg in \"$@\"; do\n" +
+      "  case \"$arg\" in\n" +
+      "    http://*|https://*) url=\"$arg\" ;;\n" +
+      "  esac\n" +
+      "  if [ \"$want_max_time\" -eq 1 ]; then max_time=\"$arg\"; want_max_time=0; fi\n" +
+      "  if [ \"$arg\" = \"--max-time\" ]; then want_max_time=1; fi\n" +
+      "done\n" +
+      "if [ \"$url\" = \"$DEPLOY_TEST_HEALTH_URL\" ]; then\n" +
+      "  attempts=0\n" +
+      "  if [ -f \"$DEPLOY_TEST_HEALTH_ATTEMPTS_FILE\" ]; then attempts=\"$(cat \"$DEPLOY_TEST_HEALTH_ATTEMPTS_FILE\")\"; fi\n" +
+      "  attempts=$((attempts + 1))\n" +
+      "  printf '%s\\n' \"$attempts\" > \"$DEPLOY_TEST_HEALTH_ATTEMPTS_FILE\"\n" +
+      "  if [ -n \"${DEPLOY_TEST_HEALTH_MAX_TIME_FILE:-}\" ]; then printf '%s\\n' \"$max_time\" >> \"$DEPLOY_TEST_HEALTH_MAX_TIME_FILE\"; fi\n" +
+      (mode === "always-refused"
+        ? "  printf '000\\n'; exit 7\n"
+        : mode === "timeout-once"
+          ? "  if [ \"$attempts\" -eq 1 ]; then printf '000\\n'; exit 28; fi\n"
+          : "  if [ \"$attempts\" -eq 1 ]; then printf '000\\n'; exit 7; fi\n") +
+      "fi\n" +
+      "exec \"$DEPLOY_TEST_REAL_CURL\" \"$@\"\n"
+  );
+  chmodSync(fakeCurl, 0o755);
+  return { fakeBin, attemptsFile, maxTimeFile, realCurl };
+}
+
 /** Stands in for /v1/capabilities/learning-task: 200 only for the expected bearer key.
  *  `onHit` (see startOkServer) fires only on the accepted (200) request. */
 function startCapabilityServer(
@@ -186,6 +273,7 @@ function baseEnv(remoteDir: string, overrides: Partial<Record<string, string>> =
     // Nonempty placeholders let tests that target source/path/install/restart gates get past the
     // deploy-only certification preflight. Tests exercising successful certification override
     // these with real local servers; negative probe tests override the relevant value to empty.
+    DEPLOY_HEALTH_READY_TIMEOUT_S: "3",
     DEPLOY_HEALTH_TAILNET_URL: "http://127.0.0.1:9/healthz",
     DEPLOY_CAPABILITY_URL: "http://127.0.0.1:9/v1/capabilities/learning-task",
     // The live verifier is independently covered below. Fixture deploys must remain offline.
@@ -555,8 +643,221 @@ describe("scripts/deploy-gateway.sh", () => {
       })
     );
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toMatch(/tailnet health probe failed/);
+    expect(r.stderr).toMatch(/tailnet readiness (?:budget exhausted|failed)/i);
     expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+  });
+
+  describe("tailnet readiness polling", () => {
+    it("does not use the old fixed two-second sleep in the default restart command", () => {
+      expect(readFileSync(SCRIPT, "utf8")).not.toContain(
+        "systemctl restart '$DEPLOY_UNIT' && sleep 2 && systemctl is-active '$DEPLOY_UNIT'"
+      );
+    });
+
+    it("retries one transient connection refusal and certifies only after HTTP 200", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const orderLog = join(remote, "ORDER_LOG");
+      const tailnet = await startOkServer(() => appendFileSync(orderLog, "tailnet\n"));
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const curlStub = installHealthCurlStub(remote, "refused-once");
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "3",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_TEST_HEALTH_URL: tailnet.url,
+          DEPLOY_TEST_HEALTH_ATTEMPTS_FILE: curlStub.attemptsFile,
+          DEPLOY_TEST_REAL_CURL: curlStub.realCurl,
+          DEPLOY_RESTART_CMD: `echo restart >> '${orderLog}'`,
+          DEPLOY_UNITS_ENABLE_CMD: `echo enable >> '${orderLog}'`,
+          PATH: `${curlStub.fakeBin}:${process.env.PATH ?? ""}`,
+        })
+      );
+
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(readFileSync(curlStub.attemptsFile, "utf8").trim()).toBe("2");
+      expect(readFileSync(orderLog, "utf8").trim().split("\n")).toEqual([
+        "restart",
+        "tailnet",
+        "enable",
+      ]);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it("retries one HTTP 503 and certifies after the next HTTP 200", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const tailnet = await startHealthStatusServer((hit) => (hit === 1 ? 503 : 200));
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "3",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(tailnet.hits()).toBe(2);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it("exhausts persistent HTTP 503 within the budget without a marker or autonomy mutation", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const enableCalled = join(remote, "AUTONOMY_ENABLE_CALLED");
+      const notifyCalled = join(remote, "AUTONOMY_NOTIFY_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+      const tailnet = await startHealthStatusServer(503);
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "1",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_UNITS_ENABLE_CMD: `touch '${enableCalled}'`,
+          DEPLOY_NOTIFY_INSTALL_CMD: `touch '${notifyCalled}'`,
+        })
+      );
+
+      expect(r.status).not.toBe(0);
+      expect(tailnet.hits()).toBeGreaterThan(0);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+      expect(existsSync(enableCalled)).toBe(false);
+      expect(existsSync(notifyCalled)).toBe(false);
+    });
+
+    it("retries one curl timeout and certifies after the next HTTP 200", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const curlStub = installHealthCurlStub(remote, "timeout-once");
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "3",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_TEST_HEALTH_URL: tailnet.url,
+          DEPLOY_TEST_HEALTH_ATTEMPTS_FILE: curlStub.attemptsFile,
+          DEPLOY_TEST_HEALTH_MAX_TIME_FILE: curlStub.maxTimeFile,
+          DEPLOY_TEST_REAL_CURL: curlStub.realCurl,
+          PATH: `${curlStub.fakeBin}:${process.env.PATH ?? ""}`,
+        })
+      );
+
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(readFileSync(curlStub.attemptsFile, "utf8").trim()).toBe("2");
+      const maxTimes = readFileSync(curlStub.maxTimeFile, "utf8")
+        .trim()
+        .split("\n")
+        .map(Number);
+      expect(maxTimes.length).toBeGreaterThan(0);
+      expect(maxTimes.every((value) => value >= 1 && value <= 3)).toBe(true);
+      expect(maxTimes.every((value, index) => index === 0 || value <= maxTimes[index - 1])).toBe(true);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it("exhausts persistent connection refusal without a marker or autonomy mutation", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const enableCalled = join(remote, "AUTONOMY_ENABLE_CALLED");
+      const notifyCalled = join(remote, "AUTONOMY_NOTIFY_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+      const tailnet = await startOkServer();
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const curlStub = installHealthCurlStub(remote, "always-refused");
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "1",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_TEST_HEALTH_URL: tailnet.url,
+          DEPLOY_TEST_HEALTH_ATTEMPTS_FILE: curlStub.attemptsFile,
+          DEPLOY_TEST_REAL_CURL: curlStub.realCurl,
+          DEPLOY_UNITS_ENABLE_CMD: `touch '${enableCalled}'`,
+          DEPLOY_NOTIFY_INSTALL_CMD: `touch '${notifyCalled}'`,
+          PATH: `${curlStub.fakeBin}:${process.env.PATH ?? ""}`,
+        })
+      );
+
+      expect(r.status).not.toBe(0);
+      expect(Number(readFileSync(curlStub.attemptsFile, "utf8").trim())).toBeGreaterThan(0);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+      expect(existsSync(enableCalled)).toBe(false);
+      expect(existsSync(notifyCalled)).toBe(false);
+    });
+
+    it("bounds a hanging health response by the readiness deadline without a marker or autonomy mutation", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const enableCalled = join(remote, "AUTONOMY_ENABLE_CALLED");
+      const notifyCalled = join(remote, "AUTONOMY_NOTIFY_CALLED");
+      writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+      const hanging = await startHangingHealthServer();
+      const startedAt = Date.now();
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "1",
+          DEPLOY_HEALTH_TAILNET_URL: hanging.url,
+          DEPLOY_CAPABILITY_URL: "http://127.0.0.1:1/unused",
+          DEPLOY_UNITS_ENABLE_CMD: `touch '${enableCalled}'`,
+          DEPLOY_NOTIFY_INSTALL_CMD: `touch '${notifyCalled}'`,
+        })
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(r.status).not.toBe(0);
+      // Leave enough room for process startup/CI scheduling while proving the old 10s curl bound
+      // is not used for a one-second readiness budget.
+      expect(elapsedMs).toBeLessThan(5_000);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+      expect(existsSync(enableCalled)).toBe(false);
+      expect(existsSync(notifyCalled)).toBe(false);
+    }, 15_000);
+
+    it.each([
+      [401, "unauthorized"],
+      [404, "not found"],
+      [302, "redirect"],
+    ])("fails terminal %s health status (%s) without retrying", async (status) => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const enableCalled = join(remote, "AUTONOMY_ENABLE_CALLED");
+      const notifyCalled = join(remote, "AUTONOMY_NOTIFY_CALLED");
+      const tailnet = await startHealthStatusServer(status);
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "3",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+          DEPLOY_UNITS_ENABLE_CMD: `touch '${enableCalled}'`,
+          DEPLOY_NOTIFY_INSTALL_CMD: `touch '${notifyCalled}'`,
+        })
+      );
+
+      expect(r.status).not.toBe(0);
+      expect(tailnet.hits()).toBe(1);
+      expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+      expect(existsSync(enableCalled)).toBe(false);
+      expect(existsSync(notifyCalled)).toBe(false);
+    });
   });
 
   it("leaves the marker absent when the authenticated capability probe is rejected (wrong key)", async () => {
@@ -578,6 +879,40 @@ describe("scripts/deploy-gateway.sh", () => {
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/authenticated capability probe returned HTTP 401/);
     expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+  });
+
+  it("does not arm autonomy or write a marker when capability fails after tailnet readiness", async () => {
+    const src = initSourceRepo();
+    const remote = tmpDir("dg-remote-");
+    const enableCalled = join(remote, "AUTONOMY_ENABLE_CALLED");
+    const notifyCalled = join(remote, "AUTONOMY_NOTIFY_CALLED");
+    const orderLog = join(remote, "ORDER_LOG");
+    const tailnet = await startOkServer(() => appendFileSync(orderLog, "tailnet\n"));
+    const cap = await startCapabilityServer(OWNER_KEY);
+    const curlStub = installHealthCurlStub(remote, "refused-once");
+    const r = await runScript(
+      "deploy",
+      src,
+      baseEnv(remote, {
+        DEPLOY_HEALTH_READY_TIMEOUT_S: "3",
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+        DEPLOY_TEST_HEALTH_URL: tailnet.url,
+        DEPLOY_TEST_HEALTH_ATTEMPTS_FILE: curlStub.attemptsFile,
+        DEPLOY_TEST_REAL_CURL: curlStub.realCurl,
+        HOMESERVER_OWNER_KEY: "wrong-key",
+        DEPLOY_UNITS_ENABLE_CMD: `touch '${enableCalled}'`,
+        DEPLOY_NOTIFY_INSTALL_CMD: `touch '${notifyCalled}'`,
+        PATH: `${curlStub.fakeBin}:${process.env.PATH ?? ""}`,
+      })
+    );
+
+    expect(r.status).not.toBe(0);
+    expect(readFileSync(curlStub.attemptsFile, "utf8").trim()).toBe("2");
+    expect(readFileSync(orderLog, "utf8").trim().split("\n")).toEqual(["tailnet"]);
+    expect(existsSync(join(remote, ".deployed-commit"))).toBe(false);
+    expect(existsSync(enableCalled)).toBe(false);
+    expect(existsSync(notifyCalled)).toBe(false);
   });
 
   it("leaves the marker absent when public HTTPS edge verification fails", async () => {
@@ -1053,6 +1388,75 @@ describe("scripts/deploy-gateway.sh", () => {
         expect(existsSync(restartCalled)).toBe(false);
         expect(readFileSync(join(remote, ".deployed-commit"), "utf8")).toBe("prior-marker\n");
         expect(readFileSync(liveContent, "utf8")).toBe("prior-content\n");
+      }
+    );
+  });
+
+  describe("tailnet readiness budget validation", () => {
+    it("declares a 30-second default readiness budget", () => {
+      expect(readFileSync(SCRIPT, "utf8")).toMatch(
+        /DEPLOY_HEALTH_READY_TIMEOUT_S="\$\{DEPLOY_HEALTH_READY_TIMEOUT_S-30\}"/
+      );
+    });
+
+    it("accepts the 60-second upper bound without waiting for it", async () => {
+      const src = initSourceRepo();
+      const remote = tmpDir("dg-remote-");
+      const tailnet = await startHealthStatusServer(200);
+      const cap = await startCapabilityServer(OWNER_KEY);
+      const r = await runScript(
+        "deploy",
+        src,
+        baseEnv(remote, {
+          DEPLOY_HEALTH_READY_TIMEOUT_S: "60",
+          DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+          DEPLOY_CAPABILITY_URL: cap.url,
+        })
+      );
+
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(tailnet.hits()).toBe(1);
+      expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+    });
+
+    it.each(["", "0", "-1", "61", "1.5", "text"])(
+      "rejects invalid DEPLOY_HEALTH_READY_TIMEOUT_S=%j before payload or remote mutation",
+      async (budget) => {
+        const src = initSourceRepo();
+        const remote = tmpDir("dg-remote-");
+        const remoteAccessed = join(remote, "REMOTE_ACCESSED");
+        const rsyncCalled = join(remote, "RSYNC_CALLED");
+        const installCalled = join(remote, "INSTALL_CALLED");
+        const restartCalled = join(remote, "RESTART_CALLED");
+        const autonomyCalled = join(remote, "AUTONOMY_CALLED");
+        const fakeBin = tmpDir("dg-budget-bin-");
+        writeFileSync(join(remote, ".deployed-commit"), "prior-marker\n");
+        const fakeRsync = join(fakeBin, "rsync");
+        writeFileSync(fakeRsync, `#!/bin/sh\ntouch '${rsyncCalled}'\nexit 1\n`);
+        chmodSync(fakeRsync, 0o755);
+
+        const r = await runScript(
+          "deploy",
+          src,
+          baseEnv(remote, {
+            DEPLOY_HEALTH_READY_TIMEOUT_S: budget,
+            DEPLOY_WORKDIR_PROBE_CMD: `touch '${remoteAccessed}'; echo '${remote}'`,
+            DEPLOY_INSTALL_CMD: `touch '${installCalled}'`,
+            DEPLOY_RESTART_CMD: `touch '${restartCalled}'`,
+            DEPLOY_NOTIFY_INSTALL_CMD: `touch '${autonomyCalled}'`,
+            DEPLOY_UNITS_ENABLE_CMD: `touch '${autonomyCalled}'`,
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          })
+        );
+
+        expect(r.status).not.toBe(0);
+        expect(`${r.stdout}\n${r.stderr}`).toMatch(/DEPLOY_HEALTH_READY_TIMEOUT_S/);
+        expect(existsSync(remoteAccessed)).toBe(false);
+        expect(existsSync(rsyncCalled)).toBe(false);
+        expect(existsSync(installCalled)).toBe(false);
+        expect(existsSync(restartCalled)).toBe(false);
+        expect(existsSync(autonomyCalled)).toBe(false);
+        expect(readFileSync(join(remote, ".deployed-commit"), "utf8")).toBe("prior-marker\n");
       }
     );
   });
