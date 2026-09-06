@@ -1,6 +1,6 @@
 # Roadmap
 
-**Last updated:** 2026-09-05
+**Last updated:** 2026-09-06
 
 **Architecture:** [`architecture.md`](./architecture.md)
 
@@ -44,16 +44,23 @@ Current issue bodies and acceptance evidence win over historical issue titles.
 
 | Milestone | Finished outcome | State |
 |---|---|---|
-| **M1 — Paired quality-protected release** | The schema-grounding gateway and matching client are released together, verified, and recoverable | **Active:** [#277](https://github.com/Magnus-Gille/gille-inference/pull/277) and client 1.3.6 preparation [#278](https://github.com/Magnus-Gille/gille-inference/pull/278) merged; paired rollout not yet accepted |
-| **M2 — Auditable usefulness baseline** | Exact model/task feedback works and a reproducible organic-use report states what is proven, failed, or unknown | **Next:** [#243](https://github.com/Magnus-Gille/gille-inference/issues/243), [#245](https://github.com/Magnus-Gille/gille-inference/issues/245) |
-| **M3 — One qualified automatic lane** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated:** [#85](https://github.com/Magnus-Gille/gille-inference/issues/85); other lanes remain shadow |
+| **M1 — Paired quality-protected release** | The schema-grounding gateway and matching client are released together, verified, and recoverable | **Active:** readiness correction [#284](https://github.com/Magnus-Gille/gille-inference/issues/284) → paired acceptance [#285](https://github.com/Magnus-Gille/gille-inference/issues/285); preparation [#277](https://github.com/Magnus-Gille/gille-inference/pull/277)/[#278](https://github.com/Magnus-Gille/gille-inference/pull/278) and fixture [#282](https://github.com/Magnus-Gille/gille-inference/pull/282) merged; live acceptance incomplete |
+| **M2 — Auditable usefulness baseline** | Exact model/task feedback works and a reproducible organic-use report states what is proven, failed, or unknown | **Next:** Exporter shipped ([#256](https://github.com/Magnus-Gille/gille-inference/pull/256)/[#275](https://github.com/Magnus-Gille/gille-inference/pull/275)); exact feedback [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) and bounded report [#245](https://github.com/Magnus-Gille/gille-inference/issues/245) remain |
+| **M3 — One qualified automatic lane** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): select/qualify lane [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) → canary integration [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) → outcome [#288](https://github.com/Magnus-Gille/gille-inference/issues/288). Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow |
 
 #### M1 activities and acceptance
 
-1. Finish the reviewed version/package contract in #278. Verify exact client archive contents,
+1. Complete bounded readiness source work in
+   [#284](https://github.com/Magnus-Gille/gille-inference/issues/284), then finish the reviewed
+   version/package contract in #278. The explicit-write fixture in
+   [#282](https://github.com/Magnus-Gille/gille-inference/pull/282) exists but does not substitute
+   for paired acceptance. Verify exact client archive contents,
    package/CLI version parity, focused client/bridge/package tests, typechecks and CI. Retain the
    already-reviewed #277 behavioral regression evidence; do not call packaging tests model evals.
-2. Record an immutable paired release and verified previous client/gateway rollback artifacts.
+2. Complete paired acceptance in [#285](https://github.com/Magnus-Gille/gille-inference/issues/285);
+   M1 remains blocked on readiness source and acceptance, and live acceptance is incomplete until
+   those gates meet the M1 boundary. Record an immutable paired release and verified previous
+   client/gateway rollback artifacts.
    Check compatibility for long-lived MCP bridges and outstanding v8 code-loop work before the
    v9 switch. Do not assume a package install updates an already-running bridge.
 3. Obtain just-in-time approval for the exact artifact, publication/install actions, release SHA,
@@ -78,8 +85,14 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
 
 #### M2 activities and acceptance
 
-1. Reconcile existing #243/#245 implementations and missing acceptance evidence before coding.
-   Keep the already-shipped measurement-epoch repairs; never invent historical attribution.
+1. Reconcile existing
+   [#243](https://github.com/Magnus-Gille/gille-inference/issues/243)/[#245](https://github.com/Magnus-Gille/gille-inference/issues/245)
+   implementations and missing acceptance evidence before coding. The #245 exporter is already
+   shipped per its issue comment and
+   [PR #256](https://github.com/Magnus-Gille/gille-inference/pull/256)/
+   [PR #275](https://github.com/Magnus-Gille/gille-inference/pull/275);
+   keep the already-shipped measurement-epoch repairs and do not rebuild the exporter. Never
+   invent historical attribution.
 2. Implement #243's owner-authorized opaque feedback handle bound to the exact model/task
    execution. Cover synchronous and durable asynchronous results, retry/restart idempotence,
    conflicting feedback rejection and access isolation. Keep usefulness separate from a
@@ -88,7 +101,8 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
    eligibility/attempt denominators, policy epochs, retention and unknown attribution. Test
    joins, duplicate/conflicting submissions, missing rows and privacy boundaries with fixtures.
    Export only closed low-cardinality dimensions with an explicit unknown bucket, never raw labels.
-4. Complete #245's reproducible read-only evidence bundle and publish the sanitized report.
+4. Produce #245's reproducible bounded read-only report and threshold decision from the shipped
+   exporter, then publish the sanitized report.
    Preserve its predeclared target of at least 20 eligible organic opportunities and at least
    60% useful completions among attempts; separate organic work, synthetic probes and evaluation.
    This is the overdue 2026-08-28 review: freeze and record the historical trial bounds plus a
@@ -114,18 +128,25 @@ attempt counts, syntactically valid output or impressive benchmark scores.
 
 #### M3 activities and acceptance
 
-1. Select exactly one low-blast-radius, non-judgment-bearing task lane from current evidence.
+1. Select and qualify exactly one low-blast-radius, non-judgment-bearing task lane from current
+   evidence under [#286](https://github.com/Magnus-Gille/gille-inference/issues/286).
    Predeclare the #85 quality/sample, availability, latency and cost gates, observation window,
    trusted behavioral verifier, canary ceiling, watchdog and keep/revert rules before enabling it.
-2. Calibrate the relevant marginal/amortized costs in
-   [#82](https://github.com/Magnus-Gille/gille-inference/issues/82). Separate verified displaced
+2. Calibrate the relevant marginal/amortized costs in the open
+   [#82](https://github.com/Magnus-Gille/gille-inference/issues/82). Fresh calibration evidence
+   in [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required before relying on
+   it.
+   Separate verified displaced
    frontier work from shadow projections; report cost per accepted task, including retries and
    verification. Keep privacy/destination eligibility ahead of cost optimization.
 3. Resolve the selected lane's blocking availability and authority prerequisites. Test outage,
    cancellation, restart/recovery, contention and rollback before the operational decision.
-4. Only after the evidence gate passes and the exact operational change is authorized, use the
-   fail-closed routing writer/diff path for a bounded canary. Observe the predeclared window and
-   publish a keep/revert decision with quality, latency, availability and cost evidence.
+4. Complete canary integration and tests in
+   [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) before seeking operational
+   approval. After the evidence gate passes and the exact operational change is authorized, run
+   the bounded live canary through the fail-closed routing writer/diff path and record its
+   keep/revert outcome in [#288](https://github.com/Magnus-Gille/gille-inference/issues/288) with
+   quality, latency, availability and cost evidence.
 
 **Done when:** the qualified canary has completed its observation and a verified keep or revert
 decision is recorded. A pre-canary HOLD is safe progress but leaves M3 incomplete. Expanding to
