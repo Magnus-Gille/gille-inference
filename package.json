@@ -23,6 +23,7 @@
     "benchmark:strix-compare": "tsx scripts/compare-strix-benchmarks.ts",
     "benchmark:strix-spec-policy": "tsx scripts/synthesize-strix-speculation-policy.ts",
     "benchmark:strix-provenance": "tsx scripts/capture-strix-provenance.ts",
+    "provenance:served": "tsx scripts/capture-served-provenance.ts",
     "benchmark:strix-host": "tsx scripts/capture-strix-host-profile.ts",
     "benchmark:strix-prefix-cache": "tsx scripts/strix-prefix-cache-probe.ts",
     "benchmark:strix-mmap-ab": "tsx scripts/strix-mmap-ab.ts",

@@ -1,6 +1,6 @@
 # Roadmap
 
-**Last updated:** 2026-09-06
+**Last updated:** 2026-09-07
 
 **Architecture:** [`architecture.md`](./architecture.md)
 
@@ -36,7 +36,8 @@ Hugin's expired validation window and pre-registered keep/reduce/remove threshol
 
 ### Ordered delivery milestones
 
-Execute M1 → M2 → M3. Each milestone has a finite acceptance boundary; a merged PR is
+Execute M1 → M2 → M3 for the bounded routing path. M4 and M5 are independent workstreams with
+the sequencing stated below. Each milestone has a finite acceptance boundary; a merged PR is
 source evidence, not deployment or demonstrated organic usefulness. Individual implementation
 leaves use separate worktrees, regression tests, independent review, and a PR before merge.
 The Conductor owns integration, quality, and any separately authorized operational action.
@@ -45,8 +46,10 @@ Current issue bodies and acceptance evidence win over historical issue titles.
 | Milestone | Finished outcome | State |
 |---|---|---|
 | **M1 — Paired quality-protected release** | The schema-grounding gateway and matching client are released together, verified, and recoverable | **Complete (2026-09-06):** client 1.3.6 / gateway v9 paired acceptance passed; [sanitized release receipt](https://github.com/Magnus-Gille/gille-inference/issues/285#issuecomment-5561882175). Readiness [#284](https://github.com/Magnus-Gille/gille-inference/issues/284) resolved by [#290](https://github.com/Magnus-Gille/gille-inference/pull/290) |
-| **M2 — Auditable usefulness baseline** | Exact model/task feedback works and a reproducible organic-use report states what is proven, failed, or unknown | **Next:** Exporter shipped ([#256](https://github.com/Magnus-Gille/gille-inference/pull/256)/[#275](https://github.com/Magnus-Gille/gille-inference/pull/275)); exact feedback [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) and bounded report [#245](https://github.com/Magnus-Gille/gille-inference/issues/245) remain |
-| **M3 — One qualified automatic lane** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): select/qualify lane [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) → canary integration [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) → outcome [#288](https://github.com/Magnus-Gille/gille-inference/issues/288). Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow |
+| **M2 — Auditable usefulness and provenance** | Exact model/task feedback, calibrated cost, organic-use evidence and a served-model provenance snapshot state what is proven, failed, or unknown | **In progress:** exact feedback [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) is closed after fresh canonical read-only deployed verification, with the sanitized closure record in [comment 5575645568](https://github.com/Magnus-Gille/gille-inference/issues/243#issuecomment-5575645568); the implementation remains reviewed green in [PR #292](https://github.com/Magnus-Gille/gille-inference/pull/292). Organic evidence [#245](https://github.com/Magnus-Gille/gille-inference/issues/245), measured calibration [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) and served-model provenance [#293](https://github.com/Magnus-Gille/gille-inference/issues/293) remain. |
+| **M3 — First bounded routing canary** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): select/qualify lane [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) → canary integration [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) → outcome [#288](https://github.com/Magnus-Gille/gille-inference/issues/288). Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow. #293 is not a blanket M3 blocker |
+| **M4 — Reliable cross-platform agent access** | Supported M5 agent setup and recovery are repeatable on macOS and Windows | **Independent workstream:** guided provisioning [#184](https://github.com/Magnus-Gille/gille-inference/issues/184), connector/outage diagnostics [#242](https://github.com/Magnus-Gille/gille-inference/issues/242), and Windows distribution/credential-backend support [#266](https://github.com/Magnus-Gille/gille-inference/issues/266) |
+| **M5 — Controlled runtime and model upgrades** | Runtime-update evaluation and hand-picked model promotion have controlled, recoverable paths | **Independent tooling/evaluation:** exclusive maintenance [#196](https://github.com/Magnus-Gille/gille-inference/issues/196), transactional roster promotion [#217](https://github.com/Magnus-Gille/gille-inference/issues/217), and the upgrade assessment [#280](https://github.com/Magnus-Gille/gille-inference/issues/280). Measured performance experiments follow the M2 baseline |
 
 #### M1 activities and acceptance — historical contract (completed 2026-09-06)
 
@@ -118,12 +121,15 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
    shipped per its issue comment and
    [PR #256](https://github.com/Magnus-Gille/gille-inference/pull/256)/
    [PR #275](https://github.com/Magnus-Gille/gille-inference/pull/275);
-   keep the already-shipped measurement-epoch repairs and do not rebuild the exporter. Never
-   invent historical attribution.
-2. Implement #243's owner-authorized opaque feedback handle bound to the exact model/task
-   execution. Cover synchronous and durable asynchronous results, retry/restart idempotence,
-   conflicting feedback rejection and access isolation. Keep usefulness separate from a
-   deterministic verifier result; feedback alone must not change routing.
+   keep the already-shipped measurement-epoch repairs and do not rebuild the exporter. The exact
+   feedback work is merged and reviewed green in [PR #292](https://github.com/Magnus-Gille/gille-inference/pull/292).
+   Never invent historical attribution. #243's fresh canonical read-only deployed verification is
+   recorded in its sanitized [closure comment](https://github.com/Magnus-Gille/gille-inference/issues/243#issuecomment-5575645568).
+2. Record acceptance evidence for #243's owner-authorized opaque feedback handle bound to the
+   exact model/task execution. Cover synchronous and durable asynchronous results,
+   retry/restart idempotence, conflicting feedback rejection and access isolation. Keep
+   usefulness separate from a deterministic verifier result; feedback alone must not change
+   routing.
 3. Add content-blind model × task × source × usefulness reporting, including absent feedback,
    eligibility/attempt denominators, policy epochs, retention and unknown attribution. Test
    joins, duplicate/conflicting submissions, missing rows and privacy boundaries with fixtures.
@@ -137,18 +143,37 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
    bundle without waiting for additional samples; insufficient evidence means HOLD, not GO.
    Report pass/fail/unknowable rather than manufacturing enough favorable samples. A new
    collection window must be declared prospectively, not substituted for the overdue review.
-5. Record queue/busy rates, latency, operator rework, feedback coverage and cost provenance where
+   The current evidence gap is recorded in [the latest #245 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5575664993).
+5. Complete [#82](https://github.com/Magnus-Gille/gille-inference/issues/82)'s measured calibration
+   acceptance with a declared comparison and a nonzero cost/quality receipt. Keep missing or
+   unknowable measurements explicit; the latest gap remains recorded in [the #82 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/82#issuecomment-5575664897).
+6. Implement and verify [#293](https://github.com/Magnus-Gille/gille-inference/issues/293)'s
+   versioned, sanitized, read-only operator JSON export for exactly one already-served model
+   through an authorized operator workflow. Bind weights and any applicable projector to actual
+   content checksums or verified immutable artifact identities tied to the serving instance;
+   include runtime, tokenizer/chat-template, quantization, gateway, context/decoding and bounded
+   hardware/resource evidence with observed, declared and unknown fields separated. Collection
+   must be explicit and outside inference requests, with freshness and cache invalidation defined.
+   Replacement/restart races or unavailable evidence must produce incomplete/stale output, never
+   a false complete claim. Exclude private paths, raw launch commands, credentials and
+   request/response content, and do not add a client-facing API in this release.
+7. Record queue/busy rates, latency, operator rework, feedback coverage and cost provenance where
    available. Missing cost or memory measurements remain unknown, not zero or inferred savings.
    Open tightly scoped follow-ups for gaps that prevent a decision.
-6. Reconcile the Hugin trial that ended 2026-08-22 against its existing keep/reduce/remove
+8. Reconcile the Hugin trial that ended 2026-08-22 against its existing keep/reduce/remove
    contract. Link the owning repository's recorded decision, or record the exact evidence gap
    and route a bounded follow-up to that owner. Do not extend the trial silently, change Hugin
    here, or count direct M5 work and synthetic smoke as durable Hugin demand.
 
-**Done when:** #243's tests/review and authorized rollout are accepted, and #245 has a reproducible
-report with explicit denominators, missingness and a next decision, plus an explicit Hugin
-outcome/gap handoff. An honest negative or
-unknowable report completes the measurement milestone, but cannot authorize M3 promotion.
+**Done when:** #243's merged implementation has accepted review, test and any separately
+authorized rollout evidence; #245 has a reproducible report with explicit denominators,
+missingness and a next decision; #82 has measured calibration with a nonzero cost/quality receipt;
+#293 has its versioned export, evidence-integrity tests,
+sanitized retention example/instructions and one operator-verified snapshot; and the Hugin
+outcome/gap handoff is explicit. If the #293 snapshot is pending, record implementation complete
+but operational validation outstanding and leave M2 open. An honest negative or unknowable #245
+report completes that report verdict, while remaining M2 acceptance still requires #82 and #293;
+it cannot authorize M3 promotion.
 
 **Expected benefit:** know which model/task pairs actually save work, instead of optimizing for
 attempt counts, syntactically valid output or impressive benchmark scores.
@@ -166,6 +191,8 @@ attempt counts, syntactically valid output or impressive benchmark scores.
    Separate verified displaced
    frontier work from shadow projections; report cost per accepted task, including retries and
    verification. Keep privacy/destination eligibility ahead of cost optimization.
+   The #293 provenance work is an M2 evidence-integrity obligation, not a blanket M3 blocker;
+   only a selected lane's specific missing identity evidence can add a qualification dependency.
 3. Resolve the selected lane's blocking availability and authority prerequisites. Test outage,
    cancellation, restart/recovery, contention and rollback before the operational decision.
 4. Complete canary integration and tests in
