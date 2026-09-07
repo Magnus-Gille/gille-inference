@@ -355,7 +355,14 @@ export async function handleCodeLoopTool(
 ): Promise<{ text: string; isError: boolean }> {
   const { startConfig, deps } = buildCodeLoopRuntime(cfg, maintenanceMode, gatewayContext);
   const callerResult = (result: CodeLoopResult): CodeLoopResult => {
-    if (!result.feedback_handle || ownsExecutionFeedback(result.feedback_handle, gatewayContext.feedbackOwner ?? null)) return result;
+    if (!result.feedback_handle) return result;
+    try {
+      if (ownsExecutionFeedback(result.feedback_handle, gatewayContext.feedbackOwner ?? null)) return result;
+    } catch {
+      // Feedback is advisory: an unavailable ownership store must hide the handle, not the
+      // completed result. Never log the handle, principal, or database exception content.
+      console.error("[execution-feedback] ownership lookup failed; completed output preserved, handle withheld");
+    }
     const { feedback_handle: _privateHandle, ...rest } = result;
     return rest;
   };

@@ -2352,7 +2352,7 @@ async function handleDelegate(
     if (feedbackOwner && result.ledgerId) {
       feedbackHandle = bindExecutionFeedback({ ledgerId: result.ledgerId, owner: feedbackOwner, surface: "delegate",
         trafficPurpose: params.trafficPurpose,
-        outputAvailable: result.delegated && !result.truncated && typeof result.output === "string" && result.output.length > 0 });
+        outputAvailable: result.delegated && result.truncated === false && typeof result.output === "string" && result.output.length > 0 });
     }
   } catch {
     // Advisory feedback must not discard completed inference or prevent normal metering.

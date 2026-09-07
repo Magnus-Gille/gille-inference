@@ -69,7 +69,7 @@ function startUpstream(): Promise<void> {
         return;
       }
       const content = model === "empty-model" ? "" : model === "truncated-model" ? "F-2" : "STUBBED COMPLETION";
-      const finishReason = model === "truncated-model" ? "length" : "stop";
+      const finishReason = model === "truncated-model" ? "length" : model === "unknown-finish-model" ? null : "stop";
       const completionTokens = model === "empty-model" ? 0 : model === "truncated-model" ? 64 : 5;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
@@ -246,6 +246,17 @@ describe("MCP ask exact execution feedback handles", () => {
     const result = await ask(STATIC_ADMIN_KEY, "excluded-legacy-static-admin", "legacy static admin prompt");
     expect(result.result.isError).toBe(false);
     expect(result.result.structuredContent?.feedback_handle).toBeUndefined();
+  });
+
+  it("preserves nonempty output but does not bind when finish metadata is unknown", async () => {
+    const before = feedbackCount();
+    const result = await ask(agentKey, "unknown-finish-model", "unknown completion metadata");
+    expect(result.result.isError).toBe(false);
+    expect(result.result.content[0]?.text).toBe("STUBBED COMPLETION");
+    const structured = result.result.structuredContent!;
+    expect(structured.text).toBe("STUBBED COMPLETION");
+    expect(structured.feedback_handle).toBeUndefined();
+    expect(feedbackCount()).toBe(before);
   });
 
   it("preserves completed output and the cost trace when feedback binding fails", async () => {

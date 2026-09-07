@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { closeDb, getDb, initDb } from "../src/db.js";
 import { createDirectGatewayHarness, type DirectGatewayHarness } from "./helpers/direct-gateway.js";
 
-type MockMode = "ok" | "length" | "failed" | "empty" | "no-model";
+type MockMode = "ok" | "length" | "failed" | "empty" | "no-model" | "unknown";
 const mockState = vi.hoisted(() => ({ mode: "ok" as MockMode, inferenceRequests: 0 }));
 vi.mock("../src/runner/lmstudio-client.js", () => ({
   runLmStudioInference: vi.fn(async () => {
@@ -15,6 +15,9 @@ vi.mock("../src/runner/lmstudio-client.js", () => ({
       return { ok: false, error: "mock truncated", truncated: true, finishReason: "length", promptTokens: 3, completionTokens: 2, durationMs: 1, ttftMs: 1 };
     }
     if (mockState.mode === "empty") return { ok: false, error: "Empty response from mock model" };
+    if (mockState.mode === "unknown") {
+      return { ok: true, response: "local output", promptTokens: 3, completionTokens: 2, durationMs: 1, ttftMs: 1, tokensPerSecond: 2, finishReason: null };
+    }
     return { ok: true, response: "local output", promptTokens: 3, completionTokens: 2, durationMs: 1, ttftMs: 1, tokensPerSecond: 2, truncated: false };
   }),
 }));
@@ -159,6 +162,24 @@ describe("owner /delegate execution feedback binding", () => {
     if (typeof ledgerId === "string") {
       const feedback = getDb().prepare("SELECT 1 FROM execution_feedback WHERE ledger_id = ?").get(ledgerId);
       expect(feedback).toBeUndefined();
+    }
+  });
+
+  it("preserves nonempty output but does not bind when truncation metadata is unknown", async () => {
+    mockState.mode = "unknown";
+    const owner = mintKey({ alias: "feedback-delegate-unknown-truncation", tier: "owner", scope: "admin" }, DEFAULTS);
+    const result = await delegate(owner.plaintextKey, {
+      prompt: "unknown completion metadata",
+      taskType: "summarize",
+      modelId: "m1",
+      trafficPurpose: "organic",
+    });
+    expect(result.response.status).toBe(200);
+    expect(result.body).toMatchObject({ delegated: true, output: "local output" });
+    expect(result.body).not.toHaveProperty("feedbackHandle");
+    const ledgerId = result.body.ledgerId;
+    if (typeof ledgerId === "string") {
+      expect(getDb().prepare("SELECT 1 FROM execution_feedback WHERE ledger_id = ?").get(ledgerId)).toBeUndefined();
     }
   });
 

@@ -34,6 +34,10 @@ that result. If durable publication fails, the result remains authoritative and 
 excluded until recovery can publish it. Prepared/unavailable rows are therefore not reportable
 completed executions.
 
+If the terminal result file itself fails to persist, its prepared binding remains unavailable
+and the in-memory response omits the handle. Recovery can publish that binding only if it finds
+the authoritative terminal file with the handle; otherwise the row stays excluded, not completed.
+
 ## Submit one usefulness judgment
 
 The same minted owner agent/admin key that ran the execution submits:

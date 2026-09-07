@@ -57,6 +57,14 @@ function writeRaw(token: string | undefined, id: string, body: string, contentTy
     headers: { "content-type": contentType }, body });
 }
 describe("owner execution feedback route", () => {
+  it("rejects an oversized body without recording feedback or echoing private content", async () => {
+    const id = handle();
+    const result = await writeRaw(agent, id, JSON.stringify({ usefulness: "pass", private: "x".repeat(2048) }));
+    expect(result.status).toBe(413);
+    expect(result.text).not.toContain(id);
+    expect(result.text).not.toContain("x".repeat(100));
+    expect((await write(agent, id)).status).toBe(201);
+  });
   it("allows only the submitting owner key, with idempotent retries and conflicts", async () => {
     const id = handle();
     expect((await write(other, id)).status).toBe(404);

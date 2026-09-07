@@ -1,5 +1,11 @@
 import Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { closeDb, getDb, initDb } from "../src/db.js";
+import { recordDelegation } from "../src/homeserver/ledger.js";
+import { bindExecutionFeedback } from "../src/homeserver/execution-feedback.js";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildExecutionFeedbackReport,
   EXECUTION_FEEDBACK_REPORT_CONTRACT,
@@ -100,6 +106,51 @@ describe("execution feedback report", () => {
       completed: 1, assessed: 1, missing: 0, pass: 1, partial: 0, redo: 0, wrong: 0, coverage: 1,
     });
     expect(report.rows.some((row) => row.model === "other")).toBe(false);
+  });
+
+  it("joins a real recordDelegation timestamp through an owner-visible feedback binding", () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "execution-feedback-report-integration-")), "test.db");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
+    try {
+      initDb(dbPath);
+      const owner = { keyHash: "sha256:integration-owner", alias: "integration-owner" };
+      const ledgerId = recordDelegation({
+        taskType: "summarize",
+        modelId: "mellum",
+        prompt: "owner-visible integration output",
+        outcome: "unverified",
+        source: "mcp-ask",
+        keyAlias: owner.alias,
+      });
+      expect(getDb().prepare("SELECT ts FROM delegations WHERE id = ?").get(ledgerId))
+        .toEqual({ ts: "2026-09-01T12:00:00.000Z" });
+
+      const handle = bindExecutionFeedback({
+        ledgerId,
+        owner,
+        surface: "ask",
+        trafficPurpose: "organic",
+        outputAvailable: true,
+      });
+      expect(handle).toMatch(/^[0-9a-f-]{36}$/);
+
+      const report = buildExecutionFeedbackReport(getDb(), { since: SINCE, until: UNTIL });
+      expect(report).toMatchObject({
+        availability: "available",
+        completed: 1,
+        assessed: 0,
+        missing: 1,
+        coverage: 0,
+      });
+      expect(report.rows).toEqual([{
+        model: "mellum", task: "summarize", source: "mcp-ask", surface: "ask",
+        completed: 1, assessed: 0, missing: 1, pass: 0, partial: 0, redo: 0, wrong: 0, coverage: 0,
+      }]);
+    } finally {
+      closeDb();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps every exported dimension closed and does not echo identity or content-shaped values", () => {

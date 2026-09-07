@@ -28,6 +28,7 @@ import type {
 } from "../src/homeserver/code-loop-types.js";
 import { execCageCommand } from "../src/homeserver/code-loop-cage.js";
 import type { ExecutionFeedbackOwner } from "../src/homeserver/execution-feedback.js";
+import * as executionFeedback from "../src/homeserver/execution-feedback.js";
 
 // Keep evidence derivation deterministic and independent of a live llama-swap backend.
 const servedCmdByModel = new Map<string, string | null>();
@@ -248,5 +249,48 @@ describe("exact execution feedback filtering on code-loop runtime reads", () => 
     const nullBody = JSON.parse(recoveredNullOwner.text) as { result?: Record<string, unknown> };
     expect(nullBody.result).toEqual(withoutHandle(result));
     expect(nullBody.result).not.toHaveProperty("feedback_handle");
+  });
+
+  it("sanitizes code_loop_result when the ownership lookup throws", async () => {
+    const { result } = await seedDurableRun();
+    const ownershipSpy = vi.spyOn(executionFeedback, "ownsExecutionFeedback").mockImplementation(() => {
+      throw new Error("simulated feedback store failure");
+    });
+    try {
+      const response = await handleCodeLoopTool(
+        "code_loop_result",
+        { work_id: result.work_id },
+        runtimeConfig(),
+        () => false,
+        gatewayContext({ alias: "colliding-alias", keyHash: "owner-a" }),
+      );
+      expect(response.isError).toBe(false);
+      expect(JSON.parse(response.text)).toEqual(withoutHandle(result));
+    } finally {
+      ownershipSpy.mockRestore();
+    }
+  });
+
+  it("sanitizes recovered code_loop_start when the ownership lookup throws", async () => {
+    const { req, result } = await seedDurableRun();
+    _resetCodeLoopStateForTests();
+    const ownershipSpy = vi.spyOn(executionFeedback, "ownsExecutionFeedback").mockImplementation(() => {
+      throw new Error("simulated feedback store failure");
+    });
+    try {
+      const response = await handleCodeLoopTool(
+        "code_loop_start",
+        req as unknown as Record<string, unknown>,
+        runtimeConfig(),
+        () => false,
+        gatewayContext({ alias: "colliding-alias", keyHash: "owner-a" }),
+      );
+      expect(response.isError).toBe(false);
+      const body = JSON.parse(response.text) as { result?: Record<string, unknown> };
+      expect(body.result).toEqual(withoutHandle(result));
+      expect(body.result).not.toHaveProperty("feedback_handle");
+    } finally {
+      ownershipSpy.mockRestore();
+    }
   });
 });

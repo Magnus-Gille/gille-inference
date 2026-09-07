@@ -1200,7 +1200,7 @@ export async function runChatCompletion(
               owner: feedbackOwner,
               surface: "ask",
               trafficPurpose: args.trafficPurpose ?? "unknown",
-              outputAvailable: !completedResult.truncated && completedResult.text.length > 0,
+              outputAvailable: completedResult.truncated === false && completedResult.text.length > 0,
             });
             if (handle) completedResult.feedbackHandle = handle;
           } catch {
