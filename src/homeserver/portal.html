@@ -197,6 +197,8 @@
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
       content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
+      Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
+      key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
     <p style="margin-bottom:8px"><strong>Models</strong> (mostly Q4_K_M; VibeThinker uses Q8_0;
       gpt-oss uses MXFP4):</p>
@@ -560,6 +562,16 @@ for chunk in stream:
           The same key, credit budget, and model allow-list apply as for the HTTP API.
           Basic tools are exposed to every permitted key. A real minted owner-agent key also gets
           the bounded code-loop tools and a content-free adoption-report tool:
+        </p>
+        <p>
+          <strong>Exact owner feedback:</strong> set <span class="badge mono">traffic_purpose: "organic"</span>
+          before an <span class="badge mono">ask</span> or <span class="badge mono">code_loop_start</span> run.
+          Eligible completed results include <span class="badge mono">feedback_handle</span>.
+          With the same owner key, send <span class="badge mono">PUT /execution-feedback/{handle}</span>
+          and JSON <span class="badge mono">{"usefulness":"pass"}</span> (or
+          <span class="badge mono">partial</span>, <span class="badge mono">redo</span>,
+          <span class="badge mono">wrong</span>). Identical retries are safe; conflicting judgments are rejected.
+          Omitted purpose remains unknown, and evaluation/synthetic runs do not count as organic evidence.
         </p>
         <table>
           <tr><th>Tool</th><th>What it does</th></tr>

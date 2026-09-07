@@ -15,6 +15,8 @@ import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
 import { ledgerReport, recentDelegations, getDelegationById, recordReviewerUsefulness } from "./ledger.js";
+import { bindExecutionFeedback, executionFeedbackOwner, recordExecutionFeedback, type ExecutionFeedbackOwner } from "./execution-feedback.js";
+import { parseExecutionFeedback, parseExecutionTrafficPurpose, type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
 import { resetRoutingTable, loadRoutingTable } from "./routing-table.js";
 import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
@@ -2028,6 +2030,7 @@ function recordOwnerChat(
 /** Validated /delegate params (the verifier is already built from its spec). */
 interface DelegateParams {
   prompt: string;
+  trafficPurpose: ExecutionTrafficPurpose;
   taskType?: string;
   systemPrompt?: string;
   modelId?: string;
@@ -2117,6 +2120,11 @@ function parseDelegateBody(rawBody: string): DelegateParse {
   } catch {
     return { ok: false, param: null, message: "Request body must be valid JSON." };
   }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, param: null, message: "Request body must be an object." };
+  }
+  const trafficPurpose = parseExecutionTrafficPurpose(body["trafficPurpose"]);
+  if (!trafficPurpose.ok) return { ok: false, param: "trafficPurpose", message: "Invalid traffic purpose." };
   if (typeof body["prompt"] !== "string" || (body["prompt"] as string).length === 0) {
     return { ok: false, param: "prompt", message: "Missing required field 'prompt'." };
   }
@@ -2206,6 +2214,7 @@ function parseDelegateBody(rawBody: string): DelegateParse {
     requestedMax: typeof body["maxTokens"] === "number" ? (body["maxTokens"] as number) : null,
     params: {
       prompt: body["prompt"] as string,
+      trafficPurpose: trafficPurpose.value,
       taskType: body["taskType"] as string | undefined,
       systemPrompt: body["systemPrompt"] as string | undefined,
       modelId: body["modelId"] as string | undefined,
@@ -2255,6 +2264,7 @@ async function handleDelegate(
   cfg: HomeserverConfig,
   controller: AdmissionController,
   lctx: LogCtx,
+  feedbackOwner: ExecutionFeedbackOwner | null,
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
   let learningTaskAdmissionId: string | undefined;
@@ -2337,8 +2347,20 @@ async function handleDelegate(
   // failure; an exact retry will recover its echo with outcomeUnavailable instead of inferring
   // twice. All pre-model credit/quota/GPU refusals occur before handleDelegate and create no claim.
   const result = await runDelegate();
+  let feedbackHandle: string | null = null;
+  try {
+    if (feedbackOwner && result.ledgerId) {
+      feedbackHandle = bindExecutionFeedback({ ledgerId: result.ledgerId, owner: feedbackOwner, surface: "delegate",
+        trafficPurpose: params.trafficPurpose,
+        outputAvailable: result.delegated && result.truncated === false && typeof result.output === "string" && result.output.length > 0 });
+    }
+  } catch {
+    // Advisory feedback must not discard completed inference or prevent normal metering.
+    console.error("[execution-feedback] delegate binding failed; completed output preserved");
+  }
   sendJson(res, 200, {
     ...result,
+    ...(feedbackHandle === null ? {} : { feedbackHandle }),
     ...(learningTaskGatewayEcho === undefined
       ? {}
       : { learningTaskGatewayEcho }),
@@ -3560,6 +3582,7 @@ function decodePathSegmentOrSend(raw: string, res: ServerResponse, lctx: LogCtx)
 }
 
 function normalizeLoggedRoute(method: string, path: string): string {
+  if (path.startsWith("/execution-feedback/")) return "/execution-feedback/:handle";
   if (path.startsWith("/ledger/")) {
     if (method === "PUT" && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
       return "/ledger/:id/reviewer-usefulness";
@@ -4683,6 +4706,7 @@ export async function handleRequest(
           cfg,
           controller,
           lctx,
+          executionFeedbackOwner(principal),
         )
       );
       return;
@@ -4857,6 +4881,51 @@ export async function handleRequest(
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
+      return;
+    }
+    if (method === "PUT" && path.startsWith("/execution-feedback/")) {
+      lctx.route = "/execution-feedback/:handle";
+      lctx.admission = "n/a";
+      const owner = executionFeedbackOwner(principal);
+      if (!owner) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(res, makeError("route_not_allowed", { message: "Execution feedback requires a minted owner agent or admin key." }));
+        return;
+      }
+      const handle = path.slice("/execution-feedback/".length);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(handle)) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        sendError(res, makeError("not_found"));
+        return;
+      }
+      let body: unknown;
+      try {
+        if (!hasJsonContentType(req)) throw new Error("invalid content type");
+        body = JSON.parse(await readBody(req, 1024));
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", { message: "Invalid execution feedback request." }));
+        return;
+      }
+      const parsed = parseExecutionFeedback(body);
+      if (!parsed.ok) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid execution feedback request." }));
+        return;
+      }
+      const result = recordExecutionFeedback({ handle, owner, usefulness: parsed.value });
+      lctx.status = result.kind === "recorded" ? 201 : result.kind === "unchanged" ? 200
+        : result.kind === "not_found" ? 404 : result.kind === "invalid" ? 400 : 409;
+      lctx.outcome = result.kind;
+      sendJson(res, lctx.status, result);
       return;
     }
     if (method === "PUT" && path.startsWith("/ledger/") && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {

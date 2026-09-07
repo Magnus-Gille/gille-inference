@@ -103,6 +103,13 @@ New series in this layer:
 
 ## 3. `adoption_evidence` (SQLite) — declared M5-agent adoption, content-blind
 
+The separate private [`execution_feedback` overlay](execution-feedback.md) joins an exact
+completed execution to one owner judgment. It contains opaque row handles and the originating
+key hash; these are never added to this coarse adoption table or exported reports. Its closed
+report counts explicit organic, current, non-shadow, available results and missing judgments,
+not opportunities or automatic routing quality. Prepared async bindings stay excluded until a
+trusted durable result exists. Existing coarse adoption retention and aggregation remain unchanged.
+
 `src/homeserver/adoption-evidence.ts`. This is a narrow, opt-in observation written by the
 owner-agent MCP tool `record_adoption_evidence` (or `m5 adoption report`). It exists because a
 healthy gateway/request count does **not** prove that eligible implementation work actually used

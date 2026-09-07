@@ -234,6 +234,14 @@ named guest-tier key and treat the alias as the tenant identity. Example:
 tsx src/homeserver/cli.ts keys mint --alias codex-cli --tier guest --models qwen3-coder --rpm 30 --daily 200000
 ```
 
+Exact organic usefulness is recorded separately through `PUT /execution-feedback/{handle}`
+using the same minted owner-agent/admin key that received the result. Declare purpose before
+execution: `trafficPurpose` on `/delegate`, `traffic_purpose` on MCP `ask` / `code_loop_start`.
+Eligible results expose `feedbackHandle` on `/delegate` and `feedback_handle` on MCP results;
+omission remains unknown, never retrospectively organic. This adds no `/delegate` or `/ledger`
+permission to agent keys. See [the exact feedback contract](../../docs/execution-feedback.md)
+for retries, durable recovery, exclusions and the read-only report exporter.
+
 `POST /delegate` is owner-admin only; tenant validation runs that need that route should
 use a named admin-scope owner key rather than the shared static owner key. `GET /ledger` exposes
 the alias as `recent[].keyAlias` for gateway/MCP delegation rows, so auditors can verify

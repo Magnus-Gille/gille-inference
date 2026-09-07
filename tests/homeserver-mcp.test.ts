@@ -753,6 +753,7 @@ describe("MCP tools/call ask", () => {
     expect(j.result.isError).toBe(false);
     expect(j.result.structuredContent).toEqual({
       model: "null-usage-model",
+      feedback_handle: expect.any(String),
       text: "NULL USAGE",
       finish_reason: "stop",
       truncated: false,
