@@ -118,6 +118,14 @@ describe("served provenance", () => {
     expect(after.configurationIdentity).toBe(before.configurationIdentity);
   });
 
+  it("excludes the operator display label from identity", () => {
+    const first = collectServedProvenance(completeInput());
+    const second = collectServedProvenance({ ...completeInput(), modelAlias: "renamed-public-label" });
+
+    expect(first.modelAlias).not.toBe(second.modelAlias);
+    expect(first.configurationIdentity).toBe(second.configurationIdentity);
+  });
+
   it("changes identity when effective configuration changes", () => {
     const before = collectServedProvenance(completeInput());
     const base = completeInput();

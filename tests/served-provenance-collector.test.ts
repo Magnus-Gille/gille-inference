@@ -85,10 +85,37 @@ describe("captureServedProcess", () => {
     expect(result).not.toHaveProperty("argv");
   });
 
+  it("does not treat model values or unrelated value text as unsupported flags", () => {
+    const { root, deps } = fixture({
+      readProcCmdline: () => [
+        "llama-server", "--model", "/models/my-lora-model.gguf", "--alias", "coder-draft",
+      ],
+    });
+    writeFileSync(join(root, "models", "my-lora-model.gguf"), "model bytes");
+    const result = captureServedProcess(42, deps);
+
+    expect(result.freshness).toBe("fresh");
+    expect(result.reasons).not.toContain("unsupported-model-loader-feature");
+    expect(result.weights).toEqual([{ sha256: digest(join(root, "models", "my-lora-model.gguf")), binding: "unproven" }]);
+  });
+
+  it("keeps explicit draft, LoRA, and adapter flags unsupported", () => {
+    const { deps } = fixture({
+      readProcCmdline: () => [
+        "llama-server", "--model", "/models/model.gguf", "--draft-model", "/models/draft.gguf",
+        "--lora", "/models/adapter.gguf", "--adapter", "/models/adapter-2.gguf",
+      ],
+    });
+    const result = captureServedProcess(42, deps);
+
+    expect(result.freshness).toBe("unavailable");
+    expect(result.reasons).toContain("unsupported-model-loader-feature");
+  });
+
   it("shows a same-path byte change across stable captures", () => {
     const { root, deps } = fixture();
     const before = captureServedProcess(42, deps);
-    writeFileSync(join(root, "models", "model.gguf"), "other bytes");
+    writeFileSync(join(root, "models", "model.gguf"), "changed model bytes");
     const after = captureServedProcess(42, deps);
 
     expect(before.freshness).toBe("fresh");
@@ -106,7 +133,7 @@ describe("captureServedProcess", () => {
       hashArtifact: (path) => {
         if (!replaced && path === modelPath) {
           replaced = true;
-          writeFileSync(path, "other bytes");
+          writeFileSync(path, "replacement with a different size");
         }
         return originalHash ? originalHash(path) : "";
       },

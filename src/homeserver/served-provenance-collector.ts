@@ -121,7 +121,7 @@ export interface ServedProvenanceCollectorDeps {
   readProcRootIdentity?: (pid: number) => ServedArtifactStat;
   readSelfRootIdentity?: () => ServedArtifactStat;
   readArtifactStat?: (path: string) => ServedArtifactStat;
-  hashArtifact?: (path: string, expectedPathStat?: ServedArtifactStat) => string | Promise<string>;
+  hashArtifact?: (path: string, expectedPathStat?: ServedArtifactStat) => string;
   listArtifactDirectory?: (path: string) => string[];
   readKernelRelease?: () => string;
   getArch?: () => string;
@@ -482,15 +482,6 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  for (const token of argv) {
-    const inline = splitInlineFlag(token);
-    const flag = inline?.flag ?? token;
-    if (isUnsupportedModelFlag(flag)) {
-      unsupported = true;
-      if (flag === "--model-split" || flag === "--split-model") splitModel = true;
-    }
-  }
-
   return {
     model: values.get("model") ?? null,
     modelCount: counts.get("model") ?? 0,
@@ -507,6 +498,7 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function isUnsupportedModelFlag(flag: string): boolean {
+  if (!flag.startsWith("-")) return false;
   if (UNSUPPORTED_MODEL_FLAGS.has(flag)) return true;
   // llama-server has acquired several spelling variants for speculative decoding and
   // adapters over time.  Treat any explicit draft/LoRA/adapter selector as opaque rather
@@ -571,7 +563,7 @@ function observeArtifact(path: string, deps: ReturnType<typeof mergedDeps>): Has
   try {
     const before = deps.readArtifactStat(path);
     if (!isRegular(before) || before.size <= 0) return { sha256: null, changed: false, unavailable: true };
-    const digest = String(awaitable(deps.hashArtifact(path, before)));
+    const digest = deps.hashArtifact(path, before);
     const after = deps.readArtifactStat(path);
     if (!sameStat(before, after)) return { sha256: null, changed: true, unavailable: false };
     if (!/^[a-f0-9]{64}$/i.test(digest)) return { sha256: null, changed: false, unavailable: true };
@@ -596,13 +588,6 @@ function runtimePath(
   if (overrides.readProcExePath !== undefined) return overrides.readProcExePath(pid);
   if (overrides.readProcExe !== undefined) return beforeExe;
   return deps.readProcExePath!(pid);
-}
-
-// captureServedProcess is synchronous from the caller's point of view.  The optional hash hook
-// remains intentionally synchronous in the public dependency contract; Promise-returning hooks
-// are rejected as unavailable rather than accidentally stringifying an object into evidence.
-function awaitable(value: string | Promise<string>): string {
-  return typeof value === "string" ? value : "";
 }
 
 function markArtifact(

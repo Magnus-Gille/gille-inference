@@ -276,6 +276,7 @@ const identitiesSchema = z.object({
 }).strict();
 
 export interface ServedProvenanceInput {
+  /** Operator-selected public display label; it is excluded from configurationIdentity. */
   readonly modelAlias: string;
   readonly observedAt: string | null;
   readonly freshness: ServedProvenanceFreshness;
@@ -336,7 +337,7 @@ export const servedProvenanceSchema = z.object({
   artifacts: artifactsSchema,
   identities: identitiesSchema,
   effectiveConfiguration: effectiveConfigurationSchema,
-  // Accept older version-1 snapshots while normalizing the newly explicit launch evidence.
+  // Version 1 normalizes an omitted launchConfiguration to explicit per-field unknown evidence.
   launchConfiguration: launchConfigurationSchema.default(unknownLaunchConfiguration()),
   environment: evidenceSchema(environmentSchema),
   configurationIdentity: configurationIdentitySchema,
@@ -385,12 +386,11 @@ function gatewayBuildIdentity(artifact: GatewayBuildArtifact): JsonValue {
   return evidenceIdentity(artifact.sha);
 }
 
-function stableConfigurationProjection(input: Pick<ServedProvenanceInput, "modelAlias" | "artifacts" | "identities" | "effectiveConfiguration" | "launchConfiguration">): JsonValue {
+function stableConfigurationProjection(input: Pick<ServedProvenanceInput, "artifacts" | "identities" | "effectiveConfiguration" | "launchConfiguration">): JsonValue {
   const projector = normalizeProjector(input.artifacts.projector);
   const configuration = input.effectiveConfiguration;
   const launch = input.launchConfiguration ?? unknownLaunchConfiguration();
   const projection: { [key: string]: JsonValue } = {
-    modelAlias: input.modelAlias,
     artifacts: {
       weights: input.artifacts.weights.map(artifactIdentity),
       projector: projectorIdentity(projector),
@@ -418,9 +418,9 @@ function stableConfigurationProjection(input: Pick<ServedProvenanceInput, "model
       },
     },
   };
-  // An all-unknown optional field carries no identity information. Omitting it preserves
-  // identity compatibility for older version-1 snapshots while observed launch values remain
-  // distinct from effective defaults and limits.
+  // An omitted launchConfiguration is normalized to all-unknown evidence by version 1. It
+  // carries no identity information, while observed launch values remain distinct from effective
+  // defaults and limits.
   if (Object.values(launch).some((evidence) => evidence.source !== "unknown")) {
     projection.launchConfiguration = {
       contextSize: evidenceIdentity(launch.contextSize),
@@ -439,7 +439,7 @@ function stableConfigurationProjection(input: Pick<ServedProvenanceInput, "model
  * Observation time, environment, freshness, completeness, and diagnostic reasons are excluded.
  */
 export function servedConfigurationIdentity(
-  input: Pick<ServedProvenanceInput, "modelAlias" | "artifacts" | "identities" | "effectiveConfiguration" | "launchConfiguration">,
+  input: Pick<ServedProvenanceInput, "artifacts" | "identities" | "effectiveConfiguration" | "launchConfiguration">,
 ): string {
   return sha256(canonicalize(stableConfigurationProjection(input)));
 }

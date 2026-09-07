@@ -5,11 +5,20 @@ The served provenance command records a bounded, content-blind observation of on
 the process, call the gateway, load a model, or prove that any particular bytes are resident in
 GPU memory.
 
+The process collector is Linux-only because it reads `/proc`. Other operating systems are
+unsupported and must fail closed as unavailable rather than infer process or artifact evidence.
+
 ## Capture a snapshot
 
 Capture is explicit and may be costly because model and runtime files can be hashed on every run.
 There is no internal cache and the command does not write a file. Redirect its JSON output to a
 private path outside the repository:
+
+`fresh` means only that this capture detected no change while it ran. It does not establish
+continuing currentness or prove which bytes are loaded or served. Retain the capture timestamp
+with the report. Any model, runtime, launch/configuration, or process-restart change invalidates
+reuse; recapture explicitly after such changes and before comparison. Consumers must not assume
+automatic caching or revalidation.
 
 ```sh
 umask 077
@@ -30,8 +39,10 @@ The command accepts:
   read-only process and artifact reads. On Linux, artifact reads require the target and collector
   to share a mount namespace and the target root to have the same device/inode identity as the
   collector root. Absolute paths stay inside `/proc/PID/root`; relative paths resolve from
-  `/proc/PID/cwd`. Remote locators and traversal are rejected, and an incompatible process view
-  leaves artifact evidence incomplete.
+  `/proc/PID/cwd`. Remote locators and traversal are rejected. A final artifact-path symlink is
+  unsupported and fails closed with `artifact-hash-failed`; `/proc/PID/exe` is the deliberate
+  process-executable magic-link exception. An incompatible process view leaves artifact evidence
+  incomplete.
 - `--alias SAFE_ALIAS`: an explicit operator-declared public label matching
   `[A-Za-z0-9._-]{1,128}`. It is a label supplied by the operator; it is not a claim that the
   gateway verified the label.
@@ -62,15 +73,19 @@ Schema version `1` contains:
   stable `configurationIdentity`.
 - `artifacts.weights`, normalized `artifacts.projector`, `artifacts.runtimeBinary`, and
   `artifacts.gatewayBuild`. An omitted or unresolved projector is normalized to an unknown
-  artifact; `{"kind":"not-applicable"}` means the collector observed that no projector was
-  selected. Artifact digests identify observed content when available; each artifact also carries
-  a binding state.
+  artifact; `{"kind":"not-applicable"}` is reserved for a separately established absence. The
+  process collector reports unknown when `--mmproj` is absent because it does not inspect
+  environment or configuration sources. Artifact digests identify observed content when
+  available; each artifact also carries a binding state.
 - `identities.quantization`, `identities.tokenizer`, and `identities.chatTemplate`.
 - `launchConfiguration`, which records numeric values recovered from the observed launch command
   line. A missing flag, ambiguous/invalid flag, or unavailable process is unknown. This is separate
   from `effectiveConfiguration`: launch flags alone do not establish runtime effective defaults or
-  limits, and per-request overrides are deliberately absent. All effective fields remain unknown in
-  the first collector, and consumers must not treat omitted or unknown values as retrieved defaults.
+  limits, and per-request overrides are deliberately absent. Version 1 normalizes an omitted
+  `launchConfiguration` to all-unknown evidence for its seven fields. The first collector leaves
+  effective defaults and limits, quantization, tokenizer, and chat-template identities unknown;
+  no live snapshot has established those values. Consumers must not treat omitted or unknown
+  values as retrieved defaults.
 - `environment` information such as OS, architecture, CPU count, memory, and resource ceilings.
   Host facts may be observed while resource ceilings remain explicit `null` unknowns.
 
@@ -78,18 +93,22 @@ Evidence values say whether they are `observed`, `operator-declared`, or `unknow
 operator-declared required value keeps the snapshot incomplete. The operator-supplied alias and
 gateway build are declarations, not gateway verification or immutable-startup evidence.
 
-`configurationIdentity` is a stable SHA-256 identity over the alias, artifact content identities,
-model identities, effective configuration, and launch configuration. Observation time and
-environment are excluded, so the identity can be compared across captures without claiming that
-the runtime environment was the same.
+`configurationIdentity` is a stable SHA-256 identity over artifact content identities, model
+identities, effective configuration, and launch configuration. The operator-selected `modelAlias`
+is a public display label and is deliberately excluded; changing the label does not represent a
+runtime configuration change. Observation time and environment are also excluded, so the identity
+can be compared across captures without claiming that the runtime environment was the same.
 
 ## Loaded-byte boundary
 
 The collector always reports loaded-byte binding as `unproven` or `stale`; no command flag can
 upgrade it. A digest of a path on disk does not prove that the same bytes were loaded into the
 running process or GPU. This tool cannot provide retrospective disk-to-GPU proof, and live
-immutable-startup binding remains unsupported. Replacing a path during collection or losing the
-process makes the relevant evidence stale or unavailable.
+immutable-startup binding remains unsupported. The first collector does not establish a loaded
+binding. It detects changes observed during capture, but a same-size rewrite completed within the
+filesystem timestamp resolution may evade stat-based detection; `fresh` therefore means only that
+no change was detected during that capture. A detected artifact replacement or loss of the process
+makes the relevant evidence stale or unavailable.
 
 The snapshot is therefore evidence to retain with a benchmark, not a reproducibility guarantee or
 a performance guarantee. It does not turn an incomplete observation into an operational M2 or
@@ -240,7 +259,7 @@ live observation:
       }
     }
   },
-  "configurationIdentity": "sha256:4f207a05586ec3f1141949535cc222f27044c574d2247053d43a9d48d79cd475"
+  "configurationIdentity": "sha256:e2bd1236bc8cdaa30c836708242d69353821103b2ff69ac44db2a19ec8fe630b"
 }
 ```
 
