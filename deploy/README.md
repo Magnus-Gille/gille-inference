@@ -531,6 +531,17 @@ transport, not the job, is dropped. The bound deploy mode restarts only when rsy
 actually transferred a content change (or `DEPLOY_FORCE_RESTART=1`), specifically to avoid
 unnecessary MCP churn on a no-op deploy.
 
+For a separately reviewed backend executable replacement, use the
+[`llama-swap backend upgrade runbook`](../docs/llama-swap-upgrade.md). It is a distinct operation
+from `deploy-gateway.sh`: replacing llama-swap can restart or cycle the gateway, its MCP transport,
+and other transitive dependents through effective `Requires`, `PartOf`, `BindsTo`, and start/stop
+propagation edges. Inspect the full dependency impact inventory, derive and approve the precise
+propagation stop/restart set with baseline states, and preserve ordering-only or unrelated units
+before any backend stop or file replacement; the MCP interruption may therefore be broader than the
+gateway deploy caveat above. The gateway's process-local `ActiveWindow` does not by itself authorize
+or survive this restart-spanning operation. Do not treat the public roster example as live
+configuration or copy it over the live config as part of an executable upgrade.
+
 ### Credential-safe authenticated capability smoke test
 
 Before credential preflight, a repository checkout with Node.js 20+ can inspect local
