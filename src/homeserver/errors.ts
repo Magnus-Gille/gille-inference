@@ -213,6 +213,8 @@ export function makeError(code: ErrorCode, opts: MakeErrorOptions = {}): ErrorEn
  *     ECONNREFUSED / ECONNRESET / ECONNABORTED / EPIPE / UND_ERR_SOCKET / UND_ERR_CONNECT_TIMEOUT
  *     → upstream_unavailable. UND_ERR_CONNECT_TIMEOUT is a FAILED TCP connect (backend unreachable),
  *     NOT a slow response — it belongs here, NOT in the AbortSignal timeout bucket.
+ *   • Undici response deadlines surface as a fetch TypeError with cause.code
+ *     UND_ERR_HEADERS_TIMEOUT or UND_ERR_BODY_TIMEOUT → upstream_timeout.
  *     A bare fetch TypeError ("fetch failed") with no cause is still treated as a connection
  *     failure (it is what an unreachable backend produces).
  *
@@ -229,6 +231,10 @@ export function classifyUpstreamError(err: unknown): "upstream_unavailable" | "u
   // A fetch() network failure is a TypeError. Match it whether or not a cause code is present.
   if (err instanceof TypeError) {
     const code = (err as { cause?: { code?: unknown } }).cause?.code;
+    const RESPONSE_TIMEOUT_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+    if (typeof code === "string" && RESPONSE_TIMEOUT_CODES.has(code)) {
+      return "upstream_timeout";
+    }
     const CONNECTION_CODES = new Set([
       "ECONNREFUSED",
       "ECONNRESET",

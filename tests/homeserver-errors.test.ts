@@ -114,6 +114,18 @@ describe("error envelope", () => {
     expect(classifyUpstreamError(e)).toBe("upstream_unavailable");
   });
 
+  it("classifyUpstreamError: Undici response timeouts → upstream_timeout", () => {
+    for (const code of ["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]) {
+      const e = Object.assign(new TypeError("fetch failed"), { cause: { code } });
+      expect(classifyUpstreamError(e), code).toBe("upstream_timeout");
+    }
+  });
+
+  it("classifyUpstreamError: an unknown fetch cause code is not classified", () => {
+    const e = Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_UNKNOWN" } });
+    expect(classifyUpstreamError(e)).toBeNull();
+  });
+
   it("classifyUpstreamError: TimeoutError / AbortError still → upstream_timeout (AbortSignal.timeout fired)", () => {
     // Timeout from the gateway's own AbortSignal deadline remains upstream_timeout (504) — the
     // connection was established but the backend was too slow to respond.
