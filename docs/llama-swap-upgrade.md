@@ -75,7 +75,7 @@ secrets, and private URLs:
 
 ```bash
 systemctl show llama-swap.service \
-  --property=Id,FragmentPath,DropInPaths,Requires,Requisite,Wants,PartOf,BindsTo,After,Before,Conflicts,PropagatesStopTo,StopPropagatedFrom,ActiveState,SubState,UnitFileState,MainPID
+  --property=Id,FragmentPath,DropInPaths,Requires,Requisite,Wants,PartOf,BindsTo,After,Before,Conflicts,PropagatesStopTo,StopPropagatedFrom,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,UnitFileState,MainPID,ControlPID,ControlGroup
 systemctl list-dependencies --all llama-swap.service
 systemctl list-dependencies --all --reverse llama-swap.service
 ```
@@ -117,8 +117,12 @@ environment. Record only the returned path, separately reviewed argument-shape
 metadata, and the current process/executable identity.
 
 For each unit in the impact inventory, inspect the same relationship properties
-and record its identity, `ActiveState`, `SubState`, `UnitFileState`, `MainPID`,
-and relevant start/stop propagation. Include gateway, MCP-serving, tunnel,
+and record its identity, `ActiveState`, `SubState`, `Result`,
+`ExecMainCode`, `ExecMainStatus`, `UnitFileState`, `MainPID`, `ControlPID`,
+`ControlGroup`, and relevant start/stop propagation. Record these properties as
+reported by systemd: a wrapper exit status and a process killed by a signal can
+produce different tuples; do not derive the tuple from a shell convention.
+Include gateway, MCP-serving, tunnel,
 socket, and other dependent units when the graph reaches them. Then derive the
 precise stop/restart propagation set from effective `Requires`, `PartOf`,
 `BindsTo`, and propagation edges. `After`, `Before`, `Wants`, network targets,
@@ -153,8 +157,9 @@ Confirm all of the following before approval:
    identities in the release record.
 5. The dependency impact inventory, precise stop/restart propagation set,
    expected temporary outage (including MCP transport interruption), baseline
-   states, verification probes, and rollback target are written into the
-   private operator record.
+   states, approved stop-result and cgroup predicate, bounded post-start
+   readiness deadline, verification probes, and rollback target are written
+   into the private operator record.
 
 ## Artifact and replacement contract
 
@@ -217,9 +222,17 @@ Using the approved operator procedure:
    stage the candidate beside the live executable, apply and verify the original
    owner and mode, and stop before any service mutation if either identity check
    fails.
-3. Stop the approved propagation set in dependency-aware order. Confirm every
-   expected unit reached its approved inactive state and that no unapproved
-   unit was stopped or started. Preserve inventory units outside that set.
+3. Stop the approved propagation set in dependency-aware order. For every
+   stopped unit, apply the exact stop predicate named in the approval:
+   `ActiveState=inactive` alone is insufficient. For any allowed failed state, confirm the predeclared
+   `Result`, `ExecMainCode`, and `ExecMainStatus` termination tuple. Also prove
+   `MainPID=0`, no `ControlPID` remains, and the service cgroup contains no
+   processes. A failed unit is not accepted merely because its main PID is zero; a
+   failed result is acceptable only when that exact result tuple was
+   predeclared and all quiescence checks pass. Any unknown result, populated
+   cgroup, remaining control process, or unknown work fails closed. Confirm
+   that no unapproved unit was stopped or started, and preserve inventory units
+   outside the approved set.
 4. Verify every relevant process again and require that no process executes the
    old executable. If any old-binary process remains, stop and escalate rather
    than replacing a running executable. Then atomically rename the
@@ -227,10 +240,15 @@ Using the approved operator procedure:
    device, and path.
 5. Start only the units that were active in the recorded baseline, using the
    approved dependency order. Do not turn an inactive service into an active
-   one merely to make a probe pass.
-6. Verify process identity and executable digest, systemd state for the entire
-   closure, backend health, and the gateway's authenticated capability seam.
-   Use content-blind checks and do not send prompts or model requests.
+   one merely to make a probe pass. After each required start, poll the
+   approved non-mutating health or listener check until the fixed, approved
+   readiness deadline. `ActiveState=active` alone is not readiness; an expired
+   or ambiguous readiness check fails closed. Never resend a model request as
+   a readiness poll.
+6. After readiness succeeds, verify process identity and executable digest,
+   systemd state for the entire closure, backend health, and the gateway's
+   authenticated capability seam. Use content-blind checks and do not send
+   prompts or model requests.
 7. Verify that MCP clients can reconnect after the expected transport
    interruption. A reconnect or synthetic readiness result is operational
    evidence only; it is not evidence of organic traffic, quality, routing
@@ -256,17 +274,27 @@ check fails, and it may not expand the approved scope.
    inventory and propagation set, baseline states, and current absence of active
    work and model residency. Do not seek a second confirmation when the exact
    rollback was already preauthorized and the recorded trigger matches.
-2. Stop the same approved propagation set and verify no process executes the
-   candidate.
+2. Stop the same approved propagation set and apply the same approved stop
+   predicate: verify any required failed-state termination tuple, `MainPID=0`, no
+   `ControlPID`, and an empty service cgroup before restoring. Verify that no
+   process executes the candidate.
 3. Restore the verified original backup by the same-filesystem atomic rename;
    preserve the original owner and mode and recheck its SHA-256 and metadata.
-4. Restart only the units that were active in the original baseline. Verify the
-   whole closure, backend health, gateway capability seam, and MCP reconnect.
+4. Restart only the units that were active in the original baseline. Poll the
+   approved non-mutating readiness check until its fixed deadline; then verify
+   the whole closure, backend health, gateway capability seam, and MCP
+   reconnect. `ActiveState=active` alone is insufficient, and no model request
+   is a readiness poll.
 5. Record whether the original executable is restored byte-for-byte and leave
    the gateway running on that known-good backend state. Do not edit roster,
    configuration, credentials, isolation, or gateway source to make rollback
    pass.
 
-If restoration, dependency state, or protected-service health is anomalous,
-stop and escalate under the owner-controlled operations procedure. Do not retry
-with a broader stop, guessed unit relationship, or unverified artifact.
+If the stop predicate is unknown, a cgroup is populated, readiness expires, or
+restoration, dependency state, or protected-service health is anomalous, keep
+the affected scope contained and stop under the owner-controlled operations
+procedure. If an apply failure matches an explicitly approved recovery trigger,
+use that recovery within its original attempt limit. If recovery itself fails or
+restoration is anomalous, stop and escalate; existing preauthorization does not
+permit another recovery attempt. Do not retry with a broader
+stop, guessed unit relationship, repeated model request, or unverified artifact.
