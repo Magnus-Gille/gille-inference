@@ -755,4 +755,52 @@ describe("R6 graceful degradation — MCP runChatCompletion upstream failures", 
     // C2: a failed call is never billed.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
   });
+
+  it.each(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"])(
+    "M2: %s from fetch → MCP request_log records upstream_timeout / status=504 / 0 credits",
+    async (code) => {
+      // Undici emits these as a TypeError with a cause code. Stub fetch so the MCP path sees the
+      // exact runtime shape without depending on timing or a live upstream.
+      const originalFetch = globalThis.fetch;
+      const timeoutError = () => Object.assign(new TypeError("fetch failed"), { cause: { code } });
+      globalThis.fetch = (async () => {
+        if (code === "UND_ERR_HEADERS_TIMEOUT") throw timeoutError();
+        return {
+          status: 200,
+          text: async () => {
+            throw timeoutError();
+          },
+        } as Response;
+      }) as typeof fetch;
+
+      const alias = `mcp-deg-${code.toLowerCase()}`;
+      const k = mintKey({ alias, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+      const rec = lookupKey(k.plaintextKey)!;
+      const cfg = { ...loadConfig(), requestLog: "on" as const };
+      const controller = new AdmissionController({ maxInflight: 2, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
+      const principal = makePrincipal(rec);
+
+      try {
+        const r = await runChatCompletion(principal, cfg, controller, noopInflight, {
+          model: "m1",
+          messages: [{ role: "user", content: "hi" }],
+          maxTokens: 16,
+        });
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.code).toBe("upstream_error");
+          expect(r.traceOutcome).toBe("upstream_timeout");
+          expect(r.traceErrorClass).toBe("upstream_timeout");
+        }
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+
+      const log = getRequestLog(200).find((r) => r.alias === alias);
+      expect(log).toBeDefined();
+      expect(log?.outcome).toBe("upstream_timeout");
+      expect(log?.status).toBe(504);
+      expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    },
+  );
 });
