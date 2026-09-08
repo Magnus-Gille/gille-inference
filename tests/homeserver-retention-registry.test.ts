@@ -88,6 +88,22 @@ describe("retention-registry — harvest store inventory", () => {
     expect(prunableHarvestStores().some((s) => s.storeId === "adoption-evidence")).toBe(true);
   });
 
+  it("registers the versioned post-cap adoption aggregate for the same bounded trial window", () => {
+    const overflow = getHarvestStoreDescriptor("adoption-evidence-overflow-v2");
+    expect(overflow).toMatchObject({
+      table: "adoption_evidence_overflow_v2",
+      classification: "content-blind",
+      retentionDays: 90,
+      policyEpoch: "2026-07-31-m5-adoption-v1",
+      pruneAction: "delete-row",
+      timestampColumn: "recorded_day",
+      timestampKind: "date",
+      primaryKeyColumn: null,
+      sampleRefColumn: "recorded_day",
+    });
+    expect(prunableHarvestStores().some((s) => s.storeId === "adoption-evidence-overflow-v2")).toBe(true);
+  });
+
   it("prunableHarvestStores excludes every prunable:false descriptor", () => {
     for (const d of prunableHarvestStores()) {
       expect(d.prunable).toBe(true);

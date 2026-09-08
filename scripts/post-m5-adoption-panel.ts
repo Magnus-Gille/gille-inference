@@ -12,8 +12,14 @@ import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
+  ADOPTION_CHECK_OUTCOMES,
+  ADOPTION_EXECUTION_MODES,
   ADOPTION_FALLBACK_REASONS,
+  ADOPTION_HARNESSES,
+  ADOPTION_RESULTS,
   ADOPTION_TRAFFIC_PURPOSES,
+  ADOPTION_USEFULNESS,
+  type AdoptionExecutionMode,
   type AdoptionTrafficPurpose,
   type AdoptionFallbackReason,
   type AdoptionHarness,
@@ -62,21 +68,32 @@ export interface LabAdoptionByPurpose {
 
 export interface AdoptionPanelOverflow {
   retainedIndividualCount: number;
+  legacyAggregatedCount: number;
+  legacyRowCount: number;
+  attributedAggregatedCount: number;
   aggregatedCount: number;
   droppedCount: number;
+  malformedDay: number;
+  missingDimensions: number;
   cappedDays: string[];
   affectedDays: string[];
   perHarnessAttribution: "complete" | "unavailable";
-  byPurpose: Record<AdoptionTrafficPurpose, {
+  byPurpose: Record<AdoptionTrafficPurpose, OverflowPanelAggregate>;
+  byHarness: Record<AdoptionHarness, OverflowPanelAggregate>;
+  byMode: Record<AdoptionExecutionMode, OverflowPanelAggregate>;
+}
+
+interface OverflowPanelAggregate {
+    legacyReports: number;
     reports: number;
     eligibleOpportunities: number;
+    unknownOpportunityDenominators: number;
     attemptedDelegations: number;
     completed: number;
     usefulCompletions: number;
     deterministicChecks: number;
     deterministicCheckPasses: number;
     fallbackCounts: Record<AdoptionFallbackReason, number>;
-  }>;
 }
 
 interface OrganicSummaryDbRow {
@@ -105,14 +122,21 @@ interface LabDbRow {
 }
 
 interface OverflowDbRow {
-  recorded_day: string;
-  traffic_purpose: AdoptionTrafficPurpose;
+  recorded_day: unknown;
+  harness?: unknown;
+  execution_mode?: unknown;
+  traffic_purpose: unknown;
   result: string;
   deterministic_check: string;
-  reviewer_usefulness: string;
-  fallback_reason: AdoptionFallbackReason;
-  report_count: number;
-  eligible_opportunities: number;
+  reviewer_usefulness: unknown;
+  fallback_reason: unknown;
+  report_count: unknown;
+  eligible_opportunities: unknown;
+  unknown_opportunity_reports: unknown;
+}
+
+function isValidCounter(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function utcDayStart(now: number): number {
@@ -161,11 +185,16 @@ function emptyOrganic(harness: AdoptionHarness): OrganicAdoptionByHarness {
 }
 
 function emptyOverflow(): AdoptionPanelOverflow {
-  const byPurpose = () => ({ reports: 0, eligibleOpportunities: 0, attemptedDelegations: 0, completed: 0, usefulCompletions: 0, deterministicChecks: 0, deterministicCheckPasses: 0, fallbackCounts: Object.fromEntries(ADOPTION_FALLBACK_REASONS.map((reason) => [reason, 0])) as Record<AdoptionFallbackReason, number> });
+  const byPurpose = (): OverflowPanelAggregate => ({ legacyReports: 0, reports: 0, eligibleOpportunities: 0, unknownOpportunityDenominators: 0, attemptedDelegations: 0, completed: 0, usefulCompletions: 0, deterministicChecks: 0, deterministicCheckPasses: 0, fallbackCounts: Object.fromEntries(ADOPTION_FALLBACK_REASONS.map((reason) => [reason, 0])) as Record<AdoptionFallbackReason, number> });
   return {
     retainedIndividualCount: 0,
+    legacyAggregatedCount: 0,
+    legacyRowCount: 0,
+    attributedAggregatedCount: 0,
     aggregatedCount: 0,
     droppedCount: 0,
+    malformedDay: 0,
+    missingDimensions: 0,
     cappedDays: [],
     affectedDays: [],
     perHarnessAttribution: "complete",
@@ -174,6 +203,8 @@ function emptyOverflow(): AdoptionPanelOverflow {
       evaluation: byPurpose(),
       synthetic: byPurpose(),
     },
+    byHarness: Object.fromEntries(ADOPTION_HARNESSES.map((harness) => [harness, byPurpose()])) as Record<AdoptionHarness, OverflowPanelAggregate>,
+    byMode: Object.fromEntries(ADOPTION_EXECUTION_MODES.map((mode) => [mode, byPurpose()])) as Record<AdoptionExecutionMode, OverflowPanelAggregate>,
   };
 }
 
@@ -184,8 +215,29 @@ function hasAdoptionEvidenceOverflowTable(db: Database.Database): boolean {
   return row?.present === 1;
 }
 
+function hasAdoptionEvidenceOverflowV2Table(db: Database.Database): boolean {
+  const row = db
+    .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'adoption_evidence_overflow_v2'")
+    .get() as { present: 1 } | undefined;
+  return row?.present === 1;
+}
+
+function tableColumns(db: Database.Database, table: string): Set<string> {
+  return new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
+}
+
 function integerCount(value: unknown): number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
+  return isValidCounter(value) ? value : 0;
+}
+
+function closedOverflowValue(value: unknown, values: readonly string[]): string {
+  return typeof value === "string" && values.includes(value) ? value : "unknown";
+}
+
+function validOverflowDay(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const time = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value;
 }
 
 /** Read post-cap content-free aggregates without widening the per-harness attribution surface. */
@@ -195,38 +247,121 @@ export function queryAdoptionEvidenceOverflow(
   now: number = Date.now(),
 ): AdoptionPanelOverflow {
   const result = emptyOverflow();
-  result.retainedIndividualCount = hasAdoptionEvidenceTable(db)
-    ? Number((db.prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day >= @sinceDay AND recorded_day < @throughDay").get({ sinceDay: windowStartDay(now, days), throughDay: windowThroughDay(now) }) as { count: number }).count)
-    : 0;
-  if (!hasAdoptionEvidenceOverflowTable(db)) return result;
-  const all = db.prepare("SELECT recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities FROM adoption_evidence_overflow ORDER BY rowid ASC").all() as OverflowDbRow[];
-  const cappedDays = new Set<string>();
-  const affectedDays = new Set<string>();
   const sinceDay = windowStartDay(now, days);
   const throughDay = windowThroughDay(now);
-  for (const row of all) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(row.recorded_day)) continue;
-    if (row.recorded_day < sinceDay || row.recorded_day >= throughDay) continue;
-    cappedDays.add(row.recorded_day);
-    affectedDays.add(row.recorded_day);
-    const reports = integerCount(row.report_count);
-    const opportunities = integerCount(row.eligible_opportunities);
-    result.aggregatedCount += reports;
-    const purpose = ADOPTION_TRAFFIC_PURPOSES.includes(row.traffic_purpose) ? row.traffic_purpose : null;
-    if (!purpose) continue;
-    const item = result.byPurpose[purpose];
-    item.reports += reports;
-    item.eligibleOpportunities += opportunities;
-    item.attemptedDelegations += ["completed", "refused", "failed"].includes(row.result) ? reports : 0;
-    item.completed += row.result === "completed" ? reports : 0;
-    item.usefulCompletions += row.result === "completed" && row.deterministic_check !== "fail" && ["pass", "partial"].includes(row.reviewer_usefulness) ? reports : 0;
-    item.deterministicChecks += row.deterministic_check !== "not_run" ? reports : 0;
-    item.deterministicCheckPasses += row.deterministic_check === "pass" ? reports : 0;
-    if (ADOPTION_FALLBACK_REASONS.includes(row.fallback_reason)) item.fallbackCounts[row.fallback_reason] += reports;
-  }
+  result.retainedIndividualCount = hasAdoptionEvidenceTable(db)
+    ? Number((db.prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day >= @sinceDay AND recorded_day < @throughDay").get({ sinceDay, throughDay }) as { count: number }).count)
+    : 0;
+  const cappedDays = new Set<string>();
+  const affectedDays = new Set<string>();
+  let legacyRowCount = 0;
+  const readRows = (table: "adoption_evidence_overflow" | "adoption_evidence_overflow_v2", attributed: boolean): OverflowDbRow[] => {
+    const columns = tableColumns(db, table);
+    const required = table === "adoption_evidence_overflow_v2"
+      ? ["recorded_day", "harness", "execution_mode", "traffic_purpose", "result", "deterministic_check", "reviewer_usefulness", "fallback_reason", "report_count", "eligible_opportunities", "unknown_opportunity_reports"]
+      : ["recorded_day", "traffic_purpose", "result", "deterministic_check", "reviewer_usefulness", "fallback_reason", "report_count", "eligible_opportunities"];
+    if (required.some((column) => !columns.has(column))) {
+      result.missingDimensions += 1;
+      return [];
+    }
+    const unknownReports = columns.has("unknown_opportunity_reports")
+      ? "unknown_opportunity_reports"
+      : "CASE WHEN eligible_opportunities = 0 THEN report_count ELSE 0 END AS unknown_opportunity_reports";
+    const fields = table === "adoption_evidence_overflow_v2"
+      ? `recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities, ${unknownReports}`
+      : `recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities, ${unknownReports}`;
+    const rows = db.prepare(`SELECT ${fields} FROM ${table} ORDER BY rowid ASC`).all() as OverflowDbRow[];
+    for (const row of rows) {
+      if (!validOverflowDay(row.recorded_day)) {
+        result.malformedDay += 1;
+        continue;
+      }
+      if (row.recorded_day < sinceDay || row.recorded_day >= throughDay) continue;
+      if (!attributed) legacyRowCount += 1;
+      cappedDays.add(row.recorded_day);
+      affectedDays.add(row.recorded_day);
+      const reports = integerCount(row.report_count);
+      const opportunities = integerCount(row.eligible_opportunities);
+      const unknownOpportunityDenominators = integerCount(row.unknown_opportunity_reports);
+      const reportsValid = isValidCounter(row.report_count);
+      const opportunitiesValid = isValidCounter(row.eligible_opportunities);
+      const unknownValid = !columns.has("unknown_opportunity_reports") || isValidCounter(row.unknown_opportunity_reports);
+      const countersValid = reportsValid && opportunitiesValid && unknownValid &&
+        (!columns.has("unknown_opportunity_reports") || unknownOpportunityDenominators <= reports);
+      const v2CounterConsistencyValid = !attributed || (
+        countersValid &&
+        reports > 0 &&
+        unknownOpportunityDenominators <= reports &&
+        opportunities >= reports - unknownOpportunityDenominators &&
+        (opportunities === 0
+          ? reports - unknownOpportunityDenominators === 0
+          : opportunities / 10000 <= reports - unknownOpportunityDenominators)
+      );
+      if (!countersValid || !v2CounterConsistencyValid) result.missingDimensions += 1;
+      if (attributed) result.attributedAggregatedCount += reports;
+      else result.legacyAggregatedCount += reports;
+      result.aggregatedCount += reports;
+      const purposeValue = closedOverflowValue(row.traffic_purpose, ADOPTION_TRAFFIC_PURPOSES);
+      const harnessValue = closedOverflowValue(row.harness, ADOPTION_HARNESSES);
+      const modeValue = closedOverflowValue(row.execution_mode, ADOPTION_EXECUTION_MODES);
+      const resultValue = closedOverflowValue(row.result, ADOPTION_RESULTS);
+      const checkValue = closedOverflowValue(row.deterministic_check, ADOPTION_CHECK_OUTCOMES);
+      const usefulnessValue = closedOverflowValue(row.reviewer_usefulness, ADOPTION_USEFULNESS);
+      const fallbackValue = closedOverflowValue(row.fallback_reason, ADOPTION_FALLBACK_REASONS);
+      const invalidDimensions = table === "adoption_evidence_overflow_v2" && [purposeValue, harnessValue, modeValue, resultValue, checkValue, usefulnessValue, fallbackValue].includes("unknown");
+      if (invalidDimensions) result.missingDimensions += 1;
+      const attempted = ["completed", "refused", "failed"].includes(resultValue) ? reports : 0;
+      const useful = resultValue === "completed" && (checkValue === "pass" || checkValue === "not_run") && ["pass", "partial"].includes(usefulnessValue) ? reports : 0;
+      const item = result.byPurpose[purposeValue as AdoptionTrafficPurpose];
+      if (item) {
+        if (!attributed) item.legacyReports += reports;
+        item.reports += reports;
+        item.eligibleOpportunities += opportunities;
+        item.unknownOpportunityDenominators += unknownOpportunityDenominators;
+        item.attemptedDelegations += attempted;
+        item.completed += resultValue === "completed" ? reports : 0;
+        item.usefulCompletions += useful;
+        item.deterministicChecks += checkValue !== "not_run" ? reports : 0;
+        item.deterministicCheckPasses += checkValue === "pass" ? reports : 0;
+        if (ADOPTION_FALLBACK_REASONS.includes(fallbackValue as AdoptionFallbackReason)) item.fallbackCounts[fallbackValue as AdoptionFallbackReason] += reports;
+      }
+      if (table === "adoption_evidence_overflow_v2" && purposeValue === "organic" && !invalidDimensions) {
+        const harness = result.byHarness[harnessValue as AdoptionHarness];
+        if (harness) {
+          harness.reports += reports;
+          harness.eligibleOpportunities += opportunities;
+          harness.unknownOpportunityDenominators += unknownOpportunityDenominators;
+          harness.attemptedDelegations += attempted;
+          harness.completed += resultValue === "completed" ? reports : 0;
+          harness.usefulCompletions += useful;
+          harness.deterministicChecks += checkValue !== "not_run" ? reports : 0;
+          harness.deterministicCheckPasses += checkValue === "pass" ? reports : 0;
+          if (ADOPTION_FALLBACK_REASONS.includes(fallbackValue as AdoptionFallbackReason)) harness.fallbackCounts[fallbackValue as AdoptionFallbackReason] += reports;
+        }
+      }
+      if (table === "adoption_evidence_overflow_v2" && !invalidDimensions) {
+        const mode = result.byMode[modeValue as AdoptionExecutionMode];
+        if (mode) {
+          mode.reports += reports;
+          mode.eligibleOpportunities += opportunities;
+          mode.unknownOpportunityDenominators += unknownOpportunityDenominators;
+          mode.attemptedDelegations += attempted;
+          mode.completed += resultValue === "completed" ? reports : 0;
+          mode.usefulCompletions += useful;
+          mode.deterministicChecks += checkValue !== "not_run" ? reports : 0;
+          mode.deterministicCheckPasses += checkValue === "pass" ? reports : 0;
+          if (ADOPTION_FALLBACK_REASONS.includes(fallbackValue as AdoptionFallbackReason)) mode.fallbackCounts[fallbackValue as AdoptionFallbackReason] += reports;
+        }
+      }
+    }
+    return rows;
+  };
+  if (hasAdoptionEvidenceOverflowV2Table(db)) readRows("adoption_evidence_overflow_v2", true);
+  if (hasAdoptionEvidenceOverflowTable(db)) readRows("adoption_evidence_overflow", false);
   result.cappedDays = [...cappedDays].sort();
   result.affectedDays = [...affectedDays].sort();
-  result.perHarnessAttribution = result.aggregatedCount > 0 ? "unavailable" : "complete";
+  result.legacyRowCount = legacyRowCount;
+  result.perHarnessAttribution = result.legacyRowCount > 0 || result.malformedDay > 0 || result.missingDimensions > 0 ? "unavailable" : "complete";
   return result;
 }
 
@@ -358,12 +493,32 @@ function mergeOrganicOverflow(
   totals.deterministicCheckPasses += item.deterministicCheckPasses;
 }
 
+function mergeOverflowIntoOrganicRow(row: OrganicAdoptionByHarness, item: OverflowPanelAggregate): void {
+  row.reports += item.reports;
+  row.eligibleOpportunities += item.eligibleOpportunities;
+  row.attemptedDelegations += item.attemptedDelegations;
+  row.completed += item.completed;
+  row.usefulCompletions += item.usefulCompletions;
+  row.deterministicChecks += item.deterministicChecks;
+  row.deterministicCheckPasses += item.deterministicCheckPasses;
+  for (const reason of ADOPTION_FALLBACK_REASONS) row.fallbackCounts[reason] += item.fallbackCounts[reason];
+}
+
 export function buildAdoptionPanels(
   organicRows: OrganicAdoptionByHarness[],
   labRows: LabAdoptionByPurpose[],
   days: number,
   overflow: AdoptionPanelOverflow = emptyOverflow(),
 ): { organic: StatusPanel; organicByHarness: TablePanel; fallbacks: TablePanel; lab: TablePanel } {
+  const byHarness = new Map(organicRows.map((row) => [row.harness, { ...row, fallbackCounts: { ...row.fallbackCounts } }]));
+  for (const harness of ADOPTION_HARNESSES) {
+    const item = overflow.byHarness[harness];
+    if (item.reports === 0) continue;
+    const row = byHarness.get(harness) ?? emptyOrganic(harness);
+    mergeOverflowIntoOrganicRow(row, item);
+    byHarness.set(harness, row);
+  }
+  const mergedOrganicRows = [...byHarness.values()].sort((a, b) => a.harness.localeCompare(b.harness));
   const totals = aggregateOrganic(organicRows);
   mergeOrganicOverflow(totals, overflow);
   for (const reason of ADOPTION_FALLBACK_REASONS) totals.fallbackCounts[reason] += overflow.byPurpose.organic.fallbackCounts[reason];
@@ -380,22 +535,31 @@ export function buildAdoptionPanels(
   }
   const mergedLabRows = [...labByPurpose.values()].sort((a, b) => a.purpose.localeCompare(b.purpose));
   const organicOverflowCount = overflow.byPurpose.organic.reports;
-  const organicIncomplete = organicOverflowCount > 0 || overflow.droppedCount > 0;
-  const fallbackIncomplete = overflow.droppedCount > 0;
-  const labIncomplete = overflow.byPurpose.evaluation.reports + overflow.byPurpose.synthetic.reports > 0 || overflow.droppedCount > 0;
+  const organicIncomplete = overflow.byPurpose.organic.legacyReports > 0 || overflow.legacyRowCount > 0 || overflow.droppedCount > 0 || overflow.malformedDay > 0 || overflow.missingDimensions > 0;
+  const fallbackIncomplete = overflow.droppedCount > 0 || overflow.malformedDay > 0 || overflow.missingDimensions > 0;
+  const labIncomplete = overflow.byPurpose.evaluation.legacyReports > 0 || overflow.byPurpose.synthetic.legacyReports > 0 || overflow.legacyRowCount > 0 || overflow.droppedCount > 0 || overflow.malformedDay > 0 || overflow.missingDimensions > 0;
+  const organicOverflowStatus = overflow.legacyRowCount > 0
+    ? "legacy overflow rows lack durable attribution"
+    : overflow.missingDimensions > 0
+      ? "overflow schema, dimensions, or counters are invalid"
+      : overflow.malformedDay > 0
+        ? "overflow day values are malformed"
+        : overflow.droppedCount > 0
+          ? "overflow includes dropped reports"
+          : "overflow retention is incomplete";
   const organic: StatusPanel = {
     service: SERVICE,
     panel: ORGANIC_PANEL,
     kind: "status",
     label: organicIncomplete
-      ? "INCOMPLETE — organic M5 agent adoption (overflow is unattributed)"
+      ? "INCOMPLETE — organic M5 agent adoption (overflow coverage is incomplete)"
       : "MEASURED — organic M5 agent adoption",
     state: totals.reports === 0 || organicIncomplete ? "warn" : "pass",
     message:
       `MEASURED: ${totals.attemptedDelegations} attempted local delegation(s) from ${totals.eligibleOpportunities} known organic eligible opportunity/opportunities in ${days}d; ` +
       `useful completion rate ${pct(totals.usefulCompletions, totals.attemptedDelegations)}; deterministic check pass rate ${pct(totals.deterministicCheckPasses, totals.deterministicChecks)}. ` +
       (organicIncomplete
-        ? `INCOMPLETE: ${organicOverflowCount} organic overflow observation(s) were aggregated on ${overflow.affectedDays.length} affected day(s); per-harness attribution is unavailable and inference availability is unaffected. `
+        ? `INCOMPLETE: ${organicOverflowCount} organic overflow observation(s) were aggregated on ${overflow.affectedDays.length} affected day(s); ${organicOverflowStatus}; per-harness attribution is unavailable and inference availability is unaffected. `
         : "") +
       "ENFORCED: evaluation and synthetic evidence are excluded from this panel. SHADOW: this measurement does not change routing or authorize frontier displacement.",
     detail: {
@@ -406,7 +570,11 @@ export function buildAdoptionPanels(
         { metric: "organic reports", value: totals.reports },
         { metric: "retained individual reports (all purposes)", value: overflow.retainedIndividualCount },
         { metric: "aggregated overflow reports", value: organicOverflowCount },
+        { metric: "legacy aggregated overflow reports", value: overflow.legacyAggregatedCount },
+        { metric: "attributed aggregated overflow reports", value: overflow.attributedAggregatedCount },
         { metric: "dropped reports", value: overflow.droppedCount },
+        { metric: "malformed overflow days", value: overflow.malformedDay },
+        { metric: "missing overflow dimensions", value: overflow.missingDimensions },
         { metric: "capped days (all purposes)", value: overflow.cappedDays.join(", ") || "none" },
         { metric: "affected days (all purposes)", value: overflow.affectedDays.join(", ") || "none" },
         { metric: "known eligible opportunities", value: totals.eligibleOpportunities },
@@ -435,7 +603,7 @@ export function buildAdoptionPanels(
       "deterministic check pass rate",
       "fallback reports",
     ],
-    rows: organicRows.map((row) => ({
+    rows: mergedOrganicRows.map((row) => ({
       harness: row.harness,
       "known eligible opportunities": row.eligibleOpportunities,
       "attempted delegations": row.attemptedDelegations,

@@ -98,9 +98,28 @@ export const ADOPTION_EVIDENCE_COLUMNS = [
   "eligible_opportunities",
 ] as const;
 
-/** Columns retained by the bounded post-cap aggregate; identity and harness dimensions are absent. */
+/** Columns retained by the historical bounded post-cap aggregate; its original schema is immutable. */
 export const ADOPTION_EVIDENCE_OVERFLOW_COLUMNS = [
   "recorded_day",
+  "traffic_purpose",
+  "result",
+  "deterministic_check",
+  "reviewer_usefulness",
+  "fallback_reason",
+  "report_count",
+  "eligible_opportunities",
+  "unknown_opportunity_reports",
+] as const;
+
+/**
+ * Columns retained by the versioned post-cap aggregate. The closed harness and execution-mode
+ * dimensions preserve the attribution needed by new reports without introducing identity, precise
+ * time, or task content. The legacy overflow table above remains available for historical rows.
+ */
+export const ADOPTION_EVIDENCE_OVERFLOW_V2_COLUMNS = [
+  "recorded_day",
+  "harness",
+  "execution_mode",
   "traffic_purpose",
   "result",
   "deterministic_check",
@@ -162,6 +181,32 @@ function ensureSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_overflow_recorded_day
       ON adoption_evidence_overflow(recorded_day);
+
+    CREATE TABLE IF NOT EXISTS adoption_evidence_overflow_v2 (
+      recorded_day           TEXT NOT NULL,
+      harness                TEXT NOT NULL,
+      execution_mode         TEXT NOT NULL,
+      traffic_purpose        TEXT NOT NULL,
+      result                 TEXT NOT NULL,
+      deterministic_check    TEXT NOT NULL,
+      reviewer_usefulness    TEXT NOT NULL,
+      fallback_reason        TEXT NOT NULL,
+      report_count           INTEGER NOT NULL,
+      eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (
+        recorded_day,
+        harness,
+        execution_mode,
+        traffic_purpose,
+        result,
+        deterministic_check,
+        reviewer_usefulness,
+        fallback_reason
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_adoption_evidence_overflow_v2_recorded_day
+      ON adoption_evidence_overflow_v2(recorded_day);
   `);
   const overflowColumns = new Set(
     (db.prepare("PRAGMA table_info(adoption_evidence_overflow)").all() as Array<{ name: string }>).map((column) => column.name),
@@ -322,7 +367,9 @@ export function allowAdoptionEvidenceReportForPrincipal(keyHash: string, nowMs =
 /**
  * Write one already-validated, content-free evidence report with only its server-derived UTC day.
  * The first retained-row bound is preserved verbatim; later reports are reduced into a bounded,
- * content-free aggregate keyed only by day and low-cardinality outcome dimensions.
+ * content-free aggregate keyed only by day and low-cardinality harness, execution-mode, and
+ * outcome dimensions. New post-cap reports use the versioned overflow table; the legacy overflow
+ * table is retained unchanged for historical data and is never backfilled or dual-written.
  */
 export function recordAdoptionEvidenceWithOutcome(report: AdoptionEvidenceReport): AdoptionEvidenceRetention {
   if (!isValidAdoptionEvidenceReport(report)) {
@@ -330,49 +377,56 @@ export function recordAdoptionEvidenceWithOutcome(report: AdoptionEvidenceReport
   }
   const db = evidenceDb();
   const recordedDay = new Date().toISOString().slice(0, 10);
-  const count = db
-    .prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day = ?")
-    .get(recordedDay) as { count: number };
-  if (count.count < MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY) {
-    db
+  const write = db.transaction((): AdoptionEvidenceRetention => {
+    // The conditional INSERT and the overflow fallback share one immediate transaction. This
+    // acquires SQLite's writer lock before the count is evaluated, so separate gateway processes
+    // cannot both observe a slot and push the retained-row bound above 25.
+    const retained = db
       .prepare(
         `INSERT INTO adoption_evidence
            (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
             reviewer_usefulness, fallback_reason, eligible_opportunities)
+         SELECT
+           @recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
+           @reviewerUsefulness, @fallbackReason, @eligibleOpportunities
+         WHERE (
+           SELECT COUNT(*) FROM adoption_evidence WHERE recorded_day = @recordedDay
+         ) < @maxRows`
+      )
+      .run({ recordedDay, ...report, maxRows: MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY });
+    if (retained.changes === 1) return "retained";
+
+    db
+      .prepare(
+        `INSERT INTO adoption_evidence_overflow_v2
+           (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+            reviewer_usefulness, fallback_reason, report_count, eligible_opportunities,
+            unknown_opportunity_reports)
          VALUES
            (@recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
-            @reviewerUsefulness, @fallbackReason, @eligibleOpportunities)`
+            @reviewerUsefulness, @fallbackReason, 1, @eligibleOpportunities, @unknownOpportunityReports)
+         ON CONFLICT (
+           recorded_day,
+           harness,
+           execution_mode,
+           traffic_purpose,
+           result,
+           deterministic_check,
+           reviewer_usefulness,
+           fallback_reason
+         ) DO UPDATE SET
+           report_count = report_count + 1,
+           eligible_opportunities = eligible_opportunities + excluded.eligible_opportunities,
+           unknown_opportunity_reports = unknown_opportunity_reports + excluded.unknown_opportunity_reports`
       )
-      .run({ recordedDay, ...report });
-    return "retained";
-  }
-
-  db
-    .prepare(
-      `INSERT INTO adoption_evidence_overflow
-         (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
-          fallback_reason, report_count, eligible_opportunities, unknown_opportunity_reports)
-       VALUES
-         (@recordedDay, @trafficPurpose, @result, @deterministicCheck, @reviewerUsefulness,
-          @fallbackReason, 1, @eligibleOpportunities, @unknownOpportunityReports)
-       ON CONFLICT (
-         recorded_day,
-         traffic_purpose,
-         result,
-         deterministic_check,
-         reviewer_usefulness,
-         fallback_reason
-       ) DO UPDATE SET
-         report_count = report_count + 1,
-         eligible_opportunities = eligible_opportunities + excluded.eligible_opportunities,
-         unknown_opportunity_reports = unknown_opportunity_reports + excluded.unknown_opportunity_reports`
-    )
-    .run({
-      recordedDay,
-      ...report,
-      unknownOpportunityReports: report.eligibleOpportunities === 0 ? 1 : 0,
-    });
-  return "aggregated";
+      .run({
+        recordedDay,
+        ...report,
+        unknownOpportunityReports: report.eligibleOpportunities === 0 ? 1 : 0,
+      });
+    return "aggregated";
+  });
+  return write.immediate();
 }
 
 /**

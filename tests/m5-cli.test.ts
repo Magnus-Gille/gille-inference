@@ -8,6 +8,7 @@ import { main } from "../client/m5.mjs";
 import { M5ClientError } from "../client/m5-client.mjs";
 
 const SECRET = "hs_cli_secret-never-print";
+const FEEDBACK_HANDLE = "01234567-89ab-cdef-0123-456789abcdef";
 const PUBLIC_URL = "https://public.private-locator.invalid";
 const PRIVATE_URL = "http://private.private-locator.invalid:8080";
 const AUTH_HELPER = "/trusted/bin/m5-auth";
@@ -962,6 +963,70 @@ describe("m5 command surface", () => {
     expect(exitCode).toBe(0);
     expect(JSON.parse(output.text())).toEqual({ accepted: true });
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("submits exact execution feedback through the fixed-origin PUT route", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "feedback", "submit"], {
+      input: Readable.from([JSON.stringify({ feedback_handle: FEEDBACK_HANDLE, usefulness: "pass" })]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (url, init) => {
+        expect(String(url)).toBe(`${PUBLIC_URL}/execution-feedback/${FEEDBACK_HANDLE}`);
+        expect(init?.method).toBe("PUT");
+        expect(init?.redirect).toBe("error");
+        expect(init?.headers).toMatchObject({
+          "content-type": "application/json",
+          authorization: `Bearer ${SECRET}`,
+        });
+        expect(JSON.parse(String(init?.body))).toEqual({ usefulness: "pass" });
+        return new Response(JSON.stringify({ kind: "recorded" }), { status: 201 });
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({ kind: "recorded" });
+    expect(error.text()).toBe("");
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("rejects invalid feedback input before credential resolution or network", async () => {
+    const output = sink();
+    const error = sink();
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const exitCode = await main(["--profile", "codex", "feedback", "submit"], {
+      input: Readable.from([JSON.stringify({
+        feedback_handle: FEEDBACK_HANDLE.toUpperCase(),
+        usefulness: "pass",
+      })]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach network");
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_execution_feedback" },
+    });
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(error.text()).not.toContain(FEEDBACK_HANDLE);
+    expect(error.text()).not.toContain(SECRET);
   });
 
   it("scopes a legacy adoption-capacity result to telemetry after a valid completed ask", async () => {

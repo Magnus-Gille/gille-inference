@@ -10,6 +10,7 @@ import {
 } from "../client/m5-client.mjs";
 
 const SECRET = "hs_owner_this-must-never-escape";
+const FEEDBACK_HANDLE = "01234567-89ab-cdef-0123-456789abcdef";
 const PROFILE = {
   publicGatewayUrl: "https://public.invalid",
   privateGatewayUrl: "http://private.invalid:8080",
@@ -517,6 +518,63 @@ describe("secret-safe M5 client", () => {
     });
     expect(JSON.stringify(seen)).toContain('"name":"list_models"');
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
+  });
+
+  it("preserves a valid ask feedback handle while keeping absent handles omitted", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            metered: true,
+            usage: null,
+            feedback_handle: FEEDBACK_HANDLE,
+          },
+        });
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task" })).resolves.toMatchObject({
+      feedback_handle: FEEDBACK_HANDLE,
+    });
+  });
+
+  it("rejects malformed ask feedback metadata without echoing the handle", async () => {
+    const malformedHandle = "not-a-valid-feedback-handle";
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            metered: true,
+            usage: null,
+            feedback_handle: malformedHandle,
+          },
+        });
+      },
+    });
+
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "malformed_mcp" });
+    expect(JSON.stringify(failure)).not.toContain(malformedHandle);
   });
 
   const validCapabilities = [
@@ -1308,6 +1366,183 @@ describe("secret-safe M5 client", () => {
     });
     await expect(client.codeResult("cl-1")).rejects.toMatchObject({ code: "invalid_code_result" });
   }
+
+  it("preserves and validates the optional code-loop feedback handle", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "{}" }],
+          isError: false,
+          structuredContent: currentTerminalCodeResult({ feedback_handle: FEEDBACK_HANDLE }),
+        });
+      },
+    });
+
+    await expect(client.codeResult("cl-1")).resolves.toMatchObject({
+      feedback_handle: FEEDBACK_HANDLE,
+    });
+    await expectClientRejectsCodeResult(currentTerminalCodeResult({ feedback_handle: "not-a-uuid" }));
+  });
+
+  it("rejects invalid feedback input before resolving credentials or fetching", async () => {
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach the network");
+      },
+    });
+
+    await expect(client.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE.toUpperCase(),
+      usefulness: "pass",
+    })).rejects.toMatchObject({ code: "invalid_execution_feedback" });
+    await expect(client.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE,
+      usefulness: "pass",
+      extra: "closed-shape rejection",
+    })).rejects.toMatchObject({ code: "invalid_execution_feedback" });
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+  });
+
+  it("submits feedback to the fixed-origin PUT route and accepts only matching idempotent acknowledgements", async () => {
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+    const responses = [
+      jsonResponse({ kind: "recorded" }, { status: 201 }),
+      jsonResponse({ kind: "unchanged" }, { status: 200 }),
+    ];
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid/base-path",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (url, init) => {
+        requests.push({ url: String(url), init: init ?? {} });
+        return responses.shift()!;
+      },
+    });
+
+    await expect(client.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE,
+      usefulness: "pass",
+    })).resolves.toEqual({ kind: "recorded" });
+    await expect(client.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE,
+      usefulness: "pass",
+    })).resolves.toEqual({ kind: "unchanged" });
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request.url).toBe(`https://gateway.invalid/execution-feedback/${FEEDBACK_HANDLE}`);
+      expect(request.init.method).toBe("PUT");
+      expect(request.init.redirect).toBe("error");
+      expect(request.init.headers).toMatchObject({
+        "content-type": "application/json",
+        accept: "application/json",
+        authorization: `Bearer ${SECRET}`,
+      });
+      expect(JSON.parse(String(request.init.body))).toEqual({ usefulness: "pass" });
+      expect(String(request.init.body)).not.toContain(FEEDBACK_HANDLE);
+    }
+  });
+
+  it.each([
+    [400, "invalid_execution_feedback"],
+    [404, "execution_feedback_not_found"],
+    [409, "execution_feedback_conflict"],
+    [403, "rejected_credential"],
+    [500, "upstream_http_error"],
+  ])("maps feedback HTTP %s without reflecting the response body", async (status, code) => {
+    const rawBody = `server detail ${FEEDBACK_HANDLE} Bearer ${SECRET}`;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async () => jsonResponse(rawBody, { status }),
+    });
+
+    const failure = await client.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE,
+      usefulness: "partial",
+    }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code });
+    expect(JSON.stringify(failure)).not.toContain(rawBody);
+    expect(JSON.stringify(failure)).not.toContain(FEEDBACK_HANDLE);
+    expect(JSON.stringify(failure)).not.toContain(SECRET);
+  });
+
+  it.each([
+    [201, { kind: "unchanged" }],
+    [200, { kind: "recorded" }],
+    [201, { kind: "recorded", extra: "ignored" }],
+  ])("rejects a status %s acknowledgement whose kind or shape is not exact", async (status, body) => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async () => jsonResponse(body, { status }),
+    });
+
+    await expect(client.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE,
+      usefulness: "redo",
+    })).rejects.toMatchObject({ code: "malformed_execution_feedback" });
+  });
+
+  it("fails safely on redirects and keeps the timeout active while consuming the response body", async () => {
+    const redirectClient = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async () => {
+        throw new TypeError(`redirected Bearer ${SECRET} ${FEEDBACK_HANDLE}`);
+      },
+    });
+    const redirectFailure = await redirectClient.recordExecutionFeedback({
+      feedback_handle: FEEDBACK_HANDLE,
+      usefulness: "wrong",
+    }).catch((error: unknown) => error);
+    expect(redirectFailure).toMatchObject({ code: "network_failure" });
+    expect(JSON.stringify(redirectFailure)).not.toContain(SECRET);
+    expect(JSON.stringify(redirectFailure)).not.toContain(FEEDBACK_HANDLE);
+
+    vi.useFakeTimers();
+    try {
+      const timeoutClient = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 1_000,
+        fetch: async (_url, init) => ({
+          status: 201,
+          text: () => new Promise<string>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("body stalled")), { once: true });
+          }),
+        } as Response),
+      });
+      const pending = timeoutClient.recordExecutionFeedback({
+        feedback_handle: FEEDBACK_HANDLE,
+        usefulness: "pass",
+      });
+      const assertion = expect(pending).rejects.toMatchObject({ code: "timeout" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it.each([
     ["missing schema_grounding", () => {

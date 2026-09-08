@@ -231,6 +231,7 @@ function help() {
       "m5 --profile <claude|codex> [--public|--private] models",
       "printf '%s' '<json>' | m5 --profile <claude|codex> [--timeout-ms <1000-600000>] ask",
       "printf '%s' '<content-free-json>' | m5 --profile <claude|codex> adoption report",
+      "printf '%s' '{\"feedback_handle\":\"<uuid>\",\"usefulness\":\"pass\"}' | m5 --profile <claude|codex> feedback submit",
       "printf '%s' '<json>' | m5 --profile <claude|codex> code run",
       "m5 --profile <claude|codex> code status <work_id>",
       "m5 --profile <claude|codex> code result <work_id>",
@@ -414,6 +415,13 @@ export async function main(
         throw new M5ClientError("invalid_args", "adoption requires: report.");
       }
       writeJson(output, await client.reportAdoption(await readBoundedInput(input)));
+      return 0;
+    }
+    if (command === "feedback") {
+      if (positional[1] !== "submit" || positional.length !== 2) {
+        throw new M5ClientError("invalid_args", "feedback requires: submit.");
+      }
+      writeJson(output, await client.recordExecutionFeedback(await readBoundedInput(input)));
       return 0;
     }
     if (command === "code") {

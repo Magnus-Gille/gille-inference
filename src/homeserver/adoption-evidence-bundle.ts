@@ -24,8 +24,8 @@ import { isKnownTaskType } from "./taxonomy.js";
 import { classifyVerifierKind, type VerifierKind } from "./verifier-classification.js";
 
 /** Local, content-blind adoption evidence export contract (#245). */
-export const ADOPTION_EVIDENCE_BUNDLE_CONTRACT = "m5-adoption-evidence-bundle-v1" as const;
-export const ADOPTION_EVIDENCE_BUNDLE_VERSION = 1 as const;
+export const ADOPTION_EVIDENCE_BUNDLE_CONTRACT = "m5-adoption-evidence-bundle-v2" as const;
+export const ADOPTION_EVIDENCE_BUNDLE_VERSION = 2 as const;
 
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -58,8 +58,12 @@ interface AdoptionBreakdownRow { bucket: string; reports: number; knownOpportuni
 
 export interface AdoptionEvidenceRetention {
   retainedIndividualCount: number;
+  legacyAggregatedCount: number;
+  attributedAggregatedCount: number;
   aggregatedCount: number;
   droppedCount: number;
+  malformedDay: number;
+  missingDimensions: number;
   cappedDays: string[];
   affectedDays: string[];
   perHarnessAttribution: "complete" | "unavailable";
@@ -87,12 +91,16 @@ interface AdoptionOverflowQueryResult {
   validMin: string | null;
   validMax: string | null;
   aggregatedCount: number;
+  legacyAggregatedCount: number;
+  legacyRows: number;
+  attributedAggregatedCount: number;
   droppedCount: number;
+  missingDimensions: number;
   cappedDays: string[];
   affectedDays: string[];
   perHarnessAttribution: "complete" | "unavailable";
   byPurpose: Record<AdoptionTrafficPurpose, AdoptionOverflowAggregate>;
-  breakdowns: { result: Map<string, AdoptionBreakdownRow>; usefulness: Map<string, AdoptionBreakdownRow>; fallback: Map<string, AdoptionBreakdownRow> };
+  breakdowns: { purpose: Map<string, AdoptionBreakdownRow>; harness: Map<string, AdoptionBreakdownRow>; mode: Map<string, AdoptionBreakdownRow>; result: Map<string, AdoptionBreakdownRow>; usefulness: Map<string, AdoptionBreakdownRow>; fallback: Map<string, AdoptionBreakdownRow> };
 }
 
 export interface AdoptionAggregate {
@@ -382,12 +390,16 @@ function emptyOverflowQuery(): AdoptionOverflowQueryResult {
     validMin: null,
     validMax: null,
     aggregatedCount: 0,
+    legacyAggregatedCount: 0,
+    legacyRows: 0,
+    attributedAggregatedCount: 0,
     droppedCount: 0,
+    missingDimensions: 0,
     cappedDays: [],
     affectedDays: [],
     perHarnessAttribution: "complete",
     byPurpose: { organic: emptyOverflowAggregate(), evaluation: emptyOverflowAggregate(), synthetic: emptyOverflowAggregate() },
-    breakdowns: { result: breakdownMap(ADOPTION_RESULTS), usefulness: breakdownMap(ADOPTION_USEFULNESS), fallback: breakdownMap(ADOPTION_FALLBACK_REASONS) },
+    breakdowns: { purpose: breakdownMap(ADOPTION_TRAFFIC_PURPOSES), harness: breakdownMap(ADOPTION_HARNESSES), mode: breakdownMap(ADOPTION_EXECUTION_MODES), result: breakdownMap(ADOPTION_RESULTS), usefulness: breakdownMap(ADOPTION_USEFULNESS), fallback: breakdownMap(ADOPTION_FALLBACK_REASONS) },
   };
 }
 
@@ -399,64 +411,161 @@ function hasAdoptionOverflowTable(db: Database.Database): boolean {
   return found?.present === 1;
 }
 
+function hasAdoptionOverflowV2Table(db: Database.Database): boolean {
+  const found = db
+    .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'adoption_evidence_overflow_v2'")
+    .get() as { present: 1 } | undefined;
+  return found?.present === 1;
+}
+
 function validCount(value: unknown): number {
-  return finiteNumber(value) && Number.isInteger(value) && value >= 0 ? value : 0;
+  return finiteNumber(value) && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+interface NormalizedOverflowRow {
+  legacy: boolean;
+  recorded_day: unknown;
+  day: string | null;
+  purpose: string;
+  harness: string;
+  mode: string;
+  result: string;
+  check: string;
+  usefulness: string;
+  fallback: string;
+  reports: number;
+  opportunities: number;
+  unknownOpportunityDenominators: number;
+  invalidDimensions: boolean;
+  invalidCounters: boolean;
+}
+
+function normalizeOverflowRow(row: Record<string, unknown>, legacy: boolean, hasUnknownColumn: boolean): NormalizedOverflowRow {
+  const purpose = closedValue(String(row.traffic_purpose ?? ""), ADOPTION_TRAFFIC_PURPOSES);
+  const harness = closedValue(String(row.harness ?? ""), ADOPTION_HARNESSES);
+  const mode = closedValue(String(row.execution_mode ?? ""), ADOPTION_EXECUTION_MODES);
+  const result = closedValue(String(row.result ?? ""), ADOPTION_RESULTS);
+  const check = closedValue(String(row.deterministic_check ?? ""), ADOPTION_CHECK_OUTCOMES);
+  const usefulness = closedValue(String(row.reviewer_usefulness ?? ""), ADOPTION_USEFULNESS);
+  const fallback = closedValue(String(row.fallback_reason ?? ""), ADOPTION_FALLBACK_REASONS);
+  const reports = validCount(row.report_count);
+  const opportunities = validCount(row.eligible_opportunities);
+  const unknownOpportunityDenominators = validCount(row.unknown_opportunity_reports);
+  const counterShapeValid =
+    finiteNumber(row.report_count) && Number.isSafeInteger(row.report_count) && row.report_count >= 0 &&
+    finiteNumber(row.eligible_opportunities) && Number.isSafeInteger(row.eligible_opportunities) && row.eligible_opportunities >= 0 &&
+    (!hasUnknownColumn || (finiteNumber(row.unknown_opportunity_reports) && Number.isSafeInteger(row.unknown_opportunity_reports) && row.unknown_opportunity_reports >= 0));
+  const counterConsistencyValid =
+    !hasUnknownColumn || unknownOpportunityDenominators <= reports;
+  const v2CounterConsistencyValid =
+    legacy || (
+      reports > 0 &&
+      unknownOpportunityDenominators <= reports &&
+      opportunities >= reports - unknownOpportunityDenominators &&
+      (opportunities === 0 ? reports - unknownOpportunityDenominators === 0 : opportunities / 10000 <= reports - unknownOpportunityDenominators)
+    );
+  return {
+    legacy,
+    recorded_day: row.recorded_day,
+    day: parseStoredDay(row.recorded_day),
+    purpose,
+    harness,
+    mode,
+    result,
+    check,
+    usefulness,
+    fallback,
+    reports,
+    opportunities,
+    unknownOpportunityDenominators,
+    invalidDimensions: legacy ? false : [purpose, harness, mode, result, check, usefulness, fallback].includes("unknown"),
+    invalidCounters: !(counterShapeValid && counterConsistencyValid && v2CounterConsistencyValid),
+  };
+}
+
+function readOverflowRows(db: Database.Database, table: "adoption_evidence_overflow" | "adoption_evidence_overflow_v2", legacy: boolean): { rows: NormalizedOverflowRow[]; schemaInvalid: boolean } {
+  const columns = tableColumns(db, table);
+  const required = legacy
+    ? ["recorded_day", "traffic_purpose", "result", "deterministic_check", "reviewer_usefulness", "fallback_reason", "report_count", "eligible_opportunities"]
+    : ["recorded_day", "harness", "execution_mode", "traffic_purpose", "result", "deterministic_check", "reviewer_usefulness", "fallback_reason", "report_count", "eligible_opportunities", "unknown_opportunity_reports"];
+  if (required.some((column) => !columns.has(column))) return { rows: [], schemaInvalid: true };
+  const unknownReports = legacy && columns.has("unknown_opportunity_reports")
+    ? "unknown_opportunity_reports"
+    : legacy ? "CASE WHEN eligible_opportunities = 0 THEN report_count ELSE 0 END AS unknown_opportunity_reports" : "unknown_opportunity_reports";
+  const fields = legacy
+    ? `recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities, ${unknownReports}`
+    : `recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities, ${unknownReports}`;
+  const rows = db.prepare(`SELECT ${fields} FROM ${table} ORDER BY rowid ASC`).all() as Array<Record<string, unknown>>;
+  return { rows: rows.map((row) => normalizeOverflowRow(row, legacy, columns.has("unknown_opportunity_reports"))), schemaInvalid: false };
+}
+
+function applyOverflowRow(output: AdoptionOverflowQueryResult, row: NormalizedOverflowRow, reports: number, attributed: boolean): void {
+  if (reports <= 0) return;
+  if (attributed) output.attributedAggregatedCount += reports;
+  else output.legacyAggregatedCount += reports;
+  output.aggregatedCount += reports;
+  const attempted = ["completed", "refused", "failed"].includes(row.result) ? reports : 0;
+  const useful = row.result === "completed" && (row.check === "pass" || row.check === "not_run") && (row.usefulness === "pass" || row.usefulness === "partial") ? reports : 0;
+  const dims: Array<[Map<string, AdoptionBreakdownRow>, string]> = [
+    [output.breakdowns.purpose, row.purpose],
+    [output.breakdowns.result, row.result],
+    [output.breakdowns.usefulness, row.usefulness],
+    [output.breakdowns.fallback, row.fallback],
+  ];
+  // Legacy rows have no durable harness or execution-mode attribution. Keep those
+  // dimensions absent instead of manufacturing an `unknown` bucket.
+  if (attributed) {
+    dims.splice(1, 0, [output.breakdowns.harness, row.harness], [output.breakdowns.mode, row.mode]);
+  }
+  for (const [map, key] of dims) {
+    const breakdown = map.get(key) ?? emptyBreakdownRow(key);
+    map.set(key, breakdown);
+    bump(breakdown, row.opportunities, attempted, useful, reports);
+  }
+  const item = output.byPurpose[row.purpose as AdoptionTrafficPurpose];
+  if (!item) return;
+  item.reports += reports;
+  item.knownOpportunities += row.opportunities;
+  item.unknownOpportunityDenominators += row.unknownOpportunityDenominators;
+  item.attempted += attempted;
+  item.completed += row.result === "completed" ? reports : 0;
+  item.useful += useful;
+  item.unassessedAttempted += row.result === "completed" && (row.check === "not_run" || row.usefulness === "not_reported" || row.usefulness === "unknown") ? reports : 0;
+  item.deterministicChecks += row.check !== "not_run" ? reports : 0;
+  item.deterministicCheckPasses += row.check === "pass" ? reports : 0;
+  if ((row.usefulness as string) !== "unknown") item.usefulness[row.usefulness as AdoptionUsefulness] += reports;
+  if (row.fallback in item.fallbackCounts) item.fallbackCounts[row.fallback] += reports;
 }
 
 function adoptionOverflowQuery(db: Database.Database, fromDay: string, throughDay: string): AdoptionOverflowQueryResult {
-  if (!hasAdoptionOverflowTable(db)) return emptyOverflowQuery();
-  const overflowColumns = tableColumns(db, "adoption_evidence_overflow");
-  const unknownReports = overflowColumns.has("unknown_opportunity_reports")
-    ? "unknown_opportunity_reports"
-    : "CASE WHEN eligible_opportunities = 0 THEN report_count ELSE 0 END AS unknown_opportunity_reports";
-  const all = db.prepare(`SELECT recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason, report_count, eligible_opportunities, ${unknownReports} FROM adoption_evidence_overflow ORDER BY rowid ASC`).all() as Array<Record<string, unknown>>;
   const output = emptyOverflowQuery();
-  output.sourceRows = all.length;
+  const legacyRead = hasAdoptionOverflowTable(db) ? readOverflowRows(db, "adoption_evidence_overflow", true) : { rows: [], schemaInvalid: false };
+  const v2Read = hasAdoptionOverflowV2Table(db) ? readOverflowRows(db, "adoption_evidence_overflow_v2", false) : { rows: [], schemaInvalid: false };
+  output.sourceRows = legacyRead.rows.length + v2Read.rows.length;
+  if (legacyRead.schemaInvalid || v2Read.schemaInvalid) output.missingDimensions += 1;
   const cappedDays = new Set<string>();
   const affectedDays = new Set<string>();
-  for (const row of all) {
-    const day = parseStoredDay(row.recorded_day);
-    if (!day) { output.malformedDay += 1; continue; }
-    output.validMin = rangeValue(output.validMin, day);
-    output.validMax = rangeMax(output.validMax, day);
-    if (day < fromDay || day >= throughDay) continue;
-    cappedDays.add(day);
-    affectedDays.add(day);
-    output.rows += 1;
-    const reports = validCount(row.report_count);
-    const opportunities = validCount(row.eligible_opportunities);
-    const unknownOpportunityDenominators = validCount(row.unknown_opportunity_reports);
-    output.aggregatedCount += reports;
-    const purpose = closedValue(String(row.traffic_purpose ?? ""), ADOPTION_TRAFFIC_PURPOSES) as AdoptionTrafficPurpose;
-    const result = closedValue(String(row.result ?? ""), ADOPTION_RESULTS);
-    const check = closedValue(String(row.deterministic_check ?? ""), ADOPTION_CHECK_OUTCOMES);
-    const usefulness = closedValue(String(row.reviewer_usefulness ?? ""), ADOPTION_USEFULNESS) as AdoptionUsefulness;
-    const fallback = closedValue(String(row.fallback_reason ?? ""), ADOPTION_FALLBACK_REASONS);
-    const attempted = ["completed", "refused", "failed"].includes(result) ? reports : 0;
-    const useful = result === "completed" && check === "pass" && (usefulness === "pass" || usefulness === "partial") ? reports : 0;
-    const dims: Array<[Map<string, AdoptionBreakdownRow>, string]> = [[output.breakdowns.result, result], [output.breakdowns.usefulness, usefulness], [output.breakdowns.fallback, fallback]];
-    for (const [map, key] of dims) {
-      const breakdown = map.get(key) ?? emptyBreakdownRow(key);
-      map.set(key, breakdown);
-      bump(breakdown, opportunities, attempted, useful, reports);
-    }
-    const item = output.byPurpose[purpose];
-    if (!item) continue;
-    item.reports += reports;
-    item.knownOpportunities += opportunities;
-    item.unknownOpportunityDenominators += unknownOpportunityDenominators;
-    item.attempted += attempted;
-    item.completed += result === "completed" ? reports : 0;
-    item.useful += useful;
-    item.unassessedAttempted += result === "completed" && (check === "not_run" || usefulness === "not_reported") ? reports : 0;
-    item.deterministicChecks += check !== "not_run" ? reports : 0;
-    item.deterministicCheckPasses += check === "pass" ? reports : 0;
-    if ((usefulness as string) !== "unknown") item.usefulness[usefulness] += reports;
-    if (fallback in item.fallbackCounts) item.fallbackCounts[fallback] += reports;
+  const inWindow = (row: NormalizedOverflowRow): boolean => {
+    if (!row.day) { output.malformedDay += 1; return false; }
+    output.validMin = rangeValue(output.validMin, row.day);
+    output.validMax = rangeMax(output.validMax, row.day);
+    if (row.day < fromDay || row.day >= throughDay) return false;
+    cappedDays.add(row.day); affectedDays.add(row.day); output.rows += 1; return true;
+  };
+  const v2InWindow = v2Read.rows.filter(inWindow);
+  const legacyInWindow = legacyRead.rows.filter(inWindow);
+  for (const row of v2InWindow) {
+    if (row.invalidDimensions || row.invalidCounters) output.missingDimensions += 1;
+    applyOverflowRow(output, row, row.reports, true);
   }
+  for (const row of legacyInWindow) {
+    if (row.invalidCounters) output.missingDimensions += 1;
+    applyOverflowRow(output, row, row.reports, false);
+  }
+  output.legacyRows = legacyInWindow.length;
   output.cappedDays = [...cappedDays].sort(compareStrings);
   output.affectedDays = [...affectedDays].sort(compareStrings);
-  output.perHarnessAttribution = output.aggregatedCount > 0 ? "unavailable" : "complete";
+  output.perHarnessAttribution = output.legacyRows > 0 || output.malformedDay > 0 || output.missingDimensions > 0 ? "unavailable" : "complete";
   return output;
 }
 
@@ -479,7 +588,7 @@ function adoptionQuery(db: Database.Database, fromDay: string, throughDay: strin
   for (const row of rows) {
     const day = parseStoredDay(row.recorded_day); if (!day) { malformedDay += 1; continue; } validMin = rangeValue(validMin, day); validMax = rangeMax(validMax, day); if (day < fromDay || day >= throughDay) continue; inWindow += 1;
     const purposeValue = closedValue(String(row.traffic_purpose ?? ""), ADOPTION_TRAFFIC_PURPOSES); const harnessValue = closedValue(String(row.harness ?? ""), ADOPTION_HARNESSES); const modeValue = closedValue(String(row.execution_mode ?? ""), ADOPTION_EXECUTION_MODES); const resultValue = closedValue(String(row.result ?? ""), ADOPTION_RESULTS); const usefulnessValue = closedValue(String(row.reviewer_usefulness ?? ""), ADOPTION_USEFULNESS); const fallbackValue = closedValue(String(row.fallback_reason ?? ""), ADOPTION_FALLBACK_REASONS);
-    const opportunities = finiteNumber(row.eligible_opportunities) && Number.isInteger(row.eligible_opportunities) && row.eligible_opportunities > 0 ? row.eligible_opportunities : 0; const attempted = ["completed", "refused", "failed"].includes(resultValue) ? 1 : 0; const useful = resultValue === "completed" && row.deterministic_check === "pass" && (usefulnessValue === "pass" || usefulnessValue === "partial") ? 1 : 0;
+    const opportunities = finiteNumber(row.eligible_opportunities) && Number.isSafeInteger(row.eligible_opportunities) && row.eligible_opportunities > 0 ? row.eligible_opportunities : 0; const attempted = ["completed", "refused", "failed"].includes(resultValue) ? 1 : 0; const useful = resultValue === "completed" && (String(row.deterministic_check) === "pass" || String(row.deterministic_check) === "not_run") && (usefulnessValue === "pass" || usefulnessValue === "partial") ? 1 : 0;
     const aggregateRow = aggregate[purposeValue as AdoptionTrafficPurpose];
     if (aggregateRow) {
       aggregateRow.reports += 1; aggregateRow.knownOpportunities += opportunities; aggregateRow.attempted += attempted; aggregateRow.useful += useful;
@@ -504,13 +613,6 @@ function adoptionQuery(db: Database.Database, fromDay: string, throughDay: strin
     for (const usefulnessValue of ADOPTION_USEFULNESS) aggregateRow.usefulness[usefulnessValue] += overflowRow.usefulness[usefulnessValue];
     aggregateRow.unknownOpportunityDenominators += overflowRow.unknownOpportunityDenominators;
     aggregateRow.unassessedAttempted += overflowRow.unassessedAttempted;
-    const purposeRow = purpose.get(purposeValue);
-    if (purposeRow) {
-      purposeRow.reports += overflowRow.reports;
-      purposeRow.knownOpportunities += overflowRow.knownOpportunities;
-      purposeRow.attempted += overflowRow.attempted;
-      purposeRow.useful += overflowRow.useful;
-    }
     for (const fallbackValue of ADOPTION_FALLBACK_REASONS) {
       const count = overflowRow.fallbackCounts[fallbackValue] ?? 0;
       if (fallbackValue === "m5_busy" || fallbackValue === "m5_refused") fallbackCoverage.capacity += count;
@@ -522,6 +624,9 @@ function adoptionQuery(db: Database.Database, fromDay: string, throughDay: strin
   mergeBreakdowns(result, overflow.breakdowns.result);
   mergeBreakdowns(usefulness, overflow.breakdowns.usefulness);
   mergeBreakdowns(fallback, overflow.breakdowns.fallback);
+  mergeBreakdowns(purpose, overflow.breakdowns.purpose);
+  mergeBreakdowns(harness, overflow.breakdowns.harness);
+  mergeBreakdowns(mode, overflow.breakdowns.mode);
   for (const value of ADOPTION_TRAFFIC_PURPOSES) { const item = aggregate[value]; item.usefulAttemptedRatio = item.attempted > 0 ? item.useful / item.attempted : null; }
   return { aggregate, breakdowns: { purpose: sortBreakdown(purpose), harness: sortBreakdown(harness), mode: sortBreakdown(mode), result: sortBreakdown(result), usefulness: sortBreakdown(usefulness), fallback: sortBreakdown(fallback) }, sourceRows: rows.length, rows: inWindow, malformedDay, validMin, validMax, fallbackCoverage, overflow };
 }
@@ -702,7 +807,8 @@ function chooseNextAction(bundle: { adoption: AdoptionEvidenceBundle["adoption"]
   const currentRows = bundle.delegations.currentRows;
   const readiness = bundle.delegations.promotionReadiness;
   const currentEvidenceIncomplete = currentRows > 0 && (!readiness.evidenceIdentityComplete || !readiness.judgePolicyCurrent || !readiness.learningTaskBindingComplete || !readiness.stateUnambiguous || !readiness.reviewerUsefulnessComplete || !readiness.costCoverageComplete || !readiness.computeReconciliationComplete || !readiness.historicalMetricUnambiguous);
-  if (malformed > 0 || bundle.admittedCompute.missingRequestTime > 0 || !readiness.stateUnambiguous || !readiness.computeReconciliationComplete || bundle.cost.unreconciled.rows > 0 || bundle.cost.unlinked.rows > 0 || bundle.adoption.fallbackCoverage.unknown > 0 || bundle.adoption.overflow.aggregatedCount > 0 || bundle.adoption.overflow.droppedCount > 0 || currentEvidenceIncomplete) return { action: "repair_measurement", reason: bundle.adoption.overflow.aggregatedCount > 0 || bundle.adoption.overflow.droppedCount > 0 ? "adoption evidence retention is capped; overflow cannot support complete promotion evidence" : "timestamp, duration, policy, identity, binding, state, cost, fallback, or reconciliation coverage is incomplete" };
+  const overflowIncomplete = !bundle.adoption.overflow.complete;
+  if (malformed > 0 || bundle.admittedCompute.missingRequestTime > 0 || !readiness.stateUnambiguous || !readiness.computeReconciliationComplete || bundle.cost.unreconciled.rows > 0 || bundle.cost.unlinked.rows > 0 || bundle.adoption.fallbackCoverage.unknown > 0 || overflowIncomplete || bundle.adoption.byPurpose.organic.unassessedAttempted > 0 || currentEvidenceIncomplete) return { action: "repair_measurement", reason: overflowIncomplete ? (bundle.adoption.overflow.legacyAggregatedCount > 0 || bundle.adoption.overflow.droppedCount > 0 ? "adoption evidence retention is capped; overflow cannot support complete promotion evidence" : "adoption evidence retention is incomplete; malformed or unattributed overflow cannot support complete promotion evidence") : bundle.adoption.byPurpose.organic.unassessedAttempted > 0 ? "adoption usefulness assessment is incomplete for one or more attempted delegations" : "timestamp, duration, policy, identity, binding, state, cost, fallback, or reconciliation coverage is incomplete" };
   const organic = bundle.adoption.byPurpose.organic;
   if (organic.reports === 0 || organic.knownOpportunities === 0 || bundle.adoption.fallbackCoverage.capacity + bundle.adoption.fallbackCoverage.transport + bundle.adoption.fallbackCoverage.access > 0) return { action: "improve_agent_access", reason: "organic adoption access or opportunity-denominator evidence is insufficient" };
   if (readiness.eligible) return { action: "propose_separately_reviewed_lane_promotion", reason: "both preregistered organic thresholds pass with complete current-M5 evidence" };
@@ -733,14 +839,18 @@ export function buildAdoptionEvidenceBundle(db: Database.Database, options: Evid
   };
   const adoptionRetention: AdoptionEvidenceRetention = {
     retainedIndividualCount: adoptionQueryResult.rows,
+    legacyAggregatedCount: adoptionQueryResult.overflow.legacyAggregatedCount,
+    attributedAggregatedCount: adoptionQueryResult.overflow.attributedAggregatedCount,
     aggregatedCount: adoptionQueryResult.overflow.aggregatedCount,
     // The overflow schema has no durable dropped counter. Keep this explicit and conservative:
     // absence of durable evidence is not converted into an invented loss count.
     droppedCount: adoptionQueryResult.overflow.droppedCount,
+    malformedDay: adoptionQueryResult.overflow.malformedDay,
+    missingDimensions: adoptionQueryResult.overflow.missingDimensions,
     cappedDays: adoptionQueryResult.overflow.cappedDays,
     affectedDays: adoptionQueryResult.overflow.affectedDays,
     perHarnessAttribution: adoptionQueryResult.overflow.perHarnessAttribution,
-    complete: adoptionQueryResult.overflow.aggregatedCount === 0 && adoptionQueryResult.overflow.droppedCount === 0,
+    complete: adoptionQueryResult.overflow.legacyRows === 0 && adoptionQueryResult.overflow.droppedCount === 0 && adoptionQueryResult.overflow.malformedDay === 0 && adoptionQueryResult.overflow.missingDimensions === 0,
   };
   const organic = adoptionQueryResult.aggregate.organic;
   const stateUnambiguous = delegation.stateCounts.reconciliation.allMatch && delegation.stateCounts.invalid === 0 && delegation.stateCounts.shadowAndSupersededM5 === 0;

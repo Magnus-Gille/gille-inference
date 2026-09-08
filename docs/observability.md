@@ -145,9 +145,11 @@ for the rolling-week query. Accepted and rejected authenticated report calls del
 the normal per-request access/request/owner logs, so this table cannot be correlated to a principal
 or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot.
 It is bounded by a transient per-key telemetry rate limit and a 25-row server-day limit on
-individually attributed rows. Later valid reports are coalesced into a second content-free table
-keyed only by day, purpose, result, check, usefulness, and fallback enums; no harness, execution
-mode, principal, request, or content survives that aggregation. The acknowledgement distinguishes
+individually attributed rows. Later valid reports are coalesced into `adoption_evidence_overflow_v2`,
+keyed by day and closed harness, execution-mode, purpose, result, check, usefulness, and fallback
+enums. Repeated buckets increment counters rather than append events. Both overflow tables have
+a 90-day retention policy. No principal, request, precise time, or content is stored. Legacy
+`adoption_evidence_overflow` rows remain unchanged and lack harness and mode attribution. The acknowledgement distinguishes
 `retained`, `aggregated`, and `dropped`, scopes limit reasons to telemetry, and states that inference
 availability is unaffected. A `telemetry_daily_cap` aggregate is non-fatal and only the telemetry
 write must not be retried until the next UTC day. Invalid, transiently telemetry-rate-limited, or
@@ -160,8 +162,9 @@ documented fixed invariant codes. Unknown caller keys are never returned, becaus
 itself contain a path, identity, or task text.
 
 The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels. A window
-containing coalesced overflow is explicitly labelled **INCOMPLETE** because the overflow cannot be
-attributed to a harness, even though its global result/usefulness/fallback totals are retained:
+containing legacy overflow or malformed attribution is explicitly labelled **INCOMPLETE**. Valid
+v2 aggregates preserve harness and mode; the poster counts individual, legacy, and v2 reports
+once each. Retention completeness does not imply complete opportunity or assessment coverage:
 
 - **MEASURED — organic M5 agent adoption:** only `traffic_purpose=organic`, by harness.
 - **MEASURED — organic M5 agent adoption by harness:** closed, content-free per-harness rows
@@ -202,7 +205,10 @@ only a server-derived UTC day; request, delegation, and cost rows use the exact 
 existing read-only DB helper, refuses an active WAL or missing required schema, and writes only to
 stdout.
 
-The bundle carries the shared `m5-admitted-compute-v2` filter epoch plus UTC-day/tier/route/node/
+Bundle contract v2 reports separate legacy and attributed aggregate counts, preserves new
+post-cap harness/mode breakdowns, and leaves historical missing attribution unknown. Missing
+checks or judgments still block threshold acceptance and promotion, even when retention is
+complete. The bundle carries the shared `m5-admitted-compute-v2` filter epoch plus UTC-day/tier/route/node/
 model utilization and exclusion reconciliations; closed adoption dimensions (purpose, harness, mode,
 result, usefulness, and fallback); a bounded current M5 task×model×verifier×source×outcome matrix;
 cost, delegator-attribution, token, and local-calibration coverage; content-blind identity/policy/

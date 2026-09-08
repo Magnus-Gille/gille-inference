@@ -167,6 +167,44 @@ describe("retention-enforcement — sqlite dry-run", () => {
     expect(JSON.stringify(overflow)).not.toMatch(/alias|principal|prompt|response|path|repo|event/i);
   });
 
+  it("includes the versioned adoption overflow in the same 90-day dry-run using only day samples", () => {
+    const parsed = parseAdoptionEvidence({
+      harness: "codex_cli",
+      execution_mode: "code_loop",
+      traffic_purpose: "organic",
+      result: "completed",
+      deterministic_check: "pass",
+      reviewer_usefulness: "pass",
+      fallback_reason: "none",
+      eligible_opportunities: 1,
+    });
+    if (!parsed.ok) throw new Error("fixture must parse");
+    recordAdoptionEvidence(parsed.value);
+    getDb().prepare(
+      `INSERT INTO adoption_evidence_overflow_v2
+         (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+          reviewer_usefulness, fallback_reason, report_count, eligible_opportunities,
+          unknown_opportunity_reports)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("2026-01-01", "codex_cli", "code_loop", "organic", "failed", "fail", "redo", "local_result_unusable", 2, 3, 0);
+    getDb().prepare(
+      `INSERT INTO adoption_evidence_overflow_v2
+         (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+          reviewer_usefulness, fallback_reason, report_count, eligible_opportunities,
+          unknown_opportunity_reports)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("2026-07-19", "codex_cli", "code_loop", "organic", "refused", "not_run", "not_reported", "m5_refused", 1, 1, 0);
+
+    const report = runRetentionDryRun(getDb(), { now: NOW, workroot: mkdtempSync(join(tmpdir(), "hs-retention-workroot-")) });
+    const overflow = report.stores.find((store) => store.storeId === "adoption-evidence-overflow-v2");
+    expect(overflow).toMatchObject({
+      retentionDays: 90,
+      expiredCount: 1,
+      sampleRefs: ["2026-01-01"],
+    });
+    expect(JSON.stringify(overflow)).not.toMatch(/alias|principal|prompt|response|path|repo|event/i);
+  });
+
   it("rejects a non-ISO 'now'", () => {
     const descriptor = getHarvestStoreDescriptor("request-log")!;
     expect(() => scanSqliteStoreForExpiry(getDb(), descriptor, "not-a-date")).toThrow();
