@@ -1,7 +1,7 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
-export const M5_CLIENT_VERSION = "1.3.6";
+export const M5_CLIENT_VERSION = "1.3.7";
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
@@ -99,6 +99,8 @@ const ADOPTION_DIAGNOSTIC_INVARIANTS = new Set([
   "noncompleted_requires_fallback",
   "unobserved_result_requires_unobserved_assessment",
 ]);
+const EXECUTION_FEEDBACK_VALUES = new Set(["pass", "partial", "redo", "wrong"]);
+const FEEDBACK_HANDLE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 const TOKEN_PATTERNS = [
@@ -591,6 +593,12 @@ function normalizeAskUsage(usage) {
   };
 }
 
+function normalizeOptionalFeedbackHandle(value) {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && FEEDBACK_HANDLE_PATTERN.test(value)) return value;
+  throw new M5ClientError("malformed_mcp", "The gateway returned malformed feedback metadata.");
+}
+
 function normalizeAskPayload(payload, fallbackModel) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
@@ -642,6 +650,7 @@ function normalizeAskPayload(payload, fallbackModel) {
         : (() => {
             throw new M5ClientError("malformed_mcp", "The ask tool returned malformed metering metadata.");
           })();
+  const feedbackHandle = normalizeOptionalFeedbackHandle(payload.feedback_handle);
   return {
     model,
     text: payload.text,
@@ -649,6 +658,7 @@ function normalizeAskPayload(payload, fallbackModel) {
     truncated,
     metered,
     usage: normalizeAskUsage(payload.usage),
+    ...(feedbackHandle === undefined ? {} : { feedback_handle: feedbackHandle }),
   };
 }
 
@@ -861,6 +871,12 @@ function validSchemaGrounding(result) {
 function validateCodeResult(result) {
   if (!result || typeof result !== "object") {
     throw new M5ClientError("invalid_code_result", "The code-loop result is malformed.");
+  }
+  if (
+    result.feedback_handle !== undefined &&
+    (typeof result.feedback_handle !== "string" || !FEEDBACK_HANDLE_PATTERN.test(result.feedback_handle))
+  ) {
+    throw new M5ClientError("invalid_code_result", "The code-loop result returned malformed feedback metadata.");
   }
   if (result.status === "running") return result;
   if (
@@ -1101,6 +1117,121 @@ export async function createM5Client({
     }
   }
 
+  async function requestExecutionFeedback(feedbackHandle, usefulness) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resolvedToken = await resolveToken();
+      const response = await fetchImpl(`${origin}/execution-feedback/${feedbackHandle}`, {
+        method: "PUT",
+        redirect: "error",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: `Bearer ${resolvedToken}`,
+          "user-agent": `m5-cli/${M5_CLIENT_VERSION}`,
+        },
+        body: JSON.stringify({ usefulness }),
+        signal: controller.signal,
+      });
+
+      // Keep the same deadline active through body consumption. Error bodies are deliberately
+      // discarded so a gateway cannot reflect prompts, handles, or credentials into the CLI.
+      const text = await response.text();
+      if (response.status === 201 || response.status === 200) {
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new M5ClientError(
+            "malformed_execution_feedback",
+            "The gateway returned a malformed execution-feedback acknowledgement.",
+          );
+        }
+        const expectedKind = response.status === 201 ? "recorded" : "unchanged";
+        if (
+          !parsed ||
+          typeof parsed !== "object" ||
+          Array.isArray(parsed) ||
+          Object.keys(parsed).length !== 1 ||
+          parsed.kind !== expectedKind
+        ) {
+          throw new M5ClientError(
+            "malformed_execution_feedback",
+            "The gateway returned an invalid execution-feedback acknowledgement.",
+          );
+        }
+        return { kind: expectedKind };
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new M5ClientError(
+          "rejected_credential",
+          credentialFailureMessage("rejected_credential", profile),
+          credentialErrorOptions("rejected_credential", profile, {
+            httpStatus: response.status,
+            failureLayer: "authentication",
+            retryable: false,
+          }),
+        );
+      }
+      if (response.status === 400 || response.status === 413) {
+        throw new M5ClientError(
+          "invalid_execution_feedback",
+          "The execution-feedback request was rejected by the gateway.",
+          { httpStatus: response.status, failureLayer: "gateway_protocol", retryable: false },
+        );
+      }
+      if (response.status === 404) {
+        throw new M5ClientError(
+          "execution_feedback_not_found",
+          "The execution-feedback handle was not found or is not available.",
+          { httpStatus: response.status, failureLayer: "gateway_health", retryable: false },
+        );
+      }
+      if (response.status === 409) {
+        throw new M5ClientError(
+          "execution_feedback_conflict",
+          "The execution-feedback handle is already judged or ineligible.",
+          { httpStatus: response.status, failureLayer: "gateway_protocol", retryable: false },
+        );
+      }
+      throw new M5ClientError(
+        "upstream_http_error",
+        `The execution-feedback gateway returned HTTP ${response.status}.`,
+        {
+          httpStatus: response.status,
+          diagnosticCode: "gateway_http_error",
+          failureLayer: "gateway_health",
+          retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+          remediation: transportRemediation(profile),
+        },
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+          diagnosticCode: "connect_timeout",
+          failureLayer: "gateway_transport",
+          retryable: true,
+          remediation: transportRemediation(profile),
+        });
+      }
+      if (error instanceof M5ClientError) throw error;
+      const diagnosticCode = networkDiagnosticCode(error);
+      throw new M5ClientError(
+        "network_failure",
+        `The M5 gateway transport failed (${diagnosticCode}).`,
+        {
+          diagnosticCode,
+          failureLayer: "gateway_transport",
+          retryable: true,
+          remediation: transportRemediation(profile),
+        },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   const client = {
     async rpc(message) {
       try {
@@ -1279,6 +1410,32 @@ export async function createM5Client({
           "invalid_adoption_report",
           "The gateway returned a malformed adoption-report acknowledgement.",
         );
+      } catch (error) {
+        throw safeError(error, secrets, profile);
+      }
+    },
+
+    async recordExecutionFeedback(input) {
+      const keys = input && typeof input === "object" && !Array.isArray(input)
+        ? Object.keys(input)
+        : [];
+      if (
+        !input ||
+        typeof input !== "object" ||
+        Array.isArray(input) ||
+        keys.length !== 2 ||
+        keys.some((key) => key !== "feedback_handle" && key !== "usefulness") ||
+        typeof input.feedback_handle !== "string" ||
+        !FEEDBACK_HANDLE_PATTERN.test(input.feedback_handle) ||
+        !EXECUTION_FEEDBACK_VALUES.has(input.usefulness)
+      ) {
+        throw new M5ClientError(
+          "invalid_execution_feedback",
+          "execution feedback must use exactly feedback_handle and usefulness.",
+        );
+      }
+      try {
+        return await requestExecutionFeedback(input.feedback_handle, input.usefulness);
       } catch (error) {
         throw safeError(error, secrets, profile);
       }

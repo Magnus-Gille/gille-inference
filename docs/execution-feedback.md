@@ -61,6 +61,19 @@ type, or usefulness shape returns `400`; bodies larger than 1,024 bytes return `
 The handle, ledger ID, key hash, alias, prompts, outputs, notes, and per-execution timestamps are never part of
 the report export. Conflict handling retains only a counter; it does not retain submitted content.
 
+The owner `m5` client preserves an optional `feedback_handle` in structured `ask` and
+`code_loop_result` output so a reviewer can submit a judgment after inspecting the real execution:
+
+```sh
+printf '%s' '{"feedback_handle":"01234567-89ab-cdef-0123-456789abcdef","usefulness":"pass"}' \
+  | m5 --profile codex feedback submit
+```
+
+The submitter must use the same named profile that ran the execution. The command returns only
+`{"kind":"recorded"}` for the first judgment or `{"kind":"unchanged"}` for an idempotent
+repeat. Usefulness is supplied by a reviewer after the execution; the client never infers it from
+structural verification, output presence, or any other automatic signal.
+
 ## Content-blind report
 
 `buildExecutionFeedbackReport(db, {since, until})` produces contract

@@ -201,6 +201,33 @@ export const HARVEST_STORE_REGISTRY: readonly HarvestStoreDescriptor[] = [
       "row cap. The aggregate has no caller, event id, task content, path, repository, or precise " +
       "timestamp; retain only through the same 90-day predeclared adoption trial window.",
   },
+  // ── adoption-evidence.ts — versioned bounded post-cap aggregates. New reports preserve the
+  //    closed harness and execution-mode dimensions; the legacy overflow descriptor above remains
+  //    for historical rows and is not backfilled or dual-written.
+  {
+    storeId: "adoption-evidence-overflow-v2",
+    mechanism: "sqlite",
+    table: "adoption_evidence_overflow_v2",
+    classification: "content-blind",
+    dataClass: "adoption-observation",
+    retentionDays: retentionDaysFor("adoption-observation"),
+    prunable: true,
+    pruneAction: "delete-row",
+    timestampColumn: "recorded_day",
+    timestampKind: "date",
+    primaryKeyColumn: null,
+    sampleRefColumn: "recorded_day",
+    contentColumns: [],
+    redactedContentValue: null,
+    ownerSource: "gille-inference",
+    sensitivity: "low",
+    policyEpoch: POLICY_EPOCH_2026_07_31,
+    purpose:
+      "Content-blind, day-granularity aggregates for new post-cap adoption-evidence reports, " +
+      "keyed by closed harness, execution mode, and outcome dimensions. The aggregate has no " +
+      "caller, event id, task content, path, repository, or precise timestamp; retain only through " +
+      "the same 90-day predeclared adoption trial window.",
+  },
 
   // ── owner-log.ts — owner_request_log: the FULL prompt/response for authenticated owner keys
   //    only. Content-bearing by design; never written for a guest.

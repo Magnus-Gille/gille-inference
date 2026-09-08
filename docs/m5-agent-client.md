@@ -13,11 +13,11 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`. For the coordinated v9 rollout,
-publish and verify the accepted 1.3.6 artifact before using this exact installation pin:
+The `m5` executable ships in the same npm package as `hs`. The current measurement release is
+`1.3.7`; when an accepted artifact is available, install and verify it with this exact pin:
 
 ```bash
-npm install --global gille-inference@1.3.6
+npm install --global gille-inference@1.3.7
 m5 --version
 ```
 
@@ -30,15 +30,20 @@ terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bo
 `writable-v1` result contract and rejects older unscoped terminal results. Version `1.3.4`
 requires bounded global turn accounting, explicit completion state, and check skip reasons.
 Version `1.3.5` adds a bounded `--timeout-ms` option for direct `m5 ask` calls.
-Version `1.3.6` requires the v9 organic schema-grounding result contract and includes
-redacted discovery-failure diagnostics. Its `code_loop` client rejects v8 results; v8 clients
-likewise reject v9 results. Publish and verify the package, then coordinate the installed
-client and gateway switch while code-loop callers are idle. Existing MCP bridge processes
+Version `1.3.6` introduced the v9 organic schema-grounding result contract and redacted
+discovery-failure diagnostics for the historical v9 rollout. Version `1.3.7` is the current
+measurement release: it retains those contracts and preserves an optional execution feedback
+handle in successful structured results, with a direct command for submitting the reviewer's
+exact usefulness judgment. Its `code_loop` client rejects v8 results; v8 clients likewise reject
+v9 results. Coordinate the installed client and gateway switch while code-loop callers are idle.
+Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
-Rollback is a paired return to the prior accepted gateway revision and client 1.3.5, with
-gateway verification and harness rechecks. Publication itself is not undone by that rollback;
-do not unpublish an accepted package as part of an operational rollback.
+Rollback is a paired return to the prior accepted gateway revision and client `1.3.6`, with
+gateway verification and harness rechecks. Readers predating this measurement repair do not
+consume the evidence bundle v2 overflow table, so reader coverage for affected rollback windows
+is unknown; follow the [measurement repair guidance](m5-agent-adoption-measurement.md) and mark
+that coverage explicitly. A rollback does not require changing package publication state.
 
 Deploy note: a gateway that serves structured `list_models` discovery must preserve the published
 `m5 1.2.0` wire contract by omitting `structuredContent` for the `m5-cli/1.2.0` user-agent.
@@ -183,6 +188,9 @@ printf '%s' '{"model":"mellum","prompt":"Classify this bounded input."}' \
 printf '%s' '{"harness":"codex_cli","execution_mode":"code_loop","traffic_purpose":"organic","result":"not_attempted","deterministic_check":"not_run","reviewer_usefulness":"not_reported","fallback_reason":"m5_auth_unavailable","eligible_opportunities":1}' \
   | m5 --profile codex adoption report
 
+printf '%s' '{"feedback_handle":"01234567-89ab-cdef-0123-456789abcdef","usefulness":"pass"}' \
+  | m5 --profile codex feedback submit
+
 printf '%s' '{
   "instruction": "Update the supplied seed file and run its focused check.",
   "files": [{"path":"src/example.ts","content":"export const value = 1;\n"}],
@@ -267,6 +275,15 @@ telemetry write was refused. A cap acknowledgement uses `reason: "telemetry_dail
 `retry_telemetry: "next_utc_day"`, and `inference_availability: "unaffected"`: do not retry that
 telemetry write during the day, but continue eligible `ask` and `code` work. The client maps the
 legacy `daily_capacity_reached` response to this scoped dropped form during rolling upgrades.
+
+When an organic `ask` or `code` execution returns an optional `feedback_handle`, a reviewer can
+submit one exact `pass`, `partial`, `redo`, or `wrong` judgment with `feedback submit` after
+inspecting that real result. The first submission returns `{"kind":"recorded"}` and an identical
+repeat returns `{"kind":"unchanged"}`. This is an exact execution-feedback overlay: it is
+separate from the coarse `adoption report` acknowledgement and from reviewer-usefulness fields
+in adoption evidence, and it does not mutate either record. The client never infers usefulness
+from structural verification, output presence, or any other automatic signal; use the same named
+profile that ran the execution.
 
 ## Doctor states
 

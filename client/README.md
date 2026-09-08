@@ -11,9 +11,9 @@ deployment URL.
 
 Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 
-### Owner-client 1.3.6 compatibility
+### Owner-client 1.3.7 compatibility
 
-The 1.3.6 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+The 1.3.7 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
 interchangeable. Restart/reconnect long-lived MCP bridge processes after installing the
 accepted package. The `hs` friend-facing API is unchanged. Publication, installation, and
@@ -90,6 +90,19 @@ printf '%s' '{"model":"mellum","prompt":"Summarize this."}' \
 ```
 
 A longer client bound does not raise server caps or guarantee completion.
+
+For a real owner execution, set `traffic_purpose` to `organic` in the `ask` or code request.
+The structured `ask` or `code_loop_result` output may then include a `feedback_handle`. After
+reviewing the real result, submit one exact usefulness judgment with the same profile that ran it:
+
+```bash
+printf '%s' '{"feedback_handle":"01234567-89ab-cdef-0123-456789abcdef","usefulness":"pass"}' \
+  | m5 --profile codex feedback submit
+```
+
+The command sends only the selected usefulness value and returns `recorded` or `unchanged`.
+Usefulness is supplied by the reviewer after execution; the client never infers it from
+structural verification or other automatic signals.
 
 The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
 `diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,

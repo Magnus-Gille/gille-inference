@@ -69,7 +69,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  for (const table of ["adoption_evidence", "adoption_evidence_overflow", "request_log", "owner_request_log"]) {
+  for (const table of ["adoption_evidence", "adoption_evidence_overflow", "adoption_evidence_overflow_v2", "request_log", "owner_request_log"]) {
     if (getDb().prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) {
       getDb().prepare(`DELETE FROM ${table}`).run();
     }
@@ -215,7 +215,8 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     expect(raw).toContain("ask, code_loop, model access, and owner usage continue normally");
     expect(raw).not.toContain("adoption-capacity-agent");
     expect(raw).not.toMatch(/prompt|response|path|alias/i);
-    expect(tableCount("adoption_evidence_overflow")).toBe(1);
+    expect(tableCount("adoption_evidence_overflow")).toBe(0);
+    expect(tableCount("adoption_evidence_overflow_v2")).toBe(1);
     expect(tableCount("request_log")).toBe(0);
     expect(tableCount("owner_request_log")).toBe(0);
     expect(accessLines).toEqual([]);
@@ -323,10 +324,12 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
     });
     expect(getDb().prepare(
       `SELECT traffic_purpose, result, deterministic_check, reviewer_usefulness, fallback_reason,
-              report_count, eligible_opportunities
-       FROM adoption_evidence_overflow ORDER BY result`
+              harness, execution_mode, report_count, eligible_opportunities
+       FROM adoption_evidence_overflow_v2 ORDER BY result`
     ).all()).toEqual([
       {
+        harness: "codex_cli",
+        execution_mode: "code_loop",
         traffic_purpose: "organic",
         result: "failed",
         deterministic_check: "fail",
@@ -336,6 +339,8 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
         eligible_opportunities: 3,
       },
       {
+        harness: "codex_cli",
+        execution_mode: "code_loop",
         traffic_purpose: "synthetic",
         result: "not_attempted",
         deterministic_check: "not_run",
@@ -345,6 +350,8 @@ describe("record_adoption_evidence MCP tool (#136)", () => {
         eligible_opportunities: 2,
       },
       {
+        harness: "codex_cli",
+        execution_mode: "code_loop",
         traffic_purpose: "organic",
         result: "refused",
         deterministic_check: "not_run",

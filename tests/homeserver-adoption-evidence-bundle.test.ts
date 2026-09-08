@@ -61,6 +61,45 @@ function createOverflowTable(db: Database.Database): void {
   `);
 }
 
+function createOverflowV2Table(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE adoption_evidence_overflow_v2 (
+      recorded_day TEXT NOT NULL, harness TEXT NOT NULL, execution_mode TEXT NOT NULL,
+      traffic_purpose TEXT NOT NULL, result TEXT NOT NULL, deterministic_check TEXT NOT NULL,
+      reviewer_usefulness TEXT NOT NULL, fallback_reason TEXT NOT NULL,
+      report_count INTEGER NOT NULL, eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL,
+      PRIMARY KEY (recorded_day, harness, execution_mode, traffic_purpose, result,
+                   deterministic_check, reviewer_usefulness, fallback_reason)
+    );
+  `);
+}
+
+function insertOverflowV2(db: Database.Database, values: {
+  day?: string;
+  harness?: string;
+  mode?: string;
+  purpose?: string;
+  result?: string;
+  check?: string;
+  usefulness?: string;
+  fallback?: string;
+  reports?: number;
+  opportunities?: number;
+  unknown?: number;
+} = {}): void {
+  db.prepare(`INSERT INTO adoption_evidence_overflow_v2
+    (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+     reviewer_usefulness, fallback_reason, report_count, eligible_opportunities,
+     unknown_opportunity_reports)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    values.day ?? "2026-08-02", values.harness ?? "claude", values.mode ?? "delegate",
+    values.purpose ?? "organic", values.result ?? "completed", values.check ?? "pass",
+    values.usefulness ?? "pass", values.fallback ?? "none", values.reports ?? 1,
+    values.opportunities ?? 1, values.unknown ?? 0,
+  );
+}
+
 function options(overrides: Partial<EvidenceBundleOptions> = {}): EvidenceBundleOptions {
   return { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED, ...overrides };
 }
@@ -486,6 +525,168 @@ describe("buildAdoptionEvidenceBundle", () => {
     expect(bundle.completeness.missingness.unknownOpportunityDenominators).toBe(1);
     db.close();
   });
+
+  it("accepts valid v2-only overflow with harness and mode attribution", () => {
+    const db = createDb();
+    createOverflowV2Table(db);
+    insertOverflowV2(db, { reports: 3, opportunities: 5 });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      aggregatedCount: 3,
+      legacyAggregatedCount: 0,
+      attributedAggregatedCount: 3,
+      perHarnessAttribution: "complete",
+      complete: true,
+    });
+    expect(bundle.adoption.breakdowns.harness).toContainEqual({
+      bucket: "claude", reports: 3, knownOpportunities: 5, attempted: 3, useful: 3,
+    });
+    expect(bundle.adoption.breakdowns.mode).toContainEqual({
+      bucket: "delegate", reports: 3, knownOpportunities: 5, attempted: 3, useful: 3,
+    });
+    db.close();
+  });
+
+  it("adds legacy and v2 rows with the same coarse key without deduplication", () => {
+    const db = createDb();
+    createOverflowTable(db);
+    createOverflowV2Table(db);
+    db.prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      "2026-08-02", "organic", "completed", "pass", "pass", "none", 2, 2,
+    );
+    insertOverflowV2(db, { reports: 3, opportunities: 3 });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      aggregatedCount: 5, legacyAggregatedCount: 2, attributedAggregatedCount: 3,
+      perHarnessAttribution: "unavailable", complete: false,
+    });
+    expect(bundle.adoption.byPurpose.organic.reports).toBe(5);
+    expect(bundle.adoption.breakdowns.purpose).toContainEqual({
+      bucket: "organic", reports: 5, knownOpportunities: 5, attempted: 5, useful: 5,
+    });
+    expect(bundle.adoption.breakdowns.harness).not.toContainEqual(expect.objectContaining({ bucket: "unknown", reports: 2 }));
+    db.close();
+  });
+
+  it("keeps a zero-count legacy row incomplete because its attribution is absent", () => {
+    const db = createDb();
+    createOverflowTable(db);
+    db.prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, 'organic', 'completed', 'pass', 'pass', 'none', 0, 0)`).run("2026-08-02");
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      aggregatedCount: 0, legacyAggregatedCount: 0, perHarnessAttribution: "unavailable", complete: false,
+    });
+    expect(bundle.nextAction.action).toBe("repair_measurement");
+    db.close();
+  });
+
+  it("marks malformed overflow days unavailable and schedules measurement repair", () => {
+    const db = createDb();
+    createOverflowV2Table(db);
+    insertOverflowV2(db, { day: "malformed-day", reports: 2, opportunities: 2 });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      malformedDay: 1, perHarnessAttribution: "unavailable", complete: false,
+    });
+    expect(bundle.nextAction.action).toBe("repair_measurement");
+    db.close();
+  });
+
+  it("keeps unknown denominators and failure-after-cap outcomes explicit", () => {
+    const db = createDb();
+    createOverflowV2Table(db);
+    insertOverflowV2(db, {
+      result: "failed", check: "fail", usefulness: "redo", fallback: "local_result_unusable",
+      reports: 4, opportunities: 0, unknown: 4,
+    });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.byPurpose.organic).toMatchObject({
+      reports: 4, knownOpportunities: 0, unknownOpportunityDenominators: 4,
+      attempted: 4, useful: 0,
+    });
+    expect(bundle.adoption.breakdowns.fallback).toContainEqual({
+      bucket: "local_result_unusable", reports: 4, knownOpportunities: 0, attempted: 4, useful: 0,
+    });
+    expect(bundle.adoption.overflow.complete).toBe(true);
+    expect(bundle.delegations.promotionReadiness.eligible).toBe(false);
+    db.close();
+  });
+
+  it("fails closed on impossible v2 counter totals", () => {
+    const db = createDb();
+    createOverflowV2Table(db);
+    insertOverflowV2(db, { reports: 0, opportunities: 0, unknown: 0 });
+    insertOverflowV2(db, { result: "failed", reports: 2, opportunities: 1, unknown: 3 });
+    insertOverflowV2(db, { result: "refused", reports: -1, opportunities: 0, unknown: 0 });
+    insertOverflowV2(db, { result: "not_attempted", reports: Number.MAX_SAFE_INTEGER + 1, opportunities: 0, unknown: 0 });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      aggregatedCount: 2,
+      missingDimensions: 4,
+      complete: false,
+    });
+    db.close();
+  });
+
+  it("fails closed when the v2 overflow schema omits a required counter", () => {
+    const db = createDb();
+    db.exec(`CREATE TABLE adoption_evidence_overflow_v2 (
+      recorded_day TEXT NOT NULL, harness TEXT NOT NULL, execution_mode TEXT NOT NULL,
+      traffic_purpose TEXT NOT NULL, result TEXT NOT NULL, deterministic_check TEXT NOT NULL,
+      reviewer_usefulness TEXT NOT NULL, fallback_reason TEXT NOT NULL,
+      report_count INTEGER NOT NULL, eligible_opportunities INTEGER NOT NULL
+    )`);
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({ missingDimensions: 1, aggregatedCount: 0, complete: false });
+    db.close();
+  });
+
+  it("counts each invalid overflow schema and schedules measurement repair", () => {
+    const db = createDb();
+    db.exec(`
+      CREATE TABLE adoption_evidence_overflow (recorded_day TEXT NOT NULL);
+      CREATE TABLE adoption_evidence_overflow_v2 (recorded_day TEXT NOT NULL);
+    `);
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      missingDimensions: 2, complete: false, perHarnessAttribution: "unavailable",
+    });
+    expect(bundle.nextAction.action).toBe("repair_measurement");
+    db.close();
+  });
+
+  it("keeps not_run usefulness descriptive while leaving the promotion gate unknowable", () => {
+    const db = createDb();
+    createOverflowV2Table(db);
+    insertOverflowV2(db, { check: "not_run", usefulness: "partial", reports: 2, opportunities: 2 });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.byPurpose.organic).toMatchObject({ attempted: 2, useful: 2, unassessedAttempted: 2 });
+    expect(bundle.adoption.thresholds.usefulAttemptedRatio).toMatchObject({ status: "unknowable" });
+    expect(bundle.delegations.promotionReadiness.eligible).toBe(false);
+    expect(bundle.nextAction.action).toBe("repair_measurement");
+    db.close();
+  });
+
+  it("uses the exact UTC day window and fails closed on malformed v2 dimensions", () => {
+    const db = createDb();
+    createOverflowV2Table(db);
+    insertOverflowV2(db, { day: "2026-07-31", reports: 7 });
+    insertOverflowV2(db, { day: "2026-08-01", reports: 2, opportunities: 2 });
+    insertOverflowV2(db, { day: "2026-08-02", reports: 3, opportunities: 3 });
+    insertOverflowV2(db, { day: "2026-08-02", harness: "private-harness-label", reports: 5, opportunities: 5 });
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow.aggregatedCount).toBe(10);
+    expect(bundle.adoption.overflow.missingDimensions).toBe(1);
+    expect(bundle.adoption.overflow.complete).toBe(false);
+    expect(JSON.stringify(bundle)).not.toContain("private-harness-label");
+    db.close();
+  });
 });
 
 describe("read-only snapshot integration", () => {
@@ -527,7 +728,7 @@ describe("export-m5-adoption-evidence CLI", () => {
     expect(exitCode).toBe(0);
     expect(errors).toEqual([]);
     expect(JSON.parse(output.join(""))).toMatchObject({
-      contract: "m5-adoption-evidence-bundle-v1",
+      contract: "m5-adoption-evidence-bundle-v2",
       window: { from: FROM, throughExclusive: THROUGH },
     });
     expect(closed).toBe(true);

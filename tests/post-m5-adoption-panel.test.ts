@@ -33,9 +33,32 @@ beforeEach(() => {
       PRIMARY KEY (recorded_day, traffic_purpose, result, deterministic_check,
                    reviewer_usefulness, fallback_reason)
     );
+    CREATE TABLE IF NOT EXISTS adoption_evidence_overflow_v2 (
+      recorded_day TEXT NOT NULL, harness TEXT NOT NULL, execution_mode TEXT NOT NULL,
+      traffic_purpose TEXT NOT NULL, result TEXT NOT NULL, deterministic_check TEXT NOT NULL,
+      reviewer_usefulness TEXT NOT NULL, fallback_reason TEXT NOT NULL,
+      report_count INTEGER NOT NULL, eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL,
+      PRIMARY KEY (recorded_day, harness, execution_mode, traffic_purpose, result,
+                   deterministic_check, reviewer_usefulness, fallback_reason)
+    );
     DELETE FROM adoption_evidence_overflow;
+    DELETE FROM adoption_evidence_overflow_v2;
   `);
 });
+
+function insertOverflowV2(values: Record<string, unknown> = {}): void {
+  getDb().prepare(`INSERT INTO adoption_evidence_overflow_v2
+    (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+     reviewer_usefulness, fallback_reason, report_count, eligible_opportunities,
+     unknown_opportunity_reports)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    values.day ?? "2026-08-02", values.harness ?? "codex_cli", values.mode ?? "code_loop",
+    values.purpose ?? "organic", values.result ?? "completed", values.check ?? "pass",
+    values.usefulness ?? "pass", values.fallback ?? "none", values.reports ?? 1,
+    values.opportunities ?? 1, values.unknown ?? 0,
+  );
+}
 
 function report(overrides: Record<string, unknown> = {}): void {
   const parsed = parseAdoptionEvidence({
@@ -201,6 +224,105 @@ describe("post-m5-adoption-panel (#136)", () => {
       completed: 4,
       usefulCompletions: 3,
     });
+  });
+
+  it("adds valid v2 overflow to global and per-harness panels exactly once", () => {
+    insertOverflowV2({ reports: 2, opportunities: 3 });
+    const now = Date.parse("2026-08-02T12:00:00.000Z");
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 2, now);
+    const panels = buildAdoptionPanels(
+      queryOrganicAdoptionByHarness(getDb(), 2, now),
+      queryLabAdoptionByPurpose(getDb(), 2, now),
+      2,
+      overflow,
+    );
+    expect(overflow).toMatchObject({
+      aggregatedCount: 2, legacyAggregatedCount: 0, attributedAggregatedCount: 2,
+      perHarnessAttribution: "complete",
+    });
+    expect(panels.organic.state).toBe("pass");
+    expect(panels.organic.label).toContain("MEASURED");
+    expect(panels.organic.detail?.rows).toEqual(expect.arrayContaining([
+      { metric: "organic reports", value: 2 },
+      { metric: "known eligible opportunities", value: 3 },
+    ]));
+    expect(panels.organicByHarness.rows).toEqual([expect.objectContaining({
+      harness: "codex_cli",
+      "known eligible opportunities": 3,
+      "attempted delegations": 2,
+      "useful completions": 2,
+    })]);
+  });
+
+  it("adds same-key legacy and v2 rows while keeping legacy unattributed", () => {
+    const day = "2026-08-02";
+    getDb().prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, 'organic', 'completed', 'pass', 'pass', 'none', 1, 2)`).run(day);
+    insertOverflowV2({ day, reports: 2, opportunities: 3 });
+    const now = Date.parse("2026-08-02T12:00:00.000Z");
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 2, now);
+    const panels = buildAdoptionPanels([], [], 2, overflow);
+    expect(overflow).toMatchObject({
+      aggregatedCount: 3, legacyAggregatedCount: 1, attributedAggregatedCount: 2,
+      perHarnessAttribution: "unavailable",
+    });
+    expect(panels.organic.detail?.rows).toEqual(expect.arrayContaining([
+      { metric: "organic reports", value: 3 },
+      { metric: "legacy aggregated overflow reports", value: 1 },
+      { metric: "attributed aggregated overflow reports", value: 2 },
+    ]));
+    expect(panels.organicByHarness.rows).toEqual([expect.objectContaining({
+      harness: "codex_cli", "known eligible opportunities": 3,
+      "attempted delegations": 2, "useful completions": 2,
+    })]);
+  });
+
+  it("keeps malformed v2 dimensions out of attribution and out of panel output", () => {
+    insertOverflowV2({ harness: "private-harness-label", reports: 4, opportunities: 4 });
+    const now = Date.parse("2026-08-02T12:00:00.000Z");
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 2, now);
+    const panels = buildAdoptionPanels([], [], 2, overflow);
+    expect(overflow).toMatchObject({ aggregatedCount: 4, missingDimensions: 1, perHarnessAttribution: "unavailable" });
+    expect(overflow.byHarness.codex_cli.reports).toBe(0);
+    expect(JSON.stringify(panels)).not.toContain("private-harness-label");
+  });
+
+  it("keeps a zero-count legacy row incomplete", () => {
+    const day = "2026-08-02";
+    getDb().prepare(`INSERT INTO adoption_evidence_overflow
+      (recorded_day, traffic_purpose, result, deterministic_check, reviewer_usefulness,
+       fallback_reason, report_count, eligible_opportunities)
+      VALUES (?, 'organic', 'completed', 'pass', 'pass', 'none', 0, 0)`).run(day);
+    const now = Date.parse("2026-08-02T12:00:00.000Z");
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 2, now);
+    const panels = buildAdoptionPanels([], [], 2, overflow);
+    expect(overflow.legacyRowCount).toBe(1);
+    expect(panels.organic.label).toContain("INCOMPLETE");
+  });
+
+  it("fails closed on impossible v2 counter totals", () => {
+    insertOverflowV2({ reports: 0, opportunities: 0, unknown: 0 });
+    insertOverflowV2({ result: "failed", reports: 2, opportunities: 1, unknown: 3 });
+    insertOverflowV2({ result: "refused", reports: -1, opportunities: 0, unknown: 0 });
+    insertOverflowV2({ result: "not_attempted", reports: Number.MAX_SAFE_INTEGER + 1, opportunities: 0, unknown: 0 });
+    const now = Date.parse("2026-08-02T12:00:00.000Z");
+    const overflow = queryAdoptionEvidenceOverflow(getDb(), 2, now);
+    const panels = buildAdoptionPanels([], [], 2, overflow);
+    expect(overflow).toMatchObject({ aggregatedCount: 2, missingDimensions: 4, perHarnessAttribution: "unavailable" });
+    expect(panels.organic.label).toContain("INCOMPLETE");
+  });
+
+  it("counts each invalid overflow schema", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE adoption_evidence_overflow (recorded_day TEXT NOT NULL);
+      CREATE TABLE adoption_evidence_overflow_v2 (recorded_day TEXT NOT NULL);
+    `);
+    const overflow = queryAdoptionEvidenceOverflow(db, 2, Date.parse("2026-08-02T12:00:00.000Z"));
+    expect(overflow).toMatchObject({ missingDimensions: 2, perHarnessAttribution: "unavailable" });
+    db.close();
   });
 
   it("uses EVAL_DB_PATH and refuses an explicitly missing evidence database before publishing", async () => {
