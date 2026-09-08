@@ -542,7 +542,8 @@ function adoptionOverflowQuery(db: Database.Database, fromDay: string, throughDa
   const legacyRead = hasAdoptionOverflowTable(db) ? readOverflowRows(db, "adoption_evidence_overflow", true) : { rows: [], schemaInvalid: false };
   const v2Read = hasAdoptionOverflowV2Table(db) ? readOverflowRows(db, "adoption_evidence_overflow_v2", false) : { rows: [], schemaInvalid: false };
   output.sourceRows = legacyRead.rows.length + v2Read.rows.length;
-  if (legacyRead.schemaInvalid || v2Read.schemaInvalid) output.missingDimensions += 1;
+  if (legacyRead.schemaInvalid) output.missingDimensions += 1;
+  if (v2Read.schemaInvalid) output.missingDimensions += 1;
   const cappedDays = new Set<string>();
   const affectedDays = new Set<string>();
   const inWindow = (row: NormalizedOverflowRow): boolean => {

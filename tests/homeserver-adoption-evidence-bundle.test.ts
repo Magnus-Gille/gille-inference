@@ -647,6 +647,20 @@ describe("buildAdoptionEvidenceBundle", () => {
     db.close();
   });
 
+  it("counts each invalid overflow schema and schedules measurement repair", () => {
+    const db = createDb();
+    db.exec(`
+      CREATE TABLE adoption_evidence_overflow (recorded_day TEXT NOT NULL);
+      CREATE TABLE adoption_evidence_overflow_v2 (recorded_day TEXT NOT NULL);
+    `);
+    const bundle = buildAdoptionEvidenceBundle(db, options());
+    expect(bundle.adoption.overflow).toMatchObject({
+      missingDimensions: 2, complete: false, perHarnessAttribution: "unavailable",
+    });
+    expect(bundle.nextAction.action).toBe("repair_measurement");
+    db.close();
+  });
+
   it("keeps not_run usefulness descriptive while leaving the promotion gate unknowable", () => {
     const db = createDb();
     createOverflowV2Table(db);

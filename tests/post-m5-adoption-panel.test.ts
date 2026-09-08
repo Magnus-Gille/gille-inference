@@ -314,6 +314,17 @@ describe("post-m5-adoption-panel (#136)", () => {
     expect(panels.organic.label).toContain("INCOMPLETE");
   });
 
+  it("counts each invalid overflow schema", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE adoption_evidence_overflow (recorded_day TEXT NOT NULL);
+      CREATE TABLE adoption_evidence_overflow_v2 (recorded_day TEXT NOT NULL);
+    `);
+    const overflow = queryAdoptionEvidenceOverflow(db, 2, Date.parse("2026-08-02T12:00:00.000Z"));
+    expect(overflow).toMatchObject({ missingDimensions: 2, perHarnessAttribution: "unavailable" });
+    db.close();
+  });
+
   it("uses EVAL_DB_PATH and refuses an explicitly missing evidence database before publishing", async () => {
     const originalEvalDb = process.env["EVAL_DB_PATH"];
     const originalHomeserverDb = process.env["HOMESERVER_DB_PATH"];
