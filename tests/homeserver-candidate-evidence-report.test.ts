@@ -151,6 +151,19 @@ describe("candidate evidence report", () => {
     expect(report).toMatchObject({ outcomes: { other: 1 }, diagnostics: { unavailableOutcomes: 1 }, feedback: { byPurpose: { organic: 1 }, organic: { completed: 0, assessed: 0, missing: 0 } } });
   });
 
+  it("retains available current-epoch organic feedback for an error without qualifying it", () => {
+    const db = schema();
+    insertDelegation(db, "organic-error", null, "error");
+    db.prepare("INSERT INTO execution_feedback VALUES (?, ?, ?, ?, ?, ?)").run("h-error", "organic-error", "organic", EXECUTION_FEEDBACK_EPOCH, "pass", 1);
+    const report = buildCandidateEvidenceReport(db, { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED });
+    expect(report).toMatchObject({
+      rows: { inWindow: 1, organic: 1 },
+      outcomes: { error: 1 },
+      diagnostics: { failedOutcomes: 1 },
+      feedback: { byPurpose: { organic: 1 }, organic: { completed: 0, assessed: 0, missing: 0 } },
+    });
+  });
+
   it("keeps every purpose, failure, unavailable, legacy, duplicate, conflict and unassessed count closed", () => {
     const db = schema();
     insertDelegation(db, "organic-missing", null, "pass");

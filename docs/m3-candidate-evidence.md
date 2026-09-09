@@ -26,7 +26,8 @@ legacy feedback, absent judgments and unknown purpose remain visible. Organic, e
 synthetic and unknown activity remain separate. Failed and unavailable outcomes do not disappear
 from diagnostic coverage simply because a completed-feedback report would exclude them.
 
-The envelope is `m5-candidate-evidence-v1`, version 1. `rows.inWindow` includes every
+The envelope is `m5-candidate-evidence-v1`, version 1: M5 names the inference node;
+M3 in the command and document names is the delivery milestone. `rows.inWindow` includes every
 parseable delegation timestamp inside the half-open interval, across nodes and execution
 states; `rows.currentM5` is a separate count of current, non-shadow M5 rows. Identity coverage,
 purpose and outcome totals describe this whole diagnostic population. They are not a
@@ -34,7 +35,8 @@ candidate-specific quality rate or an intersection of all qualification gates. M
 stored timestamps are counted separately because their window membership cannot be established.
 
 `feedback.organic.completed` requires a current, non-shadow M5 row with a recognized
-completed outcome and exactly one available organic feedback row from the current feedback
+completed outcome (`pass`, `partial`, `fail` or `unverified`, excluding infrastructure
+`error`) and exactly one available organic feedback row from the current feedback
 epoch. Assessed rows additionally require a recognized usefulness judgment. These counts
 do not require resolved candidate identity and must not be used as candidate qualification.
 
