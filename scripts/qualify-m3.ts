@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync, statSync } from "node:fs";
 import {
   evaluateM3Qualification,
+  evaluateM3FirstCanaryQualification,
+  M3_FIRST_CANARY_CONTRACT,
+  M3_FIRST_CANARY_VERSION,
   M3_QUALIFICATION_CONTRACT,
+  M3_QUALIFICATION_VERSION,
+  type M3FirstCanaryInput,
   type M3QualificationInput,
 } from "../src/homeserver/m3-qualification.js";
 
@@ -17,6 +22,18 @@ const TOP_LEVEL_KEYS = new Set([
   "thresholds",
   "candidates",
 ]);
+const FIRST_CANARY_TOP_LEVEL_KEYS = new Set([
+  "contract",
+  "version",
+  "mode",
+  "costDeferral",
+  "evaluation",
+  "window",
+  "snapshot",
+  "thresholds",
+  "candidates",
+]);
+const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
 type RecordValue = Record<string, unknown>;
 
@@ -28,10 +45,10 @@ function hasString(record: RecordValue, key: string): boolean {
   return typeof record[key] === "string";
 }
 
-function isQualificationInput(value: unknown): value is M3QualificationInput {
+function isQualificationV1Input(value: unknown): value is M3QualificationInput {
   if (!isRecord(value)) return false;
   if (![...Object.keys(value)].every((key) => TOP_LEVEL_KEYS.has(key))) return false;
-  if (value.contract !== M3_QUALIFICATION_CONTRACT || value.version !== 1) return false;
+  if (value.contract !== M3_QUALIFICATION_CONTRACT || value.version !== M3_QUALIFICATION_VERSION) return false;
 
   const evaluation = value.evaluation;
   const window = value.window;
@@ -48,6 +65,37 @@ function isQualificationInput(value: unknown): value is M3QualificationInput {
   ) {
     return false;
   }
+  if (thresholds !== null && !isRecord(thresholds)) return false;
+  return Array.isArray(candidates) && candidates.every(isRecord);
+}
+
+function isFirstCanaryInput(value: unknown): value is M3FirstCanaryInput {
+  if (!isRecord(value)) return false;
+  if (![...Object.keys(value)].every((key) => FIRST_CANARY_TOP_LEVEL_KEYS.has(key))) return false;
+  if (value.contract !== M3_FIRST_CANARY_CONTRACT || value.version !== M3_FIRST_CANARY_VERSION) return false;
+  if (value.mode !== "cost-unassessed") return false;
+  const costDeferral = value.costDeferral;
+  if (
+    !isRecord(costDeferral) ||
+    Object.keys(costDeferral).some((key) => !["reason", "followUp"].includes(key)) ||
+    !hasString(costDeferral, "reason") ||
+    !TOKEN_RE.test(costDeferral.reason) ||
+    costDeferral.followUp !== "issue-82"
+  ) return false;
+
+  const evaluation = value.evaluation;
+  const window = value.window;
+  const snapshot = value.snapshot;
+  const thresholds = value.thresholds;
+  const candidates = value.candidates;
+  if (!isRecord(evaluation) || !hasString(evaluation, "asOf")) return false;
+  if (!isRecord(window) || !hasString(window, "start") || !hasString(window, "end")) return false;
+  if (
+    !isRecord(snapshot) ||
+    !hasString(snapshot, "sha256") ||
+    typeof snapshot.immutable !== "boolean" ||
+    !hasString(snapshot, "observedAt")
+  ) return false;
   if (thresholds !== null && !isRecord(thresholds)) return false;
   return Array.isArray(candidates) && candidates.every(isRecord);
 }
@@ -126,11 +174,15 @@ function run(args: string[]): number {
   } catch {
     return writeError("E_INPUT_JSON");
   }
-  if (!isQualificationInput(parsedJson)) return writeError("E_INPUT_SCHEMA");
+  const v1 = isQualificationV1Input(parsedJson);
+  const v2 = isFirstCanaryInput(parsedJson);
+  if (!v1 && !v2) return writeError("E_INPUT_SCHEMA");
 
-  let report: ReturnType<typeof evaluateM3Qualification>;
+  let report: ReturnType<typeof evaluateM3Qualification> | ReturnType<typeof evaluateM3FirstCanaryQualification>;
   try {
-    report = evaluateM3Qualification(parsedJson);
+    report = v2
+      ? evaluateM3FirstCanaryQualification(parsedJson)
+      : evaluateM3Qualification(parsedJson);
   } catch {
     return writeError("E_EVALUATION");
   }

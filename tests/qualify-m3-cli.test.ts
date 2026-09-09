@@ -10,7 +10,10 @@ import {
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { M3_QUALIFICATION_CONTRACT } from "../src/homeserver/m3-qualification.js";
+import {
+  M3_FIRST_CANARY_CONTRACT,
+  M3_QUALIFICATION_CONTRACT,
+} from "../src/homeserver/m3-qualification.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cliPath = resolve(repoRoot, "scripts/qualify-m3.ts");
@@ -21,6 +24,27 @@ function holdInput(): Record<string, unknown> {
   return {
     contract: M3_QUALIFICATION_CONTRACT,
     version: 1,
+    evaluation: { asOf: "2026-09-03T00:00:00.000Z" },
+    window: {
+      start: "2026-09-01T00:00:00.000Z",
+      end: "2026-09-02T00:00:00.000Z",
+    },
+    snapshot: {
+      sha256: `sha256:${"a".repeat(64)}`,
+      immutable: true,
+      observedAt: "2026-09-02T00:00:00.000Z",
+    },
+    thresholds: null,
+    candidates: [],
+  };
+}
+
+function firstCanaryHoldInput(): Record<string, unknown> {
+  return {
+    contract: M3_FIRST_CANARY_CONTRACT,
+    version: 2,
+    mode: "cost-unassessed",
+    costDeferral: { reason: "cost-assessment-deferred", followUp: "issue-82" },
     evaluation: { asOf: "2026-09-03T00:00:00.000Z" },
     window: {
       start: "2026-09-01T00:00:00.000Z",
@@ -103,6 +127,55 @@ describe("qualify-m3 CLI", () => {
     expect(result.stderr).toBe("E_INPUT_SCHEMA\n");
     expect(result.stderr).not.toContain("do-not-echo");
     expect(result.stderr).not.toContain(inputPath);
+  });
+
+  it("dispatches the explicit first-canary v2 contract and preserves its scoped HOLD", () => {
+    const bytes = Buffer.from(JSON.stringify(firstCanaryHoldInput()));
+    const result = runCli(["--input", writeInput(bytes)]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    const output = JSON.parse(result.stdout) as {
+      report: {
+        contract: string;
+        version: number;
+        mode: string;
+        analysisVerdict: string;
+        canaryEligibility: string;
+        costAssessment: string;
+        selectedCandidate: unknown;
+        enablingDecision: unknown;
+      };
+    };
+    expect(output.report.contract).toBe(M3_FIRST_CANARY_CONTRACT);
+    expect(output.report.version).toBe(2);
+    expect(output.report.mode).toBe("cost-unassessed");
+    expect(output.report.analysisVerdict).toBe("HOLD");
+    expect(output.report.canaryEligibility).toBe("HOLD");
+    expect(output.report.costAssessment).toBe("unassessed");
+    expect(output.report.selectedCandidate).toBeNull();
+    expect(output.report.enablingDecision).toBeNull();
+  });
+
+  it("rejects v2 mode, deferral, and top-level metadata before evaluation", () => {
+    const wrongMode = firstCanaryHoldInput();
+    wrongMode.mode = "strict-v1";
+    const wrongModeResult = runCli(["--input", writeInput(JSON.stringify(wrongMode))]);
+
+    const wrongDeferral = firstCanaryHoldInput();
+    wrongDeferral.costDeferral = { reason: "secret reason with spaces", followUp: "issue-82" };
+    const wrongDeferralResult = runCli(["--input", writeInput(JSON.stringify(wrongDeferral))]);
+
+    const metadata = firstCanaryHoldInput();
+    metadata.operatorMetadata = "secret-metadata";
+    const metadataResult = runCli(["--input", writeInput(JSON.stringify(metadata))]);
+
+    for (const result of [wrongModeResult, wrongDeferralResult, metadataResult]) {
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("E_INPUT_SCHEMA\n");
+      expect(result.stderr).not.toContain("secret");
+    }
   });
 
   it("uses fixed usage and size failures", () => {
