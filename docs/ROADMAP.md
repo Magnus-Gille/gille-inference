@@ -46,12 +46,12 @@ Current issue bodies and acceptance evidence win over historical issue titles.
 | Milestone | Finished outcome | State |
 |---|---|---|
 | **M1 — Paired quality-protected release** | The schema-grounding gateway and matching client are released together, verified, and recoverable | **Complete (2026-09-06):** client 1.3.6 / gateway v9 paired acceptance passed; [sanitized release receipt](https://github.com/Magnus-Gille/gille-inference/issues/285#issuecomment-5561882175). Readiness [#284](https://github.com/Magnus-Gille/gille-inference/issues/284) resolved by [#290](https://github.com/Magnus-Gille/gille-inference/pull/290) |
-| **M2 — Auditable usefulness and provenance** | Exact model/task feedback, calibrated cost, organic-use evidence and a served-model provenance snapshot state what is proven, failed, or unknown | **In progress:** [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) is closed after fresh canonical read-only deployed verification, with the sanitized closure record in [comment 5575645568](https://github.com/Magnus-Gille/gille-inference/issues/243#issuecomment-5575645568). [#293](https://github.com/Magnus-Gille/gille-inference/issues/293) is closed after a fresh but incomplete operator snapshot in [comment 5600506798](https://github.com/Magnus-Gille/gille-inference/issues/293#issuecomment-5600506798); implementation [PR #294](https://github.com/Magnus-Gille/gille-inference/pull/294) and process-view documentation [PR #302](https://github.com/Magnus-Gille/gille-inference/pull/302) provide traceability. Loaded-model binding remains unproven and unknowns are preserved. [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) remains uncalibrated, and [#245](https://github.com/Magnus-Gille/gille-inference/issues/245)'s organic evidence is unresolved. |
-| **M3 — First bounded routing canary** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated/HOLD:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): the [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) qualification report was delivered with a HOLD decision; [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) and [#288](https://github.com/Magnus-Gille/gille-inference/issues/288) remain gated, and no lane is qualified. Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow. #293 is not a blanket M3 blocker |
+| **M2 — Auditable usefulness and provenance** | Exact model/task feedback, organic-use evidence, cost provenance with unknowns preserved, and a served-model provenance snapshot state what is proven, failed, or unknown | **In progress:** [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) is closed after fresh canonical read-only deployed verification, with the sanitized closure record in [comment 5575645568](https://github.com/Magnus-Gille/gille-inference/issues/243#issuecomment-5575645568). [#293](https://github.com/Magnus-Gille/gille-inference/issues/293) is closed after a fresh but incomplete operator snapshot in [comment 5600506798](https://github.com/Magnus-Gille/gille-inference/issues/293#issuecomment-5600506798); implementation [PR #294](https://github.com/Magnus-Gille/gille-inference/pull/294) and process-view documentation [PR #302](https://github.com/Magnus-Gille/gille-inference/pull/302) provide traceability. Loaded-model binding remains unproven and unknowns are preserved. [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) remains open but is deferred outside M2 pending suitable measured energy evidence, and [#245](https://github.com/Magnus-Gille/gille-inference/issues/245)'s organic evidence is unresolved. |
+| **M3 — First bounded routing canary** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated/HOLD:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): the [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) qualification report was delivered with a HOLD decision; [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) and [#288](https://github.com/Magnus-Gille/gille-inference/issues/288) remain gated, and no lane is qualified. The current strict evaluator still cost-gates, so the historical HOLD is unchanged. A first canary with cost explicitly unassessed requires explicit reviewed evaluator support; other lanes remain shadow. #293 is not a blanket M3 blocker |
 | **M4 — Reliable cross-platform agent access** | Supported M5 agent setup and recovery are repeatable on macOS and Windows | **Independent workstream:** guided provisioning [#184](https://github.com/Magnus-Gille/gille-inference/issues/184), connector/outage diagnostics [#242](https://github.com/Magnus-Gille/gille-inference/issues/242), and Windows distribution/credential-backend support [#266](https://github.com/Magnus-Gille/gille-inference/issues/266) |
 | **M5 — Controlled runtime and model upgrades** | Runtime-update evaluation and hand-picked model promotion have controlled, recoverable paths | **Independent tooling/evaluation:** exclusive maintenance [#196](https://github.com/Magnus-Gille/gille-inference/issues/196), transactional roster promotion [#217](https://github.com/Magnus-Gille/gille-inference/issues/217), and the upgrade assessment [#280](https://github.com/Magnus-Gille/gille-inference/issues/280). Measured performance experiments follow the M2 baseline |
 
-**Current M2/M3 status (2026-09-09).** M2 remains open. For [#82](https://github.com/Magnus-Gille/gille-inference/issues/82), the owner confirmed that no plug-level meter/UPS measurement is connected; a possible purchase remains undecided, and model specifications are not measured wall-energy evidence. The conditional 2026-09-09–16 [#245 window](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5584785708) did not start because its genuine-task feedback precondition was unmet before the boundary; any replacement window must be declared prospectively. The owner-declined [Hugin #165](https://github.com/Magnus-Gille/hugin/issues/165) trial was not reopened; its outcome/gap was handed off in [#245 comment 5584071494](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5584071494). These updates preserve the existing M2/M3 acceptance criteria and do not claim either milestone complete.
+**Current M2/M3 status (2026-09-09).** M2 remains open. For [#82](https://github.com/Magnus-Gille/gille-inference/issues/82), the owner confirmed that no plug-level meter/UPS measurement is connected; a possible purchase remains undecided, and model specifications are not measured wall-energy evidence. #82 therefore remains open and deferred outside M2; resume it only with suitable measured energy evidence. Unknown costs remain unknown, with no savings or economic qualification claim and no product-TDP substitute. The conditional 2026-09-09–16 [#245 window](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5584785708) did not start because its genuine-task feedback precondition was unmet before the boundary; any replacement window must be declared prospectively. The owner-declined [Hugin #165](https://github.com/Magnus-Gille/hugin/issues/165) trial was not reopened; its outcome/gap was handed off in [#245 comment 5584071494](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5584071494). The current strict evaluator remains cost-gated and the historical M3 HOLD is unchanged; a quality/reliability/latency-only first canary requires explicit reviewed evaluator support. These updates preserve all other M2/M3 acceptance gates and do not claim either milestone complete.
 
 #### M1 activities and acceptance — historical contract (completed 2026-09-06)
 
@@ -117,6 +117,11 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
 
 #### M2 activities and acceptance
 
+[#82](https://github.com/Magnus-Gille/gille-inference/issues/82) remains open but is deferred outside
+this M2 boundary. Resume its calibration only with suitable measured energy evidence and a declared
+comparison; model specifications or product TDP are not substitutes for measured wall energy. Until
+then, unknown costs remain unknown and do not support savings or economic qualification claims.
+
 1. Reconcile existing
    [#243](https://github.com/Magnus-Gille/gille-inference/issues/243)/[#245](https://github.com/Magnus-Gille/gille-inference/issues/245)
    implementations and missing acceptance evidence before coding. The #245 exporter is already
@@ -146,10 +151,7 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
    Report pass/fail/unknowable rather than manufacturing enough favorable samples. A new
    collection window must be declared prospectively, not substituted for the overdue review.
    The current evidence gap is recorded in [the #245 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5575664993).
-5. Complete [#82](https://github.com/Magnus-Gille/gille-inference/issues/82)'s measured calibration
-   acceptance with a declared comparison and a nonzero cost/quality receipt. Keep missing or
-   unknowable measurements explicit; the latest gap remains recorded in [the #82 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/82#issuecomment-5600801882).
-6. Implement and verify [#293](https://github.com/Magnus-Gille/gille-inference/issues/293)'s
+5. Implement and verify [#293](https://github.com/Magnus-Gille/gille-inference/issues/293)'s
    versioned, sanitized, read-only operator JSON export for exactly one already-served model
    through an authorized operator workflow. Bind weights and any applicable projector to actual
    content checksums or verified immutable artifact identities tied to the serving instance;
@@ -159,23 +161,23 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
    Replacement/restart races or unavailable evidence must produce incomplete/stale output, never
    a false complete claim. Exclude private paths, raw launch commands, credentials and
    request/response content, and do not add a client-facing API in this release.
-7. Record queue/busy rates, latency, operator rework, feedback coverage and cost provenance where
+6. Record queue/busy rates, latency, operator rework, feedback coverage and cost provenance where
    available. Missing cost or memory measurements remain unknown, not zero or inferred savings.
-   Open tightly scoped follow-ups for gaps that prevent a decision.
-8. Reconcile the Hugin trial that ended 2026-08-22 against its existing keep/reduce/remove
+   Do not make savings or economic qualification claims from unknown cost. Open tightly scoped
+   follow-ups for gaps that prevent a decision.
+7. Reconcile the Hugin trial that ended 2026-08-22 against its existing keep/reduce/remove
    contract. Link the owning repository's recorded decision, or record the exact evidence gap
    and route a bounded follow-up to that owner. Do not extend the trial silently, change Hugin
    here, or count direct M5 work and synthetic smoke as durable Hugin demand.
 
 **Done when:** #243's merged implementation has accepted review, test and any separately
 authorized rollout evidence; #245 has a reproducible report with explicit denominators,
-missingness and a next decision; #82 has measured calibration with a nonzero cost/quality receipt;
-#293 has its versioned export, evidence-integrity tests,
+missingness and a next decision; #293 has its versioned export, evidence-integrity tests,
 sanitized retention example/instructions and one operator-verified snapshot; and the Hugin
 outcome/gap handoff is explicit. If the #293 snapshot is pending, record implementation complete
-but operational validation outstanding and leave M2 open. An honest negative or unknowable #245
-report completes that report verdict, while remaining M2 acceptance still requires #82 and #293;
-it cannot authorize M3 promotion.
+but operational validation outstanding and leave M2 open. An honest, reproducible negative or
+unknowable #245 report satisfies that report's acceptance, but cannot qualify M3. Remaining M2
+acceptance retains the #243/#245/#293 and Hugin outcome requirements; #82 remains open outside M2.
 
 **Expected benefit:** know which model/task pairs actually save work, instead of optimizing for
 attempt counts, syntactically valid output or impressive benchmark scores.
@@ -184,15 +186,18 @@ attempt counts, syntactically valid output or impressive benchmark scores.
 
 1. Select and qualify exactly one low-blast-radius, non-judgment-bearing task lane from current
    evidence under [#286](https://github.com/Magnus-Gille/gille-inference/issues/286).
-   Predeclare the #85 quality/sample, availability, latency and cost gates, observation window,
-   trusted behavioral verifier, canary ceiling, watchdog and keep/revert rules before enabling it.
-2. Calibrate the relevant marginal/amortized costs in the open
-   [#82](https://github.com/Magnus-Gille/gille-inference/issues/82). Fresh calibration evidence
-   in [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required before relying on
-   it.
-   Separate verified displaced
-   frontier work from shadow projections; report cost per accepted task, including retries and
-   verification. Keep privacy/destination eligibility ahead of cost optimization.
+   Predeclare the #85 quality/sample, availability, latency and, where applicable, cost gates,
+   observation window, trusted behavioral verifier, canary ceiling, watchdog and keep/revert rules
+   before enabling it. The current strict evaluator remains cost-gated and its historical HOLD is
+   unchanged. See the versioned first-canary evaluator contract in [#304](https://github.com/Magnus-Gille/gille-inference/issues/304).
+2. A first canary may be qualified on quality, reliability and latency with cost explicitly
+   unassessed only after explicit reviewed evaluator support as specified in [#304](https://github.com/Magnus-Gille/gille-inference/issues/304). Without that support, cost remains a
+   gate. Where cost is assessed, separate verified displaced frontier work from shadow projections
+   and report cost per accepted task, including retries and verification. Unknown cost is not zero,
+   a savings claim or an economic qualification, and product TDP/specifications do not substitute
+   for measured energy evidence. Keep privacy/destination eligibility ahead of cost optimization.
+   This exception changes only cost assessment; identity/provenance, organic evidence, the trusted
+   verifier, data/authority, resource ceilings, rollback and JIT authorization gates remain required.
    The #293 provenance work is an M2 evidence-integrity obligation, not a blanket M3 blocker;
    only a selected lane's specific missing identity evidence can add a qualification dependency.
 3. Resolve the selected lane's blocking availability and authority prerequisites. Test outage,
@@ -202,7 +207,8 @@ attempt counts, syntactically valid output or impressive benchmark scores.
    approval. After the evidence gate passes and the exact operational change is authorized, run
    the bounded live canary through the fail-closed routing writer/diff path and record its
    keep/revert outcome in [#288](https://github.com/Magnus-Gille/gille-inference/issues/288) with
-   quality, latency, availability and cost evidence.
+   quality, reliability, latency, availability and the declared cost status (measured or explicitly
+   unassessed under reviewed evaluator support).
 
 **Done when:** the qualified canary has completed its observation and a verified keep or revert
 decision is recorded. A pre-canary HOLD is safe progress but leaves M3 incomplete. Expanding to
@@ -255,7 +261,8 @@ experiments. Hugin/fleet value and end-to-end trust obligations below remain in 
 
 - Base savings on verified displaced frontier calls.
 - Calibrate local energy/amortization assumptions against real utilization.
-- Report shadow projections separately from realized savings and total hardware ROI.
+- Keep unknown costs unknown; do not claim savings, economic qualification or hardware ROI without
+  suitable measured energy evidence. Report shadow projections separately from realized savings.
 
 ## Longer horizon
 
