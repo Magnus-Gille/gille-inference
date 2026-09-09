@@ -1,6 +1,6 @@
 # Roadmap
 
-**Last updated:** 2026-09-07
+**Last updated:** 2026-09-09
 
 **Architecture:** [`architecture.md`](./architecture.md)
 
@@ -25,7 +25,7 @@ available model in the human-facing Conductor seat.
 | 3. Capability routing | Task taxonomy, verifiers, ledger, routing table, safe regression handling | **Complete/deployed** for eligible lanes |
 | 4. Hybrid migration gates | Decide frontier versus local Conductor, local leaves, harness, serving | **Complete**: hybrid GO, local Conductor NO-GO |
 | 5. Learning from real work | Owner-only harvest, shadow policy, cost traces, trustworthy promotion | **In progress/shadow** |
-| 6. Durable fleet delegation | Hugin task lifecycle, node/provider routing, bounded agentic leaves | **Deployed; expired adoption trial needs outcome reconciliation in M2** |
+| 6. Durable fleet delegation | Hugin task lifecycle, node/provider routing, bounded agentic leaves | **Deployed; trial outcome/gap handed off, no trial reopened** |
 | 7. Trust-aware resilience | End-to-end sensitivity and tested local/controlled/general-external fallback | **Partial** |
 | 8. Evidence-maintained capability substrate | Manual model evaluation, guarded roster decisions, regression detection, actionable observability | **Partial/deployed** |
 
@@ -46,10 +46,12 @@ Current issue bodies and acceptance evidence win over historical issue titles.
 | Milestone | Finished outcome | State |
 |---|---|---|
 | **M1 — Paired quality-protected release** | The schema-grounding gateway and matching client are released together, verified, and recoverable | **Complete (2026-09-06):** client 1.3.6 / gateway v9 paired acceptance passed; [sanitized release receipt](https://github.com/Magnus-Gille/gille-inference/issues/285#issuecomment-5561882175). Readiness [#284](https://github.com/Magnus-Gille/gille-inference/issues/284) resolved by [#290](https://github.com/Magnus-Gille/gille-inference/pull/290) |
-| **M2 — Auditable usefulness and provenance** | Exact model/task feedback, calibrated cost, organic-use evidence and a served-model provenance snapshot state what is proven, failed, or unknown | **In progress:** exact feedback [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) is closed after fresh canonical read-only deployed verification, with the sanitized closure record in [comment 5575645568](https://github.com/Magnus-Gille/gille-inference/issues/243#issuecomment-5575645568); the implementation remains reviewed green in [PR #292](https://github.com/Magnus-Gille/gille-inference/pull/292). Organic evidence [#245](https://github.com/Magnus-Gille/gille-inference/issues/245), measured calibration [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) and served-model provenance [#293](https://github.com/Magnus-Gille/gille-inference/issues/293) remain. |
-| **M3 — First bounded routing canary** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): select/qualify lane [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) → canary integration [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) → outcome [#288](https://github.com/Magnus-Gille/gille-inference/issues/288). Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow. #293 is not a blanket M3 blocker |
+| **M2 — Auditable usefulness and provenance** | Exact model/task feedback, calibrated cost, organic-use evidence and a served-model provenance snapshot state what is proven, failed, or unknown | **In progress:** [#243](https://github.com/Magnus-Gille/gille-inference/issues/243) is closed after fresh canonical read-only deployed verification, with the sanitized closure record in [comment 5575645568](https://github.com/Magnus-Gille/gille-inference/issues/243#issuecomment-5575645568). [#293](https://github.com/Magnus-Gille/gille-inference/issues/293) is closed after a fresh but incomplete operator snapshot in [comment 5600506798](https://github.com/Magnus-Gille/gille-inference/issues/293#issuecomment-5600506798); loaded-model binding remains unproven and unknowns are preserved. [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) remains uncalibrated, and [#245](https://github.com/Magnus-Gille/gille-inference/issues/245)'s organic evidence is unresolved. |
+| **M3 — First bounded routing canary** | One narrow lane completes a predeclared canary and receives an evidence-backed keep/revert decision | **Gated/HOLD:** parent [#85](https://github.com/Magnus-Gille/gille-inference/issues/85): the [#286](https://github.com/Magnus-Gille/gille-inference/issues/286) qualification report was delivered with a HOLD decision; [#287](https://github.com/Magnus-Gille/gille-inference/issues/287) and [#288](https://github.com/Magnus-Gille/gille-inference/issues/288) remain gated, and no lane is qualified. Fresh calibration evidence from [#82](https://github.com/Magnus-Gille/gille-inference/issues/82) is required; other lanes remain shadow. #293 is not a blanket M3 blocker |
 | **M4 — Reliable cross-platform agent access** | Supported M5 agent setup and recovery are repeatable on macOS and Windows | **Independent workstream:** guided provisioning [#184](https://github.com/Magnus-Gille/gille-inference/issues/184), connector/outage diagnostics [#242](https://github.com/Magnus-Gille/gille-inference/issues/242), and Windows distribution/credential-backend support [#266](https://github.com/Magnus-Gille/gille-inference/issues/266) |
 | **M5 — Controlled runtime and model upgrades** | Runtime-update evaluation and hand-picked model promotion have controlled, recoverable paths | **Independent tooling/evaluation:** exclusive maintenance [#196](https://github.com/Magnus-Gille/gille-inference/issues/196), transactional roster promotion [#217](https://github.com/Magnus-Gille/gille-inference/issues/217), and the upgrade assessment [#280](https://github.com/Magnus-Gille/gille-inference/issues/280). Measured performance experiments follow the M2 baseline |
+
+**Current M2/M3 status (2026-09-09).** M2 remains open. For [#82](https://github.com/Magnus-Gille/gille-inference/issues/82), the owner confirmed that no plug-level meter/UPS measurement is connected; a possible purchase remains undecided, and model specifications are not measured wall-energy evidence. The conditional 2026-09-09–16 [#245 window](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5584785708) did not start because its genuine-task feedback precondition was unmet before the boundary; any replacement window must be declared prospectively. The owner-declined [Hugin #165](https://github.com/Magnus-Gille/hugin/issues/165) trial was not reopened; its outcome/gap was handed off in [#245 comment 5584071494](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5584071494). These updates preserve the existing M2/M3 acceptance criteria and do not claim either milestone complete.
 
 #### M1 activities and acceptance — historical contract (completed 2026-09-06)
 
@@ -143,10 +145,10 @@ tokens, reduced memory use or measured organic savings follows from shipping thi
    bundle without waiting for additional samples; insufficient evidence means HOLD, not GO.
    Report pass/fail/unknowable rather than manufacturing enough favorable samples. A new
    collection window must be declared prospectively, not substituted for the overdue review.
-   The current evidence gap is recorded in [the latest #245 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5575664993).
+   The current evidence gap is recorded in [the #245 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/245#issuecomment-5575664993).
 5. Complete [#82](https://github.com/Magnus-Gille/gille-inference/issues/82)'s measured calibration
    acceptance with a declared comparison and a nonzero cost/quality receipt. Keep missing or
-   unknowable measurements explicit; the latest gap remains recorded in [the #82 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/82#issuecomment-5575664897).
+   unknowable measurements explicit; the latest gap remains recorded in [the #82 gap comment](https://github.com/Magnus-Gille/gille-inference/issues/82#issuecomment-5600801882).
 6. Implement and verify [#293](https://github.com/Magnus-Gille/gille-inference/issues/293)'s
    versioned, sanitized, read-only operator JSON export for exactly one already-served model
    through an authorized operator workflow. Bind weights and any applicable projector to actual
