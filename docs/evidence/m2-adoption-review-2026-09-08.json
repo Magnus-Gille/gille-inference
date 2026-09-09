@@ -1,0 +1,506 @@
+{
+  "reportContract": "m2-adoption-review-2026-09-08-v1",
+  "sourceArtifactSha256": "aa79701e5bf9af83576b7c00d588cb3c9baffdb51e4259a54d06ef5f35483289",
+  "acceptedDeployedRevision": "81ed0dc6b38683626ff5203d286ccd634521de81",
+  "historicalReview": {
+    "reviewDate": "2026-08-28",
+    "originalWindow": "unknown",
+    "originalArtifact": "unavailable",
+    "knownOpportunities": "unknowable",
+    "usefulAttemptedRatio": "unknowable",
+    "decision": "HOLD"
+  },
+  "diagnostic": {
+    "contract": "m5-adoption-evidence-bundle-v1",
+    "version": 1,
+    "generatedAt": "2026-09-08T08:26:38.038Z",
+    "window": {
+      "from": "2026-08-29T00:00:00.000Z",
+      "throughExclusive": "2026-09-08T00:00:00.000Z"
+    },
+    "admittedCompute": {
+      "filter": {
+        "epoch": "m5-admitted-compute-v2",
+        "sql": "node = 'm5'\n  AND admission = 'admitted'\n  AND model IS NOT NULL\n  AND model <> 'none'\n  AND route IN ('/v1/chat/completions','/v1/audio/transcriptions','/v1/images/generations','image','/delegate','/mcp/ask')",
+        "node": "m5",
+        "admission": "admitted",
+        "excludedModel": "none",
+        "routes": [
+          "/v1/chat/completions",
+          "/v1/audio/transcriptions",
+          "/v1/images/generations",
+          "image",
+          "/delegate",
+          "/mcp/ask"
+        ],
+        "bounds": {
+          "from": "2026-08-29T00:00:00.000Z",
+          "throughExclusive": "2026-09-08T00:00:00.000Z",
+          "comparison": "ts >= from AND ts < throughExclusive after exact predicate",
+          "timestampShape": "integer epoch milliseconds; malformed values excluded and counted"
+        },
+        "historicalApplicability": {
+          "status": "mixed",
+          "currentRows": 295,
+          "missingRows": 1022,
+          "otherRows": 0,
+          "ambiguousRows": 1022,
+          "reason": "one or more current-filter-matched rows have a missing or non-current compute filter epoch; historical comparison and promotion applicability remain unknown"
+        }
+      },
+      "requests": 1317,
+      "requestTimeMs": 28226716,
+      "missingRequestTime": 0,
+      "reconciliation": {
+        "count": {
+          "total": 1317,
+          "byDay": 1317,
+          "byTier": 1317,
+          "byRoute": 1317,
+          "byNode": 1317,
+          "byModel": 1317,
+          "allMatch": true
+        },
+        "requestTimeMs": {
+          "total": 28226716,
+          "byDay": 28226716,
+          "byTier": 28226716,
+          "byRoute": 28226716,
+          "byNode": 28226716,
+          "byModel": 28226716,
+          "allMatch": true
+        }
+      },
+      "exclusions": {
+        "malformedTimestamp": 0,
+        "node": {
+          "m5": 8387,
+          "nonM5": 0,
+          "missing": 0
+        },
+        "admission": {
+          "admitted": 1317,
+          "notAdmitted": 6973,
+          "missing": 97
+        },
+        "model": {
+          "none": 6907,
+          "present": 1480,
+          "missing": 0
+        },
+        "route": {
+          "included": 1480,
+          "excluded": 6907,
+          "missing": 0
+        },
+        "reconciliation": {
+          "inWindow": 8387,
+          "byNode": 8387,
+          "byAdmission": 8387,
+          "byModel": 8387,
+          "byRoute": 8387,
+          "allMatch": true
+        }
+      },
+      "sourceWindow": {
+        "rows": 107334,
+        "inWindow": 8387,
+        "malformedTimestamp": 0,
+        "validMin": "2026-06-18T11:04:45.855Z",
+        "validMax": "2026-09-08T08:26:17.795Z"
+      }
+    },
+    "adoption": {
+      "filter": {
+        "from": "2026-08-29T00:00:00.000Z",
+        "throughExclusive": "2026-09-08T00:00:00.000Z",
+        "comparison": "recorded_day >= UTC day(from) AND recorded_day < UTC day(throughExclusive); exact day bounds are required",
+        "timestampShape": "YYYY-MM-DD UTC calendar day; malformed values excluded and counted"
+      },
+      "byPurpose": {
+        "organic": {
+          "reports": 199,
+          "knownOpportunities": 208,
+          "attempted": 197,
+          "useful": 123,
+          "usefulAttemptedRatio": 0.6243654822335025,
+          "usefulness": {
+            "pass": 41,
+            "partial": 106,
+            "redo": 10,
+            "wrong": 21,
+            "not_reported": 21
+          },
+          "unknownOpportunityDenominators": 0,
+          "unassessedAttempted": 18
+        },
+        "evaluation": {
+          "reports": 7,
+          "knownOpportunities": 7,
+          "attempted": 7,
+          "useful": 3,
+          "usefulAttemptedRatio": 0.42857142857142855,
+          "usefulness": {
+            "pass": 2,
+            "partial": 4,
+            "redo": 0,
+            "wrong": 1,
+            "not_reported": 0
+          },
+          "unknownOpportunityDenominators": 0,
+          "unassessedAttempted": 2
+        },
+        "synthetic": {
+          "reports": 10,
+          "knownOpportunities": 10,
+          "attempted": 10,
+          "useful": 7,
+          "usefulAttemptedRatio": 0.7,
+          "usefulness": {
+            "pass": 3,
+            "partial": 4,
+            "redo": 0,
+            "wrong": 0,
+            "not_reported": 3
+          },
+          "unknownOpportunityDenominators": 0,
+          "unassessedAttempted": 0
+        }
+      },
+      "fallbackCoverage": {
+        "capacity": 9,
+        "transport": 8,
+        "access": 6,
+        "unknown": 26
+      },
+      "thresholds": {
+        "knownOpportunities": {
+          "status": "pass",
+          "observed": 208,
+          "required": 20,
+          "reason": "minimum known opportunity sample reached"
+        },
+        "usefulAttemptedRatio": {
+          "status": "unknowable",
+          "observed": 0.6243654822335025,
+          "required": 0.6,
+          "reason": "one or more attempts lack a complete usefulness assessment"
+        }
+      },
+      "overflow": {
+        "retainedIndividualCount": 215,
+        "aggregatedCount": 1,
+        "droppedCount": 0,
+        "cappedDays": [
+          "2026-09-03"
+        ],
+        "affectedDays": [
+          "2026-09-03"
+        ],
+        "perHarnessAttribution": "unavailable",
+        "complete": false,
+        "byPurpose": {
+          "organic": {
+            "reports": 1,
+            "knownOpportunities": 2,
+            "unknownOpportunityDenominators": 0,
+            "attempted": 1,
+            "useful": 0,
+            "completed": 0,
+            "unassessedAttempted": 0,
+            "deterministicChecks": 0,
+            "deterministicCheckPasses": 0,
+            "usefulness": {
+              "pass": 0,
+              "partial": 0,
+              "redo": 0,
+              "wrong": 0,
+              "not_reported": 1
+            },
+            "fallbackCounts": {
+              "none": 0,
+              "m5_tool_missing": 0,
+              "m5_auth_unavailable": 0,
+              "m5_unreachable": 0,
+              "m5_busy": 1,
+              "m5_refused": 0,
+              "local_result_unusable": 0,
+              "other_known": 0
+            }
+          },
+          "evaluation": {
+            "reports": 0,
+            "knownOpportunities": 0,
+            "unknownOpportunityDenominators": 0,
+            "attempted": 0,
+            "useful": 0,
+            "completed": 0,
+            "unassessedAttempted": 0,
+            "deterministicChecks": 0,
+            "deterministicCheckPasses": 0,
+            "usefulness": {
+              "pass": 0,
+              "partial": 0,
+              "redo": 0,
+              "wrong": 0,
+              "not_reported": 0
+            },
+            "fallbackCounts": {
+              "none": 0,
+              "m5_tool_missing": 0,
+              "m5_auth_unavailable": 0,
+              "m5_unreachable": 0,
+              "m5_busy": 0,
+              "m5_refused": 0,
+              "local_result_unusable": 0,
+              "other_known": 0
+            }
+          },
+          "synthetic": {
+            "reports": 0,
+            "knownOpportunities": 0,
+            "unknownOpportunityDenominators": 0,
+            "attempted": 0,
+            "useful": 0,
+            "completed": 0,
+            "unassessedAttempted": 0,
+            "deterministicChecks": 0,
+            "deterministicCheckPasses": 0,
+            "usefulness": {
+              "pass": 0,
+              "partial": 0,
+              "redo": 0,
+              "wrong": 0,
+              "not_reported": 0
+            },
+            "fallbackCounts": {
+              "none": 0,
+              "m5_tool_missing": 0,
+              "m5_auth_unavailable": 0,
+              "m5_unreachable": 0,
+              "m5_busy": 0,
+              "m5_refused": 0,
+              "local_result_unusable": 0,
+              "other_known": 0
+            }
+          }
+        }
+      },
+      "sourceWindow": {
+        "rows": 554,
+        "inWindow": 215,
+        "malformedTimestamp": 0,
+        "validMin": "2026-07-31",
+        "validMax": "2026-09-08"
+      }
+    },
+    "delegations": {
+      "filter": {
+        "from": "2026-08-29T00:00:00.000Z",
+        "throughExclusive": "2026-09-08T00:00:00.000Z",
+        "comparison": "ts >= from AND ts < throughExclusive",
+        "timestampShape": "RFC3339 UTC with fixed YYYY-MM-DDTHH:mm:ss[.sss]Z shape; malformed values excluded and counted"
+      },
+      "rows": 460,
+      "currentRows": 460,
+      "attempted": 460,
+      "useful": 0,
+      "unverified": 403,
+      "infraErrors": 4,
+      "reviewerUsefulness": {
+        "present": 0,
+        "missing": 460
+      },
+      "coverage": {
+        "evidenceIdentity": {
+          "present": 0,
+          "missing": 460
+        },
+        "judgePolicy": {
+          "present": 0,
+          "missing": 460
+        },
+        "learningTaskBinding": {
+          "present": 0,
+          "missing": 460
+        }
+      },
+      "stateCounts": {
+        "scope": "valid-timestamped delegation rows in the exact bounded window",
+        "currentM5": 460,
+        "shadowM5": 0,
+        "supersededM5": 0,
+        "shadowAndSupersededM5": 0,
+        "nonM5": 0,
+        "invalid": 0,
+        "reconciliation": {
+          "inWindow": 460,
+          "classified": 460,
+          "allMatch": true
+        }
+      },
+      "judgePolicy": {
+        "epoch": "ctx-tools-parts-v1",
+        "current": 0,
+        "stale": 0,
+        "missing": 460,
+        "applicability": "historical-or-missing"
+      },
+      "learningTaskBinding": {
+        "scope": "current-M5 delegation rows in the exact bounded window",
+        "currentM5": 460,
+        "required": 460,
+        "present": 0,
+        "missing": 460,
+        "notRequired": 0,
+        "nonCurrentExcluded": 0
+      },
+      "promotionReadiness": {
+        "evidenceIdentityComplete": false,
+        "judgePolicyCurrent": false,
+        "learningTaskBindingComplete": false,
+        "stateUnambiguous": true,
+        "reviewerUsefulnessComplete": false,
+        "costCoverageComplete": false,
+        "computeReconciliationComplete": true,
+        "historicalMetricUnambiguous": false,
+        "eligible": false
+      },
+      "sourceWindow": {
+        "rows": 5194,
+        "inWindow": 460,
+        "malformedTimestamp": 0,
+        "validMin": "2026-06-17T21:51:26.326Z",
+        "validMax": "2026-09-08T08:04:02.080Z"
+      }
+    },
+    "cost": {
+      "filter": {
+        "from": "2026-08-29T00:00:00.000Z",
+        "throughExclusive": "2026-09-08T00:00:00.000Z",
+        "comparison": "ts >= from AND ts < throughExclusive",
+        "timestampShape": "RFC3339 UTC with fixed YYYY-MM-DDTHH:mm:ss[.sss]Z shape; malformed values excluded and counted"
+      },
+      "sourceRows": 1974,
+      "rows": 403,
+      "malformedTimestamp": 0,
+      "reconciled": {
+        "rows": 403,
+        "m5TotalUsd": null,
+        "verifiedSavingsActualUsd": null,
+        "verifiedSavingsPremiumUsd": null,
+        "potentialSavingsActualUsd": null,
+        "potentialSavingsPremiumUsd": null,
+        "missingValues": 0,
+        "confidence": "partial"
+      },
+      "unlinked": {
+        "rows": 0,
+        "m5TotalUsd": null,
+        "verifiedSavingsActualUsd": null,
+        "verifiedSavingsPremiumUsd": null,
+        "potentialSavingsActualUsd": null,
+        "potentialSavingsPremiumUsd": null,
+        "missingValues": 0,
+        "confidence": "unknowable"
+      },
+      "unreconciled": {
+        "rows": 0,
+        "m5TotalUsd": null,
+        "verifiedSavingsActualUsd": null,
+        "verifiedSavingsPremiumUsd": null,
+        "potentialSavingsActualUsd": null,
+        "potentialSavingsPremiumUsd": null,
+        "missingValues": 0,
+        "confidence": "unknowable"
+      },
+      "reconciledDelegations": 403,
+      "calibration": {
+        "present": 0,
+        "missing": 403
+      },
+      "priceCatalog": {
+        "present": 403,
+        "missing": 0,
+        "unrecognized": 38
+      },
+      "reconciliation": {
+        "currentDelegations": 460,
+        "linkedRows": 403,
+        "linkedDelegations": 403,
+        "missingDelegations": 57,
+        "duplicateLinks": 0,
+        "duplicateRows": 0,
+        "unlinkedRows": 0,
+        "unreconciledRows": 0,
+        "exactlyOnePerCurrentDelegation": false
+      },
+      "sourceWindow": {
+        "rows": 1974,
+        "inWindow": 403,
+        "malformedTimestamp": 0,
+        "validMin": "2026-07-08T10:07:32.960Z",
+        "validMax": "2026-09-08T08:04:02.081Z"
+      }
+    },
+    "completeness": {
+      "requiredTables": {
+        "adoption_evidence": true,
+        "request_log": true,
+        "delegations": true,
+        "delegation_costs": true
+      },
+      "sourceRows": {
+        "adoptionEvidence": 554,
+        "admittedCompute": 107334,
+        "delegations": 5194,
+        "costs": 1974
+      },
+      "adoptionEvidence": {
+        "retainedIndividualCount": 215,
+        "aggregatedCount": 1,
+        "droppedCount": 0,
+        "cappedDays": [
+          "2026-09-03"
+        ],
+        "affectedDays": [
+          "2026-09-03"
+        ],
+        "perHarnessAttribution": "unavailable",
+        "complete": false
+      },
+      "missingness": {
+        "unknownOpportunityDenominators": 0,
+        "unassessedAttemptedReports": 20,
+        "missingDelegationVerifier": 408,
+        "missingDelegationSource": 0,
+        "missingDelegationUsefulness": 460,
+        "missingCostValues": 0,
+        "missingRequestTime": 0,
+        "malformedTimestamps": 0
+      }
+    },
+    "maturity": [
+      {
+        "area": "admitted M5 compute evidence",
+        "label": "measured"
+      },
+      {
+        "area": "adoption evidence",
+        "label": "measured"
+      },
+      {
+        "area": "delegation/cost evidence",
+        "label": "measured"
+      },
+      {
+        "area": "lane promotion",
+        "label": "aspirational"
+      }
+    ],
+    "nextAction": {
+      "action": "repair_measurement",
+      "reason": "adoption evidence retention is capped; overflow cannot support complete promotion evidence"
+    }
+  }
+}
