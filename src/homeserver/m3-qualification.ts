@@ -11,6 +11,14 @@ import { classifyVerifierKind } from "./verifier-classification.js";
 export const M3_QUALIFICATION_CONTRACT = "m5-m3-qualification-v1" as const;
 export const M3_QUALIFICATION_VERSION = 1 as const;
 
+/**
+ * Versioned first-canary contract.  This is deliberately a separate contract from the
+ * cost-gated evaluator above: an input cannot opt into the cost-unassessed path by changing
+ * one field on a v1 report.
+ */
+export const M3_FIRST_CANARY_CONTRACT = "m5-m3-first-canary-v2" as const;
+export const M3_FIRST_CANARY_VERSION = 2 as const;
+
 export type QualificationSignalStatus = "measured" | "unknown" | "unproven";
 export type QualificationSignalProvenance = "independently-verified" | "operator-attested";
 
@@ -63,6 +71,23 @@ export interface QualificationThresholds {
   maxBusyRate: number;
   maxCostPerAcceptedUsd: number;
   maxLocalToBaselineRatio: number | null;
+}
+
+/** The reviewed threshold set for the first-canary, cost-unassessed contract. */
+export interface M3FirstCanaryThresholds {
+  version: string;
+  rationale: string;
+  review: QualificationThresholdReview;
+  expectedPolicyStamp: string;
+  acceptedTaskTypes: string[];
+  maxEvidenceAgeMs: number;
+  minOrganicOpportunities: number;
+  minOrganicAttempts: number;
+  minQualityRate: number;
+  minFeedbackCoverage: number;
+  maxErrorRate: number;
+  maxP90LatencyMs: number;
+  maxBusyRate: number;
 }
 
 export interface QualificationWindow {
@@ -161,6 +186,43 @@ export interface M3QualificationInput {
   candidates: M3QualificationCandidate[];
 }
 
+export type M3FirstCanaryMode = "cost-unassessed";
+
+export interface M3FirstCanaryCostSignal {
+  status: "unknown" | "unproven";
+  reason: string;
+}
+
+export interface M3FirstCanaryCostEvidence {
+  localCostPerAcceptedUsd: M3FirstCanaryCostSignal;
+  baselineCostPerAcceptedUsd: M3FirstCanaryCostSignal;
+  localProvenance: string;
+  baselineProvenance: string;
+  calibrated: M3FirstCanaryCostSignal;
+  exactOneCostCoverage: M3FirstCanaryCostSignal;
+}
+
+export type M3FirstCanaryCandidate = Omit<M3QualificationCandidate, "cost"> & {
+  cost: M3FirstCanaryCostEvidence;
+};
+
+export interface M3FirstCanaryCostDeferral {
+  reason: string;
+  followUp: "issue-82";
+}
+
+export interface M3FirstCanaryInput {
+  contract: typeof M3_FIRST_CANARY_CONTRACT;
+  version: typeof M3_FIRST_CANARY_VERSION;
+  mode: M3FirstCanaryMode;
+  costDeferral: M3FirstCanaryCostDeferral;
+  evaluation: { asOf: string };
+  window: QualificationWindow;
+  snapshot: QualificationSnapshot;
+  thresholds: M3FirstCanaryThresholds | null;
+  candidates: M3FirstCanaryCandidate[];
+}
+
 export interface QualificationSignalSummary {
   status: QualificationSignalStatus;
   value: number | boolean | null;
@@ -249,6 +311,45 @@ export interface M3QualificationDecision {
   enablingDecision: null;
 }
 
+export type M3FirstCanaryCandidateReport = QualificationCandidateReport;
+
+export interface M3FirstCanaryThresholdSummary {
+  version: string;
+  acceptedTaskTypes: string[];
+  maxEvidenceAgeMs: number;
+  minOrganicOpportunities: number;
+  minOrganicAttempts: number;
+  minQualityRate: number;
+  minFeedbackCoverage: number;
+  maxErrorRate: number;
+  maxP90LatencyMs: number;
+  maxBusyRate: number;
+}
+
+export interface M3FirstCanaryDecision {
+  contract: typeof M3_FIRST_CANARY_CONTRACT;
+  version: typeof M3_FIRST_CANARY_VERSION;
+  mode: M3FirstCanaryMode;
+  evidenceBasis: "operator-supplied";
+  evaluationAsOf: string;
+  window: QualificationWindow;
+  snapshot: { sha256: string; observedAt: string };
+  thresholds: M3FirstCanaryThresholdSummary | null;
+  candidates: M3FirstCanaryCandidateReport[];
+  /** Full qualification is intentionally never established by this contract. */
+  analysisVerdict: "HOLD";
+  selectedCandidate: null;
+  reasons: string[];
+  /** Qualification is diagnostic only; activation is owned by lifecycle policy. */
+  enablingDecision: null;
+  /** The diagnostic verdict is scoped to the first-canary non-cost gates. */
+  diagnosticScope: "first-canary-non-cost";
+  costAssessment: "unassessed";
+  costDeferral: M3FirstCanaryCostDeferral;
+  canaryEligibility: "ELIGIBLE" | "HOLD";
+  selectedCanaryCandidate: QualificationCandidateKey | null;
+}
+
 type AnyRecord = Record<string, unknown>;
 type NumericSignalField = "count" | "rate" | "latency" | "cost";
 type SummaryKind = "count" | "rate" | "nonnegative" | "boolean";
@@ -263,6 +364,40 @@ const CURRENT_HARVEST_POLICY = "ctx-tools-parts-v1";
 const POLICY_STAMP_RE = new RegExp(`^${CURRENT_HARVEST_POLICY}\\|ctx=(0|[1-9]\\d{0,15})$`);
 const TEXT_RE = /^[^\u0000-\u001f\u007f]{1,1024}$/u;
 const PURPOSES: QualificationTrafficPurpose[] = ["organic", "evaluation", "synthetic", "unknown"];
+const FIRST_CANARY_THRESHOLD_KEYS = [
+  "version",
+  "rationale",
+  "review",
+  "expectedPolicyStamp",
+  "acceptedTaskTypes",
+  "maxEvidenceAgeMs",
+  "minOrganicOpportunities",
+  "minOrganicAttempts",
+  "minQualityRate",
+  "minFeedbackCoverage",
+  "maxErrorRate",
+  "maxP90LatencyMs",
+  "maxBusyRate",
+] as const;
+const FIRST_CANARY_COST_KEYS = [
+  "localCostPerAcceptedUsd",
+  "baselineCostPerAcceptedUsd",
+  "localProvenance",
+  "baselineProvenance",
+  "calibrated",
+  "exactOneCostCoverage",
+] as const;
+const FIRST_CANARY_TOP_LEVEL_KEYS = [
+  "contract",
+  "version",
+  "mode",
+  "costDeferral",
+  "evaluation",
+  "window",
+  "snapshot",
+  "thresholds",
+  "candidates",
+] as const;
 const KEY_FIELDS: Array<keyof QualificationCandidateKey> = [
   "taskType",
   "nodeId",
@@ -279,6 +414,11 @@ const IDENTITY_FIELDS: Array<keyof QualificationCandidateIdentity> = [
 
 function isRecord(value: unknown): value is AnyRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(record: AnyRecord, keys: readonly string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(record).every((key) => allowed.has(key));
 }
 
 function isToken(value: unknown): value is string {
@@ -521,6 +661,90 @@ function validateThresholds(raw: unknown): { thresholds: QualificationThresholds
   return valid ? { thresholds: raw as unknown as QualificationThresholds, reasons: [] } : { thresholds: null, reasons: ["invalid_thresholds"] };
 }
 
+function validateFirstCanaryThresholds(raw: unknown): {
+  thresholds: M3FirstCanaryThresholds | null;
+  reasons: string[];
+} {
+  if (!isRecord(raw)) return { thresholds: null, reasons: ["invalid_thresholds"] };
+  // A v2 caller must use the explicit non-cost schema.  Cost thresholds belong to the strict
+  // v1 evaluator and are rejected here rather than silently being ignored.
+  if (!hasOnlyKeys(raw, FIRST_CANARY_THRESHOLD_KEYS)) {
+    return { thresholds: null, reasons: ["invalid_thresholds"] };
+  }
+  const review = isRecord(raw.review) ? raw.review : {};
+  const valid =
+    isToken(raw.version) &&
+    isText(raw.rationale) &&
+    isToken(review.reviewerId) &&
+    parseCanonicalIso(review.reviewedAt) !== null &&
+    isToken(review.decisionRef) &&
+    isCanonicalPolicyStamp(raw.expectedPolicyStamp) &&
+    Array.isArray(raw.acceptedTaskTypes) &&
+    raw.acceptedTaskTypes.length > 0 &&
+    raw.acceptedTaskTypes.every(isToken) &&
+    raw.acceptedTaskTypes.every(isKnownTaskType) &&
+    new Set(raw.acceptedTaskTypes).size === raw.acceptedTaskTypes.length &&
+    isSafeInteger(raw.maxEvidenceAgeMs) &&
+    isSafeInteger(raw.minOrganicOpportunities) &&
+    isSafeInteger(raw.minOrganicAttempts) &&
+    isRate(raw.minQualityRate) &&
+    isRate(raw.minFeedbackCoverage) &&
+    isRate(raw.maxErrorRate) &&
+    isFiniteNonnegative(raw.maxP90LatencyMs) &&
+    isRate(raw.maxBusyRate);
+  return valid
+    ? { thresholds: raw as unknown as M3FirstCanaryThresholds, reasons: [] }
+    : { thresholds: null, reasons: ["invalid_thresholds"] };
+}
+
+function firstCanaryThresholdSummary(raw: M3FirstCanaryThresholds): M3FirstCanaryThresholdSummary {
+  return {
+    version: isToken(raw.version) ? raw.version : "",
+    acceptedTaskTypes: Array.isArray(raw.acceptedTaskTypes) ? raw.acceptedTaskTypes.filter(isToken).sort() : [],
+    maxEvidenceAgeMs: isSafeInteger(raw.maxEvidenceAgeMs) ? raw.maxEvidenceAgeMs : 0,
+    minOrganicOpportunities: isSafeInteger(raw.minOrganicOpportunities) ? raw.minOrganicOpportunities : 0,
+    minOrganicAttempts: isSafeInteger(raw.minOrganicAttempts) ? raw.minOrganicAttempts : 0,
+    minQualityRate: isRate(raw.minQualityRate) ? raw.minQualityRate : 0,
+    minFeedbackCoverage: isRate(raw.minFeedbackCoverage) ? raw.minFeedbackCoverage : 0,
+    maxErrorRate: isRate(raw.maxErrorRate) ? raw.maxErrorRate : 0,
+    maxP90LatencyMs: isFiniteNonnegative(raw.maxP90LatencyMs) ? raw.maxP90LatencyMs : 0,
+    maxBusyRate: isRate(raw.maxBusyRate) ? raw.maxBusyRate : 0,
+  };
+}
+
+function validateFirstCanaryCost(raw: unknown, reasons: string[]): void {
+  const cost = isRecord(raw) ? raw : {};
+  let valid = isRecord(raw) && hasOnlyKeys(cost, FIRST_CANARY_COST_KEYS);
+  if (!isToken(cost.localProvenance) || !isToken(cost.baselineProvenance)) valid = false;
+  for (const key of [
+    "localCostPerAcceptedUsd",
+    "baselineCostPerAcceptedUsd",
+    "calibrated",
+    "exactOneCostCoverage",
+  ] as const) {
+    const signal = cost[key];
+    if (!isRecord(signal) || !hasOnlyKeys(signal, ["status", "reason"]) ||
+        (signal.status !== "unknown" && signal.status !== "unproven") || !isToken(signal.reason)) {
+      valid = false;
+    }
+  }
+  if (!valid) reasons.push("invalid_cost_evidence");
+}
+
+function firstCanaryCostSummary(raw: unknown): QualificationSignalSummary {
+  if (!isRecord(raw)) return { status: "unknown", value: null, sampleSize: null };
+  if (
+    hasOnlyKeys(raw, ["status", "reason"]) &&
+    (raw.status === "unknown" || raw.status === "unproven") &&
+    isToken(raw.reason)
+  ) {
+    return { status: raw.status, value: null, sampleSize: null };
+  }
+  // Cost is intentionally unassessed here.  Never expose a caller's measured value,
+  // sample size, source, or free-form metadata from an invalid v2 signal.
+  return { status: "unproven", value: null, sampleSize: null };
+}
+
 function destinationAllowed(dataClass: unknown, destinationClass: unknown): boolean {
   if (dataClass === "local-only") return destinationClass === "owned-local";
   if (dataClass === "controlled-external-ok") return destinationClass === "owned-local" || destinationClass === "controlled-external";
@@ -581,7 +805,13 @@ function validatePurpose(
   return { values, candidateBound };
 }
 
-function validateCandidate(raw: unknown, thresholds: QualificationThresholds | null): QualificationCandidateReport {
+type CandidateThresholds = QualificationThresholds | M3FirstCanaryThresholds;
+
+function validateCandidate(
+  raw: unknown,
+  thresholds: CandidateThresholds | null,
+  costMode: "strict" | "unassessed" = "strict",
+): QualificationCandidateReport {
   const candidate = isRecord(raw) ? raw : {};
   const reasons: string[] = [];
   const key = safeKey(candidate.key);
@@ -676,19 +906,25 @@ function validateCandidate(raw: unknown, thresholds: QualificationThresholds | n
   if (busy !== null && thresholds !== null && busy > thresholds.maxBusyRate) reasons.push("busy_rate_exceeded");
 
   const cost = isRecord(candidate.cost) ? candidate.cost : {};
-  if (!isToken(cost.localProvenance) || !isToken(cost.baselineProvenance)) reasons.push("invalid_cost");
-  const localCost = readNumber(cost.localCostPerAcceptedUsd, "cost", "cost", reasons, true);
-  const baselineCost = readNumber(cost.baselineCostPerAcceptedUsd, "baseline_cost", "cost", reasons, true);
-  const calibrated = readBoolean(cost.calibrated, "cost_calibration", reasons, true);
-  const exactCoverage = readBoolean(cost.exactOneCostCoverage, "cost_coverage", reasons, true);
-  if (calibrated === false) reasons.push("uncalibrated_cost");
-  if (exactCoverage === false) reasons.push("invalid_cost_coverage");
-  if (localCost !== null && thresholds !== null && localCost > thresholds.maxCostPerAcceptedUsd) reasons.push("cost_exceeded");
-  if (thresholds?.maxLocalToBaselineRatio !== null && thresholds?.maxLocalToBaselineRatio !== undefined) {
-    if (baselineCost === null || baselineCost <= 0 || localCost === null) {
-      reasons.push("invalid_cost");
-    } else if (localCost / baselineCost > thresholds.maxLocalToBaselineRatio) {
-      reasons.push("cost_ratio_exceeded");
+  let localCost: number | null = null;
+  let baselineCost: number | null = null;
+  if (costMode === "unassessed") {
+    validateFirstCanaryCost(candidate.cost, reasons);
+  } else {
+    if (!isToken(cost.localProvenance) || !isToken(cost.baselineProvenance)) reasons.push("invalid_cost");
+    localCost = readNumber(cost.localCostPerAcceptedUsd, "cost", "cost", reasons, true);
+    baselineCost = readNumber(cost.baselineCostPerAcceptedUsd, "baseline_cost", "cost", reasons, true);
+    const calibrated = readBoolean(cost.calibrated, "cost_calibration", reasons, true);
+    const exactCoverage = readBoolean(cost.exactOneCostCoverage, "cost_coverage", reasons, true);
+    if (calibrated === false) reasons.push("uncalibrated_cost");
+    if (exactCoverage === false) reasons.push("invalid_cost_coverage");
+    if (localCost !== null && thresholds !== null && "maxCostPerAcceptedUsd" in thresholds && localCost > thresholds.maxCostPerAcceptedUsd) reasons.push("cost_exceeded");
+    if (thresholds !== null && "maxLocalToBaselineRatio" in thresholds && thresholds.maxLocalToBaselineRatio !== null && thresholds.maxLocalToBaselineRatio !== undefined) {
+      if (baselineCost === null || baselineCost <= 0 || localCost === null) {
+        reasons.push("invalid_cost");
+      } else if (localCost / baselineCost > thresholds.maxLocalToBaselineRatio) {
+        reasons.push("cost_ratio_exceeded");
+      }
     }
   }
 
@@ -724,14 +960,16 @@ function validateCandidate(raw: unknown, thresholds: QualificationThresholds | n
     reasons.push("busy_denominator_mismatch");
   }
   const organicPass = organic.pass;
-  const localCostSampleSize = signalSampleSize(cost.localCostPerAcceptedUsd);
-  const baselineCostSampleSize = signalSampleSize(cost.baselineCostPerAcceptedUsd);
-  if (organicPass !== undefined) {
-    if (localCostSampleSize !== null && localCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
-    if (baselineCostSampleSize !== null && baselineCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
-  }
-  if (localCostSampleSize !== null && baselineCostSampleSize !== null && localCostSampleSize !== baselineCostSampleSize) {
-    reasons.push("cost_denominator_mismatch");
+  if (costMode === "strict") {
+    const localCostSampleSize = signalSampleSize(cost.localCostPerAcceptedUsd);
+    const baselineCostSampleSize = signalSampleSize(cost.baselineCostPerAcceptedUsd);
+    if (organicPass !== undefined) {
+      if (localCostSampleSize !== null && localCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
+      if (baselineCostSampleSize !== null && baselineCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
+    }
+    if (localCostSampleSize !== null && baselineCostSampleSize !== null && localCostSampleSize !== baselineCostSampleSize) {
+      reasons.push("cost_denominator_mismatch");
+    }
   }
 
   const eligibilityReport = {
@@ -754,6 +992,9 @@ function validateCandidate(raw: unknown, thresholds: QualificationThresholds | n
     local: isToken(cost.localProvenance) ? cost.localProvenance : "",
     baseline: isToken(cost.baselineProvenance) ? cost.baselineProvenance : "",
   };
+  const summarizeCost = (value: unknown, kind: SummaryKind): QualificationSignalSummary => costMode === "unassessed"
+    ? firstCanaryCostSummary(value)
+    : summarizeSignal(value, kind);
 
   const report: QualificationCandidateReport = {
     key,
@@ -774,10 +1015,10 @@ function validateCandidate(raw: unknown, thresholds: QualificationThresholds | n
       errorRate: summarizeSignal(candidate.errorRate, "rate"),
       p90LatencyMs: summarizeSignal(candidate.p90LatencyMs, "nonnegative"),
       busyRate: summarizeSignal(candidate.busyRate, "rate"),
-      localCostPerAcceptedUsd: summarizeSignal(cost.localCostPerAcceptedUsd, "nonnegative"),
-      baselineCostPerAcceptedUsd: summarizeSignal(cost.baselineCostPerAcceptedUsd, "nonnegative"),
-      calibrated: summarizeSignal(cost.calibrated, "boolean"),
-      exactOneCostCoverage: summarizeSignal(cost.exactOneCostCoverage, "boolean"),
+      localCostPerAcceptedUsd: summarizeCost(cost.localCostPerAcceptedUsd, "nonnegative"),
+      baselineCostPerAcceptedUsd: summarizeCost(cost.baselineCostPerAcceptedUsd, "nonnegative"),
+      calibrated: summarizeCost(cost.calibrated, "boolean"),
+      exactOneCostCoverage: summarizeCost(cost.exactOneCostCoverage, "boolean"),
     },
   };
   return report;
@@ -949,5 +1190,139 @@ export function evaluateM3Qualification(input: M3QualificationInput): M3Qualific
     selectedCandidate: selected,
     reasons: sortedReasons(globalReasons),
     enablingDecision: null,
+  };
+}
+
+function safeFirstCanaryDeferral(raw: unknown): M3FirstCanaryCostDeferral {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    reason: isToken(record.reason) ? record.reason : "",
+    followUp: "issue-82",
+  };
+}
+
+function validateFirstCanaryDeferral(raw: unknown): boolean {
+  if (!isRecord(raw) || !hasOnlyKeys(raw, ["reason", "followUp"])) return false;
+  return isToken(raw.reason) && raw.followUp === "issue-82";
+}
+
+/**
+ * Evaluate the explicit first-canary contract.  This report can establish scoped canary
+ * eligibility from non-cost evidence only; it never establishes full M3 qualification.
+ */
+export function evaluateM3FirstCanaryQualification(input: M3FirstCanaryInput): M3FirstCanaryDecision {
+  const raw = input as unknown;
+  const record = isRecord(raw) ? raw : {};
+  const globalReasons: string[] = [];
+
+  if (!hasOnlyKeys(record, FIRST_CANARY_TOP_LEVEL_KEYS)) globalReasons.push("invalid_input");
+  if (record.contract !== M3_FIRST_CANARY_CONTRACT || record.version !== M3_FIRST_CANARY_VERSION) {
+    globalReasons.push("invalid_input");
+  }
+  if (record.mode !== "cost-unassessed") globalReasons.push("invalid_mode");
+  if (!validateFirstCanaryDeferral(record.costDeferral)) globalReasons.push("invalid_cost_deferral");
+
+  const evaluation = isRecord(record.evaluation) ? record.evaluation : {};
+  const asOfMillis = parseCanonicalIso(evaluation.asOf);
+  const asOf = asOfMillis === null ? "" : (evaluation.asOf as string);
+  if (asOfMillis === null) globalReasons.push("invalid_input");
+
+  const window = invalidWindowValue(record.window);
+  const startMillis = parseCanonicalIso(window.start);
+  const endMillis = parseCanonicalIso(window.end);
+  if (startMillis === null || endMillis === null || startMillis >= endMillis) globalReasons.push("invalid_window");
+  if (asOfMillis !== null && endMillis !== null && endMillis > asOfMillis) globalReasons.push("window_after_asof");
+
+  const snapshot = invalidSnapshotValue(record.snapshot);
+  const snapshotRecord = isRecord(record.snapshot) ? record.snapshot : {};
+  const observedMillis = parseCanonicalIso(snapshot.observedAt);
+  if (!digest(snapshotRecord.sha256) || snapshotRecord.immutable !== true || observedMillis === null) globalReasons.push("invalid_snapshot");
+  if (asOfMillis !== null && observedMillis !== null && observedMillis > asOfMillis) globalReasons.push("snapshot_after_asof");
+  if (endMillis !== null && observedMillis !== null && observedMillis < endMillis) globalReasons.push("snapshot_before_window_end");
+
+  const thresholdValue = record.thresholds;
+  let thresholds: M3FirstCanaryThresholds | null = null;
+  if (thresholdValue === null) {
+    globalReasons.push("missing_thresholds");
+  } else {
+    const validated = validateFirstCanaryThresholds(thresholdValue);
+    thresholds = validated.thresholds;
+    globalReasons.push(...validated.reasons);
+  }
+  if (thresholds !== null && startMillis !== null) {
+    const reviewedMillis = parseCanonicalIso(thresholds.review.reviewedAt);
+    if (reviewedMillis !== null && reviewedMillis >= startMillis) globalReasons.push("review_after_window");
+  }
+  if (thresholds !== null && asOfMillis !== null && observedMillis !== null) {
+    const age = asOfMillis - observedMillis;
+    if (age < 0 || age > thresholds.maxEvidenceAgeMs) globalReasons.push("stale_snapshot");
+  }
+  if (thresholds !== null && asOfMillis !== null && endMillis !== null) {
+    const age = asOfMillis - endMillis;
+    if (age > thresholds.maxEvidenceAgeMs) globalReasons.push("stale_window");
+  }
+
+  const rawCandidates = Array.isArray(record.candidates) ? record.candidates : [];
+  if (!Array.isArray(record.candidates)) globalReasons.push("invalid_input");
+  const reports: QualificationCandidateReport[] = rawCandidates.map((candidate) =>
+    validateCandidate(candidate, thresholds, "unassessed"),
+  );
+  reports.sort((left, right) => {
+    const leftKey = keyString(left.key);
+    const rightKey = keyString(right.key);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+
+  const keyCounts = new Map<string, number>();
+  for (const report of reports) {
+    const stableKey = keyString(report.key);
+    keyCounts.set(stableKey, (keyCounts.get(stableKey) ?? 0) + 1);
+  }
+  for (const report of reports) {
+    if ((keyCounts.get(keyString(report.key)) ?? 0) > 1) {
+      report.reasons = sortedReasons([...report.reasons, "duplicate_candidate"]);
+      report.diagnostic = "HOLD";
+    }
+  }
+  const identityCounts = new Map<string, number>();
+  for (const report of reports) {
+    if (IDENTITY_FIELDS.every((field) => digest(report.identity[field]))) {
+      const identityKey = IDENTITY_FIELDS.map((field) => report.identity[field]).join("\u001f");
+      identityCounts.set(identityKey, (identityCounts.get(identityKey) ?? 0) + 1);
+    }
+  }
+  for (const report of reports) {
+    const identityKey = IDENTITY_FIELDS.map((field) => report.identity[field]).join("\u001f");
+    if ((identityCounts.get(identityKey) ?? 0) > 1) {
+      report.reasons = sortedReasons([...report.reasons, "duplicate_identity"]);
+      report.diagnostic = "HOLD";
+    }
+  }
+
+  const passing = reports.filter((report) => report.diagnostic === "PASS");
+  if (passing.length > 1) globalReasons.push("multiple_passing_candidates");
+  const hasGlobalHold = globalReasons.length > 0;
+  const canaryEligibility = !hasGlobalHold && passing.length === 1 ? "ELIGIBLE" : "HOLD";
+  const selectedCanaryCandidate = canaryEligibility === "ELIGIBLE" ? passing[0]?.key ?? null : null;
+
+  return {
+    contract: M3_FIRST_CANARY_CONTRACT,
+    version: M3_FIRST_CANARY_VERSION,
+    mode: "cost-unassessed",
+    evidenceBasis: "operator-supplied",
+    evaluationAsOf: asOf,
+    window,
+    snapshot,
+    thresholds: thresholds === null ? null : firstCanaryThresholdSummary(thresholds),
+    candidates: reports,
+    analysisVerdict: "HOLD",
+    selectedCandidate: null,
+    reasons: sortedReasons(globalReasons),
+    enablingDecision: null,
+    diagnosticScope: "first-canary-non-cost",
+    costAssessment: "unassessed",
+    costDeferral: safeFirstCanaryDeferral(record.costDeferral),
+    canaryEligibility,
+    selectedCanaryCandidate,
   };
 }

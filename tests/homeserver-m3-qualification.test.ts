@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  evaluateM3FirstCanaryQualification,
   evaluateM3Qualification,
+  M3_FIRST_CANARY_CONTRACT,
   M3_QUALIFICATION_CONTRACT,
+  type M3FirstCanaryCandidate,
+  type M3FirstCanaryCostEvidence,
+  type M3FirstCanaryInput,
+  type M3FirstCanaryThresholds,
   type M3QualificationCandidate,
   type M3QualificationInput,
   type QualificationPurposeEvidence,
@@ -130,6 +136,63 @@ function input(overrides: Partial<M3QualificationInput> = {}): M3QualificationIn
     },
     thresholds: thresholds(),
     candidates: [candidate()],
+    ...overrides,
+  };
+}
+
+function firstCanaryThresholds(): M3FirstCanaryThresholds {
+  const value = thresholds();
+  return {
+    version: value.version,
+    rationale: value.rationale,
+    review: value.review,
+    expectedPolicyStamp: value.expectedPolicyStamp,
+    acceptedTaskTypes: value.acceptedTaskTypes,
+    maxEvidenceAgeMs: value.maxEvidenceAgeMs,
+    minOrganicOpportunities: value.minOrganicOpportunities,
+    minOrganicAttempts: value.minOrganicAttempts,
+    minQualityRate: value.minQualityRate,
+    minFeedbackCoverage: value.minFeedbackCoverage,
+    maxErrorRate: value.maxErrorRate,
+    maxP90LatencyMs: value.maxP90LatencyMs,
+    maxBusyRate: value.maxBusyRate,
+  };
+}
+
+function firstCanaryCost(): M3FirstCanaryCostEvidence {
+  return {
+    localCostPerAcceptedUsd: { status: "unknown", reason: "cost-unassessed" },
+    baselineCostPerAcceptedUsd: { status: "unproven", reason: "cost-unassessed" },
+    localProvenance: "fixture-local-cost-unassessed-v2",
+    baselineProvenance: "fixture-baseline-cost-unassessed-v2",
+    calibrated: { status: "unknown", reason: "cost-unassessed" },
+    exactOneCostCoverage: { status: "unknown", reason: "cost-unassessed" },
+  };
+}
+
+function firstCanaryCandidate(): M3FirstCanaryCandidate {
+  const value = candidate();
+  return { ...value, cost: firstCanaryCost() };
+}
+
+function firstCanaryInput(overrides: Partial<M3FirstCanaryInput> = {}): M3FirstCanaryInput {
+  return {
+    contract: M3_FIRST_CANARY_CONTRACT,
+    version: 2,
+    mode: "cost-unassessed",
+    costDeferral: { reason: "cost-assessment-deferred", followUp: "issue-82" },
+    evaluation: { asOf: "2026-09-03T00:00:00.000Z" },
+    window: {
+      start: "2026-09-01T00:00:00.000Z",
+      end: "2026-09-02T00:00:00.000Z",
+    },
+    snapshot: {
+      sha256: DIGEST,
+      immutable: true,
+      observedAt: "2026-09-02T00:00:00.000Z",
+    },
+    thresholds: firstCanaryThresholds(),
+    candidates: [firstCanaryCandidate()],
     ...overrides,
   };
 }
@@ -372,5 +435,189 @@ describe("evaluateM3Qualification", () => {
     expect(result.selectedCandidate).toBeNull();
     expect(result.analysisVerdict).toBe("HOLD");
     expect(result.reasons).toContain("multiple_passing_candidates");
+  });
+});
+
+describe("evaluateM3FirstCanaryQualification", () => {
+  it("returns scoped ELIGIBLE while keeping full analysis HOLD and costs unassessed", () => {
+    const result = evaluateM3FirstCanaryQualification(firstCanaryInput());
+
+    expect(result.analysisVerdict).toBe("HOLD");
+    expect(result.canaryEligibility).toBe("ELIGIBLE");
+    expect(result.selectedCanaryCandidate).toEqual(firstCanaryCandidate().key);
+    expect(result.selectedCandidate).toBeNull();
+    expect(result.enablingDecision).toBeNull();
+    expect(result.costAssessment).toBe("unassessed");
+    expect(result.costDeferral).toEqual({ reason: "cost-assessment-deferred", followUp: "issue-82" });
+    expect(result.thresholds).not.toHaveProperty("maxCostPerAcceptedUsd");
+    expect(result.candidates[0]?.diagnostic).toBe("PASS");
+    expect(result.candidates[0]?.reasons).not.toContain("invalid_cost");
+    expect(result.candidates[0]?.evidence.localCostPerAcceptedUsd).toEqual({
+      status: "unknown",
+      value: null,
+      sampleSize: null,
+    });
+  });
+
+  it("fails closed for a wrong mode, malformed deferral, and top-level metadata", () => {
+    const wrongMode = firstCanaryInput() as unknown as Record<string, unknown>;
+    wrongMode.mode = "strict-v1";
+    const modeResult = evaluateM3FirstCanaryQualification(wrongMode as M3FirstCanaryInput);
+
+    const malformedDeferral = firstCanaryInput();
+    (malformedDeferral.costDeferral as unknown as Record<string, unknown>).reason = "secret reason with spaces";
+    const deferralResult = evaluateM3FirstCanaryQualification(malformedDeferral);
+
+    const metadata = firstCanaryInput() as unknown as Record<string, unknown>;
+    metadata.operatorMetadata = "secret-metadata";
+    const metadataResult = evaluateM3FirstCanaryQualification(metadata as M3FirstCanaryInput);
+
+    expect(modeResult.canaryEligibility).toBe("HOLD");
+    expect(modeResult.reasons).toContain("invalid_mode");
+    expect(deferralResult.canaryEligibility).toBe("HOLD");
+    expect(deferralResult.reasons).toContain("invalid_cost_deferral");
+    expect(deferralResult.costDeferral).toEqual({ reason: "", followUp: "issue-82" });
+    expect(metadataResult.canaryEligibility).toBe("HOLD");
+    expect(metadataResult.reasons).toContain("invalid_input");
+    expect(JSON.stringify({ modeResult, deferralResult, metadataResult })).not.toContain("secret");
+  });
+
+  it("rejects cost threshold fields instead of silently dropping them", () => {
+    const value = firstCanaryInput();
+    const thresholdsWithCost = value.thresholds as unknown as Record<string, unknown>;
+    thresholdsWithCost.maxCostPerAcceptedUsd = 0.25;
+    thresholdsWithCost.maxLocalToBaselineRatio = 1;
+
+    const result = evaluateM3FirstCanaryQualification(value);
+
+    expect(result.canaryEligibility).toBe("HOLD");
+    expect(result.reasons).toContain("invalid_thresholds");
+    expect(result.thresholds).toBeNull();
+    expect(result.candidates[0]?.diagnostic).toBe("HOLD");
+  });
+
+  it("rejects measured, extra, and contradictory cost evidence without echoing it", () => {
+    const measuredCost = firstCanaryInput();
+    (measuredCost.candidates[0]!.cost.localCostPerAcceptedUsd as unknown as Record<string, unknown>) = {
+      status: "measured",
+      reason: "secret-cost-reason",
+      value: 0.01,
+      sampleSize: 10,
+      source: "secret-cost-source",
+      provenance: "independently-verified",
+    };
+    const measuredResult = evaluateM3FirstCanaryQualification(measuredCost);
+
+    const extraCost = firstCanaryInput();
+    const extraSignal = extraCost.candidates[0]!.cost.calibrated as unknown as Record<string, unknown>;
+    extraSignal.sampleSize = 10;
+    const extraResult = evaluateM3FirstCanaryQualification(extraCost);
+
+    const contradictory = firstCanaryInput();
+    (contradictory.candidates[0]!.cost.exactOneCostCoverage as unknown as Record<string, unknown>).status = "measured";
+    const contradictoryResult = evaluateM3FirstCanaryQualification(contradictory);
+
+    for (const result of [measuredResult, extraResult, contradictoryResult]) {
+      expect(result.canaryEligibility).toBe("HOLD");
+      expect(result.candidates[0]?.diagnostic).toBe("HOLD");
+      expect(result.candidates[0]?.reasons).toContain("invalid_cost_evidence");
+      expect(JSON.stringify(result)).not.toContain("secret");
+    }
+  });
+
+  it("retains every reviewed non-cost gate in the scoped diagnostic", () => {
+    const cases: Array<[string, (value: M3FirstCanaryInput) => void]> = [
+      ["invalid_eligibility", (value) => { value.candidates[0]!.eligibility.nonJudgmentLane = "yes" as unknown as boolean; }],
+      ["stale_policy", (value) => { value.candidates[0]!.policy.fullStamps = ["ctx-tools-parts-v1|ctx=23000"]; }],
+      ["untrusted_verifier", (value) => { value.candidates[0]!.verifier.trusted = false; }],
+      ["unsafe_task_type", (value) => { value.candidates[0]!.safety.boundedTaskType = measured(false); }],
+      ["insufficient_organic_sample", (value) => { value.candidates[0]!.samples.organic.opportunities = measured(1, 1); }],
+      ["insufficient_quality", (value) => { value.candidates[0]!.qualityRate = measured(0.1); }],
+      ["error_rate_exceeded", (value) => { value.candidates[0]!.errorRate = measured(0.5); }],
+      ["latency_exceeded", (value) => { value.candidates[0]!.p90LatencyMs = measured(1000); }],
+      ["busy_rate_exceeded", (value) => { value.candidates[0]!.busyRate = measured(0.5); }],
+    ];
+
+    for (const [reason, mutate] of cases) {
+      const value = firstCanaryInput();
+      mutate(value);
+      const result = evaluateM3FirstCanaryQualification(value);
+      expect(result.candidates[0]?.reasons, reason).toContain(reason);
+      expect(result.canaryEligibility, reason).toBe("HOLD");
+    }
+  });
+
+  it("keeps identity, authority, feedback coverage, and freshness gates in scope", () => {
+    const identity = firstCanaryInput();
+    identity.candidates[0]!.identity.artifactSha256 = "";
+    const identityResult = evaluateM3FirstCanaryQualification(identity);
+
+    const authority = firstCanaryInput();
+    authority.candidates[0]!.eligibility.dataClass = "local-only";
+    authority.candidates[0]!.eligibility.destinationClass = "controlled-external";
+    const authorityResult = evaluateM3FirstCanaryQualification(authority);
+
+    const feedback = firstCanaryInput();
+    feedback.candidates[0]!.samples.organic.feedback.assessed = measured(1, 10);
+    const feedbackResult = evaluateM3FirstCanaryQualification(feedback);
+
+    const freshness = firstCanaryInput();
+    freshness.snapshot.observedAt = "2026-08-01T00:00:00.000Z";
+    freshness.thresholds!.maxEvidenceAgeMs = 1000;
+    freshness.thresholds!.review.reviewedAt = "2026-09-02T00:00:00.000Z";
+    const freshnessResult = evaluateM3FirstCanaryQualification(freshness);
+
+    expect(identityResult.candidates[0]?.reasons).toContain("invalid_identity");
+    expect(authorityResult.candidates[0]?.reasons).toContain("incompatible_data_destination");
+    expect(feedbackResult.candidates[0]?.reasons).toContain("insufficient_feedback");
+    expect(freshnessResult.reasons).toEqual(expect.arrayContaining([
+      "stale_snapshot",
+      "snapshot_before_window_end",
+      "review_after_window",
+    ]));
+  });
+
+  it("holds duplicate identities and multiple distinct passing candidates", () => {
+    const first = firstCanaryCandidate();
+    const second = firstCanaryCandidate();
+    second.key.modelId = "model-second";
+    const duplicateIdentityResult = evaluateM3FirstCanaryQualification(firstCanaryInput({
+      candidates: [first, second],
+    }));
+
+    const third = firstCanaryCandidate();
+    const fourth = firstCanaryCandidate();
+    fourth.key.modelId = "model-fourth";
+    fourth.identity.artifactSha256 = DIGEST_B;
+    fourth.identity.evidenceIdentitySha256 = DIGEST_B;
+    fourth.identity.runtimeSha256 = DIGEST_B;
+    fourth.identity.verifierSha256 = DIGEST_B;
+    const multipleResult = evaluateM3FirstCanaryQualification(firstCanaryInput({
+      candidates: [third, fourth],
+    }));
+
+    expect(duplicateIdentityResult.canaryEligibility).toBe("HOLD");
+    expect(duplicateIdentityResult.candidates.every((item) => item.reasons.includes("duplicate_identity"))).toBe(true);
+    expect(multipleResult.canaryEligibility).toBe("HOLD");
+    expect(multipleResult.reasons).toContain("multiple_passing_candidates");
+    expect(multipleResult.selectedCanaryCandidate).toBeNull();
+  });
+
+  it("holds duplicate candidates and any global hold before canary selection", () => {
+    const duplicate = firstCanaryInput({
+      candidates: [firstCanaryCandidate(), firstCanaryCandidate()],
+    });
+    const duplicateResult = evaluateM3FirstCanaryQualification(duplicate);
+
+    const globalHold = firstCanaryInput();
+    globalHold.snapshot.immutable = false;
+    const globalResult = evaluateM3FirstCanaryQualification(globalHold);
+
+    expect(duplicateResult.canaryEligibility).toBe("HOLD");
+    expect(duplicateResult.selectedCanaryCandidate).toBeNull();
+    expect(duplicateResult.candidates.every((item) => item.reasons.includes("duplicate_candidate"))).toBe(true);
+    expect(globalResult.canaryEligibility).toBe("HOLD");
+    expect(globalResult.selectedCanaryCandidate).toBeNull();
+    expect(globalResult.reasons).toContain("invalid_snapshot");
   });
 });
