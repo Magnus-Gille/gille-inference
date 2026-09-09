@@ -33,6 +33,8 @@ The path and timestamp above are examples; use a private, same-mount path on the
 the resulting snapshot with the benchmark record that it describes. Do not add private process
 observations or snapshots to Git.
 
+## Command-line reference
+
 The command accepts:
 
 - `--pid POSITIVE_INTEGER`: the process to inspect. The collector performs only OS-permitted,
@@ -53,6 +55,55 @@ The command accepts:
 Unknown flags, duplicate flags, missing values, and invalid values are rejected. The command has no
 `--out` flag and performs no internal file writes. It uses no authentication helpers, network,
 HTTP, or MCP calls.
+
+## Process-view troubleshooting
+
+An initial failure to read `/proc/PID/stat`, `/proc/PID/cmdline`, or `/proc/PID/exe`, including an
+ordinary permission or visibility failure for `/proc/PID/exe`, produces `process-unavailable`.
+This is distinct from `process-view-unavailable`: that reason means process metadata was readable,
+but the collector could not establish a compatible target view because the mount namespaces
+differed, the root device/inode identities did not match, or a compatibility check was inaccessible.
+Artifact reads are refused in that case. Running the collector with `sudo` from the host namespace
+can still produce `process-view-unavailable`; elevated privilege does not put the collector in the
+systemd service's mount namespace.
+
+If the target is already running and the operator is authorized to inspect it, an optional,
+read-only capture may enter the target mount namespace. Use this only after verifying that the
+same target view contains the checkout, the Node/npm runtime, and its dependencies at the paths
+used by the command. systemd service units may hide `/home` or otherwise hide the checkout. If any
+required path is hidden or unavailable, stop. Do not mount or copy files into the target view and
+do not change service protections to make those paths visible.
+
+Before using this wrapper, run `nsenter --help` and confirm that the installed implementation lists
+`-W, --wdns <dir>`. If `--wdns` is absent, stop; do not substitute `--wd`, whose path-resolution
+semantics differ.
+
+Verify a fresh, already-running `llama-server` PID immediately before the command and substitute
+that one PID for every `<pid>` placeholder:
+
+```sh
+umask 077
+sudo nsenter --target <pid> --mount --wdns=<live-checkout> \
+  /usr/bin/npm run --silent provenance:served -- \
+  --pid <pid> \
+  --alias <public-alias> \
+  > <private-output-path>
+```
+
+`<live-checkout>` must contain the intended `provenance:served` command and be visible at that path
+inside the target mount namespace. `--wdns=<live-checkout>` uses the `nsenter` equals-form to
+change the working directory after entering that namespace. The runtime path, checkout, and
+dependencies must all resolve inside the target view; otherwise stop and retain the unavailable
+result. The outer shell's `umask 077` protects the redirected JSON file.
+
+This remains one content-blind, read-only observation: it does not load or restart a model, mutate
+the service, bypass the collector's namespace gate, or prove loaded GPU bytes. Inspect the
+resulting JSON's `completeness`, `freshness`, `reasons`, and evidence `binding`/`source` fields as
+usual. If the process exits before the initial read, the capture is explicitly unavailable. If its
+identity or view changes during capture, treat the result as stale or unavailable according to the
+returned fields. Do not infer a successful capture, retry automatically, load a replacement, or
+restart the service. A further attempt requires a new check that a new PID is already running. The
+namespace command deliberately uses no `--env`, `--root`, `--network`, or `--cgroup` flags.
 
 ## Exit status and consumer checks
 
