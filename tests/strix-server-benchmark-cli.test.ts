@@ -110,4 +110,56 @@ describe("runStrixServerBenchmark", () => {
     });
     expect(exit).toBe(2);
   });
+
+  it("fails closed without publishing when an external maintenance deadline aborts the run", async () => {
+    const controller = new AbortController();
+    const writePair = vi.fn(() => ({ jsonPath: "r.json", markdownPath: "r.md" }));
+    const stderr = vi.fn();
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      })) as typeof fetch;
+    const pending = runStrixServerBenchmark([...ARGV, "--metrics-url", "none"], {
+      fetchImpl,
+      now: () => "2026-08-14T10:00:00.000Z",
+      stdout: vi.fn(),
+      stderr,
+      readFile: (path) => path === "fixtures.json" ? FIXTURES : PROVENANCE,
+      writePair,
+    }, controller.signal);
+
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    controller.abort(new Error("maintenance deadline"));
+
+    await expect(pending).resolves.toBe(1);
+    expect(writePair).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalled();
+  });
+
+  it("does not publish when cancellation lands during the final metrics snapshot", async () => {
+    const controller = new AbortController();
+    const writePair = vi.fn(() => ({ jsonPath: "r.json", markdownPath: "r.md" }));
+    let calls = 0;
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      if (calls === 1) return new Response("llamacpp:spec_decode_num_draft_tokens_total 0\n");
+      if (!String(input).endsWith("/metrics")) return sse();
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    }) as typeof fetch;
+    const pending = runStrixServerBenchmark([...ARGV, "--metrics-url", "http://127.0.0.1:8091/metrics"], {
+      fetchImpl,
+      now: () => "2026-08-14T10:00:00.000Z",
+      stdout: vi.fn(), stderr: vi.fn(),
+      readFile: (path) => path === "fixtures.json" ? FIXTURES : PROVENANCE,
+      writePair,
+    }, controller.signal);
+
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(3));
+    controller.abort(new Error("maintenance deadline"));
+
+    await expect(pending).resolves.toBe(1);
+    expect(writePair).not.toHaveBeenCalled();
+  });
 });
