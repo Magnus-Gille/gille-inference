@@ -151,6 +151,15 @@ The public
 [`llama-swap-large-models.example.yaml`](./llama-swap-large-models.example.yaml) is a reviewable
 settings example, not a live-config mirror or directly deployable file.
 
+For a reviewed roster release where the model entry is hand-picked (no registry winner),
+apply it with the transactional promoter instead of editing by hand — it renders the reviewed
+`deploy/specs/<key>.yaml` contract, then performs the backup → apply → verify-bytes → restart →
+health-check sequence with automatic restore + restart on any failure:
+
+```bash
+tsx scripts/promote-manual.ts --key <model-key> --spec deploy/specs/<model-key>.yaml --dry-run
+```
+
 For a reviewed roster release:
 
 1. Review model identity, context, cache, KV, slot, reasoning, and runtime requirements in the
