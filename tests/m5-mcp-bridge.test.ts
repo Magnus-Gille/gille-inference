@@ -13,7 +13,7 @@ function rpcResponse(id: number, result: unknown, headers?: HeadersInit): Respon
 
 function makeBridge(
   fetch: typeof globalThis.fetch,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; adoptionSpool?: unknown } = {},
 ) {
   return createM5Client({
     gatewayUrl: "https://gateway.invalid",
@@ -21,7 +21,26 @@ function makeBridge(
     credentialStore: { resolve: async () => SECRET },
     fetch,
     timeoutMs: options.timeoutMs,
-  }).then((client) => createMcpStdioBridge({ client, profile: "codex" }));
+    ...(options.adoptionSpool === undefined ? {} : { adoptionSpool: options.adoptionSpool as never }),
+  }).then((client) => createMcpStdioBridge({
+    client,
+    profile: "codex",
+    ...(options.adoptionSpool === undefined ? {} : { adoptionSpool: options.adoptionSpool as never }),
+  }));
+}
+
+function memorySpool({ fail = false } = {}) {
+  const saved: unknown[] = [];
+  return {
+    saved,
+    spool: {
+      save: async (entry: unknown) => {
+        if (fail) throw new Error("spool disk full");
+        saved.push(entry);
+        return "adoption-20260911T000000-deadbeef";
+      },
+    },
+  };
 }
 
 describe("m5 stdio MCP conformance", () => {
@@ -532,12 +551,13 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
-  it("makes an adoption-report outage explicitly recoverable without echoing its payload", async () => {
+  it("spools an adoption-report outage with a stable failing layer instead of losing it", async () => {
+    const { saved, spool } = memorySpool();
     const bridge = await makeBridge(async () => {
       throw Object.assign(new TypeError("fetch failed"), {
         cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
       });
-    });
+    }, { adoptionSpool: spool });
     const report = {
       harness: "codex_app",
       execution_mode: "ask",
@@ -562,12 +582,116 @@ describe("m5 stdio MCP conformance", () => {
           diagnostic_code: "route_unreachable",
           failure_layer: "connector_transport",
           retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+          evidence_recovery: {
+            status: "spooled",
+            spool_id: "adoption-20260911T000000-deadbeef",
+            action: "retry_same_tool_call",
+          },
+        },
+      },
+    });
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ profile: "codex", report });
+    expect(response).not.toContain("codex_app");
+    expect(response).not.toContain("eligible_opportunities");
+  });
+
+  it("keeps the legacy not_recorded contract when no spool is configured", async () => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: null });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 116,
+      method: "tools/call",
+      params: {
+        name: "record_adoption_evidence",
+        arguments: {
+          harness: "codex_app",
+          execution_mode: "ask",
+          traffic_purpose: "organic",
+          result: "failed",
+          deterministic_check: "not_run",
+          reviewer_usefulness: "not_reported",
+          fallback_reason: "m5_unreachable",
+          eligible_opportunities: 7,
+        },
+      },
+    }));
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
           evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" },
         },
       },
     });
-    expect(response).not.toContain("codex_app");
-    expect(response).not.toContain("eligible_opportunities");
+  });
+
+  it("reports spool_failed without changing the transport diagnosis", async () => {
+    const { spool } = memorySpool({ fail: true });
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: spool });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 216,
+      method: "tools/call",
+      params: {
+        name: "record_adoption_evidence",
+        arguments: {
+          harness: "codex_app",
+          execution_mode: "ask",
+          traffic_purpose: "organic",
+          result: "failed",
+          deterministic_check: "not_run",
+          reviewer_usefulness: "not_reported",
+          fallback_reason: "m5_unreachable",
+          eligible_opportunities: 7,
+        },
+      },
+    }));
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "route_unreachable",
+          failure_layer: "connector_transport",
+          evidence_recovery: { status: "spool_failed", action: "retry_same_tool_call" },
+        },
+      },
+    });
+  });
+
+  it("returns a deterministic failing layer for list_models on a dead connector route", async () => {
+    const { saved, spool } = memorySpool();
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: spool });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 316,
+      method: "tools/call",
+      params: { name: "list_models", arguments: {} },
+    }));
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "route_unreachable",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      },
+    });
+    expect(saved).toHaveLength(0);
   });
 
   it("distinguishes gateway health failures from connector transport failures", async () => {

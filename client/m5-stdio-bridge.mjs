@@ -1,7 +1,9 @@
 import {
   M5ClientError,
+  createFileAdoptionSpool,
   credentialRemediation,
   redactText,
+  spoolAdoptionOutageReport,
   transportRemediation,
 } from "./m5-client.mjs";
 
@@ -42,7 +44,25 @@ function isRetryableResultTransport(error) {
     (error.code === "network_failure" || error.code === "timeout" || error.code === "upstream_http_error");
 }
 
-function bridgeError(error, profile, message, { resultRetryAttempted = false } = {}) {
+// Closed copy of the client's evidence-recovery shape (#242). Only a valid spooled /
+// spool-failed outcome travels; anything else falls back to the legacy contract so a
+// malformed carrier can never smuggle a locator or free-form text into bridge output.
+function validEvidenceRecovery(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (value.action !== "retry_same_tool_call") return undefined;
+  if (value.status === "spooled") {
+    if (typeof value.spool_id !== "string" || !/^adoption-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$/.test(value.spool_id)) {
+      return undefined;
+    }
+    return { status: "spooled", spool_id: value.spool_id, action: "retry_same_tool_call" };
+  }
+  if (value.status === "spool_failed") {
+    return { status: "spool_failed", action: "retry_same_tool_call" };
+  }
+  return undefined;
+}
+
+async function bridgeError(error, profile, message, { resultRetryAttempted = false, adoptionSpool } = {}) {
   if (!(error instanceof M5ClientError)) {
     return { message: "The MCP bridge request failed." };
   }
@@ -57,6 +77,22 @@ function bridgeError(error, profile, message, { resultRetryAttempted = false } =
   const failureLayer = gatewayTransportFailure
     ? "connector_transport"
     : error.failureLayer;
+  // A spooled adoption report survives the outage it reports on (#242): prefer the
+  // client's closed recovery shape, else spool the caller's own content-free arguments
+  // here, else keep the legacy contract. Nothing but the closed shape ever travels.
+  let evidenceRecovery;
+  if (isAdoptionReport(message) && transportFailure) {
+    evidenceRecovery =
+      validEvidenceRecovery(error.evidenceRecovery) ??
+      (await spoolAdoptionOutageReport(adoptionSpool, {
+        profile,
+        report: message?.params?.arguments,
+        failure: { code: error.code, diagnosticCode: error.diagnosticCode },
+      })) ?? {
+        status: "not_recorded",
+        action: "retry_same_tool_call",
+      };
+  }
   return {
     message: credentialFailure
       ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
@@ -68,9 +104,7 @@ function bridgeError(error, profile, message, { resultRetryAttempted = false } =
       ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
       ...(error.retryable === undefined ? {} : { retryable: error.retryable }),
       ...(remediation === undefined ? {} : { remediation }),
-      ...(isAdoptionReport(message) && transportFailure
-        ? { evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" } }
-        : {}),
+      ...(evidenceRecovery === undefined ? {} : { evidence_recovery: evidenceRecovery }),
       ...(isCodeLoopResult(message) && resultRetryAttempted
         ? {
             result_recovery: {
@@ -100,7 +134,7 @@ function validMessage(message) {
   );
 }
 
-export function createMcpStdioBridge({ client, profile }) {
+export function createMcpStdioBridge({ client, profile, adoptionSpool = createFileAdoptionSpool() }) {
   return Object.freeze({
     async handleLine(line) {
       let message;
@@ -137,7 +171,7 @@ export function createMcpStdioBridge({ client, profile }) {
         return JSON.stringify(response);
       } catch (error) {
         if (notification) return null;
-        const failure = bridgeError(error, profile, message, { resultRetryAttempted });
+        const failure = await bridgeError(error, profile, message, { resultRetryAttempted, adoptionSpool });
         return rpcError(message.id, -32603, failure.message, failure.data);
       }
     },

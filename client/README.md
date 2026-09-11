@@ -111,8 +111,13 @@ gateway-health, and authentication failures. Adoption reports return a scoped ac
 telemetry cap was reached but the observation was folded into a safe aggregate, and
 `retention: "dropped"` identifies a telemetry-only refusal. A telemetry cap is never an M5
 inference limit: `inference_availability: "unaffected"`, and only the report should wait until
-the next UTC day. A connector/transport failure remains `not_recorded` with
-`retry_same_tool_call`; no report payload is echoed or silently persisted.
+the next UTC day. A connector/transport failure spools the content-free report locally under
+`~/.config/m5/adoption-spool/` (redacted, `0600`, newest 100 retained) and reports
+`evidence_recovery: {"status":"spooled","spool_id":…,"action":"retry_same_tool_call"}`; if the
+spool write itself fails the status is `spool_failed` with the same retry action, and with no
+spool configured the legacy `not_recorded` shape is kept. Recovery is deterministic: retry the
+same report tool call after the gateway recovers — the spool file is the backstop, not a queue.
+No report payload is echoed, and no locator or credential ever enters diagnostics.
 
 `code_loop_result` is safe to repeat for the same durable work id. The bridge automatically retries
 that one read-only tool call once after a retryable transport or gateway-health failure, using the

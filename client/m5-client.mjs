@@ -1,5 +1,8 @@
 import { execFile as nodeExecFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export const M5_CLIENT_VERSION = "1.3.7";
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
@@ -99,6 +102,26 @@ const ADOPTION_DIAGNOSTIC_INVARIANTS = new Set([
   "noncompleted_requires_fallback",
   "unobserved_result_requires_unobserved_assessment",
 ]);
+const ADOPTION_SPOOL_KEEP = 100;
+const ADOPTION_SPOOL_ID = /^adoption-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$/;
+const ADOPTION_SPOOL_STATUSES = new Set(["spooled", "spool_failed"]);
+const ADOPTION_SPOOL_TRANSPORT_CODES = new Set(["network_failure", "timeout", "upstream_http_error"]);
+
+/**
+ * Evidence-recovery attached to adoption-report transport failures (#242). The shape is
+ * closed: a stable status plus an optional spool id and the single supported action. Only
+ * the spool id (timestamp + random hex) travels — never a filesystem path, which could
+ * carry a username or other locator.
+ */
+function isValidEvidenceRecovery(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!ADOPTION_SPOOL_STATUSES.has(value.status)) return false;
+  if (value.action !== "retry_same_tool_call") return false;
+  if (value.status === "spooled") {
+    return typeof value.spool_id === "string" && ADOPTION_SPOOL_ID.test(value.spool_id);
+  }
+  return !Object.prototype.hasOwnProperty.call(value, "spool_id");
+}
 const EXECUTION_FEEDBACK_VALUES = new Set(["pass", "partial", "redo", "wrong"]);
 const FEEDBACK_HANDLE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_BLIND_CONTEXT_ROOTS = 128;
@@ -132,6 +155,9 @@ export class M5ClientError extends Error {
     }
     if (FAILURE_LAYERS.has(options.failureLayer)) this.failureLayer = options.failureLayer;
     if (typeof options.retryable === "boolean") this.retryable = options.retryable;
+    if (isValidEvidenceRecovery(options.evidenceRecovery)) {
+      this.evidenceRecovery = { ...options.evidenceRecovery };
+    }
     if (CREDENTIAL_FAILURE_CODES.has(code)) {
       // Credential failures have one owner-attended recovery action. Do not retain a
       // gateway- or caller-supplied remediation: it may contain a locator, credential, or
@@ -160,6 +186,7 @@ export class M5ClientError extends Error {
         ...(this.diagnosticCode === undefined ? {} : { diagnostic_code: this.diagnosticCode }),
         ...(this.failureLayer === undefined ? {} : { failure_layer: this.failureLayer }),
         ...(this.retryable === undefined ? {} : { retryable: this.retryable }),
+        ...(this.evidenceRecovery === undefined ? {} : { evidence_recovery: { ...this.evidenceRecovery } }),
         ...(remediation === undefined ? {} : { remediation }),
       },
     };
@@ -250,6 +277,89 @@ function redactValue(value, secrets) {
   return value;
 }
 
+/**
+ * Shared adoption-outage spool used by the direct client and the MCP bridge (#242).
+ * Returns the closed evidence-recovery shape, or undefined when there is nothing safe to
+ * spool (no spool configured, or the caller's payload fails the closed content-free
+ * contract — a malformed payload must never be persisted). A throwing or misbehaving
+ * spool degrades to spool_failed; the transport error itself is never masked.
+ */
+export async function spoolAdoptionOutageReport(
+  adoptionSpool,
+  { profile, report, secrets = [], failure = {} } = {},
+) {
+  if (!adoptionSpool || !isValidAdoptionReport(report)) return undefined;
+  try {
+    const spoolId = await adoptionSpool.save({ profile, report, secrets, failure });
+    if (typeof spoolId !== "string" || !ADOPTION_SPOOL_ID.test(spoolId)) {
+      return { status: "spool_failed", action: "retry_same_tool_call" };
+    }
+    return { status: "spooled", spool_id: spoolId, action: "retry_same_tool_call" };
+  } catch {
+    return { status: "spool_failed", action: "retry_same_tool_call" };
+  }
+}
+
+export function defaultAdoptionSpoolDir() {
+  return join(homedir(), ".config", "m5", "adoption-spool");
+}
+
+/**
+ * Durable local spool for adoption reports lost to transport outages (#242). The report
+ * contract is closed and content-free, so a spooled file carries no prompt, response, or
+ * credential material — but it is still redacted and written 0600 under a 0700 directory.
+ * Recovery is deterministic: retry the same report tool call after the gateway recovers;
+ * the spool file is the backstop, not a queue (no automatic replay, no network access).
+ */
+export function createFileAdoptionSpool({
+  spoolDir = defaultAdoptionSpoolDir(),
+  now = () => new Date(),
+  randomId = () => randomBytes(4).toString("hex"),
+} = {}) {
+  return {
+    async save(entry) {
+      if (!isValidAdoptionReport(entry?.report)) {
+        throw new M5ClientError(
+          "invalid_adoption_report",
+          "Only closed, content-free adoption reports may be spooled.",
+        );
+      }
+      const stamp = now().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "");
+      const spoolId = `adoption-${stamp}-${randomId()}`;
+      if (!ADOPTION_SPOOL_ID.test(spoolId)) {
+        throw new M5ClientError("spool_failed", "The adoption spool id is malformed.");
+      }
+      const payload = {
+        spool_id: spoolId,
+        spooled_at: now().toISOString(),
+        profile: typeof entry.profile === "string" ? entry.profile : "unknown",
+        report: redactValue(entry.report, entry.secrets ?? []),
+        failure: {
+          code: entry.failure?.code ?? "unknown",
+          ...(entry.failure?.diagnosticCode === undefined
+            ? {}
+            : { diagnostic_code: entry.failure.diagnosticCode }),
+        },
+      };
+      await mkdir(spoolDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(spoolDir, `${spoolId}.json`), `${JSON.stringify(payload)}\n`, {
+        mode: 0o600,
+      });
+      try {
+        const files = (await readdir(spoolDir))
+          .filter((name) => name.startsWith("adoption-") && name.endsWith(".json"))
+          .sort();
+        for (const stale of files.slice(0, Math.max(0, files.length - ADOPTION_SPOOL_KEEP))) {
+          await unlink(join(spoolDir, stale));
+        }
+      } catch {
+        // Pruning is best-effort: the save already succeeded and must not be failed by it.
+      }
+      return spoolId;
+    },
+  };
+}
+
 function safeError(error, secrets, profile) {
   if (error instanceof M5ClientError) {
     const message = CREDENTIAL_FAILURE_CODES.has(error.code)
@@ -262,6 +372,7 @@ function safeError(error, secrets, profile) {
       failureLayer: error.failureLayer,
       retryable: error.retryable,
       remediation: error.remediation,
+      evidenceRecovery: error.evidenceRecovery,
     }));
   }
   return new M5ClientError(
@@ -929,6 +1040,7 @@ export async function createM5Client({
   fetch: fetchImpl = globalThis.fetch,
   timeoutMs = 30_000,
   sleep = delay,
+  adoptionSpool = createFileAdoptionSpool(),
 }) {
   if (endpoint !== "public" && endpoint !== "private") {
     throw new M5ClientError(
@@ -1232,6 +1344,37 @@ export async function createM5Client({
     }
   }
 
+  // Adoption telemetry must survive the transport outage it reports on (#242). On a
+  // retryable transport failure the validated, content-free report is spooled locally and
+  // the thrown error carries the closed evidence-recovery shape; every other failure keeps
+  // the existing strict semantics with no spool side effect.
+  async function spoolAdoptionOutage({ error, input }) {
+    const transportOutage =
+      error instanceof M5ClientError &&
+      ADOPTION_SPOOL_TRANSPORT_CODES.has(error.code) &&
+      error.retryable !== false;
+    if (!transportOutage || !adoptionSpool) return safeError(error, secrets, profile);
+    const evidenceRecovery =
+      (await spoolAdoptionOutageReport(adoptionSpool, {
+        profile,
+        report: input,
+        secrets,
+        failure: { code: error.code, diagnosticCode: error.diagnosticCode },
+      })) ?? { status: "spool_failed", action: "retry_same_tool_call" };
+    return safeError(
+      new M5ClientError(error.code, error.message, {
+        httpStatus: error.httpStatus,
+        diagnosticCode: error.diagnosticCode,
+        failureLayer: error.failureLayer,
+        retryable: error.retryable,
+        remediation: error.remediation,
+        evidenceRecovery,
+      }),
+      secrets,
+      profile,
+    );
+  }
+
   const client = {
     async rpc(message) {
       try {
@@ -1411,7 +1554,7 @@ export async function createM5Client({
           "The gateway returned a malformed adoption-report acknowledgement.",
         );
       } catch (error) {
-        throw safeError(error, secrets, profile);
+        throw await spoolAdoptionOutage({ error, input });
       }
     },
 
@@ -1805,6 +1948,10 @@ export async function diagnoseProfile({
   } catch (error) {
     const failure = doctorEndpointFailure(error, profile, [token]);
     const status = failure.status;
+    // A profile without a private gateway URL has no private path to check (#242): say so
+    // explicitly instead of leaving both conditions indistinguishable. Fixed tokens only —
+    // the configured locators never leave this function.
+    const privateUnconfigured = !config.privateGatewayUrl;
     return safeDoctorResult({
       status,
       profile,
@@ -1818,8 +1965,9 @@ export async function diagnoseProfile({
       ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
       ...doctorCapabilityFields(null, null, {
         publicStatus: failure.safe.code === "model_discovery_unavailable" ? "unavailable" : "not_checked",
+        ...(privateUnconfigured ? { privateStatus: "not_configured" } : {}),
       }),
-      endpoints: { public: status, private: "not_checked" },
+      endpoints: { public: status, private: privateUnconfigured ? "not_configured" : "not_checked" },
     });
   }
 
