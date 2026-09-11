@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   M5_CLIENT_VERSION,
   M5ClientError,
+  createFileAdoptionSpool,
   createKeychainCredentialStore,
   createM5Client,
   diagnoseProfile,
@@ -2075,5 +2078,194 @@ describe("m5 doctor diagnostic distinctions", () => {
     expect(serialized).not.toContain(SECRET);
     expect(serialized).not.toContain(PROFILE.publicGatewayUrl);
     expect(serialized).not.toContain(PROFILE.privateGatewayUrl);
+  });
+});
+
+describe("adoption-report spool and unconfigured-path diagnostics (#242)", () => {
+  const REPORT = {
+    harness: "codex_app",
+    execution_mode: "ask",
+    traffic_purpose: "organic",
+    result: "failed",
+    deterministic_check: "not_run",
+    reviewer_usefulness: "not_reported",
+    fallback_reason: "m5_unreachable",
+    eligible_opportunities: 7,
+  };
+
+  function unreachableFetch() {
+    return async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    };
+  }
+
+  function memorySpool({ fail = false } = {}) {
+    const saved: unknown[] = [];
+    return {
+      saved,
+      spool: {
+        save: async (entry: unknown) => {
+          if (fail) throw new Error("spool disk full");
+          saved.push(entry);
+          return "adoption-20260911T000000-deadbeef";
+        },
+      },
+    };
+  }
+
+  async function adoptionClient(spool: unknown) {
+    return createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: unreachableFetch() as typeof globalThis.fetch,
+      adoptionSpool: spool as never,
+    });
+  }
+
+  it("spools a transport-lost report and carries the closed recovery shape", async () => {
+    const { saved, spool } = memorySpool();
+    const client = await adoptionClient(spool);
+    const failure = await client.reportAdoption(REPORT).then(
+      () => { throw new Error("expected failure"); },
+      (error) => error,
+    );
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      profile: "codex",
+      report: REPORT,
+      failure: { code: "network_failure", diagnosticCode: "route_unreachable" },
+    });
+    expect(failure).toMatchObject({
+      code: "network_failure",
+      evidenceRecovery: {
+        status: "spooled",
+        spool_id: "adoption-20260911T000000-deadbeef",
+        action: "retry_same_tool_call",
+      },
+    });
+    const serialized = failure.toJSON();
+    expect(serialized).toMatchObject({
+      error: {
+        code: "network_failure",
+        diagnostic_code: "route_unreachable",
+        failure_layer: "gateway_transport",
+        retryable: true,
+        evidence_recovery: {
+          status: "spooled",
+          spool_id: "adoption-20260911T000000-deadbeef",
+          action: "retry_same_tool_call",
+        },
+      },
+    });
+    expect(JSON.stringify(serialized)).not.toContain(SECRET);
+    // The memory spool holds the transport entry including its redaction input; the
+    // file spool below proves persisted payloads never contain secrets.
+  });
+
+  it("reports spool_failed when the spool write throws, without losing the transport error", async () => {
+    const { saved, spool } = memorySpool({ fail: true });
+    const client = await adoptionClient(spool);
+    const failure = await client.reportAdoption(REPORT).then(
+      () => { throw new Error("expected failure"); },
+      (error) => error,
+    );
+    expect(saved).toHaveLength(0);
+    expect(failure).toMatchObject({
+      code: "network_failure",
+      evidenceRecovery: { status: "spool_failed", action: "retry_same_tool_call" },
+    });
+    expect(failure.toJSON()).toMatchObject({
+      error: { evidence_recovery: { status: "spool_failed", action: "retry_same_tool_call" } },
+    });
+  });
+
+  it("does not spool non-transport adoption failures", async () => {
+    const { saved, spool } = memorySpool();
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: (async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          structuredContent: { accepted: "yes" },
+          isError: false,
+        });
+      }) as typeof globalThis.fetch,
+      adoptionSpool: spool as never,
+    });
+    await expect(client.reportAdoption(REPORT)).rejects.toMatchObject({
+      code: "invalid_adoption_report",
+    });
+    expect(saved).toHaveLength(0);
+  });
+
+  it("keeps the legacy shape when no spool is configured", async () => {
+    const client = await adoptionClient(null);
+    const failure = await client.reportAdoption(REPORT).then(
+      () => { throw new Error("expected failure"); },
+      (error) => error,
+    );
+    expect(failure).toMatchObject({ code: "network_failure" });
+    expect(failure.evidenceRecovery).toBeUndefined();
+    expect(failure.toJSON().error).not.toHaveProperty("evidence_recovery");
+  });
+
+  it("names an unconfigured private path when the public probe fails", async () => {
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: { publicGatewayUrl: "https://public.invalid" },
+      credentialStore: { resolve: async () => SECRET },
+      fetch: (async () => {
+        throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+      }) as typeof globalThis.fetch,
+    });
+    expect(result).toMatchObject({
+      status: "network_failure",
+      diagnostic_code: "connection_refused",
+      model_discovery: { public: "not_checked", private: "not_configured" },
+      inference: { public: "not_checked", private: "not_checked" },
+      endpoints: { public: "network_failure", private: "not_configured" },
+    });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+  });
+
+  it("file spool round-trips redacted reports and caps retained files", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "m5-spool-test-"));
+    try {
+      let counter = 0;
+      const spool = createFileAdoptionSpool({
+        spoolDir: dir,
+        now: () => new Date("2026-09-11T00:00:00.000Z"),
+        randomId: () => String(counter++).padStart(8, "0"),
+      });
+      const spoolId = await spool.save({
+        profile: "codex",
+        report: REPORT,
+        secrets: [SECRET],
+        failure: { code: "network_failure", diagnosticCode: "route_unreachable" },
+      });
+      expect(spoolId).toMatch(/^adoption-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$/);
+      const stored = JSON.parse(readFileSync(join(dir, `${spoolId}.json`), "utf8"));
+      expect(stored).toMatchObject({
+        spool_id: spoolId,
+        profile: "codex",
+        report: REPORT,
+        failure: { code: "network_failure", diagnostic_code: "route_unreachable" },
+      });
+      expect(JSON.stringify(stored)).not.toContain(SECRET);
+      await expect(
+        spool.save({ profile: "codex", report: { harness: "nope" }, secrets: [], failure: {} }),
+      ).rejects.toMatchObject({ code: "invalid_adoption_report" });
+      for (let index = 1; index < 102; index += 1) {
+        await spool.save({ profile: "codex", report: REPORT, secrets: [], failure: {} });
+      }
+      expect(readdirSync(dir)).toHaveLength(100);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
