@@ -21,6 +21,12 @@ function validHealth(overrides: JsonObject = {}): JsonObject {
     slots: profile.slots,
     slot_ctx: profile.context,
     kv_pool_positions: profile.context,
+    max_tokens_cap: profile.maxTokens,
+    prompt_cache: { mode: profile.cacheMode },
+    prompt_lookup: 'off', drafter_default: 'mtp', drafters_available: ['serial', 'mtp'],
+    server_defaults: { HALOGEN_MAX_TOKENS_DEFAULT: 16384, HALOGEN_TEMPERATURE: 1,
+      HALOGEN_TOP_P: 0.95, HALOGEN_TOP_K: 20, HALOGEN_MIN_P: 0,
+      HALOGEN_PRESENCE_PENALTY: 0, HALOGEN_ENABLE_THINKING: true, HALOGEN_REASONING_EFFORT: 'xhigh' },
     ...overrides,
   };
 }
@@ -120,6 +126,13 @@ describe("Halogen runtime launch plan", () => {
     expect(() => buildHalogenLaunch(profile, { ...validOptions, privileged: true })).toThrow();
   });
 
+  it("exposes only the two required GPU device nodes", () => {
+    const plan = buildHalogenLaunch(profile, validOptions);
+    expect(plan.args.filter(arg => arg.startsWith("--device="))).toEqual([
+      "--device=/dev/kfd", "--device=/dev/dri/renderD128",
+    ]);
+  });
+
   it("passes only explicit runtime environment and never inherits credential variables", () => {
     const plan = buildHalogenLaunch(profile, validOptions);
     const envPairs = plan.args.flatMap((arg, index) => arg === "--env" ? [plan.args[index + 1]!] : []);
@@ -148,6 +161,11 @@ describe("verifyHalogenHealth", () => {
     ["checkpoint format", { checkpoint_format: "gguf" }, "malformed-or-wrong-runtime-health"],
     ["slot count", { slots: profile.slots + 1 }, "slot-count-mismatch"],
     ["context size", { slot_ctx: profile.context + 1 }, "context-mismatch"],
+    ["output budget", { max_tokens_cap: 2048 }, "output-budget-mismatch"],
+    ["cache policy", { prompt_cache: { mode: 2 } }, "cache-mode-mismatch"],
+    ["drafter", { drafter_default: 'serial' }, "drafter-mismatch"],
+    ["lookup", { prompt_lookup: { ngram: 3, chain: 3 } }, "prompt-lookup-mismatch"],
+    ["sampler", { server_defaults: {} }, "server-default-mismatch"],
     ["KV pool positions", { kv_pool_positions: profile.context + 1 }, "kv-pool-mismatch"],
   ] as const)("rejects %s drift", (_label, change, expectedReason) => {
     expect(verifyHalogenHealth(profile, validHealth(change))).toContain(expectedReason);

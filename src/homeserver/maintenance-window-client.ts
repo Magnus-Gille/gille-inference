@@ -41,6 +41,11 @@ export interface MaintenanceWindowClientDependencies {
     signal: AbortSignal,
   ): Promise<number>;
   now?: () => number;
+  /** A runtime supervisor may retain exclusion when shutdown/restoration cannot be proved.
+   * The server TTL still applies. This does not extend the approved window or report restore.
+   * Omitted preserves the existing unconditional close behavior.
+   */
+  canReleaseWindow?: () => boolean;
 }
 
 /** The one credential introduced by this wrapper must never be inherited by the child command. */
@@ -142,6 +147,9 @@ export async function runMaintenanceWindowCommand(
   } catch (error) {
     childError = error;
   } finally {
+    if (deps.canReleaseWindow && !deps.canReleaseWindow()) {
+      throw new Error("maintenance window retained until server expiry: runtime cleanup is unverified; operator intervention required", { cause: childError });
+    }
     await parseJsonResponse(
       await deps.fetch(url, {
         method: "POST",

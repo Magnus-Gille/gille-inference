@@ -72,6 +72,8 @@ function makeOperations(options: {
 async function invokeEvaluation(options: {
   operations: HalogenEvaluationOperations;
   residents?: MaintenanceWindowOpeningEvidence["runningModels"];
+  expectedResidentModels?: string[];
+  approvedExpiresAt?: string;
   signal?: AbortSignal;
 }): Promise<{
   result?: unknown;
@@ -118,6 +120,8 @@ async function invokeEvaluation(options: {
     const result = await runHalogenCompatibilityEvaluation({
       operations: options.operations,
       apiKey: "test-maintenance-key",
+      expectedResidentModels: options.expectedResidentModels ?? ["prior-model"],
+      approvedExpiresAt: options.approvedExpiresAt ?? "2026-09-15T12:00:00.000Z",
       signal: options.signal,
       runWindow,
     });
@@ -230,7 +234,8 @@ describe("Halogen compatibility evaluation", () => {
       expect(events).toContain("ensureCandidateStopped");
       expect(events).toContain("assertSafeToRestore");
       expect(events).toContain("restorePriorExperiment");
-      expect(events).toContain("restoreSwap");
+      if (failAt === "restorePriorExperiment") expect(events).not.toContain("restoreSwap");
+      else expect(events).toContain("restoreSwap");
       expect(events).toContain("verifyRestoration");
     },
   );
@@ -330,4 +335,32 @@ describe("Halogen compatibility evaluation", () => {
     ]);
     expect(outcome.canReleaseAtEnd).toBe(true);
   });
+});
+
+it('stops further GPU reloads after prior-experiment restoration fails', async () => {
+  const operations = makeOperations({ failAt: 'restorePriorExperiment' });
+  const outcome = await invokeEvaluation({ operations });
+  expect(outcome.canReleaseAtEnd).toBe(false);
+  expect(operations.restoreSwap).not.toHaveBeenCalled();
+});
+
+it('rejects a resident that differs from the approved plan without mutation', async () => {
+  const operations = makeOperations();
+  const outcome = await invokeEvaluation({ operations, residents: [{ model: 'other-model', state: 'ready', ttlSeconds: 900 }] });
+  expect(outcome.error).toBeInstanceOf(Error);
+  expect(outcome.canReleaseAtEnd).toBe(true);
+  expect(operations.stopPriorExperiment).not.toHaveBeenCalled();
+});
+it('accepts an explicitly approved empty resident set', async () => {
+  const outcome = await invokeEvaluation({ operations: makeOperations(), residents: [], expectedResidentModels: [] });
+  expect(outcome.error).toBeUndefined();
+  expect(outcome.canReleaseAtEnd).toBe(true);
+});
+
+it('releases an overlong server window before any runtime mutation', async () => {
+  const operations = makeOperations();
+  const outcome = await invokeEvaluation({ operations, approvedExpiresAt: '2026-09-15T10:30:00.000Z' });
+  expect(outcome.error).toBeInstanceOf(Error);
+  expect(outcome.canReleaseAtEnd).toBe(true);
+  expect(operations.stopPriorExperiment).not.toHaveBeenCalled();
 });
