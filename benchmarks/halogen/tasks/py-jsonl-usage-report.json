@@ -10,7 +10,7 @@
     "app/report.py",
     "app/cli.py"
   ],
-  "instruction": "Implement the JSONL usage report in app/events.py, app/report.py, and app/cli.py. Parse nonblank JSON objects whose kind is request, whose id and model are nonempty strings, and whose input_tokens and output_tokens are nonnegative integers (booleans are invalid). Count malformed or invalid nonblank lines in invalidLines; blank lines do not count. Deduplicate valid records by id with the last valid record winning while preserving first-seen id order. Aggregate requests by model with numeric inputTokens and outputTokens totals, sort models lexicographically, and render the exact JSON and CSV schemas exercised by the oracle. The CLI accepts an input path or - for stdin and --format json|csv, writes only the result to stdout, and returns a nonzero status with no traceback for argument or file errors. Use Python standard library only and change only the declared app files.",
+  "instruction": "Implement the JSONL usage report in app/events.py, app/report.py, and app/cli.py. Parse nonblank JSON objects whose kind is request, whose id and model are nonempty strings, and whose input_tokens and output_tokens are nonnegative integers (booleans are invalid). Count malformed or invalid nonblank lines in invalidLines; blank lines do not count. Deduplicate valid records by id with the last valid record winning while preserving first-seen id order. Aggregate requests by model with numeric inputTokens and outputTokens totals, sorted lexicographically. The JSON report is exactly {\"invalidLines\": integer, \"models\": [{\"model\": string, \"requests\": integer, \"inputTokens\": integer, \"outputTokens\": integer}, ...]}. The CSV report has exactly the header model,requests,input_tokens,output_tokens followed by one LF-terminated row per sorted model; use standard CSV quoting for commas, quotes, and embedded newlines. The CLI invocation is app/cli.py INPUT|- [--format json|csv]; it writes only the selected report to stdout and returns a nonzero status with no traceback for argument or file errors. Use Python standard library only and change only the declared app files.",
   "allowedChangedPaths": [
     "app/events.py",
     "app/report.py",
@@ -26,19 +26,29 @@
     {
       "id": "hidden-usage-report",
       "command": "python3",
-      "args": ["-B", "tests/py_jsonl_usage_report_hidden.py"],
+      "args": [
+        "-B",
+        "tests/py_jsonl_usage_report_hidden.py"
+      ],
       "timeoutSeconds": 60
     },
     {
       "id": "fixture-imports",
       "command": "python3",
-      "args": ["-B", "-c", "import sys; sys.path.insert(0, 'app'); import events, report, cli"],
+      "args": [
+        "-B",
+        "-c",
+        "import sys; sys.path.insert(0, 'app'); import events, report, cli"
+      ],
       "timeoutSeconds": 30
     },
     {
       "id": "diff-check",
       "command": "git",
-      "args": ["diff", "--check"],
+      "args": [
+        "diff",
+        "--check"
+      ],
       "timeoutSeconds": 30
     }
   ],
