@@ -85,6 +85,51 @@ class StagingContract(unittest.TestCase):
             self.assertEqual(list(parent.iterdir()), [])
             urlopen.assert_not_called()
 
+    def test_verify_is_read_only_and_rejects_missing_or_corrupt(self):
+        manifest = tiny_manifest()
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            parent = Path(directory)
+            before = sorted(parent.rglob("*"))
+            with mock.patch.object(stage_halogen.urllib.request, "urlopen",
+                                   side_effect=AssertionError("verify performed network I/O")) as urlopen:
+                with self.assertRaisesRegex(ValueError, "artifact verification failed"):
+                    stage_halogen.stage(manifest, parent, verify=True)
+            self.assertEqual(sorted(parent.rglob("*")), before)
+            urlopen.assert_not_called()
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            parent = Path(directory)
+            root = parent / manifest["revision"]
+            root.mkdir(mode=0o700)
+            for index, item in enumerate(manifest["files"]):
+                output = root / item["path"]
+                output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                output.write_bytes(b"corrupt" if index == 0 else content_for(item))
+            before = [(path.relative_to(root), path.read_bytes()) for path in root.rglob("*") if path.is_file()]
+            with mock.patch.object(stage_halogen.urllib.request, "urlopen",
+                                   side_effect=AssertionError("verify performed network I/O")) as urlopen:
+                with self.assertRaisesRegex(ValueError, "artifact verification failed"):
+                    stage_halogen.stage(manifest, parent, verify=True)
+            after = [(path.relative_to(root), path.read_bytes()) for path in root.rglob("*") if path.is_file()]
+            self.assertEqual(after, before)
+            urlopen.assert_not_called()
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            parent = Path(directory)
+            root = parent / manifest["revision"]
+            for item in manifest["files"]:
+                output = root / item["path"]
+                output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                output.write_bytes(content_for(item))
+            before = [(path.relative_to(root), path.read_bytes()) for path in root.rglob("*") if path.is_file()]
+            with mock.patch.object(stage_halogen.urllib.request, "urlopen",
+                                   side_effect=AssertionError("verify performed network I/O")) as urlopen:
+                receipt = stage_halogen.stage(manifest, parent, verify=True)
+            after = [(path.relative_to(root), path.read_bytes()) for path in root.rglob("*") if path.is_file()]
+            self.assertEqual(receipt["mode"], "verified")
+            self.assertEqual(after, before)
+            urlopen.assert_not_called()
     def test_manifest_rejects_traversal_missing_overlay_and_duplicates(self):
         manifest = tiny_manifest()
         invalid = []
