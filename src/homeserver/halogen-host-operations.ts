@@ -332,20 +332,41 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
       return result;
     },
     async ensureCandidateStopped() {
-      // The systemd hard deadline is the final bound if a stop RPC fails. Never reload until verified.
+      // Unit and container deadlines are independent. A failed cgroup check must not
+      // make cleanup rely solely on the unit that the container may have escaped.
       let lastError: unknown;
       const deadline = Math.max(Date.now() + 60_000, candidateStartedAt + 1830_000);
       while (Date.now() < deadline) {
+        let unit: Record<string, string>;
+        let container: Record<string, any> | null;
+        try { unit = await systemProperties(launch.unit); container = await candidateInspect(); }
+        catch (error) { lastError = error; await pause(1000); continue; }
+        // Reject conflicting identities before either stop command. Container IDs are
+        // immutable, so a later reuse of the human-readable name cannot retarget a stop.
+        if (unit.LoadState !== 'not-found' && unit.Description !== `gille-317-halogen/${p.runId}`) throw new Error('refuse to stop an unowned unit');
+        if (container && container.Config?.Labels?.['gille-inference.run-id'] !== p.runId) throw new Error('unowned container occupies evaluation name');
+        if (container && !/^[a-f0-9]{64}$/.test(container.Id ?? '')) throw new Error('invalid container identity');
+        if (unit.LoadState !== 'not-found') {
+          try { await command('/usr/bin/sudo', ['-n', '/usr/bin/systemctl', 'stop', launch.unit], 40_000); }
+          catch (error) { lastError = error; }
+        }
+        if (container?.State?.Running === true) {
+          try { await command('/usr/bin/podman', ['stop', '--time', '20', container.Id], 30_000); }
+          catch (error) {
+            lastError = error;
+            try { await command('/usr/bin/podman', ['kill', '--signal', 'KILL', container.Id], 10_000); }
+            catch (killError) { lastError = new AggregateError([error, killError], 'container stop and kill failed'); }
+          }
+        }
         try {
-          const unit = await systemProperties(launch.unit);
-          if (unit.LoadState !== 'not-found' && unit.Description !== `gille-317-halogen/${p.runId}`) throw new Error('refuse to stop an unowned unit');
-          if (unit.LoadState !== 'not-found') await command('/usr/bin/sudo', ['-n', '/usr/bin/systemctl', 'stop', launch.unit], 40_000);
           const after = await systemProperties(launch.unit);
-          const container = await candidateInspect();
-          if (container && container.Config?.Labels?.['gille-inference.run-id'] !== p.runId) throw new Error('unowned container occupies evaluation name');
+          const remaining = await candidateInspect();
+          if (after.LoadState !== 'not-found' && after.Description !== `gille-317-halogen/${p.runId}`) throw new Error('unit ownership changed during cleanup');
+          if (remaining && (remaining.Config?.Labels?.['gille-inference.run-id'] !== p.runId
+            || remaining.Id !== container?.Id)) throw new Error('container identity changed during cleanup');
           if ((after.LoadState === 'not-found' || (after.MainPID === '0' && ['inactive', 'failed'].includes(after.ActiveState ?? '')))
-            && (!container || container.State?.Running === false)) return;
-          lastError = new Error('candidate still running');
+            && (!remaining || remaining.State?.Running === false)) return;
+          lastError ??= new Error('candidate still running');
         } catch (error) { lastError = error; }
         await pause(1000);
       }

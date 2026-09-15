@@ -37,7 +37,8 @@ be installed; the runtime uses `--pull=never` and cannot install it implicitly.
 ## Boundaries enforced by the runner
 
 - One 3,600-second maintenance window owns admission and the durable GPU lease; abort work
-  600 seconds before expiry. The separate candidate unit has a 1,800-second hard lifetime.
+  600 seconds before expiry. The candidate unit and Podman container each have an independent
+  1,800-second hard lifetime.
 - Use a transient **system** unit running as the explicit unprivileged owner. This permits a
   unit-scoped 96 GiB locked-memory ceiling without changing the user manager or global limits.
   The same unit enforces 96 GiB total memory, zero swap, 512 tasks and group OOM termination.
@@ -65,7 +66,10 @@ be installed; the runtime uses `--pull=never` and cannot install it implicitly.
 The supervisor snapshots the normal resident set from maintenance admission. It permits only
 an empty set or one ready model. The separate prior experiment is stopped through a PID file
 descriptor after checking its start identity; a recycled PID must not receive the signal.
-The prior experiment and normal resident are reloaded only after candidate shutdown is verified.
+Cleanup checks unit and container ownership before mutation. It stops the unit and also stops
+the container by its immutable ID, even if the unit is missing or its stop RPC fails. A failed
+container stop receives a bounded kill attempt. Both unit and container must be observed stopped
+before the prior experiment or normal resident can be reloaded.
 
 An OOM event, protected-service change, unverified shutdown or failed restoration ends the
 approved envelope. The supervisor then refuses further model reloads as applicable and retains

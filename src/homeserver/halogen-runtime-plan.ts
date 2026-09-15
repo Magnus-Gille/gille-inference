@@ -38,7 +38,7 @@ export function buildHalogenLaunch(profile: unknown, options: unknown): HalogenL
       '--property=OOMPolicy=kill', '--property=KillMode=control-group', '--property=TasksMax=512',
       `--property=RuntimeMaxSec=${HALOGEN_RUNTIME_SECONDS}`, '--property=TimeoutStopSec=30',
       '--property=RemainAfterExit=yes',
-      '/usr/bin/podman', 'run', `--name=${o.name}`, `--label=gille-inference.run-id=${o.runId}`, '--pull=never', '--network=none',
+      '/usr/bin/podman', 'run', `--name=${o.name}`, `--label=gille-inference.run-id=${o.runId}`, '--pull=never', '--network=none', `--timeout=${HALOGEN_RUNTIME_SECONDS}`,
       '--cgroups=disabled', '--read-only', '--read-only-tmpfs=false', '--image-volume=ignore',
       '--ipc=private', '--shm-size=512m',
       `--ulimit=memlock=${HALOGEN_MEMORY_BYTES}:${HALOGEN_MEMORY_BYTES}`, '--cap-drop=ALL', '--security-opt=no-new-privileges',
