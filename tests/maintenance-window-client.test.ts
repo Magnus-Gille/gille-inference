@@ -169,4 +169,116 @@ describe("maintenance window client", () => {
     await expect(opening).rejects.toThrow(/interrupted by SIGTERM/);
     expect(childRan).toBe(false);
   });
+  it("closes after success when cleanup release is proved", async () => {
+    const actions: string[] = [];
+    const evidence = await runMaintenanceWindowCommand(
+      { baseUrl: "http://m5", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["ok"] },
+      {
+        apiKey: "key",
+        canReleaseWindow: () => true,
+        runChild: async () => 0,
+        fetch: async (_input, init) => {
+          if (init?.method === "GET") return json(200, { active: false });
+          const body = JSON.parse(String(init?.body)) as { action: string };
+          actions.push(body.action);
+          if (body.action === "open") {
+            return json(201, {
+              token: "close-token-success",
+              evidence: { mode: "exclusive", startedAt: "x", expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] },
+            });
+          }
+          return json(200, { restored: true });
+        },
+      },
+    );
+    expect(actions).toEqual(["open", "close"]);
+    expect(evidence.restored).toBe(true);
+  });
+
+  it("closes after a child failure when cleanup release is proved", async () => {
+    let closed = false;
+    await expect(runMaintenanceWindowCommand(
+      { baseUrl: "http://m5", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["bad"] },
+      {
+        apiKey: "key",
+        canReleaseWindow: () => true,
+        runChild: async () => { throw new Error("child failed"); },
+        fetch: async (_input, init) => {
+          if (init?.method === "GET") return json(200, { active: false });
+          const body = JSON.parse(String(init?.body)) as { action: string };
+          if (body.action === "close") { closed = true; return json(200, { restored: true }); }
+          return json(201, { token: "close-token-failure", evidence: { mode: "exclusive", startedAt: "x", expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] } });
+        },
+      },
+    )).rejects.toThrow("child failed");
+    expect(closed).toBe(true);
+  });
+
+  it("retains exclusion without close or status checks when release cannot be proved", async () => {
+    const requests: string[] = [];
+    const retained = await runMaintenanceWindowCommand(
+      { baseUrl: "http://m5", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["ok"] },
+      {
+        apiKey: "key",
+        canReleaseWindow: () => false,
+        runChild: async () => 0,
+        fetch: async (_input, init) => {
+          if (init?.method === "GET") requests.push("status");
+          else requests.push(JSON.parse(String(init?.body)).action);
+          return json(201, {
+            token: "opaque-retained-token",
+            evidence: { mode: "exclusive", startedAt: "x", expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] },
+          });
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(retained).toBeInstanceOf(Error);
+    expect((retained as Error).message).toContain("retained until server expiry");
+    expect((retained as Error).message).not.toContain("opaque-retained-token");
+    expect(requests).toEqual(["open"]);
+  });
+
+  it("retains exclusion and preserves the child cause when release cannot be proved", async () => {
+    const childError = new Error("child failed");
+    const requests: string[] = [];
+    const retained = await runMaintenanceWindowCommand(
+      { baseUrl: "http://m5", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["bad"] },
+      {
+        apiKey: "key",
+        canReleaseWindow: () => false,
+        runChild: async () => { throw childError; },
+        fetch: async (_input, init) => {
+          if (init?.method === "GET") requests.push("status");
+          else requests.push(JSON.parse(String(init?.body)).action);
+          return json(201, {
+            token: "opaque-retained-failure-token",
+            evidence: { mode: "exclusive", startedAt: "x", expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] },
+          });
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(retained).toBeInstanceOf(Error);
+    expect((retained as Error).message).toContain("operator intervention required");
+    expect((retained as Error).message).not.toContain("opaque-retained-failure-token");
+    expect((retained as Error & { cause?: unknown }).cause).toBe(childError);
+    expect(requests).toEqual(["open"]);
+  });
+
+  it("does not invoke release gating when opening returns no token", async () => {
+    let releaseGateCalls = 0;
+    const result = runMaintenanceWindowCommand(
+      { baseUrl: "http://m5", ttlSeconds: 60, drainTimeoutSeconds: 5, command: ["ok"] },
+      {
+        apiKey: "key",
+        canReleaseWindow: () => { releaseGateCalls++; return false; },
+        runChild: async () => 0,
+        fetch: async () => json(201, {
+          evidence: { mode: "exclusive", startedAt: "x", expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] },
+        }),
+      },
+    );
+    await expect(result).rejects.toThrow("malformed maintenance-window response");
+    expect(releaseGateCalls).toBe(0);
+  });
+
 });
