@@ -70,8 +70,8 @@ class Response:
 class StagingContract(unittest.TestCase):
     def test_plan_is_read_only_and_never_networks(self):
         manifest = tiny_manifest()
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             with mock.patch.object(stage_halogen.urllib.request, "urlopen",
                                    side_effect=AssertionError("plan performed network I/O")) as urlopen:
                 receipt = stage_halogen.stage(manifest, parent)
@@ -88,8 +88,8 @@ class StagingContract(unittest.TestCase):
     def test_verify_is_read_only_and_rejects_missing_or_corrupt(self):
         manifest = tiny_manifest()
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             before = sorted(parent.rglob("*"))
             with mock.patch.object(stage_halogen.urllib.request, "urlopen",
                                    side_effect=AssertionError("verify performed network I/O")) as urlopen:
@@ -98,8 +98,8 @@ class StagingContract(unittest.TestCase):
             self.assertEqual(sorted(parent.rglob("*")), before)
             urlopen.assert_not_called()
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             root.mkdir(mode=0o700)
             for index, item in enumerate(manifest["files"]):
@@ -115,8 +115,8 @@ class StagingContract(unittest.TestCase):
             self.assertEqual(after, before)
             urlopen.assert_not_called()
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             for item in manifest["files"]:
                 output = root / item["path"]
@@ -157,8 +157,8 @@ class StagingContract(unittest.TestCase):
         item = first_item(manifest)
         payload = content_for(item)
         for status, headers in ((200, {}), (206, {"Content-Range": "bytes 1-9/*"})):
-            with self.subTest(status=status, headers=headers), tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-                parent = Path(directory)
+            with self.subTest(status=status, headers=headers), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory).resolve()
                 root = parent / manifest["revision"]
                 root.mkdir(mode=0o700)
                 target = root / item["path"]
@@ -182,8 +182,8 @@ class StagingContract(unittest.TestCase):
         manifest = tiny_manifest()
         item = first_item(manifest)
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             root.mkdir(mode=0o700)
             target = root / item["path"]
@@ -195,8 +195,8 @@ class StagingContract(unittest.TestCase):
             urlopen.assert_not_called()
             self.assertEqual(target.read_bytes(), b"wrong final")
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             root.mkdir(mode=0o700)
             target = root / item["path"]
@@ -212,8 +212,8 @@ class StagingContract(unittest.TestCase):
     def test_complete_partial_is_promoted_without_redownload(self):
         manifest = tiny_manifest()
         item = first_item(manifest)
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             root.mkdir(mode=0o700)
             target = root / item["path"]
@@ -236,16 +236,16 @@ class StagingContract(unittest.TestCase):
         manifest = tiny_manifest()
         item = first_item(manifest)
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             outside = parent / "outside"
             outside.mkdir(mode=0o700)
             os.symlink(outside, parent / manifest["revision"])
             with self.assertRaisesRegex(ValueError, "symlink in staging directory"):
                 stage_halogen.stage(manifest, parent, download=True)
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             root.mkdir(mode=0o700)
             outside = parent / "outside.hgn"
@@ -261,8 +261,8 @@ class StagingContract(unittest.TestCase):
         item = first_item(manifest)
         payload = content_for(item)
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            parent = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
             root = parent / manifest["revision"]
             root.mkdir(mode=0o700)
             for other in manifest["files"][1:]:
