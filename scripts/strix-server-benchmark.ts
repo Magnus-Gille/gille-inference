@@ -135,6 +135,7 @@ async function streamOne(input: {
   plan: StrixServerBenchmarkPlan;
   fixture: StrixServerFixture;
   apiKey: string | null;
+  signal?: AbortSignal;
 }): Promise<StrixServerRequestResult> {
   const started = performance.now();
   const headers: Record<string, string> = { "content-type": "application/json", accept: "text/event-stream" };
@@ -144,7 +145,9 @@ async function streamOne(input: {
     response = await input.fetchImpl(`${input.plan.baseUrl}/chat/completions`, {
       method: "POST",
       headers,
-      signal: AbortSignal.timeout(input.plan.timeoutMs),
+      signal: input.signal === undefined
+        ? AbortSignal.timeout(input.plan.timeoutMs)
+        : AbortSignal.any([AbortSignal.timeout(input.plan.timeoutMs), input.signal]),
       body: JSON.stringify({
         model: input.plan.model,
         ...input.fixture.request,
@@ -239,13 +242,19 @@ async function metricsSnapshot(
   fetchImpl: typeof fetch,
   url: string | null,
   apiKey: string | null,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<SpeculationSnapshot | null> {
   if (url === null) return null;
   const headers: Record<string, string> = { accept: "text/plain" };
   if (apiKey !== null) headers["authorization"] = `Bearer ${apiKey}`;
   try {
-    const response = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetchImpl(url, {
+      headers,
+      signal: signal === undefined
+        ? AbortSignal.timeout(timeoutMs)
+        : AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
+    });
     if (!response.ok) return null;
     return parsePrometheusSpeculation(await readBoundedText(response, 4 * 1024 * 1024));
   } catch {
@@ -283,8 +292,13 @@ const DEFAULT_DEPS: CliDependencies = {
   writePair,
 };
 
-export async function runStrixServerBenchmark(argv: string[], deps: CliDependencies = DEFAULT_DEPS): Promise<number> {
+export async function runStrixServerBenchmark(
+  argv: string[],
+  deps: CliDependencies = DEFAULT_DEPS,
+  signal?: AbortSignal,
+): Promise<number> {
   try {
+    signal?.throwIfAborted();
     const plan = parseStrixServerBenchmarkArgs(argv);
     const fixtureText = deps.readFile(plan.fixturesPath);
     if (Buffer.byteLength(fixtureText) > MAX_FIXTURE_BYTES) throw new Error("fixture file exceeds 2 MiB limit");
@@ -300,13 +314,16 @@ export async function runStrixServerBenchmark(argv: string[], deps: CliDependenc
     for (const fixture of fixtures) {
       for (const concurrency of plan.concurrency) {
         for (let repetition = 0; repetition < plan.repetitions; repetition++) {
-          const before = await metricsSnapshot(deps.fetchImpl, plan.metricsUrl, apiKey, plan.timeoutMs);
+          signal?.throwIfAborted();
+          const before = await metricsSnapshot(deps.fetchImpl, plan.metricsUrl, apiKey, plan.timeoutMs, signal);
           const batchStarted = performance.now();
           const requests = await Promise.all(
-            Array.from({ length: concurrency }, () => streamOne({ fetchImpl: deps.fetchImpl, plan, fixture, apiKey }))
+            Array.from({ length: concurrency }, () => streamOne({ fetchImpl: deps.fetchImpl, plan, fixture, apiKey, signal }))
           );
+          signal?.throwIfAborted();
           const wallMs = performance.now() - batchStarted;
-          const after = await metricsSnapshot(deps.fetchImpl, plan.metricsUrl, apiKey, plan.timeoutMs);
+          const after = await metricsSnapshot(deps.fetchImpl, plan.metricsUrl, apiKey, plan.timeoutMs, signal);
+          signal?.throwIfAborted();
           batches.push({
             fixtureId: fixture.id,
             taskType: fixture.taskType,
@@ -347,6 +364,7 @@ export async function runStrixServerBenchmark(argv: string[], deps: CliDependenc
       summaries,
       measurementLimits: limits,
     };
+    signal?.throwIfAborted();
     const paths = deps.writePair(
       plan.outPrefix,
       `${JSON.stringify(report, null, 2)}\n`,
