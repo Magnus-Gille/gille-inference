@@ -70,7 +70,7 @@ function makeOperations(options: {
 }
 
 const TAILNET_URL = "http://198.51.100.23:8080";
-const LOCAL_ADDRESSES = ["127.0.0.1", "::1", "198.51.100.23"];
+const LOCAL_ADDRESSES = ["127.0.0.1", "198.51.100.23"];
 
 function mockFetchGateway(status: { ok: boolean; status: number; body: unknown } | Error) {
   return vi.fn(async () => {
