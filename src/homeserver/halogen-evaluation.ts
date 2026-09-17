@@ -43,11 +43,12 @@ async function verifyGatewayIdle(
   signal: AbortSignal | undefined,
 ): Promise<void> {
   signal?.throwIfAborted();
+  const probeSignal = signal === undefined ? AbortSignal.timeout(15_000) : AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
   let response: Response;
   try {
     response = await fetchImpl(`${gatewayBaseUrl}/admin/maintenance/window`, {
       headers: { authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(15_000),
+      signal: probeSignal,
     });
   } catch (error) {
     throw new Error(

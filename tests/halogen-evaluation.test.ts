@@ -86,6 +86,7 @@ async function invokeEvaluation(options: {
   approvedExpiresAt?: string;
   signal?: AbortSignal;
   gatewayBaseUrl?: unknown;
+  fetch?: typeof fetch;
   gatewayStatus?: { ok: boolean; status: number; body: unknown } | Error;
   localAddresses?: string[];
 }): Promise<{
@@ -141,9 +142,10 @@ async function invokeEvaluation(options: {
       signal: options.signal,
       gatewayBaseUrl: (options.gatewayBaseUrl ?? TAILNET_URL) as string,
       localAddresses: options.localAddresses ?? LOCAL_ADDRESSES,
-      fetch: mockFetchGateway(
-        options.gatewayStatus ?? { ok: true, status: 200, body: { active: false, evidence: null } },
-      ) as unknown as typeof fetch,
+      fetch: (options.fetch ??
+        mockFetchGateway(
+          options.gatewayStatus ?? { ok: true, status: 200, body: { active: false, evidence: null } },
+        )) as unknown as typeof fetch,
       runWindow,
     });
     return { result, runWindowCalls, planBaseUrl, canReleaseAtEnd };
@@ -457,6 +459,18 @@ describe('Halogen gateway address (#323)', () => {
     });
     expect(outcome.error).toBeInstanceOf(Error);
     expect(String((outcome.error as Error).message)).toMatch(/401/);
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('rejects a malformed window status before any mutation', async () => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({
+      operations: makeOperations({ events }),
+      gatewayStatus: { ok: true, status: 200, body: { active: 'sometime' } },
+    });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/malformed/);
     expect(outcome.runWindowCalls).toBe(0);
     expect(events).toEqual([]);
   });

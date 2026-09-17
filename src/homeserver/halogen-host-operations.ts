@@ -23,7 +23,7 @@ export const halogenHostPlanSchema = z.object({
   gatewayBaseUrl: z.string().refine((value) => {
     try { parseGatewayBaseUrl(value); return true; }
     catch { return false; }
-  }, 'approved local gateway address required (http://<this-box>:<port>)'),
+  }, 'approved local gateway address required (http://<this-box>:<port>, checked against this machine)'),
   user: z.string().regex(/^[a-z_][a-z0-9_-]*$/), group: z.string().regex(/^[a-z_][a-z0-9_-]*$/),
   uid: z.number().int().positive(),
   protectedUnits: z.array(z.string().regex(/^[a-zA-Z0-9_.@-]+\.service$/)).min(2),
