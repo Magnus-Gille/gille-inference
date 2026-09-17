@@ -40,6 +40,7 @@ function hostPlan(): Record<string, unknown> {
     profileSha256: profileHash,
     name: containerName,
     runId,
+    gatewayBaseUrl: "http://127.0.0.1:8080",
     user: "operator",
     group: "operator",
     uid: 1000,

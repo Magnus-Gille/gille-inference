@@ -134,6 +134,7 @@ function plan(): Record<string, unknown> {
     profileSha256: profileHash,
     name: "gille-317-halogen-01",
     runId,
+    gatewayBaseUrl: "http://127.0.0.1:8080",
     user: "operator",
     group: "operator",
     uid: 1000,
@@ -199,5 +200,18 @@ describe("createHalogenHostOperations.assertHeadroom", () => {
     const threshold = HALOGEN_MEMORY_BYTES + 12 * 1024 ** 3;
     const operations = await prepared([{ error: { code: 1, stdout: "", stderr: "" } }], [200 * 1024 ** 3, Math.floor((threshold - 1) / 1024) * 1024]);
     await expect(operations.assertHeadroom()).rejects.toThrow("insufficient RAM including 12GiB reserve");
+  });
+});
+
+describe("createHalogenHostOperations gateway address (#323)", () => {
+  it.each([
+    ["missing", undefined],
+    ["path", "http://127.0.0.1:8080/admin"],
+    ["remote host", "http://203.0.113.7:8080"],
+  ])("rejects a plan with %s gateway address", async (_name, gatewayBaseUrl) => {
+    const invalid = plan() as Record<string, unknown>;
+    if (gatewayBaseUrl === undefined) delete invalid.gatewayBaseUrl;
+    else invalid.gatewayBaseUrl = gatewayBaseUrl;
+    expect(() => createHalogenHostOperations(invalid)).toThrow();
   });
 });

@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import { HALOGEN_PILOT_PROFILE, halogenProfileHash } from './halogen-profile.js';
 import { buildHalogenLaunch, HALOGEN_MEMORY_BYTES, verifyHalogenHealth } from './halogen-runtime-plan.js';
+import { parseGatewayBaseUrl } from './halogen-gateway-url.js';
 import type { HalogenEvaluationOperations } from './halogen-evaluation.js';
 
 const exec = promisify(execFile);
@@ -19,6 +20,10 @@ export const halogenHostPlanSchema = z.object({
   expiresAt: z.string().datetime(), profileSha256: z.literal(halogenProfileHash(HALOGEN_PILOT_PROFILE)),
   name: z.string().regex(/^gille-317-halogen-[0-9]{2}$/),
   runId: z.string().regex(/^[a-f0-9]{32}$/),
+  gatewayBaseUrl: z.string().refine((value) => {
+    try { parseGatewayBaseUrl(value); return true; }
+    catch { return false; }
+  }, 'approved local gateway address required (http://<this-box>:<port>)'),
   user: z.string().regex(/^[a-z_][a-z0-9_-]*$/), group: z.string().regex(/^[a-z_][a-z0-9_-]*$/),
   uid: z.number().int().positive(),
   protectedUnits: z.array(z.string().regex(/^[a-zA-Z0-9_.@-]+\.service$/)).min(2),
