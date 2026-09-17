@@ -69,22 +69,38 @@ function makeOperations(options: {
   };
 }
 
+const TAILNET_URL = "http://198.51.100.23:8080";
+const LOCAL_ADDRESSES = ["127.0.0.1", "198.51.100.23"];
+
+function mockFetchGateway(status: { ok: boolean; status: number; body: unknown } | Error) {
+  return vi.fn(async () => {
+    if (status instanceof Error) throw status;
+    return { ok: status.ok, status: status.status, json: async () => status.body };
+  });
+}
+
 async function invokeEvaluation(options: {
   operations: HalogenEvaluationOperations;
   residents?: MaintenanceWindowOpeningEvidence["runningModels"];
   expectedResidentModels?: string[];
   approvedExpiresAt?: string;
   signal?: AbortSignal;
+  gatewayBaseUrl?: unknown;
+  fetch?: typeof fetch;
+  gatewayStatus?: { ok: boolean; status: number; body: unknown } | Error;
+  localAddresses?: string[];
 }): Promise<{
   result?: unknown;
   error?: unknown;
   runWindowCalls: number;
+  planBaseUrl?: unknown;
   canReleaseAtEnd: boolean | undefined;
 }> {
   let canReleaseAtEnd: boolean | undefined;
   let runWindowCalls = 0;
+  let planBaseUrl: unknown;
   const runWindow = vi.fn(async (
-    plan: { command: string[] },
+    plan: { command: string[]; baseUrl: string },
     deps: {
       runChild: (
         command: string[],
@@ -95,6 +111,7 @@ async function invokeEvaluation(options: {
     },
   ): Promise<MaintenanceWindowClientEvidence> => {
     runWindowCalls += 1;
+    planBaseUrl = plan.baseUrl;
     expect(plan.command).toEqual(["halogen-synthetic-compatibility"]);
     try {
       const childSignal = new AbortController().signal;
@@ -123,11 +140,17 @@ async function invokeEvaluation(options: {
       expectedResidentModels: options.expectedResidentModels ?? ["prior-model"],
       approvedExpiresAt: options.approvedExpiresAt ?? "2026-09-15T12:00:00.000Z",
       signal: options.signal,
+      gatewayBaseUrl: (options.gatewayBaseUrl ?? TAILNET_URL) as string,
+      localAddresses: options.localAddresses ?? LOCAL_ADDRESSES,
+      fetch: (options.fetch ??
+        mockFetchGateway(
+          options.gatewayStatus ?? { ok: true, status: 200, body: { active: false, evidence: null } },
+        )) as unknown as typeof fetch,
       runWindow,
     });
-    return { result, runWindowCalls, canReleaseAtEnd };
+    return { result, runWindowCalls, planBaseUrl, canReleaseAtEnd };
   } catch (error) {
-    return { error, runWindowCalls, canReleaseAtEnd };
+    return { error, runWindowCalls, planBaseUrl, canReleaseAtEnd };
   }
 }
 
@@ -363,4 +386,92 @@ it('releases an overlong server window before any runtime mutation', async () =>
   expect(outcome.error).toBeInstanceOf(Error);
   expect(outcome.canReleaseAtEnd).toBe(true);
   expect(operations.stopPriorExperiment).not.toHaveBeenCalled();
+});
+
+describe('Halogen gateway address (#323)', () => {
+  it('passes the approved gateway address to the window instead of loopback', async () => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({ operations: makeOperations({ events }) });
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.runWindowCalls).toBe(1);
+    expect(outcome.planBaseUrl).toBe(TAILNET_URL);
+  });
+
+  it.each([
+    { name: 'path', url: 'http://127.0.0.1:8080/admin' },
+    { name: 'credentials', url: 'http://user:pass@127.0.0.1:8080' },
+    { name: 'missing scheme', url: '127.0.0.1:8080' },
+    { name: 'missing port', url: 'http://127.0.0.1' },
+    { name: 'https', url: 'https://127.0.0.1:8080' },
+    { name: 'empty', url: '' },
+  ])('rejects a gateway URL with $name before any window or operation', async ({ url }) => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({ operations: makeOperations({ events }), gatewayBaseUrl: url });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('rejects a non-local gateway host without sending the credential anywhere', async () => {
+    const events: string[] = [];
+    const fetch = mockFetchGateway({ ok: true, status: 200, body: { active: false } });
+    const outcome = await invokeEvaluation({
+      operations: makeOperations({ events }),
+      gatewayBaseUrl: 'http://203.0.113.7:8080',
+      fetch: fetch as unknown as typeof window.fetch,
+    });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/local|203\.0\.113\.7/);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('fails closed naming the URL when the gateway is unreachable', async () => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({
+      operations: makeOperations({ events }),
+      gatewayStatus: new Error('connect ECONNREFUSED 198.51.100.23:8080'),
+    });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/198\.51\.100\.23:8080/);
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('refuses to open when a window is already active', async () => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({
+      operations: makeOperations({ events }),
+      gatewayStatus: { ok: true, status: 200, body: { active: true, evidence: null } },
+    });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/active|already/i);
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('rejects a bad credential before any mutation', async () => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({
+      operations: makeOperations({ events }),
+      gatewayStatus: { ok: false, status: 401, body: { error: { message: 'invalid_api_key' } } },
+    });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/401/);
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('rejects a malformed window status before any mutation', async () => {
+    const events: string[] = [];
+    const outcome = await invokeEvaluation({
+      operations: makeOperations({ events }),
+      gatewayStatus: { ok: true, status: 200, body: { active: 'sometime' } },
+    });
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/malformed/);
+    expect(outcome.runWindowCalls).toBe(0);
+    expect(events).toEqual([]);
+  });
 });

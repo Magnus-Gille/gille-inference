@@ -31,6 +31,7 @@ function plan(): JsonObject {
     profileSha256,
     name: "gille-317-halogen-01",
     runId: "0123456789abcdef0123456789abcdef",
+    gatewayBaseUrl: "http://127.0.0.1:8080",
     user: "halogen",
     group: "halogen",
     uid: 1001,

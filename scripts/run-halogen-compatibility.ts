@@ -45,6 +45,7 @@ async function main(): Promise<void> {
   if (!execute) {
     console.log(JSON.stringify({ mode: 'plan-only', planSha256, runnerSha256, runnerCommit: p.runnerCommit,
       expiresAt: p.expiresAt, maintenanceSeconds: 3600, candidateSeconds: 1800,
+      gatewayBaseUrl: p.gatewayBaseUrl,
       launch, priorProcess: p.prior.pid, restoreUnit: `${p.prior.restoreName}.service`,
       expectedResidentModels: p.expectedResidentModels, protectedUnits: p.protectedUnits }, null, 2));
     return;
@@ -83,7 +84,7 @@ async function main(): Promise<void> {
   const common = { schemaVersion: 1, gate: 'synthetic-compatibility-only', planSha256, runnerSha256,
     runnerCommit: p.runnerCommit, profileSha256: p.profileSha256 };
   try {
-    const result = await runHalogenCompatibilityEvaluation({ operations, apiKey, expectedResidentModels: p.expectedResidentModels, approvedExpiresAt: p.expiresAt, signal: abort.signal });
+    const result = await runHalogenCompatibilityEvaluation({ operations, apiKey, expectedResidentModels: p.expectedResidentModels, approvedExpiresAt: p.expiresAt, gatewayBaseUrl: p.gatewayBaseUrl, signal: abort.signal });
     await writeFile(receipt, JSON.stringify({ ...common, pass: true, result }), { flag: 'wx', mode: 0o600 });
     console.log(JSON.stringify({ ...common, pass: true, receipt }));
   } catch (error) {

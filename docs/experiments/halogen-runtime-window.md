@@ -7,7 +7,7 @@ It does not promote the model, expose an endpoint, or qualify agent usefulness.
 
 The operator prepares a private JSON plan accepted by `halogenHostPlanSchema`. It binds a full
 runner commit, an expiry, the immutable profile hash, an unprivileged account, a unique 32-hex
-run ID, candidate and restoration unit names, the prior experiment's PID/start ticks, binary
+run ID, the approved local gateway address, candidate and restoration unit names, the prior experiment's PID/start ticks, binary
 hash, exact argv/cwd and model file identity, the exact approved normal resident set, and the
 protected service set. Admission must return that resident set and a window ending no later
 than the approved expiry; a mismatch ends the attempt before runtime mutations. Keep this plan and

@@ -1,6 +1,7 @@
 /** First, synthetic-only Halogen evaluation. Actual commands live behind injected operations. */
 import { z } from 'zod';
 import { runMaintenanceWindowCommand, type MaintenanceWindowClientDependencies, type MaintenanceWindowOpeningEvidence } from './maintenance-window-client.js';
+import { parseGatewayBaseUrl } from './halogen-gateway-url.js';
 
 export interface HalogenEvaluationOperations {
   /** Read-only identity, artifacts, absent-unit and protected-service checks. */
@@ -25,9 +26,44 @@ export interface HalogenEvaluationDependencies {
   apiKey: string;
   expectedResidentModels: readonly string[];
   approvedExpiresAt: string;
+  /** Approved local gateway address (#323). Never defaults: the caller binds it. */
+  gatewayBaseUrl: string;
+  /** Override for this box's interface addresses (tests only). */
+  localAddresses?: readonly string[];
   signal?: AbortSignal;
   fetch?: typeof fetch;
   runWindow?: typeof runMaintenanceWindowCommand;
+}
+
+/** Prove the approved gateway answers as the maintenance endpoint before any mutation. */
+async function verifyGatewayIdle(
+  fetchImpl: typeof fetch,
+  gatewayBaseUrl: string,
+  apiKey: string,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const probeSignal = signal === undefined ? AbortSignal.timeout(15_000) : AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
+  let response: Response;
+  try {
+    response = await fetchImpl(`${gatewayBaseUrl}/admin/maintenance/window`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: probeSignal,
+    });
+  } catch (error) {
+    throw new Error(
+      `gateway unreachable at approved address ${gatewayBaseUrl}: ${(error as Error).message}`,
+    );
+  }
+  signal?.throwIfAborted();
+  if (!response.ok) {
+    throw new Error(`gateway refused the check at ${gatewayBaseUrl} (HTTP ${response.status})`);
+  }
+  const body = (await response.json().catch(() => null)) as { active?: unknown } | null;
+  if (typeof body !== 'object' || body === null || typeof body.active !== 'boolean') {
+    throw new Error(`gateway gave a malformed window status at ${gatewayBaseUrl}`);
+  }
+  if (body.active) throw new Error(`a maintenance window is already active at ${gatewayBaseUrl}`);
 }
 
 /** Ordering is deliberate: verified candidate shutdown precedes reloading any resident model. */
@@ -35,6 +71,8 @@ export async function runHalogenCompatibilityEvaluation(deps: HalogenEvaluationD
   if (deps.expectedResidentModels.length > 1 || deps.expectedResidentModels.some(m => !/^[a-zA-Z0-9._-]{1,128}$/.test(m))) throw new Error('invalid approved resident set');
   const approvedExpiry = Date.parse(deps.approvedExpiresAt);
   if (!Number.isFinite(approvedExpiry)) throw new Error('invalid approved expiry');
+  const gatewayBaseUrl = parseGatewayBaseUrl(deps.gatewayBaseUrl, deps.localAddresses);
+  await verifyGatewayIdle(deps.fetch ?? fetch, gatewayBaseUrl, deps.apiKey, deps.signal);
   const op = deps.operations;
   await op.preflight();
   let canRelease = true;
@@ -112,7 +150,7 @@ export async function runHalogenCompatibilityEvaluation(deps: HalogenEvaluationD
     },
   };
   await (deps.runWindow ?? runMaintenanceWindowCommand)({
-    baseUrl: 'http://127.0.0.1:8080', ttlSeconds: 3600, drainTimeoutSeconds: 60,
+    baseUrl: gatewayBaseUrl, ttlSeconds: 3600, drainTimeoutSeconds: 60,
     abortBeforeExpirySeconds: 600, command: ['halogen-synthetic-compatibility'],
   }, windowDeps);
   return result;
