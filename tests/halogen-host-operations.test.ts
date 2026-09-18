@@ -3,7 +3,7 @@ import { HALOGEN_PILOT_PROFILE, halogenProfileHash } from "../src/homeserver/hal
 import { HALOGEN_MEMORY_BYTES } from "../src/homeserver/halogen-runtime-plan.js";
 
 type FuserResponse = { stdout?: string; error?: { code: number; stdout?: string; stderr?: string } };
-type State = { fuser: FuserResponse[]; memory: number[]; gpuGroups: Record<string, string>; hashIndex: number };
+type State = { fuser: FuserResponse[]; memory: number[]; gpuGroups: Record<string, string>; hashIndex: number; psName: string; inspect: any; configJson: string | Error };
 
 const runnerCommit = "b".repeat(40);
 const runId = "0123456789abcdef0123456789abcdef";
@@ -12,7 +12,10 @@ const priorModel = "/home/operator/model.gguf";
 const priorStartTicks = "123";
 const qualificationHash = "e".repeat(64);
 const profileHash = halogenProfileHash(HALOGEN_PILOT_PROFILE);
-const state: State = { fuser: [], memory: [], gpuGroups: {}, hashIndex: 0 };
+const candidatePid = 9999;
+const candidateStaticDir = "/run/containers/valid";
+const artifactDirectory = `/home/operator/halogen-eval-317/staging/${HALOGEN_PILOT_PROFILE.modelRevision}`;
+const state: State = { fuser: [], memory: [], gpuGroups: {}, hashIndex: 0, psName: "", inspect: null, configJson: "" };
 
 const properties = (unit: string): string => {
   const missing = unit === "gille-317-halogen-01.service" || unit === "gille-317-prior-01.service";
@@ -56,7 +59,11 @@ function commandCallback(executable: string, args: string[], callback: (error: E
     return;
   }
   if (executable === "/usr/bin/podman" && args[0] === "ps") {
-    callback(null, { stdout: "", stderr: "" });
+    callback(null, { stdout: state.psName, stderr: "" });
+    return;
+  }
+  if (executable === "/usr/bin/podman" && args[0] === "inspect") {
+    callback(null, { stdout: JSON.stringify(state.inspect === null ? [] : [state.inspect]), stderr: "" });
     return;
   }
   if (executable === "/usr/bin/podman" && args[0] === "image") {
@@ -87,6 +94,17 @@ beforeAll(async () => {
     if (path === `${priorModel}`) return "model";
     if (path === `/proc/${priorPid}/cmdline`) return ["/usr/bin/llama-server", "--host", "127.0.0.1", "--port", "18099", "-m", priorModel].join("\u0000") + "\u0000";
     if (path === `/proc/${priorPid}/stat`) return priorStat;
+    if (path === `/proc/${candidatePid}/status`) {
+      return "Name: conmon\nNoNewPrivs:\t1\nCapEff:\t0000000000000000\n";
+    }
+    const cgroupLimit = path.match(/^\/sys\/fs\/cgroup\/system\.slice\/gille-317-halogen-01\.service\/(.+)$/)?.[1];
+    if (cgroupLimit) {
+      return { "memory.max": "103079215104", "memory.swap.max": "0", "pids.max": "512", "memory.oom.group": "1" }[cgroupLimit] ?? "";
+    }
+    if (path === `${candidateStaticDir}/config.json`) {
+      if (state.configJson instanceof Error) throw state.configJson;
+      return state.configJson;
+    }
     const gpuPid = path.match(/^\/proc\/(\d+)\/cgroup$/)?.[1];
     if (gpuPid) return state.gpuGroups[gpuPid] ?? "0::/system.slice/unexpected.service\n";
     if (path.endsWith("/qualify-halogen.py")) return "qualification source";
@@ -213,5 +231,81 @@ describe("createHalogenHostOperations gateway address (#323)", () => {
     if (gatewayBaseUrl === undefined) delete invalid.gatewayBaseUrl;
     else invalid.gatewayBaseUrl = gatewayBaseUrl;
     expect(() => createHalogenHostOperations(invalid)).toThrow();
+  });
+});
+
+function deviceBinds(extra: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
+  return [
+    { type: "bind", source: "/dev/kfd", destination: "/dev/kfd", options: ["rbind", "rw"] },
+    { type: "bind", source: "/dev/dri/renderD128", destination: "/dev/dri/renderD128", options: ["rbind", "rw"] },
+    ...extra,
+  ];
+}
+
+function validContainer(): Record<string, unknown> {
+  return {
+    Id: "a".repeat(64),
+    StaticDir: candidateStaticDir,
+    State: { Pid: candidatePid, Running: true },
+    Config: { Labels: { "gille-inference.run-id": runId } },
+    HostConfig: { NetworkMode: "none", ReadonlyRootfs: true, Devices: [], GroupAdd: [] },
+    Mounts: [{ Destination: "/models", Source: artifactDirectory, RW: false }],
+  };
+}
+
+function validConfig(extraMounts: Array<Record<string, unknown>> = [], annotations: Record<string, string> | null = { "run.oci.keep_original_groups": "1" }): string {
+  return JSON.stringify({ mounts: deviceBinds(extraMounts), annotations });
+}
+
+async function contained(configJson: string | Error, inspectOverride?: Record<string, unknown>): Promise<{ error?: unknown }> {
+  state.psName = "";
+  state.inspect = null;
+  const operations = await prepared([{ error: { code: 1, stdout: "", stderr: "" } }]);
+  state.psName = "gille-317-halogen-01";
+  state.inspect = { ...validContainer(), ...(inspectOverride ?? {}) };
+  state.configJson = configJson;
+  state.gpuGroups[String(candidatePid)] = "0::/system.slice/gille-317-halogen-01.service\n";
+  try {
+    await operations.verifyContainment();
+    return {};
+  } catch (error) {
+    return { error };
+  }
+}
+
+describe("verifyContainment device binds (#327)", () => {
+  it("passes a rootless container whose devices arrive as OCI binds despite empty Devices/GroupAdd", async () => {
+    const outcome = await contained(validConfig());
+    expect(outcome.error).toBeUndefined();
+  });
+
+  it.each([
+    ["missing kfd bind", JSON.stringify({ mounts: deviceBinds().slice(1), annotations: { "run.oci.keep_original_groups": "1" } })],
+    ["remapped destination", JSON.stringify({ mounts: [{ type: "bind", source: "/dev/kfd", destination: "/dev/gpu0", options: ["rbind", "rw"] }, deviceBinds()[1]], annotations: { "run.oci.keep_original_groups": "1" } })],
+    ["read-only device bind", JSON.stringify({ mounts: [{ type: "bind", source: "/dev/kfd", destination: "/dev/kfd", options: ["rbind", "ro"] }, deviceBinds()[1]], annotations: { "run.oci.keep_original_groups": "1" } })],
+    ["foreign device bind", validConfig([{ type: "bind", source: "/dev/sda", destination: "/dev/sda", options: ["rbind", "rw"] }])],
+  ])("rejects %s without further checks", async (_name, configJson) => {
+    const outcome = await contained(configJson);
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/GPU device mapping mismatch/);
+  });
+
+  it("rejects a missing keep-groups annotation", async () => {
+    const outcome = await contained(validConfig([], {}));
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/group identity/);
+  });
+
+  it("rejects a container without storage identity", async () => {
+    const inspect = { ...validContainer(), StaticDir: undefined };
+    const outcome = await contained(validConfig(), inspect);
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/storage identity/);
+  });
+
+  it("rejects an unreadable OCI config", async () => {
+    const outcome = await contained(new Error("EACCES"));
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/OCI config unreadable/);
   });
 });

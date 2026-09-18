@@ -48,7 +48,10 @@ be installed; the runtime uses `--pull=never` and cannot install it implicitly.
 - Verify effective systemd settings, kernel cgroup limits, the candidate process's cgroup and
   privilege restrictions, and the actual container network/rootfs/model mount. The unique run
   identity binds both the unit description and container label; cleanup refuses a conflicting unit.
-  Device mappings must be exactly `/dev/kfd` and `/dev/dri/renderD128`. This is rootless-container
+  Device mappings must be exactly the `/dev/kfd` and `/dev/dri/renderD128` bind
+  mounts (source meets destination, never read-only) in the OCI config plus
+  the keep-groups annotation — rootless podman reports these instead of
+  `HostConfig.Devices`. This is rootless-container
   isolation on a shared host kernel, not a VM or protection against a GPU-driver vulnerability.
 - Require a 12 GiB host-memory reserve. Monitor available memory, host OOM count and protected
   service identities during startup and the compatibility request sequence. Inventory GPU users
