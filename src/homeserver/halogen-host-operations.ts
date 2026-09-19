@@ -277,11 +277,57 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
         if (c && c.State?.Pid > 0) {
           if (c.Config?.Labels?.['gille-inference.run-id'] !== p.runId) throw new Error('container ownership mismatch');
           if (c.HostConfig?.NetworkMode !== 'none' || c.HostConfig?.ReadonlyRootfs !== true) throw new Error('container network/rootfs isolation mismatch');
-          const devices = c.HostConfig?.Devices;
-          const expectedDevices = ['/dev/dri/renderD128', '/dev/kfd'];
-          if (!Array.isArray(devices) || devices.length !== 2
-            || JSON.stringify(devices.map((d: any) => d.PathOnHost).sort()) !== JSON.stringify(expectedDevices)
-            || devices.some((d: any) => d.PathOnHost !== d.PathInContainer)) throw new Error('GPU device mapping mismatch');
+          // Rootless podman translates --device into OCI bind mounts and
+          // --group-add=keep-groups into an annotation, leaving
+          // HostConfig.Devices/GroupAdd empty (#327). Verify the effective
+          // mapping in the OCI config instead of the requested flags.
+          // Match loosely on purpose: anything device-adjacent (either end
+          // under /dev, however spelled, or carrying bind options) must be
+          // exactly the two approved nodes, or the run fails closed.
+          const staticDir = typeof c.StaticDir === 'string' && c.StaticDir !== '' ? c.StaticDir : null;
+          if (!staticDir) throw new Error('container storage identity missing');
+          let spec: { mounts?: unknown; annotations?: unknown };
+          try {
+            spec = JSON.parse(await readFile(`${staticDir}/config.json`, 'utf8'));
+          } catch (error) {
+            const code = error instanceof SyntaxError
+              ? 'parse'
+              : (error as { code?: unknown }).code;
+            throw new Error(`container OCI config unreadable (${typeof code === 'string' ? code : 'io'})`);
+          }
+          const canonicalDevPath = (value: unknown): string | null => {
+            if (typeof value !== 'string') return null;
+            const collapsed = value.replace(/\/+/g, '/').replace(/\/\.\//g, '/');
+            if (collapsed === '/dev' || collapsed.startsWith('/dev/')) return collapsed;
+            return null;
+          };
+          const mounts = Array.isArray(spec.mounts) ? spec.mounts : [];
+          const devBinds: Array<{ source: string; destination: string; options: unknown }> = [];
+          for (const m of mounts) {
+            if (typeof m !== 'object' || m === null) continue;
+            const rec = m as Record<string, unknown>;
+            // Anything carrying bind/rbind options counts as a bind, whatever
+            // its type says (crun honours the option, e.g. type 'none').
+            // Plain typed non-bind mounts (tmpfs shm, devpts) carry no such
+            // option and stay out.
+            const isBind = rec.type === 'bind'
+              || (Array.isArray(rec.options) && rec.options.some((o) => o === 'bind' || o === 'rbind'));
+            if (!isBind) continue;
+            const source = canonicalDevPath(rec.source);
+            const destination = canonicalDevPath(rec.destination);
+            if (source === null && destination === null) continue;
+            devBinds.push({ source: source ?? '', destination: destination ?? '', options: rec.options });
+          }
+          const expectedBinds = ['/dev/dri/renderD128', '/dev/kfd'];
+          if (JSON.stringify(devBinds.map((m) => m.source).sort()) !== JSON.stringify(expectedBinds)
+            || devBinds.some((m) => m.destination !== m.source
+              || (Array.isArray(m.options) && m.options.includes('ro')))) {
+            throw new Error('GPU device mapping mismatch');
+          }
+          const annotations = spec.annotations as Record<string, unknown> | undefined;
+          if (annotations?.['run.oci.keep_original_groups'] !== '1') {
+            throw new Error('container group identity mismatch');
+          }
           const group = await readFile(`/proc/${c.State.Pid}/cgroup`, 'utf8');
           if (!group.includes(`/${launch.unit}\n`)) throw new Error('candidate escaped bounded unit cgroup');
           const status = await readFile(`/proc/${c.State.Pid}/status`, 'utf8');
