@@ -3,7 +3,7 @@ import { HALOGEN_PILOT_PROFILE, halogenProfileHash } from "../src/homeserver/hal
 import { HALOGEN_MEMORY_BYTES } from "../src/homeserver/halogen-runtime-plan.js";
 
 type FuserResponse = { stdout?: string; error?: { code: number; stdout?: string; stderr?: string } };
-type State = { fuser: FuserResponse[]; memory: number[]; gpuGroups: Record<string, string>; hashIndex: number; psName: string; inspect: any; configJson: string | Error };
+type State = { fuser: FuserResponse[]; memory: number[]; gpuGroups: Record<string, string>; hashIndex: number; psName: string; inspect: any; configJson: string | Error; charDevices: string[] };
 
 const runnerCommit = "b".repeat(40);
 const runId = "0123456789abcdef0123456789abcdef";
@@ -15,7 +15,7 @@ const profileHash = halogenProfileHash(HALOGEN_PILOT_PROFILE);
 const candidatePid = 9999;
 const candidateStaticDir = "/run/containers/valid";
 const artifactDirectory = `/home/operator/halogen-eval-317/staging/${HALOGEN_PILOT_PROFILE.modelRevision}`;
-const state: State = { fuser: [], memory: [], gpuGroups: {}, hashIndex: 0, psName: "", inspect: null, configJson: "" };
+const state: State = { fuser: [], memory: [], gpuGroups: {}, hashIndex: 0, psName: "", inspect: null, configJson: "", charDevices: [] };
 
 const properties = (unit: string): string => {
   const missing = unit === "gille-317-halogen-01.service" || unit === "gille-317-prior-01.service";
@@ -111,8 +111,8 @@ beforeAll(async () => {
     return "";
   });
   statMock = vi.fn(async (path: string) => path === priorModel
-    ? { size: 123, mtimeMs: 1 }
-    : { uid: 1000 });
+    ? { size: 123, mtimeMs: 1, isCharacterDevice: () => false }
+    : { uid: 1000, isCharacterDevice: () => state.charDevices.includes(path) });
   vi.doMock("node:fs/promises", () => ({
     readFile: readFileMock,
     readlink: vi.fn(async (path: string) => path.endsWith("/cwd") ? "/home/operator" : "/usr/bin/llama-server"),
@@ -257,9 +257,10 @@ function validConfig(extraMounts: Array<Record<string, unknown>> = [], annotatio
   return JSON.stringify({ mounts: deviceBinds(extraMounts), annotations });
 }
 
-async function contained(configJson: string | Error, inspectOverride?: Record<string, unknown>): Promise<{ error?: unknown }> {
+async function contained(configJson: string | Error, inspectOverride?: Record<string, unknown>, charDevices: string[] = ["/dev/kfd", "/dev/dri/renderD128"]): Promise<{ error?: unknown }> {
   state.psName = "";
   state.inspect = null;
+  state.charDevices = charDevices;
   const operations = await prepared([{ error: { code: 1, stdout: "", stderr: "" } }]);
   state.psName = "gille-317-halogen-01";
   state.inspect = { ...validContainer(), ...(inspectOverride ?? {}) };
@@ -321,6 +322,27 @@ describe("verifyContainment device binds (#327)", () => {
     const outcome = await contained("not-json{");
     expect(outcome.error).toBeInstanceOf(Error);
     expect(String((outcome.error as Error).message)).toMatch(/unreadable \(parse\)/);
+  });
+
+  it("ignores pseudo-device binds whose source is not an absolute host path", async () => {
+    const outcome = await contained(validConfig([
+      { type: "bind", source: "shm", destination: "/dev/shm", options: ["rbind", "rw"] },
+    ]));
+    expect(outcome.error).toBeUndefined();
+  });
+
+  it("rejects an absolute non-character device bind", async () => {
+    const outcome = await contained(validConfig(), undefined, ["/dev/kfd"]);
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/GPU device mapping mismatch/);
+  });
+
+  it("rejects a missing absolute device source", async () => {
+    const config = JSON.parse(validConfig());
+    config.mounts = config.mounts.filter((m: any) => m.source !== "/dev/kfd");
+    const outcome = await contained(JSON.stringify(config));
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/GPU device mapping mismatch/);
   });
 
   it("rejects a container without storage identity", async () => {
