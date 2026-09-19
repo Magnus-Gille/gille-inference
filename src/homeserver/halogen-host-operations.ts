@@ -303,6 +303,10 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
           };
           const mounts = Array.isArray(spec.mounts) ? spec.mounts : [];
           const devBinds: Array<{ source: string; destination: string; options: unknown }> = [];
+          // Pseudo-device mounts (shm and friends) name a relative source
+          // instead of a host node; only absolute sources can be devices.
+          // Every absolute source must then stat as a character device,
+          // otherwise a block node or a missing path fails closed here.
           for (const m of mounts) {
             if (typeof m !== 'object' || m === null) continue;
             const rec = m as Record<string, unknown>;
@@ -318,9 +322,22 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
             if (source === null && destination === null) continue;
             devBinds.push({ source: source ?? '', destination: destination ?? '', options: rec.options });
           }
+          const realBinds: Array<{ source: string; destination: string; options: unknown }> = [];
+          for (const b of devBinds) {
+            if (!b.source.startsWith('/')) continue;
+            let isChar = false;
+            try {
+              const st = await stat(b.source);
+              isChar = typeof st.isCharacterDevice === 'function' && st.isCharacterDevice();
+            } catch {
+              throw new Error('GPU device mapping mismatch');
+            }
+            if (!isChar) throw new Error('GPU device mapping mismatch');
+            realBinds.push(b);
+          }
           const expectedBinds = ['/dev/dri/renderD128', '/dev/kfd'];
-          if (JSON.stringify(devBinds.map((m) => m.source).sort()) !== JSON.stringify(expectedBinds)
-            || devBinds.some((m) => m.destination !== m.source
+          if (JSON.stringify(realBinds.map((m) => m.source).sort()) !== JSON.stringify(expectedBinds)
+            || realBinds.some((m) => m.destination !== m.source
               || (Array.isArray(m.options) && m.options.includes('ro')))) {
             throw new Error('GPU device mapping mismatch');
           }
