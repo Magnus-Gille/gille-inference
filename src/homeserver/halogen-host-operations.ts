@@ -281,20 +281,46 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
           // --group-add=keep-groups into an annotation, leaving
           // HostConfig.Devices/GroupAdd empty (#327). Verify the effective
           // mapping in the OCI config instead of the requested flags.
+          // Match loosely on purpose: anything device-adjacent (either end
+          // under /dev, however spelled, or carrying bind options) must be
+          // exactly the two approved nodes, or the run fails closed.
           const staticDir = typeof c.StaticDir === 'string' && c.StaticDir !== '' ? c.StaticDir : null;
           if (!staticDir) throw new Error('container storage identity missing');
           let spec: { mounts?: unknown; annotations?: unknown };
           try {
             spec = JSON.parse(await readFile(`${staticDir}/config.json`, 'utf8'));
-          } catch {
-            throw new Error('container OCI config unreadable');
+          } catch (error) {
+            const code = error instanceof SyntaxError
+              ? 'parse'
+              : (error as { code?: unknown }).code;
+            throw new Error(`container OCI config unreadable (${typeof code === 'string' ? code : 'io'})`);
           }
+          const canonicalDevPath = (value: unknown): string | null => {
+            if (typeof value !== 'string') return null;
+            const collapsed = value.replace(/\/+/g, '/').replace(/\/\.\//g, '/');
+            if (collapsed === '/dev' || collapsed.startsWith('/dev/')) return collapsed;
+            return null;
+          };
           const mounts = Array.isArray(spec.mounts) ? spec.mounts : [];
-          const devBinds = mounts.filter((m: any) =>
-            m?.type === 'bind' && typeof m?.source === 'string' && m.source.startsWith('/dev/'));
+          const devBinds: Array<{ source: string; destination: string; options: unknown }> = [];
+          for (const m of mounts) {
+            if (typeof m !== 'object' || m === null) continue;
+            const rec = m as Record<string, unknown>;
+            // Typed non-bind mounts (tmpfs shm, devpts) are kernel pseudo
+            // filesystems, not host device passthrough; untyped mounts
+            // carrying bind options still count.
+            const isBind = rec.type === 'bind'
+              || ((rec.type === undefined || rec.type === null) && Array.isArray(rec.options)
+                && rec.options.some((o) => o === 'bind' || o === 'rbind'));
+            if (!isBind) continue;
+            const source = canonicalDevPath(rec.source);
+            const destination = canonicalDevPath(rec.destination);
+            if (source === null && destination === null) continue;
+            devBinds.push({ source: source ?? '', destination: destination ?? '', options: rec.options });
+          }
           const expectedBinds = ['/dev/dri/renderD128', '/dev/kfd'];
-          if (JSON.stringify(devBinds.map((m: any) => m.source).sort()) !== JSON.stringify(expectedBinds)
-            || devBinds.some((m: any) => m.destination !== m.source
+          if (JSON.stringify(devBinds.map((m) => m.source).sort()) !== JSON.stringify(expectedBinds)
+            || devBinds.some((m) => m.destination !== m.source
               || (Array.isArray(m.options) && m.options.includes('ro')))) {
             throw new Error('GPU device mapping mismatch');
           }

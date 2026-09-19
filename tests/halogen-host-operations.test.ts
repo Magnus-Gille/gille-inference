@@ -284,16 +284,42 @@ describe("verifyContainment device binds (#327)", () => {
     ["remapped destination", JSON.stringify({ mounts: [{ type: "bind", source: "/dev/kfd", destination: "/dev/gpu0", options: ["rbind", "rw"] }, deviceBinds()[1]], annotations: { "run.oci.keep_original_groups": "1" } })],
     ["read-only device bind", JSON.stringify({ mounts: [{ type: "bind", source: "/dev/kfd", destination: "/dev/kfd", options: ["rbind", "ro"] }, deviceBinds()[1]], annotations: { "run.oci.keep_original_groups": "1" } })],
     ["foreign device bind", validConfig([{ type: "bind", source: "/dev/sda", destination: "/dev/sda", options: ["rbind", "rw"] }])],
+    ["whole /dev bind", JSON.stringify({ mounts: [{ type: "bind", source: "/dev", destination: "/dev", options: ["rbind", "rw"] }], annotations: { "run.oci.keep_original_groups": "1" } })],
+    ["doubled-slash source", JSON.stringify({ mounts: [{ type: "bind", source: "//dev/kfd", destination: "//dev/kfd", options: ["rbind", "rw"] }], annotations: { "run.oci.keep_original_groups": "1" } })],
+    ["untyped extra bind", validConfig([{ source: "/dev/sda", destination: "/dev/sda", options: ["rbind", "rw"] }])],
+    ["non-device source to device destination", JSON.stringify({ mounts: [{ type: "bind", source: "/tmp/evil", destination: "/dev/kfd", options: ["rbind", "rw"] }, deviceBinds()[1]], annotations: { "run.oci.keep_original_groups": "1" } })],
   ])("rejects %s without further checks", async (_name, configJson) => {
+    const callsBefore = readFileMock.mock.calls.length;
     const outcome = await contained(configJson);
     expect(outcome.error).toBeInstanceOf(Error);
     expect(String((outcome.error as Error).message)).toMatch(/GPU device mapping mismatch/);
+    const later = readFileMock.mock.calls.slice(callsBefore);
+    expect(later.some(([path]) => typeof path === "string" && path.includes("/proc/9999/"))).toBe(false);
   });
 
   it("rejects a missing keep-groups annotation", async () => {
     const outcome = await contained(validConfig([], {}));
     expect(outcome.error).toBeInstanceOf(Error);
     expect(String((outcome.error as Error).message)).toMatch(/group identity/);
+  });
+
+  it("rejects a falsy keep-groups annotation", async () => {
+    const outcome = await contained(validConfig([], { "run.oci.keep_original_groups": "0" }));
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/group identity/);
+  });
+
+  it("ignores typed pseudo-filesystem mounts under /dev", async () => {
+    const outcome = await contained(validConfig([
+      { type: "tmpfs", source: "shm", destination: "/dev/shm", options: ["nosuid", "noexec", "nodev"] },
+    ]));
+    expect(outcome.error).toBeUndefined();
+  });
+
+  it("rejects malformed OCI config naming the cause", async () => {
+    const outcome = await contained("not-json{");
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(String((outcome.error as Error).message)).toMatch(/unreadable \(parse\)/);
   });
 
   it("rejects a container without storage identity", async () => {
