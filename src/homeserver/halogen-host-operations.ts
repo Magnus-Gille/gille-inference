@@ -306,12 +306,12 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
           for (const m of mounts) {
             if (typeof m !== 'object' || m === null) continue;
             const rec = m as Record<string, unknown>;
-            // Typed non-bind mounts (tmpfs shm, devpts) are kernel pseudo
-            // filesystems, not host device passthrough; untyped mounts
-            // carrying bind options still count.
+            // Anything carrying bind/rbind options counts as a bind, whatever
+            // its type says (crun honours the option, e.g. type 'none').
+            // Plain typed non-bind mounts (tmpfs shm, devpts) carry no such
+            // option and stay out.
             const isBind = rec.type === 'bind'
-              || ((rec.type === undefined || rec.type === null) && Array.isArray(rec.options)
-                && rec.options.some((o) => o === 'bind' || o === 'rbind'));
+              || (Array.isArray(rec.options) && rec.options.some((o) => o === 'bind' || o === 'rbind'));
             if (!isBind) continue;
             const source = canonicalDevPath(rec.source);
             const destination = canonicalDevPath(rec.destination);

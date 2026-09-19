@@ -288,6 +288,7 @@ describe("verifyContainment device binds (#327)", () => {
     ["doubled-slash source", JSON.stringify({ mounts: [{ type: "bind", source: "//dev/kfd", destination: "//dev/kfd", options: ["rbind", "rw"] }], annotations: { "run.oci.keep_original_groups": "1" } })],
     ["untyped extra bind", validConfig([{ source: "/dev/sda", destination: "/dev/sda", options: ["rbind", "rw"] }])],
     ["non-device source to device destination", JSON.stringify({ mounts: [{ type: "bind", source: "/tmp/evil", destination: "/dev/kfd", options: ["rbind", "rw"] }, deviceBinds()[1]], annotations: { "run.oci.keep_original_groups": "1" } })],
+    ["none-typed bind options", JSON.stringify({ mounts: [{ type: "none", source: "/dev/sda", destination: "/dev/sda", options: ["rbind", "rw"] }, ...deviceBinds()], annotations: { "run.oci.keep_original_groups": "1" } })],
   ])("rejects %s without further checks", async (_name, configJson) => {
     const callsBefore = readFileMock.mock.calls.length;
     const outcome = await contained(configJson);
