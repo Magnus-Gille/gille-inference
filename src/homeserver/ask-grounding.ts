@@ -100,13 +100,17 @@ interface Sentence {
 }
 
 const NEGATION_RE = /\b(never|not|no|don't|doesn't|didn't|can't|cannot|won't|avoid|avoids|must not|mustn't|prohibit\w*|forbidden|banned)\b/iu;
-const ACTION_CUE = /(^|\b)(run|runs|running|execute|executes|use|uses|using|used|copy|copies|copied|do|does|perform|performs|follow|followed|following|type|enter|invoke|invokes|call|calls|apply|deploy|install|verif\w*)([\s:]|$)/iu;
+const ACTION_CUE = /(^|\b)(run|runs|running|execute|executes|use|uses|using|used|copy|copies|copied|do|does|perform|performs|follow|followed|following|type|enter|invoke|invokes|call|calls|apply|deploy|install|restart|restarts|start|starts|stop|stops|launch|launches|begin|begins|began|proceed|proceeds|retry|retries|try|tries|verif\w*)([\s:]|$)/iu;
 const LABEL_ASSERTION = /:\s*\S/u;
 
 function cleanToken(raw: string): string {
   return raw
     .replace(/^[\s"'`({[<]+/u, "")
     .replace(/[\s.,;:!?)"'`\]}>]+$/u, "");
+}
+
+function stripSpans(clause: string): string {
+  return clause.replace(/`[^`\n]+`/gu, " ").replace(/```[\w]*\n[\s\S]*?```/gu, " ");
 }
 
 function splitSentencesWithOffsets(text: string): Sentence[] {
@@ -314,7 +318,7 @@ function negatedRanges(text: string): Array<{ start: number; end: number }> {
       if (negated && negated.index !== undefined) {
         ranges.push({ start: clauseStart + negated.index + negated[0].length, end: clauseStart + clause.length });
         open = true;
-      } else if (open && !ACTION_CUE.test(clause)) {
+      } else if (open && !ACTION_CUE.test(stripSpans(clause))) {
         ranges.push({ start: clauseStart, end: clauseStart + clause.length });
       } else {
         open = false;

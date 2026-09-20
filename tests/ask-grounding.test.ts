@@ -191,6 +191,12 @@ describe("ask grounding checker (#237)", () => {
     expect(listed.pass).toBe(true);
   });
 
+  it("does not let new prescriptions hide behind list continuation", () => {
+    const mixed = checkAskGrounding(loadFixture(), "Never use `reboot`; restart via `npm ci`.");
+    expect(mixed.pass).toBe(false);
+    expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
+  });
+
   it("scopes negation to its own clause", () => {
     const mixed = checkAskGrounding(loadFixture(), "To avoid downtime, run `npm install`.");
     expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
