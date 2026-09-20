@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "id": "munin-recovery-checklist",
+  "sourceIssue": "https://github.com/Magnus-Gille/gille-inference/issues/237",
+  "instruction": "Using ONLY the closed fact set below, write an ordered deployment checklist. Do not invent commands, credentials, hosts, or versions. Mark anything not supported by the facts as unknown instead of filling it in.",
+  "factsText": "Munin Memory keeps three directory roles: the live database directory, the backup directory, and the rclone credential location. The service binds localhost only. Backups fail closed: a failed backup stops the rotation instead of writing a partial one. Rclone credentials live in their configured location and are never copied into deploy artifacts. The timer runs the backup on its fixed schedule. Never overwrite the production .env. Do not touch the recovered database before taking an immutable copy plus an offline integrity verification. The project-canonical database path is ~/.munin-memory/memory.db. Deployment follows the project's lockfile-based install path.",
+  "allowed": {
+    "paths": [
+      "~/.munin-memory/memory.db"
+    ],
+    "commands": [],
+    "flags": [],
+    "hosts": [
+      "localhost"
+    ],
+    "versions": []
+  },
+  "forbidden": {
+    "paths": [
+      "~/.munin-memory/munin.db"
+    ],
+    "commands": [
+      "npm install",
+      "npm ci",
+      "yarn install",
+      "pnpm install",
+      "pip install",
+      "reboot",
+      "shutdown",
+      "cp .env",
+      "backup-to-nas.sh --dry-run"
+    ],
+    "flags": [
+      "--dry-run"
+    ],
+    "hosts": [],
+    "versions": []
+  },
+  "unverifiableAspects": [
+    {
+      "aspect": "install command",
+      "keywords": [
+        "install",
+        "npm install",
+        "npm ci"
+      ],
+      "marker": "unknown|not provided|not supplied|cannot determine|need.*source"
+    },
+    {
+      "aspect": "verification command",
+      "keywords": [
+        "verif",
+        "integrity check",
+        "validate"
+      ],
+      "marker": "unknown|not provided|not supplied|cannot determine|need.*source"
+    }
+  ]
+}
