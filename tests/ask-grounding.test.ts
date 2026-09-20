@@ -197,6 +197,26 @@ describe("ask grounding checker (#237)", () => {
     expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
   });
 
+  it("catches prescriptions hiding behind switch-style continuations", () => {
+    const mixed = checkAskGrounding(loadFixture(), "Never use `reboot`; switch to `npm ci`.");
+    expect(mixed.pass).toBe(false);
+    expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
+  });
+
+  it("enforces explicitly forbidden paths however they are written", () => {
+    const fixture: AskGroundingFixture = {
+      ...loadFixture(),
+      forbidden: { ...loadFixture().forbidden, paths: ["data/backup"] },
+    };
+    const relative = checkAskGrounding(fixture, "Restore data/backup before leaving.");
+    expect(relative.findings.map((finding) => finding.findingClass)).toContain("forbidden-path");
+    const fragment = checkAskGrounding(
+      { ...loadFixture(), forbidden: { ...loadFixture().forbidden, paths: ["memory.db"] } },
+      "Check ~/.munin-memory/memory.db for state.",
+    );
+    expect(fragment.findings.map((finding) => finding.findingClass)).not.toContain("forbidden-path");
+  });
+
   it("scopes negation to its own clause", () => {
     const mixed = checkAskGrounding(loadFixture(), "To avoid downtime, run `npm install`.");
     expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");

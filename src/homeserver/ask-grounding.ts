@@ -100,7 +100,7 @@ interface Sentence {
 }
 
 const NEGATION_RE = /\b(never|not|no|don't|doesn't|didn't|can't|cannot|won't|avoid|avoids|must not|mustn't|prohibit\w*|forbidden|banned)\b/iu;
-const ACTION_CUE = /(^|\b)(run|runs|running|execute|executes|use|uses|using|used|copy|copies|copied|do|does|perform|performs|follow|followed|following|type|enter|invoke|invokes|call|calls|apply|deploy|install|restart|restarts|start|starts|stop|stops|launch|launches|begin|begins|began|proceed|proceeds|retry|retries|try|tries|verif\w*)([\s:]|$)/iu;
+const ACTION_CUE = /(^|\b)(run|runs|running|execute|executes|use|uses|using|used|copy|copies|copied|do|does|perform|performs|follow|followed|following|type|enter|invoke|invokes|call|calls|apply|deploy|install|restart|restarts|start|starts|stop|stops|launch|launches|begin|begins|began|proceed|proceeds|retry|retries|try|tries|switch|switches|change|changes|move|moves|migrate|migrates|upgrade|upgrades|update|updates|replace|replaces|swap|swaps|convert|converts|point|points|verif\w*)([\s:]|$)/iu;
 const LABEL_ASSERTION = /:\s*\S/u;
 
 function cleanToken(raw: string): string {
@@ -333,6 +333,35 @@ function inNegated(index: number, ranges: Array<{ start: number; end: number }>)
   return index >= 0 && ranges.some(({ start, end }) => index >= start && index < end);
 }
 
+function checkForbiddenPaths(
+  fullText: string,
+  known: KnownSets,
+  negated: Array<{ start: number; end: number }>,
+  findings: AskGroundingFinding[],
+): void {
+  // Forbidden paths match as path-tokens anywhere, so a curated threat is
+  // enforceable even when the extractor would not yield it (relative paths,
+  // odd spellings). Boundaries keep allowed paths safe: a forbidden fragment
+  // never fires inside a longer allowed path. Plain string operations on
+  // purpose: no quoting layers to misread.
+  const PREFIX = ["", " ", "\t", "\n", "\"", "'", "`", "(", "[", "{"];
+  const SUFFIX = ["", " ", "\t", "\n", ".", ",", ";", ":", "!", "?", "\"", "'", ")", "]", "}", ">"];
+  for (const entry of known.forbiddenPaths) {
+    let from = 0;
+    for (;;) {
+      const at = fullText.indexOf(entry, from);
+      if (at < 0) break;
+      from = at + entry.length;
+      const before = at === 0 ? "" : (fullText[at - 1] ?? "");
+      const after = at + entry.length >= fullText.length ? "" : (fullText[at + entry.length] ?? "");
+      if (!PREFIX.includes(before) || !SUFFIX.includes(after)) continue;
+      if (inNegated(at, negated)) continue;
+      findings.push({ findingClass: "forbidden-path", detail: entry });
+      break;
+    }
+  }
+}
+
 function checkTerms(
   kind: Exclude<TermClass, "command">,
   extracted: Span[],
@@ -487,6 +516,7 @@ export function checkAskGrounding(fixture: AskGroundingFixture, outputText: stri
   const known = buildKnownSets(parsed);
   const negated = negatedRanges(outputText);
   const findings: AskGroundingFinding[] = [];
+  checkForbiddenPaths(outputText, known, negated, findings);
   checkTerms("path", extractPaths(outputText), known, negated, findings);
   checkTerms("flag", extractFlags(outputText), known, negated, findings);
   checkTerms("host", extractHosts(outputText), known, negated, findings);
