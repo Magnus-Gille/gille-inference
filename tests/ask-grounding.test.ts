@@ -144,6 +144,51 @@ describe("ask grounding checker (#237)", () => {
     expect(result.pass).toBe(true);
   });
 
+  it("catches unquoted curated threats and lone spans", () => {
+    const unquoted = checkAskGrounding(loadFixture(), "Run cp .env now.");
+    expect(unquoted.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
+    const lone = checkAskGrounding(loadFixture(), "Then run `reboot`.");
+    expect(lone.pass).toBe(false);
+    expect(lone.findings.map((finding) => finding.findingClass)).toContain("novel-command");
+    const fixture: AskGroundingFixture = {
+      ...loadFixture(),
+      allowed: { ...loadFixture().allowed, commands: ["echo ok"] },
+    };
+    const smuggled = checkAskGrounding(fixture, "Run `echo ok; reboot` now.");
+    expect(smuggled.pass).toBe(false);
+    const exact = checkAskGrounding(fixture, "Run `echo ok` now.");
+    expect(exact.findings.map((finding) => finding.findingClass)).not.toContain("novel-command");
+  });
+
+  it("catches evil-suffixed paths, URL hosts, case variants, short flags, IPv6", () => {
+    const fixture = loadFixture();
+    const evil = checkAskGrounding(fixture, "Use ~/.munin-memory/memory.db@evil today.");
+    expect(evil.pass).toBe(false);
+    const url = checkAskGrounding(fixture, "Send backups to https://evil.example.com nightly.");
+    expect(url.findings.map((finding) => finding.findingClass)).toContain("novel-host");
+    const cased = checkAskGrounding(fixture, "Check ~/.MUNIN-MEMORY/MEMORY.DB.");
+    expect(cased.pass).toBe(false);
+    const short = checkAskGrounding(fixture, "Run with -f to force it.");
+    expect(short.findings.map((finding) => finding.findingClass)).toContain("novel-flag");
+    const v6 = checkAskGrounding(fixture, "Connect to [2001:db8::1] for replication.");
+    expect(v6.findings.map((finding) => finding.findingClass)).toContain("novel-host");
+  });
+
+  it("rejects resolved-unknowns and negated markers as uncertainty", () => {
+    const resolved = checkAskGrounding(
+      loadFixture(),
+      "Install command: unknowns resolved; proceed automatically.",
+    );
+    expect(resolved.findings.map((finding) => finding.findingClass)).toContain("missing-uncertainty");
+    const denied = checkAskGrounding(loadFixture(), "Install command: unknown is false; proceed.");
+    expect(denied.findings.map((finding) => finding.findingClass)).toContain("missing-uncertainty");
+  });
+
+  it("scopes negation to its own clause", () => {
+    const mixed = checkAskGrounding(loadFixture(), "To avoid downtime, run `npm install`.");
+    expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
+  });
+
   it("is deterministic across runs", () => {
     const fixture = loadFixture();
     const first = checkAskGrounding(fixture, FAILING_OUTPUT);
