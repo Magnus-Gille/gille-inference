@@ -156,6 +156,30 @@ describe("doctor tailnet reporting (#242)", () => {
     expect(JSON.stringify(result)).not.toContain("private.invalid");
   });
 
+  it("maps a private identity timeout to the local layer when tailnet is down", async () => {
+    const hangingPrivate = async (input: unknown, init?: { body?: unknown; signal?: AbortSignal }) => {
+      const url = String(input);
+      if (url.startsWith("http://private.invalid")) {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+      }
+      return splitFetch()(url, init);
+    };
+    const result = await diagnoseProfile({
+      profile: "codex",
+      profileConfig: {
+        publicGatewayUrl: "https://public.invalid",
+        privateGatewayUrl: "http://private.invalid:8080",
+      },
+      credentialStore: { resolve: async () => SECRET },
+      fetch: hangingPrivate as typeof fetch,
+      timeoutMs: 1000,
+      localProbes: { tailnet: async () => "down" },
+    });
+    expect(result.endpoints).toMatchObject({ public: "healthy", private: "tailnet_unavailable" });
+  });
+
   it("keeps the existing network_failure status when tailnet state is unknown", async () => {
     const result = await diagnoseProfile({
       profile: "codex",

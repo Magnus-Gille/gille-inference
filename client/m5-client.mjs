@@ -1797,6 +1797,7 @@ function safeDoctorResult(result) {
 async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, endpoint, localProbes) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let headersReceived = false;
   try {
     const response = await fetchImpl(`${baseUrl}/portal/me`, {
       redirect: "error",
@@ -1806,6 +1807,7 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, en
       },
       signal: controller.signal,
     });
+    headersReceived = true;
     if (response.status === 401 || response.status === 403) {
       throw new M5ClientError(
         "rejected_credential",
@@ -1838,7 +1840,19 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, en
       );
     }
   } catch (error) {
+    const preHeaders = !headersReceived;
     if (controller.signal.aborted) {
+      if (endpoint === "private" && preHeaders) {
+        const tailnet = await probeTailnetStatus(localProbes?.tailnet);
+        if (tailnet === "down") {
+          throw new M5ClientError("timeout", "The gateway identity check timed out.", {
+            diagnosticCode: "connect_timeout",
+            failureLayer: "local_tailnet_unavailable",
+            retryable: false,
+            remediation: localTailnetRemediation(profile),
+          });
+        }
+      }
       throw new M5ClientError("timeout", "The gateway identity check timed out.", {
         diagnosticCode: "connect_timeout",
         failureLayer: "gateway_transport",
@@ -1979,6 +1993,14 @@ function modelCatalogueDigest(models) {
 
 function doctorEndpointFailure(error, profile, secrets) {
   const safe = safeError(error, secrets, profile);
+  // The local layer outranks every code branch: it names where the failure
+  // happened, not how the transport surfaced it.
+  if (safe.failureLayer === "local_tailnet_unavailable") {
+    return {
+      safe,
+      status: "tailnet_unavailable",
+    };
+  }
   let status = "unavailable";
   if (safe.code === "rejected_credential") {
     status = "rejected_credential";
