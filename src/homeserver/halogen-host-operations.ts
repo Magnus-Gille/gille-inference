@@ -349,6 +349,14 @@ export function createHalogenHostOperations(input: unknown): HalogenEvaluationOp
           if (!group.includes(`/${launch.unit}\n`)) throw new Error('candidate escaped bounded unit cgroup');
           const status = await readFile(`/proc/${c.State.Pid}/status`, 'utf8');
           if (!/^NoNewPrivs:\s+1$/m.test(status) || !/^CapEff:\s+0+$/m.test(status)) throw new Error('process privilege restriction mismatch');
+          // The #330 fix relies on inheriting (not setting) the 96 GiB
+          // ceiling, so prove the live process actually holds it on both
+          // the soft and hard limit before trusting any later stage.
+          const limits = await readFile(`/proc/${c.State.Pid}/limits`, 'utf8');
+          const memlock = /^Max locked memory\s+(\d+)\s+(\d+)\s+\S+/m.exec(limits);
+          if (!memlock || memlock[1] !== String(HALOGEN_MEMORY_BYTES) || memlock[2] !== String(HALOGEN_MEMORY_BYTES)) {
+            throw new Error('memlock ceiling mismatch');
+          }
           const mount = c.Mounts?.find((m: any) => m.Destination === '/models');
           if (!mount || mount.Source !== artifactDirectory || mount.RW !== false) throw new Error('model mount mismatch');
           return;
