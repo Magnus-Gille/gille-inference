@@ -344,8 +344,8 @@ function checkForbiddenPaths(
   // odd spellings). Boundaries keep allowed paths safe: a forbidden fragment
   // never fires inside a longer allowed path. Plain string operations on
   // purpose: no quoting layers to misread.
-  const PREFIX = ["", " ", "\t", "\n", "\"", "'", "`", "(", "[", "{"];
-  const SUFFIX = ["", " ", "\t", "\n", ".", ",", ";", ":", "!", "?", "\"", "'", ")", "]", "}", ">"];
+  const PREFIX = ["", " ", "\t", "\n", "\"", "'", "`", "(", "[", "{", "<"];
+  const SUFFIX = ["", " ", "\t", "\n", ".", ",", ";", ":", "!", "?", "\"", "'", "`", ")", "]", "}", ">"];
   for (const entry of known.forbiddenPaths) {
     let from = 0;
     for (;;) {
@@ -353,7 +353,16 @@ function checkForbiddenPaths(
       if (at < 0) break;
       from = at + entry.length;
       const before = at === 0 ? "" : (fullText[at - 1] ?? "");
-      const after = at + entry.length >= fullText.length ? "" : (fullText[at + entry.length] ?? "");
+      let after = at + entry.length >= fullText.length ? "" : (fullText[at + entry.length] ?? "");
+      // A dot continues a filename (backup.old) rather than ending a
+      // sentence; only a dot followed by non-word text is a boundary.
+      if (after === ".") {
+        const next = fullText[at + entry.length + 1] ?? "";
+        if (/[A-Za-z0-9]/.test(next)) {
+          from = at + entry.length;
+          continue;
+        }
+      }
       if (!PREFIX.includes(before) || !SUFFIX.includes(after)) continue;
       if (inNegated(at, negated)) continue;
       findings.push({ findingClass: "forbidden-path", detail: entry });

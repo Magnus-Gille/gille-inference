@@ -217,6 +217,20 @@ describe("ask grounding checker (#237)", () => {
     expect(fragment.findings.map((finding) => finding.findingClass)).not.toContain("forbidden-path");
   });
 
+  it("honors angle and code delimiters, and filename dots", () => {
+    const fixture: AskGroundingFixture = {
+      ...loadFixture(),
+      forbidden: { ...loadFixture().forbidden, paths: ["data/backup"] },
+      allowed: { ...loadFixture().allowed, paths: [...loadFixture().allowed.paths, "data/backup.old"] },
+    };
+    const angled = checkAskGrounding(fixture, "Restore <data/backup> before leaving.");
+    expect(angled.findings.map((finding) => finding.findingClass)).toContain("forbidden-path");
+    const ticked = checkAskGrounding(fixture, "Restore `data/backup` before leaving.");
+    expect(ticked.findings.map((finding) => finding.findingClass)).toContain("forbidden-path");
+    const extended = checkAskGrounding(fixture, "Restore data/backup.old before leaving.");
+    expect(extended.findings.map((finding) => finding.findingClass)).not.toContain("forbidden-path");
+  });
+
   it("scopes negation to its own clause", () => {
     const mixed = checkAskGrounding(loadFixture(), "To avoid downtime, run `npm install`.");
     expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
