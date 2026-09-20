@@ -77,6 +77,7 @@ export interface AskGroundingFinding {
     | "novel-flag"
     | "novel-host"
     | "novel-version"
+    | "unsupported-quote"
     | "missing-uncertainty";
   detail: string;
 }
@@ -200,6 +201,9 @@ function extractCodeSpans(text: string): Span[] {
     if (trimmed.length > 0) found.push({ value: trimmed, index: index ?? -1 });
   };
   for (const match of text.matchAll(/`([^`\n]+)`/gu)) push(match[1]!, match.index);
+  // Double-quoted phrases are the other citation shape in checklist prose.
+  // Length-gated: short quoted words ("ok", "yes") are labels, not evidence.
+  for (const match of text.matchAll(/"([^"\n]{8,})"/gu)) push(match[1]!, match.index);
   for (const match of text.matchAll(/```[\w]*\n([\s\S]*?)```/gu)) {
     for (const line of (match[1] ?? "").split("\n")) {
       push(line.trim().replace(/^[$#>]\s*/u, ""), match.index);
@@ -517,6 +521,60 @@ function checkUncertainty(
       });
     }
   }
+}
+
+/** Verify-against-source mode (#25): every quoted span must appear verbatim
+ * in the source, and every path/command/flag/host/version must either appear
+ * in the source or be explicitly allowed (none are by default).
+ * Returns unsupported assertions as findings. Paraphrased-but-true claims
+ * still fail: token-level grounding cannot judge semantics, so a calibrated
+ * judge owns meaning while this owns verbatim anchoring. Never throws on text.
+ */
+export function checkVerifyAgainstSource(
+  sourceText: string,
+  outputText: string,
+  allowedTerms: { paths?: string[]; commands?: string[]; flags?: string[]; hosts?: string[]; versions?: string[] } = {},
+): AskGroundingResult {
+  const findings: AskGroundingFinding[] = [];
+  // Spans verified verbatim against the source are quoted evidence, not
+  // novel commands: suppress them from the span check below.
+  const verifiedQuotes = new Set<string>();
+  for (const { value: raw } of extractCodeSpans(outputText)) {
+    const quote = cleanToken(raw);
+    if (quote.length === 0) continue;
+    if (!sourceText.includes(quote)) {
+      findings.push({ findingClass: "unsupported-quote", detail: quote.slice(0, 160) });
+    } else {
+      verifiedQuotes.add(quote.toLowerCase());
+    }
+  }
+  const fixture: AskGroundingFixture = {
+    schemaVersion: 1,
+    id: "verify-against-source",
+    instruction: "Assert only what the source states; quote or abstain.",
+    factsText: sourceText,
+    allowed: {
+      paths: allowedTerms.paths ?? [],
+      commands: allowedTerms.commands ?? [],
+      flags: allowedTerms.flags ?? [],
+      hosts: allowedTerms.hosts ?? [],
+      versions: allowedTerms.versions ?? [],
+    },
+    forbidden: { paths: [], commands: [], flags: [], hosts: [], versions: [] },
+    unverifiableAspects: [],
+  };
+  const anchored = checkAskGrounding(fixture, outputText);
+  for (const finding of anchored.findings) {
+    if (
+      finding.findingClass === "novel-command" &&
+      verifiedQuotes.has(cleanToken(finding.detail).toLowerCase())
+    ) {
+      continue;
+    }
+    findings.push(finding);
+  }
+  findings.sort((a, b) => a.findingClass.localeCompare(b.findingClass) || a.detail.localeCompare(b.detail));
+  return { pass: findings.length === 0, findings };
 }
 
 /** Check one model output against a parsed fixture. Never throws on text. */

@@ -104,6 +104,26 @@ An execution is not automatically capability evidence.
 - Capability evidence is written to or imported into the authoritative M5 ledger; Hugin must not
   create a competing capability database.
 
+### Verification-shaped tasks
+
+Verification prompts ("did X survive in Y", "list what B omits", deployment checklists from
+closed facts) are a known-weak lane: local tiers have fabricated confirmations and false-positive
+finding lists under them (#25), and invented deployment specifics under explicit no-invention
+constraints (#237). Until measured otherwise for a specific tier:
+
+- Shape the prompt as closed-fact plus cite-or-abstain: supply the source text, name the exact
+  allowed references, prohibit invention explicitly, and require uncertainty markers where the
+  facts run out. `checkVerifyAgainstSource` enforces verbatim anchoring deterministically
+  (unsupported quotes and novel terms fail); paraphrased-but-true claims and semantic
+  equivalence belong to a calibrated judge, tracked separately from constraint adherence.
+- Route high-stakes verification to the strongest eligible tier (frontier L1 when sensitivity
+  permits); treat qwen3-30B-class verification output as a draft requiring independent
+  confirmation, never as evidence on its own.
+- Under contention, expect first-attempt busy/timeout rates in the tens of percent on the
+  serial-GPU lanes (measured 40–60% at 3-way concurrency, #25): bounded retry, then escalate
+  per the rules above. Deeper contention behavior belongs to #18 (owner priority) and #196
+  (maintenance windows), not to the caller.
+
 ## Escalation
 
 Escalation is explicit and policy-bounded. Valid reasons include:

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   askGroundingFixtureSchema,
   checkAskGrounding,
+  checkVerifyAgainstSource,
   type AskGroundingFixture,
 } from "../src/homeserver/ask-grounding.js";
 
@@ -242,4 +243,42 @@ describe("ask grounding checker (#237)", () => {
     const second = checkAskGrounding(fixture, FAILING_OUTPUT);
     expect(second).toEqual(first);
   });
+});
+
+describe("verify-against-source mode (#25)", () => {
+  const SOURCE = [
+    "The rotation completed at midnight.",
+    "Config path: /srv/app/config.yaml.",
+    "Only owners may approve a rollback.",
+  ].join("\n");
+
+  it("fails fabricated quotes and invented terms", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'The log says "rotation completed at noon" and /srv/app/other.yaml holds it.',
+    );
+    expect(result.pass).toBe(false);
+    const classes = result.findings.map((finding) => finding.findingClass);
+    expect(classes).toContain("unsupported-quote");
+    expect(classes).toContain("novel-path");
+  });
+
+  it("passes fully anchored answers", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'Per source: "rotation completed at midnight" (see /srv/app/config.yaml); approval is owners-only per source.',
+    );
+    expect(result.findings).toEqual([]);
+    expect(result.pass).toBe(true);
+  });
+
+  it("leaves paraphrased truth to judges (documented residual)", () => {
+    // A true claim in other words introduces no novel path/command/flag/
+    // host/version and quotes nothing, so token-level grounding passes it.
+    // Catching that requires semantics: the calibrated judge owns meaning,
+    // this checker owns verbatim anchoring. The residual is the point.
+    const result = checkVerifyAgainstSource(SOURCE, "It finished at 12am.");
+    expect(result.pass).toBe(true);
+    expect(result.findings).toEqual([]);
+});
 });
