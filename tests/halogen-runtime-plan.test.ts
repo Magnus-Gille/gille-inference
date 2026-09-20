@@ -45,7 +45,10 @@ describe("Halogen runtime launch plan", () => {
     expect(args).toContain("--setenv=XDG_RUNTIME_DIR=/run/user/1000");
     expect(args).toContain("--property=SupplementaryGroups=render video");
     expect(args).toContain("--property=LimitMEMLOCK=" + HALOGEN_MEMORY_BYTES);
-    expect(args).toContain("--ulimit=memlock=" + HALOGEN_MEMORY_BYTES + ":" + HALOGEN_MEMORY_BYTES);
+    // #330: a rootless container cannot raise its own hard memlock limit
+    // (crun EPERM), so no container-level memlock ulimit may be passed. The
+    // processes inherit the unit-level LimitMEMLOCK ceiling instead.
+    expect(args.filter((arg) => arg.startsWith("--ulimit="))).toEqual([]);
     expect(args).toContain("--setenv=PATH=/usr/bin:/bin");
     expect(args).not.toContain("--user");
     expect(args).not.toContain("--global");

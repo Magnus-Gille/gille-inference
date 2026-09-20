@@ -41,7 +41,10 @@ export function buildHalogenLaunch(profile: unknown, options: unknown): HalogenL
       '/usr/bin/podman', 'run', `--name=${o.name}`, `--label=gille-inference.run-id=${o.runId}`, '--pull=never', '--network=none', `--timeout=${HALOGEN_RUNTIME_SECONDS}`,
       '--cgroups=disabled', '--read-only', '--read-only-tmpfs=false', '--image-volume=ignore',
       '--ipc=private', '--shm-size=512m',
-      `--ulimit=memlock=${HALOGEN_MEMORY_BYTES}:${HALOGEN_MEMORY_BYTES}`, '--cap-drop=ALL', '--security-opt=no-new-privileges',
+      // No container-level memlock ulimit (#330): a rootless container
+      // cannot raise its own hard limit (crun EPERM). The processes inherit
+      // the unit-level LimitMEMLOCK ceiling above instead.
+      '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--group-add=keep-groups', '--device=/dev/kfd', '--device=/dev/dri/renderD128',
       '--volume', `${o.artifactDirectory}:/models:ro`,
       '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=512m',

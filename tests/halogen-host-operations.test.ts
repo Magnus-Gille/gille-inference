@@ -3,7 +3,7 @@ import { HALOGEN_PILOT_PROFILE, halogenProfileHash } from "../src/homeserver/hal
 import { HALOGEN_MEMORY_BYTES } from "../src/homeserver/halogen-runtime-plan.js";
 
 type FuserResponse = { stdout?: string; error?: { code: number; stdout?: string; stderr?: string } };
-type State = { fuser: FuserResponse[]; memory: number[]; gpuGroups: Record<string, string>; hashIndex: number; psName: string; inspect: any; configJson: string | Error; charDevices: string[] };
+type State = { fuser: FuserResponse[]; memory: number[]; gpuGroups: Record<string, string>; hashIndex: number; psName: string; inspect: any; configJson: string | Error; charDevices: string[]; procLimits: string };
 
 const runnerCommit = "b".repeat(40);
 const runId = "0123456789abcdef0123456789abcdef";
@@ -15,7 +15,7 @@ const profileHash = halogenProfileHash(HALOGEN_PILOT_PROFILE);
 const candidatePid = 9999;
 const candidateStaticDir = "/run/containers/valid";
 const artifactDirectory = `/home/operator/halogen-eval-317/staging/${HALOGEN_PILOT_PROFILE.modelRevision}`;
-const state: State = { fuser: [], memory: [], gpuGroups: {}, hashIndex: 0, psName: "", inspect: null, configJson: "", charDevices: [] };
+const state: State = { fuser: [], memory: [], gpuGroups: {}, hashIndex: 0, psName: "", inspect: null, configJson: "", charDevices: [], procLimits: "Max locked memory 103079215104 103079215104 bytes" };
 
 const properties = (unit: string): string => {
   const missing = unit === "gille-317-halogen-01.service" || unit === "gille-317-prior-01.service";
@@ -96,6 +96,10 @@ beforeAll(async () => {
     if (path === `/proc/${priorPid}/stat`) return priorStat;
     if (path === `/proc/${candidatePid}/status`) {
       return "Name: conmon\nNoNewPrivs:\t1\nCapEff:\t0000000000000000\n";
+    }
+    if (path === `/proc/${candidatePid}/limits`) {
+      if (state.procLimits === "THROW") throw new Error("EACCES");
+      return state.procLimits;
     }
     const cgroupLimit = path.match(/^\/sys\/fs\/cgroup\/system\.slice\/gille-317-halogen-01\.service\/(.+)$/)?.[1];
     if (cgroupLimit) {
@@ -261,6 +265,7 @@ async function contained(configJson: string | Error, inspectOverride?: Record<st
   state.psName = "";
   state.inspect = null;
   state.charDevices = charDevices;
+  state.procLimits = "Max locked memory 103079215104 103079215104 bytes";
   const operations = await prepared([{ error: { code: 1, stdout: "", stderr: "" } }]);
   state.psName = "gille-317-halogen-01";
   state.inspect = { ...validContainer(), ...(inspectOverride ?? {}) };
@@ -316,6 +321,26 @@ describe("verifyContainment device binds (#327)", () => {
       { type: "tmpfs", source: "shm", destination: "/dev/shm", options: ["nosuid", "noexec", "nodev"] },
     ]));
     expect(outcome.error).toBeUndefined();
+  });
+
+  it("proves the live memlock ceiling instead of assuming inheritance (#330)", async () => {
+    const outcome = await contained(validConfig());
+    expect(outcome.error).toBeUndefined();
+  });
+
+  it.each([
+    ["soft limit lowered", "Max locked memory 65536 103079215104 bytes"],
+    ["ceiling missing", "Max open files 1024 1048576 files"],
+  ])("rejects %s memlock evidence", async (_label, procLimits) => {
+    state.psName = "";
+    state.inspect = null;
+    const operations = await prepared([{ error: { code: 1, stdout: "", stderr: "" } }]);
+    state.psName = "gille-317-halogen-01";
+    state.inspect = validContainer();
+    state.configJson = validConfig();
+    state.procLimits = procLimits;
+    state.gpuGroups[String(candidatePid)] = "0::/system.slice/gille-317-halogen-01.service\n";
+    await expect(operations.verifyContainment()).rejects.toThrow("memlock ceiling mismatch");
   });
 
   it("rejects malformed OCI config naming the cause", async () => {
