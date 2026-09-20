@@ -17,6 +17,7 @@ import {
   createKeychainCredentialStore,
   createM5Client,
   diagnoseProfile,
+  provisionRemediation,
   redactText,
   validateProfileConfig,
 } from "./m5-client.mjs";
@@ -255,6 +256,7 @@ function selectedProfile(config, profile) {
     throw new M5ClientError(
       "unknown_profile",
       "The selected profile is not present in m5 config.",
+      { remediation: provisionRemediation(profile) },
     );
   }
   return validateProfileConfig(raw);
@@ -386,6 +388,11 @@ export async function main(
       throw new M5ClientError(
         "endpoint_not_configured",
         "The selected profile does not configure that gateway path.",
+        {
+          failureLayer: "public_route_unconfigured",
+          retryable: false,
+          remediation: `Configure the ${endpoint} gateway path for the profile, then verify it: m5 --profile ${/^[a-z][a-z0-9_-]{0,31}$/i.test(profile ?? "") ? profile : "selected"} doctor. Never point a profile at a loopback address as a substitute for a configured route.`,
+        },
       );
     }
     const client = await createM5Client({

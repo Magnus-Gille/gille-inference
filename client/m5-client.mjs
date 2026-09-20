@@ -47,6 +47,12 @@ const FAILURE_LAYERS = new Set([
   "gateway_transport",
   "gateway_health",
   "gateway_protocol",
+  // Local failing layers (#242): named before any network access so a dead
+  // tailnet, an unconfigured route, or a broken connector transport is never
+  // reported as a generic gateway failure.
+  "connector_transport",
+  "local_tailnet_unavailable",
+  "public_route_unconfigured",
 ]);
 
 /** The standalone client cannot inspect an interactive host connector session. */
@@ -204,6 +210,22 @@ export function credentialRemediation(profile) {
   const selected = safeProfileForDiagnostic(profile);
   const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
   return `Restore the selected profile credential through the owner-attended Keychain recovery/rotation procedure, then rerun: ${command}.`;
+}
+
+/** Locator-free recovery for a down local tailnet (#242). */
+export function localTailnetRemediation(profile) {
+  const selected = safeProfileForDiagnostic(profile);
+  const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
+  return `Start Tailscale on this machine and verify the tailnet path is up, then run ${command}; no request reached the gateway.`;
+}
+
+/** Recovery routing for a missing named profile: the secret-safe provision flow (#184). */
+export function provisionRemediation(profile) {
+  const selected = safeProfileForDiagnostic(profile);
+  if (selected === "selected") {
+    return "Create the profile through the owner-attended secret-safe provision flow, then verify it with m5 doctor.";
+  }
+  return `The profile is not present. Create it through the owner-attended secret-safe provision flow (m5 --profile ${selected} provision), then verify it with m5 --profile ${selected} doctor. Never copy a bearer between configs or machines.`;
 }
 
 /** Fixed, locator-free recovery text shared by direct and connector transport failures. */
@@ -1030,6 +1052,45 @@ function delay(ms) {
 }
 
 /**
+ * Best-effort local tailnet state (#242). Returns up/down/unknown and never
+ * throws: an absent CLI, a timeout, or a malformed injected probe all mean
+ * unknown, never a fabricated down. Only consulted after a private-path
+ * transport failure, never on the hot path.
+ */
+export function probeTailnetStatus(tailnetProbe) {
+  const probe = tailnetProbe ?? defaultTailnetProbe;
+  return (async () => {
+    try {
+      const status = await probe();
+      if (status === "up" || status === "down" || status === "unknown") return status;
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
+  })();
+}
+
+function defaultTailnetProbe() {
+  return new Promise((resolve) => {
+    nodeExecFile("tailscale", ["status"], { timeout: 5_000, killSignal: "SIGTERM" }, (error) => {
+      if (!error) {
+        resolve("up");
+        return;
+      }
+      if (error.code === "ENOENT") {
+        resolve("unknown");
+        return;
+      }
+      if (error.killed === true || error.code === "ETIMEDOUT") {
+        resolve("unknown");
+        return;
+      }
+      resolve("down");
+    });
+  });
+}
+
+/**
  * Resolve the selected credential once, then retain it only in closure scope.
  */
 export async function createM5Client({
@@ -1041,7 +1102,14 @@ export async function createM5Client({
   timeoutMs = 30_000,
   sleep = delay,
   adoptionSpool = createFileAdoptionSpool(),
+  localProbes,
 }) {
+  if (localProbes !== undefined && (typeof localProbes !== "object" || localProbes === null || Array.isArray(localProbes))) {
+    throw new M5ClientError(
+      "invalid_config",
+      "localProbes must be an object with optional probe functions.",
+    );
+  }
   if (endpoint !== "public" && endpoint !== "private") {
     throw new M5ClientError(
       "invalid_config",
@@ -1214,6 +1282,21 @@ export async function createM5Client({
       }
       if (error instanceof M5ClientError) throw error;
       const diagnosticCode = networkDiagnosticCode(error);
+      if (endpoint === "private") {
+        const tailnet = await probeTailnetStatus(localProbes?.tailnet);
+        if (tailnet === "down") {
+          throw new M5ClientError(
+            "network_failure",
+            `The M5 gateway transport failed (${diagnosticCode}).`,
+            {
+              diagnosticCode,
+              failureLayer: "local_tailnet_unavailable",
+              retryable: false,
+              remediation: localTailnetRemediation(profile),
+            },
+          );
+        }
+      }
       throw new M5ClientError(
         "network_failure",
         `The M5 gateway transport failed (${diagnosticCode}).`,
@@ -1329,6 +1412,21 @@ export async function createM5Client({
       }
       if (error instanceof M5ClientError) throw error;
       const diagnosticCode = networkDiagnosticCode(error);
+      if (endpoint === "private") {
+        const tailnet = await probeTailnetStatus(localProbes?.tailnet);
+        if (tailnet === "down") {
+          throw new M5ClientError(
+            "network_failure",
+            `The M5 gateway transport failed (${diagnosticCode}).`,
+            {
+              diagnosticCode,
+              failureLayer: "local_tailnet_unavailable",
+              retryable: false,
+              remediation: localTailnetRemediation(profile),
+            },
+          );
+        }
+      }
       throw new M5ClientError(
         "network_failure",
         `The M5 gateway transport failed (${diagnosticCode}).`,
@@ -1662,7 +1760,7 @@ function safeDoctorResult(result) {
   }, []);
 }
 
-async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs) {
+async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, endpoint, localProbes) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -1716,6 +1814,21 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs) {
     }
     if (error instanceof M5ClientError) throw error;
     const diagnosticCode = networkDiagnosticCode(error);
+    if (endpoint === "private") {
+      const tailnet = await probeTailnetStatus(localProbes?.tailnet);
+      if (tailnet === "down") {
+        throw new M5ClientError(
+          "network_failure",
+          `The gateway identity check transport failed (${diagnosticCode}).`,
+          {
+            diagnosticCode,
+            failureLayer: "local_tailnet_unavailable",
+            retryable: false,
+            remediation: localTailnetRemediation(profile),
+          },
+        );
+      }
+    }
     throw new M5ClientError(
       "network_failure",
       `The gateway identity check transport failed (${diagnosticCode}).`,
@@ -1758,8 +1871,9 @@ async function endpointDoctor({
   credentialStore,
   fetchImpl,
   timeoutMs,
+  localProbes,
 }) {
-  const identity = await identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs);
+  const identity = await identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, endpoint, localProbes);
   const client = await createM5Client({
     gatewayUrl: baseUrl,
     endpoint,
@@ -1767,6 +1881,7 @@ async function endpointDoctor({
     credentialStore,
     fetch: fetchImpl,
     timeoutMs,
+    localProbes,
   });
   const response = await client.rpc({
     jsonrpc: "2.0",
@@ -1844,6 +1959,8 @@ function doctorEndpointFailure(error, profile, secrets) {
     if (/\b(?:server\s+)?busy\b/i.test(safe.message)) status = "busy";
     else if (/\b(?:timed?\s*out|timeout)\b/i.test(safe.message)) status = "timeout";
     else status = "backend_failure";
+  } else if (safe.failureLayer === "local_tailnet_unavailable") {
+    status = "tailnet_unavailable";
   } else if (safe.code === "network_failure") {
     // `network_failure` was the original public doctor status. Keep it stable for callers while
     // retaining the richer diagnostic code for newer consumers.
@@ -1898,6 +2015,7 @@ export async function diagnoseProfile({
   credentialStore = createKeychainCredentialStore(),
   fetch: fetchImpl = globalThis.fetch,
   timeoutMs = 10_000,
+  localProbes,
 }) {
   const config = validateProfileConfig(profileConfig);
   let token;
@@ -1944,6 +2062,7 @@ export async function diagnoseProfile({
       credentialStore: internalStore,
       fetchImpl,
       timeoutMs,
+      localProbes,
     });
   } catch (error) {
     const failure = doctorEndpointFailure(error, profile, [token]);
@@ -2042,6 +2161,7 @@ export async function diagnoseProfile({
       credentialStore: internalStore,
       fetchImpl,
       timeoutMs,
+      localProbes,
     });
   } catch (error) {
     const failure = doctorEndpointFailure(error, profile, [token]);
@@ -2052,6 +2172,9 @@ export async function diagnoseProfile({
       credential: "present",
       ...(status === "rejected_credential"
         ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
+        : {}),
+      ...(status === "tailnet_unavailable"
+        ? { remediation: failure.safe.remediation ?? localTailnetRemediation(profile) }
         : {}),
       ...(failure.safe.code === "rejected_credential"
         ? {}

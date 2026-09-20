@@ -106,7 +106,11 @@ structural verification or other automatic signals.
 
 The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
 `diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,
-gateway-health, and authentication failures. Adoption reports return a scoped acknowledgement:
+gateway-health, and authentication failures. Three local layers name failures before any
+network access: `public_route_unconfigured` (the profile has no route — configure it, never
+substitute loopback), `local_tailnet_unavailable` (private path with the tailnet down —
+start Tailscale, then rerun doctor), and the already-emitted `connector_transport`. A missing
+profile routes to the secret-safe provision flow. Adoption reports return a scoped acknowledgement:
 `retention: "retained"` means the row was stored, `retention: "aggregated"` means the bounded
 telemetry cap was reached but the observation was folded into a safe aggregate, and
 `retention: "dropped"` identifies a telemetry-only refusal. A telemetry cap is never an M5
