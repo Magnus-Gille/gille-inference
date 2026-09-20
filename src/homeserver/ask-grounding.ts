@@ -78,6 +78,7 @@ export interface AskGroundingFinding {
     | "novel-host"
     | "novel-version"
     | "unsupported-quote"
+    | "polarity-reversal"
     | "missing-uncertainty";
   detail: string;
 }
@@ -201,14 +202,32 @@ function extractCodeSpans(text: string): Span[] {
     if (trimmed.length > 0) found.push({ value: trimmed, index: index ?? -1 });
   };
   for (const match of text.matchAll(/`([^`\n]+)`/gu)) push(match[1]!, match.index);
-  // Double-quoted phrases are the other citation shape in checklist prose.
-  // Length-gated: short quoted words ("ok", "yes") are labels, not evidence.
-  for (const match of text.matchAll(/"([^"\n]{8,})"/gu)) push(match[1]!, match.index);
   for (const match of text.matchAll(/```[\w]*\n([\s\S]*?)```/gu)) {
     for (const line of (match[1] ?? "").split("\n")) {
       push(line.trim().replace(/^[$#>]\s*/u, ""), match.index);
     }
   }
+  return found;
+}
+
+/**
+ * Quoted spans are citation candidates, not commands: backticked and fenced
+ * content (above), double-quoted phrases, single-quoted phrases containing a
+ * space (so don't/it's never count), and curly-quoted phrases. Length-gated
+ * so short labels ("ok", "yes") are never treated as evidence claims.
+ */
+function extractQuotedSpans(text: string): Span[] {
+  const found: Span[] = [];
+  const push = (raw: string, index: number | undefined): void => {
+    const trimmed = raw.trim();
+    if (trimmed.length > 0) found.push({ value: trimmed, index: index ?? -1 });
+  };
+  for (const match of text.matchAll(/`([^`\n]+)`/gu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/"([^"\n]{8,})"/gu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/'([^'\n]{8,}?[^'\n\s][^'\n]*)'/gu)) {
+    if (/\s/u.test(match[1] ?? "")) push(match[1]!, match.index);
+  }
+  for (const match of text.matchAll(/\u201c([^\u201d\n]{8,})\u201d/gu)) push(match[1]!, match.index);
   return found;
 }
 
@@ -539,13 +558,24 @@ export function checkVerifyAgainstSource(
   // Spans verified verbatim against the source are quoted evidence, not
   // novel commands: suppress them from the span check below.
   const verifiedQuotes = new Set<string>();
-  for (const { value: raw } of extractCodeSpans(outputText)) {
+  const CONTRAST_RE = /\b(but|however|instead|ignore|ignoring|disregard|despite|although|though|nevertheless)\b/iu;
+  for (const { value: raw, index } of extractQuotedSpans(outputText)) {
     const quote = cleanToken(raw);
     if (quote.length === 0) continue;
     if (!sourceText.includes(quote)) {
       findings.push({ findingClass: "unsupported-quote", detail: quote.slice(0, 160) });
-    } else {
-      verifiedQuotes.add(quote.toLowerCase());
+      continue;
+    }
+    verifiedQuotes.add(quote.toLowerCase());
+    const at = index < 0 ? 0 : index;
+    const windowAfter = outputText.slice(at, at + quote.length + 120);
+    const windowBefore = outputText.slice(Math.max(0, at - 120), at);
+    if (
+      CONTRAST_RE.test(windowAfter) &&
+      ACTION_CUE.test(windowAfter) &&
+      !CONTRAST_RE.test(windowBefore)
+    ) {
+      findings.push({ findingClass: "polarity-reversal", detail: quote.slice(0, 160) });
     }
   }
   const fixture: AskGroundingFixture = {

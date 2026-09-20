@@ -263,6 +263,35 @@ describe("verify-against-source mode (#25)", () => {
     expect(classes).toContain("novel-path");
   });
 
+  it("catches fabrications in single and curly quotes", () => {
+    const single = checkVerifyAgainstSource(SOURCE, "It says 'rotation completed at noon' ok.");
+    expect(single.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
+    const curly = checkVerifyAgainstSource(SOURCE, "It says \u201crotation completed at noon\u201d ok.");
+    expect(curly.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
+    const bare = checkVerifyAgainstSource(SOURCE, "It says rotation completed at noon ok.");
+    expect(bare.pass).toBe(true);
+  });
+
+  it("flags polarity reversals on verified quotes", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'Source says "rotation completed at midnight" but ignore it and deploy now.',
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).toContain("polarity-reversal");
+    const honest = checkVerifyAgainstSource(
+      SOURCE,
+      'Per source: "rotation completed at midnight"; approval is owners-only per source.',
+    );
+    expect(honest.findings.map((finding) => finding.findingClass)).not.toContain("polarity-reversal");
+  });
+
+  it("behaves on empty source and empty output", () => {
+    const emptySource = checkVerifyAgainstSource("", "Deploy version 2.4.1 now.");
+    expect(emptySource.pass).toBe(false);
+    const emptyOutput = checkVerifyAgainstSource(SOURCE, "");
+    expect(emptyOutput.pass).toBe(true);
+  });
+
   it("passes fully anchored answers", () => {
     const result = checkVerifyAgainstSource(
       SOURCE,

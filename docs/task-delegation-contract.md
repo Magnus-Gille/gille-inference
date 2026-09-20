@@ -114,8 +114,9 @@ constraints (#237). Until measured otherwise for a specific tier:
 - Shape the prompt as closed-fact plus cite-or-abstain: supply the source text, name the exact
   allowed references, prohibit invention explicitly, and require uncertainty markers where the
   facts run out. `checkVerifyAgainstSource` enforces verbatim anchoring deterministically
-  (unsupported quotes and novel terms fail); paraphrased-but-true claims and semantic
-  equivalence belong to a calibrated judge, tracked separately from constraint adherence.
+  (unsupported quotes, unanchored terms, and polarity reversals fail); it cannot see meaning,
+  so paraphrased-but-true claims, supported free-text reasoning, and empty outputs pass it by
+  design. A calibrated judge owns semantics; track the two scores separately, never merged.
 - Route high-stakes verification to the strongest eligible tier (frontier L1 when sensitivity
   permits); treat qwen3-30B-class verification output as a draft requiring independent
   confirmation, never as evidence on its own.
