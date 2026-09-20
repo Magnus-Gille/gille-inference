@@ -16,9 +16,10 @@
  * - Bare integers and single-label names are checked against the forbidden
  *   lists only: flagging every number or word as novel would drown honest
  *   output, while curated threats are still caught.
- * - Findings inside negating clauses ("never run X") are skipped: prohibiting
- *   an item is not introducing it. Negation never crosses a clause boundary
- *   ("to avoid downtime, run X" stays checked).
+ * - A negation word exempts only what follows it: "never run X" is a
+ *   prohibition, but "run X to avoid downtime" stays checked. The exemption
+ *   carries over clause boundaries only into verbless list continuations
+ *   ("never use A, B, or C"), never into a clause with its own action.
  * - Single-slash relative paths without dots, bare integers, and single-label
  *   names are checked against the forbidden lists only: flagging every
  *   slash-pair, number, or word as novel would drown honest output, while
@@ -98,7 +99,7 @@ interface Sentence {
   end: number;
 }
 
-const NEGATION_RE = /\b(never|don't|does not|doesn't|do not|avoid|avoids|must not|mustn't|prohibit\w*|forbidden|banned|instead of|rather than)\b/iu;
+const NEGATION_RE = /\b(never|not|no|don't|doesn't|didn't|can't|cannot|won't|avoid|avoids|must not|mustn't|prohibit\w*|forbidden|banned)\b/iu;
 const ACTION_CUE = /(^|\b)(run|runs|running|execute|executes|use|uses|using|used|copy|copies|copied|do|does|perform|performs|follow|followed|following|type|enter|invoke|invokes|call|calls|apply|deploy|install|verif\w*)([\s:]|$)/iu;
 const LABEL_ASSERTION = /:\s*\S/u;
 
@@ -299,13 +300,25 @@ function knownAnywhere(raw: string, known: KnownSets, caseSensitive: boolean): b
 }
 
 function negatedRanges(text: string): Array<{ start: number; end: number }> {
-  // Negation exempts only its own clause: "never run X" is a prohibition,
-  // but "to avoid downtime, run X" prescribes X and stays checked.
+  // A negation word exempts what FOLLOWS it: "never run X" covers X, while
+  // "run X to avoid downtime" leaves X checked. The exemption carries over
+  // a clause boundary only into verbless list continuations ("never use A,
+  // B, or C"), never into a clause with its own action verb.
   const ranges: Array<{ start: number; end: number }> = [];
   for (const { text: sentence, start: base } of splitSentencesWithOffsets(text)) {
     let cursor = 0;
+    let open = false;
     for (const clause of sentence.split(/[,;:]/u)) {
-      if (NEGATION_RE.test(clause)) ranges.push({ start: base + cursor, end: base + cursor + clause.length });
+      const clauseStart = base + cursor;
+      const negated = NEGATION_RE.exec(clause);
+      if (negated && negated.index !== undefined) {
+        ranges.push({ start: clauseStart + negated.index + negated[0].length, end: clauseStart + clause.length });
+        open = true;
+      } else if (open && !ACTION_CUE.test(clause)) {
+        ranges.push({ start: clauseStart, end: clauseStart + clause.length });
+      } else {
+        open = false;
+      }
       cursor += clause.length + 1;
     }
   }

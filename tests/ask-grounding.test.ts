@@ -184,6 +184,13 @@ describe("ask grounding checker (#237)", () => {
     expect(denied.findings.map((finding) => finding.findingClass)).toContain("missing-uncertainty");
   });
 
+  it("exempts only what follows the negation word", () => {
+    const after = checkAskGrounding(loadFixture(), "Run `npm install` to avoid downtime.");
+    expect(after.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
+    const listed = checkAskGrounding(loadFixture(), "Never use `npm install`, `yarn install`, or `reboot`.");
+    expect(listed.pass).toBe(true);
+  });
+
   it("scopes negation to its own clause", () => {
     const mixed = checkAskGrounding(loadFixture(), "To avoid downtime, run `npm install`.");
     expect(mixed.findings.map((finding) => finding.findingClass)).toContain("forbidden-command");
