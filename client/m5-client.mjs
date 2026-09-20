@@ -53,6 +53,7 @@ const FAILURE_LAYERS = new Set([
   "connector_transport",
   "local_tailnet_unavailable",
   "public_route_unconfigured",
+  "private_route_unconfigured",
 ]);
 
 /** The standalone client cannot inspect an interactive host connector session. */
@@ -1070,22 +1071,21 @@ export function probeTailnetStatus(tailnetProbe) {
   })();
 }
 
-function defaultTailnetProbe() {
+export function defaultTailnetProbe(execImpl = nodeExecFile) {
   return new Promise((resolve) => {
-    nodeExecFile("tailscale", ["status"], { timeout: 5_000, killSignal: "SIGTERM" }, (error) => {
+    execImpl("tailscale", ["status"], { timeout: 5_000, killSignal: "SIGTERM" }, (error) => {
       if (!error) {
         resolve("up");
         return;
       }
-      if (error.code === "ENOENT") {
-        resolve("unknown");
+      // Only a clean non-zero exit from a real tailscale CLI means down.
+      // Missing binaries, timeouts, permission errors, and anything else
+      // mean unknown: never fabricate a down state without evidence.
+      if (typeof error.code === "number") {
+        resolve("down");
         return;
       }
-      if (error.killed === true || error.code === "ETIMEDOUT") {
-        resolve("unknown");
-        return;
-      }
-      resolve("down");
+      resolve("unknown");
     });
   });
 }
@@ -1172,6 +1172,7 @@ export async function createM5Client({
   async function request(message, retrySession = true) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let headersReceived = false;
     try {
       const resolvedToken = await resolveToken();
       const response = await fetchImpl(`${origin}/mcp`, {
@@ -1221,6 +1222,7 @@ export async function createM5Client({
       if (returnedSession) sessionId = returnedSession;
       // Keep the same abort deadline active through body consumption. Fetch resolving headers
       // is not completion: a peer can otherwise hold this sequential stdio bridge forever.
+      headersReceived = true;
       const text = await response.text();
       if (text.trim() === "") {
         if (message.id === undefined || message.id === null) return null;
@@ -1272,7 +1274,22 @@ export async function createM5Client({
       }
       return redactValue(parsed, secrets);
     } catch (error) {
+      // The tailnet layer applies only before response headers: a reset
+      // after HTTP 200 means the gateway was reached (and may have accepted
+      // the operation), so it must never be relabeled local.
+      const preHeaders = !headersReceived;
       if (controller.signal.aborted) {
+        if (endpoint === "private" && preHeaders) {
+          const tailnet = await probeTailnetStatus(localProbes?.tailnet);
+          if (tailnet === "down") {
+            throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+              diagnosticCode: "connect_timeout",
+              failureLayer: "local_tailnet_unavailable",
+              retryable: false,
+              remediation: localTailnetRemediation(profile),
+            });
+          }
+        }
         throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
           diagnosticCode: "connect_timeout",
           failureLayer: "gateway_transport",
@@ -1282,7 +1299,7 @@ export async function createM5Client({
       }
       if (error instanceof M5ClientError) throw error;
       const diagnosticCode = networkDiagnosticCode(error);
-      if (endpoint === "private") {
+      if (endpoint === "private" && preHeaders) {
         const tailnet = await probeTailnetStatus(localProbes?.tailnet);
         if (tailnet === "down") {
           throw new M5ClientError(
@@ -1315,6 +1332,7 @@ export async function createM5Client({
   async function requestExecutionFeedback(feedbackHandle, usefulness) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let headersReceived = false;
     try {
       const resolvedToken = await resolveToken();
       const response = await fetchImpl(`${origin}/execution-feedback/${feedbackHandle}`, {
@@ -1332,6 +1350,7 @@ export async function createM5Client({
 
       // Keep the same deadline active through body consumption. Error bodies are deliberately
       // discarded so a gateway cannot reflect prompts, handles, or credentials into the CLI.
+      headersReceived = true;
       const text = await response.text();
       if (response.status === 201 || response.status === 200) {
         let parsed;
@@ -1402,7 +1421,22 @@ export async function createM5Client({
         },
       );
     } catch (error) {
+      // The tailnet layer applies only before response headers: a reset
+      // after HTTP 200 means the gateway was reached (and may have accepted
+      // the operation), so it must never be relabeled local.
+      const preHeaders = !headersReceived;
       if (controller.signal.aborted) {
+        if (endpoint === "private" && preHeaders) {
+          const tailnet = await probeTailnetStatus(localProbes?.tailnet);
+          if (tailnet === "down") {
+            throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+              diagnosticCode: "connect_timeout",
+              failureLayer: "local_tailnet_unavailable",
+              retryable: false,
+              remediation: localTailnetRemediation(profile),
+            });
+          }
+        }
         throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
           diagnosticCode: "connect_timeout",
           failureLayer: "gateway_transport",
@@ -1412,7 +1446,7 @@ export async function createM5Client({
       }
       if (error instanceof M5ClientError) throw error;
       const diagnosticCode = networkDiagnosticCode(error);
-      if (endpoint === "private") {
+      if (endpoint === "private" && preHeaders) {
         const tailnet = await probeTailnetStatus(localProbes?.tailnet);
         if (tailnet === "down") {
           throw new M5ClientError(
@@ -1450,7 +1484,7 @@ export async function createM5Client({
     const transportOutage =
       error instanceof M5ClientError &&
       ADOPTION_SPOOL_TRANSPORT_CODES.has(error.code) &&
-      error.retryable !== false;
+      (error.retryable !== false || error.failureLayer === "local_tailnet_unavailable");
     if (!transportOutage || !adoptionSpool) return safeError(error, secrets, profile);
     const evidenceRecovery =
       (await spoolAdoptionOutageReport(adoptionSpool, {

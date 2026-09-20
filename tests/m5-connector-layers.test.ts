@@ -10,6 +10,7 @@ import {
   localTailnetRemediation,
   provisionRemediation,
   createFileAdoptionSpool,
+  defaultTailnetProbe,
 } from "../client/m5-client.mjs";
 import { main as m5main } from "../client/m5.mjs";
 
@@ -177,19 +178,26 @@ describe("adoption evidence spool (#242)", () => {
     rmSync(spoolDir, { recursive: true, force: true });
   });
 
-  function spooledClient() {
+  function spooledClient(tailnet: () => Promise<string>) {
     return createM5Client({
       gatewayUrl: "http://private.invalid:8080",
       endpoint: "private",
       profile: "codex",
       credentialStore: { resolve: async () => SECRET },
       fetch: refusedFetch(),
+      localProbes: { tailnet },
       adoptionSpool: createFileAdoptionSpool({ spoolDir }),
     });
   }
 
-  it("spools a validated report on transport failure and names the recovery", async () => {
-    const client = await spooledClient();
+  function spooledPayloads(dir: string): unknown[] {
+    return readdirSync(dir)
+      .filter((name) => name.startsWith("adoption-"))
+      .map((name) => JSON.parse(readFileSync(join(dir, name), "utf8")));
+  }
+
+  it("spools on transport failure with unknown tailnet and names the recovery", async () => {
+    const client = await spooledClient(async () => "unknown");
     const failure = await client.reportAdoption(VALID_REPORT).then(
       () => { throw new Error("expected failure"); },
       (error: unknown) => error as M5ClientError,
@@ -199,65 +207,95 @@ describe("adoption evidence spool (#242)", () => {
     expect(serialized.error.evidence_recovery.status).toBe("spooled");
     expect(serialized.error.evidence_recovery.spool_id).toMatch(/^adoption-/);
     expect(serialized.error.evidence_recovery.action).toBe("retry_same_tool_call");
-    expect(JSON.stringify(stored(spoolDir))).not.toContain(SECRET);
+    const payloads = spooledPayloads(spoolDir);
+    expect(payloads).toHaveLength(1);
+    expect(JSON.stringify(payloads)).not.toContain(SECRET);
+  });
+
+  it("still spools when the tailnet layer makes the failure non-retryable", async () => {
+    const client = await spooledClient(async () => "down");
+    const failure = await client.reportAdoption(VALID_REPORT).then(
+      () => { throw new Error("expected failure"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.failureLayer).toBe("local_tailnet_unavailable");
+    expect(failure.retryable).toBe(false);
+    const serialized = JSON.parse(JSON.stringify(failure.toJSON("codex")));
+    expect(serialized.error.evidence_recovery.status).toBe("spooled");
+    expect(spooledPayloads(spoolDir)).toHaveLength(1);
   });
 
   it("never spools an invalid report", async () => {
-    const client = await spooledClient();
+    const client = await spooledClient(async () => "unknown");
     const failure = await client.reportAdoption({ nope: true }).then(
       () => { throw new Error("expected failure"); },
       (error: unknown) => error as M5ClientError,
     );
     expect(failure.code).toBe("invalid_adoption_report");
-    expect(listSpoolFiles(spoolDir)).toHaveLength(0);
+    expect(spooledPayloads(spoolDir)).toHaveLength(0);
   });
 });
 
-function stored(spoolDir: string): unknown {
-  const files = listSpoolFiles(spoolDir);
-  expect(files).toHaveLength(1);
-  return JSON.parse(readFileSync(join(spoolDir, files[0] as string), "utf8"));
-}
-
-function listSpoolFiles(spoolDir: string): string[] {
-  return readdirSync(spoolDir).filter((name) => name.startsWith("adoption-"));
-}
-
-describe("CLI route failures (#242)", () => {
-  function sink() {
-    let value = "";
-    return { stream: { write(chunk: string) { value += chunk; return true; } }, text: () => value };
+describe("tailnet probe semantics (#242)", () => {
+  function fakeExec(outcome: { error?: { code?: unknown; killed?: boolean } }) {
+    return ((_cmd: string, _args: string[], _opts: unknown, cb: (error: unknown) => void) => {
+      cb(outcome.error ?? null);
+    }) as never;
   }
 
-  async function runCli(argv: string[], config: unknown) {
-    const output = sink();
-    const error = sink();
-    const exitCode = await m5main(argv, {
-      input: Readable.from([]),
-      output: output.stream,
-      error: error.stream,
-      configLoader: () => config,
-      credentialStore: { resolve: async () => SECRET },
-    });
-    return { exitCode, body: JSON.parse(error.text()) };
-  }
-
-  it("routes a missing profile to the provision flow", async () => {
-    const { exitCode, body } = await runCli(["--profile", "nope", "models"], { version: 1, profiles: {} });
-    expect(exitCode).toBe(1);
-    expect(body.error.code).toBe("unknown_profile");
-    expect(body.error.remediation).toContain("m5 --profile nope provision");
+  it.each([
+    ["clean exit", {}, "up"],
+    ["non-zero exit", { error: { code: 1 } }, "down"],
+    ["missing CLI", { error: { code: "ENOENT" } }, "unknown"],
+    ["permission error", { error: { code: "EACCES" } }, "unknown"],
+    ["timeout kill", { error: { code: "ETIMEDOUT", killed: true } }, "unknown"],
+  ])("default probe maps %s to %s", async (_label, outcome, expected) => {
+    await expect(defaultTailnetProbe(fakeExec(outcome))).resolves.toBe(expected);
   });
 
-  it("names public_route_unconfigured for a missing private path", async () => {
-    const { exitCode, body } = await runCli(
-      ["--profile", "codex", "--private", "models"],
-      { version: 1, profiles: { codex: { publicGatewayUrl: "https://public.invalid" } } },
+  it("maps a private-path timeout to the local layer when tailnet is down", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "http://private.invalid:8080",
+      endpoint: "private",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: (_input: unknown, init?: { signal?: AbortSignal }) =>
+        new Promise(((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted") as Error & { code?: string };
+            error.code = "ETIMEDOUT";
+            reject(error);
+          });
+        }) as never),
+      timeoutMs: 1_000,
+      localProbes: { tailnet: async () => "down" },
+    });
+    const failure = await client.models().then(
+      () => { throw new Error("expected failure"); },
+      (error: unknown) => error as M5ClientError,
     );
-    expect(exitCode).toBe(1);
-    expect(body.error.code).toBe("endpoint_not_configured");
-    expect(body.error.failure_layer).toBe("public_route_unconfigured");
-    expect(body.error.retryable).toBe(false);
-    expect(body.error.remediation).toContain("m5 --profile codex doctor");
+    expect(failure.code).toBe("timeout");
+    expect(failure.failureLayer).toBe("local_tailnet_unavailable");
+  });
+
+  it("keeps gateway_transport for a reset after response headers arrived", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "http://private.invalid:8080",
+      endpoint: "private",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async () => ({
+        status: 200,
+        headers: new Headers(),
+        text: () => Promise.reject(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })),
+      }),
+      localProbes: { tailnet: async () => "down" },
+    });
+    const failure = await client.models().then(
+      () => { throw new Error("expected failure"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.failureLayer).toBe("gateway_transport");
+    expect(failure.remediation).not.toMatch(/no request reached/i);
   });
 });

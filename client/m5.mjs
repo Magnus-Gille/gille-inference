@@ -389,7 +389,7 @@ export async function main(
         "endpoint_not_configured",
         "The selected profile does not configure that gateway path.",
         {
-          failureLayer: "public_route_unconfigured",
+          failureLayer: endpoint === "private" ? "private_route_unconfigured" : "public_route_unconfigured",
           retryable: false,
           remediation: `Configure the ${endpoint} gateway path for the profile, then verify it: m5 --profile ${/^[a-z][a-z0-9_-]{0,31}$/i.test(profile ?? "") ? profile : "selected"} doctor. Never point a profile at a loopback address as a substitute for a configured route.`,
         },

@@ -107,7 +107,7 @@ structural verification or other automatic signals.
 The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
 `diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,
 gateway-health, and authentication failures. Three local layers name failures before any
-network access: `public_route_unconfigured` (the profile has no route — configure it, never
+network access: `public_route_unconfigured` / `private_route_unconfigured` (the profile has no route — configure it, never
 substitute loopback), `local_tailnet_unavailable` (private path with the tailnet down —
 start Tailscale, then rerun doctor), and the already-emitted `connector_transport`. A missing
 profile routes to the secret-safe provision flow. Adoption reports return a scoped acknowledgement:
