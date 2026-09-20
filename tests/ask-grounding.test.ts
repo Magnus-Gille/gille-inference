@@ -285,6 +285,27 @@ describe("verify-against-source mode (#25)", () => {
     expect(honest.findings.map((finding) => finding.findingClass)).not.toContain("polarity-reversal");
   });
 
+  it("catches contrast placed before the citation", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      "Ignore the manual, `rotation completed at midnight`, deploy it now.",
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).toContain("polarity-reversal");
+  });
+
+  it("excuses admissions of uncertainty near contrast", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'Per source "rotation completed at midnight", but the installer path is unknown.',
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).not.toContain("polarity-reversal");
+  });
+
+  it("checks multiline quotations", () => {
+    const multi = checkVerifyAgainstSource(SOURCE, 'Log reads:\n"rotation started\nat midnight ok".');
+    expect(multi.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
+  });
+
   it("behaves on empty source and empty output", () => {
     const emptySource = checkVerifyAgainstSource("", "Deploy version 2.4.1 now.");
     expect(emptySource.pass).toBe(false);

@@ -223,11 +223,16 @@ function extractQuotedSpans(text: string): Span[] {
     if (trimmed.length > 0) found.push({ value: trimmed, index: index ?? -1 });
   };
   for (const match of text.matchAll(/`([^`\n]+)`/gu)) push(match[1]!, match.index);
-  for (const match of text.matchAll(/"([^"\n]{8,})"/gu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/"([^"]{8,})"/gsu)) push(match[1]!, match.index);
   for (const match of text.matchAll(/'([^'\n]{8,}?[^'\n\s][^'\n]*)'/gu)) {
     if (/\s/u.test(match[1] ?? "")) push(match[1]!, match.index);
   }
   for (const match of text.matchAll(/\u201c([^\u201d\n]{8,})\u201d/gu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/```[\w]*\n([\s\S]*?)```/gu)) {
+    for (const line of (match[1] ?? "").split("\n")) {
+      push(line.trim().replace(/^[$#>\s]*/u, ""), match.index);
+    }
+  }
   return found;
 }
 
@@ -560,20 +565,22 @@ export function checkVerifyAgainstSource(
   const verifiedQuotes = new Set<string>();
   const CONTRAST_RE = /\b(but|however|instead|ignore|ignoring|disregard|despite|although|though|nevertheless)\b/iu;
   for (const { value: raw, index } of extractQuotedSpans(outputText)) {
-    const quote = cleanToken(raw);
+    const quote = raw.trim();
     if (quote.length === 0) continue;
     if (!sourceText.includes(quote)) {
       findings.push({ findingClass: "unsupported-quote", detail: quote.slice(0, 160) });
       continue;
     }
     verifiedQuotes.add(quote.toLowerCase());
+    verifiedQuotes.add(cleanToken(quote).toLowerCase());
+    // Contrast on either side yokes the citation to a fresh prescription;
+    // an uncertainty admission in the same span excuses it.
     const at = index < 0 ? 0 : index;
-    const windowAfter = outputText.slice(at, at + quote.length + 120);
-    const windowBefore = outputText.slice(Math.max(0, at - 120), at);
+    const window = outputText.slice(Math.max(0, at - 120), at + quote.length + 120);
     if (
-      CONTRAST_RE.test(windowAfter) &&
-      ACTION_CUE.test(windowAfter) &&
-      !CONTRAST_RE.test(windowBefore)
+      CONTRAST_RE.test(window) &&
+      ACTION_CUE.test(window) &&
+      !/\b(unknown|unclear|uncertain|not provided|not supplied|TBD|missing)\b/iu.test(window)
     ) {
       findings.push({ findingClass: "polarity-reversal", detail: quote.slice(0, 160) });
     }
