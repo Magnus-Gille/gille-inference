@@ -14,10 +14,10 @@ route.
 ## Installation and versioning contract
 
 The `m5` executable ships in the same npm package as `hs`. The current measurement release is
-`1.3.7`; when an accepted artifact is available, install and verify it with this exact pin:
+`1.3.8`; when an accepted artifact is available, install and verify it with this exact pin:
 
 ```bash
-npm install --global gille-inference@1.3.7
+npm install --global gille-inference@1.3.8
 m5 --version
 ```
 
@@ -31,7 +31,7 @@ terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bo
 requires bounded global turn accounting, explicit completion state, and check skip reasons.
 Version `1.3.5` adds a bounded `--timeout-ms` option for direct `m5 ask` calls.
 Version `1.3.6` introduced the v9 organic schema-grounding result contract and redacted
-discovery-failure diagnostics for the historical v9 rollout. Version `1.3.7` is the current
+discovery-failure diagnostics for the historical v9 rollout. Version `1.3.8` is the current
 measurement release: it retains those contracts and preserves an optional execution feedback
 handle in successful structured results, with a direct command for submitting the reviewer's
 exact usefulness judgment. Its `code_loop` client rejects v8 results; v8 clients likewise reject

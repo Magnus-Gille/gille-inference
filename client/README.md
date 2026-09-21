@@ -11,9 +11,9 @@ deployment URL.
 
 Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 
-### Owner-client 1.3.7 compatibility
+### Owner-client 1.3.8 compatibility
 
-The 1.3.7 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+The 1.3.8 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
 interchangeable. Restart/reconnect long-lived MCP bridge processes after installing the
 accepted package. The `hs` friend-facing API is unchanged. Publication, installation, and
