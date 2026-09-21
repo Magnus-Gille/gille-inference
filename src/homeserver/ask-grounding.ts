@@ -229,8 +229,19 @@ function extractQuotedSpans(text: string): Span[] {
   }
   for (const match of text.matchAll(/\u201c([^\u201d\n]{8,})\u201d/gu)) push(match[1]!, match.index);
   for (const match of text.matchAll(/```[\w]*\n([\s\S]*?)```/gu)) {
-    for (const line of (match[1] ?? "").split("\n")) {
-      push(line.trim().replace(/^[$#>\s]*/u, ""), match.index);
+    // Each line carries its own offset: sharing the fence start would slide
+    // every polarity window and could miss a reversal deep in the block.
+    const body = match[1] ?? "";
+    const fenceStart = match.index ?? -1;
+    const bodyOffset = match[0].indexOf(body);
+    let cursor = 0;
+    for (const line of body.split("\n")) {
+      const at = body.indexOf(line, cursor);
+      cursor = at < 0 ? cursor + line.length + 1 : at + line.length + 1;
+      push(
+        line.trim().replace(/^[$#>\s]*/u, ""),
+        fenceStart < 0 || at < 0 ? fenceStart : fenceStart + bodyOffset + at,
+      );
     }
   }
   return found;

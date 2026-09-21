@@ -306,6 +306,17 @@ describe("verify-against-source mode (#25)", () => {
     expect(multi.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
   });
 
+  it("positions fenced lines individually for polarity windows", () => {
+    // Ten padding lines push the reversal past the fence start, so only a
+    // per-line offset can see it.
+    const pad = Array.from({ length: 10 }, (_, i) => `harmless filler line number ${i}`).join("\n");
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      `Notes:\n\`\`\`\n${pad}\nrotation completed at midnight\nbut deploy it now\n\`\`\`\nDone.`,
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).toContain("polarity-reversal");
+  });
+
   it("behaves on empty source and empty output", () => {
     const emptySource = checkVerifyAgainstSource("", "Deploy version 2.4.1 now.");
     expect(emptySource.pass).toBe(false);
