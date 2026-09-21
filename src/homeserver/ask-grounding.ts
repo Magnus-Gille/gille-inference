@@ -77,6 +77,8 @@ export interface AskGroundingFinding {
     | "novel-flag"
     | "novel-host"
     | "novel-version"
+    | "unsupported-quote"
+    | "polarity-reversal"
     | "missing-uncertainty";
   detail: string;
 }
@@ -203,6 +205,43 @@ function extractCodeSpans(text: string): Span[] {
   for (const match of text.matchAll(/```[\w]*\n([\s\S]*?)```/gu)) {
     for (const line of (match[1] ?? "").split("\n")) {
       push(line.trim().replace(/^[$#>]\s*/u, ""), match.index);
+    }
+  }
+  return found;
+}
+
+/**
+ * Quoted spans are citation candidates, not commands: backticked and fenced
+ * content (above), double-quoted phrases, single-quoted phrases containing a
+ * space (so don't/it's never count), and curly-quoted phrases. Length-gated
+ * so short labels ("ok", "yes") are never treated as evidence claims.
+ */
+function extractQuotedSpans(text: string): Span[] {
+  const found: Span[] = [];
+  const push = (raw: string, index: number | undefined): void => {
+    const trimmed = raw.trim();
+    if (trimmed.length > 0) found.push({ value: trimmed, index: index ?? -1 });
+  };
+  for (const match of text.matchAll(/`([^`\n]+)`/gu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/"([^"]{8,})"/gsu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/'([^'\n]{8,}?[^'\n\s][^'\n]*)'/gu)) {
+    if (/\s/u.test(match[1] ?? "")) push(match[1]!, match.index);
+  }
+  for (const match of text.matchAll(/\u201c([^\u201d\n]{8,})\u201d/gu)) push(match[1]!, match.index);
+  for (const match of text.matchAll(/```[\w]*\n([\s\S]*?)```/gu)) {
+    // Each line carries its own offset: sharing the fence start would slide
+    // every polarity window and could miss a reversal deep in the block.
+    const body = match[1] ?? "";
+    const fenceStart = match.index ?? -1;
+    const bodyOffset = match[0].indexOf(body);
+    let cursor = 0;
+    for (const line of body.split("\n")) {
+      const at = body.indexOf(line, cursor);
+      cursor = at < 0 ? cursor + line.length + 1 : at + line.length + 1;
+      push(
+        line.trim().replace(/^[$#>\s]*/u, ""),
+        fenceStart < 0 || at < 0 ? fenceStart : fenceStart + bodyOffset + at,
+      );
     }
   }
   return found;
@@ -517,6 +556,73 @@ function checkUncertainty(
       });
     }
   }
+}
+
+/** Verify-against-source mode (#25): every quoted span must appear verbatim
+ * in the source, and every path/command/flag/host/version must either appear
+ * in the source or be explicitly allowed (none are by default).
+ * Returns unsupported assertions as findings. Paraphrased-but-true claims
+ * still fail: token-level grounding cannot judge semantics, so a calibrated
+ * judge owns meaning while this owns verbatim anchoring. Never throws on text.
+ */
+export function checkVerifyAgainstSource(
+  sourceText: string,
+  outputText: string,
+  allowedTerms: { paths?: string[]; commands?: string[]; flags?: string[]; hosts?: string[]; versions?: string[] } = {},
+): AskGroundingResult {
+  const findings: AskGroundingFinding[] = [];
+  // Spans verified verbatim against the source are quoted evidence, not
+  // novel commands: suppress them from the span check below.
+  const verifiedQuotes = new Set<string>();
+  const CONTRAST_RE = /\b(but|however|instead|ignore|ignoring|disregard|despite|although|though|nevertheless)\b/iu;
+  for (const { value: raw, index } of extractQuotedSpans(outputText)) {
+    const quote = raw.trim();
+    if (quote.length === 0) continue;
+    if (!sourceText.includes(quote)) {
+      findings.push({ findingClass: "unsupported-quote", detail: quote.slice(0, 160) });
+      continue;
+    }
+    verifiedQuotes.add(quote.toLowerCase());
+    verifiedQuotes.add(cleanToken(quote).toLowerCase());
+    // Contrast on either side yokes the citation to a fresh prescription;
+    // an uncertainty admission in the same span excuses it.
+    const at = index < 0 ? 0 : index;
+    const window = outputText.slice(Math.max(0, at - 120), at + quote.length + 120);
+    if (
+      CONTRAST_RE.test(window) &&
+      ACTION_CUE.test(window) &&
+      !/\b(unknown|unclear|uncertain|not provided|not supplied|TBD|missing)\b/iu.test(window)
+    ) {
+      findings.push({ findingClass: "polarity-reversal", detail: quote.slice(0, 160) });
+    }
+  }
+  const fixture: AskGroundingFixture = {
+    schemaVersion: 1,
+    id: "verify-against-source",
+    instruction: "Assert only what the source states; quote or abstain.",
+    factsText: sourceText,
+    allowed: {
+      paths: allowedTerms.paths ?? [],
+      commands: allowedTerms.commands ?? [],
+      flags: allowedTerms.flags ?? [],
+      hosts: allowedTerms.hosts ?? [],
+      versions: allowedTerms.versions ?? [],
+    },
+    forbidden: { paths: [], commands: [], flags: [], hosts: [], versions: [] },
+    unverifiableAspects: [],
+  };
+  const anchored = checkAskGrounding(fixture, outputText);
+  for (const finding of anchored.findings) {
+    if (
+      finding.findingClass === "novel-command" &&
+      verifiedQuotes.has(cleanToken(finding.detail).toLowerCase())
+    ) {
+      continue;
+    }
+    findings.push(finding);
+  }
+  findings.sort((a, b) => a.findingClass.localeCompare(b.findingClass) || a.detail.localeCompare(b.detail));
+  return { pass: findings.length === 0, findings };
 }
 
 /** Check one model output against a parsed fixture. Never throws on text. */

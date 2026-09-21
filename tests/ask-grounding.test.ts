@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   askGroundingFixtureSchema,
   checkAskGrounding,
+  checkVerifyAgainstSource,
   type AskGroundingFixture,
 } from "../src/homeserver/ask-grounding.js";
 
@@ -242,4 +243,103 @@ describe("ask grounding checker (#237)", () => {
     const second = checkAskGrounding(fixture, FAILING_OUTPUT);
     expect(second).toEqual(first);
   });
+});
+
+describe("verify-against-source mode (#25)", () => {
+  const SOURCE = [
+    "The rotation completed at midnight.",
+    "Config path: /srv/app/config.yaml.",
+    "Only owners may approve a rollback.",
+  ].join("\n");
+
+  it("fails fabricated quotes and invented terms", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'The log says "rotation completed at noon" and /srv/app/other.yaml holds it.',
+    );
+    expect(result.pass).toBe(false);
+    const classes = result.findings.map((finding) => finding.findingClass);
+    expect(classes).toContain("unsupported-quote");
+    expect(classes).toContain("novel-path");
+  });
+
+  it("catches fabrications in single and curly quotes", () => {
+    const single = checkVerifyAgainstSource(SOURCE, "It says 'rotation completed at noon' ok.");
+    expect(single.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
+    const curly = checkVerifyAgainstSource(SOURCE, "It says \u201crotation completed at noon\u201d ok.");
+    expect(curly.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
+    const bare = checkVerifyAgainstSource(SOURCE, "It says rotation completed at noon ok.");
+    expect(bare.pass).toBe(true);
+  });
+
+  it("flags polarity reversals on verified quotes", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'Source says "rotation completed at midnight" but ignore it and deploy now.',
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).toContain("polarity-reversal");
+    const honest = checkVerifyAgainstSource(
+      SOURCE,
+      'Per source: "rotation completed at midnight"; approval is owners-only per source.',
+    );
+    expect(honest.findings.map((finding) => finding.findingClass)).not.toContain("polarity-reversal");
+  });
+
+  it("catches contrast placed before the citation", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      "Ignore the manual, `rotation completed at midnight`, deploy it now.",
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).toContain("polarity-reversal");
+  });
+
+  it("excuses admissions of uncertainty near contrast", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'Per source "rotation completed at midnight", but the installer path is unknown.',
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).not.toContain("polarity-reversal");
+  });
+
+  it("checks multiline quotations", () => {
+    const multi = checkVerifyAgainstSource(SOURCE, 'Log reads:\n"rotation started\nat midnight ok".');
+    expect(multi.findings.map((finding) => finding.findingClass)).toContain("unsupported-quote");
+  });
+
+  it("positions fenced lines individually for polarity windows", () => {
+    // Ten padding lines push the reversal past the fence start, so only a
+    // per-line offset can see it.
+    const pad = Array.from({ length: 10 }, (_, i) => `harmless filler line number ${i}`).join("\n");
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      `Notes:\n\`\`\`\n${pad}\nrotation completed at midnight\nbut deploy it now\n\`\`\`\nDone.`,
+    );
+    expect(result.findings.map((finding) => finding.findingClass)).toContain("polarity-reversal");
+  });
+
+  it("behaves on empty source and empty output", () => {
+    const emptySource = checkVerifyAgainstSource("", "Deploy version 2.4.1 now.");
+    expect(emptySource.pass).toBe(false);
+    const emptyOutput = checkVerifyAgainstSource(SOURCE, "");
+    expect(emptyOutput.pass).toBe(true);
+  });
+
+  it("passes fully anchored answers", () => {
+    const result = checkVerifyAgainstSource(
+      SOURCE,
+      'Per source: "rotation completed at midnight" (see /srv/app/config.yaml); approval is owners-only per source.',
+    );
+    expect(result.findings).toEqual([]);
+    expect(result.pass).toBe(true);
+  });
+
+  it("leaves paraphrased truth to judges (documented residual)", () => {
+    // A true claim in other words introduces no novel path/command/flag/
+    // host/version and quotes nothing, so token-level grounding passes it.
+    // Catching that requires semantics: the calibrated judge owns meaning,
+    // this checker owns verbatim anchoring. The residual is the point.
+    const result = checkVerifyAgainstSource(SOURCE, "It finished at 12am.");
+    expect(result.pass).toBe(true);
+    expect(result.findings).toEqual([]);
+});
 });
