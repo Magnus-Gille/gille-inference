@@ -419,6 +419,29 @@ describe("m5 command surface", () => {
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 
+  it("exits successfully when doctor reports MCP catalogue reachability", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "doctor"], {
+      input: Readable.from([]), output: output.stream, error: error.stream,
+      configLoader: () => ({ version: 1, profiles: { codex: { publicGatewayUrl: PUBLIC_URL } } }),
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/portal/me")) {
+          return new Response(JSON.stringify({ alias: "doctor-agent", tier: "owner", scope: "agent" }));
+        }
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        const result = request.params?.name === "list_models"
+          ? { content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }], isError: false }
+          : { tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name, inputSchema: { type: "object" } })) };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toMatchObject({ status: "mcp_reachable" });
+    expect(error.text()).toBe("");
+  });
+
   it("requires an explicit profile before credential lookup", async () => {
     let keychainCalls = 0;
     const output = sink();

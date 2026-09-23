@@ -11,9 +11,9 @@ deployment URL.
 
 Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 
-### Owner-client 1.4.0 compatibility
+### Owner-client 1.4.1 compatibility
 
-The 1.4.0 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+The 1.4.1 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
 Its doctor reports MCP catalogue reachability without calling metered inference; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not

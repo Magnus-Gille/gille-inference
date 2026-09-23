@@ -15,10 +15,10 @@ route.
 
 The `m5` executable ships in the same npm package as `hs`. The npm registry's latest published
 version was `1.3.7` when checked on 2026-09-23. Version `1.3.8` exists in repository source but
-is not published to npm. Install the reviewed `1.4.0` package only after publication:
+is not published to npm. Install the reviewed `1.4.1` package only after publication:
 
 ```bash
-npm install --global gille-inference@1.4.0
+npm install --global gille-inference@1.4.1
 m5 --version
 ```
 
@@ -36,8 +36,10 @@ discovery-failure diagnostics for the historical v9 rollout. Version `1.3.8` is 
 it retains those contracts and preserves an optional execution feedback
 handle in successful structured results, with a direct command for submitting the reviewer's
 exact usefulness judgment. Its `code_loop` client rejects v8 results; v8 clients likewise reject
-v9 results. Version `1.4.0` narrows doctor success to MCP catalogue reachability and makes
-connector diagnostic codes visible even in MCP hosts that hide JSON-RPC error data. Coordinate the
+v9 results. Version `1.4.1` narrows doctor success to MCP catalogue reachability and makes
+connector diagnostic codes visible even in MCP hosts that hide JSON-RPC error data. `1.4.1`
+also returns process exit code 0 when `doctor` reports `mcp_reachable`; the source-only `1.4.0`
+client incorrectly returned 1 despite a successful catalogue check. Coordinate the
 installed client and gateway switch while code-loop callers are idle.
 Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
@@ -318,7 +320,7 @@ The result makes that boundary explicit:
 ```json
 {
   "status": "mcp_reachable",
-  "client_version": "1.4.0",
+  "client_version": "1.4.1",
   "health_scope": "mcp_catalogue_only",
   "model_discovery": { "public": "available", "private": "available" },
   "inference": { "public": "not_checked", "private": "not_checked" },
