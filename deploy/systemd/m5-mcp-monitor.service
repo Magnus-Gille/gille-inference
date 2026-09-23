@@ -1,0 +1,14 @@
+[Unit]
+Description=Gille Inference public and private MCP tool-call monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=magnus
+EnvironmentFile=/etc/gille-inference/mcp-monitor.env
+ExecStart=/usr/bin/node /usr/local/libexec/gille-inference/monitor-mcp.mjs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
