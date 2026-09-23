@@ -415,7 +415,7 @@ describe("m5 command surface", () => {
     });
     expect(exitCode).toBe(0);
     expect(provisionerCalls).toHaveLength(1);
-    expect(JSON.parse(output.text())).toMatchObject({ status: "healthy", profile: "pi" });
+    expect(JSON.parse(output.text())).toMatchObject({ status: "mcp_reachable", profile: "pi" });
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 

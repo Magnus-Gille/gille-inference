@@ -44,6 +44,29 @@ function isRetryableResultTransport(error) {
     (error.code === "network_failure" || error.code === "timeout" || error.code === "upstream_http_error");
 }
 
+// Some MCP hosts render only error.message and discard JSON-RPC error.data. Keep
+// the actionable diagnosis in both places, with a closed vocabulary so an upstream
+// response cannot put arbitrary content or a locator into the visible message.
+const VISIBLE_DIAGNOSTICS = new Set([
+  "dns_failure", "connection_refused", "route_unreachable", "connection_reset",
+  "connect_timeout", "tls_failure", "network_failure", "gateway_http_error",
+]);
+const VISIBLE_LAYERS = new Set([
+  "authentication", "gateway_transport", "gateway_health", "gateway_protocol",
+  "connector_transport", "local_tailnet_unavailable", "public_route_unconfigured",
+  "private_route_unconfigured",
+]);
+
+function visibleFailureSuffix(error, failureLayer) {
+  if (!VISIBLE_DIAGNOSTICS.has(error.diagnosticCode) && !VISIBLE_LAYERS.has(failureLayer)) {
+    return "";
+  }
+  const diagnostic = VISIBLE_DIAGNOSTICS.has(error.diagnosticCode)
+    ? error.diagnosticCode : "unknown";
+  const layer = VISIBLE_LAYERS.has(failureLayer) ? failureLayer : "unknown";
+  return ` [diagnostic_code=${diagnostic}; failure_layer=${layer}; retryable=${error.retryable === true}]`;
+}
+
 // Closed copy of the client's evidence-recovery shape (#242). Only a valid spooled /
 // spool-failed outcome travels; anything else falls back to the legacy contract so a
 // malformed carrier can never smuggle a locator or free-form text into bridge output.
@@ -93,10 +116,11 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
         action: "retry_same_tool_call",
       };
   }
+  const visibleMessage = credentialFailure
+    ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
+    : error.message;
   return {
-    message: credentialFailure
-      ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
-      : error.message,
+    message: `${visibleMessage}${visibleFailureSuffix(error, failureLayer)}`,
     data: {
       m5_code: error.code,
       ...(error.diagnosticCode === undefined ? {} : { diagnostic_code: error.diagnosticCode }),

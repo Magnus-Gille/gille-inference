@@ -141,6 +141,28 @@ to point here rather than re-describing the topology.
   placeholder path* for docs/tests, the same way it uses `example.com` — that usage is intentional
   and unrelated to this correction.)
 
+### MCP tool-path monitor
+
+`scripts/monitor-mcp.mjs` submits an authenticated, content-free
+`tools/call(list_models)` request to both configured public and private `/mcp` routes. It
+checks the JSON-RPC result and exits nonzero if either path fails, distinguishing HTTP status,
+transport failure, and MCP tool error without logging a key, route locator, model list, or response
+body. This tests the tool path that `/healthz` cannot cover; it deliberately does not establish
+model inference readiness or load a model. The operator can run it from a network with access to
+both routes using `M5_PROBE_PUBLIC_URL`, `M5_PROBE_PRIVATE_URL`, and `M5_PROBE_KEY` in the process
+environment. The public URL must be an HTTPS origin; the private URL may use HTTP on the trusted private network. Neither URL may contain a path or userinfo. Use an existing least-privilege
+key permitted to call `list_models`; keep the key in a private secret store, never in Git or a
+command argument.
+
+The installable `deploy/systemd/m5-mcp-monitor.service` and `.timer` run the check every five
+minutes on M5. Install the reviewed script bytes from the accepted release at
+`/usr/local/libexec/gille-inference/monitor-mcp.mjs` with root ownership and mode `0644`, and
+verify their hash against the release before enabling the timer. The unit reads
+`/etc/gille-inference/mcp-monitor.env` (root-owned, mode `0600`); its `ProtectHome=true` isolation does not expose the live
+checkout or any home directory. Installing/enabling the units and provisioning the private env
+file are separate owner-attended production changes; a gateway source deploy does not perform them.
+A timer on M5 cannot detect loss of the entire host and its private check does not prove that a remote tailnet caller can connect. Run the same probe off-host for those failure modes and connect the timer or off-host runner to an operator alert path. Compare the two route statuses on failure; verify a real synthetic inference request only inside an approved resource window. Journal output contains only the route labels and closed status codes.
+
 ### Deploying llama-swap roster changes
 
 The model roster is separate mutable production state and is not an input to

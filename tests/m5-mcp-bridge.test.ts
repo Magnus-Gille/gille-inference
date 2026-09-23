@@ -701,6 +701,7 @@ describe("m5 stdio MCP conformance", () => {
     );
     expect(JSON.parse(response!)).toMatchObject({
       error: {
+        message: expect.stringContaining("gateway_http_error"),
         data: {
           m5_code: "upstream_http_error",
           diagnostic_code: "gateway_http_error",

@@ -13,11 +13,11 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`. The current measurement release is
-`1.3.8`; when an accepted artifact is available, install and verify it with this exact pin:
+The `m5` executable ships in the same npm package as `hs`. The last published measurement release
+is `1.3.8`; install the reviewed `1.4.0` package only after publication:
 
 ```bash
-npm install --global gille-inference@1.3.8
+npm install --global gille-inference@1.4.0
 m5 --version
 ```
 
@@ -31,11 +31,13 @@ terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bo
 requires bounded global turn accounting, explicit completion state, and check skip reasons.
 Version `1.3.5` adds a bounded `--timeout-ms` option for direct `m5 ask` calls.
 Version `1.3.6` introduced the v9 organic schema-grounding result contract and redacted
-discovery-failure diagnostics for the historical v9 rollout. Version `1.3.8` is the current
+discovery-failure diagnostics for the historical v9 rollout. Version `1.3.8` is the last published
 measurement release: it retains those contracts and preserves an optional execution feedback
 handle in successful structured results, with a direct command for submitting the reviewer's
 exact usefulness judgment. Its `code_loop` client rejects v8 results; v8 clients likewise reject
-v9 results. Coordinate the installed client and gateway switch while code-loop callers are idle.
+v9 results. Version `1.4.0` narrows doctor success to MCP catalogue reachability and makes
+connector diagnostic codes visible even in MCP hosts that hide JSON-RPC error data. Coordinate the
+installed client and gateway switch while code-loop callers are idle.
 Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
@@ -70,6 +72,10 @@ A public-path Claude registration has this data shape:
 
 For a private-network registration, append `--private`. The private locator still comes from the
 local `m5` profile file; it is not copied into harness configuration or diagnostic output.
+Without `--private`, MCP and OpenAI commands use the profile's public HTTPS origin. With
+`--private`, they use the configured private origin. `m5-auth --env` is a separate on-machine
+helper: its non-tailnet URL may be a direct IP origin and must not be interpreted as the profile's
+Cloudflare route. `m5-auth --env --tailnet` emits its explicit tailnet origin.
 
 The npm package is the versioned distribution authority. The gateway's unauthenticated `/hs`
 download remains the single-file `hs` client and does not serve or version `m5`.
@@ -302,15 +308,17 @@ even when its `list_models` call is unavailable; `model_discovery` still records
 failure.
 
 The discovery call does not run `ask`, load a model, or establish inference readiness. `ask` is a
-metered inference operation, so doctor never issues a paid probe. A successful doctor result means
-that the authenticated gateway and required agent surface are healthy—not that a subsequent
-inference will succeed.
+metered inference operation, so doctor never issues a paid probe. A successful doctor result
+establishes authenticated MCP catalogue reachability at the instant of the checks. It does not
+establish that a subsequent inference request will succeed.
 
 The result makes that boundary explicit:
 
 ```json
 {
-  "status": "healthy",
+  "status": "mcp_reachable",
+  "client_version": "1.4.0",
+  "health_scope": "mcp_catalogue_only",
   "model_discovery": { "public": "available", "private": "available" },
   "inference": { "public": "not_checked", "private": "not_checked" },
   "endpoints": { "public": "healthy", "private": "healthy" }
@@ -356,7 +364,7 @@ Its top-level `status` also distinguishes:
 - `wrong_scope`
 - `missing_tools`
 - `path_parity_failed`
-- `healthy`
+- `mcp_reachable`
 
 `diagnostic_code` and `http_status`, when present, are content-free transport/catalogue details.
 No token or endpoint locator is included in the result. For `missing_credential` and
@@ -381,7 +389,9 @@ stdout, rejects malformed input and upstream envelopes locally, bounds each HTTP
 response-body consumption, and continues serving later messages after a failed request. A stale
 HTTP MCP session (`404`/`410`) is retried once without the session identifier.
 
-Connector failures are returned as redacted JSON-RPC error data rather than a bare `fetch failed`:
+Connector failures are returned as redacted JSON-RPC error data. The visible error message also
+contains a closed, locator-free `diagnostic_code`, `failure_layer`, and `retryable` summary for
+MCP hosts that do not display JSON-RPC error data:
 
 - `failure_layer` distinguishes `connector_transport`, `gateway_health`, and `authentication`.
 - `diagnostic_code` distinguishes `dns_failure`, `connection_refused`, `route_unreachable`,

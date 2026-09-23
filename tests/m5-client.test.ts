@@ -1983,7 +1983,7 @@ describe("m5 doctor diagnostic distinctions", () => {
     });
 
     expect(result).toMatchObject({
-      status: "healthy",
+      status: "mcp_reachable",
       model_discovery: { public: "available", private: "available" },
       inference: { public: "not_checked", private: "not_checked" },
     });
@@ -2068,7 +2068,7 @@ describe("m5 doctor diagnostic distinctions", () => {
   it("reports healthy without tokens or endpoint locator values", async () => {
     const result = await diagnose();
     expect(result).toMatchObject({
-      status: "healthy",
+      status: "mcp_reachable",
       profile: "codex",
       model_discovery: { public: "available", private: "available" },
       inference: { public: "not_checked", private: "not_checked" },

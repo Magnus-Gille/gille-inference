@@ -4,7 +4,7 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.3.8";
+export const M5_CLIENT_VERSION = "1.4.0";
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
@@ -1790,6 +1790,9 @@ export async function createM5Client({
 function safeDoctorResult(result) {
   return redactValue({
     connector: { ...UNSUPPORTED_CONNECTOR_DIAGNOSTIC },
+    client_version: M5_CLIENT_VERSION,
+    // The probe reaches /mcp tools/list and list_models. It never submits metered inference.
+    health_scope: "mcp_catalogue_only",
     ...result,
   }, []);
 }
@@ -2199,7 +2202,7 @@ export async function diagnoseProfile({
 
   if (!config.privateGatewayUrl) {
     return safeDoctorResult({
-      status: "healthy",
+      status: "mcp_reachable",
       profile,
       credential: "present",
       ...doctorCapabilityFields(publicProbe, null),
@@ -2309,7 +2312,7 @@ export async function diagnoseProfile({
   }
 
   return safeDoctorResult({
-    status: "healthy",
+    status: "mcp_reachable",
     profile,
     credential: "present",
     identity: {
