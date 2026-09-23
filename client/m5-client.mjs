@@ -291,6 +291,14 @@ async function gatewayHttpError(response, profile, endpoint, operation) {
   });
 }
 
+function gatewayTimeoutMessage(endpoint, preHeaders, operation) {
+  if (!preHeaders) {
+    return `The ${operation} timed out while reading the gateway response after HTTP headers. The operation may have been accepted; check its status before retrying.`;
+  }
+  const route = endpoint === "private" ? "private" : "public";
+  return `The ${route} ${operation} timed out before any HTTP response. The route or gateway did not answer before the deadline; the specific cause is unknown. Check ${route === "private" ? "tailnet and gateway listener" : "Cloudflare Tunnel and gateway"} status.`;
+}
+
 function networkDiagnosticCode(error) {
   const codes = [];
   let current = error;
@@ -1327,7 +1335,7 @@ export async function createM5Client({
         if (endpoint === "private" && preHeaders) {
           const tailnet = await probeTailnetStatus(localProbes?.tailnet);
           if (tailnet === "down") {
-            throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+            throw new M5ClientError("timeout", "The private M5 gateway request timed out because the local tailnet is unavailable. Start Tailscale and check the route.", {
               diagnosticCode: "connect_timeout",
               failureLayer: "local_tailnet_unavailable",
               retryable: false,
@@ -1335,7 +1343,7 @@ export async function createM5Client({
             });
           }
         }
-        throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+        throw new M5ClientError("timeout", gatewayTimeoutMessage(endpoint, preHeaders, "M5 gateway request"), {
           diagnosticCode: "connect_timeout",
           failureLayer: "gateway_transport",
           retryable: true,
@@ -1464,7 +1472,7 @@ export async function createM5Client({
         if (endpoint === "private" && preHeaders) {
           const tailnet = await probeTailnetStatus(localProbes?.tailnet);
           if (tailnet === "down") {
-            throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+            throw new M5ClientError("timeout", "The private execution-feedback request timed out because the local tailnet is unavailable. Start Tailscale and check the route.", {
               diagnosticCode: "connect_timeout",
               failureLayer: "local_tailnet_unavailable",
               retryable: false,
@@ -1472,7 +1480,7 @@ export async function createM5Client({
             });
           }
         }
-        throw new M5ClientError("timeout", "The M5 gateway request timed out.", {
+        throw new M5ClientError("timeout", gatewayTimeoutMessage(endpoint, preHeaders, "execution-feedback request"), {
           diagnosticCode: "connect_timeout",
           failureLayer: "gateway_transport",
           retryable: true,
@@ -1873,7 +1881,7 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, en
       if (endpoint === "private" && preHeaders) {
         const tailnet = await probeTailnetStatus(localProbes?.tailnet);
         if (tailnet === "down") {
-          throw new M5ClientError("timeout", "The gateway identity check timed out.", {
+          throw new M5ClientError("timeout", "The private gateway identity check timed out because the local tailnet is unavailable. Start Tailscale and check the route.", {
             diagnosticCode: "connect_timeout",
             failureLayer: "local_tailnet_unavailable",
             retryable: false,
@@ -1881,7 +1889,7 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, en
           });
         }
       }
-      throw new M5ClientError("timeout", "The gateway identity check timed out.", {
+      throw new M5ClientError("timeout", gatewayTimeoutMessage(endpoint, preHeaders, "gateway identity check"), {
         diagnosticCode: "connect_timeout",
         failureLayer: "gateway_transport",
         retryable: true,

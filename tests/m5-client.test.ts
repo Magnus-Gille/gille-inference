@@ -318,7 +318,10 @@ describe("secret-safe M5 client", () => {
 
     await expect(
       client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
-    ).rejects.toMatchObject({ code: "timeout" });
+    ).rejects.toMatchObject({
+      code: "timeout",
+      message: expect.stringContaining("operation may have been accepted"),
+    });
     await expect(
       client.rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
     ).resolves.toMatchObject({ id: 2, result: { tools: [] } });

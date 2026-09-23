@@ -402,6 +402,10 @@ MCP hosts that do not display JSON-RPC error data:
   connector. Other Cloudflare 530 pages become `cloudflare_origin_unresolved`, without
   guessing the 1xxx cause. HTTP 502 states that an upstream route failed and the specific
   cause remains unknown. The response body is never echoed.
+- A timeout before HTTP headers identifies the selected public or private route and states that
+  its exact cause is unknown. A timeout after headers warns that the operation may have been
+  accepted, so callers should check status before retrying. If the private tailnet probe is
+  definitively down, the bridge preserves `local_tailnet_unavailable` and Tailscale recovery.
 - `retryable` and a fixed locator-free `remediation` tell the caller whether to retry the same
   operation and then run the selected profile's `m5 doctor` check.
 

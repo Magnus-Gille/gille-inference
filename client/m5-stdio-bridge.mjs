@@ -3,6 +3,7 @@ import {
   createFileAdoptionSpool,
   credentialRemediation,
   gatewayHttpRemediation,
+  localTailnetRemediation,
   redactText,
   spoolAdoptionOutageReport,
   transportRemediation,
@@ -98,10 +99,12 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
     ? credentialRemediation(profile)
     : error.code === "upstream_http_error"
       ? gatewayHttpRemediation(profile, error.diagnosticCode)
+      : error.failureLayer === "local_tailnet_unavailable"
+        ? localTailnetRemediation(profile)
       : gatewayTransportFailure
       ? transportRemediation(profile)
       : error.remediation;
-  const failureLayer = gatewayTransportFailure
+  const failureLayer = gatewayTransportFailure && error.failureLayer !== "local_tailnet_unavailable"
     ? "connector_transport"
     : error.failureLayer;
   // A spooled adoption report survives the outage it reports on (#242): prefer the
