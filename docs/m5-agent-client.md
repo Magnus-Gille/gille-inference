@@ -13,8 +13,9 @@ route.
 
 ## Installation and versioning contract
 
-The `m5` executable ships in the same npm package as `hs`. The last published measurement release
-is `1.3.8`; install the reviewed `1.4.0` package only after publication:
+The `m5` executable ships in the same npm package as `hs`. The npm registry's latest published
+version was `1.3.7` when checked on 2026-09-23. Version `1.3.8` exists in repository source but
+is not published to npm. Install the reviewed `1.4.0` package only after publication:
 
 ```bash
 npm install --global gille-inference@1.4.0
@@ -31,8 +32,8 @@ terminal `code_loop_result` retrieval. Version `1.3.3` requires the gateway's bo
 requires bounded global turn accounting, explicit completion state, and check skip reasons.
 Version `1.3.5` adds a bounded `--timeout-ms` option for direct `m5 ask` calls.
 Version `1.3.6` introduced the v9 organic schema-grounding result contract and redacted
-discovery-failure diagnostics for the historical v9 rollout. Version `1.3.8` is the last published
-measurement release: it retains those contracts and preserves an optional execution feedback
+discovery-failure diagnostics for the historical v9 rollout. Version `1.3.8` is a source release:
+it retains those contracts and preserves an optional execution feedback
 handle in successful structured results, with a direct command for submitting the reviewer's
 exact usefulness judgment. Its `code_loop` client rejects v8 results; v8 clients likewise reject
 v9 results. Version `1.4.0` narrows doctor success to MCP catalogue reachability and makes
