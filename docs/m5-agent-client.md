@@ -397,7 +397,11 @@ MCP hosts that do not display JSON-RPC error data:
 - `failure_layer` distinguishes `connector_transport`, `gateway_health`, and `authentication`.
 - `diagnostic_code` distinguishes `dns_failure`, `connection_refused`, `route_unreachable`,
   `connection_reset`, `connect_timeout`, `tls_failure`, the residual `network_failure`, and
-  `gateway_http_error`.
+  `gateway_http_error`. A public Cloudflare HTTP 530 page with error 1033 becomes
+  `cloudflare_tunnel_unavailable`: Cloudflare could not find a healthy `cloudflared`
+  connector. Other Cloudflare 530 pages become `cloudflare_origin_unresolved`, without
+  guessing the 1xxx cause. HTTP 502 states that an upstream route failed and the specific
+  cause remains unknown. The response body is never echoed.
 - `retryable` and a fixed locator-free `remediation` tell the caller whether to retry the same
   operation and then run the selected profile's `m5 doctor` check.
 

@@ -123,6 +123,12 @@ the next UTC day. A connector/transport failure spools the content-free report l
 spool write itself fails the status is `spool_failed` with the same retry action, and with no
 spool configured the legacy `not_recorded` shape is kept. Recovery is deterministic: retry the
 same report tool call after the gateway recovers — the spool file is the backstop, not a queue.
+
+On the public path, a Cloudflare HTTP 530 page containing 1033 reports
+`cloudflare_tunnel_unavailable` and directs the operator to `cloudflared` and tunnel connections.
+Another Cloudflare 530 reports `cloudflare_origin_unresolved`; inspect its 1xxx code before
+attributing a more precise cause. HTTP 502 reports the upstream route failure while explicitly
+leaving its specific cause unknown. The client never copies an error-page body into its output.
 No report payload is echoed, and no locator or credential ever enters diagnostics.
 
 `code_loop_result` is safe to repeat for the same durable work id. The bridge automatically retries

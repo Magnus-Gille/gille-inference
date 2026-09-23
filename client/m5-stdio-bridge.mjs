@@ -2,6 +2,7 @@ import {
   M5ClientError,
   createFileAdoptionSpool,
   credentialRemediation,
+  gatewayHttpRemediation,
   redactText,
   spoolAdoptionOutageReport,
   transportRemediation,
@@ -50,6 +51,7 @@ function isRetryableResultTransport(error) {
 const VISIBLE_DIAGNOSTICS = new Set([
   "dns_failure", "connection_refused", "route_unreachable", "connection_reset",
   "connect_timeout", "tls_failure", "network_failure", "gateway_http_error",
+  "cloudflare_tunnel_unavailable", "cloudflare_origin_unresolved",
 ]);
 const VISIBLE_LAYERS = new Set([
   "authentication", "gateway_transport", "gateway_health", "gateway_protocol",
@@ -94,7 +96,9 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
   const transportFailure = gatewayTransportFailure || error.code === "upstream_http_error";
   const remediation = credentialFailure
     ? credentialRemediation(profile)
-    : transportFailure
+    : error.code === "upstream_http_error"
+      ? gatewayHttpRemediation(profile, error.diagnosticCode)
+      : gatewayTransportFailure
       ? transportRemediation(profile)
       : error.remediation;
   const failureLayer = gatewayTransportFailure

@@ -41,6 +41,8 @@ const NETWORK_DIAGNOSTIC_CODES = new Set([
   "tls_failure",
   "network_failure",
   "gateway_http_error",
+  "cloudflare_tunnel_unavailable",
+  "cloudflare_origin_unresolved",
 ]);
 const FAILURE_LAYERS = new Set([
   "authentication",
@@ -234,6 +236,59 @@ export function transportRemediation(profile) {
   const selected = safeProfileForDiagnostic(profile);
   const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
   return `Retry the same operation once. If it still fails, run ${command}; the standalone doctor tests the configured profile path and explicitly reports that it cannot inspect the host connector session itself.`;
+}
+
+export function gatewayHttpRemediation(profile, diagnosticCode) {
+  const selected = safeProfileForDiagnostic(profile);
+  const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
+  if (diagnosticCode === "cloudflare_tunnel_unavailable") {
+    return `The public Cloudflare Tunnel has no healthy connector. Check cloudflared status and tunnel connections, then run ${command}. A model catalogue or private route success does not verify this public path.`;
+  }
+  if (diagnosticCode === "cloudflare_origin_unresolved") {
+    return `Cloudflare could not resolve the public origin. Check the Cloudflare error code and route configuration, then run ${command}.`;
+  }
+  return `The gateway or its upstream returned an HTTP error; the specific cause is unknown. Check gateway and tunnel logs, then run ${command}.`;
+}
+
+async function gatewayHttpError(response, profile, endpoint, operation) {
+  let diagnosticCode = "gateway_http_error";
+  let failureLayer = "gateway_health";
+  let message = `The ${operation} returned HTTP ${response.status}.`;
+  if (endpoint === "public" && response.status === 530 &&
+      response.headers?.get("server")?.toLowerCase().includes("cloudflare")) {
+    // Cloudflare puts its 1xxx code in the error body. Inspect only a small prefix and
+    // never include any of that untrusted page in diagnostics or logs.
+    let prefix = "";
+    try {
+      const reader = response.body?.getReader();
+      if (reader) {
+        const decoder = new TextDecoder();
+        while (prefix.length < 4096) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          prefix += decoder.decode(chunk.value.subarray(0, 4096 - prefix.length), { stream: true });
+        }
+        await reader.cancel().catch(() => {});
+      }
+    } catch {
+      // A failed error-page read cannot hide the original HTTP failure.
+    }
+    diagnosticCode = /\b1033\b/.test(prefix)
+      ? "cloudflare_tunnel_unavailable" : "cloudflare_origin_unresolved";
+    failureLayer = "gateway_transport";
+    message = diagnosticCode === "cloudflare_tunnel_unavailable"
+      ? "Cloudflare returned HTTP 530 / 1033: the public Cloudflare Tunnel has no healthy cloudflared connector. The M5 gateway did not return this response. Check cloudflared and tunnel connections."
+      : "Cloudflare returned HTTP 530 before the M5 gateway responded. The public origin could not be resolved; inspect the Cloudflare 1xxx code and route configuration.";
+  } else if (response.status === 502) {
+    message = `The ${operation} returned HTTP 502: an upstream route failed; the specific cause is unknown. Check gateway and tunnel logs.`;
+  }
+  return new M5ClientError("upstream_http_error", message, {
+    httpStatus: response.status,
+    diagnosticCode,
+    failureLayer,
+    retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+    remediation: gatewayHttpRemediation(profile, diagnosticCode),
+  });
 }
 
 function networkDiagnosticCode(error) {
@@ -1205,17 +1260,7 @@ export async function createM5Client({
         );
       }
       if (response.status >= 400) {
-        throw new M5ClientError(
-          "upstream_http_error",
-          `The MCP gateway returned HTTP ${response.status}.`,
-          {
-            httpStatus: response.status,
-            diagnosticCode: "gateway_http_error",
-            failureLayer: "gateway_health",
-            retryable: response.status === 408 || response.status === 429 || response.status >= 500,
-            remediation: transportRemediation(profile),
-          },
-        );
+        throw await gatewayHttpError(response, profile, endpoint, "MCP gateway");
       }
 
       const returnedSession = response.headers.get("mcp-session-id");
@@ -1409,17 +1454,7 @@ export async function createM5Client({
           { httpStatus: response.status, failureLayer: "gateway_protocol", retryable: false },
         );
       }
-      throw new M5ClientError(
-        "upstream_http_error",
-        `The execution-feedback gateway returned HTTP ${response.status}.`,
-        {
-          httpStatus: response.status,
-          diagnosticCode: "gateway_http_error",
-          failureLayer: "gateway_health",
-          retryable: response.status === 408 || response.status === 429 || response.status >= 500,
-          remediation: transportRemediation(profile),
-        },
-      );
+      throw await gatewayHttpError(response, profile, endpoint, "execution-feedback gateway");
     } catch (error) {
       // The tailnet layer applies only before response headers: a reset
       // after HTTP 200 means the gateway was reached (and may have accepted
@@ -1822,17 +1857,7 @@ async function identityRequest(baseUrl, token, profile, fetchImpl, timeoutMs, en
       );
     }
     if (!response.ok) {
-      throw new M5ClientError(
-        "upstream_http_error",
-        `The gateway identity check returned HTTP ${response.status}.`,
-        {
-          httpStatus: response.status,
-          diagnosticCode: "gateway_http_error",
-          failureLayer: "gateway_health",
-          retryable: response.status === 408 || response.status === 429 || response.status >= 500,
-          remediation: transportRemediation(profile),
-        },
-      );
+      throw await gatewayHttpError(response, profile, endpoint, "gateway identity check");
     }
     try {
       return await response.json();
@@ -1910,7 +1935,9 @@ function discoveryFailureDetails(error, endpoint, profile) {
     ...(known && typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
     ...(httpStatus === undefined ? {} : { http_status: httpStatus }),
     ...(diagnosticCode === "model_discovery_unavailable"
-      ? {} : { remediation: transportRemediation(profile) }),
+      ? {} : { remediation: diagnosticCode.startsWith("cloudflare_")
+        ? gatewayHttpRemediation(profile, diagnosticCode)
+        : transportRemediation(profile) }),
   };
 }
 
@@ -2010,7 +2037,9 @@ function doctorEndpointFailure(error, profile, secrets) {
   } else if (safe.code === "timeout") {
     status = "timeout";
   } else if (safe.code === "upstream_http_error") {
-    if (safe.httpStatus === 503) status = "busy";
+    if (safe.diagnosticCode === "cloudflare_tunnel_unavailable") status = "tunnel_unavailable";
+    else if (safe.diagnosticCode === "cloudflare_origin_unresolved") status = "public_origin_unresolved";
+    else if (safe.httpStatus === 503) status = "busy";
     else if (safe.httpStatus === 504 || safe.httpStatus === 408) status = "timeout";
     else if (safe.httpStatus >= 500) status = "backend_failure";
     else status = "backend_failure";
@@ -2137,6 +2166,9 @@ export async function diagnoseProfile({
       ...(status === "rejected_credential"
         ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
         : {}),
+      ...(failure.safe.code === "upstream_http_error"
+        ? { remediation: gatewayHttpRemediation(profile, failure.safe.diagnosticCode) }
+        : {}),
       ...(failure.safe.code === "rejected_credential"
         ? {}
         : { diagnostic_code: failure.safe.diagnosticCode ?? failure.safe.code }),
@@ -2231,6 +2263,9 @@ export async function diagnoseProfile({
       credential: "present",
       ...(status === "rejected_credential"
         ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
+        : {}),
+      ...(failure.safe.code === "upstream_http_error"
+        ? { remediation: gatewayHttpRemediation(profile, failure.safe.diagnosticCode) }
         : {}),
       ...(status === "tailnet_unavailable"
         ? { remediation: failure.safe.remediation ?? localTailnetRemediation(profile) }

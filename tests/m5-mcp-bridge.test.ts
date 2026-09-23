@@ -713,6 +713,51 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
+  it("explains a Cloudflare 1033 tunnel failure in the visible MCP error", async () => {
+    const bridge = await makeBridge(async () => new Response(
+      "<html><title>Error 1033</title><p>private data must not echo</p></html>",
+      { status: 530, headers: { server: "cloudflare", "content-type": "text/html" } },
+    ));
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":18,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("Cloudflare Tunnel");
+    expect(response.error.message).toContain("cloudflared");
+    expect(response.error.message).not.toContain("private data");
+    expect(response.error.data).toMatchObject({
+      diagnostic_code: "cloudflare_tunnel_unavailable",
+      http_status: 530,
+      failure_layer: "gateway_transport",
+    });
+  });
+
+  it("explains a 502 without inventing a specific upstream cause", async () => {
+    const bridge = await makeBridge(async () => new Response("internal secret", { status: 502 }));
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":19,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("HTTP 502");
+    expect(response.error.message).toContain("specific cause is unknown");
+    expect(response.error.message).not.toContain("internal secret");
+    expect(response.error.data).toMatchObject({
+      diagnostic_code: "gateway_http_error",
+      http_status: 502,
+      failure_layer: "gateway_health",
+    });
+  });
+
+  it("does not call every Cloudflare 530 a tunnel outage", async () => {
+    const bridge = await makeBridge(async () => new Response(
+      "<title>Error 1016</title>", { status: 530, headers: { server: "cloudflare" } },
+    ));
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":20,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("HTTP 530");
+    expect(response.error.message).not.toContain("no healthy cloudflared");
+    expect(response.error.data.diagnostic_code).toBe("cloudflare_origin_unresolved");
+  });
+
   it("reconnects once without a stale HTTP MCP session", async () => {
     const sessions: Array<string | undefined> = [];
     let calls = 0;
