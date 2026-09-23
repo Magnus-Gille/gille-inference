@@ -377,7 +377,7 @@ export async function main(
         fetch: fetchImpl,
       });
       writeJson(output, result);
-      return result.status === "healthy" ? 0 : 1;
+      return result.status === "mcp_reachable" ? 0 : 1;
     }
 
     const gatewayUrl =

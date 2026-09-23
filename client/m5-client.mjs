@@ -4,7 +4,7 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.4.0";
+export const M5_CLIENT_VERSION = "1.4.1";
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
