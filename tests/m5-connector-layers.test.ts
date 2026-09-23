@@ -300,6 +300,7 @@ describe("tailnet probe semantics (#242)", () => {
     );
     expect(failure.code).toBe("timeout");
     expect(failure.failureLayer).toBe("local_tailnet_unavailable");
+    expect(failure.message).toContain("local tailnet is unavailable");
   });
 
   it("keeps gateway_transport for a reset after response headers arrived", async () => {

@@ -105,7 +105,11 @@ async function diagnose({
       const endpoint = isPrivate ? "private" : "public";
       if (url.endsWith("/portal/me")) {
         if (!isPrivate && rejectPublic !== undefined) {
-          return new Response("", { status: rejectPublic });
+          return rejectPublic === 530
+            ? new Response("<title>Error 1033</title>", {
+                status: 530, headers: { server: "cloudflare" },
+              })
+            : new Response("", { status: rejectPublic });
         }
         return jsonResponse({ alias: "doctor-agent", tier: "owner", scope: "agent" });
       }
@@ -189,6 +193,20 @@ async function diagnose({
   expect(askCalls).toBe(0);
   return result;
 }
+
+describe("public route outage diagnosis", () => {
+  it("names Cloudflare Tunnel 1033 and tells an agent which component to check", async () => {
+    const result = await diagnose({ rejectPublic: 530 });
+    expect(result).toMatchObject({
+      status: "tunnel_unavailable",
+      diagnostic_code: "cloudflare_tunnel_unavailable",
+      http_status: 530,
+      endpoints: { public: "tunnel_unavailable", private: "not_checked" },
+      remediation: expect.stringContaining("cloudflared"),
+    });
+    expectNoTaintedContent(result);
+  });
+});
 
 function expectNoTaintedContent(value: unknown): void {
   const serialized = JSON.stringify(value);
