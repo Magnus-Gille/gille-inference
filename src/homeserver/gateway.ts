@@ -1389,6 +1389,17 @@ async function handleChatProxy(
   // The raw requested model string is what llama-swap would start, so it is what we check.
   if (parsed.model !== null) {
     const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, parsed.model, memoryDeps, lctx.model);
+    // The disconnect listener below is registered after this wait and a missed 'close' is not
+    // replayed, so a caller that left during the observation is detected here. Nothing reached
+    // upstream, so there is no model start and no recurrent state to clear. (In `off` mode the
+    // check does no I/O and cannot span a disconnect, so the existing flow is left untouched.)
+    if (cfg.hostMemoryAdmission.mode !== "off" && res.destroyed && !res.writableEnded) {
+      lctx.status = 499;
+      lctx.outcome = "client_closed";
+      lctx.errorClass = "client_closed";
+      emitResponseTrace("client_closed");
+      return ZERO_RESULT;
+    }
     if (memoryRejection !== null) {
       lctx.status = 503;
       lctx.outcome = "memory_refused";

@@ -249,6 +249,20 @@ describe("parseHostMemoryBudgets", () => {
     // A reclaim estimate above the peak, non-numeric, empty or zero invalidates the entry.
     expect(invalid).toEqual(["c", "d", "e", "f"]);
   });
+  it("a model id listed twice is ambiguous: every entry for it is dropped, with its reclaim estimate", () => {
+    const { budgets, reclaim, invalid } = parseHostMemoryBudgets("other=60:50,other=10,big=50,other=5:5");
+    expect([...budgets.keys()]).toEqual(["big"]);
+    expect(reclaim.size).toBe(0);
+    expect(invalid).toEqual(["other", "other", "other"]);
+  });
+  it("validates the converted byte value, not the GiB text", () => {
+    // 1e-100 GiB rounds to 0 bytes and 1e300 GiB overflows a safe integer.
+    const { budgets, reclaim, invalid } = parseHostMemoryBudgets("tiny=1e-100,huge=1e300:1e300,big=60:1e300,ok=1");
+    expect([...budgets.keys()]).toEqual(["ok"]);
+    expect(reclaim.size).toBe(0);
+    expect(invalid).toEqual(["tiny", "huge", "big"]);
+    for (const v of budgets.values()) expect(Number.isSafeInteger(v) && v > 0).toBe(true);
+  });
   it("unset or blank yields nothing", () => {
     expect(parseHostMemoryBudgets(undefined)).toEqual({ budgets: new Map(), reclaim: new Map(), invalid: [] });
     expect(parseHostMemoryBudgets("  ")).toEqual({ budgets: new Map(), reclaim: new Map(), invalid: [] });
@@ -427,6 +441,41 @@ describe("admitHostMemory orchestration", () => {
       log: () => { throw new Error("sink down"); },
     }, "big");
     expect(r).toBeNull();
+    // A rejection value that cannot be converted to a string, and a getter that throws synchronously.
+    const logs: Record<string, unknown>[] = [];
+    const unprintable = await admitHostMemory(base("shadow"), "big", {
+      getRunning: () => Promise.reject(Object.create(null)),
+      readMemory: () => { throw Object.create(null); },
+      log: (rec) => logs.push(rec),
+    }, "big");
+    expect(unprintable).toBeNull();
+    expect(logs[0]).toMatchObject({ residencyError: "unprintable error value", memoryError: "unprintable error value" });
+  });
+
+  it("an expired residency observation is cancelled, and both observations share one deadline", async () => {
+    let seen: AbortSignal | undefined;
+    const started = Date.now();
+    const r = await admitHostMemory(base("enforce"), "big", {
+      getRunning: (signal) => { seen = signal; return new Promise(() => {}); },
+      readMemory: () => new Promise(() => {}),
+      log: () => {},
+      observationTimeoutMs: 60,
+    }, "big");
+    const elapsed = Date.now() - started;
+    expect(r).toMatchObject({ code: "memory_admission_unavailable" });
+    expect(seen?.aborted).toBe(true);
+    // One shared budget: well under two full deadlines even with timer slack.
+    expect(elapsed).toBeLessThan(110);
+  });
+
+  it("a completed observation is not aborted", async () => {
+    let seen: AbortSignal | undefined;
+    await admitHostMemory(base("shadow"), "big", {
+      getRunning: async (signal) => { seen = signal; return []; },
+      readMemory: async () => ({ ok: true, memory: mem(100, 90) }),
+      log: () => {},
+    }, "big");
+    expect(seen?.aborted).toBe(false);
   });
 
   it("a throwing log sink does not turn an enforce allow into a failure", async () => {

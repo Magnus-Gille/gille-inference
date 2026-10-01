@@ -18,6 +18,9 @@ let chatShouldFail = false;
 let runningStatus = 200;
 let runningModels: Array<{ model: string; state: string; cmd?: string; proxy?: string; ttl?: number }> = [];
 let runningPayloadOverride: unknown | undefined;
+// When set, /running sends headers and a partial body, then never finishes (a stalled body).
+let runningStallBody = false;
+const stalledResponses: ServerResponse[] = [];
 
 function startMock(): Promise<void> {
   mockServer = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -38,6 +41,13 @@ function startMock(): Promise<void> {
             ],
           })
         );
+        return;
+      }
+
+      if (url === "/running" && method === "GET" && runningStallBody) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write('{"running":[');
+        stalledResponses.push(res);
         return;
       }
 
@@ -237,6 +247,22 @@ describe("getRunningSnapshot", () => {
     ]);
     expect(snapshot[0]).not.toHaveProperty("cmd");
     expect(snapshot[0]).not.toHaveProperty("proxy");
+  });
+
+  it("a caller signal cancels a /running response whose body stalls after the headers", async () => {
+    runningStallBody = true;
+    try {
+      const deadline = new AbortController();
+      const started = Date.now();
+      const pending = llamaswap.getRunningSnapshot(deadline.signal);
+      setTimeout(() => deadline.abort(), 80);
+      await expect(pending).rejects.toMatchObject({ name: "RunningSnapshotUnavailableError" });
+      // Cancelled by the signal, not left to the body, which never completes.
+      expect(Date.now() - started).toBeLessThan(2000);
+    } finally {
+      runningStallBody = false;
+      for (const res of stalledResponses.splice(0)) res.destroy();
+    }
   });
 
   it("reports /running as unavailable when it is non-OK", async () => {

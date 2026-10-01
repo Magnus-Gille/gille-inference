@@ -600,9 +600,10 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    other models that are `ready` (llama-swap would evict them), capped at the host memory currently in
    use (`MemTotal - MemAvailable`). A reclaim estimate is a conservative lower bound on what evicting
    that model releases; a peak start budget is not such a bound, so an unknown residency or a resident
-   model without a declared reclaim estimate gives no credit. Each observation (residency, host
-   memory) has a 2 s deadline, because the check runs while the request holds an admission slot; an
-   expired observation counts as unavailable. The shared log carries only the gateway's canonical
+   model without a declared reclaim estimate gives no credit. The two observations (residency,
+   then host memory) share one 750 ms deadline, because the check runs while the request holds an
+   admission slot; an expired observation is cancelled and counts as unavailable. A caller that
+   disconnects during the observation is not forwarded. The shared log carries only the gateway's canonical
    model label (`unknown` for an id the trusted catalogue does not list), never the raw requested
    string. GTT counters are
    recorded in the decision log for calibration but do not affect the decision. The default is `off`
@@ -748,7 +749,7 @@ HOMESERVER_MAX_INFLIGHT=2                      # GPU slot budget (concurrent req
 HOMESERVER_OWNER_QUEUE_MAX_MS=5000            # how long an owner may queue for a slot
 HOMESERVER_BUSY_RETRY_AFTER_S=2               # Retry-After on a guest 503 at capacity
 HOMESERVER_HOST_MEMORY_ADMISSION=off          # whole-host memory check before a model start (#350): off (default) | shadow (log only, never rejects) | enforce
-HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[:reclaimGiB] (decimals ok): peak host memory a start may need, and optionally a conservative lower bound on what evicting the model releases (<= peak; absent = no eviction credit); invalid entries dropped and named at startup; uncalibrated
+HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[:reclaimGiB] (decimals ok): peak host memory a start may need, and optionally a conservative lower bound on what evicting the model releases (<= peak; absent = no eviction credit); invalid entries, and every entry for a model id listed twice, are dropped and named at startup; uncalibrated
 HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
 HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108

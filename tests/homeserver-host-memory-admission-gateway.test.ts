@@ -18,6 +18,7 @@ let runningCalls = 0; // all /running hits (other gateway subsystems also observ
 let featureRunningCalls = 0; // only the host-memory feature's residency getter
 let chatCalls = 0;
 let runningModels: Array<{ model: string; state: string }> = [];
+let runningDelayMs = 0;
 let memory: HostMemoryReadResult = { ok: true, memory: snapshot(100, 10) };
 let logs: Record<string, unknown>[] = [];
 let ownerKey = "";
@@ -80,6 +81,7 @@ async function withGateway(
     hostMemoryAdmissionDependencies: {
       getRunning: async () => {
         featureRunningCalls++;
+        if (runningDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, runningDelayMs));
         return runningModels.map((m) => ({ ...m, ttlSeconds: null }));
       },
       readMemory: async () => memory,
@@ -135,6 +137,7 @@ beforeEach(() => {
   featureRunningCalls = 0;
   chatCalls = 0;
   runningModels = [];
+  runningDelayMs = 0;
   memory = { ok: true, memory: snapshot(100, 10) };
   logs = [];
 });
@@ -212,6 +215,31 @@ describe("HTTP chat host-memory admission (#350)", () => {
       expect(body.error.message).toContain("budget_unknown");
     });
     expect(chatCalls).toBe(0);
+  });
+
+  it("a caller that disconnects during the observation never reaches upstream", async () => {
+    // Would be allowed: plenty of memory. The caller leaves while residency is still being observed.
+    memory = { ok: true, memory: snapshot(200, 190) };
+    runningDelayMs = 300;
+    await withGateway({ HOMESERVER_HOST_MEMORY_ADMISSION: "enforce", ...BUDGETS }, async (port) => {
+      const gone = new AbortController();
+      const pending = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ownerKey}` },
+        body: JSON.stringify({ model: "big", messages: [{ role: "user", content: "hi" }], max_tokens: 8 }),
+        signal: gone.signal,
+      }).catch(() => null);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      gone.abort();
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      expect(featureRunningCalls).toBe(1);
+      expect(chatCalls).toBe(0);
+      // The slot was released: a later request is served.
+      runningDelayMs = 0;
+      expect((await chat(port, "big")).status).toBe(200);
+      expect(chatCalls).toBe(1);
+    });
   });
 
   it("repeated refusals do not leak admission slots", async () => {

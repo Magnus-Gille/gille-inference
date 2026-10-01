@@ -79,17 +79,19 @@ export function parseHostMemoryMode(raw: string | undefined): HostMemoryAdmissio
   return raw === "shadow" || raw === "enforce" ? raw : "off";
 }
 
-function parsePositiveGib(text: string): number | null {
+/** GiB text to a byte count; null unless the CONVERTED value is a positive safe integer. */
+function parseGibAsBytes(text: string): number | null {
   if (text === "") return null;
-  const gib = Number(text);
-  return Number.isFinite(gib) && gib > 0 ? gib : null;
+  const bytes = Math.round(Number(text) * GIB);
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : null;
 }
 
 /**
  * Parse `modelId=peakGiB[:reclaimGiB],...`. `peakGiB` is the host memory a start may need;
  * the optional `reclaimGiB` is a conservative lower bound on what evicting the model releases and
  * must not exceed the peak. Invalid entries are dropped whole (never guessed) and their names
- * returned so startup can report them once; the value is never returned.
+ * returned so startup can report them once; the value is never returned. A model id that appears
+ * more than once is ambiguous, so every entry for it is dropped.
  */
 export function parseHostMemoryBudgets(
   raw: string | undefined,
@@ -97,6 +99,7 @@ export function parseHostMemoryBudgets(
   const budgets = new Map<string, number>();
   const reclaim = new Map<string, number>();
   const invalid: string[] = [];
+  const seen = new Set<string>();
   if (raw === undefined || raw.trim() === "") return { budgets, reclaim, invalid };
   for (const entry of raw.split(",")) {
     const trimmed = entry.trim();
@@ -105,15 +108,23 @@ export function parseHostMemoryBudgets(
     const name = eq > 0 ? trimmed.slice(0, eq).trim() : eq === 0 ? "" : trimmed;
     const valueText = eq > 0 ? trimmed.slice(eq + 1).trim() : "";
     const colon = valueText.indexOf(":");
-    const peakGib = parsePositiveGib(colon < 0 ? valueText : valueText.slice(0, colon).trim());
-    const reclaimGib = colon < 0 ? null : parsePositiveGib(valueText.slice(colon + 1).trim());
-    const reclaimValid = colon < 0 || (reclaimGib !== null && peakGib !== null && reclaimGib <= peakGib);
-    if (eq <= 0 || name === "" || peakGib === null || !reclaimValid) {
+    const peakBytes = parseGibAsBytes(colon < 0 ? valueText : valueText.slice(0, colon).trim());
+    const reclaimBytes = colon < 0 ? null : parseGibAsBytes(valueText.slice(colon + 1).trim());
+    const reclaimValid = colon < 0 || (reclaimBytes !== null && peakBytes !== null && reclaimBytes <= peakBytes);
+    if (eq <= 0 || name === "" || peakBytes === null || !reclaimValid) {
       invalid.push(name === "" ? "(empty)" : name);
       continue;
     }
-    budgets.set(name, Math.round(peakGib * GIB));
-    if (reclaimGib !== null) reclaim.set(name, Math.round(reclaimGib * GIB));
+    if (seen.has(name)) {
+      // Drop the earlier entry too: a later entry must not inherit an earlier reclaim estimate.
+      if (budgets.delete(name)) invalid.push(name);
+      reclaim.delete(name);
+      invalid.push(name);
+      continue;
+    }
+    seen.add(name);
+    budgets.set(name, peakBytes);
+    if (reclaimBytes !== null) reclaim.set(name, reclaimBytes);
   }
   return { budgets, reclaim, invalid };
 }
@@ -250,31 +261,56 @@ export async function readHostMemory(
 // ─── Orchestration ───────────────────────────────────────────────────────────────────
 
 export interface HostMemoryAdmissionDeps {
-  /** Residency observation (llama-swap GET /running). Throws when unavailable. */
-  getRunning: () => Promise<RunningSnapshotEntry[]>;
+  /**
+   * Residency observation (llama-swap GET /running). Throws when unavailable. The signal aborts
+   * when the observation deadline expires, so the underlying request is cancelled, not abandoned.
+   */
+  getRunning: (signal: AbortSignal) => Promise<RunningSnapshotEntry[]>;
   /** Defaults to readHostMemory() against the real host files. */
   readMemory?: () => Promise<HostMemoryReadResult>;
   /** Structured-log sink. Defaults to one JSON line on stdout. */
   log?: (record: Record<string, unknown>) => void;
-  /** Deadline for each observation (residency, host memory). Defaults to 2000 ms. */
+  /** Total deadline shared by both observations (residency, then host memory). Defaults to 750 ms. */
   observationTimeoutMs?: number;
 }
 
-const DEFAULT_OBSERVATION_TIMEOUT_MS = 2000;
+/**
+ * The check runs while the request holds an admission slot, and guests are rejected as soon as the
+ * slots are full. Both observations are local (loopback HTTP, procfs) and normally take about a
+ * millisecond, so the shared deadline is short: it only matters when the model backend is
+ * unresponsive, when inference would fail regardless.
+ */
+const DEFAULT_OBSERVATION_TIMEOUT_MS = 750;
 
+/** Never throws, including for values that cannot be converted to a string. */
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  try {
+    return err instanceof Error ? err.message : String(err);
+  } catch {
+    return "unprintable error value";
+  }
 }
 
 /**
- * Bound an observation. The check runs while the request holds an admission slot, so a hung
- * residency fetch or host read must not hold that slot; on expiry the caller treats the
- * observation as unavailable. The abandoned promise is left to settle on its own.
+ * Bound an observation and cancel it on expiry; the caller then treats the observation as
+ * unavailable. A late settlement of the cancelled work is consumed here, never left unhandled.
  */
-function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+function withDeadline<T>(run: (signal: AbortSignal) => Promise<T>, ms: number, what: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      reject(new Error(`${what} timed out after ${ms}ms`));
+      controller.abort();
+    }, ms);
     timer.unref?.();
+    let work: Promise<T>;
+    try {
+      work = run(controller.signal);
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+      return;
+    }
     work.then(
       (value) => { clearTimeout(timer); resolve(value); },
       (err: unknown) => { clearTimeout(timer); reject(err); },
@@ -324,12 +360,13 @@ export async function admitHostMemory(
   logLabel: string | null = null,
 ): Promise<HostMemoryRejection | null> {
   if (config.mode === "off") return null;
-  const timeoutMs = deps.observationTimeoutMs ?? DEFAULT_OBSERVATION_TIMEOUT_MS;
+  const deadlineAt = Date.now() + (deps.observationTimeoutMs ?? DEFAULT_OBSERVATION_TIMEOUT_MS);
+  const remainingMs = (): number => Math.max(1, deadlineAt - Date.now());
 
   let running: RunningSnapshotEntry[] | null = null;
   let residencyError: string | undefined;
   try {
-    running = await withDeadline(deps.getRunning(), timeoutMs, "residency observation");
+    running = await withDeadline((signal) => deps.getRunning(signal), remainingMs(), "residency observation");
   } catch (err) {
     // Unknown residency means no eviction credit (fail-conservative), never silently "empty".
     residencyError = errorText(err);
@@ -346,7 +383,7 @@ export async function admitHostMemory(
   let memory: HostMemorySnapshot | null = null;
   let memoryError: string | undefined;
   try {
-    const read = await withDeadline((deps.readMemory ?? readHostMemory)(), timeoutMs, "host memory read");
+    const read = await withDeadline(() => (deps.readMemory ?? readHostMemory)(), remainingMs(), "host memory read");
     if (read.ok) memory = read.memory;
     else memoryError = read.error;
   } catch (err) {
