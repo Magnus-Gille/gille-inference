@@ -24,6 +24,8 @@ export type ErrorCode =
   | "rate_limit_exceeded" // 429
   | "credits_exhausted" // 402 (lifetime credit budget spent)
   | "server_busy" // 503
+  | "insufficient_memory" // 503 (host cannot afford starting the requested model now; Retry-After)
+  | "memory_admission_unavailable" // 503 (memory admission cannot decide; operator action needed)
   | "upstream_unavailable" // 502 (model backend refused / reset the connection)
   | "upstream_timeout" // 504 (model backend timed out — may be loading a model)
   | "internal_error"; // 500 (generic, detail logged server-side only)
@@ -133,6 +135,19 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
     param: null,
     message:
       "The server is busy serving other requests. This is not a problem with your request — please retry after a moment.",
+  },
+  insufficient_memory: {
+    status: 503,
+    type: "server_error",
+    param: null,
+    message: "There is not enough host memory to start the requested model right now. Please retry later.",
+  },
+  memory_admission_unavailable: {
+    status: 503,
+    type: "server_error",
+    param: null,
+    message:
+      "Host memory admission cannot approve starting the requested model. Retrying will not help until the operator fixes it.",
   },
   upstream_unavailable: {
     // The model backend (LM Studio / llama-swap) refused or reset the connection. This is a

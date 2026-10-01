@@ -97,7 +97,7 @@ export function parseStrixHostProfileArgs(argv: string[]): StrixHostProfileArgs 
   return { biosUma, outPrefix };
 }
 
-function meminfoBytes(meminfo: string, key: string): number | null {
+export function meminfoBytes(meminfo: string, key: string): number | null {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = meminfo.match(new RegExp(`^${escaped}:\\s+(\\d+)\\s+kB$`, "m"));
   return match ? Number(match[1]) * 1024 : null;

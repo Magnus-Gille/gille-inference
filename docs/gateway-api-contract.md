@@ -65,6 +65,8 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 429 | quota codes | RPM/TPM/daily budget exceeded |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
 | 503 | `server_busy` (admission) | Owner preempted the serial GPU; client should retry after `Retry-After` seconds |
+| 503 | `insufficient_memory` | Whole-host memory admission (opt-in, `enforce` mode only): the host cannot afford starting the requested non-resident model now; carries `Retry-After`; nothing reached the backend and nothing was billed |
+| 503 | `memory_admission_unavailable` | Whole-host memory admission (opt-in, `enforce` mode only) cannot decide (no declared budget for the model, or host memory unreadable); no `Retry-After`, retrying will not help until the operator fixes it |
 | 504 | `upstream_timeout` | Backend exceeded the call timeout (often a cold model load); carries `Retry-After` |
 | 500 | `internal_error` | Uniform envelope; raw detail (SQLite/stack) is logged server-side, never leaked |
 

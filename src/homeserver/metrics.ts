@@ -53,6 +53,10 @@ const admissionRejectionsTotal: LabelMap = new Map();
 // homeserver_rate_limited_total{surface}
 const rateLimitedTotal: LabelMap = new Map();
 
+// homeserver_host_memory_admission_total{mode, outcome, reason} — whole-host memory admission
+// decisions (#350). Content-blind and low-cardinality: no model label.
+const hostMemoryAdmissionTotal: LabelMap = new Map();
+
 // homeserver_audio_seconds_total{model} — total seconds of audio transcribed (speech-to-text).
 // Content-blind: the only label is the canonical model. The TRANSCRIPT TEXT is never recorded here.
 const audioSecondsTotal: LabelMap = new Map();
@@ -339,6 +343,14 @@ export function recordRateLimited(surface: string): void {
   incCounter(rateLimitedTotal, labelKey({ surface: sanitizeLabel(surface) }));
 }
 
+/** Record one host-memory admission decision (#350). Never labelled by model. */
+export function recordHostMemoryAdmission(mode: string, outcome: string, reason: string): void {
+  incCounter(
+    hostMemoryAdmissionTotal,
+    labelKey({ mode: sanitizeLabel(mode), outcome: sanitizeLabel(outcome), reason: sanitizeLabel(reason) }),
+  );
+}
+
 // ─── Text exposition ──────────────────────────────────────────────────────────
 
 /** Emit a single counter metric family in Prometheus 0.0.4 text format. */
@@ -444,6 +456,11 @@ export function renderMetrics(): string {
       rateLimitedTotal
     ),
     renderCounter(
+      "homeserver_host_memory_admission_total",
+      "Whole-host memory admission decisions by mode, outcome, and reason",
+      hostMemoryAdmissionTotal
+    ),
+    renderCounter(
       "homeserver_audio_seconds_total",
       "Total seconds of audio transcribed (speech-to-text) by model",
       audioSecondsTotal
@@ -519,6 +536,7 @@ export function resetMetrics(): void {
   creditsTotal.clear();
   admissionRejectionsTotal.clear();
   rateLimitedTotal.clear();
+  hostMemoryAdmissionTotal.clear();
   audioSecondsTotal.clear();
   imagesTotal.clear();
   poisonClearTotal.clear();

@@ -6,6 +6,11 @@ import {
   type ReviewCascadeShadowConfig,
 } from "./review-cascade-shadow.js";
 import { sanitizeTraceIdentity } from "./tracing.js";
+import {
+  parseHostMemoryBudgets,
+  parseHostMemoryMode,
+  type HostMemoryAdmissionConfig,
+} from "./host-memory-admission.js";
 
 export type { ShadowLaneConfig };
 export type { ReviewCascadeShadowConfig };
@@ -326,6 +331,11 @@ export interface HomeserverConfig {
   harvestExcludedTaskTypes: string[];
   policy: PolicyConfig;
   delegatePolicy: DelegatePolicyConfig;
+  /**
+   * #350: whole-host memory admission before a llama-swap model start. Default OFF; `shadow`
+   * observes only. Budgets are operator-declared, not calibrated.
+   */
+  hostMemoryAdmission: HostMemoryAdmissionConfig;
   /** #234: background candidate-evidence lane on router-escalated leaves. Default OFF. */
   shadowLane: ShadowLaneConfig;
   /** #132: owner-only GPT-OSS → Qwen review measurement lane. Default OFF. */
@@ -568,6 +578,26 @@ function envNum(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+let hostMemoryBudgetsWarned = false;
+
+function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
+  const { budgets, invalid } = parseHostMemoryBudgets(process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"]);
+  if (invalid.length > 0 && !hostMemoryBudgetsWarned) {
+    hostMemoryBudgetsWarned = true;
+    console.warn(
+      `[host-memory-admission] ignoring invalid HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB entries: ${invalid.join(", ")}`,
+    );
+  }
+  const reserveGib = envNum("HOMESERVER_HOST_MEMORY_RESERVE_GIB", 12);
+  const retryAfter = envNum("HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS", 30);
+  return {
+    mode: parseHostMemoryMode(process.env["HOMESERVER_HOST_MEMORY_ADMISSION"]),
+    modelBudgetBytes: budgets,
+    reserveBytes: Math.round(Math.max(0, reserveGib) * 1024 ** 3),
+    retryAfterSeconds: Math.max(1, Math.round(retryAfter)),
+  };
+}
+
 /** Parse `model=positive_integer,...`; malformed entries are ignored rather than weakening caps. */
 export function parseModelMaxTokens(raw: string | undefined): Record<string, number> {
   if (raw === undefined) return { ...DEFAULT_MODEL_MAX_TOKENS };
@@ -721,6 +751,7 @@ export function loadConfig(): HomeserverConfig {
         1
       ),
     },
+    hostMemoryAdmission: loadHostMemoryAdmissionConfig(),
     delegatePolicy: {
       mode: (() => {
         const v = process.env["HOMESERVER_DELEGATE_POLICY"];

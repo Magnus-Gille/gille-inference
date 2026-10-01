@@ -52,6 +52,7 @@ import {
 } from "./maintenance-window.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
+import { admitHostMemory, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
@@ -1154,7 +1155,7 @@ function gatewayTraceTaskType(route: string): string {
 function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" | "degraded" | "failed" | "unknown" {
   if (outcome === "client_closed") return "unknown";
   if (outcome === "bad_request" || outcome === "forbidden" || outcome === "credits_exhausted") return "unknown";
-  if (outcome === "busy" || outcome === "rate_limited") return "degraded";
+  if (outcome === "busy" || outcome === "rate_limited" || outcome === "memory_refused") return "degraded";
   if (
     outcome === "stream_failed"
     || outcome === "degenerate"
@@ -1214,6 +1215,8 @@ const HANDLER_OWNED_OUTCOMES = new Set([
   // the original delegation outcome. The handler returns a truthful 200/error envelope so Hugin
   // can preserve the join evidence without triggering another model call.
   "learning_task_admission_recovered",
+  // #350: host-memory admission refused a model start (503); nothing reached upstream, billed 0.
+  "memory_refused",
 ]);
 
 async function handleChatProxy(
@@ -1223,7 +1226,8 @@ async function handleChatProxy(
   cfg: HomeserverConfig,
   effectiveMax: number,
   lctx: LogCtx,
-  principal: PrincipalContext
+  principal: PrincipalContext,
+  memoryDeps: HostMemoryAdmissionDeps,
 ): Promise<MeteredResult> {
   // C3: the model is safe to label only after upstream returns 2xx for it. We thread the
   // already-canonicalized lctx.model (set at the route) through as the canonicalModel.
@@ -1377,6 +1381,31 @@ async function handleChatProxy(
         ttftMs: null,
       };
     });
+  }
+
+  // #350: whole-host memory admission, immediately before the M5 upstream call (the Orin branch
+  // above never reaches llama-swap). A refusal never reaches upstream and returns ZERO_RESULT, so
+  // the spine releases the admission slot and reconciles credits/quota to 0 like any failed call.
+  // The raw requested model string is what llama-swap would start, so it is what we check.
+  if (parsed.model !== null) {
+    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, parsed.model, memoryDeps);
+    if (memoryRejection !== null) {
+      lctx.status = 503;
+      lctx.outcome = "memory_refused";
+      lctx.errorClass = memoryRejection.code;
+      if (memoryRejection.retryAfterSeconds !== null) lctx.retryAfterS = memoryRejection.retryAfterSeconds;
+      emitResponseTrace(lctx.outcome);
+      sendError(
+        res,
+        makeError(memoryRejection.code, {
+          message: memoryRejection.message,
+          ...(memoryRejection.retryAfterSeconds !== null
+            ? { retryAfterSeconds: memoryRejection.retryAfterSeconds }
+            : {}),
+        }),
+      );
+      return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: memoryRejection.code };
+    }
   }
 
   // TTFT clock: ms from the upstream call start to the first CONTENT chunk we receive (streaming).
@@ -3329,6 +3358,8 @@ export interface GatewayHandle {
 }
 
 export interface GatewayComposition {
+  /** Test seam for the whole-host memory admission readers/log sink (#350). Production uses real host files. */
+  hostMemoryAdmissionDependencies?: Partial<HostMemoryAdmissionDeps>;
   /**
    * Protected local provider for server-owned roster observations and registries.
    * The default is deliberately empty/fail-closed; deployment wrappers may inject
@@ -3410,6 +3441,10 @@ export function startGateway(
     setDefaultLogger(createAccessLogger(() => { /* no-op */ }));
   }
 
+  const hostMemoryDeps: HostMemoryAdmissionDeps = {
+    getRunning: getRunningSnapshot,
+    ...composition.hostMemoryAdmissionDependencies,
+  };
   const controller = new AdmissionController({
     maxInflight: cfg.maxInflight,
     ownerQueueMaxMs: cfg.ownerQueueMaxMs,
@@ -3497,6 +3532,7 @@ export function startGateway(
       learningTaskCapabilityEpoch,
       composition.rosterAdmissionDependencies,
       maintenanceWindow,
+      hostMemoryDeps,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -3602,6 +3638,7 @@ export async function handleRequest(
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch,
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
   maintenanceWindow?: ExclusiveMaintenanceWindow,
+  hostMemoryDeps: HostMemoryAdmissionDeps = { getRunning: getRunningSnapshot },
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -4473,6 +4510,7 @@ export async function handleRequest(
         gatewayRequestId: `opaque:${lctx.requestId}`,
         userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
         learningTaskCapabilityEpoch,
+        hostMemoryAdmission: hostMemoryDeps,
         inflight: {
           inc: incInflight,
           dec: decInflight,
@@ -4534,7 +4572,7 @@ export async function handleRequest(
       const effectiveMax = clampMaxTokensForModel(cfg, parsed.model, parsed.requestedMax);
       const est = estimateTokens(raw, effectiveMax);
       await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, est, lctx, async () => {
-        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal);
+        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps);
         traceOutcomeOverride = result.traceOutcome ?? null;
         traceErrorClassOverride = result.traceErrorClass ?? null;
         return result;

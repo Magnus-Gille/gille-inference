@@ -2,6 +2,7 @@ import type { ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { clampMaxTokensForModel, type HomeserverConfig } from "./config.js";
 import { listModels } from "./model-admin.js";
+import { admitHostMemory, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
 import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
@@ -616,7 +617,14 @@ export type RunChatResult =
     }
   | {
       ok: false;
-      code: "credits_exhausted" | "rate_limited" | "server_busy" | "model_not_allowed" | "upstream_error";
+      code:
+        | "credits_exhausted"
+        | "rate_limited"
+        | "server_busy"
+        | "insufficient_memory"
+        | "memory_admission_unavailable"
+        | "model_not_allowed"
+        | "upstream_error";
       message: string;
       traceOutcome: string;
       traceErrorClass: string;
@@ -766,7 +774,8 @@ export async function runChatCompletion(
   cfg: HomeserverConfig,
   controller: AdmissionController,
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number },
-  args: RunChatArgs
+  args: RunChatArgs,
+  hostMemoryAdmission?: HostMemoryAdmissionDeps,
 ): Promise<RunChatResult> {
   // Wall clock for the whole metered attempt — covers pre-admission rejections too, so every
   // request_log row (success OR failure) carries a real total_ms.
@@ -914,6 +923,41 @@ export async function runChatCompletion(
       };
     }
     throw err;
+  }
+
+  // #350: whole-host memory admission before anything that could make llama-swap start a model.
+  // A refusal releases the slot and rolls back the credit/quota reservations exactly like the
+  // server_busy path above; the call never ran, so it is not billed or recorded as a delegation.
+  if (hostMemoryAdmission !== undefined) {
+    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, args.model, hostMemoryAdmission)
+      .catch((err: unknown) => {
+        release();
+        releaseReserve();
+        recordUsage(principal.alias, 0, Date.now(), reservation);
+        throw err;
+      });
+    if (memoryRejection !== null) {
+      release();
+      releaseReserve();
+      recordUsage(principal.alias, 0, Date.now(), reservation);
+      recordRequest({
+        model: canonModel,
+        outcome: "memory_refused",
+        tier: principal.tier,
+        promptTokens: null,
+        completionTokens: null,
+        durationMs: Date.now() - attemptStart,
+        creditsCharged: null,
+      });
+      logInferenceFailure(503, "memory_refused", memoryRejection.code, "admitted");
+      return {
+        ok: false,
+        code: memoryRejection.code,
+        message: memoryRejection.message,
+        traceOutcome: "memory_refused",
+        traceErrorClass: memoryRejection.code,
+      };
+    }
   }
 
   // OWNER-ONLY full request log. Strictly owner-tier AND a real minted key (keyHash !== null) —
@@ -1253,6 +1297,8 @@ interface ToolCallContext {
   gatewayRequestId: string;
   userAgent: string | null;
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch;
+  /** #350 whole-host memory admission readers; absent in tests that predate it (feature then inert). */
+  hostMemoryAdmission?: HostMemoryAdmissionDeps;
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
 }
 
@@ -1426,7 +1472,7 @@ async function callTool(
         outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE && supportsReasoningEffort(model)
           ? "low"
           : undefined,
-    });
+    }, ctx.hostMemoryAdmission);
     if (r.ok) {
       const structuredContent = toAskStructuredContent(model, r);
       if (isAskTokenLimitTruncation(r)) {
