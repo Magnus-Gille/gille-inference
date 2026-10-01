@@ -49,13 +49,20 @@ function getOrigin(): string {
 async function fetchWithTimeout(
   url: string,
   init: RequestInit = {},
-  timeoutMs = 5000
+  timeoutMs = 5000,
+  // Optional caller cancellation. Unlike the header timer below it stays active through body
+  // consumption, so a caller deadline also ends a response whose body stalls.
+  signal?: AbortSignal,
 ): Promise<Response> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const headers = { ...(init.headers ?? {}), ...currentTraceHeaders() };
-    return await fetch(url, { ...init, headers, signal: ctrl.signal });
+    return await fetch(url, {
+      ...init,
+      headers,
+      signal: signal === undefined ? ctrl.signal : AbortSignal.any([ctrl.signal, signal]),
+    });
   } finally {
     clearTimeout(t);
   }
@@ -100,8 +107,8 @@ function isRunningEntry(value: unknown): value is LlamaSwapRunningEntry {
 }
 
 /** Fetch /running, distinguishing an HTTP failure from a valid empty running list. */
-async function fetchRunningProbe(origin: string): Promise<RunningProbeResult> {
-  const res = await fetchWithTimeout(`${origin}/running`, {}, 5000);
+async function fetchRunningProbe(origin: string, signal?: AbortSignal): Promise<RunningProbeResult> {
+  const res = await fetchWithTimeout(`${origin}/running`, {}, 5000, signal);
   if (!res.ok) return { ok: false, status: res.status };
   const data = (await res.json()) as unknown;
   const running =
@@ -117,9 +124,9 @@ async function fetchRunningProbe(origin: string): Promise<RunningProbeResult> {
 }
 
 /** Fetch /running; failures are unavailable, never an idle empty snapshot. */
-async function fetchRunning(origin: string): Promise<LlamaSwapRunningEntry[]> {
+async function fetchRunning(origin: string, signal?: AbortSignal): Promise<LlamaSwapRunningEntry[]> {
   try {
-    const probe = await fetchRunningProbe(origin);
+    const probe = await fetchRunningProbe(origin, signal);
     if (!probe.ok) {
       throw new RunningSnapshotUnavailableError(
         `llama-swap GET /running returned ${probe.status}`,
@@ -188,9 +195,9 @@ export async function getRunningCmd(modelId: string): Promise<string | null> {
 }
 
 /** Return a sanitized read-only observation of all entries reported by /running. */
-export async function getRunningSnapshot(): Promise<RunningSnapshotEntry[]> {
+export async function getRunningSnapshot(signal?: AbortSignal): Promise<RunningSnapshotEntry[]> {
   const origin = getOrigin();
-  const running = await fetchRunning(origin);
+  const running = await fetchRunning(origin, signal);
   return running.map(({ model, state, ttl }) => ({
     model,
     state,

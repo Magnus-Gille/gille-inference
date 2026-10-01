@@ -181,7 +181,7 @@ export async function getRunningCmd(_modelId: string): Promise<string | null> {
 }
 
 /** LM Studio has no equivalent running-entry endpoint, so report no observation explicitly. */
-export async function getRunningSnapshot(): Promise<RunningSnapshotEntry[]> {
+export async function getRunningSnapshot(_signal?: AbortSignal): Promise<RunningSnapshotEntry[]> {
   throw new RunningSnapshotUnavailableError("LM Studio running-model observation unavailable");
 }
 
