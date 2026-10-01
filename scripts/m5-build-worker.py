@@ -331,7 +331,19 @@ def run_container(config, repo, request):
                     if count > MAX_OUTPUT:
                         raise BuildError('Build exceeded the 256 MiB output limit.')
                     emit(key.data, data=base64.b64encode(block).decode('ascii'))
-        code = process.wait(timeout=max(1, WALL_SECONDS - (time.monotonic() - started)))
+        # Closing stdout/stderr does not prove the container/client has exited.
+        # Continue polling the SSH channel even after both output pipes reach EOF.
+        while process.poll() is None:
+            if client_gone():
+                raise BuildError('Build SSH channel disconnected; cancelling its container.')
+            remaining = WALL_SECONDS - (time.monotonic() - started)
+            if remaining <= 0:
+                raise BuildError('Build exceeded the 30-minute wall limit.')
+            try:
+                process.wait(timeout=min(0.5, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        code = process.wait(timeout=1)
         if code < 0 or code > 255:
             raise BuildError('Build runtime ended without a command exit status.')
         return code

@@ -164,6 +164,22 @@ class WorkerContract(unittest.TestCase):
                     w.run_container(dict(podman=str(runtime), image='x@sha256:'+'a'*64), Path(tmp), header())
                 stop.assert_called_once()
 
+    def test_disconnect_after_both_output_streams_close_cancels_without_waiting_for_wall_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)/'podman'
+            marker = Path(tmp)/'streams-closed'
+            runtime.write_text('#!' + sys.executable + '\nimport json,sys,os,time\n'
+                'if sys.argv[1]=="info": print(json.dumps({"host":{"security":{"rootless":True},"cgroupVersion":"v2","cgroupManager":"systemd"}}))\n'
+                'elif sys.argv[1]=="run":\n os.close(1)\n os.close(2)\n'
+                ' open(' + repr(str(marker)) + ', "w").close()\n time.sleep(10)\n')
+            runtime.chmod(0o700)
+            with mock.patch.object(w, 'WALL_SECONDS', 0.15), \
+                 mock.patch.object(w, 'client_gone', side_effect=marker.exists), \
+                 mock.patch.object(w, 'stop_container') as stop:
+                with self.assertRaisesRegex(w.BuildError, 'disconnected'):
+                    w.run_container(dict(podman=str(runtime), image='x@sha256:'+'a'*64), Path(tmp), header())
+                stop.assert_called_once()
+
     def test_silent_disconnected_stdout_is_detected(self):
         read_fd, write_fd = os.pipe()
         try:
