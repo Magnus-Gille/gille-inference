@@ -163,7 +163,6 @@ describe("HTTP chat host-memory admission (#350)", () => {
     expect(logs[0]).toMatchObject({
       event: "host_memory_admission",
       mode: "shadow",
-      model: "big",
       outcome: "refuse",
       reason: "insufficient_memory",
       enforced: false,

@@ -11,9 +11,19 @@ import {
 
 const GIB = 1024 ** 3;
 
-function cfg(budgetsGib: Record<string, number>, reserveGib = 12): Pick<HostMemoryAdmissionConfig, "modelBudgetBytes" | "reserveBytes"> {
+function gibMap(entries: Record<string, number>): Map<string, number> {
+  return new Map(Object.entries(entries).map(([k, v]) => [k, Math.round(v * GIB)]));
+}
+
+/** `reclaimGib` is the declared lower bound on memory released by evicting a model. */
+function cfg(
+  budgetsGib: Record<string, number>,
+  reserveGib = 12,
+  reclaimGib: Record<string, number> = {},
+): Pick<HostMemoryAdmissionConfig, "modelBudgetBytes" | "modelReclaimBytes" | "reserveBytes"> {
   return {
-    modelBudgetBytes: new Map(Object.entries(budgetsGib).map(([k, v]) => [k, Math.round(v * GIB)])),
+    modelBudgetBytes: gibMap(budgetsGib),
+    modelReclaimBytes: gibMap(reclaimGib),
     reserveBytes: Math.round(reserveGib * GIB),
   };
 }
@@ -39,7 +49,23 @@ describe("decideHostMemoryAdmission", () => {
     expect([d.outcome, d.reason]).toEqual(["not_needed", "already_resident"]);
   });
 
-  it("present in a non-ready state is a start in progress", () => {
+  it.each(["stopping", "stopped", "shutdown", "something-new"])(
+    "the requested model in state %s does not bypass the check",
+    (state) => {
+      const running = [{ model: "big", state }];
+      const noBudget = decideHostMemoryAdmission({ requestedModel: "big", running, memory: mem(100, 90), config: cfg({}) });
+      expect([noBudget.outcome, noBudget.reason]).toEqual(["refuse", "budget_unknown"]);
+      const noMemory = decideHostMemoryAdmission({ requestedModel: "big", running, memory: null, config: cfg({ big: 10 }) });
+      expect([noMemory.outcome, noMemory.reason]).toEqual(["refuse", "host_memory_unknown"]);
+      // Its own reclaim estimate is never credited to itself.
+      const self = decideHostMemoryAdmission({
+        requestedModel: "big", running, memory: mem(100, 20), config: cfg({ big: 60 }, 12, { big: 60 }),
+      });
+      expect([self.outcome, self.evictionCreditBytes]).toEqual(["refuse", 0]);
+    },
+  );
+
+  it("present in the starting state is a start in progress", () => {
     const d = decideHostMemoryAdmission({
       requestedModel: "big",
       running: [{ model: "big", state: "starting" }],
@@ -50,7 +76,7 @@ describe("decideHostMemoryAdmission", () => {
   });
 
   it("fits only thanks to eviction credit of another ready model", () => {
-    const config = cfg({ big: 48, other: 40 });
+    const config = cfg({ big: 48, other: 40 }, 12, { other: 40 });
     const input = { requestedModel: "big", memory: mem(100, 20), config };
     const without = decideHostMemoryAdmission({ ...input, running: [] });
     expect(without.reason).toBe("insufficient_memory");
@@ -71,12 +97,12 @@ describe("decideHostMemoryAdmission", () => {
     expect([d.outcome, d.reason]).toEqual(["refuse", "insufficient_memory"]);
   });
 
-  it("a resident model without a declared budget gives no credit", () => {
+  it("a resident model without a declared reclaim estimate gives no credit, even with a peak budget", () => {
     const d = decideHostMemoryAdmission({
       requestedModel: "big",
       running: [{ model: "mystery", state: "ready" }],
       memory: mem(100, 20),
-      config: cfg({ big: 60 }),
+      config: cfg({ big: 60, mystery: 50 }),
     });
     expect(d.evictionCreditBytes).toBe(0);
     expect(d.outcome).toBe("refuse");
@@ -87,7 +113,7 @@ describe("decideHostMemoryAdmission", () => {
       requestedModel: "big",
       running: [{ model: "other", state: "stopping" }],
       memory: mem(100, 20),
-      config: cfg({ big: 60, other: 40 }),
+      config: cfg({ big: 60, other: 40 }, 12, { other: 40 }),
     });
     expect(d.evictionCreditBytes).toBe(0);
     expect(d.outcome).toBe("refuse");
@@ -116,7 +142,7 @@ describe("decideHostMemoryAdmission", () => {
       requestedModel: "big",
       running: null,
       memory: mem(100, 20),
-      config: cfg({ big: 60, other: 40 }),
+      config: cfg({ big: 60, other: 40 }, 12, { other: 40 }),
     });
     expect(d.residencyKnown).toBe(false);
     expect(d.evictionCreditBytes).toBe(0);
@@ -129,10 +155,23 @@ describe("decideHostMemoryAdmission", () => {
       requestedModel: "big",
       running: [{ model: "other", state: "ready" }],
       memory: mem(100, 70),
-      config: cfg({ big: 80, other: 90 }),
+      config: cfg({ big: 80, other: 90 }, 12, { other: 90 }),
     });
     expect(d.evictionCreditBytes).toBe(30 * GIB);
     expect(d.projectedAvailableBytes).toBe(100 * GIB);
+  });
+
+  it("a peak budget is not eviction credit: other tenants plus a small resident footprint refuse", () => {
+    // 100 GiB host, 20 GiB available. The resident model's peak budget is 60 GiB but it actually
+    // releases about 20 GiB; unrelated tenants hold the rest. Crediting the peak would approve a
+    // 60 GiB start that cannot fit.
+    const input = { requestedModel: "big", running: [{ model: "other", state: "ready" }], memory: mem(100, 20) };
+    const d = decideHostMemoryAdmission({ ...input, config: cfg({ big: 60, other: 60 }, 12, { other: 20 }) });
+    expect(d.evictionCreditBytes).toBe(20 * GIB);
+    expect(d.projectedAvailableBytes).toBe(40 * GIB);
+    expect([d.outcome, d.reason]).toEqual(["refuse", "insufficient_memory"]);
+    const undeclared = decideHostMemoryAdmission({ ...input, config: cfg({ big: 60, other: 60 }) });
+    expect(undeclared.evictionCreditBytes).toBe(0);
   });
 
   it("fits on raw MemAvailable but is refused once free CMA is subtracted", () => {
@@ -155,15 +194,18 @@ describe("decideHostMemoryAdmission", () => {
     expect(floored.usableAvailableBytes).toBe(0);
   });
 
-  it("eviction credit cap uses usable (CMA-adjusted) available memory", () => {
+  it("the eviction credit cap does not hand free CMA memory back as capacity", () => {
+    // 30 GiB is in use, so eviction can release at most 30 GiB. The 10 GiB of free CMA is neither
+    // usable nor recoverable: 60 usable + 30 credit = 90, short of 80 + 12.
     const d = decideHostMemoryAdmission({
       requestedModel: "big",
       running: [{ model: "other", state: "ready" }],
       memory: { ...mem(100, 70), cmaFreeBytes: 10 * GIB },
-      config: cfg({ big: 80, other: 90 }),
+      config: cfg({ big: 80, other: 90 }, 12, { other: 90 }),
     });
-    expect(d.evictionCreditBytes).toBe(40 * GIB); // 100 total - 60 usable
-    expect(d.projectedAvailableBytes).toBe(100 * GIB);
+    expect(d.evictionCreditBytes).toBe(30 * GIB);
+    expect(d.projectedAvailableBytes).toBe(90 * GIB);
+    expect([d.outcome, d.reason]).toEqual(["refuse", "insufficient_memory"]);
   });
 
   it("carries GTT as evidence without affecting the decision", () => {
@@ -176,7 +218,7 @@ describe("decideHostMemoryAdmission", () => {
 
   // ILLUSTRATIVE numbers only: NOT measured on the host, chosen to show the incident shape.
   describe("incident shape (illustrative, not measured)", () => {
-    const config = cfg({ "model-a": 70, "model-b": 92 }, 12);
+    const config = cfg({ "model-a": 70, "model-b": 92 }, 12, { "model-a": 60 });
     const running = [{ model: "model-a", state: "ready" }];
     it("refused when other tenants hold memory (MemAvailable 30 GiB)", () => {
       const d = decideHostMemoryAdmission({ requestedModel: "model-b", running, memory: mem(122.7, 30), config });
@@ -191,15 +233,25 @@ describe("decideHostMemoryAdmission", () => {
 
 describe("parseHostMemoryBudgets", () => {
   it("parses valid entries including decimals and drops invalid ones by name", () => {
-    const { budgets, invalid } = parseHostMemoryBudgets("a=70, b=1.5,c=0,d=-3,e=abc,f,=5,g=Infinity");
+    const { budgets, reclaim, invalid } = parseHostMemoryBudgets("a=70, b=1.5,c=0,d=-3,e=abc,f,=5,g=Infinity");
     expect(budgets.get("a")).toBe(70 * GIB);
     expect(budgets.get("b")).toBe(Math.round(1.5 * GIB));
     expect([...budgets.keys()]).toEqual(["a", "b"]);
+    expect(reclaim.size).toBe(0);
     expect(invalid).toEqual(["c", "d", "e", "f", "(empty)", "g"]);
   });
+  it("parses an optional reclaim estimate and drops the whole entry when it is invalid", () => {
+    const { budgets, reclaim, invalid } = parseHostMemoryBudgets("a=70:55.5,b=40,c=50:60,d=50:x,e=50:,f=50:0,g=50:50");
+    expect([...budgets.keys()]).toEqual(["a", "b", "g"]);
+    expect(reclaim.get("a")).toBe(Math.round(55.5 * GIB));
+    expect(reclaim.has("b")).toBe(false);
+    expect(reclaim.get("g")).toBe(50 * GIB);
+    // A reclaim estimate above the peak, non-numeric, empty or zero invalidates the entry.
+    expect(invalid).toEqual(["c", "d", "e", "f"]);
+  });
   it("unset or blank yields nothing", () => {
-    expect(parseHostMemoryBudgets(undefined)).toEqual({ budgets: new Map(), invalid: [] });
-    expect(parseHostMemoryBudgets("  ")).toEqual({ budgets: new Map(), invalid: [] });
+    expect(parseHostMemoryBudgets(undefined)).toEqual({ budgets: new Map(), reclaim: new Map(), invalid: [] });
+    expect(parseHostMemoryBudgets("  ")).toEqual({ budgets: new Map(), reclaim: new Map(), invalid: [] });
   });
 });
 
@@ -233,11 +285,12 @@ describe("parseHostMemoryMode / config", () => {
     });
     it("reads the env vars", async () => {
       process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
-      process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] = "m=10";
+      process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] = "m=10:8";
       process.env["HOMESERVER_HOST_MEMORY_RESERVE_GIB"] = "4";
       process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"] = "7";
       const c = (await freshLoad()).hostMemoryAdmission;
       expect([c.mode, c.modelBudgetBytes.get("m"), c.reserveBytes, c.retryAfterSeconds]).toEqual(["enforce", 10 * GIB, 4 * GIB, 7]);
+      expect(c.modelReclaimBytes.get("m")).toBe(8 * GIB);
     });
   });
 });
@@ -310,7 +363,7 @@ describe("admitHostMemory orchestration", () => {
       getRunning: async () => [],
       readMemory: async () => ({ ok: true, memory: mem(100, 10) }),
       log: (rec) => logs.push(rec),
-    });
+    }, "big");
     expect(r).toBeNull();
     expect(logs).toHaveLength(1);
     expect(logs[0]).toMatchObject({ event: "host_memory_admission", mode: "shadow", model: "big", outcome: "refuse", reason: "insufficient_memory", enforced: false });
@@ -336,5 +389,77 @@ describe("admitHostMemory orchestration", () => {
     });
     expect(r).toMatchObject({ code: "memory_admission_unavailable", retryAfterSeconds: null, reason: "host_memory_unknown" });
     expect(logs[0]).toMatchObject({ residencyError: "running down", memoryError: "meminfo gone", residencyKnown: false });
+  });
+
+  it("logs only the caller's trusted label, never the raw requested model text", async () => {
+    const logs: Record<string, unknown>[] = [];
+    const secretShaped = "sk-live-0123456789abcdef-not-a-model";
+    for (const label of [null, "unknown"]) {
+      const r = await admitHostMemory(base("enforce"), secretShaped, {
+        getRunning: async () => [],
+        readMemory: async () => ({ ok: true, memory: mem(100, 90) }),
+        log: (rec) => logs.push(rec),
+      }, label);
+      // The caller still sees its own input echoed in the refusal.
+      expect(r).toMatchObject({ code: "memory_admission_unavailable", reason: "budget_unknown" });
+      expect(r!.message).toContain(secretShaped);
+    }
+    expect(logs).toHaveLength(2);
+    expect(logs.map((l) => l["model"])).toEqual(["unknown", "unknown"]);
+    expect(JSON.stringify(logs)).not.toContain("sk-live");
+  });
+
+  it("a resident model in a non-start state is still checked and logged", async () => {
+    const logs: Record<string, unknown>[] = [];
+    const r = await admitHostMemory(base("enforce"), "big", {
+      getRunning: async () => [{ model: "big", state: "stopping", ttlSeconds: null }],
+      readMemory: async () => ({ ok: true, memory: mem(100, 10) }),
+      log: (rec) => logs.push(rec),
+    }, "big");
+    expect(r).toMatchObject({ code: "insufficient_memory" });
+    expect(logs).toHaveLength(1);
+  });
+
+  it("shadow never fails a request: throwing log sink, non-Error rejections", async () => {
+    const r = await admitHostMemory(base("shadow"), "big", {
+      getRunning: () => Promise.reject(undefined),
+      readMemory: () => Promise.reject(null),
+      log: () => { throw new Error("sink down"); },
+    }, "big");
+    expect(r).toBeNull();
+  });
+
+  it("a throwing log sink does not turn an enforce allow into a failure", async () => {
+    const r = await admitHostMemory(base("enforce"), "big", {
+      getRunning: async () => [],
+      readMemory: async () => ({ ok: true, memory: mem(100, 90) }),
+      log: () => { throw new Error("sink down"); },
+    }, "big");
+    expect(r).toBeNull();
+  });
+
+  it("observations that never settle are bounded by the deadline", async () => {
+    const never = <T>(): Promise<T> => new Promise<T>(() => {});
+    const logs: Record<string, unknown>[] = [];
+    const started = Date.now();
+    const shadow = await admitHostMemory(base("shadow"), "big", {
+      getRunning: () => never(),
+      readMemory: () => never(),
+      log: (rec) => logs.push(rec),
+      observationTimeoutMs: 25,
+    }, "big");
+    expect(shadow).toBeNull();
+    expect(logs[0]).toMatchObject({ residencyKnown: false, reason: "host_memory_unknown" });
+    expect(String(logs[0]!["residencyError"])).toContain("timed out");
+    expect(String(logs[0]!["memoryError"])).toContain("timed out");
+    // Enforce fails closed on the same condition instead of hanging.
+    const enforce = await admitHostMemory(base("enforce"), "big", {
+      getRunning: () => never(),
+      readMemory: () => never(),
+      log: () => {},
+      observationTimeoutMs: 25,
+    }, "big");
+    expect(enforce).toMatchObject({ code: "memory_admission_unavailable", reason: "host_memory_unknown" });
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });

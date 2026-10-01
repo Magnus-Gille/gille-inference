@@ -581,7 +581,7 @@ function envNum(name: string, fallback: number): number {
 let hostMemoryBudgetsWarned = false;
 
 function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
-  const { budgets, invalid } = parseHostMemoryBudgets(process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"]);
+  const { budgets, reclaim, invalid } = parseHostMemoryBudgets(process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"]);
   if (invalid.length > 0 && !hostMemoryBudgetsWarned) {
     hostMemoryBudgetsWarned = true;
     console.warn(
@@ -593,6 +593,7 @@ function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
   return {
     mode: parseHostMemoryMode(process.env["HOMESERVER_HOST_MEMORY_ADMISSION"]),
     modelBudgetBytes: budgets,
+    modelReclaimBytes: reclaim,
     reserveBytes: Math.round(Math.max(0, reserveGib) * 1024 ** 3),
     retryAfterSeconds: Math.max(1, Math.round(retryAfter)),
   };

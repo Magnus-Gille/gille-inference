@@ -592,13 +592,19 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
 7. **Whole-host memory admission (#350, default OFF)** — GPU memory on the unified-memory host is not
    charged to the model service's cgroup, so starting a large non-resident model can exhaust the whole
    host. Before forwarding a chat request (`/v1/chat/completions` and MCP `ask`) the gateway checks
-   `GET /running`: a model that is already resident, or whose start is in progress, is forwarded
-   untouched. Otherwise it needs a declared budget and a readable `/proc/meminfo`, and the request is
+   `GET /running`: a model that is `ready` or `starting` is forwarded untouched; any other state is
+   checked like an absent model. Otherwise it needs a declared budget and a readable `/proc/meminfo`, and the request is
    allowed only if `usable available memory + eviction credit >= budget + reserve`. Usable available
    memory is `MemAvailable` minus `CmaFree` (free CMA pages are counted in `MemAvailable` but ordinary
-   allocations cannot use them). Eviction credit is the summed declared budgets of the *other* models
-   that are `ready` (llama-swap would evict them), capped at the host memory currently in use; an
-   unknown residency or a resident model without a declared budget gives no credit. GTT counters are
+   allocations cannot use them). Eviction credit is the summed declared *reclaim estimates* of the
+   other models that are `ready` (llama-swap would evict them), capped at the host memory currently in
+   use (`MemTotal - MemAvailable`). A reclaim estimate is a conservative lower bound on what evicting
+   that model releases; a peak start budget is not such a bound, so an unknown residency or a resident
+   model without a declared reclaim estimate gives no credit. Each observation (residency, host
+   memory) has a 2 s deadline, because the check runs while the request holds an admission slot; an
+   expired observation counts as unavailable. The shared log carries only the gateway's canonical
+   model label (`unknown` for an id the trusted catalogue does not list), never the raw requested
+   string. GTT counters are
    recorded in the decision log for calibration but do not affect the decision. The default is `off`
    (no `/running` fetch, no file read). `shadow` logs one content-free `host_memory_admission` JSON line
    for each request that would need a model start (a resident model adds a metric count but no log
@@ -742,7 +748,7 @@ HOMESERVER_MAX_INFLIGHT=2                      # GPU slot budget (concurrent req
 HOMESERVER_OWNER_QUEUE_MAX_MS=5000            # how long an owner may queue for a slot
 HOMESERVER_BUSY_RETRY_AFTER_S=2               # Retry-After on a guest 503 at capacity
 HOMESERVER_HOST_MEMORY_ADMISSION=off          # whole-host memory check before a model start (#350): off (default) | shadow (log only, never rejects) | enforce
-HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=GiB peak host-memory budgets (decimals ok); invalid entries dropped and named at startup; uncalibrated
+HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[:reclaimGiB] (decimals ok): peak host memory a start may need, and optionally a conservative lower bound on what evicting the model releases (<= peak; absent = no eviction credit); invalid entries dropped and named at startup; uncalibrated
 HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
 HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108

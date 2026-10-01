@@ -929,7 +929,7 @@ export async function runChatCompletion(
   // A refusal releases the slot and rolls back the credit/quota reservations exactly like the
   // server_busy path above; the call never ran, so it is not billed or recorded as a delegation.
   if (hostMemoryAdmission !== undefined) {
-    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, args.model, hostMemoryAdmission)
+    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, args.model, hostMemoryAdmission, canonModel)
       .catch((err: unknown) => {
         release();
         releaseReserve();

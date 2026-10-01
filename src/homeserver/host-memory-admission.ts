@@ -25,8 +25,14 @@ export type HostMemoryAdmissionMode = "off" | "shadow" | "enforce";
 
 export interface HostMemoryAdmissionConfig {
   mode: HostMemoryAdmissionMode;
-  /** Operator-declared peak host-memory cost per model id (bytes). Not calibrated. */
+  /** Operator-declared peak host-memory cost of STARTING a model (bytes). Not calibrated. */
   modelBudgetBytes: ReadonlyMap<string, number>;
+  /**
+   * Operator-declared conservative LOWER bound on the host memory released when that model is
+   * evicted (bytes). A peak start budget is not such a bound, so a model without an entry here
+   * gives no eviction credit.
+   */
+  modelReclaimBytes: ReadonlyMap<string, number>;
   reserveBytes: number;
   retryAfterSeconds: number;
 }
@@ -73,30 +79,57 @@ export function parseHostMemoryMode(raw: string | undefined): HostMemoryAdmissio
   return raw === "shadow" || raw === "enforce" ? raw : "off";
 }
 
+function parsePositiveGib(text: string): number | null {
+  if (text === "") return null;
+  const gib = Number(text);
+  return Number.isFinite(gib) && gib > 0 ? gib : null;
+}
+
 /**
- * Parse `modelId=GiB,...`. Invalid entries are dropped (never guessed) and their names returned so
- * startup can report them once. Only the model name is returned for an invalid entry, not the value.
+ * Parse `modelId=peakGiB[:reclaimGiB],...`. `peakGiB` is the host memory a start may need;
+ * the optional `reclaimGiB` is a conservative lower bound on what evicting the model releases and
+ * must not exceed the peak. Invalid entries are dropped whole (never guessed) and their names
+ * returned so startup can report them once; the value is never returned.
  */
 export function parseHostMemoryBudgets(
   raw: string | undefined,
-): { budgets: Map<string, number>; invalid: string[] } {
+): { budgets: Map<string, number>; reclaim: Map<string, number>; invalid: string[] } {
   const budgets = new Map<string, number>();
+  const reclaim = new Map<string, number>();
   const invalid: string[] = [];
-  if (raw === undefined || raw.trim() === "") return { budgets, invalid };
+  if (raw === undefined || raw.trim() === "") return { budgets, reclaim, invalid };
   for (const entry of raw.split(",")) {
     const trimmed = entry.trim();
     if (trimmed === "") continue;
     const eq = trimmed.lastIndexOf("=");
     const name = eq > 0 ? trimmed.slice(0, eq).trim() : eq === 0 ? "" : trimmed;
     const valueText = eq > 0 ? trimmed.slice(eq + 1).trim() : "";
-    const gib = valueText === "" ? Number.NaN : Number(valueText);
-    if (eq <= 0 || name === "" || !Number.isFinite(gib) || gib <= 0) {
+    const colon = valueText.indexOf(":");
+    const peakGib = parsePositiveGib(colon < 0 ? valueText : valueText.slice(0, colon).trim());
+    const reclaimGib = colon < 0 ? null : parsePositiveGib(valueText.slice(colon + 1).trim());
+    const reclaimValid = colon < 0 || (reclaimGib !== null && peakGib !== null && reclaimGib <= peakGib);
+    if (eq <= 0 || name === "" || peakGib === null || !reclaimValid) {
       invalid.push(name === "" ? "(empty)" : name);
       continue;
     }
-    budgets.set(name, Math.round(gib * GIB));
+    budgets.set(name, Math.round(peakGib * GIB));
+    if (reclaimGib !== null) reclaim.set(name, Math.round(reclaimGib * GIB));
   }
-  return { budgets, invalid };
+  return { budgets, reclaim, invalid };
+}
+
+/** "ready" or "starting" when the model needs no new start; null otherwise. */
+function residentStartState(
+  running: Array<{ model: string; state: string }> | null,
+  model: string,
+): "ready" | "starting" | null {
+  let found: "ready" | "starting" | null = null;
+  for (const r of running ?? []) {
+    if (r.model !== model) continue;
+    if (r.state === "ready") return "ready";
+    if (r.state === "starting") found = "starting";
+  }
+  return found;
 }
 
 function usableAvailable(memory: HostMemorySnapshot): number {
@@ -107,7 +140,7 @@ export function decideHostMemoryAdmission(input: {
   requestedModel: string;
   running: Array<{ model: string; state: string }> | null;
   memory: HostMemorySnapshot | null;
-  config: Pick<HostMemoryAdmissionConfig, "modelBudgetBytes" | "reserveBytes">;
+  config: Pick<HostMemoryAdmissionConfig, "modelBudgetBytes" | "modelReclaimBytes" | "reserveBytes">;
 }): HostMemoryDecision {
   const { requestedModel, running, memory, config } = input;
   const budget = config.modelBudgetBytes.get(requestedModel) ?? null;
@@ -125,12 +158,14 @@ export function decideHostMemoryAdmission(input: {
     residencyKnown: running !== null,
   };
 
-  const self = running?.find((r) => r.model === requestedModel);
-  if (self !== undefined) {
+  // Only a ready model, or one whose start is already under way, needs no new start. Any other
+  // state (stopping, stopped, unknown) proves neither, so it is checked like an absent model.
+  const selfState = residentStartState(running, requestedModel);
+  if (selfState !== null) {
     return {
       ...base,
       outcome: "not_needed",
-      reason: self.state === "ready" ? "already_resident" : "start_in_progress",
+      reason: selfState === "ready" ? "already_resident" : "start_in_progress",
     };
   }
   if (budget === null) return { ...base, outcome: "refuse", reason: "budget_unknown" };
@@ -138,10 +173,12 @@ export function decideHostMemoryAdmission(input: {
 
   let credit = 0;
   for (const r of running ?? []) {
-    if (r.state === "ready") credit += config.modelBudgetBytes.get(r.model) ?? 0;
+    if (r.model !== requestedModel && r.state === "ready") credit += config.modelReclaimBytes.get(r.model) ?? 0;
   }
   const usable = usableAvailable(memory);
-  credit = Math.min(credit, Math.max(0, memory.memTotalBytes - usable));
+  // Eviction cannot release more than is in use. Free CMA pages are not in use, so the cap is taken
+  // on raw MemAvailable; subtracting CMA here would hand that unusable memory back as credit.
+  credit = Math.min(credit, Math.max(0, memory.memTotalBytes - memory.memAvailableBytes));
   const projected = usable + credit;
   const required = budget + config.reserveBytes;
   return {
@@ -183,7 +220,7 @@ export async function readHostMemory(
   try {
     meminfo = await readFile("/proc/meminfo");
   } catch (err) {
-    return { ok: false, error: `cannot read /proc/meminfo: ${(err as Error).message}` };
+    return { ok: false, error: `cannot read /proc/meminfo: ${errorText(err)}` };
   }
   const memTotalBytes = meminfoBytes(meminfo, "MemTotal");
   const memAvailableBytes = meminfoBytes(meminfo, "MemAvailable");
@@ -219,6 +256,30 @@ export interface HostMemoryAdmissionDeps {
   readMemory?: () => Promise<HostMemoryReadResult>;
   /** Structured-log sink. Defaults to one JSON line on stdout. */
   log?: (record: Record<string, unknown>) => void;
+  /** Deadline for each observation (residency, host memory). Defaults to 2000 ms. */
+  observationTimeoutMs?: number;
+}
+
+const DEFAULT_OBSERVATION_TIMEOUT_MS = 2000;
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Bound an observation. The check runs while the request holds an admission slot, so a hung
+ * residency fetch or host read must not hold that slot; on expiry the caller treats the
+ * observation as unavailable. The abandoned promise is left to settle on its own.
+ */
+function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err: unknown) => { clearTimeout(timer); reject(err); },
+    );
+  });
 }
 
 export type HostMemoryRejection =
@@ -230,6 +291,18 @@ function safeModelLabel(model: string): string {
   return model.replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 128);
 }
 
+/**
+ * Telemetry is best effort: a failing log sink or metric must never fail or reject a request,
+ * least of all in shadow mode.
+ */
+function bestEffort(action: () => void): void {
+  try {
+    action();
+  } catch {
+    // Deliberately dropped: there is no safer channel to report a failing log sink on.
+  }
+}
+
 function defaultLog(record: Record<string, unknown>): void {
   process.stdout.write(`${JSON.stringify(record)}\n`);
 }
@@ -237,55 +310,64 @@ function defaultLog(record: Record<string, unknown>): void {
 /**
  * Check whole-host memory before forwarding a request that may make llama-swap start `model`.
  * Returns a rejection only in `enforce` mode with a `refuse` decision; otherwise null. In `off`
- * mode this returns immediately and performs no I/O.
+ * mode this returns immediately and performs no I/O. It never throws.
+ *
+ * `model` is the raw requested id: it is used for lookup and echoed only to the caller who sent it.
+ * `logLabel` is the caller's already-canonicalised label (validated against trusted model
+ * configuration, else "unknown"); only that label reaches the shared log, because a raw model
+ * string is caller-controlled text.
  */
 export async function admitHostMemory(
   config: HostMemoryAdmissionConfig,
   model: string,
   deps: HostMemoryAdmissionDeps,
+  logLabel: string | null = null,
 ): Promise<HostMemoryRejection | null> {
   if (config.mode === "off") return null;
+  const timeoutMs = deps.observationTimeoutMs ?? DEFAULT_OBSERVATION_TIMEOUT_MS;
 
   let running: RunningSnapshotEntry[] | null = null;
   let residencyError: string | undefined;
   try {
-    running = await deps.getRunning();
+    running = await withDeadline(deps.getRunning(), timeoutMs, "residency observation");
   } catch (err) {
     // Unknown residency means no eviction credit (fail-conservative), never silently "empty".
-    residencyError = (err as Error).message;
+    residencyError = errorText(err);
   }
 
   // A resident (or already starting) model needs no start. Count it, but skip the host reads and
   // the log line so steady-state traffic adds no per-request log volume.
-  if (running?.some((r) => r.model === model)) {
+  if (residentStartState(running, model) !== null) {
     const notNeeded = decideHostMemoryAdmission({ requestedModel: model, running, memory: null, config });
-    recordHostMemoryAdmission(config.mode, notNeeded.outcome, notNeeded.reason);
+    bestEffort(() => recordHostMemoryAdmission(config.mode, notNeeded.outcome, notNeeded.reason));
     return null;
   }
 
   let memory: HostMemorySnapshot | null = null;
   let memoryError: string | undefined;
   try {
-    const read = await (deps.readMemory ?? readHostMemory)();
+    const read = await withDeadline((deps.readMemory ?? readHostMemory)(), timeoutMs, "host memory read");
     if (read.ok) memory = read.memory;
     else memoryError = read.error;
   } catch (err) {
-    memoryError = (err as Error).message;
+    memoryError = errorText(err);
   }
 
   const decision = decideHostMemoryAdmission({ requestedModel: model, running, memory, config });
   const enforced = config.mode === "enforce";
-  (deps.log ?? defaultLog)({
-    event: "host_memory_admission",
-    ts: new Date().toISOString(),
-    mode: config.mode,
-    model: safeModelLabel(model),
-    ...decision,
-    ...(residencyError !== undefined ? { residencyError } : {}),
-    ...(memoryError !== undefined ? { memoryError } : {}),
-    enforced,
-  });
-  recordHostMemoryAdmission(config.mode, decision.outcome, decision.reason);
+  bestEffort(() =>
+    (deps.log ?? defaultLog)({
+      event: "host_memory_admission",
+      ts: new Date().toISOString(),
+      mode: config.mode,
+      model: logLabel === null ? "unknown" : safeModelLabel(logLabel),
+      ...decision,
+      ...(residencyError !== undefined ? { residencyError } : {}),
+      ...(memoryError !== undefined ? { memoryError } : {}),
+      enforced,
+    }),
+  );
+  bestEffort(() => recordHostMemoryAdmission(config.mode, decision.outcome, decision.reason));
 
   if (!enforced || decision.outcome !== "refuse") return null;
   const label = safeModelLabel(model);

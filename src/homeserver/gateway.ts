@@ -1388,7 +1388,7 @@ async function handleChatProxy(
   // the spine releases the admission slot and reconciles credits/quota to 0 like any failed call.
   // The raw requested model string is what llama-swap would start, so it is what we check.
   if (parsed.model !== null) {
-    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, parsed.model, memoryDeps);
+    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, parsed.model, memoryDeps, lctx.model);
     if (memoryRejection !== null) {
       lctx.status = 503;
       lctx.outcome = "memory_refused";
