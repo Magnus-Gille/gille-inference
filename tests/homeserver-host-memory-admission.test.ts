@@ -255,6 +255,15 @@ describe("parseHostMemoryBudgets", () => {
     expect(reclaim.size).toBe(0);
     expect(invalid).toEqual(["other", "other", "other"]);
   });
+  it.each(["other=60:50,other=bad", "other=bad,other=60:50", "other=60:50,other", "other,other=60:50"])(
+    "a malformed duplicate also makes the id ambiguous: %s",
+    (raw) => {
+      const { budgets, reclaim, invalid } = parseHostMemoryBudgets(raw);
+      expect(budgets.size).toBe(0);
+      expect(reclaim.size).toBe(0);
+      expect(invalid).toEqual(["other", "other"]);
+    },
+  );
   it("validates the converted byte value, not the GiB text", () => {
     // 1e-100 GiB rounds to 0 bytes and 1e300 GiB overflows a safe integer.
     const { budgets, reclaim, invalid } = parseHostMemoryBudgets("tiny=1e-100,huge=1e300:1e300,big=60:1e300,ok=1");

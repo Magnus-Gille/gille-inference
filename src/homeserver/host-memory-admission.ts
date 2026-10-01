@@ -107,6 +107,17 @@ export function parseHostMemoryBudgets(
     const eq = trimmed.lastIndexOf("=");
     const name = eq > 0 ? trimmed.slice(0, eq).trim() : eq === 0 ? "" : trimmed;
     const valueText = eq > 0 ? trimmed.slice(eq + 1).trim() : "";
+    // Duplicates are detected by name BEFORE the value is validated, so a malformed entry also
+    // makes its id ambiguous, whichever order the entries come in.
+    if (name !== "") {
+      if (seen.has(name)) {
+        if (budgets.delete(name)) invalid.push(name);
+        reclaim.delete(name);
+        invalid.push(name);
+        continue;
+      }
+      seen.add(name);
+    }
     const colon = valueText.indexOf(":");
     const peakBytes = parseGibAsBytes(colon < 0 ? valueText : valueText.slice(0, colon).trim());
     const reclaimBytes = colon < 0 ? null : parseGibAsBytes(valueText.slice(colon + 1).trim());
@@ -115,14 +126,6 @@ export function parseHostMemoryBudgets(
       invalid.push(name === "" ? "(empty)" : name);
       continue;
     }
-    if (seen.has(name)) {
-      // Drop the earlier entry too: a later entry must not inherit an earlier reclaim estimate.
-      if (budgets.delete(name)) invalid.push(name);
-      reclaim.delete(name);
-      invalid.push(name);
-      continue;
-    }
-    seen.add(name);
     budgets.set(name, peakBytes);
     if (reclaimBytes !== null) reclaim.set(name, reclaimBytes);
   }
