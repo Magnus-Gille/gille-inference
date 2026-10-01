@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import pwd
 import re
 import selectors
+import select
 import shutil
 import signal
 import stat
@@ -250,7 +251,7 @@ def container_command(config, repo, name, request):
     return [config['podman'], 'run', '--name', name, '--rm', '--pull=never', '--network=none',
             '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
             '--userns=keep-id', '--cpus=2', '--cpu-shares=128', '--memory=8g',
-            '--memory-swap=8g', '--pids-limit=512', '--stop-timeout=5',
+            '--memory-swap=8g', '--pids-limit=512', '--stop-timeout=5', '--timeout=1800',
             '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--workdir=/workspace',
             '--mount', 'type=bind,src=' + str(workspace) + ',dst=/workspace,rw',
             '--mount', 'type=bind,src=' + str(target) + ',dst=/target,rw',
@@ -282,6 +283,18 @@ def stop_container(config, name, env):
             raise BuildError('Build container cleanup failed; operator intervention required.')
 
 
+def client_gone():
+    # A silent container must not wait until its next write to notice a dead
+    # SSH channel. poll() reports a pipe writer's missing reader without writing.
+    fd = sys.stdout.fileno()
+    info = os.fstat(fd)
+    if not (stat.S_ISFIFO(info.st_mode) or stat.S_ISSOCK(info.st_mode)):
+        return False  # local/operator redirection; runtime timeout still applies
+    channel = select.poll()
+    channel.register(fd, select.POLLERR | select.POLLHUP)
+    return bool(channel.poll(0))
+
+
 def run_container(config, repo, request):
     env = runtime_environment()
     result = subprocess.run([config['podman'], 'info', '--format=json'], env=env,
@@ -304,6 +317,8 @@ def run_container(config, repo, request):
             streams.register(process.stdout, selectors.EVENT_READ, 'stdout')
             streams.register(process.stderr, selectors.EVENT_READ, 'stderr')
             while streams.get_map():
+                if client_gone():
+                    raise BuildError('Build SSH channel disconnected; cancelling its container.')
                 if time.monotonic() - started >= WALL_SECONDS:
                     raise BuildError('Build exceeded the 30-minute wall limit.')
                 for key, _ in streams.select(timeout=0.5):
@@ -323,12 +338,18 @@ def run_container(config, repo, request):
     finally:
         # A forced SSH disconnect, stream write failure, timeout, or signal must
         # terminate the cgroup/container, not just its local podman client.
-        if process is not None and process.poll() is None:
+        if process is not None:
             try:
+                # podman/conmon/container have independent lifetimes: a dead
+                # client never proves that its container was removed.
                 stop_container(config, name, env)
             finally:
-                process.kill()
-                process.wait(timeout=10)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
 
 
 def remove_tree(path):

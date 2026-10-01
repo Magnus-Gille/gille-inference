@@ -94,7 +94,7 @@ class WorkerContract(unittest.TestCase):
             rendered = ' '.join(command)
             for flag in ['--network=none', '--pull=never', '--read-only', '--cap-drop=ALL',
                          '--security-opt=no-new-privileges', '--cpus=2', '--memory=8g',
-                         '--memory-swap=8g', '--pids-limit=512', '--userns=keep-id']:
+                         '--memory-swap=8g', '--pids-limit=512', '--userns=keep-id', '--timeout=1800']:
                 self.assertIn(flag, command)
             self.assertNotIn('/home/magnus', rendered)
             self.assertNotIn('--privileged', command)
@@ -144,6 +144,39 @@ class WorkerContract(unittest.TestCase):
                 code = w.run_container(dict(podman=str(runtime), image='x@sha256:'+'a'*64), Path(tmp), header())
             self.assertEqual(code, 7)
             self.assertEqual({kind for kind, _ in events}, {'stdout', 'stderr'})
+
+    def test_cleanup_is_verified_even_after_podman_client_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)/'podman'
+            runtime.write_text('#!' + sys.executable + '\nimport json,sys\n'
+                'if sys.argv[1]=="info": print(json.dumps({"host":{"security":{"rootless":True},"cgroupVersion":"v2","cgroupManager":"systemd"}}))\n'
+                'elif sys.argv[1]=="run": sys.exit(137)\n')
+            runtime.chmod(0o700)
+            with mock.patch.object(w, 'stop_container') as stop:
+                self.assertEqual(w.run_container(dict(podman=str(runtime), image='x@sha256:'+'a'*64), Path(tmp), header()), 137)
+                stop.assert_called_once()
+                self.assertRegex(stop.call_args.args[1], '^m5-build-[a-f0-9]{32}$')
+            with mock.patch.object(w, 'stop_container', side_effect=w.BuildError('cleanup failed')):
+                with self.assertRaisesRegex(w.BuildError, 'cleanup failed'):
+                    w.run_container(dict(podman=str(runtime), image='x@sha256:'+'a'*64), Path(tmp), header())
+            with mock.patch.object(w, 'client_gone', return_value=True), mock.patch.object(w, 'stop_container') as stop:
+                with self.assertRaisesRegex(w.BuildError, 'disconnected'):
+                    w.run_container(dict(podman=str(runtime), image='x@sha256:'+'a'*64), Path(tmp), header())
+                stop.assert_called_once()
+
+    def test_silent_disconnected_stdout_is_detected(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with mock.patch.object(w.sys, 'stdout') as output:
+                output.fileno.return_value = write_fd
+                self.assertFalse(w.client_gone())
+                os.close(read_fd)
+                read_fd = None
+                self.assertTrue(w.client_gone())
+        finally:
+            if read_fd is not None:
+                os.close(read_fd)
+            os.close(write_fd)
 
     def test_execution_sync_removes_deleted_files_and_collects_reports(self):
         with tempfile.TemporaryDirectory() as tmp:

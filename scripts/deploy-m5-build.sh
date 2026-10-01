@@ -30,10 +30,20 @@ done
 printf 'Plan: %s separate M5 build runtime at release %s; digest-pinned offline image.\n' "$mode" "$release"
 [[ $mode != dry-run ]] || exit 0
 stage=/opt/gille-build/staged/$release
+ssh_args=(-T -o BatchMode=yes -o ForwardAgent=no -o ClearAllForwardings=yes
+  -o 'SendEnv=-*' -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
+run_ssh() (
+  # Keep only local OpenSSH authentication/connection inputs; provider/API and
+  # application credential environments may not enter the operator transport.
+  for name in $(compgen -e); do
+    case "$name" in HOME|PATH|SSH_AUTH_SOCK|USER|LOGNAME) ;; *) unset "$name" ;; esac
+  done
+  ssh "${ssh_args[@]}" -- "$host" "$@"
+)
 if [[ $mode == preflight ]]; then
   # No upload, temporary remote directory, privileged copy or host mutation.
   # Requires the exact payload already present from an owner-approved stage/apply.
-  ssh -T -o BatchMode=yes -- "$host" "sudo -n bash '$stage/scripts/install-m5-build.sh' preflight '$release' '$image'"
+  run_ssh "sudo -n bash '$stage/scripts/install-m5-build.sh' preflight '$release' '$image'"
   exit
 fi
 scratch=$(mktemp -d)
@@ -44,6 +54,6 @@ printf '%s\n' "$release" > "$scratch/.build-release"
 # Root extracts an allowlisted archive from stdin, not worktree bytes or a
 # caller-writable remote stage. No credential is accepted or forwarded.
 # Refuse an existing release stage rather than overwrite an uncertain payload.
-tar -cf - -C "$scratch" .build-release "${files[@]}" | ssh -T -o BatchMode=yes -- "$host" \
+tar -cf - -C "$scratch" .build-release "${files[@]}" | run_ssh \
   "sudo -n /bin/bash -c 'set -euo pipefail; umask 077; test ! -e $stage; mkdir -p /opt/gille-build/staged; mkdir -m700 $stage; tar --no-same-owner -xf - -C $stage; chmod -R go-w $stage; bash $stage/scripts/install-m5-build.sh apply $release $image'"
 printf '%s\n' 'Runtime installation completed. Verify protected inference and owner-attended SSH/build acceptance before declaring issue #347 complete.'

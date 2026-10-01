@@ -136,7 +136,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     command, ...(selected === undefined ? {} : { toolchain: selected }), pull, archive_bytes: prepared.archive.length };
   const requestLine = `${JSON.stringify(request)}\n`;
   if (Buffer.byteLength(requestLine) > 8192) throw new Error("Build header exceeds its 8192-byte limit.");
-  const child = spawnImpl("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "SendEnv=",
+  const child = spawnImpl("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "SendEnv=-*",
     "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "ServerAliveInterval=15",
     "-o", "ServerAliveCountMax=2", "-T", build.sshTarget, "m5-build-worker"], {
     env: { ...LOCAL_ENV, HOME: homedir() }, stdio: ["pipe", "pipe", "pipe"],
