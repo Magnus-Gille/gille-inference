@@ -89,6 +89,8 @@ Munin Memory, Mimir, and Heimdall are optional consumers or peers.
 ### Bounded agentic and research execution
 
 - pi-harness drives an accepted read/edit/run loop inside a tested cage.
+- The optional offline-first `m5 build` client runs bounded Linux build checks on a dedicated
+  remote worker; it is separate from gateway inference. See [`docs/m5-remote-build.md`](./docs/m5-remote-build.md).
 - The deep-research harness uses code-defined stages, pluggable search/read adapters, and a
   deterministic citation verifier.
 - Explicit model evaluation records evidence for already-staged local candidates without changing
@@ -175,6 +177,8 @@ See [`SECURITY.md`](./SECURITY.md),
 - [`docs/hugin-role-validation.md`](./docs/hugin-role-validation.md) — dated trial that decides
   whether Hugin's implementation earns its maintenance surface.
 - [`docs/gateway-api-contract.md`](./docs/gateway-api-contract.md) — concrete gateway surfaces.
+- [`docs/m5-remote-build.md`](./docs/m5-remote-build.md) — optional isolated remote builds, installation, and limits.
+- [`docs/m5-agent-client.md`](./docs/m5-agent-client.md) — owner-agent client and local MCP tools.
 - [`docs/ox-alpha-pi.md`](./docs/ox-alpha-pi.md) — secret-safe headless Pi launcher for the external
   Nous `stealth/ox-alpha` agent and isolated subagents.
 - [`docs/observability.md`](./docs/observability.md) — content and telemetry boundaries.

@@ -8,8 +8,10 @@ surfaces:
 - `m5` is the secret-safe client substrate for Claude, Codex, and shell automation.
 
 MCP remains the discoverable agent protocol. `m5 mcp` is a stdio-to-HTTP bridge, not another MCP
-server implementation: every accepted JSON-RPC message is forwarded to the fixed gateway `/mcp`
-route.
+server implementation: gateway-backed MCP calls are forwarded to the fixed gateway `/mcp` route.
+The optional `build_run` tool is the exception: it is a local client bridge tool, enabled only by
+`~/.config/m5/build.json`, and runs the isolated offline-first worker without gateway routing or
+inference. See the [remote build guide](m5-remote-build.md) for its contract and limits.
 
 ## Installation and versioning contract
 
