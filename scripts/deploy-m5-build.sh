@@ -23,7 +23,8 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # Only these regular, tracked files enter the root-owned remote payload.
 files=(scripts/install-m5-build.sh scripts/m5-build-worker.py)
 for file in "${files[@]}"; do
-  [[ $(git ls-tree "$release" -- "$file") == 100644\ blob\ * ]] || {
+  entry=$(git ls-tree "$release" -- "$file")
+  [[ $entry == 100644\ blob\ * || $entry == 100755\ blob\ * ]] || {
     printf 'ERROR: installer payload must consist of regular tracked files.\n' >&2; exit 1;
   }
 done
