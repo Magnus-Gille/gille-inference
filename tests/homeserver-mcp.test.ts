@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1053,6 +1053,14 @@ describe("MCP M2b: credits_exhausted outcome alignment", () => {
 // minted-key ONLY (mirrors owner-log) so no GUEST content is ever excerpted. These rows are
 // usage-only — outcome "unverified" — so they never affect capability VERDICT math.
 describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
+  // Only these cost fixtures need a historical date; other MCP scopes stay real.
+  // Row queries use insertion order because earlier scopes have real timestamps.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
   beforeAll(() => {
     ensureLedgerSchema();
     ensureDelegationCostSchema();
@@ -1098,7 +1106,7 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
     expect(mcpAskDelegations()).toBe(before + 1);
 
     const row = getDb()
-      .prepare("SELECT task_type, model_id, outcome, source, completion_tokens FROM delegations WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1")
+      .prepare("SELECT task_type, model_id, outcome, source, completion_tokens FROM delegations WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1")
       .get() as { task_type: string; model_id: string; outcome: string; source: string; completion_tokens: number | null };
     expect(row.source).toBe("mcp-ask");
     expect(row.outcome).toBe("unverified");
@@ -1131,7 +1139,7 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
 
     const row = getDb()
       .prepare(
-        "SELECT source, delegator_model, delegator_model_source, cost_status, actual_baseline_cost_usd, potential_savings_actual_usd, delegate_policy_mode, delegate_policy_action FROM delegation_costs WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1"
+        "SELECT source, delegator_model, delegator_model_source, cost_status, actual_baseline_cost_usd, potential_savings_actual_usd, delegate_policy_mode, delegate_policy_action FROM delegation_costs WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1"
       )
       .get() as {
         source: string;
@@ -1178,7 +1186,7 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
     expect(mcpAskDelegations()).toBe(before + 1);
 
     const row = getDb()
-      .prepare("SELECT task_type, model_id, outcome, error_class FROM delegations WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1")
+      .prepare("SELECT task_type, model_id, outcome, error_class FROM delegations WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1")
       .get() as { task_type: string; model_id: string; outcome: string; error_class: string | null };
     expect(row.model_id).toBe("boom-model");
     expect(row.outcome).toBe("error");
