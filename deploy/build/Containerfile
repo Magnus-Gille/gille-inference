@@ -1,0 +1,27 @@
+# Build outside production only after approving dependency downloads. Both base
+# arguments MUST be immutable digest references; final image MUST also be pinned.
+# Example: podman build --build-arg RUST_IMAGE=rust@sha256:<digest>
+#   --build-arg NODE_IMAGE=node@sha256:<digest> -f deploy/build/Containerfile .
+# Use the Rust 1.98.0/bookworm and Node 22/bookworm image variants (same libc).
+ARG NODE_IMAGE
+ARG RUST_IMAGE
+FROM ${NODE_IMAGE} AS node
+FROM ${RUST_IMAGE}
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && rustc --version | grep '^rustc 1\.98\.0 ' \
+ && node --version | grep '^v22\.' \
+ && rustup component add clippy rustfmt --toolchain 1.98.0 \
+ && cargo install --locked sccache --version 0.10.0 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends python3 pkg-config build-essential \
+      libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+      libasound2-dev file xdotool patchelf \
+ && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup RUSTUP_AUTO_INSTALL=0
+ENV PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+# No credentials, SSH config, provider tools or host home are baked into the image.
+# Runtime selects an explicit entrypoint; no shell interpolation is involved.
+WORKDIR /workspace

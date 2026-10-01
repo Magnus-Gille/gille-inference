@@ -184,17 +184,19 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
       try {
         let response;
         if (message.method === "tools/call" && message.params?.name === "build_run") {
+          if (notification) return null;
           if (!buildConfig) throw new M5ClientError("build_unavailable", "Local build is not configured.");
           const args = message.params.arguments;
-          if (!args || typeof args !== "object" || Array.isArray(args) || !isAbsolute(args.cwd) ||
-              !Array.isArray(args.command) || args.command.some(value => typeof value !== "string") ||
+          if (!args || typeof args !== "object" || Array.isArray(args) || typeof args.cwd !== "string" || !isAbsolute(args.cwd) ||
+              Object.keys(args).some(key => !["cwd", "command", "pull", "toolchain"].includes(key)) ||
+              !Array.isArray(args.command) || args.command.length === 0 || args.command.some(value => typeof value !== "string") ||
               (args.pull !== undefined && (!Array.isArray(args.pull) || args.pull.some(value => typeof value !== "string"))) ||
               (args.toolchain !== undefined && typeof args.toolchain !== "string")) {
             throw new M5ClientError("invalid_args", "build_run requires absolute cwd, command string array, optional toolchain, and optional pull paths.");
           }
           const quiet = { write() { return true; } };
           const result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
-          response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: false } };
+          response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
         } else {
           try {
             response = await client.rpc(message);

@@ -227,6 +227,7 @@ function help() {
     name: "m5",
     version: M5_CLIENT_VERSION,
     usage: [
+      "m5 build [--pull relative/file] [--toolchain version] -- command args",
       "m5 --profile <claude|codex> doctor",
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
@@ -281,7 +282,7 @@ export async function main(
   try {
     if (argv[0] === "build") {
       const parsed = parseBuildArgs(argv.slice(1));
-      const result = await buildRunner(parsed);
+      const result = await buildRunner({ ...parsed, stdout: output, stderr: error });
       return result.exit_code;
     }
     const {
@@ -469,7 +470,7 @@ export async function main(
             redactText(caught instanceof Error ? caught.message : "m5 failed."),
           );
     writeJson(error, safe.toJSON(selectedProfileName));
-    return 1;
+    return argv[0] === "build" ? 125 : 1;
   }
 }
 

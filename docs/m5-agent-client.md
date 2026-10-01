@@ -17,10 +17,10 @@ inference. See the [remote build guide](m5-remote-build.md) for its contract and
 
 The `m5` executable ships in the same npm package as `hs`. The npm registry's latest published
 version was `1.3.7` when checked on 2026-09-23. Version `1.3.8` exists in repository source but
-is not published to npm. Install the reviewed `1.4.1` package only after publication:
+is not published to npm. Install the reviewed `1.5.0` package only after publication:
 
 ```bash
-npm install --global gille-inference@1.4.1
+npm install --global gille-inference@1.5.0
 m5 --version
 ```
 
@@ -43,6 +43,10 @@ connector diagnostic codes visible even in MCP hosts that hide JSON-RPC error da
 also returns process exit code 0 when `doctor` reports `mcp_reachable`; the source-only `1.4.0`
 client incorrectly returned 1 despite a successful catalogue check. Coordinate the
 installed client and gateway switch while code-loop callers are idle.
+Version `1.5.0` adds the credential-independent offline `m5 build` SSH client and optional local
+`build_run` MCP tool. Remote builds require local Python 3, Git and OpenSSH; inference commands
+remain Node-only. New Python dirfd filesystem checks refuse links, forbidden/ignored files and
+unsafe artifact destinations; builds never send workspace bytes to the inference gateway.
 Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
@@ -322,7 +326,7 @@ The result makes that boundary explicit:
 ```json
 {
   "status": "mcp_reachable",
-  "client_version": "1.4.1",
+  "client_version": "1.5.0",
   "health_scope": "mcp_catalogue_only",
   "model_discovery": { "public": "available", "private": "available" },
   "inference": { "public": "not_checked", "private": "not_checked" },
