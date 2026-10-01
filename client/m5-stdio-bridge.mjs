@@ -1,3 +1,5 @@
+import { isAbsolute } from "node:path";
+import { runBuild } from "./m5-build.mjs";
 import {
   M5ClientError,
   createFileAdoptionSpool,
@@ -165,7 +167,7 @@ function validMessage(message) {
   );
 }
 
-export function createMcpStdioBridge({ client, profile, adoptionSpool = createFileAdoptionSpool() }) {
+export function createMcpStdioBridge({ client, profile, adoptionSpool = createFileAdoptionSpool(), buildConfig, buildRunner = runBuild }) {
   return Object.freeze({
     async handleLine(line) {
       let message;
@@ -181,14 +183,30 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
       let resultRetryAttempted = false;
       try {
         let response;
-        try {
-          response = await client.rpc(message);
+        if (message.method === "tools/call" && message.params?.name === "build_run") {
+          if (notification) return null;
+          if (!buildConfig) throw new M5ClientError("build_unavailable", "Local build is not configured.");
+          const args = message.params.arguments;
+          if (!args || typeof args !== "object" || Array.isArray(args) || typeof args.cwd !== "string" || !isAbsolute(args.cwd) ||
+              Object.keys(args).some(key => !["cwd", "command", "pull", "toolchain"].includes(key)) ||
+              !Array.isArray(args.command) || args.command.length === 0 || args.command.some(value => typeof value !== "string") ||
+              (args.pull !== undefined && (!Array.isArray(args.pull) || args.pull.some(value => typeof value !== "string"))) ||
+              (args.toolchain !== undefined && typeof args.toolchain !== "string")) {
+            throw new M5ClientError("invalid_args", "build_run requires absolute cwd, command string array, optional toolchain, and optional pull paths.");
+          }
+          const quiet = { write() { return true; } };
+          const result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
+          response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
+        } else {
+          try {
+            response = await client.rpc(message);
         } catch (error) {
           if (!notification && isCodeLoopResult(message) && isRetryableResultTransport(error)) {
             resultRetryAttempted = true;
             response = await client.rpc(message);
           } else {
             throw error;
+          }
           }
         }
         if (notification) return null;
@@ -198,6 +216,17 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
             -32603,
             "The MCP gateway returned an empty response for a request.",
           );
+        }
+        if (message.method === "tools/list" && buildConfig && response?.result?.tools && !response.result.tools.some(tool => tool.name === "build_run")) {
+          response.result.tools = [...response.result.tools, {
+            name: "build_run",
+            description: "Run a local M5 build over the configured SSH build worker; never uses gateway credentials.",
+            inputSchema: { type: "object", additionalProperties: false, required: ["cwd", "command"], properties: {
+              cwd: { type: "string", description: "Absolute local git worktree path." },
+              command: { type: "array", items: { type: "string" }, description: "Literal command argv." },
+              toolchain: { type: "string" }, pull: { type: "array", items: { type: "string" } },
+            } },
+          }];
         }
         return JSON.stringify(response);
       } catch (error) {

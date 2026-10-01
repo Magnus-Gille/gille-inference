@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,9 +13,14 @@ import {
 import { cmdLedger } from "../src/homeserver/cli.js";
 
 beforeEach(() => {
+  // Price fixtures use the catalog's validity window; async timers stay real.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
   const dir = mkdtempSync(join(tmpdir(), "hs-deleg-cost-test-"));
   initDb(join(dir, "test.db"));
 });
+
+afterEach(() => vi.useRealTimers());
 
 describe("delegation cost trace", () => {
   it("records verified savings only when outcome is pass", () => {

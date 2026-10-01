@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   DEFAULT_PREMIUM_BASELINE_MODEL_ID,
   estimateTokenCostUsd,
@@ -7,6 +7,14 @@ import {
 } from "../src/homeserver/cost-catalog.js";
 
 describe("homeserver cost catalog", () => {
+  // Exercise the pinned tariff snapshot, not the date on the CI runner.
+  // Explicit expiry tests below must still fail closed after validUntil.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
   it("prices the fixed premium baseline (Claude Fable 5)", () => {
     const price = lookupModelTokenPrice(DEFAULT_PREMIUM_BASELINE_MODEL_ID);
     expect(price?.inputUsdPerMTok).toBe(10);

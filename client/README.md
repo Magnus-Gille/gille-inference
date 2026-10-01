@@ -6,14 +6,15 @@ This package contains two deliberately separate zero-dependency clients:
 - `m5` is the profile-based, Keychain-backed owner-agent client and stdio MCP bridge.
 
 The box-local operator CLI remains `src/homeserver/cli.ts`; neither packaged client replaces it.
-All `example.com` URLs below are reserved documentation examples; replace them with your
-deployment URL.
+The optional `m5 build` command is a separate SSH-based, offline-first remote build bridge, not a
+gateway inference route; see the [remote build guide](../docs/m5-remote-build.md). All
+`example.com` URLs below are reserved documentation examples; replace them with your deployment URL.
 
 Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 
-### Owner-client 1.4.1 compatibility
+### Owner-client 1.5.0 compatibility
 
-The 1.4.1 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+The 1.5.0 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
 Its doctor reports MCP catalogue reachability without calling metered inference; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
@@ -162,4 +163,5 @@ See the
 [`m5` agent client guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-agent-client.md)
 for the profile schema, Keychain account mapping, structured code commands, `claude-config`
 installation/versioning contract, and security boundary. The server-side cage and diff-only result
-are authoritative; the client never applies a returned diff.
+are authoritative; the client never applies a returned diff. See the [remote build guide](../docs/m5-remote-build.md)
+for the optional local MCP `build_run` tool and dedicated-worker contract.

@@ -1,6 +1,6 @@
 {
   "name": "gille-inference",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Dependency-free friend and secret-safe owner-agent clients for Gille Inference.",
   "type": "module",
   "bin": {
@@ -13,6 +13,8 @@
     "m5-client.mjs",
     "m5-provision.mjs",
     "m5-stdio-bridge.mjs",
+    "m5-build.mjs",
+    "m5-build-files.py",
     "README.md"
   ],
   "engines": {

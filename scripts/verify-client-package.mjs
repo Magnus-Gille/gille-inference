@@ -11,12 +11,14 @@ const expectedFiles = [
   "README.md",
   "hs.mjs",
   "m5-client.mjs",
+  "m5-build.mjs",
+  "m5-build-files.py",
   "m5-provision.mjs",
   "m5-stdio-bridge.mjs",
   "m5.mjs",
   "package.json",
 ];
-const expectedVersion = "1.4.1";
+const expectedVersion = "1.5.0";
 
 function fail(message) {
   throw new Error(`client package release gate: ${message}`);

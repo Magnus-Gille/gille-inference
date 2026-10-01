@@ -23,6 +23,7 @@ import {
 } from "./m5-client.mjs";
 import { provisionProfile } from "./m5-provision.mjs";
 import { createMcpStdioBridge, runMcpStdioBridge } from "./m5-stdio-bridge.mjs";
+import { loadBuildConfig, parseBuildArgs, runBuild } from "./m5-build.mjs";
 
 const MAX_STDIN_BYTES = 3 * 1024 * 1024;
 
@@ -226,6 +227,7 @@ function help() {
     name: "m5",
     version: M5_CLIENT_VERSION,
     usage: [
+      "m5 build [--pull relative/file] [--toolchain version] -- command args",
       "m5 --profile <claude|codex> doctor",
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
@@ -273,10 +275,16 @@ export async function main(
     fetch: fetchImpl = globalThis.fetch,
     bridgeRunner = runMcpStdioBridge,
     provisioner = provisionProfile,
+    buildRunner = runBuild,
   } = {},
 ) {
   let selectedProfileName;
   try {
+    if (argv[0] === "build") {
+      const parsed = parseBuildArgs(argv.slice(1));
+      const result = await buildRunner({ ...parsed, stdout: output, stderr: error });
+      return result.exit_code;
+    }
     const {
       profile,
       endpoint,
@@ -405,7 +413,9 @@ export async function main(
     });
 
     if (command === "mcp") {
-      const bridge = createMcpStdioBridge({ client, profile });
+      let buildConfig;
+      try { buildConfig = await loadBuildConfig(); } catch { /* Build is omitted unless locally configured. */ }
+      const bridge = createMcpStdioBridge({ client, profile, buildConfig });
       await bridgeRunner({ bridge, input, output });
       return 0;
     }
@@ -460,7 +470,7 @@ export async function main(
             redactText(caught instanceof Error ? caught.message : "m5 failed."),
           );
     writeJson(error, safe.toJSON(selectedProfileName));
-    return 1;
+    return argv[0] === "build" ? 125 : 1;
   }
 }
 

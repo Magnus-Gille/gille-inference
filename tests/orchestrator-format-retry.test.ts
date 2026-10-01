@@ -16,7 +16,7 @@
  *
  * Written BEFORE the implementation (red→green).
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // ── mocks: inference clients, the loaded-model resolver, and the DB-touching ledger ──
 const lmInferenceMock = vi.fn();
@@ -118,6 +118,13 @@ describe("isTransientFormatError — the format-error signature", () => {
 
 // ── The retry actually recovers / caps at one / never over-fires ──────────────────
 describe("delegate() — retry-on-transient-parse-error (#164)", () => {
+  // Savings assertions use the pinned tariff snapshot; retry timers stay real.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
   it("fails once with the PEG error then succeeds on retry → returns the successful delegation", async () => {
     lmInferenceMock
       .mockResolvedValueOnce({ ok: false as const, error: PEG_ERROR })

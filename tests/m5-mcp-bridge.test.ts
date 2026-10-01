@@ -901,3 +901,15 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 });
+
+describe("local build_run MCP tool", () => {
+  it("advertises and executes build_run locally without forwarding it", async () => {
+    const calls: unknown[]=[];
+    const bridge=createMcpStdioBridge({client:{rpc:async (message:unknown)=>{calls.push(message);return {jsonrpc:"2.0",id:1,result:{tools:[]}};}},profile:"codex",buildConfig:{version:1,sshTarget:"m5-build"},buildRunner:async (options:any)=>({exit_code:4,truncated:{stdout:false,stderr:false},stdout:"out",stderr:"err",cwd:options.cwd,command:options.command})} as any);
+    const listed=JSON.parse((await bridge.handleLine('{"jsonrpc":"2.0","id":1,"method":"tools/list"}'))!);
+    expect(listed.result.tools).toContainEqual(expect.objectContaining({name:"build_run"}));
+    const called=JSON.parse((await bridge.handleLine(JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"build_run",arguments:{cwd:"/tmp/worktree",command:["echo","--help"],toolchain:"stable",pull:[]}}})))!);
+    expect(called.result.content[0].text).toContain('"exit_code":4');
+    expect(calls).toHaveLength(1); expect(JSON.stringify(calls)).not.toContain("build_run");
+  });
+});
