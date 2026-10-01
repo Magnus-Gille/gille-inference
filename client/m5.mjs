@@ -23,6 +23,7 @@ import {
 } from "./m5-client.mjs";
 import { provisionProfile } from "./m5-provision.mjs";
 import { createMcpStdioBridge, runMcpStdioBridge } from "./m5-stdio-bridge.mjs";
+import { loadBuildConfig, parseBuildArgs, runBuild } from "./m5-build.mjs";
 
 const MAX_STDIN_BYTES = 3 * 1024 * 1024;
 
@@ -273,10 +274,16 @@ export async function main(
     fetch: fetchImpl = globalThis.fetch,
     bridgeRunner = runMcpStdioBridge,
     provisioner = provisionProfile,
+    buildRunner = runBuild,
   } = {},
 ) {
   let selectedProfileName;
   try {
+    if (argv[0] === "build") {
+      const parsed = parseBuildArgs(argv.slice(1));
+      const result = await buildRunner(parsed);
+      return result.exit_code;
+    }
     const {
       profile,
       endpoint,
@@ -405,7 +412,9 @@ export async function main(
     });
 
     if (command === "mcp") {
-      const bridge = createMcpStdioBridge({ client, profile });
+      let buildConfig;
+      try { buildConfig = await loadBuildConfig(); } catch { /* Build is omitted unless locally configured. */ }
+      const bridge = createMcpStdioBridge({ client, profile, buildConfig });
       await bridgeRunner({ bridge, input, output });
       return 0;
     }

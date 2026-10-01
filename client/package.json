@@ -13,6 +13,7 @@
     "m5-client.mjs",
     "m5-provision.mjs",
     "m5-stdio-bridge.mjs",
+    "m5-build.mjs",
     "README.md"
   ],
   "engines": {

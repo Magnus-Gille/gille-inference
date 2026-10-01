@@ -1302,3 +1302,16 @@ describe("m5 command surface", () => {
     expect(error.text()).toBe("");
   });
 });
+
+describe("m5 build command", () => {
+  it("dispatches before gateway profile/config/credential lookup and preserves argv", async () => {
+    const output=sink(); const error=sink(); let configLoads=0,credentialLookups=0;
+    const buildRunner=vi.fn(async ({command}: {command:string[]})=>{expect(command).toEqual(["echo","--help","--profile","not-a-profile"]);return {exit_code:9};});
+    const exit=await main(["build","--toolchain","stable","--","echo","--help","--profile","not-a-profile"],{
+      input:Readable.from([]),output:output.stream,error:error.stream,
+      configLoader:()=>{configLoads++;return configLoader();},
+      credentialStore:{resolve:async()=>{credentialLookups++;return SECRET;}},buildRunner,
+    });
+    expect(exit).toBe(9); expect(configLoads).toBe(0); expect(credentialLookups).toBe(0); expect(buildRunner).toHaveBeenCalledOnce();
+  });
+});
