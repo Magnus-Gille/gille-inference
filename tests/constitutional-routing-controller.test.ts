@@ -343,6 +343,11 @@ const proofVerifier = {
   }),
 };
 
+// The child is a fresh `node --import tsx` process: its startup (transpile + import graph) is the
+// dominant, load-sensitive cost. Every wait below is event-driven (resolves the moment the child
+// closes / emits its marker), so a generous ceiling costs nothing when healthy (#358).
+const CHILD_WAIT_MS = 30_000;
+
 const CHILD_MARKER = "AFTER-CLIENT-CHECK-BEFORE-RESOURCE-MUTATION";
 
 type ChildClose = { code: number | null; signal: NodeJS.Signals | null };
@@ -351,7 +356,7 @@ function isMissingChild(error: unknown): boolean {
   return error instanceof Error && (error as NodeJS.ErrnoException).code === "ESRCH";
 }
 
-async function waitForLeasesAcquirable(paths: string[], timeoutMs = 5_000): Promise<void> {
+async function waitForLeasesAcquirable(paths: string[], timeoutMs = CHILD_WAIT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastBusy: ConstitutionalLeaseBusyError | undefined;
   do {
@@ -374,7 +379,7 @@ async function waitForChildMarker(
   marker: string,
   getClose: () => ChildClose | undefined,
   getError: () => Error | undefined,
-  timeoutMs = 5_000,
+  timeoutMs = CHILD_WAIT_MS,
 ): Promise<void> {
   if (getStdout().includes(marker)) return;
   if (getError()) throw getError();
@@ -487,8 +492,8 @@ describe("constitutional micro-routing controller", () => {
     let primaryFailure: unknown;
     try {
       if (mode === "kill9") {
-        const result = await waitForChildClose(closed, () => closeResult, 5_000);
-        if (!result) throw new Error("kill9 fault-harness child did not close within 5000ms");
+        const result = await waitForChildClose(closed, () => closeResult, CHILD_WAIT_MS);
+        if (!result) throw new Error(`kill9 fault-harness child did not close within ${CHILD_WAIT_MS}ms`);
         if (childError) throw childError;
         expect(result.signal, `unexpected child close code=${result.code}; stderr=${stderr}`).toBe("SIGKILL");
       } else {
@@ -524,8 +529,8 @@ describe("constitutional micro-routing controller", () => {
       expect(routeDb.read()).toBe(baseline);
       if (mode === "stop") {
         process.kill(child.pid!, "SIGCONT");
-        const resumed = await waitForChildClose(closed, () => closeResult, 5_000);
-        if (!resumed) throw new Error("resumed fault-harness child did not close within 5000ms");
+        const resumed = await waitForChildClose(closed, () => closeResult, CHILD_WAIT_MS);
+        if (!resumed) throw new Error(`resumed fault-harness child did not close within ${CHILD_WAIT_MS}ms`);
         expect(resumed.code).not.toBe(0);
         expect(stderr).toMatch(/expired or superseded/);
         expect(routeDb.read()).toBe(baseline);
@@ -546,7 +551,7 @@ describe("constitutional micro-routing controller", () => {
         }
       }
     }
-  }, 15_000);
+  }, 60_000);
 
   it("writes a schema-valid authoritative prefix before apply and commits only after fresh rechecks", () => {
     const root = mkdtempSync(join(tmpdir(), "constitutional-controller-"));
