@@ -32,17 +32,13 @@ afterEach(async () => {
 });
 
 describe('Halogen run identity receipts', () => {
-  it('refuses a stale receipt before any synthetic service callback and records the current attempt', async () => {
+  it('refuses a stale receipt and records the current attempt', async () => {
     const directory = await fixture();
     const staleReceipt = join(directory, `${runName}.json`);
     await writeFile(staleReceipt, JSON.stringify({ pass: false, error: 'old attempt' }), { mode: 0o600 });
-    let serviceCalls = 0;
-
     const reservation = await reserveHalogenRun({ runDirectory: directory, runName, common });
 
     expect(reservation.status).toBe('refused');
-    if (reservation.status === 'reserved') serviceCalls++;
-    expect(serviceCalls).toBe(0);
     if (reservation.status !== 'refused') return;
     expect(reservation.reason).toBe(HALOGEN_RUN_IDENTITY_COLLISION);
     expect(reservation.collision).toBe('receipt');
@@ -55,7 +51,6 @@ describe('Halogen run identity receipts', () => {
       reason: HALOGEN_RUN_IDENTITY_COLLISION,
       receipt: reservation.receiptPath,
     });
-    // A refusal is returned before the caller constructs or invokes host operations.
   });
 
   it('refuses a claimed identity without exposing arbitrary collision details', async () => {

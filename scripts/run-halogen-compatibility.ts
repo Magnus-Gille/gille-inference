@@ -77,11 +77,11 @@ async function main(): Promise<void> {
     return;
   }
   const receipt = reservation.receiptPath;
-  const operations = createHalogenHostOperations(p);
   const abort = new AbortController();
   const interrupt = (): void => abort.abort(new Error('operator interrupted evaluation'));
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(signal, interrupt);
   try {
+    const operations = createHalogenHostOperations(p);
     const result = await runHalogenCompatibilityEvaluation({ operations, apiKey, expectedResidentModels: p.expectedResidentModels, approvedExpiresAt: p.expiresAt, gatewayBaseUrl: p.gatewayBaseUrl, signal: abort.signal });
     await writeHalogenRunReceipt(receipt, { ...common, pass: true, result });
     console.log(JSON.stringify({ ...common, pass: true, receipt }));

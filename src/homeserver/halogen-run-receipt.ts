@@ -39,7 +39,10 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 /**
- * Reserve one exact run identity before any host operation is invoked.
+ * Reserve one exact run identity before any host operation is invoked. The
+ * `.claim` file means the identity is reserved before host-operation preflight,
+ * not that candidate launch was attempted. An abrupt exit after reservation
+ * intentionally consumes the identity so another invocation cannot overlap it.
  *
  * A refusal receipt uses a hash-bound, deterministic attempt name and O_EXCL,
  * so an old run receipt can never be reported as the current attempt's result.

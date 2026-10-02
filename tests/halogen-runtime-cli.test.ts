@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -165,7 +165,7 @@ describe("run-halogen-compatibility CLI", () => {
     await unchanged(directory, before);
   });
 
-  it("reports an existing-run collision at the CLI boundary without entering host operations", async () => {
+  it("reports run collisions and records host-factory failures before evaluation", async () => {
     const directory = await tempDirectory("halogen-cli-collision-");
     const hostRoot = await tempDirectory("halogen-cli-host-root-");
     const planPath = await writePlan(directory, { ...plan(), uid: process.getuid() });
@@ -210,6 +210,7 @@ describe("run-halogen-compatibility CLI", () => {
               export const halogenHostPlanSchema = { parse: value => value };
               export async function fileSha256(path) { return createHash('sha256').update(await readFile(path)).digest('hex'); }
               export function createHalogenHostOperations() {
+                if (process.env.HALOGEN_TEST_THROW_FACTORY === '1') throw new Error('synthetic Halogen host factory failure');
                 void writeFile(process.env.HALOGEN_TEST_HOST_MARKER, 'host operations constructed');
                 return {};
               }
@@ -271,6 +272,30 @@ describe("run-halogen-compatibility CLI", () => {
     });
     expect(await readFile(oldReceiptPath, "utf8")).toBe(oldReceipt);
     expect((await stat(refusalFile)).mode & 0o777).toBe(0o600);
+
+    await rm(oldReceiptPath);
+    const factoryFailure = run([
+      "--plan", planPath, "--execute",
+      "--accepted-plan-sha256", rendered.planSha256,
+      "--accepted-runner-sha256", rendered.runnerSha256,
+    ], directory, {
+      bundle: collisionBundle,
+      env: { ...testEnv, M5_MAINTENANCE_KEY: "synthetic-test-only", HALOGEN_TEST_THROW_FACTORY: "1" },
+    });
+    expect(factoryFailure.status).toBe(1);
+    const factoryResponse = JSON.parse(factoryFailure.stderr) as JsonObject;
+    const failureReceiptPath = join(runDirectory, `${plan().name}.json`);
+    expect(factoryResponse).toMatchObject({ pass: false, receipt: `/home/halogen/halogen-eval-317/runs/${plan().name}.json` });
+    expect(JSON.parse(await readFile(failureReceiptPath, "utf8"))).toMatchObject({
+      pass: false,
+      errorClass: "Error",
+      diagnostics: [{ name: "Error", message: "synthetic Halogen host factory failure" }],
+    });
+    expect(JSON.parse(await readFile(join(runDirectory, `${plan().name}.claim`), "utf8"))).toMatchObject({
+      planSha256: rendered.planSha256,
+      runnerSha256: rendered.runnerSha256,
+      runnerCommit,
+    });
     await unchanged(directory, ["plan.json"]);
     expect(await readdir(directory)).not.toContain("host-operation-invoked");
   });
