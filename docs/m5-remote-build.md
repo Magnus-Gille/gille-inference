@@ -49,11 +49,16 @@ There is no new gateway route or production gateway restart requirement. MCP cap
   Disk formatting/account/key/image preparation is **not** performed by the installer.
 - Rootless Podman, systemd cgroup v2 and a **preloaded immutable image digest**. The illustrative
   [`Containerfile`](../deploy/build/Containerfile) builds Rust 1.99.0/clippy, Node 22, sccache,
-  cmake/clang/libclang for native build scripts and Linux Tauri packages; resolve and approve both base-image digests and downloads separately.
+  cmake/clang/libclang for native build scripts and Linux Tauri packages; resolve and approve both
+  base-image digests and downloads separately. Use the **Debian 13 (trixie)** base variants:
+  prebuilt static libraries that projects link (for example ONNX Runtime) need glibc 2.38 or
+  newer, and on Debian 12 the link fails on undefined `__isoc23_*` symbols.
   Image/default toolchain choice must match the repository's **current** CI pin, not an old ticket.
 - Vendored dependencies or prewarmed **per-repository** Cargo/npm caches. Runtime networking is
   always `none`: missing dependencies/toolchains fail offline, never fetch via host credentials.
   This version does **not** implement registry allowlisted egress or automatic cache warming.
+- For crates whose build script downloads a native library, a prewarmed copy and a Cargo
+  configuration in the repository cache; see "Build scripts that download binaries" below.
 - Owner-attended SSH public-key provisioning. Never copy gateway/provider credentials, Cargo
   credentials or an operator home into the builder image/cache. The installed OpenSSH forced
   command disables shells, forwarding, TTYs, user rc, password and keyboard-interactive login.
@@ -74,6 +79,44 @@ prior configs/pointer before mutation, refuses an existing release directory, an
 build-specific config, forced SSH command, dedicated slice limits and cleanup timer. It reloads
 OpenSSH, **never** gateway/model/tunnel units. A failed apply is not certification: retain its
 backup record and require explicit recovery approval. No automated rollback is claimed.
+
+## Build scripts that download binaries
+
+Some crates fetch a prebuilt native library in their build script. That cannot work here: the
+container has no network and sets `CARGO_NET_OFFLINE=true`. `ort-sys` (ONNX Runtime) is the known
+case. With that variable set it skips both the download and its own download cache, defers the
+error to the link step, and the build then fails with `undefined symbol: OrtGetApiBase`.
+`cargo check` and `cargo clippy` still pass, because nothing is linked.
+
+The supported route needs no change in the project and none in the worker. It is an operator
+prewarm step, done once per repository and per library version:
+
+1. Take the artifact URL and SHA-256 from the crate itself (for `ort-sys`:
+   `build/download/dist.txt`, the row for the target and feature set). The project's `Cargo.lock`
+   pins the crate, so this is the same binary the project's CI downloads.
+2. In one networked container as the build account, with only the repository cache mounted:
+   download the artifact, verify the SHA-256, and unpack it under
+   `<repo cache>/native/<name>-<version>-<target>/` with a path-checked extractor. Run no
+   third-party code in that container. (`ort-sys` archives are a raw LZMA2 stream with a 64 MiB
+   dictionary around a plain tar.)
+3. Write `<repo cache>/cargo/config.toml`. The container's `CARGO_HOME` is `/cache/cargo`, so
+   Cargo reads it for every build of that repository:
+
+   ```toml
+   [env]
+   ORT_LIB_LOCATION = "/cache/native/onnxruntime-<version>-x86_64-unknown-linux-gnu"
+   ```
+
+   `ort-sys` checks an explicit library location before its offline flag and links the static
+   library found there.
+
+To undo, delete that `config.toml` and the `native/` directory. The repository cache is writable
+by that repository's own build containers, so this adds no new trust: a build could already alter
+its own cache.
+
+With an explicit location the crate links whatever library is there and does not check its
+version. When the project bumps the crate, repeat the prewarm with the new artifact and a new
+versioned path; otherwise tests keep running against the old library.
 
 ## Isolation, limits, outputs
 
