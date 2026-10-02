@@ -71,6 +71,10 @@ install -d -o root -g root -m 755 /run/gille-build
 exec 9>/run/gille-build/install.lock
 chmod 644 /run/gille-build/install.lock
 flock -n 9 || fail 'A build or another installation is in progress.'
+ssh_dropin=/etc/ssh/sshd_config.d/70-gille-build.conf
+# Checked before anything is changed: writing through a symlink would alter its target, and the
+# backup below would then hold the link, not the original bytes, so it could not be restored.
+[[ ! -L $ssh_dropin ]] || fail 'Build SSH drop-in is a symlink; replace it with a regular file under explicit review first.'
 release_dir=/opt/gille-build/releases/$release
 [[ ! -e $release_dir ]] || fail 'Release already staged; verify or use a new approved release, do not overwrite it.'
 install -d -o root -g root -m 755 /opt/gille-build/releases /usr/local/libexec /etc/gille-build-backups
@@ -103,14 +107,16 @@ install -d -o root -g root -m 755 "$slice_dir" /etc/ssh/sshd_config.d
 printf '%s\n' 'd /run/gille-build 0755 root root -' 'f /run/gille-build/install.lock 0644 root root -' > /etc/tmpfiles.d/gille-build.conf
 printf '%s\n' '[Slice]' 'CPUQuota=600%' 'CPUWeight=10' 'IOWeight=10' 'MemoryMax=24G' \
   'MemorySwapMax=0' 'TasksMax=1700' > "$slice_dir/70-gille-build.conf"
-ssh_dropin=/etc/ssh/sshd_config.d/70-gille-build.conf
 restore_ssh_dropin() {
   # A rejected drop-in must not stay installed: a later sshd restart would fail on it and could
   # cut off remote access. Put back the recorded previous file, or remove ours if there was none.
   if [[ -e $backup/70-gille-build.conf ]]; then cp -a -- "$backup/70-gille-build.conf" "$ssh_dropin"
   else rm -f -- "$ssh_dropin"; fi
+  /usr/sbin/sshd -t || printf '%s\n' 'ERROR: sshd configuration is still invalid after restoring the previous build drop-in; repair it before any sshd restart.' >&2
 }
-cat > "$ssh_dropin" <<'SSH'
+# Write a complete file beside the target and rename it into place. The temporary name does not
+# match the *.conf include pattern, so sshd never reads a partial drop-in.
+cat > "$ssh_dropin.new" <<'SSH'
 Match User gille-build
     ForceCommand /usr/local/libexec/m5-build-worker
     AuthenticationMethods publickey
@@ -125,6 +131,8 @@ Match User gille-build
     GatewayPorts no
 Match all
 SSH
+chmod 644 "$ssh_dropin.new"
+mv -Tf "$ssh_dropin.new" "$ssh_dropin"
 # Reject hosts that don't include the drop-in, or have an earlier overriding rule.
 /usr/sbin/sshd -t || { restore_ssh_dropin; fail 'OpenSSH configuration invalid; the previous build drop-in state was restored and sshd was not reloaded.'; }
 /usr/sbin/sshd -T -C user=gille-build,host=localhost,addr=127.0.0.1 | python3 -c '
