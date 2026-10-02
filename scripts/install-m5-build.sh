@@ -20,6 +20,10 @@ mode=$1 release=$2 image=$3
 [[ $image =~ ^[a-zA-Z0-9][a-zA-Z0-9./:_-]*@sha256:[a-f0-9]{64}$ ]] || fail 'A builder image digest is required.'
 [[ $EUID == 0 ]] || fail 'Host provisioning needs exact owner approval and root.'
 payload=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# The deploy transport starts in the operator's login directory, which the build account cannot
+# enter. runuser keeps the working directory and rootless Podman refuses to start from one it
+# cannot chdir into, so every later check would fail with a misleading cause.
+cd /
 [[ $(stat -c %u "$payload") == 0 && $(stat -c %a "$payload") == 700 ]] || fail 'Payload must be an immutable root-owned private archive directory.'
 [[ -f $payload/.build-release && ! -L $payload/.build-release ]] || fail 'Missing source identity.'
 [[ $(< "$payload/.build-release") == "$release" ]] || fail 'Payload release does not match the approved revision.'
@@ -51,7 +55,9 @@ run_build() {
   runuser -u gille-build -- env -i PATH=/usr/bin:/bin HOME="$home" USER=gille-build \
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
 }
-[[ -z $(run_build /usr/bin/podman ps -q) ]] || fail 'Existing build containers must finish before installation.'
+# Fail closed: an unreadable container list is not an empty one.
+containers=$(run_build /usr/bin/podman ps -q) || fail 'Cannot list build containers as the build identity.'
+[[ -z $containers ]] || fail 'Existing build containers must finish before installation.'
 run_build /usr/bin/podman image exists "$image" || fail 'Preload the approved builder image digest; no implicit network pull.'
 run_build /usr/bin/podman info --format=json | python3 -c '
 import json,sys
