@@ -502,6 +502,11 @@ export async function main(argv) {
       process.stderr.write(`Credits exhausted: ${err.message}\n`);
     } else if (status === 429) {
       process.stderr.write(`Rate limited: ${err.message}${retry}\n`);
+    } else if (status === 503 && err.code === "memory_admission_unavailable") {
+      // Operator-fixable (#357): no Retry-After is sent and retrying will not help.
+      process.stderr.write(`Memory admission unavailable (operator action needed, do not retry): ${err.message}\n`);
+    } else if (status === 503 && err.code === "insufficient_memory") {
+      process.stderr.write(`Not enough host memory to start this model right now: ${err.message}${retry}\n`);
     } else if (status === 503) {
       // Box busy — distinct, transient, retryable.
       process.stderr.write(`Server busy: ${err.message}${retry}\n`);

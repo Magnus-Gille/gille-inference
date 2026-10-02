@@ -13,6 +13,16 @@ const CHANNEL = /^(?:\d+\.\d+(?:\.\d+)?|stable)$/;
 const FILE_HELPER = fileURLToPath(new URL("./m5-build-files.py", import.meta.url));
 const LOCAL_ENV = { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C.UTF-8" };
 
+/**
+ * An error from this client with a stable machine-readable code. Only errors created here are
+ * shown to an MCP caller with their message, so every message passed to this function must be a
+ * fixed sentence: no paths, host locators, subprocess output or remote text. Untagged errors
+ * (for example a filesystem-helper diagnostic) reach an MCP caller as a generic `build_failed`.
+ */
+function buildError(code, message) {
+  return Object.assign(new Error(message), { buildCode: code });
+}
+
 export function defaultBuildConfigPath() {
   return join(homedir(), ".config", "m5", "build.json");
 }
@@ -70,7 +80,7 @@ async function fileHelper(operation, request, maxBytes) {
 
 export async function createBuildArchive(cwd = process.cwd(), pull = []) {
   if (!Array.isArray(pull) || pull.length > 32 || new Set(pull).size !== pull.length || pull.some(path => !safeRelative(path))) {
-    throw new Error("Pull paths must be distinct safe relative file paths (at most 32).");
+    throw buildError("build_invalid_request", "Pull paths must be distinct safe relative file paths (at most 32).");
   }
   const response = await fileHelper("snapshot", { cwd, pull }, MAX_ARCHIVE + 8192);
   const newline = response.indexOf(10);
@@ -82,7 +92,7 @@ export async function createBuildArchive(cwd = process.cwd(), pull = []) {
 function selectToolchain(prepared, explicit, command) {
   const executable = command[0].split("/").at(-1);
   if (executable !== "cargo") {
-    if (explicit !== undefined) throw new Error("--toolchain applies only to cargo commands.");
+    if (explicit !== undefined) throw buildError("build_invalid_request", "--toolchain applies only to cargo commands.");
     return undefined;
   }
   let channel = explicit;
@@ -90,16 +100,16 @@ function selectToolchain(prepared, explicit, command) {
     const text = prepared.toolchainFile;
     const matches = [...text.matchAll(/^\s*channel\s*=\s*["']([^"']+)["']\s*(?:#.*)?$/gm)];
     if (matches.length !== 1 || text.split(/\r?\n/).some(line => /^\s*channel\s*=/.test(line) && !/^\s*channel\s*=\s*["'][^"']+["']\s*(?:#.*)?$/.test(line))) {
-      throw new Error("Unsupported rust-toolchain.toml; pass --toolchain explicitly.");
+      throw buildError("build_invalid_request", "Unsupported rust-toolchain.toml; pass --toolchain explicitly.");
     }
     channel = matches[0][1];
   } else if (channel === undefined && prepared.plainToolchain !== null) {
     channel = prepared.plainToolchain.trim();
   }
   if (channel !== undefined && (typeof channel !== "string" || !CHANNEL.test(channel))) {
-    throw new Error("Use a preinstalled numeric Rust toolchain or stable.");
+    throw buildError("build_invalid_request", "Use a preinstalled numeric Rust toolchain or stable.");
   }
-  if (channel !== undefined && command[1]?.startsWith("+")) throw new Error("Do not combine --toolchain/repo toolchain with cargo +toolchain.");
+  if (channel !== undefined && command[1]?.startsWith("+")) throw buildError("build_invalid_request", "Do not combine --toolchain/repo toolchain with cargo +toolchain.");
   // Without a repo pin, use the immutable image's default, never install online.
   return channel;
 }
@@ -107,13 +117,13 @@ function selectToolchain(prepared, explicit, command) {
 function validateCommand(command) {
   if (!Array.isArray(command) || !command.length || command.length > 128 || !command[0] ||
       command.some(value => typeof value !== "string" || value.includes("\0") || Buffer.byteLength(value) > 4096)) {
-    throw new Error("Build command must be a bounded literal argv array.");
+    throw buildError("build_invalid_request", "Build command must be a bounded literal argv array.");
   }
   const executable = command[0].split("/").at(-1);
   if (["xcrun", "xcodebuild", "swift", "codesign", "notarytool", "productbuild"].includes(executable) ||
       command.some(arg => arg.includes("apple-darwin") || arg.includes("apple-ios")) ||
       (executable === "cargo" && command.includes("tauri") && command.includes("build"))) {
-    throw new Error("macOS-only job: use your Mac or a GitHub macOS runner.");
+    throw buildError("build_macos_only", "macOS-only job: use your Mac or a GitHub macOS runner.");
   }
 }
 
@@ -145,7 +155,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
   const totals = { stdout: 0, stderr: 0 }; const truncated = { stdout: false, stderr: false };
   const captured = { stdout: [], stderr: [] }; const artifacts = new Map(); let pullTotal = 0;
   const abort = error => { protocolError ??= error; child.kill(); };
-  const timer = setTimeout(() => abort(new Error("Remote build timed out; check dedicated worker cleanup.")), timeoutMs);
+  const timer = setTimeout(() => abort(buildError("build_timeout", "Remote build timed out; check dedicated worker cleanup.")), timeoutMs);
   timer.unref?.();
   // Consume but never print SSH diagnostics: they may contain private locators.
   child.stderr.on("data", () => {});
@@ -176,7 +186,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     } else if (message.type === "error" && message.code === 125 && typeof message.message === "string") {
       workerFailure = true;
       // Do not trust a compromised remote process to provide safe free-form diagnostics.
-      protocolError = new Error("Build worker infrastructure failure; verify dedicated host, offline caches and resource limits.");
+      protocolError = buildError("build_worker_failure", "Build worker infrastructure failure; verify dedicated host, offline caches and resource limits.");
     } else throw new Error("Malformed build worker protocol.");
   }
   child.stdout.on("data", chunk => {
@@ -190,7 +200,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
         lineBuffer = lineBuffer.subarray(newline + 1);
       }
       if (lineBuffer.length > MAX_LINE) throw new Error("Build protocol line exceeds its bound.");
-    } catch (error) { abort(new Error("Invalid remote build protocol.")); }
+    } catch (error) { abort(buildError("build_protocol_error", "Invalid remote build protocol.")); }
   });
   try {
     const completion = new Promise((resolve, reject) => {
@@ -200,7 +210,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     child.stdin.write(requestLine); child.stdin.write(prepared.archive); child.stdin.end();
     const sshExit = await completion;
     if (protocolError || lineBuffer.length || remoteExit === undefined || sshExit !== remoteExit) {
-      throw protocolError ?? new Error("Build ended without a matching remote exit record.");
+      throw protocolError ?? buildError("build_protocol_error", "Build ended without a matching remote exit record.");
     }
     if (pull.some(path => !artifacts.has(path))) throw new Error("Worker did not return every selected artifact.");
     if (artifacts.size) {

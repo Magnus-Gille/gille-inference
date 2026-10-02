@@ -4,7 +4,10 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.5.0";
+export const M5_CLIENT_VERSION = "1.5.1";
+// A retry delay above one day is treated as not given: no caller should park itself that long on
+// the word of a remote peer.
+const MAX_RETRY_AFTER_SECONDS = 86_400;
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
@@ -164,6 +167,10 @@ export class M5ClientError extends Error {
     }
     if (FAILURE_LAYERS.has(options.failureLayer)) this.failureLayer = options.failureLayer;
     if (typeof options.retryable === "boolean") this.retryable = options.retryable;
+    if (Number.isInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 0 &&
+        options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
+      this.retryAfterSeconds = options.retryAfterSeconds;
+    }
     if (isValidEvidenceRecovery(options.evidenceRecovery)) {
       this.evidenceRecovery = { ...options.evidenceRecovery };
     }
@@ -195,6 +202,7 @@ export class M5ClientError extends Error {
         ...(this.diagnosticCode === undefined ? {} : { diagnostic_code: this.diagnosticCode }),
         ...(this.failureLayer === undefined ? {} : { failure_layer: this.failureLayer }),
         ...(this.retryable === undefined ? {} : { retryable: this.retryable }),
+        ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
         ...(this.evidenceRecovery === undefined ? {} : { evidence_recovery: { ...this.evidenceRecovery } }),
         ...(remediation === undefined ? {} : { remediation }),
       },
@@ -457,6 +465,7 @@ function safeError(error, secrets, profile) {
       diagnosticCode: error.diagnosticCode,
       failureLayer: error.failureLayer,
       retryable: error.retryable,
+      retryAfterSeconds: error.retryAfterSeconds,
       remediation: error.remediation,
       evidenceRecovery: error.evidenceRecovery,
     }));
@@ -856,6 +865,59 @@ function normalizeAskPayload(payload, fallbackModel) {
     metered,
     usage: normalizeAskUsage(payload.usage),
     ...(feedbackHandle === undefined ? {} : { feedback_handle: feedbackHandle }),
+  };
+}
+
+/**
+ * Host-memory admission refusals (#350/#357). The gateway's MCP tool result for these carries
+ * only `isError:true` plus fixed message text (no code field, no structuredContent), so the
+ * code is recovered from the gateway's own sentences. Anchored matches only: anything else
+ * stays an ordinary `tool_error`. Returns null when the text is not a memory refusal.
+ *   insufficient_memory: retry later (retryAfterSeconds parsed from the gateway's own sentence).
+ *   memory_admission_unavailable: the operator must fix it; retrying will not help.
+ */
+export function classifyAskRefusal(text) {
+  if (typeof text !== "string") return null;
+  const short = /^There is not enough host memory to start the (?:requested )?model(?: '[^\n]*')? right now\.(?: (?:Retry after (\d{1,6})s\.|Please retry later\.))?$/s.exec(text.trim());
+  if (short) {
+    // Same bound as M5ClientError and the `_meta` path: an absurd delay is dropped, not relayed.
+    const parsed = short[1] === undefined ? undefined : Number(short[1]);
+    const seconds = parsed !== undefined && parsed <= MAX_RETRY_AFTER_SECONDS ? parsed : undefined;
+    return {
+      code: "insufficient_memory",
+      retryable: true,
+      ...(seconds === undefined ? {} : { retryAfterSeconds: seconds }),
+      message: text.trim(),
+    };
+  }
+  if (/^(?:Memory admission cannot approve starting the (?:requested )?model|Host memory admission cannot approve starting the requested model)[^\n]*Retrying will not help until the operator fixes it\.$/s.test(text.trim())) {
+    return {
+      code: "memory_admission_unavailable",
+      retryable: false,
+      message: text.trim(),
+    };
+  }
+  return null;
+}
+
+// Retryability is part of each code's contract, so it is fixed here, not taken from the peer.
+const ASK_REFUSAL_RETRYABLE = new Map([["insufficient_memory", true], ["memory_admission_unavailable", false]]);
+
+/**
+ * The gateway's own machine-readable cause, when it sends one in the result's `_meta` (newer
+ * gateways). Preferred over reading the sentence. Returns null for anything else, so an older
+ * gateway or an unknown code falls back to `classifyAskRefusal` and then to `tool_error`.
+ */
+export function askRefusalFromMeta(result, text) {
+  const meta = result?._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta) || !ASK_REFUSAL_RETRYABLE.has(meta.m5_code)) return null;
+  const retryable = ASK_REFUSAL_RETRYABLE.get(meta.m5_code);
+  const seconds = meta.retry_after_seconds;
+  return {
+    code: meta.m5_code,
+    retryable,
+    ...(retryable && Number.isInteger(seconds) && seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS ? { retryAfterSeconds: seconds } : {}),
+    message: typeof text === "string" ? text.trim() : "",
   };
 }
 
@@ -1668,6 +1730,13 @@ export async function createM5Client({
           } catch {
             // A broken structured error payload must not mask the real tool_error content.
           }
+        }
+        const refusal = askRefusalFromMeta(result, toolResultText(result)) ?? classifyAskRefusal(toolResultText(result));
+        if (refusal !== null) {
+          throw new M5ClientError(refusal.code, refusal.message, {
+            retryable: refusal.retryable,
+            retryAfterSeconds: refusal.retryAfterSeconds,
+          });
         }
         throw new M5ClientError(
           "tool_error",

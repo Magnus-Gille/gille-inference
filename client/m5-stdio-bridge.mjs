@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import { runBuild } from "./m5-build.mjs";
 import {
   M5ClientError,
+  classifyAskRefusal,
   createFileAdoptionSpool,
   credentialRemediation,
   gatewayHttpRemediation,
@@ -35,6 +36,38 @@ function redactValue(value) {
 function isAdoptionReport(message) {
   return message?.method === "tools/call" &&
     message?.params?.name === "record_adoption_evidence";
+}
+
+const BUILD_CODES = new Set([
+  "build_macos_only", "build_invalid_request", "build_timeout", "build_worker_failure", "build_protocol_error",
+]);
+const BUILD_FAILED_MESSAGE =
+  "The local build client could not run this build. Run the same command with `m5 build` in a terminal to see the reason.";
+
+// The gateway's ask refusals for host-memory admission carry only fixed text (#350). Expose the
+// machine-readable code beside the untouched result so a caller can branch without parsing prose.
+function annotateAskRefusal(message, response) {
+  const result = response?.result;
+  if (message?.method !== "tools/call" || message?.params?.name !== "ask" ||
+      !result || typeof result !== "object" || result.isError !== true ||
+      result.structuredContent !== undefined) return response;
+  const text = Array.isArray(result.content) ? result.content.find(entry => entry?.type === "text")?.text : undefined;
+  // A newer gateway already says so itself; leave its `_meta` as sent.
+  if (result._meta && typeof result._meta === "object" && typeof result._meta.m5_code === "string") return response;
+  const refusal = classifyAskRefusal(text);
+  if (refusal === null) return response;
+  return {
+    ...response,
+    result: {
+      ...result,
+      _meta: {
+        ...(result._meta && typeof result._meta === "object" && !Array.isArray(result._meta) ? result._meta : {}),
+        m5_code: refusal.code,
+        retryable: refusal.retryable,
+        ...(refusal.retryAfterSeconds === undefined ? {} : { retry_after_seconds: refusal.retryAfterSeconds }),
+      },
+    },
+  };
 }
 
 function isCodeLoopResult(message) {
@@ -195,7 +228,18 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
             throw new M5ClientError("invalid_args", "build_run requires absolute cwd, command string array, optional toolchain, and optional pull paths.");
           }
           const quiet = { write() { return true; } };
-          const result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
+          let result;
+          try {
+            result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
+          } catch (error) {
+            // Pass the build client's own refusal through, as the CLI prints it (#357), but only
+            // for errors it tagged with a code: those messages are fixed sentences. Anything else
+            // can carry a local path or subprocess diagnostic (for example the filesystem helper's
+            // stderr), so it gets a fixed message and the generic code.
+            if (error instanceof M5ClientError || !(error instanceof Error)) throw error;
+            if (BUILD_CODES.has(error.buildCode)) throw new M5ClientError(error.buildCode, error.message);
+            throw new M5ClientError("build_failed", BUILD_FAILED_MESSAGE);
+          }
           response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
         } else {
           try {
@@ -210,6 +254,7 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           }
         }
         if (notification) return null;
+        response = annotateAskRefusal(message, response);
         if (response === null) {
           return rpcError(
             message.id,

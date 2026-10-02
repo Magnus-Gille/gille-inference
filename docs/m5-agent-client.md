@@ -17,10 +17,10 @@ inference. See the [remote build guide](m5-remote-build.md) for its contract and
 
 The `m5` executable ships in the same npm package as `hs`. The npm registry's latest published
 version was `1.3.7` when checked on 2026-09-23. Version `1.3.8` exists in repository source but
-is not published to npm. Install the reviewed `1.5.0` package only after publication:
+is not published to npm. Install the reviewed `1.5.1` package only after publication:
 
 ```bash
-npm install --global gille-inference@1.5.0
+npm install --global gille-inference@1.5.1
 m5 --version
 ```
 
@@ -47,7 +47,8 @@ Version `1.5.0` adds the credential-independent offline `m5 build` SSH client an
 `build_run` MCP tool. Remote builds require local Python 3, Git and OpenSSH; inference commands
 remain Node-only. New Python dirfd filesystem checks refuse links, forbidden/ignored files and
 unsafe artifact destinations; builds never send workspace bytes to the inference gateway.
-Existing MCP bridge processes
+Version `1.5.1` names the gateway's host-memory refusals and local build refusals (#357); see
+"Memory refusals and build_run errors" below. Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
 Rollback is a paired return to the prior accepted gateway revision and client `1.3.6`, with
@@ -326,7 +327,7 @@ The result makes that boundary explicit:
 ```json
 {
   "status": "mcp_reachable",
-  "client_version": "1.5.0",
+  "client_version": "1.5.1",
   "health_scope": "mcp_catalogue_only",
   "model_discovery": { "public": "available", "private": "available" },
   "inference": { "public": "not_checked", "private": "not_checked" },
@@ -349,6 +350,35 @@ code; raw errors and upstream remediation are never forwarded. Known transport
 diagnostics include the client's fixed recovery guidance. Gateway discovery does
 not confirm inference readiness, and the standalone profile doctor still cannot
 inspect the interactive host connector session.
+
+### Memory refusals and build_run errors (1.5.1)
+
+The gateway refuses an `ask` that would start a model the host cannot afford with two 503-class
+causes. A gateway that includes the failure cause in the result's `_meta`
+(`{ m5_code, retryable?, retry_after_seconds? }`) is read directly. An older gateway sends only
+`isError:true` and fixed text, so there the client recognises the gateway's own sentences. Anything
+else stays a plain `tool_error`:
+
+| Client `code` | Meaning | `retryable` | Delay |
+| --- | --- | --- | --- |
+| `insufficient_memory` | Not enough host memory to start the model right now | `true` | `retry_after_seconds` when the message names one |
+| `memory_admission_unavailable` | The host cannot approve the start; the operator must fix it | `false` | none (retrying will not help) |
+
+`m5 ask` prints these in its normal error object. The MCP bridge forwards the `ask` result
+unchanged and adds `_meta: { m5_code, retryable, retry_after_seconds? }` when the gateway did not
+send it itself. The `hs` CLI labels the
+direct-HTTP `503` by its error code instead of always "Server busy".
+
+`build_run` over MCP returns the build client's own refusal as a JSON-RPC error whose
+`data.m5_code` is `build_macos_only`, `build_invalid_request`, `build_timeout`,
+`build_worker_failure` or `build_protocol_error`, plus `invalid_args` as before. Those messages are
+fixed sentences written by the build client. Any other local failure is reported as `build_failed`
+with one fixed message: its real text (for example a filesystem-helper diagnostic) can contain a
+local path, so it is shown only by the `m5 build` CLI in the user's own terminal. Remote worker
+text is never forwarded.
+
+Retryability for the two memory codes is fixed by the code, not taken from the peer, and a retry
+delay above one day is treated as not given, on every surface.
 
 For example, a refused private connection is reported with
 `discovery_failure: { endpoint: "private", diagnostic_code: "connection_refused",

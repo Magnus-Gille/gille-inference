@@ -12,9 +12,9 @@ gateway inference route; see the [remote build guide](../docs/m5-remote-build.md
 
 Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 
-### Owner-client 1.5.0 compatibility
+### Owner-client 1.5.x compatibility
 
-The 1.5.0 `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+The 1.5.x `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
 Its doctor reports MCP catalogue reachability without calling metered inference; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
@@ -139,6 +139,20 @@ same JSON-RPC request and work id. If both attempts fail, `result_recovery` repo
 retryable, otherwise to follow that error's remediation. Structured `unknown work_id` and
 `terminal result unavailable after restart` responses are returned unchanged and are never
 treated as transport failures.
+
+### Memory refusals and `build_run` errors (1.5.1)
+
+`m5 ask` reports the gateway's host-memory refusals with stable codes in its error object:
+`insufficient_memory` (`retryable: true`, plus `retry_after_seconds` when the gateway named one)
+and `memory_admission_unavailable` (`retryable: false`; the operator must fix it, retrying will
+not help). The client reads the cause from the gateway's `_meta` when present and falls back to
+the gateway's fixed sentences for older gateways. The MCP bridge adds the same fields as `_meta` on the unchanged `ask` result, and `hs`
+labels the direct-HTTP 503 by its code. Over MCP, `build_run` refusals arrive with the build
+client's own message and `data.m5_code` (`build_macos_only`, `build_invalid_request`,
+`build_timeout`, `build_worker_failure`, `build_protocol_error`). Any other local failure arrives
+as `build_failed` with a fixed message, because its real text can contain a local path; run the
+same command with `m5 build` in a terminal to see it. Remote worker text is never forwarded. A
+retry delay above one day is treated as not given.
 
 ### Provisioning a new owner-agent profile
 
