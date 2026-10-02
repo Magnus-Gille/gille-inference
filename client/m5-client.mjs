@@ -895,6 +895,25 @@ export function classifyAskRefusal(text) {
   return null;
 }
 
+const ASK_REFUSAL_CODES = new Set(["insufficient_memory", "memory_admission_unavailable"]);
+
+/**
+ * The gateway's own machine-readable cause, when it sends one in the result's `_meta` (newer
+ * gateways). Preferred over reading the sentence. Returns null for anything else, so an older
+ * gateway or an unknown code falls back to `classifyAskRefusal` and then to `tool_error`.
+ */
+export function askRefusalFromMeta(result, text) {
+  const meta = result?._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta) || !ASK_REFUSAL_CODES.has(meta.m5_code)) return null;
+  const seconds = meta.retry_after_seconds;
+  return {
+    code: meta.m5_code,
+    retryable: typeof meta.retryable === "boolean" ? meta.retryable : meta.m5_code === "insufficient_memory",
+    ...(Number.isInteger(seconds) && seconds >= 0 && seconds <= 86_400 ? { retryAfterSeconds: seconds } : {}),
+    message: typeof text === "string" ? text.trim() : "",
+  };
+}
+
 function toolResultText(result) {
   const text = Array.isArray(result?.content)
     ? result.content.find((entry) => entry?.type === "text")?.text
@@ -1705,7 +1724,7 @@ export async function createM5Client({
             // A broken structured error payload must not mask the real tool_error content.
           }
         }
-        const refusal = classifyAskRefusal(toolResultText(result));
+        const refusal = askRefusalFromMeta(result, toolResultText(result)) ?? classifyAskRefusal(toolResultText(result));
         if (refusal !== null) {
           throw new M5ClientError(refusal.code, refusal.message, {
             retryable: refusal.retryable,

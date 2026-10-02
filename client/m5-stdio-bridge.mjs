@@ -50,6 +50,8 @@ function annotateAskRefusal(message, response) {
       !result || typeof result !== "object" || result.isError !== true ||
       result.structuredContent !== undefined) return response;
   const text = Array.isArray(result.content) ? result.content.find(entry => entry?.type === "text")?.text : undefined;
+  // A newer gateway already says so itself; leave its `_meta` as sent.
+  if (result._meta && typeof result._meta === "object" && typeof result._meta.m5_code === "string") return response;
   const refusal = classifyAskRefusal(text);
   if (refusal === null) return response;
   return {

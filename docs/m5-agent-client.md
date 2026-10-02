@@ -354,9 +354,10 @@ inspect the interactive host connector session.
 ### Memory refusals and build_run errors (1.5.1)
 
 The gateway refuses an `ask` that would start a model the host cannot afford with two 503-class
-causes. Its MCP tool result carries only `isError:true` and fixed text (no code or delay field),
-so the client recognises the gateway's own sentences and otherwise leaves the error a plain
-`tool_error`:
+causes. A gateway that includes the failure cause in the result's `_meta`
+(`{ m5_code, retryable?, retry_after_seconds? }`) is read directly. An older gateway sends only
+`isError:true` and fixed text, so there the client recognises the gateway's own sentences. Anything
+else stays a plain `tool_error`:
 
 | Client `code` | Meaning | `retryable` | Delay |
 | --- | --- | --- | --- |
@@ -364,7 +365,8 @@ so the client recognises the gateway's own sentences and otherwise leaves the er
 | `memory_admission_unavailable` | The host cannot approve the start; the operator must fix it | `false` | none (retrying will not help) |
 
 `m5 ask` prints these in its normal error object. The MCP bridge forwards the `ask` result
-unchanged and adds `_meta: { m5_code, retryable, retry_after_seconds? }`. The `hs` CLI labels the
+unchanged and adds `_meta: { m5_code, retryable, retry_after_seconds? }` when the gateway did not
+send it itself. The `hs` CLI labels the
 direct-HTTP `503` by its error code instead of always "Server busy".
 
 `build_run` over MCP returns the build client's own refusal as a JSON-RPC error whose

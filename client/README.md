@@ -145,7 +145,8 @@ treated as transport failures.
 `m5 ask` reports the gateway's host-memory refusals with stable codes in its error object:
 `insufficient_memory` (`retryable: true`, plus `retry_after_seconds` when the gateway named one)
 and `memory_admission_unavailable` (`retryable: false`; the operator must fix it, retrying will
-not help). The MCP bridge adds the same fields as `_meta` on the unchanged `ask` result, and `hs`
+not help). The client reads the cause from the gateway's `_meta` when present and falls back to
+the gateway's fixed sentences for older gateways. The MCP bridge adds the same fields as `_meta` on the unchanged `ask` result, and `hs`
 labels the direct-HTTP 503 by its code. Over MCP, `build_run` refusals arrive with the build
 client's own message and `data.m5_code` (`build_macos_only`, `build_timeout`,
 `build_worker_failure`, `build_protocol_error`, else `build_failed`); remote worker text is never

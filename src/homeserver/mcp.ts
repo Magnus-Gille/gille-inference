@@ -121,6 +121,7 @@ const ASK_DESCRIPTION =
   "Pick a model from list_models; pass the full prompt (and an optional system instruction). " +
   "Successful calls return the model text plus structuredContent {model,text,finish_reason,truncated,metered,usage}. " +
   "A token-limit finish (finish_reason=length) returns isError:true while preserving the partial text in content and the same structuredContent; the truncated call is already metered and any retry is a new billable call. " +
+  "Any other failure returns isError:true with the reason as text and the cause in _meta {m5_code, retryable, retry_after_seconds}: retry only when retryable is true, after retry_after_seconds when given. " +
   "For multi-section work that must finish inside max_tokens, opt into output_profile='complete-within-budget'; it prioritizes structural completion and uses low reasoning effort on gpt-oss. " +
   "Use this liberally for bounded work to save cost and keep data local. " +
   "Call list_models for the live, content-blind ask.files capability state before using file " +
@@ -626,9 +627,36 @@ export type RunChatResult =
         | "model_not_allowed"
         | "upstream_error";
       message: string;
+      /** Present when the gateway knows how long the caller should wait before retrying. */
+      retryAfterSeconds?: number;
       traceOutcome: string;
       traceErrorClass: string;
     };
+
+/**
+ * Machine-readable cause for a failed `ask`, sent in the MCP result's `_meta` (#349, #357). The
+ * text content stays the human sentence; a caller must not have to parse it to learn whether a
+ * retry can help. `_meta` is used, not `structuredContent`, because `ask` declares an output shape
+ * for successful calls and strict MCP clients validate `structuredContent` against it.
+ * `retryable` is omitted when the gateway cannot tell (an upstream model error).
+ */
+const ASK_FAILURE_RETRYABLE: Partial<Record<Extract<RunChatResult, { ok: false }>["code"], boolean>> = {
+  server_busy: true,
+  rate_limited: true,
+  insufficient_memory: true,
+  memory_admission_unavailable: false,
+  credits_exhausted: false,
+  model_not_allowed: false,
+};
+
+export function askFailureMeta(failure: Extract<RunChatResult, { ok: false }>): Record<string, unknown> {
+  const retryable = ASK_FAILURE_RETRYABLE[failure.code];
+  return {
+    m5_code: failure.code,
+    ...(retryable === undefined ? {} : { retryable }),
+    ...(failure.retryAfterSeconds === undefined ? {} : { retry_after_seconds: failure.retryAfterSeconds }),
+  };
+}
 
 const ASK_TRUNCATION_FINISH_REASON = "length";
 
@@ -888,6 +916,7 @@ export async function runChatCompletion(
       ok: false,
       code: "rate_limited",
       message: `Rate limit reached. Retry after ${q.retryAfterSeconds}s.`,
+      retryAfterSeconds: q.retryAfterSeconds,
       traceOutcome: "rate_limited",
       traceErrorClass: "rate_limit_exceeded",
     };
@@ -918,6 +947,7 @@ export async function runChatCompletion(
         ok: false,
         code: "server_busy",
         message: `The server is busy. Retry after ${err.retryAfterSeconds}s.`,
+        retryAfterSeconds: err.retryAfterSeconds,
         traceOutcome: "busy",
         traceErrorClass: "server_busy",
       };
@@ -954,6 +984,7 @@ export async function runChatCompletion(
         ok: false,
         code: memoryRejection.code,
         message: memoryRejection.message,
+        ...(memoryRejection.retryAfterSeconds === null ? {} : { retryAfterSeconds: memoryRejection.retryAfterSeconds }),
         traceOutcome: "memory_refused",
         traceErrorClass: memoryRejection.code,
       };
@@ -1307,7 +1338,7 @@ async function callTool(
   name: string,
   args: Record<string, unknown>,
   ctx: ToolCallContext
-): Promise<{ text: string; isError: boolean; structuredContent?: unknown; trace?: McpTraceOverride }> {
+): Promise<{ text: string; isError: boolean; structuredContent?: unknown; meta?: Record<string, unknown>; trace?: McpTraceOverride }> {
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal);
     const structuredContent = buildListModelsStructuredContent(
@@ -1487,6 +1518,7 @@ async function callTool(
     return {
       text: r.message,
       isError: true,
+      meta: askFailureMeta(r),
       trace: { traceOutcome: r.traceOutcome, traceErrorClass: r.traceErrorClass },
     };
   }
@@ -1592,7 +1624,7 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     const toolArgs = (typeof params.arguments === "object" && params.arguments !== null ? params.arguments : {}) as Record<string, unknown>;
     const out = await callTool(name, toolArgs, ctx);
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }) }));
+    res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }), ...(out.meta === undefined ? {} : { _meta: out.meta }) }));
     const trace = out.trace ?? (out.isError ? genericToolErrorTrace() : undefined);
     return trace === undefined ? {} : { trace };
   }

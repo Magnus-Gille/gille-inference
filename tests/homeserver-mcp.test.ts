@@ -937,6 +937,27 @@ describe("MCP auth + method", () => {
   });
 });
 
+// ─── #357: machine-readable ask failure cause ────────────────────────────────────────
+describe("askFailureMeta", () => {
+  const base = { ok: false as const, message: "m", traceOutcome: "o", traceErrorClass: "c" };
+  it("names the code, says whether a retry can help, and carries the delay when known", async () => {
+    const { askFailureMeta } = await import("../src/homeserver/mcp.js");
+    expect(askFailureMeta({ ...base, code: "insufficient_memory", retryAfterSeconds: 30 })).toEqual({
+      m5_code: "insufficient_memory", retryable: true, retry_after_seconds: 30,
+    });
+    expect(askFailureMeta({ ...base, code: "memory_admission_unavailable" })).toEqual({
+      m5_code: "memory_admission_unavailable", retryable: false,
+    });
+    expect(askFailureMeta({ ...base, code: "server_busy", retryAfterSeconds: 5 })).toEqual({
+      m5_code: "server_busy", retryable: true, retry_after_seconds: 5,
+    });
+    expect(askFailureMeta({ ...base, code: "rate_limited", retryAfterSeconds: 48 })).toMatchObject({ retryable: true, retry_after_seconds: 48 });
+    expect(askFailureMeta({ ...base, code: "credits_exhausted" })).toEqual({ m5_code: "credits_exhausted", retryable: false });
+    // The gateway cannot tell whether an upstream model error is transient, so it does not claim to.
+    expect(askFailureMeta({ ...base, code: "upstream_error" })).toEqual({ m5_code: "upstream_error" });
+  });
+});
+
 // ─── M2a: model_not_allowed increments /metrics ───────────────────────────────────────
 // Codex MEDIUM finding: a disallowed-model rejection was invisible in /metrics (only the
 // outer transport /mcp row with model="none"/outcome="ok" reached Prometheus). After the
@@ -969,9 +990,15 @@ describe("MCP M2a: model_not_allowed increments /metrics", () => {
       scopedKey
     );
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { isError: boolean; content: Array<{ type: string; text: string }> } };
+    const j = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ type: string; text: string }>; _meta?: Record<string, unknown>; structuredContent?: unknown };
+    };
     expect(j.result.isError).toBe(true);
     expect(j.result.content[0]!.text).toMatch(/not permitted/i);
+    // #357: the cause is machine-readable in `_meta`, never in `structuredContent`, which is
+    // reserved for the declared output shape of a successful ask.
+    expect(j.result._meta).toEqual({ m5_code: "model_not_allowed", retryable: false });
+    expect(j.result.structuredContent).toBeUndefined();
 
     // Read metrics AFTER — the forbidden counter sum must have grown by exactly 1.
     const metricsAfter = await fetch(`http://127.0.0.1:${gatewayPort}/metrics`, {

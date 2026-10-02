@@ -40,6 +40,50 @@ async function askRefusal(text: string) {
   return client.ask({ model: "mellum", prompt: "bounded task" });
 }
 
+describe("gateway-supplied cause in _meta is preferred over the sentence (#357)", () => {
+  function metaFetch(text: string, meta: unknown): typeof globalThis.fetch {
+    return (async (_input: unknown, init: { body?: unknown }) => {
+      const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+      if (request.params?.name === "ask") {
+        return rpcResult(request.id, { content: [{ type: "text", text }], isError: true, _meta: meta });
+      }
+      return rpcResult(request.id, { tools: [{ name: "ask", inputSchema: { type: "object" } }] });
+    }) as never;
+  }
+  async function askWith(text: string, meta: unknown) {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: metaFetch(text, meta),
+    });
+    return client.ask({ model: "mellum", prompt: "bounded task" }).catch((e) => e);
+  }
+
+  it("classifies by the code even when the wording is not the known sentence", async () => {
+    const error = await askWith("Reworded: no room for that model at the moment.", {
+      m5_code: "insufficient_memory", retryable: true, retry_after_seconds: 45,
+    });
+    expect(error).toMatchObject({ code: "insufficient_memory", retryable: true, retryAfterSeconds: 45 });
+    expect(error.message).toBe("Reworded: no room for that model at the moment.");
+  });
+
+  it("takes retryability from the gateway and ignores a malformed delay", async () => {
+    const error = await askWith("Reworded: the operator has to fix this.", {
+      m5_code: "memory_admission_unavailable", retryable: false, retry_after_seconds: "soon",
+    });
+    expect(error).toMatchObject({ code: "memory_admission_unavailable", retryable: false });
+    expect(error.toJSON().error).not.toHaveProperty("retry_after_seconds");
+  });
+
+  it("does not let _meta rename codes the client does not map yet", async () => {
+    for (const meta of [{ m5_code: "server_busy", retryable: true }, { m5_code: "made_up" }, "nope", null]) {
+      const error = await askWith("The server is busy. Retry after 5s.", meta);
+      expect(error).toMatchObject({ code: "tool_error" });
+    }
+  });
+});
+
 describe("host-memory admission refusals on ask (#357)", () => {
   it("names insufficient_memory as retryable with the gateway's delay", async () => {
     const error = await askRefusal(BUSY).catch((e) => e);
