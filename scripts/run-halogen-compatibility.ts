@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /** Operator-only entry point. Default prints a plan; --execute requires exact reviewed hashes. */
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { halogenHostPlanSchema, createHalogenHostOperations, fileSha256 } from '../src/homeserver/halogen-host-operations.js';
 import { buildHalogenLaunch } from '../src/homeserver/halogen-runtime-plan.js';
 import { HALOGEN_PILOT_PROFILE } from '../src/homeserver/halogen-profile.js';
 import { runHalogenCompatibilityEvaluation } from '../src/homeserver/halogen-evaluation.js';
+import { reserveHalogenRun, writeHalogenRunReceipt } from '../src/homeserver/halogen-run-receipt.js';
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -66,26 +67,23 @@ async function main(): Promise<void> {
   if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== p.uid || (directory.mode & 0o777) !== 0o700) {
     throw new Error('run directory must be caller-owned mode0700');
   }
-  const receipt = `${runDirectory}/${p.name}.json`;
-  const claim = `${runDirectory}/${p.name}.claim`;
-  for (const target of [receipt, claim]) {
-    try { await lstat(target); throw new Error('run identity already used'); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const common = { schemaVersion: 1, gate: 'synthetic-compatibility-only', planSha256, runnerSha256,
+    runnerCommit: p.runnerCommit, profileSha256: p.profileSha256 } as const;
+  const reservation = await reserveHalogenRun({ runDirectory, runName: p.name, common });
+  if (reservation.status === 'refused') {
+    console.error(JSON.stringify({ ...common, pass: false, status: 'refused', attemptedRun: reservation.attemptedRun,
+      reason: reservation.reason, collision: reservation.collision, receipt: reservation.receiptPath }));
+    process.exitCode = 1;
+    return;
   }
+  const receipt = reservation.receiptPath;
   const operations = createHalogenHostOperations(p);
-  const start = operations.startCandidate.bind(operations);
-  operations.startCandidate = async () => {
-    await writeFile(claim, JSON.stringify({ planSha256, runnerSha256, runnerCommit: p.runnerCommit }), { flag: 'wx', mode: 0o600 });
-    await start();
-  };
   const abort = new AbortController();
   const interrupt = (): void => abort.abort(new Error('operator interrupted evaluation'));
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(signal, interrupt);
-  const common = { schemaVersion: 1, gate: 'synthetic-compatibility-only', planSha256, runnerSha256,
-    runnerCommit: p.runnerCommit, profileSha256: p.profileSha256 };
   try {
     const result = await runHalogenCompatibilityEvaluation({ operations, apiKey, expectedResidentModels: p.expectedResidentModels, approvedExpiresAt: p.expiresAt, gatewayBaseUrl: p.gatewayBaseUrl, signal: abort.signal });
-    await writeFile(receipt, JSON.stringify({ ...common, pass: true, result }), { flag: 'wx', mode: 0o600 });
+    await writeHalogenRunReceipt(receipt, { ...common, pass: true, result });
     console.log(JSON.stringify({ ...common, pass: true, receipt }));
   } catch (error) {
     const diagnostics: Array<{ name: string; message: string }> = [];
@@ -97,8 +95,8 @@ async function main(): Promise<void> {
     };
     collect(error);
     const diagnostic = JSON.stringify(diagnostics);
-    await writeFile(receipt, JSON.stringify({ ...common, pass: false,
-      errorClass: error instanceof Error ? error.name : 'UnknownError', diagnostics }), { flag: 'wx', mode: 0o600 });
+    await writeHalogenRunReceipt(receipt, { ...common, pass: false,
+      errorClass: error instanceof Error ? error.name : 'UnknownError', diagnostics });
     console.error(JSON.stringify({ ...common, pass: false, receipt, errorSha256: createHash('sha256').update(diagnostic).digest('hex') }));
     process.exitCode = 1;
   } finally {
