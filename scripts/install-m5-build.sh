@@ -87,7 +87,10 @@ if [[ -f $slice_dir/70-gille-build.conf ]]; then cp -a "$slice_dir/70-gille-buil
 printf '%s\n' "$release" > "$backup/requested-release"
 install -d -o root -g root -m 755 "$release_dir"
 install -o root -g root -m 755 "$worker" "$release_dir/m5-build-worker.py"
-[[ $(sha256sum "$worker" | cut -d' ' -f1) == $(sha256sum "$release_dir/m5-build-worker.py" | cut -d' ' -f1) ]] || fail 'Worker copy identity mismatch.'
+# Hash each side separately: two failed substitutions would otherwise compare equal as empty strings.
+payload_sum=$(sha256sum "$worker" | cut -d' ' -f1) || fail 'Cannot hash the worker payload.'
+installed_sum=$(sha256sum "$release_dir/m5-build-worker.py" | cut -d' ' -f1) || fail 'Cannot hash the installed worker.'
+[[ $payload_sum =~ ^[0-9a-f]{64}$ && $payload_sum == "$installed_sum" ]] || fail 'Worker copy identity mismatch.'
 python3 - "$image" > /etc/gille-build.json.new <<'PY'
 import json, sys
 print(json.dumps(dict(version=1, image=sys.argv[1], podman='/usr/bin/podman')))
@@ -100,7 +103,14 @@ install -d -o root -g root -m 755 "$slice_dir" /etc/ssh/sshd_config.d
 printf '%s\n' 'd /run/gille-build 0755 root root -' 'f /run/gille-build/install.lock 0644 root root -' > /etc/tmpfiles.d/gille-build.conf
 printf '%s\n' '[Slice]' 'CPUQuota=600%' 'CPUWeight=10' 'IOWeight=10' 'MemoryMax=24G' \
   'MemorySwapMax=0' 'TasksMax=1700' > "$slice_dir/70-gille-build.conf"
-cat > /etc/ssh/sshd_config.d/70-gille-build.conf <<'SSH'
+ssh_dropin=/etc/ssh/sshd_config.d/70-gille-build.conf
+restore_ssh_dropin() {
+  # A rejected drop-in must not stay installed: a later sshd restart would fail on it and could
+  # cut off remote access. Put back the recorded previous file, or remove ours if there was none.
+  if [[ -e $backup/70-gille-build.conf ]]; then cp -a -- "$backup/70-gille-build.conf" "$ssh_dropin"
+  else rm -f -- "$ssh_dropin"; fi
+}
+cat > "$ssh_dropin" <<'SSH'
 Match User gille-build
     ForceCommand /usr/local/libexec/m5-build-worker
     AuthenticationMethods publickey
@@ -116,13 +126,13 @@ Match User gille-build
 Match all
 SSH
 # Reject hosts that don't include the drop-in, or have an earlier overriding rule.
-/usr/sbin/sshd -t || fail 'OpenSSH configuration invalid; restore the recorded backup before reload.'
+/usr/sbin/sshd -t || { restore_ssh_dropin; fail 'OpenSSH configuration invalid; the previous build drop-in state was restored and sshd was not reloaded.'; }
 /usr/sbin/sshd -T -C user=gille-build,host=localhost,addr=127.0.0.1 | python3 -c '
 import sys
 v=dict(line.strip().split(" ",1) for line in sys.stdin if " " in line)
 for k,w in {"forcecommand":"/usr/local/libexec/m5-build-worker", "authenticationmethods":"publickey", "passwordauthentication":"no", "kbdinteractiveauthentication":"no", "permittty":"no", "permituserrc":"no", "allowtcpforwarding":"no", "allowstreamlocalforwarding":"no", "x11forwarding":"no", "permittunnel":"no", "gatewayports":"no"}.items():
     assert v.get(k)==w, "Build SSH policy not effective: "+k
-' || fail 'Dedicated SSH restrictions not effective; do not enable access.'
+' || { restore_ssh_dropin; fail 'Dedicated SSH restrictions not effective; the previous build drop-in state was restored and sshd was not reloaded.'; }
 cat > /etc/systemd/system/gille-build-cleanup.service <<UNIT
 [Unit]
 Description=Remove stale idle M5 build worktrees (not production state)

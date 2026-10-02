@@ -47,4 +47,18 @@ describe('remote build SSH policy', () => {
     expect(source).toContain("containers=$(run_build /usr/bin/podman ps -q) || fail 'Cannot list build containers as the build identity.'");
     expect(source).not.toContain('[[ -z $(run_build /usr/bin/podman ps -q) ]]');
   });
+
+  it('installer does not leave a rejected SSH drop-in installed and does not compare failed checksums', () => {
+    const source = readFileSync(fileURLToPath(new URL('../scripts/install-m5-build.sh', import.meta.url)), 'utf8');
+    // Both SSH validations restore the previous drop-in state before failing, and neither reloads.
+    expect(source).toContain('/usr/sbin/sshd -t || { restore_ssh_dropin; fail ');
+    expect(source).toMatch(/' \|\| \{ restore_ssh_dropin; fail 'Dedicated SSH restrictions not effective/);
+    expect(source).toContain('else rm -f -- "$ssh_dropin"; fi');
+    const reload = source.indexOf('systemctl reload ssh.service');
+    expect(reload).toBeGreaterThan(source.indexOf("fail 'Dedicated SSH restrictions not effective"));
+    // Checksums are captured separately with their own failure guards and a format check.
+    expect(source).toContain("payload_sum=$(sha256sum \"$worker\" | cut -d' ' -f1) || fail 'Cannot hash the worker payload.'");
+    expect(source).toContain('[[ $payload_sum =~ ^[0-9a-f]{64}$ && $payload_sum == "$installed_sum" ]]');
+    expect(source).not.toMatch(/\[\[ \$\(sha256sum/);
+  });
 });
