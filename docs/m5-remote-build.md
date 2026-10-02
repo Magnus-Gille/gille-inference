@@ -6,14 +6,16 @@ Run Linux-compatible checks on the M5 without gateway credentials or GPU inferen
 m5 build -- cargo clippy --workspace --all-targets -- -D warnings
 m5 build -- cargo test -p sagascript-core -p sagascript-cli
 m5 build -- npm test
-m5 build --toolchain 1.98.0 -- cargo check --workspace
+m5 build --toolchain 1.99.0 -- cargo check --workspace
 m5 build --pull reports/test.xml -- npm test
 ```
 
 The command preserves literal arguments after `--`, streams stdout/stderr and returns the remote
 command's exit code. Infrastructure/protocol errors are distinct (125). Run from any Git worktree
-or subdirectory: the snapshot covers the **whole owning worktree**, including unstaged/untracked
-nonignored files and tracked deletions. No `.git` metadata is sent. Selected `.env*`, `secrets/**`,
+or subdirectory: the command always starts at the **worktree root**, whichever subdirectory you
+invoke it from. For a Cargo workspace that is not at the root, pass `--manifest-path` (for example
+`cargo test --manifest-path src-tauri/Cargo.toml`). The snapshot covers the **whole owning
+worktree**, including unstaged/untracked nonignored files and tracked deletions. No `.git` metadata is sent. Selected `.env*`, `secrets/**`,
 ignored tracked files, links/hardlinks and special files fail closed. Ordinary ignored files are
 excluded. Snapshot limit: 128 MiB. Local Python dirfd operations prevent ancestor-symlink traversal.
 
@@ -46,8 +48,8 @@ There is no new gateway route or production gateway restart requirement. MCP cap
   lingered user manager and home `/var/lib/gille-build` on a separate **≤64 GiB** filesystem.
   Disk formatting/account/key/image preparation is **not** performed by the installer.
 - Rootless Podman, systemd cgroup v2 and a **preloaded immutable image digest**. The illustrative
-  [`Containerfile`](../deploy/build/Containerfile) builds Rust 1.98.0/clippy, Node 22, sccache and
-  Linux Tauri packages; resolve and approve both base-image digests and downloads separately.
+  [`Containerfile`](../deploy/build/Containerfile) builds Rust 1.99.0/clippy, Node 22, sccache,
+  cmake/clang/libclang for native build scripts and Linux Tauri packages; resolve and approve both base-image digests and downloads separately.
   Image/default toolchain choice must match the repository's **current** CI pin, not an old ticket.
 - Vendored dependencies or prewarmed **per-repository** Cargo/npm caches. Runtime networking is
   always `none`: missing dependencies/toolchains fail offline, never fetch via host credentials.
