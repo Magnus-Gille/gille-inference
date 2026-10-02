@@ -54,6 +54,14 @@ describe('remote build SSH policy', () => {
     expect(source).toContain('/usr/sbin/sshd -t || { restore_ssh_dropin; fail ');
     expect(source).toMatch(/' \|\| \{ restore_ssh_dropin; fail 'Dedicated SSH restrictions not effective/);
     expect(source).toContain('else rm -f -- "$ssh_dropin"; fi');
+    // The drop-in is written beside the target and renamed into place, and a symlinked drop-in is
+    // refused before anything is changed (the backup would hold the link, not the original bytes).
+    expect(source).toContain('cat > "$ssh_dropin.new" <<');
+    expect(source).toContain('mv -Tf "$ssh_dropin.new" "$ssh_dropin"');
+    expect(source).not.toContain('cat > "$ssh_dropin" <<');
+    const symlinkGuard = source.indexOf("[[ ! -L $ssh_dropin ]] || fail");
+    expect(symlinkGuard).toBeGreaterThan(-1);
+    expect(symlinkGuard).toBeLessThan(source.indexOf('backup=$(mktemp -d'));
     const reload = source.indexOf('systemctl reload ssh.service');
     expect(reload).toBeGreaterThan(source.indexOf("fail 'Dedicated SSH restrictions not effective"));
     // Checksums are captured separately with their own failure guards and a format check.
