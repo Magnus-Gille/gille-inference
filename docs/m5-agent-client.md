@@ -370,9 +370,15 @@ send it itself. The `hs` CLI labels the
 direct-HTTP `503` by its error code instead of always "Server busy".
 
 `build_run` over MCP returns the build client's own refusal as a JSON-RPC error whose
-`data.m5_code` is `build_macos_only`, `build_timeout`, `build_worker_failure`,
-`build_protocol_error` or the generic `build_failed`, plus `invalid_args` as before. Messages are
-the fixed text written by the build client; remote worker text is never forwarded.
+`data.m5_code` is `build_macos_only`, `build_invalid_request`, `build_timeout`,
+`build_worker_failure` or `build_protocol_error`, plus `invalid_args` as before. Those messages are
+fixed sentences written by the build client. Any other local failure is reported as `build_failed`
+with one fixed message: its real text (for example a filesystem-helper diagnostic) can contain a
+local path, so it is shown only by the `m5 build` CLI in the user's own terminal. Remote worker
+text is never forwarded.
+
+Retryability for the two memory codes is fixed by the code, not taken from the peer, and a retry
+delay above one day is treated as not given, on every surface.
 
 For example, a refused private connection is reported with
 `discovery_failure: { endpoint: "private", diagnostic_code: "connection_refused",

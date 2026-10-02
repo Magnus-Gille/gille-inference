@@ -39,8 +39,10 @@ function isAdoptionReport(message) {
 }
 
 const BUILD_CODES = new Set([
-  "build_macos_only", "build_timeout", "build_worker_failure", "build_protocol_error",
+  "build_macos_only", "build_invalid_request", "build_timeout", "build_worker_failure", "build_protocol_error",
 ]);
+const BUILD_FAILED_MESSAGE =
+  "The local build client could not run this build. Run the same command with `m5 build` in a terminal to see the reason.";
 
 // The gateway's ask refusals for host-memory admission carry only fixed text (#350). Expose the
 // machine-readable code beside the untouched result so a caller can branch without parsing prose.
@@ -230,10 +232,13 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           try {
             result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
           } catch (error) {
-            // Pass the build client's own refusal through, as the CLI prints it (#357). m5-build.mjs
-            // never forwards free-form remote worker text into these messages, so this stays safe.
+            // Pass the build client's own refusal through, as the CLI prints it (#357), but only
+            // for errors it tagged with a code: those messages are fixed sentences. Anything else
+            // can carry a local path or subprocess diagnostic (for example the filesystem helper's
+            // stderr), so it gets a fixed message and the generic code.
             if (error instanceof M5ClientError || !(error instanceof Error)) throw error;
-            throw new M5ClientError(BUILD_CODES.has(error.buildCode) ? error.buildCode : "build_failed", error.message);
+            if (BUILD_CODES.has(error.buildCode)) throw new M5ClientError(error.buildCode, error.message);
+            throw new M5ClientError("build_failed", BUILD_FAILED_MESSAGE);
           }
           response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
         } else {

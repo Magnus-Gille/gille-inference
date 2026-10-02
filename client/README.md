@@ -148,9 +148,11 @@ and `memory_admission_unavailable` (`retryable: false`; the operator must fix it
 not help). The client reads the cause from the gateway's `_meta` when present and falls back to
 the gateway's fixed sentences for older gateways. The MCP bridge adds the same fields as `_meta` on the unchanged `ask` result, and `hs`
 labels the direct-HTTP 503 by its code. Over MCP, `build_run` refusals arrive with the build
-client's own message and `data.m5_code` (`build_macos_only`, `build_timeout`,
-`build_worker_failure`, `build_protocol_error`, else `build_failed`); remote worker text is never
-forwarded.
+client's own message and `data.m5_code` (`build_macos_only`, `build_invalid_request`,
+`build_timeout`, `build_worker_failure`, `build_protocol_error`). Any other local failure arrives
+as `build_failed` with a fixed message, because its real text can contain a local path; run the
+same command with `m5 build` in a terminal to see it. Remote worker text is never forwarded. A
+retry delay above one day is treated as not given.
 
 ### Provisioning a new owner-agent profile
 

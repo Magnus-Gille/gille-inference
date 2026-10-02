@@ -5,6 +5,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const M5_CLIENT_VERSION = "1.5.1";
+// A retry delay above one day is treated as not given: no caller should park itself that long on
+// the word of a remote peer.
+const MAX_RETRY_AFTER_SECONDS = 86_400;
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
@@ -165,7 +168,7 @@ export class M5ClientError extends Error {
     if (FAILURE_LAYERS.has(options.failureLayer)) this.failureLayer = options.failureLayer;
     if (typeof options.retryable === "boolean") this.retryable = options.retryable;
     if (Number.isInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 0 &&
-        options.retryAfterSeconds <= 86_400) {
+        options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
       this.retryAfterSeconds = options.retryAfterSeconds;
     }
     if (isValidEvidenceRecovery(options.evidenceRecovery)) {
@@ -877,7 +880,9 @@ export function classifyAskRefusal(text) {
   if (typeof text !== "string") return null;
   const short = /^There is not enough host memory to start the (?:requested )?model(?: '[^\n]*')? right now\.(?: (?:Retry after (\d{1,6})s\.|Please retry later\.))?$/s.exec(text.trim());
   if (short) {
-    const seconds = short[1] === undefined ? undefined : Number(short[1]);
+    // Same bound as M5ClientError and the `_meta` path: an absurd delay is dropped, not relayed.
+    const parsed = short[1] === undefined ? undefined : Number(short[1]);
+    const seconds = parsed !== undefined && parsed <= MAX_RETRY_AFTER_SECONDS ? parsed : undefined;
     return {
       code: "insufficient_memory",
       retryable: true,
@@ -895,7 +900,8 @@ export function classifyAskRefusal(text) {
   return null;
 }
 
-const ASK_REFUSAL_CODES = new Set(["insufficient_memory", "memory_admission_unavailable"]);
+// Retryability is part of each code's contract, so it is fixed here, not taken from the peer.
+const ASK_REFUSAL_RETRYABLE = new Map([["insufficient_memory", true], ["memory_admission_unavailable", false]]);
 
 /**
  * The gateway's own machine-readable cause, when it sends one in the result's `_meta` (newer
@@ -904,12 +910,13 @@ const ASK_REFUSAL_CODES = new Set(["insufficient_memory", "memory_admission_unav
  */
 export function askRefusalFromMeta(result, text) {
   const meta = result?._meta;
-  if (!meta || typeof meta !== "object" || Array.isArray(meta) || !ASK_REFUSAL_CODES.has(meta.m5_code)) return null;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta) || !ASK_REFUSAL_RETRYABLE.has(meta.m5_code)) return null;
+  const retryable = ASK_REFUSAL_RETRYABLE.get(meta.m5_code);
   const seconds = meta.retry_after_seconds;
   return {
     code: meta.m5_code,
-    retryable: typeof meta.retryable === "boolean" ? meta.retryable : meta.m5_code === "insufficient_memory",
-    ...(Number.isInteger(seconds) && seconds >= 0 && seconds <= 86_400 ? { retryAfterSeconds: seconds } : {}),
+    retryable,
+    ...(retryable && Number.isInteger(seconds) && seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS ? { retryAfterSeconds: seconds } : {}),
     message: typeof text === "string" ? text.trim() : "",
   };
 }

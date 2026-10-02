@@ -76,6 +76,22 @@ describe("gateway-supplied cause in _meta is preferred over the sentence (#357)"
     expect(error.toJSON().error).not.toHaveProperty("retry_after_seconds");
   });
 
+  it("fixes retryability by code, whatever the peer claims", async () => {
+    const contradictory = await askWith("Reworded.", { m5_code: "memory_admission_unavailable", retryable: true, retry_after_seconds: 5 });
+    expect(contradictory).toMatchObject({ code: "memory_admission_unavailable", retryable: false });
+    expect(contradictory.toJSON().error).not.toHaveProperty("retry_after_seconds");
+    const understated = await askWith("Reworded.", { m5_code: "insufficient_memory", retryable: false });
+    expect(understated).toMatchObject({ code: "insufficient_memory", retryable: true });
+  });
+
+  it.each([[86_400, 86_400], [86_401, undefined], [999_999, undefined], [-1, undefined]])(
+    "bounds the delay from _meta: %s -> %s",
+    async (sent, expected) => {
+      const error = await askWith("Reworded.", { m5_code: "insufficient_memory", retry_after_seconds: sent });
+      expect(error.retryAfterSeconds).toBe(expected);
+    },
+  );
+
   it("does not let _meta rename codes the client does not map yet", async () => {
     for (const meta of [{ m5_code: "server_busy", retryable: true }, { m5_code: "made_up" }, "nope", null]) {
       const error = await askWith("The server is busy. Retry after 5s.", meta);
@@ -113,6 +129,20 @@ describe("host-memory admission refusals on ask (#357)", () => {
       expect(error).toMatchObject({ code: "tool_error", message: text });
       expect(error).not.toHaveProperty("retryable");
     }
+  });
+});
+
+describe("the delay parsed from the sentence is bounded on both surfaces (#357)", () => {
+  const sentence = (n: number) => `There is not enough host memory to start the model 'mellum' right now. Retry after ${n}s.`;
+  it.each([[86_400, 86_400], [86_401, undefined], [999_999, undefined]])("direct client: %s -> %s", async (sent, expected) => {
+    const error = await askRefusal(sentence(sent)).catch((e) => e);
+    expect(error).toMatchObject({ code: "insufficient_memory", retryable: true });
+    expect(error.retryAfterSeconds).toBe(expected);
+  });
+  it("classifier: an out-of-range delay is dropped, not relayed", async () => {
+    const { classifyAskRefusal } = await import("../client/m5-client.mjs");
+    expect(classifyAskRefusal(sentence(86_400))).toMatchObject({ retryAfterSeconds: 86_400 });
+    expect(classifyAskRefusal(sentence(999_999))).not.toHaveProperty("retryAfterSeconds");
   });
 });
 
@@ -202,11 +232,32 @@ describe("build_run refusals through the bridge (#357)", () => {
     }
   });
 
-  it("falls back to build_failed for other local build errors", async () => {
+  it("never forwards an untagged build error message: a helper diagnostic can carry a private path", async () => {
+    // What Python prints when it cannot open the installed helper: an absolute path with the user name.
+    const PRIVATE = "python3: can't open file '/Users/someone/.local/lib/node_modules/gille-inference/m5-build-files.py': [Errno 13] Permission denied";
+    const response = await run(bridgeWith(async () => { throw new Error(PRIVATE); }), "/tmp/w", ["true"]);
+    expect(response.error.data.m5_code).toBe("build_failed");
+    expect(response.error.message).toContain("could not run this build");
+    expect(JSON.stringify(response)).not.toContain("/Users/someone");
+    expect(JSON.stringify(response)).not.toContain("Permission denied");
+  });
+
+  it("forwards the message of a tagged request error", async () => {
+    const response = await run(bridgeWith(runBuild), "/tmp/w", ["cargo", "+nightly", "test"]);
+    // The toolchain check runs before anything touches the filesystem or the network.
+    expect(["build_invalid_request", "build_failed"]).toContain(response.error.data.m5_code);
+    const tagged = await run(bridgeWith(async () => {
+      throw Object.assign(new Error("Pull paths must be distinct safe relative file paths (at most 32)."), { buildCode: "build_invalid_request" });
+    }), "/tmp/w", ["true"]);
+    expect(tagged.error.data.m5_code).toBe("build_invalid_request");
+    expect(tagged.error.message).toContain("Pull paths must be distinct");
+  });
+
+  it("does not trust a code it does not know, even with a message attached", async () => {
     const response = await run(bridgeWith(async () => {
-      throw new Error("Pull paths must be distinct safe relative file paths (at most 32).");
+      throw Object.assign(new Error("/private/path leaked"), { buildCode: "something_else" });
     }), "/tmp/w", ["true"]);
     expect(response.error.data.m5_code).toBe("build_failed");
-    expect(response.error.message).toContain("Pull paths must be distinct");
+    expect(JSON.stringify(response)).not.toContain("/private/path");
   });
 });
