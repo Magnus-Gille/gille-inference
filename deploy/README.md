@@ -132,7 +132,7 @@ to point here rather than re-describing the topology.
   `git -C /home/magnus/home-server-eval rev-parse` fails with "not a git repository". There is no
   local history to diff against on the box; `.deployed-commit` (below) is the only record of
   deployed identity.
-- Deployed commit: **`fc97f75b345ec297aa01165a62c9b56052c0982d`**, accepted 2026-10-02 with every
+- Deployed commit: **`469c9275ea460c254d2ee3c926f5ede50d8390fe`**, accepted 2026-10-02 with every
   deploy probe passing and the content check matching. This line is a convenience and goes stale;
   `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
 - `/srv/gille-inference` — previously documented in `AGENTS.md` as the live path — **does not
@@ -549,8 +549,9 @@ scripts/deploy-gateway.sh deploy <known-good-full-sha>
 ```
 
 The rollback target is the **previous accepted commit**, currently
-**`dee0b27df6fdb25695163b0dc0c55ed4c4ed5ab6`** (live until 2026-10-02, when
-`fc97f75b345ec297aa01165a62c9b56052c0982d` replaced it). Update both this line and the "Deployed
+**`fc97f75b345ec297aa01165a62c9b56052c0982d`** (live earlier on 2026-10-02, until
+`469c9275ea460c254d2ee3c926f5ede50d8390fe` replaced it; the one before was
+`dee0b27df6fdb25695163b0dc0c55ed4c4ed5ab6`). Update both this line and the "Deployed
 commit" line under "Live facts" whenever a new deploy is accepted (i.e. whenever
 `.deployed-commit` changes on the box), so a future rollback always has a concrete target without
 needing to reconstruct one — the box itself keeps no deploy history. If these lines and
