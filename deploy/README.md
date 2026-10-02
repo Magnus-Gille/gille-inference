@@ -123,7 +123,7 @@ up to date. Every other document (`AGENTS.md`'s "Deploying the M5 gateway" secti
 `docs/`) points here instead of repeating these facts — if you find a stale copy elsewhere, fix it
 to point here rather than re-describing the topology.
 
-**Live facts** (verified 2026-07-19/20, issue #23):
+**Live facts** (topology verified 2026-07-19/20, issue #23; deployed commit last updated 2026-10-02):
 
 - systemd unit: `home-gateway.service`
 - `WorkingDirectory`: `/home/magnus/home-server-eval`
@@ -132,9 +132,9 @@ to point here rather than re-describing the topology.
   `git -C /home/magnus/home-server-eval rev-parse` fails with "not a git repository". There is no
   local history to diff against on the box; `.deployed-commit` (below) is the only record of
   deployed identity.
-- Current baseline: commit **`8caf400`** ("feat: add LearningTaskContract gateway handshake
-  (#20)"), content-verified against `canonical/main` by sha256-comparing
-  `src/homeserver/learning-task-contract.ts` and `src/homeserver/gateway.ts` on 2026-07-19.
+- Deployed commit: **`fc97f75b345ec297aa01165a62c9b56052c0982d`**, accepted 2026-10-02 with every
+  deploy probe passing and the content check matching. This line is a convenience and goes stale;
+  `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
 - `/srv/gille-inference` — previously documented in `AGENTS.md` as the live path — **does not
   exist** on the box and is not this unit's `WorkingDirectory`. That claim was wrong; this section
   is now the source of truth. (`CONTRIBUTING.md` also uses `/srv/gille-inference` as a *reserved
@@ -542,15 +542,19 @@ The unit is not a git checkout, so "rollback" means **redeploy a known-good comm
 `git revert` on the box:
 
 ```bash
-git worktree add /tmp/gille-rollback <known-good-sha>   # e.g. 8caf400, the current baseline
+git worktree add /tmp/gille-rollback <known-good-sha>   # the previous accepted commit, see below
 cd /tmp/gille-rollback
 npm ci
 scripts/deploy-gateway.sh deploy <known-good-full-sha>
 ```
 
-The current known-good baseline is **`8caf400`**. Update this line whenever a new deploy is
-accepted (i.e. whenever `.deployed-commit` changes on the box), so a future rollback always has a
-concrete target without needing to reconstruct one — the box itself keeps no deploy history.
+The rollback target is the **previous accepted commit**, currently
+**`dee0b27df6fdb25695163b0dc0c55ed4c4ed5ab6`** (live until 2026-10-02, when
+`fc97f75b345ec297aa01165a62c9b56052c0982d` replaced it). Update both this line and the "Deployed
+commit" line under "Live facts" whenever a new deploy is accepted (i.e. whenever
+`.deployed-commit` changes on the box), so a future rollback always has a concrete target without
+needing to reconstruct one — the box itself keeps no deploy history. If these lines and
+`scripts/deploy-gateway.sh verify` disagree, the script is right and this file is stale.
 
 ### MCP-restart caveat
 
