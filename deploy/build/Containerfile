@@ -2,7 +2,10 @@
 # arguments MUST be immutable digest references; final image MUST also be pinned.
 # Example: podman build --build-arg RUST_IMAGE=rust@sha256:<digest>
 #   --build-arg NODE_IMAGE=node@sha256:<digest> -f deploy/build/Containerfile .
-# Use the Rust 1.99.0/bookworm and Node 22/bookworm image variants (same libc).
+# Use the Rust 1.99.0/trixie and Node 22/trixie image variants (same libc). Debian 13 is
+# required, not a preference: prebuilt native libraries that projects link statically (for
+# example ONNX Runtime) are built against glibc 2.38 or newer, which Debian 12 does not provide,
+# and the link then fails on undefined `__isoc23_*` symbols.
 ARG NODE_IMAGE
 ARG RUST_IMAGE
 FROM ${NODE_IMAGE} AS node
