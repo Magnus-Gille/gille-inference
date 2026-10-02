@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -107,5 +107,41 @@ describe('Halogen run identity receipts', () => {
     expect(second.receiptPath).toMatch(/\.attempt-aaaaaaaaaaaaaaaa-02\.json$/);
     expect(first.receiptPath).not.toBe(second.receiptPath);
     expect(await readFile(join(directory, `${runName}.json`), 'utf8')).toBe('old receipt');
+  });
+
+  it('allows only one concurrent reservation and gives the loser a fresh private refusal receipt', async () => {
+    const directory = await fixture();
+
+    const reservations = await Promise.all([
+      reserveHalogenRun({ runDirectory: directory, runName, common }),
+      reserveHalogenRun({ runDirectory: directory, runName, common }),
+    ]);
+
+    const winners = reservations.filter(reservation => reservation.status === 'reserved');
+    const refusals = reservations.filter(reservation => reservation.status === 'refused');
+    expect(winners).toHaveLength(1);
+    expect(refusals).toHaveLength(1);
+    const winner = winners[0]!;
+    const refusal = refusals[0]!;
+    if (winner.status !== 'reserved' || refusal.status !== 'refused') return;
+
+    expect(refusal).toMatchObject({
+      attemptedRun: runName,
+      collision: 'claim',
+      reason: HALOGEN_RUN_IDENTITY_COLLISION,
+    });
+    expect(refusal.receiptPath).not.toBe(winner.receiptPath);
+    await writeHalogenRunReceipt(winner.receiptPath, { ...common, pass: true, result: 'winner' });
+    const refusalReceipt = JSON.parse(await readFile(refusal.receiptPath, 'utf8')) as Record<string, unknown>;
+    expect(refusalReceipt).toMatchObject({
+      pass: false,
+      status: 'refused',
+      attemptedRun: runName,
+      reason: HALOGEN_RUN_IDENTITY_COLLISION,
+      collision: 'claim',
+      receipt: refusal.receiptPath,
+    });
+    expect(JSON.parse(await readFile(winner.receiptPath, 'utf8'))).toMatchObject({ pass: true, result: 'winner' });
+    expect((await stat(refusal.receiptPath)).mode & 0o777).toBe(0o600);
   });
 });

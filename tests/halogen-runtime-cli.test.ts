@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { build } from "esbuild";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 
 import { HALOGEN_PILOT_PROFILE, halogenProfileHash } from "../src/homeserver/halogen-profile.js";
@@ -59,10 +60,10 @@ async function writePlan(directory: string, value: unknown = plan(), mode = 0o60
   return path;
 }
 
-function run(args: string[], directory: string): ChildResult {
-  const result = spawnSync(process.execPath, [bundlePath, ...args], {
+function run(args: string[], directory: string, options: { bundle?: string; env?: Record<string, string> } = {}): ChildResult {
+  const result = spawnSync(process.execPath, [options.bundle ?? bundlePath, ...args], {
     cwd: directory,
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...options.env },
     encoding: "utf8",
   });
   if (result.error) throw result.error;
@@ -162,6 +163,116 @@ describe("run-halogen-compatibility CLI", () => {
     expect(result.stderr).toContain('"pass":false');
     expect(result.stderr).not.toContain("M5_MAINTENANCE_KEY");
     await unchanged(directory, before);
+  });
+
+  it("reports an existing-run collision at the CLI boundary without entering host operations", async () => {
+    const directory = await tempDirectory("halogen-cli-collision-");
+    const hostRoot = await tempDirectory("halogen-cli-host-root-");
+    const planPath = await writePlan(directory, { ...plan(), uid: process.getuid() });
+    const runDirectory = join(hostRoot, "halogen", "halogen-eval-317", "runs");
+    await mkdir(runDirectory, { recursive: true, mode: 0o700 });
+    const oldReceiptPath = join(runDirectory, `${plan().name}.json`);
+    const oldReceipt = JSON.stringify({ pass: false, error: "pre-existing receipt" });
+    await writeFile(oldReceiptPath, oldReceipt, { mode: 0o600 });
+    const markerPath = join(directory, "host-operation-invoked");
+    const collisionBundle = join(bundleDir, "run-halogen-compatibility-collision.mjs");
+
+    await build({
+      entryPoints: [entry],
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      outfile: collisionBundle,
+      plugins: [{
+        name: "halogen-collision-test-seams",
+        setup(buildApi) {
+          buildApi.onResolve({ filter: /^node:fs\/promises$/, namespace: "file" }, () => ({ path: "fs-promises", namespace: "halogen-test" }));
+          buildApi.onLoad({ filter: /^fs-promises$/, namespace: "halogen-test" }, () => ({
+            contents: `
+              import * as fs from 'node:fs/promises';
+              import { resolve } from 'node:path';
+              const mapped = path => path === '/home' ? process.env.HALOGEN_TEST_ROOT
+                : typeof path === 'string' && path.startsWith('/home/')
+                ? resolve(process.env.HALOGEN_TEST_ROOT, path.slice('/home/'.length)) : path;
+              export const lstat = (path, ...args) => fs.lstat(mapped(path), ...args);
+              export const mkdir = (path, ...args) => fs.mkdir(mapped(path), ...args);
+              export const readFile = (path, ...args) => fs.readFile(mapped(path), ...args);
+              export const writeFile = (path, data, ...args) => fs.writeFile(mapped(path), data, ...args);
+            `,
+            loader: "js",
+          }));
+          buildApi.onResolve({ filter: /halogen-host-operations\.js$/, namespace: "file" }, () => ({ path: "host-operations", namespace: "halogen-test" }));
+          buildApi.onLoad({ filter: /^host-operations$/, namespace: "halogen-test" }, () => ({
+            contents: `
+              import { createHash } from 'node:crypto';
+              import { readFile, writeFile } from 'node:fs/promises';
+              // The fixture plan is already schema-validated by the ordinary CLI tests.
+              export const halogenHostPlanSchema = { parse: value => value };
+              export async function fileSha256(path) { return createHash('sha256').update(await readFile(path)).digest('hex'); }
+              export function createHalogenHostOperations() {
+                void writeFile(process.env.HALOGEN_TEST_HOST_MARKER, 'host operations constructed');
+                return {};
+              }
+            `,
+            loader: "js",
+          }));
+          buildApi.onResolve({ filter: /halogen-evaluation\.js$/, namespace: "file" }, () => ({ path: "halogen-evaluation", namespace: "halogen-test" }));
+          buildApi.onLoad({ filter: /^halogen-evaluation$/, namespace: "halogen-test" }, () => ({
+            contents: `
+              import { writeFile } from 'node:fs/promises';
+              export async function runHalogenCompatibilityEvaluation() {
+                await writeFile(process.env.HALOGEN_TEST_HOST_MARKER, 'evaluation entered');
+                return {};
+              }
+            `,
+            loader: "js",
+          }));
+        },
+      }],
+    });
+
+    const testEnv = {
+      HALOGEN_TEST_ROOT: hostRoot,
+      HALOGEN_TEST_HOST_MARKER: markerPath,
+    };
+    const renderedResult = run(["--plan", planPath], directory, { bundle: collisionBundle, env: testEnv });
+    expect(renderedResult.status, renderedResult.stderr).toBe(0);
+    const rendered = JSON.parse(renderedResult.stdout) as JsonObject;
+    const result = run([
+      "--plan", planPath, "--execute",
+      "--accepted-plan-sha256", rendered.planSha256,
+      "--accepted-runner-sha256", rendered.runnerSha256,
+    ], directory, {
+      bundle: collisionBundle,
+      env: { ...testEnv, M5_MAINTENANCE_KEY: "synthetic-test-only" },
+    });
+
+    expect(result.status).toBe(1);
+    const response = JSON.parse(result.stderr) as JsonObject;
+    expect(response, result.stderr).toMatchObject({
+      pass: false,
+      status: "refused",
+      attemptedRun: plan().name,
+      reason: "run-identity-collision",
+      collision: "receipt",
+      planSha256: rendered.planSha256,
+      runnerSha256: rendered.runnerSha256,
+    });
+    const refusalPath = response.receipt as string;
+    const refusalFile = join(runDirectory, `${plan().name}.attempt-${rendered.planSha256.slice(0, 16)}.json`);
+    expect(refusalPath).toBe(`/home/halogen/halogen-eval-317/runs/${plan().name}.attempt-${rendered.planSha256.slice(0, 16)}.json`);
+    expect(JSON.parse(await readFile(refusalFile, "utf8"))).toMatchObject({
+      pass: false,
+      status: "refused",
+      attemptedRun: plan().name,
+      reason: "run-identity-collision",
+      collision: "receipt",
+      receipt: refusalPath,
+    });
+    expect(await readFile(oldReceiptPath, "utf8")).toBe(oldReceipt);
+    expect((await stat(refusalFile)).mode & 0o777).toBe(0o600);
+    await unchanged(directory, ["plan.json"]);
+    expect(await readdir(directory)).not.toContain("host-operation-invoked");
   });
 
   it.each([
