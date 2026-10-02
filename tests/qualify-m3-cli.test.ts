@@ -60,6 +60,16 @@ function firstCanaryHoldInput(): Record<string, unknown> {
   };
 }
 
+// tsx's loader calls the deprecated `module.register()` (DEP0205, Node >= 26), so Node prints a
+// runtime warning on the child's stderr. It is not the tool's output: drop only those Node warning
+// lines and keep asserting that nothing else is on stderr (#358).
+function withoutNodeRuntimeWarnings(stderr: string): string {
+  return stderr
+    .split("\n")
+    .filter((line) => !/^\(node:\d+\) \[DEP\d+\] /.test(line) && !/^\(Use `node --trace-deprecation/.test(line))
+    .join("\n");
+}
+
 function runCli(args: string[]) {
   const result = spawnSync(process.execPath, ["--import", tsxLoader, cliPath, ...args], {
     cwd: repoRoot,
@@ -68,7 +78,7 @@ function runCli(args: string[]) {
   return {
     status: result.status,
     stdout: result.stdout,
-    stderr: result.stderr,
+    stderr: withoutNodeRuntimeWarnings(result.stderr),
     error: result.error,
   };
 }
