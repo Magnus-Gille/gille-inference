@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import { runBuild } from "./m5-build.mjs";
 import {
   M5ClientError,
+  classifyAskRefusal,
   createFileAdoptionSpool,
   credentialRemediation,
   gatewayHttpRemediation,
@@ -35,6 +36,34 @@ function redactValue(value) {
 function isAdoptionReport(message) {
   return message?.method === "tools/call" &&
     message?.params?.name === "record_adoption_evidence";
+}
+
+const BUILD_CODES = new Set([
+  "build_macos_only", "build_timeout", "build_worker_failure", "build_protocol_error",
+]);
+
+// The gateway's ask refusals for host-memory admission carry only fixed text (#350). Expose the
+// machine-readable code beside the untouched result so a caller can branch without parsing prose.
+function annotateAskRefusal(message, response) {
+  const result = response?.result;
+  if (message?.method !== "tools/call" || message?.params?.name !== "ask" ||
+      !result || typeof result !== "object" || result.isError !== true ||
+      result.structuredContent !== undefined) return response;
+  const text = Array.isArray(result.content) ? result.content.find(entry => entry?.type === "text")?.text : undefined;
+  const refusal = classifyAskRefusal(text);
+  if (refusal === null) return response;
+  return {
+    ...response,
+    result: {
+      ...result,
+      _meta: {
+        ...(result._meta && typeof result._meta === "object" && !Array.isArray(result._meta) ? result._meta : {}),
+        m5_code: refusal.code,
+        retryable: refusal.retryable,
+        ...(refusal.retryAfterSeconds === undefined ? {} : { retry_after_seconds: refusal.retryAfterSeconds }),
+      },
+    },
+  };
 }
 
 function isCodeLoopResult(message) {
@@ -195,7 +224,15 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
             throw new M5ClientError("invalid_args", "build_run requires absolute cwd, command string array, optional toolchain, and optional pull paths.");
           }
           const quiet = { write() { return true; } };
-          const result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
+          let result;
+          try {
+            result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
+          } catch (error) {
+            // Pass the build client's own refusal through, as the CLI prints it (#357). m5-build.mjs
+            // never forwards free-form remote worker text into these messages, so this stays safe.
+            if (error instanceof M5ClientError || !(error instanceof Error)) throw error;
+            throw new M5ClientError(BUILD_CODES.has(error.buildCode) ? error.buildCode : "build_failed", error.message);
+          }
           response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
         } else {
           try {
@@ -210,6 +247,7 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           }
         }
         if (notification) return null;
+        response = annotateAskRefusal(message, response);
         if (response === null) {
           return rpcError(
             message.id,

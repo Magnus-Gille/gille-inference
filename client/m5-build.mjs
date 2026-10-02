@@ -13,6 +13,11 @@ const CHANNEL = /^(?:\d+\.\d+(?:\.\d+)?|stable)$/;
 const FILE_HELPER = fileURLToPath(new URL("./m5-build-files.py", import.meta.url));
 const LOCAL_ENV = { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C.UTF-8" };
 
+/** An error from this client with a stable machine-readable code (surfaced by the MCP bridge). */
+function buildError(code, message) {
+  return Object.assign(new Error(message), { buildCode: code });
+}
+
 export function defaultBuildConfigPath() {
   return join(homedir(), ".config", "m5", "build.json");
 }
@@ -113,7 +118,7 @@ function validateCommand(command) {
   if (["xcrun", "xcodebuild", "swift", "codesign", "notarytool", "productbuild"].includes(executable) ||
       command.some(arg => arg.includes("apple-darwin") || arg.includes("apple-ios")) ||
       (executable === "cargo" && command.includes("tauri") && command.includes("build"))) {
-    throw new Error("macOS-only job: use your Mac or a GitHub macOS runner.");
+    throw buildError("build_macos_only", "macOS-only job: use your Mac or a GitHub macOS runner.");
   }
 }
 
@@ -145,7 +150,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
   const totals = { stdout: 0, stderr: 0 }; const truncated = { stdout: false, stderr: false };
   const captured = { stdout: [], stderr: [] }; const artifacts = new Map(); let pullTotal = 0;
   const abort = error => { protocolError ??= error; child.kill(); };
-  const timer = setTimeout(() => abort(new Error("Remote build timed out; check dedicated worker cleanup.")), timeoutMs);
+  const timer = setTimeout(() => abort(buildError("build_timeout", "Remote build timed out; check dedicated worker cleanup.")), timeoutMs);
   timer.unref?.();
   // Consume but never print SSH diagnostics: they may contain private locators.
   child.stderr.on("data", () => {});
@@ -176,7 +181,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     } else if (message.type === "error" && message.code === 125 && typeof message.message === "string") {
       workerFailure = true;
       // Do not trust a compromised remote process to provide safe free-form diagnostics.
-      protocolError = new Error("Build worker infrastructure failure; verify dedicated host, offline caches and resource limits.");
+      protocolError = buildError("build_worker_failure", "Build worker infrastructure failure; verify dedicated host, offline caches and resource limits.");
     } else throw new Error("Malformed build worker protocol.");
   }
   child.stdout.on("data", chunk => {
@@ -190,7 +195,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
         lineBuffer = lineBuffer.subarray(newline + 1);
       }
       if (lineBuffer.length > MAX_LINE) throw new Error("Build protocol line exceeds its bound.");
-    } catch (error) { abort(new Error("Invalid remote build protocol.")); }
+    } catch (error) { abort(buildError("build_protocol_error", "Invalid remote build protocol.")); }
   });
   try {
     const completion = new Promise((resolve, reject) => {
@@ -200,7 +205,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     child.stdin.write(requestLine); child.stdin.write(prepared.archive); child.stdin.end();
     const sshExit = await completion;
     if (protocolError || lineBuffer.length || remoteExit === undefined || sshExit !== remoteExit) {
-      throw protocolError ?? new Error("Build ended without a matching remote exit record.");
+      throw protocolError ?? buildError("build_protocol_error", "Build ended without a matching remote exit record.");
     }
     if (pull.some(path => !artifacts.has(path))) throw new Error("Worker did not return every selected artifact.");
     if (artifacts.size) {
