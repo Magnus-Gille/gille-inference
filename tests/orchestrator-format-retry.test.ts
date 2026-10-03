@@ -17,6 +17,7 @@
  * Written BEFORE the implementation (red→green).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { HostMemoryAdmissionError } from "../src/homeserver/host-memory-admission.js";
 
 // ── mocks: inference clients, the loaded-model resolver, and the DB-touching ledger ──
 const lmInferenceMock = vi.fn();
@@ -152,6 +153,38 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
     const rec = recordDelegationMock.mock.calls[0]![0] as { outcome: string; notes: string | null };
     expect(rec.outcome).toBe("unverified");
     expect(rec.notes ?? "").toContain("format-retry");
+  });
+
+  it("invokes model-start admission for both the initial attempt and its format retry", async () => {
+    lmInferenceMock
+      .mockResolvedValueOnce({ ok: false as const, error: PEG_ERROR })
+      .mockResolvedValueOnce(lmOk("LOCAL JSON ANSWER"));
+    const beforeModelStart = vi.fn(async () => {});
+
+    const out = await delegate({ prompt: "output ONLY JSON", beforeModelStart });
+
+    expect(out.formatRetried).toBe(true);
+    expect(lmInferenceMock).toHaveBeenCalledTimes(2);
+    expect(beforeModelStart).toHaveBeenCalledTimes(2);
+    expect(beforeModelStart.mock.calls.map(([model]) => model)).toEqual(["gpt-oss-120b", "gpt-oss-120b"]);
+  });
+
+  it("propagates primary admission refusal before inference, ledger failure, or frontier fallback", async () => {
+    const beforeModelStart = vi.fn(async () => {
+      throw new HostMemoryAdmissionError({
+        code: "insufficient_memory",
+        message: "memory refused",
+        retryAfterSeconds: 9,
+        reason: "insufficient_memory",
+      });
+    });
+
+    await expect(delegate({ prompt: "output ONLY JSON", beforeModelStart, frontierModelId: "anthropic/claude-sonnet-4-6" }))
+      .rejects.toBeInstanceOf(HostMemoryAdmissionError);
+    expect(beforeModelStart).toHaveBeenCalledTimes(1);
+    expect(lmInferenceMock).not.toHaveBeenCalled();
+    expect(recordDelegationMock).not.toHaveBeenCalled();
+    expect(frontierMock).not.toHaveBeenCalled();
   });
 
   it("fails twice with the PEG error → falls through to escalate/record (capped at one retry)", async () => {

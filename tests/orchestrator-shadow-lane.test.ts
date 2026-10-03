@@ -11,6 +11,7 @@
  *   4. the lane is OFF by default — no second model call, no extra ledger row.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { createModelStartAdmission } from "../src/homeserver/host-memory-admission.js";
 
 const lmInferenceMock = vi.fn();
 vi.mock("../src/runner/lmstudio-client.js", () => ({
@@ -154,6 +155,50 @@ describe("shadow lane — evidence on an escalated leaf", () => {
     // Local and frontier said the same thing → graded a pass against the frontier reference.
     expect(row["outcome"]).toBe("pass");
     expect(row["escalated"]).toBe(true);
+  });
+
+  it("runs the real shadow admission factory content-blind before permitting the candidate", async () => {
+    shadowOn();
+    const admissionLog = vi.fn();
+    const beforeModelStart = createModelStartAdmission(
+      {
+        mode: "shadow",
+        modelBudgetBytes: new Map([[SHADOW_MODEL, 1 * 2 ** 30]]),
+        modelReclaimBytes: new Map(),
+        reserveBytes: 1 * 2 ** 30,
+        retryAfterSeconds: 9,
+      },
+      {
+        getRunning: async () => [],
+        readMemory: async () => ({
+          ok: true as const,
+          memory: {
+            memTotalBytes: 32 * 2 ** 30,
+            memAvailableBytes: 20 * 2 ** 30,
+            cmaFreeBytes: null,
+            gttUsedBytes: null,
+            gttTotalBytes: null,
+          },
+        }),
+        log: admissionLog,
+      },
+    );
+
+    const out = await delegate({ ...escalatedTask(), beforeModelStart });
+    await shadowLaneIdle();
+
+    expect(out.escalate).toBe(true);
+    expect(lmInferenceMock).toHaveBeenCalledTimes(1);
+    expect(admissionLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: "host_memory_admission",
+      mode: "shadow",
+      outcome: "allow",
+      model: "unknown",
+      enforced: false,
+    }));
+    const logged = admissionLog.mock.calls[0]![0] as Record<string, unknown>;
+    expect(logged).not.toHaveProperty("prompt");
+    expect(logged).not.toHaveProperty("response");
   });
 
   it("a shadow answer that DISAGREES with the frontier is recorded as a fail (not silently dropped)", async () => {

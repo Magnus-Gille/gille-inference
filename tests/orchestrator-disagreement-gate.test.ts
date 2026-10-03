@@ -95,8 +95,9 @@ describe("delegate() — disagreement gate (unverified path)", () => {
   it("gate=on + disagreeing secondary → escalates, calls frontier, records the gate", async () => {
     setConfig({ disagreementGate: "on" });
     wireLocalModels("ANSWER: 7", "ANSWER: 42"); // numeric → disagreementScore 1.0
+    const beforeModelStart = vi.fn(async () => {});
 
-    const out = await delegate({ prompt: "what is the value?", frontierModelId: "anthropic/claude-sonnet-4-6" });
+    const out = await delegate({ prompt: "what is the value?", beforeModelStart, frontierModelId: "anthropic/claude-sonnet-4-6" });
 
     expect(out.delegated).toBe(true);
     expect(out.escalate).toBe(true);
@@ -105,6 +106,7 @@ describe("delegate() — disagreement gate (unverified path)", () => {
     // second local model was actually called
     expect(lmInferenceMock).toHaveBeenCalledTimes(2);
     expect(lmInferenceMock.mock.calls.map((c) => c[0]).sort()).toEqual(["mellum", "qwen3-coder-next-80b"]);
+    expect(beforeModelStart.mock.calls.map(([model]) => model)).toEqual(["mellum", "qwen3-coder-next-80b"]);
     // frontier fallback ran and its output is attached
     expect(frontierMock).toHaveBeenCalledTimes(1);
     expect(out.frontierOutput).toBe("FRONTIER ANSWER: 9");

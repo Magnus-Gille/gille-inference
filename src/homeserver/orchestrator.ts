@@ -4,6 +4,7 @@ import { policyTaskTypeIdentity } from "./task-type-identity.js";
 import { shouldDelegate, recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import type { Verifier } from "./verifier.js";
 import { getLoaded, getRunningCmd } from "./model-admin.js";
+import type { ModelStartAdmission } from "./host-memory-admission.js";
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
@@ -84,6 +85,8 @@ export interface DelegationTask {
   verifierName?: string;
   /** Force a specific model id; otherwise the currently-loaded model is used. */
   modelId?: string;
+  /** Internal gateway-only admission hook invoked before every M5 model start. */
+  beforeModelStart?: ModelStartAdmission;
   /** Explicit macro-routing decision from Hugin; this gateway never auto-selects Orin. */
   nodeId?: ComputeNodeId;
   /**
@@ -307,6 +310,7 @@ function maybeScheduleEscalationShadow(
               canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
             });
           }
+          await task.beforeModelStart?.(modelId);
           const sampling = resolveLocalSampling(modelId, task);
           const responseFormat = resolveResponseFormat(
             job.taskType,
@@ -482,6 +486,7 @@ async function runSecondaryInference(
         canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
       });
     }
+    await task.beforeModelStart?.(secondaryModelId);
     const sampling = resolveLocalSampling(secondaryModelId, task);
     const res = await runLmStudioInference(secondaryModelId, task.prompt, {
       systemPrompt: task.systemPrompt,
@@ -865,6 +870,10 @@ async function delegateImpl(
   }
   const runLocalOnce = async (retryOrdinal: number): Promise<LocalInferenceResult> => {
     return withTraceSpan("inference", { retryOrdinal }, async () => {
+      // Keep admission outside the inference-error conversion below: a typed refusal must reach
+      // the authenticated gateway caller without creating a quality-ledger failure or triggering
+      // the frontier fallback.
+      if (nodeId === "m5") await task.beforeModelStart?.(modelId);
       const controller = new AbortController();
       const startedAtMs = Date.now();
       let timedOut = false;
