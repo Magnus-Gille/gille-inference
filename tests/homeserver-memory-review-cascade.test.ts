@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { initDb } from "../src/db.js";
 
 const GIB = 1024 ** 3;
+const MELLUM_MODEL = "mellum";
 const GPT_MODEL = "gpt-oss-120b";
 const QWEN_MODEL = "qwen35-122b-a10b";
 const SOURCE = "L1|const id = req.id;\nL2|db.exec(`SELECT * FROM users WHERE id=${id}`);";
@@ -25,9 +26,17 @@ const DECISION = JSON.stringify({ adjudications: [{
 let upstream: Server;
 let upstreamPort = 0;
 let backendModels: string[] = [];
+let activeBackendCalls = 0;
+let maxConcurrentBackendCalls = 0;
 let logs: Record<string, unknown>[] = [];
+let cascadeAggregates: Record<string, unknown>[] = [];
 let ownerKey = "";
 let ownerCounter = 0;
+let holdBackground = false;
+let heldBackground = false;
+let firstBackgroundStarted: Promise<void> = Promise.resolve();
+let resolveFirstBackgroundStarted: (() => void) | null = null;
+let releaseHeldBackground: (() => void) | null = null;
 
 function memorySnapshot() {
   return {
@@ -57,14 +66,32 @@ function startUpstream(): Promise<void> {
     }
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
+    req.on("end", async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+        model?: string;
+        messages?: Array<{ content?: string }>;
+      };
+      const foreground = body.messages?.some((message) => message.content === "foreground request") === true;
       backendModels.push(body.model ?? "");
+      activeBackendCalls++;
+      maxConcurrentBackendCalls = Math.max(maxConcurrentBackendCalls, activeBackendCalls);
+      const responseFinished = { value: false };
+      const releaseIfClosed = () => {
+        if (!responseFinished.value) releaseHeldBackground?.();
+      };
+      res.once("close", releaseIfClosed);
+      if (!foreground && holdBackground && !heldBackground) {
+        heldBackground = true;
+        resolveFirstBackgroundStarted?.();
+        await new Promise<void>((resolve) => { releaseHeldBackground = resolve; });
+      }
       const response = body.model === QWEN_MODEL ? DECISION : CANDIDATE;
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(`data: ${JSON.stringify({ id: "cascade-test", choices: [{ delta: { content: response } }] })}\n\n`);
       res.write(`data: ${JSON.stringify({ id: "cascade-test", choices: [], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } })}\n\n`);
+      responseFinished.value = true;
       res.end("data: [DONE]\n\n");
+      activeBackendCalls--;
     });
   });
   return new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => {
@@ -92,6 +119,12 @@ async function withGateway(
   for (const key of keys) delete process.env[key];
   Object.assign(process.env, env);
   vi.resetModules();
+  const metricsModule = await import("../src/homeserver/metrics.js");
+  const recordAggregate = metricsModule.recordReviewCascade;
+  const aggregateSpy = vi.spyOn(metricsModule, "recordReviewCascade").mockImplementation((row) => {
+    cascadeAggregates.push(row as unknown as Record<string, unknown>);
+    recordAggregate(row);
+  });
   const gateway = await import("../src/homeserver/gateway.js");
   const keystore = await import("../src/homeserver/keystore.js");
   ownerKey = keystore.mintKey({ alias: `cascade-memory-${ownerCounter++}`, tier: "owner", scope: "admin" }, {
@@ -111,6 +144,7 @@ async function withGateway(
     await fn(handle.port);
   } finally {
     await handle.stop();
+    aggregateSpy.mockRestore();
     for (const key of keys) delete process.env[key];
   }
 }
@@ -127,6 +161,28 @@ async function metrics(port: number): Promise<string> {
   return (await fetch(`http://127.0.0.1:${port}/metrics`, {
     headers: { authorization: `Bearer ${ownerKey}` },
   })).text();
+}
+
+async function recentLedger(port: number): Promise<Array<Record<string, unknown>>> {
+  const body = await (await fetch(`http://127.0.0.1:${port}/ledger?includeShadow=1`, {
+    headers: { authorization: `Bearer ${ownerKey}` },
+  })).json() as { recent?: Array<Record<string, unknown>> };
+  return body.recent ?? [];
+}
+
+async function chat(port: number): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${ownerKey}` },
+    body: JSON.stringify({ model: MELLUM_MODEL, messages: [{ role: "user", content: "foreground request" }], max_tokens: 8 }),
+  });
+}
+
+async function waitForFirstBackgroundStart(): Promise<void> {
+  await Promise.race([
+    firstBackgroundStarted,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("background model did not start")), 2_000)),
+  ]);
 }
 
 beforeAll(async () => {
@@ -154,7 +210,14 @@ afterAll(async () => {
 
 beforeEach(() => {
   backendModels = [];
+  activeBackendCalls = 0;
+  maxConcurrentBackendCalls = 0;
   logs = [];
+  cascadeAggregates = [];
+  holdBackground = false;
+  heldBackground = false;
+  releaseHeldBackground = null;
+  firstBackgroundStarted = new Promise((resolve) => { resolveFirstBackgroundStarted = resolve; });
 });
 
 const COMMON = {
@@ -164,7 +227,7 @@ const COMMON = {
   HOMESERVER_REVIEW_CASCADE_TASK_TYPES: "code-review",
   HOMESERVER_USE_ROUTING_TABLE: "on",
   HOMESERVER_HOST_MEMORY_RESERVE_GIB: "1",
-  HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB: `${GPT_MODEL}=1,${QWEN_MODEL}=60`,
+  HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB: `${MELLUM_MODEL}=1,${GPT_MODEL}=1,${QWEN_MODEL}=60`,
 };
 
 describe("gateway review-cascade model-start admission", () => {
@@ -176,10 +239,13 @@ describe("gateway review-cascade model-start admission", () => {
 
       expect(backendModels).toEqual([GPT_MODEL]);
       expect(logs).toEqual(expect.arrayContaining([
-        expect.objectContaining({ model: "unknown", outcome: "allow", enforced: true }),
-        expect.objectContaining({ model: "unknown", outcome: "refuse", reason: "insufficient_memory", enforced: true }),
+        expect.objectContaining({ model: GPT_MODEL, outcome: "allow", enforced: true }),
+        expect.objectContaining({ model: QWEN_MODEL, outcome: "refuse", reason: "insufficient_memory", enforced: true }),
       ]));
-      expect(await metrics(port)).toContain('homeserver_review_cascade_runs_total{terminal="error"} 1');
+      expect(await metrics(port)).toContain('homeserver_review_cascade_runs_total{terminal="skipped"} 1');
+      expect(cascadeAggregates).toEqual(expect.arrayContaining([
+        expect.objectContaining({ terminal: "skipped", candidateCount: 1 }),
+      ]));
 
       // A leaked background lease would make this second eligible cascade skip as busy.
       expect((await delegate(port)).status).toBe(200);
@@ -197,10 +263,45 @@ describe("gateway review-cascade model-start admission", () => {
 
       expect(backendModels).toEqual([GPT_MODEL, QWEN_MODEL]);
       expect(logs).toEqual(expect.arrayContaining([
-        expect.objectContaining({ model: "unknown", outcome: "allow", enforced: false }),
-        expect.objectContaining({ model: "unknown", outcome: "refuse", reason: "insufficient_memory", enforced: false }),
+        expect.objectContaining({ model: GPT_MODEL, outcome: "allow", enforced: false }),
+        expect.objectContaining({ model: QWEN_MODEL, outcome: "refuse", reason: "insufficient_memory", enforced: false }),
       ]));
       expect(await metrics(port)).toContain('homeserver_review_cascade_runs_total{terminal="completed"} 1');
+    });
+  });
+
+  it("shares one preemptible background lease between escalation shadow and review cascade", async () => {
+    await withGateway({
+      ...COMMON,
+      HOMESERVER_SHADOW_LANE: "on",
+      HOMESERVER_SHADOW_LANE_MODEL: MELLUM_MODEL,
+      HOMESERVER_SHADOW_LANE_TASK_TYPES: "code-review",
+      HOMESERVER_MAX_INFLIGHT: "1",
+      HOMESERVER_HOST_MEMORY_ADMISSION: "shadow",
+    }, async (port) => {
+      holdBackground = true;
+      expect((await delegate(port)).status).toBe(200);
+      await waitForFirstBackgroundStart();
+
+      // The first background start is held in the fake SSE upstream. The competing lane must
+      // acquire no second model call, and a foreground request must preempt the held background.
+      expect(backendModels).toHaveLength(1);
+      expect((await chat(port)).status).toBe(200);
+      releaseHeldBackground?.();
+      const review = await import("../src/homeserver/review-cascade-shadow.js");
+      const shadow = await import("../src/homeserver/shadow-lane.js");
+      await Promise.all([review.reviewCascadeShadowIdle(), shadow.shadowLaneIdle()]);
+      expect(maxConcurrentBackendCalls).toBeLessThanOrEqual(1);
+      expect((await recentLedger(port)).some((row) => row.source === "shadow")).toBe(false);
+
+      // Once the foreground preemption released the shared lease, a later background request can
+      // run again; it still serializes the two optional background lanes.
+      holdBackground = false;
+      const beforeLater = backendModels.length;
+      expect((await delegate(port)).status).toBe(200);
+      await Promise.all([review.reviewCascadeShadowIdle(), shadow.shadowLaneIdle()]);
+      expect(backendModels.length).toBeGreaterThan(beforeLater);
+      expect(maxConcurrentBackendCalls).toBeLessThanOrEqual(1);
     });
   });
 });
