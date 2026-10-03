@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createModelStartAdmission,
+  HostMemoryAdmissionError,
+} from "../src/homeserver/host-memory-admission.js";
 
 /**
  * Tests for the llama-swap admin adapter (src/homeserver/llamaswap-admin.ts)
@@ -14,6 +18,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 let mockServer: Server;
 let mockPort = 0;
 let lastUnloadPath = "";
+let chatRequestCount = 0;
 let chatShouldFail = false;
 let runningStatus = 200;
 let runningModels: Array<{ model: string; state: string; cmd?: string; proxy?: string; ttl?: number }> = [];
@@ -68,6 +73,7 @@ function startMock(): Promise<void> {
       }
 
       if (url === "/v1/chat/completions" && method === "POST") {
+        chatRequestCount += 1;
         if (chatShouldFail) {
           res.writeHead(500, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: { message: "model load failed" } }));
@@ -128,6 +134,7 @@ afterAll(() => {
 
 beforeEach(() => {
   lastUnloadPath = "";
+  chatRequestCount = 0;
   chatShouldFail = false;
   runningStatus = 200;
   runningModels = [];
@@ -406,6 +413,74 @@ describe("loadModel", () => {
     expect(r.ok).toBe(true);
     expect(r.message).toBe("already loaded");
   });
+
+  it("propagates typed admission refusal before the warm-up POST", async () => {
+    const refusal = new HostMemoryAdmissionError({
+      code: "insufficient_memory",
+      message: "blocked by test admission",
+      retryAfterSeconds: 9,
+      reason: "insufficient_memory",
+    });
+    runningModels = [];
+
+    await expect(
+      llamaswap.loadModel("llama3.2:3b", {
+        beforeModelStart: async () => {
+          throw refusal;
+        },
+      }),
+    ).rejects.toBe(refusal);
+    expect(chatRequestCount).toBe(0);
+    expect(lastUnloadPath).toBe("");
+  });
+
+  it("does not invoke admission for an already-ready model", async () => {
+    runningModels = [{ model: "llama3.2:3b", state: "ready" }];
+    let called = false;
+    const r = await llamaswap.loadModel("llama3.2:3b", {
+      beforeModelStart: async () => {
+        called = true;
+      },
+    });
+    expect(r.message).toBe("already loaded");
+    expect(called).toBe(false);
+    expect(chatRequestCount).toBe(0);
+  });
+
+  it("permits the warm-up through the real shadow admission factory and records its decision", async () => {
+    const records: Record<string, unknown>[] = [];
+    const admission = createModelStartAdmission(
+      {
+        mode: "shadow",
+        modelBudgetBytes: new Map([["llama3.2:3b", 64 * 2 ** 30]]),
+        modelReclaimBytes: new Map(),
+        reserveBytes: 1 * 2 ** 30,
+        retryAfterSeconds: 9,
+      },
+      {
+        getRunning: async () => [],
+        readMemory: async () => ({
+          ok: true as const,
+          memory: {
+            memTotalBytes: 128 * 2 ** 30,
+            memAvailableBytes: 100 * 2 ** 30,
+            cmaFreeBytes: 0,
+            gttUsedBytes: null,
+            gttTotalBytes: null,
+          },
+        }),
+        log: (record) => records.push(record),
+      },
+      () => "test-model",
+    );
+    runningModels = [];
+
+    const result = await llamaswap.loadModel("llama3.2:3b", { beforeModelStart: admission });
+    expect(result.ok).toBe(true);
+    expect(chatRequestCount).toBe(1);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ mode: "shadow", outcome: "allow", enforced: false });
+  });
 });
 
 // ─── ensureLoaded ─────────────────────────────────────────────────────────────
@@ -424,6 +499,26 @@ describe("ensureLoaded", () => {
     chatShouldFail = false;
     const r = await llamaswap.ensureLoaded("llama3.2:8b");
     expect(r.ok).toBe(true);
+  });
+
+  it("preserves admission on the absent-model load path", async () => {
+    const refusal = new HostMemoryAdmissionError({
+      code: "insufficient_memory",
+      message: "blocked by test admission",
+      retryAfterSeconds: 9,
+      reason: "insufficient_memory",
+    });
+    runningModels = [];
+
+    await expect(
+      llamaswap.ensureLoaded("llama3.2:8b", 32768, {
+        beforeModelStart: async () => {
+          throw refusal;
+        },
+      }),
+    ).rejects.toBe(refusal);
+    expect(chatRequestCount).toBe(0);
+    expect(lastUnloadPath).toBe("");
   });
 });
 

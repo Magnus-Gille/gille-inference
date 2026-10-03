@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { loadConfig } from "./config.js";
+import type { ModelStartAdmission } from "./host-memory-admission.js";
 
 /**
  * DEPRECATED (#146) — the live box runs llama-swap; this adapter has no production
@@ -81,6 +82,8 @@ export interface LoadOptions {
   ttlSeconds?: number;
   /** API identifier to assign; defaults to the model key so the OpenAI id stays stable. */
   identifier?: string;
+  /** Internal admission callback invoked immediately before a model-start side effect. */
+  beforeModelStart?: ModelStartAdmission;
 }
 
 export interface LoadResult {
@@ -218,6 +221,7 @@ export async function loadModel(modelKey: string, opts: LoadOptions = {}): Promi
   args.push("--", modelKey);
 
   const start = Date.now();
+  await opts.beforeModelStart?.(modelKey, { forceStart: true });
   try {
     const { stdout, stderr } = await execFileAsync("lms", args, {
       timeout: 300_000,
@@ -276,8 +280,9 @@ export async function ensureLoaded(
       message: `already loaded at ${current.contextLength} ctx`,
     };
   }
+  if (opts.beforeModelStart) await opts.beforeModelStart(modelKey, { forceStart: true });
   if (current) await unloadModel(modelKey);
-  return loadModel(modelKey, { ...opts, contextLength: minContext });
+  return loadModel(modelKey, { ...opts, contextLength: minContext, beforeModelStart: undefined });
 }
 
 /**

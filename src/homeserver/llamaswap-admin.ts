@@ -284,6 +284,7 @@ export async function loadModel(
     // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
     const cfg = loadConfig();
     const timeoutMs = cfg.callTimeoutMs ?? 300_000;
+    await opts.beforeModelStart?.(modelKey);
     try {
       const res = await fetchWithTimeout(
         `${origin}/v1/chat/completions`,
