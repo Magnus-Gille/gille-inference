@@ -52,7 +52,7 @@ import {
 } from "./maintenance-window.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
-import { admitHostMemory, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
+import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, type HostMemoryAdmissionDeps, type ModelStartAdmission } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
@@ -127,6 +127,7 @@ import {
 import {
   claimLearningTaskAdmission,
   lookupLearningTaskAdmission,
+  releaseLearningTaskAdmission,
 } from "./learning-task-admission-store.js";
 import {
   ROSTER_PROPOSAL_PRINCIPAL,
@@ -2295,6 +2296,24 @@ function sendLearningTaskAdmissionRecovery(
   });
 }
 
+function gatewayModelStartAdmission(cfg: HomeserverConfig, deps: HostMemoryAdmissionDeps): ModelStartAdmission {
+  return createModelStartAdmission(cfg.hostMemoryAdmission, deps,
+    (model) => canonicalizeModelTrusted(model, []));
+}
+
+function sendModelStartRefusal(res: ServerResponse, lctx: LogCtx, err: HostMemoryAdmissionError): MeteredResult {
+  const rejection = err.rejection;
+  lctx.status = 503;
+  lctx.outcome = "memory_refused";
+  lctx.errorClass = rejection.code;
+  if (rejection.retryAfterSeconds !== null) lctx.retryAfterS = rejection.retryAfterSeconds;
+  sendError(res, makeError(rejection.code, {
+    message: rejection.message,
+    ...(rejection.retryAfterSeconds !== null ? { retryAfterSeconds: rejection.retryAfterSeconds } : {}),
+  }));
+  return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: rejection.code };
+}
+
 async function handleDelegate(
   params: DelegateParams,
   res: ServerResponse,
@@ -2305,6 +2324,7 @@ async function handleDelegate(
   controller: AdmissionController,
   lctx: LogCtx,
   feedbackOwner: ExecutionFeedbackOwner | null,
+  memoryDeps: HostMemoryAdmissionDeps,
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
   let learningTaskAdmissionId: string | undefined;
@@ -2350,7 +2370,15 @@ async function handleDelegate(
     }
     learningTaskAdmissionId = claim.record.admissionRecordId;
   }
+  const beforeModelStart = gatewayModelStartAdmission(cfg, memoryDeps);
+  let inferenceMayHaveStarted = false;
   const runDelegate = () => delegate({
+    beforeModelStart: async (model, options) => {
+      await beforeModelStart(model, options);
+      // From here an upstream attempt may occur. Preserve the stamped claim on any later
+      // retry refusal; only a first pre-inference refusal proves replay remains safe.
+      inferenceMayHaveStarted = true;
+    },
     prompt: params.prompt,
     taskType: params.taskType,
     systemPrompt: params.systemPrompt,
@@ -2385,8 +2413,18 @@ async function handleDelegate(
   // after the upstream model has already answered (for example while persisting its ledger row),
   // so no exception from this point proves that replay is safe. Preserve the claim on every
   // failure; an exact retry will recover its echo with outcomeUnavailable instead of inferring
-  // twice. All pre-model credit/quota/GPU refusals occur before handleDelegate and create no claim.
-  const result = await runDelegate();
+  // twice. A typed first-attempt memory refusal proves no inference began, so that claim alone
+  // can be released safely. Later retry refusals preserve it.
+  let result: DelegationOutcome;
+  try {
+    result = await runDelegate();
+  } catch (err) {
+    if (!(err instanceof HostMemoryAdmissionError)) throw err;
+    if (learningTaskAdmissionId !== undefined && !inferenceMayHaveStarted) {
+      releaseLearningTaskAdmission(learningTaskAdmissionId);
+    }
+    return sendModelStartRefusal(res, lctx, err);
+  }
   let feedbackHandle: string | null = null;
   try {
     if (feedbackOwner && result.ledgerId) {
@@ -2408,7 +2446,7 @@ async function handleDelegate(
   // #132 is attached only after the caller response *and* its foreground admission lease are
   // complete. Otherwise its own queue-depth gate can see the just-finished request and skip.
   const afterRelease = ownerContent && result.nodeId === "m5" && !result.delegated && result.escalate
-    ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
+    ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller, beforeModelStart)
     : undefined;
   lctx.node = result.nodeId;
   // C3/#179: the orchestrator bound one server-computed safe identity to this exact result before
@@ -2436,15 +2474,19 @@ function scheduleReviewCascadeAfterDelegate(
   keyAlias: string,
   outcome: DelegationOutcome,
   cfg: HomeserverConfig,
-  controller: AdmissionController
+  controller: AdmissionController,
+  beforeModelStart: ModelStartAdmission,
 ): void {
   scheduleReviewCascadeShadow(
     { taskType: outcome.taskType, ownerContent: true, source },
     {
       config: cfg.reviewCascadeShadow,
       queueDepth: () => controller.snapshot().inflight,
-      acquireBackground: (abort) => controller.tryAcquireBackground(abort),
+      acquireBackground: (abort) => controller.snapshot().maintenanceMode
+        ? null : controller.tryAcquireBackground(abort),
       infer: async (modelId, prompt, cascadeCfg, signal) => {
+        await beforeModelStart(modelId);
+        if (signal.aborted) return { ok: false, error: "cancelled before inference" };
         const call = new AbortController();
         const propagate = () => call.abort();
         signal.addEventListener("abort", propagate, { once: true });
@@ -3237,7 +3279,10 @@ function handleImageJobCancel(
   sendJson(res, 200, { id, status: out.status ?? "cancelled" });
 }
 
-async function handleAdminLoad(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleAdminLoad(req: IncomingMessage, res: ServerResponse,
+  controller: AdmissionController, principal: PrincipalContext, lctx: LogCtx,
+  beforeModelStart: ModelStartAdmission,
+): Promise<void> {
   const body = JSON.parse(await readBody(req)) as {
     modelKey?: string;
     contextLength?: number;
@@ -3249,13 +3294,33 @@ async function handleAdminLoad(req: IncomingMessage, res: ServerResponse): Promi
     sendError(res, makeError("invalid_request_error", { param: "modelKey", message: "Missing required field 'modelKey'." }));
     return;
   }
-  const r = await loadModel(body.modelKey, {
-    contextLength: body.contextLength,
-    parallel: body.parallel,
-    gpu: body.gpu,
-    ttlSeconds: body.ttlSeconds,
-  });
-  sendJson(res, r.ok ? 200 : 500, r);
+  let release: (() => void) | undefined;
+  try {
+    // Model loading is unmetered admin work, but it shares inference slots and maintenance
+    // exclusion. Check memory only after the slot is held, immediately before backend start.
+    release = await controller.acquire({ lane: principal.tier as Lane,
+      requestedModel: body.modelKey, keyId: principal.alias,
+      keyMaxParallel: principal.maxParallel, keyInflight: keyInflight.get(principal.alias) ?? 0 });
+    lctx.admission = "admitted";
+    const r = await loadModel(body.modelKey, {
+      contextLength: body.contextLength,
+      parallel: body.parallel,
+      gpu: body.gpu,
+      ttlSeconds: body.ttlSeconds,
+      beforeModelStart,
+    });
+    sendJson(res, r.ok ? 200 : 500, r);
+  } catch (err) {
+    if (err instanceof HostMemoryAdmissionError) {
+      sendModelStartRefusal(res, lctx, err);
+    } else if (err instanceof AdmissionRejected) {
+      lctx.status = 503; lctx.outcome = "busy"; lctx.errorClass = "server_busy";
+      lctx.admission = "busy"; lctx.retryAfterS = err.retryAfterSeconds;
+      sendError(res, makeError("server_busy", { retryAfterSeconds: err.retryAfterSeconds }));
+    } else throw err;
+  } finally {
+    release?.();
+  }
 }
 
 async function handleAdminUnload(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -4756,6 +4821,7 @@ export async function handleRequest(
           controller,
           lctx,
           executionFeedbackOwner(principal),
+          hostMemoryDeps,
         )
       );
       return;
@@ -5119,10 +5185,11 @@ export async function handleRequest(
     // ─── Admin surface ───
     if (path === "/admin/models/load" && method === "POST") {
       if (!requireAdmin()) return;
-      await handleAdminLoad(req, res);
-      lctx.status = res.statusCode;
-      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
-      lctx.admission = "n/a";
+      await handleAdminLoad(req, res, controller, principal, lctx, gatewayModelStartAdmission(cfg, hostMemoryDeps));
+      if (lctx.outcome !== "memory_refused" && lctx.outcome !== "busy") {
+        lctx.status = res.statusCode;
+        lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      }
       return;
     }
     if (path === "/admin/models/unload" && method === "POST") {

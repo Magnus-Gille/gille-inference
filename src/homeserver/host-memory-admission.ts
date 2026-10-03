@@ -454,7 +454,7 @@ export function createModelStartAdmission(
     // own memory as eviction credit. Observe the other residents normally.
     const observationDeps = options?.forceStart ? {
       ...deps,
-      getRunning: async (signal?: AbortSignal) =>
+      getRunning: async (signal: AbortSignal) =>
         (await deps.getRunning(signal)).filter((entry) => entry.model !== model),
     } : deps;
     const rejection = await admitHostMemory(config, model, observationDeps, logLabel(model));

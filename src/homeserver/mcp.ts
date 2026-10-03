@@ -1539,6 +1539,7 @@ async function callTool(
         authentication: "gateway-owner-auth",
         gatewayRequestId: ctx.gatewayRequestId,
         capabilityEpoch: ctx.learningTaskCapabilityEpoch,
+        hostMemoryAdmissionDependencies: ctx.hostMemoryAdmission,
       },
     );
     return { ...out, structuredContent: JSON.parse(out.text) };

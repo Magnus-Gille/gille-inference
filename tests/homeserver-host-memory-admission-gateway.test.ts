@@ -22,6 +22,7 @@ let runningDelayMs = 0;
 let memory: HostMemoryReadResult = { ok: true, memory: snapshot(100, 10) };
 let logs: Record<string, unknown>[] = [];
 let ownerKey = "";
+let adminKey = "";
 
 function snapshot(totalGib: number, availGib: number): Extract<HostMemoryReadResult, { ok: true }>["memory"] {
   return {
@@ -70,7 +71,7 @@ async function withGateway(
   env: Record<string, string>,
   fn: (port: number) => Promise<void>,
 ): Promise<void> {
-  const keys = ["HOMESERVER_HOST_MEMORY_ADMISSION", "HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
+  const keys = [...new Set(["HOMESERVER_HOST_MEMORY_ADMISSION", "HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB", ...Object.keys(env)])];
   for (const k of keys) delete process.env[k];
   Object.assign(process.env, env);
   // loadConfig() caches per module instance; a fresh graph is needed per mode.
@@ -126,6 +127,7 @@ beforeAll(async () => {
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
   const ks = await import("../src/homeserver/keystore.js");
   ownerKey = ks.mintKey({ alias: "hostmem-owner", tier: "owner" }, DEFAULTS).plaintextKey;
+  adminKey = ks.mintKey({ alias: "hostmem-admin", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
 });
 
 afterAll(async () => {
@@ -294,5 +296,43 @@ describe("MCP ask host-memory admission (#350)", () => {
       delete process.env["HOMESERVER_HOST_MEMORY_ADMISSION"];
       delete process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
     }
+  });
+});
+
+async function ownerPost(port: number, path: string, body: unknown): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}${path}`, { method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${adminKey}` },
+    body: JSON.stringify(body) });
+}
+
+describe("remaining gateway model-start admission (#353)", () => {
+  it.each(["/delegate", "/admin/models/load"])("enforce refuses %s before upstream", async (path) => {
+    await withGateway({ HOMESERVER_HOST_MEMORY_ADMISSION: "enforce", ...BUDGETS,
+      HOMESERVER_POLICY_EXPLORATION: "1" }, async (port) => {
+      const body = path === "/delegate" ? { prompt: "resource-only test", modelId: "big", taskType: "extract", maxTokens: 8 }
+        : { modelKey: "big" };
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await ownerPost(port, path, body);
+        expect(res.status).toBe(503);
+        expect((await res.json()).error.code).toBe("insufficient_memory");
+        expect(res.headers.get("retry-after")).not.toBeNull();
+      }
+      // The refusal must release any slot; the following fitting chat proceeds.
+      memory = { ok: true, memory: snapshot(100, 90) };
+      expect((await chat(port, "big")).status).toBe(200);
+    });
+    expect(chatCalls).toBe(1);
+    expect(logs[0]).toMatchObject({ outcome: "refuse", enforced: true });
+  });
+  it.each(["/delegate", "/admin/models/load"])("shadow observes %s but forwards", async (path) => {
+    await withGateway({ HOMESERVER_HOST_MEMORY_ADMISSION: "shadow", ...BUDGETS,
+      HOMESERVER_POLICY_EXPLORATION: "1" }, async (port) => {
+      const body = path === "/delegate" ? { prompt: "resource-only test", modelId: "big", taskType: "extract", maxTokens: 8 }
+        : { modelKey: "big" };
+      expect((await ownerPost(port, path, body)).status).toBe(200);
+    });
+    expect(chatCalls).toBe(1);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ outcome: "refuse", enforced: false });
   });
 });
