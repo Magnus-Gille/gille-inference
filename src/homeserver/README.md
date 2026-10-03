@@ -624,7 +624,9 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    the gateway, so each inference rechecks admission if another job has evicted its model. An enforced
    launch refusal returns `insufficient_memory` or `memory_admission_unavailable` before creating the
    cage or launching the engine; its admission claim is released. An HTTP delegation refusal uses the
-   same 503 error codes, without recording a model quality failure. A stamped task refused before any
+   same 503 error codes, without recording a model quality failure. Refused secondary and shadow starts
+   are skipped without quality evidence or a task-exposure event. Delegation model-call timeouts start after
+   admission observation. A stamped task refused before any
    inference may retry; once an inference may have started, the claim stays reserved against replay.
    Shadow mode observes these starts and allows execution. Internal admission callbacks cannot be
    supplied by request JSON.

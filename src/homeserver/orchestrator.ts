@@ -296,12 +296,13 @@ function maybeScheduleEscalationShadow(
       infer: async (modelId, job, laneCfg): Promise<ShadowInference> => {
         const controller = new AbortController();
         let timedOut = false;
-        const timer = setTimeout(() => {
-          timedOut = true;
-          controller.abort();
-        }, laneCfg.timeoutMs);
+        let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           await task.beforeModelStart?.(modelId);
+          timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, laneCfg.timeoutMs);
           if (task.keyAlias) {
             recordTaskExposureBestEffort({
               taskText: job.prompt,
@@ -348,7 +349,7 @@ function maybeScheduleEscalationShadow(
                 : String(err),
           };
         } finally {
-          clearTimeout(timer);
+          if (timer !== undefined) clearTimeout(timer);
         }
       },
       record: (row: ShadowLedgerRow) => {
@@ -475,12 +476,13 @@ async function runSecondaryInference(
 ): Promise<{ ok: true; response: string; latencyMs: number } | { ok: false; error: string; resourceRefused?: boolean }> {
   const controller = new AbortController();
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await task.beforeModelStart?.(secondaryModelId);
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
     if (task.keyAlias) {
       recordTaskExposureBestEffort({
         taskText: task.prompt,
@@ -511,7 +513,7 @@ async function runSecondaryInference(
     }
     return { ok: false, error: timedOut ? TIMEOUT_SENTINEL : err instanceof Error ? err.message : String(err) };
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
