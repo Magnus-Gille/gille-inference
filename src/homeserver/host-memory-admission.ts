@@ -426,3 +426,31 @@ export async function admitHostMemory(
     reason: decision.reason,
   };
 }
+
+/** A pre-inference refusal is a resource decision, never evidence of model quality. */
+export class HostMemoryAdmissionError extends Error {
+  constructor(readonly rejection: HostMemoryRejection) {
+    super(rejection.message);
+    this.name = "HostMemoryAdmissionError";
+  }
+}
+
+/** Called immediately before any operation that could start the selected local model. */
+export type ModelStartAdmission = (model: string) => Promise<void>;
+
+/**
+ * Adapt the existing content-blind decision to internal model-start callers. The caller supplies
+ * trusted label canonicalization separately from the raw model used for exact budget lookup.
+ * Direct operator tools may omit this boundary; gateway callers must wire it explicitly.
+ */
+export function createModelStartAdmission(
+  config: HostMemoryAdmissionConfig,
+  deps: HostMemoryAdmissionDeps,
+  logLabel: (model: string) => string | null = () => null,
+): ModelStartAdmission {
+  return async (model) => {
+    if (config.mode === "off") return;
+    const rejection = await admitHostMemory(config, model, deps, logLabel(model));
+    if (rejection !== null) throw new HostMemoryAdmissionError(rejection);
+  };
+}
