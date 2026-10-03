@@ -19,6 +19,10 @@ let featureRunningCalls = 0; // only the host-memory feature's residency getter
 let chatCalls = 0;
 let runningModels: Array<{ model: string; state: string }> = [];
 let runningDelayMs = 0;
+let holdNextChat = false;
+let releaseHeldChat: (() => void) | null = null;
+let firstChatForwarded: Promise<void> = Promise.resolve();
+let signalFirstChatForwarded: (() => void) | null = null;
 let memory: HostMemoryReadResult = { ok: true, memory: snapshot(100, 10) };
 let logs: Record<string, unknown>[] = [];
 let ownerKey = "";
@@ -49,8 +53,16 @@ function startUpstream(): Promise<void> {
       return;
     }
     req.resume();
-    req.on("end", () => {
+    req.on("end", async () => {
       chatCalls++;
+      if (holdNextChat) {
+        holdNextChat = false;
+        signalFirstChatForwarded?.();
+        signalFirstChatForwarded = null;
+        await new Promise<void>((resolve) => {
+          releaseHeldChat = resolve;
+        });
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         id: "c1",
@@ -140,6 +152,11 @@ beforeEach(() => {
   chatCalls = 0;
   runningModels = [];
   runningDelayMs = 0;
+  holdNextChat = false;
+  releaseHeldChat = null;
+  firstChatForwarded = new Promise<void>((resolve) => {
+    signalFirstChatForwarded = resolve;
+  });
   memory = { ok: true, memory: snapshot(100, 10) };
   logs = [];
 });
@@ -306,6 +323,31 @@ async function ownerPost(port: number, path: string, body: unknown): Promise<Res
 }
 
 describe("remaining gateway model-start admission (#353)", () => {
+  it("enforces the same-key parallel cap for held admin model loads and releases it", async () => {
+    await withGateway({ HOMESERVER_MAX_INFLIGHT: "2", HOMESERVER_OWNER_QUEUE_MAX_MS: "200" }, async (port) => {
+      holdNextChat = true;
+      const first = ownerPost(port, "/admin/models/load", { modelKey: "big" });
+      try {
+        await firstChatForwarded;
+        const second = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+        expect(second.status).toBe(503);
+        expect((await second.json()).error.code).toBe("server_busy");
+        expect(chatCalls).toBe(1);
+
+        releaseHeldChat?.();
+        const firstResponse = await first;
+        expect(firstResponse.status).toBe(200);
+
+        const afterRelease = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+        expect(afterRelease.status).toBe(200);
+        expect(chatCalls).toBe(2);
+      } finally {
+        releaseHeldChat?.();
+        await first.catch(() => undefined);
+      }
+    });
+  });
+
   it("exclusive maintenance refuses admin model starts without warm-up, then restores and serves", async () => {
     await withGateway({}, async (port) => {
       const engaged = await ownerPost(port, "/admin/maintenance", {
