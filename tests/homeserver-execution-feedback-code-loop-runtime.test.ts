@@ -34,6 +34,7 @@ import * as executionFeedback from "../src/homeserver/execution-feedback.js";
 const servedCmdByModel = new Map<string, string | null>();
 vi.mock("../src/homeserver/model-admin.js", () => ({
   getLoaded: async () => [{ key: "qwen3-coder-next-80b" }],
+  getRunningSnapshot: vi.fn(async () => []),
   getRunningCmd: async (modelId: string) => servedCmdByModel.get(modelId) ?? null,
 }));
 
@@ -77,6 +78,10 @@ function runtimeConfig(): HomeserverConfig {
     lmStudioBaseUrl: "http://127.0.0.1:1234/v1",
     gatewayHost: "127.0.0.1",
     gatewayPort: 8080,
+    hostMemoryAdmission: {
+      mode: "off", modelBudgetBytes: new Map(), modelReclaimBytes: new Map(),
+      reserveBytes: 0, retryAfterSeconds: 30,
+    },
     codeLoop: "on",
     codeLoopPiBin: "",
     codeLoopNodeModulesDir: "",

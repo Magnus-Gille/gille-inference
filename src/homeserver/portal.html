@@ -197,6 +197,8 @@
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
       content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
+      Optional host-memory protection checks gateway model starts, including owner delegation,
+      coding jobs and admin loads; it stays off until the owner validates the memory budgets.
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
@@ -524,6 +526,11 @@ for chunk in stream:
           Any OpenAI Whisper client works unchanged.
         </p>
 
+        <p>
+          When host-memory protection is enabled, a request that cannot safely start its model is
+          refused before that start. A refused start is not billed. Admin loads may also receive
+          <span class="badge">503 server_busy</span> during maintenance or when all request slots are occupied.
+        </p>
         <p><strong>Errors — what they mean and what to do:</strong></p>
         <table>
           <tr><th>HTTP</th><th>Code</th><th>Meaning</th><th>What to do</th></tr>
