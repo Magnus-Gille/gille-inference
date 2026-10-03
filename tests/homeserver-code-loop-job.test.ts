@@ -43,6 +43,7 @@ import {
 import { execCageCommand } from "../src/homeserver/code-loop-cage.js";
 import { isAdvisoryOnlyTaskType } from "../src/homeserver/delegate-policy.js";
 import type { CodeLoopDeps, EngineRunResult } from "../src/homeserver/code-loop-types.js";
+import { createModelStartAdmission, HostMemoryAdmissionError } from "../src/homeserver/host-memory-admission.js";
 import {
   acquireDurableCodeLoopLease,
   claimDurableCodeLoopRun,
@@ -570,6 +571,94 @@ describe("startCodeLoop — refusals", () => {
     const r = await startCodeLoop({ ...req, client_run_id: "bad/id" }, startCfg(), fakeDeps());
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal).toBe("invalid-request");
+  });
+
+  it("host-memory refusal rolls back the start claim before cage, seed, lease, or engine work", async () => {
+    const engineRun = vi.fn(async (): Promise<EngineRunResult> => ({
+      outcome: "completed",
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      finalMessage: "done",
+      unparseableLines: 0,
+      detail: "",
+    }));
+    const cageSelfTest = vi.fn(async () => ({ ok: true, failures: [] }));
+    const acquireLease = vi.fn(async () => ({ release: async () => {} }));
+    const spawnPi = vi.fn(() => { throw new Error("spawn must not run"); });
+    const deps = fakeDeps({ engineRun });
+    deps.cageSelfTest = cageSelfTest;
+    deps.acquireLease = acquireLease;
+    deps.spawnPi = spawnPi;
+    deps.beforeModelStart = async () => {
+      throw new HostMemoryAdmissionError({
+        code: "insufficient_memory",
+        message: "not enough memory",
+        retryAfterSeconds: 7,
+        reason: "insufficient_memory",
+      });
+    };
+
+    const workrootBefore = readdirSync(workroot).filter((entry) => entry !== ".code-loop-state-v1");
+    const refused = await startCodeLoop(req, startCfg(), deps);
+    expect(refused).toMatchObject({ ok: false, refusal: "insufficient_memory", message: "not enough memory" });
+    expect(cageSelfTest).not.toHaveBeenCalled();
+    expect(acquireLease).not.toHaveBeenCalled();
+    expect(spawnPi).not.toHaveBeenCalled();
+    expect(engineRun).not.toHaveBeenCalled();
+    expect(readdirSync(workroot).filter((entry) => entry !== ".code-loop-state-v1")).toEqual(workrootBefore);
+
+    const healthy = await startCodeLoop(req, startCfg(), { ...deps, beforeModelStart: async () => {} });
+    expect(healthy).toMatchObject({ ok: true, status: "running" });
+    if (healthy.ok) await waitForTerminal(healthy.work_id);
+  });
+
+  it("shadow model-start admission records the refusal and still allows the engine", async () => {
+    const logs: Record<string, unknown>[] = [];
+    const engineRun = vi.fn(async (): Promise<EngineRunResult> => ({
+      outcome: "completed",
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      finalMessage: "done",
+      unparseableLines: 0,
+      detail: "",
+    }));
+    const deps = fakeDeps({ engineRun });
+    deps.beforeModelStart = createModelStartAdmission(
+      {
+        mode: "shadow",
+        modelBudgetBytes: new Map([["qwen3-coder-next-80b", 60 * 1024 ** 3]]),
+        modelReclaimBytes: new Map(),
+        reserveBytes: 12 * 1024 ** 3,
+        retryAfterSeconds: 7,
+      },
+      {
+        getRunning: async () => [],
+        readMemory: async () => ({
+          ok: true,
+          memory: {
+            memTotalBytes: 100 * 1024 ** 3,
+            memAvailableBytes: 1 * 1024 ** 3,
+            cmaFreeBytes: null,
+            gttUsedBytes: null,
+            gttTotalBytes: null,
+          },
+        }),
+        log: (record) => logs.push(record),
+      },
+      (model) => model,
+    );
+
+    const started = await startCodeLoop(req, startCfg(), deps);
+    expect(started).toMatchObject({ ok: true, status: "running" });
+    if (started.ok) await waitForTerminal(started.work_id);
+    expect(engineRun).toHaveBeenCalledTimes(1);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      event: "host_memory_admission",
+      mode: "shadow",
+      model: "qwen3-coder-next-80b",
+      outcome: "refuse",
+      reason: "insufficient_memory",
+      enforced: false,
+    });
   });
 });
 

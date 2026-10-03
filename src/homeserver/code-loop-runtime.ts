@@ -17,6 +17,8 @@ import {
   type GatewayRelay,
 } from "./code-loop-cage.js";
 import { acquireGpuLease } from "./gpu-lease.js";
+import { createModelStartAdmission, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
+import { getRunningSnapshot } from "./model-admin.js";
 import {
   LearningTaskContractError,
   parseHuginRequestStamp,
@@ -119,6 +121,7 @@ export interface CodeLoopGatewayContext {
   authentication: "gateway-owner-auth" | "service-auth";
   gatewayRequestId: string;
   capabilityEpoch: LearningTaskCapabilityEpoch;
+  hostMemoryAdmissionDependencies?: Partial<HostMemoryAdmissionDeps>;
 }
 
 export function buildCodeLoopRuntime(
@@ -135,6 +138,15 @@ export function buildCodeLoopRuntime(
   const gatewayHost = cfg.gatewayHost;
   const gatewayPort = cfg.gatewayPort;
   const workroot = resolve(cfg.codeLoopWorkroot);
+  const hostMemoryAdmissionDependencies: HostMemoryAdmissionDeps = {
+    getRunning: getRunningSnapshot,
+    ...(gatewayContext?.hostMemoryAdmissionDependencies ?? {}),
+  };
+  const beforeModelStart = createModelStartAdmission(
+    cfg.hostMemoryAdmission,
+    hostMemoryAdmissionDependencies,
+    () => cfg.codeLoopModel,
+  );
 
   // pi lives under $HOME (hidden by the cage tmpfs) — punch narrow ro holes for it, and have
   // the self-test PROVE runnability (not just confinement) at every job start.
@@ -198,6 +210,7 @@ export function buildCodeLoopRuntime(
     now: Date.now,
     keyAlias: gatewayContext?.authenticatedPrincipalId ?? null,
     feedbackOwner: gatewayContext?.feedbackOwner ?? null,
+    beforeModelStart,
     ...(gatewayContext === undefined
       ? {}
       : {
