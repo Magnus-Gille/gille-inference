@@ -3302,6 +3302,7 @@ async function handleAdminLoad(req: IncomingMessage, res: ServerResponse,
       requestedModel: body.modelKey, keyId: principal.alias,
       keyMaxParallel: principal.maxParallel, keyInflight: keyInflight.get(principal.alias) ?? 0 });
     lctx.admission = "admitted";
+    incInflight(principal.alias);
     const r = await loadModel(body.modelKey, {
       contextLength: body.contextLength,
       parallel: body.parallel,
@@ -3319,7 +3320,10 @@ async function handleAdminLoad(req: IncomingMessage, res: ServerResponse,
       sendError(res, makeError("server_busy", { retryAfterSeconds: err.retryAfterSeconds }));
     } else throw err;
   } finally {
-    release?.();
+    if (release !== undefined) {
+      decInflight(principal.alias);
+      release();
+    }
   }
 }
 

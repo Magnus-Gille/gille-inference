@@ -4,7 +4,7 @@ import { policyTaskTypeIdentity } from "./task-type-identity.js";
 import { shouldDelegate, recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import type { Verifier } from "./verifier.js";
 import { getLoaded, getRunningCmd } from "./model-admin.js";
-import type { ModelStartAdmission } from "./host-memory-admission.js";
+import { HostMemoryAdmissionError, type ModelStartAdmission } from "./host-memory-admission.js";
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
@@ -301,6 +301,7 @@ function maybeScheduleEscalationShadow(
           controller.abort();
         }, laneCfg.timeoutMs);
         try {
+          await task.beforeModelStart?.(modelId);
           if (task.keyAlias) {
             recordTaskExposureBestEffort({
               taskText: job.prompt,
@@ -310,7 +311,6 @@ function maybeScheduleEscalationShadow(
               canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
             });
           }
-          await task.beforeModelStart?.(modelId);
           const sampling = resolveLocalSampling(modelId, task);
           const responseFormat = resolveResponseFormat(
             job.taskType,
@@ -336,6 +336,9 @@ function maybeScheduleEscalationShadow(
             tokPerSec: result.tokensPerSecond,
           };
         } catch (err) {
+          if (err instanceof HostMemoryAdmissionError) {
+            return { ok: false, resourceRefused: true, error: err.rejection.code };
+          }
           return {
             ok: false,
             error: timedOut
@@ -469,7 +472,7 @@ async function runSecondaryInference(
   maxTokens: number,
   timeoutMs: number,
   responseFormat: ResponseFormat | undefined
-): Promise<{ ok: true; response: string; latencyMs: number } | { ok: false; error: string }> {
+): Promise<{ ok: true; response: string; latencyMs: number } | { ok: false; error: string; resourceRefused?: boolean }> {
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -477,6 +480,7 @@ async function runSecondaryInference(
     controller.abort();
   }, timeoutMs);
   try {
+    await task.beforeModelStart?.(secondaryModelId);
     if (task.keyAlias) {
       recordTaskExposureBestEffort({
         taskText: task.prompt,
@@ -486,7 +490,6 @@ async function runSecondaryInference(
         canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
       });
     }
-    await task.beforeModelStart?.(secondaryModelId);
     const sampling = resolveLocalSampling(secondaryModelId, task);
     const res = await runLmStudioInference(secondaryModelId, task.prompt, {
       systemPrompt: task.systemPrompt,
@@ -503,6 +506,9 @@ async function runSecondaryInference(
     if (res.ok) return { ok: true, response: res.response, latencyMs: res.durationMs };
     return { ok: false, error: res.error };
   } catch (err) {
+    if (err instanceof HostMemoryAdmissionError) {
+      return { ok: false, resourceRefused: true, error: err.rejection.code };
+    }
     return { ok: false, error: timedOut ? TIMEOUT_SENTINEL : err instanceof Error ? err.message : String(err) };
   } finally {
     clearTimeout(timer);
@@ -859,21 +865,21 @@ async function delegateImpl(
   // harmony/PEG 500. Resolved once and shared by the primary AND the disagreement-gate secondary call.
   const responseFormat = resolveResponseFormat(taskType, task.responseFormat, cfg.autoJsonResponseFormat);
   const sampling = resolveLocalSampling(modelId, task);
-  if (task.keyAlias) {
-    recordTaskExposureBestEffort({
-      taskText: task.prompt,
-      lane: "delegate",
-      modelId,
-      harnessId: nodeId === "orin" ? "delegate-orin" : "delegate-local",
-      canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
-    });
-  }
   const runLocalOnce = async (retryOrdinal: number): Promise<LocalInferenceResult> => {
     return withTraceSpan("inference", { retryOrdinal }, async () => {
       // Keep admission outside the inference-error conversion below: a typed refusal must reach
       // the authenticated gateway caller without creating a quality-ledger failure or triggering
       // the frontier fallback.
       if (nodeId === "m5") await task.beforeModelStart?.(modelId);
+      if (retryOrdinal === 0 && task.keyAlias) {
+        recordTaskExposureBestEffort({
+          taskText: task.prompt,
+          lane: "delegate",
+          modelId,
+          harnessId: nodeId === "orin" ? "delegate-orin" : "delegate-local",
+          canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
+        });
+      }
       const controller = new AbortController();
       const startedAtMs = Date.now();
       let timedOut = false;
@@ -1013,6 +1019,7 @@ async function delegateImpl(
   // self-confidence on real sub-tasks (docs/cascade-gate-experiment-design.md). "shadow" mode
   // runs + records the gate but does NOT change routing (the live-ledger validation path).
   let gate: DelegationOutcome["gate"];
+  let gateResourceRefusal: string | undefined;
   const gateCfg: GateConfig = {
     mode: cfg.disagreementGate,
     secondaryModel: cfg.disagreementGateModel,
@@ -1030,6 +1037,9 @@ async function delegateImpl(
     if (sec.ok) {
       const d = gateDecision(result.response, sec.response, gateCfg.threshold);
       gate = { mode, model: gateCfg.secondaryModel, score: d.score, wouldEscalate: d.disagree, latencyMs: sec.latencyMs };
+    } else if (sec.resourceRefused) {
+      // No second opinion ran: keep its resource refusal out of gate reliability/quality evidence.
+      gateResourceRefusal = sec.error;
     } else {
       // Best-effort: a failed second opinion never escalates on its own (a flaky secondary
       // must not cause mass escalation) — record it and keep the primary's verdict.
@@ -1043,7 +1053,9 @@ async function delegateImpl(
     ? gate.secondaryError
       ? `gate(${gate.mode}):${gate.model} error=${gate.secondaryError.slice(0, 80)}`
       : `gate(${gate.mode}):${gate.model} score=${gate.score.toFixed(2)} disagree=${gate.wouldEscalate ? 1 : 0}`
-    : undefined;
+    : gateResourceRefusal
+      ? `gate(${gateCfg.mode}):${gateCfg.secondaryModel} skipped=${gateResourceRefusal}`
+      : undefined;
   const combinedNotes = [notes, gateNote, retryNote].filter(Boolean).join(" | ") || undefined;
 
   const verdictEscalate = outcome === "fail" || outcome === "error";

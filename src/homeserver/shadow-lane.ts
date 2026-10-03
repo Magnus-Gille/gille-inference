@@ -222,6 +222,8 @@ export interface ShadowJob {
 
 export interface ShadowInference {
   ok: boolean;
+  /** Admission refused before inference; skip without model-quality evidence. */
+  resourceRefused?: boolean;
   response?: string;
   error?: string;
   latencyMs?: number;
@@ -321,6 +323,10 @@ export function scheduleShadowEvaluation(job: ShadowJob, deps: ShadowDeps): void
         return;
       }
       const res = await deps.infer(modelId, job, deps.config);
+      if (res.resourceRefused) {
+        deps.onOutcome?.("skipped");
+        return;
+      }
       if (!res.ok || res.response === undefined) {
         deps.record({
           taskType: job.taskType,
