@@ -293,6 +293,30 @@ describe("gateway review-cascade model-start admission", () => {
     });
   });
 
+  it.each(["shadow", "enforce"] as const)("runs the escalation shadow candidate with cascade disabled in host-memory %s mode", async (admissionMode) => {
+    await withGateway({
+      ...COMMON,
+      HOMESERVER_REVIEW_CASCADE: "off",
+      HOMESERVER_SHADOW_LANE: "on",
+      HOMESERVER_SHADOW_LANE_MODEL: MELLUM_MODEL,
+      HOMESERVER_SHADOW_LANE_TASK_TYPES: "code-review",
+      HOMESERVER_HOST_MEMORY_ADMISSION: admissionMode,
+    }, async (port) => {
+      const initialShadowRows = (await recentLedger(port)).filter((row) => row.source === "shadow").length;
+      expect((await delegate(port)).status).toBe(200);
+      const shadow = await import("../src/homeserver/shadow-lane.js");
+      await shadow.shadowLaneIdle();
+
+      expect(backendModels).toEqual([MELLUM_MODEL]);
+      expect(backgroundAttempts.filter((attempt) => attempt.model === MELLUM_MODEL)).toEqual([
+        { model: MELLUM_MODEL, aborted: false, completed: true },
+      ]);
+      const shadowRows = (await recentLedger(port)).filter((row) => row.source === "shadow");
+      expect(shadowRows.length - initialShadowRows).toBe(1);
+      expect(shadowRows.at(0)).toEqual(expect.objectContaining({ modelId: MELLUM_MODEL, source: "shadow", shadow: true }));
+    });
+  });
+
   it.each(["shadow", "enforce"] as const)("shares one preemptible background lease in host-memory %s mode", async (admissionMode) => {
     await withGateway({
       ...COMMON,
@@ -319,6 +343,7 @@ describe("gateway review-cascade model-start admission", () => {
       expect(backgroundAborts).toBeGreaterThanOrEqual(1);
       const shadowRows = (await recentLedger(port)).filter((row) => row.source === "shadow");
       const shadowAttempts = backgroundAttempts.filter((attempt) => attempt.model === MELLUM_MODEL);
+      expect(shadowAttempts.length).toBeGreaterThan(0);
       expect(shadowRows.length - initialShadowRows).toBe(shadowAttempts.filter((attempt) => attempt.completed).length);
       expect(shadowAttempts.filter((attempt) => attempt.aborted)).toHaveLength(
         shadowAttempts.filter((attempt) => !attempt.completed).length,
