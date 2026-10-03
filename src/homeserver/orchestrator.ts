@@ -87,6 +87,8 @@ export interface DelegationTask {
   modelId?: string;
   /** Internal gateway-only admission hook invoked before every M5 model start. */
   beforeModelStart?: ModelStartAdmission;
+  /** Gateway-owned idle background slot, shared with other model-starting measurement lanes. */
+  acquireBackground?: (abort: () => void) => (() => void) | null;
   /** Explicit macro-routing decision from Hugin; this gateway never auto-selects Orin. */
   nodeId?: ComputeNodeId;
   /**
@@ -285,6 +287,7 @@ function maybeScheduleEscalationShadow(
     {
       config: shadowConfig,
       queueDepth: () => activeDelegations,
+      acquireBackground: task.acquireBackground,
       resolveModelId: async () => {
         const modelId = shadowConfig.model || (await currentModel());
         // Only pay for the served-model /running lookup when the original task was stamped — an
@@ -293,12 +296,16 @@ function maybeScheduleEscalationShadow(
         if (modelId && task.learningTaskStamp) shadowServedFields = await resolveServedModelIdentity(modelId);
         return modelId;
       },
-      infer: async (modelId, job, laneCfg): Promise<ShadowInference> => {
+      infer: async (modelId, job, laneCfg, signal): Promise<ShadowInference> => {
         const controller = new AbortController();
+        const propagate = () => controller.abort();
+        signal?.addEventListener("abort", propagate, { once: true });
         let timedOut = false;
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
+          if (signal?.aborted) return { ok: false, cancelled: true };
           await task.beforeModelStart?.(modelId);
+          if (signal?.aborted) return { ok: false, cancelled: true };
           timer = setTimeout(() => {
             timedOut = true;
             controller.abort();
@@ -325,6 +332,7 @@ function maybeScheduleEscalationShadow(
             responseFormat,
             signal: controller.signal,
           });
+          if (signal?.aborted) return { ok: false, cancelled: true };
           if (timedOut) return { ok: false, error: `timeout after ${laneCfg.timeoutMs}ms` };
           if (!result.ok) return { ok: false, error: result.error };
           return {
@@ -337,6 +345,7 @@ function maybeScheduleEscalationShadow(
             tokPerSec: result.tokensPerSecond,
           };
         } catch (err) {
+          if (signal?.aborted) return { ok: false, cancelled: true };
           if (err instanceof HostMemoryAdmissionError) {
             return { ok: false, resourceRefused: true, error: err.rejection.code };
           }
@@ -350,6 +359,7 @@ function maybeScheduleEscalationShadow(
           };
         } finally {
           if (timer !== undefined) clearTimeout(timer);
+          signal?.removeEventListener("abort", propagate);
         }
       },
       record: (row: ShadowLedgerRow) => {
@@ -710,6 +720,7 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
   const requestId = randomUUID();
   const startMs = Date.now();
   let finalOutcome: DelegationOutcome | undefined;
+  let resourceRefused = false;
   activeDelegations++;
 
   try {
@@ -718,13 +729,18 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
     finalOutcome = await delegateImpl(task, cfg);
     bindDelegateTelemetryModel(task, finalOutcome, cfg);
     return finalOutcome;
+  } catch (error) {
+    resourceRefused = error instanceof HostMemoryAdmissionError;
+    throw error;
   } finally {
     activeDelegations--;
     const totalMs = Date.now() - startMs;
     const fo = finalOutcome;
     // Emit one delegate_decision log line covering classify→decision→outcome.
     // Uses the module-level defaultLogger (replaced by no-op when accessLog=off).
-    const { decision, outcome: summaryOutcome, escalated } = summarizeDelegation(fo);
+    const { decision, outcome: summaryOutcome, escalated } = resourceRefused
+      ? { decision: "refused", outcome: "memory_refused", escalated: null }
+      : summarizeDelegation(fo);
     defaultLogger.log({
       event: "delegate_decision",
       requestId,
@@ -868,11 +884,10 @@ async function delegateImpl(
   const responseFormat = resolveResponseFormat(taskType, task.responseFormat, cfg.autoJsonResponseFormat);
   const sampling = resolveLocalSampling(modelId, task);
   const runLocalOnce = async (retryOrdinal: number): Promise<LocalInferenceResult> => {
+    // Resource admission is outside model spans and inference-error conversion: a refused start
+    // is neither a model attempt nor quality evidence.
+    if (nodeId === "m5") await task.beforeModelStart?.(modelId);
     return withTraceSpan("inference", { retryOrdinal }, async () => {
-      // Keep admission outside the inference-error conversion below: a typed refusal must reach
-      // the authenticated gateway caller without creating a quality-ledger failure or triggering
-      // the frontier fallback.
-      if (nodeId === "m5") await task.beforeModelStart?.(modelId);
       if (retryOrdinal === 0 && task.keyAlias) {
         recordTaskExposureBestEffort({
           taskText: task.prompt,

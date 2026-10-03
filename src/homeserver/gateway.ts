@@ -2297,19 +2297,23 @@ function sendLearningTaskAdmissionRecovery(
 }
 
 function gatewayModelStartAdmission(cfg: HomeserverConfig, deps: HostMemoryAdmissionDeps): ModelStartAdmission {
+  const configuredIds = [...configuredDelegateModelIds(cfg), cfg.codeLoopModel,
+    cfg.disagreementGateModel, cfg.shadowLane.model, cfg.reviewCascadeShadow.gptModel,
+    cfg.reviewCascadeShadow.qwenModel, ...cfg.hostMemoryAdmission.modelBudgetBytes.keys()];
   return createModelStartAdmission(cfg.hostMemoryAdmission, deps,
-    (model) => canonicalizeModelTrusted(model, []));
+    (model) => canonicalizeModelFromTrustedCatalogue(model, configuredIds));
 }
 
-function sendModelStartRefusal(res: ServerResponse, lctx: LogCtx, err: HostMemoryAdmissionError): MeteredResult {
+function sendModelStartRefusal(res: ServerResponse, lctx: LogCtx, err: HostMemoryAdmissionError, allowRetry = true): MeteredResult {
   const rejection = err.rejection;
   lctx.status = 503;
   lctx.outcome = "memory_refused";
   lctx.errorClass = rejection.code;
-  if (rejection.retryAfterSeconds !== null) lctx.retryAfterS = rejection.retryAfterSeconds;
+  if (allowRetry && rejection.retryAfterSeconds !== null) lctx.retryAfterS = rejection.retryAfterSeconds;
   sendError(res, makeError(rejection.code, {
-    message: rejection.message,
-    ...(rejection.retryAfterSeconds !== null ? { retryAfterSeconds: rejection.retryAfterSeconds } : {}),
+    message: allowRetry ? rejection.message
+      : "Memory admission refused this task. Its admission remains reserved; an exact replay recovers the existing admission without repeating inference.",
+    ...(allowRetry && rejection.retryAfterSeconds !== null ? { retryAfterSeconds: rejection.retryAfterSeconds } : {}),
   }));
   return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: rejection.code };
 }
@@ -2373,6 +2377,8 @@ async function handleDelegate(
   const beforeModelStart = gatewayModelStartAdmission(cfg, memoryDeps);
   let inferenceMayHaveStarted = false;
   const runDelegate = () => delegate({
+    acquireBackground: (abort) => controller.snapshot().maintenanceMode
+      ? null : controller.tryAcquireBackground(abort),
     beforeModelStart: async (model, options) => {
       await beforeModelStart(model, options);
       // From here an upstream attempt may occur. Preserve the stamped claim on any later
@@ -2420,10 +2426,17 @@ async function handleDelegate(
     result = await runDelegate();
   } catch (err) {
     if (!(err instanceof HostMemoryAdmissionError)) throw err;
+    let allowRetry: boolean = learningTaskAdmissionId === undefined || !inferenceMayHaveStarted;
     if (learningTaskAdmissionId !== undefined && !inferenceMayHaveStarted) {
-      releaseLearningTaskAdmission(learningTaskAdmissionId);
+      try {
+        releaseLearningTaskAdmission(learningTaskAdmissionId);
+      } catch {
+        // Preserve the ambiguous durable claim, and don't advertise a replay that cannot execute.
+        console.warn("[delegate] refused task admission could not be released; claim preserved");
+        allowRetry = false;
+      }
     }
-    return sendModelStartRefusal(res, lctx, err);
+    return sendModelStartRefusal(res, lctx, err, allowRetry);
   }
   let feedbackHandle: string | null = null;
   try {
@@ -2485,8 +2498,14 @@ function scheduleReviewCascadeAfterDelegate(
       acquireBackground: (abort) => controller.snapshot().maintenanceMode
         ? null : controller.tryAcquireBackground(abort),
       infer: async (modelId, prompt, cascadeCfg, signal) => {
-        await beforeModelStart(modelId);
-        if (signal.aborted) return { ok: false, error: "cancelled before inference" };
+        if (signal.aborted) return { ok: false, cancelled: true };
+        try {
+          await beforeModelStart(modelId);
+        } catch (error) {
+          if (error instanceof HostMemoryAdmissionError) return { ok: false, resourceRefused: true };
+          throw error;
+        }
+        if (signal.aborted) return { ok: false, cancelled: true };
         const call = new AbortController();
         const propagate = () => call.abort();
         signal.addEventListener("abort", propagate, { once: true });
@@ -2498,10 +2517,12 @@ function scheduleReviewCascadeAfterDelegate(
             responseFormat: { type: "json_object" },
             signal: call.signal,
           });
+          if (signal.aborted) return { ok: false, cancelled: true, latencyMs: result.durationMs };
           return result.ok
             ? { ok: true, response: result.response, latencyMs: result.durationMs }
             : { ok: false, error: result.error, latencyMs: result.durationMs };
         } catch (error) {
+          if (signal.aborted) return { ok: false, cancelled: true };
           return { ok: false, error: error instanceof Error ? error.message : String(error) };
         } finally {
           clearTimeout(timer);

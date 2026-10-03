@@ -457,7 +457,11 @@ export function createModelStartAdmission(
       getRunning: async (signal: AbortSignal) =>
         (await deps.getRunning(signal)).filter((entry) => entry.model !== model),
     } : deps;
-    const rejection = await admitHostMemory(config, model, observationDeps, logLabel(model));
+    let label: string | null = null;
+    try { label = logLabel(model); } catch {
+      console.warn("[host_memory_admission] trusted model label unavailable");
+    }
+    const rejection = await admitHostMemory(config, model, observationDeps, label);
     if (rejection !== null) throw new HostMemoryAdmissionError(rejection);
   };
 }

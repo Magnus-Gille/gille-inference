@@ -627,12 +627,21 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    same 503 error codes, without recording a model quality failure. Refused secondary and shadow starts
    are skipped without quality evidence or a task-exposure event. Delegation model-call timeouts start after
    admission observation. A stamped task refused before any
-   inference may retry; once an inference may have started, the claim stays reserved against replay.
+   inference may retry; once an inference may have started, the claim stays reserved against replay
+   and a refused retry has no `Retry-After`. Its exact replay recovers admission without rerunning.
    Shadow mode observes these starts and allows execution. Internal admission callbacks cannot be
    supplied by request JSON.
 
-   Admin model loads also hold a gateway request slot and respect maintenance exclusion; they remain
-   unmetered. A context-changing LM Studio reload is checked before unloading, even when the model is
+   Gateway escalation shadows and review cascades share one idle background slot, skip during
+   maintenance, and are preempted by foreground requests. Refused or preempted background attempts
+   are skipped rather than counted as model failures; a cascade retains completed first-stage counts.
+   These are observations per admission check: code-loop launch and relay can each observe the same
+   cold start, so decision counts are not unique starts. Log labels use the trusted catalogue and
+   finite server-configured model IDs, including declared budget IDs; other requested IDs stay `unknown`.
+
+   Admin model loads also hold a gateway request slot, respect per-key `maxParallel` and exclusive
+   maintenance exclusion, and remain unmetered. These admin controls apply even with memory admission
+   `off`; standalone maintenance/benchmark scripts use direct backend controls and are unaffected. A context-changing LM Studio reload is checked before unloading, even when the model is
    already resident; the model cannot contribute its own eviction credit to that check.
 
    Deliberately **unchecked** paths are standalone operator load/ensure commands, CLI probes and

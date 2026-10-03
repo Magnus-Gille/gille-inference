@@ -38,6 +38,12 @@ describe("model-start admission boundary", () => {
     await expect(f.guard("big", { forceStart: true })).rejects.toBeInstanceOf(HostMemoryAdmissionError);
     expect(f.readMemory).toHaveBeenCalledOnce();
   });
+  it("a broken trusted label lookup cannot refuse shadow execution", async () => {
+    const f = fixture("shadow");
+    f.label.mockImplementation(() => { throw new Error("label unavailable"); });
+    await f.guard("big");
+    expect(f.log).toHaveBeenCalledWith(expect.objectContaining({ model: "unknown", enforced: false }));
+  });
   it("off performs no observations or label lookup", async () => {
     const f = fixture("off"); await f.guard("big");
     expect(f.getRunning).not.toHaveBeenCalled(); expect(f.readMemory).not.toHaveBeenCalled();

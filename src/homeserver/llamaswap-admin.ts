@@ -241,7 +241,7 @@ export async function loadModel(
 ): Promise<LoadResult> {
   let runningProbeFailed = false;
   return withTraceSpan("model_load", {}, async () => {
-    void opts; // opts ignored — llama-swap owns startup config
+    void opts; // runtime load settings are owned by llama-swap; the internal admission callback is honored — llama-swap owns startup config
     assertModelKey(modelKey);
     const origin = getOrigin();
     const start = Date.now();

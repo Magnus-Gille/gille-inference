@@ -34,8 +34,8 @@
  *
  * The shadow never delays the caller: it is scheduled fire-and-forget AFTER the escalated response
  * is built, and it runs only when the delegate queue is empty, at most one at a time. On a busy box
- * it simply never fires. It holds no gateway admission slot, so a request that arrives mid-shadow
- * still contends for the GPU with it — bounding that properly is the owner-priority lane of #108.
+ * it simply never fires. Gateway callers provide the shared idle background slot; a foreground
+ * request preempts it. Standalone operator callers without that callback retain their own controls.
  */
 import { disagreementScore } from "./disagreement-gate.js";
 import type { Outcome } from "./ledger.js";
@@ -224,6 +224,8 @@ export interface ShadowInference {
   ok: boolean;
   /** Admission refused before inference; skip without model-quality evidence. */
   resourceRefused?: boolean;
+  /** Foreground work preempted the background attempt; never model-quality evidence. */
+  cancelled?: boolean;
   response?: string;
   error?: string;
   latencyMs?: number;
@@ -237,10 +239,11 @@ export interface ShadowDeps {
   config: ShadowLaneConfig;
   /** Delegations in flight RIGHT NOW, excluding any that already returned. */
   queueDepth: () => number;
+  acquireBackground?: (abort: () => void) => (() => void) | null;
   /** Resolve the candidate model: the configured one, else the loaded one, else null. */
   resolveModelId: () => Promise<string | null>;
   /** Run the candidate. Must never throw — a shadow failure is recorded, not propagated. */
-  infer: (modelId: string, job: ShadowJob, config: ShadowLaneConfig) => Promise<ShadowInference>;
+  infer: (modelId: string, job: ShadowJob, config: ShadowLaneConfig, signal?: AbortSignal) => Promise<ShadowInference>;
   /** Write the (shadow-flagged) ledger row. */
   record: (row: ShadowLedgerRow) => void;
   /** Content-blind metric hook. */
@@ -316,14 +319,24 @@ export function scheduleShadowEvaluation(job: ShadowJob, deps: ShadowDeps): void
     }
 
     running++;
+    let release: (() => void) | undefined;
+    const controller = new AbortController();
     try {
       const modelId = await deps.resolveModelId();
       if (!modelId) {
         deps.onOutcome?.("skipped");
         return;
       }
-      const res = await deps.infer(modelId, job, deps.config);
-      if (res.resourceRefused) {
+      if (deps.acquireBackground !== undefined) {
+        const slot = deps.acquireBackground(() => controller.abort());
+        if (slot === null) {
+          deps.onOutcome?.("skipped");
+          return;
+        }
+        release = slot;
+      }
+      const res = await deps.infer(modelId, job, deps.config, controller.signal);
+      if (res.resourceRefused || res.cancelled) {
         deps.onOutcome?.("skipped");
         return;
       }
@@ -383,6 +396,7 @@ export function scheduleShadowEvaluation(job: ShadowJob, deps: ShadowDeps): void
       deps.onOutcome?.("error");
     } finally {
       running--;
+      release?.();
     }
   })();
 
