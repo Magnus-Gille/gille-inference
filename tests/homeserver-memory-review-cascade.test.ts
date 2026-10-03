@@ -26,8 +26,10 @@ const DECISION = JSON.stringify({ adjudications: [{
 let upstream: Server;
 let upstreamPort = 0;
 let backendModels: string[] = [];
-let activeBackendCalls = 0;
-let maxConcurrentBackendCalls = 0;
+let activeBackgroundCalls = 0;
+let maxConcurrentBackgroundCalls = 0;
+let backgroundAborts = 0;
+let backgroundAttempts: Array<{ model: string; aborted: boolean; completed: boolean }> = [];
 let logs: Record<string, unknown>[] = [];
 let cascadeAggregates: Record<string, unknown>[] = [];
 let ownerKey = "";
@@ -73,11 +75,29 @@ function startUpstream(): Promise<void> {
       };
       const foreground = body.messages?.some((message) => message.content === "foreground request") === true;
       backendModels.push(body.model ?? "");
-      activeBackendCalls++;
-      maxConcurrentBackendCalls = Math.max(maxConcurrentBackendCalls, activeBackendCalls);
+      const attempt = foreground ? null : { model: body.model ?? "", aborted: false, completed: false };
+      if (attempt !== null) backgroundAttempts.push(attempt);
+      if (!foreground) {
+        activeBackgroundCalls++;
+        maxConcurrentBackgroundCalls = Math.max(maxConcurrentBackgroundCalls, activeBackgroundCalls);
+      }
       const responseFinished = { value: false };
+      let activeCounted = true;
+      const decrementActive = () => {
+        if (!activeCounted) return;
+        activeCounted = false;
+        if (!foreground) activeBackgroundCalls--;
+      };
       const releaseIfClosed = () => {
-        if (!responseFinished.value) releaseHeldBackground?.();
+        if (responseFinished.value) return;
+        if (!foreground) {
+          backgroundAborts++;
+          attempt!.aborted = true;
+          releaseHeldBackground?.();
+        }
+        // A client-side abort closes the response before the held handler resumes. Count that
+        // lifecycle transition immediately so foreground preemption cannot look like overlap.
+        decrementActive();
       };
       res.once("close", releaseIfClosed);
       if (!foreground && holdBackground && !heldBackground) {
@@ -90,8 +110,9 @@ function startUpstream(): Promise<void> {
       res.write(`data: ${JSON.stringify({ id: "cascade-test", choices: [{ delta: { content: response } }] })}\n\n`);
       res.write(`data: ${JSON.stringify({ id: "cascade-test", choices: [], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } })}\n\n`);
       responseFinished.value = true;
+      if (attempt !== null && !attempt.aborted) attempt.completed = true;
       res.end("data: [DONE]\n\n");
-      activeBackendCalls--;
+      decrementActive();
     });
   });
   return new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => {
@@ -210,8 +231,10 @@ afterAll(async () => {
 
 beforeEach(() => {
   backendModels = [];
-  activeBackendCalls = 0;
-  maxConcurrentBackendCalls = 0;
+  activeBackgroundCalls = 0;
+  maxConcurrentBackgroundCalls = 0;
+  backgroundAborts = 0;
+  backgroundAttempts = [];
   logs = [];
   cascadeAggregates = [];
   holdBackground = false;
@@ -280,6 +303,7 @@ describe("gateway review-cascade model-start admission", () => {
       HOMESERVER_HOST_MEMORY_ADMISSION: admissionMode,
     }, async (port) => {
       holdBackground = true;
+      const initialShadowRows = (await recentLedger(port)).filter((row) => row.source === "shadow").length;
       expect((await delegate(port)).status).toBe(200);
       await waitForFirstBackgroundStart();
 
@@ -291,8 +315,14 @@ describe("gateway review-cascade model-start admission", () => {
       const review = await import("../src/homeserver/review-cascade-shadow.js");
       const shadow = await import("../src/homeserver/shadow-lane.js");
       await Promise.all([review.reviewCascadeShadowIdle(), shadow.shadowLaneIdle()]);
-      expect(maxConcurrentBackendCalls).toBeLessThanOrEqual(1);
-      expect((await recentLedger(port)).some((row) => row.source === "shadow")).toBe(false);
+      expect(maxConcurrentBackgroundCalls).toBeLessThanOrEqual(1);
+      expect(backgroundAborts).toBeGreaterThanOrEqual(1);
+      const shadowRows = (await recentLedger(port)).filter((row) => row.source === "shadow");
+      const shadowAttempts = backgroundAttempts.filter((attempt) => attempt.model === MELLUM_MODEL);
+      expect(shadowRows.length - initialShadowRows).toBe(shadowAttempts.filter((attempt) => attempt.completed).length);
+      expect(shadowAttempts.filter((attempt) => attempt.aborted)).toHaveLength(
+        shadowAttempts.filter((attempt) => !attempt.completed).length,
+      );
 
       // Once the foreground preemption released the shared lease, a later background request can
       // run again; it still serializes the two optional background lanes.
@@ -301,7 +331,7 @@ describe("gateway review-cascade model-start admission", () => {
       expect((await delegate(port)).status).toBe(200);
       await Promise.all([review.reviewCascadeShadowIdle(), shadow.shadowLaneIdle()]);
       expect(backendModels.length).toBeGreaterThan(beforeLater);
-      expect(maxConcurrentBackendCalls).toBeLessThanOrEqual(1);
+      expect(maxConcurrentBackgroundCalls).toBeLessThanOrEqual(1);
     });
   });
 });
