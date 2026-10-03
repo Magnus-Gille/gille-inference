@@ -633,7 +633,9 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    supplied by request JSON.
 
    Gateway escalation shadows and review cascades share one idle background slot, skip during
-   maintenance, and are preempted by foreground requests. Refused or preempted background attempts
+   maintenance, and are preempted by foreground requests. The escalation shadow is scheduled first;
+   the first lane ready to acquire the idle slot runs, and a competing lane skips without queuing.
+   The shadow releases its slot after inference, before deterministic grading. Refused or preempted background attempts
    are skipped rather than counted as model failures; a cascade retains completed first-stage counts.
    These are observations per admission check: code-loop launch and relay can each observe the same
    cold start, so decision counts are not unique starts. Log labels use the trusted catalogue and

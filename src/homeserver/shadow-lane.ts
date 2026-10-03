@@ -239,6 +239,7 @@ export interface ShadowDeps {
   config: ShadowLaneConfig;
   /** Delegations in flight RIGHT NOW, excluding any that already returned. */
   queueDepth: () => number;
+  /** Inference-only GPU slot. A verifier that starts a model needs its own admission. */
   acquireBackground?: (abort: () => void) => (() => void) | null;
   /** Resolve the candidate model: the configured one, else the loaded one, else null. */
   resolveModelId: () => Promise<string | null>;
@@ -336,6 +337,9 @@ export function scheduleShadowEvaluation(job: ShadowJob, deps: ShadowDeps): void
         release = slot;
       }
       const res = await deps.infer(modelId, job, deps.config, controller.signal);
+      // Grading does not own the model-start slot; gateway verifiers are deterministic.
+      release?.();
+      release = undefined;
       if (res.resourceRefused || res.cancelled) {
         deps.onOutcome?.("skipped");
         return;
