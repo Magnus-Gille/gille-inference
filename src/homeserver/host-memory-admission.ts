@@ -436,7 +436,7 @@ export class HostMemoryAdmissionError extends Error {
 }
 
 /** Called immediately before any operation that could start the selected local model. */
-export type ModelStartAdmission = (model: string) => Promise<void>;
+export type ModelStartAdmission = (model: string, options?: { forceStart?: boolean }) => Promise<void>;
 
 /**
  * Adapt the existing content-blind decision to internal model-start callers. The caller supplies
@@ -448,9 +448,16 @@ export function createModelStartAdmission(
   deps: HostMemoryAdmissionDeps,
   logLabel: (model: string) => string | null = () => null,
 ): ModelStartAdmission {
-  return async (model) => {
+  return async (model, options) => {
     if (config.mode === "off") return;
-    const rejection = await admitHostMemory(config, model, deps, logLabel(model));
+    // A context-changing reload cannot use the requested model's resident shortcut or count its
+    // own memory as eviction credit. Observe the other residents normally.
+    const observationDeps = options?.forceStart ? {
+      ...deps,
+      getRunning: async (signal?: AbortSignal) =>
+        (await deps.getRunning(signal)).filter((entry) => entry.model !== model),
+    } : deps;
+    const rejection = await admitHostMemory(config, model, observationDeps, logLabel(model));
     if (rejection !== null) throw new HostMemoryAdmissionError(rejection);
   };
 }

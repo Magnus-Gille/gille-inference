@@ -4,7 +4,7 @@ import { createModelStartAdmission, HostMemoryAdmissionError } from "../src/home
 const GIB = 2 ** 30;
 function fixture(mode: "off" | "shadow" | "enforce") {
   const log = vi.fn();
-  const getRunning = vi.fn(async () => []);
+  const getRunning = vi.fn(async () => [] as import("../src/homeserver/lmstudio-admin.js").RunningSnapshotEntry[]);
   const readMemory = vi.fn(async () => ({ ok: true as const, memory: {
     memTotalBytes: 100 * GIB, memAvailableBytes: 10 * GIB,
     cmaFreeBytes: null, gttUsedBytes: null, gttTotalBytes: null,
@@ -29,6 +29,14 @@ describe("model-start admission boundary", () => {
   it("shadow observes the same refusal but permits the backend", async () => {
     const f = fixture("shadow"); await f.guard("big");
     expect(f.log).toHaveBeenCalledWith(expect.objectContaining({ outcome: "refuse", enforced: false }));
+  });
+  it("a forced reload must be checked even while the requested model is resident", async () => {
+    const f = fixture("enforce");
+    f.getRunning.mockResolvedValue([{ model: "big", state: "ready", ttlSeconds: null }]);
+    await f.guard("big");
+    expect(f.readMemory).not.toHaveBeenCalled();
+    await expect(f.guard("big", { forceStart: true })).rejects.toBeInstanceOf(HostMemoryAdmissionError);
+    expect(f.readMemory).toHaveBeenCalledOnce();
   });
   it("off performs no observations or label lookup", async () => {
     const f = fixture("off"); await f.guard("big");
