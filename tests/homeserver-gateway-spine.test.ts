@@ -1047,6 +1047,7 @@ describe("gateway spine — HTTP integration", () => {
       body: JSON.stringify(requestBody),
     });
     expect(refused.status).toBe(503);
+    expect(refused.headers.get("retry-after")).toBe("7");
     expect((await refused.json()) as { error: { code: string } }).toMatchObject({ error: { code: "insufficient_memory" } });
     expect(upstreamInferenceRequestCount).toBe(0);
     expect(tableCount("learning_task_admissions")).toBe(admissionsBefore);
@@ -1091,6 +1092,7 @@ describe("gateway spine — HTTP integration", () => {
       body: JSON.stringify(requestBody),
     });
     expect(refusedRetry.status).toBe(503);
+    expect(refusedRetry.headers.get("retry-after")).toBeNull();
     expect((await refusedRetry.json()) as { error: { code: string } }).toMatchObject({ error: { code: "insufficient_memory" } });
     const callsAfterPriorInference = upstreamInferenceRequestCount;
     expect(callsAfterPriorInference).toBeGreaterThan(0);

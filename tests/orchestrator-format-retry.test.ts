@@ -31,6 +31,27 @@ vi.mock("../src/runner/openrouter-client.js", () => ({
   runInference: (modelId: string, prompt: string, opts: unknown) => frontierMock(modelId, prompt, opts),
 }));
 
+const delegateDecisionMock = vi.fn();
+vi.mock("../src/homeserver/access-log.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/homeserver/access-log.js")>("../src/homeserver/access-log.js");
+  return {
+    ...actual,
+    defaultLogger: { log: (record: unknown) => delegateDecisionMock(record) },
+  };
+});
+
+const withTraceSpanMock = vi.fn();
+vi.mock("../src/homeserver/tracing.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/homeserver/tracing.js")>("../src/homeserver/tracing.js");
+  return {
+    ...actual,
+    withTraceSpan: (...args: Parameters<typeof actual.withTraceSpan>) => {
+      withTraceSpanMock(...args);
+      return actual.withTraceSpan(...args);
+    },
+  };
+});
+
 const recordTaskExposureMock = vi.fn();
 vi.mock("../src/homeserver/task-exposure.js", async () => {
   const actual = await vi.importActual<typeof import("../src/homeserver/task-exposure.js")>("../src/homeserver/task-exposure.js");
@@ -196,6 +217,27 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
     expect(recordDelegationMock).not.toHaveBeenCalled();
     expect(frontierMock).not.toHaveBeenCalled();
     expect(recordTaskExposureMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a primary memory refusal without an inference span", async () => {
+    const beforeModelStart = vi.fn(async () => {
+      throw new HostMemoryAdmissionError({
+        code: "insufficient_memory",
+        message: "memory refused",
+        retryAfterSeconds: 9,
+        reason: "insufficient_memory",
+      });
+    });
+
+    await expect(delegate({ prompt: "output ONLY JSON", beforeModelStart })).rejects.toBeInstanceOf(HostMemoryAdmissionError);
+
+    const decision = delegateDecisionMock.mock.calls
+      .map(([record]) => record as { event?: string; decision?: string; outcome?: string })
+      .find((record) => record.event === "delegate_decision");
+    expect(decision).toMatchObject({ decision: "refused", outcome: "memory_refused" });
+    expect(withTraceSpanMock.mock.calls.some(([phase, , , options]) =>
+      phase === "inference" && (options as { surface?: string } | undefined)?.surface === "model"
+    )).toBe(false);
   });
 
   it("fails twice with the PEG error → falls through to escalate/record (capped at one retry)", async () => {
