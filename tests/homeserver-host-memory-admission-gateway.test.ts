@@ -306,6 +306,37 @@ async function ownerPost(port: number, path: string, body: unknown): Promise<Res
 }
 
 describe("remaining gateway model-start admission (#353)", () => {
+  it("exclusive maintenance refuses admin model starts without warm-up, then restores and serves", async () => {
+    await withGateway({}, async (port) => {
+      const engaged = await ownerPost(port, "/admin/maintenance", {
+        on: true,
+        mode: "exclusive",
+        ttlSeconds: 60,
+      });
+      expect(engaged.status).toBe(200);
+      expect((await engaged.json()).mode).toBe("exclusive");
+
+      const refused = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+      expect(refused.status).toBe(503);
+      expect((await refused.json()).error.code).toBe("server_busy");
+      expect(chatCalls).toBe(0);
+
+      const during = await fetch(`http://127.0.0.1:${port}/admin/maintenance`, {
+        headers: { authorization: `Bearer ${adminKey}` },
+      });
+      expect(during.status).toBe(200);
+      expect(await during.json()).toMatchObject({ maintenance: true, mode: "exclusive", inflight: 0 });
+
+      const restored = await ownerPost(port, "/admin/maintenance", { on: false });
+      expect(restored.status).toBe(200);
+      expect((await restored.json()).mode).toBe("off");
+
+      const loaded = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+      expect(loaded.status).toBe(200);
+      expect(chatCalls).toBe(1);
+    });
+  });
+
   it.each(["/delegate", "/admin/models/load"])("enforce refuses %s before upstream", async (path) => {
     await withGateway({ HOMESERVER_HOST_MEMORY_ADMISSION: "enforce", ...BUDGETS,
       HOMESERVER_POLICY_EXPLORATION: "1" }, async (port) => {
