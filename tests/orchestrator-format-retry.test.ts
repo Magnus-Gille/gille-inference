@@ -31,6 +31,15 @@ vi.mock("../src/runner/openrouter-client.js", () => ({
   runInference: (modelId: string, prompt: string, opts: unknown) => frontierMock(modelId, prompt, opts),
 }));
 
+const recordTaskExposureMock = vi.fn();
+vi.mock("../src/homeserver/task-exposure.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/homeserver/task-exposure.js")>("../src/homeserver/task-exposure.js");
+  return {
+    ...actual,
+    recordTaskExposureBestEffort: (input: unknown) => recordTaskExposureMock(input),
+  };
+});
+
 vi.mock("../src/homeserver/model-admin.js", () => ({
   getLoaded: async () => [{ key: "gpt-oss-120b" }],
 }));
@@ -161,12 +170,13 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
       .mockResolvedValueOnce(lmOk("LOCAL JSON ANSWER"));
     const beforeModelStart = vi.fn(async () => {});
 
-    const out = await delegate({ prompt: "output ONLY JSON", beforeModelStart });
+    const out = await delegate({ prompt: "output ONLY JSON", beforeModelStart, keyAlias: "owner" });
 
     expect(out.formatRetried).toBe(true);
     expect(lmInferenceMock).toHaveBeenCalledTimes(2);
     expect(beforeModelStart).toHaveBeenCalledTimes(2);
     expect(beforeModelStart.mock.calls.map(([model]) => model)).toEqual(["gpt-oss-120b", "gpt-oss-120b"]);
+    expect(recordTaskExposureMock).toHaveBeenCalledTimes(1);
   });
 
   it("propagates primary admission refusal before inference, ledger failure, or frontier fallback", async () => {
@@ -179,12 +189,13 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
       });
     });
 
-    await expect(delegate({ prompt: "output ONLY JSON", beforeModelStart, frontierModelId: "anthropic/claude-sonnet-4-6" }))
+    await expect(delegate({ prompt: "output ONLY JSON", beforeModelStart, keyAlias: "owner", frontierModelId: "anthropic/claude-sonnet-4-6" }))
       .rejects.toBeInstanceOf(HostMemoryAdmissionError);
     expect(beforeModelStart).toHaveBeenCalledTimes(1);
     expect(lmInferenceMock).not.toHaveBeenCalled();
     expect(recordDelegationMock).not.toHaveBeenCalled();
     expect(frontierMock).not.toHaveBeenCalled();
+    expect(recordTaskExposureMock).not.toHaveBeenCalled();
   });
 
   it("fails twice with the PEG error → falls through to escalate/record (capped at one retry)", async () => {
