@@ -59,6 +59,7 @@ import {
 import { deriveEvidenceIdentity, resolveTaskType } from "./orchestrator.js";
 import { TASK_TYPES } from "./taxonomy.js";
 import { validateSchemaChecks, skippedSchemaGrounding, isSchemaGroundingResult, type CodeLoopSchemaCheck, type CodeLoopSchemaGrounding } from "./code-loop-schema-checks.js";
+import { HostMemoryAdmissionError } from "./host-memory-admission.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -97,7 +98,7 @@ const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
   "engine-failure",
 ]);
 const CODE_LOOP_REFUSAL_ENUM = [
-  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery",
+  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
 ] as const;
 
 const CODE_LOOP_START_OUTPUT_SCHEMA = {
@@ -1170,6 +1171,23 @@ export async function startCodeLoop(
     }
     if (runningWorkId === workId) runningWorkId = null;
   };
+  // Resource admission must happen after the synchronous single-flight/durable lease claim (so an
+  // await cannot reopen the start race), but before any cage, seed, GPU lease, or engine work.
+  if (deps.beforeModelStart !== undefined) {
+    try {
+      await deps.beforeModelStart(cfg.model);
+    } catch (err) {
+      rollbackAdmission();
+      if (err instanceof HostMemoryAdmissionError) {
+        return {
+          ok: false,
+          refusal: err.rejection.code,
+          message: err.rejection.message,
+        };
+      }
+      throw err;
+    }
+  }
   // Cage self-test gate (design §6). With confinement=required, a failing probe refuses the job.
   if (cfg.confinement === "required") {
     let probe: { ok: boolean; failures: string[] };

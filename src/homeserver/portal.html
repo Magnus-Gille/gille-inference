@@ -197,6 +197,8 @@
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
       content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
+      Optional host-memory protection checks gateway model starts, including owner delegation,
+      coding jobs and admin loads; it stays off until the owner validates the memory budgets.
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
@@ -507,6 +509,13 @@ for chunk in stream:
           <span class="badge mono">min_p</span> as extra request-body fields, as above.
         </p>
 
+        <p>
+          When host-memory protection is enabled, a request that cannot safely start its model is
+          refused before that start. A refused start is not billed. Admin loads may also receive
+          <span class="badge">503 server_busy</span> during exclusive maintenance, when request slots are occupied, or when the same key
+          already has its maximum number of parallel requests. These admin limits apply even when
+          host-memory protection is off.
+        </p>
         <p><strong>Speech-to-text (transcription):</strong></p>
         <pre>curl https://inference.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $HS_KEY" \

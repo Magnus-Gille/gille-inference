@@ -4,6 +4,7 @@ import { policyTaskTypeIdentity } from "./task-type-identity.js";
 import { shouldDelegate, recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import type { Verifier } from "./verifier.js";
 import { getLoaded, getRunningCmd } from "./model-admin.js";
+import { HostMemoryAdmissionError, type ModelStartAdmission } from "./host-memory-admission.js";
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
@@ -84,6 +85,10 @@ export interface DelegationTask {
   verifierName?: string;
   /** Force a specific model id; otherwise the currently-loaded model is used. */
   modelId?: string;
+  /** Internal gateway-only admission hook invoked before every M5 model start. */
+  beforeModelStart?: ModelStartAdmission;
+  /** Gateway-owned idle background slot, shared with other model-starting measurement lanes. */
+  acquireBackground?: (abort: () => void) => (() => void) | null;
   /** Explicit macro-routing decision from Hugin; this gateway never auto-selects Orin. */
   nodeId?: ComputeNodeId;
   /**
@@ -282,6 +287,7 @@ function maybeScheduleEscalationShadow(
     {
       config: shadowConfig,
       queueDepth: () => activeDelegations,
+      acquireBackground: task.acquireBackground,
       resolveModelId: async () => {
         const modelId = shadowConfig.model || (await currentModel());
         // Only pay for the served-model /running lookup when the original task was stamped — an
@@ -290,14 +296,20 @@ function maybeScheduleEscalationShadow(
         if (modelId && task.learningTaskStamp) shadowServedFields = await resolveServedModelIdentity(modelId);
         return modelId;
       },
-      infer: async (modelId, job, laneCfg): Promise<ShadowInference> => {
+      infer: async (modelId, job, laneCfg, signal): Promise<ShadowInference> => {
         const controller = new AbortController();
+        const propagate = () => controller.abort();
+        signal?.addEventListener("abort", propagate, { once: true });
         let timedOut = false;
-        const timer = setTimeout(() => {
-          timedOut = true;
-          controller.abort();
-        }, laneCfg.timeoutMs);
+        let timer: ReturnType<typeof setTimeout> | undefined;
         try {
+          if (signal?.aborted) return { ok: false, cancelled: true };
+          await task.beforeModelStart?.(modelId);
+          if (signal?.aborted) return { ok: false, cancelled: true };
+          timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, laneCfg.timeoutMs);
           if (task.keyAlias) {
             recordTaskExposureBestEffort({
               taskText: job.prompt,
@@ -320,6 +332,7 @@ function maybeScheduleEscalationShadow(
             responseFormat,
             signal: controller.signal,
           });
+          if (signal?.aborted) return { ok: false, cancelled: true };
           if (timedOut) return { ok: false, error: `timeout after ${laneCfg.timeoutMs}ms` };
           if (!result.ok) return { ok: false, error: result.error };
           return {
@@ -332,6 +345,10 @@ function maybeScheduleEscalationShadow(
             tokPerSec: result.tokensPerSecond,
           };
         } catch (err) {
+          if (signal?.aborted) return { ok: false, cancelled: true };
+          if (err instanceof HostMemoryAdmissionError) {
+            return { ok: false, resourceRefused: true, error: err.rejection.code };
+          }
           return {
             ok: false,
             error: timedOut
@@ -341,7 +358,8 @@ function maybeScheduleEscalationShadow(
                 : String(err),
           };
         } finally {
-          clearTimeout(timer);
+          if (timer !== undefined) clearTimeout(timer);
+          signal?.removeEventListener("abort", propagate);
         }
       },
       record: (row: ShadowLedgerRow) => {
@@ -465,14 +483,16 @@ async function runSecondaryInference(
   maxTokens: number,
   timeoutMs: number,
   responseFormat: ResponseFormat | undefined
-): Promise<{ ok: true; response: string; latencyMs: number } | { ok: false; error: string }> {
+): Promise<{ ok: true; response: string; latencyMs: number } | { ok: false; error: string; resourceRefused?: boolean }> {
   const controller = new AbortController();
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    await task.beforeModelStart?.(secondaryModelId);
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
     if (task.keyAlias) {
       recordTaskExposureBestEffort({
         taskText: task.prompt,
@@ -498,9 +518,12 @@ async function runSecondaryInference(
     if (res.ok) return { ok: true, response: res.response, latencyMs: res.durationMs };
     return { ok: false, error: res.error };
   } catch (err) {
+    if (err instanceof HostMemoryAdmissionError) {
+      return { ok: false, resourceRefused: true, error: err.rejection.code };
+    }
     return { ok: false, error: timedOut ? TIMEOUT_SENTINEL : err instanceof Error ? err.message : String(err) };
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -697,6 +720,7 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
   const requestId = randomUUID();
   const startMs = Date.now();
   let finalOutcome: DelegationOutcome | undefined;
+  let resourceRefused = false;
   activeDelegations++;
 
   try {
@@ -705,13 +729,18 @@ export async function delegate(task: DelegationTask): Promise<DelegationOutcome>
     finalOutcome = await delegateImpl(task, cfg);
     bindDelegateTelemetryModel(task, finalOutcome, cfg);
     return finalOutcome;
+  } catch (error) {
+    resourceRefused = error instanceof HostMemoryAdmissionError;
+    throw error;
   } finally {
     activeDelegations--;
     const totalMs = Date.now() - startMs;
     const fo = finalOutcome;
     // Emit one delegate_decision log line covering classify→decision→outcome.
     // Uses the module-level defaultLogger (replaced by no-op when accessLog=off).
-    const { decision, outcome: summaryOutcome, escalated } = summarizeDelegation(fo);
+    const { decision, outcome: summaryOutcome, escalated } = resourceRefused
+      ? { decision: "refused", outcome: "memory_refused", escalated: null }
+      : summarizeDelegation(fo);
     defaultLogger.log({
       event: "delegate_decision",
       requestId,
@@ -854,17 +883,20 @@ async function delegateImpl(
   // harmony/PEG 500. Resolved once and shared by the primary AND the disagreement-gate secondary call.
   const responseFormat = resolveResponseFormat(taskType, task.responseFormat, cfg.autoJsonResponseFormat);
   const sampling = resolveLocalSampling(modelId, task);
-  if (task.keyAlias) {
-    recordTaskExposureBestEffort({
-      taskText: task.prompt,
-      lane: "delegate",
-      modelId,
-      harnessId: nodeId === "orin" ? "delegate-orin" : "delegate-local",
-      canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
-    });
-  }
   const runLocalOnce = async (retryOrdinal: number): Promise<LocalInferenceResult> => {
+    // Resource admission is outside model spans and inference-error conversion: a refused start
+    // is neither a model attempt nor quality evidence.
+    if (nodeId === "m5") await task.beforeModelStart?.(modelId);
     return withTraceSpan("inference", { retryOrdinal }, async () => {
+      if (retryOrdinal === 0 && task.keyAlias) {
+        recordTaskExposureBestEffort({
+          taskText: task.prompt,
+          lane: "delegate",
+          modelId,
+          harnessId: nodeId === "orin" ? "delegate-orin" : "delegate-local",
+          canonicalFingerprintSha256: task.canonicalTaskFingerprintSha256,
+        });
+      }
       const controller = new AbortController();
       const startedAtMs = Date.now();
       let timedOut = false;
@@ -1004,6 +1036,7 @@ async function delegateImpl(
   // self-confidence on real sub-tasks (docs/cascade-gate-experiment-design.md). "shadow" mode
   // runs + records the gate but does NOT change routing (the live-ledger validation path).
   let gate: DelegationOutcome["gate"];
+  let gateResourceRefusal: string | undefined;
   const gateCfg: GateConfig = {
     mode: cfg.disagreementGate,
     secondaryModel: cfg.disagreementGateModel,
@@ -1021,6 +1054,9 @@ async function delegateImpl(
     if (sec.ok) {
       const d = gateDecision(result.response, sec.response, gateCfg.threshold);
       gate = { mode, model: gateCfg.secondaryModel, score: d.score, wouldEscalate: d.disagree, latencyMs: sec.latencyMs };
+    } else if (sec.resourceRefused) {
+      // No second opinion ran: keep its resource refusal out of gate reliability/quality evidence.
+      gateResourceRefusal = sec.error;
     } else {
       // Best-effort: a failed second opinion never escalates on its own (a flaky secondary
       // must not cause mass escalation) — record it and keep the primary's verdict.
@@ -1034,7 +1070,9 @@ async function delegateImpl(
     ? gate.secondaryError
       ? `gate(${gate.mode}):${gate.model} error=${gate.secondaryError.slice(0, 80)}`
       : `gate(${gate.mode}):${gate.model} score=${gate.score.toFixed(2)} disagree=${gate.wouldEscalate ? 1 : 0}`
-    : undefined;
+    : gateResourceRefusal
+      ? `gate(${gateCfg.mode}):${gateCfg.secondaryModel} skipped=${gateResourceRefusal}`
+      : undefined;
   const combinedNotes = [notes, gateNote, retryNote].filter(Boolean).join(" | ") || undefined;
 
   const verdictEscalate = outcome === "fail" || outcome === "error";

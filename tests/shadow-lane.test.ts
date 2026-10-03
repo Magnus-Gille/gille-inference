@@ -9,11 +9,13 @@
  *
  * Everything here is pure (no I/O), so the policy is testable without a model or a DB.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   shadowEligible,
   gradeShadowOutput,
   SHADOW_FRONTIER_VERIFIER,
+  scheduleShadowEvaluation,
+  shadowLaneIdle,
   type ShadowLaneConfig,
 } from "../src/homeserver/shadow-lane.js";
 
@@ -126,5 +128,64 @@ describe("gradeShadowOutput — grade the shadow, never trust it", () => {
     expect(g.outcome).toBe("unverified");
     expect(g.score).toBeNull();
     expect(g.verifierName).toBe("none");
+  });
+});
+
+describe("scheduleShadowEvaluation — release the gateway lease before grading", () => {
+  it("releases a gateway-owned background lease while an async verifier is still blocked", async () => {
+    let resolveVerifier: () => void = () => {};
+    let markVerifierStarted: () => void = () => {};
+    const verifierStarted = new Promise<void>((resolve) => {
+      markVerifierStarted = resolve;
+    });
+    const verifierMayResolve = new Promise<void>((resolve) => {
+      resolveVerifier = resolve;
+    });
+    let inferCompleted = false;
+    let verifierResolved = false;
+    const releaseLease = vi.fn();
+    const record = vi.fn();
+
+    scheduleShadowEvaluation(
+      {
+        taskType: "code-review",
+        nodeId: "m5",
+        prompt: "review this diff",
+        delegated: false,
+        frontierOutput: "same answer",
+        escalationReason: "router gap",
+        verifier: async () => {
+          markVerifierStarted();
+          expect(inferCompleted).toBe(true);
+          await verifierMayResolve;
+          verifierResolved = true;
+          return { outcome: "pass", score: 1 };
+        },
+        verifierName: "async-check",
+      },
+      {
+        config: CFG,
+        queueDepth: () => 0,
+        acquireBackground: () => releaseLease,
+        resolveModelId: async () => CFG.model,
+        infer: async () => {
+          inferCompleted = true;
+          return { ok: true, response: "same answer" };
+        },
+        record,
+      },
+    );
+
+    await verifierStarted;
+    try {
+      expect(inferCompleted).toBe(true);
+      expect(releaseLease).toHaveBeenCalledTimes(1);
+      expect(verifierResolved).toBe(false);
+    } finally {
+      resolveVerifier();
+      await shadowLaneIdle();
+    }
+    expect(verifierResolved).toBe(true);
+    expect(record).toHaveBeenCalledTimes(1);
   });
 });

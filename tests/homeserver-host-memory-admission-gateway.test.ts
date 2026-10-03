@@ -19,9 +19,14 @@ let featureRunningCalls = 0; // only the host-memory feature's residency getter
 let chatCalls = 0;
 let runningModels: Array<{ model: string; state: string }> = [];
 let runningDelayMs = 0;
+let holdNextChat = false;
+let releaseHeldChat: (() => void) | null = null;
+let firstChatForwarded: Promise<void> = Promise.resolve();
+let signalFirstChatForwarded: (() => void) | null = null;
 let memory: HostMemoryReadResult = { ok: true, memory: snapshot(100, 10) };
 let logs: Record<string, unknown>[] = [];
 let ownerKey = "";
+let adminKey = "";
 
 function snapshot(totalGib: number, availGib: number): Extract<HostMemoryReadResult, { ok: true }>["memory"] {
   return {
@@ -48,8 +53,16 @@ function startUpstream(): Promise<void> {
       return;
     }
     req.resume();
-    req.on("end", () => {
+    req.on("end", async () => {
       chatCalls++;
+      if (holdNextChat) {
+        holdNextChat = false;
+        signalFirstChatForwarded?.();
+        signalFirstChatForwarded = null;
+        await new Promise<void>((resolve) => {
+          releaseHeldChat = resolve;
+        });
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         id: "c1",
@@ -70,7 +83,7 @@ async function withGateway(
   env: Record<string, string>,
   fn: (port: number) => Promise<void>,
 ): Promise<void> {
-  const keys = ["HOMESERVER_HOST_MEMORY_ADMISSION", "HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
+  const keys = [...new Set(["HOMESERVER_HOST_MEMORY_ADMISSION", "HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB", ...Object.keys(env)])];
   for (const k of keys) delete process.env[k];
   Object.assign(process.env, env);
   // loadConfig() caches per module instance; a fresh graph is needed per mode.
@@ -126,6 +139,7 @@ beforeAll(async () => {
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
   const ks = await import("../src/homeserver/keystore.js");
   ownerKey = ks.mintKey({ alias: "hostmem-owner", tier: "owner" }, DEFAULTS).plaintextKey;
+  adminKey = ks.mintKey({ alias: "hostmem-admin", tier: "owner", scope: "admin" }, DEFAULTS).plaintextKey;
 });
 
 afterAll(async () => {
@@ -138,6 +152,11 @@ beforeEach(() => {
   chatCalls = 0;
   runningModels = [];
   runningDelayMs = 0;
+  holdNextChat = false;
+  releaseHeldChat = null;
+  firstChatForwarded = new Promise<void>((resolve) => {
+    signalFirstChatForwarded = resolve;
+  });
   memory = { ok: true, memory: snapshot(100, 10) };
   logs = [];
 });
@@ -294,5 +313,99 @@ describe("MCP ask host-memory admission (#350)", () => {
       delete process.env["HOMESERVER_HOST_MEMORY_ADMISSION"];
       delete process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
     }
+  });
+});
+
+async function ownerPost(port: number, path: string, body: unknown): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}${path}`, { method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${adminKey}` },
+    body: JSON.stringify(body) });
+}
+
+describe("remaining gateway model-start admission (#353)", () => {
+  it("enforces the same-key parallel cap for held admin model loads and releases it", async () => {
+    await withGateway({ HOMESERVER_MAX_INFLIGHT: "2", HOMESERVER_OWNER_QUEUE_MAX_MS: "200" }, async (port) => {
+      holdNextChat = true;
+      const first = ownerPost(port, "/admin/models/load", { modelKey: "big" });
+      try {
+        await firstChatForwarded;
+        const second = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+        expect(second.status).toBe(503);
+        expect((await second.json()).error.code).toBe("server_busy");
+        expect(chatCalls).toBe(1);
+
+        releaseHeldChat?.();
+        const firstResponse = await first;
+        expect(firstResponse.status).toBe(200);
+
+        const afterRelease = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+        expect(afterRelease.status).toBe(200);
+        expect(chatCalls).toBe(2);
+      } finally {
+        releaseHeldChat?.();
+        await first.catch(() => undefined);
+      }
+    });
+  });
+
+  it("exclusive maintenance refuses admin model starts without warm-up, then restores and serves", async () => {
+    await withGateway({}, async (port) => {
+      const engaged = await ownerPost(port, "/admin/maintenance", {
+        on: true,
+        mode: "exclusive",
+        ttlSeconds: 60,
+      });
+      expect(engaged.status).toBe(200);
+      expect((await engaged.json()).mode).toBe("exclusive");
+
+      const refused = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+      expect(refused.status).toBe(503);
+      expect((await refused.json()).error.code).toBe("server_busy");
+      expect(chatCalls).toBe(0);
+
+      const during = await fetch(`http://127.0.0.1:${port}/admin/maintenance`, {
+        headers: { authorization: `Bearer ${adminKey}` },
+      });
+      expect(during.status).toBe(200);
+      expect(await during.json()).toMatchObject({ maintenance: true, mode: "exclusive", inflight: 0 });
+
+      const restored = await ownerPost(port, "/admin/maintenance", { on: false });
+      expect(restored.status).toBe(200);
+      expect((await restored.json()).mode).toBe("off");
+
+      const loaded = await ownerPost(port, "/admin/models/load", { modelKey: "big" });
+      expect(loaded.status).toBe(200);
+      expect(chatCalls).toBe(1);
+    });
+  });
+
+  it.each(["/delegate", "/admin/models/load"])("enforce refuses %s before upstream", async (path) => {
+    await withGateway({ HOMESERVER_HOST_MEMORY_ADMISSION: "enforce", ...BUDGETS,
+      HOMESERVER_POLICY_EXPLORATION: "1" }, async (port) => {
+      const body = path === "/delegate" ? { prompt: "resource-only test", modelId: "big", taskType: "extract", maxTokens: 8 }
+        : { modelKey: "big" };
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await ownerPost(port, path, body);
+        expect(res.status).toBe(503);
+        expect((await res.json()).error.code).toBe("insufficient_memory");
+        expect(res.headers.get("retry-after")).not.toBeNull();
+      }
+      // The refusal must release any slot; the following fitting chat proceeds.
+      memory = { ok: true, memory: snapshot(100, 90) };
+      expect((await chat(port, "big")).status).toBe(200);
+    });
+    expect(chatCalls).toBe(1);
+    expect(logs[0]).toMatchObject({ outcome: "refuse", enforced: true });
+  });
+  it.each(["/delegate", "/admin/models/load"])("shadow observes %s but forwards", async (path) => {
+    await withGateway({ HOMESERVER_HOST_MEMORY_ADMISSION: "shadow", ...BUDGETS,
+      HOMESERVER_POLICY_EXPLORATION: "1" }, async (port) => {
+      const body = path === "/delegate" ? { prompt: "resource-only test", modelId: "big", taskType: "extract", maxTokens: 8 }
+        : { modelKey: "big" };
+      expect((await ownerPost(port, path, body)).status).toBe(200);
+    });
+    expect(chatCalls).toBe(1);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ outcome: "refuse", enforced: false });
   });
 });

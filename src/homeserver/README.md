@@ -589,9 +589,9 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    `finally` path, forwards `SIGINT`, `SIGTERM`, and `SIGHUP`, verifies the window is closed, and emits
    content-blind evidence. Server TTL remains the recovery backstop for `SIGKILL` or a lost client.
 
-7. **Whole-host memory admission (#350, default OFF)** — GPU memory on the unified-memory host is not
+7. **Whole-host memory admission (#350, #353, default OFF)** — GPU memory on the unified-memory host is not
    charged to the model service's cgroup, so starting a large non-resident model can exhaust the whole
-   host. Before forwarding a chat request (`/v1/chat/completions` and MCP `ask`) the gateway checks
+   host. Before a gateway model start, the gateway checks
    `GET /running`: a model that is `ready` or `starting` is forwarded untouched; any other state is
    checked like an absent model. Otherwise it needs a declared budget and a readable `/proc/meminfo`, and the request is
    allowed only if `usable available memory + eviction credit >= budget + reserve`. Usable available
@@ -612,12 +612,44 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    line and no host read) and never rejects. `enforce` rejects only a `refuse` decision: `503 insufficient_memory`
    with `Retry-After` when memory is short, or `503 memory_admission_unavailable` (no `Retry-After`;
    the model has no declared budget or host memory is unreadable) — a refused request never reaches the
-   model backend and is not billed. Budgets are operator-declared and **not yet calibrated**. A request
+   model backend and is not billed. Budgets are operator-declared; the [#352 measurements](https://github.com/Magnus-Gille/gille-inference/issues/352)
+   do not yet qualify production budgets or the reserve. A request
    whose model alias the roster does not list under `/running` is treated as needing a start.
    `MemAvailable` also counts page cache that the model service's `MemoryMin` protects from reclaim,
-   so the reserve must cover that as well. Other paths that can start a model are **not covered**:
-   `code_loop` (the caged agent reaches the model backend through its own relay), `/delegate`, the
-   owner admin load endpoint, probes, and anything that talks to the model backend directly.
+   so the reserve must cover that as well.
+
+   Covered paths are chat (`/v1/chat/completions`, MCP `ask`), every M5 inference inside `/delegate`
+   (primary, format retry, disagreement secondary and escalation shadow), its background review
+   cascade, the owner admin load endpoint, and `code_loop` job launch. The caged agent's relay calls
+   the gateway, so each inference rechecks admission if another job has evicted its model. An enforced
+   launch refusal returns `insufficient_memory` or `memory_admission_unavailable` before creating the
+   cage or launching the engine; its admission claim is released. An HTTP delegation refusal uses the
+   same 503 error codes, without recording a model quality failure. Refused secondary and shadow starts
+   are skipped without quality evidence or a task-exposure event. Delegation model-call timeouts start after
+   admission observation. A stamped task refused before any
+   inference may retry; once an inference may have started, the claim stays reserved against replay
+   and a refused retry has no `Retry-After`. Its exact replay recovers admission without rerunning.
+   Shadow mode observes these starts and allows execution. Internal admission callbacks cannot be
+   supplied by request JSON.
+
+   Gateway escalation shadows and review cascades share one idle background slot, skip during
+   maintenance, and are preempted by foreground requests. The escalation shadow is scheduled first;
+   the first lane ready to acquire the idle slot runs, and a competing lane skips without queuing.
+   The shadow releases its slot after inference, before deterministic grading. Refused or preempted background attempts
+   are skipped rather than counted as model failures; a cascade retains completed first-stage counts.
+   These are observations per admission check: code-loop launch and relay can each observe the same
+   cold start, so decision counts are not unique starts. Log labels use the trusted catalogue and
+   finite server-configured model IDs, including declared budget IDs; other requested IDs stay `unknown`.
+
+   Admin model loads also hold a gateway request slot, respect per-key `maxParallel` and exclusive
+   maintenance exclusion, and remain unmetered. These admin controls apply even with memory admission
+   `off`; standalone maintenance/benchmark scripts use direct backend controls and are unaffected. A context-changing LM Studio reload is checked before unloading, even when the model is
+   already resident; the model cannot contribute its own eviction credit to that check.
+
+   Deliberately **unchecked** paths are standalone operator load/ensure commands, CLI probes and
+   experiment runners that call the backend directly, and other direct backend clients. These bypass
+   the gateway and must be operated under their own resource controls. A probe sent through the gateway
+   inherits the checks above; there is no separate gateway probe endpoint.
 
 Every auth / inference error uses a uniform OpenAI-shaped envelope:
 `{ error: { message, type, code, param } }` with the right status (401/403/400/429/503)

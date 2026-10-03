@@ -426,3 +426,42 @@ export async function admitHostMemory(
     reason: decision.reason,
   };
 }
+
+/** A pre-inference refusal is a resource decision, never evidence of model quality. */
+export class HostMemoryAdmissionError extends Error {
+  constructor(readonly rejection: HostMemoryRejection) {
+    super(rejection.message);
+    this.name = "HostMemoryAdmissionError";
+  }
+}
+
+/** Called immediately before any operation that could start the selected local model. */
+export type ModelStartAdmission = (model: string, options?: { forceStart?: boolean }) => Promise<void>;
+
+/**
+ * Adapt the existing content-blind decision to internal model-start callers. The caller supplies
+ * trusted label canonicalization separately from the raw model used for exact budget lookup.
+ * Direct operator tools may omit this boundary; gateway callers must wire it explicitly.
+ */
+export function createModelStartAdmission(
+  config: HostMemoryAdmissionConfig,
+  deps: HostMemoryAdmissionDeps,
+  logLabel: (model: string) => string | null = () => null,
+): ModelStartAdmission {
+  return async (model, options) => {
+    if (config.mode === "off") return;
+    // A context-changing reload cannot use the requested model's resident shortcut or count its
+    // own memory as eviction credit. Observe the other residents normally.
+    const observationDeps = options?.forceStart ? {
+      ...deps,
+      getRunning: async (signal: AbortSignal) =>
+        (await deps.getRunning(signal)).filter((entry) => entry.model !== model),
+    } : deps;
+    let label: string | null = null;
+    try { label = logLabel(model); } catch {
+      console.warn("[host_memory_admission] trusted model label unavailable");
+    }
+    const rejection = await admitHostMemory(config, model, observationDeps, label);
+    if (rejection !== null) throw new HostMemoryAdmissionError(rejection);
+  };
+}

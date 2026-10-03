@@ -241,7 +241,7 @@ export async function loadModel(
 ): Promise<LoadResult> {
   let runningProbeFailed = false;
   return withTraceSpan("model_load", {}, async () => {
-    void opts; // opts ignored — llama-swap owns startup config
+    // llama-swap owns startup settings; only the internal admission callback uses opts.
     assertModelKey(modelKey);
     const origin = getOrigin();
     const start = Date.now();
@@ -284,6 +284,7 @@ export async function loadModel(
     // Warm-up: a minimal chat completion triggers llama-swap to spawn the model.
     const cfg = loadConfig();
     const timeoutMs = cfg.callTimeoutMs ?? 300_000;
+    await opts.beforeModelStart?.(modelKey);
     try {
       const res = await fetchWithTimeout(
         `${origin}/v1/chat/completions`,

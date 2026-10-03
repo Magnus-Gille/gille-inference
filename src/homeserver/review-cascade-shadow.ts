@@ -39,6 +39,8 @@ export interface ReviewCascadeShadowJob {
 
 export interface CascadeInference {
   ok: boolean;
+  resourceRefused?: boolean;
+  cancelled?: boolean;
   response?: string;
   error?: string;
   latencyMs?: number;
@@ -148,6 +150,10 @@ export function scheduleReviewCascadeShadow(job: ReviewCascadeShadowJob, deps: R
     try {
       const recall = await deps.infer(deps.config.gptModel, buildRecallPrompt(job.source), deps.config, controller.signal);
       occupancyMs += recall.latencyMs ?? 0;
+      if (recall.resourceRefused || recall.cancelled) {
+        deps.recordAggregate(aggregate("skipped", [], [], occupancyMs));
+        return;
+      }
       if (!recall.ok || recall.response === undefined) {
         deps.recordAggregate(aggregate("error", [], [], occupancyMs));
         return;
@@ -164,6 +170,10 @@ export function scheduleReviewCascadeShadow(job: ReviewCascadeShadowJob, deps: R
         controller.signal
       );
       occupancyMs += precision.latencyMs ?? 0;
+      if (precision.resourceRefused || precision.cancelled) {
+        deps.recordAggregate(aggregate("skipped", findings.findings, [], occupancyMs));
+        return;
+      }
       if (!precision.ok || precision.response === undefined) {
         deps.recordAggregate(aggregate("error", findings.findings, [], occupancyMs));
         return;

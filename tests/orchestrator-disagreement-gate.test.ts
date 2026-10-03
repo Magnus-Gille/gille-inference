@@ -11,6 +11,7 @@
  *   - gate "off" (default)                  → no second model call at all.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { HostMemoryAdmissionError } from "../src/homeserver/host-memory-admission.js";
 
 // ── mocks: inference clients, the loaded-model resolver, and the ledger (DB) ──
 const lmInferenceMock = vi.fn();
@@ -23,6 +24,15 @@ const frontierMock = vi.fn();
 vi.mock("../src/runner/openrouter-client.js", () => ({
   runInference: (modelId: string, prompt: string, opts: unknown) => frontierMock(modelId, prompt, opts),
 }));
+
+const recordTaskExposureMock = vi.fn();
+vi.mock("../src/homeserver/task-exposure.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/homeserver/task-exposure.js")>("../src/homeserver/task-exposure.js");
+  return {
+    ...actual,
+    recordTaskExposureBestEffort: (input: unknown) => recordTaskExposureMock(input),
+  };
+});
 
 vi.mock("../src/homeserver/model-admin.js", () => ({
   getLoaded: async () => [{ key: "mellum" }],
@@ -95,8 +105,9 @@ describe("delegate() — disagreement gate (unverified path)", () => {
   it("gate=on + disagreeing secondary → escalates, calls frontier, records the gate", async () => {
     setConfig({ disagreementGate: "on" });
     wireLocalModels("ANSWER: 7", "ANSWER: 42"); // numeric → disagreementScore 1.0
+    const beforeModelStart = vi.fn(async () => {});
 
-    const out = await delegate({ prompt: "what is the value?", frontierModelId: "anthropic/claude-sonnet-4-6" });
+    const out = await delegate({ prompt: "what is the value?", beforeModelStart, frontierModelId: "anthropic/claude-sonnet-4-6" });
 
     expect(out.delegated).toBe(true);
     expect(out.escalate).toBe(true);
@@ -105,6 +116,7 @@ describe("delegate() — disagreement gate (unverified path)", () => {
     // second local model was actually called
     expect(lmInferenceMock).toHaveBeenCalledTimes(2);
     expect(lmInferenceMock.mock.calls.map((c) => c[0]).sort()).toEqual(["mellum", "qwen3-coder-next-80b"]);
+    expect(beforeModelStart.mock.calls.map(([model]) => model)).toEqual(["mellum", "qwen3-coder-next-80b"]);
     // frontier fallback ran and its output is attached
     expect(frontierMock).toHaveBeenCalledTimes(1);
     expect(out.frontierOutput).toBe("FRONTIER ANSWER: 9");
@@ -227,5 +239,66 @@ describe("delegate() — disagreement gate (unverified path)", () => {
     expect(rec.gateMode).toBe("on");
     expect(rec.gateError).toBe("fetch failed");
     expect(rec.gateWouldEscalate).toBe(false);
+  });
+
+  it("typed secondary memory refusal keeps the primary verdict without gate evidence or secondary exposure", async () => {
+    setConfig({ disagreementGate: "on" });
+    wireLocalModels("ANSWER: 7", "ANSWER: 42");
+    const beforeModelStart = vi.fn(async (model: string) => {
+      if (model === "qwen3-coder-next-80b") {
+        throw new HostMemoryAdmissionError({
+          code: "insufficient_memory",
+          message: "secondary memory refused",
+          retryAfterSeconds: 9,
+          reason: "insufficient_memory",
+        });
+      }
+    });
+
+    const out = await delegate({
+      prompt: "what is the value?",
+      keyAlias: "owner",
+      beforeModelStart,
+      frontierModelId: "anthropic/claude-sonnet-4-6",
+    });
+
+    expect(out.outcome).toBe("unverified");
+    expect(out.escalate).toBe(false);
+    expect(out.gate).toBeUndefined();
+    expect(lmInferenceMock).toHaveBeenCalledTimes(1);
+    expect(frontierMock).not.toHaveBeenCalled();
+    expect(recordTaskExposureMock).toHaveBeenCalledTimes(1);
+    expect((recordTaskExposureMock.mock.calls[0]![0] as { modelId?: string }).modelId).toBe("mellum");
+    const rec = recordDelegationMock.mock.calls[0]![0] as {
+      gateMode: string | null;
+      gateScore: number | null;
+      gateWouldEscalate: boolean | null;
+      gateError: string | null;
+    };
+    expect(rec.gateMode).toBeNull();
+    expect(rec.gateScore).toBeNull();
+    expect(rec.gateWouldEscalate).toBeNull();
+    expect(rec.gateError).toBeNull();
+  });
+
+  it("starts the secondary timeout after slow model-start admission", async () => {
+    setConfig({ disagreementGate: "on", callTimeoutMs: 20 });
+    wireLocalModels("ANSWER: 7", "ANSWER: 42");
+    const beforeModelStart = vi.fn(async (model: string) => {
+      if (model === "qwen3-coder-next-80b") {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+    });
+
+    const out = await delegate({
+      prompt: "what is the value?",
+      beforeModelStart,
+      frontierModelId: "anthropic/claude-sonnet-4-6",
+    });
+
+    expect(lmInferenceMock).toHaveBeenCalledTimes(2);
+    expect(out.gate).toMatchObject({ wouldEscalate: true, score: 1 });
+    expect(out.gate).not.toHaveProperty("secondaryError");
+    expect(frontierMock).toHaveBeenCalledTimes(1);
   });
 });

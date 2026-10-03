@@ -4,6 +4,7 @@ import type {
   LearningTaskGatewayEcho,
 } from "./learning-task-contract.js";
 import type { CodeLoopSchemaCheck, CodeLoopSchemaGrounding } from "./code-loop-schema-checks.js";
+import type { ModelStartAdmission } from "./host-memory-admission.js";
 
 /**
  * code_loop — frozen type contract (issue #116, docs/agentic-code-tool-design.md).
@@ -86,6 +87,8 @@ export type CodeLoopRefusal =
   | "maintenance"
   | "lease-unavailable"
   | "cage-unavailable"
+  | "insufficient_memory"
+  | "memory_admission_unavailable"
   | "invalid-request"
   | "conflict"
   | "admission-recovery";
@@ -319,6 +322,8 @@ export interface CodeLoopDeps {
   /** Authenticated key alias persisted on the derived capability-ledger row. */
   keyAlias?: string | null;
   feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
+  /** Optional pre-start resource admission; invoked before cage, seed, GPU lease, or engine work. */
+  beforeModelStart?: ModelStartAdmission;
   /** Poll gateway/model readiness after a suspected degeneracy abort; resolves ready?. */
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */

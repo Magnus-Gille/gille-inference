@@ -11,6 +11,7 @@ import {
   SUBSCRIPTION_NOT_INDEPENDENT_NOTE,
   type ExposureReceiptEnvelope,
 } from "../src/homeserver/exposure-receipt-schema.js";
+import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admission.js";
 
 // The gateway reads config from env at startGateway() time. We must set env BEFORE
 // importing config/gateway, and isolate the DB before any keystore call. Tests drive a
@@ -18,10 +19,11 @@ import {
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "nonjson" | "reset" | "length" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
+let hostMemoryAvailableGib = 90;
 // Keep this below HOMESERVER_OWNER_QUEUE_MAX_MS (3000ms in this file): a wrongly queued owner
 // must NOT be able to "pass" by timing out while we still hold the only slot.
 const BUSY_RECOVERY_SETTLE_BUDGET_MS = 2_500;
@@ -64,6 +66,15 @@ function startUpstream(): Promise<void> {
         // usage frame in the body to prove the gateway does NOT read it on a non-2xx (Fix #1).
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "boom" }, usage: { total_tokens: 9999 } }));
+        return;
+      }
+      if (mockMode === "format500" && req.url?.endsWith("/chat/completions")) {
+        // The first local inference reaches upstream, then the retry admission observes the
+        // deliberately lowered snapshot and refuses. This exercises the stamped claim boundary
+        // after an inference attempt without contacting a live model service.
+        hostMemoryAvailableGib = 10;
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "does not match the expected peg-native format" } }));
         return;
       }
       if (mockMode === "reset") {
@@ -131,6 +142,25 @@ let taskFingerprintVersion: typeof import("../src/homeserver/task-exposure.js").
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 
+function memoryComposition() {
+  return {
+    hostMemoryAdmissionDependencies: {
+      getRunning: async () => [],
+      readMemory: async (): Promise<HostMemoryReadResult> => ({
+        ok: true,
+        memory: {
+          memTotalBytes: 100 * 1024 ** 3,
+          memAvailableBytes: hostMemoryAvailableGib * 1024 ** 3,
+          cmaFreeBytes: null,
+          gttUsedBytes: null,
+          gttTotalBytes: null,
+        },
+      }),
+      log: () => {},
+    },
+  };
+}
+
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), "hs-spine-test-"));
   initDb(join(dir, "test.db"));
@@ -145,6 +175,10 @@ beforeAll(async () => {
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
+  process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
+  process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] =
+    "m1=60,m2=60,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
+  process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"] = "7";
   process.env["HOMESERVER_REVIEW_CASCADE"] = "shadow";
   process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] = "gpt-oss-120b";
   process.env["HOMESERVER_REVIEW_CASCADE_QWEN_MODEL"] = "qwen35-122b-a10b";
@@ -167,7 +201,7 @@ beforeAll(async () => {
   taskTextFingerprint = exposure.taskTextFingerprint;
   taskFingerprintVersion = exposure.TASK_FINGERPRINT_VERSION;
 
-  const handle = await startGateway();
+  const handle = await startGateway(memoryComposition());
   // startGateway resolves with a stop handle + the bound port (spec: returns control).
   gatewayPort = handle.port;
   stopGateway = handle.stop;
@@ -176,12 +210,16 @@ beforeAll(async () => {
 afterAll(async () => {
   if (stopGateway) await stopGateway();
   await new Promise<void>((r) => upstream.close(() => r()));
+  delete process.env["HOMESERVER_HOST_MEMORY_ADMISSION"];
+  delete process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
+  delete process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"];
 });
 
 beforeEach(() => {
   mockMode = "ok";
   releaseStall = null;
   upstreamInferenceRequestCount = 0;
+  hostMemoryAvailableGib = 90;
   resetQuotaWindows();
 });
 
@@ -195,6 +233,12 @@ async function chat(token: string, body: Record<string, unknown>): Promise<Respo
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify({ model: "m1", messages: [{ role: "user", content: "hi" }], ...body }),
   });
+}
+
+function tableCount(table: string): number {
+  const present = getDb().prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+  if (present === undefined) return 0;
+  return (getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
 }
 
 const ADMIN = "admin-static-key";
@@ -418,7 +462,7 @@ describe("gateway spine — HTTP integration", () => {
     // A real restart rotates the private capability epoch. That invalidates new sends, but an
     // already-admitted exact retry must still recover its original echo without inference.
     await stopGateway?.();
-    const restarted = await startGateway();
+    const restarted = await startGateway(memoryComposition());
     gatewayPort = restarted.port;
     stopGateway = restarted.stop;
     const callsBeforeRestartRecovery = upstreamInferenceRequestCount;
@@ -984,6 +1028,89 @@ describe("gateway spine — HTTP integration", () => {
     // fail-safe behaviour resolveServedModelIdentity is built for.
     expect(snapshot!.bundle.modelArtifact.kind).toBe("unknown");
     expect(snapshot!.bundle.configEpoch.kind).toBe("unknown");
+  });
+
+  it("releases a first-attempt stamped claim on memory refusal, then recovers the successful retry", async () => {
+    const owner = mintKey({ alias: `stamped-memory-first-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    requestBody.taskType = "other";
+    requestBody.learningTaskStamp.task_type.id = "other";
+    hostMemoryAvailableGib = 10;
+
+    const { ensureLearningTaskAdmissionSchema } = await import("../src/homeserver/learning-task-admission-store.js");
+    ensureLearningTaskAdmissionSchema();
+    const admissionsBefore = tableCount("learning_task_admissions");
+    const qualityEvidenceBefore = tableCount("delegations");
+    const refused = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(refused.status).toBe(503);
+    expect(refused.headers.get("retry-after")).toBe("7");
+    expect((await refused.json()) as { error: { code: string } }).toMatchObject({ error: { code: "insufficient_memory" } });
+    expect(upstreamInferenceRequestCount).toBe(0);
+    expect(tableCount("learning_task_admissions")).toBe(admissionsBefore);
+    expect(tableCount("delegations")).toBe(qualityEvidenceBefore);
+
+    hostMemoryAvailableGib = 90;
+    const accepted = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(accepted.status).toBe(200);
+    const acceptedBody = await accepted.json() as { ledgerId?: string; learningTaskGatewayEcho?: unknown };
+    expect(acceptedBody.ledgerId).toEqual(expect.any(String));
+    expect(acceptedBody.learningTaskGatewayEcho).toBeDefined();
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    const replay = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      outcome: "error",
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+    });
+    expect(upstreamInferenceRequestCount).toBe(1);
+  });
+
+  it("preserves a stamped claim when format retry is refused after inference began", async () => {
+    const owner = mintKey({ alias: `stamped-memory-retry-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    requestBody.taskType = "other";
+    requestBody.learningTaskStamp.task_type.id = "other";
+    mockMode = "format500";
+    const qualityEvidenceBefore = tableCount("delegations");
+
+    const refusedRetry = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(refusedRetry.status).toBe(503);
+    expect(refusedRetry.headers.get("retry-after")).toBeNull();
+    expect((await refusedRetry.json()) as { error: { code: string } }).toMatchObject({ error: { code: "insufficient_memory" } });
+    const callsAfterPriorInference = upstreamInferenceRequestCount;
+    expect(callsAfterPriorInference).toBeGreaterThan(0);
+    expect(tableCount("delegations")).toBe(qualityEvidenceBefore);
+
+    hostMemoryAvailableGib = 90;
+    mockMode = "ok";
+    const replay = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      outcome: "error",
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsAfterPriorInference);
   });
 
   it("task exposure lookup denies guest and identity-less static admin keys", async () => {
