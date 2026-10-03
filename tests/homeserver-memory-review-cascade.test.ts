@@ -270,14 +270,14 @@ describe("gateway review-cascade model-start admission", () => {
     });
   });
 
-  it("shares one preemptible background lease between escalation shadow and review cascade", async () => {
+  it.each(["shadow", "enforce"] as const)("shares one preemptible background lease in host-memory %s mode", async (admissionMode) => {
     await withGateway({
       ...COMMON,
       HOMESERVER_SHADOW_LANE: "on",
       HOMESERVER_SHADOW_LANE_MODEL: MELLUM_MODEL,
       HOMESERVER_SHADOW_LANE_TASK_TYPES: "code-review",
       HOMESERVER_MAX_INFLIGHT: "1",
-      HOMESERVER_HOST_MEMORY_ADMISSION: "shadow",
+      HOMESERVER_HOST_MEMORY_ADMISSION: admissionMode,
     }, async (port) => {
       holdBackground = true;
       expect((await delegate(port)).status).toBe(200);
