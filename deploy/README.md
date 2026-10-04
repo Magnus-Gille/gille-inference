@@ -133,10 +133,15 @@ to point here rather than re-describing the topology.
   local history to diff against on the box; `.deployed-commit` (below) is the only record of
   deployed identity.
 - Deployed commit: **`df898714d2dc376f48d15a5ae4f1cd45914ca057`**, accepted 2026-10-04 with every
-  deploy probe passing and the content check matching. This line is a convenience and goes stale; `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
-- Paired client: **`1.5.3`**, including worker status/capacity reporting and the
-  idle-cleanup policy of 7 days for `target` directories and 14 days for whole idle worktrees;
-  both client 1.5.3 and retained client 1.5.1 passed bounded offline build acceptance.
+  deploy probe passing and the content check matching. This line is a convenience and goes stale;
+  `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
+- Paired client: **`1.5.3`**, installed from a verified local tarball. npm publication remains
+  blocked by the existing registry authentication failure. Both this client and retained client
+  `1.5.1` passed a bounded (60-second) offline dispatch smoke (`true`); this does not establish
+  compiler or model readiness.
+- The separately installed worker at that release supplies capacity/status records and idle
+  cleanup: 7 days for `target` directories, 14 days for whole idle worktrees, retaining active work,
+  caches and locks. See [`docs/m5-remote-build.md`](../docs/m5-remote-build.md).
 - `/srv/gille-inference` — previously documented in `AGENTS.md` as the live path — **does not
   exist** on the box and is not this unit's `WorkingDirectory`. That claim was wrong; this section
   is now the source of truth. (`CONTRIBUTING.md` also uses `/srv/gille-inference` as a *reserved
@@ -544,17 +549,35 @@ The unit is not a git checkout, so "rollback" means **redeploy a known-good comm
 `git revert` on the box:
 
 ```bash
+umask 022  # archived public source must remain readable by the isolated service account
 git worktree add /tmp/gille-rollback <known-good-sha>   # the previous accepted commit, see below
 cd /tmp/gille-rollback
 npm ci
 scripts/deploy-gateway.sh deploy <known-good-full-sha>
+scripts/deploy-gateway.sh verify
+# On each client machine, restore the matching, retained verified package:
+npm install --global --ignore-scripts <approved-paired-client.tgz>
+m5 --profile codex doctor
+m5 --profile claude doctor
 ```
 
 The rollback target is the **previous accepted gateway commit**, currently
-**`c45c1f295758dc013e8f81b763ee9ec471be4d9a`**, paired with client **`1.5.2`**. The safe older
-fallback is **`bb6afa8946ba2d5fd94c3b0f66fd864e9951dbeb`** with client **`1.5.1`**. It preserves
-the former runtime with a safe stdin-header probe; earlier deploy tooling put the bearer in argv.
-Use these reviewed deploy-tool revisions for recovery. Update both this line and the "Deployed commit"
+**`c45c1f295758dc013e8f81b763ee9ec471be4d9a`**, paired with client **`1.5.2`**. That pairing was
+accepted and verified on both configured routes on 2026-10-04 before the final release. Restore
+both gateway and client: the doctor reports version drift. Retain the verified client tarballs
+from those accepted source revisions; versions 1.5.2/1.5.3 were installed locally and are not yet
+published to npm. This gateway/client rollback leaves the separately installed build worker at
+`df898714d2dc376f48d15a5ae4f1cd45914ca057`; worker recovery uses its own exact installer backup and
+acceptance procedure in [`docs/m5-remote-build.md`](../docs/m5-remote-build.md).
+
+The older fallback **`bb6afa8946ba2d5fd94c3b0f66fd864e9951dbeb`** with client **`1.5.1`** was
+exercised and verified on 2026-10-04. Its runtime matches the previously deployed
+`b80b617c6898187e5d552f24ae3bbc7defc9ca3a`, with a safe stdin-header deploy probe added. Earlier
+deploy tooling put the bearer in argv; use these reviewed deploy-tool revisions for recovery.
+Keep private operator logs separately permission-restricted; `umask 077` during archive
+materialization makes the public source unreadable to the isolated service account.
+
+Update both this line and the "Deployed commit"
 line under "Live facts" whenever a new deploy is accepted (i.e. whenever
 `.deployed-commit` changes on the box), so a future rollback always has a concrete target without
 needing to reconstruct one — the box itself keeps no deploy history. If these lines and
