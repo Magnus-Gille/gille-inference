@@ -106,7 +106,9 @@ repository. It must contain this schema, with placeholders until the refresh is 
   "installer_backup_id": "<sanitized backup identifier>",
   "observations": {
     "protected_services": {
+      "manager": "<system|user per protected unit>",
       "fields": [
+        "result",
         "load_state",
         "sub_state",
         "active_state",
@@ -144,7 +146,9 @@ record; they are required before changing the installed image.
 
 Run these blocks as reviewed Bash scripts with `set -euo pipefail`, rather than pasting them into
 an interactive shell; the preparation script owns its EXIT trap. Use a clean checkout at the
-accepted source release. Set placeholders locally; do not replace them
+accepted source release. Begin every separate script with the placeholder assignments it uses
+(including `IMAGE_REF` in M5-side scripts); assignments in one script do not persist in another.
+Set placeholders locally; do not replace them
 in this document or publish the resulting values:
 
 ```sh
@@ -222,7 +226,8 @@ runtime slice settings:
 ```sh
 set -euo pipefail
 BUILD_UID="$(id -u gille-build)"
-systemctl is-enabled gille-build-cleanup.timer
+TIMER_STATE="$(systemctl is-enabled gille-build-cleanup.timer)" || true
+case "$TIMER_STATE" in enabled|disabled) printf '%s\n' "$TIMER_STATE" ;; *) exit 1 ;; esac
 systemctl show "user-$BUILD_UID.slice" \
   --property=CPUQuotaPerSecUSec,CPUWeight,IOWeight,MemoryMax,MemorySwapMax,TasksMax
 ```
@@ -237,7 +242,9 @@ an existing stage to bypass the identity gate. Do not retry an `apply` failure w
 until the failed attempt's backup and any partial mutation have been handled through the rollback
 path below.
 
-From that same clean checkout, run the repository-owned transport in this order:
+Complete these steps before the transport: record the prior baseline; quiesce submissions;
+verify an empty container list and the preloaded image; capture protected `before` state; run
+gateway verification. Then, from the same clean checkout, run the transport in this order:
 
 ```sh
 set -euo pipefail
@@ -261,15 +268,21 @@ Before `apply`, while the offline acceptance build runs, and after the build, pe
 protected-service check from the approved host procedure. Identify the full protected set before
 `apply`: gateway, model, tunnel, and protected autonomy services/timers. Use the same reviewed
 arrays and helper in every read-only connection; record their identity in the private receipt.
-Persistent services and timers must stay active with unchanged restart-sensitive identities.
+Record each unit's system or user manager; use the corresponding approved manager context for
+checks. The helper below is a system-manager example. A user-manager unit requires equivalent
+checks using its user manager, and must never be silently omitted. Persistent services and timers
+must stay active with unchanged restart-sensitive identities.
 Scheduled one-shot services are checked separately for existence and `Result=success`, because a
 normal timer invocation changes their service invocation ID and may be sampled while activating.
+Add every scheduled one-shot's associated timer to the persistent protected set.
 
 ```sh
 set -euo pipefail
 # On M5. Add all protected persistent autonomy services/timers from the approved procedure.
 ACTIVE_PROTECTED_UNITS=(home-gateway.service llama-swap.service cloudflared.service)
 SCHEDULED_ONESHOT_UNITS=() # Add the approved protected scheduled one-shot services.
+PHASE="${1:?supply before, during, or after}"
+case "$PHASE" in before|during|after) ;; *) exit 1 ;; esac
 capture_protected_state() {
   phase="$1"
   for unit in "${ACTIVE_PROTECTED_UNITS[@]}"; do
@@ -286,10 +299,8 @@ capture_protected_state() {
     systemctl show "$unit" --property=Id,LoadState,Result || return 1
   done
 }
-# Run exactly one phase per connection/time point, with identical definitions above.
-capture_protected_state before
-# In another read-only connection while the acceptance build runs: capture_protected_state during
-# After the acceptance build and verification: capture_protected_state after
+# Run the identical script with the phase as argv[1] in each connection/time point.
+capture_protected_state "$PHASE"
 ```
 
 Compare each persistent unit's `before`, `during`, and `after` tuples. Changed `InvocationID`,
