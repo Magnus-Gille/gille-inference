@@ -48,6 +48,7 @@ async function diagnose({
   registryCalls?: string[];
   topLevelGateway?: Record<string, unknown>;
   checkLatest?: boolean;
+  credential?: string | null;
 } = {}) {
   return diagnoseProfile({
     profile: "codex",
@@ -143,12 +144,12 @@ describe("m5 doctor gateway compatibility", () => {
     expect(result).toMatchObject({ status: "degraded", compatibility: { public: compatibility, private: compatibility } });
   });
 
-  it("keeps older reachability status when metadata is missing or malicious", async () => {
+  it("degrades on malformed metadata without echoing it", async () => {
     const result = await diagnose({
       publicGateway: {
         revision: "https://attacker.invalid/locator",
         client_version: "npm install attacker-package",
-        result_contract: "run attacker command https://attacker.invalid",
+        result_contract: SECRET,
         evil: SECRET,
       },
     });
@@ -162,6 +163,12 @@ describe("m5 doctor gateway compatibility", () => {
     });
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(JSON.stringify(result)).not.toContain("attacker.invalid");
+  });
+
+  it.each([null, [], "reflected-secret"])("degrades on a malformed present gateway object (%s)", async (metadata) => {
+    const result = await diagnose({ publicGateway: metadata });
+    expect(result.status).toBe("degraded");
+    expect(result.compatibility.public).toBe("incompatible");
   });
 
   it("treats absent metadata as unknown and ignores undocumented top-level fields", async () => {

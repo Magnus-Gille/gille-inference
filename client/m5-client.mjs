@@ -18,7 +18,7 @@ const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-05-v9";
 const CODE_LOOP_RESULT_CONTRACT_PREFIX = CODE_LOOP_RESULT_HARNESS_VERSION.replace(/-v\d+$/, "");
 const STABLE_SEMVER_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GATEWAY_REVISION_PATTERN = /^[0-9a-f]{40}$/i;
-const GATEWAY_CONTRACT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const GATEWAY_CONTRACT_PATTERN = /^code-loop-pi-2026-09-05-v(?:0|[1-9]\d{0,5})$/;
 const GATEWAY_COMPATIBILITY_VALUES = new Set([
   "ok",
   "client_outdated",
@@ -2149,7 +2149,8 @@ function sanitizeGatewayMetadata(identity) {
     GATEWAY_CONTRACT_PATTERN.test(metadata.result_contract);
   return {
     gateway: { revision, client_version: clientVersion, result_contract: resultContractValid ? metadata.result_contract : null },
-    contract_state: !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
+    contract_state: Object.hasOwn(identity ?? {}, "gateway") && !gatewayPresent ? "invalid"
+      : !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
   };
 }
 
