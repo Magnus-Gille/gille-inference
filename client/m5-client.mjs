@@ -2149,7 +2149,7 @@ function sanitizeGatewayMetadata(identity) {
     GATEWAY_CONTRACT_PATTERN.test(metadata.result_contract);
   return {
     gateway: { revision, client_version: clientVersion, result_contract: resultContractValid ? metadata.result_contract : null },
-    contract_state: Object.hasOwn(identity ?? {}, "gateway") && !gatewayPresent ? "invalid"
+    contract_state: gatewayPresent && (!identity.gateway || typeof identity.gateway !== "object" || Array.isArray(identity.gateway)) ? "invalid"
       : !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
   };
 }
