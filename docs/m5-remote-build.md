@@ -63,6 +63,10 @@ There is no new gateway route or production gateway restart requirement. MCP cap
   credentials or an operator home into the builder image/cache. The installed OpenSSH forced
   command disables shells, forwarding, TTYs, user rc, password and keyboard-interactive login.
 
+When the CI toolchain or native build requirements change, follow the [M5 builder refresh
+policy](./m5-builder-refresh.md). The image is refreshed on demand from an explicitly approved
+source release and immutable image digest; the worker never pulls or updates an image online.
+
 From the clean accepted-release checkout, preview and then apply only after confirmation:
 
 ```sh
