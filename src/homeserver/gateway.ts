@@ -53,9 +53,10 @@ import {
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
 import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, type HostMemoryAdmissionDeps, type ModelStartAdmission } from "./host-memory-admission.js";
-import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
+import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
+import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
 import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
@@ -4858,6 +4859,7 @@ export async function handleRequest(
       // no-store: per-key usage data must not be cached by intermediaries (Fix #7).
       res.setHeader("cache-control", "no-store");
       sendJson(res, 200, {
+        ...(isCodeLoopOwner(principal) ? { gateway: gatewayRelease } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,

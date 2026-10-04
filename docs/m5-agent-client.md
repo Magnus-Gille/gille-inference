@@ -17,10 +17,10 @@ inference. See the [remote build guide](m5-remote-build.md) for its contract and
 
 The `m5` executable ships in the same npm package as `hs`. The npm registry's latest published
 version was `1.3.7` when checked on 2026-09-23. Version `1.3.8` exists in repository source but
-is not published to npm. Install the reviewed `1.5.1` package only after publication:
+is not published to npm. Install the reviewed `1.5.2` package only after publication:
 
 ```bash
-npm install --global gille-inference@1.5.1
+npm install --global gille-inference@1.5.2
 m5 --version
 ```
 
@@ -51,6 +51,11 @@ Version `1.5.1` names the gateway's host-memory refusals and local build refusal
 "Memory refusals and build_run errors" below. Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
+Version `1.5.2` adds doctor compatibility diagnostics for the gateway's result contract and
+bundled client version. A known mismatch reports `status: "degraded"` and a nonzero doctor exit;
+missing metadata remains an older-gateway `unknown` compatibility result. Doctor never recommends
+downgrading a newer installed client. An upgrade pin is advisory until `--check-latest` confirms
+that exact version is published; only then does the output include an executable install command.
 Rollback is a paired return to the prior accepted gateway revision and client `1.3.6`, with
 gateway verification and harness rechecks. Readers predating this measurement repair do not
 consume the evidence bundle v2 overflow table, so reader coverage for affected rollback windows
@@ -327,7 +332,7 @@ The result makes that boundary explicit:
 ```json
 {
   "status": "mcp_reachable",
-  "client_version": "1.5.1",
+  "client_version": "1.5.2",
   "health_scope": "mcp_catalogue_only",
   "model_discovery": { "public": "available", "private": "available" },
   "inference": { "public": "not_checked", "private": "not_checked" },
@@ -350,6 +355,13 @@ code; raw errors and upstream remediation are never forwarded. Known transport
 diagnostics include the client's fixed recovery guidance. Gateway discovery does
 not confirm inference readiness, and the standalone profile doctor still cannot
 inspect the interactive host connector session.
+
+Doctor also returns sanitized per-route `gateway` metadata and a `compatibility` enum. Each route
+is `ok`, `client_outdated`, `gateway_outdated`, `incompatible`, or `unknown`; a known mismatch
+changes the overall status to `degraded` and the CLI exits nonzero. Missing metadata remains
+`unknown` for older gateways. An upgrade pin is advisory until `--check-latest` confirms the exact
+version is published; only then is an executable install command included. A newer installed
+client never receives a downgrade command for an older gateway.
 
 ### Memory refusals and build_run errors (1.5.1)
 

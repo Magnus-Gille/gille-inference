@@ -161,7 +161,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks). |
 | `GET /` · `GET /portal` | none | Serves the self-service portal page (HTML; `nosniff` + restrictive CSP + `no-store`). Per-IP throttled. |
 | `POST /portal/redeem` | none (the **code** is the credential) | `{code}` → `200 {key, alias, model, models, creditLimit}` (`Cache-Control: no-store`). Trades a one-time invite code for a freshly minted key. Uniform `409 invite_invalid` for an unknown **or** already-used code (identical body — no enumeration oracle); `400` for a missing code. Per-IP throttled (`HOMESERVER_REDEEM_RPM`, default 10 / 10 min) → `429`. |
-| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` (`Cache-Control: no-store`). |
+| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` plus `gateway` release metadata only for minted owner agent/admin keys (`Cache-Control: no-store`). |
 | `GET /portal/stats` | none | **PUBLIC, content-blind grand aggregate** powering the portal's "Served so far" card → `200 {total_tokens, total_requests, since}` (`Cache-Control: public, max-age=30`). Summed from the **durable** `request_log` (survives restarts — the honest "served so far"), NOT the in-memory Prometheus counters. Exposes ONLY fleet-wide totals — never any per-user / per-key / per-alias / per-model / content dimension. Per-IP throttled (shares the redeem window). Deliberately distinct from authed `/metrics`. |
 | `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the historical manual model-evaluation registry (`model-registry.ts`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. Prompt caching is server-owned and forced on for the ordinary exact-common-prefix path; client-supplied `id_slot` and `n_cache_reuse` are stripped so one principal cannot select a shared slot or alter the reviewed cache policy. A changed message/file prefix naturally diverges and its suffix is re-evaluated; the gateway stores no repository path or prompt cache. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
@@ -872,3 +872,9 @@ To run it on the box: install LM Studio (or `llama-server`), point `LMSTUDIO_BAS
 at it, set `HOMESERVER_HOST=0.0.0.0` + API keys, and run `tsx src/homeserver/cli.ts serve`
 under a process supervisor (launchd/systemd). A future v2 can split this into its own
 package with a real `llama-server` backend (per the deep-research Tier-A recommendation).
+
+`m5 doctor` reports client/gateway versions and result-contract compatibility from
+an authenticated, content-free `GET /portal/me` using a minted owner agent/admin key.
+Guests and inference keys receive no release metadata. Gateway source SHA is embedded by
+`git archive`; development checkouts report unknown. Version compatibility does
+not establish inference readiness. See [gateway release advertisement](../../docs/gateway-api-contract.md#gateway-release-advertisement).
