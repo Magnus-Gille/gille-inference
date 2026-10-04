@@ -123,7 +123,7 @@ up to date. Every other document (`AGENTS.md`'s "Deploying the M5 gateway" secti
 `docs/`) points here instead of repeating these facts — if you find a stale copy elsewhere, fix it
 to point here rather than re-describing the topology.
 
-**Live facts** (topology verified 2026-07-19/20, issue #23; deployed commit last updated 2026-10-03):
+**Live facts** (topology verified 2026-07-19/20, issue #23; deployment receipt last updated 2026-10-04):
 
 - systemd unit: `home-gateway.service`
 - `WorkingDirectory`: `/home/magnus/home-server-eval`
@@ -132,9 +132,16 @@ to point here rather than re-describing the topology.
   `git -C /home/magnus/home-server-eval rev-parse` fails with "not a git repository". There is no
   local history to diff against on the box; `.deployed-commit` (below) is the only record of
   deployed identity.
-- Deployed commit: **`b80b617c6898187e5d552f24ae3bbc7defc9ca3a`**, accepted 2026-10-03 with every
+- Deployed commit: **`df898714d2dc376f48d15a5ae4f1cd45914ca057`**, accepted 2026-10-04 with every
   deploy probe passing and the content check matching. This line is a convenience and goes stale;
   `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
+- Paired client: **`1.5.3`**, installed from a verified local tarball. npm publication remains
+  blocked by the existing registry authentication failure. Both this client and retained client
+  `1.5.1` passed a bounded (60-second) offline dispatch smoke (`true`); this does not establish
+  compiler or model readiness.
+- The separately installed worker at `df898714d2dc376f48d15a5ae4f1cd45914ca057` supplies
+  capacity/status records and idle
+  cleanup: 7 days for `target` directories, 14 days for whole idle worktrees. See [`docs/m5-remote-build.md`](../docs/m5-remote-build.md).
 - `/srv/gille-inference` — previously documented in `AGENTS.md` as the live path — **does not
   exist** on the box and is not this unit's `WorkingDirectory`. That claim was wrong; this section
   is now the source of truth. (`CONTRIBUTING.md` also uses `/srv/gille-inference` as a *reserved
@@ -542,20 +549,43 @@ The unit is not a git checkout, so "rollback" means **redeploy a known-good comm
 `git revert` on the box:
 
 ```bash
+(
+umask 022  # archived public source must remain readable by the isolated service account
 git worktree add /tmp/gille-rollback <known-good-sha>   # the previous accepted commit, see below
 cd /tmp/gille-rollback
 npm ci
 scripts/deploy-gateway.sh deploy <known-good-full-sha>
+scripts/deploy-gateway.sh verify
+)  # preserve the caller's umask for private operator files
+# On each client machine, restore the matching, retained verified package:
+npm install --global --ignore-scripts <approved-paired-client.tgz>
+m5 --profile codex doctor
+m5 --profile claude doctor
 ```
 
-The rollback target is the **previous accepted commit**, currently
-**`469c9275ea460c254d2ee3c926f5ede50d8390fe`** (live earlier on 2026-10-02, until
-`b80b617c6898187e5d552f24ae3bbc7defc9ca3a` replaced it; the one before was
-`fc97f75b345ec297aa01165a62c9b56052c0982d`). Update both this line and the "Deployed
-commit" line under "Live facts" whenever a new deploy is accepted (i.e. whenever
+The rollback target is the **previous accepted gateway commit**, currently
+**`c45c1f295758dc013e8f81b763ee9ec471be4d9a`**, paired with client **`1.5.2`**. That pairing was
+accepted and verified on both configured routes on 2026-10-04 before the final release. Restore
+both gateway and client: client 1.5.2 and newer report version drift; the older 1.5.1 doctor
+predates that compatibility check. Retain the verified client tarballs
+from those accepted source revisions; versions 1.5.2/1.5.3 were installed locally and are not yet
+published to npm. This gateway/client rollback leaves the separately installed build worker at
+`df898714d2dc376f48d15a5ae4f1cd45914ca057`; worker recovery uses its own exact installer backup and
+acceptance procedure in [`docs/m5-remote-build.md`](../docs/m5-remote-build.md).
+
+The older fallback **`bb6afa8946ba2d5fd94c3b0f66fd864e9951dbeb`** with client **`1.5.1`** was
+exercised and verified on 2026-10-04. Its runtime matches the previously deployed
+`b80b617c6898187e5d552f24ae3bbc7defc9ca3a`, with a safe stdin-header deploy probe added. Earlier
+deploy tooling put the bearer in argv; use these reviewed deploy-tool revisions for recovery.
+Keep private operator logs separately permission-restricted; `umask 077` during archive
+materialization makes the public source unreadable to the isolated service account.
+
+Update the accepted and rollback gateway revisions, paired client, publication status and separate
+worker receipt whenever a new deploy is accepted (i.e. whenever
 `.deployed-commit` changes on the box), so a future rollback always has a concrete target without
 needing to reconstruct one — the box itself keeps no deploy history. If these lines and
-`scripts/deploy-gateway.sh verify` disagree, the script is right and this file is stale.
+`scripts/deploy-gateway.sh verify` disagree about the gateway, the script is right and this file is
+stale; verify client and worker identity separately.
 
 ### MCP-restart caveat
 
