@@ -517,7 +517,10 @@ def main():
         # select cleanup via the actual launcher's argv; ssh forced command has
         # no arguments irrespective of what the caller asked SSH to execute.
         if sys.argv[1:] == ['--cleanup']:
-            config = load_config()
+            config = load_config(check_capacity=False)
+            capacity = observe_capacity()
+            if capacity['total_bytes'] > MAX_FILESYSTEM_BYTES:
+                raise BuildError('Build filesystem must be at most 64 GiB.')
             cleanup_stale(private_directory(ROOT / 'state'))
             return 0
         if sys.argv[1:]:
@@ -536,8 +539,8 @@ def main():
         capacity = observe_capacity()
         if capacity['total_bytes'] > MAX_FILESYSTEM_BYTES:
             raise BuildError('Build filesystem must be at most 64 GiB.')
-        emit('capacity', **capacity)
         if capacity['free_bytes'] < MINIMUM_FREE_BYTES:
+            emit('capacity', **capacity)
             emit('error', code=125, diagnostic_code='build_capacity_low', capacity=capacity)
             return 125
         request, payload = read_request(sys.stdin.buffer, first_line=header_line)

@@ -24,6 +24,13 @@ describe("read-only build capacity surfaces", () => {
   const refused=JSON.parse((await bridge.handleLine(JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"build_status",arguments:{cleanup:true}}})))!);
   expect(refused.error).toBeDefined(); expect(status).toHaveBeenCalledOnce();
  });
+ it("MCP build_run preserves locally constructed capacity refusal diagnostics", async () => {
+  const bridge=createMcpStdioBridge({client:{rpc:vi.fn()},buildConfig:{sshTarget:"m5-build"},
+   buildRunner:async()=>{ throw Object.assign(new Error("Remote build filesystem has 512 bytes free; at least 1073741824 bytes free are required."), {buildCode:"build_capacity_low"}); }} as any);
+  const response=JSON.parse((await bridge.handleLine(JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"build_run",arguments:{cwd:"/tmp/fixture",command:["true"]}}})))!);
+  expect(response.error.data.m5_code).toBe("build_capacity_low");
+  expect(response.error.message).toContain("512 bytes free");
+ });
  it("MCP only advertises status when local builds are configured", async () => {
   const make=()=>({rpc:vi.fn(async()=>({jsonrpc:"2.0",id:1,result:{tools:[]}}))});
   for (const configured of [true,false]) {

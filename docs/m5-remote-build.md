@@ -148,7 +148,7 @@ run three distinct worktrees concurrently, and record before/during/after gatewa
 protected unit identity/health and OOM counters. Stop on any anomaly. Exact host facts and receipts
 belong in the private operations tracker; publish only sanitized reusable evidence.
 
-The daily timer and build-start cleanup reclaim idle worktree `target` directories after
+The daily timer (including below the admission floor) and build-start cleanup reclaim idle worktree `target` directories after
 7 days and the whole idle worktree after 14 days, under the same per-worktree/build-slot
 locks. Source snapshots remain until day 14; per-repository dependency caches and lock files
 remain. Active builds, recent trees and missing/future usage stamps are never evicted.
@@ -169,3 +169,9 @@ and works even below the admission floor. With local build configuration, MCP ad
 reservation. A low-space build refusal uses `build_capacity_low` and reports observed free,
 total and required bytes. Existing workers remain usable for builds without capacity records;
 status against an old worker fails explicitly until the separately approved worker upgrade.
+
+The upgraded worker keeps the original record set for successful builds, so older clients keep
+working. Capacity records precede only low-space refusals; older clients still refuse those jobs,
+while the updated client names the free-space limit. Keep the existing volume ceiling of 64 GiB; use status observations to decide future capacity
+changes. Superseded final builder images may be removed only through the refresh policy's
+separate approval gate, with the current and rollback identities retained.

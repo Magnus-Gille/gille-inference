@@ -29,10 +29,10 @@ function capacity(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function childFor(lines: unknown[], closeCode = 0, capturedInput: string[] = []) {
+function childFor(lines: unknown[], closeCode = 0, capturedInput: string[] = [], uploadFailure = false) {
   const child: any = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
-  child.stdin = { write(value: string) { capturedInput.push(value); }, end() {} }; child.kill = vi.fn();
-  queueMicrotask(() => { child.stdout.emit("data", Buffer.from(lines.map(line => JSON.stringify(line) + "\n").join(""))); child.emit("close", closeCode); });
+  child.stdin = Object.assign(new EventEmitter(), { write(value: string) { capturedInput.push(value); }, end() {} }); child.kill = vi.fn();
+  queueMicrotask(() => { if (uploadFailure) child.stdin.emit("error", new Error("EPIPE private locator")); child.stdout.emit("data", Buffer.from(lines.map(line => JSON.stringify(line) + "\n").join(""))); child.emit("close", closeCode); });
   return child;
 }
 
@@ -46,7 +46,7 @@ describe("M5 build capacity protocol", () => {
 
   it.each([
     [capacity({ free_bytes: Number.MAX_SAFE_INTEGER + 1 }), "counter"],
-    [capacity({ observed_at: "9999-01-01T00:00:00Z" }), "timestamp"],
+    [capacity({ observed_at: "2026-02-30T00:00:00Z" }), "timestamp"],
     [capacity(), "duplicate"],
   ])("rejects malformed or duplicate status capacity records (%s)", async (record, _label) => {
     const records = _label === "duplicate" ? [record, record, { type: "exit", code: 0 }] : [record, { type: "exit", code: 0 }];
@@ -58,12 +58,33 @@ describe("M5 build capacity protocol", () => {
     await expect(getBuildStatus({ config, spawnImpl: vi.fn(() => childFor([capacity(), { type: "exit", code: 0 }], 1)) as any })).rejects.toMatchObject({ buildCode: "build_protocol_error" });
   });
 
-  it("refuses low capacity with a safe local error and no remote message", async () => {
+  it.each([false, true])("preserves safe low-space diagnostics even when upload fails first (%s)", async (uploadFailure) => {
     const root = repo();
     const low = capacity({ free_bytes: 512 * 1024 ** 2 });
-    const spawnImpl = vi.fn(() => childFor([low, { type: "error", code: 125, diagnostic_code: "build_capacity_low", message: "/private/secret" }], 125));
+    const spawnImpl = vi.fn(() => childFor([low, { type: "error", code: 125, diagnostic_code: "build_capacity_low", message: "/private/secret" }], 125, [], uploadFailure));
     await expect(runBuild({ cwd: root, command: ["true"], config, spawnImpl: spawnImpl as any, stdout: { write() {} } as any, stderr: { write() {} } as any }))
       .rejects.toMatchObject({ buildCode: "build_capacity_low", message: "Remote build filesystem has 536870912 bytes free of 68719476736; at least 1073741824 bytes free are required. Check m5 build status and request scoped cleanup." });
+  });
+
+  it("accepts a valid clock-skewed observation and ordered safe thresholds", async () => {
+    await expect(getBuildStatus({ config, spawnImpl: vi.fn(() => childFor([
+      capacity({ observed_at: "2099-01-01T00:00:00Z", minimum_free_bytes: 2 * 1024 ** 3, warning_free_bytes: 12 * 1024 ** 3 }),
+      { type: "exit", code: 0 }])) as any })).resolves.toMatchObject({ minimum_free_bytes: 2 * 1024 ** 3 });
+  });
+
+  it("distinguishes a closed worker refusal from malformed status without echoing it", async () => {
+    await expect(getBuildStatus({ config, spawnImpl: vi.fn(() => childFor([
+      { type: "error", code: 125, message: "/private/secret" }], 125)) as any })).rejects.toMatchObject({
+        buildCode: "build_worker_failure", message: "Build status worker refused the request; verify dedicated worker provisioning." });
+  });
+
+  it("rejects late capacity records and refusals with no preceding observation", async () => {
+    for (const lines of [
+      [{ type: "stdout", data: "b2s=" }, capacity(), { type: "exit", code: 0 }],
+      [{ type: "error", code: 125, diagnostic_code: "build_capacity_low" }],
+    ]) await expect(runBuild({ cwd: repo(), command: ["true"], config,
+      spawnImpl: vi.fn(() => childFor(lines)) as any, stdout: { write() {} } as any, stderr: { write() {} } as any }))
+      .rejects.toMatchObject({ buildCode: "build_protocol_error" });
   });
 
   it("keeps compatibility with a legacy worker that has no capacity record", async () => {

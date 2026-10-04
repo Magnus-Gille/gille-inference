@@ -227,6 +227,7 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           try { capacity = await buildStatusRunner({ config: buildConfig }); }
           catch (error) {
             if (error?.buildCode === "build_timeout") throw new M5ClientError("build_timeout", "Remote build status timed out; check dedicated worker availability.");
+            if (error?.buildCode === "build_worker_failure") throw new M5ClientError("build_worker_failure", "Build status worker refused the request; verify dedicated worker provisioning.");
             if (error?.buildCode === "build_protocol_error") throw new M5ClientError("build_protocol_error", "Invalid remote build status protocol; verify dedicated worker provisioning.");
             throw new M5ClientError("build_failed", "Build capacity status unavailable; verify dedicated worker provisioning.");
           }

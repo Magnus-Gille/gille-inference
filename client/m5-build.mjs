@@ -8,8 +8,6 @@ const MAX_ARCHIVE = 128 * 1024 * 1024;
 const MAX_LINE = 128 * 1024; // 48 KiB worker chunks become 64 KiB + JSON framing.
 const MAX_PULL_FILE = 16 * 1024 * 1024;
 const MAX_PULL_TOTAL = 32 * 1024 * 1024;
-const MINIMUM_FREE_BYTES = 1024 ** 3;
-const WARNING_FREE_BYTES = 8 * 1024 ** 3;
 const MAX_CAPACITY_VALUE = Number.MAX_SAFE_INTEGER;
 const MAX_FILESYSTEM_BYTES = 64 * 1024 ** 3;
 const MAX_STATUS_BYTES = 512 * 1024;
@@ -21,7 +19,8 @@ const LOCAL_ENV = { PATH: "/usr/bin:/bin:/opt/homebrew/bin", LANG: "C.UTF-8" };
 /**
  * An error from this client with a stable machine-readable code. Only errors created here are
  * shown to an MCP caller with their message, so every message passed to this function must be a
- * fixed sentence: no paths, host locators, subprocess output or remote text. Untagged errors
+ * fixed sentence, optionally with validated capacity integers: no paths, host locators,
+ * subprocess output or free-form remote text. Untagged errors
  * (for example a filesystem-helper diagnostic) reach an MCP caller as a generic `build_failed`.
  */
 function buildError(code, message) {
@@ -152,11 +151,12 @@ function validateCapacity(value) {
   }
   const observedAt = typeof value.observed_at === "string" && Date.parse(value.observed_at);
   if (value.used_bytes > value.total_bytes || value.free_bytes > value.total_bytes ||
-      value.minimum_free_bytes !== MINIMUM_FREE_BYTES || value.warning_free_bytes !== WARNING_FREE_BYTES ||
+      value.used_bytes + value.free_bytes > value.total_bytes ||
+      value.minimum_free_bytes > value.warning_free_bytes || value.warning_free_bytes > MAX_FILESYSTEM_BYTES ||
       value.total_bytes > MAX_FILESYSTEM_BYTES ||
       typeof value.observed_at !== "string" ||
       !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value.observed_at) ||
-      !Number.isFinite(observedAt) || observedAt > Date.now() + 60_000) {
+      !Number.isFinite(observedAt) || new Date(observedAt).toISOString().replace(".000Z", "Z") !== value.observed_at) {
     throw new Error("Invalid build capacity record.");
   }
   return {
@@ -197,8 +197,8 @@ export async function getBuildStatus({ config, spawnImpl = spawn, timeoutMs = 30
     } else if (message.type === "exit" && Number.isInteger(message.code) && message.code >= 0 && message.code <= 255) {
       if (!capacity || message.code !== 0) throw new Error("Incomplete build status protocol.");
       remoteExit = message.code;
-    } else if (message.type === "error") {
-      throw new Error("Build status worker failure.");
+    } else if (message.type === "error" && message.code === 125 && typeof message.message === "string") {
+      throw buildError("build_worker_failure", "Build status worker refused the request; verify dedicated worker provisioning.");
     } else throw new Error("Malformed build status protocol.");
   }
   child.stdout.on("data", chunk => {
@@ -217,7 +217,7 @@ export async function getBuildStatus({ config, spawnImpl = spawn, timeoutMs = 30
         lineBuffer = lineBuffer.subarray(newline + 1);
       }
       if (lineBuffer.length > MAX_LINE) throw new Error("Build status protocol line exceeds its bound.");
-    } catch { abort(buildError("build_protocol_error", "Invalid remote build status protocol.")); }
+    } catch (error) { abort(error?.buildCode === "build_worker_failure" ? error : buildError("build_protocol_error", "Invalid remote build status protocol.")); }
   });
   try {
     const completion = new Promise((resolve, reject) => {
@@ -250,7 +250,7 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     env: workerEnv(), stdio: ["pipe", "pipe", "pipe"],
   });
   let lineBuffer = Buffer.alloc(0); let remoteExit; let protocolError; let workerFailure = false;
-  let capacity; let sawRecord = false;
+  let capacity; let sawRecord = false; let uploadError;
   const totals = { stdout: 0, stderr: 0 }; const truncated = { stdout: false, stderr: false };
   const captured = { stdout: [], stderr: [] }; const artifacts = new Map(); let pullTotal = 0;
   const abort = error => { protocolError ??= error; child.kill(); };
@@ -258,7 +258,9 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
   timer.unref?.();
   // Consume but never print SSH diagnostics: they may contain private locators.
   child.stderr.on("data", () => {});
-  child.stdin.on?.("error", () => abort(new Error("SSH build upload failed; no local fallback.")));
+  // A worker can refuse before consuming the archive. Drain its bounded stdout
+  // before choosing between the content-free refusal and an upload failure.
+  child.stdin.on?.("error", () => { uploadError ??= new Error("SSH build upload failed; no local fallback."); });
   function consume(line) {
     const message = JSON.parse(line.toString("utf8"));
     if (!message || typeof message !== "object" || Array.isArray(message) || remoteExit !== undefined || workerFailure) {
@@ -321,8 +323,8 @@ export async function runBuild({ cwd = process.cwd(), command, pull = [], toolch
     });
     child.stdin.write(requestLine); child.stdin.write(prepared.archive); child.stdin.end();
     const sshExit = await completion;
-    if (protocolError || lineBuffer.length || remoteExit === undefined || sshExit !== remoteExit) {
-      throw protocolError ?? buildError("build_protocol_error", "Build ended without a matching remote exit record.");
+    if (protocolError || uploadError || lineBuffer.length || remoteExit === undefined || sshExit !== remoteExit) {
+      throw protocolError ?? uploadError ?? buildError("build_protocol_error", "Build ended without a matching remote exit record.");
     }
     if (pull.some(path => !artifacts.has(path))) throw new Error("Worker did not return every selected artifact.");
     if (artifacts.size) {
