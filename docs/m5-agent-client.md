@@ -17,10 +17,10 @@ inference. See the [remote build guide](m5-remote-build.md) for its contract and
 
 The `m5` executable ships in the same npm package as `hs`. The npm registry's latest published
 version was `1.3.7` when checked on 2026-09-23. Version `1.3.8` exists in repository source but
-is not published to npm. Install the reviewed `1.5.2` package only after publication:
+is not published to npm. Install the reviewed `1.5.3` package only after publication:
 
 ```bash
-npm install --global gille-inference@1.5.2
+npm install --global gille-inference@1.5.3
 m5 --version
 ```
 
@@ -51,6 +51,8 @@ Version `1.5.1` names the gateway's host-memory refusals and local build refusal
 "Memory refusals and build_run errors" below. Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
+Version `1.5.3` adds read-only `m5 build status`/MCP `build_status`, low-space diagnostics,
+and seven-day idle target eviction while preserving older clients' healthy build protocol.
 Version `1.5.2` adds doctor compatibility diagnostics for the gateway's result contract and
 bundled client version. A known mismatch reports `status: "degraded"` and a nonzero doctor exit;
 missing metadata remains an older-gateway `unknown` compatibility result. Doctor never recommends
@@ -332,7 +334,7 @@ The result makes that boundary explicit:
 ```json
 {
   "status": "mcp_reachable",
-  "client_version": "1.5.2",
+  "client_version": "1.5.3",
   "health_scope": "mcp_catalogue_only",
   "model_discovery": { "public": "available", "private": "available" },
   "inference": { "public": "not_checked", "private": "not_checked" },

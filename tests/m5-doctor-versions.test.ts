@@ -67,7 +67,7 @@ async function diagnose({
       if (url === "https://registry.npmjs.org/gille-inference/latest") {
         registryCalls?.push(url);
         if (registry instanceof Error) throw registry;
-        return registry ?? jsonResponse({ version: "1.5.2" });
+        return registry ?? jsonResponse({ version: "1.5.3" });
       }
       const isPrivate = url.startsWith(PRIVATE_URL);
       if (url.endsWith("/portal/me")) {
@@ -102,10 +102,10 @@ async function diagnose({
 
 describe("m5 doctor gateway compatibility", () => {
   it("reports matching sanitized gateway metadata for both routes", async () => {
-    const metadata = { revision: "a".repeat(40), client_version: "1.5.2", result_contract: CONTRACT };
+    const metadata = { revision: "a".repeat(40), client_version: "1.5.3", result_contract: CONTRACT };
     await expect(diagnose({ publicGateway: metadata })).resolves.toMatchObject({
       status: "mcp_reachable",
-      client_version: "1.5.2",
+      client_version: "1.5.3",
       gateway: { public: metadata, private: metadata },
       compatibility: { public: "ok", private: "ok" },
     });
@@ -120,7 +120,7 @@ describe("m5 doctor gateway compatibility", () => {
       compatibility: { public: "client_outdated", private: "client_outdated" },
       recommendation: {
         install: "gille-inference@1.6.0",
-        rollback_pin: "gille-inference@1.5.2",
+        rollback_pin: "gille-inference@1.5.3",
       },
     });
     expect(result.recommendation).not.toHaveProperty("command");
@@ -140,7 +140,7 @@ describe("m5 doctor gateway compatibility", () => {
     ["code-loop-pi-2026-09-05-v10", "client_outdated"],
     ["future-contract", "incompatible"],
   ])("classifies contract %s as %s", async (contract, compatibility) => {
-    const result = await diagnose({ publicGateway: { revision: "d".repeat(40), client_version: "1.5.2", result_contract: contract } });
+    const result = await diagnose({ publicGateway: { revision: "d".repeat(40), client_version: "1.5.3", result_contract: contract } });
     expect(result).toMatchObject({ status: "degraded", compatibility: { public: compatibility, private: compatibility } });
   });
 
@@ -189,7 +189,7 @@ describe("m5 doctor gateway compatibility", () => {
 
   it("keeps route drift visible without collapsing it into path parity failure", async () => {
     const result = await diagnose({
-      publicGateway: { revision: "e".repeat(40), client_version: "1.5.2", result_contract: CONTRACT },
+      publicGateway: { revision: "e".repeat(40), client_version: "1.5.3", result_contract: CONTRACT },
       privateGateway: { revision: "f".repeat(40), client_version: "1.5.1", result_contract: CONTRACT },
     });
     expect(result).toMatchObject({
@@ -201,7 +201,7 @@ describe("m5 doctor gateway compatibility", () => {
 
   it("does not invent an upgrade pin when routes disagree", async () => {
     const result = await diagnose({
-      publicGateway: { revision: "e".repeat(40), client_version: "1.5.2", result_contract: CONTRACT },
+      publicGateway: { revision: "e".repeat(40), client_version: "1.5.3", result_contract: CONTRACT },
       privateGateway: { revision: "f".repeat(40), client_version: "1.6.0", result_contract: CONTRACT },
     });
     expect(result.status).toBe("degraded");
@@ -210,7 +210,7 @@ describe("m5 doctor gateway compatibility", () => {
 
   it("does not claim reinstalling the same pin repairs a newer wire contract", async () => {
     const result = await diagnose({ publicGateway: {
-      revision: "d".repeat(40), client_version: "1.5.2", result_contract: "code-loop-pi-2026-09-05-v10",
+      revision: "d".repeat(40), client_version: "1.5.3", result_contract: "code-loop-pi-2026-09-05-v10",
     }});
     expect(result.status).toBe("degraded");
     expect(result.recommendation).toBeUndefined();
@@ -218,7 +218,7 @@ describe("m5 doctor gateway compatibility", () => {
 
   it("degrades a public-only profile when its known gateway contract is incompatible", async () => {
     const result = await diagnose({
-      publicGateway: { revision: "1".repeat(40), client_version: "1.5.2", result_contract: "future-contract" },
+      publicGateway: { revision: "1".repeat(40), client_version: "1.5.3", result_contract: "future-contract" },
       privateUrl: null,
     });
     expect(result).toMatchObject({
@@ -270,11 +270,11 @@ describe("m5 doctor gateway compatibility", () => {
       credential: null,
       checkLatest: true,
       registryCalls,
-      registry: jsonResponse({ version: "1.5.2" }),
+      registry: jsonResponse({ version: "1.5.3" }),
     });
     expect(result).toMatchObject({
       status: "missing_credential",
-      latest: { status: "available", version: "1.5.2" },
+      latest: { status: "available", version: "1.5.3" },
     });
     expect(registryCalls).toEqual(["https://registry.npmjs.org/gille-inference/latest"]);
   });
@@ -295,7 +295,7 @@ describe("m5 doctor gateway compatibility", () => {
       status: "degraded",
       recommendation: {
         install: "gille-inference@1.6.0",
-        rollback_pin: "gille-inference@1.5.2",
+        rollback_pin: "gille-inference@1.5.3",
         publication: "confirmed",
         command: "npm install --global gille-inference@1.6.0",
       },

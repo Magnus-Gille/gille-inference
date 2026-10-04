@@ -22,11 +22,11 @@ excluded. Snapshot limit: 128 MiB. Local Python dirfd operations prevent ancesto
 
 ## One-time installation
 
-Client `1.5.2` is a source release until published; do not substitute npm `latest`:
+Client `1.5.3` is a source release until published; do not substitute npm `latest`:
 
 ```sh
 # Only after reviewed publication:
-npm install --global gille-inference@1.5.2
+npm install --global gille-inference@1.5.3
 ```
 
 Builds additionally need **Python 3.9+, Git and OpenSSH** locally. Configure SSH alias `m5-build`
