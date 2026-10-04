@@ -107,6 +107,8 @@ repository. It must contain this schema, with placeholders until the refresh is 
   "observations": {
     "protected_services": {
       "fields": [
+        "load_state",
+        "sub_state",
         "active_state",
         "invocation_id",
         "main_pid",
@@ -140,10 +142,13 @@ record; they are required before changing the installed image.
 
 ## Preparation and installation
 
-Use a clean checkout at the accepted source release. Set placeholders locally; do not replace them
+Run these blocks as reviewed Bash scripts with `set -euo pipefail`, rather than pasting them into
+an interactive shell; the preparation script owns its EXIT trap. Use a clean checkout at the
+accepted source release. Set placeholders locally; do not replace them
 in this document or publish the resulting values:
 
 ```sh
+set -euo pipefail
 RELEASE_SHA='<accepted-full-40-character-sha>'
 NODE_BASE_IMAGE='node:22-trixie@sha256:<approved-node-base-digest>'
 RUST_BASE_IMAGE='rust:1.99.0-trixie@sha256:<approved-rust-base-digest>'
@@ -156,6 +161,7 @@ preparation environment. Base-image acquisition and build downloads are separate
 inputs. After those inputs are present, the build itself must not update them:
 
 ```sh
+set -euo pipefail
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 EMPTY_CONTEXT="$(mktemp -d)"
@@ -176,10 +182,12 @@ The absolute Containerfile and empty context make the build input explicit; this
 copies no project files. Resolve the printed final digest and image ID into
 `IMAGE_REF`, record the base variants/digests, final digest/ID, platform, glibc version, and
 installed tool versions, then have the owner attend preloading of exactly `IMAGE_REF` into the
-`gille-build` user's rootless Podman store on the M5. The existing installer does not build, pull,
+`gille-build` user's rootless Podman store on the M5, from working directory `/`. The existing installer does not build, pull,
 or preload images. It checks that same rootless store with a sterile environment:
 
 ```sh
+set -euo pipefail
+cd /
 BUILD_UID="$(id -u gille-build)"
 sudo -n runuser -u gille-build -- env -i \
   PATH=/usr/bin:/bin HOME=/var/lib/gille-build USER=gille-build \
@@ -194,6 +202,13 @@ sudo -n runuser -u gille-build -- env -i \
   --format '{{.Digest}} {{.Id}} {{.Os}}/{{.Architecture}}'
 ```
 
+Before `apply`, also list build containers with that same sterile environment, from `/`.
+Assign the result of `podman ps -q` to a variable, require that command to succeed, and require an
+empty result. Do this before staging, so a busy worker does not consume the accepted source SHA.
+If `IMAGE_REF` does not resolve after transfer, inspect by the recorded image ID with the same
+sterile environment (`podman image inspect '<recorded-image-id>'`). This is diagnostic only and
+does not authorize accepting the returned digest.
+
 Compare the digest, image ID and `linux/amd64` platform with the private record. The matching
 image ID binds the transferred bytes to the preparation-time Debian trixie/glibc observation. If the M5 digest differs, stop before
 `apply`. Re-transfer with a method that preserves both digest and image ID, or explicitly
@@ -205,6 +220,7 @@ Before any mutation, record the current baseline, including cleanup-timer enable
 runtime slice settings:
 
 ```sh
+set -euo pipefail
 BUILD_UID="$(id -u gille-build)"
 systemctl is-enabled gille-build-cleanup.timer
 systemctl show "user-$BUILD_UID.slice" \
@@ -224,6 +240,7 @@ path below.
 From that same clean checkout, run the repository-owned transport in this order:
 
 ```sh
+set -euo pipefail
 scripts/deploy-m5-build.sh dry-run "$RELEASE_SHA" "$IMAGE_REF"
 scripts/deploy-m5-build.sh apply "$RELEASE_SHA" "$IMAGE_REF"
 scripts/deploy-m5-build.sh preflight "$RELEASE_SHA" "$IMAGE_REF"
@@ -232,7 +249,7 @@ scripts/deploy-m5-build.sh preflight "$RELEASE_SHA" "$IMAGE_REF"
 `dry-run` checks the accepted full SHA, immutable image reference, clean worktree, repository root,
 and `HEAD` identity without contacting the host. `apply` is the explicit host mutation: it archives
 only the tracked worker and installer at the accepted SHA, refuses an existing release directory,
-records the prior build config/worker and build-specific systemd state, and installs the new image
+records the prior build config/worker and build-specific unit-file bytes, and installs the new image
 reference. It does not restart gateway, model, tunnel, or autonomy units. `preflight` is read-only
 and must pass against the already staged release and preloaded image. A nonzero `apply` can occur
 after `/etc/gille-build.json` and the worker link have switched; retain the printed installer
@@ -240,55 +257,54 @@ backup ID and enter the rollback path rather than retrying over that baseline. I
 printing a backup ID, preserve the failure and staged-release evidence and still do not retry until
 the owner-approved rollback/recovery review is complete.
 
-Before `apply`, immediately after `preflight`, and again after the acceptance build, perform the
-protected-service check from the release operator's approved host procedure. The approved set must
-include `home-gateway.service`, `llama-swap.service`, `cloudflared.service`, and every autonomy
-protected unit named by the approved host procedure; identify the complete set before `apply`.
-Record the expected health state for timers and any normally inactive one-shot units. Capture each phase as `before`, `during`, and `after` in the private observations.
-At each phase, fail closed if a unit differs from its approved health state and capture the
-restart-sensitive identity fields:
+Before `apply`, while the offline acceptance build runs, and after the build, perform the
+protected-service check from the approved host procedure. Identify the full protected set before
+`apply`: gateway, model, tunnel, and protected autonomy services/timers. Use the same reviewed
+arrays and helper in every read-only connection; record their identity in the private receipt.
+Persistent services and timers must stay active with unchanged restart-sensitive identities.
+Scheduled one-shot services are checked separately for existence and `Result=success`, because a
+normal timer invocation changes their service invocation ID and may be sampled while activating.
 
 ```sh
-# On the M5, through the approved read-only operator connection. Define this helper once;
-# execute exactly one labelled call at each phase below, rather than running all three calls
-# as one uninterrupted command.
-PROTECTED_UNITS=(home-gateway.service llama-swap.service cloudflared.service)
-PROTECTED_STATES=(active active active)
-# Append each approved protected autonomy unit and its expected state to these paired arrays.
+set -euo pipefail
+# On M5. Add all protected persistent autonomy services/timers from the approved procedure.
+ACTIVE_PROTECTED_UNITS=(home-gateway.service llama-swap.service cloudflared.service)
+SCHEDULED_ONESHOT_UNITS=() # Add the approved protected scheduled one-shot services.
 capture_protected_state() {
   phase="$1"
-  [ "${#PROTECTED_UNITS[@]}" = "${#PROTECTED_STATES[@]}" ] || return 1
-  for index in "${!PROTECTED_UNITS[@]}"; do
-    unit="${PROTECTED_UNITS[$index]}"
-    state="$(systemctl is-active "$unit")" || true
-    if [ "$state" != "${PROTECTED_STATES[$index]}" ]; then
-      printf 'STOP: %s differs from its approved health state during %s\n' "$unit" "$phase" >&2
-      return 1
-    fi
+  for unit in "${ACTIVE_PROTECTED_UNITS[@]}"; do
+    [ "$(systemctl show "$unit" --property=LoadState --value)" = loaded ] || return 1
+    systemctl is-active --quiet "$unit" || return 1
     printf 'protected phase=%s unit=%s\n' "$phase" "$unit"
     systemctl show "$unit" \
       --property=Id,LoadState,ActiveState,SubState,FragmentPath,InvocationID,MainPID,ActiveEnterTimestamp,NRestarts || return 1
   done
+  for unit in "${SCHEDULED_ONESHOT_UNITS[@]}"; do
+    [ "$(systemctl show "$unit" --property=LoadState --value)" = loaded ] || return 1
+    [ "$(systemctl show "$unit" --property=Result --value)" = success ] || return 1
+    printf 'scheduled phase=%s unit=%s\n' "$phase" "$unit"
+    systemctl show "$unit" --property=Id,LoadState,Result || return 1
+  done
 }
-# Before apply, after recording the baseline and before quiescing submissions:
+# Run exactly one phase per connection/time point, with identical definitions above.
 capture_protected_state before
-# While the offline acceptance command is running, from another approved read-only connection:
-capture_protected_state during
-# After the offline acceptance command and its verification:
-capture_protected_state after
+# In another read-only connection while the acceptance build runs: capture_protected_state during
+# After the acceptance build and verification: capture_protected_state after
 ```
 
-Compare the `before`, `during`, and `after` tuples for every protected unit. Any change in
-`InvocationID`, `MainPID`, `ActiveEnterTimestamp`, or `NRestarts` counts as a restart/change even
-when the unit returns healthy; changes in active state or load/fragment identity also fail the
-refresh. The `systemctl is-active` result is a gate, not a discarded status line. Keep literal
-`FragmentPath` values out of the private record; retain only the approved sanitized identity or a
-hash of the identity fields.
+Compare each persistent unit's `before`, `during`, and `after` tuples. Changed `InvocationID`,
+`MainPID`, `ActiveEnterTimestamp`, `NRestarts`, active state, or load/fragment identity stops the
+refresh even when the unit returns healthy. Scheduled one-shots must remain loaded and successful;
+compare the associated timer's persistent identity rather than one-shot invocation IDs.
+Keep literal `FragmentPath` out of the private record. `sanitized_identity` covers `Id`,
+`LoadState`, and a hash of `FragmentPath`; record active/sub state beside the restart-sensitive
+fields. A missing or misnamed unit fails the load-state gate.
 
 From the release operator checkout, with its configured verification environment, run the
 authoritative gateway verification at each phase as required by the approved procedure:
 
 ```sh
+set -euo pipefail
 scripts/deploy-gateway.sh verify
 ```
 
@@ -312,12 +328,14 @@ backup record to restore the exact previous state. A failed `apply` may already 
 image config and worker link, so treat its backup as the only baseline and do not retry an apply
 that would replace or obscure it:
 
-1. verify that the previous image digest is still preloaded;
+1. from `/`, verify that the previous image digest is still preloaded in the dedicated rootless store;
 2. restore the previous `/etc/gille-build.json` image identity;
 3. restore the previous worker release and `/usr/local/libexec/m5-build-worker` identity;
 4. restore the recorded build SSH drop-in, cleanup units, and dedicated slice settings as a
    single owner-approved recovery action; and
-5. rerun the worker preflight and protected-service verification, recording the result.
+5. read back the restored image reference, config hash, worker link target and worker hash, and
+   compare them with the prior record; then rerun preflight from the prior accepted checkout,
+   run one owner-attended offline smoke build, and verify protected services.
 
 The private operations tracker owns the exact recovery command and backup location for the host;
 this document defines the required identities and checks without claiming an installer restore
