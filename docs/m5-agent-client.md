@@ -51,8 +51,9 @@ Version `1.5.1` names the gateway's host-memory refusals and local build refusal
 "Memory refusals and build_run errors" below. Existing MCP bridge processes
 must reconnect/restart to load the new client code; changing the executable on disk does
 not update a running process. A package version check alone is not a harness smoke test.
-Version `1.5.3` adds read-only `m5 build status`/MCP `build_status`, low-space diagnostics,
-and seven-day idle target eviction while preserving older clients' healthy build protocol.
+Version `1.5.3` adds read-only `m5 build status`/MCP `build_status` and consumes low-space
+diagnostics. The separately approved worker rollout enables those status/refusal records and
+seven-day idle target eviction, while preserving older clients' healthy build protocol.
 Version `1.5.2` adds doctor compatibility diagnostics for the gateway's result contract and
 bundled client version. A known mismatch reports `status: "degraded"` and a nonzero doctor exit;
 missing metadata remains an older-gateway `unknown` compatibility result. Doctor never recommends
