@@ -1,5 +1,5 @@
 import { isAbsolute } from "node:path";
-import { runBuild } from "./m5-build.mjs";
+import { getBuildStatus, runBuild } from "./m5-build.mjs";
 import {
   M5ClientError,
   classifyAskRefusal,
@@ -39,7 +39,7 @@ function isAdoptionReport(message) {
 }
 
 const BUILD_CODES = new Set([
-  "build_macos_only", "build_invalid_request", "build_timeout", "build_worker_failure", "build_protocol_error",
+  "build_capacity_low", "build_macos_only", "build_invalid_request", "build_timeout", "build_worker_failure", "build_protocol_error",
 ]);
 const BUILD_FAILED_MESSAGE =
   "The local build client could not run this build. Run the same command with `m5 build` in a terminal to see the reason.";
@@ -200,7 +200,7 @@ function validMessage(message) {
   );
 }
 
-export function createMcpStdioBridge({ client, profile, adoptionSpool = createFileAdoptionSpool(), buildConfig, buildRunner = runBuild }) {
+export function createMcpStdioBridge({ client, profile, adoptionSpool = createFileAdoptionSpool(), buildConfig, buildRunner = runBuild, buildStatusRunner = getBuildStatus }) {
   return Object.freeze({
     async handleLine(line) {
       let message;
@@ -216,7 +216,22 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
       let resultRetryAttempted = false;
       try {
         let response;
-        if (message.method === "tools/call" && message.params?.name === "build_run") {
+        if (message.method === "tools/call" && message.params?.name === "build_status") {
+          if (notification) return null;
+          if (!buildConfig) throw new M5ClientError("build_unavailable", "Local build is not configured.");
+          const args = message.params.arguments ?? {};
+          if (typeof args !== "object" || args === null || Array.isArray(args) || Object.keys(args).length) {
+            throw new M5ClientError("invalid_args", "build_status accepts no arguments.");
+          }
+          let capacity;
+          try { capacity = await buildStatusRunner({ config: buildConfig }); }
+          catch (error) {
+            if (error?.buildCode === "build_timeout") throw new M5ClientError("build_timeout", "Remote build status timed out; check dedicated worker availability.");
+            if (error?.buildCode === "build_protocol_error") throw new M5ClientError("build_protocol_error", "Invalid remote build status protocol; verify dedicated worker provisioning.");
+            throw new M5ClientError("build_failed", "Build capacity status unavailable; verify dedicated worker provisioning.");
+          }
+          response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(capacity) }], isError: false } };
+        } else if (message.method === "tools/call" && message.params?.name === "build_run") {
           if (notification) return null;
           if (!buildConfig) throw new M5ClientError("build_unavailable", "Local build is not configured.");
           const args = message.params.arguments;
@@ -271,6 +286,13 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
               command: { type: "array", items: { type: "string" }, description: "Literal command argv." },
               toolchain: { type: "string" }, pull: { type: "array", items: { type: "string" } },
             } },
+          }];
+        }
+        if (message.method === "tools/list" && buildConfig && response?.result?.tools && !response.result.tools.some(tool => tool.name === "build_status")) {
+          response.result.tools = [...response.result.tools, {
+            name: "build_status",
+            description: "Read-only build filesystem capacity; no snapshot, build or cleanup.",
+            inputSchema: { type: "object", properties: {}, additionalProperties: false },
           }];
         }
         return JSON.stringify(response);

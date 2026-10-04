@@ -188,3 +188,9 @@ for the profile schema, Keychain account mapping, structured code commands, `cla
 installation/versioning contract, and security boundary. The server-side cage and diff-only result
 are authoritative; the client never applies a returned diff. See the [remote build guide](../docs/m5-remote-build.md)
 for the optional local MCP `build_run` tool and dedicated-worker contract.
+
+`m5 build status` and the optional local MCP `build_status` expose content-free filesystem
+capacity without a worktree snapshot or gateway credential. Inspect free bytes against the
+reported warning threshold before a large build. New builds below the reported minimum fail
+with `build_capacity_low`; idle target directories are reclaimable after seven days, while
+whole idle worktrees retain the fourteen-day policy. See the [build guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-remote-build.md).

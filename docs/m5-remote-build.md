@@ -6,6 +6,7 @@ Run Linux-compatible checks on the M5 without gateway credentials or GPU inferen
 m5 build -- cargo clippy --workspace --all-targets -- -D warnings
 m5 build -- cargo test -p sagascript-core -p sagascript-cli
 m5 build -- npm test
+m5 build status
 m5 build --toolchain 1.99.0 -- cargo check --workspace
 m5 build --pull reports/test.xml -- npm test
 ```
@@ -147,9 +148,24 @@ run three distinct worktrees concurrently, and record before/during/after gatewa
 protected unit identity/health and OOM counters. Stop on any anomaly. Exact host facts and receipts
 belong in the private operations tracker; publish only sanitized reusable evidence.
 
-The daily timer removes only idle worktree source/target directories older than 14 days, under
-locks; caches and lock files remain. The separate filesystem provides a hard capacity boundary;
+The daily timer and build-start cleanup reclaim idle worktree `target` directories after
+7 days and the whole idle worktree after 14 days, under the same per-worktree/build-slot
+locks. Source snapshots remain until day 14; per-repository dependency caches and lock files
+remain. Active builds, recent trees and missing/future usage stamps are never evicted.
+There is no automatic disk-pressure eviction of recent work; removing it needs scoped approval. The separate filesystem provides a hard capacity boundary;
 new jobs refuse <1 GiB free. To roll back, disable only dedicated build SSH access, drain/stop its
 own containers and restore the recorded root configs/pointer and dedicated slice settings with
 an approved exact recovery command. Keep production services and caches untouched. Account,
 filesystem, key, image, branch and worktree deletion each require scoped cleanup approval.
+
+### Build capacity status
+
+`m5 build status` reports total, used and free bytes, a UTC observation time, the 1 GiB
+admission floor and an 8 GiB early-warning threshold. It uses the dedicated build connection
+without a shell, source snapshot, gateway credentials, inference, cleanup or cache warming,
+and works even below the admission floor. With local build configuration, MCP advertises
+`build_status` with the same content-free result. Compare `free_bytes` with
+`warning_free_bytes` before launching a large build; the warning is advisory, not a storage
+reservation. A low-space build refusal uses `build_capacity_low` and reports observed free,
+total and required bytes. Existing workers remain usable for builds without capacity records;
+status against an old worker fails explicitly until the separately approved worker upgrade.

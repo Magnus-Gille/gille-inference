@@ -34,6 +34,10 @@ WALL_SECONDS = 1800
 ROOT = Path('/var/lib/gille-build')
 CONFIG = Path('/etc/gille-build.json')
 USER = 'gille-build'
+MINIMUM_FREE_BYTES = 1024 ** 3
+WARNING_FREE_BYTES = 8 * 1024 ** 3
+MAX_CAPACITY_VALUE = (1 << 53) - 1
+MAX_FILESYSTEM_BYTES = 64 * 1024 ** 3
 
 
 class BuildError(Exception):
@@ -87,14 +91,15 @@ def validate_request(value):
     return value
 
 
-def read_request(stream):
-    line = stream.readline(8193)
-    if len(line) > 8192 or not line.endswith(b'\n'):
-        raise BuildError('Missing or oversized build header.')
-    try:
-        request = validate_request(json.loads(line))
-    except (ValueError, UnicodeError) as exc:
-        raise BuildError('Invalid build header JSON.') from exc
+def read_request(stream, first_line=None):
+    if first_line is None:
+        first_line, value = read_header_line(stream)
+    else:
+        try:
+            value = json.loads(first_line)
+        except (ValueError, UnicodeError) as exc:
+            raise BuildError('Invalid build header JSON.') from exc
+    request = validate_request(value)
     payload = tempfile.TemporaryFile()
     try:
         remaining = request['archive_bytes']
@@ -205,7 +210,24 @@ def validate_runtime_info(info):
         raise BuildError('Rootless Podman with systemd cgroup v2 is required; no unsafe fallback.')
 
 
-def load_config():
+def observe_capacity():
+    usage = shutil.disk_usage(ROOT)
+    values = (usage.total, usage.used, usage.free)
+    if any(type(value) is not int or value < 0 or value > MAX_CAPACITY_VALUE for value in values):
+        raise BuildError('Build filesystem capacity observation is invalid.')
+    if usage.used > usage.total or usage.free > usage.total:
+        raise BuildError('Build filesystem capacity observation is inconsistent.')
+    return {
+        'total_bytes': usage.total,
+        'used_bytes': usage.used,
+        'free_bytes': usage.free,
+        'minimum_free_bytes': MINIMUM_FREE_BYTES,
+        'warning_free_bytes': WARNING_FREE_BYTES,
+        'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+
+
+def load_config(*, check_capacity=True, create_root=True):
     info = CONFIG.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
         raise BuildError('Build config must be root-owned and not group/world-writable.')
@@ -221,12 +243,20 @@ def load_config():
     account = pwd.getpwnam(USER)
     if os.getuid() == 0 or os.getuid() != account.pw_uid or Path(account.pw_dir) != ROOT:
         raise BuildError('Worker must run only as the dedicated unprivileged build account.')
-    private_directory(ROOT)
+    if create_root:
+        private_directory(ROOT)
+    else:
+        root_info = ROOT.lstat()
+        if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != account.pw_uid or root_info.st_mode & 0o077:
+            raise BuildError('Build state ownership or permissions are unsafe.')
     if not os.path.ismount(ROOT):
         raise BuildError('Build home must be a separate capacity-bounded filesystem.')
-    usage = shutil.disk_usage(ROOT)
-    if usage.total > 64 * 1024**3 or usage.free < 1024**3:
-        raise BuildError('Build filesystem must be at most 64 GiB with at least 1 GiB free.')
+    if check_capacity:
+        capacity = observe_capacity()
+        if capacity['total_bytes'] > MAX_FILESYSTEM_BYTES:
+            raise BuildError('Build filesystem must be at most 64 GiB.')
+        if capacity['free_bytes'] < MINIMUM_FREE_BYTES:
+            raise BuildError('Build filesystem must be at most 64 GiB with at least 1 GiB free.')
     return value
 
 
@@ -268,6 +298,29 @@ def container_command(config, repo, name, request):
 def emit(kind, **fields):
     sys.stdout.write(json.dumps(dict(type=kind, **fields), separators=(',', ':')) + '\n')
     sys.stdout.flush()
+
+
+def read_header_line(stream):
+    line = stream.readline(8193)
+    if len(line) > 8192 or not line.endswith(b'\n'):
+        raise BuildError('Missing or oversized build header.')
+    try:
+        return line, json.loads(line)
+    except (ValueError, UnicodeError) as exc:
+        raise BuildError('Invalid build header JSON.') from exc
+
+
+def read_status_request(stream, value):
+    if (not isinstance(value, dict) or set(value) != {'version', 'operation'}
+            or value.get('version') != 1 or isinstance(value.get('version'), bool)
+            or value.get('operation') != 'status'):
+        raise BuildError('Invalid status protocol request.')
+    if stream.read(1):
+        raise BuildError('Unexpected bytes after status request.')
+
+
+def is_status_request(value):
+    return isinstance(value, dict) and 'operation' in value
 
 
 def stop_container(config, name, env):
@@ -371,8 +424,8 @@ def remove_tree(path):
         shutil.rmtree(path)
 
 
-def cleanup_stale(state, age=14 * 86400):
-    """No cache/lock deletion; only old idle hashed worktree source/target dirs."""
+def cleanup_stale(state, age=14 * 86400, target_age=7 * 86400):
+    """Reclaim idle targets after 7 days, whole trees after 14; keep caches/locks."""
     repos = state / 'repos'
     if not repos.exists():
         return
@@ -389,12 +442,15 @@ def cleanup_stale(state, age=14 * 86400):
             if not re.fullmatch('[a-f0-9]{64}', tree.name) or tree.is_symlink():
                 raise BuildError('Unexpected build worktree state; cleanup refused.')
             stamp = tree / '.last-used'
-            if not stamp.exists() or stamp.is_symlink() or now - stamp.stat().st_mtime < age:
+            if not stamp.exists() or stamp.is_symlink() or now - stamp.stat().st_mtime < min(age, target_age):
                 continue
             try:
                 with job_locks(state / 'locks', tree.name):
-                    if now - stamp.stat().st_mtime >= age:
+                    idle = now - stamp.stat().st_mtime
+                    if idle >= age:
                         remove_tree(tree)
+                    elif idle >= target_age:
+                        remove_tree(tree / 'target')
             except BuildError as exc:
                 if str(exc) not in ('This worktree already has a build; retry after it finishes.',
                                     'All three build slots are busy; retry later.'):
@@ -457,16 +513,34 @@ def main():
             fcntl.flock(install_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise BuildError('Build worker upgrade in progress; retry later.') from exc
-        config = load_config()
         # SSH_ORIGINAL_COMMAND is NEVER evaluated. Only the root-owned timer may
         # select cleanup via the actual launcher's argv; ssh forced command has
         # no arguments irrespective of what the caller asked SSH to execute.
         if sys.argv[1:] == ['--cleanup']:
+            config = load_config()
             cleanup_stale(private_directory(ROOT / 'state'))
             return 0
         if sys.argv[1:]:
             raise BuildError('This worker accepts only its framed stdin protocol.')
-        request, payload = read_request(sys.stdin.buffer)
+        header_line, header = read_header_line(sys.stdin.buffer)
+        if is_status_request(header):
+            read_status_request(sys.stdin.buffer, header)
+            load_config(check_capacity=False, create_root=False)
+            capacity = observe_capacity()
+            if capacity['total_bytes'] > MAX_FILESYSTEM_BYTES:
+                raise BuildError('Build filesystem must be at most 64 GiB.')
+            emit('capacity', **capacity)
+            emit('exit', code=0)
+            return 0
+        config = load_config(check_capacity=False)
+        capacity = observe_capacity()
+        if capacity['total_bytes'] > MAX_FILESYSTEM_BYTES:
+            raise BuildError('Build filesystem must be at most 64 GiB.')
+        emit('capacity', **capacity)
+        if capacity['free_bytes'] < MINIMUM_FREE_BYTES:
+            emit('error', code=125, diagnostic_code='build_capacity_low', capacity=capacity)
+            return 125
+        request, payload = read_request(sys.stdin.buffer, first_line=header_line)
         with payload:
             code = execute(request, payload, config)
         emit('exit', code=code)

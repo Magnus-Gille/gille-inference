@@ -23,7 +23,7 @@ import {
 } from "./m5-client.mjs";
 import { provisionProfile } from "./m5-provision.mjs";
 import { createMcpStdioBridge, runMcpStdioBridge } from "./m5-stdio-bridge.mjs";
-import { loadBuildConfig, parseBuildArgs, runBuild } from "./m5-build.mjs";
+import { getBuildStatus, loadBuildConfig, parseBuildArgs, runBuild } from "./m5-build.mjs";
 
 const MAX_STDIN_BYTES = 3 * 1024 * 1024;
 
@@ -234,6 +234,7 @@ function help() {
     name: "m5",
     version: M5_CLIENT_VERSION,
     usage: [
+      "m5 build status",
       "m5 build [--pull relative/file] [--toolchain version] -- command args",
       "m5 --profile <claude|codex> doctor [--check-latest]",
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
@@ -283,11 +284,17 @@ export async function main(
     bridgeRunner = runMcpStdioBridge,
     provisioner = provisionProfile,
     buildRunner = runBuild,
+    buildStatusRunner = getBuildStatus,
   } = {},
 ) {
   let selectedProfileName;
   try {
     if (argv[0] === "build") {
+      if (argv[1] === "status") {
+        if (argv.length !== 2) throw new M5ClientError("invalid_args", "m5 build status accepts no arguments.");
+        writeJson(output, await buildStatusRunner());
+        return 0;
+      }
       const parsed = parseBuildArgs(argv.slice(1));
       const result = await buildRunner({ ...parsed, stdout: output, stderr: error });
       return result.exit_code;
