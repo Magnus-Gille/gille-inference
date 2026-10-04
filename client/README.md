@@ -15,12 +15,21 @@ Requires Node 18+ (uses built-in `fetch`). No external dependencies.
 ### Owner-client 1.5.x compatibility
 
 The 1.5.x `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
-Its doctor reports MCP catalogue reachability without calling metered inference; bridge errors
+Its doctor reports MCP catalogue reachability without calling metered inference and checks the
+installed client against the gateway's advertised result contract; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
 interchangeable. Restart/reconnect long-lived MCP bridge processes after installing the
 accepted package. The `hs` friend-facing API is unchanged. Publication, installation, and
 gateway deployment are separate operations; source documentation does not prove any occurred.
+
+`m5 doctor` keeps older gateways with missing compatibility metadata in the existing reachability
+status, while a known contract or version mismatch reports `status: "degraded"` and exits nonzero.
+It includes only validated gateway revision, client version, and result contract fields. Use
+`m5 --profile <name> doctor --check-latest` only when an explicit registry check is needed; this
+uses the fixed public npm endpoint and does not send credentials. An upgrade recommendation names
+the exact gateway client pin and the installed rollback pin, but has no executable install command
+until the registry check confirms that the gateway pin is published.
 
 ## Install
 

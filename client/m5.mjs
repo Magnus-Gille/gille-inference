@@ -64,6 +64,7 @@ function parseGlobalArgs(argv) {
   let sshTarget;
   let authHelper;
   let timeoutMsRaw;
+  let checkLatest = false;
   const positional = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -125,6 +126,11 @@ function parseGlobalArgs(argv) {
       }
       timeoutMsRaw = value;
       index += 1;
+    } else if (arg === "--check-latest") {
+      if (checkLatest) {
+        throw new M5ClientError("invalid_args", "--check-latest may be specified only once.");
+      }
+      checkLatest = true;
     } else if (arg === "--help" || arg === "-h") {
       positional.push("help");
     } else if (arg === "--version" || arg === "-v") {
@@ -142,6 +148,7 @@ function parseGlobalArgs(argv) {
     sshTarget,
     authHelper,
     timeoutMsRaw,
+    checkLatest,
   };
 }
 
@@ -228,7 +235,7 @@ function help() {
     version: M5_CLIENT_VERSION,
     usage: [
       "m5 build [--pull relative/file] [--toolchain version] -- command args",
-      "m5 --profile <claude|codex> doctor",
+      "m5 --profile <claude|codex> doctor [--check-latest]",
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
@@ -294,6 +301,7 @@ export async function main(
       sshTarget,
       authHelper,
       timeoutMsRaw,
+      checkLatest,
     } = parseGlobalArgs(argv);
     selectedProfileName = profile;
     const command = positional[0];
@@ -304,6 +312,9 @@ export async function main(
         "invalid_args",
         "--timeout-ms is only valid with ask.",
       );
+    }
+    if (checkLatest && command !== "doctor") {
+      throw new M5ClientError("invalid_args", "--check-latest is only valid with doctor.");
     }
     const askTimeoutMs =
       timeoutMsRaw === undefined ? M5_ASK_TIMEOUT_MS_DEFAULT : parseAskTimeoutMs(timeoutMsRaw);
@@ -383,6 +394,7 @@ export async function main(
         profileConfig,
         credentialStore,
         fetch: fetchImpl,
+        checkLatest,
       });
       writeJson(output, result);
       return result.status === "mcp_reachable" ? 0 : 1;

@@ -686,7 +686,10 @@ probe_capability() {
     echo "ERROR: \$$key_env is not set — cannot run the authenticated capability probe." >&2
     return 1
   fi
-  code="$(curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${key}" "$url" 2>/dev/null || true)"
+  # curl argv is visible to local processes. Supply the header via stdin, not -H text.
+  # Reject line breaks rather than allowing an environment value to add extra headers.
+  case "$key" in *$'\r'*|*$'\n'*) echo "ERROR: invalid capability bearer format." >&2; return 1 ;; esac
+  code="$(printf 'Authorization: Bearer %s\n' "$key" | curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' -H @- "$url" 2>/dev/null || true)"
   if [ "$code" != "200" ]; then
     echo "ERROR: authenticated capability probe returned HTTP ${code:-<no response>}." >&2
     return 1

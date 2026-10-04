@@ -369,7 +369,7 @@ describe("m5 doctor model-discovery diagnostics", () => {
     expect(result).toMatchObject({
       status: "mcp_reachable",
       health_scope: "mcp_catalogue_only",
-      client_version: "1.5.1",
+      client_version: "1.5.2",
       profile: "codex",
       credential: "present",
       model_discovery: { public: "available", private: "available" },

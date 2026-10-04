@@ -279,7 +279,7 @@ const CODE_LOOP_OWNER_INSTRUCTIONS =
  * owner-content/privacy boundary; agent or admin scope supplies route authority. Implicit-admin,
  * legacy static admins (both keyHash === null), inference scope, and guests are excluded.
  */
-function isCodeLoopOwner(principal: McpPrincipal): boolean {
+export function isCodeLoopOwner(principal: McpPrincipal): boolean {
   return (
     principal.tier === "owner"
     && principal.keyHash !== null

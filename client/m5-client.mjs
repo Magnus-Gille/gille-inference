@@ -4,7 +4,7 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.5.1";
+export const M5_CLIENT_VERSION = "1.5.2";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
 // the word of a remote peer.
 const MAX_RETRY_AFTER_SECONDS = 86_400;
@@ -15,6 +15,20 @@ export const M5_ASK_TIMEOUT_MS_DEFAULT = 30_000;
 export const M5_ASK_TIMEOUT_MS_MIN = 1_000;
 export const M5_ASK_TIMEOUT_MS_MAX = 600_000;
 const CODE_LOOP_RESULT_HARNESS_VERSION = "code-loop-pi-2026-09-05-v9";
+const CODE_LOOP_RESULT_CONTRACT_PREFIX = CODE_LOOP_RESULT_HARNESS_VERSION.replace(/-v\d+$/, "");
+const STABLE_SEMVER_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+const GATEWAY_REVISION_PATTERN = /^[0-9a-f]{40}$/i;
+const GATEWAY_CONTRACT_PATTERN = /^code-loop-pi-2026-09-05-v(?:0|[1-9]\d{0,5})$/;
+const GATEWAY_COMPATIBILITY_VALUES = new Set([
+  "ok",
+  "client_outdated",
+  "gateway_outdated",
+  "incompatible",
+  "unknown",
+]);
+const REGISTRY_LATEST_URL = "https://registry.npmjs.org/gille-inference/latest";
+const REGISTRY_CHECK_TIMEOUT_MS = 3_000;
+const REGISTRY_MAX_BODY_BYTES = 16 * 1024;
 const CODE_LOOP_RESULT_SCOPE_CAPABILITY = "writable-v1";
 const CODE_LOOP_COMPLETION_ACCOUNTING_CAPABILITY = "bounded-turns-v1";
 const CODE_LOOP_TERMINAL_STATUSES = new Set(["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]);
@@ -2088,6 +2102,7 @@ async function endpointDoctor({
       tier: identity?.tier,
       scope: identity?.scope,
     },
+    gateway_compatibility: classifyGatewayCompatibility(identity),
     tools,
     model_discovery: modelDiscovery,
   };
@@ -2096,6 +2111,190 @@ async function endpointDoctor({
 function modelCatalogueDigest(models) {
   const ids = models.map((model) => model.id).sort();
   return createHash("sha256").update(JSON.stringify(ids)).digest("hex");
+}
+
+function isStableSemver(value) {
+  return typeof value === "string" && value.length <= 32 && STABLE_SEMVER_PATTERN.test(value) &&
+    value.split(".").every(part => Number.isSafeInteger(Number(part)));
+}
+
+function compareStableSemver(left, right) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] > b[index] ? 1 : -1;
+  }
+  return 0;
+}
+
+/**
+ * /portal/me is authenticated gateway metadata, but remains an untrusted wire response.
+ * Keep this closed and locator-free so doctor output cannot become a metadata exfiltration
+ * channel. Invalid fields stay visible as null to distinguish an older gateway from a
+ * gateway that supplied a valid claim.
+ */
+function sanitizeGatewayMetadata(identity) {
+  const gatewayPresent = Boolean(
+    identity && typeof identity === "object" && !Array.isArray(identity) &&
+    Object.prototype.hasOwnProperty.call(identity, "gateway"),
+  );
+  const metadata = gatewayPresent && identity.gateway && typeof identity.gateway === "object" &&
+    !Array.isArray(identity.gateway) ? identity.gateway : {};
+  const revision = typeof metadata.revision === "string" && GATEWAY_REVISION_PATTERN.test(metadata.revision)
+    ? metadata.revision.toLowerCase()
+    : null;
+  const clientVersion = isStableSemver(metadata.client_version) ? metadata.client_version : null;
+  const contractPresent = Object.prototype.hasOwnProperty.call(metadata, "result_contract");
+  const resultContractValid = typeof metadata.result_contract === "string" &&
+    GATEWAY_CONTRACT_PATTERN.test(metadata.result_contract);
+  return {
+    gateway: { revision, client_version: clientVersion, result_contract: resultContractValid ? metadata.result_contract : null },
+    contract_state: gatewayPresent && (!identity.gateway || typeof identity.gateway !== "object" || Array.isArray(identity.gateway)) ? "invalid"
+      : !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
+  };
+}
+
+function classifyGatewayCompatibility(metadata) {
+  const sanitized = sanitizeGatewayMetadata(metadata);
+  const gateway = sanitized.gateway;
+  if (sanitized.contract_state === "absent") return { gateway, compatibility: "unknown" };
+  if (sanitized.contract_state === "invalid") return { gateway, compatibility: "incompatible" };
+  if (gateway.result_contract === CODE_LOOP_RESULT_HARNESS_VERSION) {
+    if (gateway.client_version === null) return { gateway, compatibility: "unknown" };
+    const versionOrder = compareStableSemver(gateway.client_version, M5_CLIENT_VERSION);
+    return {
+      gateway,
+      compatibility: versionOrder > 0
+        ? "client_outdated"
+        : versionOrder < 0
+          ? "gateway_outdated"
+          : "ok",
+    };
+  }
+  const recognized = new RegExp(`^${CODE_LOOP_RESULT_CONTRACT_PREFIX}-v(\\d+)$`).exec(
+    gateway.result_contract,
+  );
+  if (recognized) {
+    const expectedVersion = Number(CODE_LOOP_RESULT_HARNESS_VERSION.match(/-v(\d+)$/)?.[1]);
+    const gatewayVersion = Number(recognized[1]);
+    return {
+      gateway,
+      compatibility: gatewayVersion > expectedVersion ? "client_outdated" : "gateway_outdated",
+    };
+  }
+  return { gateway, compatibility: "incompatible" };
+}
+
+function doctorCompatibilityFields(publicProbe, privateProbe) {
+  const publicCompatibility = publicProbe?.gateway_compatibility ?? { gateway: null, compatibility: "unknown" };
+  const privateCompatibility = privateProbe?.gateway_compatibility ?? { gateway: null, compatibility: "unknown" };
+  return {
+    gateway: {
+      public: publicCompatibility.gateway,
+      private: privateCompatibility.gateway,
+    },
+    compatibility: {
+      public: GATEWAY_COMPATIBILITY_VALUES.has(publicCompatibility.compatibility)
+        ? publicCompatibility.compatibility : "unknown",
+      private: GATEWAY_COMPATIBILITY_VALUES.has(privateCompatibility.compatibility)
+        ? privateCompatibility.compatibility : "unknown",
+    },
+  };
+}
+
+function compatibilityRecommendation(publicProbe, privateProbe, compatibility) {
+  if (!Object.values(compatibility).some((value) => value === "client_outdated" || value === "gateway_outdated")) {
+    return undefined;
+  }
+  if (Object.values(compatibility).some((value) => value === "gateway_outdated" || value === "incompatible")) {
+    return undefined;
+  }
+  const candidates = [publicProbe, privateProbe]
+    .map((probe) => probe?.gateway_compatibility?.gateway?.client_version)
+    .filter(isStableSemver);
+  // Different route pins have no single safe pairing, and reinstalling the current
+  // client cannot repair an independently mismatched result contract.
+  if (
+    candidates.length === 0 ||
+    new Set(candidates).size !== 1 ||
+    compareStableSemver(candidates[0], M5_CLIENT_VERSION) <= 0
+  ) return undefined;
+  return {
+    install: `gille-inference@${candidates[0]}`,
+    rollback_pin: `gille-inference@${M5_CLIENT_VERSION}`,
+    publication: "unverified",
+  };
+}
+
+async function readBoundedRegistryBody(response) {
+  if (response.body?.getReader) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    try {
+      while (text.length <= REGISTRY_MAX_BODY_BYTES) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        text += decoder.decode(chunk.value, { stream: true });
+        if (Buffer.byteLength(text, "utf8") > REGISTRY_MAX_BODY_BYTES) throw new Error("registry_body_too_large");
+      }
+      return text + decoder.decode();
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > REGISTRY_MAX_BODY_BYTES) throw new Error("registry_body_too_large");
+  return text;
+}
+
+async function latestRegistryVersion(fetchImpl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REGISTRY_CHECK_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(REGISTRY_LATEST_URL, {
+      redirect: "error",
+      headers: {
+        accept: "application/json",
+        "user-agent": `m5-cli/${M5_CLIENT_VERSION}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) return { status: "unknown", reason: "registry_http_error" };
+    let parsed;
+    try {
+      parsed = JSON.parse(await readBoundedRegistryBody(response));
+    } catch {
+      return { status: "unknown", reason: "invalid_registry_response" };
+    }
+    if (!isStableSemver(parsed?.version)) return { status: "unknown", reason: "invalid_registry_response" };
+    return { status: "available", version: parsed.version };
+  } catch {
+    return { status: "unknown", reason: "network_failure" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function appendLatestCheck(result, fetchImpl, checkLatest) {
+  if (!checkLatest) return result;
+  const latest = await latestRegistryVersion(fetchImpl);
+  const recommendation = result.recommendation;
+  if (recommendation && latest.status === "available") {
+    const candidate = /^gille-inference@(\d+\.\d+\.\d+)$/.exec(recommendation.install)?.[1];
+    if (candidate && latest.version === candidate) {
+      return {
+        ...result,
+        latest,
+        recommendation: {
+          ...recommendation,
+          publication: "confirmed",
+          command: `npm install --global ${recommendation.install}`,
+        },
+      };
+    }
+  }
+  return { ...result, latest };
 }
 
 function doctorEndpointFailure(error, profile, secrets) {
@@ -2153,6 +2352,8 @@ function doctorCredentialResult({ profile, status, credential, endpoints }) {
       : {}),
     model_discovery: { public: "not_checked", private: "not_checked" },
     inference: { public: "not_checked", private: "not_checked" },
+    gateway: { public: null, private: null },
+    compatibility: { public: "unknown", private: "unknown" },
     endpoints,
   });
 }
@@ -2163,6 +2364,7 @@ function doctorCapabilityFields(
   { publicStatus = "not_checked", privateStatus = "not_checked" } = {},
 ) {
   return {
+    ...doctorCompatibilityFields(publicProbe, privateProbe),
     // `available` means only that the content-free model catalogue was returned. It is not
     // an inference/readiness claim.
     model_discovery: {
@@ -2174,7 +2376,13 @@ function doctorCapabilityFields(
   };
 }
 
-export async function diagnoseProfile({
+export async function diagnoseProfile(options) {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const result = await diagnoseProfileCore(options);
+  return appendLatestCheck(result, fetchImpl, options.checkLatest === true);
+}
+
+async function diagnoseProfileCore({
   profile,
   profileConfig,
   credentialStore = createKeychainCredentialStore(),
@@ -2310,13 +2518,23 @@ export async function diagnoseProfile({
   }
 
   if (!config.privateGatewayUrl) {
-    return safeDoctorResult({
-      status: "mcp_reachable",
+    const compatibilityFields = doctorCompatibilityFields(publicProbe, null);
+    const recommendation = compatibilityRecommendation(
+      publicProbe,
+      null,
+      compatibilityFields.compatibility,
+    );
+    const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
+      .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
+    const result = safeDoctorResult({
+      status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
       profile,
       credential: "present",
       ...doctorCapabilityFields(publicProbe, null),
+      ...(recommendation === undefined ? {} : { recommendation }),
       endpoints: { public: "healthy", private: "not_configured" },
     });
+    return result;
   }
 
   let privateProbe;
@@ -2423,8 +2641,16 @@ export async function diagnoseProfile({
     });
   }
 
-  return safeDoctorResult({
-    status: "mcp_reachable",
+  const compatibilityFields = doctorCompatibilityFields(publicProbe, privateProbe);
+  const recommendation = compatibilityRecommendation(
+    publicProbe,
+    privateProbe,
+    compatibilityFields.compatibility,
+  );
+  const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
+    .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
+  const result = safeDoctorResult({
+    status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
     profile,
     credential: "present",
     identity: {
@@ -2433,6 +2659,8 @@ export async function diagnoseProfile({
     },
     tools: REQUIRED_AGENT_TOOLS,
     ...doctorCapabilityFields(publicProbe, privateProbe),
+    ...(recommendation === undefined ? {} : { recommendation }),
     endpoints: { public: "healthy", private: "healthy" },
   });
+  return result;
 }

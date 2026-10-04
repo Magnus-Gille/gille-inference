@@ -468,6 +468,7 @@ describe("GET /portal/me", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store"); // Fix #7
     const j = (await res.json()) as {
+      gateway?: { revision: string | null; client_version: string | null; result_contract: string };
       alias: string;
       tier: string;
       scope: string;
@@ -482,7 +483,26 @@ describe("GET /portal/me", () => {
     expect(j.creditLimit).toBe(9000);
     expect(j.creditsUsed).toBe(1234);
     expect(j.models).toEqual(["m1"]);
+    expect(j.gateway).toBeUndefined();
     expect(typeof j.rpm).toBe("number");
+  });
+
+  it.each(["agent", "admin"] as const)("advertises release metadata to minted owner %s keys", async (scope) => {
+    const { plaintextKey } = mintKey({ alias: uniq("owner-release"), tier: "owner", scope }, DEFAULTS);
+    const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const j = await res.json() as { gateway: { revision: string | null; client_version: string; result_contract: string } };
+    expect(j.gateway.revision === null || /^[a-f0-9]{40}$/.test(j.gateway.revision)).toBe(true);
+    expect(j.gateway.result_contract).toBe("code-loop-pi-2026-09-05-v9");
+    expect(j.gateway.client_version).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("does not disclose owner metadata to owner inference keys", async () => {
+    const { plaintextKey } = mintKey({ alias: uniq("owner-inference"), tier: "owner", scope: "inference" }, DEFAULTS);
+    const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+    expect(res.status).toBe(200);
+    expect((await res.json() as { gateway?: unknown }).gateway).toBeUndefined();
   });
 
   it("no key → 401 enveloped", async () => {
