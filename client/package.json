@@ -1,6 +1,6 @@
 {
   "name": "gille-inference",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "Dependency-free friend and secret-safe owner-agent clients for Gille Inference.",
   "type": "module",
   "bin": {

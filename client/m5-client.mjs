@@ -4,7 +4,7 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.5.2";
+export const M5_CLIENT_VERSION = "1.5.3";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
 // the word of a remote peer.
 const MAX_RETRY_AFTER_SECONDS = 86_400;
