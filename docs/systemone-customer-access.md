@@ -21,9 +21,8 @@ it is not in the active llama-swap customer catalogue. Datagate's local model se
 Apache-2.0 model package and records the crucial distinction between the current release and
 older published benchmark weights. Bespoke's [public repository](https://github.com/bespokelabsai/nimble)
 reports 74.8% macro agreement over 3,880 human-labelled examples for an *older* checkpoint,
-against 76.0% for Jev. Datagate's later, local 463-case comparison found 349/463 reference
-matches for Nimble and 371/463 for Jev; that is project evidence, not independent public
-validation or a result transferable to customer tasks. The current release has no independently
+against 76.0% for Jev. Datagate's local tests remain exploratory and do not establish customer
+quality. The current release has no independently
 verified Swedish quality or calibration and needs its own durable serving adapter, GPU admission
 integration, and per-customer billing path. Keep it as the second candidate for a separate
 qualification; having weights on M5 does not make it customer-ready.
