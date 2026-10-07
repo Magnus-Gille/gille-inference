@@ -280,6 +280,12 @@
       </tr>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
+      <strong>Typed decisions:</strong> If your key lists <span class="badge mono">clef-flash</span>,
+      Cloudflare&#8217;s 9B decision model is available through
+      <span class="badge mono">POST /v1/systemone</span> for choice, score and yes/no probabilities.
+      It does not generate chat text. Its speed on this box has not yet been published.
+    </p>
+    <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
       Models load on first use and unload after 30&nbsp;min idle. Cold loads are roughly 6&#8211;15s
       for Mellum and up to roughly 40&#8211;70s for the largest models.
@@ -425,6 +431,25 @@
         <p><strong>List models your key can use:</strong></p>
         <pre>curl https://inference.example.com/v1/models \
   -H "Authorization: Bearer $HS_KEY"</pre>
+
+        <p><strong>Typed decision (when <span class="badge mono">clef-flash</span> is in your model list):</strong></p>
+        <pre>curl https://inference.example.com/v1/systemone \
+  -H "Authorization: Bearer $HS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "clef-flash",
+    "state": "Checkout is down for all customers.",
+    "questions": {
+      "urgent": {"type": "noul", "instructions": "Is this urgent?"}
+    }
+  }'</pre>
+        <p>
+          Returns a probability in <span class="badge mono">answers.urgent.noul</span>.
+          You can also ask <span class="badge mono">choice</span> and
+          <span class="badge mono">score</span> questions. Up to 16 questions and 8&nbsp;KiB of
+          text/JSON request data per call; images and streaming are not enabled here. Successful
+          calls use input-token credits. This is a separate endpoint from chat completions.
+        </p>
 
         <p><strong>Learning-task capability preflight (automation clients):</strong></p>
         <pre>curl https://inference.example.com/v1/capabilities/learning-task \
@@ -588,7 +613,7 @@ for chunk in stream:
           <tr><th>Tool</th><th>What it does</th></tr>
           <tr>
             <td><span class="badge mono">list_models</span></td>
-            <td>Returns the models your key may use (same as <span class="badge mono">GET /v1/models</span>), each with a one-line strength hint and the current content-blind <span class="badge mono">ask.files</span> discovery state.</td>
+            <td>Returns the chat models your key may use with <span class="badge mono">ask</span>, each with a one-line strength hint and the current content-blind <span class="badge mono">ask.files</span> discovery state. Decision models use the HTTP API above.</td>
           </tr>
           <tr>
             <td><span class="badge mono">ask</span></td>

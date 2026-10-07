@@ -27,6 +27,7 @@ import { pathToFileURL } from "node:url";
 import {
   PROMOTION_DEFAULTS,
   applyManualPromotion,
+  manualWarmupRequest,
   parseManualSpec,
   renderManualEntry,
   type PromotionCommandResult,
@@ -119,13 +120,23 @@ async function main(): Promise<void> {
       return (data.data ?? []).map((m) => m.id);
     },
     warmupModel: async (modelId) => {
-      const resp = await fetch(`${LLAMASWAP_URL}/v1/chat/completions`, {
+      const systemOne = spec.api === "systemone";
+      const warmup = manualWarmupRequest(spec, modelId);
+      const resp = await fetch(`${LLAMASWAP_URL}${warmup.path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+        body: JSON.stringify(warmup.body),
         signal: AbortSignal.timeout(180_000),
       });
       if (!resp.ok) throw new Error(`warm-up HTTP ${resp.status}`);
+      if (systemOne) {
+        const body = await resp.json() as { answers?: { greeting?: { noul?: unknown } } };
+        const probability = body.answers?.greeting?.noul;
+        if (typeof probability !== "number" || !Number.isFinite(probability) ||
+          probability < 0 || probability > 1) {
+          throw new Error("System One warm-up returned no greeting probability");
+        }
+      }
     },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => new Date(),

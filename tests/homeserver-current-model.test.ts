@@ -69,4 +69,10 @@ describe("currentModel — resolves via the configured backend (llamaswap)", () 
     expect(runningHits).toBe(0); // override returns early — no backend query at all
     expect(lmStudioRestHits).toBe(0);
   });
+
+  it("never selects a configured decision model for chat delegation", async () => {
+    setConfig({ backend: "llamaswap", lmStudioBaseUrl: `http://127.0.0.1:${port}/v1` });
+    expect(await currentModel(undefined, ["test-model"])).toBeNull();
+    expect(await currentModel("test-model", ["test-model"])).toBeNull();
+  });
 });

@@ -10,7 +10,7 @@ import {
   getRunningSnapshot,
   RunningSnapshotUnavailableError,
 } from "./model-admin.js";
-import { delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
+import { currentModel, delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
@@ -81,6 +81,8 @@ import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCa
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
+import { parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
+  validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
 import {
   startImageWorker,
@@ -1189,6 +1191,84 @@ function estimatePromptTokens(rawBody: string): number {
 
 /** A metered result that charges nothing (errored / non-2xx upstream). */
 const ZERO_RESULT: MeteredResult = { totalTokens: 0, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
+
+async function handleSystemOneProxy(
+  req: SystemOneRequest,
+  res: ServerResponse,
+  cfg: HomeserverConfig,
+  lctx: LogCtx,
+  memoryDeps: HostMemoryAdmissionDeps,
+): Promise<MeteredResult> {
+  if (cfg.backend !== "llamaswap" || !cfg.systemOneModels.includes(req.model)) {
+    lctx.status = 400;
+    lctx.outcome = "bad_request";
+    lctx.errorClass = "model_not_found";
+    sendError(res, makeError("model_not_found", { param: "model" }));
+    return modelNotFoundResult();
+  }
+  const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, req.model, memoryDeps, req.model);
+  if (memoryRejection !== null) {
+    lctx.status = 503;
+    lctx.outcome = "memory_refused";
+    lctx.errorClass = memoryRejection.code;
+    if (memoryRejection.retryAfterSeconds !== null) lctx.retryAfterS = memoryRejection.retryAfterSeconds;
+    sendError(res, makeError(memoryRejection.code, {
+      message: memoryRejection.message,
+      ...(memoryRejection.retryAfterSeconds !== null
+        ? { retryAfterSeconds: memoryRejection.retryAfterSeconds }
+        : {}),
+    }));
+    return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: memoryRejection.code };
+  }
+  const clientGone = new AbortController();
+  let clientAborted = false;
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientAborted = true;
+      clientGone.abort();
+    }
+  });
+  try {
+    const upstream = await fetch(`${cfg.lmStudioBaseUrl}/systemone`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
+      body: JSON.stringify(req.body),
+      signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
+    });
+    // Never forward an upstream error body: it may contain local model paths or runtime details.
+    if (!upstream.ok) {
+      lctx.status = upstream.status === 404 ? 400 : 502;
+      lctx.outcome = upstream.status === 404 ? "bad_request" : "upstream_unavailable";
+      lctx.errorClass = upstream.status === 404 ? "model_not_found" : "upstream_unavailable";
+      sendError(res, makeError(upstream.status === 404 ? "model_not_found" : "upstream_unavailable"));
+      return ZERO_RESULT;
+    }
+    const payload = await upstream.json() as unknown;
+    const inputTokens = validateSystemOneResponse(payload, req);
+    sendJson(res, 200, payload);
+    lctx.status = 200;
+    lctx.outcome = "ok";
+    return { totalTokens: inputTokens, promptTokens: inputTokens, completionTokens: 0,
+      canonicalModel: req.model, ttftMs: null };
+  } catch (err) {
+    if (clientAborted) {
+      lctx.status = 499;
+      lctx.outcome = "client_closed";
+      lctx.errorClass = "client_closed";
+      return ZERO_RESULT;
+    }
+    const kind = classifyUpstreamError(err);
+    if (kind !== "upstream_timeout" && kind !== "upstream_unavailable" &&
+      !(err instanceof SyntaxError) && !(err instanceof SystemOneResponseError)) throw err;
+    lctx.status = kind === "upstream_timeout" ? 504 : 502;
+    lctx.outcome = kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable";
+    lctx.errorClass = lctx.outcome;
+    sendError(res, makeError(kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable", {
+      ...(kind === "upstream_timeout" ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {}),
+    }));
+    return ZERO_RESULT;
+  }
+}
 
 function modelNotFoundResult(): MeteredResult {
   return {
@@ -4628,9 +4708,56 @@ export async function handleRequest(
     }
 
     // ─── Inference surface (through the spine) ───
+    if (path === "/v1/systemone" && method === "POST") {
+      res.setHeader("Cache-Control", "no-store");
+      const raw = await readBody(req, 8 * 1024);
+      let parsed: SystemOneRequest;
+      try {
+        parsed = parseSystemOneBody(raw);
+      } catch (err) {
+        if (!(err instanceof SystemOneRequestError)) throw err;
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: err.param, message: err.message }));
+        return;
+      }
+      lctx.model = cfg.systemOneModels.includes(parsed.model) ? parsed.model : "unknown";
+      // Clef uses one shared prompt; other decision models may use one prompt per question.
+      // Reserve full context(s); reconcile exact successful usage after the call.
+      const estimatedTokens = systemOneTokenReservation(parsed);
+      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, estimatedTokens, lctx,
+        () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps));
+      return;
+    }
     if (path === "/v1/chat/completions" && method === "POST") {
       const raw = await readBody(req);
       const parsed = parseChatBody(raw);
+      if (parsed.model === null && principal.modelAllowList.length === 0 &&
+        cfg.systemOneModels.length > 0 && parsed.node !== "orin") {
+        let chatModel: string | undefined | null = await currentModel(undefined, cfg.systemOneModels);
+        if (chatModel === null) {
+          try {
+            chatModel = (await listModels()).find((candidate) => !cfg.systemOneModels.includes(candidate.key))?.key;
+          } catch {
+            chatModel = null;
+          }
+        }
+        if (chatModel === undefined || chatModel === null) {
+          lctx.status = 503; lctx.outcome = "upstream_unavailable"; lctx.errorClass = "upstream_unavailable";
+          sendError(res, makeError("upstream_unavailable"));
+          return;
+        }
+        parsed.model = chatModel;
+        parsed.obj["model"] = chatModel;
+      }
+      if (parsed.model !== null && cfg.systemOneModels.includes(parsed.model)) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", {
+          param: "model", message: "Decision models use POST /v1/systemone.",
+        }));
+        return;
+      }
       if (parsed.node !== undefined && !isComputeNodeId(parsed.node)) {
         lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
         sendError(res, makeError("invalid_request_error", { param: "node", message: "'node' must be 'm5' or 'orin'." }));
@@ -4909,7 +5036,10 @@ export async function handleRequest(
       const all = await listModels();
       const allow = principal.modelAllowList;
       const visible = allow.length === 0 ? all : all.filter((m) => allow.includes(m.key));
-      const data = visible.map((m) => ({ id: m.key, object: "model", created: 0, owned_by: "home-gateway" }));
+      const data = visible.map((m) => ({
+        id: m.key, object: "model", created: 0,
+        owned_by: cfg.systemOneModels.includes(m.key) ? "home-gateway-systemone" : "home-gateway",
+      }));
       // Advertise the speech-to-text model alongside the chat models (empty allow-list = visible;
       // otherwise only when the key is permitted the whisper model). So OpenAI SDKs that probe
       // /v1/models can discover the transcription endpoint's model id.

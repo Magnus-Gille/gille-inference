@@ -7,6 +7,7 @@ import {
   modelsIsLastTopLevel,
   parseManualSpec,
   renderManualEntry,
+  manualWarmupRequest,
   type ManualPromotionDeps,
   type ManualServingSpec,
 } from "../src/homeserver/manual-promotion.js";
@@ -63,6 +64,7 @@ describe("manual-promotion spec contract (#217)", () => {
   it("parses a full reviewed spec", () => {
     expect(parseManualSpec(FULL_SPEC_TEXT)).toEqual({
       key: "manual-35b",
+      api: "chat",
       gguf: "/m/manual-35b.Q4_K_M.gguf",
       runtimeBin: "/r/9b05354ec/bin/llama-server",
       ctx: 65536,
@@ -113,6 +115,20 @@ describe("manual-promotion spec contract (#217)", () => {
     expect(renderManualEntry(spec)).toContain("-ngl 0 -ub 512 -c 8192 --jinja -fa off");
     expect(renderManualEntry(spec)).not.toContain("-mm ");
     expect(renderManualEntry(spec)).not.toContain("--spec-type");
+  });
+
+  it("records the System One API for a decision-model warm-up", () => {
+    const spec = parseManualSpec(FULL_SPEC_TEXT.replace("key: manual-35b", "key: clef-flash\napi: systemone"));
+    expect(spec.api).toBe("systemone");
+    expect(renderManualEntry(spec)).toContain('"clef-flash"');
+    expect(manualWarmupRequest(spec, "clef-flash")).toEqual({
+      path: "/v1/systemone",
+      body: { model: "clef-flash", state: "Hello", questions: {
+        greeting: { type: "noul", instructions: "Is this a greeting?" },
+      } },
+    });
+    expect(manualWarmupRequest(parseManualSpec(FULL_SPEC_TEXT), "manual-35b").path)
+      .toBe("/v1/chat/completions");
   });
 
   it.each([
