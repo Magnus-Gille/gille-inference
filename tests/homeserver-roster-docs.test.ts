@@ -40,4 +40,16 @@ describe("production roster documentation", () => {
     expect(portal).not.toContain("promoted automatically");
     expect(readme).not.toContain("weekly Model Scout");
   });
+
+  it("documents Clef as conditionally granted System One access", () => {
+    const clefRosterCopy = readme.match(/The `clef-flash` System One decision model[\s\S]*?automatic delegation[^\n]*\./)?.[0] ?? "";
+
+    expect(clefRosterCopy).toContain("Customer");
+    expect(clefRosterCopy).toContain("explicit grant");
+    expect(clefRosterCopy).toContain("authenticated `GET /v1/models`");
+    expect(clefRosterCopy).toContain("until it appears, it is unavailable");
+    expect(clefRosterCopy).toContain("`POST /v1/systemone`");
+    expect(clefRosterCopy).toContain("near `1` means yes and near `0` means no");
+    expect(clefRosterCopy).toContain("not chat text");
+  });
 });

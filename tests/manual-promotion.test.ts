@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { validateSystemOneWarmupResponse } from "../scripts/promote-manual.js";
@@ -130,6 +131,30 @@ describe("manual-promotion spec contract (#217)", () => {
     });
     expect(manualWarmupRequest(parseManualSpec(FULL_SPEC_TEXT), "manual-35b").path)
       .toBe("/v1/chat/completions");
+  });
+
+  it("keeps the public Clef fixture on the typed System One serving path", () => {
+    const fixture = readFileSync(new URL("../deploy/specs/clef-flash.yaml", import.meta.url), "utf8");
+    const spec = parseManualSpec(fixture);
+
+    expect(spec).toMatchObject({
+      key: "clef-flash",
+      api: "systemone",
+      ctx: 8192,
+      ubatch: 8192,
+      ctk: "f16",
+      ctv: "f16",
+      ttl: 1800,
+    });
+
+    const warmup = manualWarmupRequest(spec, spec.key);
+    expect(warmup).toMatchObject({
+      path: "/v1/systemone",
+      body: {
+        model: "clef-flash",
+        questions: { greeting: { type: "noul" } },
+      },
+    });
   });
 
   it.each([

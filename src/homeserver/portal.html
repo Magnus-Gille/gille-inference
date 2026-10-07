@@ -280,11 +280,15 @@
       </tr>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
-      <strong>Typed decisions:</strong> The gateway supports choice, score and yes/no probabilities
-      through <span class="badge mono">POST /v1/systemone</span>. Cloudflare&#8217;s 9B
-      <span class="badge mono">clef-flash</span> model can be called only when it appears in your
-      authenticated <span class="badge mono">/v1/models</span> list. It does not generate chat text.
-      Its speed on this box has not yet been published.
+      <strong>Typed decisions (separately gated):</strong> Cloudflare&#8217;s 9B
+      <span class="badge mono">clef-flash</span> System One decision model is available to a
+      customer only after its runtime and roster are activated and that customer&#8217;s key receives
+      an explicit grant. Confirm that <span class="badge mono">clef-flash</span> appears in your
+      authenticated <span class="badge mono">/v1/models</span> response before calling
+      <span class="badge mono">POST /v1/systemone</span>; if it is absent, it is not available for
+      your key yet. For a <span class="badge mono">noul</span> question, a probability near
+      <span class="badge mono">1</span> means yes and near <span class="badge mono">0</span> means no.
+      Clef-flash returns typed decisions, not chat text.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
@@ -433,7 +437,7 @@
         <pre>curl https://inference.example.com/v1/models \
   -H "Authorization: Bearer $HS_KEY"</pre>
 
-        <p><strong>Typed decision (when <span class="badge mono">clef-flash</span> is in your model list):</strong></p>
+        <p><strong>Clef-flash System One decision (after explicit activation and model-list check):</strong></p>
         <pre>curl https://inference.example.com/v1/systemone \
   -H "Authorization: Bearer $HS_KEY" \
   -H "Content-Type: application/json" \
@@ -445,9 +449,14 @@
     }
   }'</pre>
         <p>
-          Returns a probability in <span class="badge mono">answers.urgent.noul</span>.
-          You can also ask <span class="badge mono">choice</span> and
-          <span class="badge mono">score</span> questions. Up to 16 questions and 8&nbsp;KiB of
+          Use this only after an authenticated <span class="badge mono">/v1/models</span> response
+          for your explicitly granted key includes <span class="badge mono">clef-flash</span>.
+          If it is missing, your key grant or the runtime/roster activation may still be pending. A
+          <span class="badge mono">noul</span> result near <span class="badge mono">1</span> means yes;
+          near <span class="badge mono">0</span> means no, in
+          <span class="badge mono">answers.urgent.noul</span>. You can also ask
+          <span class="badge mono">choice</span> and <span class="badge mono">score</span> questions.
+          Clef-flash returns typed decisions, not chat text. Up to 16 questions and 8&nbsp;KiB of
           text/JSON request data per call; images and streaming are not enabled here. Successful
           calls use input-token credits. This is a separate endpoint from chat completions.
         </p>
