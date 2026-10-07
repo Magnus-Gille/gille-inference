@@ -295,6 +295,13 @@
       and rate limits. Published benchmark scores do not establish accuracy on your own task.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
+      The existing <span class="badge mono">qwen3-30b-instruct</span> model is for ordinary chat.
+      It is not a native System One
+      decision model. If it appears in your authenticated <span class="badge mono">/v1/models</span>
+      response, use it through <span class="badge mono">POST /v1/chat/completions</span> with your
+      normal credits and rate limits.
+    </p>
+    <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
       Models load on first use and unload after 30&nbsp;min idle. Cold loads are roughly 6&#8211;15s
       for Mellum and up to roughly 40&#8211;70s for the largest models.

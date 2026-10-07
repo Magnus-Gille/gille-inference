@@ -25,6 +25,7 @@ import {
   revokeKey,
   listKeys,
   grantSystemOneModelToKeys,
+  grantExistingChatModelToCustomerKeys,
   redeemInvite,
   reserveCredits,
   reconcileCredits,
@@ -35,6 +36,7 @@ import {
   InvalidParamError,
   InvalidScopeError,
   InvalidSystemOneGrantError,
+  InvalidExistingChatModelGrantError,
   KeyLifetimePolicyError,
   type KeyScope,
   type Tier,
@@ -3585,6 +3587,32 @@ async function handleSystemOneKeyGrant(req: IncomingMessage, res: ServerResponse
   }
 }
 
+async function handleExistingChatKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((key) => key !== "model" && key !== "aliases") ||
+      body["model"] !== "qwen3-30b-instruct" || !Array.isArray(body["aliases"]) ||
+      body["aliases"].length === 0 || body["aliases"].length > 128 ||
+      body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
+    sendError(res, makeError("invalid_request_error", { message: "Require the reviewed Qwen model and 1–128 customer key aliases." }));
+    return;
+  }
+  try {
+    const result = grantExistingChatModelToCustomerKeys(body["aliases"] as string[], body["model"]);
+    sendJson(res, 200, { model: body["model"], ...result });
+  } catch (err) {
+    if (!(err instanceof InvalidExistingChatModelGrantError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Inactive, duplicate, non-customer, or missing key alias." }));
+  }
+}
+
 // ─── Server ──────────────────────────────────────────────────────────────────────────
 
 export interface GatewayHandle {
@@ -5448,6 +5476,14 @@ export async function handleRequest(
     if (path === "/admin/keys/systemone-grants" && method === "POST") {
       if (!requireAdmin()) return;
       await handleSystemOneKeyGrant(req, res);
+      lctx.status = res.statusCode;
+      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/chat-grants" && method === "POST") {
+      if (!requireAdmin()) return;
+      await handleExistingChatKeyGrant(req, res);
       lctx.status = res.statusCode;
       lctx.outcome = res.statusCode < 300 ? "ok" : "error";
       lctx.admission = "n/a";

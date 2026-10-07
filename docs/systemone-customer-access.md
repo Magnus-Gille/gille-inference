@@ -29,6 +29,12 @@ integration, and per-customer billing path. Keep it as the second candidate for 
 qualification; having weights on M5 does not make it customer-ready. The follow-on proposal below
 keeps that qualification boundary explicit.
 
+Datagate also used the already-served `qwen3-30b-instruct` as an ordinary chat model in
+structured-prompt experiments. It is a distinct, existing M5 model, not a trained System One
+decider. Customer access to it uses `/v1/chat/completions` and ordinary credits. An unrestricted
+customer key already has chat access; an exact batch of restricted customer keys can receive this
+ID through `/admin/keys/chat-grants` after live key inventory and review.
+
 Perplexity's 27B decider was initially deferred because its
 [model card](https://huggingface.co/perplexity-ai/pplx-decider-v1-27b) calls for about 49 GiB of
 weights plus working memory and documents CUDA inference. That is a much larger, unverified load

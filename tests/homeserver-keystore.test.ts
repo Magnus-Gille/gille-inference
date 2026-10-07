@@ -6,6 +6,7 @@ import { initDb, getDb } from "../src/db.js";
 import {
   mintKey,
   grantSystemOneModel,
+  grantExistingChatModelToCustomerKeys,
   lookupKey,
   revokeKey,
   listKeys,
@@ -34,6 +35,43 @@ function alias(): string {
 }
 
 describe("keystore mint / lookup", () => {
+  it("atomically adds the existing Qwen chat model only to restricted customer keys", () => {
+    const restricted = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: ["mellum"], creditLimit: 100 }, DEFAULTS);
+    const open = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: [], creditLimit: 200 }, DEFAULTS);
+    const internal = mintKey({ alias: alias(), tier: "owner", scope: "agent", modelAllowList: ["mellum"] }, DEFAULTS);
+    const before = lookupKey(restricted.plaintextKey)!;
+
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, "missing"], "qwen3-30b-instruct"))
+      .toThrow();
+    expect(lookupKey(restricted.plaintextKey)!.modelAllowList).toEqual(["mellum"]);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, internal.record.alias], "qwen3-30b-instruct"))
+      .toThrow();
+    expect(lookupKey(restricted.plaintextKey)!.modelAllowList).toEqual(["mellum"]);
+
+    expect(grantExistingChatModelToCustomerKeys([restricted.record.alias, open.record.alias], "qwen3-30b-instruct"))
+      .toEqual({ changed: [restricted.record.alias], unchanged: [open.record.alias] });
+    expect(grantExistingChatModelToCustomerKeys([restricted.record.alias], "qwen3-30b-instruct"))
+      .toEqual({ changed: [], unchanged: [restricted.record.alias] });
+    const after = lookupKey(restricted.plaintextKey)!;
+    expect(after.modelAllowList).toEqual(["mellum", "qwen3-30b-instruct"]);
+    expect(after.keyHash).toBe(before.keyHash);
+    expect(after.creditLimit).toBe(before.creditLimit);
+    expect(after.creditsUsed).toBe(before.creditsUsed);
+    expect(after.useCount).toBe(before.useCount);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias], "clef-flash")).toThrow();
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, restricted.record.alias], "qwen3-30b-instruct"))
+      .toThrow();
+    const revoked = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: ["mellum"] }, DEFAULTS);
+    revokeKey(revoked.record.alias);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, revoked.record.alias], "qwen3-30b-instruct"))
+      .toThrow();
+    const expiring = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: ["mellum"],
+      ttlSeconds: 3600 }, DEFAULTS);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, expiring.record.alias],
+      "qwen3-30b-instruct", new Date(Date.now() + 7200 * 1000))).toThrow();
+    expect(lookupKey(expiring.plaintextKey)!.modelAllowList).toEqual(["mellum"]);
+  });
+
   it("grants a decision model without changing an existing credential or ordinary model access", () => {
     const key = mintKey({ alias: alias(), tier: "guest", modelAllowList: [], creditLimit: 100 }, DEFAULTS);
     const before = lookupKey(key.plaintextKey)!;
