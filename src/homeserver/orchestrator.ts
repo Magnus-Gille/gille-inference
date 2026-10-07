@@ -30,6 +30,7 @@ import {
   type ShadowLedgerRow,
 } from "./shadow-lane.js";
 import type { HomeserverConfig } from "./config.js";
+import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { recordTaskExposureBestEffort } from "./task-exposure.js";
 import type { HuginRequestStamp } from "./learning-task-contract.js";
 import {
@@ -289,7 +290,7 @@ function maybeScheduleEscalationShadow(
       queueDepth: () => activeDelegations,
       acquireBackground: task.acquireBackground,
       resolveModelId: async () => {
-        const modelId = shadowConfig.model || (await currentModel());
+        const modelId = await currentModel(shadowConfig.model || undefined, cfg.systemOneModels);
         // Only pay for the served-model /running lookup when the original task was stamped — an
         // unstamped task's shadow row stays a null/legacy identity anyway (see `record` below), so
         // there is nothing to join the served fields against.
@@ -587,12 +588,12 @@ export function resolveTaskType(task: { taskType?: string; prompt: string }): st
   return classifyTask(task.prompt).taskType;
 }
 
-/** Get the model id to delegate to: explicit override, else first loaded LLM. */
-export async function currentModel(override?: string): Promise<string | null> {
-  if (override) return override;
+/** Get the model id to delegate to: explicit override, else first eligible loaded LLM. */
+export async function currentModel(override?: string, excludedModels: readonly string[] = []): Promise<string | null> {
+  if (override) return isSystemOneDecisionModel(override, excludedModels) ? null : override;
   try {
     const loaded = await getLoaded();
-    return loaded[0]?.key ?? null;
+    return loaded.find((model) => !isSystemOneDecisionModel(model.key, excludedModels))?.key ?? null;
   } catch (err) {
     // A backend failure (not a genuine "no model loaded") must be visible — silently returning null
     // is exactly what hid the lmstudio-admin /api/v1/models 404 and made the router escalate everything.
@@ -805,7 +806,8 @@ async function delegateImpl(
   }
   const routedModelId = route.kind === "local" ? route.modelId : undefined;
 
-  const modelId = nodeId === "orin" ? cfg.orin.model : await currentModel(task.modelId ?? routedModelId);
+  const modelId = nodeId === "orin" ? cfg.orin.model :
+    await currentModel(task.modelId ?? routedModelId, cfg.systemOneModels);
   if (nodeId === "orin" && (!task.modelId || task.modelId !== cfg.orin.model || !orinAllowsTask(taskType, cfg))) {
     return finishNoLocalEscalation({
       delegated: false,

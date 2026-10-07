@@ -243,6 +243,8 @@ export interface HomeserverConfig {
    * silently reactivate the deprecated adapter.
    */
   backend: "lmstudio" | "llamaswap";
+  /** Explicitly enabled decision-model IDs served through POST /v1/systemone. Empty disables it. */
+  systemOneModels: string[];
   /** Explicit remote small-model backend. Empty URL keeps the gateway M5-only. */
   orin: {
     url: string;
@@ -670,6 +672,7 @@ export function loadConfig(): HomeserverConfig {
     lmStudioBaseUrl: lmBase,
     lmStudioRestUrl: `${origin}/api/v1`,
     backend: (process.env["HOMESERVER_BACKEND"] === "lmstudio" ? "lmstudio" : "llamaswap"),
+    systemOneModels: envList("HOMESERVER_SYSTEMONE_MODELS"),
     orin: {
       // Tailscale address belongs in deployment env, never source. Unset = disabled.
       url: (process.env["HOMESERVER_ORIN_URL"] ?? "").replace(/\/$/, ""),

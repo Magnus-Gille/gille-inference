@@ -1,0 +1,20 @@
+# Reviewed template for one text-only System One decision model. Resolve both paths in the
+# private deployment ticket before promotion; this public file cannot be applied as-is.
+# Source: ggml-org/Clef-Flash-GGUF, Clef-Flash-Q8_0.gguf, Apache-2.0.
+# Source-file SHA256: 8754b06f7d16d6d6ab63493b2ee385cc0ed6abde8c25c39298dc3e1eb05593d9
+# Requires a llama.cpp build with Clef and /v1/systemone (v0.6.0 or later) and
+# llama-swap v262 or later. Keep that runtime isolated from existing model entries.
+key: clef-flash
+api: systemone
+gguf: /operator-resolve/models/Clef-Flash-Q8_0.gguf
+runtime_bin: /operator-resolve/llama.cpp-v0.6.0/bin/llama-server
+ctx: 8192
+ngl: 999
+ubatch: 8192
+np: 1
+jinja: true
+fa: on
+cache_ram_mib: 512
+ctk: f16
+ctv: f16
+ttl: 1800

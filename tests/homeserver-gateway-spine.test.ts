@@ -19,7 +19,7 @@ import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admissi
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "clef-running" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
@@ -54,8 +54,21 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", async () => {
-      if (req.url?.endsWith("/chat/completions")) upstreamInferenceRequestCount += 1;
+      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
+      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "clef-running") && req.url === "/running") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ running: mockMode === "systemone-list" ? [] : [
+          { model: mockMode === "clef-running" ? "clef-flash" : "m1",
+            state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 },
+        ] }));
+        return;
+      }
+      if ((mockMode === "systemone-list" || mockMode === "clef-running") && req.url === "/v1/models") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: "clef-flash" }] }));
+        return;
+      }
       if (mockMode === "notfound") {
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "model not found" } }));
@@ -113,6 +126,14 @@ function startUpstream(): Promise<void> {
             usage: { prompt_tokens: 5, completion_tokens: 64, total_tokens: 69 },
           })
         );
+        return;
+      }
+      if (req.url?.endsWith("/systemone")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          answers: { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
+          usage: { input_tokens: 18, output_tokens: 0 },
+        }));
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -173,11 +194,12 @@ beforeAll(async () => {
   process.env["HOMESERVER_OWNER_QUEUE_MAX_MS"] = "3000";
   process.env["HOMESERVER_BUSY_RETRY_AFTER_S"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
+  process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
   process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] =
-    "m1=60,m2=60,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
+    "m1=60,m2=60,clef-flash=20,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
   process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"] = "7";
   process.env["HOMESERVER_REVIEW_CASCADE"] = "shadow";
   process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] = "gpt-oss-120b";
@@ -293,6 +315,138 @@ async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Prom
 }
 
 describe("gateway spine — HTTP integration", () => {
+  it("serves a configured System One model through guest auth, admission, and exact usage billing", async () => {
+    const minted = mintKey({
+      alias: `systemone-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const body = {
+      model: "clef-flash",
+      state: "The checkout is unavailable for all customers.",
+      questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+    };
+    const call = (payload: unknown, token = minted.plaintextKey) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    const unauthenticated = await fetch(url("/v1/systemone"), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    expect(unauthenticated.status).toBe(401);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const unscopedGuest = mintKey({ alias: `systemone-unscoped-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const unscopedAttempt = await call(body, unscopedGuest.plaintextKey);
+    expect(unscopedAttempt.status).toBe(403);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const denied = await call({ ...body, model: "m1" });
+    expect(denied.status).toBe(403);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const malformed = await call({ ...body, questions: {} });
+    expect(malformed.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const success = await call(body);
+    expect(success.status).toBe(200);
+    expect(await success.json()).toMatchObject({ answers: { urgent: { noul: 0.92 } } });
+    expect(JSON.parse(lastUpstreamBody)).toEqual(body);
+    expect(upstreamInferenceRequestCount).toBe(1);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    const wrongSurface = await chat(minted.plaintextKey, { model: "clef-flash" });
+    expect(wrongSurface.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    mockMode = "error500";
+    const failure = await call(body);
+    expect(failure.status).toBe(502);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    mockMode = "systemone-malformed";
+    const malformedUpstream = await call(body);
+    expect(malformedUpstream.status).toBe(502);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+  });
+
+  it("keeps Clef out of chat when the System One setting is absent", async () => {
+    const cfg = loadConfig();
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      const guest = mintKey({ alias: `systemone-drift-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+      const response = await chat(guest.plaintextKey, { model: "clef-flash" });
+      expect(response.status).toBe(400);
+      expect(upstreamInferenceRequestCount).toBe(0);
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
+  it("does not forward model-less chat to a resident Clef after config loss", async () => {
+    mockMode = "clef-running";
+    const cfg = loadConfig();
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      const guest = mintKey({ alias: `systemone-resident-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+      const response = await chat(guest.plaintextKey, { model: undefined });
+      expect(response.status).toBe(200);
+      expect(JSON.parse(lastUpstreamBody)).toMatchObject({ model: "m1" });
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
+  it("lists Clef only when enabled and explicitly granted to a guest", async () => {
+    mockMode = "systemone-list";
+    const cfg = loadConfig();
+    const unscopedGuest = mintKey({ alias: `systemone-list-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const scopedGuest = mintKey({ alias: `systemone-list-scoped-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["clef-flash"] }, DEFAULTS);
+    const owner = mintKey({ alias: `systemone-list-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin" }, DEFAULTS);
+    const scopedOwner = mintKey({ alias: `systemone-list-scoped-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin", modelAllowList: ["m1"] }, DEFAULTS);
+    const modelsFor = async (token: string): Promise<string[]> => {
+      const response = await fetch(url("/v1/models"), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { data: Array<{ id: string }> };
+      return body.data.map((model) => model.id);
+    };
+    const legacyModelsFor = async (token: string): Promise<string[]> => {
+      const response = await fetch(url("/models"), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { models: Array<{ key: string }> };
+      return body.models.map((model) => model.key);
+    };
+    expect(await modelsFor(unscopedGuest.plaintextKey)).not.toContain("clef-flash");
+    expect(await legacyModelsFor(unscopedGuest.plaintextKey)).not.toContain("clef-flash");
+    expect(await modelsFor(scopedGuest.plaintextKey)).toContain("clef-flash");
+    expect(await legacyModelsFor(scopedGuest.plaintextKey)).toContain("clef-flash");
+    expect(await modelsFor(owner.plaintextKey)).toContain("clef-flash");
+    expect(await modelsFor(scopedOwner.plaintextKey)).not.toContain("clef-flash");
+    expect(await legacyModelsFor(scopedOwner.plaintextKey)).not.toContain("clef-flash");
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      expect(await modelsFor(scopedGuest.plaintextKey)).not.toContain("clef-flash");
+      expect(await modelsFor(owner.plaintextKey)).not.toContain("clef-flash");
+      expect(await legacyModelsFor(owner.plaintextKey)).not.toContain("clef-flash");
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
   it("observes rejected promises without creating a second unhandled rejection", async () => {
     const rejectingPromise = Promise.reject(new Error("boom"));
 
@@ -675,6 +829,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("model allow-list: an empty allow-list (owner) MAY omit the model", async () => {
+    mockMode = "validrunning";
     const owner = mintKey({ alias: "allow-list-owner-omit", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/v1/chat/completions"), {
       method: "POST",

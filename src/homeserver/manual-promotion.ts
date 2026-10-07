@@ -21,6 +21,7 @@
 
 const SPEC_FIELDS = new Set([
   "key",
+  "api",
   "gguf",
   "runtime_bin",
   "ctx",
@@ -59,6 +60,7 @@ const ABSOLUTE_PATH_RE = /^\//;
 
 export interface ManualServingSpec {
   key: string;
+  api: "chat" | "systemone";
   gguf: string;
   runtimeBin: string;
   ctx: number;
@@ -77,6 +79,23 @@ export interface ManualServingSpec {
   reasoningFormat: string | null;
   reasoning: string | null;
   ttl: number;
+}
+
+export function manualWarmupRequest(spec: ManualServingSpec, modelId: string): {
+  path: string;
+  body: Record<string, unknown>;
+} {
+  return spec.api === "systemone"
+    ? { path: "/v1/systemone", body: {
+      model: modelId,
+      state: "Hello",
+      questions: { greeting: { type: "noul", instructions: "Is this a greeting?" } },
+    } }
+    : { path: "/v1/chat/completions", body: {
+      model: modelId,
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1,
+    } };
 }
 
 export interface PromotionDefaults {
@@ -187,9 +206,12 @@ export function parseManualSpec(text: string): ManualServingSpec {
   if ((reasoningFormat === null) !== (reasoning === null)) {
     fail("spec fields 'reasoning_format' and 'reasoning' must be set together");
   }
+  const api = opt("api") ?? "chat";
+  if (api !== "chat" && api !== "systemone") fail("spec field 'api' must be 'chat' or 'systemone'");
 
   return {
     key: flagToken(get("key"), "key", /^[a-z0-9][a-z0-9.-]{0,63}$/),
+    api,
     gguf: absolutePath(get("gguf"), "gguf"),
     runtimeBin: absolutePath(get("runtime_bin"), "runtime_bin"),
     ctx: boundedInt(Number(get("ctx")), "ctx", 1024, 1048576),

@@ -210,6 +210,17 @@ For a reviewed roster release:
    gateway, and verify private-network health plus the authenticated model list.
 7. Roll back through the private ticket's recorded backups and re-run the same health checks.
 
+For a System One decision model, use a spec with `api: systemone` so the transactional
+promoter warms `/v1/systemone` and verifies a typed probability rather than sending a chat
+completion. The [Clef-flash customer contract](../docs/systemone-customer-access.md) records
+its public artifact checksum and the required llama.cpp/llama-swap versions. Its public spec
+has placeholder paths and cannot be applied unchanged. Since the current roster already has
+12 models and the promoter defaults to a 12-model ceiling, an approved Clef-flash addition
+must explicitly set `PROMOTE_MAX_SERVED=13` for that one transaction. Verify the resulting
+roster and the existing-model rollback path before enabling customer keys. Activate the gateway's
+`HOMESERVER_SYSTEMONE_MODELS=clef-flash` setting before the roster transaction; otherwise the
+new model can appear in `/v1/models` before its decision endpoint is enabled.
+
 The 2026-07-28 `qwen35-122b-a10b` release uses a pinned llama.cpp `9a3bf2b84` runtime, 32K
 context, reasoning off, F16 KV, a 2 GiB prompt cache, one slot, and the service-level 96 GiB/no-swap
 ceiling. It is an explicit/shadow precision specialist; `gpt-oss-120b` remains the standard large

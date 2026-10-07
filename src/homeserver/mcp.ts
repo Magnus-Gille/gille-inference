@@ -39,6 +39,7 @@ import type { KeyScope } from "./keystore.js";
 // deriveEvidenceIdentity doc comment for why this is lane-agnostic and safe to share.
 import { deriveEvidenceIdentity } from "./orchestrator.js";
 import { currentTraceHeaders } from "./tracing.js";
+import { isSystemOneDecisionModel } from "./systemone-request.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -559,12 +560,13 @@ function strengthHint(modelKey: string): string {
  *     return it directly. We do NOT gate on what listModels() currently reports as loaded,
  *     so a friend always sees exactly the models their key was issued for (and the matching
  *     `ask` enforcement is purely allow-list based, so the two never disagree).
- *   • Open key (empty allow-list = all): fall back to the live catalogue from listModels().
+ *   • Open key (empty allow-list = ordinary chat models): fall back to the live catalogue.
  */
-async function visibleModels(principal: McpPrincipal): Promise<string[]> {
+async function visibleModels(principal: McpPrincipal, cfg: HomeserverConfig): Promise<string[]> {
   const allow = principal.modelAllowList;
-  if (allow.length > 0) return allow;
-  return (await listModels()).map((m) => m.key);
+  const configured = cfg.systemOneModels;
+  if (allow.length > 0) return allow.filter((id) => !isSystemOneDecisionModel(id, configured));
+  return (await listModels()).map((m) => m.key).filter((id) => !isSystemOneDecisionModel(id, configured));
 }
 
 // ─── Shared metered chat path (used by BOTH the MCP `ask` tool and, ideally, /v1) ──────
@@ -862,6 +864,16 @@ export async function runChatCompletion(
       code: "model_not_allowed",
       message: `Your API key is not permitted to use model '${args.model}'. Allowed: ${principal.modelAllowList.join(", ")}.`,
       traceOutcome: "forbidden",
+      traceErrorClass: "model_not_allowed",
+    };
+  }
+  if (isSystemOneDecisionModel(args.model, cfg.systemOneModels)) {
+    logInferenceFailure(400, "bad_request", "model_not_allowed", "n/a");
+    return {
+      ok: false,
+      code: "model_not_allowed",
+      message: "Decision models use POST /v1/systemone instead of MCP ask.",
+      traceOutcome: "bad_request",
       traceErrorClass: "model_not_allowed",
     };
   }
@@ -1340,7 +1352,7 @@ async function callTool(
   ctx: ToolCallContext
 ): Promise<{ text: string; isError: boolean; structuredContent?: unknown; meta?: Record<string, unknown>; trace?: McpTraceOverride }> {
   if (name === "list_models") {
-    const models = await visibleModels(ctx.principal);
+    const models = await visibleModels(ctx.principal, ctx.cfg);
     const structuredContent = buildListModelsStructuredContent(
       models,
       askFilesCapability(ctx.principal, ctx.cfg)
