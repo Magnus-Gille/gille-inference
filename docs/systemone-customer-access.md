@@ -36,7 +36,9 @@ on the M5's serial GPU. A second model needs a separate M5 comparison on custome
 
 - `POST /v1/systemone` uses the existing bearer key, model allow-list, credit cap, rate quota,
   owner-preempting GPU admission, and host-memory admission. The endpoint is disabled until
-  `HOMESERVER_SYSTEMONE_MODELS=clef-flash` is set on a llama-swap gateway.
+  `HOMESERVER_SYSTEMONE_MODELS=clef-flash` is set on a llama-swap gateway. A guest key must
+  explicitly list `clef-flash`; an empty guest allow-list grants ordinary chat models but not
+  decision models. Owner keys can run release checks before guest access is granted.
 - Request: `model`, a text or JSON-object `state`, and 1–16 named `questions`. Each question has
   `type` (`noul`, `choice`, or `score`) and `instructions`; `choice` needs 2–26 named criteria,
   `score` needs 2–10 ordered labels. The gateway accepts at most 8 KiB of request JSON. Images,
@@ -47,8 +49,10 @@ on the M5's serial GPU. A second model needs a separate M5 comparison on custome
 - Admission reserves Clef's full 8,192-token shared context, then reconciles to exact successful
   usage. An upstream response above that bound is rejected. Other decision models need their own
   context accounting before customer activation.
-- `/v1/models` lists a decision model only after it is in the llama-swap roster and the key can
-  use it. MCP `list_models` remains a list of chat models for the MCP `ask` tool.
+- `/v1/models` and `/models` list a decision model only after it is in the llama-swap roster and the key can
+  use it. A known decision model stays out of chat, MCP `ask`, delegation and model discovery
+  even if its enablement setting is removed while it remains in the roster. MCP `list_models`
+  remains a list of chat models for the MCP `ask` tool.
 - The gateway never records guest state/questions/answers in the owner content log. Existing
   request telemetry is content-blind and uses only the configured model ID.
 
@@ -74,13 +78,16 @@ return 404 or fail to load this model.
 
 Set `HOMESERVER_SYSTEMONE_MODELS=clef-flash` on the gateway **before** adding Clef-flash to the
 llama-swap roster. At that stage the endpoint cannot succeed because the model is not served, and
-the existing chat/delegation paths already exclude its ID. Then use the
+chat/delegation paths exclude its ID regardless of this setting. Existing unscoped guest keys
+cannot use or discover Clef after the roster addition. Then use the
 [roster procedure](../deploy/README.md#deploying-llama-swap-roster-changes) with a
 reviewed maximum of 13 served entries. The existing promoter's warm-up is selected by the
-spec's `api: systemone`. Before customer access, verify a text-only owner call, a guest key
-restricted to `clef-flash`, rejection of a different model and malformed schema, exact credit
+spec's `api: systemone` and validates the same response shape and usage as the customer API.
+Before customer access, verify a text-only owner call, a disposable test guest key
+restricted to `clef-flash`, rejection of an unscoped guest key, a different model and malformed schema, exact credit
 usage, `/v1/models` visibility, a short representative quality set, host memory and OOM state,
-and restoration of the preexisting model service. Record measured cold/warm latency and keep
+and restoration of the preexisting model service. Revoke the test key and grant customer keys
+only after those checks pass. Record measured cold/warm latency and keep
 publisher benchmarks separate from M5 observations.
 Declare a measured `clef-flash` budget in `HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB` before
 enabling host-memory enforcement; an unknown budget must remain a refusal, not a guess.

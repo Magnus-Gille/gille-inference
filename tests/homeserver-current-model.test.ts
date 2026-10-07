@@ -75,4 +75,8 @@ describe("currentModel — resolves via the configured backend (llamaswap)", () 
     expect(await currentModel(undefined, ["test-model"])).toBeNull();
     expect(await currentModel("test-model", ["test-model"])).toBeNull();
   });
+
+  it("never delegates to Clef even when the System One setting is absent", async () => {
+    expect(await currentModel("clef-flash")).toBeNull();
+  });
 });

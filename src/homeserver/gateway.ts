@@ -81,7 +81,7 @@ import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCa
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
-import { parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
+import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
 import {
@@ -1191,6 +1191,13 @@ function estimatePromptTokens(rawBody: string): number {
 
 /** A metered result that charges nothing (errored / non-2xx upstream). */
 const ZERO_RESULT: MeteredResult = { totalTokens: 0, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
+
+function modelVisibleInDiscovery(modelId: string, cfg: HomeserverConfig, principal: PrincipalContext): boolean {
+  if (!isSystemOneDecisionModel(modelId, cfg.systemOneModels)) return true;
+  return cfg.systemOneModels.includes(modelId) &&
+    (principal.modelAllowList.includes(modelId) ||
+      (principal.tier === "owner" && principal.modelAllowList.length === 0));
+}
 
 async function handleSystemOneProxy(
   req: SystemOneRequest,
@@ -4722,6 +4729,16 @@ export async function handleRequest(
         sendError(res, makeError("invalid_request_error", { param: err.param, message: err.message }));
         return;
       }
+      // Guest access to a decision model requires an explicit grant. Ordinary open guest keys
+      // must not gain a new model merely because the operator stages it in the roster.
+      if (principal.tier === "guest" && !principal.modelAllowList.includes(parsed.model)) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        return;
+      }
       lctx.model = cfg.systemOneModels.includes(parsed.model) ? parsed.model : "unknown";
       // Clef uses one shared prompt; other decision models may use one prompt per question.
       // Reserve full context(s); reconcile exact successful usage after the call.
@@ -4734,11 +4751,12 @@ export async function handleRequest(
       const raw = await readBody(req);
       const parsed = parseChatBody(raw);
       if (parsed.model === null && principal.modelAllowList.length === 0 &&
-        cfg.systemOneModels.length > 0 && parsed.node !== "orin") {
+        cfg.backend === "llamaswap" && parsed.node !== "orin") {
         let chatModel: string | undefined | null = await currentModel(undefined, cfg.systemOneModels);
         if (chatModel === null) {
           try {
-            chatModel = (await listModels()).find((candidate) => !cfg.systemOneModels.includes(candidate.key))?.key;
+            chatModel = (await listModels()).find((candidate) =>
+              !isSystemOneDecisionModel(candidate.key, cfg.systemOneModels))?.key;
           } catch {
             chatModel = null;
           }
@@ -4751,7 +4769,7 @@ export async function handleRequest(
         parsed.model = chatModel;
         parsed.obj["model"] = chatModel;
       }
-      if (parsed.model !== null && cfg.systemOneModels.includes(parsed.model)) {
+      if (parsed.model !== null && isSystemOneDecisionModel(parsed.model, cfg.systemOneModels)) {
         lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
         sendError(res, makeError("invalid_request_error", {
           param: "model", message: "Decision models use POST /v1/systemone.",
@@ -5002,7 +5020,8 @@ export async function handleRequest(
       return;
     }
     if (path === "/models" && method === "GET") {
-      sendJson(res, 200, { models: await listModels() });
+      sendJson(res, 200, { models: (await listModels()).filter((model) =>
+        modelVisibleInDiscovery(model.key, cfg, principal)) });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -5032,10 +5051,14 @@ export async function handleRequest(
     }
     if (path === "/v1/models" && method === "GET") {
       // OpenAI-compatible model list (so OpenAI SDKs / LiteLLM / IDE plugins that probe
-      // /v1/models work). Filtered to the key's allow-list — empty allow-list = all models.
+      // /v1/models work). An empty allow-list includes ordinary models; decision models
+      // require an explicit guest grant and an active endpoint setting.
       const all = await listModels();
       const allow = principal.modelAllowList;
-      const visible = allow.length === 0 ? all : all.filter((m) => allow.includes(m.key));
+      const visible = all.filter((m) => {
+        if (allow.length > 0 && !allow.includes(m.key)) return false;
+        return modelVisibleInDiscovery(m.key, cfg, principal);
+      });
       const data = visible.map((m) => ({
         id: m.key, object: "model", created: 0,
         owned_by: cfg.systemOneModels.includes(m.key) ? "home-gateway-systemone" : "home-gateway",

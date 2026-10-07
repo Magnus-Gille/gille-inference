@@ -19,7 +19,7 @@ import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admissi
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "validrunning" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "clef-running" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
@@ -56,9 +56,17 @@ function startUpstream(): Promise<void> {
     req.on("end", async () => {
       if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
-      if (mockMode === "validrunning" && req.url === "/running") {
+      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "clef-running") && req.url === "/running") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ running: [{ model: "m1", state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 }] }));
+        res.end(JSON.stringify({ running: mockMode === "systemone-list" ? [] : [
+          { model: mockMode === "clef-running" ? "clef-flash" : "m1",
+            state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 },
+        ] }));
+        return;
+      }
+      if ((mockMode === "systemone-list" || mockMode === "clef-running") && req.url === "/v1/models") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: "clef-flash" }] }));
         return;
       }
       if (mockMode === "notfound") {
@@ -331,6 +339,11 @@ describe("gateway spine — HTTP integration", () => {
     expect(unauthenticated.status).toBe(401);
     expect(upstreamInferenceRequestCount).toBe(0);
 
+    const unscopedGuest = mintKey({ alias: `systemone-unscoped-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const unscopedAttempt = await call(body, unscopedGuest.plaintextKey);
+    expect(unscopedAttempt.status).toBe(403);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
     const denied = await call({ ...body, model: "m1" });
     expect(denied.status).toBe(403);
     expect(upstreamInferenceRequestCount).toBe(0);
@@ -359,6 +372,79 @@ describe("gateway spine — HTTP integration", () => {
     const malformedUpstream = await call(body);
     expect(malformedUpstream.status).toBe(502);
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+  });
+
+  it("keeps Clef out of chat when the System One setting is absent", async () => {
+    const cfg = loadConfig();
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      const guest = mintKey({ alias: `systemone-drift-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+      const response = await chat(guest.plaintextKey, { model: "clef-flash" });
+      expect(response.status).toBe(400);
+      expect(upstreamInferenceRequestCount).toBe(0);
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
+  it("does not forward model-less chat to a resident Clef after config loss", async () => {
+    mockMode = "clef-running";
+    const cfg = loadConfig();
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      const guest = mintKey({ alias: `systemone-resident-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+      const response = await chat(guest.plaintextKey, { model: undefined });
+      expect(response.status).toBe(200);
+      expect(JSON.parse(lastUpstreamBody)).toMatchObject({ model: "m1" });
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
+  it("lists Clef only when enabled and explicitly granted to a guest", async () => {
+    mockMode = "systemone-list";
+    const cfg = loadConfig();
+    const unscopedGuest = mintKey({ alias: `systemone-list-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const scopedGuest = mintKey({ alias: `systemone-list-scoped-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["clef-flash"] }, DEFAULTS);
+    const owner = mintKey({ alias: `systemone-list-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin" }, DEFAULTS);
+    const scopedOwner = mintKey({ alias: `systemone-list-scoped-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin", modelAllowList: ["m1"] }, DEFAULTS);
+    const modelsFor = async (token: string): Promise<string[]> => {
+      const response = await fetch(url("/v1/models"), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { data: Array<{ id: string }> };
+      return body.data.map((model) => model.id);
+    };
+    const legacyModelsFor = async (token: string): Promise<string[]> => {
+      const response = await fetch(url("/models"), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { models: Array<{ key: string }> };
+      return body.models.map((model) => model.key);
+    };
+    expect(await modelsFor(unscopedGuest.plaintextKey)).not.toContain("clef-flash");
+    expect(await legacyModelsFor(unscopedGuest.plaintextKey)).not.toContain("clef-flash");
+    expect(await modelsFor(scopedGuest.plaintextKey)).toContain("clef-flash");
+    expect(await legacyModelsFor(scopedGuest.plaintextKey)).toContain("clef-flash");
+    expect(await modelsFor(owner.plaintextKey)).toContain("clef-flash");
+    expect(await modelsFor(scopedOwner.plaintextKey)).not.toContain("clef-flash");
+    expect(await legacyModelsFor(scopedOwner.plaintextKey)).not.toContain("clef-flash");
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      expect(await modelsFor(scopedGuest.plaintextKey)).not.toContain("clef-flash");
+      expect(await modelsFor(owner.plaintextKey)).not.toContain("clef-flash");
+      expect(await legacyModelsFor(owner.plaintextKey)).not.toContain("clef-flash");
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
   });
 
   it("observes rejected promises without creating a second unhandled rejection", async () => {

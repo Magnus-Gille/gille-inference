@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { validateSystemOneWarmupResponse } from "../scripts/promote-manual.js";
 import {
   PROMOTION_DEFAULTS,
   applyManualPromotion,
@@ -309,5 +310,22 @@ describe("manual-promotion transaction (#217)", () => {
     await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/restored backup and restarted/);
     expect(live.text).toBe(BASE_CONFIG);
     expect(calls.commands).toHaveLength(1);
+  });
+
+  it("restores the prior roster when a System One warm-up returns malformed JSON", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG, { listed: ["clef-flash"] });
+    const systemOneSpec = parseManualSpec(FULL_SPEC_TEXT.replace("key: manual-35b", "key: clef-flash\napi: systemone"));
+    const malformedResponse = {
+      answers: { greeting: { noul: 0.5 } },
+      usage: { input_tokens: 1, output_tokens: 0 },
+    };
+    deps.warmupModel = async (modelId) => {
+      validateSystemOneWarmupResponse(malformedResponse, modelId, manualWarmupRequest(systemOneSpec, modelId).body);
+    };
+
+    await expect(applyManualPromotion(systemOneSpec, deps)).rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.restores).toHaveLength(1);
+    expect(calls.commands).toHaveLength(2);
   });
 });

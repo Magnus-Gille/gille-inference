@@ -1,4 +1,12 @@
 /** Bounded, text/JSON-only request contract for the customer decision-model surface. */
+// Classification must survive a missing enablement setting while a model remains in the
+// llama-swap roster. Add each reviewed decision-model ID here before it can be served.
+const KNOWN_DECISION_MODELS = new Set(["clef-flash"]);
+
+export function isSystemOneDecisionModel(model: string, enabledModels: readonly string[]): boolean {
+  return KNOWN_DECISION_MODELS.has(model) || enabledModels.includes(model);
+}
+
 export class SystemOneRequestError extends Error {
   constructor(readonly param: string, message: string) {
     super(message);

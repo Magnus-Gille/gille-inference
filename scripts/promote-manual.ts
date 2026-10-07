@@ -32,6 +32,10 @@ import {
   renderManualEntry,
   type PromotionCommandResult,
 } from "../src/homeserver/manual-promotion.js";
+import {
+  validateSystemOneResponse,
+  type SystemOneRequest,
+} from "../src/homeserver/systemone-request.js";
 
 const CONFIG = process.env["LLAMASWAP_CONFIG"] ?? PROMOTION_DEFAULTS.configPath;
 const LLAMASWAP_URL = (process.env["LLAMASWAP_URL"] ?? PROMOTION_DEFAULTS.llamaswapUrl).replace(/\/$/, "");
@@ -53,6 +57,23 @@ function runCommand(argv: string[]): Promise<PromotionCommandResult> {
       });
     });
   });
+}
+
+/** Validate the warm-up using the exact response contract exposed to customers. */
+export function validateSystemOneWarmupResponse(
+  payload: unknown,
+  modelId: string,
+  body: Record<string, unknown>,
+): number {
+  const request: SystemOneRequest = {
+    model: modelId,
+    body: {
+      model: body.model as string,
+      state: body.state,
+      questions: body.questions as Record<string, unknown>,
+    },
+  };
+  return validateSystemOneResponse(payload, request);
 }
 
 async function main(): Promise<void> {
@@ -130,12 +151,7 @@ async function main(): Promise<void> {
       });
       if (!resp.ok) throw new Error(`warm-up HTTP ${resp.status}`);
       if (systemOne) {
-        const body = await resp.json() as { answers?: { greeting?: { noul?: unknown } } };
-        const probability = body.answers?.greeting?.noul;
-        if (typeof probability !== "number" || !Number.isFinite(probability) ||
-          probability < 0 || probability > 1) {
-          throw new Error("System One warm-up returned no greeting probability");
-        }
+        validateSystemOneWarmupResponse(await resp.json(), modelId, warmup.body);
       }
     },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
