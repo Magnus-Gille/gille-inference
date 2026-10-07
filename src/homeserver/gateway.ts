@@ -3561,8 +3561,16 @@ async function handleKeysMint(
 }
 
 async function handleSystemOneKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
-  if (typeof body["model"] !== "string" || !Array.isArray(body["aliases"]) ||
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body) ||
+      typeof body["model"] !== "string" || !Array.isArray(body["aliases"]) ||
       body["aliases"].length === 0 || body["aliases"].length > 128 ||
       body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
     sendError(res, makeError("invalid_request_error", { message: "Require model and 1–128 key aliases." }));

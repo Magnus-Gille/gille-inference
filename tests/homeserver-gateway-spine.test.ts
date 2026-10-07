@@ -1990,6 +1990,14 @@ describe("gateway spine — HTTP integration", () => {
       headers: { "content-type": "application/json", authorization: "Bearer admin-static-key" },
       body: JSON.stringify({ model: "clef-flash", aliases }),
     });
+    for (const invalidBody of ["null", "{"]) {
+      const invalid = await fetch(url("/admin/keys/systemone-grants"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer admin-static-key" },
+        body: invalidBody,
+      });
+      expect(invalid.status).toBe(400);
+    }
     const before = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
     const beforeModels = (await before.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id);
     expect(beforeModels).toContain("m1");
