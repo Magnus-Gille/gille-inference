@@ -190,7 +190,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/models/download` | **admin** | `{modelKey, wait?}`. |
 | `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). New keys are lifetime-bounded and least-scope by default: owner→`agent`, guest→`inference`; admin must be explicit. Guest keys may carry only `inference` or read-only `monitor`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
-| `POST /admin/keys/systemone-grants` | **admin** | Atomically grant a reviewed System One model to an exact set of active minted keys: `{model:"clef-flash",aliases:["..."]}` → `200 {model,changed,unchanged}`. Missing, expired, revoked, or duplicate aliases reject the entire batch. Existing plaintext, hashes, ordinary model access, quotas, credits, expiry, and counters stay intact. Legacy static environment keys have no keystore row and are outside this operation. |
+| `POST /admin/keys/systemone-grants` | **admin** | Atomically grant a reviewed System One model to an exact set of active minted keys: `{model:"<decision-model-id>",aliases:["..."]}` → `200 {model,changed,unchanged}`. Missing, expired, revoked, or duplicate aliases reject the entire batch. Existing plaintext, hashes, ordinary model access, quotas, credits, expiry, and counters stay intact. Legacy static environment keys have no keystore row and are outside this operation. |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
 | `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, mode, inflight, ownerQueued, maxInflight}`. `mode` is `off`, `guest`, or `exclusive`. |
 | `POST /admin/maintenance` | **admin** | Toggle bench/maintenance mode: `{on: true\|false, mode?: "guest"\|"exclusive", ttlSeconds?: number}` → same status body. Default `guest` mode refuses guests while owners remain unaffected. Explicit `exclusive` mode refuses both lanes and requires `ttlSeconds`. The TTL auto-expires either mode if nobody calls `{on:false}` (#105, #196). This admission fence does not itself acquire the filesystem GPU lease or prove llama-swap idle; it is one component of the reviewed maintenance-window workflow. |
@@ -696,7 +696,8 @@ profile configuration, diagnostics, and transport behavior.
 
 ### Production text roster
 
-llama-swap serves one of twelve text models at a time. The roster IDs are `mellum`,
+llama-swap serves one of twelve text models at a time. The current production roster has
+13 entries: the text models below plus the separately gated `clef-flash` System One entry. The roster IDs are `mellum`,
 `qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`,
 `qwen3-coder-next-80b`, `gpt-oss-120b`, `qwen35-122b-a10b`, `muse-glimmer-30b`,
 `nemotron-3.5-lightning-30b-a3b`, `qwen38-27b`, and `ornith-1.5-35b`.
@@ -708,6 +709,15 @@ confirm that `clef-flash` appears in the authenticated `GET /v1/models` response
 a probability near `1` means yes and near `0` means no. Unscoped guest keys cannot call or
 discover it. Clef-flash returns typed decisions, not chat text, and does not participate in chat,
 MCP `ask`, or automatic delegation, even if the setting is lost.
+
+Two follow-on native System One entries are proposed and remain unavailable pending the isolated
+M5 host evaluation and runtime/roster checks: `bespoke-nimble-9b` (the Apache-2.0
+`bespokelabs/Bespoke-Nimble-9B` release) and `pplx-decider-v1-27b` (the Apache-2.0
+`perplexity-ai/pplx-decider-v1-27b` release). Their public specs use a Python/ROCm adapter rather
+than the llama.cpp chat path. If either is promoted, it is listed and callable only for keys with
+an explicit System One grant, uses the key's ordinary credits and quotas, and remains excluded from
+chat, MCP `ask`, delegation, and automatic routing. Do not treat the presence of a public spec or
+source code as live availability; the authenticated `GET /v1/models` response is authoritative.
 
 `gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
 `qwen38-27b` and `ornith-1.5-35b` are 64K multimodal Q4_K_M models served with Q8 KV and native

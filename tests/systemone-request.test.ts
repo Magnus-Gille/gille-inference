@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSystemOneBody, SystemOneRequestError, SystemOneResponseError,
+import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError,
   systemOneTokenReservation, validateSystemOneResponse } from "../src/homeserver/systemone-request.js";
 
 const base = {
@@ -15,6 +15,10 @@ const base = {
 };
 
 describe("System One customer request", () => {
+  it.each(["clef-flash", "bespoke-nimble-9b", "pplx-decider-v1-27b"])(
+    "keeps known decision model %s out of chat when enablement is missing",
+    (model) => expect(isSystemOneDecisionModel(model, [])).toBe(true),
+  );
   it("preserves a typed text/JSON decision request", () => {
     expect(parseSystemOneBody(JSON.stringify(base)).body).toEqual(base);
   });
