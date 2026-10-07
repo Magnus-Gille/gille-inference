@@ -12,7 +12,8 @@ evaluation details. The [official model card](https://huggingface.co/Cloudflare/
 states the license and architecture. The
 [ggml-org GGUF conversion](https://huggingface.co/ggml-org/Clef-Flash-GGUF) has more than 17,000
 reported downloads in its latest-month counter and supplies a 9.66 GB Q8_0 file with
-[SHA256 `8754b06f…93d9`](https://huggingface.co/ggml-org/Clef-Flash-GGUF/blob/main/Clef-Flash-Q8_0.gguf).
+[SHA256 `d7c352fa…2f1f1`](https://huggingface.co/ggml-org/Clef-Flash-GGUF/blob/4a192915ef971886004b5b13294f2b4c7a7fc39d/Clef-Flash-Q8_0.gguf)
+at immutable repository revision `4a192915ef971886004b5b13294f2b4c7a7fc39d`.
 Download count indicates interest, not quality. Q8_0 quality and latency on M5 remain unmeasured.
 
 Datagate's existing local candidate is [Bespoke Nimble 9B](https://huggingface.co/bespokelabs/Bespoke-Nimble-9B),
@@ -70,6 +71,9 @@ curl https://inference.example.com/v1/systemone \
 The public [`deploy/specs/clef-flash.yaml`](../deploy/specs/clef-flash.yaml) is a reviewable
 template. Resolve its artifact and runtime paths in the private operations ticket; do not copy
 live paths or service state into this public repository. Verify the downloaded GGUF checksum and
+the pinned Hub revision: the upstream conversion changed on 2026-10-05, so a download from
+`main` is not an immutable artifact identity. The selected revision includes the updated GGUF
+metadata; this release remains text-only and does not use its separate vision projector. Then
 build a complete isolated llama.cpp runtime from a pinned release with Clef and
 `/v1/systemone` support (v0.6.0 or later). The
 [llama-swap v262 release](https://github.com/mostlygeek/llama-swap/releases/tag/v262) adds the

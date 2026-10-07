@@ -696,6 +696,11 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
   var $ = function (id) { return document.getElementById(id); };
   var origin = window.location.origin;
 
+  // Keep private hostnames out of the public source while showing visitors copyable URLs.
+  document.querySelectorAll("#docs-section pre, #docs-section span.badge.mono").forEach(function (node) {
+    node.textContent = node.textContent.split("https://inference.example.com").join(origin);
+  });
+
   function show(view) {
     $("redeem-view").classList.toggle("hide", view !== "redeem");
     $("dash-view").classList.toggle("hide", view !== "dash");
