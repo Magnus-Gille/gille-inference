@@ -696,10 +696,14 @@ llama-swap serves one of twelve text models at a time. The roster IDs are `mellu
 `qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`,
 `qwen3-coder-next-80b`, `gpt-oss-120b`, `qwen35-122b-a10b`, `muse-glimmer-30b`,
 `nemotron-3.5-lightning-30b-a3b`, `qwen38-27b`, and `ornith-1.5-35b`.
-The `clef-flash` System One decision model is a separate, gated roster addition; it is listed
-for customers only after the runtime, roster, and `HOMESERVER_SYSTEMONE_MODELS` setting are
-verified and their key explicitly grants it. Unscoped guest keys cannot call or discover it.
-It does not participate in chat, MCP `ask`, or automatic delegation, even if the setting is lost.
+The `clef-flash` System One decision model is a separate, gated roster addition. Customer
+availability is conditional: the runtime, roster, and `HOMESERVER_SYSTEMONE_MODELS` setting
+must be verified, and the customer's key must receive an explicit grant. The customer must then
+confirm that `clef-flash` appears in the authenticated `GET /v1/models` response before calling
+`POST /v1/systemone`; until it appears, it is unavailable for that key. For a `noul` question,
+a probability near `1` means yes and near `0` means no. Unscoped guest keys cannot call or
+discover it. Clef-flash returns typed decisions, not chat text, and does not participate in chat,
+MCP `ask`, or automatic delegation, even if the setting is lost.
 
 `gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
 `qwen38-27b` and `ornith-1.5-35b` are 64K multimodal Q4_K_M models served with Q8 KV and native

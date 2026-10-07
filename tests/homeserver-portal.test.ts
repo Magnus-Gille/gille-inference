@@ -681,6 +681,23 @@ describe("portal page content", () => {
     expect(body).toContain("one at a time");
   });
 
+  it("GET /portal explains Clef activation and typed yes/no decisions separately from chat", async () => {
+    const res = await fetch(url("/portal"));
+    const body = await res.text();
+    const clefCopy = body.match(/<strong>Typed decisions \(separately gated\):<\/strong>[\s\S]*?<\/p>/)?.[0] ?? "";
+    const systemOneDocs = body.match(/<p><strong>Clef-flash System One decision[\s\S]*?separate endpoint from chat completions\.\s*<\/p>/)?.[0] ?? "";
+
+    expect(clefCopy).toContain("explicit grant");
+    expect(clefCopy).toContain("authenticated");
+    expect(clefCopy).toContain("/v1/models");
+    expect(clefCopy).toContain("POST /v1/systemone");
+    expect(clefCopy).toContain("<span class=\"badge mono\">1</span>");
+    expect(clefCopy).toContain("means yes");
+    expect(clefCopy).toContain("not chat text");
+    expect(systemOneDocs).toContain("If it is missing");
+    expect(systemOneDocs).toContain("separate endpoint from chat completions");
+  });
+
   it("key warning is inside the redeem card, not in a standalone footer", async () => {
     const res = await fetch(url("/portal"));
     const body = await res.text();
