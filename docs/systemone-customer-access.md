@@ -35,11 +35,13 @@ on the M5's serial GPU. A second model needs a separate M5 comparison on custome
 
 ## Customer contract
 
-- `POST /v1/systemone` uses the existing bearer key, model allow-list, credit cap, rate quota,
+- `POST /v1/systemone` uses the existing bearer key, an explicit System One grant, credit cap, rate quota,
   owner-preempting GPU admission, and host-memory admission. The endpoint is disabled until
   `HOMESERVER_SYSTEMONE_MODELS=clef-flash` is set on a llama-swap gateway. A guest key must
-  explicitly list `clef-flash`; an empty guest allow-list grants ordinary chat models but not
-  decision models. Owner keys can run release checks before guest access is granted.
+  explicitly have `clef-flash` in `systemOneModelAllowList` (or the legacy ordinary
+  `modelAllowList`). An empty guest ordinary allow-list grants ordinary chat models but not
+  decision models. Granting Clef to such a key leaves ordinary chat access intact.
+  Owner keys with an empty ordinary allow-list can run release checks before guest access is granted.
 - Request: `model`, a text or JSON-object `state`, and 1–16 named `questions`. Each question has
   `type` (`noul`, `choice`, or `score`) and `instructions`; `choice` needs 2–26 named criteria,
   `score` needs 2–10 ordered labels. The gateway accepts at most 8 KiB of request JSON. Images,
@@ -90,8 +92,10 @@ spec's `api: systemone` and validates the same response shape and usage as the c
 Before customer access, verify a text-only owner call, a disposable test guest key
 restricted to `clef-flash`, rejection of an unscoped guest key, a different model and malformed schema, exact credit
 usage, `/v1/models` visibility, a short representative quality set, host memory and OOM state,
-and restoration of the preexisting model service. Revoke the test key and grant customer keys
-only after those checks pass. Record measured cold/warm latency and keep
+and restoration of the preexisting model service. Revoke the test key and grant existing customer
+keys through the atomic `POST /admin/keys/systemone-grants` operation only after those checks
+pass. Use an exact reviewed alias list; the operation leaves existing credentials, chat access,
+quotas, credit caps, expiry, and use counters intact. Record measured cold/warm latency and keep
 publisher benchmarks separate from M5 observations.
 Declare a measured `clef-flash` budget in `HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB` before
 enabling host-memory enforcement; an unknown budget must remain a refusal, not a guess.

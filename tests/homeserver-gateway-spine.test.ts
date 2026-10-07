@@ -1981,4 +1981,67 @@ describe("gateway spine — HTTP integration", () => {
     // Billing invariant: a failed upstream call (no successful completion) must charge 0.
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(0);
   });
+
+  it("grants Clef to an existing open guest key without taking away ordinary chat", async () => {
+    mockMode = "systemone-list";
+    const key = mintKey({ alias: `clef-open-${randomUUID()}`, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const adminGrant = (aliases: string[]) => fetch(url("/admin/keys/systemone-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer admin-static-key" },
+      body: JSON.stringify({ model: "clef-flash", aliases }),
+    });
+    for (const invalidBody of ["null", "{"]) {
+      const invalid = await fetch(url("/admin/keys/systemone-grants"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer admin-static-key" },
+        body: invalidBody,
+      });
+      expect(invalid.status).toBe(400);
+    }
+    const before = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    const beforeModels = (await before.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id);
+    expect(beforeModels).toContain("m1");
+    expect(beforeModels).not.toContain("clef-flash");
+
+    const forbidden = await fetch(url("/admin/keys/systemone-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key.plaintextKey}` },
+      body: JSON.stringify({ model: "clef-flash", aliases: [key.record.alias] }),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(lookupKey(key.plaintextKey)!.systemOneModelAllowList).toEqual([]);
+
+    const rejected = await adminGrant([key.record.alias, "missing-key"]);
+    expect(rejected.status).toBe(400);
+    expect(lookupKey(key.plaintextKey)!.systemOneModelAllowList).toEqual([]);
+    const maximalAliases = Array.from({ length: 128 }, (_, index) =>
+      "x".repeat(125) + String(index).padStart(3, "0"));
+    expect((await adminGrant(maximalAliases)).status).toBe(400);
+
+    const grant = await adminGrant([key.record.alias]);
+    expect(grant.status).toBe(200);
+    expect(await grant.json()).toMatchObject({ changed: [key.record.alias], unchanged: [] });
+    const duplicate = await adminGrant([key.record.alias]);
+    expect(await duplicate.json()).toMatchObject({ changed: [], unchanged: [key.record.alias] });
+    expect(lookupKey(key.plaintextKey)!.modelAllowList).toEqual([]);
+
+    const after = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    const afterModels = (await after.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id);
+    expect(afterModels).toContain("m1");
+    expect(afterModels).toContain("clef-flash");
+    expect((await chat(key.plaintextKey, {
+      model: "m1", messages: [{ role: "user", content: `Clef grant test ${randomUUID()}` }],
+    })).status).toBe(200);
+    const decision = await fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key.plaintextKey}` },
+      body: JSON.stringify({
+        model: "clef-flash",
+        state: "The checkout is unavailable for all customers.",
+        questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+      }),
+    });
+    expect(decision.status).toBe(200);
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+  });
 });
