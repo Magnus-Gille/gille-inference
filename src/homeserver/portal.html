@@ -280,10 +280,11 @@
       </tr>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
-      <strong>Typed decisions:</strong> If your key lists <span class="badge mono">clef-flash</span>,
-      Cloudflare&#8217;s 9B decision model is available through
-      <span class="badge mono">POST /v1/systemone</span> for choice, score and yes/no probabilities.
-      It does not generate chat text. Its speed on this box has not yet been published.
+      <strong>Typed decisions:</strong> The gateway supports choice, score and yes/no probabilities
+      through <span class="badge mono">POST /v1/systemone</span>. Cloudflare&#8217;s 9B
+      <span class="badge mono">clef-flash</span> model can be called only when it appears in your
+      authenticated <span class="badge mono">/v1/models</span> list. It does not generate chat text.
+      Its speed on this box has not yet been published.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
