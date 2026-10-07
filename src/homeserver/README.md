@@ -190,6 +190,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/models/download` | **admin** | `{modelKey, wait?}`. |
 | `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). New keys are lifetime-bounded and least-scope by default: owner→`agent`, guest→`inference`; admin must be explicit. Guest keys may carry only `inference` or read-only `monitor`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
+| `POST /admin/keys/systemone-grants` | **admin** | Atomically grant a reviewed System One model to an exact set of active minted keys: `{model:"clef-flash",aliases:["..."]}` → `200 {model,changed,unchanged}`. Missing, expired, revoked, or duplicate aliases reject the entire batch. Existing plaintext, hashes, ordinary model access, quotas, credits, expiry, and counters stay intact. Legacy static environment keys have no keystore row and are outside this operation. |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
 | `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, mode, inflight, ownerQueued, maxInflight}`. `mode` is `off`, `guest`, or `exclusive`. |
 | `POST /admin/maintenance` | **admin** | Toggle bench/maintenance mode: `{on: true\|false, mode?: "guest"\|"exclusive", ttlSeconds?: number}` → same status body. Default `guest` mode refuses guests while owners remain unaffected. Explicit `exclusive` mode refuses both lanes and requires `ttlSeconds`. The TTL auto-expires either mode if nobody calls `{on:false}` (#105, #196). This admission fence does not itself acquire the filesystem GPU lease or prove llama-swap idle; it is one component of the reviewed maintenance-window workflow. |
@@ -560,7 +561,10 @@ Minted keys are stored as **sha256 hashes only** (plaintext is returned once at 
 and never persisted); lookup is timing-safe. Each request then passes the spine:
 
 1. **Model allow-list** — a key with a non-empty `modelAllowList` requesting any other
-   model gets `403 model_not_allowed`.
+   ordinary model gets `403 model_not_allowed`. System One uses a separate, explicit
+   `systemOneModelAllowList` grant so granting Clef to an open guest key does not narrow
+   its chat access. Existing keys that explicitly list Clef in `modelAllowList` retain
+   that System One grant for compatibility.
 2. **`max_tokens` cap** — every request's `max_tokens` is clamped to
    `min(request, HOMESERVER_PER_REQUEST_MAX_TOKENS)` before proxying.
 3. **Quota** — per-key sliding-window RPM/TPM (60s) + a persisted daily token budget.

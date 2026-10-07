@@ -24,6 +24,7 @@ import {
   mintKey,
   revokeKey,
   listKeys,
+  grantSystemOneModelToKeys,
   redeemInvite,
   reserveCredits,
   reconcileCredits,
@@ -33,6 +34,7 @@ import {
   InviteInvalidError,
   InvalidParamError,
   InvalidScopeError,
+  InvalidSystemOneGrantError,
   KeyLifetimePolicyError,
   type KeyScope,
   type Tier,
@@ -182,6 +184,7 @@ interface PrincipalContext {
   /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models*. */
   isMonitor?: boolean;
   modelAllowList: string[];
+  systemOneModelAllowList: string[];
   limits: QuotaLimits;
   maxParallel: number;
   /**
@@ -244,6 +247,7 @@ function resolvePrincipal(
         scope: "admin",
         isAdmin: true,
         modelAllowList: [],
+        systemOneModelAllowList: [],
         limits: keyLimits(cfg),
         maxParallel: cfg.keyDefaults.maxParallel,
         keyHash: null,
@@ -265,6 +269,7 @@ function resolvePrincipal(
       isAdmin: rec.scope === "admin",
       isMonitor: rec.scope === "monitor",
       modelAllowList: rec.modelAllowList,
+      systemOneModelAllowList: rec.systemOneModelAllowList,
       limits: { rpm: rec.rpm, tpm: rec.tpm, dailyTokenBudget: rec.dailyTokenBudget },
       maxParallel: rec.maxParallel,
       keyHash: rec.keyHash,
@@ -282,6 +287,7 @@ function resolvePrincipal(
       scope: "admin",
       isAdmin: true,
       modelAllowList: [],
+      systemOneModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -299,6 +305,7 @@ function resolvePrincipal(
       scope: "inference",
       isAdmin: false,
       modelAllowList: [],
+      systemOneModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -319,6 +326,7 @@ function resolvePrincipal(
       isAdmin: false,
       isMonitor: true,
       modelAllowList: [],
+      systemOneModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -894,7 +902,8 @@ async function admitAndMeterLogged(
   requestedModel: string | null,
   estTokens: number,
   lctx: LogCtx,
-  handler: () => Promise<MeteredResult>
+  handler: () => Promise<MeteredResult>,
+  systemOne = false,
 ): Promise<void> {
   // Lifetime credit cap (non-resetting). Refuse BEFORE any inference if the key has spent
   // its budget. Distinct from the daily-resetting quota below: this never frees up on its own.
@@ -945,7 +954,17 @@ async function admitAndMeterLogged(
     let admissionThrew = false;
     try {
       // Model allow-list check.
-      if (principal.modelAllowList.length > 0) {
+      if (systemOne && (requestedModel === null || !systemOneGranted(principal, requestedModel))) {
+        releaseReserve();
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
+      if (!systemOne && principal.modelAllowList.length > 0) {
         if (requestedModel === null) {
           releaseReserve();
           lctx.status = 403;
@@ -1192,11 +1211,15 @@ function estimatePromptTokens(rawBody: string): number {
 /** A metered result that charges nothing (errored / non-2xx upstream). */
 const ZERO_RESULT: MeteredResult = { totalTokens: 0, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
 
+function systemOneGranted(principal: PrincipalContext, modelId: string): boolean {
+  return principal.systemOneModelAllowList.includes(modelId) ||
+    principal.modelAllowList.includes(modelId) ||
+    (principal.tier === "owner" && principal.modelAllowList.length === 0);
+}
+
 function modelVisibleInDiscovery(modelId: string, cfg: HomeserverConfig, principal: PrincipalContext): boolean {
   if (!isSystemOneDecisionModel(modelId, cfg.systemOneModels)) return true;
-  return cfg.systemOneModels.includes(modelId) &&
-    (principal.modelAllowList.includes(modelId) ||
-      (principal.tier === "owner" && principal.modelAllowList.length === 0));
+  return cfg.systemOneModels.includes(modelId) && systemOneGranted(principal, modelId);
 }
 
 async function handleSystemOneProxy(
@@ -3537,6 +3560,23 @@ async function handleKeysMint(
   sendJson(res, 201, result);
 }
 
+async function handleSystemOneKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  if (typeof body["model"] !== "string" || !Array.isArray(body["aliases"]) ||
+      body["aliases"].length === 0 || body["aliases"].length > 128 ||
+      body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
+    sendError(res, makeError("invalid_request_error", { message: "Require model and 1–128 key aliases." }));
+    return;
+  }
+  try {
+    const result = grantSystemOneModelToKeys(body["aliases"] as string[], body["model"]);
+    sendJson(res, 200, { model: body["model"], ...result });
+  } catch (err) {
+    if (!(err instanceof InvalidSystemOneGrantError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Unknown model or inactive, duplicate, or missing key alias." }));
+  }
+}
+
 // ─── Server ──────────────────────────────────────────────────────────────────────────
 
 export interface GatewayHandle {
@@ -4731,7 +4771,7 @@ export async function handleRequest(
       }
       // Guest access to a decision model requires an explicit grant. Ordinary open guest keys
       // must not gain a new model merely because the operator stages it in the roster.
-      if (principal.tier === "guest" && !principal.modelAllowList.includes(parsed.model)) {
+      if (!systemOneGranted(principal, parsed.model)) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "model_not_allowed";
@@ -4744,7 +4784,7 @@ export async function handleRequest(
       // Reserve full context(s); reconcile exact successful usage after the call.
       const estimatedTokens = systemOneTokenReservation(parsed);
       await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, estimatedTokens, lctx,
-        () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps));
+        () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), true);
       return;
     }
     if (path === "/v1/chat/completions" && method === "POST") {
@@ -5056,7 +5096,8 @@ export async function handleRequest(
       const all = await listModels();
       const allow = principal.modelAllowList;
       const visible = all.filter((m) => {
-        if (allow.length > 0 && !allow.includes(m.key)) return false;
+        if (!isSystemOneDecisionModel(m.key, cfg.systemOneModels) &&
+            allow.length > 0 && !allow.includes(m.key)) return false;
         return modelVisibleInDiscovery(m.key, cfg, principal);
       });
       const data = visible.map((m) => ({
@@ -5391,6 +5432,14 @@ export async function handleRequest(
     if (path === "/admin/keys" && method === "POST") {
       if (!requireAdmin()) return;
       await handleKeysMint(req, res, cfg);
+      lctx.status = res.statusCode;
+      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/systemone-grants" && method === "POST") {
+      if (!requireAdmin()) return;
+      await handleSystemOneKeyGrant(req, res);
       lctx.status = res.statusCode;
       lctx.outcome = res.statusCode < 300 ? "ok" : "error";
       lctx.admission = "n/a";

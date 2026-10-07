@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import {
   mintKey,
+  grantSystemOneModel,
   lookupKey,
   revokeKey,
   listKeys,
@@ -33,6 +34,21 @@ function alias(): string {
 }
 
 describe("keystore mint / lookup", () => {
+  it("grants a decision model without changing an existing credential or ordinary model access", () => {
+    const key = mintKey({ alias: alias(), tier: "guest", modelAllowList: [], creditLimit: 100 }, DEFAULTS);
+    const before = lookupKey(key.plaintextKey)!;
+    expect(before.systemOneModelAllowList).toEqual([]);
+    expect(grantSystemOneModel(before.alias, "clef-flash")).toBe(true);
+    expect(grantSystemOneModel(before.alias, "clef-flash")).toBe(false);
+    const after = lookupKey(key.plaintextKey)!;
+    expect(after.modelAllowList).toEqual([]);
+    expect(after.systemOneModelAllowList).toEqual(["clef-flash"]);
+    expect(after.keyHash).toBe(before.keyHash);
+    expect(after.creditLimit).toBe(before.creditLimit);
+    expect(after.creditsUsed).toBe(before.creditsUsed);
+    expect(after.useCount).toBe(before.useCount);
+  });
+
   it("defaults new owner keys to agent, guest keys to inference, and preserves explicit scope", () => {
     const owner = mintKey({ alias: alias(), tier: "owner" }, DEFAULTS);
     expect(owner.record.scope).toBe("agent");
@@ -346,6 +362,7 @@ describe("rotateKey (#99)", () => {
       { alias: base, tier: "guest", modelAllowList: ["m1"], rpm: 7, tpm: 700, dailyTokenBudget: 70, maxParallel: 3, creditLimit: 5000 },
       DEFAULTS
     );
+    grantSystemOneModel(base, "clef-flash");
     // Rotate WITHOUT re-specifying tier/limits — they must be inherited.
     const rot = rotateKey(base, {}, DEFAULTS);
     expect(rot.newAlias).toBe(`${base}-r2`);
@@ -356,6 +373,7 @@ describe("rotateKey (#99)", () => {
     expect(live.alias).toBe(`${base}-r2`);
     expect(live.tier).toBe("guest");
     expect(live.modelAllowList).toEqual(["m1"]);
+    expect(live.systemOneModelAllowList).toEqual(["clef-flash"]);
     expect(live.rpm).toBe(7);
     expect(live.creditLimit).toBe(5000);
     expect(live.creditsUsed).toBe(0); // fresh balance
