@@ -122,7 +122,7 @@ const ASK_DESCRIPTION =
   "Pick a model from list_models; pass the full prompt (and an optional system instruction). " +
   "Successful calls return the model text plus structuredContent {model,text,finish_reason,truncated,metered,usage}. " +
   "A token-limit finish (finish_reason=length) returns isError:true while preserving the partial text in content and the same structuredContent; the truncated call is already metered and any retry is a new billable call. " +
-  "Any other failure returns isError:true with the reason as text and the cause in _meta {m5_code, retryable, retry_after_seconds}: retry only when retryable is true, after retry_after_seconds when given. " +
+  "Any other failure returns isError:true with the reason as text and the cause in _meta {m5_code, retryable, retry_after_seconds}; rate limits also include quota details {reason, scope, window, limit, requested, counted, retry_after_seconds}. Isolated keys also receive used_before; shared static tiers do not. Retry only when retryable is true, after retry_after_seconds when given. " +
   "For multi-section work that must finish inside max_tokens, opt into output_profile='complete-within-budget'; it prioritizes structural completion and uses low reasoning effort on gpt-oss. " +
   "Use this liberally for bounded work to save cost and keep data local. " +
   "Call list_models for the live, content-blind ask.files capability state before using file " +
@@ -631,9 +631,25 @@ export type RunChatResult =
       message: string;
       /** Present when the gateway knows how long the caller should wait before retrying. */
       retryAfterSeconds?: number;
+      /** Present for quota rejections; excludes key identity and other consumers' usage. */
+      quota?: AskQuotaFailureDetail;
       traceOutcome: string;
       traceErrorClass: string;
     };
+
+interface AskQuotaFailureCommon {
+  reason: "rpm" | "tpm" | "daily";
+  window: "60s" | "utc_day";
+  limit: number;
+  requested: number;
+  counted: false;
+  retry_after_seconds: number;
+}
+
+export type AskQuotaFailureDetail = AskQuotaFailureCommon & (
+  | { scope: "key"; used_before: number }
+  | { scope: "shared_static_tier"; used_before?: never }
+);
 
 /**
  * Machine-readable cause for a failed `ask`, sent in the MCP result's `_meta` (#349, #357). The
@@ -657,6 +673,7 @@ export function askFailureMeta(failure: Extract<RunChatResult, { ok: false }>): 
     m5_code: failure.code,
     ...(retryable === undefined ? {} : { retryable }),
     ...(failure.retryAfterSeconds === undefined ? {} : { retry_after_seconds: failure.retryAfterSeconds }),
+    ...(failure.quota === undefined ? {} : { quota: failure.quota }),
   };
 }
 
@@ -924,11 +941,38 @@ export async function runChatCompletion(
     releaseReserve();
     recordRateLimited("quota");
     logInferenceFailure(429, "rate_limited", "rate_limit_exceeded", "n/a");
+    const quotaBase: AskQuotaFailureCommon = {
+      reason: q.reason,
+      window: q.reason === "daily" ? "utc_day" : "60s",
+      limit: q.reason === "rpm" ? q.snapshot.rpmLimit : q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.dailyLimit,
+      requested: q.reason === "rpm" ? 1 : estTokens,
+      counted: false,
+      retry_after_seconds: q.retryAfterSeconds,
+    };
+    // Legacy static tokens share one tier-wide alias. A minted key may also collide with that
+    // reserved alias, so decide from the actual quota bucket name as well as credential type.
+    // Such usage can include another consumer; never expose its exact count as per-key usage.
+    const sharedStaticBucket = principal.keyHash === null
+      || principal.alias === "static:user"
+      || principal.alias === "static:admin"
+      || principal.alias === "static:monitor";
+    const quota: AskQuotaFailureDetail = sharedStaticBucket
+      ? { ...quotaBase, scope: "shared_static_tier" }
+      : {
+          ...quotaBase,
+          scope: "key",
+          used_before: q.reason === "rpm"
+            ? q.snapshot.rpmUsed - 1
+            : q.reason === "tpm"
+              ? q.snapshot.tpmUsed - estTokens
+              : q.snapshot.dailyUsed,
+        };
     return {
       ok: false,
       code: "rate_limited",
-      message: `Rate limit reached. Retry after ${q.retryAfterSeconds}s.`,
+      message: `${quota.scope === "key" ? "Per-key" : "Shared static-tier"} ${q.reason} limit reached (${quota.limit} ${q.reason === "rpm" ? "requests" : "estimated tokens"} per ${quota.window === "60s" ? "60s" : "UTC day"}). This rejected request was not counted. Retry after ${q.retryAfterSeconds}s.`,
       retryAfterSeconds: q.retryAfterSeconds,
+      quota,
       traceOutcome: "rate_limited",
       traceErrorClass: "rate_limit_exceeded",
     };

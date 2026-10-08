@@ -163,11 +163,11 @@ beforeAll(async () => {
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
-  process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
+  process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_REDEEM_RPM"] = "10000";
   process.env["HOMESERVER_DELEGATION_COST_LOG"] = "on";
-  delete process.env["HOMESERVER_API_KEYS"];
+  process.env["HOMESERVER_API_KEYS"] = "test-legacy-static-a,test-legacy-static-b";
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
 
   const ks = await import("../src/homeserver/keystore.js");
@@ -934,6 +934,95 @@ describe("MCP auth + method", () => {
     expect(res.status).toBe(200);
     const j = (await res.json()) as { error?: { code: number } };
     expect(j.error?.code).toBe(-32700);
+  });
+});
+
+describe("MCP ask quota rejection detail", () => {
+  it("does not expose shared usage from another legacy static token", async () => {
+    const call = { jsonrpc: "2.0", id: 348, method: "tools/call", params: { name: "ask", arguments: { model: "any-model", prompt: "1234", max_tokens: 10 } } };
+    const first = await rpc(call, "test-legacy-static-a");
+    const firstBody = (await first.json()) as { result: { isError: boolean } };
+    expect(firstBody.result.isError).toBe(false);
+
+    const second = await rpc(call, "test-legacy-static-b");
+    const secondBody = (await second.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }>; _meta: { quota?: Record<string, unknown> } };
+    };
+    expect(secondBody.result.isError).toBe(true);
+    expect(secondBody.result.content[0]?.text).toContain("Shared static-tier rpm limit reached");
+    expect(secondBody.result._meta.quota).toMatchObject({
+      reason: "rpm", scope: "shared_static_tier", window: "60s", limit: 1, requested: 1, counted: false,
+    });
+    expect(secondBody.result._meta.quota).not.toHaveProperty("used_before");
+
+    const collidingKey = mintKey(
+      { alias: "static:user", tier: "guest" },
+      { rpm: 1, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 2 }
+    ).plaintextKey;
+    const collision = await rpc(call, collidingKey);
+    const collisionBody = (await collision.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }>; _meta: { quota?: Record<string, unknown> } };
+    };
+    expect(collisionBody.result.isError).toBe(true);
+    expect(collisionBody.result.content[0]?.text).toContain("Shared static-tier rpm limit reached");
+    expect(collisionBody.result._meta.quota).toMatchObject({ scope: "shared_static_tier", counted: false });
+    expect(collisionBody.result._meta.quota).not.toHaveProperty("used_before");
+  });
+
+  it.each([
+    {
+      reason: "rpm",
+      limits: { rpm: 0, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 2 },
+      expected: { window: "60s", limit: 0, used_before: 0, requested: 1 },
+    },
+    {
+      reason: "tpm",
+      limits: { rpm: 100, tpm: 1, dailyTokenBudget: 0, maxParallel: 2 },
+      expected: { window: "60s", limit: 1, used_before: 0, requested: 11 },
+    },
+    {
+      reason: "daily",
+      limits: { rpm: 100, tpm: 1_000, dailyTokenBudget: 1, maxParallel: 2 },
+      expected: { window: "utc_day", limit: 1, used_before: 0, requested: 11 },
+    },
+  ])("returns safe $reason quota details for an uncounted rejection", async ({ reason, limits, expected }) => {
+    const key = mintKey({ alias: `mcp-quota-${reason}`, tier: "guest" }, limits).plaintextKey;
+    const res = await rpc(
+      { jsonrpc: "2.0", id: 349, method: "tools/call", params: { name: "ask", arguments: { model: "any-model", prompt: "1234", max_tokens: 10 } } },
+      key
+    );
+    const j = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }>; _meta?: Record<string, unknown>; structuredContent?: unknown };
+    };
+    expect(j.result.isError).toBe(true);
+    expect(j.result.content[0]?.text).toContain(`Per-key ${reason} limit reached`);
+    expect(j.result.content[0]?.text).toContain("This rejected request was not counted.");
+    expect(j.result.structuredContent).toBeUndefined();
+    expect(j.result._meta).toMatchObject({
+      m5_code: "rate_limited",
+      retryable: true,
+      quota: {
+        reason,
+        scope: "key",
+        ...expected,
+        counted: false,
+        retry_after_seconds: expect.any(Number),
+      },
+    });
+    expect(Object.keys(j.result._meta!.quota as Record<string, unknown>).sort()).toEqual([
+      "counted",
+      "limit",
+      "reason",
+      "requested",
+      "retry_after_seconds",
+      "scope",
+      "used_before",
+      "window",
+    ]);
+    expect(j.result._meta).not.toHaveProperty("alias");
+    expect(j.result._meta).not.toHaveProperty("key");
+    expect(j.result._meta).not.toHaveProperty("model");
+    expect(j.result._meta).not.toHaveProperty("ip");
   });
 });
 
