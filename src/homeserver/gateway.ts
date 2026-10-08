@@ -1319,7 +1319,7 @@ async function handleEmbeddingProxy(
       signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
     });
     if (!upstream.ok) {
-      await upstream.body?.cancel();
+      await upstream.body?.cancel().catch(() => undefined);
       const invalidInput = upstream.status === 400 || upstream.status === 413;
       const unknownModel = upstream.status === 404;
       lctx.status = invalidInput ? upstream.status : unknownModel ? 400 : 502;

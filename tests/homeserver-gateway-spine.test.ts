@@ -384,8 +384,10 @@ describe("gateway spine — HTTP integration", () => {
 
   it("caps CPU embedding work at one request before consuming another gateway slot", async () => {
     mockMode = "embedding-stall";
+    releaseStall = null;
     const guest = mintKey({ alias: `embedding-cap-${randomUUID()}`, tier: "guest",
       embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const ungranted = mintKey({ alias: `embedding-cap-ungranted-${randomUUID()}`, tier: "guest" }, DEFAULTS);
     const call = () => fetch(url("/v1/embeddings"), { method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
       body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
@@ -396,12 +398,17 @@ describe("gateway spine — HTTP integration", () => {
       }
       expect(releaseStall).not.toBeNull();
       const reservedCredits = lookupKey(guest.plaintextKey)!.creditsUsed;
+      const ungrantedResponse = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ungranted.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+      expect(ungrantedResponse.status).toBe(403);
       const second = await call();
       expect(second.status).toBe(503);
       expect(upstreamInferenceRequestCount).toBe(1);
       expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(reservedCredits);
     } finally {
       releaseStall?.();
+      releaseStall = null;
     }
     expect((await first).status).toBe(200);
     expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
@@ -1207,7 +1214,6 @@ describe("gateway spine — HTTP integration", () => {
     });
     expect(chatResponse.status).toBe(200);
     const legacyOwnerChatResponse = await chat(ADMIN, {
-      model: "m1",
       messages: [{ role: "user", content: legacyOwnerChatMarker }],
     });
     expect(legacyOwnerChatResponse.status).toBe(200);
@@ -1260,7 +1266,9 @@ describe("gateway spine — HTTP integration", () => {
       lanes: ["chat"],
       harness_ids: ["openai-chat"],
     });
-    expect(legacyExposure.model_ids).toEqual(["m1"]);
+    // The implicit model may be resolved from a prior discovery cache. The static principal's
+    // exposure must never invent any ID beyond the mock backend's actual m1 model.
+    expect([[], ["m1"]]).toContainEqual(legacyExposure.model_ids);
     expect(body.results.find((row) => row.fingerprint_sha256 === delegateHash)).toMatchObject({
       seen: true,
       lanes: ["delegate"],

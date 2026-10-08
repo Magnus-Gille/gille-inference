@@ -730,7 +730,8 @@ to immutable, checksum-verified local artifacts after a bounded M5 evaluation. I
 loopback, uses CPU only, and has an 8 GiB memory cap. It does not request a llama-swap model change;
 before enabling it, include up to 8 GiB of sidecar growth in the host-memory reserve for future
 chat loads and verify real headroom. Embedding calls still use ordinary gateway admission and can
-occupy an inflight slot. A public template does not prove deployment.
+occupy an inflight slot. Only one embedding call per gateway instance may be in flight; concurrent
+calls receive a retryable 503 without a credit charge. A public template does not prove deployment.
 The proposed text GGUF is `ggml-org/embeddinggemma-2-GGUF` revision
 `bfcd298762cc34d0357ece5ebdd31791a3a374d8`, file `embeddinggemma-2-BF16.gguf`
 (557,950,176 bytes, SHA-256 `68bae29d62fb8c7d23e98d21fd4662753ddd636e6b62b8a70dfe059a9844f216`).
@@ -739,6 +740,8 @@ The proposed compatible llama.cpp source revision is
 recognize this architecture. These pinned identities are evaluation inputs, not claims of a
 successful build or a live release. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the
 sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
+Change the portal's planned-status wording to active only in the exact gateway release that
+enables the sidecar, and verify the rendered page after deployment.
 The authenticated `GET /v1/models` response is the customer-facing availability check.
 
 `gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
