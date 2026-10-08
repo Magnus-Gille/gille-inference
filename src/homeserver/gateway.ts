@@ -361,6 +361,9 @@ function keyLimits(cfg: HomeserverConfig): QuotaLimits {
 // ─── Per-key in-flight tracking ──────────────────────────────────────────────────────
 
 const keyInflight = new Map<string, number>();
+// One CPU embedding call per gateway instance matches the sidecar's single server slot and
+// prevents queued sidecar calls from occupying every shared GPU admission slot.
+const embeddingInFlight = new WeakSet<AdmissionController>();
 
 function incInflight(alias: string): void {
   keyInflight.set(alias, (keyInflight.get(alias) ?? 0) + 1);
@@ -1253,11 +1256,11 @@ function modelVisibleInDiscovery(modelId: string, cfg: HomeserverConfig, princip
   return cfg.systemOneModels.includes(modelId) && systemOneGranted(principal, modelId);
 }
 
-async function embeddingSidecarReady(cfg: HomeserverConfig): Promise<boolean> {
+async function embeddingSidecarReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
   if (!cfg.embeddingModels.includes(EMBEDDING_MODEL_ID) || cfg.embeddingBaseUrl === "") return false;
   try {
     const response = await fetch(`${cfg.embeddingBaseUrl}/models`, {
-      signal: AbortSignal.timeout(2_000),
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(2_000), signal]) : AbortSignal.timeout(2_000),
     });
     if (!response.ok) {
       await response.body?.cancel();
@@ -1287,13 +1290,6 @@ async function handleEmbeddingProxy(
     sendError(res, makeError("model_not_found", { param: "model" }));
     return modelNotFoundResult();
   }
-  if (!await embeddingSidecarReady(cfg)) {
-    lctx.status = 502;
-    lctx.outcome = "upstream_unavailable";
-    lctx.errorClass = "upstream_unavailable";
-    sendError(res, makeError("upstream_unavailable"));
-    return ZERO_RESULT;
-  }
   const clientGone = new AbortController();
   let clientAborted = false;
   res.on("close", () => {
@@ -1303,6 +1299,19 @@ async function handleEmbeddingProxy(
     }
   });
   try {
+    if (!await embeddingSidecarReady(cfg, clientGone.signal)) {
+      if (clientAborted) {
+        lctx.status = 499;
+        lctx.outcome = "client_closed";
+        lctx.errorClass = "client_closed";
+        return ZERO_RESULT;
+      }
+      lctx.status = 502;
+      lctx.outcome = "upstream_unavailable";
+      lctx.errorClass = "upstream_unavailable";
+      sendError(res, makeError("upstream_unavailable"));
+      return ZERO_RESULT;
+    }
     const upstream = await fetch(`${cfg.embeddingBaseUrl}/embeddings`, {
       method: "POST",
       headers: { "content-type": "application/json", ...currentTraceHeaders() },
@@ -1310,6 +1319,7 @@ async function handleEmbeddingProxy(
       signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
     });
     if (!upstream.ok) {
+      await upstream.body?.cancel();
       const invalidInput = upstream.status === 400 || upstream.status === 413;
       const unknownModel = upstream.status === 404;
       lctx.status = invalidInput ? upstream.status : unknownModel ? 400 : 502;
@@ -5016,9 +5026,23 @@ export async function handleRequest(
         return;
       }
       lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
-        embeddingTokenReservation(parsed), lctx,
-        () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
+      if (embeddingInFlight.has(controller)) {
+        lctx.status = 503;
+        lctx.outcome = "busy";
+        lctx.errorClass = "server_busy";
+        lctx.retryAfterS = cfg.busyRetryAfterSeconds;
+        lctx.admission = "busy";
+        sendError(res, makeError("server_busy", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
+        return;
+      }
+      embeddingInFlight.add(controller);
+      try {
+        await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
+          embeddingTokenReservation(parsed), lctx,
+          () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
+      } finally {
+        embeddingInFlight.delete(controller);
+      }
       return;
     }
     if (path === "/v1/chat/completions" && method === "POST") {

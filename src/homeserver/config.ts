@@ -679,7 +679,7 @@ export function loadConfig(): HomeserverConfig {
     }
     if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" ||
         !parsed.port || parsed.pathname !== "/v1" || parsed.username || parsed.password ||
-        parsed.search || parsed.hash) {
+        parsed.search || parsed.hash || embeddingBaseUrl !== `${parsed.origin}/v1`) {
       throw new Error("HOMESERVER_EMBEDDING_BASE_URL must be an explicit loopback /v1 URL when embeddings are enabled.");
     }
   }

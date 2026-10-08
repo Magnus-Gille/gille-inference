@@ -37,6 +37,8 @@ describe("embedding sidecar configuration", () => {
     "http://localhost:8107/v1",
     "http://127.0.0.1:8107/admin",
     "http://127.0.0.1:8107/v1?x=1",
+    "http://127.0.0.1:8107/v1?",
+    "http://127.0.0.1:8107/v1#",
     "http://user:pass@127.0.0.1:8107/v1",
   ])("rejects a nonconforming sidecar URL: %s", (url) => {
     process.env.HOMESERVER_EMBEDDING_MODELS = "embeddinggemma-2";

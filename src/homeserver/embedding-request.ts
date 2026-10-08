@@ -6,9 +6,11 @@ const MAX_RAW_JSON_BYTES = 32 * 1024;
 const MAX_INPUT_ITEMS = 16;
 const MAX_ITEM_CHARS = 16 * 1024;
 const MAX_TOTAL_CHARS = 32 * 1024;
+const MAX_USER_CHARS = 256;
 const EMBEDDING_SIZE = 768;
 
 export type EmbeddingDimension = 128 | 256 | 512 | 768;
+export type EmbeddingEncodingFormat = "float" | "base64";
 export type EmbeddingInput = string | string[];
 
 export interface EmbeddingUpstreamBody {
@@ -20,6 +22,8 @@ export interface EmbeddingUpstreamBody {
 export interface EmbeddingRequest {
   model: typeof EMBEDDING_MODEL_ID;
   input: EmbeddingInput;
+  user: string | undefined;
+  encodingFormat: EmbeddingEncodingFormat;
   dimensions: EmbeddingDimension | undefined;
   upstreamBody: EmbeddingUpstreamBody;
 }
@@ -70,9 +74,9 @@ export function parseEmbeddingBody(raw: string): EmbeddingRequest {
   }
   if (!record(value)) requestError("body", "Body must be a JSON object.");
 
-  const supportedFields = ["model", "input", "dimensions", "encoding_format"];
+  const supportedFields = ["model", "input", "user", "dimensions", "encoding_format"];
   if (Object.keys(value).some((key) => !supportedFields.includes(key))) {
-    requestError("body", "Only model, input, dimensions, and encoding_format are supported.");
+    requestError("body", "Only model, input, user, dimensions, and encoding_format are supported.");
   }
 
   const model = value["model"];
@@ -108,6 +112,15 @@ export function parseEmbeddingBody(raw: string): EmbeddingRequest {
     requestError("input", "The combined input exceeds the maximum length.");
   }
 
+  let user: string | undefined;
+  if (value["user"] !== undefined) {
+    if (typeof value["user"] !== "string" || charCount(value["user"]) === 0 ||
+      charCount(value["user"]) > MAX_USER_CHARS) {
+      requestError("user", "User must be a non-empty string of at most 256 characters.");
+    }
+    user = value["user"];
+  }
+
   let dimensions: EmbeddingDimension | undefined;
   if (value["dimensions"] !== undefined) {
     const candidate = value["dimensions"];
@@ -117,8 +130,12 @@ export function parseEmbeddingBody(raw: string): EmbeddingRequest {
     dimensions = candidate;
   }
 
-  if (value["encoding_format"] !== undefined && value["encoding_format"] !== "float") {
-    requestError("encoding_format", "Only float encoding is supported.");
+  let encodingFormat: EmbeddingEncodingFormat = "float";
+  if (value["encoding_format"] !== undefined) {
+    if (value["encoding_format"] !== "float" && value["encoding_format"] !== "base64") {
+      requestError("encoding_format", "Encoding format must be float or base64.");
+    }
+    encodingFormat = value["encoding_format"];
   }
 
   const upstreamBody: EmbeddingUpstreamBody = {
@@ -126,7 +143,7 @@ export function parseEmbeddingBody(raw: string): EmbeddingRequest {
     input,
     encoding_format: "float",
   };
-  return { model: EMBEDDING_MODEL_ID, input, dimensions, upstreamBody };
+  return { model: EMBEDDING_MODEL_ID, input, user, encodingFormat, dimensions, upstreamBody };
 }
 
 /** Reserve a conservative prompt-token estimate before contacting the embedding runtime. */
@@ -163,13 +180,22 @@ function normalizedPrefix(vector: number[], dimensions: EmbeddingDimension | und
   return prefix.map((item) => (item / scale) / norm);
 }
 
+function base64Embedding(vector: number[]): string {
+  const bytes = new Uint8Array(vector.length * Float32Array.BYTES_PER_ELEMENT);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < vector.length; index += 1) {
+    view.setFloat32(index * Float32Array.BYTES_PER_ELEMENT, vector[index]!, true);
+  }
+  return Buffer.from(bytes).toString("base64");
+}
+
 /** Validate the runtime payload and return an OpenAI-shaped, normalized response. */
 export function validateAndShapeEmbeddingResponse(
   payload: unknown,
   request: EmbeddingRequest,
 ): { body: {
   object: "list";
-  data: Array<{ object: "embedding"; embedding: number[]; index: number }>;
+  data: Array<{ object: "embedding"; embedding: number[] | string; index: number }>;
   model: typeof EMBEDDING_MODEL_ID;
   usage: { prompt_tokens: number; total_tokens: number };
 }; inputTokens: number } {
@@ -184,16 +210,17 @@ export function validateAndShapeEmbeddingResponse(
     throw new EmbeddingResponseError("Embedding response count does not match the request.");
   }
 
-  const shapedData: Array<{ object: "embedding"; embedding: number[]; index: number }> = [];
+  const shapedData: Array<{ object: "embedding"; embedding: number[] | string; index: number }> = [];
   for (let index = 0; index < data.length; index += 1) {
     const item = data[index];
     if (!record(item) || item["index"] !== index || item["object"] !== "embedding" ||
       !finiteVector(item["embedding"])) {
       throw new EmbeddingResponseError("Invalid embedding vector response.");
     }
+    const embedding = normalizedPrefix(item["embedding"], request.dimensions);
     shapedData.push({
       object: "embedding",
-      embedding: normalizedPrefix(item["embedding"], request.dimensions),
+      embedding: request.encodingFormat === "base64" ? base64Embedding(embedding) : embedding,
       index,
     });
   }

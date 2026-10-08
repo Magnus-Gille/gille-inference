@@ -26,14 +26,17 @@ function upstreamResponse(requested: ReturnType<typeof request>, data = requeste
 
 describe("embedding request contract", () => {
   it("accepts one string and builds a float-only upstream body", () => {
-    const parsed = request("hello", { dimensions: 256 });
+    const parsed = request("hello", { dimensions: 256, user: "sdk-user" });
     expect(parsed).toMatchObject({
       model: EMBEDDING_MODEL_ID,
       input: "hello",
+      user: "sdk-user",
+      encodingFormat: "float",
       dimensions: 256,
       upstreamBody: { model: EMBEDDING_MODEL_ID, input: "hello", encoding_format: "float" },
     });
     expect(parsed.upstreamBody).not.toHaveProperty("dimensions");
+    expect(parsed.upstreamBody).not.toHaveProperty("user");
   });
 
   it("accepts 1 to 16 text inputs and reserves a conservative byte-based token bound", () => {
@@ -50,7 +53,10 @@ describe("embedding request contract", () => {
     ["multimedia input", { model: EMBEDDING_MODEL_ID, input: [{ type: "text", text: "safe" }] }],
     ["too many inputs", { model: EMBEDDING_MODEL_ID, input: Array(17).fill("x") }],
     ["invalid dimensions", { model: EMBEDDING_MODEL_ID, input: "safe", dimensions: 129 }],
-    ["invalid encoding", { model: EMBEDDING_MODEL_ID, input: "safe", encoding_format: "base64" }],
+    ["invalid encoding", { model: EMBEDDING_MODEL_ID, input: "safe", encoding_format: "binary" }],
+    ["invalid user type", { model: EMBEDDING_MODEL_ID, input: "safe", user: 42 }],
+    ["empty user", { model: EMBEDDING_MODEL_ID, input: "safe", user: "" }],
+    ["long user", { model: EMBEDDING_MODEL_ID, input: "safe", user: "x".repeat(257) }],
     ["unknown field", { model: EMBEDDING_MODEL_ID, input: "safe", temperature: 0 }],
   ])("rejects %s without exposing input text", (_name, body) => {
     const serialized = JSON.stringify(body);
@@ -100,6 +106,25 @@ describe("embedding upstream response validation", () => {
     }, parsed);
     expect(result.body.data[0]?.embedding).toHaveLength(768);
     expect(result.body.data[0]?.embedding.slice(0, 2)).toEqual([0.6, 0.8]);
+  });
+
+  it("encodes the normalized, truncated vector as little-endian Float32 base64", () => {
+    const parsed = request("hello", { dimensions: 128, encoding_format: "base64" });
+    const vector = Array(768).fill(0);
+    vector[0] = 3;
+    vector[1] = 4;
+    const result = validateAndShapeEmbeddingResponse({
+      ...upstreamResponse(parsed),
+      data: [{ object: "embedding", index: 0, embedding: vector }],
+    }, parsed);
+    const encoded = result.body.data[0]?.embedding;
+    expect(typeof encoded).toBe("string");
+    const bytes = Buffer.from(encoded as string, "base64");
+    expect(bytes).toHaveLength(128 * Float32Array.BYTES_PER_ELEMENT);
+    const decoded = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    expect(decoded.getFloat32(0, true)).toBeCloseTo(0.6);
+    expect(decoded.getFloat32(4, true)).toBeCloseTo(0.8);
+    expect(decoded.getFloat32(8, true)).toBe(0);
   });
 
   it.each([
