@@ -59,6 +59,34 @@ function verifyReviewedRocmDropin(path: string, loadedPath: string, ownerIsRoot 
   ], { cwd: root, encoding: "utf8", stderr: "pipe" });
 }
 
+function verifyGatewayBackendRelations(
+  requires: string,
+  wants: string,
+  after: string,
+  reviewedFragment: boolean,
+): string {
+  return execFileSync("bash", [
+    "-c",
+    "source \"$1\"; requires=\"$2\"; wants=\"$3\"; after=\"$4\"; reviewed=\"$5\"; " +
+      "show_value() { case \"$2\" in Requires) printf '%s\\n' \"$requires\" ;; Wants) printf '%s\\n' \"$wants\" ;; After) printf '%s\\n' \"$after\" ;; esac; }; " +
+      "reviewed_gateway_soft_fragment() { [ \"$reviewed\" = yes ]; }; " +
+      "require_gateway_backend_dependency home-gateway.service 999",
+    "--", script, requires, wants, after, reviewedFragment ? "yes" : "no",
+  ], { cwd: root, encoding: "utf8", stderr: "pipe" });
+}
+
+function verifyReviewedGatewayFragment(fragment: string, ownerIsRoot = true): string {
+  const observedMode = (statSync(fragment).mode & 0o777).toString(8);
+  return execFileSync("bash", [
+    "-c",
+    "source \"$1\"; fragment=\"$2\"; owner=\"$3\"; observed_mode=\"$4\"; " +
+      "require_owner_group() { [ \"$owner\" = yes ] && [ \"$2:$3\" = root:root ]; }; " +
+      "require_mode() { [ \"$observed_mode\" = \"$2\" ] || die \"$1 mode is $observed_mode, expected $2\"; }; " +
+      "reviewed_gateway_soft_fragment home-gateway.service \"$fragment\"",
+    "--", script, fragment, ownerIsRoot ? "yes" : "no", observedMode,
+  ], { cwd: root, encoding: "utf8", stderr: "pipe" });
+}
+
 function runGatewayApplyFailureHarness(): string {
   const work = mkdtempSync(join(tmpdir(), "gille-isolation-harness-"));
   const log = join(work, "order.log");
@@ -767,6 +795,70 @@ describe("service-isolation migration contract (#151)", () => {
     const symlink = join(dir, "link.conf");
     symlinkSync(dropin, symlink);
     expect(() => verifyReviewedRocmDropin(symlink, symlink)).toThrow(/not a regular file/);
+  });
+
+  it("retains the isolated user-manager requirement while softening only the backend restart dependency", () => {
+    expect(verifyGatewayBackendRelations(
+      "llama-swap.service user@999.service system.slice",
+      "network-online.target",
+      "llama-swap.service user@999.service",
+      false,
+    )).toBe("");
+    const requires = "user@999.service system.slice sysinit.target";
+    const wants = "llama-swap.service network-online.target";
+    const after = "llama-swap.service user@999.service network-online.target";
+    expect(verifyGatewayBackendRelations(requires, wants, after, true)).toBe("");
+    expect(() => verifyGatewayBackendRelations(`${requires} llama-swap.service`, wants, after, true))
+      .toThrow(/hard backend dependency/);
+    expect(() => verifyGatewayBackendRelations("system.slice", wants, after, true))
+      .toThrow(/user-manager dependency/);
+    expect(() => verifyGatewayBackendRelations(requires, "network-online.target", after, true))
+      .toThrow(/soft backend dependency/);
+    expect(() => verifyGatewayBackendRelations(requires, wants, "user@999.service", true))
+      .toThrow(/backend ordering/);
+    expect(readFileSync(script, "utf8")).toContain('require_gateway_backend_dependency "$unit" "$gateway_uid"');
+  });
+
+  it("recognizes only the old or new base dependency form", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gille-gateway-backend-"));
+    const fragment = join(dir, "home-gateway.service");
+    writeFileSync(fragment, "[Unit]\nAfter=llama-swap.service\nWants=network-online.target\nRequires=llama-swap.service\n[Service]\n");
+    chmodSync(fragment, 0o644);
+    expect(() => verifyReviewedGatewayFragment(fragment)).toThrow();
+    writeFileSync(fragment, "[Unit]\nAfter=llama-swap.service\nWants=network-online.target\nWants=llama-swap.service\n[Service]\n");
+    expect(verifyReviewedGatewayFragment(fragment)).toBe("");
+    expect(() => verifyReviewedGatewayFragment(fragment, false)).toThrow();
+    chmodSync(fragment, 0o600);
+    expect(() => verifyReviewedGatewayFragment(fragment)).toThrow(/mode is 600/);
+    chmodSync(fragment, 0o644);
+    writeFileSync(fragment, "[Unit]\nRequires=llama-swap.service\nRequires=other-critical.service\n[Service]\n");
+    expect(() => verifyReviewedGatewayFragment(fragment)).toThrow(/neither the reviewed/);
+    const symlink = join(dir, "link.conf");
+    symlinkSync(fragment, symlink);
+    expect(() => verifyReviewedGatewayFragment(symlink)).toThrow(/not a regular file/);
+  });
+
+  it("stages an exact one-line, hash-gated full-unit replacement", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gille-gateway-unit-patch-"));
+    const source = join(dir, "source.service");
+    const output = join(dir, "staged.service");
+    const old = "[Unit]\nAfter=llama-swap.service network.target\nWants=network-online.target\nRequires=llama-swap.service\n[Service]\nEnvironment=EXAMPLE_VALUE\n";
+    writeFileSync(source, old);
+    const digest = execFileSync("shasum", ["-a", "256", source], { encoding: "utf8" }).split(" ")[0];
+    const patcher = join(root, "scripts/soften-gateway-backend-unit.py");
+    const run = (hash: string, from = source, to = output) => execFileSync("python3", [
+      patcher, "--source", from, "--output", to, "--expected-sha256", hash,
+    ], { cwd: root, encoding: "utf8", stderr: "pipe" });
+    expect(() => run("0".repeat(64))).toThrow(/differs from approved baseline/);
+    expect(existsSync(output)).toBe(false);
+    expect(run(digest)).toContain("output_sha256=");
+    expect(readFileSync(output, "utf8")).toBe(old.replace("Requires=llama-swap.service", "Wants=llama-swap.service"));
+    expect((statSync(output).mode & 0o777)).toBe(0o600);
+    expect(() => run(digest)).toThrow(/File exists/);
+    const drift = join(dir, "drift.service");
+    writeFileSync(drift, old.replace("Requires=llama-swap.service", "Requires=llama-swap.service other.service"));
+    const driftHash = execFileSync("shasum", ["-a", "256", drift], { encoding: "utf8" }).split(" ")[0];
+    expect(() => run(driftHash, drift, join(dir, "drift-output"))).toThrow(/unexpected \[Unit\]/);
   });
 
   it("rejects unknown services and does not silently apply all services", () => {
