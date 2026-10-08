@@ -723,6 +723,18 @@ describe("portal page content", () => {
     expect(systemOneDocs).toContain("separate endpoint from chat completions");
   });
 
+  it("GET /portal presents EmbeddingGemma 2 in a distinct embedding table with an API example", async () => {
+    const body = await (await fetch(url("/portal"))).text();
+    const embeddingTable = body.match(/<table class="decision-table" aria-label="Embedding model use, API and access">[\s\S]*?<\/table>/)?.[0] ?? "";
+    expect(embeddingTable).toContain("EmbeddingGemma 2");
+    expect(embeddingTable).toContain("embeddinggemma-2");
+    expect(embeddingTable).toContain("/v1/embeddings");
+    expect(embeddingTable).toContain("Explicit key grant");
+    expect(embeddingTable).not.toContain("/v1/chat/completions");
+    expect(body).toContain('"dimensions":256');
+    expect(body).toContain("Image, audio and");
+  });
+
   it("key warning is inside the redeem card, not in a standalone footer", async () => {
     const res = await fetch(url("/portal"));
     const body = await res.text();

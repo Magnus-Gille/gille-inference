@@ -93,10 +93,38 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | PUT | `/execution-feedback/{handle}` | same minted owner-agent/admin key that ran the task | Exact organic execution usefulness (`pass`, `partial`, `redo`, `wrong`); 201 first write, 200 identical retry, 409 conflicting/ineligible write, 404 unknown/other-key handle. Separate from the reviewer overlay and routing; see [contract](execution-feedback.md). |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio/llama.cpp). The gateway forces ordinary exact-prefix prompt caching and strips client-directed `id_slot`/`n_cache_reuse`; slot/cache lifecycle remains server-owned. |
 | POST | `/v1/systemone` | owner key or guest key explicitly granted the model | Typed decision API for explicitly enabled llama-swap models. Credits, quota, GPU queue, and host-memory admission match chat; an empty guest model allow-list does not grant decision models. 8 KiB JSON body limit, text/JSON-object state, 1–16 `noul`/`choice`/`score` questions, no images or streaming. Successful upstream `usage.input_tokens` is billed; failures bill zero. See [customer contract](systemone-customer-access.md). |
+| POST | `/v1/embeddings` | owner key or guest key explicitly granted the model | OpenAI-shaped text/code vectors for enabled `embeddinggemma-2`. One string or 1–16 strings; optional `dimensions` 128/256/512/768 and `encoding_format:"float"`; 32 KiB body cap. Uses ordinary admission, quota and credits; bills successful upstream `usage.prompt_tokens`, failures zero. Empty ordinary guest model lists do not grant embedding access. No media input, streaming, chat or MCP `ask`. |
 | POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
 | POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
 | POST | `/admin/models/unload` | admin scope | Unload one/all models |
 | POST | `/admin/models/download` | admin scope | Download a model (fire-and-forget; modelKey **syntax** validated) |
+| POST | `/admin/keys/embedding-grants` | admin scope | Atomically grant `embeddinggemma-2` to exact active guest/inference aliases without rotating keys or changing chat access, credits or quotas. |
+
+### POST `/v1/embeddings`
+
+The first EmbeddingGemma 2 contract accepts text or code as a JSON string or an array of up to
+16 strings, each at most 16,384 Unicode characters. The request body is capped at 32 KiB; the
+runtime context is 8,192 tokens, so very dense inputs can still be rejected upstream. `dimensions`
+may be 128, 256, 512 or 768
+(default 768); `encoding_format` must be `float` when present. The gateway validates the upstream
+768-dimensional vectors, truncates to the requested size, and L2-normalizes each result. The
+response has OpenAI's `object:"list"`, ordered `data[{object:"embedding",index,embedding}]`,
+`model`, and `usage{prompt_tokens,total_tokens}` fields. Successful input tokens consume the
+key's ordinary credits. A malformed upstream response returns 502 and consumes no credits.
+
+```json
+{"model":"embeddinggemma-2","input":"title: none | text: A short document","dimensions":256}
+```
+
+Google's retrieval prefixes distinguish a query (`task: search result | query: `) from a document
+(`title: none | text: `). Keep output dimensions consistent within an index. The text-only
+deployment uses the BF16 GGUF without its multimodal projector; image, audio, and video inputs
+are outside this contract. The model appears in authenticated `/v1/models` only after the
+dedicated CPU sidecar and gateway setting are active, its health check passes, and the caller has
+access. Customer keys need an explicit embedding grant or the exact ID in a restricted allow-list;
+owner keys have access by default. A grant can be added to an existing open or restricted customer
+key through `/admin/keys/embedding-grants`. Calls share the gateway's ordinary inflight slots and
+credit policy; the sidecar is not a second GPU model in llama-swap.
 
 ### GET `/healthz`
 

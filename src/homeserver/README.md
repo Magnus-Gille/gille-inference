@@ -166,6 +166,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the historical manual model-evaluation registry (`model-registry.ts`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. Prompt caching is server-owned and forced on for the ordinary exact-common-prefix path; client-supplied `id_slot` and `n_cache_reuse` are stripped so one principal cannot select a shared slot or alter the reviewed cache policy. A changed message/file prefix naturally diverges and its suffix is re-evaluated; the gateway stores no repository path or prompt cache. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
 | `POST /v1/systemone` | user | Typed `noul`/`choice`/`score` decisions for explicitly configured llama-swap models (`HOMESERVER_SYSTEMONE_MODELS`); text or JSON-object state, 1–16 questions, 8 KiB body cap, no images/streaming/keep-alive. Guest keys need an explicit model grant, even when their ordinary chat allow-list is empty. Shares lifetime credits, quotas, GPU and host-memory admission with chat. Charges successful `usage.input_tokens`; failures charge zero. Decision models cannot be called through chat or MCP `ask`. See [customer contract](../../docs/systemone-customer-access.md). |
+| `POST /v1/embeddings` | user | OpenAI-shaped text/code embeddings for explicitly enabled `embeddinggemma-2` (`HOMESERVER_EMBEDDING_MODELS`). Accepts one string or 1–16 strings, at most 32 KiB JSON, `encoding_format: "float"`, and optional `dimensions` 128/256/512/768. Vectors are validated and L2-normalized after any truncation. Guest keys require an explicit embedding grant or exact ID in their restricted ordinary allow-list; an empty ordinary allow-list alone does not grant access. Shares admission, quotas and ordinary credits with chat; successful `usage.prompt_tokens` is charged, failures zero. Embedding models are excluded from chat, MCP `ask`, and automatic delegation. Text/code only; no projector or media input. |
 | `GET /v1/capabilities/learning-task` | user | **LearningTaskContract v1 preflight.** Returns the closed four-feature capability advertisement, `service:gille-inference` identity, exact observation/expiry clocks, and an opaque advertisement ID bound to the current process/configuration epoch (`Cache-Control: private, max-age=900`). Hugin must carry this exact fresh response for every new stamped `/delegate` or `code_loop_start` claim; stale, downgraded, cross-principal, or cross-epoch new claims fail closed. Exact authenticated durable admission recovery remains available after expiry/restart without executing new work. |
 | `POST /v1/roster-proposals` | minted logical `service:hugin` owner | Content-blind roster-proposal validation and durable admission only. This rotation-family credential is route-scoped before generic owner dispatch and receives `403` everywhere except proposal submit and exact own-read. No apply/re-arm/widen/model-admin operation. Production rejects until the atomic five-state roster observer, common provider fence/mutator lock, and all restore/template/canary registries are configured; see `docs/roster-proposal-contract.md`. |
 | `GET /v1/roster-proposals/:proposalId` | owner | Principal-scoped durable proposal read; no list surface. |
@@ -177,7 +178,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys) and, for a real minted owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` plus `record_adoption_evidence` (invisible + unknown-tool-shaped error otherwise, #116/#136). The adoption tool accepts only a closed, content-free evidence shape; its weekly dashboard is separate from evaluation/synthetic lab traffic and remains **SHADOW** for routing. Report calls suppress normal per-request correlation logs and are transiently telemetry-rate-limited. The first 25 valid reports per server day retain individual low-cardinality rows; later reports are coalesced into bounded content-free v2 aggregates preserving closed harness and execution-mode attribution. Legacy aggregates remain unchanged; windows with legacy or malformed attribution stay **INCOMPLETE**. Both overflow tables retain 90 days. Its structured acknowledgement distinguishes `retained`, `aggregated`, and `dropped`, uses telemetry-scoped limit reasons, and explicitly says inference availability is unaffected. Retry guidance applies only to `record_adoption_evidence`, never `ask`, `code_loop`, model access, credits, or owner inference. `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). Its structured result exposes `finish_reason`, explicit `truncated`, content-blind `usage`, and `metered:true`; a token-limit finish returns `isError:true`, keeps the paid partial answer in the content block behind a loud warning, and means any retry is a new billable call. `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
 | `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
 | `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
-| `GET /models` | user | Models on disk + loaded. Decision models appear only when enabled and explicitly granted to guest keys. |
+| `GET /models` | user | Models on disk + loaded. Decision and embedding models appear only when enabled and explicitly granted to guest keys. |
 | `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable"}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
 | `GET /ops/summary` | **admin or monitor** | Small, durable M5 activity summary for Heimdall: current in-flight count, last-use time, trailing-24-hour and seven-day request/time totals, plus seven UTC-calendar days newest-first. Counts only admitted M5 compute rows and excludes the outer `/mcp` transport row, so one MCP ask is never counted twice. Includes the content-blind `filterEpoch` (`m5-admitted-compute-v2`) so pre-epoch route-only history is treated as a historical break. No aliases, keys, tokens, content, or per-model dimensions. |
 | `scripts/export-m5-adoption-evidence.ts` | local operator | Read-only JSON evidence bundle for an exact full-UTC-day `[from, throughExclusive)` window. Uses the shared `m5-admitted-compute-v2` predicate, UTC-day/tier/route/node/model and exclusion reconciliation, closed adoption dimensions, a bounded current M5 task×model×verifier×source×outcome matrix, exclusive delegation state counts, current/stale/missing judge-policy coverage, cost/attribution/calibration coverage, finite privacy buckets, evidence-only maturity labels, explicit threshold states, promotion readiness, and a deterministic next action. Refuses active WAL/live snapshots and missing schema; writes only to stdout. |
@@ -191,6 +192,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). New keys are lifetime-bounded and least-scope by default: owner→`agent`, guest→`inference`; admin must be explicit. Guest keys may carry only `inference` or read-only `monitor`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
 | `POST /admin/keys/systemone-grants` | **admin** | Atomically grant a reviewed System One model to an exact set of active minted keys: `{model:"<decision-model-id>",aliases:["..."]}` → `200 {model,changed,unchanged}`. Missing, expired, revoked, or duplicate aliases reject the entire batch. Existing plaintext, hashes, ordinary model access, quotas, credits, expiry, and counters stay intact. Legacy static environment keys have no keystore row and are outside this operation. |
+| `POST /admin/keys/embedding-grants` | **admin** | Atomically grant `embeddinggemma-2` to an exact set of active minted guest/inference customer keys: `{model:"embeddinggemma-2",aliases:["..."]}` → `200 {model,changed,unchanged}`. Also works for open chat allow-lists without widening chat access. Missing, expired, revoked, duplicate, or non-customer aliases reject the entire batch; credentials, ordinary model access, quotas and credits remain intact. |
 | `POST /admin/keys/chat-grants` | **admin** | Atomically grant the already-served `qwen3-30b-instruct` chat model to an exact set of active guest/inference keys: `{model:"qwen3-30b-instruct",aliases:["..."]}` → `200 {model,changed,unchanged}`. Restricted lists gain only that ID; empty lists already grant all ordinary chat models and stay empty. Missing, expired, revoked, duplicate, or non-customer aliases reject the batch. Credentials, credits, quotas, expiry, and counters stay intact. |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
 | `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, mode, inflight, ownerQueued, maxInflight}`. `mode` is `off`, `guest`, or `exclusive`. |
@@ -697,19 +699,19 @@ profile configuration, diagnostics, and transport behavior.
 
 ### Production text roster
 
-llama-swap serves one of twelve text models at a time. The current production roster has
-13 entries: the text models below plus the separately gated `clef-flash` System One entry. The roster IDs are `mellum`,
+llama-swap serves one model at a time. The latest verified production roster has
+15 entries: the twelve chat models below plus three separately gated System One entries. The chat roster IDs are `mellum`,
 `qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`,
 `qwen3-coder-next-80b`, `gpt-oss-120b`, `qwen35-122b-a10b`, `muse-glimmer-30b`,
 `nemotron-3.5-lightning-30b-a3b`, `qwen38-27b`, and `ornith-1.5-35b`.
-The `clef-flash` System One decision model is a separate, gated roster addition. Customer
-availability is conditional: the runtime, roster, and `HOMESERVER_SYSTEMONE_MODELS` setting
-must be verified, and the customer's key must receive an explicit grant. The customer must then
-confirm that `clef-flash` appears in the authenticated `GET /v1/models` response before calling
-`POST /v1/systemone`; until it appears, it is unavailable for that key. For a `noul` question,
-a probability near `1` means yes and near `0` means no. Unscoped guest keys cannot call or
-discover it. Clef-flash returns typed decisions, not chat text, and does not participate in chat,
-MCP `ask`, or automatic delegation, even if the setting is lost.
+The `clef-flash`, `bespoke-nimble-9b`, and `pplx-decider-v1-27b` System One decision models
+are separate, gated roster additions. Customer availability is conditional: the runtime, roster,
+and `HOMESERVER_SYSTEMONE_MODELS` setting must be verified, and the customer's key must receive
+an explicit grant. The requested ID must then appear in the authenticated `GET /v1/models`
+response before calling `POST /v1/systemone`. For a `noul` question, a probability near `1`
+means yes and near `0` means no. Unscoped guest keys cannot call or discover these models.
+They return typed decisions, not chat text, and do not participate in chat, MCP `ask`, or
+automatic delegation, even if the setting is lost.
 
 `qwen3-30b-instruct` is an existing ordinary chat model, not a native System One decider.
 Its appearance in an authenticated customer's `/v1/models` response verifies chat access;
@@ -717,14 +719,27 @@ restricted customer keys can receive its exact ID through `/admin/keys/chat-gran
 rotation or credit reset. A customer should call it through `/v1/chat/completions`, using the
 same ordinary credits and quotas.
 
-Two follow-on native System One entries are proposed and remain unavailable pending the isolated
-M5 host evaluation and runtime/roster checks: `bespoke-nimble-9b` (the Apache-2.0
-`bespokelabs/Bespoke-Nimble-9B` release) and `pplx-decider-v1-27b` (the Apache-2.0
-`perplexity-ai/pplx-decider-v1-27b` release). Their public specs use a Python/ROCm adapter rather
-than the llama.cpp chat path. If either is promoted, it is listed and callable only for keys with
-an explicit System One grant, uses the key's ordinary credits and quotas, and remains excluded from
-chat, MCP `ask`, delegation, and automatic routing. Do not treat the presence of a public spec or
-source code as live availability; the authenticated `GET /v1/models` response is authoritative.
+`embeddinggemma-2` is a separate proposed embedding service and remains unavailable until a
+compatible CPU sidecar, gateway release, and explicit key grant are verified. Its
+first serving contract is text/code only, using the 768-dimensional BF16 GGUF without the
+multimodal projector. The gateway accepts 128/256/512/768 output dimensions and normalizes
+after truncation. Google's documented retrieval prefixes distinguish queries (`task: search result | query: `)
+from documents (`title: none | text: `). The non-deployable service template is
+`deploy/systemd/gille-embeddinggemma2.service`; its runtime and model placeholders must be resolved
+to immutable, checksum-verified local artifacts after a bounded M5 evaluation. It listens only on
+loopback, uses CPU only, and has an 8 GiB memory cap. It does not request a llama-swap model change;
+before enabling it, include up to 8 GiB of sidecar growth in the host-memory reserve for future
+chat loads and verify real headroom. Embedding calls still use ordinary gateway admission and can
+occupy an inflight slot. A public template does not prove deployment.
+The proposed text GGUF is `ggml-org/embeddinggemma-2-GGUF` revision
+`bfcd298762cc34d0357ece5ebdd31791a3a374d8`, file `embeddinggemma-2-BF16.gguf`
+(557,950,176 bytes, SHA-256 `68bae29d62fb8c7d23e98d21fd4662753ddd636e6b62b8a70dfe059a9844f216`).
+The proposed compatible llama.cpp source revision is
+`4f92965a7bfa9e8eb6519908ff962e23c2cb7b93`; the currently installed M5 build does not
+recognize this architecture. These pinned identities are evaluation inputs, not claims of a
+successful build or a live release. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the
+sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
+The authenticated `GET /v1/models` response is the customer-facing availability check.
 
 `gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
 `qwen38-27b` and `ornith-1.5-35b` are 64K multimodal Q4_K_M models served with Q8 KV and native
@@ -820,6 +835,8 @@ HOMESERVER_PER_REQUEST_MAX_TOKENS=12288       # fleet default and ordinary-model
 HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768 # exact-model explicit-request ceilings; empty disables
 HOMESERVER_RECURRENT_MODEL_IDS=qwen3-coder-next-80b  # recurrent models that poison-clear (unload) on abrupt disconnect; "" disables. Default qwen3-coder-next-80b.
 HOMESERVER_SYSTEMONE_MODELS=                  # comma-separated enabled decision-model IDs; empty disables /v1/systemone, but known Clef remains excluded from chat/delegation. Stage before roster entry; issue explicit guest grants only after live checks.
+HOMESERVER_EMBEDDING_MODELS=                  # comma-separated enabled embedding IDs; empty disables /v1/embeddings. Known embedding IDs stay excluded from chat/delegation even while disabled.
+HOMESERVER_EMBEDDING_BASE_URL=                # required when embedding models are enabled; exact loopback http://127.0.0.1:<port>/v1 of the dedicated CPU sidecar
 HOMESERVER_POISON_CLEAR_COOLDOWN_MS=60000     # ≤1 recurrent-model unload per window (recovery-latency dial; see docs/m5-qwen3next-recurrent-degeneration-2026-06-24.md)
 HOMESERVER_DEGENERACY_RUN_THRESHOLD=400       # Fix #2 silent backstop: ≥N consecutive identical non-ws chars in a recurrent model's SSE stream → abort + poison-clear (the no-disconnect "?????" case). 0 disables.
 HOMESERVER_KEY_DEFAULT_RPM=60                 # default requests/min for a new key

@@ -1,4 +1,5 @@
 import { loadEnv } from "../env.js";
+import { isEmbeddingModel } from "./embedding-request.js";
 import { MAX_BLIND_CONTEXT_ROOTS } from "./blind-context.js";
 import type { ShadowLaneConfig } from "./shadow-lane.js";
 import {
@@ -245,6 +246,10 @@ export interface HomeserverConfig {
   backend: "lmstudio" | "llamaswap";
   /** Explicitly enabled decision-model IDs served through POST /v1/systemone. Empty disables it. */
   systemOneModels: string[];
+  /** Explicitly enabled embedding-model IDs served through POST /v1/embeddings. */
+  embeddingModels: string[];
+  /** Optional dedicated loopback embedding server's OpenAI-compatible /v1 base. */
+  embeddingBaseUrl: string;
   /** Explicit remote small-model backend. Empty URL keeps the gateway M5-only. */
   orin: {
     url: string;
@@ -659,6 +664,25 @@ export function loadConfig(): HomeserverConfig {
   const lmBase = (process.env["LMSTUDIO_BASE_URL"] ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
   const origin = lmBase.replace(/\/v1$/, "");
   const blindContextRoots = envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS");
+  const embeddingModels = envList("HOMESERVER_EMBEDDING_MODELS");
+  if (embeddingModels.some((model) => !isEmbeddingModel(model)) ||
+      new Set(embeddingModels).size !== embeddingModels.length) {
+    throw new Error("HOMESERVER_EMBEDDING_MODELS may contain only the reviewed embeddinggemma-2 ID once.");
+  }
+  const embeddingBaseUrl = (process.env["HOMESERVER_EMBEDDING_BASE_URL"] ?? "").replace(/\/$/, "");
+  if (embeddingModels.length > 0) {
+    let parsed: URL;
+    try {
+      parsed = new URL(embeddingBaseUrl);
+    } catch {
+      throw new Error("HOMESERVER_EMBEDDING_BASE_URL must be an explicit loopback /v1 URL when embeddings are enabled.");
+    }
+    if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" ||
+        !parsed.port || parsed.pathname !== "/v1" || parsed.username || parsed.password ||
+        parsed.search || parsed.hash) {
+      throw new Error("HOMESERVER_EMBEDDING_BASE_URL must be an explicit loopback /v1 URL when embeddings are enabled.");
+    }
+  }
   if (blindContextRoots.length > MAX_BLIND_CONTEXT_ROOTS) {
     throw new Error(
       `HOMESERVER_BLIND_CONTEXT_ROOTS may list at most ${MAX_BLIND_CONTEXT_ROOTS} entries.`
@@ -673,6 +697,8 @@ export function loadConfig(): HomeserverConfig {
     lmStudioRestUrl: `${origin}/api/v1`,
     backend: (process.env["HOMESERVER_BACKEND"] === "lmstudio" ? "lmstudio" : "llamaswap"),
     systemOneModels: envList("HOMESERVER_SYSTEMONE_MODELS"),
+    embeddingModels,
+    embeddingBaseUrl,
     orin: {
       // Tailscale address belongs in deployment env, never source. Unset = disabled.
       url: (process.env["HOMESERVER_ORIN_URL"] ?? "").replace(/\/$/, ""),

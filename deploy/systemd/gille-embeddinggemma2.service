@@ -1,0 +1,31 @@
+# Reviewed template only. Resolve the immutable runtime and GGUF paths after the bounded
+# M5 evaluation; do not install this file with /operator-resolve placeholders.
+[Unit]
+Description=Gille EmbeddingGemma 2 text embedding sidecar (CPU)
+After=network.target
+
+[Service]
+Type=simple
+User=magnus
+Group=magnus
+ExecStart=/operator-resolve/llama.cpp-embeddinggemma2/bin/llama-server --model /operator-resolve/models/embeddinggemma-2-BF16.gguf --alias embeddinggemma-2 --host 127.0.0.1 --port 8107 --embedding -c 8192 -b 8192 -ub 8192 -ngl 0 -np 1 --log-disable
+Restart=on-failure
+RestartSec=5
+MemoryMax=8G
+MemorySwapMax=0
+OOMPolicy=stop
+CPUQuota=300%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
