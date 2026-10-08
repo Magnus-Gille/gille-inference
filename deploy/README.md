@@ -204,6 +204,14 @@ For a reviewed roster release:
    configuration, and verify the applied bytes without copying them into the public ticket.
 4. Install the [`systemd/llama-swap-memory.conf`](./systemd/llama-swap-memory.conf) limits, reload
    systemd, and verify the effective `MemoryMax`, `MemorySwapMax`, and `OOMPolicy`.
+   Native ROCm System One models also require `/dev/kfd` in the private unit's closed device
+   policy. Install the additive, reviewed
+   [`systemd/llama-swap-rocm-device.conf`](./systemd/llama-swap-rocm-device.conf) at
+   `/etc/systemd/system/llama-swap.service.d/60-systemone-rocm.conf` as a separate
+   owner-approved service change; preserve the existing render-node allow-list and verify the
+   effective `DevicePolicy=closed` and `DeviceAllow` entries before starting a model. A successful
+   import under the service user does not prove GPU device access. Qualify one typed System One
+   request in an exclusive maintenance window before changing the customer roster or grants.
 5. Restart llama-swap, verify model readiness, then issue one explicit owner-only completion
    against the new model. A roster addition is not an automatic route change.
 6. Apply only the non-secret shadow/canary routing settings from the accepted release, restart the
