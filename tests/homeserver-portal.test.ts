@@ -681,19 +681,44 @@ describe("portal page content", () => {
     expect(body).toContain("one at a time");
   });
 
-  it("GET /portal explains Clef activation and typed yes/no decisions separately from chat", async () => {
+  it("GET /portal lists each System One model in a separate decision table", async () => {
     const res = await fetch(url("/portal"));
     const body = await res.text();
-    const clefCopy = body.match(/<strong>Typed decisions \(separately gated\):<\/strong>[\s\S]*?<\/p>/)?.[0] ?? "";
+    const chatTable = body.match(/<h3>Chat and general models<\/h3>[\s\S]*?<\/table>/)?.[0] ?? "";
+    const decisionTable = body.match(/<table class="decision-table" aria-label="Model use, API and access">[\s\S]*?<\/table>/)?.[0] ?? "";
+    const decisionRows = decisionTable.match(/<tbody>[\s\S]*?<\/tbody>/)?.[0] ?? "";
+    const accessNote = body.match(/Availability requires an activated runtime[\s\S]*?<\/p>/)?.[0] ?? "";
+    const decisionCopy = body.match(/These models return typed probabilities[\s\S]*?<\/p>/)?.[0] ?? "";
     const systemOneDocs = body.match(/<p><strong>System One decision[\s\S]*?separate endpoint from chat completions\.\s*<\/p>/)?.[0] ?? "";
 
-    expect(clefCopy).toContain("explicit grant");
-    expect(clefCopy).toContain("authenticated");
-    expect(clefCopy).toContain("/v1/models");
-    expect(clefCopy).toContain("POST /v1/systemone");
-    expect(clefCopy).toContain("<span class=\"badge mono\">1</span>");
-    expect(clefCopy).toContain("means yes");
-    expect(clefCopy).toContain("not chat text");
+    expect(body).toMatch(/<h3 id="systemone-models-heading"[^>]*>System One decision models<\/h3>[\s\S]*?<div class="model-table-scroll" role="region" aria-labelledby="systemone-models-heading" tabindex="0">[\s\S]*?<table class="decision-table" aria-label="Model use, API and access">/);
+    expect(accessNote).toContain("explicit key grant");
+    expect(accessNote).toContain("roster entry");
+    expect(chatTable).toContain("qwen3-30b-instruct");
+    expect(decisionTable).toContain("<th>Use</th><th>API</th><th>Access</th>");
+    expect(decisionTable).not.toContain("qwen3-30b-instruct");
+    expect(decisionRows.match(/<tr>/g)).toHaveLength(3);
+    for (const [model, name, provider] of [
+      ["clef-flash", "Clef Flash", "Cloudflare"],
+      ["bespoke-nimble-9b", "Bespoke Nimble", "Bespoke"],
+      ["pplx-decider-v1-27b", "Perplexity Decider", "Perplexity"],
+    ]) {
+      expect(chatTable).not.toContain(model);
+      const row = decisionRows.split("<tr>").find((fragment) => fragment.includes(model)) ?? "";
+      expect(row).toContain('<th scope="row"><strong>' + name + '</strong>');
+      expect(row).toContain("by " + provider);
+      expect(row.match(/<td>/g)).toHaveLength(3);
+      expect(row).toContain("Typed decisions");
+      expect(row).toContain("POST<br><span class=\"mono api-path\">/v1/systemone</span>");
+      expect(row).toContain("Explicit key grant<br>Ordinary credits");
+    }
+    expect(decisionCopy).toContain("authenticated");
+    expect(decisionCopy).toContain("/v1/models");
+    expect(decisionCopy).toContain("POST /v1/systemone");
+    expect(decisionCopy).toContain("<span class=\"badge mono\">1</span>");
+    expect(decisionCopy).toContain("means yes");
+    expect(decisionCopy).toContain("not chat text");
+    expect(decisionCopy).toContain("ordinary credits and rate limits");
     expect(systemOneDocs).toContain("If it is missing");
     expect(systemOneDocs).toContain("separate endpoint from chat completions");
   });

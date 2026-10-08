@@ -139,6 +139,20 @@
   table {
     width: 100%; border-collapse: collapse; font-size: 12.5px;
   }
+  .model-table-scroll { max-width: 100%; overflow-x: auto; }
+  .decision-table { min-width: 500px; table-layout: fixed; }
+  .decision-table th:nth-child(1) { width: 29%; }
+  .decision-table th:nth-child(2) { width: 27%; }
+  .decision-table th:nth-child(3) { width: 24%; }
+  .decision-table th:nth-child(4) { width: 20%; }
+  .decision-table td { overflow-wrap: anywhere; }
+  .decision-table .model-id { font-size: 11px; color: var(--muted); }
+  .decision-table .api-path { white-space: nowrap; font-size: 11px; }
+  .decision-table th[scope="row"] {
+    text-align: left; font-size: 12.5px; text-transform: none; letter-spacing: normal;
+    color: var(--text); font-weight: 400; vertical-align: top; padding: 7px 8px;
+  }
+  .decision-table tr:last-child th[scope="row"] { border-bottom: 0; }
   th {
     text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border);
@@ -203,8 +217,8 @@
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
-    <p style="margin-bottom:8px"><strong>Models</strong> (mostly Q4_K_M; VibeThinker uses Q8_0;
-      gpt-oss uses MXFP4):</p>
+    <h3>Chat and general models</h3>
+    <p style="margin-bottom:8px">Mostly Q4_K_M; VibeThinker uses Q8_0; gpt-oss uses MXFP4.</p>
     <table>
       <tr><th>Model</th><th>What it is</th><th>Best for</th><th>~tok/s</th></tr>
       <tr>
@@ -280,19 +294,43 @@
         <td>~75<br><span style="font-size:11px;color:var(--muted)">served canary</span></td>
       </tr>
     </table>
+    <h3 id="systemone-models-heading" style="margin-top:16px">System One decision models</h3>
+    <p style="margin-bottom:8px;font-size:12.5px">
+      Availability requires an activated runtime and roster entry plus an explicit key grant.
+    </p>
+    <div class="model-table-scroll" role="region" aria-labelledby="systemone-models-heading" tabindex="0">
+      <table class="decision-table" aria-label="Model use, API and access">
+        <thead><tr><th>Model</th><th>Use</th><th>API</th><th>Access</th></tr></thead>
+        <tbody>
+          <tr>
+            <th scope="row"><strong>Clef Flash</strong><br><span class="mono model-id">clef-flash</span><br>by Cloudflare</th>
+            <td>Typed decisions</td>
+            <td>POST<br><span class="mono api-path">/v1/systemone</span></td>
+            <td>Explicit key grant<br>Ordinary credits</td>
+          </tr>
+          <tr>
+            <th scope="row"><strong>Bespoke Nimble</strong><br><span class="mono model-id">bespoke-nimble-9b</span><br>by Bespoke</th>
+            <td>Typed decisions</td>
+            <td>POST<br><span class="mono api-path">/v1/systemone</span></td>
+            <td>Explicit key grant<br>Ordinary credits</td>
+          </tr>
+          <tr>
+            <th scope="row"><strong>Perplexity Decider</strong><br><span class="mono model-id">pplx-decider-v1-27b</span><br>by Perplexity</th>
+            <td>Typed decisions</td>
+            <td>POST<br><span class="mono api-path">/v1/systemone</span></td>
+            <td>Explicit key grant<br>Ordinary credits</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
     <p style="margin-top:10px;font-size:12.5px">
-      <strong>Typed decisions (separately gated):</strong> Cloudflare&#8217;s
-      <span class="badge mono">clef-flash</span>, Bespoke&#8217;s
-      <span class="badge mono">bespoke-nimble-9b</span>, and Perplexity&#8217;s
-      <span class="badge mono">pplx-decider-v1-27b</span> use the System One endpoint.
-      Each model is available to a customer only after its runtime and roster are activated
-      and that customer&#8217;s key receives an explicit grant. Confirm that the model appears in your
+      These models return typed probabilities, not chat text. Confirm that a model appears in your
       authenticated <span class="badge mono">/v1/models</span> response before calling
       <span class="badge mono">POST /v1/systemone</span>; if it is absent, it is not available for
       your key yet. For a <span class="badge mono">noul</span> question, a probability near
       <span class="badge mono">1</span> means yes and near <span class="badge mono">0</span> means no.
-      Decision models return typed probabilities, not chat text. They share your ordinary credits
-      and rate limits. Published benchmark scores do not establish accuracy on your own task.
+      They share your ordinary credits and rate limits. Published benchmark scores do not establish
+      accuracy on your own task.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       The existing <span class="badge mono">qwen3-30b-instruct</span> model is for ordinary chat.
