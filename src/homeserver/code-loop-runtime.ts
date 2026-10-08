@@ -17,6 +17,7 @@ import {
   type GatewayRelay,
 } from "./code-loop-cage.js";
 import { acquireGpuLease } from "./gpu-lease.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
 import { createModelStartAdmission, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
 import { getRunningSnapshot } from "./model-admin.js";
 import {
@@ -211,6 +212,9 @@ export function buildCodeLoopRuntime(
     keyAlias: gatewayContext?.authenticatedPrincipalId ?? null,
     feedbackOwner: gatewayContext?.feedbackOwner ?? null,
     beforeModelStart,
+    // The offline fixture mode has no user manager; production confinement
+    // always probes the actual dedicated bus before new work is admitted.
+    ...(confinement === "required" ? { codeLoopTransportProbe: probeCodeLoopTransport } : {}),
     ...(gatewayContext === undefined
       ? {}
       : {

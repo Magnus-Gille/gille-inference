@@ -87,6 +87,7 @@ export type CodeLoopRefusal =
   | "maintenance"
   | "lease-unavailable"
   | "cage-unavailable"
+  | "cage-transport-unavailable"
   | "insufficient_memory"
   | "memory_admission_unavailable"
   | "invalid-request"
@@ -324,6 +325,8 @@ export interface CodeLoopDeps {
   feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
   /** Optional pre-start resource admission; invoked before cage, seed, GPU lease, or engine work. */
   beforeModelStart?: ModelStartAdmission;
+  /** Content-free reachability of the dedicated user-bus listener before new work. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
   /** Poll gateway/model readiness after a suspected degeneracy abort; resolves ready?. */
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */

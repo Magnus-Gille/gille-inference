@@ -25,6 +25,9 @@ gateway deployment are separate operations; source documentation does not prove 
 
 `m5 doctor` keeps older gateways with missing compatibility metadata in the existing reachability
 status, while a known contract or version mismatch reports `status: "degraded"` and exits nonzero.
+It also checks the public, content-free `/healthz` code-loop transport field without a bearer.
+`unavailable` reports degraded; a missing or invalid field reports `unknown`. This socket check
+does not prove that the caged code loop or inference can complete.
 It includes only validated gateway revision, client version, and result contract fields. Use
 `m5 --profile <name> doctor --check-latest` only when an explicit registry check is needed; this
 uses the fixed public npm endpoint and does not send credentials. An upgrade recommendation names

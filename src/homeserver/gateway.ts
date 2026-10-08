@@ -62,6 +62,7 @@ import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
 import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
@@ -3633,6 +3634,8 @@ export interface GatewayComposition {
   rosterAdmissionDependencies?: RosterAdmissionDependencies;
   /** Injectable only for deterministic maintenance-window tests. Production uses the canonical lease. */
   maintenanceWindowDependencies?: MaintenanceWindowDependencies;
+  /** Test seam for the bounded, content-free dedicated user-bus transport probe. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
 }
 
 export interface GatewayRegistryInitializers {
@@ -3798,6 +3801,7 @@ export function startGateway(
       composition.rosterAdmissionDependencies,
       maintenanceWindow,
       hostMemoryDeps,
+      composition.codeLoopTransportProbe,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -3904,6 +3908,7 @@ export async function handleRequest(
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
   maintenanceWindow?: ExclusiveMaintenanceWindow,
   hostMemoryDeps: HostMemoryAdmissionDeps = { getRunning: getRunningSnapshot },
+  codeLoopTransportProbe: () => Promise<boolean> = probeCodeLoopTransport,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -4007,7 +4012,14 @@ export async function handleRequest(
     // Gate healthz logging behind the config toggle (default: off, to avoid noise).
     if (path === "/healthz" && method === "GET") {
       const orin = await probeOrin(cfg);
-      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin] });
+      // This is a transport observation, not an inference or cage-isolation probe.
+      // Legacy file binds can remain visible after user@UID restarts, so test a
+      // real listener. Keep overall liveness independent: ordinary inference can work
+      // while code_loop is unavailable.
+      const codeLoopTransport = cfg.codeLoop === "on"
+        ? await codeLoopTransportProbe().then((ready) => ready ? "available" : "unavailable", () => "unavailable")
+        : "disabled";
+      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin], codeLoopTransport });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";

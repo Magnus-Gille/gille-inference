@@ -535,11 +535,12 @@ sudo scripts/service-isolation.sh verify --service gateway
 ```
 
 The refresh requires the dedicated lingered user manager to be healthy before mutation, backs up
-the exact prior drop-in, orders `home-gateway.service` after and requires the resolved
-`user@<gille-gateway-uid>.service`, restarts once, and verifies that a user-manager transport is
-visible inside the gateway's mount namespace. It binds only the private manager directory and the
-ordinary session-bus socket read-only; `systemd-run --pipe` needs the latter to pass stdio file
-descriptors. The dedicated user manager spawns each transient code-loop service, so `pasta` can
+the exact prior drop-in, orders `home-gateway.service` after the resolved
+`user@<gille-gateway-uid>.service`, then restarts both units and verifies that a user-manager
+transport is visible inside the gateway's mount namespace. It binds the dedicated manager's
+runtime directory read-only, so replacement socket paths resolve after the manager restarts;
+`systemd-run --pipe` needs the ordinary session bus to pass stdio file descriptors. The
+dedicated user manager spawns each transient code-loop service, so `pasta` can
 construct its namespace without granting `AF_NETLINK`, TUN, or weaker
 `NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
 receives no host `/run` mounts or session-bus access. Isolation-only runtime variables also take
@@ -560,6 +561,19 @@ namespace can reach it. Complete recovery with one harmless owner-agent `ask` an
 seed-file `code_loop` smoke from a supported client; the latter must still prove every cage marker
 before inference begins.
 
+The initial gateway migration and recovery refresh install a reviewed drop-in for that exact
+dedicated `user@UID.service`: `Restart=on-failure` and `OOMScoreAdjust=-500`.
+Refresh restarts the manager once to activate its new OOM score and
+checks that the gateway process did not restart as a result. A later manager recovery should
+leave the gateway process running while its directory mount sees replacement bus sockets.
+An intentional gateway stop does not trigger a restart. The refresh backs up and restores both
+unit drop-ins together on failure; it rejects an existing manager drop-in whose contents differ
+from the reviewed template. Gateway migration rollback removes the owned manager drop-in.
+Before owner-attended rollout, verify the resolved systemd dependencies, exercise an unexpected
+manager failure on a non-production unit, and check ordinary inference plus a caged code-loop
+smoke. `/healthz.codeLoopTransport` and `m5 doctor` report only the content-free socket-listener
+observation, not end-to-end code-loop readiness.
+
 Rollback is likewise one service at a time and explicit:
 
 ```bash
@@ -567,7 +581,8 @@ sudo scripts/service-isolation.sh rollback --service gateway --ack-rollback
 ```
 
 It stops the selected service, restores only its moved source paths, removes the isolation
-drop-in (leaving other pre-existing drop-ins intact), reloads systemd, and demands a recovered
+drop-in and its exact owned manager recovery drop-in (leaving other pre-existing drop-ins intact),
+reloads systemd, and demands a recovered
 legacy `magnus` unit. It refuses any merge with a non-empty original state directory. The
 dedicated inactive account/runtime is retained, mode-restricted, for forensic recovery; delete it
 only in a separate owner-approved cleanup.

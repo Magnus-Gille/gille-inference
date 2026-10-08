@@ -2105,7 +2105,30 @@ async function endpointDoctor({
     gateway_compatibility: classifyGatewayCompatibility(identity),
     tools,
     model_discovery: modelDiscovery,
+    code_loop_transport: await doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs),
   };
+}
+
+// /healthz is public and content-free. Treat missing/older/invalid responses as
+// unknown, never as proof of code-loop health. No credential or model prompt is sent.
+async function doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 1500));
+  try {
+    const response = await fetchImpl(`${baseUrl}/healthz`, {
+      redirect: "error",
+      headers: { accept: "application/json", "user-agent": `m5-cli/${M5_CLIENT_VERSION}` },
+      signal: controller.signal,
+    });
+    if (!response.ok) return "unknown";
+    const payload = JSON.parse(await readBoundedRegistryBody(response));
+    return ["available", "unavailable", "disabled"].includes(payload?.codeLoopTransport)
+      ? payload.codeLoopTransport : "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function modelCatalogueDigest(models) {
@@ -2373,6 +2396,10 @@ function doctorCapabilityFields(
     },
     // Doctor never calls `ask`: that path is metered, so readiness remains explicitly unknown.
     inference: { public: "not_checked", private: "not_checked" },
+    code_loop_transport: {
+      public: publicProbe?.code_loop_transport ?? "unknown",
+      private: privateProbe?.code_loop_transport ?? "unknown",
+    },
   };
 }
 
@@ -2527,7 +2554,7 @@ async function diagnoseProfileCore({
     const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
       .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
     const result = safeDoctorResult({
-      status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
+      status: knownCompatibilityMismatch || publicProbe.code_loop_transport === "unavailable" ? "degraded" : "mcp_reachable",
       profile,
       credential: "present",
       ...doctorCapabilityFields(publicProbe, null),
@@ -2650,7 +2677,8 @@ async function diagnoseProfileCore({
   const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
     .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
   const result = safeDoctorResult({
-    status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
+    status: knownCompatibilityMismatch || [publicProbe, privateProbe].some((probe) => probe.code_loop_transport === "unavailable")
+      ? "degraded" : "mcp_reachable",
     profile,
     credential: "present",
     identity: {

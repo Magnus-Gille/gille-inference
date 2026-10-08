@@ -95,7 +95,7 @@ function runGatewayApplyFailureHarness(): string {
 LOG="$2"; BACKUP_ROOT="$3"; source "$1"
 record() { printf '%s\\n' "$1" >> "$LOG"; }
 root_only() { :; }; need() { :; }; show_value() { printf 'magnus\\n'; }
-preflight() { :; }; create_service_user() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; provision_gateway_codeloop_toolchain() { :; }; install() { :; }; stat() { printf '1\\n'; }
+preflight() { :; }; create_service_user() { :; }; require_gateway_manager_dropin_absent() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; provision_gateway_codeloop_toolchain() { :; }; install() { :; }; stat() { printf '1\\n'; }
 backup_unit() { mkdir -p "$3"; printf 'enabled\\n' > "$3/legacy-timer.enabled"; printf 'active\\n' > "$3/legacy-timer.active"; }
 disable_legacy_autonomy_timer() { record disable; }
 migrate_gateway_state() { record migrate; false; }
@@ -358,8 +358,32 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(unit).toContain("[Unit]\nRequires=user@4242.service\nAfter=user@4242.service\n");
+    expect(unit).toContain("[Unit]\nWants=user@4242.service\nAfter=user@4242.service\n");
+    expect(unit).not.toContain("BindsTo=");
     expect(unit.indexOf("[Unit]")).toBeLessThan(unit.indexOf("[Service]"));
+  });
+
+  it("renders a dedicated manager recovery contract without changing other user managers", () => {
+    const unit = execFileSync("bash", ["-c", "source \"$1\"; render_gateway_manager_recovery", "--", script], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(unit).not.toContain("Wants=");
+    expect(unit).not.toContain("Upholds=");
+    expect(unit).toContain("Restart=on-failure");
+    expect(unit).toContain("OOMScoreAdjust=-500");
+    expect(unit).not.toContain("KillMode=");
+  });
+
+  it("verifies the exact manager recovery policy and effective OOM score", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-recovery-"));
+    const file = join(work, "50-gille-gateway-recovery.conf");
+    writeFileSync(file, execFileSync("bash", ["-c", "source \"$1\"; render_gateway_manager_recovery", "--", script], { encoding: "utf8" }));
+    const verify = `source "$1"; dropin="$3"; score="$4"; require_owner_group() { :; }; require_mode() { :; }; \
+show_value() { case "$2" in DropInPaths) printf '%s\\n' "$dropin" ;; Restart) printf 'on-failure\\n' ;; OOMScoreAdjust) printf '%s\\n' "$score" ;; Wants) printf 'user@4242.service\\n' ;; MainPID) printf '1234\\n' ;; esac; }; \
+effective_oom_score_adj() { printf '%s\\n' "$score"; }; \
+verify_gateway_manager_recovery 4242 "$2"`;
+    expect(() => execFileSync("bash", ["-c", verify, "--", script, file, file, "-500"], { encoding: "utf8" })).not.toThrow();
+    expect(() => execFileSync("bash", ["-c", verify, "--", script, file, file, "100"], { encoding: "utf8", stderr: "pipe" })).toThrow();
   });
 
   it("fails gateway startup unless both user-manager transports are visible inside its mount namespace", () => {
@@ -375,12 +399,12 @@ describe("service-isolation migration contract (#151)", () => {
     );
     expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/systemd/private");
     expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/bus");
-    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/systemd");
-    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/bus");
+    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242\n");
+    expect(unit).not.toContain("BindReadOnlyPaths=/run/user/4242/bus");
     const source = readFileSync(script, "utf8");
     expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"');
     expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/bus"');
-    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd" "/run/user/$gateway_uid/bus"');
+    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid"');
   });
 
   it("keeps the isolated gateway off AF_NETLINK because pasta is manager-spawned", () => {
@@ -528,6 +552,21 @@ describe("service-isolation migration contract (#151)", () => {
     expect(output).toContain("verify:gateway 1 0 0 0 0 0");
     expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
     expect(output).not.toContain("AF_NETLINK");
+  });
+
+  it("removes a newly installed manager recovery drop-in when gateway refresh fails", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-refresh-rollback-"));
+    const backup = join(work, "backup");
+    mkdirSync(backup);
+    const gatewayDropin = join(work, "gateway.conf");
+    const managerDropin = join(work, "manager.conf");
+    writeFileSync(join(backup, "dropin.before.conf"), "[Unit]\nRequires=user@4242.service\n");
+    writeFileSync(gatewayDropin, "[Unit]\nBindsTo=user@4242.service\n");
+    writeFileSync(managerDropin, "[Unit]\nWants=home-gateway.service\n");
+    execFileSync("bash", ["-c", `source "$1"; REFRESH_BACKUP="$2"; REFRESH_DROPIN="$3"; REFRESH_MANAGER_DROPIN="$4"; REFRESH_MANAGER_EXISTED=0; REFRESH_UNIT=home-gateway.service; \
+restore_gateway_codeloop_config() { :; }; restore_gateway_codeloop_toolchain_pointer() { :; }; atomic_install_file() { cp "$1" "$2"; }; systemctl() { :; }; verify() { :; }; restore_isolation_refresh`, "--", script, backup, gatewayDropin, managerDropin], { encoding: "utf8" });
+    expect(existsSync(managerDropin)).toBe(false);
+    expect(readFileSync(gatewayDropin, "utf8")).toBe("[Unit]\nRequires=user@4242.service\n");
   });
 
   it("can restore and exactly verify the superseded netlink drop-in after a failed refresh", () => {

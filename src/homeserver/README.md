@@ -158,7 +158,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 
 | Method + path | Auth | Purpose |
 |---|---|---|
-| `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks). |
+| `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks), plus content-free `codeLoopTransport: "available" \| "unavailable" \| "disabled"`. This checks the dedicated user-bus socket listener only when code loops are enabled. Overall `ok` remains independent of this field because ordinary inference can work while code loops cannot. It does not prove that a caged job can run. |
 | `GET /` · `GET /portal` | none | Serves the self-service portal page (HTML; `nosniff` + restrictive CSP + `no-store`). Per-IP throttled. |
 | `POST /portal/redeem` | none (the **code** is the credential) | `{code}` → `200 {key, alias, model, models, creditLimit}` (`Cache-Control: no-store`). Trades a one-time invite code for a freshly minted key. Uniform `409 invite_invalid` for an unknown **or** already-used code (identical body — no enumeration oracle); `400` for a missing code. Per-IP throttled (`HOMESERVER_REDEEM_RPM`, default 10 / 10 min) → `429`. |
 | `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` plus `gateway` release metadata only for minted owner agent/admin keys (`Cache-Control: no-store`). |
@@ -389,7 +389,8 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
 - `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?}`
   → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, capabilities}`
   immediately, or a structured refusal (`disabled` / `busy` / `maintenance` /
-  `lease-unavailable` / `cage-unavailable` / `invalid-request` / `conflict` /
+  `lease-unavailable` / `cage-unavailable` / `cage-transport-unavailable` /
+  `invalid-request` / `conflict` /
   `admission-recovery`). Optional
   `client_run_id` activates `client-run-id-v1`: an exclusive durable binding to the canonical
   request digest is committed before execution; same id+request recovers the original
@@ -906,6 +907,11 @@ package with a real `llama-server` backend (per the deep-research Tier-A recomme
 
 `m5 doctor` reports client/gateway versions and result-contract compatibility from
 an authenticated, content-free `GET /portal/me` using a minted owner agent/admin key.
+It also reads the public, content-free `/healthz` transport field without sending a key. An
+unavailable code-loop transport degrades doctor; missing or older fields remain `unknown`.
+Doctor still does not execute a code loop or a metered inference request.
+When the dedicated user bus is absent, a new `code_loop_start` refuses before model admission
+with `cage-transport-unavailable`. An exact idempotent retry may still recover its earlier run.
 Guests and inference keys receive no release metadata. Gateway source SHA is embedded by
 `git archive`; development checkouts report unknown. Version compatibility does
 not establish inference readiness. See [gateway release advertisement](../../docs/gateway-api-contract.md#gateway-release-advertisement).

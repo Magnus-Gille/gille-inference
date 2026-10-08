@@ -552,6 +552,19 @@ describe("startCodeLoop — refusals", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal).toBe("maintenance");
   });
+  it("names an absent user-bus transport before model admission or cage work", async () => {
+    const beforeModelStart = vi.fn(async () => {});
+    const cageSelfTest = vi.fn(async () => ({ ok: true, failures: [] }));
+    const r = await startCodeLoop(req, startCfg(), {
+      ...fakeDeps(),
+      codeLoopTransportProbe: async () => false,
+      beforeModelStart,
+      cageSelfTest,
+    });
+    expect(r).toMatchObject({ ok: false, refusal: "cage-transport-unavailable" });
+    expect(beforeModelStart).not.toHaveBeenCalled();
+    expect(cageSelfTest).not.toHaveBeenCalled();
+  });
   it("cage self-test failure refuses with cage-unavailable (confinement required)", async () => {
     const r = await startCodeLoop(req, startCfg({ confinement: "required", cage: { buildArgv: () => [] } }), fakeDeps({ cageOk: false }));
     expect(r.ok).toBe(false);

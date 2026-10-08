@@ -214,6 +214,8 @@
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
       Optional host-memory protection checks gateway model starts, including owner delegation,
       coding jobs and admin loads; it stays off until the owner validates the memory budgets.
+      The optional owner code loop has a separate, content-free user-bus transport check in
+      <span class="badge mono">/healthz</span>; gateway liveness alone does not prove code-loop readiness.
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
@@ -525,6 +527,16 @@
           downgraded, cross-principal, replayed, or cross-restart stamps before model work begins.
           Unstamped <span class="badge mono">/delegate</span> remains a legacy compatibility path
           and is not eligible for joined learning-task evidence.
+        </p>
+
+        <p><strong>Gateway and code-loop transport status (no key needed):</strong></p>
+        <pre>curl https://inference.example.com/healthz</pre>
+        <p>
+          <span class="badge mono">ok</span> reports gateway liveness. The content-free
+          <span class="badge mono">codeLoopTransport</span> field is
+          <span class="badge mono">available</span>, <span class="badge mono">unavailable</span>,
+          or <span class="badge mono">disabled</span>. It tests the dedicated user-bus socket
+          listener when code loops are enabled; it does not run a code loop or test inference.
         </p>
 
         <p><strong>Public usage stats (no key needed):</strong></p>
