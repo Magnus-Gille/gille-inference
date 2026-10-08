@@ -337,6 +337,40 @@ require_show_exact_set() {
   expected="$(printf '%s\n' "$@" | normalize_show_set)"
   [ "$actual" = "$expected" ] || die "$unit effective $property differs from the reviewed allowlist"
 }
+show_has_token() {
+  local unit="$1" property="$2" token="$3"
+  [[ " $(show_value "$unit" "$property") " == *" $token "* ]]
+}
+reviewed_gateway_soft_fragment() {
+  local unit="$1" fragment="${2:-}" requirements wants
+  if [ -z "$fragment" ]; then
+    fragment="$(show_value "$unit" FragmentPath)"
+    [ "$fragment" = /etc/systemd/system/home-gateway.service ] || die "gateway base fragment is not the reviewed path"
+  fi
+  [ -f "$fragment" ] && [ ! -L "$fragment" ] || die "gateway base fragment is not a regular file"
+  require_owner_group "$fragment" root root
+  require_mode "$fragment" 644
+  requirements="$(awk '/^\[/{in_unit=($0=="[Unit]")} in_unit && /^Requires=/{print}' "$fragment")"
+  wants="$(awk '/^\[/{in_unit=($0=="[Unit]")} in_unit && /^Wants=/{print}' "$fragment")"
+  if [ -z "$requirements" ] && printf '%s\n' "$wants" | grep -Eq '(=|[[:space:]])llama-swap[.]service([[:space:]]|$)'; then
+    return 0
+  fi
+  [ "$requirements" = 'Requires=llama-swap.service' ] || die "gateway base backend dependency is neither the reviewed old nor new form"
+  ! printf '%s\n' "$wants" | grep -Eq '(=|[[:space:]])llama-swap[.]service([[:space:]]|$)' || die "gateway base contains redundant backend want"
+  return 1
+}
+require_gateway_backend_dependency() {
+  local unit="$1" gateway_uid="$2"
+  if reviewed_gateway_soft_fragment "$unit"; then
+    show_has_token "$unit" Requires "user@$gateway_uid.service" || die "gateway user-manager dependency was lost"
+    ! show_has_token "$unit" Requires llama-swap.service || die "gateway hard backend dependency remains"
+    show_has_token "$unit" Wants llama-swap.service || die "gateway soft backend dependency is absent"
+    show_has_token "$unit" After llama-swap.service || die "gateway backend ordering is absent"
+    show_has_token "$unit" After "user@$gateway_uid.service" || die "gateway user-manager ordering was lost"
+  else
+    show_has_token "$unit" Requires llama-swap.service || die "gateway backend dependency is absent"
+  fi
+}
 require_show_exact_device_allow() {
   local unit="$1" actual expected
   shift
@@ -1210,6 +1244,7 @@ verify() {
       [ "$(show_value "$unit" PrivateDevices)" = yes ] || die "$unit PrivateDevices is not enabled"
       local gateway_uid
       gateway_uid="$(id -u "$GATEWAY_USER")"
+      require_gateway_backend_dependency "$unit" "$gateway_uid"
       if [ "$require_user_manager_order" = 1 ] && [ "$require_gateway_session_bus" = 1 ]; then
         require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd" "/run/user/$gateway_uid/bus"
       elif [ "$require_user_manager_order" = 1 ]; then

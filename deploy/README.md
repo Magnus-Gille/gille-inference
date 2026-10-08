@@ -212,6 +212,20 @@ For a reviewed roster release:
    effective `DevicePolicy=closed` and `DeviceAllow` entries before starting a model. A successful
    import under the service user does not prove GPU device access. Qualify one typed System One
    request in an exclusive maintenance window before changing the customer roster or grants.
+   The transactional promoter restarts `llama-swap.service`. If the gateway's base unit has
+   `Requires=llama-swap.service`, systemd also restarts the gateway and destroys its process-local
+   exclusive-window token. A drop-in cannot remove a `Requires=` dependency. In a separately
+   approved service change, back up the full `/etc/systemd/system/home-gateway.service` unit and
+   use [`soften-gateway-backend-unit.py`](../scripts/soften-gateway-backend-unit.py) with the exact
+   approved baseline SHA-256 to stage a private replacement. Review that the only changed line is
+   `Requires=llama-swap.service` to `Wants=llama-swap.service`, without printing any private unit
+   contents. Install the replacement as root:root mode 0644, run `systemctl daemon-reload`, and
+   verify the effective dependencies: no hard llama-swap requirement, a soft llama-swap want, and
+   unchanged `After=llama-swap.service` plus the isolated `user@<gateway-uid>.service` requirement.
+   Verify gateway service isolation again. In the private rollout, first prove that one bounded
+   llama-swap restart leaves the gateway and exclusive window alive; restore prior model residency
+   after the restart. On rollback, restore the exact backed-up unit and dependency set before
+   resuming normal service.
 5. Restart llama-swap, verify model readiness, then issue one explicit owner-only completion
    against the new model. A roster addition is not an automatic route change.
 6. Apply only the non-secret shadow/canary routing settings from the accepted release, restart the
