@@ -198,13 +198,18 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
 | `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
-`GET /models/residency` returns `200 {models:[...]}` when the backend snapshot is available. Each
-row contains only `model`, `state`, `ttl`, `classification` (`serving`, `ttl_retained`,
-`unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`). Admin output may
-also contain `lastUse.alias`; monitor output deliberately omits it. If the snapshot is
-unavailable, the safe response is `503 {status:"unavailable"}` with no `models` array. This
-endpoint is read-only and content-blind: it does not expose prompts, responses, token counts, keys,
-key hashes, raw backend commands, backend addresses/IPs, or other unsafe fields.
+`GET /models/residency` returns `200 {models:[...],hostMemory:{...}}` when the backend snapshot is
+available. Each model row contains only `model`, `state`, `ttl`, `classification` (`serving`,
+`ttl_retained`, `unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
+Admin output may also contain `lastUse.alias`; monitor output deliberately omits it. The content-blind
+`hostMemory` object reports total RAM, `MemAvailable`, free CMA, and best-effort DRM GTT used/total
+bytes. GTT counters are device-wide and always marked `unattributed` when present; they cannot say
+which model or process owns the allocation, even with resident models. Missing DRM counters are
+explicit `null` values and `gttAccounting:"unknown"`. If the memory snapshot itself cannot be read,
+the object reports `status:"unknown"` and null values. If the model snapshot is unavailable, the
+safe response remains `503 {status:"unavailable"}` with no `models` array. This endpoint is
+read-only and content-blind: it does not expose prompts, responses, token counts, keys, key hashes,
+raw backend commands, backend addresses/IPs, or other unsafe fields.
 
 **Credits vs. daily budget.** `creditLimit` is a **lifetime, non-resetting** total-token cap
 (0 = unlimited) — when `creditsUsed >= creditLimit` the key is refused with `402

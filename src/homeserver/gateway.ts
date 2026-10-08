@@ -56,7 +56,7 @@ import {
 } from "./maintenance-window.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
-import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, type HostMemoryAdmissionDeps, type ModelStartAdmission } from "./host-memory-admission.js";
+import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, readHostMemory, type HostMemoryAdmissionDeps, type HostMemoryReadResult, type ModelStartAdmission } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
@@ -562,11 +562,56 @@ interface ModelResidencyResponseRow {
 }
 
 type ModelResidencyResponse =
-  | { models: ModelResidencyResponseRow[]; status?: never }
+  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; status?: never }
   | { status: "unavailable"; models?: never };
 
+interface HostMemoryResponse {
+  status: "available" | "unknown";
+  memTotalBytes: number | null;
+  memAvailableBytes: number | null;
+  cmaFreeBytes: number | null;
+  gttUsedBytes: number | null;
+  gttTotalBytes: number | null;
+  /** Device-wide counters cannot be attributed to external models from these observations. */
+  gttAccounting: "unattributed" | "unknown";
+}
+
+function narrowHostMemory(result: HostMemoryReadResult): HostMemoryResponse {
+  if (!result.ok) {
+    return {
+      status: "unknown",
+      memTotalBytes: null,
+      memAvailableBytes: null,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+      gttAccounting: "unknown",
+    };
+  }
+  const { memory } = result;
+  const hasGttCounters = memory.gttUsedBytes !== null && memory.gttTotalBytes !== null;
+  return {
+    status: "available",
+    memTotalBytes: memory.memTotalBytes,
+    memAvailableBytes: memory.memAvailableBytes,
+    cmaFreeBytes: memory.cmaFreeBytes,
+    gttUsedBytes: memory.gttUsedBytes,
+    gttTotalBytes: memory.gttTotalBytes,
+    gttAccounting: hasGttCounters ? "unattributed" : "unknown",
+  };
+}
+
+async function readHostMemoryForResidency(reader: () => Promise<HostMemoryReadResult>): Promise<HostMemoryResponse> {
+  try {
+    return narrowHostMemory(await reader());
+  } catch {
+    // Diagnostics must remain content-blind and available even if the best-effort reader throws.
+    return narrowHostMemory({ ok: false, error: "host memory reader failed" });
+  }
+}
+
 /** Read and narrow the content-blind model-residency diagnostic for the HTTP surface. */
-async function readModelResidency(includeAlias: boolean): Promise<ModelResidencyResponse> {
+async function readModelResidency(includeAlias: boolean, readMemory: () => Promise<HostMemoryReadResult>): Promise<ModelResidencyResponse> {
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
   try {
     running = await getRunningSnapshot();
@@ -609,7 +654,8 @@ async function readModelResidency(includeAlias: boolean): Promise<ModelResidency
             : { ts: use.ts, route: use.route, outcome: use.outcome },
     };
   });
-  return { models: modelsOutput };
+  const hostMemory = await readHostMemoryForResidency(readMemory);
+  return { models: modelsOutput, hostMemory };
 }
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
@@ -5117,7 +5163,10 @@ export async function handleRequest(
         );
         return;
       }
-      const residency = await readModelResidency(principal.isAdmin);
+      const residency = await readModelResidency(
+        principal.isAdmin,
+        hostMemoryDeps.readMemory ?? readHostMemory,
+      );
       const status = residency.status === "unavailable" ? 503 : 200;
       sendJson(res, status, residency);
       lctx.status = status;
