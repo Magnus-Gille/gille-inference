@@ -604,8 +604,10 @@ function narrowHostMemory(result: HostMemoryReadResult): HostMemoryResponse {
 async function readHostMemoryForResidency(reader: () => Promise<HostMemoryReadResult>): Promise<HostMemoryResponse> {
   try {
     return narrowHostMemory(await reader());
-  } catch {
+  } catch (err) {
     // Diagnostics must remain content-blind and available even if the best-effort reader throws.
+    const name = err instanceof Error ? err.name : typeof err;
+    console.warn("[model-residency] host memory reader failed", /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown");
     return narrowHostMemory({ ok: false, error: "host memory reader failed" });
   }
 }

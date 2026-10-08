@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,7 +19,7 @@ let monitorKey = "residency-monitor-static";
 let guestKey = "";
 let agentKey = "";
 
-let hostMemory: HostMemoryReadResult = {
+let hostMemory: HostMemoryReadResult | Error = {
   ok: true,
   memory: {
     memTotalBytes: 64 * 1024 ** 3,
@@ -81,7 +81,10 @@ beforeAll(async () => {
   guestKey = keystore.mintKey({ alias: "residency-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   const gateway = await import("../src/homeserver/gateway.js");
-  const handle = await gateway.startGateway({ hostMemoryAdmissionDependencies: { readMemory: async () => hostMemory } });
+  const handle = await gateway.startGateway({ hostMemoryAdmissionDependencies: { readMemory: async () => {
+    if (hostMemory instanceof Error) throw hostMemory;
+    return hostMemory;
+  } } });
   gatewayPort = handle.port;
   stopGateway = handle.stop;
 });
@@ -287,6 +290,22 @@ describe("GET /models/residency", () => {
       gttAccounting: "unknown",
     });
     expect(JSON.stringify(body)).not.toContain("private host reader error");
+  });
+
+  it("keeps thrown reader details out of the residency response", async () => {
+    hostMemory = new Error("private host reader exception");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const response = await getResidency(monitorKey);
+      expect(response.status).toBe(200);
+      const body = await response.json() as { hostMemory: Record<string, unknown> };
+      expect(body.hostMemory.status).toBe("unknown");
+      expect(JSON.stringify(body)).not.toContain("private host reader exception");
+      expect(warning).toHaveBeenCalledWith("[model-residency] host memory reader failed", "Error");
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("private host reader exception");
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("fails closed for unauthenticated, guest, ordinary agent, and legacy user callers", async () => {
