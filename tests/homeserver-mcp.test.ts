@@ -1047,12 +1047,12 @@ describe("askFailureMeta", () => {
     expect(askFailureMeta({
       ...base,
       code: "upstream_error",
-      reason: "upstream_process_down",
+      reason: "upstream_connection_failed",
       layer: "model_backend",
       retryAfterSeconds: 2,
     })).toEqual({
       m5_code: "upstream_error",
-      reason: "upstream_process_down",
+      reason: "upstream_connection_failed",
       layer: "model_backend",
       retryable: true,
       retry_after_seconds: 2,

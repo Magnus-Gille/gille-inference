@@ -694,7 +694,7 @@ describe("R6 graceful degradation — MCP runChatCompletion upstream failures", 
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.code).toBe("upstream_error");
-      expect(r.reason).toBe("upstream_process_down");
+      expect(r.reason).toBe("upstream_connection_failed");
       expect(r.layer).toBe("model_backend");
       expect(r.retryable).toBe(true);
       expect(r.retryAfterSeconds).toBe(cfg.busyRetryAfterSeconds);

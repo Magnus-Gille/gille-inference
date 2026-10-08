@@ -632,7 +632,7 @@ export type RunChatResult =
       /** Present when the gateway knows how long the caller should wait before retrying. */
       retryAfterSeconds?: number;
       /** Sanitized backend failure detail; never contains the backend error or URL. */
-      reason?: "upstream_process_down" | "upstream_timeout";
+      reason?: "upstream_connection_failed" | "upstream_timeout";
       /** Trust boundary that produced a sanitized reason. */
       layer?: "model_backend";
       /** Explicit retry guidance for classified transient backend failures. */
@@ -1220,7 +1220,7 @@ export async function runChatCompletion(
         ok: false,
         code: "upstream_error",
         message: "The model backend is unavailable — please retry shortly.",
-        reason: "upstream_process_down",
+        reason: "upstream_connection_failed",
         layer: "model_backend",
         retryable: true,
         retryAfterSeconds: cfg.busyRetryAfterSeconds,
