@@ -569,6 +569,133 @@ restore_gateway_codeloop_config() { :; }; restore_gateway_codeloop_toolchain_poi
     expect(readFileSync(gatewayDropin, "utf8")).toBe("[Unit]\nRequires=user@4242.service\n");
   });
 
+  it("restarts the manager under its restored OOM policy before the gateway after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-refresh-live-rollback-"));
+    const backup = join(work, "backup");
+    mkdirSync(backup);
+    const gatewayDropin = join(work, "gateway.conf");
+    const managerDropin = join(work, "manager.conf");
+    writeFileSync(join(backup, "dropin.before.conf"), "[Unit]\nRequires=user@4242.service\n");
+    writeFileSync(gatewayDropin, "[Unit]\nWants=user@4242.service\n");
+    writeFileSync(managerDropin, "[Service]\nOOMScoreAdjust=-500\n");
+    const output = execFileSync("bash", ["-c", `
+source "$1"
+REFRESH_BACKUP="$2"
+REFRESH_DROPIN="$3"
+REFRESH_MANAGER_DROPIN="$4"
+REFRESH_MANAGER_EXISTED=0
+REFRESH_MANAGER_UID=4242
+REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=1
+REFRESH_UNIT=home-gateway.service
+live_score=-500
+restore_gateway_codeloop_config() { :; }
+restore_gateway_codeloop_toolchain_pointer() { :; }
+atomic_install_file() { cp "$1" "$2"; }
+show_value() { case "$2" in OOMScoreAdjust) printf '0\\n' ;; MainPID) printf '1234\\n' ;; esac; }
+effective_oom_score_adj() { printf '%s\\n' "$live_score"; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+systemctl() {
+  case "$*" in
+    'daemon-reload') printf 'reload\\n' ;;
+    'restart user@4242.service')
+      [ ! -e "$REFRESH_MANAGER_DROPIN" ] || return 1
+      live_score=0
+      printf 'manager-restart\\n'
+      ;;
+    'restart home-gateway.service')
+      [ "$live_score" = 0 ] || return 1
+      printf 'gateway-restart\\n'
+      ;;
+  esac
+}
+verify() { [ "$live_score" = 0 ] && printf 'verified\\n'; }
+restore_isolation_refresh
+`, "--", script, backup, gatewayDropin, managerDropin], { encoding: "utf8" });
+    expect(output).toMatch(/reload\nmanager-restart\ngateway-restart\nverified\n/);
+    expect(existsSync(managerDropin)).toBe(false);
+  });
+
+  it("reloads the legacy manager OOM policy before restarting the gateway during migration rollback", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-migration-rollback-"));
+    const fakeRoot = join(work, "root");
+    const fakeEtc = join(work, "etc");
+    const fakeTree = join(work, "tree");
+    const fakeSystemd = join(work, "systemd");
+    const backup = join(work, "backup");
+    const log = join(work, "order.log");
+    mkdirSync(join(fakeRoot, "gateway", "data"), { recursive: true });
+    mkdirSync(join(fakeEtc, "gateway"), { recursive: true });
+    mkdirSync(fakeTree);
+    mkdirSync(join(fakeSystemd, "home-gateway.service.d"), { recursive: true });
+    mkdirSync(join(fakeSystemd, "user@4242.service.d"), { recursive: true });
+    mkdirSync(backup);
+    writeFileSync(join(fakeEtc, "gateway", "gateway.env"), "fake=1\n");
+    writeFileSync(join(backup, "unit.before.txt"), "legacy unit\n");
+    writeFileSync(join(backup, "gateway-data.mode"), "0700\n");
+    writeFileSync(join(fakeSystemd, "home-gateway.service.d", "50-service-isolation.conf"), "isolation\n");
+    writeFileSync(join(fakeSystemd, "user@4242.service.d", "50-gille-gateway-recovery.conf"), "recovery\n");
+    const harness = join(work, "service-isolation-harness.sh");
+    writeFileSync(harness, readFileSync(script, "utf8")
+      .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+      .replace('readonly ETC="/etc/gille-inference"', `readonly ETC="${fakeEtc}"`)
+      .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`)
+      .replaceAll("/etc/systemd/system", fakeSystemd));
+    const command = `
+source "$1"
+LOG="$3"
+FAIL_MANAGER="$4"
+loaded_user="\${5:-magnus}"
+live_score=-500
+gateway_active=1
+root_only() { :; }
+need() { :; }
+id() { printf '4242\\n'; }
+rollback_feasible() { :; }
+capture_transaction_dependents() { :; }
+restore_transaction_dependents() { :; }
+restore_legacy_autonomy_timer() { printf 'timer-restored\\n' >> "$LOG"; }
+render_gateway_manager_recovery() { printf 'recovery\\n'; }
+chown() { :; }
+install() { cp "\${@: -2:1}" "\${@: -1}"; }
+show_value() { case "$2" in User) printf '%s\\n' "$loaded_user" ;; OOMScoreAdjust) printf '0\\n' ;; MainPID) printf '1234\\n' ;; esac; }
+effective_oom_score_adj() { printf '%s\\n' "$live_score"; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+systemctl() {
+  case "$*" in
+    'stop home-gateway.service') gateway_active=0 ;;
+    'is-active --quiet home-gateway.service') [ "$gateway_active" = 1 ] ;;
+    'is-active --quiet user@4242.service') : ;;
+    'daemon-reload') loaded_user=magnus; printf 'reload\\n' >> "$LOG" ;;
+    'restart user@4242.service')
+      if [ "$FAIL_MANAGER" = 1 ]; then printf 'manager-failed\\n' >> "$LOG"; return 1; fi
+      live_score=0
+      printf 'manager-restart\\n' >> "$LOG"
+      ;;
+    'restart home-gateway.service')
+      if [ "$FAIL_MANAGER" = 0 ]; then [ "$live_score" = 0 ] || return 1; fi
+      gateway_active=1
+      printf 'gateway-restart\\n' >> "$LOG"
+      ;;
+  esac
+}
+rollback gateway "$2"
+`;
+    expect(() => execFileSync("bash", ["-c", command, "--", harness, backup, log, "1"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+    expect(readFileSync(log, "utf8")).toBe("reload\nmanager-failed\ngateway-restart\ntimer-restored\n");
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(true);
+    expect(existsSync(join(fakeSystemd, "user@4242.service.d", "50-gille-gateway-recovery.conf"))).toBe(false);
+    mkdirSync(join(backup, "rollback-receipt"));
+    expect(() => execFileSync("bash", ["-c", command, "--", harness, backup, log, "0", "gille-gateway"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(true);
+    execFileSync("rmdir", [join(backup, "rollback-receipt")]);
+    const resumed = execFileSync("bash", ["-c", command, "--", harness, backup, log, "0", "gille-gateway"], { encoding: "utf8" });
+    expect(resumed).toContain("ROLLED BACK: gateway");
+    expect(readFileSync(log, "utf8")).toBe("reload\nmanager-failed\ngateway-restart\ntimer-restored\nreload\nmanager-restart\ngateway-restart\ntimer-restored\nreload\nmanager-restart\ngateway-restart\ntimer-restored\n");
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(false);
+  });
+
   it("can restore and exactly verify the superseded netlink drop-in after a failed refresh", () => {
     const work = mkdtempSync(join(tmpdir(), "gille-refresh-netlink-dropin-"));
     const backup = join(work, "backup");

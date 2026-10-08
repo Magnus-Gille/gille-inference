@@ -28,6 +28,8 @@ REFRESH_DROPIN=""
 REFRESH_UNIT=""
 REFRESH_MANAGER_DROPIN=""
 REFRESH_MANAGER_EXISTED=0
+REFRESH_MANAGER_UID=""
+REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=0
 REFRESH_TOOLCHAIN_CURRENT=""
 REFRESH_CODELOOP_CONFIG=""
 REFRESH_ACTIVE=0
@@ -392,6 +394,29 @@ require_gateway_backend_dependency() {
 }
 
 effective_oom_score_adj() { cat "/proc/$1/oom_score_adj"; }
+verify_manager_live_oom_policy() {
+  local manager="$1" expected pid
+  expected="$(show_value "$manager" OOMScoreAdjust)" || return 1
+  [[ "$expected" =~ ^-?[0-9]+$ ]] || return 1
+  pid="$(show_value "$manager" MainPID)" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [ "$(effective_oom_score_adj "$pid")" = "$expected" ]
+}
+
+restart_gateway_user_manager_with_loaded_policy() {
+  local uid="$1" manager="user@$1.service"
+  systemctl restart "$manager" || return 1
+  systemctl is-active --quiet "$manager" || return 1
+  verify_manager_live_oom_policy "$manager" || return 1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if gateway_user_bus_ready "$uid" && gateway_user_default_target_active "$uid"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 verify_gateway_manager_recovery() {
   local uid="$1" manager="user@$1.service" dropin="${2:-/etc/systemd/system/user@$1.service.d/50-gille-gateway-recovery.conf}" manager_pid
   [ -f "$dropin" ] && [ ! -L "$dropin" ] || die "dedicated manager recovery drop-in is absent or unsafe"
@@ -1184,6 +1209,10 @@ restore_isolation_refresh() {
   fi
   atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
   systemctl daemon-reload || return 1
+  if [ "$REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED" = 1 ]; then
+    [ -n "$REFRESH_MANAGER_UID" ] || return 1
+    restart_gateway_user_manager_with_loaded_policy "$REFRESH_MANAGER_UID" || return 1
+  fi
   systemctl restart "$REFRESH_UNIT" || return 1
   ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 0 ) || return 1
 }
@@ -1263,17 +1292,19 @@ refresh_isolation() {
   REFRESH_DROPIN="$dropin"
   REFRESH_UNIT="$unit"
   REFRESH_MANAGER_DROPIN="$manager_dropin"
+  REFRESH_MANAGER_UID="$uid"
   REFRESH_ACTIVE=1
   trap 'refresh_exit_handler "$?"' EXIT
   provision_gateway_codeloop_config
   provision_gateway_codeloop_toolchain
   install -d -m 0755 -o root -g root "$manager_dir"
+  REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=1
   atomic_install_file "$backup/manager.new.conf" "$manager_dropin" || die "could not install dedicated manager recovery drop-in"
   atomic_render_dropin "$service" "$dropin" || die "could not atomically install refreshed gateway isolation drop-in"
   systemctl restart "$unit" || die "refreshed gateway unit did not restart"
   gateway_pid="$(show_value "$unit" MainPID)"
   [[ "$gateway_pid" =~ ^[1-9][0-9]*$ ]] || die "refreshed gateway has no running main process"
-  systemctl restart "user@$uid.service" || die "dedicated manager did not restart with its recovery policy"
+  restart_gateway_user_manager_with_loaded_policy "$uid" || die "dedicated manager did not restart with its recovery policy and transport"
   [ "$(show_value "$unit" MainPID)" = "$gateway_pid" ] || die "gateway restarted when its dedicated manager restarted"
   ( verify "$service" ) || die "refreshed gateway unit did not verify"
   printf 'service=%s\nunit=%s\nbackup=%s\nverified_at=%s\n' "$service" "$unit" "$backup" "$(date -u +%FT%TZ)" >"$backup/refresh-receipt" \
@@ -1281,6 +1312,7 @@ refresh_isolation() {
   REFRESH_ACTIVE=0
   REFRESH_TOOLCHAIN_CURRENT=""
   REFRESH_CODELOOP_CONFIG=""
+  REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=0
   trap - EXIT
   note "REFRESHED: $service isolation. Prior drop-in: $backup/dropin.before.conf"
 }
@@ -1504,6 +1536,25 @@ apply() {
   note "APPLIED: $service. Backup/rollback evidence: $backup"
 }
 
+finish_pending_gateway_rollback() {
+  local backup="$1" unit="$2" uid="$3" manager_recovered=1
+  systemctl daemon-reload || die "could not reload restored legacy units"
+  [ "$(show_value "$unit" User)" = magnus ] || die "rollback did not load the legacy magnus unit identity"
+  if ! restart_gateway_user_manager_with_loaded_policy "$uid"; then
+    manager_recovered=0
+    note "Dedicated manager recovery is incomplete; restoring the legacy gateway and timer before reporting failure"
+  fi
+  systemctl restart "$unit" || die "legacy gateway did not restart after rollback"
+  restore_legacy_autonomy_timer "$backup"
+  [ "$(show_value "$unit" User)" = magnus ] || die "rollback did not restore the legacy magnus unit identity"
+  systemctl is-active --quiet "$unit" || die "legacy unit did not recover after rollback"
+  [ "$manager_recovered" = 1 ] || die "legacy gateway and timer recovered, but dedicated manager policy/transport did not; retry rollback from $backup"
+  printf 'service=gateway\nbackup=%s\nrolled_back_at=%s\n' "$backup" "$(date -u +%FT%TZ)" >"$backup/rollback-receipt" \
+    || die "could not record completed gateway rollback"
+  rm -f -- "$backup/rollback-pending-manager" || die "could not clear pending gateway rollback marker"
+  note "ROLLED BACK: gateway. The unused dedicated account/runtime is retained mode-restricted for forensic recovery; remove it only through a separate owner-approved cleanup."
+}
+
 rollback() {
   local service="$1" backup_root="$2" unit backup dropin dependent_state_file manager_dropin gateway_uid
   root_only; need systemctl; need install; need mv; need chown; need chmod; need find; need sed; need grep; need runuser
@@ -1515,6 +1566,17 @@ rollback() {
   fi
   [ -n "$backup" ] || die "no recorded backup found for $service"
   [ -f "$backup/unit.before.txt" ] || die "backup is incomplete: $backup"
+  if [ -e "$backup/rollback-pending-manager" ] || [ -L "$backup/rollback-pending-manager" ]; then
+    [ "$service" = gateway ] && [ -f "$backup/rollback-pending-manager" ] && [ ! -L "$backup/rollback-pending-manager" ] \
+      || die "rollback pending marker is unsafe or belongs to another service"
+    gateway_uid="$(id -u "$GATEWAY_USER")"
+    [ -d "$GATEWAY_DATA" ] && [ -f "$GATEWAY_TREE/.env" ] \
+      || die "pending rollback does not have intact legacy gateway state"
+    [ ! -e "/etc/systemd/system/user@$gateway_uid.service.d/50-gille-gateway-recovery.conf" ] \
+      || die "pending rollback still has a manager recovery drop-in"
+    finish_pending_gateway_rollback "$backup" "$unit" "$gateway_uid"
+    return 0
+  fi
   if [ -f "$backup/rollback-receipt" ]; then
     [ "$(show_value "$unit" User)" = magnus ] || die "rollback receipt exists but legacy unit identity is not restored"
     systemctl is-active --quiet "$unit" || die "rollback receipt exists but legacy unit is not active"
@@ -1523,6 +1585,10 @@ rollback() {
         [ -d "$GATEWAY_DATA" ] && [ -f "$GATEWAY_TREE/.env" ] || die "rollback receipt exists but gateway legacy paths are absent"
         [ ! -e "$GATEWAY_ISOLATION_MARKER" ] && [ ! -e /etc/systemd/system/gille-autonomy-tick.service ] && [ ! -e /etc/systemd/system/gille-autonomy-tick.timer ] || die "rollback receipt exists but isolation artifacts remain"
         [ ! -e "/etc/systemd/system/user@$(id -u "$GATEWAY_USER").service.d/50-gille-gateway-recovery.conf" ] || die "rollback receipt exists but manager recovery drop-in remains"
+        if systemctl is-active --quiet "user@$(id -u "$GATEWAY_USER").service"; then
+          verify_manager_live_oom_policy "user@$(id -u "$GATEWAY_USER").service" \
+            || die "rollback receipt exists but the manager still runs with a stale OOM policy"
+        fi
         assert_legacy_autonomy_timer_state "$backup"
         ;;
       cloudflared) [ -d "$TUNNEL_SOURCE" ] || die "rollback receipt exists but cloudflared legacy path is absent" ;;
@@ -1598,6 +1664,11 @@ rollback() {
     rmdir "/etc/systemd/system/user@$gateway_uid.service.d" 2>/dev/null || true
   fi
   rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
+  if [ "$service" = gateway ]; then
+    : >"$backup/rollback-pending-manager" || die "could not record resumable gateway rollback"
+    finish_pending_gateway_rollback "$backup" "$unit" "$gateway_uid"
+    return 0
+  fi
   systemctl daemon-reload
   systemctl restart "$unit"
   restore_transaction_dependents "$service" "$dependent_state_file"
