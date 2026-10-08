@@ -1044,6 +1044,32 @@ describe("askFailureMeta", () => {
     expect(askFailureMeta({ ...base, code: "credits_exhausted" })).toEqual({ m5_code: "credits_exhausted", retryable: false });
     // The gateway cannot tell whether an upstream model error is transient, so it does not claim to.
     expect(askFailureMeta({ ...base, code: "upstream_error" })).toEqual({ m5_code: "upstream_error" });
+    expect(askFailureMeta({
+      ...base,
+      code: "upstream_error",
+      reason: "upstream_process_down",
+      layer: "model_backend",
+      retryAfterSeconds: 2,
+    })).toEqual({
+      m5_code: "upstream_error",
+      reason: "upstream_process_down",
+      layer: "model_backend",
+      retryable: true,
+      retry_after_seconds: 2,
+    });
+    expect(askFailureMeta({
+      ...base,
+      code: "upstream_error",
+      reason: "upstream_timeout",
+      layer: "model_backend",
+      retryAfterSeconds: 7,
+    })).toEqual({
+      m5_code: "upstream_error",
+      reason: "upstream_timeout",
+      layer: "model_backend",
+      retryable: true,
+      retry_after_seconds: 7,
+    });
   });
 });
 

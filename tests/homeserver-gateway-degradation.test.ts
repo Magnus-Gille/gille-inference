@@ -692,7 +692,14 @@ describe("R6 graceful degradation — MCP runChatCompletion upstream failures", 
       maxTokens: 16,
     });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.code).toBe("upstream_error");
+    if (!r.ok) {
+      expect(r.code).toBe("upstream_error");
+      expect(r.reason).toBe("upstream_process_down");
+      expect(r.layer).toBe("model_backend");
+      expect(r.retryable).toBe(true);
+      expect(r.retryAfterSeconds).toBe(cfg.busyRetryAfterSeconds);
+      expect(r.message).not.toContain("127.0.0.1");
+    }
     // C2: a failed upstream call is never billed.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
   });
@@ -791,6 +798,10 @@ describe("R6 graceful degradation — MCP runChatCompletion upstream failures", 
           expect(r.code).toBe("upstream_error");
           expect(r.traceOutcome).toBe("upstream_timeout");
           expect(r.traceErrorClass).toBe("upstream_timeout");
+          expect(r.reason).toBe("upstream_timeout");
+          expect(r.layer).toBe("model_backend");
+          expect(r.retryable).toBe(true);
+          expect(r.retryAfterSeconds).toBe(cfg.busyRetryAfterSeconds);
         }
       } finally {
         globalThis.fetch = originalFetch;
