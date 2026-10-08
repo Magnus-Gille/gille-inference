@@ -17,6 +17,8 @@ readonly LLAMA_MODELS="/home/magnus/models"
 readonly LLAMA_RUNTIME="/home/magnus/llama.cpp"
 readonly LLAMA_GPU_RENDER_DEVICE="${LLAMA_GPU_RENDER_DEVICE:-/dev/dri/renderD128}"
 readonly LLAMA_GPU_CARD_DEVICE="${LLAMA_GPU_CARD_DEVICE:-/dev/dri/card0}"
+readonly LLAMA_ROCM_DROPIN="/etc/systemd/system/llama-swap.service.d/60-systemone-rocm.conf"
+readonly LLAMA_ROCM_TEMPLATE="$(dirname "${BASH_SOURCE[0]}")/../deploy/systemd/llama-swap-rocm-device.conf"
 readonly GATEWAY_ISOLATION_MARKER="$ROOT/gateway/isolation-marker"
 APPLY_BACKUP=""
 APPLY_SERVICE=""
@@ -343,18 +345,36 @@ require_show_exact_device_allow() {
   expected="$(printf '%s\n' "$@" | LC_ALL=C sort -u)"
   [ "$actual" = "$expected" ] || die "$unit effective DeviceAllow differs from the reviewed allowlist"
 }
+reviewed_llama_rocm_dropin() {
+  local unit="$1" dropin="${2:-$LLAMA_ROCM_DROPIN}" template="${3:-$LLAMA_ROCM_TEMPLATE}" paths
+  if [ ! -e "$dropin" ] && [ ! -L "$dropin" ]; then
+    return 1
+  fi
+  [ -f "$dropin" ] && [ ! -L "$dropin" ] || die "llama-swap ROCm drop-in is not a regular file"
+  require_owner_group "$dropin" root root
+  require_mode "$dropin" 644
+  cmp -s "$template" "$dropin" || die "llama-swap ROCm drop-in differs from the reviewed template"
+  paths="$(show_value "$unit" DropInPaths)"
+  [[ " $paths " == *" $dropin "* ]] || die "llama-swap ROCm drop-in is not loaded by systemd"
+}
 require_llama_device_allow() {
   local unit="$1"
+  local -a expected=(
+    "/dev/null:rw"
+    "/dev/urandom:r"
+    "/dev/random:r"
+    "$LLAMA_GPU_RENDER_DEVICE:rw"
+    "$LLAMA_GPU_CARD_DEVICE:rw"
+    "char-rtc:r"
+  )
   # ProtectClock=true implicitly adds the abstract `char-rtc r` rule to the
   # effective DeviceAllow set. Keep that protection enabled and accept only
   # this documented systemd-derived rule plus the source-authored allowlist.
-  require_show_exact_device_allow "$unit" \
-    "/dev/null:rw" \
-    "/dev/urandom:r" \
-    "/dev/random:r" \
-    "$LLAMA_GPU_RENDER_DEVICE:rw" \
-    "$LLAMA_GPU_CARD_DEVICE:rw" \
-    "char-rtc:r"
+  # The sole optional device requires an exact, loaded, root-owned drop-in.
+  if reviewed_llama_rocm_dropin "$unit"; then
+    expected+=("/dev/kfd:rw")
+  fi
+  require_show_exact_device_allow "$unit" "${expected[@]}"
 }
 assert_unit_prerequisites() {
   local service="$1" unit user actual_user fragment execstart

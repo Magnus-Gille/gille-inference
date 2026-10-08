@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -30,18 +30,33 @@ function render(service: string): string {
   return readFileSync(join(out, `${service}.conf`), "utf8");
 }
 
-function verifyLlamaDeviceAllow(effective: string): string {
+function verifyLlamaDeviceAllow(effective: string, reviewedRocmDropin = false): string {
   return execFileSync(
     "bash",
     [
       "-c",
-      "source \"$1\"; effective=\"$2\"; show_value() { printf '%s\\n' \"$effective\"; }; require_llama_device_allow llama-swap.service",
+      "source \"$1\"; effective=\"$2\"; reviewed=\"$3\"; show_value() { printf '%s\\n' \"$effective\"; }; reviewed_llama_rocm_dropin() { [ \"$reviewed\" = yes ]; }; require_llama_device_allow llama-swap.service",
       "--",
       script,
       effective,
+      reviewedRocmDropin ? "yes" : "no",
     ],
     { cwd: root, encoding: "utf8", stderr: "pipe" },
   );
+}
+
+function verifyReviewedRocmDropin(path: string, loadedPath: string, ownerIsRoot = true): string {
+  const observedMode = (statSync(path).mode & 0o777).toString(8);
+  return execFileSync("bash", [
+    "-c",
+    "source \"$1\"; fake_dropin_paths=\"$3\"; owner=\"$5\"; observed_mode=\"$6\"; " +
+      "show_value() { printf '%s\\n' \"$fake_dropin_paths\"; }; " +
+      "require_owner_group() { [ \"$owner\" = yes ] && [ \"$2:$3\" = root:root ]; }; " +
+      "require_mode() { [ \"$observed_mode\" = \"$2\" ] || die \"$1 mode is $observed_mode, expected $2\"; }; " +
+      "reviewed_llama_rocm_dropin llama-swap.service \"$2\" \"$4\"",
+    "--", script, path, loadedPath,
+    join(root, "deploy/systemd/llama-swap-rocm-device.conf"), ownerIsRoot ? "yes" : "no", observedMode,
+  ], { cwd: root, encoding: "utf8", stderr: "pipe" });
 }
 
 function runGatewayApplyFailureHarness(): string {
@@ -719,6 +734,39 @@ describe("service-isolation migration contract (#151)", () => {
       "/dev/mem r",
     ].join(" ");
     expect(() => verifyLlamaDeviceAllow(effective)).toThrow(/effective DeviceAllow differs from the reviewed allowlist/);
+  });
+
+  it("accepts only the reviewed ROCm variant with exactly /dev/kfd added", () => {
+    const base = [
+      "/dev/null rw", "/dev/urandom r", "/dev/random r",
+      "/dev/dri/renderD128 rw", "/dev/dri/card0 rw", "char-rtc r",
+    ];
+    const rocm = [...base, "/dev/kfd rw"].join(" ");
+    expect(verifyLlamaDeviceAllow(rocm, true)).toBe("");
+    expect(() => verifyLlamaDeviceAllow(rocm, false)).toThrow(/reviewed allowlist/);
+    expect(() => verifyLlamaDeviceAllow(base.join(" "), true)).toThrow(/reviewed allowlist/);
+    expect(() => verifyLlamaDeviceAllow([...base, "/dev/kfd rw", "/dev/mem r"].join(" "), true))
+      .toThrow(/reviewed allowlist/);
+  });
+
+  it("requires the ROCm drop-in's exact bytes, mode, root owner and loaded path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gille-rocm-dropin-"));
+    const dropin = join(dir, "60-systemone-rocm.conf");
+    const template = readFileSync(join(root, "deploy/systemd/llama-swap-rocm-device.conf"));
+    writeFileSync(dropin, template);
+    chmodSync(dropin, 0o644);
+    expect(verifyReviewedRocmDropin(dropin, dropin)).toBe("");
+    expect(() => verifyReviewedRocmDropin(dropin, `${dropin}.other`)).toThrow(/not loaded/);
+    expect(() => verifyReviewedRocmDropin(dropin, dropin, false)).toThrow();
+    chmodSync(dropin, 0o600);
+    expect(() => verifyReviewedRocmDropin(dropin, dropin)).toThrow(/mode is 600/);
+    chmodSync(dropin, 0o644);
+    writeFileSync(dropin, Buffer.concat([template, Buffer.from("# drift\n")]));
+    expect(() => verifyReviewedRocmDropin(dropin, dropin)).toThrow(/differs from the reviewed template/);
+    writeFileSync(dropin, template);
+    const symlink = join(dir, "link.conf");
+    symlinkSync(dropin, symlink);
+    expect(() => verifyReviewedRocmDropin(symlink, symlink)).toThrow(/not a regular file/);
   });
 
   it("rejects unknown services and does not silently apply all services", () => {
