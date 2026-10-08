@@ -192,8 +192,9 @@
       Radeon 8060S integrated GPU. One home box, one GPU.
     </p>
     <p>
-      <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) serving each model via
-      llama-server, hot-swapped by llama-swap, behind an authenticating &amp; metering gateway,
+      <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) for the existing roster and
+      an isolated native ROCm path for qualified decision models, hot-swapped by llama-swap,
+      behind an authenticating &amp; metering gateway,
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
       content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
@@ -280,15 +281,25 @@
       </tr>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
-      <strong>Typed decisions (separately gated):</strong> Cloudflare&#8217;s 9B
-      <span class="badge mono">clef-flash</span> System One decision model is available to a
-      customer only after its runtime and roster are activated and that customer&#8217;s key receives
-      an explicit grant. Confirm that <span class="badge mono">clef-flash</span> appears in your
+      <strong>Typed decisions (separately gated):</strong> Cloudflare&#8217;s
+      <span class="badge mono">clef-flash</span>, Bespoke&#8217;s
+      <span class="badge mono">bespoke-nimble-9b</span>, and Perplexity&#8217;s
+      <span class="badge mono">pplx-decider-v1-27b</span> use the System One endpoint.
+      Each model is available to a customer only after its runtime and roster are activated
+      and that customer&#8217;s key receives an explicit grant. Confirm that the model appears in your
       authenticated <span class="badge mono">/v1/models</span> response before calling
       <span class="badge mono">POST /v1/systemone</span>; if it is absent, it is not available for
       your key yet. For a <span class="badge mono">noul</span> question, a probability near
       <span class="badge mono">1</span> means yes and near <span class="badge mono">0</span> means no.
-      Clef-flash returns typed decisions, not chat text.
+      Decision models return typed probabilities, not chat text. They share your ordinary credits
+      and rate limits. Published benchmark scores do not establish accuracy on your own task.
+    </p>
+    <p style="margin-top:10px;font-size:12.5px">
+      The existing <span class="badge mono">qwen3-30b-instruct</span> model is for ordinary chat.
+      It is not a native System One
+      decision model. If it appears in your authenticated <span class="badge mono">/v1/models</span>
+      response, use it through <span class="badge mono">POST /v1/chat/completions</span> with your
+      normal credits and rate limits.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
@@ -437,7 +448,7 @@
         <pre>curl https://inference.example.com/v1/models \
   -H "Authorization: Bearer $HS_KEY"</pre>
 
-        <p><strong>Clef-flash System One decision (after explicit activation and model-list check):</strong></p>
+        <p><strong>System One decision (after explicit activation and model-list check):</strong></p>
         <pre>curl https://inference.example.com/v1/systemone \
   -H "Authorization: Bearer $HS_KEY" \
   -H "Content-Type: application/json" \
@@ -450,13 +461,16 @@
   }'</pre>
         <p>
           Use this only after an authenticated <span class="badge mono">/v1/models</span> response
-          for your explicitly granted key includes <span class="badge mono">clef-flash</span>.
+          for your explicitly granted key includes the requested model. Set
+          <span class="badge mono">model</span> to <span class="badge mono">clef-flash</span>,
+          <span class="badge mono">bespoke-nimble-9b</span>, or
+          <span class="badge mono">pplx-decider-v1-27b</span> only when that ID is listed.
           If it is missing, your key grant or the runtime/roster activation may still be pending. A
           <span class="badge mono">noul</span> result near <span class="badge mono">1</span> means yes;
           near <span class="badge mono">0</span> means no, in
           <span class="badge mono">answers.urgent.noul</span>. You can also ask
           <span class="badge mono">choice</span> and <span class="badge mono">score</span> questions.
-          Clef-flash returns typed decisions, not chat text. Up to 16 questions and 8&nbsp;KiB of
+          Decision models return typed decisions, not chat text. Up to 16 questions and 8&nbsp;KiB of
           text/JSON request data per call; images and streaming are not enabled here. Successful
           calls use input-token credits. This is a separate endpoint from chat completions.
         </p>

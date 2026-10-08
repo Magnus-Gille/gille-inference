@@ -22,6 +22,9 @@
 const SPEC_FIELDS = new Set([
   "key",
   "api",
+  "runtime_kind",
+  "server_script",
+  "checkpoint",
   "gguf",
   "runtime_bin",
   "ctx",
@@ -58,7 +61,7 @@ const REQUIRED_SPEC_FIELDS = [
 const KV_QUANT_RE = /^(f16|q[458]_[01])$/;
 const ABSOLUTE_PATH_RE = /^\//;
 
-export interface ManualServingSpec {
+export interface LlamaServingSpec {
   key: string;
   api: "chat" | "systemone";
   gguf: string;
@@ -80,6 +83,18 @@ export interface ManualServingSpec {
   reasoning: string | null;
   ttl: number;
 }
+
+export interface NativeServingSpec {
+  runtimeKind: "native";
+  key: "bespoke-nimble-9b" | "pplx-decider-v1-27b";
+  api: "systemone";
+  runtimeBin: string;
+  serverScript: string;
+  checkpoint: string;
+  ttl: number;
+}
+
+export type ManualServingSpec = LlamaServingSpec | NativeServingSpec;
 
 export function manualWarmupRequest(spec: ManualServingSpec, modelId: string): {
   path: string;
@@ -145,6 +160,13 @@ function absolutePath(value: unknown, field: string): string {
   return value;
 }
 
+/** Paths embedded in llama-swap's command must be single, inert shell tokens. */
+function commandPath(value: unknown, field: string): string {
+  const path = absolutePath(value, field);
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(path)) fail(`spec field '${field}' has unsupported command characters`);
+  return path;
+}
+
 function flagToken(value: unknown, field: string, allowed: RegExp): string {
   if (typeof value !== "string" || value.length === 0 || !allowed.test(value)) {
     fail(`spec field '${field}' has an unsupported value`);
@@ -176,6 +198,29 @@ export function parseManualSpec(text: string): ManualServingSpec {
       value = value.slice(1, -1);
     }
     raw.set(field, value);
+  }
+  const native = raw.get("runtime_kind") === "native";
+  if (raw.has("runtime_kind") && !native) fail("spec field 'runtime_kind' must be 'native'");
+  if (native) {
+    const nativeFields = new Set(["key", "api", "runtime_kind", "runtime_bin", "server_script", "checkpoint", "ttl"]);
+    for (const field of raw.keys()) {
+      if (!nativeFields.has(field)) fail(`field '${field}' is not supported by a native runtime`);
+    }
+    for (const field of nativeFields) {
+      if (!raw.has(field)) fail(`missing required spec field '${field}'`);
+    }
+    const key = raw.get("key");
+    if (key !== "bespoke-nimble-9b" && key !== "pplx-decider-v1-27b") {
+      fail("native runtime key must be a reviewed decision model");
+    }
+    if (raw.get("api") !== "systemone") fail("native runtime requires the System One API");
+    return {
+      runtimeKind: "native", key, api: "systemone",
+      runtimeBin: commandPath(raw.get("runtime_bin"), "runtime_bin"),
+      serverScript: commandPath(raw.get("server_script"), "server_script"),
+      checkpoint: commandPath(raw.get("checkpoint"), "checkpoint"),
+      ttl: boundedInt(Number(raw.get("ttl")), "ttl", 60, 86400),
+    };
   }
   for (const field of REQUIRED_SPEC_FIELDS) {
     if (!raw.has(field)) fail(`missing required spec field '${field}'`);
@@ -241,6 +286,16 @@ export function parseManualSpec(text: string): ManualServingSpec {
  * candidate diffs cleanly against reviewed stanzas. Pure and deterministic.
  */
 export function renderManualEntry(spec: ManualServingSpec): string {
+  if ("runtimeKind" in spec) {
+    return [
+      `  "${spec.key}":`,
+      "    cmd: |",
+      `      ${spec.runtimeBin} ${spec.serverScript} --model ${spec.key} --checkpoint ${spec.checkpoint} --port \${PORT}`,
+      "    checkEndpoint: /health",
+      `    ttl: ${spec.ttl}`,
+      "",
+    ].join("\n");
+  }
   const lines = [
     `  "${spec.key}":`,
     `    cmd: |`,
@@ -340,11 +395,18 @@ export async function applyManualPromotion(
   if (!modelsIsLastTopLevel(configText)) {
     fail("config has a top-level key after `models:` — refusing to append (would corrupt)");
   }
-  if (!deps.fileExists(spec.gguf)) {
-    fail(`served GGUF not present on disk: ${spec.gguf}`);
-  }
-  if (spec.mmproj !== null && !deps.fileExists(spec.mmproj)) {
-    fail(`served mmproj not present on disk: ${spec.mmproj}`);
+  if ("runtimeKind" in spec) {
+    for (const [label, path] of [["runtime binary", spec.runtimeBin], ["server script", spec.serverScript],
+      ["checkpoint", spec.checkpoint]] as const) {
+      if (!deps.fileExists(path)) fail(`${label} not present on disk: ${path}`);
+    }
+  } else {
+    if (!deps.fileExists(spec.gguf)) {
+      fail(`served GGUF not present on disk: ${spec.gguf}`);
+    }
+    if (spec.mmproj !== null && !deps.fileExists(spec.mmproj)) {
+      fail(`served mmproj not present on disk: ${spec.mmproj}`);
+    }
   }
 
   const entryBlock = renderManualEntry(spec);

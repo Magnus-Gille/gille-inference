@@ -19,7 +19,7 @@ import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admissi
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "clef-running" | "validrunning" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
@@ -56,17 +56,17 @@ function startUpstream(): Promise<void> {
     req.on("end", async () => {
       if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
-      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "clef-running") && req.url === "/running") {
+      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ running: mockMode === "systemone-list" ? [] : [
-          { model: mockMode === "clef-running" ? "clef-flash" : "m1",
+          { model: mockMode === "clef-running" ? "clef-flash" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "m1",
             state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 },
         ] }));
         return;
       }
-      if ((mockMode === "systemone-list" || mockMode === "clef-running") && req.url === "/v1/models") {
+      if ((mockMode === "systemone-list" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: "clef-flash" }] }));
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash" }] }));
         return;
       }
       if (mockMode === "notfound") {
@@ -199,7 +199,7 @@ beforeAll(async () => {
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
   process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] =
-    "m1=60,m2=60,clef-flash=20,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
+    "m1=60,m2=60,clef-flash=20,qwen3-30b-instruct=60,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
   process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"] = "7";
   process.env["HOMESERVER_REVIEW_CASCADE"] = "shadow";
   process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] = "gpt-oss-120b";
@@ -2042,6 +2042,37 @@ describe("gateway spine — HTTP integration", () => {
       }),
     });
     expect(decision.status).toBe(200);
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+  });
+
+  it("grants the existing Qwen chat model only to exact active customer keys", async () => {
+    mockMode = "qwen-list";
+    const key = mintKey({ alias: `qwen-customer-${randomUUID()}`, tier: "guest", scope: "inference",
+      modelAllowList: ["m1"], creditLimit: 1_000_000 }, DEFAULTS);
+    const grant = (aliases: string[], auth = "Bearer admin-static-key") => fetch(url("/admin/keys/chat-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: auth },
+      body: JSON.stringify({ model: "qwen3-30b-instruct", aliases }),
+    });
+    const before = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    expect((await before.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id))
+      .toEqual(["m1"]);
+    expect((await grant([key.record.alias], `Bearer ${key.plaintextKey}`)).status).toBe(403);
+    expect((await grant([key.record.alias, "missing"])).status).toBe(400);
+    expect(lookupKey(key.plaintextKey)!.modelAllowList).toEqual(["m1"]);
+    expect(await (await grant([key.record.alias])).json()).toMatchObject({
+      model: "qwen3-30b-instruct", changed: [key.record.alias], unchanged: [],
+    });
+    expect(await (await grant([key.record.alias])).json()).toMatchObject({
+      changed: [], unchanged: [key.record.alias],
+    });
+    const after = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    expect((await after.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id))
+      .toContain("qwen3-30b-instruct");
+    expect(lookupKey(key.plaintextKey)!.creditLimit).toBe(1_000_000);
+    expect((await chat(key.plaintextKey, {
+      model: "qwen3-30b-instruct", messages: [{ role: "user", content: "Short greeting" }],
+    })).status).toBe(200);
     expect(lookupKey(key.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
   });
 });

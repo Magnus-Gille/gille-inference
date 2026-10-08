@@ -90,3 +90,13 @@ condition = "AND"
 regexTarget = "match"
 paths = ['''^tests/post-harvest-decision-panel\.test\.ts$''']
 regexes = ['''qwen3-30b-instruct''']
+
+# The reviewed public roster identifier is a model key, not an API credential.
+# Scope the exception to the exact value in its public placeholder spec.
+[[allowlists]]
+description = "Perplexity System One roster model key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+paths = ['''^deploy/specs/pplx-decider-v1-27b\.yaml$''']
+regexes = ['''^key: pplx-decider-v1-27b$''']

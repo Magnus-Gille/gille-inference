@@ -685,7 +685,7 @@ describe("portal page content", () => {
     const res = await fetch(url("/portal"));
     const body = await res.text();
     const clefCopy = body.match(/<strong>Typed decisions \(separately gated\):<\/strong>[\s\S]*?<\/p>/)?.[0] ?? "";
-    const systemOneDocs = body.match(/<p><strong>Clef-flash System One decision[\s\S]*?separate endpoint from chat completions\.\s*<\/p>/)?.[0] ?? "";
+    const systemOneDocs = body.match(/<p><strong>System One decision[\s\S]*?separate endpoint from chat completions\.\s*<\/p>/)?.[0] ?? "";
 
     expect(clefCopy).toContain("explicit grant");
     expect(clefCopy).toContain("authenticated");

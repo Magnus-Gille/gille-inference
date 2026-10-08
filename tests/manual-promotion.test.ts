@@ -36,6 +36,16 @@ const FULL_SPEC_TEXT = [
   "ttl: 1800",
 ].join("\n");
 
+const NATIVE_SPEC_TEXT = [
+  "key: bespoke-nimble-9b",
+  "api: systemone",
+  "runtime_kind: native",
+  "runtime_bin: /r/nimble/bin/python",
+  "server_script: /r/source/scripts/systemone-native-server.py",
+  "checkpoint: /m/Bespoke-Nimble-9B",
+  "ttl: 1800",
+].join("\n");
+
 const EXPECTED_ENTRY = [
   '  "manual-35b":',
   "    cmd: |",
@@ -63,6 +73,17 @@ const BASE_CONFIG = [
 ].join("\n");
 
 describe("manual-promotion spec contract (#217)", () => {
+  it("renders the pinned native decision adapter without shell metacharacters", () => {
+    const spec = parseManualSpec(NATIVE_SPEC_TEXT);
+    expect(manualWarmupRequest(spec, spec.key).path).toBe("/v1/systemone");
+    expect(renderManualEntry(spec)).toContain(
+      "/r/nimble/bin/python /r/source/scripts/systemone-native-server.py --model bespoke-nimble-9b --checkpoint /m/Bespoke-Nimble-9B --port ${PORT}",
+    );
+    expect(renderManualEntry(spec)).toContain("checkEndpoint: /health");
+    expect(() => parseManualSpec(NATIVE_SPEC_TEXT.replace(
+      "/m/Bespoke-Nimble-9B", "/m/model;touch /tmp/unsafe",
+    ))).toThrow(/unsupported|absolute path/);
+  });
   it("parses a full reviewed spec", () => {
     expect(parseManualSpec(FULL_SPEC_TEXT)).toEqual({
       key: "manual-35b",
@@ -302,6 +323,27 @@ describe("manual-promotion transaction (#217)", () => {
     const { deps, calls } = harness(BASE_CONFIG, { files: new Set() });
     await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/not present on disk/);
     expect(calls.backups).toHaveLength(0);
+  });
+
+  it("refuses a missing native checkpoint before touching the roster", async () => {
+    const files = new Set(["/r/nimble/bin/python", "/r/source/scripts/systemone-native-server.py"]);
+    const { deps, calls } = harness(BASE_CONFIG, { files });
+    await expect(applyManualPromotion(parseManualSpec(NATIVE_SPEC_TEXT), deps))
+      .rejects.toThrow(/checkpoint not present/);
+    expect(calls.backups).toHaveLength(0);
+    expect(calls.commands).toHaveLength(0);
+  });
+
+  it("transactionally restores after native model warm-up failure", async () => {
+    const files = new Set(["/r/nimble/bin/python", "/r/source/scripts/systemone-native-server.py",
+      "/m/Bespoke-Nimble-9B"]);
+    const { deps, calls, live } = harness(BASE_CONFIG, { files, listed: ["bespoke-nimble-9b"] });
+    deps.warmupModel = async () => { throw new Error("native typed warm-up failed"); };
+    await expect(applyManualPromotion(parseManualSpec(NATIVE_SPEC_TEXT), deps))
+      .rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.restores).toHaveLength(1);
+    expect(calls.commands).toHaveLength(2);
   });
 
   it("restores byte-identical config and restarts when health never lists the key", async () => {

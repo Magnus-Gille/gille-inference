@@ -147,6 +147,14 @@ export class InvalidSystemOneGrantError extends Error {
   }
 }
 
+/** A requested ordinary-chat grant was not the reviewed model/customer set. */
+export class InvalidExistingChatModelGrantError extends Error {
+  constructor() {
+    super("invalid existing chat model grant");
+    this.name = "InvalidExistingChatModelGrantError";
+  }
+}
+
 /** Thrown before persistence when a requested TTL exceeds the scope's maximum lifetime. */
 export class KeyLifetimePolicyError extends Error {
   constructor(public scope: KeyScope, public ttlSeconds: number, public maximumSeconds: number) {
@@ -1023,6 +1031,45 @@ export function grantSystemOneModelToKeys(
       }
       db.prepare(`UPDATE api_keys SET system_one_model_allow_list = ? WHERE alias = ?`)
         .run(JSON.stringify([...grants, model]), alias);
+      changed.push(alias);
+    }
+    return { changed, unchanged };
+  })();
+}
+
+/**
+ * Grant the already-served Qwen chat model to an exact set of customer keys. An empty ordinary
+ * allow-list already means all chat models, so leave it empty. Never rotate credentials or reset
+ * credits/quotas to expand a restricted customer allow-list.
+ */
+export function grantExistingChatModelToCustomerKeys(
+  aliases: string[], model: string, now: Date = new Date()
+): { changed: string[]; unchanged: string[] } {
+  if (model !== "qwen3-30b-instruct" || aliases.length === 0 ||
+      new Set(aliases).size !== aliases.length ||
+      aliases.some((alias) => typeof alias !== "string" || alias.length === 0)) {
+    throw new InvalidExistingChatModelGrantError();
+  }
+  const db = ksDb();
+  return db.transaction(() => {
+    const changed: string[] = [];
+    const unchanged: string[] = [];
+    for (const alias of aliases) {
+      const row = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(alias) as KeyRow | undefined;
+      if (!row || row.revoked_at !== null ||
+          (row.expires_at !== null && row.expires_at <= now.toISOString())) {
+        throw new InvalidExistingChatModelGrantError();
+      }
+      const key = rowToRecord(row);
+      if (key.tier !== "guest" || key.scope !== "inference") {
+        throw new InvalidExistingChatModelGrantError();
+      }
+      if (key.modelAllowList.length === 0 || key.modelAllowList.includes(model)) {
+        unchanged.push(alias);
+        continue;
+      }
+      db.prepare(`UPDATE api_keys SET model_allow_list = ? WHERE alias = ?`)
+        .run(JSON.stringify([...key.modelAllowList, model]), alias);
       changed.push(alias);
     }
     return { changed, unchanged };
