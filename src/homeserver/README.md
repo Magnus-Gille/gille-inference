@@ -736,8 +736,9 @@ multimodal projector. The gateway accepts 128/256/512/768 output dimensions and 
 after truncation. Google's documented retrieval prefixes distinguish queries (`task: search result | query: `)
 from documents (`title: none | text: `). The non-deployable service template is
 `deploy/systemd/gille-embeddinggemma2.service`; its runtime and model placeholders must be resolved
-to immutable, checksum-verified local artifacts after a bounded M5 evaluation. It listens only on
-loopback, uses CPU only, and has an 8 GiB memory cap. It does not request a llama-swap model change;
+to immutable, checksum-verified artifacts under root-owned `/opt` paths. It listens only on
+loopback, uses CPU only, runs as a dedicated dynamic user without home or host-device access, and has
+an 8 GiB memory cap. It does not request a llama-swap model change;
 before enabling it, include up to 8 GiB of sidecar growth in the host-memory reserve for future
 chat loads and verify real headroom. Embedding calls still use ordinary gateway admission and can
 occupy an inflight slot. Only one embedding call per gateway instance may be in flight; concurrent
