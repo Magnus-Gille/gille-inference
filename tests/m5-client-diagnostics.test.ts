@@ -137,7 +137,7 @@ describe("gateway-supplied cause in _meta is preferred over the sentence (#357)"
     expect(error).not.toHaveProperty("retryAfterSeconds");
   });
 
-  it("keeps unknown or malformed backend metadata as generic tool_error", async () => {
+  it("keeps unknown or malformed backend metadata generic without exposing backend details", async () => {
     const raw = "backend https://model.internal/v1 leaked detail";
     for (const meta of [
       { m5_code: "upstream_error", reason: "upstream_connection_failed", layer: "gateway_transport" },
@@ -147,9 +147,15 @@ describe("gateway-supplied cause in _meta is preferred over the sentence (#357)"
       { m5_code: "upstream_error", reason: "upstream_timeout", layer: "model_backend", retry_after_seconds: null },
     ]) {
       const error = await askWith(raw, meta);
-      expect(error).toMatchObject({ code: "tool_error", message: raw });
+      expect(error).toMatchObject({ code: "tool_error", message: "The model backend reported an error." });
       expect(error).not.toHaveProperty("retryable");
+      expect(JSON.stringify(error.toJSON())).not.toContain(raw);
     }
+  });
+
+  it("preserves older gateway errors without backend metadata", async () => {
+    const error = await askWith("The MCP tool reported an error.", undefined);
+    expect(error).toMatchObject({ code: "tool_error", message: "The MCP tool reported an error." });
   });
 });
 

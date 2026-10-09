@@ -931,10 +931,11 @@ export function askRefusalFromMeta(result, text) {
   const meta = result?._meta;
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
   if (meta.m5_code === "upstream_error") {
+    const generic = { code: "tool_error", message: "The model backend reported an error." };
     const message = ASK_BACKEND_MESSAGES.get(meta.reason);
-    if (meta.layer !== "model_backend" || message === undefined) return null;
+    if (meta.layer !== "model_backend" || message === undefined) return generic;
     if (Object.prototype.hasOwnProperty.call(meta, "retry_after_seconds") &&
-        !Number.isInteger(meta.retry_after_seconds)) return null;
+        !Number.isInteger(meta.retry_after_seconds)) return generic;
     const seconds = meta.retry_after_seconds;
     return {
       code: "upstream_error",
