@@ -18,118 +18,224 @@ jobs:
     name: Collect report-only code health
     if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read
     steps:
       - name: Initialize artifact directory
+        id: initialize
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/code-health-v1/evidence"
-          printf '%s\n' '{"version":"1.0","producer_status":"not-run","reason":"collector-not-started"}' \
+          mkdir -p "$RUNNER_TEMP/code-health-v1/evidence" "$RUNNER_TEMP/code-health-phases"
+          date +%s%3N > "$RUNNER_TEMP/code-health-start-ms"
+          printf '%s\n' '{"version":"1.0","producer_status":"not-run","reason":"workflow-not-started"}' \
             > "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
 
       - name: Checkout complete history
         id: checkout
+        timeout-minutes: 3
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node.js 22
+        id: node
         if: steps.checkout.outcome == 'success'
+        timeout-minutes: 2
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: package-lock.json
 
+      - name: Check synthetic producer and workflow conformance
+        id: conformance
+        if: steps.node.outcome == 'success'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set +e
+          start_ms=$(date +%s%3N)
+          printf '%s\n' "$start_ms" > "$RUNNER_TEMP/code-health-phases/conformance.start"
+          node --test research/code-health-402/test-producer.mjs
+          result=$?
+          date +%s%3N > "$RUNNER_TEMP/code-health-phases/conformance.end"
+          exit "$result"
+
       - name: Install locked project dependencies
         id: project-dependencies
-        if: success() && steps.checkout.outcome == 'success'
-        run: npm ci
+        if: >-
+          success() && steps.conformance.outcome == 'success' &&
+          ((github.event_name == 'schedule' && github.event.schedule == '47 4 * * 1') ||
+           (github.event_name == 'workflow_dispatch' && inputs.collect_static))
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set +e
+          start_ms=$(date +%s%3N)
+          printf '%s\n' "$start_ms" > "$RUNNER_TEMP/code-health-phases/project-dependencies.start"
+          npm ci
+          result=$?
+          date +%s%3N > "$RUNNER_TEMP/code-health-phases/project-dependencies.end"
+          exit "$result"
 
       - name: Install isolated pinned analyzer tools
         id: analyzer-dependencies
-        if: success() && steps.project-dependencies.outcome == 'success'
-        run: |
-          set -euo pipefail
-          npm ci --prefix research/code-health-401/tooling --ignore-scripts
-          npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts
-          mkdir -p node_modules/@vitest
-          provider_link='../../research/code-health-401/coverage-tooling/node_modules/@vitest/coverage-v8'
-          provider_target='node_modules/@vitest/coverage-v8'
-          if [[ -e "$provider_target" || -L "$provider_target" ]]; then
-            if [[ ! -L "$provider_target" || "$(readlink "$provider_target")" != "$provider_link" ]]; then
-              echo 'unexpected existing Vitest coverage provider; refusing to replace it' >&2
-              exit 1
-            fi
-          else
-            ln -s "$provider_link" "$provider_target"
-          fi
-
-      - name: Check producer and workflow conformance
-        if: success() && steps.analyzer-dependencies.outcome == 'success'
-        run: node --test research/code-health-402/test-producer.mjs
-
-      - name: Collect report without a token on pull requests
-        if: success() && steps.analyzer-dependencies.outcome == 'success' && github.event_name == 'pull_request'
-        env:
-          CODE_HEALTH_COLLECT_STATIC: 'true'
-          OUTPUT_DIR: ${{ runner.temp }}/code-health-v1
+        if: >-
+          success() && steps.project-dependencies.outcome == 'success' &&
+          ((github.event_name == 'schedule' && github.event.schedule == '47 4 * * 1') ||
+           (github.event_name == 'workflow_dispatch' && inputs.collect_static))
+        timeout-minutes: 5
         shell: bash
         run: |
           set -uo pipefail
-          collector_log="$RUNNER_TEMP/code-health-collector.log"
-          node research/code-health-402/collect.mjs --output "$OUTPUT_DIR" --static > "$collector_log" 2>&1
-          collector_status=$?
-          if [[ "$collector_status" -eq 0 ]]; then
-            report_status="$(sed -n 's/^report_status=\(complete\|partial\);.*/\1/p' "$collector_log")"
-            if [[ "$report_status" != complete && "$report_status" != partial ]]; then
-              collector_status=1
+          start_ms=$(date +%s%3N)
+          printf '%s\n' "$start_ms" > "$RUNNER_TEMP/code-health-phases/analyzer-dependencies.start"
+          npm ci --prefix research/code-health-401/tooling --ignore-scripts
+          result=$?
+          if [[ "$result" -eq 0 ]]; then
+            npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts
+            result=$?
+          fi
+          if [[ "$result" -eq 0 ]]; then
+            mkdir -p node_modules/@vitest
+            provider_link='../../research/code-health-401/coverage-tooling/node_modules/@vitest/coverage-v8'
+            provider_target='node_modules/@vitest/coverage-v8'
+            if [[ -e "$provider_target" || -L "$provider_target" ]]; then
+              if [[ ! -L "$provider_target" || "$(readlink "$provider_target")" != "$provider_link" ]]; then
+                echo 'unexpected existing Vitest coverage provider; refusing to replace it' >&2
+                result=1
+              fi
             else
-              printf '{"version":"1.0","producer_status":"valid","report_status":"%s"}\n' "$report_status" \
-                > "$OUTPUT_DIR/evidence/producer-status.json"
-              printf 'code-health report_status=%s\n' "$report_status"
-              exit 0
+              ln -s "$provider_link" "$provider_target" || result=$?
             fi
           fi
-          printf '%s\n' '{"version":"1.0","producer_status":"failed","reason":"collector-or-conformance-failure"}' \
-            > "$OUTPUT_DIR/evidence/producer-status.json"
-          echo 'Code-health producer failed; detailed diagnostics were withheld from the artifact.' >&2
-          exit "$collector_status"
+          date +%s%3N > "$RUNNER_TEMP/code-health-phases/analyzer-dependencies.end"
+          exit "$result"
 
-      - name: Collect report with read-only Actions access
-        if: success() && steps.analyzer-dependencies.outcome == 'success' && github.event_name != 'pull_request'
+      - name: Collect once on schedule or manual dispatch
+        id: collection
+        if: >-
+          success() && steps.conformance.outcome == 'success' && github.event_name != 'pull_request' &&
+          ((github.event_name != 'schedule' || github.event.schedule != '47 4 * * 1' || steps.analyzer-dependencies.outcome == 'success') &&
+           (github.event_name != 'workflow_dispatch' || !inputs.collect_static || steps.analyzer-dependencies.outcome == 'success'))
+        timeout-minutes: 5
         env:
           CODE_HEALTH_GITHUB_TOKEN: ${{ github.token }}
           CODE_HEALTH_COLLECT_STATIC: ${{ (github.event_name == 'schedule' && github.event.schedule == '47 4 * * 1') || (github.event_name == 'workflow_dispatch' && inputs.collect_static) }}
           OUTPUT_DIR: ${{ runner.temp }}/code-health-v1
         shell: bash
         run: |
-          set -uo pipefail
+          set +e
+          start_ms=$(date +%s%3N)
+          printf '%s\n' "$start_ms" > "$RUNNER_TEMP/code-health-phases/collection.start"
           collector_log="$RUNNER_TEMP/code-health-collector.log"
           node research/code-health-402/collect.mjs --output "$OUTPUT_DIR" > "$collector_log" 2>&1
-          collector_status=$?
-          if [[ "$collector_status" -eq 0 ]]; then
+          result=$?
+          date +%s%3N > "$RUNNER_TEMP/code-health-phases/collection.end"
+          if [[ "$result" -eq 0 ]]; then
             report_status="$(sed -n 's/^report_status=\(complete\|partial\);.*/\1/p' "$collector_log")"
-            if [[ "$report_status" != complete && "$report_status" != partial ]]; then
-              collector_status=1
-            else
-              printf '{"version":"1.0","producer_status":"valid","report_status":"%s"}\n' "$report_status" \
-                > "$OUTPUT_DIR/evidence/producer-status.json"
-              printf 'code-health report_status=%s\n' "$report_status"
+            if [[ "$report_status" == complete || "$report_status" == partial ]]; then
+              printf '%s\n' "$report_status" > "$RUNNER_TEMP/code-health-report-status"
               exit 0
             fi
+            result=1
           fi
-          printf '%s\n' '{"version":"1.0","producer_status":"failed","reason":"collector-or-conformance-failure"}' \
-            > "$OUTPUT_DIR/evidence/producer-status.json"
-          echo 'Code-health producer failed; detailed diagnostics were withheld from the artifact.' >&2
-          exit "$collector_status"
+          echo 'Code-health collector failed; raw diagnostics remain in workflow logs.' >&2
+          exit "$result"
+
+      - name: Finalize bounded workflow status and timing
+        if: always()
+        timeout-minutes: 1
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          NODE_OUTCOME: ${{ steps.node.outcome }}
+          CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+          PROJECT_DEPENDENCIES_OUTCOME: ${{ steps.project-dependencies.outcome }}
+          ANALYZER_DEPENDENCIES_OUTCOME: ${{ steps.analyzer-dependencies.outcome }}
+          COLLECTION_OUTCOME: ${{ steps.collection.outcome }}
+          COLLECT_EXPECTED: ${{ github.event_name != 'pull_request' }}
+          STATIC_REQUESTED: ${{ (github.event_name == 'schedule' && github.event.schedule == '47 4 * * 1') || (github.event_name == 'workflow_dispatch' && inputs.collect_static) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=not-run
+          phase=none
+          reason=conformance-only-pull-request
+          report_status=''
+          if [[ "$CHECKOUT_OUTCOME" != success || "$NODE_OUTCOME" != success ]]; then
+            status=failed; phase=setup; reason=setup-step-failed
+          elif [[ "$CONFORMANCE_OUTCOME" != success ]]; then
+            status=failed; phase=conformance; reason=conformance-step-failed
+          elif [[ "$STATIC_REQUESTED" == true && ( "$PROJECT_DEPENDENCIES_OUTCOME" != success || "$ANALYZER_DEPENDENCIES_OUTCOME" != success ) ]]; then
+            status=failed; phase=setup; reason=tool-install-step-failed
+          elif [[ "$COLLECT_EXPECTED" == true && "$COLLECTION_OUTCOME" != success ]]; then
+            status=failed; phase=collection; reason=collector-step-failed
+          elif [[ "$COLLECT_EXPECTED" == true && -f "$RUNNER_TEMP/code-health-report-status" ]]; then
+            report_status=$(cat "$RUNNER_TEMP/code-health-report-status")
+            if [[ "$report_status" == complete || "$report_status" == partial ]]; then
+              status=valid; phase=complete; reason=''
+            else
+              status=failed; phase=collection; reason=invalid-report-status
+            fi
+          elif [[ "$COLLECT_EXPECTED" == true ]]; then
+            status=failed; phase=collection; reason=report-status-missing
+          fi
+
+          now_ms=$(date +%s%3N)
+          total_ms=$(( now_ms - $(cat "$RUNNER_TEMP/code-health-start-ms") ))
+          budget_ms=30000
+          if [[ "$STATIC_REQUESTED" == true ]]; then budget_ms=900000; fi
+          budget_status=within_budget
+          report_status_reason=''
+          if (( total_ms > budget_ms )); then
+            budget_status=over_budget
+            if [[ "$status" == valid ]]; then
+              report_status=partial
+              report_status_reason=workflow-pre-upload-budget-exceeded
+              if [[ -f "$RUNNER_TEMP/code-health-v1/report.md" ]]; then
+                sed -i 's/^Report status: complete$/Report status: partial/' "$RUNNER_TEMP/code-health-v1/report.md"
+                printf '\nWorkflow pre-upload time exceeded its %s ms budget. Inventories are retained; upload duration is external and unknown.\n' "$budget_ms" \
+                  >> "$RUNNER_TEMP/code-health-v1/report.md"
+              fi
+            fi
+          fi
+          printf '{"version":"1.0","producer_status":"%s","phase":"%s","reason":"%s"' "$status" "$phase" "$reason" \
+            > "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
+          if [[ -n "$report_status" ]]; then
+            printf ',"report_status":"%s"' "$report_status" >> "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
+          fi
+          if [[ -n "$report_status_reason" ]]; then
+            printf ',"report_status_reason":"%s"' "$report_status_reason" >> "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
+          fi
+          printf ',"pre_upload_budget_status":"%s","pre_upload_budget_ms":%s' "$budget_status" "$budget_ms" >> "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
+          printf '}\n' >> "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
+
+          duration_ms() {
+            local name="$1"
+            local start_file="$RUNNER_TEMP/code-health-phases/$name.start"
+            local end_file="$RUNNER_TEMP/code-health-phases/$name.end"
+            if [[ -f "$start_file" && -f "$end_file" ]]; then
+              printf '%s' "$(( $(cat "$end_file") - $(cat "$start_file") ))"
+            else
+              printf 'null'
+            fi
+          }
+          printf '{"version":"1.0","event_name":"%s","phase_outcomes":{"checkout":"%s","node_setup":"%s","conformance":"%s","project_dependencies":"%s","analyzer_dependencies":"%s","collection":"%s"},' \
+            "$GITHUB_EVENT_NAME" "$CHECKOUT_OUTCOME" "$NODE_OUTCOME" "$CONFORMANCE_OUTCOME" "$PROJECT_DEPENDENCIES_OUTCOME" "$ANALYZER_DEPENDENCIES_OUTCOME" "$COLLECTION_OUTCOME" \
+            > "$RUNNER_TEMP/code-health-v1/workflow-run.json"
+          printf '"phase_elapsed_ms":{"conformance":%s,"project_dependencies":%s,"analyzer_dependencies":%s,"collection":%s},' \
+            "$(duration_ms conformance)" "$(duration_ms project-dependencies)" "$(duration_ms analyzer-dependencies)" "$(duration_ms collection)" \
+            >> "$RUNNER_TEMP/code-health-v1/workflow-run.json"
+          printf '"elapsed_before_upload_ms":%s,"static_pre_upload_budget_ms":900000,"metadata_pre_upload_budget_ms":30000,"pre_upload_budget_status":"%s","end_to_end_budget_status":"unknown-upload-duration","external_step_timing":["checkout","node_setup","artifact_upload"],"artifact_upload":{"timeout_minutes":3,"duration_source":"GitHub Actions step timing; visible in the workflow run"}}\n' "$total_ms" "$budget_status" \
+            >> "$RUNNER_TEMP/code-health-v1/workflow-run.json"
 
       - name: Upload code-health-v1 report and evidence
         if: always()
+        timeout-minutes: 3
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: code-health-v1

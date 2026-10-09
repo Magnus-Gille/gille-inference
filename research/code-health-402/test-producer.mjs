@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,12 +10,14 @@ import {
   buildCohortRuns,
   countFunctionNodes,
   eslintInventoryComplete,
+  mapJobConclusion,
   normalizeCoverageSummary,
   normalizeKnipRows,
   parseEslintReport,
   reliabilityCounts,
   summarizeComplexity,
   summarizeCoverage,
+  unclassifiableKnownFailures,
 } from './lib/core.mjs';
 import {
   buildFirstAttemptEvidence,
@@ -24,7 +25,7 @@ import {
   fetchJsonWithRetry,
   getFirstAttempt,
 } from './lib/ci.mjs';
-import { checkVendorContract, collect, runProcess } from './collect.mjs';
+import { checkVendorContract, collect, inferTriage, reportMarkdown, runProcess } from './collect.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTRACT_ROOT = path.join(ROOT, 'contracts/grimnir-code-health-v1');
@@ -310,7 +311,103 @@ test('CI requests attempt one and never substitutes a successful rerun', async (
   assert.equal(reliabilityCounts(inaccessible).fraction, null);
 });
 
-test('local static collection without analyzer installs or credentials emits a truthful partial artifact', async () => {
+test('provider conclusions keep terminal timeouts in the failure denominator without guessing infrastructure', () => {
+  const runs = buildCohortRuns({
+    runs: [makeRun(51, { conclusion: 'timed_out' }), makeRun(52, { conclusion: 'startup_failure' })],
+    attempts: new Map([
+      [51, { status: 'completed', jobs: [{ name: 'test', conclusion: 'timed_out' }] }],
+      [52, { status: 'completed', jobs: [{ name: 'test', conclusion: 'startup_failure' }] }],
+    ]),
+    expectedJobRefs: ['ref:job-test'],
+    jobNameToRef: { test: 'ref:job-test' },
+    windowStart: '2026-09-01T00:00:00Z', windowEnd: '2026-10-01T00:00:00Z',
+  });
+  assert.deepEqual(runs.map(run => run.jobs[0].conclusion), ['failure', 'failure']);
+  assert.equal(reliabilityCounts(runs).denominator, 2);
+  assert.equal(mapJobConclusion({ conclusion: 'infra_failure' }), 'unknown');
+  assert.equal(mapJobConclusion({ conclusion: 'neutral' }), 'unknown');
+
+  const workflowLevelStartup = buildCohortRuns({
+    runs: [makeRun(53, { conclusion: 'startup_failure' })],
+    attempts: new Map([[53, { status: 'completed', conclusion: 'startup_failure', jobs: [] }]]),
+    expectedJobRefs: ['ref:job-test'], jobNameToRef: { test: 'ref:job-test' },
+    windowStart: '2026-09-01T00:00:00Z', windowEnd: '2026-10-01T00:00:00Z',
+  });
+  assert.equal(workflowLevelStartup[0].overall_conclusion, 'unknown');
+  assert.equal(reliabilityCounts(workflowLevelStartup).denominator, 0);
+  const unclassified = unclassifiableKnownFailures([{
+    run_id: 53, first_attempt_conclusion: 'startup_failure',
+  }], [{
+    run_ref: 'ref:gha-run-53-attempt-1', overall_conclusion: 'unknown',
+    jobs: [{ conclusion: 'unknown' }, { conclusion: 'unknown' }],
+  }]);
+  assert.equal(unclassified[0].provider_conclusion, 'startup_failure');
+  assert.match(unclassified[0].reason, /no expected job conclusion represents/);
+
+  const mixedUnclassified = unclassifiableKnownFailures([{
+    run_id: 55, first_attempt_conclusion: 'failure',
+  }], [{
+    run_ref: 'ref:gha-run-55-attempt-1', overall_conclusion: 'unknown',
+    jobs: [{ conclusion: 'success' }, { conclusion: 'unknown' }],
+  }]);
+  assert.equal(mixedUnclassified.length, 1, 'a known run failure stays visible when mixed job outcomes normalize overall to unknown');
+  assert.equal(mixedUnclassified[0].provider_conclusion, 'failure');
+});
+
+test('workflow-level startup failure with no jobs stays unknown and retains provider evidence', async () => {
+  const result = await buildFirstAttemptEvidence({
+    enumeration: {
+      totalCount: 1, pageCount: 1, windowCount: 1,
+      windowRuns: [makeRun(54, { conclusion: 'startup_failure' })],
+      query: { start: '2026-09-01T00:00:00Z', end: '2026-10-01T00:00:00Z' },
+    },
+    attempts: new Map([[54, { status: 'completed', conclusion: 'startup_failure', jobs: [] }]]),
+    workflowConfigForCommit: async () => DIGEST,
+    expectedWorkflowDigest: DIGEST,
+    expectedJobRefs: ['ref:job-test'], jobNameToRef: { test: 'ref:job-test' },
+    start: '2026-09-01T00:00:00Z', end: '2026-10-01T00:00:00Z',
+  });
+  assert.equal(result.runs[0].overall_conclusion, 'unknown');
+  assert.equal(reliabilityCounts(result.runs).denominator, 0);
+  assert.equal(result.evidence.runs[0].first_attempt_conclusion, 'startup_failure');
+  assert.deepEqual(result.evidence.runs[0].jobs, []);
+  assert.deepEqual(unclassifiableKnownFailures(result.evidence.runs, result.runs), [{
+    run_id: 54,
+    provider_conclusion: 'startup_failure',
+    classification: 'unknown',
+    reason: 'frozen v1 derives the run outcome from expected jobs; no expected job conclusion represents this provider run-level failure',
+  }]);
+});
+
+test('manual Knip triage binds file, symbol, and line together', () => {
+  const prior = { candidates: [
+    { path: 'src/a.ts', candidate_type: 'unused-file', classification: 'false-positive' },
+    { path: 'src/a.ts:keepMe@12', candidate_type: 'unused-export', classification: 'uncertain' },
+  ] };
+  assert.equal(inferTriage({ kind: 'files', file: 'src/a.ts' }, prior).classification, 'false-positive');
+  assert.equal(inferTriage({ kind: 'exports', file: 'src/a.ts', name: 'keepMe', line: 12 }, prior).classification, 'uncertain');
+  assert.equal(inferTriage({ kind: 'exports', file: 'src/a.ts', name: 'keepMe', line: 13 }, prior).classification, 'unreviewed-candidate');
+  assert.equal(inferTriage({ kind: 'exports', file: 'src/b.ts', name: 'keepMe', line: 12 }, prior).classification, 'unreviewed-candidate');
+});
+
+test('CI-only Markdown names only evidence the collector emits', () => {
+  const metrics = Object.fromEntries([
+    'complex_functions', 'unused_candidates', 'coverage', 'ci_first_attempt', 'confirmed_regressions',
+  ].map(name => [name, { status: 'unknown' }]));
+  const report = reportMarkdown({
+    objective: { repository: { owner: 'owner', name: 'repo' }, commit: 'a'.repeat(40), snapshot_id: 'ref:test', observed_at: '2026-10-09T12:00:00Z', metrics },
+    aggregate: { metrics: { ci_first_attempt: { status: 'unknown' } } },
+    sourceContextData: { languages: [], change_frequency: { status: 'unknown' } },
+    timings: [], errors: [], staticRequested: false, reportStatus: 'partial',
+    staticMetadataElapsedMs: 1, coverageElapsedMs: null,
+  });
+  assert.doesNotMatch(report, /evidence\/(?:complexity|unused|coverage)\//);
+  const paths = [...report.matchAll(/(?:evidence\/[A-Za-z0-9_./-]+|evidence-index\.json)/g)]
+    .map(match => match[0].replace(/[.,;:]+$/, ''));
+  assert.deepEqual([...new Set(paths)], ['evidence/ci/inventory.json', 'evidence/release-regression-survey.json', 'evidence-index.json']);
+});
+
+test('local static collection smoke emits a truthful partial artifact', { skip: process.env.CODE_HEALTH_REAL_SMOKE !== 'true' }, async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-report-'));
   const outputDir = path.join(temp, 'artifact');
   try {
@@ -384,6 +481,19 @@ test('local static collection without analyzer installs or credentials emits a t
     const knipFindings = JSON.parse(await readFile(path.join(outputDir, 'evidence/unused/findings.json'), 'utf8'));
     assert.equal(knipFindings.candidate_count, normalizeKnipRows(knipRun.raw_report).length);
     assert.equal(knipFindings.candidate_rows.filter(row => row.kind === 'files').length, knipRun.raw_report.files.length);
+    const priorTriage = JSON.parse(await readFile(path.join(ROOT, 'research/code-health-401/artifacts/knip-triage.json'), 'utf8'));
+    for (const candidate of priorTriage.candidates) {
+      const fileCandidate = candidate.candidate_type === 'unused-file';
+      const separator = fileCandidate ? -1 : candidate.path.lastIndexOf(':');
+      const at = fileCandidate ? -1 : candidate.path.lastIndexOf('@');
+      const file = fileCandidate ? candidate.path : candidate.path.slice(0, separator);
+      const name = fileCandidate ? null : candidate.path.slice(separator + 1, at);
+      const line = fileCandidate ? null : Number(candidate.path.slice(at + 1));
+      assert.ok(knipFindings.candidate_rows.some(row => row.path === file
+        && row.triage.classification === candidate.classification
+        && (fileCandidate ? row.kind === 'files' : row.kind === 'exports' && row.name === name && row.line === line)),
+      `manual triage was not retained for ${candidate.path}`);
+    }
     for (const relative of files) {
       const filePath = path.join(outputDir, relative);
       const content = await readFile(filePath, 'utf8');
@@ -391,15 +501,6 @@ test('local static collection without analyzer installs or credentials emits a t
       assert.doesNotMatch(content, /(?:\/Users|\/private\/|\/tmp\/|\/home\/|\/var\/folders\/|file:\/\/)/, `artifact retained a local path marker in ${relative}`);
     }
 
-    const cliOutput = path.join(temp, 'cli-artifact');
-    const cli = spawnSync(process.execPath, [path.join(ROOT, 'research/code-health-402/collect.mjs'), '--output', cliOutput, '--static'], {
-      cwd: ROOT,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', CI: 'true', NODE_ENV: 'test' },
-      encoding: 'utf8',
-    });
-    assert.equal(cli.status, 0, cli.stderr);
-    assert.match(cli.stdout, /report_status=partial/);
-    assert.match(await readFile(path.join(cliOutput, 'report.md'), 'utf8'), /Report status: partial/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -417,11 +518,22 @@ test('informational workflow preserves the read-only, always-artifact contract a
   assert.match(workflow, /retention-days: 30/);
   assert.match(workflow, /if: always\(\)/);
   assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /Collect report without a token on pull requests[\s\S]*?github\.event_name == 'pull_request'/);
-  assert.match(workflow, /Collect report with read-only Actions access[\s\S]*?CODE_HEALTH_GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(workflow, /Check synthetic producer and workflow conformance[\s\S]*?node --test research\/code-health-402\/test-producer\.mjs/);
+  const producerTests = await readFile(path.join(ROOT, 'research/code-health-402/test-producer.mjs'), 'utf8');
+  assert.match(producerTests, /CODE_HEALTH_REAL_SMOKE !== 'true'/);
+  assert.doesNotMatch(workflow, /CODE_HEALTH_REAL_SMOKE/);
   assert.match(workflow, /npm ci --prefix research\/code-health-401\/tooling --ignore-scripts/);
   assert.match(workflow, /npm ci --prefix research\/code-health-401\/coverage-tooling --ignore-scripts/);
   assert.match(workflow, /node research\/code-health-402\/collect\.mjs --output/);
+  assert.match(workflow, /Collect once on schedule or manual dispatch[\s\S]*?github\.event_name != 'pull_request'/);
+  assert.doesNotMatch(workflow, /Collect report without a token on pull requests/);
+  assert.match(workflow, /Install isolated pinned analyzer tools[\s\S]*?github\.event\.schedule == '47 4 \* \* 1'/);
+  assert.match(workflow, /Finalize bounded workflow status and timing[\s\S]*?elapsed_before_upload_ms/);
+  assert.match(workflow, /static_pre_upload_budget_ms\":900000/);
+  assert.match(workflow, /metadata_pre_upload_budget_ms\":30000/);
+  assert.match(workflow, /pre_upload_budget_status/);
+  assert.match(workflow, /end_to_end_budget_status\":\"unknown-upload-duration\"/);
+  assert.match(workflow, /artifact_upload[\s\S]*?timeout-minutes: 3/);
   assert.match(workflow, /report_status|report\.md/);
   assert.match(workflow, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\.0\.1/);
   assert.match(workflow, /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7\.0\.0/);

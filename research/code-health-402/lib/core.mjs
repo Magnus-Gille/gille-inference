@@ -216,10 +216,14 @@ export function normalizeKnipRows(report) {
 export function mapJobConclusion(job, attemptStatus = 'completed') {
   if (!job) return attemptStatus === 'completed' ? 'unknown' : 'pending';
   const conclusion = job.conclusion;
+  // GitHub's provider conclusions are deliberately mapped only where their meaning is explicit.
+  // startup_failure is a failed suite start, not evidence that infrastructure caused it.
   if (conclusion === 'success' || conclusion === 'failure' || conclusion === 'cancelled' || conclusion === 'skipped') {
     return conclusion;
   }
-  if (conclusion === 'infra_failure') return 'infra_failure';
+  if (conclusion === 'timed_out' || conclusion === 'startup_failure') return 'failure';
+  // infra_failure requires separate source evidence; an unrecognized provider string is not enough.
+  if (conclusion === 'infra_failure') return 'unknown';
   if (conclusion === null && attemptStatus !== 'completed') return 'pending';
   return 'unknown';
 }
@@ -287,6 +291,22 @@ export function reliabilityCounts(runs) {
     denominator,
     fraction: denominator === 0 ? null : runCounts.success / denominator,
   };
+}
+
+export function unclassifiableKnownFailures(firstAttemptEvidence, cohortRuns) {
+  const normalizedById = new Map(cohortRuns.map(run => [Number(run.run_ref.match(/gha-run-(\d+)-attempt-1/)?.[1]), run]));
+  return firstAttemptEvidence
+    .filter(run => {
+      const normalized = normalizedById.get(Number(run.run_id));
+      return ['failure', 'timed_out', 'startup_failure'].includes(run.first_attempt_conclusion)
+        && normalized?.overall_conclusion === 'unknown';
+    })
+    .map(run => ({
+      run_id: run.run_id,
+      provider_conclusion: run.first_attempt_conclusion,
+      classification: 'unknown',
+      reason: 'frozen v1 derives the run outcome from expected jobs; no expected job conclusion represents this provider run-level failure',
+    }));
 }
 
 export function slot({ name, observedAt, status, unit, reason = null, payload = null, source = null, population = null, priorSnapshotRef }) {

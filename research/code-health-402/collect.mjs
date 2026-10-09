@@ -20,6 +20,7 @@ import {
   source,
   summarizeComplexity,
   summarizeCoverage,
+  unclassifiableKnownFailures,
 } from './lib/core.mjs';
 import {
   buildFirstAttemptEvidence,
@@ -354,13 +355,20 @@ function safeLintEvidence(report, root) {
   }));
 }
 
-function inferTriage(row, priorTriage) {
+export function inferTriage(row, priorTriage) {
   const candidates = priorTriage.candidates ?? [];
   const match = candidates.find(candidate => {
-    if (candidate.path !== row.file) return false;
-    if (candidate.candidate_type === 'unused-file') return row.kind === 'files' || row.kind === 'file';
-    const name = candidate.path.split(':')[1]?.split('@')[0];
-    return name !== undefined && name === row.name;
+    if (candidate.candidate_type === 'unused-file') {
+      return candidate.path === row.file && (row.kind === 'files' || row.kind === 'file');
+    }
+    if (candidate.candidate_type !== 'unused-export') return false;
+    const at = candidate.path.lastIndexOf('@');
+    const separator = candidate.path.lastIndexOf(':', at);
+    if (separator < 1 || at <= separator + 1) return false;
+    const file = candidate.path.slice(0, separator);
+    const name = candidate.path.slice(separator + 1, at);
+    const line = Number(candidate.path.slice(at + 1));
+    return file === row.file && name === row.name && line === row.line && row.kind === 'exports';
   });
   return match ? {
     classification: match.classification,
@@ -878,6 +886,7 @@ async function collectCi({ outputRoot, observedAt, collectionRef, attempt, token
     complete.evidence.workflow_config_cohorts = configurationExcluded;
     complete.evidence.first_attempt_fetch_errors = attemptErrors;
     complete.evidence.attempt_evidence_complete = attemptErrors.length === 0;
+    const unclassifiableFailures = unclassifiableKnownFailures(complete.evidence.runs, complete.runs);
     const runInventoryRef = refId(`${collectionRef.slice(4)}-ci-inventory`);
     const payload = ciPayload({
       runs: complete.runs,
@@ -892,13 +901,28 @@ async function collectCi({ outputRoot, observedAt, collectionRef, attempt, token
       window_start: start,
       window_end: end,
       complete_run_enumeration: true,
+      unclassifiable_known_failures: unclassifiableFailures,
       denominator: complete.runs.reduce((count, run) => count + ['success', 'failure', 'infra_failure'].includes(run.overall_conclusion), 0),
-      denominator_policy: 'success + failure + explicit infra_failure; other outcomes remain separate',
+      denominator_policy: 'success + failure + source-attributed infra_failure; workflow-level failures without expected job results remain unknown',
     });
     await writeJson(outputRoot, detailsPath, {
       first_attempts: complete.evidence.runs,
       retry_policy: 'always request attempt 1; latest attempt is retained as context only',
-      unmapped_provider_conclusions: 'unknown; never infer flakiness or infrastructure cause from a generic failure',
+      provider_conclusion_mapping: {
+        success: 'success',
+        failure: 'failure',
+        timed_out: 'failure',
+        startup_failure: 'failure when returned for an expected job; workflow-level result without jobs remains unknown',
+        cancelled: 'cancelled',
+        skipped: 'skipped',
+        action_required: 'unknown',
+        neutral: 'unknown',
+        stale: 'unknown',
+        other: 'unknown; provider raw value is retained',
+        infra_failure: 'unknown unless separately supported by source evidence',
+      },
+      unknown_capability_reason: 'The frozen cohort can classify expected job results but cannot assign a workflow-level failure when no expected jobs were created.',
+      unclassifiable_known_failures: unclassifiableFailures,
     });
     const runRef = refId(`${collectionRef.slice(4)}-ci`);
     const slotValue = slot({
@@ -960,7 +984,7 @@ export async function checkVendorContract(contractRoot = CONTRACT_ROOT) {
   return manifest;
 }
 
-function reportMarkdown({ objective, aggregate, sourceContextData, timings, errors, staticRequested, reportStatus, staticMetadataElapsedMs, coverageElapsedMs }) {
+export function reportMarkdown({ objective, aggregate, sourceContextData, timings, errors, staticRequested, reportStatus, staticMetadataElapsedMs, coverageElapsedMs }) {
   const metrics = objective.metrics;
   const lines = [
     '# Code health v1 report',
@@ -976,9 +1000,9 @@ function reportMarkdown({ objective, aggregate, sourceContextData, timings, erro
     '',
     '| Metric | State | Evidence |',
     '| --- | --- | --- |',
-    `| Complex functions | ${metrics.complex_functions.status} | evidence/complexity/summary.json |`,
-    `| Unused candidates | ${metrics.unused_candidates.status} | evidence/unused/findings.json — graph remains unqualified |`,
-    `| Scoped coverage | ${metrics.coverage.status} | evidence/coverage/coverage-summary.json |`,
+    `| Complex functions | ${metrics.complex_functions.status} | ${staticRequested ? 'evidence/complexity/summary.json' : 'not collected (static cadence)'} |`,
+    `| Unused candidates | ${metrics.unused_candidates.status} | ${staticRequested ? 'evidence/unused/findings.json — graph remains unqualified' : 'not collected (static cadence)'} |`,
+    `| Scoped coverage | ${metrics.coverage.status} | ${staticRequested ? 'evidence/coverage/coverage-summary.json' : 'not collected (static cadence)'} |`,
     `| First-attempt main CI | ${metrics.ci_first_attempt.status} | evidence/ci/inventory.json |`,
     `| Confirmed regressions | ${metrics.confirmed_regressions.status} | evidence/release-regression-survey.json |`,
     '',

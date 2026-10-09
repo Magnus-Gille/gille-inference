@@ -23,10 +23,12 @@ later retry is green. An inaccessible attempt remains visible with unknown job o
 1,000 runs, incomplete enumeration, or an unrecognized workflow config produces an unavailable
 slot instead of a truncated measurement.
 
-Complexity, Knip candidates, and scoped TypeScript coverage run weekly on Monday, and on an
-explicit `workflow_dispatch` with `collect_static=true`. The same explicit scope can be requested
-before or after an agreed simplification sprint. Daily CI-only snapshots mark the static slots
-unknown with `not-collected`. Complexity uses the #401 ESLint correction configuration at a
+Pull requests run only synthetic producer tests and conformance checks; they do not install
+analyzers or collect a report. Daily scheduled runs collect CI metadata only and mark the static
+slots unknown with `not-collected`. Complexity, Knip candidates, and scoped TypeScript coverage
+run weekly on Monday or on a main-branch `workflow_dispatch` with `collect_static=true`; each
+static run installs the pinned tools and invokes the collector once. The same explicit scope can be
+requested before or after an agreed simplification sprint. Complexity uses the #401 ESLint correction configuration at a
 threshold of 20 and a separate complete TypeScript executable-function inventory. Coverage uses
 the #401 two-test/three-source-file V8 profile; the declared scope includes the unimported
 `image-sidecar.ts` file. Static size and 30-day change-frequency context is reported separately
@@ -34,13 +36,22 @@ from the five contract metrics.
 
 ## Setup, overhead, and artifacts
 
-The producer uses root dependencies from `npm ci`, the isolated pinned #401 analyzer lock, and the
-isolated pinned V8 provider lock. The coverage provider is linked into the temporary checkout's
-Vitest resolution path; it is not added to the runtime package manifest or lock. The workflow
-records measured tool wall time and emits the analyzer output, coverage summary, CI run/job
-inventory, source inventory, config digests, and cohort counts. The #401 local measurements were
-7.2 seconds for the scoped coverage command, 1.92 seconds for corrected ESLint, and 4.4 seconds for
-Knip; hosted setup and GitHub API time are measured separately by this producer.
+The static workflow records setup, conformance, dependency installation, analyzer installation,
+collector, and total pre-upload elapsed times separately. It applies a 900-second pre-upload
+budget to static runs and a 30-second pre-upload budget to metadata-only runs. Exceeding the
+workflow budget marks an otherwise valid report partial while retaining its completed inventories.
+Collector time is also recorded against its own 30-second metadata and 180-second coverage bounds.
+Artifact upload has a three-minute timeout, but its measured duration is visible only in GitHub
+Actions step timing. Therefore the recorded budget result covers pre-upload work only; end-to-end
+workflow duration including upload remains unknown until the Actions run is inspected.
+
+For an explicit local static smoke test, install the pinned root and analyzer dependencies as
+described by the workflow, then run
+`CODE_HEALTH_REAL_SMOKE=true node --test research/code-health-402/test-producer.mjs` from the
+repository root. Ordinary `node --test research/code-health-402/test-producer.mjs` runs only the
+synthetic suite and skips the real analyzer smoke. The #401 local measurements were 7.2 seconds
+for the scoped coverage command, 1.92 seconds for corrected ESLint, and 4.4 seconds for Knip;
+hosted setup and GitHub API time are measured separately.
 
 Artifacts are versioned with the immutable commit SHA and retained for 30 days as bounded raw
 collection evidence. No Munin or Heimdall credentials are exposed to this workflow. The producer
