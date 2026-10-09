@@ -5150,13 +5150,25 @@ export async function handleRequest(
     }
     if (path === "/v1/embeddings" && method === "POST") {
       res.setHeader("Cache-Control", "no-store");
-      // Reject ungranted callers and concurrent work before decoding large inline media.
+      // Reject ungranted callers before accepting inline media. An unfinished upload must
+      // not hold the single CPU embedding slot; take it after the bounded body arrives.
       if (!embeddingGranted(principal, EMBEDDING_MODEL_ID)) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "model_not_allowed";
         lctx.admission = "n/a";
         sendError(res, makeError("model_not_allowed", { param: "model" }));
+        return;
+      }
+      let rawEmbeddingBody: string;
+      try {
+        rawEmbeddingBody = await readBody(req, cfg.embeddingMediaEnabled ? 8 * 1024 * 1024 : 32 * 1024);
+      } catch (err) {
+        if (!(err instanceof BodyTooLargeError)) throw err;
+        lctx.status = 413;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "payload_too_large";
+        sendError(res, makeError("payload_too_large"));
         return;
       }
       if (embeddingInFlight.has(controller)) {
@@ -5172,19 +5184,13 @@ export async function handleRequest(
       try {
         let parsed: EmbeddingRequest;
         try {
-          parsed = parseEmbeddingBody(
-            await readBody(req, cfg.embeddingMediaEnabled ? 8 * 1024 * 1024 : 32 * 1024),
-            cfg.embeddingMediaEnabled,
-          );
+          parsed = parseEmbeddingBody(rawEmbeddingBody, cfg.embeddingMediaEnabled);
         } catch (err) {
-          if (!(err instanceof EmbeddingRequestError) && !(err instanceof BodyTooLargeError)) throw err;
-          const tooLarge = err instanceof BodyTooLargeError;
-          lctx.status = tooLarge ? 413 : 400;
+          if (!(err instanceof EmbeddingRequestError)) throw err;
+          lctx.status = 400;
           lctx.outcome = "bad_request";
-          lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-          sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", {
-            ...(!tooLarge ? { param: err.param, message: err.message } : {}),
-          }));
+          lctx.errorClass = "invalid_request_error";
+          sendError(res, makeError("invalid_request_error", { param: err.param, message: err.message }));
           return;
         }
         if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {

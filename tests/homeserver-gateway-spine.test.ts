@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -470,6 +470,26 @@ describe("gateway spine — HTTP integration", () => {
     }
     expect((await first).status).toBe(200);
     expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("does not let an unfinished authorized upload hold the embedding slot", async () => {
+    mockMode = "embedding-list";
+    const guest = mintKey({ alias: `embedding-upload-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const unfinished = httpRequest(url("/v1/embeddings"), { method: "POST", headers: {
+      authorization: `Bearer ${guest.plaintextKey}`, "content-type": "application/json",
+    } });
+    unfinished.on("error", () => undefined);
+    try {
+      await new Promise<void>((resolve) => unfinished.write('{"model":"embeddinggemma-2","input":"', resolve));
+      const response = await fetch(url("/v1/embeddings"), { method: "POST", headers: {
+        authorization: `Bearer ${guest.plaintextKey}`, "content-type": "application/json",
+      }, body: JSON.stringify({ model: "embeddinggemma-2", input: "another request" }) });
+      expect(response.status).toBe(200);
+      expect(upstreamInferenceRequestCount).toBe(1);
+    } finally {
+      unfinished.destroy();
+    }
   });
 
   it("accepts the OpenAI SDK base64 format and user field without forwarding user", async () => {
