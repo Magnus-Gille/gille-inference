@@ -55,10 +55,13 @@ describe("production roster documentation", () => {
     expect(clefRosterCopy).toContain("`POST /v1/systemone`");
     expect(clefRosterCopy.replace(/\s+/g, " ")).toContain("near `1` means yes and near `0` means no");
     expect(clefRosterCopy).toContain("not chat text");
-    const embeddingCopy = readme.match(/`embeddinggemma-2` is a separate proposed embedding service[\s\S]*?customer-facing availability check\./)?.[0] ?? "";
-    expect(embeddingCopy).toContain("remains unavailable until");
-    expect(embeddingCopy).toContain("explicit key grant");
+    const embeddingCopy = readme.match(/`embeddinggemma-2` is a separate embedding service[\s\S]*?customer-facing availability check\./)?.[0] ?? "";
+    expect(embeddingCopy).toContain("available only when");
+    expect(embeddingCopy).toContain("explicit customer key grant");
     expect(embeddingCopy).toContain("BF16 GGUF");
+    expect(portal).toContain("EmbeddingGemma 2 serves customer keys that see it in their authenticated model list");
+    expect(portal).toContain("Check /v1/models");
+    expect(portal).not.toContain("Planned: EmbeddingGemma 2");
     expect(portal).toContain("/v1/embeddings");
   });
 });

@@ -729,8 +729,8 @@ restricted customer keys can receive its exact ID through `/admin/keys/chat-gran
 rotation or credit reset. A customer should call it through `/v1/chat/completions`, using the
 same ordinary credits and quotas.
 
-`embeddinggemma-2` is a separate proposed embedding service and remains unavailable until a
-compatible CPU sidecar, gateway release, and explicit key grant are verified. Its
+`embeddinggemma-2` is a separate embedding service, available only when its compatible CPU
+sidecar, gateway release, and explicit customer key grant are verified. Its
 first serving contract is text/code only, using the 768-dimensional BF16 GGUF without the
 multimodal projector. The gateway accepts 128/256/512/768 output dimensions and normalizes
 after truncation. Google's documented retrieval prefixes distinguish queries (`task: search result | query: `)
@@ -754,11 +754,11 @@ and two inputs; 768 raw dimensions per vector). The evaluation launcher SHA-256 
 `763c444d2a03ff0aca301cbfeb5e0b7e8fe01f7868694941b27b715b8c4ad832`, but upstream
 fetched UI assets through a mutable `latest` fallback. A production build must add
 `-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` to avoid that fetch and record the new exact
-launcher checksum. The evaluation cleaned up its transient artifacts; there is no installed
-sidecar or live embedding release. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the
-installed sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
-Change the portal's planned-status wording to active only in the exact gateway release that
-enables the sidecar, and verify the rendered page after deployment.
+launcher checksum. The evaluation cleaned up its transient artifacts and did not install a
+production sidecar. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the installed
+sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
+The portal copy in this release describes access through authenticated model discovery; deploy
+it only with the verified sidecar and gateway settings, then verify the rendered page.
 The authenticated `GET /v1/models` response is the customer-facing availability check.
 
 `gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
