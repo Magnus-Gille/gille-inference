@@ -370,7 +370,13 @@ describe("GET /models/residency", () => {
 
     const response = await getResidency(adminKey);
     expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ status: "unavailable" });
+    expect(await response.json()).toMatchObject({
+      status: "unavailable",
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
+    });
     expect(upstreamRequests.filter((request) => request === "GET /running").length).toBeGreaterThanOrEqual(1);
     expect(upstreamRequests.some((request) => request.startsWith("POST "))).toBe(false);
   });
@@ -380,6 +386,14 @@ describe("GET /models/residency", () => {
 
     const response = await getResidency(adminKey);
     expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ status: "unavailable" });
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toMatchObject({
+      status: "unavailable",
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
+    });
+    expect(body).not.toHaveProperty("models");
   });
 });

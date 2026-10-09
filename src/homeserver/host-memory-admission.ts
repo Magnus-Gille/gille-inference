@@ -224,9 +224,11 @@ function parseByteInteger(text: string): number | null {
 
 /** Parse the host-wide cumulative /proc/vmstat oom_kill counter. */
 export function parseOomKillCount(text: string): number | null {
-  const matches = [...text.matchAll(/^oom_kill[ \t]+([0-9]+)[ \t]*\r?$/gm)];
-  if (matches.length !== 1) return null;
-  const value = Number(matches[0]?.[1]);
+  const rows = text.split(/\r?\n/).filter((line) => /^oom_kill(?:[ \t]|$)/.test(line));
+  if (rows.length !== 1) return null;
+  const match = /^oom_kill[ \t]+([0-9]+)[ \t]*$/.exec(rows[0]!);
+  if (match === null) return null;
+  const value = Number(match[1]);
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 

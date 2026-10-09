@@ -563,7 +563,7 @@ interface ModelResidencyResponseRow {
 
 type ModelResidencyResponse =
   | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; resourceEvidence: ResourceEvidence; status?: never }
-  | { status: "unavailable"; models?: never };
+  | { status: "unavailable"; resourceEvidence: ResourceEvidence; models?: never };
 
 interface ResourceEvidence {
   admissionMode: HostMemoryAdmissionMode;
@@ -646,6 +646,7 @@ async function readModelResidency(
   admissionMode: HostMemoryAdmissionMode,
   readOom: () => Promise<number | null>,
 ): Promise<ModelResidencyResponse> {
+  const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
   try {
     running = await getRunningSnapshot();
@@ -653,7 +654,7 @@ async function readModelResidency(
     if (error instanceof RunningSnapshotUnavailableError) {
       // An unavailable observation is not an idle backend. Keep the response safe and
       // explicit so consumers do not infer that no models are resident.
-      return { status: "unavailable" };
+      return { status: "unavailable", resourceEvidence };
     }
     throw error;
   }
@@ -689,7 +690,6 @@ async function readModelResidency(
     };
   });
   const hostMemory = await readHostMemoryForResidency(readMemory);
-  const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   return { models: modelsOutput, hostMemory, resourceEvidence };
 }
 

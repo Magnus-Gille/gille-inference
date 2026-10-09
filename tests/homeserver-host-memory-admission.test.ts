@@ -377,6 +377,8 @@ describe("OOM kill counter", () => {
     "oom_kill 1.5",
     "oom_kill 9007199254740992",
     "oom_kill 17 extra",
+    "oom_kill 17\noom_kill broken\n",
+    "oom_kill broken\noom_kill 17\n",
   ])("rejects malformed or unsafe counter %j", (text) => {
     expect(parseOomKillCount(text)).toBeNull();
   });

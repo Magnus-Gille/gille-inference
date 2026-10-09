@@ -153,7 +153,7 @@ unreadable OOM evidence is returned as `status: "unknown"`, `oomKillCount: null`
 `observedAt: null`. `admissionMode: "shadow"` observes and reports the mode but does not enforce
 admission decisions.
 
-**Response 503:** `{ "status": "unavailable" }` when the backend snapshot cannot be obtained.
+**Response 503:** `{ "status": "unavailable", "resourceEvidence": ResourceEvidence }` when the backend snapshot cannot be obtained. Local OOM evidence is read independently and remains available during a backend outage; it does not establish the outage's cause.
 The unavailable response deliberately has no `models` array, so callers cannot interpret an empty
 array as evidence that no models are resident.
 
