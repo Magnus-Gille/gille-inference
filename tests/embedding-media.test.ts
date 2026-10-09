@@ -65,7 +65,7 @@ function wav(seconds = 1): string {
   return out.toString("base64");
 }
 
-function mp4(frameCount = 2, durationSeconds = 1): string {
+function mp4(frameCount = 2, durationSeconds = 1, width = 640, height = 480): string {
   const box = (type: string, body: Buffer): Buffer => {
     const out = Buffer.alloc(8 + body.length);
     out.writeUInt32BE(out.length, 0);
@@ -94,9 +94,15 @@ function mp4(frameCount = 2, durationSeconds = 1): string {
   stsz.writeUInt32BE(0, 4);
   stsz.writeUInt32BE(frameCount, 8);
   for (let i = 0; i < frameCount; i += 1) stsz.writeUInt32BE(1, 12 + i * 4);
-  const stsd = Buffer.alloc(16);
+  const visualEntry = Buffer.alloc(86);
+  visualEntry.writeUInt32BE(86, 0);
+  visualEntry.write("mp4v", 4, "ascii");
+  visualEntry.writeUInt16BE(width, 32);
+  visualEntry.writeUInt16BE(height, 34);
+  const stsd = Buffer.alloc(8 + visualEntry.length);
   stsd.writeUInt32BE(0, 0);
   stsd.writeUInt32BE(1, 4);
+  visualEntry.copy(stsd, 8);
   const stbl = box("stbl", Buffer.concat([box("stsd", stsd), box("stts", stts), box("stsz", stsz)]));
   const minf = box("minf", stbl);
   const mdia = box("mdia", Buffer.concat([box("mdhd", mdhd), box("hdlr", hdlr), minf]));
@@ -184,6 +190,9 @@ describe("embedding media input", () => {
       .toThrow(EmbeddingMediaError);
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: { data: mp4(1, 11), format: "mp4" } }] }]))
       .toThrow(EmbeddingMediaError);
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: {
+      data: mp4(2, 1, 2049, 480), format: "mp4",
+    } }] }])).toThrow(EmbeddingMediaError);
   });
 
   it("rejects truncated PNG and JPEG payloads", () => {

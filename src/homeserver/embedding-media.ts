@@ -275,7 +275,16 @@ function validateMp4(bytes: Buffer): void {
     if (!mdhd || !stsd || !stts || !stsz || stsd.payload + 8 > stsd.end || stts.payload + 8 > stts.end ||
       stsz.payload + 12 > stsz.end || bytes.readUInt32BE(stsd.payload + 4) === 0) invalid();
     const sampleDescriptionCount = bytes.readUInt32BE(stsd.payload + 4);
-    if (sampleDescriptionCount > Math.floor((stsd.end - stsd.payload - 8) / 8)) invalid();
+    if (sampleDescriptionCount !== 1) invalid();
+    const sampleEntry = stsd.payload + 8;
+    if (sampleEntry + 86 > stsd.end) invalid();
+    const sampleEntrySize = bytes.readUInt32BE(sampleEntry);
+    const sampleEntryType = ascii(bytes, sampleEntry + 4, 4);
+    if (sampleEntrySize < 86 || sampleEntry + sampleEntrySize > stsd.end ||
+      !["mp4v", "avc1", "avc2", "avc3", "avc4", "hvc1", "hev1", "av01", "vp09"].includes(sampleEntryType)) invalid();
+    const videoWidth = bytes.readUInt16BE(sampleEntry + 32);
+    const videoHeight = bytes.readUInt16BE(sampleEntry + 34);
+    if (videoWidth < 1 || videoHeight < 1 || videoWidth > 2048 || videoHeight > 2048) invalid();
     const mdhdVersion = bytes[mdhd.payload]!;
     const mdhdTimescaleOffset = mdhdVersion === 1 ? 20 : 12;
     const mdhdDurationOffset = mdhdVersion === 1 ? 24 : 16;
