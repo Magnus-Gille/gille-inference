@@ -536,7 +536,7 @@ async function collectComplexity({ files, outputRoot, observedAt, collectionRef,
   const command = path.resolve(ROOT, 'research/code-health-401/tooling/node_modules/.bin/eslint');
   const args = [
     '--config', 'research/code-health-401/eslint-correction.config.mjs',
-    '--no-warn-ignored', '--format', 'json', 'src', 'scripts',
+    '--no-warn-ignored', '--format', 'json', ...files,
   ];
   const startedAt = isoSecond();
   const run = await runProcess(command, args, { deadline });

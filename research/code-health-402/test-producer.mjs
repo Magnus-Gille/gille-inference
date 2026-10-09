@@ -368,6 +368,16 @@ test('local static collection without analyzer installs or credentials emits a t
     const complexityInventory = JSON.parse(await readFile(path.join(outputDir, 'evidence/complexity/inventory.json'), 'utf8'));
     assert.equal(complexityInventory.failed_files.length, 0, 'every tracked TypeScript source file must parse');
     assert.equal(complexityInventory.parsed_files, complexityInventory.files.length);
+    const complexityScan = JSON.parse(await readFile(path.join(outputDir, 'evidence/complexity/scan.json'), 'utf8'));
+    assert.equal(complexityScan.exit_code, 0);
+    assert.equal(complexityScan.parse_error, null);
+    assert.deepEqual(complexityScan.parse_errors, []);
+    assert.equal(complexityScan.result_files.length, complexityInventory.files.length);
+    assert.ok(eslintInventoryComplete(
+      complexityScan.result_files.map(result => ({ filePath: result.path })),
+      complexityInventory.files.map(file => file.path),
+      ROOT,
+    ), 'ESLint must emit exactly the eligible tracked TypeScript inventory');
     const knipRun = JSON.parse(await readFile(path.join(outputDir, 'evidence/unused/knip.json'), 'utf8'));
     assert.equal(knipRun.parse_error, null, 'the pinned Knip grouped-issues format must parse');
     assert.ok(Array.isArray(knipRun.raw_report.issues));
