@@ -121,6 +121,8 @@ key's ordinary credits. A malformed upstream response returns 502 and consumes n
 Google's retrieval prefixes distinguish a query (`task: search result | query: `) from a document
 (`title: none | text: `). Keep output dimensions consistent within an index. Media is disabled by
 default. Once the BF16 projector and `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` are activated,
+the gateway permits an 8 MiB JSON body; wrapped input is forwarded only while the sidecar
+reports image, audio and video support. With the flag off, text requests retain the 32 KiB cap.
 `input` may contain 1–4 objects, each with `content` of 1–4 typed parts. Each object yields one
 vector; only one video may appear in a request. Accepted parts are text, inline PNG/JPEG image
 data URI (at most 2 MiB and 2048×2048), base64 PCM WAV audio with `format:"wav"` (at most 3 MiB

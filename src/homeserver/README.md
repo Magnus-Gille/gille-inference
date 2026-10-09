@@ -736,7 +736,9 @@ false; enable it only after an immutable projector installation and real image/a
 The gateway accepts 128/256/512/768 output dimensions and normalizes
 after truncation. Google's documented retrieval prefixes distinguish queries (`task: search result | query: `)
 from documents (`title: none | text: `). The non-deployable service template is
-`deploy/systemd/gille-embeddinggemma2.service`; its runtime and model placeholders must be resolved
+`deploy/systemd/gille-embeddinggemma2.service` for text. The separate reviewed
+`deploy/systemd/gille-embeddinggemma2-multimodal.service` template adds the projector only
+during an approved media activation. Its runtime, model and projector placeholders must be resolved
 to immutable, checksum-verified artifacts under root-owned `/opt` paths. It listens only on
 loopback, uses CPU only, runs as a dedicated dynamic user without home or host-device access, and has
 an 8 GiB memory cap. It does not request a llama-swap model change.
@@ -756,6 +758,8 @@ SHA-256 `d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766`.
 The compatible installed M5 llama.cpp source revision is
 `4f92965a7bfa9e8eb6519908ff962e23c2cb7b93`; the installed CPU launcher SHA-256 is
 `cc8c82a86e130280e8ec1ffde47890d96c5bc4e6c98e975390d90942f3d6b6d3`.
+Builds must use `-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` to avoid fetching mutable
+UI assets; verify the complete installed runtime bundle and record the exact launcher hash.
 The text sidecar and customer gateway are active from release
 `e6a86a45aa15fc4a25dd95d53746e7e944ef05a9`. A multimodal projector changes the sidecar
 unit as well as the gateway contract; installation and activation require separate exact

@@ -22,6 +22,7 @@ let upstreamPort = 0;
 let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
+let upstreamModelRequestCount = 0;
 let releaseStall: (() => void) | null = null;
 let hostMemoryAvailableGib = 90;
 // Keep this below HOMESERVER_OWNER_QUEUE_MAX_MS (3000ms in this file): a wrongly queued owner
@@ -56,6 +57,7 @@ function startUpstream(): Promise<void> {
     req.on("end", async () => {
       if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone") || req.url?.endsWith("/embeddings")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
+      if (req.url === "/v1/models") upstreamModelRequestCount += 1;
       if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ running: mockMode === "systemone-list" || mockMode === "embedding-list" ? [] : [
@@ -267,6 +269,7 @@ beforeEach(() => {
   mockMode = "ok";
   releaseStall = null;
   upstreamInferenceRequestCount = 0;
+  upstreamModelRequestCount = 0;
   hostMemoryAvailableGib = 90;
   resetQuotaWindows();
 });
@@ -390,6 +393,9 @@ describe("gateway spine — HTTP integration", () => {
     expect(portal).toContain("PNG/JPEG images");
     expect(portal).toContain("remote and local URLs are rejected");
     expect(portal).not.toContain("EMBEDDING_MEDIA_EXAMPLE");
+    const sidecarReads = upstreamModelRequestCount;
+    expect((await fetch(url("/portal"))).status).toBe(200);
+    expect(upstreamModelRequestCount).toBe(sidecarReads);
     const scoped = mintKey({ alias: `embedding-media-${randomUUID()}`, tier: "guest",
       embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 10_000 }, DEFAULTS);
     const discovery = await fetch(url("/v1/models"), {
@@ -422,6 +428,12 @@ describe("gateway spine — HTTP integration", () => {
       input: [{ content: [{ type: "input_audio", input_audio: { data: wav.toString("base64") } }] }],
       encoding_format: "float" });
     expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    const beforeWrapped = upstreamInferenceRequestCount;
+    mockMode = "embedding-error500"; // Model metadata omits the media projector.
+    const wrappedText = await call([{ content: [{ type: "text", text: "A short document" }] }]);
+    expect(wrappedText.status).toBe(502);
+    expect(upstreamInferenceRequestCount).toBe(beforeWrapped);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
   });
 
   it("caps CPU embedding work at one request before consuming another gateway slot", async () => {
@@ -446,6 +458,10 @@ describe("gateway spine — HTTP integration", () => {
       expect(ungrantedResponse.status).toBe(403);
       const second = await call();
       expect(second.status).toBe(503);
+      const malformedConcurrent = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: [{ unsupported: "value" }] }) });
+      expect(malformedConcurrent.status).toBe(503);
       expect(upstreamInferenceRequestCount).toBe(1);
       expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(reservedCredits);
     } finally {

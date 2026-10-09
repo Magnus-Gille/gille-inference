@@ -91,6 +91,7 @@ import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, Sy
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
 import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
   embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
+import { EmbeddingVideoProbeError, validateEmbeddingVideoBitstream } from "./embedding-video-probe.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
 import {
   startImageWorker,
@@ -1397,6 +1398,25 @@ async function embeddingMediaReady(cfg: HomeserverConfig, signal?: AbortSignal):
   return modalities !== null && ["image", "audio", "video"].every((item) => modalities.includes(item));
 }
 
+const portalMediaSnapshots = new Map<string, {
+  value: boolean; expiresAt: number; inFlight?: Promise<boolean>;
+}>();
+
+/** Keep public portal loads independent of a sidecar round trip while refreshing capability. */
+async function portalEmbeddingMediaReady(cfg: HomeserverConfig): Promise<boolean> {
+  if (!cfg.embeddingMediaEnabled) return false;
+  const key = cfg.embeddingBaseUrl;
+  const cached = portalMediaSnapshots.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached?.inFlight) return await cached.inFlight;
+  const inFlight = embeddingMediaReady(cfg).then((value) => {
+    portalMediaSnapshots.set(key, { value, expiresAt: Date.now() + 10_000 });
+    return value;
+  });
+  portalMediaSnapshots.set(key, { value: false, expiresAt: 0, inFlight });
+  return await inFlight;
+}
+
 async function handleEmbeddingProxy(
   request: EmbeddingRequest,
   res: ServerResponse,
@@ -1419,8 +1439,9 @@ async function handleEmbeddingProxy(
     }
   });
   try {
+    const wrappedInput = Array.isArray(request.input) && typeof request.input[0] !== "string";
     if (!await embeddingSidecarReady(cfg, clientGone.signal) ||
-        (request.hasMedia && !await embeddingMediaReady(cfg, clientGone.signal))) {
+        (wrappedInput && !await embeddingMediaReady(cfg, clientGone.signal))) {
       if (clientAborted) {
         lctx.status = 499;
         lctx.outcome = "client_closed";
@@ -1432,6 +1453,19 @@ async function handleEmbeddingProxy(
       lctx.errorClass = "upstream_unavailable";
       sendError(res, makeError("upstream_unavailable"));
       return ZERO_RESULT;
+    }
+    if (wrappedInput) {
+      try {
+        await validateEmbeddingVideoBitstream(request.input as import("./embedding-media.js").EmbeddingMediaItem[]);
+      } catch (err) {
+        if (!(err instanceof EmbeddingVideoProbeError)) throw err;
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: "input",
+          message: "Video bitstream validation failed." }));
+        return ZERO_RESULT;
+      }
     }
     const upstream = await fetch(`${cfg.embeddingBaseUrl}/embeddings`, {
       method: "POST",
@@ -4347,7 +4381,7 @@ export async function handleRequest(
     if ((path === "/portal" || path === "/") && method === "GET") {
       lctx.route = "/portal";
       if (!throttlePublic()) return;
-      sendHtml(res, 200, portalHtml(await embeddingMediaReady(cfg)));
+      sendHtml(res, 200, portalHtml(await portalEmbeddingMediaReady(cfg)));
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -5116,32 +5150,8 @@ export async function handleRequest(
     }
     if (path === "/v1/embeddings" && method === "POST") {
       res.setHeader("Cache-Control", "no-store");
-      let parsed: EmbeddingRequest;
-      try {
-        parsed = parseEmbeddingBody(
-          await readBody(req, cfg.embeddingMediaEnabled ? 8 * 1024 * 1024 : 32 * 1024),
-          cfg.embeddingMediaEnabled,
-        );
-      } catch (err) {
-        if (!(err instanceof EmbeddingRequestError) && !(err instanceof BodyTooLargeError)) throw err;
-        const tooLarge = err instanceof BodyTooLargeError;
-        lctx.status = tooLarge ? 413 : 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", {
-          ...(!tooLarge ? { param: err.param, message: err.message } : {}),
-        }));
-        return;
-      }
-      if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {
-        lctx.status = 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = "model_not_found";
-        lctx.admission = "n/a";
-        sendError(res, makeError("model_not_found", { param: "model" }));
-        return;
-      }
-      if (!embeddingGranted(principal, parsed.model)) {
+      // Reject ungranted callers and concurrent work before decoding large inline media.
+      if (!embeddingGranted(principal, EMBEDDING_MODEL_ID)) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "model_not_allowed";
@@ -5149,7 +5159,6 @@ export async function handleRequest(
         sendError(res, makeError("model_not_allowed", { param: "model" }));
         return;
       }
-      lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
       if (embeddingInFlight.has(controller)) {
         lctx.status = 503;
         lctx.outcome = "busy";
@@ -5161,6 +5170,32 @@ export async function handleRequest(
       }
       embeddingInFlight.add(controller);
       try {
+        let parsed: EmbeddingRequest;
+        try {
+          parsed = parseEmbeddingBody(
+            await readBody(req, cfg.embeddingMediaEnabled ? 8 * 1024 * 1024 : 32 * 1024),
+            cfg.embeddingMediaEnabled,
+          );
+        } catch (err) {
+          if (!(err instanceof EmbeddingRequestError) && !(err instanceof BodyTooLargeError)) throw err;
+          const tooLarge = err instanceof BodyTooLargeError;
+          lctx.status = tooLarge ? 413 : 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+          sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", {
+            ...(!tooLarge ? { param: err.param, message: err.message } : {}),
+          }));
+          return;
+        }
+        if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "model_not_found";
+          lctx.admission = "n/a";
+          sendError(res, makeError("model_not_found", { param: "model" }));
+          return;
+        }
+        lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
         await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
           embeddingTokenReservation(parsed), lctx,
           () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
