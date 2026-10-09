@@ -421,7 +421,20 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
       'ci_first_attempt', 'complex_functions', 'confirmed_regressions', 'coverage', 'unused_candidates',
     ]);
     assert.ok(Object.values(result.objective.metrics).every(metric => ['unknown', 'failed', 'unsupported', 'stale', 'measured'].includes(metric.status)));
-    assert.ok(['failed', 'unknown'].includes(result.objective.metrics.complex_functions.status));
+    const complexityMetric = result.objective.metrics.complex_functions;
+    assert.ok(['failed', 'unknown', 'measured'].includes(complexityMetric.status));
+    if (complexityMetric.status === 'measured') {
+      assert.equal(complexityMetric.payload.algorithm, 'cyclomatic-complexity-v1');
+      assert.equal(complexityMetric.payload.threshold, 20);
+      assert.ok(Number.isSafeInteger(complexityMetric.payload.eligible_functions) && complexityMetric.payload.eligible_functions >= 0);
+      assert.ok(Number.isSafeInteger(complexityMetric.payload.above_threshold_functions)
+        && complexityMetric.payload.above_threshold_functions >= 0
+        && complexityMetric.payload.above_threshold_functions <= complexityMetric.payload.eligible_functions);
+      assert.ok(complexityMetric.source && complexityMetric.population,
+        'a measured complexity slot must retain source and complete-population provenance');
+    } else {
+      assert.equal(complexityMetric.payload, null, 'an unavailable complexity slot must not carry a measured payload');
+    }
     assert.ok(['failed', 'unknown'].includes(result.objective.metrics.unused_candidates.status));
     assert.ok(['failed', 'unknown'].includes(result.objective.metrics.coverage.status));
     assert.equal(result.objective.metrics.ci_first_attempt.status, 'unknown');
@@ -463,6 +476,15 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
     assert.ok(files.includes('evidence/coverage/run.json'));
     assert.ok(!files.some(file => file.startsWith('coverage/')), 'Vitest scratch output must stay outside the published artifact');
     const complexityInventory = JSON.parse(await readFile(path.join(outputDir, 'evidence/complexity/inventory.json'), 'utf8'));
+    const complexitySummary = JSON.parse(await readFile(path.join(outputDir, 'evidence/complexity/summary.json'), 'utf8'));
+    assert.equal(complexitySummary.status, complexityMetric.status);
+    if (complexityMetric.status === 'measured') {
+      assert.equal(complexitySummary.eligible_function_count, complexityMetric.payload.eligible_functions);
+      assert.equal(complexitySummary.above_threshold_count, complexityMetric.payload.above_threshold_functions);
+    } else {
+      assert.equal(complexitySummary.eligible_function_count, null);
+      assert.equal(complexitySummary.above_threshold_count, null);
+    }
     assert.equal(complexityInventory.failed_files.length, 0, 'every tracked TypeScript source file must parse');
     assert.equal(complexityInventory.parsed_files, complexityInventory.files.length);
     const complexityScan = JSON.parse(await readFile(path.join(outputDir, 'evidence/complexity/scan.json'), 'utf8'));
