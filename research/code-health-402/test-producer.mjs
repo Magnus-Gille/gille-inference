@@ -422,7 +422,7 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
     ]);
     assert.ok(Object.values(result.objective.metrics).every(metric => ['unknown', 'failed', 'unsupported', 'stale', 'measured'].includes(metric.status)));
     const complexityMetric = result.objective.metrics.complex_functions;
-    assert.ok(['failed', 'unknown', 'measured'].includes(complexityMetric.status));
+    assert.equal(complexityMetric.status, 'measured', 'opt-in real smoke requires a clean committed worktree and the pinned installed analyzers');
     if (complexityMetric.status === 'measured') {
       assert.equal(complexityMetric.payload.algorithm, 'cyclomatic-complexity-v1');
       assert.equal(complexityMetric.payload.threshold, 20);
@@ -436,7 +436,13 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
       assert.equal(complexityMetric.payload, null, 'an unavailable complexity slot must not carry a measured payload');
     }
     assert.ok(['failed', 'unknown'].includes(result.objective.metrics.unused_candidates.status));
-    assert.ok(['failed', 'unknown'].includes(result.objective.metrics.coverage.status));
+    const coverageMetric = result.objective.metrics.coverage;
+    assert.equal(coverageMetric.status, 'measured', 'opt-in real smoke must exercise actual pinned coverage successfully');
+    assert.equal(coverageMetric.payload.covered, 186);
+    assert.equal(coverageMetric.payload.eligible, 246);
+    assert.equal(coverageMetric.payload.emitted_source_files, 3);
+    assert.equal(coverageMetric.payload.eligible_source_files, 3);
+    assert.equal(coverageMetric.payload.source_inventory, 'complete-declared-inventory');
     assert.equal(result.objective.metrics.ci_first_attempt.status, 'unknown');
     assert.equal(result.objective.metrics.confirmed_regressions.status, 'unknown');
 
