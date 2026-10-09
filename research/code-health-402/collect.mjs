@@ -812,7 +812,12 @@ async function gitWorkflowDigest(commit, deadline) {
   return createHash('sha256').update(run.stdout).digest('hex');
 }
 
-async function collectCi({ outputRoot, observedAt, collectionRef, attempt, token, evidenceRefs, deadline }) {
+export async function collectCi({
+  outputRoot, observedAt, collectionRef, attempt, token, evidenceRefs, deadline,
+  enumerateRuns = enumerateWorkflowRuns,
+  fetchFirstAttempt = getFirstAttempt,
+  workflowDigestForCommit = gitWorkflowDigest,
+}) {
   const inventoryPath = 'evidence/ci/inventory.json';
   const detailsPath = 'evidence/ci/first-attempt-details.json';
   await writeJson(outputRoot, detailsPath, { status: 'not-collected', first_attempts: null });
@@ -848,14 +853,14 @@ async function collectCi({ outputRoot, observedAt, collectionRef, attempt, token
   const began = performance.now();
   const collectionDeadline = deadline ?? (Date.now() + STATIC_AND_METADATA_BUDGET_MS);
   try {
-    const enumeration = await enumerateWorkflowRuns({
+    const enumeration = await enumerateRuns({
       token, owner: 'Magnus-Gille', repo: 'gille-inference', workflow: 'ci.yml', start, end,
       deadline: collectionDeadline,
     });
     const configCache = new Map();
     const configForCommit = async sha => {
       if (Date.now() >= collectionDeadline) throw new Error('CI collection time budget exhausted while verifying workflow history');
-      if (!configCache.has(sha)) configCache.set(sha, await gitWorkflowDigest(sha, collectionDeadline));
+      if (!configCache.has(sha)) configCache.set(sha, await workflowDigestForCommit(sha, collectionDeadline));
       return configCache.get(sha);
     };
     const selectedForAttempts = [];
@@ -869,7 +874,7 @@ async function collectCi({ outputRoot, observedAt, collectionRef, attempt, token
     const attemptErrors = [];
     for (const run of selectedForAttempts) {
       try {
-        attempts.set(Number(run.id), await getFirstAttempt({
+        attempts.set(Number(run.id), await fetchFirstAttempt({
           token, owner: 'Magnus-Gille', repo: 'gille-inference', runId: run.id, deadline: collectionDeadline,
         }));
       } catch (error) {
@@ -945,6 +950,16 @@ async function collectCi({ outputRoot, observedAt, collectionRef, attempt, token
     for (const run of complete.runs) {
       const runId = Number(run.run_ref.match(/gha-run-(\d+)-attempt-1/)?.[1]);
       if (Number.isSafeInteger(runId) && runId > 0) addRef(evidenceRefs, run.run_ref, { kind: 'github-run', run_id: runId, attempt: 1 });
+    }
+    if (unclassifiableFailures.length > 0) {
+      return {
+        slot: slot({
+          name: 'ci_first_attempt', observedAt, status: 'unknown', unit: 'runs',
+          reason: REASON_TEXT.incompleteInput,
+        }),
+        elapsedMs: Math.round(performance.now() - began),
+        status: 'unknown',
+      };
     }
     return { slot: slotValue, elapsedMs: Math.round(performance.now() - began), status: 'measured' };
   } catch (error) {

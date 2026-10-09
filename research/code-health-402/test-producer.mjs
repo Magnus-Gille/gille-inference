@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,7 +26,8 @@ import {
   fetchJsonWithRetry,
   getFirstAttempt,
 } from './lib/ci.mjs';
-import { checkVendorContract, collect, inferTriage, reportMarkdown, runProcess } from './collect.mjs';
+import { checkVendorContract, collect, collectCi, inferTriage, reportMarkdown, runProcess } from './collect.mjs';
+import { validateObjective } from '../../contracts/grimnir-code-health-v1/scripts/lib/code-health-objective.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTRACT_ROOT = path.join(ROOT, 'contracts/grimnir-code-health-v1');
@@ -377,6 +379,100 @@ test('workflow-level startup failure with no jobs stays unknown and retains prov
     classification: 'unknown',
     reason: 'frozen v1 derives the run outcome from expected jobs; no expected job conclusion represents this provider run-level failure',
   }]);
+});
+
+test('CI collector withholds the measured slot for unclassifiable known failures', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-ci-slot-'));
+  try {
+    const workflowDigest = createHash('sha256')
+      .update(await readFile(path.join(ROOT, '.github/workflows/ci.yml')))
+      .digest('hex');
+    const fixtures = [
+      {
+        id: 61,
+        providerConclusion: 'startup_failure',
+        jobs: [],
+        expectedStatus: 'unknown',
+      },
+      {
+        id: 62,
+        providerConclusion: 'failure',
+        jobs: [
+          { id: 6201, name: 'Gitleaks', status: 'completed', conclusion: 'success' },
+          { id: 6202, name: 'test', status: 'completed', conclusion: null },
+        ],
+        expectedStatus: 'unknown',
+      },
+      {
+        id: 63,
+        providerConclusion: 'failure',
+        jobs: [
+          { id: 6301, name: 'Gitleaks', status: 'completed', conclusion: 'success' },
+          { id: 6302, name: 'test', status: 'completed', conclusion: 'failure' },
+        ],
+        expectedStatus: 'measured',
+      },
+    ];
+    const collected = [];
+    for (const fixture of fixtures) {
+      const run = makeRun(fixture.id, { conclusion: fixture.providerConclusion });
+      const enumeration = {
+        totalCount: 1, pageCount: 1, windowCount: 1, windowRuns: [run],
+        query: { start: '2026-09-11T12:00:00Z', end: '2026-10-09T12:00:00Z' },
+      };
+      const evidenceRefs = {};
+      const result = await collectCi({
+        outputRoot: path.join(temp, `case-${fixture.id}`),
+        observedAt: '2026-10-09T12:00:00Z',
+        collectionRef: `ref:collection-ci-slot-${fixture.id}`,
+        attempt: 1,
+        token: 'synthetic-test-token',
+        evidenceRefs,
+        deadline: Date.now() + 10_000,
+        enumerateRuns: async () => enumeration,
+        fetchFirstAttempt: async () => ({
+          runAttempt: 1, status: 'completed', conclusion: fixture.providerConclusion, jobs: fixture.jobs,
+        }),
+        workflowDigestForCommit: async () => workflowDigest,
+      });
+      assert.equal(result.status, fixture.expectedStatus, `collector state for fixture ${fixture.id}`);
+      assert.equal(result.slot.status, fixture.expectedStatus, `published slot state for fixture ${fixture.id}`);
+      const inventory = JSON.parse(await readFile(path.join(temp, `case-${fixture.id}`, 'evidence/ci/inventory.json'), 'utf8'));
+      assert.equal(inventory.complete, true);
+      assert.equal(inventory.runs.length, 1, 'raw attempt inventory remains available');
+      assert.ok(evidenceRefs[`ref:gha-run-${fixture.id}-attempt-1`], 'raw run evidence remains indexed');
+      if (fixture.expectedStatus === 'unknown') {
+        assert.equal(result.slot.reason, 'incomplete-input');
+        assert.equal(result.slot.payload, null);
+        assert.equal(result.slot.source, null);
+        assert.equal(result.slot.population, null);
+        assert.equal(inventory.unclassifiable_known_failures.length, 1);
+      } else {
+        assert.ok(result.slot.payload);
+        assert.ok(result.slot.source);
+        assert.ok(result.slot.population);
+        assert.equal(inventory.unclassifiable_known_failures.length, 0);
+      }
+      collected.push(result.slot);
+    }
+
+    const baseline = await collect({
+      outputDir: path.join(temp, 'baseline-objective'),
+      collectStatic: false,
+      token: null,
+      now: new Date('2026-10-09T12:00:00Z'),
+      runId: null,
+      attempt: 1,
+    });
+    const schema = JSON.parse(await readFile(path.join(CONTRACT_ROOT, 'docs/code-health-objective-v1.schema.json'), 'utf8'));
+    for (const ciSlot of collected) {
+      const objective = structuredClone(baseline.objective);
+      objective.metrics.ci_first_attempt = ciSlot;
+      assert.equal(validateObjective(schema, objective).valid, true, `full objective schema for ${ciSlot.status} CI slot`);
+    }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test('manual Knip triage binds file, symbol, and line together', () => {
