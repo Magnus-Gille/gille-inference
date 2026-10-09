@@ -34,9 +34,10 @@ Every heavy arm used `MemoryMax=96G`, `MemorySwapMax=0`, `OOMPolicy=kill`, and p
 minimum 12 GiB host-memory reserve. The benchmark process could not swap; pre-existing host-level
 swap use was observed separately.
 
-Correction (2026-10-01, issue #354): the 12 GiB figure was a planning reserve, not a whole-host
-guarantee from `MemoryMax=96G`. On this unified-memory M5, GPU allocations draw from RAM but bypass
-cgroup accounting, so separate whole-host admission is required to enforce a host-memory reserve.
+Correction after the 2026-10-01 incident (#350/#354): the 12 GiB figure was a planning reserve,
+not a whole-host guarantee from `MemoryMax=96G`. On this unified-memory M5, GPU allocations draw
+from RAM but bypass cgroup accounting, so separate whole-host admission is required to enforce a
+host-memory reserve.
 
 ## Quality result
 
