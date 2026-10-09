@@ -222,6 +222,27 @@ function parseByteInteger(text: string): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/** Parse the host-wide cumulative /proc/vmstat oom_kill counter. */
+export function parseOomKillCount(text: string): number | null {
+  const rows = text.split(/\r?\n/).filter((line) => /^oom_kill(?:[ \t]|$)/.test(line));
+  if (rows.length !== 1) return null;
+  const match = /^oom_kill[ \t]+([0-9]+)[ \t]*$/.exec(rows[0]!);
+  if (match === null) return null;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** Read the cumulative OOM-kill counter; null means missing or malformed evidence. */
+export async function readOomKillCount(
+  readFile: ReadTextFile = (p) => fsReadFile(p, "utf8"),
+): Promise<number | null> {
+  try {
+    return parseOomKillCount(await readFile("/proc/vmstat"));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read whole-host memory from /proc/meminfo plus (best effort) the first readable
  * /sys/class/drm/card<N>/device/mem_info_gtt_{used,total} pair. Missing GTT files yield null GTT
@@ -271,6 +292,8 @@ export interface HostMemoryAdmissionDeps {
   getRunning: (signal: AbortSignal) => Promise<RunningSnapshotEntry[]>;
   /** Defaults to readHostMemory() against the real host files. */
   readMemory?: () => Promise<HostMemoryReadResult>;
+  /** Defaults to the cumulative host-wide oom_kill counter in /proc/vmstat. */
+  readOomKillCount?: () => Promise<number | null>;
   /** Structured-log sink. Defaults to one JSON line on stdout. */
   log?: (record: Record<string, unknown>) => void;
   /** Total deadline shared by both observations (residency, then host memory). Defaults to 750 ms. */

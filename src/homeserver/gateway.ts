@@ -58,7 +58,7 @@ import {
 } from "./maintenance-window.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
-import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, type HostMemoryAdmissionDeps, type ModelStartAdmission } from "./host-memory-admission.js";
+import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, readHostMemory, readOomKillCount, type HostMemoryAdmissionDeps, type HostMemoryAdmissionMode, type HostMemoryReadResult, type ModelStartAdmission } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
 import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
@@ -575,11 +575,91 @@ interface ModelResidencyResponseRow {
 }
 
 type ModelResidencyResponse =
-  | { models: ModelResidencyResponseRow[]; status?: never }
-  | { status: "unavailable"; models?: never };
+  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; resourceEvidence: ResourceEvidence; status?: never }
+  | { status: "unavailable"; resourceEvidence: ResourceEvidence; models?: never };
+
+interface ResourceEvidence {
+  admissionMode: HostMemoryAdmissionMode;
+  oom: {
+    status: "available" | "unknown";
+    oomKillCount: number | null;
+    observedAt: string | null;
+  };
+}
+
+interface HostMemoryResponse {
+  status: "available" | "unknown";
+  memTotalBytes: number | null;
+  memAvailableBytes: number | null;
+  cmaFreeBytes: number | null;
+  gttUsedBytes: number | null;
+  gttTotalBytes: number | null;
+  /** Device-wide counters cannot be attributed to external models from these observations. */
+  gttAccounting: "unattributed" | "unknown";
+}
+
+function narrowHostMemory(result: HostMemoryReadResult): HostMemoryResponse {
+  if (!result.ok) {
+    return {
+      status: "unknown",
+      memTotalBytes: null,
+      memAvailableBytes: null,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+      gttAccounting: "unknown",
+    };
+  }
+  const { memory } = result;
+  const hasGttCounters = memory.gttUsedBytes !== null && memory.gttTotalBytes !== null;
+  return {
+    status: "available",
+    memTotalBytes: memory.memTotalBytes,
+    memAvailableBytes: memory.memAvailableBytes,
+    cmaFreeBytes: memory.cmaFreeBytes,
+    gttUsedBytes: memory.gttUsedBytes,
+    gttTotalBytes: memory.gttTotalBytes,
+    gttAccounting: hasGttCounters ? "unattributed" : "unknown",
+  };
+}
+
+async function readHostMemoryForResidency(reader: () => Promise<HostMemoryReadResult>): Promise<HostMemoryResponse> {
+  try {
+    return narrowHostMemory(await reader());
+  } catch (err) {
+    // Diagnostics must remain content-blind and available even if the best-effort reader throws.
+    const name = err instanceof Error ? err.name : typeof err;
+    console.warn("[model-residency] host memory reader failed", /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown");
+    return narrowHostMemory({ ok: false, error: "host memory reader failed" });
+  }
+}
+
+async function readResourceEvidence(
+  admissionMode: HostMemoryAdmissionMode,
+  reader: () => Promise<number | null>,
+): Promise<ResourceEvidence> {
+  try {
+    const oomKillCount = await reader();
+    if (oomKillCount !== null && Number.isSafeInteger(oomKillCount) && oomKillCount >= 0) {
+      return {
+        admissionMode,
+        oom: { status: "available", oomKillCount, observedAt: new Date().toISOString() },
+      };
+    }
+  } catch {
+    // OOM evidence is best effort and must not expose reader failures through HTTP or logs.
+  }
+  return { admissionMode, oom: { status: "unknown", oomKillCount: null, observedAt: null } };
+}
 
 /** Read and narrow the content-blind model-residency diagnostic for the HTTP surface. */
-async function readModelResidency(includeAlias: boolean): Promise<ModelResidencyResponse> {
+async function readModelResidency(
+  includeAlias: boolean,
+  readMemory: () => Promise<HostMemoryReadResult>,
+  admissionMode: HostMemoryAdmissionMode,
+  readOom: () => Promise<number | null>,
+): Promise<ModelResidencyResponse> {
+  const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
   try {
     running = await getRunningSnapshot();
@@ -587,7 +667,7 @@ async function readModelResidency(includeAlias: boolean): Promise<ModelResidency
     if (error instanceof RunningSnapshotUnavailableError) {
       // An unavailable observation is not an idle backend. Keep the response safe and
       // explicit so consumers do not infer that no models are resident.
-      return { status: "unavailable" };
+      return { status: "unavailable", resourceEvidence };
     }
     throw error;
   }
@@ -622,7 +702,8 @@ async function readModelResidency(includeAlias: boolean): Promise<ModelResidency
             : { ts: use.ts, route: use.route, outcome: use.outcome },
     };
   });
-  return { models: modelsOutput };
+  const hostMemory = await readHostMemoryForResidency(readMemory);
+  return { models: modelsOutput, hostMemory, resourceEvidence };
 }
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
@@ -5353,7 +5434,12 @@ export async function handleRequest(
         );
         return;
       }
-      const residency = await readModelResidency(principal.isAdmin);
+      const residency = await readModelResidency(
+        principal.isAdmin,
+        hostMemoryDeps.readMemory ?? readHostMemory,
+        cfg.hostMemoryAdmission.mode,
+        hostMemoryDeps.readOomKillCount ?? readOomKillCount,
+      );
       const status = residency.status === "unavailable" ? 503 : 200;
       sendJson(res, status, residency);
       lctx.status = status;

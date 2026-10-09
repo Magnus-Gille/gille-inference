@@ -30,9 +30,14 @@ Those are the artifacts actually available for deployment, so their size and qua
 part of the replacement decision. Qwen ran in its supported reasoning-off mode. GPT-OSS kept
 native reasoning for the primary arm, with a labelled reasoning-off sensitivity arm.
 
-Every heavy arm used `MemoryMax=96G`, `MemorySwapMax=0`, `OOMPolicy=kill`, and a minimum 12 GiB
-host-memory reserve. The benchmark process could not swap; pre-existing host-level swap use was
-observed separately.
+Every heavy arm used `MemoryMax=96G`, `MemorySwapMax=0`, `OOMPolicy=kill`, and planned for a
+minimum 12 GiB host-memory reserve. The benchmark process could not swap; pre-existing host-level
+swap use was observed separately.
+
+Correction after the 2026-10-01 incident (#350/#354): the 12 GiB figure was a planning reserve,
+not a whole-host guarantee from `MemoryMax=96G`. On this unified-memory M5, GPU allocations draw
+from RAM but bypass cgroup accounting, so separate whole-host admission is required to enforce a
+host-memory reserve.
 
 ## Quality result
 

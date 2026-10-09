@@ -80,7 +80,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 |--------|------|------|---------|
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
-| POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. A failed `ask` (busy, rate limit, credits, model not allowed, host memory, upstream error) returns `isError:true` with the human sentence in `content` and the machine-readable cause in `_meta {m5_code, retryable?, retry_after_seconds?}`; `retryable` is omitted when the gateway cannot tell, and `structuredContent` is not used for failures because it is reserved for the declared success shape. The truncated call is already metered, and any retry is a new billable call. Optional `output_profile: "complete-within-budget"` prioritizes structural completion inside `max_tokens`, tells bounded reviews to stop after the requested verdict, and requests low reasoning effort only for gpt-oss; it never masks or retries truncation, so `finish_reason="length"` remains `isError:true` with the paid partial content. |
+| POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. A failed `ask` (busy, rate limit, credits, model not allowed, host memory, upstream error) returns `isError:true` with the human sentence in `content` and the machine-readable cause in `_meta {m5_code, reason?, layer?, retryable?, retry_after_seconds?}`. Classified backend connection failures and timeouts retain `m5_code:"upstream_error"` and add only the sanitized `reason` (`upstream_connection_failed` or `upstream_timeout`), `layer:"model_backend"`, `retryable:true`, and the configured retry delay. Quota rejections also name the reason, window and uncounted rejection in the text, plus `_meta.quota {reason, scope, window, limit, requested, counted:false, retry_after_seconds}`. Isolated minted-key buckets have `scope:"key"` and `used_before`; legacy static tokens and any minted alias colliding with a reserved `static:` bucket have `scope:"shared_static_tier"` and omit `used_before` to avoid disclosing another consumer's usage. No key identity is included. `requested` is 1 for RPM and the pre-admission estimated tokens for TPM/daily; `window` is `60s` for RPM/TPM and `utc_day` for daily. `retryable` is omitted when the gateway cannot tell, and `structuredContent` is not used for failures because it is reserved for the declared success shape. The truncated call is already metered, and any retry is a new billable call. Optional `output_profile: "complete-within-budget"` prioritizes structural completion inside `max_tokens`, tells bounded reviews to stop after the requested verdict, and requests low reasoning effort only for gpt-oss; it never masks or retries truncation, so `finish_reason="length"` remains `isError:true` with the paid partial content. |
 | GET | `/models/residency` | admin or monitor | Read-only, content-blind residency diagnostic |
 | GET | `/ops/summary` | admin or monitor | Durable, content-blind M5 activity summary for Heimdall; includes `filterEpoch: "m5-admitted-compute-v2"` so pre-epoch route-only history is a documented historical break |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
@@ -164,14 +164,26 @@ interface ModelInfo {
 
 Read-only, content-blind operator diagnostics. Requires an admin key or a read-only monitor
 key. A monitor response omits `lastUse.alias`; an admin response may include that safe alias
-field. The endpoint returns only the fields shown below: model identity and state, the observed
-TTL, a coarse residency classification, and safe last-use metadata. It never returns prompts,
-responses, tokens, keys, key hashes, raw backend commands, backend addresses/IPs, or other
-content-bearing or credential-bearing fields.
+field. The endpoint returns model identity and state, the observed TTL, a coarse residency
+classification, safe last-use metadata, a best-effort host-memory snapshot, and resource evidence. Host memory
+includes total RAM, `MemAvailable`, free CMA, and (when DRM exposes both counters) GTT used/total
+bytes. GTT accounting is explicitly `unattributed`: these device-wide counters do not identify
+which model or process owns the memory, including when models are resident. Missing DRM counters
+are `null` with `gttAccounting: "unknown"`; an unreadable host-memory snapshot returns null values
+and `status: "unknown"`. The endpoint never returns prompts, responses, tokens, keys, key hashes,
+raw backend commands, backend addresses/IPs, or other content-bearing or credential-bearing fields.
 
-**Response 200:** `{ "models": ResidencyModel[] }` when the snapshot is available.
+**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory, "resourceEvidence": ResourceEvidence }` when the model
+snapshot is available. An unknown host-memory observation is returned inside `hostMemory` with
+null values, without making model residency unavailable. The additive `resourceEvidence` object
+reports the configured host-memory admission mode and a best-effort host-wide cumulative
+`/proc/vmstat` `oom_kill` counter. `oomKillCount` is a cumulative count observed at `observedAt`,
+not a recent delta and not an inference-readiness or model-quality signal. Missing, malformed, or
+unreadable OOM evidence is returned as `status: "unknown"`, `oomKillCount: null`, and
+`observedAt: null`. `admissionMode: "shadow"` observes and reports the mode but does not enforce
+admission decisions.
 
-**Response 503:** `{ "status": "unavailable" }` when the backend snapshot cannot be obtained.
+**Response 503:** `{ "status": "unavailable", "resourceEvidence": ResourceEvidence }` when the backend snapshot cannot be obtained. Local OOM evidence is read independently and remains available during a backend outage; it does not establish the outage's cause.
 The unavailable response deliberately has no `models` array, so callers cannot interpret an empty
 array as evidence that no models are resident.
 
@@ -189,6 +201,27 @@ interface ResidencyModel {
     alias?: string | null;
   } | null;
 }
+
+interface HostMemory {
+  status: "available" | "unknown";
+  memTotalBytes: number | null;
+  memAvailableBytes: number | null;
+  cmaFreeBytes: number | null;
+  gttUsedBytes: number | null;
+  gttTotalBytes: number | null;
+  gttAccounting: "unattributed" | "unknown";
+}
+
+interface ResourceEvidence {
+  admissionMode: "off" | "shadow" | "enforce";
+  oom: {
+    status: "available" | "unknown";
+    oomKillCount: number | null;
+    observedAt: string | null;
+  };
+}
+
+// Successful response: { models: ResidencyModel[], hostMemory: HostMemory, resourceEvidence: ResourceEvidence }
 ```
 
 ### GET `/v1/capabilities/learning-task`

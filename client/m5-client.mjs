@@ -73,6 +73,7 @@ const FAILURE_LAYERS = new Set([
   "local_tailnet_unavailable",
   "public_route_unconfigured",
   "private_route_unconfigured",
+  "model_backend",
 ]);
 
 /** The standalone client cannot inspect an interactive host connector session. */
@@ -916,6 +917,10 @@ export function classifyAskRefusal(text) {
 
 // Retryability is part of each code's contract, so it is fixed here, not taken from the peer.
 const ASK_REFUSAL_RETRYABLE = new Map([["insufficient_memory", true], ["memory_admission_unavailable", false]]);
+const ASK_BACKEND_MESSAGES = new Map([
+  ["upstream_connection_failed", "The model backend is unavailable — please retry shortly."],
+  ["upstream_timeout", "The model backend timed out (it may be loading a model) — please retry in a few seconds."],
+]);
 
 /**
  * The gateway's own machine-readable cause, when it sends one in the result's `_meta` (newer
@@ -924,7 +929,25 @@ const ASK_REFUSAL_RETRYABLE = new Map([["insufficient_memory", true], ["memory_a
  */
 export function askRefusalFromMeta(result, text) {
   const meta = result?._meta;
-  if (!meta || typeof meta !== "object" || Array.isArray(meta) || !ASK_REFUSAL_RETRYABLE.has(meta.m5_code)) return null;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+  if (meta.m5_code === "upstream_error") {
+    const generic = { code: "tool_error", message: "The model backend reported an error." };
+    const message = ASK_BACKEND_MESSAGES.get(meta.reason);
+    if (meta.layer !== "model_backend" || message === undefined) return generic;
+    if (Object.prototype.hasOwnProperty.call(meta, "retry_after_seconds") &&
+        !Number.isInteger(meta.retry_after_seconds)) return generic;
+    const seconds = meta.retry_after_seconds;
+    return {
+      code: "upstream_error",
+      retryable: true,
+      failureLayer: "model_backend",
+      ...(Number.isInteger(seconds) && seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS ? { retryAfterSeconds: seconds } : {}),
+      // Do not trust the tool text for a classified backend failure: the gateway's fixed
+      // reason-specific message is the safe client contract.
+      message,
+    };
+  }
+  if (!ASK_REFUSAL_RETRYABLE.has(meta.m5_code)) return null;
   const retryable = ASK_REFUSAL_RETRYABLE.get(meta.m5_code);
   const seconds = meta.retry_after_seconds;
   return {
@@ -1749,6 +1772,7 @@ export async function createM5Client({
         if (refusal !== null) {
           throw new M5ClientError(refusal.code, refusal.message, {
             retryable: refusal.retryable,
+            failureLayer: refusal.failureLayer,
             retryAfterSeconds: refusal.retryAfterSeconds,
           });
         }
