@@ -745,11 +745,17 @@ calls receive a retryable 503 without a credit charge. A public template does no
 The proposed text GGUF is `ggml-org/embeddinggemma-2-GGUF` revision
 `bfcd298762cc34d0357ece5ebdd31791a3a374d8`, file `embeddinggemma-2-BF16.gguf`
 (557,950,176 bytes, SHA-256 `68bae29d62fb8c7d23e98d21fd4662753ddd636e6b62b8a70dfe059a9844f216`).
-The proposed compatible llama.cpp source revision is
+The compatible pinned llama.cpp source revision is
 `4f92965a7bfa9e8eb6519908ff962e23c2cb7b93`; the currently installed M5 build does not
-recognize this architecture. These pinned identities are evaluation inputs, not claims of a
-successful build or a live release. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the
-sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
+recognize this architecture. A one-shot bounded CPU-only M5 evaluation on 2026-10-09 built that
+source against the checksum-verified GGUF and passed three synthetic embedding calls (one, one,
+and two inputs; 768 raw dimensions per vector). The evaluation launcher SHA-256 was
+`763c444d2a03ff0aca301cbfeb5e0b7e8fe01f7868694941b27b715b8c4ad832`, but upstream
+fetched UI assets through a mutable `latest` fallback. A production build must add
+`-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` to avoid that fetch and record the new exact
+launcher checksum. The evaluation cleaned up its transient artifacts; there is no installed
+sidecar or live embedding release. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the
+installed sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
 Change the portal's planned-status wording to active only in the exact gateway release that
 enables the sidecar, and verify the rendered page after deployment.
 The authenticated `GET /v1/models` response is the customer-facing availability check.
