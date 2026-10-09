@@ -1,0 +1,33 @@
+# Reviewed multimodal activation template only. Install the checksum-verified
+# BF16 projector into a new immutable /opt release before rendering this unit.
+# Resolve all /operator-resolve placeholders; never install this file verbatim.
+[Unit]
+Description=Gille EmbeddingGemma 2 multimodal embedding sidecar (CPU)
+After=network.target
+
+[Service]
+Type=simple
+User=gille-embeddinggemma2
+DynamicUser=yes
+ExecStart=/operator-resolve/llama.cpp-embeddinggemma2/bin/llama-server --model /operator-resolve/models/embeddinggemma-2-BF16.gguf --mmproj /operator-resolve/models/mmproj-embeddinggemma-2-BF16.gguf --mmproj-device none --no-mmproj-offload --alias embeddinggemma-2 --host 127.0.0.1 --port 8107 --embedding -c 8192 -b 8192 -ub 8192 -ngl 0 -np 1 -t 3 -tb 3 --threads-http 4 --log-disable --no-slots
+Restart=on-failure
+RestartSec=5
+MemoryMax=8G
+MemorySwapMax=0
+OOMPolicy=stop
+CPUQuota=300%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
