@@ -1,11 +1,43 @@
 import { describe, expect, it } from "vitest";
+import { deflateSync } from "node:zlib";
 import { EmbeddingMediaError, parseEmbeddingMediaInput } from "../src/homeserver/embedding-media.js";
 
-const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAC7xk2DAAAA";
 const jpeg = Buffer.from([
   0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02,
   0x01, 0x01, 0x11, 0x00, 0xff, 0xd9,
 ]).toString("base64");
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function png(width = 2, height = 2): string {
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const header = Buffer.from(type, "ascii");
+    const body = Buffer.concat([header, data]);
+    const out = Buffer.alloc(12 + data.length);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body), 8 + data.length);
+    return out;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const scanlines = Buffer.alloc(height * (1 + width * 4));
+  for (let row = 0; row < height; row += 1) scanlines[row * (1 + width * 4)] = 0;
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk("IHDR", ihdr), chunk("IDAT", deflateSync(scanlines)), chunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
 
 function dataUri(mime: string, value: string): string {
   return `data:${mime};base64,${value}`;
@@ -81,7 +113,7 @@ describe("embedding media input", () => {
     const result = parseEmbeddingMediaInput([{
       content: [
         { type: "text", text: "hello" },
-        { type: "image_url", image_url: { url: dataUri("image/png", png) } },
+        { type: "image_url", image_url: { url: dataUri("image/png", png()) } },
         { type: "input_audio", input_audio: { data: wav(), format: "wav" } },
         { type: "input_video", input_video: { data: mp4(), format: "mp4" } },
       ],
@@ -90,9 +122,9 @@ describe("embedding media input", () => {
     expect(result.input).toEqual([{
       content: [
         { type: "text", text: "hello" },
-        { type: "image_url", image_url: { url: dataUri("image/png", png) } },
-        { type: "input_audio", input_audio: { data: wav(), format: "wav" } },
-        { type: "input_video", input_video: { data: mp4(), format: "mp4" } },
+        { type: "image_url", image_url: { url: dataUri("image/png", png()) } },
+        { type: "input_audio", input_audio: { data: wav() } },
+        { type: "input_video", input_video: { data: mp4() } },
       ],
     }]);
   });
@@ -113,7 +145,7 @@ describe("embedding media input", () => {
     "https://example.invalid/a.png",
     "file:///tmp/a.png",
     dataUri("image/png", "not-base64"),
-    dataUri("image/gif", png),
+    dataUri("image/gif", png()),
   ])("rejects unsafe or malformed image URL %s", (url) => {
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "image_url", image_url: { url } }] }]))
       .toThrow(EmbeddingMediaError);
@@ -130,6 +162,9 @@ describe("embedding media input", () => {
     ])).toThrow(EmbeddingMediaError);
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "unknown", value: "x" }] }]))
       .toThrow(EmbeddingMediaError);
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: {
+      data: mp4().slice(0, -8), format: "mp4",
+    } }] }])).toThrow(EmbeddingMediaError);
   });
 
   it("enforces part and vector counts", () => {
@@ -141,7 +176,7 @@ describe("embedding media input", () => {
 
   it("enforces image dimensions, audio duration, and video frame and duration bounds", () => {
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "image_url", image_url: {
-      url: dataUri("image/png", "iVBORw0KGgoAAAANSUhEUgAACQEAAAAA"),
+      url: dataUri("image/png", png(2049, 1)),
     } }] }])).toThrow(EmbeddingMediaError);
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_audio", input_audio: { data: wav(31), format: "wav" } }] }]))
       .toThrow(EmbeddingMediaError);
@@ -149,5 +184,15 @@ describe("embedding media input", () => {
       .toThrow(EmbeddingMediaError);
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: { data: mp4(1, 11), format: "mp4" } }] }]))
       .toThrow(EmbeddingMediaError);
+  });
+
+  it("rejects truncated PNG and JPEG payloads", () => {
+    const pngBytes = Buffer.from(png(), "base64");
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "image_url", image_url: {
+      url: dataUri("image/png", pngBytes.subarray(0, -12).toString("base64")),
+    } }] }])).toThrow(EmbeddingMediaError);
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "image_url", image_url: {
+      url: dataUri("image/jpeg", Buffer.from(jpeg, "base64").subarray(0, -2).toString("base64")),
+    } }] }])).toThrow(EmbeddingMediaError);
   });
 });

@@ -9,8 +9,8 @@ const MAX_VIDEO_BYTES = 4 * 1024 * 1024;
 
 type TextPart = { type: "text"; text: string };
 type ImagePart = { type: "image_url"; image_url: { url: string } };
-type AudioPart = { type: "input_audio"; input_audio: { data: string; format: "wav" } };
-type VideoPart = { type: "input_video"; input_video: { data: string; format: "mp4" } };
+type AudioPart = { type: "input_audio"; input_audio: { data: string } };
+type VideoPart = { type: "input_video"; input_video: { data: string } };
 
 export type EmbeddingMediaPart = TextPart | ImagePart | AudioPart | VideoPart;
 export type EmbeddingMediaItem = { content: EmbeddingMediaPart[] };
@@ -58,24 +58,90 @@ function ascii(bytes: Buffer, offset: number, length: number): string {
 }
 
 function validatePng(bytes: Buffer): void {
-  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ||
-    ascii(bytes, 12, 4) !== "IHDR" || bytes.readUInt32BE(8) < 13) invalid();
-  const width = bytes.readUInt32BE(16);
-  const height = bytes.readUInt32BE(20);
-  if (width < 1 || height < 1 || width > 2048 || height > 2048) invalid();
+  if (bytes.length < 33 || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) invalid();
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let foundHeader = false;
+  let foundData = false;
+  let foundEnd = false;
+  while (offset < bytes.length) {
+    if (offset + 12 > bytes.length) invalid();
+    const length = bytes.readUInt32BE(offset);
+    const end = offset + 12 + length;
+    if (end > bytes.length) invalid();
+    const type = ascii(bytes, offset + 4, 4);
+    const dataStart = offset + 8;
+    const chunkData = bytes.subarray(dataStart, dataStart + length);
+    const checksum = bytes.readUInt32BE(dataStart + length);
+    const checksumInput = Buffer.concat([Buffer.from(type, "ascii"), chunkData]);
+    if (crc32(checksumInput) !== checksum) invalid();
+    if (type === "IHDR") {
+      if (foundHeader || length !== 13) invalid();
+      width = bytes.readUInt32BE(dataStart);
+      height = bytes.readUInt32BE(dataStart + 4);
+      foundHeader = true;
+    } else if (type === "IDAT") {
+      if (!foundHeader || length === 0) invalid();
+      foundData = true;
+    } else if (type === "IEND") {
+      if (length !== 0 || foundEnd || !foundData) invalid();
+      foundEnd = true;
+      if (end !== bytes.length) invalid();
+    }
+    offset = end;
+  }
+  if (!foundHeader || !foundData || !foundEnd || width < 1 || height < 1 || width > 2048 || height > 2048) invalid();
+}
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function validateJpeg(bytes: Buffer): void {
   if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) invalid();
   let offset = 2;
   let dimensions: [number, number] | undefined;
+  let foundEoi = false;
   while (offset < bytes.length) {
     if (bytes[offset] !== 0xff) invalid();
     while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
     if (offset >= bytes.length) invalid();
     const marker = bytes[offset]!;
     offset += 1;
-    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker === 0xd9) {
+      foundEoi = true;
+      break;
+    }
+    if (marker === 0xda) {
+      if (offset + 2 > bytes.length) invalid();
+      const scanLength = bytes.readUInt16BE(offset);
+      if (scanLength < 2 || offset + scanLength > bytes.length) invalid();
+      offset += scanLength;
+      while (offset + 1 < bytes.length) {
+        if (bytes[offset] !== 0xff) {
+          offset += 1;
+          continue;
+        }
+        const scanMarker = bytes[offset + 1]!;
+        if (scanMarker === 0x00 || (scanMarker >= 0xd0 && scanMarker <= 0xd7)) {
+          offset += 2;
+          continue;
+        }
+        if (scanMarker === 0xd9) {
+          foundEoi = true;
+          offset += 2;
+          break;
+        }
+        invalid();
+      }
+      break;
+    }
     if (marker >= 0xd0 && marker <= 0xd7) continue;
     if (offset + 2 > bytes.length) invalid();
     const segmentLength = bytes.readUInt16BE(offset);
@@ -87,11 +153,10 @@ function validateJpeg(bytes: Buffer): void {
       const height = bytes.readUInt16BE(offset + 3);
       const width = bytes.readUInt16BE(offset + 5);
       dimensions = [width, height];
-      break;
     }
     offset += segmentLength;
   }
-  if (!dimensions || dimensions[0] < 1 || dimensions[1] < 1 || dimensions[0] > 2048 || dimensions[1] > 2048) invalid();
+  if (!dimensions || !foundEoi || dimensions[0] < 1 || dimensions[1] < 1 || dimensions[0] > 2048 || dimensions[1] > 2048) invalid();
 }
 
 function validateImage(dataUri: unknown): void {
@@ -184,11 +249,12 @@ function validateMp4(bytes: Buffer): void {
   const moov = top.find((box) => box.type === "moov");
   if (!ftyp || ftyp.payload + 8 > ftyp.end || !moov) invalid();
   const mvhd = child(bytes, moov, "mvhd");
-  if (!mvhd || mvhd.payload + 20 > mvhd.end) invalid();
+  if (!mvhd || mvhd.payload + 1 > mvhd.end) invalid();
   const mvhdVersion = bytes[mvhd.payload]!;
+  if (mvhdVersion > 1 || mvhd.payload + (mvhdVersion === 1 ? 32 : 20) > mvhd.end) invalid();
   const movieTimescale = bytes.readUInt32BE(mvhd.payload + (mvhdVersion === 1 ? 20 : 12));
   const movieDuration = mvhdVersion === 1 ? uint64(bytes, mvhd.payload + 24) : BigInt(bytes.readUInt32BE(mvhd.payload + 16));
-  if (mvhdVersion > 1 || movieTimescale === 0 || movieDuration > BigInt(movieTimescale * 10)) invalid();
+  if (movieTimescale === 0 || movieDuration > BigInt(movieTimescale * 10)) invalid();
 
   let videoFound = false;
   for (const trak of boxes(bytes, moov.payload, moov.end).filter((box) => box.type === "trak")) {
@@ -256,8 +322,8 @@ function parsePart(value: unknown): { part: EmbeddingMediaPart; media: boolean }
     if (type === "input_audio") validateWav(bytes);
     else validateMp4(bytes);
     return type === "input_audio"
-      ? { part: { type, input_audio: { data: nested["data"] as string, format: "wav" } }, media: true }
-      : { part: { type, input_video: { data: nested["data"] as string, format: "mp4" } }, media: true };
+      ? { part: { type, input_audio: { data: nested["data"] as string } }, media: true }
+      : { part: { type, input_video: { data: nested["data"] as string } }, media: true };
   }
   invalid();
 }
