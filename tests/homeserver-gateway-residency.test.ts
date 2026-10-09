@@ -1,10 +1,11 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import { appendModelLifecycleEvent } from "../src/homeserver/model-lifecycle.js";
+import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admission.js";
 
 let upstream: Server;
 let upstreamPort = 0;
@@ -17,6 +18,17 @@ let adminKey = "";
 let monitorKey = "residency-monitor-static";
 let guestKey = "";
 let agentKey = "";
+
+let hostMemory: HostMemoryReadResult | Error = {
+  ok: true,
+  memory: {
+    memTotalBytes: 64 * 1024 ** 3,
+    memAvailableBytes: 24 * 1024 ** 3,
+    cmaFreeBytes: 2 * 1024 ** 3,
+    gttUsedBytes: 18 * 1024 ** 3,
+    gttTotalBytes: 32 * 1024 ** 3,
+  },
+};
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -69,7 +81,10 @@ beforeAll(async () => {
   guestKey = keystore.mintKey({ alias: "residency-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   const gateway = await import("../src/homeserver/gateway.js");
-  const handle = await gateway.startGateway();
+  const handle = await gateway.startGateway({ hostMemoryAdmissionDependencies: { readMemory: async () => {
+    if (hostMemory instanceof Error) throw hostMemory;
+    return hostMemory;
+  } } });
   gatewayPort = handle.port;
   stopGateway = handle.stop;
 });
@@ -82,6 +97,16 @@ afterAll(async () => {
 beforeEach(() => {
   runningStatus = 200;
   runningModels = [];
+  hostMemory = {
+    ok: true,
+    memory: {
+      memTotalBytes: 64 * 1024 ** 3,
+      memAvailableBytes: 24 * 1024 ** 3,
+      cmaFreeBytes: 2 * 1024 ** 3,
+      gttUsedBytes: 18 * 1024 ** 3,
+      gttTotalBytes: 32 * 1024 ** 3,
+    },
+  };
   upstreamRequests = [];
   getDb().exec("DELETE FROM request_log");
 });
@@ -155,6 +180,15 @@ describe("GET /models/residency", () => {
     const body = await response.json() as { models: Array<Record<string, unknown>> };
     // Without a current lifecycle epoch, lastUse is evidence only; retention must fail closed.
     expect(body).toEqual({
+      hostMemory: {
+        status: "available",
+        memTotalBytes: 64 * 1024 ** 3,
+        memAvailableBytes: 24 * 1024 ** 3,
+        cmaFreeBytes: 2 * 1024 ** 3,
+        gttUsedBytes: 18 * 1024 ** 3,
+        gttTotalBytes: 32 * 1024 ** 3,
+        gttAccounting: "unattributed",
+      },
       models: [
         {
           model: "qwen-main",
@@ -192,6 +226,15 @@ describe("GET /models/residency", () => {
     expect(response.status).toBe(200);
     const body = await response.json() as { models: Array<Record<string, unknown>> };
     expect(body).toEqual({
+      hostMemory: {
+        status: "available",
+        memTotalBytes: 64 * 1024 ** 3,
+        memAvailableBytes: 24 * 1024 ** 3,
+        cmaFreeBytes: 2 * 1024 ** 3,
+        gttUsedBytes: 18 * 1024 ** 3,
+        gttTotalBytes: 32 * 1024 ** 3,
+        gttAccounting: "unattributed",
+      },
       models: [
         {
           model: "qwen-main",
@@ -208,6 +251,61 @@ describe("GET /models/residency", () => {
     });
     expect(body.models[0]?.lastUse).not.toHaveProperty("alias");
     expect(JSON.stringify(body)).not.toContain("residency-owner-secret-alias");
+  });
+
+  it("marks missing DRM counters unknown and leaves RAM evidence available", async () => {
+    hostMemory = { ok: true, memory: {
+      memTotalBytes: 64 * 1024 ** 3,
+      memAvailableBytes: 24 * 1024 ** 3,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+    } };
+    const response = await getResidency(monitorKey);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { hostMemory: Record<string, unknown> };
+    expect(body.hostMemory).toEqual({
+      status: "available",
+      memTotalBytes: 64 * 1024 ** 3,
+      memAvailableBytes: 24 * 1024 ** 3,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+      gttAccounting: "unknown",
+    });
+  });
+
+  it("returns explicit unknown host-memory accounting when the host reader fails", async () => {
+    hostMemory = { ok: false, error: "private host reader error" };
+    const response = await getResidency(monitorKey);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { hostMemory: Record<string, unknown> };
+    expect(body.hostMemory).toEqual({
+      status: "unknown",
+      memTotalBytes: null,
+      memAvailableBytes: null,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+      gttAccounting: "unknown",
+    });
+    expect(JSON.stringify(body)).not.toContain("private host reader error");
+  });
+
+  it("keeps thrown reader details out of the residency response", async () => {
+    hostMemory = new Error("private host reader exception");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const response = await getResidency(monitorKey);
+      expect(response.status).toBe(200);
+      const body = await response.json() as { hostMemory: Record<string, unknown> };
+      expect(body.hostMemory.status).toBe("unknown");
+      expect(JSON.stringify(body)).not.toContain("private host reader exception");
+      expect(warning).toHaveBeenCalledWith("[model-residency] host memory reader failed", "Error");
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("private host reader exception");
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("fails closed for unauthenticated, guest, ordinary agent, and legacy user callers", async () => {

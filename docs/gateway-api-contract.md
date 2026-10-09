@@ -134,12 +134,18 @@ interface ModelInfo {
 
 Read-only, content-blind operator diagnostics. Requires an admin key or a read-only monitor
 key. A monitor response omits `lastUse.alias`; an admin response may include that safe alias
-field. The endpoint returns only the fields shown below: model identity and state, the observed
-TTL, a coarse residency classification, and safe last-use metadata. It never returns prompts,
-responses, tokens, keys, key hashes, raw backend commands, backend addresses/IPs, or other
-content-bearing or credential-bearing fields.
+field. The endpoint returns model identity and state, the observed TTL, a coarse residency
+classification, safe last-use metadata, and a best-effort host-memory snapshot. Host memory
+includes total RAM, `MemAvailable`, free CMA, and (when DRM exposes both counters) GTT used/total
+bytes. GTT accounting is explicitly `unattributed`: these device-wide counters do not identify
+which model or process owns the memory, including when models are resident. Missing DRM counters
+are `null` with `gttAccounting: "unknown"`; an unreadable host-memory snapshot returns null values
+and `status: "unknown"`. The endpoint never returns prompts, responses, tokens, keys, key hashes,
+raw backend commands, backend addresses/IPs, or other content-bearing or credential-bearing fields.
 
-**Response 200:** `{ "models": ResidencyModel[] }` when the snapshot is available.
+**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory }` when the model
+snapshot is available. An unknown host-memory observation is returned inside `hostMemory` with
+null values, without making model residency unavailable.
 
 **Response 503:** `{ "status": "unavailable" }` when the backend snapshot cannot be obtained.
 The unavailable response deliberately has no `models` array, so callers cannot interpret an empty
@@ -159,6 +165,18 @@ interface ResidencyModel {
     alias?: string | null;
   } | null;
 }
+
+interface HostMemory {
+  status: "available" | "unknown";
+  memTotalBytes: number | null;
+  memAvailableBytes: number | null;
+  cmaFreeBytes: number | null;
+  gttUsedBytes: number | null;
+  gttTotalBytes: number | null;
+  gttAccounting: "unattributed" | "unknown";
+}
+
+// Successful response: { models: ResidencyModel[], hostMemory: HostMemory }
 ```
 
 ### GET `/v1/capabilities/learning-task`
