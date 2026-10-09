@@ -631,6 +631,12 @@ export type RunChatResult =
       message: string;
       /** Present when the gateway knows how long the caller should wait before retrying. */
       retryAfterSeconds?: number;
+      /** Sanitized backend failure detail; never contains the backend error or URL. */
+      reason?: "upstream_connection_failed" | "upstream_timeout";
+      /** Trust boundary that produced a sanitized reason. */
+      layer?: "model_backend";
+      /** Explicit retry guidance for classified transient backend failures. */
+      retryable?: boolean;
       /** Present for quota rejections; excludes key identity and other consumers' usage. */
       quota?: AskQuotaFailureDetail;
       traceOutcome: string;
@@ -668,9 +674,11 @@ const ASK_FAILURE_RETRYABLE: Partial<Record<Extract<RunChatResult, { ok: false }
 };
 
 export function askFailureMeta(failure: Extract<RunChatResult, { ok: false }>): Record<string, unknown> {
-  const retryable = ASK_FAILURE_RETRYABLE[failure.code];
+  const retryable = failure.retryable ?? (failure.reason !== undefined ? true : ASK_FAILURE_RETRYABLE[failure.code]);
   return {
     m5_code: failure.code,
+    ...(failure.reason === undefined ? {} : { reason: failure.reason }),
+    ...(failure.layer === undefined ? {} : { layer: failure.layer }),
     ...(retryable === undefined ? {} : { retryable }),
     ...(failure.retryAfterSeconds === undefined ? {} : { retry_after_seconds: failure.retryAfterSeconds }),
     ...(failure.quota === undefined ? {} : { quota: failure.quota }),
@@ -1197,6 +1205,10 @@ export async function runChatCompletion(
         ok: false,
         code: "upstream_error",
         message: "The model backend timed out (it may be loading a model) — please retry in a few seconds.",
+        reason: "upstream_timeout",
+        layer: "model_backend",
+        retryable: true,
+        retryAfterSeconds: cfg.busyRetryAfterSeconds,
         traceOutcome: "upstream_timeout",
         traceErrorClass: "upstream_timeout",
       };
@@ -1208,6 +1220,10 @@ export async function runChatCompletion(
         ok: false,
         code: "upstream_error",
         message: "The model backend is unavailable — please retry shortly.",
+        reason: "upstream_connection_failed",
+        layer: "model_backend",
+        retryable: true,
+        retryAfterSeconds: cfg.busyRetryAfterSeconds,
         traceOutcome: "upstream_unavailable",
         traceErrorClass: "upstream_unavailable",
       };
