@@ -77,6 +77,7 @@ import {
   type LatestSuccessfulModelUse,
 } from "./request-log.js";
 import { queryM5UsageSummary } from "./usage-summary.js";
+import { queryLatestSuccessfulM5InferenceAt } from "./inference-freshness.js";
 import { getDb } from "../db.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
@@ -5160,8 +5161,35 @@ export async function handleRequest(
       // The dashboard's data source: the authenticated key reports its own limits + usage.
       // no-store: per-key usage data must not be cached by intermediaries (Fix #7).
       res.setHeader("cache-control", "no-store");
+      const ownerAgent = isCodeLoopOwner(principal);
+      let inferenceObservation: {
+        source: "request_log";
+        scope: "m5_global";
+        status: "observed" | "none" | "disabled" | "unavailable";
+        lastSuccessfulAt: string | null;
+      } | undefined;
+      if (ownerAgent) {
+        const base = { source: "request_log" as const, scope: "m5_global" as const };
+        if (cfg.requestLog === "off") {
+          inferenceObservation = { ...base, status: "disabled", lastSuccessfulAt: null };
+        } else {
+          try {
+            const lastSuccessfulAt = queryLatestSuccessfulM5InferenceAt(getDb());
+            inferenceObservation = {
+              ...base,
+              status: lastSuccessfulAt === null ? "none" : "observed",
+              lastSuccessfulAt,
+            };
+          } catch (error) {
+            // A telemetry read must never break key discovery. Report the gap without exposing
+            // database paths or treating a failed read as proof that no inference succeeded.
+            console.warn("[portal/me] inference observation unavailable:", error instanceof Error ? error.name : "unknown");
+            inferenceObservation = { ...base, status: "unavailable", lastSuccessfulAt: null };
+          }
+        }
+      }
       sendJson(res, 200, {
-        ...(isCodeLoopOwner(principal) ? { gateway: gatewayRelease } : {}),
+        ...(ownerAgent ? { gateway: gatewayRelease, inferenceObservation } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,
