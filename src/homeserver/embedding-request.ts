@@ -1,8 +1,11 @@
 /** Pure request and upstream-response validation for POST /v1/embeddings. */
+import { EmbeddingMediaError, parseEmbeddingMediaInput,
+  type EmbeddingMediaItem } from "./embedding-media.js";
 
 export const EMBEDDING_MODEL_ID = "embeddinggemma-2" as const;
 
 const MAX_RAW_JSON_BYTES = 32 * 1024;
+const MAX_MEDIA_RAW_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_INPUT_ITEMS = 16;
 const MAX_ITEM_CHARS = 16 * 1024;
 const MAX_TOTAL_CHARS = 32 * 1024;
@@ -11,7 +14,7 @@ const EMBEDDING_SIZE = 768;
 
 export type EmbeddingDimension = 128 | 256 | 512 | 768;
 export type EmbeddingEncodingFormat = "float" | "base64";
-export type EmbeddingInput = string | string[];
+export type EmbeddingInput = string | string[] | EmbeddingMediaItem[];
 
 export interface EmbeddingUpstreamBody {
   model: typeof EMBEDDING_MODEL_ID;
@@ -25,6 +28,7 @@ export interface EmbeddingRequest {
   user: string | undefined;
   encodingFormat: EmbeddingEncodingFormat;
   dimensions: EmbeddingDimension | undefined;
+  hasMedia: boolean;
   upstreamBody: EmbeddingUpstreamBody;
 }
 
@@ -61,8 +65,9 @@ export function isEmbeddingModel(id: string): boolean {
 }
 
 /** Parse and validate a raw JSON body without retaining prompt text in errors. */
-export function parseEmbeddingBody(raw: string): EmbeddingRequest {
-  if (typeof raw !== "string" || new TextEncoder().encode(raw).byteLength > MAX_RAW_JSON_BYTES) {
+export function parseEmbeddingBody(raw: string, allowMedia = false): EmbeddingRequest {
+  if (typeof raw !== "string" ||
+    new TextEncoder().encode(raw).byteLength > (allowMedia ? MAX_MEDIA_RAW_JSON_BYTES : MAX_RAW_JSON_BYTES)) {
     requestError("body", "Request body exceeds the maximum size.");
   }
 
@@ -89,26 +94,38 @@ export function parseEmbeddingBody(raw: string): EmbeddingRequest {
 
   const inputValue = value["input"];
   let input: EmbeddingInput;
+  let hasMedia = false;
   if (typeof inputValue === "string") {
     input = inputValue;
   } else if (Array.isArray(inputValue)) {
-    if (inputValue.length < 1 || inputValue.length > MAX_INPUT_ITEMS ||
-      inputValue.some((item) => typeof item !== "string")) {
+    if (inputValue.length >= 1 && inputValue.length <= MAX_INPUT_ITEMS &&
+      inputValue.every((item) => typeof item === "string")) {
+      input = inputValue as string[];
+    } else if (allowMedia) {
+      try {
+        const parsed = parseEmbeddingMediaInput(inputValue);
+        input = parsed.input;
+        hasMedia = parsed.hasMedia;
+      } catch (err) {
+        if (!(err instanceof EmbeddingMediaError)) throw err;
+        requestError("input", err.message);
+      }
+    } else {
       requestError("input", "Input must be a string or an array of 1 to 16 strings.");
     }
-    input = inputValue as string[];
   } else {
     requestError("input", "Input must be a string or an array of 1 to 16 strings.");
   }
 
   const inputs = typeof input === "string" ? [input] : input;
-  if (inputs.some((item) => charCount(item) === 0)) {
+  const textInputs = inputs.filter((item): item is string => typeof item === "string");
+  if (textInputs.some((item) => charCount(item) === 0)) {
     requestError("input", "Input strings must not be empty.");
   }
-  if (inputs.some((item) => charCount(item) > MAX_ITEM_CHARS)) {
+  if (textInputs.some((item) => charCount(item) > MAX_ITEM_CHARS)) {
     requestError("input", "An input string exceeds the maximum length.");
   }
-  if (inputs.reduce((total, item) => total + charCount(item), 0) > MAX_TOTAL_CHARS) {
+  if (textInputs.reduce((total, item) => total + charCount(item), 0) > MAX_TOTAL_CHARS) {
     requestError("input", "The combined input exceeds the maximum length.");
   }
 
@@ -143,16 +160,19 @@ export function parseEmbeddingBody(raw: string): EmbeddingRequest {
     input,
     encoding_format: "float",
   };
-  return { model: EMBEDDING_MODEL_ID, input, user, encodingFormat, dimensions, upstreamBody };
+  return { model: EMBEDDING_MODEL_ID, input, user, encodingFormat, dimensions, hasMedia, upstreamBody };
 }
 
 /** Reserve a conservative prompt-token estimate before contacting the embedding runtime. */
 export function embeddingTokenReservation(request: EmbeddingRequest): number {
   const inputs = typeof request.input === "string" ? [request.input] : request.input;
+  // Media tokenization is model-specific and can greatly exceed the encoded byte count.
+  // The runtime context cap is the conservative bound for each media-bearing vector.
+  if (typeof inputs[0] !== "string") return 8192 * inputs.length;
   // Reserve more than a chars/4 estimate: a Unicode-heavy string or task-prefix overhead can
   // tokenize much more densely. One token per UTF-8 byte plus 64 per input is conservative
   // while remaining below the model's 8192-token context ceiling per input.
-  const bytes = inputs.reduce((total, item) => total + new TextEncoder().encode(item).byteLength, 0);
+  const bytes = (inputs as string[]).reduce((total, item) => total + new TextEncoder().encode(item).byteLength, 0);
   return Math.min(8192 * inputs.length, bytes + 64 * inputs.length);
 }
 

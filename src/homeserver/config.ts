@@ -250,6 +250,8 @@ export interface HomeserverConfig {
   embeddingModels: string[];
   /** Optional dedicated loopback embedding server's OpenAI-compatible /v1 base. */
   embeddingBaseUrl: string;
+  /** Enable reviewed inline media inputs only after the projector is active and probed. */
+  embeddingMediaEnabled: boolean;
   /** Explicit remote small-model backend. Empty URL keeps the gateway M5-only. */
   orin: {
     url: string;
@@ -670,6 +672,14 @@ export function loadConfig(): HomeserverConfig {
     throw new Error("HOMESERVER_EMBEDDING_MODELS may contain only the reviewed embeddinggemma-2 ID once.");
   }
   const embeddingBaseUrl = (process.env["HOMESERVER_EMBEDDING_BASE_URL"] ?? "").replace(/\/$/, "");
+  const embeddingMediaSetting = process.env["HOMESERVER_EMBEDDING_MEDIA_ENABLED"] ?? "false";
+  if (embeddingMediaSetting !== "true" && embeddingMediaSetting !== "false") {
+    throw new Error("HOMESERVER_EMBEDDING_MEDIA_ENABLED must be true or false.");
+  }
+  const embeddingMediaEnabled = embeddingMediaSetting === "true";
+  if (embeddingMediaEnabled && embeddingModels.length === 0) {
+    throw new Error("HOMESERVER_EMBEDDING_MEDIA_ENABLED requires an enabled embedding model.");
+  }
   if (embeddingModels.length > 0) {
     let parsed: URL;
     try {
@@ -699,6 +709,7 @@ export function loadConfig(): HomeserverConfig {
     systemOneModels: envList("HOMESERVER_SYSTEMONE_MODELS"),
     embeddingModels,
     embeddingBaseUrl,
+    embeddingMediaEnabled,
     orin: {
       // Tailscale address belongs in deployment env, never source. Unset = disabled.
       url: (process.env["HOMESERVER_ORIN_URL"] ?? "").replace(/\/$/, ""),

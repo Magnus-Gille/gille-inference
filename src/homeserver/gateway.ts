@@ -91,6 +91,7 @@ import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, Sy
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
 import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
   embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
+import { EmbeddingVideoProbeError, validateEmbeddingVideoBitstream } from "./embedding-video-probe.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
 import {
   startImageWorker,
@@ -710,15 +711,37 @@ async function readModelResidency(
 
 const PORTAL_HTML_PATH = join(dirname(fileURLToPath(import.meta.url)), "portal.html");
 let _portalHtml: string | null = null;
+const portalByEmbeddingMedia = new Map<boolean, string>();
 
 /**
  * Load the portal page. Cached after the first read (it is a static asset that ships with
  * the gateway). The page is fully self-contained — inline CSS/JS, no external assets — so it
  * works behind Tailscale / Cloudflare with no CDN dependency.
  */
-function portalHtml(): string {
+function portalHtml(embeddingMediaEnabled = false): string {
   if (_portalHtml === null) _portalHtml = readFileSync(PORTAL_HTML_PATH, "utf-8");
-  return _portalHtml;
+  const cached = portalByEmbeddingMedia.get(embeddingMediaEnabled);
+  if (cached !== undefined) return cached;
+  const rendered = _portalHtml
+    .replace("<!-- EMBEDDING_USES -->", embeddingMediaEnabled
+      ? "Text, code, PNG/JPEG images, PCM WAV audio and MP4 video vectors<br>768, 512, 256 or 128 dimensions"
+      : "Text and code vectors<br>768, 512, 256 or 128 dimensions")
+    .replace("<!-- EMBEDDING_DESC -->", embeddingMediaEnabled
+      ? "EmbeddingGemma 2 accepts bounded inline images, audio, video and mixed text/media as well as text/code. Confirm that the model appears in your authenticated /v1/models response; the runtime and your key grant must both be active. Successful calls use ordinary input-token credits and rate limits."
+      : "The first EmbeddingGemma 2 serving path accepts text and code. Confirm that embeddinggemma-2 appears in your authenticated /v1/models response; the runtime and your key grant must both be active. Successful calls use ordinary input-token credits and rate limits. Image, audio and video embeddings are not enabled on this endpoint.")
+    .replace("<!-- EMBEDDING_MEDIA_EXAMPLE -->", embeddingMediaEnabled
+      ? `<p><strong>Inline media embeddings (after model-list check):</strong></p>
+        <pre>{"model":"embeddinggemma-2","input":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,&lt;BASE64&gt;"}}]}],"dimensions":256}</pre>
+        <p>Use the same wrapped <span class="badge mono">content</span> shape with
+          <span class="badge mono">input_audio:{data,format:"wav"}</span> or
+          <span class="badge mono">input_video:{data,format:"mp4"}</span>. The data is raw base64 for WAV/MP4.
+          You may mix up to four text/media parts per vector. PNG/JPEG images are limited to 2 MiB and
+          2048×2048 pixels; PCM WAV to 3 MiB and 30 seconds; MP4 to 4 MiB, 10 seconds and 64 frames.
+          Up to four wrapped vectors per request, with one video total. Media must be inline;
+          remote and local URLs are rejected. Failed calls cost zero.</p>`
+      : "");
+  portalByEmbeddingMedia.set(embeddingMediaEnabled, rendered);
+  return rendered;
 }
 
 // ─── hs CLI (client/hs.mjs — served unauthenticated so friends can install before they have a key) ──
@@ -1337,25 +1360,61 @@ function modelVisibleInDiscovery(modelId: string, cfg: HomeserverConfig, princip
   return cfg.systemOneModels.includes(modelId) && systemOneGranted(principal, modelId);
 }
 
-async function embeddingSidecarReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
-  if (!cfg.embeddingModels.includes(EMBEDDING_MODEL_ID) || cfg.embeddingBaseUrl === "") return false;
+async function embeddingSidecarInputModalities(cfg: HomeserverConfig, signal?: AbortSignal): Promise<string[] | null> {
+  if (!cfg.embeddingModels.includes(EMBEDDING_MODEL_ID) || cfg.embeddingBaseUrl === "") return null;
   try {
     const response = await fetch(`${cfg.embeddingBaseUrl}/models`, {
       signal: signal ? AbortSignal.any([AbortSignal.timeout(2_000), signal]) : AbortSignal.timeout(2_000),
     });
     if (!response.ok) {
       await response.body?.cancel();
-      return false;
+      return null;
     }
     const payload = await response.json() as unknown;
-    return typeof payload === "object" && payload !== null &&
-      Array.isArray((payload as { data?: unknown }).data) &&
-      (payload as { data: unknown[] }).data.some((entry) =>
-        typeof entry === "object" && entry !== null &&
-        (entry as { id?: unknown }).id === EMBEDDING_MODEL_ID);
+    if (typeof payload !== "object" || payload === null ||
+        !Array.isArray((payload as { data?: unknown }).data)) return null;
+    const entry = (payload as { data: unknown[] }).data.find((candidate) =>
+      typeof candidate === "object" && candidate !== null &&
+      (candidate as { id?: unknown }).id === EMBEDDING_MODEL_ID);
+    if (typeof entry !== "object" || entry === null) return null;
+    const architecture = (entry as { architecture?: unknown }).architecture;
+    const modalities = typeof architecture === "object" && architecture !== null
+      ? (architecture as { input_modalities?: unknown }).input_modalities : undefined;
+    // Older sidecars can omit capability metadata; treat that as text-only.
+    return Array.isArray(modalities) && modalities.every((item) => typeof item === "string")
+      ? modalities as string[] : ["text"];
   } catch {
-    return false;
+    return null;
   }
+}
+
+async function embeddingSidecarReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
+  return await embeddingSidecarInputModalities(cfg, signal) !== null;
+}
+
+async function embeddingMediaReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
+  if (!cfg.embeddingMediaEnabled) return false;
+  const modalities = await embeddingSidecarInputModalities(cfg, signal);
+  return modalities !== null && ["image", "audio", "video"].every((item) => modalities.includes(item));
+}
+
+const portalMediaSnapshots = new Map<string, {
+  value: boolean; expiresAt: number; inFlight?: Promise<boolean>;
+}>();
+
+/** Keep public portal loads independent of a sidecar round trip while refreshing capability. */
+async function portalEmbeddingMediaReady(cfg: HomeserverConfig): Promise<boolean> {
+  if (!cfg.embeddingMediaEnabled) return false;
+  const key = cfg.embeddingBaseUrl;
+  const cached = portalMediaSnapshots.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached?.inFlight) return await cached.inFlight;
+  const inFlight = embeddingMediaReady(cfg).then((value) => {
+    portalMediaSnapshots.set(key, { value, expiresAt: Date.now() + 10_000 });
+    return value;
+  });
+  portalMediaSnapshots.set(key, { value: false, expiresAt: 0, inFlight });
+  return await inFlight;
 }
 
 async function handleEmbeddingProxy(
@@ -1380,7 +1439,9 @@ async function handleEmbeddingProxy(
     }
   });
   try {
-    if (!await embeddingSidecarReady(cfg, clientGone.signal)) {
+    const wrappedInput = Array.isArray(request.input) && typeof request.input[0] !== "string";
+    if (!await embeddingSidecarReady(cfg, clientGone.signal) ||
+        (wrappedInput && !await embeddingMediaReady(cfg, clientGone.signal))) {
       if (clientAborted) {
         lctx.status = 499;
         lctx.outcome = "client_closed";
@@ -1392,6 +1453,19 @@ async function handleEmbeddingProxy(
       lctx.errorClass = "upstream_unavailable";
       sendError(res, makeError("upstream_unavailable"));
       return ZERO_RESULT;
+    }
+    if (wrappedInput) {
+      try {
+        await validateEmbeddingVideoBitstream(request.input as import("./embedding-media.js").EmbeddingMediaItem[]);
+      } catch (err) {
+        if (!(err instanceof EmbeddingVideoProbeError)) throw err;
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: "input",
+          message: "Video bitstream validation failed." }));
+        return ZERO_RESULT;
+      }
     }
     const upstream = await fetch(`${cfg.embeddingBaseUrl}/embeddings`, {
       method: "POST",
@@ -4307,7 +4381,7 @@ export async function handleRequest(
     if ((path === "/portal" || path === "/") && method === "GET") {
       lctx.route = "/portal";
       if (!throttlePublic()) return;
-      sendHtml(res, 200, portalHtml());
+      sendHtml(res, 200, portalHtml(await portalEmbeddingMediaReady(cfg)));
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -5076,29 +5150,9 @@ export async function handleRequest(
     }
     if (path === "/v1/embeddings" && method === "POST") {
       res.setHeader("Cache-Control", "no-store");
-      let parsed: EmbeddingRequest;
-      try {
-        parsed = parseEmbeddingBody(await readBody(req, 32 * 1024));
-      } catch (err) {
-        if (!(err instanceof EmbeddingRequestError) && !(err instanceof BodyTooLargeError)) throw err;
-        const tooLarge = err instanceof BodyTooLargeError;
-        lctx.status = tooLarge ? 413 : 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", {
-          ...(!tooLarge ? { param: err.param, message: err.message } : {}),
-        }));
-        return;
-      }
-      if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {
-        lctx.status = 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = "model_not_found";
-        lctx.admission = "n/a";
-        sendError(res, makeError("model_not_found", { param: "model" }));
-        return;
-      }
-      if (!embeddingGranted(principal, parsed.model)) {
+      // Reject ungranted callers before accepting inline media. An unfinished upload must
+      // not hold the single CPU embedding slot; take it after the bounded body arrives.
+      if (!embeddingGranted(principal, EMBEDDING_MODEL_ID)) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
         lctx.errorClass = "model_not_allowed";
@@ -5106,7 +5160,17 @@ export async function handleRequest(
         sendError(res, makeError("model_not_allowed", { param: "model" }));
         return;
       }
-      lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
+      let rawEmbeddingBody: string;
+      try {
+        rawEmbeddingBody = await readBody(req, cfg.embeddingMediaEnabled ? 8 * 1024 * 1024 : 32 * 1024);
+      } catch (err) {
+        if (!(err instanceof BodyTooLargeError)) throw err;
+        lctx.status = 413;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "payload_too_large";
+        sendError(res, makeError("payload_too_large"));
+        return;
+      }
       if (embeddingInFlight.has(controller)) {
         lctx.status = 503;
         lctx.outcome = "busy";
@@ -5118,6 +5182,26 @@ export async function handleRequest(
       }
       embeddingInFlight.add(controller);
       try {
+        let parsed: EmbeddingRequest;
+        try {
+          parsed = parseEmbeddingBody(rawEmbeddingBody, cfg.embeddingMediaEnabled);
+        } catch (err) {
+          if (!(err instanceof EmbeddingRequestError)) throw err;
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "invalid_request_error";
+          sendError(res, makeError("invalid_request_error", { param: err.param, message: err.message }));
+          return;
+        }
+        if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "model_not_found";
+          lctx.admission = "n/a";
+          sendError(res, makeError("model_not_found", { param: "model" }));
+          return;
+        }
+        lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
         await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
           embeddingTokenReservation(parsed), lctx,
           () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
@@ -5464,9 +5548,16 @@ export async function handleRequest(
         owned_by: cfg.systemOneModels.includes(m.key) ? "home-gateway-systemone" :
           isEmbeddingModel(m.key) ? "home-gateway-embedding" : "home-gateway",
       }));
-      if (embeddingGranted(principal, EMBEDDING_MODEL_ID) && await embeddingSidecarReady(cfg)) {
-        data.push({ id: EMBEDDING_MODEL_ID, object: "model", created: 0,
-          owned_by: "home-gateway-embedding" });
+      const embeddingModalities = embeddingGranted(principal, EMBEDDING_MODEL_ID)
+        ? await embeddingSidecarInputModalities(cfg) : null;
+      if (embeddingModalities !== null) {
+        const activeModalities = cfg.embeddingMediaEnabled &&
+          ["image", "audio", "video"].every((item) => embeddingModalities.includes(item))
+          ? ["text", "image", "audio", "video"] : ["text"];
+        const embeddingEntry = { id: EMBEDDING_MODEL_ID, object: "model", created: 0,
+          owned_by: "home-gateway-embedding",
+          architecture: { input_modalities: activeModalities, output_modalities: ["embedding"] } };
+        data.push(embeddingEntry);
       }
       // Advertise the speech-to-text model alongside the chat models (empty allow-list = visible;
       // otherwise only when the key is permitted the whisper model). So OpenAI SDKs that probe
