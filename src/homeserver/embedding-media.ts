@@ -139,9 +139,12 @@ function validateJpeg(bytes: Buffer): void {
           offset += 2;
           break;
         }
-        invalid();
+        // A non-stuffed, non-restart marker terminates this entropy-coded scan. Leave
+        // the marker in place so the outer loop can parse DHT/SOS and other segments.
+        break;
       }
-      break;
+      if (foundEoi) break;
+      continue;
     }
     if (marker >= 0xd0 && marker <= 0xd7) continue;
     if (offset + 2 > bytes.length) invalid();
@@ -248,7 +251,8 @@ function validateMp4(bytes: Buffer): void {
   const top = boxes(bytes, 0, bytes.length);
   const ftyp = top.find((box) => box.type === "ftyp");
   const moov = top.find((box) => box.type === "moov");
-  if (!ftyp || ftyp.payload + 8 > ftyp.end || !moov) invalid();
+  if (!ftyp || ftyp.payload + 8 > ftyp.end || !moov || top.some((box) => box.type === "moof") ||
+    child(bytes, moov, "mvex")) invalid();
   const mvhd = child(bytes, moov, "mvhd");
   if (!mvhd || mvhd.payload + 1 > mvhd.end) invalid();
   const mvhdVersion = bytes[mvhd.payload]!;

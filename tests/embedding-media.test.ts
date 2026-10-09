@@ -6,6 +6,7 @@ const jpeg = Buffer.from([
   0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02,
   0x01, 0x01, 0x11, 0x00, 0xff, 0xd9,
 ]).toString("base64");
+const progressiveJpeg = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wgALCAACAAIBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAABv/aAAgBAQAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oACAEBAAAAEP8A/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=";
 
 function crc32(bytes: Buffer): number {
   let crc = 0xffffffff;
@@ -114,6 +115,40 @@ function mp4(frameCount = 2, durationSeconds = 1, width = 640, height = 480): st
   return Buffer.concat([box("ftyp", ftypBody), moov]).toString("base64");
 }
 
+function fragmentedMp4(): string {
+  const base = Buffer.from(mp4(), "base64");
+  const box = (type: string, body: Buffer): Buffer => {
+    const out = Buffer.alloc(8 + body.length);
+    out.writeUInt32BE(out.length, 0);
+    out.write(type, 4, "ascii");
+    body.copy(out, 8);
+    return out;
+  };
+  const mfhd = Buffer.alloc(8);
+  mfhd.writeUInt32BE(1, 4);
+  const tfhd = Buffer.alloc(8);
+  tfhd.writeUInt32BE(1, 4);
+  const trun = Buffer.alloc(8);
+  trun.writeUInt32BE(1, 4);
+  const moof = box("moof", Buffer.concat([box("mfhd", mfhd), box("traf", Buffer.concat([box("tfhd", tfhd), box("trun", trun)]))]));
+  return Buffer.concat([base, moof]).toString("base64");
+}
+
+function mp4WithMovieExtends(): string {
+  const base = Buffer.from(mp4(), "base64");
+  const moovStart = base.indexOf("moov") - 4;
+  const moovSize = base.readUInt32BE(moovStart);
+  const mvex = Buffer.alloc(8);
+  mvex.writeUInt32BE(8, 0);
+  mvex.write("mvex", 4, "ascii");
+  const moov = Buffer.alloc(moovSize + mvex.length);
+  moov.writeUInt32BE(moov.length, 0);
+  moov.write("moov", 4, "ascii");
+  base.copy(moov, 8, moovStart + 8, moovStart + moovSize);
+  mvex.copy(moov, moovSize);
+  return Buffer.concat([base.subarray(0, moovStart), moov, base.subarray(moovStart + moovSize)]).toString("base64");
+}
+
 describe("embedding media input", () => {
   it("preserves sanitized text and accepted inline image/audio/video parts", () => {
     const result = parseEmbeddingMediaInput([{
@@ -147,6 +182,12 @@ describe("embedding media input", () => {
     } }] }]).hasMedia).toBe(true);
   });
 
+  it("accepts a progressive JPEG with multiple scans", () => {
+    expect(parseEmbeddingMediaInput([{ content: [{ type: "image_url", image_url: {
+      url: dataUri("image/jpeg", progressiveJpeg),
+    } }] }]).hasMedia).toBe(true);
+  });
+
   it.each([
     "https://example.invalid/a.png",
     "file:///tmp/a.png",
@@ -170,6 +211,12 @@ describe("embedding media input", () => {
       .toThrow(EmbeddingMediaError);
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: {
       data: mp4().slice(0, -8), format: "mp4",
+    } }] }])).toThrow(EmbeddingMediaError);
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: {
+      data: fragmentedMp4(), format: "mp4",
+    } }] }])).toThrow(EmbeddingMediaError);
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: {
+      data: mp4WithMovieExtends(), format: "mp4",
     } }] }])).toThrow(EmbeddingMediaError);
   });
 
