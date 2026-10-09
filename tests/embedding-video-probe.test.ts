@@ -34,7 +34,8 @@ describe("embedding video bitstream probe", () => {
 
   it("accepts one bounded video stream with measured limits", async () => {
     const path = await probeScript(JSON.stringify({
-      streams: [{ codec_type: "video", width: 1920, height: 1080, nb_read_frames: "64", duration: "9.5" }],
+      streams: [{ codec_type: "video", width: 1920, height: 1080, nb_read_frames: "2", duration: "9.5" }],
+      frames: Array.from({ length: 2 }, () => ({ media_type: "video", width: 1920, height: 1080 })),
       format: { duration: "9.5" },
     }));
     await expect(validateEmbeddingVideoBitstream(input(), path)).resolves.toBeUndefined();
@@ -46,9 +47,17 @@ describe("embedding video bitstream probe", () => {
       { codec_type: "video", width: 1, height: 1, nb_read_frames: "1", duration: "1" },
       { codec_type: "video", width: 1, height: 1, nb_read_frames: "1", duration: "1" },
     ], format: { duration: "1" } }],
-    ["oversized dimensions", { streams: [{ codec_type: "video", width: 2049, height: 1, nb_read_frames: "1" }], format: { duration: "1" } }],
-    ["too many actual frames", { streams: [{ codec_type: "video", width: 1, height: 1, nb_read_frames: "65" }], format: { duration: "1" } }],
-    ["too long actual duration", { streams: [{ codec_type: "video", width: 1, height: 1, nb_read_frames: "1" }], format: { duration: "10.1" } }],
+    ["oversized dimensions", { streams: [{ codec_type: "video", width: 2049, height: 1, nb_read_frames: "1" }],
+      frames: [{ media_type: "video", width: 2049, height: 1 }], format: { duration: "1" } }],
+    ["too many actual frames", { streams: [{ codec_type: "video", width: 1, height: 1, nb_read_frames: "65" }],
+      frames: [{ media_type: "video", width: 1, height: 1 }], format: { duration: "1" } }],
+    ["too long actual duration", { streams: [{ codec_type: "video", width: 1, height: 1, nb_read_frames: "1" }],
+      frames: [{ media_type: "video", width: 1, height: 1 }], format: { duration: "10.1" } }],
+    ["resolution switch after a small first frame", { streams: [{ codec_type: "video", width: 16, height: 16,
+      nb_read_frames: "2" }], frames: [
+        { media_type: "video", width: 16, height: 16 },
+        { media_type: "video", width: 4096, height: 16 },
+      ], format: { duration: "2" } }],
   ])("rejects %s without exposing probe data", async (_label, result) => {
     const path = await probeScript(JSON.stringify(result));
     await expect(validateEmbeddingVideoBitstream(input(), path)).rejects.toBeInstanceOf(EmbeddingVideoProbeError);

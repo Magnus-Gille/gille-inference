@@ -45,6 +45,7 @@ function decodeVideo(data: string): Buffer {
 
 interface ProbeOutput {
   streams?: unknown;
+  frames?: unknown;
   format?: unknown;
 }
 
@@ -80,6 +81,18 @@ function validateProbeOutput(raw: Buffer): void {
 
   const frames = finiteNumber(stream["nb_read_frames"] ?? stream["nb_frames"]);
   if (frames === undefined || !Number.isInteger(frames) || frames < 1 || frames > MAX_FRAMES) fail();
+  if (!Array.isArray(parsed.frames)) fail();
+  const videoFrames = parsed.frames.filter((frame): frame is Record<string, unknown> =>
+    record(frame) && frame["media_type"] === "video");
+  if (videoFrames.length !== frames) fail();
+  for (const frame of videoFrames) {
+    const frameWidth = finiteNumber(frame["width"]);
+    const frameHeight = finiteNumber(frame["height"]);
+    if (frameWidth === undefined || frameHeight === undefined ||
+      !Number.isInteger(frameWidth) || !Number.isInteger(frameHeight) ||
+      frameWidth < 1 || frameHeight < 1 ||
+      frameWidth > MAX_DIMENSION || frameHeight > MAX_DIMENSION) fail();
+  }
 
   const format = record(parsed.format) ? finiteNumber(parsed.format["duration"]) : undefined;
   const duration = format ?? finiteNumber(stream["duration"]);
@@ -101,7 +114,8 @@ export function validateEmbeddingVideoBitstream(
       "-protocol_whitelist", "pipe",
       "-f", "mp4",
       "-count_frames",
-      "-show_entries", "stream=codec_type,width,height,nb_read_frames,nb_frames,duration:format=duration",
+      "-show_frames",
+      "-show_entries", "stream=codec_type,width,height,nb_read_frames,nb_frames,duration:format=duration:frame=media_type,width,height",
       "-of", "json",
       "-i", "pipe:0",
     ], {
