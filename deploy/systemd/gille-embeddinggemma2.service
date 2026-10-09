@@ -1,0 +1,33 @@
+# Reviewed template only. Resolve the immutable runtime and GGUF paths under
+# root-owned /opt before installation; do not install /operator-resolve placeholders.
+# Release directories and files must be readable by the dynamic service user.
+[Unit]
+Description=Gille EmbeddingGemma 2 text embedding sidecar (CPU)
+After=network.target
+
+[Service]
+Type=simple
+User=gille-embeddinggemma2
+DynamicUser=yes
+ExecStart=/operator-resolve/llama.cpp-embeddinggemma2/bin/llama-server --model /operator-resolve/models/embeddinggemma-2-BF16.gguf --alias embeddinggemma-2 --host 127.0.0.1 --port 8107 --embedding -c 8192 -b 512 -ub 512 -ngl 0 -np 1 -t 3 -tb 3 --threads-http 4 --log-disable --no-slots
+Restart=on-failure
+RestartSec=5
+MemoryMax=8G
+MemorySwapMax=0
+OOMPolicy=stop
+CPUQuota=300%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

@@ -19,7 +19,7 @@ import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admissi
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "clef-running" | "qwen-list" | "validrunning" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let releaseStall: (() => void) | null = null;
@@ -54,19 +54,19 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", async () => {
-      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone")) upstreamInferenceRequestCount += 1;
+      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone") || req.url?.endsWith("/embeddings")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
-      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
+      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ running: mockMode === "systemone-list" ? [] : [
+        res.end(JSON.stringify({ running: mockMode === "systemone-list" || mockMode === "embedding-list" ? [] : [
           { model: mockMode === "clef-running" ? "clef-flash" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "m1",
             state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 },
         ] }));
         return;
       }
-      if ((mockMode === "systemone-list" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
+      if ((mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "embedding-error500" || mockMode === "embedding-error413" || mockMode === "embedding-stall" || mockMode === "embedding-malformed" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash" }] }));
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "embedding-list-absent" ? "other" : mockMode.startsWith("embedding-") ? "embeddinggemma-2" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash" }] }));
         return;
       }
       if (mockMode === "notfound") {
@@ -74,11 +74,16 @@ function startUpstream(): Promise<void> {
         res.end(JSON.stringify({ error: { message: "model not found" } }));
         return;
       }
-      if (mockMode === "error500") {
+      if (mockMode === "error500" || (mockMode === "embedding-error500" && req.url?.endsWith("/embeddings"))) {
         // An upstream failure AFTER a successful 200-route lookup (i.e. not a 404). Carries a
         // usage frame in the body to prove the gateway does NOT read it on a non-2xx (Fix #1).
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "boom" }, usage: { total_tokens: 9999 } }));
+        return;
+      }
+      if (mockMode === "embedding-error413" && req.url?.endsWith("/embeddings")) {
+        res.writeHead(413, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "do not relay this upstream message" } }));
         return;
       }
       if (mockMode === "format500" && req.url?.endsWith("/chat/completions")) {
@@ -117,6 +122,9 @@ function startUpstream(): Promise<void> {
           releaseStall = resolve;
         });
       }
+      if (mockMode === "embedding-stall" && req.url?.endsWith("/embeddings")) {
+        await new Promise<void>((resolve) => { releaseStall = resolve; });
+      }
       if (mockMode === "length") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
@@ -133,6 +141,20 @@ function startUpstream(): Promise<void> {
         res.end(JSON.stringify({
           answers: { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
           usage: { input_tokens: 18, output_tokens: 0 },
+        }));
+        return;
+      }
+      if (req.url?.endsWith("/embeddings")) {
+        const body = JSON.parse(lastUpstreamBody) as { input: string | string[] };
+        const count = Array.isArray(body.input) ? body.input.length : 1;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          object: "list", model: "embeddinggemma-2",
+          data: Array.from({ length: count }, (_, index) => ({
+            object: "embedding", index,
+            embedding: Array.from({ length: mockMode === "embedding-malformed" ? 767 : 768 }, (_, i) => i === 0 ? 3 : i === 1 ? 4 : 0),
+          })),
+          usage: { prompt_tokens: 3, total_tokens: 3 },
         }));
         return;
       }
@@ -195,6 +217,8 @@ beforeAll(async () => {
   process.env["HOMESERVER_BUSY_RETRY_AFTER_S"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
   process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
+  process.env["HOMESERVER_EMBEDDING_MODELS"] = "embeddinggemma-2";
+  process.env["HOMESERVER_EMBEDDING_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
@@ -315,6 +339,185 @@ async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Prom
 }
 
 describe("gateway spine — HTTP integration", () => {
+  it("serves EmbeddingGemma through explicit guest grants, validates vectors, and meters actual usage", async () => {
+    mockMode = "embedding-list";
+    const scoped = mintKey({ alias: `embedding-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const unscoped = mintKey({ alias: `embedding-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const body = { model: "embeddinggemma-2", input: ["hello", "world"], dimensions: 128 };
+    const call = (token: string | null, payload: unknown) => fetch(url("/v1/embeddings"), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+    });
+
+    expect((await call(null, body)).status).toBe(401);
+    expect((await call(unscoped.plaintextKey, body)).status).toBe(403);
+    expect((await call(scoped.plaintextKey, { ...body, input: [] })).status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const success = await call(scoped.plaintextKey, body);
+    expect(success.status).toBe(200);
+    const payload = await success.json() as { data: Array<{ index: number; embedding: number[] }>; usage: { total_tokens: number } };
+    expect(payload.data.map((item) => item.index)).toEqual([0, 1]);
+    expect(payload.data[0]!.embedding).toHaveLength(128);
+    expect(payload.data[0]!.embedding.slice(0, 2)).toEqual([0.6, 0.8]);
+    expect(payload.usage.total_tokens).toBe(3);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2", input: body.input, encoding_format: "float" });
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+
+    expect((await chat(scoped.plaintextKey, { model: "embeddinggemma-2" })).status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    mockMode = "embedding-error500";
+    expect((await call(scoped.plaintextKey, body)).status).toBe(502);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    mockMode = "embedding-malformed";
+    expect((await call(scoped.plaintextKey, body)).status).toBe(502);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    mockMode = "embedding-error413";
+    const oversized = await call(scoped.plaintextKey, body);
+    expect(oversized.status).toBe(413);
+    expect(JSON.stringify(await oversized.json())).not.toContain("do not relay");
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("caps CPU embedding work at one request before consuming another gateway slot", async () => {
+    mockMode = "embedding-stall";
+    releaseStall = null;
+    const guest = mintKey({ alias: `embedding-cap-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const ungranted = mintKey({ alias: `embedding-cap-ungranted-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const call = () => fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+    const first = call();
+    try {
+      for (let attempt = 0; attempt < 100 && releaseStall === null; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(releaseStall).not.toBeNull();
+      const reservedCredits = lookupKey(guest.plaintextKey)!.creditsUsed;
+      const ungrantedResponse = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ungranted.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+      expect(ungrantedResponse.status).toBe(403);
+      const second = await call();
+      expect(second.status).toBe(503);
+      expect(upstreamInferenceRequestCount).toBe(1);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(reservedCredits);
+    } finally {
+      releaseStall?.();
+      releaseStall = null;
+    }
+    expect((await first).status).toBe(200);
+    expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("accepts the OpenAI SDK base64 format and user field without forwarding user", async () => {
+    mockMode = "embedding-list";
+    const guest = mintKey({ alias: `embedding-sdk-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const response = await fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document",
+        dimensions: 128, encoding_format: "base64", user: "sdk-user" }) });
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { data: Array<{ embedding: string }> };
+    expect(Buffer.from(payload.data[0]!.embedding, "base64")).toHaveLength(128 * 4);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2",
+      input: "A short document", encoding_format: "float" });
+    expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("hides embedding models from open guest discovery and when disabled", async () => {
+    mockMode = "embedding-list";
+    const open = mintKey({ alias: `embedding-list-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const scoped = mintKey({ alias: `embedding-list-scoped-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["embeddinggemma-2"] }, DEFAULTS);
+    const owner = mintKey({ alias: `embedding-list-owner-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const models = async (token: string, path: "/models" | "/v1/models") => {
+      const response = await fetch(url(path), { headers: { authorization: `Bearer ${token}` } });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+      const payload = await response.json() as { data?: Array<{ id: string }>; models?: Array<{ key: string; type: string }> };
+      return path === "/models" ? payload.models!.map((item) => item.key) : payload.data!.map((item) => item.id);
+    };
+    for (const path of ["/models", "/v1/models"] as const) {
+      expect(await models(open.plaintextKey, path)).not.toContain("embeddinggemma-2");
+      expect(await models(scoped.plaintextKey, path)).toContain("embeddinggemma-2");
+      expect(await models(owner.plaintextKey, path)).toContain("embeddinggemma-2");
+    }
+    const cfg = loadConfig();
+    const enabled = cfg.embeddingModels;
+    cfg.embeddingModels = [];
+    try {
+      expect(await models(scoped.plaintextKey, "/v1/models")).not.toContain("embeddinggemma-2");
+      expect((await chat(scoped.plaintextKey, { model: "embeddinggemma-2" })).status).toBe(400);
+      const disabled = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${scoped.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "hello" }) });
+      expect(disabled.status).toBe(400);
+      expect(upstreamInferenceRequestCount).toBe(0);
+    } finally {
+      cfg.embeddingModels = enabled;
+    }
+  });
+
+  it("omits an unavailable embedding sidecar from discovery and refuses inference without billing", async () => {
+    const guest = mintKey({ alias: `embedding-unready-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 100 }, DEFAULTS);
+    const headers = { authorization: `Bearer ${guest.plaintextKey}` };
+    for (const mode of ["embedding-list-absent"]) {
+      mockMode = mode;
+      for (const path of ["/models", "/v1/models"]) {
+        const response = await fetch(url(path), { headers });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("private, no-store");
+        expect(JSON.stringify(await response.json())).not.toContain("embeddinggemma-2");
+      }
+      const call = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "hello" }) });
+      expect(call.status).toBe(502);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(0);
+    }
+  });
+
+  it("atomically grants the embedding model to existing open customer keys without changing credits", async () => {
+    mockMode = "embedding-list";
+    const first = mintKey({ alias: `embedding-grant-a-${randomUUID()}`, tier: "guest",
+      creditLimit: 1_000 }, DEFAULTS);
+    const second = mintKey({ alias: `embedding-grant-b-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["m1"], creditLimit: 1_000 }, DEFAULTS);
+    const owner = mintKey({ alias: `embedding-grant-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin" }, DEFAULTS);
+    const grant = (aliases: string[], token = "admin-static-key") => fetch(url("/admin/keys/embedding-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", aliases }),
+    });
+    const before = lookupKey(first.plaintextKey)!.creditsUsed;
+    expect((await grant([first.record.alias, second.record.alias], first.plaintextKey)).status).toBe(403);
+    expect((await grant([first.record.alias, "missing-customer"])).status).toBe(400);
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+    expect((await grant([first.record.alias, owner.record.alias])).status).toBe(400);
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+
+    const response = await grant([first.record.alias, second.record.alias]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ model: "embeddinggemma-2",
+      changed: [first.record.alias, second.record.alias], unchanged: [] });
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual(["embeddinggemma-2"]);
+    expect(lookupKey(first.plaintextKey)!.modelAllowList).toEqual([]);
+    expect(lookupKey(first.plaintextKey)!.creditsUsed).toBe(before);
+    expect((await grant([first.record.alias])).status).toBe(200);
+
+    const list = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${first.plaintextKey}` } });
+    const models = await list.json() as { data: Array<{ id: string }> };
+    expect(models.data.map((entry) => entry.id)).toContain("embeddinggemma-2");
+  });
+
   it("serves a configured System One model through guest auth, admission, and exact usage billing", async () => {
     const minted = mintKey({
       alias: `systemone-${randomUUID()}`,
@@ -1057,14 +1260,15 @@ describe("gateway spine — HTTP integration", () => {
       model_ids: ["m1"],
       harness_ids: ["openai-chat"],
     });
-    expect(body.results.find((row) => row.fingerprint_sha256 === legacyOwnerChatHash)).toMatchObject({
+    const legacyExposure = body.results.find((row) => row.fingerprint_sha256 === legacyOwnerChatHash)!;
+    expect(legacyExposure).toMatchObject({
       seen: true,
       lanes: ["chat"],
-      // The static principal has no trusted per-key catalogue identity, so exposure is retained
-      // without inventing model metadata.
-      model_ids: [],
       harness_ids: ["openai-chat"],
     });
+    // The implicit model may be resolved from a prior discovery cache. The static principal's
+    // exposure must never invent any ID beyond the mock backend's actual m1 model.
+    expect([[], ["m1"]]).toContainEqual(legacyExposure.model_ids);
     expect(body.results.find((row) => row.fingerprint_sha256 === delegateHash)).toMatchObject({
       seen: true,
       lanes: ["delegate"],

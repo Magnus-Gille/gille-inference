@@ -25,6 +25,7 @@ import {
   revokeKey,
   listKeys,
   grantSystemOneModelToKeys,
+  grantEmbeddingModelToCustomerKeys,
   grantExistingChatModelToCustomerKeys,
   redeemInvite,
   reserveCredits,
@@ -36,6 +37,7 @@ import {
   InvalidParamError,
   InvalidScopeError,
   InvalidSystemOneGrantError,
+  InvalidEmbeddingGrantError,
   InvalidExistingChatModelGrantError,
   KeyLifetimePolicyError,
   type KeyScope,
@@ -87,6 +89,8 @@ import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
+import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
+  embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
 import {
   startImageWorker,
@@ -187,6 +191,7 @@ interface PrincipalContext {
   isMonitor?: boolean;
   modelAllowList: string[];
   systemOneModelAllowList: string[];
+  embeddingModelAllowList: string[];
   limits: QuotaLimits;
   maxParallel: number;
   /**
@@ -250,6 +255,7 @@ function resolvePrincipal(
         isAdmin: true,
         modelAllowList: [],
         systemOneModelAllowList: [],
+        embeddingModelAllowList: [],
         limits: keyLimits(cfg),
         maxParallel: cfg.keyDefaults.maxParallel,
         keyHash: null,
@@ -272,6 +278,7 @@ function resolvePrincipal(
       isMonitor: rec.scope === "monitor",
       modelAllowList: rec.modelAllowList,
       systemOneModelAllowList: rec.systemOneModelAllowList,
+      embeddingModelAllowList: rec.embeddingModelAllowList,
       limits: { rpm: rec.rpm, tpm: rec.tpm, dailyTokenBudget: rec.dailyTokenBudget },
       maxParallel: rec.maxParallel,
       keyHash: rec.keyHash,
@@ -290,6 +297,7 @@ function resolvePrincipal(
       isAdmin: true,
       modelAllowList: [],
       systemOneModelAllowList: [],
+      embeddingModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -308,6 +316,7 @@ function resolvePrincipal(
       isAdmin: false,
       modelAllowList: [],
       systemOneModelAllowList: [],
+      embeddingModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -329,6 +338,7 @@ function resolvePrincipal(
       isMonitor: true,
       modelAllowList: [],
       systemOneModelAllowList: [],
+      embeddingModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -351,6 +361,9 @@ function keyLimits(cfg: HomeserverConfig): QuotaLimits {
 // ─── Per-key in-flight tracking ──────────────────────────────────────────────────────
 
 const keyInflight = new Map<string, number>();
+// One CPU embedding call per gateway instance matches the sidecar's single server slot and
+// prevents queued sidecar calls from occupying every shared GPU admission slot.
+const embeddingInFlight = new WeakSet<AdmissionController>();
 
 function incInflight(alias: string): void {
   keyInflight.set(alias, (keyInflight.get(alias) ?? 0) + 1);
@@ -986,7 +999,7 @@ async function admitAndMeterLogged(
   estTokens: number,
   lctx: LogCtx,
   handler: () => Promise<MeteredResult>,
-  systemOne = false,
+  surface: "chat" | "systemone" | "embedding" = "chat",
 ): Promise<void> {
   // Lifetime credit cap (non-resetting). Refuse BEFORE any inference if the key has spent
   // its budget. Distinct from the daily-resetting quota below: this never frees up on its own.
@@ -1037,7 +1050,7 @@ async function admitAndMeterLogged(
     let admissionThrew = false;
     try {
       // Model allow-list check.
-      if (systemOne && (requestedModel === null || !systemOneGranted(principal, requestedModel))) {
+      if (surface === "systemone" && (requestedModel === null || !systemOneGranted(principal, requestedModel))) {
         releaseReserve();
         lctx.status = 403;
         lctx.outcome = "forbidden";
@@ -1047,7 +1060,17 @@ async function admitAndMeterLogged(
         finishAdmissionTrace(lctx.outcome);
         return { admitted: false as const };
       }
-      if (!systemOne && principal.modelAllowList.length > 0) {
+      if (surface === "embedding" && (requestedModel === null || !embeddingGranted(principal, requestedModel))) {
+        releaseReserve();
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
+      if (surface === "chat" && principal.modelAllowList.length > 0) {
         if (requestedModel === null) {
           releaseReserve();
           lctx.status = 403;
@@ -1300,9 +1323,118 @@ function systemOneGranted(principal: PrincipalContext, modelId: string): boolean
     (principal.tier === "owner" && principal.modelAllowList.length === 0);
 }
 
+function embeddingGranted(principal: PrincipalContext, modelId: string): boolean {
+  // An empty guest chat allow-list does not grant a newly staged embedding model.
+  return principal.embeddingModelAllowList.includes(modelId) || principal.modelAllowList.includes(modelId) ||
+    (principal.tier === "owner" && principal.modelAllowList.length === 0);
+}
+
 function modelVisibleInDiscovery(modelId: string, cfg: HomeserverConfig, principal: PrincipalContext): boolean {
+  if (isEmbeddingModel(modelId)) {
+    return cfg.embeddingModels.includes(modelId) && embeddingGranted(principal, modelId);
+  }
   if (!isSystemOneDecisionModel(modelId, cfg.systemOneModels)) return true;
   return cfg.systemOneModels.includes(modelId) && systemOneGranted(principal, modelId);
+}
+
+async function embeddingSidecarReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
+  if (!cfg.embeddingModels.includes(EMBEDDING_MODEL_ID) || cfg.embeddingBaseUrl === "") return false;
+  try {
+    const response = await fetch(`${cfg.embeddingBaseUrl}/models`, {
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(2_000), signal]) : AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return false;
+    }
+    const payload = await response.json() as unknown;
+    return typeof payload === "object" && payload !== null &&
+      Array.isArray((payload as { data?: unknown }).data) &&
+      (payload as { data: unknown[] }).data.some((entry) =>
+        typeof entry === "object" && entry !== null &&
+        (entry as { id?: unknown }).id === EMBEDDING_MODEL_ID);
+  } catch {
+    return false;
+  }
+}
+
+async function handleEmbeddingProxy(
+  request: EmbeddingRequest,
+  res: ServerResponse,
+  cfg: HomeserverConfig,
+  lctx: LogCtx,
+): Promise<MeteredResult> {
+  if (cfg.embeddingBaseUrl === "" || !cfg.embeddingModels.includes(request.model)) {
+    lctx.status = 400;
+    lctx.outcome = "bad_request";
+    lctx.errorClass = "model_not_found";
+    sendError(res, makeError("model_not_found", { param: "model" }));
+    return modelNotFoundResult();
+  }
+  const clientGone = new AbortController();
+  let clientAborted = false;
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientAborted = true;
+      clientGone.abort();
+    }
+  });
+  try {
+    if (!await embeddingSidecarReady(cfg, clientGone.signal)) {
+      if (clientAborted) {
+        lctx.status = 499;
+        lctx.outcome = "client_closed";
+        lctx.errorClass = "client_closed";
+        return ZERO_RESULT;
+      }
+      lctx.status = 502;
+      lctx.outcome = "upstream_unavailable";
+      lctx.errorClass = "upstream_unavailable";
+      sendError(res, makeError("upstream_unavailable"));
+      return ZERO_RESULT;
+    }
+    const upstream = await fetch(`${cfg.embeddingBaseUrl}/embeddings`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
+      body: JSON.stringify(request.upstreamBody),
+      signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
+    });
+    if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => undefined);
+      const invalidInput = upstream.status === 400 || upstream.status === 413;
+      const unknownModel = upstream.status === 404;
+      lctx.status = invalidInput ? upstream.status : unknownModel ? 400 : 502;
+      lctx.outcome = invalidInput || unknownModel ? "bad_request" : "upstream_unavailable";
+      const code = unknownModel ? "model_not_found" : upstream.status === 413 ? "payload_too_large" :
+        invalidInput ? "invalid_request_error" : "upstream_unavailable";
+      lctx.errorClass = code;
+      sendError(res, makeError(code));
+      return ZERO_RESULT;
+    }
+    const shaped = validateAndShapeEmbeddingResponse(await upstream.json() as unknown, request);
+    sendJson(res, 200, shaped.body);
+    lctx.status = 200;
+    lctx.outcome = "ok";
+    return { totalTokens: shaped.inputTokens, promptTokens: shaped.inputTokens, completionTokens: 0,
+      canonicalModel: request.model, ttftMs: null };
+  } catch (err) {
+    if (clientAborted) {
+      lctx.status = 499;
+      lctx.outcome = "client_closed";
+      lctx.errorClass = "client_closed";
+      return ZERO_RESULT;
+    }
+    const kind = classifyUpstreamError(err);
+    if (kind !== "upstream_timeout" && kind !== "upstream_unavailable" &&
+      !(err instanceof SyntaxError) && !(err instanceof EmbeddingResponseError)) throw err;
+    lctx.status = kind === "upstream_timeout" ? 504 : 502;
+    lctx.outcome = kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable";
+    lctx.errorClass = lctx.outcome;
+    sendError(res, makeError(kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable", {
+      ...(kind === "upstream_timeout" ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {}),
+    }));
+    return ZERO_RESULT;
+  }
 }
 
 async function handleSystemOneProxy(
@@ -3648,6 +3780,10 @@ async function handleSystemOneKeyGrant(req: IncomingMessage, res: ServerResponse
   try {
     body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
   } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendError(res, makeError("payload_too_large"));
+      return;
+    }
     if (!(err instanceof SyntaxError)) throw err;
     sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
     return;
@@ -3665,6 +3801,40 @@ async function handleSystemOneKeyGrant(req: IncomingMessage, res: ServerResponse
   } catch (err) {
     if (!(err instanceof InvalidSystemOneGrantError)) throw err;
     sendError(res, makeError("invalid_request_error", { message: "Unknown model or inactive, duplicate, or missing key alias." }));
+  }
+}
+
+async function handleEmbeddingKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendError(res, makeError("payload_too_large"));
+      return;
+    }
+    if (!(err instanceof SyntaxError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((key) => key !== "model" && key !== "aliases") ||
+      !isEmbeddingModel(body["model"] as string) || !Array.isArray(body["aliases"]) ||
+      body["aliases"].length === 0 || body["aliases"].length > 128 ||
+      body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
+    sendError(res, makeError("invalid_request_error", {
+      message: "Require the reviewed embedding model and 1–128 customer key aliases.",
+    }));
+    return;
+  }
+  try {
+    const result = grantEmbeddingModelToCustomerKeys(body["aliases"] as string[], body["model"] as string);
+    sendJson(res, 200, { model: body["model"], ...result });
+  } catch (err) {
+    if (!(err instanceof InvalidEmbeddingGrantError)) throw err;
+    sendError(res, makeError("invalid_request_error", {
+      message: "Unknown model or inactive, duplicate, non-customer, or missing key alias.",
+    }));
   }
 }
 
@@ -4901,7 +5071,59 @@ export async function handleRequest(
       // Reserve full context(s); reconcile exact successful usage after the call.
       const estimatedTokens = systemOneTokenReservation(parsed);
       await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, estimatedTokens, lctx,
-        () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), true);
+        () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), "systemone");
+      return;
+    }
+    if (path === "/v1/embeddings" && method === "POST") {
+      res.setHeader("Cache-Control", "no-store");
+      let parsed: EmbeddingRequest;
+      try {
+        parsed = parseEmbeddingBody(await readBody(req, 32 * 1024));
+      } catch (err) {
+        if (!(err instanceof EmbeddingRequestError) && !(err instanceof BodyTooLargeError)) throw err;
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", {
+          ...(!tooLarge ? { param: err.param, message: err.message } : {}),
+        }));
+        return;
+      }
+      if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "model_not_found";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_found", { param: "model" }));
+        return;
+      }
+      if (!embeddingGranted(principal, parsed.model)) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        return;
+      }
+      lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
+      if (embeddingInFlight.has(controller)) {
+        lctx.status = 503;
+        lctx.outcome = "busy";
+        lctx.errorClass = "server_busy";
+        lctx.retryAfterS = cfg.busyRetryAfterSeconds;
+        lctx.admission = "busy";
+        sendError(res, makeError("server_busy", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
+        return;
+      }
+      embeddingInFlight.add(controller);
+      try {
+        await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
+          embeddingTokenReservation(parsed), lctx,
+          () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
+      } finally {
+        embeddingInFlight.delete(controller);
+      }
       return;
     }
     if (path === "/v1/chat/completions" && method === "POST") {
@@ -4913,7 +5135,8 @@ export async function handleRequest(
         if (chatModel === null) {
           try {
             chatModel = (await listModels()).find((candidate) =>
-              !isSystemOneDecisionModel(candidate.key, cfg.systemOneModels))?.key;
+              !isSystemOneDecisionModel(candidate.key, cfg.systemOneModels) &&
+              !isEmbeddingModel(candidate.key))?.key;
           } catch {
             chatModel = null;
           }
@@ -4930,6 +5153,13 @@ export async function handleRequest(
         lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
         sendError(res, makeError("invalid_request_error", {
           param: "model", message: "Decision models use POST /v1/systemone.",
+        }));
+        return;
+      }
+      if (parsed.model !== null && isEmbeddingModel(parsed.model)) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", {
+          param: "model", message: "Embedding models use POST /v1/embeddings.",
         }));
         return;
       }
@@ -5177,8 +5407,14 @@ export async function handleRequest(
       return;
     }
     if (path === "/models" && method === "GET") {
-      sendJson(res, 200, { models: (await listModels()).filter((model) =>
-        modelVisibleInDiscovery(model.key, cfg, principal)) });
+      res.setHeader("Cache-Control", "private, no-store");
+      const models = (await listModels()).filter((model) =>
+        !isEmbeddingModel(model.key) && modelVisibleInDiscovery(model.key, cfg, principal));
+      if (embeddingGranted(principal, EMBEDDING_MODEL_ID) && await embeddingSidecarReady(cfg)) {
+        models.push({ key: EMBEDDING_MODEL_ID, type: "embedding", displayName: "EmbeddingGemma 2",
+          loaded: true, loadedContext: 8192 });
+      }
+      sendJson(res, 200, { models });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -5212,20 +5448,26 @@ export async function handleRequest(
       return;
     }
     if (path === "/v1/models" && method === "GET") {
+      res.setHeader("Cache-Control", "private, no-store");
       // OpenAI-compatible model list (so OpenAI SDKs / LiteLLM / IDE plugins that probe
       // /v1/models work). An empty allow-list includes ordinary models; decision models
       // require an explicit guest grant and an active endpoint setting.
-      const all = await listModels();
+      const all = (await listModels()).filter((model) => !isEmbeddingModel(model.key));
       const allow = principal.modelAllowList;
       const visible = all.filter((m) => {
-        if (!isSystemOneDecisionModel(m.key, cfg.systemOneModels) &&
+        if (!isSystemOneDecisionModel(m.key, cfg.systemOneModels) && !isEmbeddingModel(m.key) &&
             allow.length > 0 && !allow.includes(m.key)) return false;
         return modelVisibleInDiscovery(m.key, cfg, principal);
       });
       const data = visible.map((m) => ({
         id: m.key, object: "model", created: 0,
-        owned_by: cfg.systemOneModels.includes(m.key) ? "home-gateway-systemone" : "home-gateway",
+        owned_by: cfg.systemOneModels.includes(m.key) ? "home-gateway-systemone" :
+          isEmbeddingModel(m.key) ? "home-gateway-embedding" : "home-gateway",
       }));
+      if (embeddingGranted(principal, EMBEDDING_MODEL_ID) && await embeddingSidecarReady(cfg)) {
+        data.push({ id: EMBEDDING_MODEL_ID, object: "model", created: 0,
+          owned_by: "home-gateway-embedding" });
+      }
       // Advertise the speech-to-text model alongside the chat models (empty allow-list = visible;
       // otherwise only when the key is permitted the whisper model). So OpenAI SDKs that probe
       // /v1/models can discover the transcription endpoint's model id.
@@ -5562,6 +5804,14 @@ export async function handleRequest(
     if (path === "/admin/keys/systemone-grants" && method === "POST") {
       if (!requireAdmin()) return;
       await handleSystemOneKeyGrant(req, res);
+      lctx.status = res.statusCode;
+      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/embedding-grants" && method === "POST") {
+      if (!requireAdmin()) return;
+      await handleEmbeddingKeyGrant(req, res);
       lctx.status = res.statusCode;
       lctx.outcome = res.statusCode < 300 ? "ok" : "error";
       lctx.admission = "n/a";

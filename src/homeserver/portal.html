@@ -332,6 +332,27 @@
       They share your ordinary credits and rate limits. Published benchmark scores do not establish
       accuracy on your own task.
     </p>
+    <h3 id="embedding-models-heading" style="margin-top:16px">Embedding models</h3>
+    <p style="margin-bottom:8px;font-size:12.5px">EmbeddingGemma 2 serves customer keys that see it in their authenticated model list. Check your access before calling the API.</p>
+    <div class="model-table-scroll" role="region" aria-labelledby="embedding-models-heading" tabindex="0">
+      <table class="decision-table" aria-label="Embedding model use, API and access">
+        <thead><tr><th>Model</th><th>Use</th><th>API</th><th>Access</th></tr></thead>
+        <tbody><tr>
+          <th scope="row"><strong>EmbeddingGemma 2</strong><br><span class="mono model-id">embeddinggemma-2</span><br>by Google</th>
+          <td>Text and code vectors<br>768, 512, 256 or 128 dimensions</td>
+          <td>POST<br><span class="mono api-path">/v1/embeddings</span></td>
+          <td>Explicit key grant<br>Ordinary credits<br>Check /v1/models</td>
+        </tr></tbody>
+      </table>
+    </div>
+    <p style="margin-top:10px;font-size:12.5px">
+      The first EmbeddingGemma 2 serving path accepts text and code. Confirm that
+      <span class="badge mono">embeddinggemma-2</span> appears in your authenticated
+      <span class="badge mono">/v1/models</span> response before calling it; the runtime and your
+      key grant must both be active. It returns vectors as floats or base64 encoded Float32, not chat or typed decisions.
+      Successful calls use your ordinary input-token credits and rate limits. Image, audio and
+      video embeddings are not enabled on this endpoint.
+    </p>
     <p style="margin-top:10px;font-size:12.5px">
       The existing <span class="badge mono">qwen3-30b-instruct</span> model is for ordinary chat.
       It is not a native System One
@@ -511,6 +532,21 @@
           Decision models return typed decisions, not chat text. Up to 16 questions and 8&nbsp;KiB of
           text/JSON request data per call; images and streaming are not enabled here. Successful
           calls use input-token credits. This is a separate endpoint from chat completions.
+        </p>
+
+        <p><strong>Text or code embeddings (after model-list check):</strong></p>
+        <pre>curl https://inference.example.com/v1/embeddings \
+  -H "Authorization: Bearer $HS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"embeddinggemma-2","input":"title: none | text: A short document","dimensions":256}'</pre>
+        <p>
+          The response is OpenAI-shaped: <span class="badge mono">data[0].embedding</span> is a
+          normalized numeric vector. Use the same dimension for stored documents and queries,
+          with the appropriate prefix for each. Supported dimensions are 128, 256, 512 and 768; 768 is the
+          default. For retrieval, Google's model card recommends a query prefix
+          <span class="badge mono">task: search result | query: </span> and a document prefix
+          <span class="badge mono">title: none | text: </span>. Up to 16 text inputs may be sent in
+          one call. Successful calls use input-token credits; failed calls cost zero.
         </p>
 
         <p><strong>Learning-task capability preflight (automation clients):</strong></p>

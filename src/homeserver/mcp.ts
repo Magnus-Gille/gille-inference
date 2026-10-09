@@ -40,6 +40,7 @@ import type { KeyScope } from "./keystore.js";
 import { deriveEvidenceIdentity } from "./orchestrator.js";
 import { currentTraceHeaders } from "./tracing.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
+import { isEmbeddingModel } from "./embedding-request.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -565,8 +566,8 @@ function strengthHint(modelKey: string): string {
 async function visibleModels(principal: McpPrincipal, cfg: HomeserverConfig): Promise<string[]> {
   const allow = principal.modelAllowList;
   const configured = cfg.systemOneModels;
-  if (allow.length > 0) return allow.filter((id) => !isSystemOneDecisionModel(id, configured));
-  return (await listModels()).map((m) => m.key).filter((id) => !isSystemOneDecisionModel(id, configured));
+  if (allow.length > 0) return allow.filter((id) => !isSystemOneDecisionModel(id, configured) && !isEmbeddingModel(id));
+  return (await listModels()).map((m) => m.key).filter((id) => !isSystemOneDecisionModel(id, configured) && !isEmbeddingModel(id));
 }
 
 // ─── Shared metered chat path (used by BOTH the MCP `ask` tool and, ideally, /v1) ──────
@@ -898,6 +899,16 @@ export async function runChatCompletion(
       ok: false,
       code: "model_not_allowed",
       message: "Decision models use POST /v1/systemone instead of MCP ask.",
+      traceOutcome: "bad_request",
+      traceErrorClass: "model_not_allowed",
+    };
+  }
+  if (isEmbeddingModel(args.model)) {
+    logInferenceFailure(400, "bad_request", "model_not_allowed", "n/a");
+    return {
+      ok: false,
+      code: "model_not_allowed",
+      message: "Embedding models use POST /v1/embeddings instead of MCP ask.",
       traceOutcome: "bad_request",
       traceErrorClass: "model_not_allowed",
     };
