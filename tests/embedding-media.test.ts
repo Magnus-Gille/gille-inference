@@ -194,5 +194,10 @@ describe("embedding media input", () => {
     expect(() => parseEmbeddingMediaInput([{ content: [{ type: "image_url", image_url: {
       url: dataUri("image/jpeg", Buffer.from(jpeg, "base64").subarray(0, -2).toString("base64")),
     } }] }])).toThrow(EmbeddingMediaError);
+    const truncatedVersionOne = Buffer.from(mp4(), "base64");
+    truncatedVersionOne[truncatedVersionOne.indexOf("mvhd") + 4] = 1;
+    expect(() => parseEmbeddingMediaInput([{ content: [{ type: "input_video", input_video: {
+      data: truncatedVersionOne.toString("base64"), format: "mp4",
+    } }] }])).toThrow(EmbeddingMediaError);
   });
 });

@@ -76,6 +76,7 @@ function validatePng(bytes: Buffer): void {
     const checksum = bytes.readUInt32BE(dataStart + length);
     const checksumInput = Buffer.concat([Buffer.from(type, "ascii"), chunkData]);
     if (crc32(checksumInput) !== checksum) invalid();
+    if (!foundHeader && type !== "IHDR") invalid();
     if (type === "IHDR") {
       if (foundHeader || length !== 13) invalid();
       width = bytes.readUInt32BE(dataStart);
