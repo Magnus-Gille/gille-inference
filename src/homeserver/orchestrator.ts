@@ -31,6 +31,7 @@ import {
 } from "./shadow-lane.js";
 import type { HomeserverConfig } from "./config.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
+import { isEmbeddingModel } from "./embedding-request.js";
 import { recordTaskExposureBestEffort } from "./task-exposure.js";
 import type { HuginRequestStamp } from "./learning-task-contract.js";
 import {
@@ -590,10 +591,11 @@ export function resolveTaskType(task: { taskType?: string; prompt: string }): st
 
 /** Get the model id to delegate to: explicit override, else first eligible loaded LLM. */
 export async function currentModel(override?: string, excludedModels: readonly string[] = []): Promise<string | null> {
-  if (override) return isSystemOneDecisionModel(override, excludedModels) ? null : override;
+  if (override) return isSystemOneDecisionModel(override, excludedModels) || isEmbeddingModel(override) ? null : override;
   try {
     const loaded = await getLoaded();
-    return loaded.find((model) => !isSystemOneDecisionModel(model.key, excludedModels))?.key ?? null;
+    return loaded.find((model) => !isSystemOneDecisionModel(model.key, excludedModels) &&
+      !isEmbeddingModel(model.key))?.key ?? null;
   } catch (err) {
     // A backend failure (not a genuine "no model loaded") must be visible — silently returning null
     // is exactly what hid the lmstudio-admin /api/v1/models 404 and made the router escalate everything.

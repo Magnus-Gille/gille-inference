@@ -20,16 +20,20 @@ const servedModelIds = [
 ] as const;
 
 describe("production roster documentation", () => {
-  it("advertises the verified 12-model roster in both operator-facing truth surfaces", () => {
+  it("advertises the verified 12 chat and 3 decision models in both operator-facing truth surfaces", () => {
     const portalRoster = portal.match(/WHAT'S RUNNING[\s\S]*?NEW MODEL EVALUATIONS/)?.[0] ?? "";
     const readmeRoster = readme.match(/### Production text roster[\s\S]*?## Coordinating heavy GPU jobs/)?.[0] ?? "";
 
     expect(portalRoster).not.toBe("");
     expect(readmeRoster).not.toBe("");
-    expect(readmeRoster).toContain("one of twelve text models");
+    expect(readmeRoster).toContain("15 entries: the twelve chat models");
     for (const modelId of servedModelIds) {
       expect(portalRoster, `portal roster is missing ${modelId}`).toContain(modelId);
       expect(readmeRoster, `homeserver README roster is missing ${modelId}`).toContain(modelId);
+    }
+    for (const modelId of ["clef-flash", "bespoke-nimble-9b", "pplx-decider-v1-27b"]) {
+      expect(portalRoster).toContain(modelId);
+      expect(readmeRoster).toContain(modelId);
     }
   });
 
@@ -41,15 +45,23 @@ describe("production roster documentation", () => {
     expect(readme).not.toContain("weekly Model Scout");
   });
 
-  it("documents Clef as conditionally granted System One access", () => {
-    const clefRosterCopy = readme.match(/The `clef-flash` System One decision model[\s\S]*?automatic delegation[^\n]*\./)?.[0] ?? "";
+  it("documents System One and EmbeddingGemma as conditionally granted typed access", () => {
+    const clefRosterCopy = readme.match(/The `clef-flash`, `bespoke-nimble-9b`, and `pplx-decider-v1-27b` System One decision models[\s\S]*?automatic delegation[^\n]*\./)?.[0] ?? "";
 
     expect(clefRosterCopy).toContain("Customer");
     expect(clefRosterCopy).toContain("explicit grant");
     expect(clefRosterCopy).toContain("authenticated `GET /v1/models`");
-    expect(clefRosterCopy).toContain("until it appears, it is unavailable");
+    expect(clefRosterCopy).toContain("before calling");
     expect(clefRosterCopy).toContain("`POST /v1/systemone`");
-    expect(clefRosterCopy).toContain("near `1` means yes and near `0` means no");
+    expect(clefRosterCopy.replace(/\s+/g, " ")).toContain("near `1` means yes and near `0` means no");
     expect(clefRosterCopy).toContain("not chat text");
+    const embeddingCopy = readme.match(/`embeddinggemma-2` is a separate embedding service[\s\S]*?customer-facing availability check\./)?.[0] ?? "";
+    expect(embeddingCopy).toContain("available only when");
+    expect(embeddingCopy).toContain("explicit customer key grant");
+    expect(embeddingCopy).toContain("BF16 GGUF");
+    expect(portal).toContain("EmbeddingGemma 2 serves customer keys that see it in their authenticated model list");
+    expect(portal).toContain("Check /v1/models");
+    expect(portal).not.toContain("Planned: EmbeddingGemma 2");
+    expect(portal).toContain("/v1/embeddings");
   });
 });

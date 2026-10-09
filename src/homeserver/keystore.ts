@@ -2,6 +2,7 @@ import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import type Database from "better-sqlite3";
 import { closeReadOnlyDb, getDb, openReadOnlyDb } from "../db.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
+import { isEmbeddingModel } from "./embedding-request.js";
 
 /**
  * Per-key auth store.
@@ -46,6 +47,8 @@ export interface ApiKeyRecord {
   modelAllowList: string[]; // [] = all models allowed
   /** Explicit decision-model grants; [] = no System One access for guests. */
   systemOneModelAllowList: string[];
+  /** Explicit embedding-model grants; [] = no embedding access for guests. */
+  embeddingModelAllowList: string[];
   rpm: number;
   tpm: number;
   dailyTokenBudget: number; // 0 = unlimited
@@ -81,6 +84,7 @@ export interface MintOptions {
   scope?: KeyScope;
   modelAllowList?: string[];
   systemOneModelAllowList?: string[];
+  embeddingModelAllowList?: string[];
   rpm?: number;
   tpm?: number;
   dailyTokenBudget?: number;
@@ -144,6 +148,13 @@ export class InvalidSystemOneGrantError extends Error {
   constructor() {
     super("unknown decision model or missing, duplicate, revoked, or expired key alias");
     this.name = "InvalidSystemOneGrantError";
+  }
+}
+
+export class InvalidEmbeddingGrantError extends Error {
+  constructor() {
+    super("unknown embedding model or missing, duplicate, non-customer, revoked, or expired key alias");
+    this.name = "InvalidEmbeddingGrantError";
   }
 }
 
@@ -213,6 +224,7 @@ function ensureSchema(db: Database.Database): void {
       scope              TEXT,
       model_allow_list   TEXT NOT NULL DEFAULT '[]',
       system_one_model_allow_list TEXT NOT NULL DEFAULT '[]',
+      embedding_model_allow_list TEXT NOT NULL DEFAULT '[]',
       rpm                INTEGER NOT NULL,
       tpm                INTEGER NOT NULL,
       daily_token_budget INTEGER NOT NULL DEFAULT 0,
@@ -272,6 +284,9 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("system_one_model_allow_list")) {
       db.exec(`ALTER TABLE api_keys ADD COLUMN system_one_model_allow_list TEXT NOT NULL DEFAULT '[]'`);
     }
+    if (!names.has("embedding_model_allow_list")) {
+      db.exec(`ALTER TABLE api_keys ADD COLUMN embedding_model_allow_list TEXT NOT NULL DEFAULT '[]'`);
+    }
     // The index backs rotateKey's family lookup (no full scan under the write lock). Created
     // UNCONDITIONALLY (IF NOT EXISTS) — NOT only alongside the column-add — so a DB that already
     // has the column but is missing the index (partial/manual migration) still gets it. (Codex #99.)
@@ -328,6 +343,7 @@ interface KeyRow {
   scope: string | null;
   model_allow_list: string;
   system_one_model_allow_list: string;
+  embedding_model_allow_list: string;
   rpm: number;
   tpm: number;
   daily_token_budget: number;
@@ -351,6 +367,7 @@ function rowToRecord(r: KeyRow): ApiKeyRecord {
     scope: storedScope(tier, r.scope),
     modelAllowList: JSON.parse(r.model_allow_list) as string[],
     systemOneModelAllowList: JSON.parse(r.system_one_model_allow_list) as string[],
+    embeddingModelAllowList: JSON.parse(r.embedding_model_allow_list ?? "[]") as string[],
     rpm: r.rpm,
     tpm: r.tpm,
     dailyTokenBudget: r.daily_token_budget,
@@ -395,6 +412,13 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
           typeof model !== "string" || !isSystemOneDecisionModel(model, [])))) {
     throw new InvalidSystemOneGrantError();
   }
+  if (opts.embeddingModelAllowList !== undefined &&
+      (!Array.isArray(opts.embeddingModelAllowList) ||
+        new Set(opts.embeddingModelAllowList).size !== opts.embeddingModelAllowList.length ||
+        opts.embeddingModelAllowList.some((model) =>
+          typeof model !== "string" || !isEmbeddingModel(model)))) {
+    throw new InvalidEmbeddingGrantError();
+  }
   // Reject non-integer / negative numeric limits BEFORE touching the DB. A negative
   // creditLimit is the dangerous case (it would read as "unlimited" in isCreditExhausted).
   assertNonNegativeInt("creditLimit", opts.creditLimit);
@@ -426,6 +450,7 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
     scope,
     modelAllowList: opts.modelAllowList ?? [],
     systemOneModelAllowList: opts.systemOneModelAllowList ?? [],
+    embeddingModelAllowList: opts.embeddingModelAllowList ?? [],
     rpm: opts.rpm ?? defaults.rpm,
     tpm: opts.tpm ?? defaults.tpm,
     dailyTokenBudget: opts.dailyTokenBudget ?? defaults.dailyTokenBudget,
@@ -443,11 +468,11 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
   try {
     db.prepare(
       `INSERT INTO api_keys
-         (alias, key_hash, tier, scope, model_allow_list, system_one_model_allow_list, rpm, tpm, daily_token_budget,
+         (alias, key_hash, tier, scope, model_allow_list, system_one_model_allow_list, embedding_model_allow_list, rpm, tpm, daily_token_budget,
           max_parallel, credit_limit, credits_used, expires_at, created_at, revoked_at, logical_alias,
           last_used_at, use_count)
        VALUES
-         (@alias, @keyHash, @tier, @scope, @modelAllowList, @systemOneModelAllowList, @rpm, @tpm, @dailyTokenBudget,
+         (@alias, @keyHash, @tier, @scope, @modelAllowList, @systemOneModelAllowList, @embeddingModelAllowList, @rpm, @tpm, @dailyTokenBudget,
           @maxParallel, @creditLimit, @creditsUsed, @expiresAt, @createdAt, @revokedAt, @logicalAlias,
           @lastUsedAt, @useCount)`
     ).run({
@@ -457,6 +482,7 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
       scope: record.scope,
       modelAllowList: JSON.stringify(record.modelAllowList),
       systemOneModelAllowList: JSON.stringify(record.systemOneModelAllowList),
+      embeddingModelAllowList: JSON.stringify(record.embeddingModelAllowList),
       rpm: record.rpm,
       tpm: record.tpm,
       dailyTokenBudget: record.dailyTokenBudget,
@@ -645,6 +671,7 @@ export function rotateKey(
         scope,
         modelAllowList: opts.modelAllowList ?? current?.modelAllowList,
         systemOneModelAllowList: opts.systemOneModelAllowList ?? current?.systemOneModelAllowList,
+        embeddingModelAllowList: opts.embeddingModelAllowList ?? current?.embeddingModelAllowList,
         rpm: opts.rpm ?? current?.rpm,
         tpm: opts.tpm ?? current?.tpm,
         dailyTokenBudget: opts.dailyTokenBudget ?? current?.dailyTokenBudget,
@@ -800,6 +827,7 @@ export function stageKeyRotation(
         scope,
         modelAllowList: opts.modelAllowList ?? current.modelAllowList,
         systemOneModelAllowList: opts.systemOneModelAllowList ?? current.systemOneModelAllowList,
+        embeddingModelAllowList: opts.embeddingModelAllowList ?? current.embeddingModelAllowList,
         rpm: opts.rpm ?? current.rpm,
         tpm: opts.tpm ?? current.tpm,
         dailyTokenBudget: opts.dailyTokenBudget ?? current.dailyTokenBudget,
@@ -1031,6 +1059,43 @@ export function grantSystemOneModelToKeys(
       }
       db.prepare(`UPDATE api_keys SET system_one_model_allow_list = ? WHERE alias = ?`)
         .run(JSON.stringify([...grants, model]), alias);
+      changed.push(alias);
+    }
+    return { changed, unchanged };
+  })();
+}
+
+/** Atomically add one reviewed embedding model to exact active customer keys. */
+export function grantEmbeddingModelToCustomerKeys(
+  aliases: string[], model: string, now: Date = new Date()
+): { changed: string[]; unchanged: string[] } {
+  if (!isEmbeddingModel(model) || aliases.length === 0 ||
+      new Set(aliases).size !== aliases.length ||
+      aliases.some((alias) => typeof alias !== "string" || alias.length === 0)) {
+    throw new InvalidEmbeddingGrantError();
+  }
+  const db = ksDb();
+  return db.transaction(() => {
+    const changed: string[] = [];
+    const unchanged: string[] = [];
+    for (const alias of aliases) {
+      const row = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(alias) as KeyRow | undefined;
+      if (!row || row.revoked_at !== null ||
+          (row.expires_at !== null && row.expires_at <= now.toISOString())) {
+        throw new InvalidEmbeddingGrantError();
+      }
+      const key = rowToRecord(row);
+      if (key.tier !== "guest" || key.scope !== "inference") throw new InvalidEmbeddingGrantError();
+      const staged = db.prepare(
+        `SELECT 1 FROM key_rotation_plans WHERE logical_alias = ? AND status = 'staged' LIMIT 1`
+      ).get(key.logicalAlias ?? key.alias);
+      if (staged) throw new InvalidEmbeddingGrantError();
+      if (key.embeddingModelAllowList.includes(model)) {
+        unchanged.push(alias);
+        continue;
+      }
+      db.prepare(`UPDATE api_keys SET embedding_model_allow_list = ? WHERE alias = ?`)
+        .run(JSON.stringify([...key.embeddingModelAllowList, model]), alias);
       changed.push(alias);
     }
     return { changed, unchanged };
