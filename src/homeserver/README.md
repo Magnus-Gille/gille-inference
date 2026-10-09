@@ -166,7 +166,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the historical manual model-evaluation registry (`model-registry.ts`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. Prompt caching is server-owned and forced on for the ordinary exact-common-prefix path; client-supplied `id_slot` and `n_cache_reuse` are stripped so one principal cannot select a shared slot or alter the reviewed cache policy. A changed message/file prefix naturally diverges and its suffix is re-evaluated; the gateway stores no repository path or prompt cache. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
 | `POST /v1/systemone` | user | Typed `noul`/`choice`/`score` decisions for explicitly configured llama-swap models (`HOMESERVER_SYSTEMONE_MODELS`); text or JSON-object state, 1–16 questions, 8 KiB body cap, no images/streaming/keep-alive. Guest keys need an explicit model grant, even when their ordinary chat allow-list is empty. Shares lifetime credits, quotas, GPU and host-memory admission with chat. Charges successful `usage.input_tokens`; failures charge zero. Decision models cannot be called through chat or MCP `ask`. See [customer contract](../../docs/systemone-customer-access.md). |
-| `POST /v1/embeddings` | user | OpenAI-shaped text/code embeddings for explicitly enabled `embeddinggemma-2` (`HOMESERVER_EMBEDDING_MODELS`). Accepts one string or 1–16 strings, at most 32 KiB JSON, `encoding_format: "float"` or `"base64"`, optional `user`, and optional `dimensions` 128/256/512/768. Vectors are validated and L2-normalized after any truncation. Guest keys require an explicit embedding grant or exact ID in their restricted ordinary allow-list; an empty ordinary allow-list alone does not grant access. Shares admission, quotas and ordinary credits with chat; successful `usage.prompt_tokens` is charged, failures zero. Embedding models are excluded from chat, MCP `ask`, and automatic delegation. Text/code only; no projector or media input. |
+| `POST /v1/embeddings` | user | OpenAI-shaped EmbeddingGemma 2 vectors for explicitly enabled `embeddinggemma-2` (`HOMESERVER_EMBEDDING_MODELS`). Text accepts one string or 1–16 strings and at most 32 KiB JSON. When `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` is activated with a verified projector, bounded wrapped text/image/audio/video inputs are also accepted (8 MiB JSON cap; contract below). `encoding_format` is `float` or `base64`; optional `user` and `dimensions` 128/256/512/768. Vectors are validated and L2-normalized after truncation. Guest keys require an explicit embedding grant or exact ID in their restricted ordinary allow-list. Shares admission, quotas and ordinary credits with chat; successful `usage.prompt_tokens` is charged, failures zero. Embedding models are excluded from chat, MCP `ask`, and automatic delegation. |
 | `GET /v1/capabilities/learning-task` | user | **LearningTaskContract v1 preflight.** Returns the closed four-feature capability advertisement, `service:gille-inference` identity, exact observation/expiry clocks, and an opaque advertisement ID bound to the current process/configuration epoch (`Cache-Control: private, max-age=900`). Hugin must carry this exact fresh response for every new stamped `/delegate` or `code_loop_start` claim; stale, downgraded, cross-principal, or cross-epoch new claims fail closed. Exact authenticated durable admission recovery remains available after expiry/restart without executing new work. |
 | `POST /v1/roster-proposals` | minted logical `service:hugin` owner | Content-blind roster-proposal validation and durable admission only. This rotation-family credential is route-scoped before generic owner dispatch and receives `403` everywhere except proposal submit and exact own-read. No apply/re-arm/widen/model-admin operation. Production rejects until the atomic five-state roster observer, common provider fence/mutator lock, and all restore/template/canary registries are configured; see `docs/roster-proposal-contract.md`. |
 | `GET /v1/roster-proposals/:proposalId` | owner | Principal-scoped durable proposal read; no list surface. |
@@ -730,9 +730,10 @@ rotation or credit reset. A customer should call it through `/v1/chat/completion
 same ordinary credits and quotas.
 
 `embeddinggemma-2` is a separate embedding service, available only when its compatible CPU
-sidecar, gateway release, and explicit customer key grant are verified. Its
-first serving contract is text/code only, using the 768-dimensional BF16 GGUF without the
-multimodal projector. The gateway accepts 128/256/512/768 output dimensions and normalizes
+sidecar, gateway release, and explicit customer key grant are verified. The initial serving
+contract uses the BF16 GGUF for text/code only. A separate `HOMESERVER_EMBEDDING_MEDIA_ENABLED` flag defaults to
+false; enable it only after an immutable projector installation and real image/audio/video probes.
+The gateway accepts 128/256/512/768 output dimensions and normalizes
 after truncation. Google's documented retrieval prefixes distinguish queries (`task: search result | query: `)
 from documents (`title: none | text: `). The non-deployable service template is
 `deploy/systemd/gille-embeddinggemma2.service`; its runtime and model placeholders must be resolved
@@ -747,20 +748,18 @@ Before enabling it, include up to 8 GiB of sidecar growth in the host-memory res
 chat loads and verify real headroom. Embedding calls still use ordinary gateway admission and can
 occupy an inflight slot. Only one embedding call per gateway instance may be in flight; concurrent
 calls receive a retryable 503 without a credit charge. A public template does not prove deployment.
-The proposed text GGUF is `ggml-org/embeddinggemma-2-GGUF` revision
+The pinned GGUF is `ggml-org/embeddinggemma-2-GGUF` revision
 `bfcd298762cc34d0357ece5ebdd31791a3a374d8`, file `embeddinggemma-2-BF16.gguf`
 (557,950,176 bytes, SHA-256 `68bae29d62fb8c7d23e98d21fd4662753ddd636e6b62b8a70dfe059a9844f216`).
-The compatible pinned llama.cpp source revision is
-`4f92965a7bfa9e8eb6519908ff962e23c2cb7b93`; the currently installed M5 build does not
-recognize this architecture. A one-shot bounded CPU-only M5 evaluation on 2026-10-09 built that
-source against the checksum-verified GGUF and passed three synthetic embedding calls (one, one,
-and two inputs; 768 raw dimensions per vector). The evaluation launcher SHA-256 was
-`763c444d2a03ff0aca301cbfeb5e0b7e8fe01f7868694941b27b715b8c4ad832`, but upstream
-fetched UI assets through a mutable `latest` fallback. A production build must add
-`-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` to avoid that fetch and record the new exact
-launcher checksum. The evaluation cleaned up its transient artifacts and did not install a
-production sidecar. Before enabling `HOMESERVER_EMBEDDING_MODELS`, confirm the installed
-sidecar's `/v1/models` and `/v1/embeddings`, memory cap, and unaffected chat residency.
+The BF16 multimodal projector at that revision is 982,074,784 bytes,
+SHA-256 `d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766`.
+The compatible installed M5 llama.cpp source revision is
+`4f92965a7bfa9e8eb6519908ff962e23c2cb7b93`; the installed CPU launcher SHA-256 is
+`cc8c82a86e130280e8ec1ffde47890d96c5bc4e6c98e975390d90942f3d6b6d3`.
+The text sidecar and customer gateway are active from release
+`e6a86a45aa15fc4a25dd95d53746e7e944ef05a9`. A multimodal projector changes the sidecar
+unit as well as the gateway contract; installation and activation require separate exact
+production approval and real modality probes. Check memory cap and chat residency at activation.
 The portal copy in this release describes access through authenticated model discovery; deploy
 it only with the verified sidecar and gateway settings, then verify the rendered page.
 The authenticated `GET /v1/models` response is the customer-facing availability check.

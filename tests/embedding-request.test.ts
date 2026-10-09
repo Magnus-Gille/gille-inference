@@ -13,6 +13,23 @@ function request(input: unknown, extra: Record<string, unknown> = {}) {
   return parseEmbeddingBody(JSON.stringify({ model: EMBEDDING_MODEL_ID, input, ...extra }));
 }
 
+function wavSample(): string {
+  const bytes = Buffer.alloc(46);
+  bytes.write("RIFF", 0);
+  bytes.writeUInt32LE(38, 4);
+  bytes.write("WAVEfmt ", 8);
+  bytes.writeUInt32LE(16, 16);
+  bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22);
+  bytes.writeUInt32LE(8_000, 24);
+  bytes.writeUInt32LE(16_000, 28);
+  bytes.writeUInt16LE(2, 32);
+  bytes.writeUInt16LE(16, 34);
+  bytes.write("data", 36);
+  bytes.writeUInt32LE(2, 40);
+  return bytes.toString("base64");
+}
+
 function upstreamResponse(requested: ReturnType<typeof request>, data = requested.input instanceof Array
   ? requested.input.map((_, index) => ({ object: "embedding", index, embedding: Array(768).fill(1) }))
   : [{ object: "embedding", index: 0, embedding: Array(768).fill(1) }]) {
@@ -44,6 +61,20 @@ describe("embedding request contract", () => {
     expect(parsed.input).toEqual(["a", "bc"]);
     expect(embeddingTokenReservation(parsed)).toBe(131);
     expect(embeddingTokenReservation(request("a".repeat(4_001)))).toBe(4_065);
+  });
+
+  it("gates and meters a bounded typed audio input without forwarding SDK-only fields", () => {
+    const input = [{ content: [{ type: "input_audio", input_audio: { data: wavSample(), format: "wav" } }] }];
+    const raw = JSON.stringify({ model: EMBEDDING_MODEL_ID, input, user: "private-user", dimensions: 256 });
+    expect(() => parseEmbeddingBody(raw)).toThrow(EmbeddingRequestError);
+    const parsed = parseEmbeddingBody(raw, true);
+    expect(parsed.hasMedia).toBe(true);
+    expect(parsed.upstreamBody.input).toEqual([{ content: [{
+      type: "input_audio", input_audio: { data: wavSample() },
+    }] }]);
+    expect(parsed.upstreamBody).not.toHaveProperty("user");
+    expect(parsed.upstreamBody).not.toHaveProperty("dimensions");
+    expect(embeddingTokenReservation(parsed)).toBe(8192);
   });
 
   it.each([

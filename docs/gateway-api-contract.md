@@ -93,7 +93,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | PUT | `/execution-feedback/{handle}` | same minted owner-agent/admin key that ran the task | Exact organic execution usefulness (`pass`, `partial`, `redo`, `wrong`); 201 first write, 200 identical retry, 409 conflicting/ineligible write, 404 unknown/other-key handle. Separate from the reviewer overlay and routing; see [contract](execution-feedback.md). |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio/llama.cpp). The gateway forces ordinary exact-prefix prompt caching and strips client-directed `id_slot`/`n_cache_reuse`; slot/cache lifecycle remains server-owned. |
 | POST | `/v1/systemone` | owner key or guest key explicitly granted the model | Typed decision API for explicitly enabled llama-swap models. Credits, quota, GPU queue, and host-memory admission match chat; an empty guest model allow-list does not grant decision models. 8 KiB JSON body limit, text/JSON-object state, 1–16 `noul`/`choice`/`score` questions, no images or streaming. Successful upstream `usage.input_tokens` is billed; failures bill zero. See [customer contract](systemone-customer-access.md). |
-| POST | `/v1/embeddings` | owner or guest key with exact model access | OpenAI-shaped text/code vectors for enabled `embeddinggemma-2`. One string or 1–16 strings; optional `dimensions` 128/256/512/768, `encoding_format:"float"` or `"base64"`, and `user`; 32 KiB body cap. Uses ordinary admission, quota and credits; bills successful upstream `usage.prompt_tokens`, failures zero. An owner with an empty ordinary allow-list has access by default; an owner with a restricted list needs the exact model ID in that list or an explicit embedding grant. An empty ordinary guest model list does not grant embedding access. No media input, streaming, chat or MCP `ask`. |
+| POST | `/v1/embeddings` | owner or guest key with exact model access | OpenAI-shaped vectors for enabled `embeddinggemma-2`. Text: one string or 1–16 strings, 32 KiB body cap. With `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` and verified projector: bounded wrapped text/image/audio/video inputs, 8 MiB body cap (details below). Optional `dimensions` 128/256/512/768, `encoding_format:"float"` or `"base64"`, and `user`. Uses ordinary admission, quota and credits; bills successful upstream `usage.prompt_tokens`, failures zero. An owner with an empty ordinary allow-list has access by default; an owner with a restricted list needs the exact model ID or explicit embedding grant. An empty ordinary guest model list does not grant embedding access. No streaming, chat or MCP `ask`. |
 | POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
 | POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
 | POST | `/admin/models/unload` | admin scope | Unload one/all models |
@@ -119,9 +119,25 @@ key's ordinary credits. A malformed upstream response returns 502 and consumes n
 ```
 
 Google's retrieval prefixes distinguish a query (`task: search result | query: `) from a document
-(`title: none | text: `). Keep output dimensions consistent within an index. The text-only
-deployment uses the BF16 GGUF without its multimodal projector; image, audio, and video inputs
-are outside this contract. The model appears in authenticated `/v1/models` only after the
+(`title: none | text: `). Keep output dimensions consistent within an index. Media is disabled by
+default. Once the BF16 projector and `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` are activated,
+`input` may contain 1–4 objects, each with `content` of 1–4 typed parts. Each object yields one
+vector; only one video may appear in a request. Accepted parts are text, inline PNG/JPEG image
+data URI (at most 2 MiB and 2048×2048), base64 PCM WAV audio with `format:"wav"` (at most 3 MiB
+and 30 seconds), and base64 MP4 video with `format:"mp4"` (at most 4 MiB, 10 seconds and 64
+frames). Mixed text/media parts share one vector. URLs, file paths, unknown fields, malformed
+files and unsupported formats are rejected before forwarding. For example:
+
+```json
+{"model":"embeddinggemma-2","input":[{"content":[{"type":"text","text":"A red square"},{"type":"image_url","image_url":{"url":"data:image/png;base64,<PNG_BASE64>"}}]}],"dimensions":256}
+```
+
+For audio use `{ "type":"input_audio", "input_audio":{ "data":"<WAV_BASE64>", "format":"wav" } }`;
+for video use `{ "type":"input_video", "input_video":{ "data":"<MP4_BASE64>", "format":"mp4" } }`.
+The `format` field is checked by the gateway and omitted upstream. Wrapped requests reserve the model's
+8192-token context per vector against ordinary quotas and credits, then reconcile to successful
+upstream `usage.prompt_tokens`; failed requests consume zero credits. Authenticated `/v1/models`
+advertises media only when the gateway flag and sidecar modality metadata both confirm it. The model appears only after the
 dedicated CPU sidecar and gateway setting are active, its health check passes, and the caller has
 access. Customer keys need an explicit embedding grant or the exact ID in a restricted allow-list;
 owner keys with an empty ordinary model allow-list have access by default. A grant can be added to an existing open or restricted customer

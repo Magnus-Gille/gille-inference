@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig, resetConfig } from "../src/homeserver/config.js";
 
-const keys = ["HOMESERVER_EMBEDDING_MODELS", "HOMESERVER_EMBEDDING_BASE_URL"] as const;
+const keys = ["HOMESERVER_EMBEDDING_MODELS", "HOMESERVER_EMBEDDING_BASE_URL",
+  "HOMESERVER_EMBEDDING_MEDIA_ENABLED"] as const;
 const saved = new Map<string, string | undefined>();
 
 beforeEach(() => {
@@ -30,6 +31,19 @@ describe("embedding sidecar configuration", () => {
     process.env.HOMESERVER_EMBEDDING_MODELS = "embeddinggemma-2";
     process.env.HOMESERVER_EMBEDDING_BASE_URL = "http://127.0.0.1:8107/v1/";
     expect(loadConfig().embeddingBaseUrl).toBe("http://127.0.0.1:8107/v1");
+    expect(loadConfig().embeddingMediaEnabled).toBe(false);
+  });
+
+  it("requires an embedding model and exact boolean for media activation", () => {
+    process.env.HOMESERVER_EMBEDDING_MEDIA_ENABLED = "true";
+    expect(() => loadConfig()).toThrow(/requires an enabled embedding model/);
+    resetConfig();
+    process.env.HOMESERVER_EMBEDDING_MODELS = "embeddinggemma-2";
+    process.env.HOMESERVER_EMBEDDING_BASE_URL = "http://127.0.0.1:8107/v1";
+    expect(loadConfig().embeddingMediaEnabled).toBe(true);
+    resetConfig();
+    process.env.HOMESERVER_EMBEDDING_MEDIA_ENABLED = "yes";
+    expect(() => loadConfig()).toThrow(/must be true or false/);
   });
 
   it.each([

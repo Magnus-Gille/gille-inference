@@ -17,6 +17,11 @@ describe("EmbeddingGemma 2 sidecar unit", () => {
     };
 
     expect(argv).toContain("--embedding");
+    expect(argv).toContain("--mmproj");
+    expect(argv[argv.indexOf("--mmproj") + 1]).toBe("/operator-resolve/models/mmproj-embeddinggemma-2-BF16.gguf");
+    expect(argv).toContain("--no-mmproj-offload");
+    expect(argv.slice(argv.indexOf("--mmproj-device"), argv.indexOf("--mmproj-device") + 2))
+      .toEqual(["--mmproj-device", "none"]);
     const context = value("-c");
     const logicalBatch = value("-b");
     const physicalBatch = value("-ub");

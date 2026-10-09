@@ -66,7 +66,8 @@ function startUpstream(): Promise<void> {
       }
       if ((mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "embedding-error500" || mockMode === "embedding-error413" || mockMode === "embedding-stall" || mockMode === "embedding-malformed" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "embedding-list-absent" ? "other" : mockMode.startsWith("embedding-") ? "embeddinggemma-2" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash" }] }));
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "embedding-list-absent" ? "other" : mockMode.startsWith("embedding-") ? "embeddinggemma-2" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash",
+          ...(mockMode === "embedding-list" ? { architecture: { input_modalities: ["text", "image", "audio", "video"] } } : {}) }] }));
         return;
       }
       if (mockMode === "notfound") {
@@ -219,6 +220,7 @@ beforeAll(async () => {
   process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
   process.env["HOMESERVER_EMBEDDING_MODELS"] = "embeddinggemma-2";
   process.env["HOMESERVER_EMBEDDING_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
+  process.env["HOMESERVER_EMBEDDING_MEDIA_ENABLED"] = "true";
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
@@ -379,6 +381,46 @@ describe("gateway spine — HTTP integration", () => {
     const oversized = await call(scoped.plaintextKey, body);
     expect(oversized.status).toBe(413);
     expect(JSON.stringify(await oversized.json())).not.toContain("do not relay");
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("accepts bounded typed media for an existing embedding grant and charges actual successful usage", async () => {
+    mockMode = "embedding-list";
+    const portal = await (await fetch(url("/portal"))).text();
+    expect(portal).toContain("PNG/JPEG images");
+    expect(portal).toContain("remote and local URLs are rejected");
+    expect(portal).not.toContain("EMBEDDING_MEDIA_EXAMPLE");
+    const scoped = mintKey({ alias: `embedding-media-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 10_000 }, DEFAULTS);
+    const discovery = await fetch(url("/v1/models"), {
+      headers: { authorization: `Bearer ${scoped.plaintextKey}` },
+    });
+    expect(discovery.status).toBe(200);
+    const listed = await discovery.json() as { data: Array<{ id: string; architecture?: { input_modalities: string[] } }> };
+    expect(listed.data.find((item) => item.id === "embeddinggemma-2")?.architecture?.input_modalities)
+      .toEqual(["text", "image", "audio", "video"]);
+    const wav = Buffer.alloc(46);
+    wav.write("RIFF", 0); wav.writeUInt32LE(38, 4); wav.write("WAVEfmt ", 8);
+    wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(8_000, 24); wav.writeUInt32LE(16_000, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+    wav.write("data", 36); wav.writeUInt32LE(2, 40);
+    const call = (input: unknown) => fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${scoped.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input, dimensions: 256 }) });
+    const priorCalls = upstreamInferenceRequestCount;
+    const invalid = await call([{ content: [{ type: "image_url", image_url: { url: "http://example.invalid/a.png" } }] }]);
+    expect(invalid.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(priorCalls);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(0);
+    const success = await call([{ content: [{ type: "input_audio", input_audio: {
+      data: wav.toString("base64"), format: "wav",
+    } }] }]);
+    expect(success.status).toBe(200);
+    expect((await success.json() as { data: Array<{ embedding: number[] }> }).data[0]?.embedding).toHaveLength(256);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2",
+      input: [{ content: [{ type: "input_audio", input_audio: { data: wav.toString("base64") } }] }],
+      encoding_format: "float" });
     expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
   });
 

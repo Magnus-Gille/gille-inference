@@ -339,19 +339,14 @@
         <thead><tr><th>Model</th><th>Use</th><th>API</th><th>Access</th></tr></thead>
         <tbody><tr>
           <th scope="row"><strong>EmbeddingGemma 2</strong><br><span class="mono model-id">embeddinggemma-2</span><br>by Google</th>
-          <td>Text and code vectors<br>768, 512, 256 or 128 dimensions</td>
+          <td><!-- EMBEDDING_USES --></td>
           <td>POST<br><span class="mono api-path">/v1/embeddings</span></td>
           <td>Explicit key grant<br>Ordinary credits<br>Check /v1/models</td>
         </tr></tbody>
       </table>
     </div>
     <p style="margin-top:10px;font-size:12.5px">
-      The first EmbeddingGemma 2 serving path accepts text and code. Confirm that
-      <span class="badge mono">embeddinggemma-2</span> appears in your authenticated
-      <span class="badge mono">/v1/models</span> response before calling it; the runtime and your
-      key grant must both be active. It returns vectors as floats or base64 encoded Float32, not chat or typed decisions.
-      Successful calls use your ordinary input-token credits and rate limits. Image, audio and
-      video embeddings are not enabled on this endpoint.
+      <!-- EMBEDDING_DESC -->
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       The existing <span class="badge mono">qwen3-30b-instruct</span> model is for ordinary chat.
@@ -548,6 +543,7 @@
           <span class="badge mono">title: none | text: </span>. Up to 16 text inputs may be sent in
           one call. Successful calls use input-token credits; failed calls cost zero.
         </p>
+        <!-- EMBEDDING_MEDIA_EXAMPLE -->
 
         <p><strong>Learning-task capability preflight (automation clients):</strong></p>
         <pre>curl https://inference.example.com/v1/capabilities/learning-task \
