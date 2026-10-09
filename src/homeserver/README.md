@@ -738,8 +738,12 @@ from documents (`title: none | text: `). The non-deployable service template is
 `deploy/systemd/gille-embeddinggemma2.service`; its runtime and model placeholders must be resolved
 to immutable, checksum-verified artifacts under root-owned `/opt` paths. It listens only on
 loopback, uses CPU only, runs as a dedicated dynamic user without home or host-device access, and has
-an 8 GiB memory cap. It does not request a llama-swap model change;
-before enabling it, include up to 8 GiB of sidecar growth in the host-memory reserve for future
+an 8 GiB memory cap. It does not request a llama-swap model change.
+The pinned pooled embedding runtime must process each input in one physical batch, so the
+template sets both batch sizes to the 8192-token context length. A 512-token physical batch
+passed short probes but returned a server error for a longer synthetic input; the corrected
+batch size requires a fresh bounded M5 memory and long-input check before activation.
+Before enabling it, include up to 8 GiB of sidecar growth in the host-memory reserve for future
 chat loads and verify real headroom. Embedding calls still use ordinary gateway admission and can
 occupy an inflight slot. Only one embedding call per gateway instance may be in flight; concurrent
 calls receive a retryable 503 without a credit charge. A public template does not prove deployment.
