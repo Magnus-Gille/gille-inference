@@ -4,6 +4,8 @@ import {
   decideHostMemoryAdmission,
   parseHostMemoryBudgets,
   parseHostMemoryMode,
+  parseOomKillCount,
+  readOomKillCount,
   readHostMemory,
   type HostMemoryAdmissionConfig,
   type HostMemorySnapshot,
@@ -359,6 +361,34 @@ describe("readHostMemory", () => {
     const r = await readHostMemory(files({ "/proc/meminfo": "garbage" }));
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/MemTotal/);
+  });
+});
+
+describe("OOM kill counter", () => {
+  it("parses the exact cumulative oom_kill counter", () => {
+    expect(parseOomKillCount("nr_free_pages 42\noom_kill 17\n")).toBe(17);
+    expect(parseOomKillCount("oom_kill 9007199254740991\n")).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it.each([
+    "",
+    "oom_kill",
+    "oom_kill -1",
+    "oom_kill 1.5",
+    "oom_kill 9007199254740992",
+    "oom_kill 17 extra",
+    "oom_kill 17\noom_kill broken\n",
+    "oom_kill broken\noom_kill 17\n",
+  ])("rejects malformed or unsafe counter %j", (text) => {
+    expect(parseOomKillCount(text)).toBeNull();
+  });
+
+  it("reads the counter through the injected file reader", async () => {
+    await expect(readOomKillCount(async (path) => {
+      expect(path).toBe("/proc/vmstat");
+      return "oom_kill 23\n";
+    })).resolves.toBe(23);
+    await expect(readOomKillCount(async () => { throw new Error("private vmstat error"); })).resolves.toBeNull();
   });
 });
 

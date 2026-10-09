@@ -135,7 +135,7 @@ interface ModelInfo {
 Read-only, content-blind operator diagnostics. Requires an admin key or a read-only monitor
 key. A monitor response omits `lastUse.alias`; an admin response may include that safe alias
 field. The endpoint returns model identity and state, the observed TTL, a coarse residency
-classification, safe last-use metadata, and a best-effort host-memory snapshot. Host memory
+classification, safe last-use metadata, a best-effort host-memory snapshot, and resource evidence. Host memory
 includes total RAM, `MemAvailable`, free CMA, and (when DRM exposes both counters) GTT used/total
 bytes. GTT accounting is explicitly `unattributed`: these device-wide counters do not identify
 which model or process owns the memory, including when models are resident. Missing DRM counters
@@ -143,11 +143,17 @@ are `null` with `gttAccounting: "unknown"`; an unreadable host-memory snapshot r
 and `status: "unknown"`. The endpoint never returns prompts, responses, tokens, keys, key hashes,
 raw backend commands, backend addresses/IPs, or other content-bearing or credential-bearing fields.
 
-**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory }` when the model
+**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory, "resourceEvidence": ResourceEvidence }` when the model
 snapshot is available. An unknown host-memory observation is returned inside `hostMemory` with
-null values, without making model residency unavailable.
+null values, without making model residency unavailable. The additive `resourceEvidence` object
+reports the configured host-memory admission mode and a best-effort host-wide cumulative
+`/proc/vmstat` `oom_kill` counter. `oomKillCount` is a cumulative count observed at `observedAt`,
+not a recent delta and not an inference-readiness or model-quality signal. Missing, malformed, or
+unreadable OOM evidence is returned as `status: "unknown"`, `oomKillCount: null`, and
+`observedAt: null`. `admissionMode: "shadow"` observes and reports the mode but does not enforce
+admission decisions.
 
-**Response 503:** `{ "status": "unavailable" }` when the backend snapshot cannot be obtained.
+**Response 503:** `{ "status": "unavailable", "resourceEvidence": ResourceEvidence }` when the backend snapshot cannot be obtained. Local OOM evidence is read independently and remains available during a backend outage; it does not establish the outage's cause.
 The unavailable response deliberately has no `models` array, so callers cannot interpret an empty
 array as evidence that no models are resident.
 
@@ -176,7 +182,16 @@ interface HostMemory {
   gttAccounting: "unattributed" | "unknown";
 }
 
-// Successful response: { models: ResidencyModel[], hostMemory: HostMemory }
+interface ResourceEvidence {
+  admissionMode: "off" | "shadow" | "enforce";
+  oom: {
+    status: "available" | "unknown";
+    oomKillCount: number | null;
+    observedAt: string | null;
+  };
+}
+
+// Successful response: { models: ResidencyModel[], hostMemory: HostMemory, resourceEvidence: ResourceEvidence }
 ```
 
 ### GET `/v1/capabilities/learning-task`

@@ -178,7 +178,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
 | `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
 | `GET /models` | user | Models on disk + loaded. Decision models appear only when enabled and explicitly granted to guest keys. |
-| `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable"}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
+| `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
 | `GET /ops/summary` | **admin or monitor** | Small, durable M5 activity summary for Heimdall: current in-flight count, last-use time, trailing-24-hour and seven-day request/time totals, plus seven UTC-calendar days newest-first. Counts only admitted M5 compute rows and excludes the outer `/mcp` transport row, so one MCP ask is never counted twice. Includes the content-blind `filterEpoch` (`m5-admitted-compute-v2`) so pre-epoch route-only history is treated as a historical break. No aliases, keys, tokens, content, or per-model dimensions. |
 | `scripts/export-m5-adoption-evidence.ts` | local operator | Read-only JSON evidence bundle for an exact full-UTC-day `[from, throughExclusive)` window. Uses the shared `m5-admitted-compute-v2` predicate, UTC-day/tier/route/node/model and exclusion reconciliation, closed adoption dimensions, a bounded current M5 task×model×verifier×source×outcome matrix, exclusive delegation state counts, current/stale/missing judge-policy coverage, cost/attribution/calibration coverage, finite privacy buckets, evidence-only maturity labels, explicit threshold states, promotion readiness, and a deterministic next action. Refuses active WAL/live snapshots and missing schema; writes only to stdout. |
 | `GET /ledger` | **admin or monitor** | The learning report + recent delegations (`recent[]` rows carry `id`, #227). Read-only monitors (e.g. Heimdall) via `HOMESERVER_MONITOR_API_KEYS`. |
@@ -198,7 +198,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
 | `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
-`GET /models/residency` returns `200 {models:[...],hostMemory:{...}}` when the backend snapshot is
+`GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...}}` when the backend snapshot is
 available. Each model row contains only `model`, `state`, `ttl`, `classification` (`serving`,
 `ttl_retained`, `unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
 Admin output may also contain `lastUse.alias`; monitor output deliberately omits it. The content-blind
@@ -207,9 +207,14 @@ bytes. GTT counters are device-wide and always marked `unattributed` when presen
 which model or process owns the allocation, even with resident models. Missing DRM counters are
 explicit `null` values and `gttAccounting:"unknown"`. If the memory snapshot itself cannot be read,
 the object reports `status:"unknown"` and null values. If the model snapshot is unavailable, the
-safe response remains `503 {status:"unavailable"}` with no `models` array. This endpoint is
+safe response remains `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. This endpoint is
 read-only and content-blind: it does not expose prompts, responses, token counts, keys, key hashes,
-raw backend commands, backend addresses/IPs, or other unsafe fields.
+raw backend commands, backend addresses/IPs, or other unsafe fields. `resourceEvidence` reports the
+configured host-memory `admissionMode` and a best-effort host-wide cumulative `/proc/vmstat`
+`oom_kill` count with its observation timestamp. The count is cumulative, not a recent delta or an
+inference-readiness signal. Missing, malformed, or unreadable OOM evidence is explicit
+`status:"unknown"` with null count and timestamp. During a model-snapshot outage, the 503 response still includes `resourceEvidence` but no `models` array; the counter does not identify the outage's cause. `shadow` mode reports observations but does not
+enforce admission decisions.
 
 **Credits vs. daily budget.** `creditLimit` is a **lifetime, non-resetting** total-token cap
 (0 = unlimited) — when `creditsUsed >= creditLimit` the key is refused with `402

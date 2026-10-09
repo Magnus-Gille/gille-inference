@@ -29,6 +29,7 @@ let hostMemory: HostMemoryReadResult | Error = {
     gttTotalBytes: 32 * 1024 ** 3,
   },
 };
+let oomKillCount: number | null | Error = 17;
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -81,10 +82,16 @@ beforeAll(async () => {
   guestKey = keystore.mintKey({ alias: "residency-guest", tier: "guest" }, DEFAULTS).plaintextKey;
 
   const gateway = await import("../src/homeserver/gateway.js");
-  const handle = await gateway.startGateway({ hostMemoryAdmissionDependencies: { readMemory: async () => {
-    if (hostMemory instanceof Error) throw hostMemory;
-    return hostMemory;
-  } } });
+  const handle = await gateway.startGateway({ hostMemoryAdmissionDependencies: {
+    readMemory: async () => {
+      if (hostMemory instanceof Error) throw hostMemory;
+      return hostMemory;
+    },
+    readOomKillCount: async () => {
+      if (oomKillCount instanceof Error) throw oomKillCount;
+      return oomKillCount;
+    },
+  } });
   gatewayPort = handle.port;
   stopGateway = handle.stop;
 });
@@ -107,6 +114,7 @@ beforeEach(() => {
       gttTotalBytes: 32 * 1024 ** 3,
     },
   };
+  oomKillCount = 17;
   upstreamRequests = [];
   getDb().exec("DELETE FROM request_log");
 });
@@ -189,6 +197,10 @@ describe("GET /models/residency", () => {
         gttTotalBytes: 32 * 1024 ** 3,
         gttAccounting: "unattributed",
       },
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
       models: [
         {
           model: "qwen-main",
@@ -235,6 +247,10 @@ describe("GET /models/residency", () => {
         gttTotalBytes: 32 * 1024 ** 3,
         gttAccounting: "unattributed",
       },
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
       models: [
         {
           model: "qwen-main",
@@ -273,6 +289,12 @@ describe("GET /models/residency", () => {
       gttTotalBytes: null,
       gttAccounting: "unknown",
     });
+    expect(body).toMatchObject({
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
+    });
   });
 
   it("returns explicit unknown host-memory accounting when the host reader fails", async () => {
@@ -290,6 +312,32 @@ describe("GET /models/residency", () => {
       gttAccounting: "unknown",
     });
     expect(JSON.stringify(body)).not.toContain("private host reader error");
+    expect(body).toMatchObject({
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
+    });
+  });
+
+  it("returns unknown OOM evidence without exposing a reader failure", async () => {
+    oomKillCount = new Error("private oom reader exception");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const response = await getResidency(monitorKey);
+      expect(response.status).toBe(200);
+      const body = await response.json() as Record<string, unknown>;
+      expect(body).toMatchObject({
+        resourceEvidence: {
+          admissionMode: "off",
+          oom: { status: "unknown", oomKillCount: null, observedAt: null },
+        },
+      });
+      expect(JSON.stringify(body)).not.toContain("private oom reader exception");
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("private oom reader exception");
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("keeps thrown reader details out of the residency response", async () => {
@@ -322,7 +370,13 @@ describe("GET /models/residency", () => {
 
     const response = await getResidency(adminKey);
     expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ status: "unavailable" });
+    expect(await response.json()).toMatchObject({
+      status: "unavailable",
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
+    });
     expect(upstreamRequests.filter((request) => request === "GET /running").length).toBeGreaterThanOrEqual(1);
     expect(upstreamRequests.some((request) => request.startsWith("POST "))).toBe(false);
   });
@@ -332,6 +386,14 @@ describe("GET /models/residency", () => {
 
     const response = await getResidency(adminKey);
     expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ status: "unavailable" });
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toMatchObject({
+      status: "unavailable",
+      resourceEvidence: {
+        admissionMode: "off",
+        oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
+      },
+    });
+    expect(body).not.toHaveProperty("models");
   });
 });
