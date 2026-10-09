@@ -198,7 +198,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
 | `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
-`GET /models/residency` returns `200 {models:[...],hostMemory:{...}}` when the backend snapshot is
+`GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...}}` when the backend snapshot is
 available. Each model row contains only `model`, `state`, `ttl`, `classification` (`serving`,
 `ttl_retained`, `unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
 Admin output may also contain `lastUse.alias`; monitor output deliberately omits it. The content-blind
@@ -209,7 +209,12 @@ explicit `null` values and `gttAccounting:"unknown"`. If the memory snapshot its
 the object reports `status:"unknown"` and null values. If the model snapshot is unavailable, the
 safe response remains `503 {status:"unavailable"}` with no `models` array. This endpoint is
 read-only and content-blind: it does not expose prompts, responses, token counts, keys, key hashes,
-raw backend commands, backend addresses/IPs, or other unsafe fields.
+raw backend commands, backend addresses/IPs, or other unsafe fields. `resourceEvidence` reports the
+configured host-memory `admissionMode` and a best-effort host-wide cumulative `/proc/vmstat`
+`oom_kill` count with its observation timestamp. The count is cumulative, not a recent delta or an
+inference-readiness signal. Missing, malformed, or unreadable OOM evidence is explicit
+`status:"unknown"` with null count and timestamp. `shadow` mode reports observations but does not
+enforce admission decisions.
 
 **Credits vs. daily budget.** `creditLimit` is a **lifetime, non-resetting** total-token cap
 (0 = unlimited) — when `creditsUsed >= creditLimit` the key is refused with `402
