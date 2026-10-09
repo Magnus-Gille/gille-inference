@@ -88,7 +88,8 @@
     "sourceRoots": [
       "src/**/*.ts",
       "scripts/**/*.ts",
-      "client/**/*.mjs"
+      "client/**/*.mjs",
+      "scripts/**/*.mjs"
     ],
     "sourceCounts": {
       "ts": 271,
@@ -96,7 +97,6 @@
       "py": 10,
       "mjs": 10
     },
-    "complexityFiles": 275,
     "complexityBaselineWarnings": 429,
     "complexityCorrectionWarnings": 152,
     "correctionThreshold": 20,
@@ -346,6 +346,12 @@
       "shellcheckExit": 1,
       "shellcheckDiagnostics": 4,
       "nativeRuntimeDependency": "better-sqlite3"
+    },
+    "complexityProcessedRows": 275,
+    "complexityAnalyzedTypeScriptFiles": 271,
+    "javascriptInventory": {
+      "client": 6,
+      "scripts": 4
     }
   },
   "tools": {
