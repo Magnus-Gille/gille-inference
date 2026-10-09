@@ -1,0 +1,138 @@
+name: Informational code health
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+    - cron: '47 4 * * 1'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      collect_static:
+        description: Run the weekly complexity, candidate, and coverage analyzers
+        type: boolean
+        required: true
+        default: true
+
+jobs:
+  collect:
+    name: Collect report-only code health
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Initialize artifact directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/code-health-v1/evidence"
+          printf '%s\n' '{"version":"1.0","producer_status":"not-run","reason":"collector-not-started"}' \
+            > "$RUNNER_TEMP/code-health-v1/evidence/producer-status.json"
+
+      - name: Checkout complete history
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        if: steps.checkout.outcome == 'success'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked project dependencies
+        id: project-dependencies
+        if: success() && steps.checkout.outcome == 'success'
+        run: npm ci
+
+      - name: Install isolated pinned analyzer tools
+        id: analyzer-dependencies
+        if: success() && steps.project-dependencies.outcome == 'success'
+        run: |
+          set -euo pipefail
+          npm ci --prefix research/code-health-401/tooling --ignore-scripts
+          npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts
+          mkdir -p node_modules/@vitest
+          provider_link='../../research/code-health-401/coverage-tooling/node_modules/@vitest/coverage-v8'
+          provider_target='node_modules/@vitest/coverage-v8'
+          if [[ -e "$provider_target" || -L "$provider_target" ]]; then
+            if [[ ! -L "$provider_target" || "$(readlink "$provider_target")" != "$provider_link" ]]; then
+              echo 'unexpected existing Vitest coverage provider; refusing to replace it' >&2
+              exit 1
+            fi
+          else
+            ln -s "$provider_link" "$provider_target"
+          fi
+
+      - name: Check producer and workflow conformance
+        if: success() && steps.analyzer-dependencies.outcome == 'success'
+        run: node --test research/code-health-402/test-producer.mjs
+
+      - name: Collect report without a token on pull requests
+        if: success() && steps.analyzer-dependencies.outcome == 'success' && github.event_name == 'pull_request'
+        env:
+          CODE_HEALTH_COLLECT_STATIC: 'true'
+          OUTPUT_DIR: ${{ runner.temp }}/code-health-v1
+        shell: bash
+        run: |
+          set -uo pipefail
+          collector_log="$RUNNER_TEMP/code-health-collector.log"
+          node research/code-health-402/collect.mjs --output "$OUTPUT_DIR" --static > "$collector_log" 2>&1
+          collector_status=$?
+          if [[ "$collector_status" -eq 0 ]]; then
+            report_status="$(sed -n 's/^report_status=\(complete\|partial\);.*/\1/p' "$collector_log")"
+            if [[ "$report_status" != complete && "$report_status" != partial ]]; then
+              collector_status=1
+            else
+              printf '{"version":"1.0","producer_status":"valid","report_status":"%s"}\n' "$report_status" \
+                > "$OUTPUT_DIR/evidence/producer-status.json"
+              printf 'code-health report_status=%s\n' "$report_status"
+              exit 0
+            fi
+          fi
+          printf '%s\n' '{"version":"1.0","producer_status":"failed","reason":"collector-or-conformance-failure"}' \
+            > "$OUTPUT_DIR/evidence/producer-status.json"
+          echo 'Code-health producer failed; detailed diagnostics were withheld from the artifact.' >&2
+          exit "$collector_status"
+
+      - name: Collect report with read-only Actions access
+        if: success() && steps.analyzer-dependencies.outcome == 'success' && github.event_name != 'pull_request'
+        env:
+          CODE_HEALTH_GITHUB_TOKEN: ${{ github.token }}
+          CODE_HEALTH_COLLECT_STATIC: ${{ (github.event_name == 'schedule' && github.event.schedule == '47 4 * * 1') || (github.event_name == 'workflow_dispatch' && inputs.collect_static) }}
+          OUTPUT_DIR: ${{ runner.temp }}/code-health-v1
+        shell: bash
+        run: |
+          set -uo pipefail
+          collector_log="$RUNNER_TEMP/code-health-collector.log"
+          node research/code-health-402/collect.mjs --output "$OUTPUT_DIR" > "$collector_log" 2>&1
+          collector_status=$?
+          if [[ "$collector_status" -eq 0 ]]; then
+            report_status="$(sed -n 's/^report_status=\(complete\|partial\);.*/\1/p' "$collector_log")"
+            if [[ "$report_status" != complete && "$report_status" != partial ]]; then
+              collector_status=1
+            else
+              printf '{"version":"1.0","producer_status":"valid","report_status":"%s"}\n' "$report_status" \
+                > "$OUTPUT_DIR/evidence/producer-status.json"
+              printf 'code-health report_status=%s\n' "$report_status"
+              exit 0
+            fi
+          fi
+          printf '%s\n' '{"version":"1.0","producer_status":"failed","reason":"collector-or-conformance-failure"}' \
+            > "$OUTPUT_DIR/evidence/producer-status.json"
+          echo 'Code-health producer failed; detailed diagnostics were withheld from the artifact.' >&2
+          exit "$collector_status"
+
+      - name: Upload code-health-v1 report and evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: code-health-v1
+          path: ${{ runner.temp }}/code-health-v1/
+          if-no-files-found: error
+          retention-days: 30
