@@ -1,0 +1,5 @@
+artifacts/raw/
+artifacts/baseline/c8/tmp/
+artifacts/correction/ts-coverage/coverage-summary.json
+artifacts/correction/ts-coverage/stdout.txt
+artifacts/correction/ts-coverage/stderr.txt

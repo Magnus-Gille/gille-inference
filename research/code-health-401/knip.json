@@ -1,0 +1,29 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/homeserver/cli.ts!",
+    "src/runner/index.ts!",
+    "src/judge/index.ts!",
+    "src/analysis/index.ts!",
+    "scripts/**/*.ts!",
+    "client/**/*.mjs!"
+  ],
+  "project": [
+    "src/**/*.ts",
+    "scripts/**/*.ts",
+    "client/**/*.mjs"
+  ],
+  "ignore": [
+    "research/code-health-401/**",
+    "vitest.config.ts",
+    "tests/**",
+    "gate-d/**",
+    "benchmarks/**"
+  ],
+  "ignoreDependencies": [
+    "@types/better-sqlite3"
+  ],
+  "vitest": false,
+  "eslint": false,
+  "tsx": false
+}
