@@ -33,6 +33,7 @@ import {
 } from "./keystore.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
+import { observeGpuLeaseMutex, type GpuMutexObservation } from "./gpu-lease-observation.js";
 import { buildCageArgv } from "./code-loop-cage.js";
 import { codeLoopSecretPath, resolveNodeModulesDir, runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
 import { homedir } from "node:os";
@@ -770,21 +771,32 @@ export function parseDurationMs(raw: string | undefined): number | null {
 }
 
 /**
- * Render the GPU-lease queue as an aligned table for `gpu status`. Pure (takes a snapshot + a
- * clock) so it is unit-testable. `now` lets remaining-ETA be computed deterministically.
+ * Render the GPU-lease queue and the separately observed mkdir mutex for `gpu status`. Pure (takes
+ * snapshots + a clock) so it is unit-testable. `now` lets remaining-ETA be computed deterministically.
  */
-export function formatGpuStatus(sel: HolderSelection, now: number): string {
-  if (sel.live.length === 0) return "GPU is idle — no leases held or queued.";
+export function formatGpuStatus(sel: HolderSelection, now: number, mutex: GpuMutexObservation): string {
+  const mutexLine = (() => {
+    if (mutex.state === "occupied") {
+      if (mutex.owner) {
+        return `GPU mutex: occupied (recorded owner id=${mutex.owner.id} pid=${mutex.owner.pid} state=${mutex.ownerState})`;
+      }
+      return `GPU mutex: occupied (recorded owner unavailable state=${mutex.ownerState})`;
+    }
+    if (mutex.state === "absent") return "GPU mutex: absent (no mutex observed)";
+    return `GPU mutex: UNKNOWN (${mutex.reason})`;
+  })();
+  const note = "Note: ticket and mutex are separately sampled; owner* means the recorded owner ID matches a queued ticket, not a liveness claim.";
+  if (sel.live.length === 0) return [mutexLine, "GPU queue: empty.", note].join("\n");
   const fmtAgo = (ms: number) => (ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`);
   const lines = sel.live.map((t, i) => {
-    const role = i === 0 ? "HOLDING" : `queued#${i}`;
+    const role = mutex.state === "occupied" && mutex.owner?.id === t.id ? "owner*" : `queued#${i + 1}`;
     const held = fmtAgo(now - t.enqueuedAt);
     const eta =
       t.etaMs != null ? ` eta~${fmtAgo(Math.max(0, t.etaMs - (now - t.enqueuedAt)))}` : "";
     const purpose = t.purpose ? ` "${t.purpose}"` : "";
     return `  ${role.padEnd(9)} ${t.model.padEnd(22)} ${held.padStart(4)}${eta} [${t.host}/${t.pid}]${purpose}`;
   });
-  return [`GPU leases (${sel.live.length} live${sel.stale.length ? `, ${sel.stale.length} stale` : ""}):`, ...lines].join("\n");
+  return [mutexLine, `GPU leases (${sel.live.length} live${sel.stale.length ? `, ${sel.stale.length} stale` : ""}):`, ...lines, note].join("\n");
 }
 
 /**
@@ -799,7 +811,12 @@ async function cmdGpu(argv: string[]): Promise<void> {
   const staleMs = cfg.gpuLeaseStaleMs;
 
   if (sub === "status") {
-    console.log(formatGpuStatus(await gpuLeaseStatus(dir, { staleMs }), Date.now()));
+    const now = Date.now();
+    const [mutex, queue] = await Promise.all([
+      observeGpuLeaseMutex(dir, { staleMs }),
+      gpuLeaseStatus(dir, { staleMs }),
+    ]);
+    console.log(formatGpuStatus(queue, now, mutex));
     return;
   }
 
