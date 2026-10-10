@@ -11,6 +11,11 @@ It is not a complete host collector. A separately reviewed, approved host adapte
 the remaining observations and installation operations below. Existing private rollout packets and
 the Halogen evaluation runner retain their original rules; this code does not widen them.
 
+`install-backend-inventory.ts` and `install-coverage.ts` now define the accepted inventory,
+receipt reconciliation and bounded adapter interface for that missing coverage. They do not supply
+a deployed host adapter or discover a complete host boundary. The offline checker below validates
+the consistency of supplied evidence; it cannot authenticate it or authorize an installation.
+
 ## Decision contract
 
 The strict version-1 plan binds an exact 40-character release SHA, an immutable input-manifest
@@ -220,3 +225,96 @@ with a null check, rather than a fabricated observation timestamp.
 
 Vitest coverage is synthetic policy/lifecycle evidence and local process cancellation evidence.
 It is not a production installation, live backend-activity verification or measured model quality.
+
+## Complete inventory and traffic coverage contract
+
+Completeness needs an independently accepted host boundary. A list of endpoints supplied to the
+metrics CLI, a public model catalog, `/running`, an empty gateway queue or stable process fingerprints
+cannot establish that boundary. Do not relabel these observations as end-to-end work counters.
+
+The strict `installBackendInventorySchema` describes a graph of logical backends and ingress paths.
+Backends include runtime processes and sidecars; ingress kinds are gateway, proxy, direct and lifecycle.
+Every backend requires both a direct and a lifecycle path, even if an approved fence makes one
+unreachable. Loading, unloading, process spawning, warm-up and work initiated without a network
+request belong to the lifecycle path. Shared paths can link multiple backends. Links must be symmetric,
+all references must resolve, and IDs and links must be unique. Limits are 64 backends and 128 paths.
+
+`hashInstallBackendInventory` hashes a versioned canonical representation, sorting copies of all
+IDs and links. Ordering does not affect the hash; host boot, topology and kind changes do. The
+separate accepted binding pins this hash, a `boundaryIdentitySha256`, an expiry and maximum observation
+age (at most 60 seconds). Accepting these values is an operator/host-adapter obligation outside this
+library, not an authority conferred by a JSON file.
+
+The boundary fingerprint must cover the separately reviewed physical mapping and isolation contract:
+owning host/namespaces, service and runtime managers, effective configuration bytes, producer-to-ID
+bindings, all inference ingress and any exclusions or enforced fences. The logical graph hash alone
+does not bind ports, services or executable bytes. A boot fingerprint is equality evidence, not
+authenticated machine identity. The host adapter must verify the physical contract independently;
+copying expected digests or zero counts into a receipt is not measurement.
+
+### Evidence required for every sample
+
+`evaluateInstallCoverage` accepts two full `host-inventory-v1` receipts bracketing all activity
+receipts. Both inventories must match the accepted host boot, topology digest, boundary digest and
+exact backend/path ID sets, with zero unclassified backends **and** ingress paths. Unknown counts,
+duplicates, omitted or extra members, stale/future samples, changes or an expired binding block
+complete coverage. All activity timestamps must lie inside the inventory bracket. The oldest sample
+is returned for downstream freshness checks.
+
+Every backend and every path needs exactly one receipt. Its producer identity must be non-null and
+unchanged before/after its measurement, and it must bind the same boot and inventory. Activity counts
+are nonnegative safe integers for active, queued **and loading** work. An unavailable counter is null,
+not zero. The source names specify semantic obligations, not mere string tags:
+
+| Receipt source | Required host-adapter proof |
+|---|---|
+| `backend-work-v1` | All work in that backend, including already accepted work after client disconnect/timeout and loading transitions; scheduler gauges alone do not meet this contract. |
+| `backend-stopped-v1` | Independently verified process absence with stable lifecycle-manager identity and no pending/active/loading work; its lifecycle and direct paths still need receipts. |
+| `ingress-work-v1` | The entire mapped path, from accepting/queueing a request through backend settlement, including automatic loads and non-HTTP producers. Gateway fetch completion is not backend settlement. |
+| `ingress-fence-v1` | An approved, enforced fence covering the whole mapped path, unexpired at evaluation, with existing active/queued/loading work independently proved drained. An enabled flag or an empty socket table is insufficient. |
+
+`coverage: "complete"` means these supplied receipts satisfy the accepted graph contract.
+`activity: "idle"` additionally requires all counts to be zero. Fully observed nonzero work returns
+complete/busy, while missing or contradictory evidence returns unknown with closed reason codes.
+Counters at successive stages can overlap, so the report does **not** sum them into invented request
+totals. The checker emits only validated topology IDs after the graph hash/expiry binding passes;
+raw errors and rejected input are omitted. Keep reports and actual host contracts in private storage.
+
+### Current source map and remaining live integration
+
+The following are code/config surfaces, not a claim about current deployment:
+
+| Surface | Why the existing observation is insufficient |
+|---|---|
+| Primary llama-swap / legacy LM Studio (`model-admin.ts`) | The facade covers only the primary backend. `/running` is residency, not a full request/lifecycle queue. The repository llama-swap YAML is a manually synchronized mirror. |
+| Embedding sidecar (`config.ts`, embedding systemd templates) | Separate service/endpoint; it must be inventoried even when omitted from a primary-backend snapshot. Readiness is not absence of work. |
+| System One, image/audio and other configured direct providers | Configuration, process placement and actual producer paths must be reconciled separately, not inferred from the public model catalog. |
+| Remote providers such as ORIN | Exclude only when the approved boundary independently proves they cannot execute inference on the installation host; account for local proxy/gateway work separately. |
+| Gateway admission / maintenance | Tracks gateway admission and its waiters; does not cover direct backend callers, all lifecycle operations or backend work continuing after a disconnect. It cannot alone issue `ingress-work-v1`. |
+
+No production source currently implements the full receipt contract. `observeInstallCoverage` is a
+read-only orchestration seam for reviewed collectors: inventory before, all backend/path receipts,
+inventory after, then reconciliation. It rejects an invalid first inventory before subsequent probes.
+One shared cancellation signal and monotonic deadline cover the whole sequence (default 5 seconds,
+maximum 30); binding expiry can shorten it. Returned receipts are copied so adapter object reuse cannot
+rewrite an earlier sample. After cancellation, no subsequent collector is invoked. An already-running
+read may finish later; collectors must stay read-only, bound their payloads and honor the shared signal.
+No source-producer authentication or correctness is inferred from a callback's return value.
+
+Polling/bracketing is not atomic, does not reserve resources and cannot rule out work between samples.
+The existing installation guard's resource caps, fresh host/release proof, watchdog and approval remain
+required. This change does not wire coverage results into `runControlledInstall`, enable maintenance,
+alter network rules, or mark the live host covered. Completing #409 still requires independently
+reviewed host inventory/counter/fence adapters and approved live verification.
+
+### Offline coverage checker
+
+```sh
+node --import tsx scripts/check-install-coverage.ts INVENTORY.json BINDING.json EVIDENCE.json
+```
+
+Each input is bounded to 1 MiB and must be a stable regular file. Exit 0 means supplied evidence
+reconciles as complete/idle; 1 means busy, unknown or rejected; 2 means usage or input-read failure.
+Source `install-coverage-check-v1` is deliberately different from `host-probe-v1`. A saved receipt,
+an accepted hash or this exit status never grants live installation admission. Tests exercise synthetic
+graphs, omissions, stale/replaced evidence, counters/fences and cancellation, not live completeness.
