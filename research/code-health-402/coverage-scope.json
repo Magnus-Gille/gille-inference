@@ -1,0 +1,15 @@
+{
+  "version": "code-health-401-selected-typescript-scope-v1",
+  "source_inventory": [
+    "src/homeserver/errors.ts",
+    "src/homeserver/task-type-identity.ts",
+    "src/homeserver/image-sidecar.ts"
+  ],
+  "test_inventory": [
+    "tests/homeserver-errors.test.ts",
+    "tests/homeserver-policy-task-type-identity.test.ts"
+  ],
+  "measure": "lines",
+  "includes_inline_tests": false,
+  "source_inventory_policy": "complete-declared-inventory-including-unimported-source"
+}
