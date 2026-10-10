@@ -31,3 +31,21 @@ describe("read-only activity diagnostic CLI", () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });
+
+const base = ["--lease-dir", "/unread-test-placeholder", "--backend", "a=http://127.0.0.1:8081/metrics"];
+describe("activity CLI mapping validation", () => {
+  it.each([
+    ["--expect-host", "a".repeat(64)],
+    ["--runtime", "a=42", "--runtime", "a=43"],
+    ["--runtime", "other=42"],
+    ["--runtime", "a=42", "--expect-runtime", `other=${"a".repeat(64)}`],
+    ["--runtime", "a=0"],
+    ["--runtime", "a=42", "--backend", "b=http://127.0.0.1:8082/metrics"],
+  ])("rejects incomplete or ambiguous mappings: %j", async (...args) => {
+    const result = await run([...base, ...args]);
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr.split("\n")[0]!)).toEqual({ source: "install-activity-diagnostic-v1", reason: "invalid-input-or-observation-failed" });
+    expect(result.stderr).not.toContain("/unread-test-placeholder");
+  });
+});

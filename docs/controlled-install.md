@@ -161,6 +161,46 @@ or an unexpected collector failure. None means installation admission. Its diagn
 deliberately differs from `host-probe-v1`. An unresponsive filesystem read can outlive its deadline,
 but performs no mutation. Keep reports in private operator storage, never Git.
 
+### Sampled process and listener identity
+
+On little-endian Linux, add one `--runtime ID=PID` for **every** backend to bracket the
+metrics request with process/listener observations. For example, append `--runtime runtime-a=1234`
+to the command above, using the independently identified runtime PID. This is an optional stronger
+diagnostic mode; the original command remains an unbound scheduler observation. Duplicate or
+unmatched mappings are rejected before observation.
+
+The collector reads the boot ID, process start ticks, PID/network namespace links, executable
+file metadata, TCP listener tables and the declared process's descriptor links. It requires the
+collector and runtime to share PID/network namespaces, exactly one listener on the specified port
+across IPv4 and IPv6, the exact loopback binding, and a matching socket descriptor in that process.
+Wildcard listeners, unreadable/missing IPv6 tables, competing listeners, unsupported platforms,
+permission errors and changes between samples fail closed. It never reads `cmdline`, `environ`,
+executable bytes or loaded libraries, and never emits descriptor paths, raw boot IDs or raw errors.
+The parser follows the [Linux proc documentation](https://docs.kernel.org/filesystems/proc.html)
+and [TCP table format](https://docs.kernel.org/networking/proc_net_tcp.html); TCP queue fields are
+not inference request counts.
+
+Each collection compares two samples and returns opaque SHA-256 fingerprints. Metrics are
+retained only when collections before and after the HTTP request agree. `--expect-host SHA256`
+and `--expect-runtime ID=SHA256` can additionally pin fingerprints from an independently accepted
+observation. A reboot, process restart, executable-metadata change or listener replacement invalidates
+the corresponding pin. Pins establish equality with that accepted sample, not trust by themselves.
+Without a pin, a stable identity is only observed. The host fingerprint identifies a sampled boot,
+not an authenticated machine or durable hardware identity.
+
+The executable fingerprint uses device/inode/mode/size and nanosecond modification/change times;
+it is **not** a binary hash or immutable release attestation. A listener descriptor can be shared
+or inherited, so holding it does not prove exclusive request handling or that the process is
+llama.cpp. Bracketing is not an atomic reservation and cannot exclude changes between observations.
+An operator must still establish the intended direct runtime before probing its `/metrics` route.
+
+Reads are capped at 64 KiB for process stat, 1 MiB/4096 rows per TCP table and 1024 descriptors per
+process. Bound observation has a shared deadline for identity checks and HTTP activity; an expired
+operation cannot start subsequent checks. An in-progress read may finish later without mutation.
+All fixtures are synthetic; live host validation remains outstanding. This mode still reports
+`coverage: "unknown"`. It does not discover the complete runtime inventory, account for proxy
+queues or loading, fence ingress, or satisfy installation admission.
+
 ### Installation contract checker
 
 ```sh
