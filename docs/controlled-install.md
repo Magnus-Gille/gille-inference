@@ -87,7 +87,11 @@ Call `runControlledInstall(plan, operations, operatorSignal)` with these operati
 4. `cleanup(signal)` removes/restores only artifacts owned by this run, idempotently. It must
    observe cancellation and never start additional work after returning or being aborted.
 5. `verifyRestoration(baseline, signal)` independently verifies owned cleanup and preserved
-   protected state. A final fresh observation also rechecks the decision against the baseline.
+   protected state. A final fresh observation checks restoration against the baseline: release/input
+   identity, expiry, protected service health/invocations/restarts, OOM counters and residency policy.
+   New customer activity or admission headroom after proven stop do not make restoration fail.
+   Maintenance must remain inactive: the installation owns arbitration until restoration finishes.
+   Admission and the running watchdog still enforce all activity/resource/maintenance predicates.
 
 The supervisor reserves separate time for stop, cleanup, restoration verification and final
 observation before approval expires. Stop and cleanup receive fresh bounded signals so cancelling
@@ -357,3 +361,39 @@ Exit 0 means the visible sample is `observed`; exit 1 means `partial` or `unknow
 input or an unexpected top-level failure. No exit status grants installation admission. This adds
 actual procfs discovery, but complete backend classification and traffic/lifecycle measurement remain
 separate obligations before #409 can admit installations using live evidence.
+
+## Version-2 continuity contract (local implementation only)
+
+`live-install-observation.ts` adds a separate `host-probe-v2` schema and pure decision/session API.
+It does not upgrade v1 diagnostics or wire a live collector, privileged launcher or host deadman.
+The accepted binding fixes the host boot, manifest, run identity, complete producer identity list
+(instance/build/config digests) and protected unit list. A matching hash alone is not authentication;
+the future reviewed collector must bind channel peer identity, challenge and the observed bytes.
+
+`evaluateLiveInstall` requires two distinct, fresh, complete idle samples, using the host's wall
+and monotonic clocks and the current challenge. It rejects changed producer start sequences even
+when current active/queued/loading counts have returned to zero. It also checks actual GPU owner
+state, the installation lease, per-protected-cgroup OOM counters and existing resource/residency
+invariants. Missing or extra producers, resets, observer replacement, stale samples and v1 sources
+are rejected. The accepted manifest must cover gateway, proxy, direct runtime and lifecycle paths;
+this module cannot discover omitted paths or prove the caller's declared coverage.
+
+`LiveInstallEvidenceSession` owns a copied last sample and latches failures. Its first healthy sample
+is only priming. Two healthy samples may issue a numeric monotonic permit deadline bounded by evidence
+age and approval expiry. Reading the permit never renews it; after expiry or failure, later healthy
+samples cannot revive the session. A restart must not create a new session for an existing job.
+This is runner policy, not an independent stop mechanism: the planned host deadman must enforce the
+deadline outside the runner process and require qualified recovery before another run.
+
+`InstallProducerActivity` provides content-blind in-process accounting for accepted queued, active
+and loading work. Call `begin` before accepted work can progress and settle the handle only when
+actual producer work finishes, including after client disconnect. `track` settles in `finally`
+after the wrapped operation completes. Short completed work leaves an incremented start sequence;
+capacity/sequence/invariant failures permanently make counts unknown. `track` preserves the real
+operation's result/failure despite known accounting faults; `failureReason()` retains the closed
+instrumentation diagnostic. Low-level `begin` callers must likewise handle accounting failure without
+suppressing inference. This helper is not yet wired
+into gateway routes or upstream runtimes and therefore supplies no deployed coverage claim.
+
+See the [reviewed M5 integration plan](controlled-install-m5-integration-plan.md) for the remaining
+native observer, runtime/proxy instrumentation, arbitration, containment and exact approval gates.
