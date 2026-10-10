@@ -6,8 +6,9 @@ can be idle. Conversely, an empty gateway queue cannot prove that a direct backe
 
 `src/homeserver/controlled-install.ts` provides the pure decision and bounded run lifecycle.
 It is operator tooling, not a gateway route, permission grant, GPU lease, or automatic installer.
-There is no live host collector in this change. A separately reviewed, approved host adapter must
-provide the observations and installation operations below. Existing private rollout packets and
+The read-only activity diagnostic below samples configured runtime schedulers and the GPU mutex.
+It is not a complete host collector. A separately reviewed, approved host adapter must provide
+the remaining observations and installation operations below. Existing private rollout packets and
 the Halogen evaluation runner retain their original rules; this code does not widen them.
 
 ## Decision contract
@@ -106,6 +107,61 @@ stop adapter. Never pass credentials in argv or use this helper to run the gatew
 without its existing release/approval gates.
 
 ## Read-only diagnostics
+
+### Activity and recorded GPU-lock owner
+
+Run on the host that owns the lease directory and direct runtime ports, using explicitly verified
+operator bindings. These example paths and ports are placeholders, not a live deployment map:
+
+```sh
+node --import tsx scripts/observe-install-activity.ts \
+  --lease-dir /absolute/approved/lease-directory \
+  --backend runtime-a=http://127.0.0.1:8081/metrics \
+  --timeout-ms 2000
+```
+
+The command only reads. It does not enable metrics, load/unload models, acquire/reclaim locks,
+restart services or perform installation. It has no credential input. Backend URLs must be
+literal loopback HTTP addresses with an explicit port and exactly `/metrics`: no DNS, userinfo,
+queries, fragments or redirect following. Verify that each port serves the intended **direct
+runtime**, not a proxy/router which can load models. Syntax alone cannot prove runtime identity.
+At most 16 targets are accepted; each request and filesystem observation defaults to a 2-second
+deadline (configurable up to 30 seconds), and each metrics body is limited to 128 KiB.
+
+The parser requires exactly one unlabelled, nonnegative safe-integer sample and one `gauge` TYPE
+declaration for both `llamacpp:requests_processing` and `llamacpp:requests_deferred`. Missing,
+malformed, duplicate or incompatible data yields null counts and a closed reason code.
+llama.cpp documents these as scheduler gauges behind `--metrics`; `/running` in llama-swap
+describes resident processes, not equivalent active/queued request counts. See the upstream
+[llama.cpp metrics contract](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#get-metrics)
+and [llama-swap API](https://github.com/mostlygeek/llama-swap#api). These references do not prove
+the versions or flags on an installed host.
+
+Each backend sample includes start/completion times and source `llamacpp-metrics-v1`. The report
+always retains `coverage: "unknown"` with scope `configured-runtime-schedulers`, even if every
+configured runtime reports zero. It cannot see requests waiting upstream, model-loading transitions,
+unlisted runtimes or traffic between polls. An approved host adapter must prove inventory, process
+identity and complete ingress coverage before supplying `backend.coverage: "complete"` to the
+installation guard. Do not copy these per-runtime zeros into whole-host counts.
+
+The GPU observer reads `.holder/owner.json` under the specified existing lease directory. A
+present mutex is occupied even with a stale, missing, oversized or invalid owner marker (including
+an owner-file symlink). Missing lease roots, symlink root/mutex entries and metadata changes during
+the sample yield unknown; the observer never
+creates or repairs evidence. The returned UUID, PID and heartbeat describe the **recorded** owner,
+not OS process liveness. Output omits hostnames, paths, URLs and raw error/response content.
+Directory absence is a momentary observation, not a GPU-idle guarantee or reservation. Use the
+real configured local directory; a valid but unrelated empty directory cannot prove anything.
+The existing `gpu status` command now labels the actual mutex separately from FIFO tickets; its
+ticket list and mutex observation are separate samples, not an atomic ownership snapshot.
+
+Exit 0 means the mutex state and all configured scheduler samples were observed, even if busy;
+1 means at least one observation is unknown or no runtime was configured; 2 means invalid input
+or an unexpected collector failure. None means installation admission. Its diagnostic schema
+deliberately differs from `host-probe-v1`. An unresponsive filesystem read can outlive its deadline,
+but performs no mutation. Keep reports in private operator storage, never Git.
+
+### Installation contract checker
 
 ```sh
 node --import tsx scripts/check-controlled-install.ts PLAN.json OBSERVATION.json [BASELINE.json]
