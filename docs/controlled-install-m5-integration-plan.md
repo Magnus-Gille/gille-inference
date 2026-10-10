@@ -255,7 +255,9 @@ source/artifact bytes; do not derive an accepted release from whichever checkout
 Use `scripts/deploy-gateway.sh deploy <accepted-full-sha>` and its `verify` mode for the gateway.
 Extend reviewed repo-owned transactional tooling for observer/runtime/config operations; a gateway
 source deployment must not silently install privileged units or change llama-swap/embedding flags.
-Proposed packet/launcher tooling is not yet executable and must be built/tested at G0. Refuse execution
+The [G1 review-bundle checker](observer-review-bundle.md) now validates offline packet structure,
+ceilings, expiry and supplied artifact hashes. It neither authenticates qualification receipts nor
+executes the packet; the privileged packet/launcher tooling must still be built/tested at G0. Refuse execution
 until every packet field is concrete. The merged diagnostic SHA is not the future integrated release.
 
 ### G2 bootstrap and availability impact
