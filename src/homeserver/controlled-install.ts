@@ -116,6 +116,65 @@ export function evaluateControlledInstall(
   return decision();
 }
 
+/**
+ * Pure post-stop decision. Admission-only activity and capacity evidence is not
+ * required here: after the adapter has proved that this run stopped and cleaned up, those fields
+ * may reflect independent customer work. Protected state and the approved resident set remain
+ * fail-closed restoration invariants.
+ */
+export function evaluateControlledInstallRestoration(
+  input: unknown, evidence: unknown, prior?: unknown, nowMs = Date.now(),
+): InstallDecision {
+  const p = controlledInstallPlanSchema.safeParse(input);
+  const o = controlledInstallObservationSchema.safeParse(evidence);
+  const b = prior === undefined ? undefined : controlledInstallObservationSchema.safeParse(prior);
+  const reasons: string[] = [];
+  if (!p.success) reasons.push("invalid-plan");
+  if (!o.success) reasons.push("invalid-observation");
+  if (prior === undefined) reasons.push("invalid-baseline");
+  if (b && !b.success) reasons.push("invalid-baseline");
+  const decision = (): InstallDecision => ({
+    admit: reasons.length === 0, reasons,
+    observedAt: o.success ? o.data.observedAt : null, source: o.success ? o.data.source : null,
+  });
+  if (!p.success || !o.success || !b?.success) return decision();
+
+  const plan = p.data;
+  const obs = o.data;
+  const expiresAtMs = Date.parse(plan.expiresAt);
+  const observedAtMs = Date.parse(obs.observedAt);
+  if (!Number.isFinite(nowMs)) reasons.push("invalid-clock");
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) reasons.push("approval-expired");
+  const age = nowMs - observedAtMs;
+  if (!Number.isFinite(observedAtMs) || !Number.isFinite(age) || age < 0 || age > plan.timing.maxObservationAgeMs) {
+    reasons.push("observation-not-fresh");
+  }
+  if (obs.releaseSha !== plan.releaseSha || obs.inputsSha256 !== plan.inputsSha256) reasons.push("identity-mismatch");
+
+  if (obs.oomKills === null || b.data.oomKills === null) reasons.push("oom-unknown");
+  // Installation/maintenance arbitration is held until restoration finishes, not only until stop.
+  if (obs.maintenanceActive !== false) reasons.push("maintenance-not-idle");
+  if (obs.protectedServices.some(service => !service.active)) reasons.push("protected-service-unhealthy");
+  const baseline = b.data;
+  if (baseline.releaseSha !== plan.releaseSha || baseline.inputsSha256 !== plan.inputsSha256) {
+    reasons.push("baseline-identity-mismatch");
+  }
+  if (obs.oomKills !== null && baseline.oomKills !== null && obs.oomKills !== baseline.oomKills) {
+    reasons.push("oom-drift");
+  }
+  if (!sameSet(obs.protectedServices.map(s => s.unit), baseline.protectedServices.map(s => s.unit)) ||
+      obs.protectedServices.some(service => {
+        const previous = baseline.protectedServices.find(s => s.unit === service.unit);
+        return !previous || service.invocationId !== previous.invocationId || service.restarts !== previous.restarts;
+      })) {
+    reasons.push("protected-service-drift");
+  }
+  if (plan.residency === "preserve" && !sameSet(obs.residentModels, baseline.residentModels)) {
+    reasons.push("residency-drift");
+  }
+  return decision();
+}
+
 export interface ControlledInstallOperations {
   /** Fresh complete probe, including direct backend coverage and enforced limits. No mutations. */
   observe(signal: AbortSignal): Promise<unknown>;
@@ -246,7 +305,7 @@ export async function runControlledInstall(
   } catch { return { ...result, status: "restoration-failed", reasons: [...result.reasons, "restoration-unverified"] }; }
   try {
     const final = await bounded(s => op.observe(s), t.observationTimeoutMs);
-    const check = evaluateControlledInstall(plan, final, baseline);
+    const check = evaluateControlledInstallRestoration(plan, final, baseline);
     result.checks.final = check;
     if (!check.admit) return { ...result, status: "restoration-failed", reasons: [...result.reasons, ...check.reasons] };
   } catch { return { ...result, status: "restoration-failed", reasons: [...result.reasons, "final-observation-failed"] }; }
