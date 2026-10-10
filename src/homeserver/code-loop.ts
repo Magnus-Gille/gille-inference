@@ -98,7 +98,7 @@ const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
   "engine-failure",
 ]);
 const CODE_LOOP_REFUSAL_ENUM = [
-  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
+  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
 ] as const;
 
 const CODE_LOOP_START_OUTPUT_SCHEMA = {
@@ -1125,6 +1125,12 @@ export async function startCodeLoop(
 
   if (deps.maintenanceMode()) {
     return { ok: false, refusal: "maintenance", message: "The box is in maintenance mode for an explicit evaluation window. Try again shortly." };
+  }
+  if (deps.codeLoopTransportProbe !== undefined) {
+    const transportReady = await deps.codeLoopTransportProbe().catch(() => false);
+    if (!transportReady) {
+      return { ok: false, refusal: "cage-transport-unavailable", message: "The dedicated code_loop user bus is unavailable. Retry after the service recovers." };
+    }
   }
   if (runningWorkId !== null) {
     return { ok: false, refusal: "busy", message: "A code_loop run is already in progress (single-flight). Retry when it finishes." };

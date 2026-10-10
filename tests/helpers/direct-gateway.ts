@@ -106,7 +106,7 @@ function makeRequest(args: DirectGatewayInvokeArgs): IncomingMessage {
   return req as IncomingMessage;
 }
 
-export function createDirectGatewayHarness(): DirectGatewayHarness {
+export function createDirectGatewayHarness(codeLoopTransportProbe?: () => Promise<boolean>): DirectGatewayHarness {
   initializeGatewayRegistries();
   resetConfig();
   const cfg = loadConfig();
@@ -131,6 +131,10 @@ export function createDirectGatewayHarness(): DirectGatewayHarness {
         controller,
         implicitAdminAllowed,
         learningTaskCapabilityEpoch,
+        undefined,
+        undefined,
+        undefined,
+        codeLoopTransportProbe,
       );
       const text = res.bodyText();
       let json: unknown | null = null;

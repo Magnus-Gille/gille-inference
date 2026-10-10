@@ -68,6 +68,8 @@ type DiagnoseOptions = {
   publicTools?: string[];
   privateTools?: string[];
   rejectPublic?: number;
+  publicTransport?: string;
+  privateTransport?: string;
 };
 
 function discoveryFailureForEndpoint(
@@ -85,6 +87,8 @@ async function diagnose({
   publicTools = REQUIRED_TOOLS,
   privateTools = publicTools,
   rejectPublic,
+  publicTransport = "available",
+  privateTransport = publicTransport,
 }: DiagnoseOptions = {}) {
   let askCalls = 0;
   const result = await diagnoseProfile({
@@ -112,6 +116,10 @@ async function diagnose({
             : new Response("", { status: rejectPublic });
         }
         return jsonResponse({ alias: "doctor-agent", tier: "owner", scope: "agent" });
+      }
+      if (url.endsWith("/healthz")) {
+        expect(init?.headers).not.toHaveProperty("authorization");
+        return jsonResponse({ ok: true, codeLoopTransport: isPrivate ? privateTransport : publicTransport });
       }
 
       const request = JSON.parse(String(init?.body)) as {
@@ -374,10 +382,27 @@ describe("m5 doctor model-discovery diagnostics", () => {
       credential: "present",
       model_discovery: { public: "available", private: "available" },
       inference: { public: "not_checked", private: "not_checked" },
+      code_loop_transport: { public: "available", private: "available" },
       endpoints: { public: "healthy", private: "healthy" },
       connector: { status: "unsupported" },
     });
     expect(result).not.toHaveProperty("discovery_failure");
+    expectNoTaintedContent(result);
+  });
+
+  it("reports a dead code-loop transport without claiming inference was checked", async () => {
+    const result = await diagnose({ publicTransport: "unavailable", privateTransport: "unavailable" });
+    expect(result).toMatchObject({
+      status: "degraded",
+      code_loop_transport: { public: "unavailable", private: "unavailable" },
+      inference: { public: "not_checked", private: "not_checked" },
+    });
+    expectNoTaintedContent(result);
+  });
+
+  it("does not trust an unknown transport label from the gateway", async () => {
+    const result = await diagnose({ publicTransport: `unavailable ${SECRET} ${LOCATOR}` });
+    expect(result).toMatchObject({ code_loop_transport: { public: "unknown", private: "unknown" } });
     expectNoTaintedContent(result);
   });
 

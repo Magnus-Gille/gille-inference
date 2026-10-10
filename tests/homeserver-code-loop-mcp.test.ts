@@ -223,7 +223,7 @@ describe("code_loop_* visibility in tools/list", () => {
     for (const value of ["running", "completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]) {
       expect(schemaText).toContain(value);
     }
-    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
+    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
       expect(schemaText).toContain(refusal);
     }
   });
