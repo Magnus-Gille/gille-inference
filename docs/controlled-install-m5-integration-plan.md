@@ -202,7 +202,9 @@ Each mutating leaf uses its own worktree. There is no M5 mutation during these l
 | G4: real installation | New exact immutable payload and resource envelope, all prior gates passed, fresh owner approval | Only that approved installation |
 
 G0 includes a Linux test host with distinct service UIDs and restricted procfs, not just injected
-JSON. Test the exact runtime build with direct and proxied requests, cold load, deferred queue,
+JSON. The [test-host preflight](observer-test-host.md) inventories the existing CI runner's
+prerequisites without installing dependencies or claiming observer qualification. Test the exact
+runtime build with direct and proxied requests, cold load, deferred queue,
 slow body, client disconnect and work shorter than one polling interval. Verify `--metrics` does not
 enable `/slots`; test all active runtime types. No live M5 inference test is implied by local approval.
 
