@@ -318,3 +318,42 @@ reconciles as complete/idle; 1 means busy, unknown or rejected; 2 means usage or
 Source `install-coverage-check-v1` is deliberately different from `host-probe-v1`. A saved receipt,
 an accepted hash or this exit status never grants live installation admission. Tests exercise synthetic
 graphs, omissions, stale/replaced evidence, counters/fences and cancellation, not live completeness.
+
+### Native Linux discovery diagnostic
+
+```sh
+node --import tsx scripts/observe-host-inventory.ts --timeout-ms 5000
+```
+
+`linux-host-inventory.ts` discovers numeric PIDs from the visible `/proc` mount, parses both TCP
+tables, and associates listening socket inodes with all readable descriptor holders. It requires no
+predeclared backend list. Each process sample brackets descriptor reads with process start time,
+PID/network namespace and executable inode metadata. The executable contents/path, command line,
+environment, prompts and request bodies are never read. Reports contain only numeric IDs, validated
+kernel TCP address hex/ports, counts, hashes and closed reason codes; keep actual reports private.
+
+Two full scans expose changes to the visible PID set, identities, listener membership and sampled
+established-socket counts. Shared listener ownership is preserved rather than choosing an arbitrary
+PID. Read errors, process exit/reuse, foreign namespaces and unreadable holders are explicit gaps.
+The report retains unknown process entries instead of silently omitting them. Whole-scan failures
+or expiry return `unknown`; partial scans return `partial`. A common deadline (1–30000 ms) and caller
+cancellation stop further reader calls. A pending filesystem read can finish later, within fixed
+payload/entry limits: at most 8192 PIDs, 4096 descriptors per PID and 1 MiB/4096 rows per TCP table.
+
+The source is `linux-host-inventory-v1`, scope `observer-visible-procfs`, and coverage is always
+`unknown`. Even an `observed` result says only that the visible samples were readable and unchanged:
+procfs visibility restrictions, containers, alternate namespaces, UDP/Unix sockets, non-network
+work and lifecycle producers can remain outside this view. Kernel/zombie processes or permission
+restrictions may make the observation partial. This output cannot issue a `host-inventory-v1`
+receipt or establish the accepted boundary required above.
+
+`tcpEstablishedSockets` is a process's observed descriptor-held TCP socket count in ESTABLISHED
+state, including outbound and non-inference traffic. Shared sockets may appear for multiple holders;
+counts must not be summed into requests. Zero is not idle proof, and a positive value is not active
+inference proof. It is discovery evidence to reconcile with runtime scheduler and lifecycle sources.
+The collector does not query unknown listeners, change services, load models or fence traffic.
+
+Exit 0 means the visible sample is `observed`; exit 1 means `partial` or `unknown`; exit 2 means invalid
+input or an unexpected top-level failure. No exit status grants installation admission. This adds
+actual procfs discovery, but complete backend classification and traffic/lifecycle measurement remain
+separate obligations before #409 can admit installations using live evidence.

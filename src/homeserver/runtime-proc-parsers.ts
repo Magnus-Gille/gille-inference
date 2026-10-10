@@ -52,6 +52,14 @@ type TcpRow = {
   inode: string;
 };
 
+export interface ProcTcpSocket {
+  family: "ipv4" | "ipv6";
+  addressHex: string;
+  port: number;
+  state: number;
+  inode: string;
+}
+
 function parseHex(value: string): bigint | null {
   if (!/^[0-9a-fA-F]+$/.test(value)) return null;
   try {
@@ -155,4 +163,51 @@ export function findLoopbackListener(
     listener = row.inode;
   }
   return listener;
+}
+
+export function parseProcTcpSockets(tcp: string, tcp6: string): ProcTcpSocket[] | null {
+  const seenInodes = new Set<string>();
+  const ipv4Rows = parseTcpTable(tcp, false, seenInodes);
+  const ipv6Rows = parseTcpTable(tcp6, true, seenInodes);
+  if (ipv4Rows === null || ipv6Rows === null) return null;
+
+  // Unlike a single-listener lookup, inventory joins every descriptor by inode. The two
+  // non-atomic tables must not assign a nonzero identity to more than one socket row.
+  const allInodes = new Set<string>();
+  for (const row of [...ipv4Rows, ...ipv6Rows]) {
+    if (row.inode === "0") continue;
+    if (allInodes.has(row.inode)) return null;
+    allInodes.add(row.inode);
+  }
+
+  return [
+    ...ipv4Rows.map((row) => ({
+      family: "ipv4" as const,
+      addressHex: row.address,
+      port: row.port,
+      state: row.state,
+      inode: row.inode,
+    })),
+    ...ipv6Rows.map((row) => ({
+      family: "ipv6" as const,
+      addressHex: row.address,
+      port: row.port,
+      state: row.state,
+      inode: row.inode,
+    })),
+  ];
+}
+
+export function parseProcPidNames(names: string[]): number[] | null {
+  if (!Array.isArray(names) || names.length > 8192) return null;
+
+  const parsed = new Set<number>();
+  for (const name of names) {
+    if (typeof name !== "string" || !/^[1-9]\d*$/.test(name) || name.length > 10) return null;
+    const pid = Number(name);
+    if (!Number.isSafeInteger(pid) || pid > 2_147_483_647 || parsed.has(pid)) return null;
+    parsed.add(pid);
+  }
+
+  return [...parsed].sort((a, b) => a - b);
 }

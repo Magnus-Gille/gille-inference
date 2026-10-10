@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { findLoopbackListener, parseProcessStartTicks } from "../src/homeserver/runtime-proc-parsers.js";
+import {
+  findLoopbackListener,
+  parseProcPidNames,
+  parseProcTcpSockets,
+  parseProcessStartTicks,
+} from "../src/homeserver/runtime-proc-parsers.js";
 
 function statLine(pid: string, comm: string, state: string, starttime: string, fields = 19): string {
   const afterState = Array.from({ length: fields }, (_, index) =>
@@ -131,5 +136,77 @@ describe("findLoopbackListener", () => {
 
   it("rejects a table over the 1 MiB UTF-8 limit", () => {
     expect(findLoopbackListener(`${TABLE_HEADER}\n${"x".repeat(1_048_576)}`, tcpTable([], true), "127.0.0.1", 8080)).toBeNull();
+  });
+});
+
+describe("parseProcTcpSockets", () => {
+  it("returns every IPv4 and IPv6 row with uppercase addresses and numeric states", () => {
+    const tcp = tcpTable([
+      tcpRow({ address: "abcdef01", port: 8080, state: "01", inode: "00042" }),
+      tcpRow({ slot: 1, address: "00000000", port: 8081, state: "0A", inode: "43" }),
+    ]);
+    const tcp6 = tcpTable(
+      [tcpRow({ address: "abcdefabcdefabcdefabcdefabcdefab", port: 9090, state: "06", inode: "44" })],
+      true,
+    );
+
+    expect(parseProcTcpSockets(tcp, tcp6)).toEqual([
+      { family: "ipv4", addressHex: "ABCDEF01", port: 8080, state: 1, inode: "42" },
+      { family: "ipv4", addressHex: "00000000", port: 8081, state: 10, inode: "43" },
+      { family: "ipv6", addressHex: "ABCDEFABCDEFABCDEFABCDEFABCDEFAB", port: 9090, state: 6, inode: "44" },
+    ]);
+  });
+
+  it.each([
+    ["missing IPv4 table", "", tcpTable([], true)],
+    ["malformed IPv6 row", tcpTable([]), `${TABLE6_HEADER}\n0: bad\n`],
+    ["duplicate listening inode", tcpTable([tcpRow({ inode: "42" })]), tcpTable([tcpRow({ address: "00000000000000000000000001000000", inode: "42" })], true)],
+  ] as const)("fails closed for %s", (_name, tcp, tcp6) => {
+    expect(parseProcTcpSockets(tcp, tcp6)).toBeNull();
+  });
+
+  it("rejects a table over the strict row limit", () => {
+    const rows = Array.from({ length: 4097 }, (_, index) => tcpRow({ slot: index, port: 8081, inode: String(index + 1) }));
+    expect(parseProcTcpSockets(tcpTable(rows), tcpTable([], true))).toBeNull();
+  });
+  it.each(["01", "0A"])("rejects inode reuse across families/states (%s)", state => {
+    expect(parseProcTcpSockets(
+      tcpTable([tcpRow({ state: "01", inode: "42" })]),
+      tcpTable([tcpRow({ address: "00000000000000000000000001000000", state, inode: "42" })], true),
+    )).toBeNull();
+  });
+  it("allows repeated zero inodes for sockets without a descriptor identity", () => {
+    expect(parseProcTcpSockets(tcpTable([
+      tcpRow({ state: "06", inode: "0" }), tcpRow({ slot: 1, state: "06", inode: "0" }),
+    ]), tcpTable([], true))).toHaveLength(2);
+  });
+});
+
+describe("parseProcPidNames", () => {
+  it("sorts numeric PIDs without mutating the input", () => {
+    const names = ["214", "3", "42"];
+    expect(parseProcPidNames(names)).toEqual([3, 42, 214]);
+    expect(names).toEqual(["214", "3", "42"]);
+  });
+
+  it("accepts an empty candidate set", () => {
+    expect(parseProcPidNames([])).toEqual([]);
+  });
+
+  it.each([
+    ["zero", ["0"]],
+    ["leading zero", ["01"]],
+    ["non-numeric", ["12x"]],
+    ["signed", ["+12"]],
+    ["duplicate", ["12", "12"]],
+    ["over the PID maximum", ["2147483648"]],
+    ["empty entry", [""]],
+  ] as const)("rejects %s", (_name, names) => {
+    expect(parseProcPidNames(names)).toBeNull();
+  });
+
+  it("rejects more than 8192 entries", () => {
+    const names = Array.from({ length: 8193 }, (_, index) => String(index + 1));
+    expect(parseProcPidNames(names)).toBeNull();
   });
 });
