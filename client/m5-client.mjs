@@ -2126,6 +2126,7 @@ async function endpointDoctor({
       tier: identity?.tier,
       scope: identity?.scope,
     },
+    inference_observation: sanitizeInferenceObservation(identity),
     gateway_compatibility: classifyGatewayCompatibility(identity),
     tools,
     model_discovery: modelDiscovery,
@@ -2176,6 +2177,28 @@ function sanitizeGatewayMetadata(identity) {
     contract_state: gatewayPresent && (!identity.gateway || typeof identity.gateway !== "object" || Array.isArray(identity.gateway)) ? "invalid"
       : !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
   };
+}
+
+/** A global request-log observation, never a live inference readiness claim. */
+function sanitizeInferenceObservation(identity) {
+  const unsupported = { status: "not_supported", last_successful_at: null };
+  if (!identity || typeof identity !== "object" || Array.isArray(identity) ||
+    !Object.prototype.hasOwnProperty.call(identity, "inferenceObservation")) return unsupported;
+  const value = identity.inferenceObservation;
+  const invalid = { status: "invalid", last_successful_at: null };
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    value.source !== "request_log" || value.scope !== "m5_global") return invalid;
+  if (value.status === "observed") {
+    const at = value.lastSuccessfulAt;
+    if (typeof at !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(at)) return invalid;
+    const parsed = Date.parse(at);
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== at) return invalid;
+    return { status: "observed", last_successful_at: at };
+  }
+  if (["none", "disabled", "unavailable"].includes(value.status) && value.lastSuccessfulAt === null) {
+    return { status: value.status, last_successful_at: null };
+  }
+  return invalid;
 }
 
 function classifyGatewayCompatibility(metadata) {
@@ -2376,6 +2399,11 @@ function doctorCredentialResult({ profile, status, credential, endpoints }) {
       : {}),
     model_discovery: { public: "not_checked", private: "not_checked" },
     inference: { public: "not_checked", private: "not_checked" },
+    inference_observation: {
+      source: "request_log", scope: "m5_global",
+      public: { status: "not_checked", last_successful_at: null },
+      private: { status: "not_checked", last_successful_at: null },
+    },
     gateway: { public: null, private: null },
     compatibility: { public: "unknown", private: "unknown" },
     endpoints,
@@ -2397,6 +2425,11 @@ function doctorCapabilityFields(
     },
     // Doctor never calls `ask`: that path is metered, so readiness remains explicitly unknown.
     inference: { public: "not_checked", private: "not_checked" },
+    inference_observation: {
+      source: "request_log", scope: "m5_global",
+      public: publicProbe?.inference_observation ?? { status: "not_checked", last_successful_at: null },
+      private: privateProbe?.inference_observation ?? { status: "not_checked", last_successful_at: null },
+    },
   };
 }
 

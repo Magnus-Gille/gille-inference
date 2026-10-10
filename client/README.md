@@ -18,6 +18,11 @@ The 1.5.x `m5` client requires the gateway's v9 schema-grounding contract for `c
 Its doctor reports MCP catalogue reachability without calling metered inference and checks the
 installed client against the gateway's advertised result contract; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
+For minted owner agent/admin keys, `inference_observation` reports the last successful admitted
+M5 inference recorded in the gateway's content-blind request log. It is global historical evidence,
+not a public/private route probe: `inference` stays `not_checked` even when a timestamp exists.
+Older gateways report `not_supported`; an unavailable or disabled log cannot establish that no
+inference succeeded.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
 interchangeable. Restart/reconnect long-lived MCP bridge processes after installing the
 accepted package. The `hs` friend-facing API is unchanged. Publication, installation, and
