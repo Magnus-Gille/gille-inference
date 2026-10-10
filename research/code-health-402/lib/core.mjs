@@ -30,6 +30,16 @@ export function digest(value) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+export function codeHealthSnapshotId({ repository, commit, collectionRef, attempt }) {
+  if (!repository || typeof repository.owner !== 'string' || typeof repository.name !== 'string'
+    || !/^[a-f0-9]{40}$/.test(commit ?? '')
+    || !/^ref:[a-z0-9][a-z0-9-]{0,95}$/.test(collectionRef ?? '')
+    || !Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new TypeError('snapshot identity requires a repository, full commit SHA, collection reference, and positive attempt');
+  }
+  return refId(`objective-${digest({ repository, commit, collection_ref: collectionRef, attempt })}`);
+}
+
 export function refId(value) {
   const slug = String(value)
     .toLowerCase()

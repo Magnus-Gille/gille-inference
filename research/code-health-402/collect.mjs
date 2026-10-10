@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile, mkdir, mkdtemp, realpath, rm, writeFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import {
   canonical,
   assertToolVersion,
   analyzerStatus,
+  codeHealthSnapshotId,
   countFunctionNodes,
   digest,
   eslintInventoryComplete,
@@ -272,6 +273,15 @@ function makeMetricSource({ collectionRef, attempt, toolName, toolVersion, langu
     configDigest: configDigestValue,
     scopeDigest: scopeDigestValue,
   });
+}
+
+export function newCollectionRef({ runId, attempt }) {
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new TypeError('collector attempt must be a positive integer');
+  if (runId !== null && (!Number.isSafeInteger(Number(runId)) || Number(runId) < 1)) {
+    throw new TypeError('GitHub run ID must be a positive integer');
+  }
+  const runIdentity = runId === null ? `local-${randomUUID()}` : `gha-${Number(runId)}`;
+  return refId(`collection-${runIdentity}-attempt-${attempt}`);
 }
 
 function aggregateResult(result, metricName) {
@@ -1112,8 +1122,7 @@ export async function collect({
   if (!Number.isSafeInteger(attempt) || attempt < 1) throw new TypeError('collector attempt must be a positive integer');
   const providerRunId = runId === null ? null : Number(runId);
   if (providerRunId !== null && (!Number.isSafeInteger(providerRunId) || providerRunId < 1)) throw new TypeError('GitHub run ID must be a positive integer');
-  const runSlug = providerRunId !== null ? `gha-${providerRunId}` : `local-${Date.parse(observedAt)}`;
-  const collectionRef = refId(`collection-${runSlug}-${attempt}`);
+  const collectionRef = newCollectionRef({ runId: providerRunId, attempt });
   const sourceList = await sourceFiles(pilotDeadline);
   const tsFiles = sourceList.filter(file => /^(src|scripts)\/.+\.ts$/.test(file));
   const trackedClean = await cleanTrackedWorktree(pilotDeadline);
@@ -1196,7 +1205,12 @@ export async function collect({
 
   const objective = {
     contract_version: '1.0',
-    snapshot_id: refId(`objective-${commit.slice(0, 12)}-${Date.parse(observedAt)}`),
+    snapshot_id: codeHealthSnapshotId({
+      repository: { owner: 'Magnus-Gille', name: 'gille-inference' },
+      commit,
+      collectionRef,
+      attempt,
+    }),
     supersedes_ref: null,
     correction_ref: null,
     repository: { owner: 'Magnus-Gille', name: 'gille-inference' },

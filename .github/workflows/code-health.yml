@@ -16,7 +16,9 @@ on:
 jobs:
   collect:
     name: Collect report-only code health
-    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
+    if: >-
+      ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') &&
+          (github.event_name != 'schedule' || vars.CODE_HEALTH_COLLECTION_ENABLED == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

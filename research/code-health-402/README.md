@@ -23,10 +23,13 @@ later retry is green. An inaccessible attempt remains visible with unknown job o
 1,000 runs, incomplete enumeration, or an unrecognized workflow config produces an unavailable
 slot instead of a truncated measurement.
 
-Pull requests run only synthetic producer tests and conformance checks; they do not install
-analyzers or collect a report. Daily scheduled runs collect CI metadata only and mark the static
+Scheduled collection is skipped unless the repository Actions variable
+`CODE_HEALTH_COLLECTION_ENABLED` is the exact string `true`. Pull requests still run only synthetic
+producer tests and conformance checks; they do not install analyzers or collect a report. When
+enabled, daily scheduled runs collect CI metadata only and mark the static
 slots unknown with `not-collected`. Complexity, Knip candidates, and scoped TypeScript coverage
-run weekly on Monday or on a main-branch `workflow_dispatch` with `collect_static=true`; each
+run weekly on Monday. A main-branch `workflow_dispatch` with `collect_static=true` remains available
+independently of the schedule variable; each
 static run installs the pinned tools and invokes the collector once. The same explicit scope can be
 requested before or after an agreed simplification sprint. Complexity uses the #401 ESLint correction configuration at a
 threshold of 20 and a separate complete TypeScript executable-function inventory. Coverage uses
@@ -60,11 +63,14 @@ owning repository's reviewed adoption work.
 
 ## Disable and reverse
 
-Disable collection by removing or reverting `.github/workflows/code-health.yml`; no application
-runtime reads these files. To restore the prior state, revert the workflow and this research
-directory in a reviewed commit. Verify that scheduled code-health runs stop and that the existing
-`.github/workflows/ci.yml` checks remain unchanged. This does not delete previously uploaded
-artifacts; they expire under their declared retention period.
+Set the repository Actions variable `CODE_HEALTH_COLLECTION_ENABLED` to `true` to enable scheduled
+metadata and weekly static collection. Unset it or change it to any other value to disable scheduled
+collection. Pull-request conformance and main-branch `workflow_dispatch` remain available in either
+state. No application runtime reads these files. To remove the producer entirely, revert
+`.github/workflows/code-health.yml` and this research directory in a reviewed commit. Verify that
+scheduled code-health runs stop and that the existing `.github/workflows/ci.yml` checks remain
+unchanged. This does not delete previously uploaded artifacts; they expire under their declared
+retention period.
 
 The implementation is an informational adoption audit for gille-inference #402, linked to Grimnir
 #211. The exact vendored contract source revision and file hashes are recorded in

@@ -9,6 +9,7 @@ import {
   analyzerStatus,
   assertToolVersion,
   buildCohortRuns,
+  codeHealthSnapshotId,
   countFunctionNodes,
   eslintInventoryComplete,
   mapJobConclusion,
@@ -26,7 +27,7 @@ import {
   fetchJsonWithRetry,
   getFirstAttempt,
 } from './lib/ci.mjs';
-import { checkVendorContract, collect, collectCi, inferTriage, reportMarkdown, runProcess } from './collect.mjs';
+import { checkVendorContract, collect, collectCi, inferTriage, newCollectionRef, reportMarkdown, runProcess } from './collect.mjs';
 import { validateObjective } from '../../contracts/grimnir-code-health-v1/scripts/lib/code-health-objective.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -46,6 +47,28 @@ const makeRun = (id, overrides = {}) => ({
   ...overrides,
 });
 const response = value => ({ ok: true, status: 200, json: async () => value });
+
+test('snapshot identity is stable for replay and distinct for runs, attempts, and full commit SHAs', () => {
+  const identity = {
+    repository: { owner: 'Magnus-Gille', name: 'gille-inference' },
+    commit: 'a'.repeat(40),
+    collectionRef: 'ref:collection-gha-7021-attempt-1',
+    attempt: 1,
+  };
+  const first = codeHealthSnapshotId(identity);
+  assert.equal(codeHealthSnapshotId(identity), first);
+  assert.notEqual(codeHealthSnapshotId({ ...identity, collectionRef: 'ref:collection-gha-7022-attempt-1' }), first);
+  assert.notEqual(codeHealthSnapshotId({ ...identity, collectionRef: 'ref:collection-gha-7021-attempt-2', attempt: 2 }), first);
+  assert.notEqual(codeHealthSnapshotId({ ...identity, commit: 'a'.repeat(12) + 'b'.repeat(28) }), first);
+});
+
+test('collection references are stable for GitHub artifacts and unique for local invocations', () => {
+  assert.equal(newCollectionRef({ runId: '7021', attempt: 2 }), newCollectionRef({ runId: '7021', attempt: 2 }));
+  const first = newCollectionRef({ runId: null, attempt: 1 });
+  const second = newCollectionRef({ runId: null, attempt: 1 });
+  assert.match(first, /^ref:collection-local-[0-9a-f-]+-attempt-1$/);
+  assert.notEqual(first, second);
+});
 
 async function listFiles(directory, prefix = '') {
   const result = [];
@@ -637,6 +660,8 @@ test('informational workflow preserves the read-only, always-artifact contract a
   assert.match(workflow, /cron: '47 4 \* \* 1'/);
   assert.match(workflow, /pull_request:/);
   assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /github\.event_name != 'workflow_dispatch' \|\| github\.ref == 'refs\/heads\/main'/);
+  assert.match(workflow, /github\.event_name != 'schedule' \|\| vars\.CODE_HEALTH_COLLECTION_ENABLED == 'true'/);
   assert.match(workflow, /node-version: '22'/);
   assert.match(workflow, /name: code-health-v1/);
   assert.match(workflow, /retention-days: 30/);
