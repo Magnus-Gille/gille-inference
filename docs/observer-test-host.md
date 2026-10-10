@@ -1,8 +1,8 @@
 # Observer Linux test-host prerequisites
 
 G0 needs a disposable Linux fixture to test the native observer across service UIDs,
-restricted procfs, systemd activation and enforcing AppArmor. The existing Ubuntu CI job
-runs a read-only prerequisite inventory before its normal checks:
+restricted procfs, systemd activation and enforcing AppArmor. A separate workflow uses
+the existing Ubuntu runner image for a read-only prerequisite inventory:
 
 ```sh
 python3 scripts/check-observer-test-host.py

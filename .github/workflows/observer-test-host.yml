@@ -1,0 +1,29 @@
+name: Observer test-host prerequisites
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: observer-test-host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Observer test-host preflight contract
+        run: python3 tests/test_observer_test_host.py -v
+
+      # Missing facilities are diagnostic, not observer qualification.
+      - name: Inspect observer test-host prerequisites
+        run: python3 scripts/check-observer-test-host.py

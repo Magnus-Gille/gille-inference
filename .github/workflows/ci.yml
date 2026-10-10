@@ -75,14 +75,6 @@ jobs:
           node-version: '22'
           cache: npm
 
-      - name: Observer test-host preflight contract
-        run: python3 tests/test_observer_test_host.py -v
-
-      # Read-only prerequisite inventory. Missing facilities are diagnostic;
-      # this never qualifies the observer or enables privileged fixture work.
-      - name: Inspect observer test-host prerequisites
-        run: python3 scripts/check-observer-test-host.py
-
       # npm ci builds better-sqlite3 (prebuilt for node 22 / linux x64, or
       # compiled via node-gyp — ubuntu-latest has the toolchain).
       - name: Install dependencies
