@@ -50,6 +50,10 @@ actually true:
 
 ## Build vs configure
 
+For bounded CPU installation preflight and watchdog tooling, see
+[`docs/controlled-install.md`](../docs/controlled-install.md). Its activity/resource predicate
+requires an explicitly approved host adapter; it does not change the live deployment gates below.
+
 | Layer | How | Notes |
 |---|---|---|
 | Transport / TLS / DDoS | **configure** Cloudflare Tunnel | `cloudflared`, see `cloudflared/config.example.yml` |
