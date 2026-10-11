@@ -200,6 +200,13 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
 | `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
+For `choice`, supply `criteria` as an object with 2–26 named options, for example
+`{"billing":"Payment issue","support":"Technical issue"}`. Read the selected key from
+`answers.<question-id>.choice`; `probabilities` uses the same keys. The portal and
+[customer contract](../../docs/systemone-customer-access.md) include a complete request,
+illustrative response and troubleshooting for invalid criteria and upstream failures.
+
+
 `GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...}}` when the backend snapshot is
 available. Each model row contains only `model`, `state`, `ttl`, `classification` (`serving`,
 `ttl_retained`, `unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
