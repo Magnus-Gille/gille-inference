@@ -2,6 +2,8 @@
 
 This directory is the first Linux execution fixture for G0. It is not an installed observer,
 a complete inventory collector, an authenticated evidence channel, or an executable G1 packet.
+Counter parsers reject missing, duplicate, malformed and overflowing evidence; they do not
+turn failed reads into zero. The fixture checks live read/parse access, not admission or OOM continuity.
 Its output explicitly says `qualifiesObserver: false`. No fixture connects to M5.
 
 The observer uses C and the distribution's systemd library instead of implementing D-Bus framing.
@@ -33,6 +35,7 @@ four tasks and a ten-second start timeout. CAP_DAC_READ_SEARCH is not granted by
 
 The test executable is a deliberately bounded fixture probe, not the eventual observer. It checks:
 
+- Bounded memory-headroom and global/per-unit OOM metadata reads under the same confinement.
 - Cross-UID process stat and executable-link access to a synthetic, credential-free sentinel.
 - A readable synthetic-file control followed by denial under AppArmor; forbidden procfs paths
   are tested by open/close only, with no content read even if a policy is broken.

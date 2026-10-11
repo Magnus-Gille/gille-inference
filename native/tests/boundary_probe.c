@@ -2,6 +2,7 @@
 /* Disposable Linux fixture only. Not an observer, launcher or M5 executable. */
 #include "../observer/lockdown.h"
 #include "../observer/proc_stat.h"
+#include "../observer/counters.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -49,6 +50,28 @@ static void check_unix_peer(bool abstract, bool control)
     check(abstract ? "abstract-peer-boundary" : "pathname-peer-boundary",
         fd >= 0 && (control ? result == 0 : result == -1 && (error == EACCES || error == EPERM)));
     if (fd >= 0) close(fd);
+}
+
+/* Only source-constant metadata paths reach this helper. Require EOF within the
+ * parser bound; short reads do not turn a truncated file into a valid sample. */
+static bool check_counter_file(const char *path, bool memory)
+{
+    char data[65537];
+    size_t used = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    bool eof = false;
+    while (used < sizeof data) {
+        ssize_t count = read(fd, data + used, sizeof data - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) break;
+        if (count == 0) { eof = true; break; }
+        used += (size_t)count;
+    }
+    close(fd);
+    uint64_t value = 0;
+    return eof && (memory ? gi_parse_mem_available(data, used, &value) :
+        gi_parse_oom_kill(data, used, &value)) == 0;
 }
 
 static int fixed_bus(sd_bus **bus)
@@ -104,6 +127,10 @@ int main(int argc, char **argv)
     if (!pidfile || fscanf(pidfile, "%u", &target) != 1 || target == 0 || target > INT32_MAX) return 2;
     fclose(pidfile);
     if (gi_observer_lockdown() != 0) return 2;
+    check("memory-metadata", check_counter_file("/proc/meminfo", true));
+    check("global-oom-metadata", check_counter_file("/proc/vmstat", false));
+    check("unit-oom-metadata", check_counter_file(
+        "/sys/fs/cgroup/system.slice/gi-observer-fixture-target.service/memory.events", false));
     check_unix_peer(false, control);
     check_unix_peer(true, control);
 
