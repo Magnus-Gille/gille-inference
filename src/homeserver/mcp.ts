@@ -274,6 +274,37 @@ const ASK_OUTPUT_SCHEMA = {
   required: ["model", "text", "finish_reason", "truncated", "metered", "usage"],
 } as const;
 
+/** Only the separately requested reasoning field is capped; generation/usage is unchanged. */
+export const ASK_REASONING_MAX_BYTES = 16_384;
+class InvalidAskResponse extends Error {}
+interface AskReasoning {
+  content: string | null;
+  truncated: boolean | null;
+}
+function boundedAskReasoning(raw: unknown): AskReasoning {
+  if (typeof raw !== "string") return { content: null, truncated: null };
+  let bytes = 0;
+  let end = 0;
+  // Stop at a complete Unicode code point. Never decode a sliced UTF-8 byte sequence.
+  for (const character of raw) {
+    const next = Buffer.byteLength(character, "utf8");
+    if (bytes + next > ASK_REASONING_MAX_BYTES) return { content: raw.slice(0, end), truncated: true };
+    bytes += next;
+    end += character.length;
+  }
+  return { content: raw, truncated: false };
+}
+const ASK_OWNER_OUTPUT_SCHEMA = {
+  ...ASK_OUTPUT_SCHEMA,
+  properties: {
+    ...ASK_OUTPUT_SCHEMA.properties,
+    reasoning_content: { type: ["string", "null"], maxLength: ASK_REASONING_MAX_BYTES,
+      description: "Only with include_reasoning:true: upstream reasoning text, limited to 16384 UTF-8 bytes, or null when unavailable." },
+    reasoning_truncated: { type: ["boolean", "null"],
+      description: "Whether the reasoning field was clipped by the response byte cap; null when unavailable. Independent of generation finish_reason." },
+  },
+} as const;
+
 const CODE_LOOP_OWNER_INSTRUCTIONS =
   "code_loop is OWNER-AGENT ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
 
@@ -502,6 +533,10 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
             description:
               "optional actual known cloud delegator model id for savings accounting; omit when unknown, never guess",
           },
+          ...(principal.tier === "owner" ? {
+            include_reasoning: { type: "boolean", default: false,
+              description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
+          } : {}),
           files: {
             type: "array",
             items: { type: "string" },
@@ -513,7 +548,7 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
         },
         required: ["model", "prompt"],
       },
-      outputSchema: ASK_OUTPUT_SCHEMA,
+      outputSchema: principal.tier === "owner" ? ASK_OWNER_OUTPUT_SCHEMA : ASK_OUTPUT_SCHEMA,
     },
   ];
   if (isAdoptionReporter(principal)) {
@@ -586,6 +621,8 @@ export interface RunChatArgs {
   topK?: number;
   minP?: number;
   reasoningEffort?: "low";
+  /** Expose native reasoning only when true AND the authenticated caller is owner-tier. */
+  includeReasoning?: boolean;
   /**
    * #33: an already-ADMITTED LearningTaskContract Hugin request stamp, when the caller has one —
    * threaded straight through to the ledger write's evidence-identity derivation (lane "mcp-ask"),
@@ -620,6 +657,7 @@ export type RunChatResult =
       truncated: boolean | null;
       usage: AskUsageMetadata;
       feedbackHandle?: string;
+      reasoning?: AskReasoning;
     }
   | {
       ok: false;
@@ -781,6 +819,8 @@ function toAskStructuredContent(
   truncated: boolean | null;
   metered: true;
   feedback_handle?: string;
+  reasoning_content?: string | null;
+  reasoning_truncated?: boolean | null;
   usage: {
     prompt_tokens: number | null;
     completion_tokens: number | null;
@@ -793,6 +833,9 @@ function toAskStructuredContent(
   return {
     model,
     text: result.text,
+    ...(result.reasoning === undefined ? {} : {
+      reasoning_content: result.reasoning.content, reasoning_truncated: result.reasoning.truncated,
+    }),
     finish_reason: result.finishReason,
     truncated: result.truncated,
     metered: true,
@@ -1146,6 +1189,9 @@ export async function runChatCompletion(
     }
 
     let content = "";
+    // Recheck tier at the shared helper boundary; never mix reasoning into final text or logs.
+    const includeReasoning = args.includeReasoning === true && principal.tier === "owner";
+    let reasoning = includeReasoning ? boundedAskReasoning(undefined) : undefined;
     let promptTokens: number | null = null;
     let completionTokens: number | null = null;
     let usageMetadata = emptyAskUsageMetadata();
@@ -1153,10 +1199,16 @@ export async function runChatCompletion(
     let truncated: boolean | null = null;
     try {
       const json = JSON.parse(text) as {
-        choices?: Array<{ message?: { content?: string }; finish_reason?: string | null }>;
+        choices?: Array<{ message?: { content?: string; reasoning_content?: unknown }; finish_reason?: string | null }>;
         usage?: unknown;
       };
-      content = json.choices?.[0]?.message?.content ?? "";
+      if (json === null || typeof json !== "object" || Array.isArray(json) ||
+          (json.choices != null && !Array.isArray(json.choices))) throw new InvalidAskResponse();
+      const message = json.choices?.[0]?.message;
+      if (message != null && (typeof message !== "object" || Array.isArray(message) ||
+          (message.content != null && typeof message.content !== "string"))) throw new InvalidAskResponse();
+      content = message?.content ?? "";
+      if (includeReasoning) reasoning = boundedAskReasoning(message?.reasoning_content);
       usageMetadata = parseAskUsageMetadata(json.usage);
       promptTokens = usageMetadata.promptTokens;
       completionTokens = usageMetadata.completionTokens;
@@ -1167,10 +1219,13 @@ export async function runChatCompletion(
         (promptTokens !== null && completionTokens !== null
           ? promptTokens + completionTokens
           : Math.ceil(promptChars / 4));
-    } catch {
-      // 2xx non-JSON: surface the raw body, charge only the prompt estimate.
-      content = text;
-      actualTokens = Math.ceil(promptChars / 4);
+    } catch (error) {
+      if (!(error instanceof SyntaxError) && !(error instanceof InvalidAskResponse)) throw error;
+      // A malformed envelope may contain reasoning bytes. Never reflect it as a final answer
+      // or persist it in owner logs; this failed call is reconciled to zero as other failures are.
+      actualTokens = 0;
+      return { ok: false, code: "upstream_error", message: "The model backend returned an invalid chat response.",
+        traceOutcome: "error", traceErrorClass: "upstream_error" };
     }
     metricPrompt = promptTokens;
     metricCompletion = completionTokens;
@@ -1201,6 +1256,7 @@ export async function runChatCompletion(
       finishReason,
       truncated,
       usage: usageMetadata,
+      ...(reasoning === undefined ? {} : { reasoning }),
     };
     return completedResult;
   } catch (err) {
@@ -1457,6 +1513,15 @@ async function callTool(
   }
 
   if (name === "ask") {
+    const includeReasoning = args["include_reasoning"];
+    if (includeReasoning !== undefined && typeof includeReasoning !== "boolean") {
+      return { text: "'include_reasoning' must be a boolean.", isError: true, trace: badRequestTrace() };
+    }
+    if (includeReasoning === true && ctx.principal.tier !== "owner") {
+      return { text: "'include_reasoning' requires an owner-tier API key.", isError: true,
+        meta: { m5_code: "route_not_allowed", retryable: false },
+        trace: { traceOutcome: "forbidden", traceErrorClass: "route_not_allowed" } };
+    }
     const model = typeof args["model"] === "string" ? (args["model"] as string) : "";
     const prompt = typeof args["prompt"] === "string" ? (args["prompt"] as string) : "";
     const system = typeof args["system"] === "string" ? (args["system"] as string) : undefined;
@@ -1578,6 +1643,7 @@ async function callTool(
       model,
       messages,
       exposureTaskText: prompt,
+      ...(includeReasoning === true ? { includeReasoning: true } : {}),
       trafficPurpose: trafficPurpose.value,
       maxTokens,
       delegatorModelId,

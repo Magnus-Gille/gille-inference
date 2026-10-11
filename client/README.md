@@ -103,6 +103,14 @@ printf '%s' '{"model":"mellum","prompt":"Summarize this."}' \
 
 A longer client bound does not raise server caps or guarantee completion.
 
+With a gateway and client containing #441, owner callers may add `"include_reasoning":true` to
+an `ask` input. The JSON result then preserves separate `reasoning_content` and
+`reasoning_truncated` fields; missing native data is `null`, and the gateway caps the text at
+16 KiB of UTF-8. Defaults omit both fields. The generic MCP bridge passes the same input and
+structured output without changing the final-answer text. See the
+[synthetic MCP example](../docs/m5-agent-client.md#native-reasoning-through-mcp); no credential
+export is needed and reasoning-token usage must never be inferred from the text.
+
 For a real owner execution, set `traffic_purpose` to `organic` in the `ask` or code request.
 The structured `ask` or `code_loop_result` output may then include a `feedback_handle`. After
 reviewing the real result, submit one exact usefulness judgment with the same profile that ran it:

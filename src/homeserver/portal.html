@@ -203,6 +203,8 @@
     <p><strong>Tokenizer:</strong> the MCP <span class="badge mono">tokenize</span> tool returns exact
       raw-text token counts and pieces for supported llama.cpp models. It is a utility, not a
       separate model, and charges no inference credits.</p>
+    <p><strong>Owner reasoning:</strong> MCP <span class="badge mono">ask</span> can optionally return
+      native reasoning text separately from the answer. This is owner-only and off by default.</p>
     <p>
       <strong>Hardware:</strong> BosGame M5 &#8212; AMD Ryzen AI Max+ 395 &#8220;Strix Halo&#8221;,
       128&nbsp;GB unified LPDDR5X memory shared between CPU and GPU,
@@ -786,6 +788,13 @@ for chunk in stream:
             <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. After 25 individual rows/day it coalesces later reports into bounded aggregates and marks the dashboard window incomplete. Telemetry limits never limit <span class="badge mono">ask</span>, code loops, models, credits, or owner inference. It accepts no prompt, response, path, repository, or identifier; adoption remains shadow-only and never changes routing.</td>
           </tr>
         </table>
+        <p><strong>Owner reasoning:</strong> add <span class="badge mono">include_reasoning: true</span>
+          to <span class="badge mono">ask</span> to receive native
+          <span class="badge mono">reasoning_content</span> in its structured result, separately
+          from the final answer. Missing backend data is <span class="badge mono">null</span>;
+          <span class="badge mono">reasoning_truncated</span> reports clipping at 16 KiB of UTF-8.
+          Guest opt-in is rejected. Defaults omit these fields. This remains a metered inference
+          call, and token counts are never inferred from the reasoning text.</p>
         <p><strong>Tokenization example:</strong> call <span class="badge mono">tokenize</span>
           with <span class="badge mono">{"model":"mellum","text":"Hej världen!"}</span>, using a
           model your key permits. Pieces are strings or byte arrays for tokens splitting a Unicode
