@@ -2127,12 +2127,25 @@ describe("m5 doctor diagnostic distinctions", () => {
     expect(JSON.stringify(result)).not.toContain(PROFILE.privateGatewayUrl);
   });
 
-  it("distinguishes wrong credential scope", async () => {
-    await expect(
-      diagnose({
-        publicIdentity: { alias: "wrong", tier: "owner", scope: "inference" },
-      }),
-    ).resolves.toMatchObject({ status: "wrong_scope" });
+  it.each([
+    [
+      "public",
+      { publicIdentity: { alias: "wrong", tier: "owner", scope: "inference" } },
+      { public: "healthy", private: "not_checked" },
+    ],
+    [
+      "private",
+      { privateIdentity: { alias: "wrong", tier: "owner", scope: "inference" } },
+      { public: "healthy", private: "wrong_scope" },
+    ],
+  ] as const)("distinguishes wrong credential scope on the %s endpoint", async (_endpoint, options, endpoints) => {
+    const result = await diagnose(options);
+    expect(result).toMatchObject({
+      status: "wrong_scope",
+      identity: { tier: "owner", scope: "inference" },
+      endpoints,
+    });
+    expect(result).not.toHaveProperty("discovery_failure");
   });
 
   it("reports wrong scope even when model discovery fails", async () => {
@@ -2148,11 +2161,26 @@ describe("m5 doctor diagnostic distinctions", () => {
     });
   });
 
-  it("distinguishes missing MCP tools", async () => {
-    await expect(diagnose({ publicTools: ["list_models", "ask"] })).resolves.toMatchObject({
+  it.each([
+    [
+      "public",
+      { publicTools: ["list_models", "ask"] },
+      { public: "missing_tools", private: "not_checked" },
+    ],
+    [
+      "private",
+      { privateTools: ["list_models", "ask"] },
+      { public: "healthy", private: "missing_tools" },
+    ],
+  ] as const)("distinguishes missing MCP tools on the %s endpoint", async (_endpoint, options, endpoints) => {
+    const result = await diagnose(options);
+    expect(result).toMatchObject({
       status: "missing_tools",
+      identity: { tier: "owner", scope: "agent" },
       missing_tools: ["code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
+      endpoints,
     });
+    expect(result).not.toHaveProperty("discovery_failure");
   });
 
   it("reports missing tools even when list_models fails", async () => {

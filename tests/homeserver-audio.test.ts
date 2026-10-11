@@ -498,19 +498,41 @@ describe("POST /v1/audio/transcriptions", () => {
 
   it("maps an oversized streamed body (no Content-Length) to 413, not 400", async () => {
     const k = mintKey({ alias: "aud-413-stream", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
-    // A body that exceeds AUDIO_MAX_BYTES once buffered. fetch sets Content-Length for a Buffer
-    // body, so this also exercises the header path, but the assertion is the 413 mapping.
-    const big = Buffer.alloc(AUDIO_MAX_BYTES + 1024, 0x61);
-    const res = await fetch(`http://127.0.0.1:${gatewayPort}/v1/audio/transcriptions`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${k.plaintextKey}`,
-        "content-type": "multipart/form-data; boundary=----x",
-      },
-      body: big,
-    });
-    expect(res.status).toBe(413);
+    const big = "a".repeat(AUDIO_MAX_BYTES + 1024);
+    const res = await rawPost(gatewayPort, [
+      "POST /v1/audio/transcriptions HTTP/1.1",
+      "Host: 127.0.0.1",
+      `Authorization: Bearer ${k.plaintextKey}`,
+      "Content-Type: multipart/form-data; boundary=----x",
+      "Transfer-Encoding: chunked",
+      "Connection: close",
+      "",
+      big.length.toString(16), big, "0", "", "",
+    ].join("\r\n"));
+    expect(res.statusCode).toBe(413);
+    expect(res.body).toContain("payload_too_large");
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+  });
+
+  it("closes an idle audio upload without charging the caller", async () => {
+    const { loadConfig } = await import("../src/homeserver/config.js");
+    const originalIdleMs = loadConfig().audioReadIdleMs;
+    setConfig({ audioReadIdleMs: 50 });
+    const idleGateway = await startGateway();
+    try {
+      const k = mintKey({ alias: "aud-idle", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+      const res = await rawPost(idleGateway.port, [
+        "POST /v1/audio/transcriptions HTTP/1.1", "Host: 127.0.0.1",
+        `Authorization: Bearer ${k.plaintextKey}`,
+        "Content-Type: multipart/form-data; boundary=----x",
+        "Content-Length: 20", "Connection: close", "", "",
+      ].join("\r\n"));
+      expect(res.statusCode).toBe(0); // The read timeout drops the incomplete request's socket.
+      expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    } finally {
+      setConfig({ audioReadIdleMs: originalIdleMs });
+      await idleGateway.stop();
+    }
   });
 
   // ── temperature validation ───────────────────────────────────────────────────────────

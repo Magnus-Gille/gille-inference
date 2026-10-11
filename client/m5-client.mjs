@@ -1681,6 +1681,22 @@ export async function createM5Client({
     );
   }
 
+  async function callToolResponse(name, args) {
+    const response = await client.rpc({
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: { name, arguments: args },
+    });
+    if (response?.error) {
+      throw new M5ClientError(
+        "mcp_error",
+        redactText(rpcErrorMessage(response), secrets),
+      );
+    }
+    return response;
+  }
+
   const client = {
     async rpc(message) {
       try {
@@ -1691,19 +1707,7 @@ export async function createM5Client({
     },
 
     async tool(name, args) {
-      const id = nextId++;
-      const response = await client.rpc({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name, arguments: args },
-      });
-      if (response?.error) {
-        throw new M5ClientError(
-          "mcp_error",
-          redactText(rpcErrorMessage(response), secrets),
-        );
-      }
+      const response = await callToolResponse(name, args);
       try {
         return redactValue(toolPayload(response?.result), secrets);
       } catch (error) {
@@ -1713,19 +1717,7 @@ export async function createM5Client({
 
     async models() {
       try {
-        const id = nextId++;
-        const response = await client.rpc({
-          jsonrpc: "2.0",
-          id,
-          method: "tools/call",
-          params: { name: "list_models", arguments: {} },
-        });
-        if (response?.error) {
-          throw new M5ClientError(
-            "mcp_error",
-            redactText(rpcErrorMessage(response), secrets),
-          );
-        }
+        const response = await callToolResponse("list_models", {});
         const result = response?.result;
         if (!result || typeof result !== "object") {
           throw new M5ClientError(
@@ -1774,19 +1766,7 @@ export async function createM5Client({
           "ask requires JSON with non-empty model and prompt strings.",
         );
       }
-      const id = nextId++;
-      const response = await client.rpc({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name: "ask", arguments: input },
-      });
-      if (response?.error) {
-        throw new M5ClientError(
-          "mcp_error",
-          redactText(rpcErrorMessage(response), secrets),
-        );
-      }
+      const response = await callToolResponse("ask", input);
       const result = redactValue(response?.result, secrets);
       if (!result || typeof result !== "object") {
         throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
@@ -1843,19 +1823,7 @@ export async function createM5Client({
         // Adoption refusals are still useful acknowledgements. Read the structured result even
         // when an older gateway marks a telemetry-only refusal as an MCP tool error; ask and
         // code-loop tool errors retain their existing strict client.tool() semantics.
-        const id = nextId++;
-        const response = await client.rpc({
-          jsonrpc: "2.0",
-          id,
-          method: "tools/call",
-          params: { name: "record_adoption_evidence", arguments: input },
-        });
-        if (response?.error) {
-          throw new M5ClientError(
-            "mcp_error",
-            redactText(rpcErrorMessage(response), secrets),
-          );
-        }
+        const response = await callToolResponse("record_adoption_evidence", input);
         const result = response?.result;
         if (result?.structuredContent !== undefined) {
           return normalizeAdoptionAcknowledgement(result.structuredContent);
@@ -2373,14 +2341,11 @@ function doctorEndpointFailure(error, profile, secrets) {
     else if (safe.diagnosticCode === "cloudflare_origin_unresolved") status = "public_origin_unresolved";
     else if (safe.httpStatus === 503) status = "busy";
     else if (safe.httpStatus === 504 || safe.httpStatus === 408) status = "timeout";
-    else if (safe.httpStatus >= 500) status = "backend_failure";
     else status = "backend_failure";
   } else if (safe.code === "tool_error" || safe.code === "mcp_error") {
     if (/\b(?:server\s+)?busy\b/i.test(safe.message)) status = "busy";
     else if (/\b(?:timed?\s*out|timeout)\b/i.test(safe.message)) status = "timeout";
     else status = "backend_failure";
-  } else if (safe.failureLayer === "local_tailnet_unavailable") {
-    status = "tailnet_unavailable";
   } else if (safe.code === "network_failure") {
     // `network_failure` was the original public doctor status. Keep it stable for callers while
     // retaining the richer diagnostic code for newer consumers.
@@ -2430,6 +2395,47 @@ function doctorCapabilityFields(
     // Doctor never calls `ask`: that path is metered, so readiness remains explicitly unknown.
     inference: { public: "not_checked", private: "not_checked" },
   };
+}
+
+/** Share the endpoint capability gates while preserving public/private diagnostic labels. */
+function doctorProbeFailure(profile, publicProbe, privateProbe = null) {
+  const probe = privateProbe ?? publicProbe;
+  let status;
+  let details = {};
+  if (probe.identity.tier !== "owner" || !["agent", "admin"].includes(probe.identity.scope)) {
+    status = "wrong_scope";
+  } else {
+    const missing = REQUIRED_AGENT_TOOLS.filter((tool) => !probe.tools.includes(tool));
+    if (missing.length > 0) {
+      status = "missing_tools";
+      details = { missing_tools: missing };
+    } else if (probe.model_discovery.status === "unavailable") {
+      status = "model_discovery_unavailable";
+      details = {
+        diagnostic_code: probe.model_discovery.failure_code,
+        discovery_failure: probe.model_discovery.failure_details,
+        ...(probe.model_discovery.http_status === undefined
+          ? {}
+          : { http_status: probe.model_discovery.http_status }),
+      };
+    } else {
+      return null;
+    }
+  }
+  return safeDoctorResult({
+    status,
+    profile,
+    credential: "present",
+    identity: {
+      tier: probe.identity.tier ?? "unknown",
+      scope: probe.identity.scope ?? "unknown",
+    },
+    ...details,
+    ...doctorCapabilityFields(publicProbe, privateProbe),
+    endpoints: privateProbe
+      ? { public: "healthy", private: status }
+      : { public: status === "wrong_scope" ? "healthy" : status, private: "not_checked" },
+  });
 }
 
 export async function diagnoseProfile(options) {
@@ -2522,56 +2528,8 @@ async function diagnoseProfileCore({
     });
   }
 
-  if (publicProbe.identity.tier !== "owner" || !["agent", "admin"].includes(publicProbe.identity.scope)) {
-    return safeDoctorResult({
-      status: "wrong_scope",
-      profile,
-      credential: "present",
-      identity: {
-        tier: publicProbe.identity.tier ?? "unknown",
-        scope: publicProbe.identity.scope ?? "unknown",
-      },
-      ...doctorCapabilityFields(publicProbe, null),
-      endpoints: { public: "healthy", private: "not_checked" },
-    });
-  }
-
-  const publicMissing = REQUIRED_AGENT_TOOLS.filter(
-    (tool) => !publicProbe.tools.includes(tool),
-  );
-  if (publicMissing.length > 0) {
-    return safeDoctorResult({
-      status: "missing_tools",
-      profile,
-      credential: "present",
-      identity: {
-        tier: publicProbe.identity.tier ?? "unknown",
-        scope: publicProbe.identity.scope ?? "unknown",
-      },
-      missing_tools: publicMissing,
-      ...doctorCapabilityFields(publicProbe, null),
-      endpoints: { public: "missing_tools", private: "not_checked" },
-    });
-  }
-
-  if (publicProbe.model_discovery.status === "unavailable") {
-    return safeDoctorResult({
-      status: "model_discovery_unavailable",
-      profile,
-      credential: "present",
-      identity: {
-        tier: publicProbe.identity.tier,
-        scope: publicProbe.identity.scope,
-      },
-      diagnostic_code: publicProbe.model_discovery.failure_code,
-      discovery_failure: publicProbe.model_discovery.failure_details,
-      ...(publicProbe.model_discovery.http_status === undefined
-        ? {}
-        : { http_status: publicProbe.model_discovery.http_status }),
-      ...doctorCapabilityFields(publicProbe, null),
-      endpoints: { public: "model_discovery_unavailable", private: "not_checked" },
-    });
-  }
+  const publicFailure = doctorProbeFailure(profile, publicProbe);
+  if (publicFailure) return publicFailure;
 
   if (!config.privateGatewayUrl) {
     const compatibilityFields = doctorCompatibilityFields(publicProbe, null);
@@ -2632,56 +2590,8 @@ async function diagnoseProfileCore({
     });
   }
 
-  if (privateProbe.identity.tier !== "owner" || !["agent", "admin"].includes(privateProbe.identity.scope)) {
-    return safeDoctorResult({
-      status: "wrong_scope",
-      profile,
-      credential: "present",
-      identity: {
-        tier: privateProbe.identity.tier ?? "unknown",
-        scope: privateProbe.identity.scope ?? "unknown",
-      },
-      ...doctorCapabilityFields(publicProbe, privateProbe),
-      endpoints: { public: "healthy", private: "wrong_scope" },
-    });
-  }
-
-  const privateMissing = REQUIRED_AGENT_TOOLS.filter(
-    (tool) => !privateProbe.tools.includes(tool),
-  );
-  if (privateMissing.length > 0) {
-    return safeDoctorResult({
-      status: "missing_tools",
-      profile,
-      credential: "present",
-      identity: {
-        tier: privateProbe.identity.tier ?? "unknown",
-        scope: privateProbe.identity.scope ?? "unknown",
-      },
-      missing_tools: privateMissing,
-      ...doctorCapabilityFields(publicProbe, privateProbe),
-      endpoints: { public: "healthy", private: "missing_tools" },
-    });
-  }
-
-  if (privateProbe.model_discovery.status === "unavailable") {
-    return safeDoctorResult({
-      status: "model_discovery_unavailable",
-      profile,
-      credential: "present",
-      identity: {
-        tier: privateProbe.identity.tier,
-        scope: privateProbe.identity.scope,
-      },
-      diagnostic_code: privateProbe.model_discovery.failure_code,
-      discovery_failure: privateProbe.model_discovery.failure_details,
-      ...(privateProbe.model_discovery.http_status === undefined
-        ? {}
-        : { http_status: privateProbe.model_discovery.http_status }),
-      ...doctorCapabilityFields(publicProbe, privateProbe),
-      endpoints: { public: "healthy", private: "model_discovery_unavailable" },
-    });
-  }
+  const privateFailure = doctorProbeFailure(profile, publicProbe, privateProbe);
+  if (privateFailure) return privateFailure;
 
   if (
     JSON.stringify(publicProbe.identity) !== JSON.stringify(privateProbe.identity) ||

@@ -850,47 +850,10 @@ export function clientIp(req: IncomingMessage, trustedProxies: string[]): string
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024): Promise<string> {
-  // Early rejection on a declared Content-Length over the cap (mirrors readBuffer) — do NOT destroy
-  // the socket: the caller must stay able to write the 413 response. resume() drains in-flight bytes.
-  const declared = Number(req.headers["content-length"]);
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    req.resume();
-    return Promise.reject(new BodyTooLargeError());
-  }
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    let settled = false;
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => {
-      if (settled) return;
-      size += c.length;
-      if (size > maxBytes) {
-        // #15 / Codex finding 2: typed so the top-level catch maps it to a uniform 413 envelope.
-        // Stop buffering and reject, but keep the connection WRITABLE so the 413 can be sent — the
-        // old req.destroy() here raced the response write and the client saw a connection reset.
-        // resume() drains the rest of the upload instead of destroying the socket.
-        settled = true;
-        chunks.length = 0;
-        req.resume();
-        reject(new BodyTooLargeError());
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => {
-      if (settled) return;
-      settled = true;
-      resolve(Buffer.concat(chunks).toString("utf-8"));
-    });
-    req.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
-  });
+  return (await readBuffer(req, maxBytes, null)).toString("utf-8");
 }
 
-/** Thrown by readBuffer when the body exceeds the size cap — caller maps it to HTTP 413. */
+/** Thrown when a request body exceeds the size cap — caller maps it to HTTP 413. */
 class BodyTooLargeError extends Error {
   constructor() {
     super("request body too large");
@@ -916,7 +879,7 @@ class BodyTooLargeError extends Error {
 async function readBuffer(
   req: IncomingMessage,
   maxBytes = 32 * 1024 * 1024,
-  idleMs = 30_000
+  idleMs: number | null = 30_000
 ): Promise<Buffer> {
   // Early rejection on a declared Content-Length over the cap — before buffering anything. We do
   // NOT destroy the socket here: the caller still has to write a 413 response, which requires the
@@ -938,6 +901,7 @@ async function readBuffer(
       }
     };
     const armIdle = (): void => {
+      if (idleMs === null) return; // Text routes retain their existing no-idle-timeout policy.
       clearIdle();
       idle = setTimeout(() => {
         if (settled) return;
