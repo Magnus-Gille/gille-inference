@@ -30,4 +30,10 @@ enum gi_producer_result {
  * Any failure clears the complete output. This is not an admission decision. */
 int gi_observe_proxy_activity(const struct gi_proxy_binding *binding,
                              struct gi_producer_receipt *out);
+/* Runtime channel: validated ASCII producer ID (1..64 [A-Za-z0-9_-]) from
+ * the trusted collector binding, never an arbitrary caller-controlled path.
+ * Uses /run/gille-producer-observer-<id>/activity.sock and the same checks.
+ * The name does not attest that a runtime is instrumented or accepted. */
+int gi_observe_runtime_activity(const struct gi_proxy_binding *binding,
+                               const char *producer_id, struct gi_producer_receipt *out);
 #endif

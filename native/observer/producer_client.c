@@ -108,8 +108,9 @@ static int random_nonce(char nonce[65], uint64_t deadline)
     return 0;
 }
 
-int gi_observe_proxy_activity(const struct gi_proxy_binding *binding,
-                             struct gi_producer_receipt *out)
+static int observe_activity(const struct gi_proxy_binding *binding,
+                            const char *producer_id, const char *directory_path,
+                            const char *socket_path, struct gi_producer_receipt *out)
 {
     if (out == NULL) return GI_PRODUCER_INVALID_BINDING;
     memset(out, 0, sizeof *out);
@@ -126,7 +127,7 @@ int gi_observe_proxy_activity(const struct gi_proxy_binding *binding,
     struct gi_producer_receipt receipt;
     char nonce[65], request[75], response[GI_RECEIPT_BOUND + 1];
     if (!process_matches(binding, deadline)) return GI_PRODUCER_IDENTITY_CHANGED;
-    directory = open(GI_PROXY_DIRECTORY, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    directory = open(directory_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (directory < 0 || fstat(directory, &parent_before) != 0 ||
         parent_before.st_uid != binding->uid || (parent_before.st_mode & 0022) != 0 ||
         fstatat(directory, "activity.sock", &socket_before, AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -134,7 +135,7 @@ int gi_observe_proxy_activity(const struct gi_proxy_binding *binding,
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) goto done;
     struct sockaddr_un address = { .sun_family = AF_UNIX };
-    memcpy(address.sun_path, GI_PROXY_SOCKET, sizeof GI_PROXY_SOCKET);
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1);
     if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
         if (errno != EINPROGRESS) goto done;
         result = wait_ready(fd, POLLOUT, deadline);
@@ -177,12 +178,12 @@ int gi_observe_proxy_activity(const struct gi_proxy_binding *binding,
     if (gi_parse_producer_receipt(response, used, &receipt) != 0) {
         result = GI_PRODUCER_INVALID_RECEIPT; goto done;
     }
-    if (strcmp(receipt.producer_id, "llama-swap") != 0 ||
+    if (strcmp(receipt.producer_id, producer_id) != 0 ||
         strcmp(receipt.request_nonce_sha256, nonce) != 0 ||
         strcmp(receipt.instance_sha256, binding->instance_sha256) != 0 ||
         strcmp(receipt.build_sha256, binding->build_sha256) != 0 ||
         strcmp(receipt.config_sha256, binding->config_sha256) != 0 ||
-        !process_matches(binding, deadline) || lstat(GI_PROXY_DIRECTORY, &parent_after) != 0 ||
+        !process_matches(binding, deadline) || lstat(directory_path, &parent_after) != 0 ||
         !same_inode(&parent_before, &parent_after) ||
         fstatat(directory, "activity.sock", &socket_after, AT_SYMLINK_NOFOLLOW) != 0 ||
         !same_inode(&socket_before, &socket_after)) {
@@ -195,4 +196,32 @@ done:
     if (fd >= 0) close(fd);
     if (directory >= 0) close(directory);
     return result;
+}
+
+int gi_observe_proxy_activity(const struct gi_proxy_binding *binding,
+                             struct gi_producer_receipt *out)
+{
+    return observe_activity(binding, "llama-swap", GI_PROXY_DIRECTORY, GI_PROXY_SOCKET, out);
+}
+
+int gi_observe_runtime_activity(const struct gi_proxy_binding *binding,
+                               const char *producer_id, struct gi_producer_receipt *out)
+{
+    if (out == NULL) return GI_PRODUCER_INVALID_BINDING;
+    memset(out, 0, sizeof *out);
+    if (producer_id == NULL) return GI_PRODUCER_INVALID_BINDING;
+    size_t length = strnlen(producer_id, 65);
+    if (length == 0 || length > 64) return GI_PRODUCER_INVALID_BINDING;
+    for (size_t i = 0; i < length; ++i) {
+        char c = producer_id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            return GI_PRODUCER_INVALID_BINDING;
+    }
+    char directory[96], path[108];
+    int d = snprintf(directory, sizeof directory, "/run/gille-producer-observer-%s", producer_id);
+    int p = snprintf(path, sizeof path, "%s/activity.sock", directory);
+    if (d <= 0 || (size_t)d >= sizeof directory || p <= 0 || (size_t)p >= sizeof path)
+        return GI_PRODUCER_INVALID_BINDING;
+    return observe_activity(binding, producer_id, directory, path, out);
 }
