@@ -5,6 +5,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { jcsCanonicalize } from "./learning-task-contract.js";
+import { acceptedHostManifestSchema, type AcceptedHostManifest } from "./accepted-host-manifest.js";
 
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
@@ -81,6 +82,7 @@ export const observerReviewPacketSchema = z.object({
   if (!unique(paths) || paths.some((a, i) => paths.some((b, j) => i !== j && a.startsWith(`${b}/`)))) fail();
   const files = roles.map(role => p.artifacts[role].file.toLowerCase());
   if (!unique(files) || files.includes("packet.json")) fail();
+  if (p.artifacts.hostManifest.bytes > 4 * 1024 * 1024) fail();
   if (roles.reduce((sum, role) => sum + p.artifacts[role].bytes, 0) > 128 * 1024 * 1024) fail();
   if (!unique(p.priorState.residentModelIds) || !unique(p.priorState.services.map(service => service.unit)) ||
       p.priorState.services.some(service => service.unit === p.target.unit)) fail();
@@ -193,9 +195,24 @@ export async function checkObserverReviewBundle(directory: string, expectedDiges
     if (report.reasons.length) return report;
     for (const role of roles) {
       const expected = packet.artifacts[role];
-      const actual = await readFileBounded(join(root, expected.file), expected.bytes, false);
+      const actual = await readFileBounded(join(root, expected.file), expected.bytes, role === "hostManifest");
       if (actual.bytes !== expected.bytes || actual.sha256 !== expected.sha256) {
         report.reasons.push("artifact-mismatch"); return report;
+      }
+      if (role === "hostManifest") {
+        let manifest: AcceptedHostManifest;
+        try { manifest = acceptedHostManifestSchema.parse(parseUnambiguousJson(actual.data)); }
+        catch { report.reasons.push("invalid-host-manifest"); return report; }
+        const observer = manifest.processes.find(p => p.role.kind === "owned" && p.role.purpose === "observer");
+        if (manifest.hostId !== packet.host || manifest.hostBootIdSha256 !== packet.hostBootIdSha256 ||
+            !observer || observer.unit !== packet.target.unit || observer.uid !== packet.target.existingIdentity.uid ||
+            observer.executable.path !== packet.target.observerPath ||
+            observer.executable.sha256 !== packet.artifacts.observer.sha256 ||
+            packet.priorState.services.some(service => !manifest.processes.some(p =>
+              p.unit === service.unit && p.executable.sha256 === service.executableSha256 &&
+              p.configSha256 === service.configSha256))) {
+          report.reasons.push("host-manifest-binding-mismatch"); return report;
+        }
       }
     }
     if (!stable(before, await fileStat(root)) || !stable(inputRoot, await fileStat(directory))) throw new Error("read-rejected");

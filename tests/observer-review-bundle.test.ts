@@ -29,9 +29,40 @@ function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function makeManifest() {
+  const process = {
+    id: "gateway", unit: "home-gateway.service", uid: 1000,
+    cgroup: "/system.slice/home-gateway.service",
+    executable: { path: "/opt/gateway/bin/server", sha256: DIGEST },
+    configSha256: DIGEST, unitDefinitionSha256: DIGEST,
+    containmentSha256: DIGEST, reviewSha256: DIGEST,
+    control: "identity-checked", role: { kind: "producer", producerId: "gateway" },
+  };
+  return {
+    schemaVersion: 1, source: "accepted-host-manifest-v1", hostId: "synthetic-host",
+    hostBootIdSha256: DIGEST,
+    namespaces: { pidSha256: DIGEST, networkSha256: DIGEST, userSha256: DIGEST, mountSha256: DIGEST },
+    processes: [process, {
+      ...process, id: "observer", unit: "gille-observer-eval-synthetic-1.service", uid: 1234,
+      cgroup: "/system.slice/gille-observer-eval-synthetic-1.service",
+      executable: { path: "/var/lib/gille-observer-eval/observer", sha256: sha256("synthetic-observer-artifact") },
+      control: "root-owned-nonwritable", role: { kind: "owned", purpose: "observer", runIdSha256: DIGEST },
+    }],
+    listeners: [],
+    activations: [
+      { id: "gateway-start", unit: "home-gateway.service", kind: "manual-unit", definitionSha256: DIGEST, targetProcessIds: ["gateway"] },
+      { id: "observer-start", unit: "gille-observer-eval-synthetic-1.service", kind: "manual-unit", definitionSha256: DIGEST, targetProcessIds: ["observer"] },
+    ],
+  };
+}
+
+function artifactContent(role: typeof ROLES[number]): string {
+  return role === "hostManifest" ? JSON.stringify(makeManifest()) : `synthetic-${role}-artifact`;
+}
+
 function makePacket() {
   const artifacts = Object.fromEntries(ROLES.map((role) => {
-    const content = `synthetic-${role}-artifact`;
+    const content = artifactContent(role);
     return [role, {
       file: `${role}.txt`,
       sha256: sha256(content),
@@ -129,7 +160,7 @@ async function createBundle(packet: Packet = makePacket(), writeArtifacts = true
   if (writeArtifacts) {
     for (const role of ROLES) {
       const artifact = packet.artifacts[role];
-      const content = `synthetic-${role}-artifact`;
+      const content = artifactContent(role);
       await writeFile(join(root, artifact.file), content, "utf8");
     }
   }
@@ -245,6 +276,30 @@ describe("offline observer review bundle checks", () => {
       valid: false, packetSha256: null, reasons: ["invalid-packet"],
     });
   });
+  it.each([
+    ["opaque", () => "synthetic-hostManifest-artifact", "invalid-host-manifest"],
+    ["duplicate JSON key", () => JSON.stringify(makeManifest()).replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'), "invalid-host-manifest"],
+    ["wrong host", () => JSON.stringify({ ...makeManifest(), hostId: "other-host" }), "host-manifest-binding-mismatch"],
+    ["wrong boot", () => JSON.stringify({ ...makeManifest(), hostBootIdSha256: "f".repeat(64) }), "host-manifest-binding-mismatch"],
+    ["wrong protected binary", () => {
+      const manifest = makeManifest(); manifest.processes[0].executable.sha256 = "f".repeat(64); return JSON.stringify(manifest);
+    }, "host-manifest-binding-mismatch"],
+    ["wrong observer UID", () => {
+      const manifest = makeManifest(); manifest.processes[1].uid = 1235; return JSON.stringify(manifest);
+    }, "host-manifest-binding-mismatch"],
+    ["wrong observer binary", () => {
+      const manifest = makeManifest(); manifest.processes[1].executable.sha256 = "f".repeat(64); return JSON.stringify(manifest);
+    }, "host-manifest-binding-mismatch"],
+  ] as const)("rejects hash-correct manifest with %s", async (_, content, reason) => {
+    const packet = makePacket(), text = content();
+    packet.artifacts.hostManifest.sha256 = sha256(text);
+    packet.artifacts.hostManifest.bytes = Buffer.byteLength(text);
+    const bundle = await createBundle(packet);
+    await writeFile(join(bundle.root, packet.artifacts.hostManifest.file), text, "utf8");
+    expect(await checkObserverReviewBundle(bundle.root, bundle.digest, NOW))
+      .toMatchObject({ valid: false, authorizesMutation: false, reasons: [reason] });
+  });
+
   it("accepts a valid synthetic bundle while never authorizing mutation", async () => {
     const bundle = await createBundle();
     await expect(checkObserverReviewBundle(bundle.root, bundle.digest, NOW)).resolves.toEqual({

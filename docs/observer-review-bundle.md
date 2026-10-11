@@ -1,7 +1,7 @@
 # G1 observer review bundle
 
 The offline checker binds the material submitted for G1 review to one digest. It checks structure,
-ceilings, expiry and artifact bytes. It does **not** approve a mutation, execute commands, authenticate
+ceilings, expiry, artifact bytes and the declared host manifest contract. It does **not** approve a mutation, execute commands, authenticate
 host evidence, interpret an AppArmor policy, establish that a binary came from a claimed build, or
 qualify a Linux observer. A passing result always includes `authorizesMutation: false`.
 
@@ -21,7 +21,7 @@ A private directory contains `packet.json` and ten distinct regular files, one f
 | `apparmor` | Enforcing profile for that executable and its bounded read surface |
 | `busPolicy` | Method-filtered, read-only systemd access |
 | `polkitPolicy` | Explicit denial of service mutations for the observer identity |
-| `hostManifest` | Complete accepted inventory, identities and classified exclusions |
+| `hostManifest` | Strict `accepted-host-manifest-v1` JSON: declared process, listener and activation boundary |
 | `buildProvenance` | Source/toolchain/input hashes and reproducible artifact verification |
 | `linuxQualification` | Positive visibility and negative access/syscall tests on the exact candidate |
 | `operations` | Exact launcher and commands: preflight, create/start, verify, stop and cleanup |
@@ -61,9 +61,36 @@ artifact contents or private paths. A digest or time-window mismatch stops befor
 Any subsequent change requires a new digest and review; expiry or host changes require refreshed
 evidence and owner approval. No actual M5 bundle or host-specific baseline is committed here.
 
+## Declared host boundary
+
+The `hostManifest` artifact must parse as the strict
+[`acceptedHostManifestSchema`](../src/homeserver/accepted-host-manifest.ts). It declares host/boot and
+namespace identities, finite process classes (exact unit, UID, cgroup, executable and configuration
+identity), concrete TCP/UDP/Unix listeners, and unit activation/lifecycle paths. Every process class
+needs an activation reference. Duplicate matching rules, endpoint aliases, dangling links, wildcard
+paths, unknown fields and unbounded lists are rejected. Exclusions and exact owned observer,
+launcher and installation roles require root-controlled, non-writable executable/containment
+expectations and review hashes. Producer binaries may instead require measured identity without
+changing their existing service ownership.
+
+The bundle checker also matches host/boot, the owned observer's unit/UID/path/executable digest and
+each protected service's executable/configuration identity against the packet. Manifest JSON uses
+the same duplicate-key and invalid-UTF-8 rejection as packet JSON. Even hash-correct arbitrary text
+or an internally inconsistent manifest is refused. The separate `hashAcceptedHostManifest` function
+hashes the parsed declaration canonically, normalizing IP spellings and sorting set-like rows and
+activation targets without mutating input. The artifact's byte hash still binds the exact file.
+
+These are declarations for review, not observed facts, operator signatures or a complete-coverage
+receipt. A future confined collector must reconcile every visible process, listener and service
+activation with them; bind PID/start ticks, invocation and host namespaces; verify executable/config
+bytes and effective containment/ownership; and maintain event continuity. An exclusion name or
+review hash does not prove non-inference. Kernel threads require positive kernel metadata, and
+unmanaged or unexplained entries remain unknown. The checker does not read nominated live paths,
+contact a host, convert v1 diagnostics to live evidence or enable installation admission.
+
 ## File boundary and remaining execution obligations
 
-Packet JSON is limited to 1 MiB, each artifact to 64 MiB, and the artifact total to 128 MiB. Reads
+Packet JSON is limited to 1 MiB, the host manifest to 4 MiB, other artifacts to 64 MiB, and the artifact total to 128 MiB. Reads
 reject non-regular files, final-component symlinks and hardlinks; compare descriptor/path identity
 and metadata before/after bounded reading; and check the bundle directory for change. Artifact
 names cannot contain path separators or collide after ASCII case folding. Parent directories of the supplied bundle path are resolved
