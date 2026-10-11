@@ -26,7 +26,11 @@ jobs:
             native/observer/cgroup_events.c native/observer/test_cgroup_events.c -o "$RUNNER_TEMP/cgroup-parser-tests"
           timeout 15 "$RUNNER_TEMP/cgroup-parser-tests"
           cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/observer/cgroup_limits.c native/observer/test_cgroup_limits.c -o "$RUNNER_TEMP/cgroup-limits-tests"
+          timeout 15 "$RUNNER_TEMP/cgroup-limits-tests"
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer \
             native/observer/cgroup_events.c native/launcher/cgroup_state.c native/tests/cgroup_state_fixture.c \
+            native/observer/cgroup_limits.c native/launcher/resource_limits.c \
             -o "$RUNNER_TEMP/cgroup-state-fixture"
       - name: Verify real descendant population and empty subtree after owned kill
         run: |
@@ -37,3 +41,6 @@ jobs:
       - name: Prove a filesystem imitation cannot supply kernel evidence
         run: |
           python3 native/tests/test-cgroup-state-regression.py
+      - name: Prove a changed task limit cannot release the prepared gate
+        run: |
+          python3 native/tests/test-resource-limits-regression.py
