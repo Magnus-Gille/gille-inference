@@ -202,7 +202,8 @@
     <h2>What&#8217;s running</h2>
     <p><strong>Tokenizer:</strong> the MCP <span class="badge mono">tokenize</span> tool returns exact
       raw-text token counts and pieces for supported llama.cpp models. It is a utility, not a
-      separate model, and charges no inference credits.</p>
+      separate model, and charges no inference credits. The first call may take several minutes
+      while the model loads.</p>
     <p><strong>Owner reasoning:</strong> MCP <span class="badge mono">ask</span> can optionally return
       native reasoning text separately from the answer. This is owner-only and off by default.</p>
     <p>
@@ -780,7 +781,11 @@ for chunk in stream:
             <td><span class="badge mono">{model, text}</span> returns exact raw-text token counts,
               IDs and pieces from the selected llama.cpp tokenizer. Uses your model allow-list and
               request rate limit, with no inference credit charge. Maximum 16,384 UTF-8 bytes;
-              no chat template or added special tokens. It may load the model through normal admission.
+              no chat template or added special tokens. It may load the model through normal admission;
+              cold starts can take several minutes. Allow enough time in your MCP client for the
+              configured gateway call timeout. The stock <span class="badge mono">m5 ... mcp</span>
+              bridge has a 30-second upstream limit: use an already loaded model your key permits,
+              or a direct MCP client with a longer timeout for cold starts.
               Unsupported runtimes return an error.</td>
           </tr>
           <tr>

@@ -18,7 +18,8 @@ export const TOKENIZE_TOOL = {
   description: "Get exact raw-text token counts, token IDs and pieces from a served llama.cpp model's own tokenizer. " +
     "Use a model id from list_models; tokenizer is a tool, not a separate model. No generation, chat template or added special tokens. " +
     "Pieces are Unicode strings or raw byte arrays for tokens splitting UTF-8 characters. Maximum 16384 UTF-8 input bytes. " +
-    "May load the model through normal admission and memory checks. Counts toward request rate limits, but charges no inference credits. " +
+    "May load the model through normal admission and memory checks; cold starts can take several minutes within the configured gateway call timeout. " +
+    "Counts toward request rate limits, but charges no inference credits. " +
     "Unsupported runtimes return an error; never substitute a guessed count or another encoding.",
   inputSchema: {
     type: "object", additionalProperties: false, required: ["model", "text"],
@@ -100,7 +101,9 @@ export async function runTokenize(args: Record<string, unknown>, ctx: TokenizeCo
     const memory = await admitHostMemory(cfg.hostMemoryAdmission, model, ctx.hostMemoryAdmission ?? { getRunning: getRunningSnapshot });
     if (memory !== null) return failure("server_busy", "Model memory admission refused tokenization.", true, memory.retryAfterSeconds ?? undefined);
     const origin = (process.env["LLAMASWAP_BASE_URL"] || cfg.lmStudioBaseUrl.replace(/\/v1\/?$/, "")).replace(/\/$/, "");
-    timer = setTimeout(() => abort.abort(), Math.min(cfg.callTimeoutMs, 60_000));
+    // The native endpoint may cold-load the model before returning tokens. Use the
+    // configured upstream deadline rather than cutting healthy model starts short.
+    timer = setTimeout(() => abort.abort(), cfg.callTimeoutMs);
     const response = await fetch(`${origin}/upstream/${encodeURIComponent(model)}/tokenize`, {
       method: "POST", redirect: "error", signal: abort.signal,
       headers: { "content-type": "application/json" },
