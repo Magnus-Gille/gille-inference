@@ -1,0 +1,292 @@
+--- a/llama-swap.go
++++ b/llama-swap.go
+@@ -6,6 +6,7 @@
+ 	"errors"
+ 	"flag"
+ 	"fmt"
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ 	"io"
+ 	"log/slog"
+ 	"net"
+@@ -115,6 +116,7 @@
+ }
+ 
+ func main() {
++	startupActivity := activity.Process().Begin(activity.Loading)
+ 	flagConfig := flag.String("config", "", "path to config file")
+ 	flagConfigDir := flag.String("config-dir", "", "directory of *.yml/*.yaml config files (additive to -config)")
+ 	flagListen := flag.String("listen", "", "listen address (default :8080 or :8443 for TLS)")
+@@ -124,6 +126,7 @@
+ 	flagVersion := flag.Bool("version", false, "show version and exit")
+ 	flagWatchConfig := flag.Bool("watch-config", false, "reload config on file change")
+ 	flagValidate := flag.Bool("validate", false, "validate the config file and exit (without starting the server)")
++	flagObserverUID := flag.Int64("install-observer-uid", -1, "enable private installation observer for this Linux UID (-1 disables)")
+ 	flag.Parse()
+ 
+ 	if *flagVersion {
+@@ -247,6 +250,13 @@
+ 		os.Exit(1)
+ 	}
+ 
++	closeObserver, observerErr := activity.StartConfigured(*flagObserverUID, cfg)
++	if observerErr != nil {
++		slog.Error("private installation observer startup failed")
++		os.Exit(1)
++	}
++	defer closeObserver()
++
+ 	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs)
+ 	if err != nil {
+ 		slog.Error("failed to create server", "error", err)
+@@ -313,6 +323,8 @@
+ 	var reloadMu sync.Mutex
+ 
+ 	reload := func() {
++		// Identity cannot survive configuration replacement, including a failed reload.
++		activity.Process().Invalidate()
+ 		reloadMu.Lock()
+ 		if reloading {
+ 			reloadMu.Unlock()
+@@ -462,6 +474,7 @@
+ 		proxyLog.Infof("llama-swap is reachable by all hosts on the network, use -listen localhost:%s to restrict to loopback only", port)
+ 	}
+ 
++	startupActivity.Finish()
+ 	exitChan := make(chan struct{})
+ 
+ 	go func() {
+@@ -472,6 +485,7 @@
+ 				proxyLog.Info("received SIGHUP, reloading config")
+ 				go reload()
+ 			case syscall.SIGINT, syscall.SIGTERM:
++				activity.Process().Invalidate()
+ 				proxyLog.Infof("received signal %v, shutting down", sig)
+ 				watcherCancel()
+ 
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -4,6 +4,7 @@
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ 	"net/http"
+ 	"slices"
+ 	"strings"
+@@ -423,12 +424,16 @@
+ }
+ 
+ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	work := activity.PublicRequest(r)
++	defer work.Finish()
+ 	s.handler.ServeHTTP(w, r)
+ }
+ 
+ // ServeTailcatHTTP applies Tailcat's deliberately narrow HTTP capability
+ // surface before delegating to the normal, API-key-protected handler.
+ func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
++	work := activity.PublicRequest(r)
++	defer work.Finish()
+ 	tc := s.cfg.Tailcat
+ 	if !s.cfg.TailcatEnabled() || tc == nil {
+ 		http.NotFound(w, r)
+--- a/internal/server/api.go
++++ b/internal/server/api.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ 	"net/http"
+ 	"sort"
+ 	"strings"
+@@ -392,7 +393,9 @@
+ 	if len(models) == 0 {
+ 		return
+ 	}
++	work := activity.Process().Begin(activity.Loading)
+ 	go func() {
++		defer work.Finish()
+ 		for _, modelID := range models {
+ 			if !s.local.Handles(modelID) {
+ 				s.logs.ProxyLogs.Warnf("preload: model %s is not a local model, skipping", modelID)
+--- a/internal/router/base.go
++++ b/internal/router/base.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"fmt"
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ 	"net/http"
+ 	"sort"
+ 	"sync"
+@@ -178,7 +179,11 @@
+ 
+ // StartSwap implements scheduler.Effects, launching the swap goroutine.
+ func (b *baseRouter) StartSwap(modelID string, evict []string) {
+-	go b.doSwap(modelID, evict)
++	work := activity.Process().Begin(activity.Loading)
++	go func() {
++		defer work.Finish()
++		b.doSwap(modelID, evict)
++	}()
+ }
+ 
+ // GrantError implements scheduler.Effects.
+@@ -463,6 +468,8 @@
+ }
+ 
+ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
++	work := activity.Process().Begin(activity.Queued)
++	defer work.Finish()
+ 	if b.shuttingDown.Load() {
+ 		swaputil.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+ 		return
+--- a/internal/process/process_command.go
++++ b/internal/process/process_command.go
+@@ -4,6 +4,7 @@
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -178,7 +179,13 @@
+ 	// p.status mirrors `state` so State() can observe transitions; setState
+ 	// writes both.
+ 	state := StateStopped
++	var lifecycle *activity.Handle
++	defer func() { lifecycle.Finish() }()
+ 	setState := func(s ProcessState) {
++		if (s == StateStarting || s == StateStopping || s == StateShutdown) && lifecycle == nil {
++			lifecycle = activity.Process().Begin(activity.Loading)
++		}
++
+ 		old := state
+ 		state = s
+ 		next := &Status{State: s}
+@@ -196,6 +203,10 @@
+ 				OldState:    string(old),
+ 				NewState:    string(s),
+ 			})
++		}
++		if s == StateReady || s == StateStopped {
++			lifecycle.Finish()
++			lifecycle = nil
+ 		}
+ 	}
+ 	var (
+@@ -259,6 +270,8 @@
+ 		// cmdDone is nil while no process is running, so this case is
+ 		// dormant outside of StateReady.
+ 		case <-cmdDone:
++			// Unexpected backend exit revokes installation evidence until restart.
++			activity.Process().Invalidate()
+ 			if cmdCancel != nil {
+ 				cmdCancel()
+ 			}
+@@ -827,6 +840,8 @@
+ }
+ 
+ func (p *ProcessCommand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	work := activity.Process().Begin(activity.Active)
++	defer work.Finish()
+ 	fn := p.handler.Load()
+ 	if fn == nil {
+ 		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, fmt.Sprintf("[%s] process is not ready", p.id))
+--- a/internal/server/capabilities.go
++++ b/internal/server/capabilities.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ 	"net/url"
+ 	"reflect"
+ 
+@@ -27,7 +28,11 @@
+ 	if !ok || mc.Capabilities.DisableAuto {
+ 		return
+ 	}
+-	go s.refreshCapabilities(e.ProcessName, mc)
++	work := activity.Process().Begin(activity.Loading)
++	go func() {
++		defer work.Finish()
++		s.refreshCapabilities(e.ProcessName, mc)
++	}()
+ }
+ 
+ // refreshCapabilities probes one ready model and caches what it reports.
+--- a/internal/event/event.go
++++ b/internal/event/event.go
+@@ -11,6 +11,8 @@
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++
++	activity "github.com/mostlygeek/llama-swap/internal/installactivity"
+ )
+ 
+ // Event represents an event contract
+@@ -181,13 +183,18 @@
+ 
+ // consumer represents a consumer with a message queue
+ type consumer[T Event] struct {
+-	queue []T  // Current work queue
+-	stop  bool // Stop signal
++	queue []queuedEvent[T] // Current work queue
++	stop  bool             // Stop signal
++}
++
++type queuedEvent[T Event] struct {
++	value T
++	work  *activity.Handle
+ }
+ 
+ // Listen listens to the event queue and processes events
+ func (s *consumer[T]) Listen(c *sync.Cond, fn func(T)) {
+-	pending := make([]T, 0, 128)
++	pending := make([]queuedEvent[T], 0, 128)
+ 
+ 	for {
+ 		c.L.Lock()
+@@ -209,7 +216,8 @@
+ 
+ 		// Outside of the critical section, process the work
+ 		for _, event := range pending {
+-			fn(event)
++			fn(event.value)
++			event.work.Finish()
+ 		}
+ 
+ 		// Notify potential publishers waiting due to backpressure
+@@ -229,6 +237,9 @@
+ 
+ // Broadcast sends an event to all consumers
+ func (s *group[T]) Broadcast(ev T) {
++	work := activity.Process().Begin(activity.Queued)
++	defer work.Finish()
++
+ 	s.cond.L.Lock()
+ 	defer s.cond.L.Unlock()
+ 
+@@ -256,7 +267,8 @@
+ 	// Add event to all queues and track new maximum
+ 	newMax := 0
+ 	for _, sub := range s.subs {
+-		sub.queue = append(sub.queue, ev)
++		sub.queue = append(sub.queue, queuedEvent[T]{value: ev,
++			work: activity.Process().Begin(activity.Queued)})
+ 		if len(sub.queue) > newMax {
+ 			newMax = len(sub.queue)
+ 		}
+@@ -268,7 +280,7 @@
+ // Add adds a subscriber to the list
+ func (s *group[T]) Add(handler func(T)) *consumer[T] {
+ 	sub := &consumer[T]{
+-		queue: make([]T, 0, 64),
++		queue: make([]queuedEvent[T], 0, 64),
+ 	}
+ 
+ 	// Add the consumer to the list of active consumers
