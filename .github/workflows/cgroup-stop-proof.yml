@@ -30,7 +30,9 @@ jobs:
             -o "$RUNNER_TEMP/cgroup-state-fixture"
       - name: Verify real descendant population and empty subtree after owned kill
         run: |
-          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+          test "${GITHUB_ACTIONS:?}" = true
+          test "${RUNNER_ENVIRONMENT:?}" = github-hosted
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "GITHUB_ACTIONS=$GITHUB_ACTIONS" "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT" \
             timeout 15 "$RUNNER_TEMP/cgroup-state-fixture"
       - name: Prove a filesystem imitation cannot supply kernel evidence
         run: |

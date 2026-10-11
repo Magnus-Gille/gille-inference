@@ -19,7 +19,10 @@ owned-cgroup kill, and requires a known empty snapshot afterward. It also reject
 ordinary file; the compiled mutant without a cgroup-filesystem check must fail that assertion.
 
 These fixture mutations happen only on disposable GitHub-hosted Linux, with explicit environment
-and root guards, an empty environment allowlist, and exact owned-path cleanup. No M5 connection,
+and root guards, a minimal environment allowlist, and owned-path cleanup on normal exit. The
+workflow and mutation driver check and forward the actual runner identity before invoking root;
+these are accident guards, not authentication. An external timeout can interrupt cleanup, so the
+disposable runner's teardown remains the final recovery boundary. No M5 connection,
 service restart, dependency installation or production stop API is involved.
 
 The directory binding is internal trusted input, not authenticated RPC data or proof of an accepted
