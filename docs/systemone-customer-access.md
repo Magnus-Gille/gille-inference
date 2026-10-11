@@ -69,9 +69,11 @@ spec, enabled setting, or source checkout alone does not grant access or establi
   decision models. Granting a decision model to such a key leaves ordinary chat access intact.
   Owner keys with an empty ordinary allow-list can run release checks before guest access is granted.
 - Request: `model`, a text or JSON-object `state`, and 1–16 named `questions`. Each question has
-  `type` (`noul`, `choice`, or `score`) and `instructions`; `choice` needs 2–26 named criteria,
-  `score` needs 2–10 ordered labels. The gateway accepts at most 8 KiB of request JSON. Images,
-  streaming, `keep_alive`, and arbitrary runtime parameters are not enabled in this release.
+  `type` (`noul`, `choice`, or `score`) and `instructions`; `choice` needs a criteria object with
+  2–26 named options. Each option key must match `^[A-Za-z0-9_-]{1,64}$`, and each option
+  description must be a string or `null`. `score` needs 2–10 ordered labels. The gateway accepts
+  at most 8 KiB of request JSON. Images, streaming, `keep_alive`, and arbitrary runtime parameters
+  are not enabled in this release.
 - Response: compatible typed `answers` and `usage` from the selected decision adapter. Credits charge the upstream
   `usage.input_tokens` on successful calls; rejected or failed calls charge zero. A decision
   model is not a chat model: `/v1/chat/completions` and MCP `ask` reject it.
@@ -85,14 +87,63 @@ spec, enabled setting, or source checkout alone does not grant access or establi
 - The gateway never records guest state/questions/answers in the owner content log. Existing
   request telemetry is content-blind and uses only the configured model ID.
 
-Example:
+For a yes/no probability, use a `noul` question such as
+`"questions":{"urgent":{"type":"noul","instructions":"Does this need immediate attention?"}}`.
+Read its probability from `answers.urgent.noul`.
+
+Choice example:
 
 ```bash
+cat > choice.json <<'JSON'
+{
+  "model": "clef-flash",
+  "state": "The customer was charged twice for the same order.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this request?",
+      "criteria": {
+        "billing": "Payments, charges and refunds",
+        "support": "Technical product problems"
+      }
+    }
+  }
+}
+JSON
+
 curl https://inference.example.com/v1/systemone \
-  -H "Authorization: Bearer $HS_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"clef-flash","state":"Checkout is down for all customers.","questions":{"urgent":{"type":"noul","instructions":"Does this need immediate attention?"}}}'
+  --data-binary @choice.json \
+  -H @- <<EOF
+Authorization: Bearer ${HS_KEY}
+Content-Type: application/json
+EOF
 ```
+
+The header heredoc keeps the bearer value on standard input rather than in the command arguments;
+set `HS_KEY` in the shell first. A choice response has the selected option in
+`answers.route.choice`, matching `answers.route.probabilities` for every criteria key, and a
+`answers.route.confidence` value. Example response (probabilities and token counts vary):
+
+```json
+{
+  "answers": {
+    "route": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": {"billing": 0.9, "support": 0.1},
+      "confidence": 0.8
+    }
+  },
+  "usage": {"input_tokens": 123, "output_tokens": 0}
+}
+```
+
+Common `400` errors are a criteria array instead of an object, fewer than 2 or more than 26
+options, invalid ASCII option keys, non-string/non-null descriptions, empty instructions, or
+unsupported fields. A `400 invalid_request_error` is request syntax/schema validation; another
+`400` code such as `model_not_found` has a different cause. A `502` means the gateway could not
+return a valid upstream decision; the status alone does not prove that the request JSON caused the
+failure.
 
 ## Release gate
 

@@ -25,6 +25,10 @@ export interface SystemOneRequest {
 
 export class SystemOneResponseError extends Error {}
 
+const CHOICE_CRITERIA_HELP = 'Choice needs a criteria object with 2 to 26 named options, e.g. '
+  + '{"billing":"Payment issue","support":"Technical issue"}. '
+  + 'Option names use letters A-Z/a-z, digits, underscores or hyphens (1 to 64 characters); descriptions are strings or null.';
+
 /** The first serving contract fixes ctx=8192. */
 export const SYSTEMONE_MAX_TOKENS_PER_QUESTION = 8192;
 
@@ -123,6 +127,10 @@ export function parseSystemOneBody(raw: string): SystemOneRequest {
       throw new SystemOneRequestError("questions", "Question IDs must be short names with object values.");
     }
     if (Object.keys(question).some((key) => !["type", "instructions", "criteria"].includes(key))) {
+      if (question["type"] === "choice" &&
+          (Object.hasOwn(question, "choices") || Object.hasOwn(question, "options"))) {
+        throw new SystemOneRequestError(`questions.${id}.criteria`, CHOICE_CRITERIA_HELP);
+      }
       throw new SystemOneRequestError("questions", "Unsupported question field.");
     }
     if (typeof question["instructions"] !== "string" || question["instructions"].trim().length === 0) {
@@ -134,7 +142,7 @@ export function parseSystemOneBody(raw: string): SystemOneRequest {
       if (!record(criteria) || Object.keys(criteria).length < 2 || Object.keys(criteria).length > 26 ||
         Object.keys(criteria).some((key) => !/^[A-Za-z0-9_-]{1,64}$/.test(key)) ||
         Object.values(criteria).some((item) => item !== null && typeof item !== "string")) {
-        throw new SystemOneRequestError("questions", "Choice needs 2 to 26 named options.");
+        throw new SystemOneRequestError(`questions.${id}.criteria`, CHOICE_CRITERIA_HELP);
       }
     } else if (type === "score") {
       if (!Array.isArray(criteria) || criteria.length < 2 || criteria.length > 10 ||
