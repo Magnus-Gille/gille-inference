@@ -8,9 +8,13 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 \
 cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 \
   "$root/native/observer/counters.c" "$root/native/observer/test_counters.c" -o "$1/test-counters"
 "$1/test-counters"
+cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 \
+  "$root/native/observer/service_census.c" "$root/native/observer/test_service_census.c" \
+  $(pkg-config --cflags --libs libsystemd) -o "$1/test-service-census"
+"$1/test-service-census"
 cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
   "$root/native/observer/lockdown.c" "$root/native/observer/proc_stat.c" "$root/native/observer/counters.c" \
-  "$root/native/tests/boundary_probe.c" $(pkg-config --cflags --libs libsystemd libseccomp) \
+  "$root/native/observer/service_census.c" "$root/native/tests/boundary_probe.c" $(pkg-config --cflags --libs libsystemd libseccomp) \
   -Wl,-z,relro,-z,now -o "$1/boundary-probe"
 cc -std=c11 -Wall -Wextra -Werror -pedantic -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
   "$root/native/tests/socket_listener.c" -Wl,-z,relro,-z,now -o "$1/socket-listener"
