@@ -68,7 +68,7 @@ const processSchema = z.object({
   cgroup: absolutePathSchema,
   executable: z.object({ path: absolutePathSchema, sha256: digestSchema }).strict(),
   configSha256: digestSchema,
-  unitDefinitionSha256: digestSchema,
+  unitFileSha256: digestSchema,
   containmentSha256: digestSchema,
   reviewSha256: digestSchema,
   control: z.enum(["root-owned-nonwritable", "identity-checked"]),
@@ -109,7 +109,7 @@ const listenerSchema = z.discriminatedUnion("transport", [
 const activationSchema = z.object({
   id: idSchema,
   unit: activationUnitSchema,
-  definitionSha256: digestSchema,
+  unitFileSha256: digestSchema,
   kind: z.enum(["manual-unit", "socket", "timer", "path", "preload", "load", "unload", "replacement"]),
   targetProcessIds: z.array(idSchema).min(1).max(4_096),
 }).strict();
@@ -141,6 +141,15 @@ function endpointKey(listener: AcceptedHostManifest["listeners"][number]): strin
 }
 
 export const acceptedHostManifestSchema = baseAcceptedHostManifestSchema.superRefine((manifest, ctx) => {
+  // SHA-256 of raw unit-file bytes only; effective drop-ins/configuration are separate evidence.
+  const unitFiles = new Map<string, string>();
+  for (const entry of [...manifest.processes, ...manifest.activations]) {
+    const prior = unitFiles.get(entry.unit);
+    if (prior !== undefined && prior !== entry.unitFileSha256) {
+      addIssue(ctx, [], "one unit cannot have conflicting raw unit-file identities");
+    }
+    unitFiles.set(entry.unit, entry.unitFileSha256);
+  }
   const processIds = new Set<string>();
   const globalIds = new Set<string>();
   const processTuples = new Set<string>();

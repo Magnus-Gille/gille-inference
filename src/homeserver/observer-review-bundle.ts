@@ -206,6 +206,7 @@ export async function checkObserverReviewBundle(directory: string, expectedDiges
         const observer = manifest.processes.find(p => p.role.kind === "owned" && p.role.purpose === "observer");
         if (manifest.hostId !== packet.host || manifest.hostBootIdSha256 !== packet.hostBootIdSha256 ||
             !observer || observer.unit !== packet.target.unit || observer.uid !== packet.target.existingIdentity.uid ||
+            observer.unitFileSha256 !== packet.artifacts.unit.sha256 ||
             observer.executable.path !== packet.target.observerPath ||
             observer.executable.sha256 !== packet.artifacts.observer.sha256 ||
             packet.priorState.services.some(service => !manifest.processes.some(p =>

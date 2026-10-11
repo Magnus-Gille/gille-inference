@@ -23,7 +23,7 @@ function validManifest() {
         cgroup: "/sys/fs/cgroup/inference",
         executable: { path: "/usr/bin/producer", sha256: digest("f") },
         configSha256: digest("0"),
-        unitDefinitionSha256: digest("1"),
+        unitFileSha256: digest("1"),
         containmentSha256: digest("2"),
         reviewSha256: digest("3"),
         control: "root-owned-nonwritable",
@@ -36,7 +36,7 @@ function validManifest() {
         cgroup: "/sys/fs/cgroup/observer",
         executable: { path: "/usr/bin/observer", sha256: digest("4") },
         configSha256: digest("5"),
-        unitDefinitionSha256: digest("6"),
+        unitFileSha256: digest("6"),
         containmentSha256: digest("7"),
         reviewSha256: digest("8"),
         control: "root-owned-nonwritable",
@@ -49,7 +49,7 @@ function validManifest() {
         cgroup: "/sys/fs/cgroup/other",
         executable: { path: "/usr/bin/other", sha256: digest("a") },
         configSha256: digest("b"),
-        unitDefinitionSha256: digest("c"),
+        unitFileSha256: digest("c"),
         containmentSha256: digest("d"),
         reviewSha256: digest("e"),
         control: "root-owned-nonwritable",
@@ -69,7 +69,7 @@ function validManifest() {
       {
         id: "activation-inference",
         unit: "inference.service",
-        definitionSha256: digest("f"),
+        unitFileSha256: digest("1"),
         kind: "manual-unit",
         targetProcessIds: ["p-observer", "p-producer", "p-excluded"],
       },
@@ -155,6 +155,12 @@ describe("accepted host manifest contract", () => {
     expect(() => contract.acceptedHostManifestSchema.parse(ownedIdentity)).toThrow();
   });
 
+  it("rejects conflicting raw unit-file identities across declarations", () => {
+    const candidate = validManifest();
+    candidate.activations[0].unitFileSha256 = digest("a");
+    expect(contract.acceptedHostManifestSchema.safeParse(candidate).success).toBe(false);
+  });
+
   it("bounds total activation target references across rows", () => {
     const candidate = structuredClone(validManifest());
     candidate.processes = Array.from({ length: 4_096 }, (_, index) => ({
@@ -164,7 +170,7 @@ describe("accepted host manifest contract", () => {
       cgroup: `/sys/fs/cgroup/p-${index}`,
       executable: { path: `/usr/bin/p-${index}`, sha256: digest("a") },
       configSha256: digest("b"),
-      unitDefinitionSha256: digest("c"),
+      unitFileSha256: digest("c"),
       containmentSha256: digest("d"),
       reviewSha256: digest("e"),
       control: "root-owned-nonwritable" as const,
@@ -177,7 +183,7 @@ describe("accepted host manifest contract", () => {
     candidate.activations = Array.from({ length: 5 }, (_, index) => ({
       id: `activation-${index}`,
       unit: `bulk-${index}.service`,
-      definitionSha256: digest("f"),
+      unitFileSha256: digest("f"),
       kind: "preload" as const,
       targetProcessIds: index < 4 ? [...allProcessIds] : ["p-0"],
     }));

@@ -73,12 +73,18 @@ launcher and installation roles require root-controlled, non-writable executable
 expectations and review hashes. Producer binaries may instead require measured identity without
 changing their existing service ownership.
 
+`unitFileSha256` means SHA-256 of the raw unit-file bytes, not effective systemd configuration.
+All declarations naming the same unit must agree on that file identity. Drop-ins, runtime properties
+and effective containment remain separately measured configuration evidence; a file hash cannot
+establish them.
+
 The bundle checker also matches host/boot, the owned observer's unit/UID/path/executable digest and
 each protected service's executable/configuration identity against the packet. Manifest JSON uses
 the same duplicate-key and invalid-UTF-8 rejection as packet JSON. Even hash-correct arbitrary text
 or an internally inconsistent manifest is refused. The separate `hashAcceptedHostManifest` function
 hashes the parsed declaration canonically, normalizing IP spellings and sorting set-like rows and
 activation targets without mutating input. The artifact's byte hash still binds the exact file.
+The owned observer's `unitFileSha256` must also match the submitted `unit` artifact's byte hash.
 
 These are declarations for review, not observed facts, operator signatures or a complete-coverage
 receipt. A future confined collector must reconcile every visible process, listener and service

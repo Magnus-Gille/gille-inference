@@ -34,7 +34,7 @@ function makeManifest() {
     id: "gateway", unit: "home-gateway.service", uid: 1000,
     cgroup: "/system.slice/home-gateway.service",
     executable: { path: "/opt/gateway/bin/server", sha256: DIGEST },
-    configSha256: DIGEST, unitDefinitionSha256: DIGEST,
+    configSha256: DIGEST, unitFileSha256: DIGEST,
     containmentSha256: DIGEST, reviewSha256: DIGEST,
     control: "identity-checked", role: { kind: "producer", producerId: "gateway" },
   };
@@ -45,13 +45,14 @@ function makeManifest() {
     processes: [process, {
       ...process, id: "observer", unit: "gille-observer-eval-synthetic-1.service", uid: 1234,
       cgroup: "/system.slice/gille-observer-eval-synthetic-1.service",
+      unitFileSha256: sha256("synthetic-unit-artifact"),
       executable: { path: "/var/lib/gille-observer-eval/observer", sha256: sha256("synthetic-observer-artifact") },
       control: "root-owned-nonwritable", role: { kind: "owned", purpose: "observer", runIdSha256: DIGEST },
     }],
     listeners: [],
     activations: [
-      { id: "gateway-start", unit: "home-gateway.service", kind: "manual-unit", definitionSha256: DIGEST, targetProcessIds: ["gateway"] },
-      { id: "observer-start", unit: "gille-observer-eval-synthetic-1.service", kind: "manual-unit", definitionSha256: DIGEST, targetProcessIds: ["observer"] },
+      { id: "gateway-start", unit: "home-gateway.service", kind: "manual-unit", unitFileSha256: DIGEST, targetProcessIds: ["gateway"] },
+      { id: "observer-start", unit: "gille-observer-eval-synthetic-1.service", kind: "manual-unit", unitFileSha256: sha256("synthetic-unit-artifact"), targetProcessIds: ["observer"] },
     ],
   };
 }
@@ -283,6 +284,12 @@ describe("offline observer review bundle checks", () => {
     ["wrong boot", () => JSON.stringify({ ...makeManifest(), hostBootIdSha256: "f".repeat(64) }), "host-manifest-binding-mismatch"],
     ["wrong protected binary", () => {
       const manifest = makeManifest(); manifest.processes[0].executable.sha256 = "f".repeat(64); return JSON.stringify(manifest);
+    }, "host-manifest-binding-mismatch"],
+    ["wrong observer unit bytes", () => {
+      const manifest = makeManifest();
+      manifest.processes[1].unitFileSha256 = "f".repeat(64);
+      manifest.activations[1].unitFileSha256 = "f".repeat(64);
+      return JSON.stringify(manifest);
     }, "host-manifest-binding-mismatch"],
     ["wrong observer UID", () => {
       const manifest = makeManifest(); manifest.processes[1].uid = 1235; return JSON.stringify(manifest);
