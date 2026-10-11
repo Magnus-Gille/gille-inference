@@ -30,6 +30,8 @@ try:
                 cwd=scratch, capture_output=True, timeout=15, check=False)
             output = result.stdout + result.stderr
             if result.returncode != 1 or b'http server error' not in output:
+                # Only this credential-free synthetic fixture's bounded output.
+                print(output[-4096:].decode('utf-8', errors='replace'), file=sys.stderr)
                 raise SystemExit('fixture did not reach the intended post-observer listener failure')
             exists = socket.exists() or socket.is_symlink()
             if expect_stale:
