@@ -13,6 +13,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-boundary:
+    # Fixed OS series; record concrete package/compiler and artifact identities.
+    # Every job gets a fresh hosted VM. Nothing here connects to M5.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies in disposable CI
+        run: |
+          sudo -n apt-get update -qq
+          sudo -n apt-get install --no-install-recommends -y libsystemd-dev libseccomp-dev
+          dpkg-query -W -f='${Package} ${Version}\n' libsystemd-dev libsystemd0 libseccomp-dev libseccomp2 apparmor
+          cc --version | head -n 1
+      - name: Build native fixture and test metadata parser
+        run: |
+          mkdir "$RUNNER_TEMP/observer-native"
+          bash native/tests/build.sh "$RUNNER_TEMP/observer-native"
+          sha256sum "$RUNNER_TEMP/observer-native/boundary-probe" "$RUNNER_TEMP/observer-native/socket-listener" \
+            native/observer/lockdown.c native/tests/socket_listener.c native/tests/observer-fixture.apparmor
+      - name: Prove Linux MAC and syscall boundary with distinct UIDs
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            bash native/tests/run-linux-boundary.sh "$RUNNER_TEMP/observer-native/boundary-probe" \
+              "$RUNNER_TEMP/observer-native/socket-listener"
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 2
