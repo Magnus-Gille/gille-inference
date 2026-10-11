@@ -24,7 +24,7 @@
  	flag.Parse()
  
  	if *flagVersion {
-@@ -247,6 +250,13 @@
+@@ -247,11 +250,23 @@
  		os.Exit(1)
  	}
  
@@ -34,11 +34,31 @@
 +		os.Exit(1)
 +	}
 +	defer closeObserver()
++	exitWithObserverCleanup := func(code int) {
++		activity.Process().Invalidate()
++		closeObserver()
++		os.Exit(code)
++	}
 +
  	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs)
  	if err != nil {
  		slog.Error("failed to create server", "error", err)
-@@ -313,6 +323,8 @@
+ 		initialStore.Close()
+-		os.Exit(1)
++		exitWithObserverCleanup(1)
+ 	}
+ 
+ 	// activeSrv is swapped atomically during hot reload.
+@@ -289,7 +304,7 @@
+ 			slog.Error("failed to start Tailcat server", "error", err)
+ 			initialSrv.Shutdown(shutdownTimeout)
+ 			initialStore.Close()
+-			os.Exit(1)
++			exitWithObserverCleanup(1)
+ 		}
+ 	}
+ 	if activeTailcat != nil {
+@@ -313,6 +328,8 @@
  	var reloadMu sync.Mutex
  
  	reload := func() {
@@ -47,7 +67,34 @@
  		reloadMu.Lock()
  		if reloading {
  			reloadMu.Unlock()
-@@ -462,6 +474,7 @@
+@@ -412,7 +429,7 @@
+ 			absConfigPath, err := filepath.Abs(*flagConfig)
+ 			if err != nil {
+ 				slog.Error("watch-config: failed to resolve config path", "error", err)
+-				os.Exit(1)
++				exitWithObserverCleanup(1)
+ 			}
+ 			go func() {
+ 				(&configwatcher.Watcher{
+@@ -427,7 +444,7 @@
+ 			absConfigDir, err := filepath.Abs(*flagConfigDir)
+ 			if err != nil {
+ 				slog.Error("watch-config: failed to resolve config-dir path", "error", err)
+-				os.Exit(1)
++				exitWithObserverCleanup(1)
+ 			}
+ 			go func() {
+ 				(&configwatcher.DirWatcher{
+@@ -453,7 +470,7 @@
+ 		}
+ 		if startErr != nil && !errors.Is(startErr, http.ErrServerClosed) {
+ 			slog.Error("http server error", "error", startErr)
+-			os.Exit(1)
++			exitWithObserverCleanup(1)
+ 		}
+ 	}()
+ 
+@@ -462,6 +479,7 @@
  		proxyLog.Infof("llama-swap is reachable by all hosts on the network, use -listen localhost:%s to restrict to loopback only", port)
  	}
  
@@ -55,7 +102,7 @@
  	exitChan := make(chan struct{})
  
  	go func() {
-@@ -472,6 +485,7 @@
+@@ -472,6 +490,7 @@
  				proxyLog.Info("received SIGHUP, reloading config")
  				go reload()
  			case syscall.SIGINT, syscall.SIGTERM:
@@ -63,6 +110,15 @@
  				proxyLog.Infof("received signal %v, shutting down", sig)
  				watcherCancel()
  
+@@ -482,7 +501,7 @@
+ 				go func() {
+ 					time.Sleep(shutdownTimeout + 5*time.Second)
+ 					proxyLog.Warnf("graceful shutdown exceeded %v, forcing exit", shutdownTimeout)
+-					os.Exit(1)
++					exitWithObserverCleanup(1)
+ 				}()
+ 
+ 				activeMu.RLock()
 --- a/internal/server/server.go
 +++ b/internal/server/server.go
 @@ -4,6 +4,7 @@

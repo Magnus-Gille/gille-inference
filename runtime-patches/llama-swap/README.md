@@ -23,7 +23,16 @@ The socket accepts cross-UID connections but checks kernel `SO_PEERCRED` against
 UID before reading or replying. It accepts only `snapshot <64 lowercase hex nonce>\n`, returns
 fixed identity/count fields and the same nonce, permits at most four concurrent handlers, and
 bounds each connection to 500 ms. No request can select a path, PID, command or URL.
+Explicit fatal exits invalidate evidence and close the endpoint before terminating; Linux CI exercises
+a listener-start failure twice and proves the missing-cleanup regression with a built mutant.
 Cleanup checks the original socket inode before unlinking; replacement files are preserved.
+
+A later G2 unit must use a dedicated systemd-managed `RuntimeDirectory=llama-swap-observer`,
+`RuntimeDirectoryMode=0755` and `RuntimeDirectoryPreserve=no`, reviewed against any existing
+runtime-directory settings. This is mandatory for SIGKILL/crash recovery, where no process cleanup
+can run. Do not enable the flag until the exact unit proves directory removal on stop/failure and
+recreation with the correct service ownership on restart. The binary deliberately refuses existing
+paths; it never guesses that a socket is stale or deletes it to make startup pass.
 
 Identity includes a new random process-instance identifier, the SHA256 of `/proc/self/exe`, and
 the SHA256 of serialized effective configuration. No configuration values, prompts, responses,

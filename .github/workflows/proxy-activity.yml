@@ -79,3 +79,22 @@ jobs:
             -o "$RUNNER_TEMP/llama-swap-observer" .
           sha256sum "$RUNNER_TEMP/llama-swap-observer" ../runtime-patches/llama-swap/instrumentation.patch go.sum ui/package-lock.json
           echo 'Candidate build only; no observer qualification or deployment.'
+      - name: Prove fatal startup cleanup with built candidate and regression mutation
+        working-directory: upstream
+        run: |
+          cp llama-swap.go "$RUNNER_TEMP/llama-swap-reviewed.go"
+          trap 'cp "$RUNNER_TEMP/llama-swap-reviewed.go" llama-swap.go' EXIT
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('llama-swap.go')
+          s = p.read_text()
+          before = '\t\tcloseObserver()\n\t\tos.Exit(code)'
+          assert s.count(before) == 1
+          p.write_text(s.replace(before, '\t\tos.Exit(code)'))
+          PYCODE
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -tags embed_ui -o "$RUNNER_TEMP/llama-swap-stale-mutant" .
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            python3 ../runtime-patches/llama-swap/test-startup-cleanup.py "$RUNNER_TEMP/llama-swap-stale-mutant" --expect-stale
+          cp "$RUNNER_TEMP/llama-swap-reviewed.go" llama-swap.go
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            python3 ../runtime-patches/llama-swap/test-startup-cleanup.py "$RUNNER_TEMP/llama-swap-observer"
