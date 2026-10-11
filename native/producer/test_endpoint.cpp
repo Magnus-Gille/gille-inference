@@ -430,6 +430,8 @@ void slowClientDeadline() {
     Fixture fixture(5);
     const Identity identity = identityFor(fixture.producerId);
     Activity activity;
+    const Token active = activity.begin(Stage::active);
+    require(static_cast<bool>(active), "slow-client activity setup failed");
     Endpoint endpoint(activity, identity, static_cast<std::uint32_t>(geteuid()));
     require(endpoint.start(), "slow-client endpoint start failed");
     const std::string nonce(64, '2');
