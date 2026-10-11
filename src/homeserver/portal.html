@@ -200,6 +200,9 @@
        so a portal-only edit requires a gateway restart to take effect. See CLAUDE.md → "Keep the portal in sync". -->
   <div class="info-card">
     <h2>What&#8217;s running</h2>
+    <p><strong>Tokenizer:</strong> the MCP <span class="badge mono">tokenize</span> tool returns exact
+      raw-text token counts and pieces for supported llama.cpp models. It is a utility, not a
+      separate model, and charges no inference credits.</p>
     <p>
       <strong>Hardware:</strong> BosGame M5 &#8212; AMD Ryzen AI Max+ 395 &#8220;Strix Halo&#8221;,
       128&nbsp;GB unified LPDDR5X memory shared between CPU and GPU,
@@ -771,10 +774,22 @@ for chunk in stream:
             <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. For bounded multi-section work, <span class="badge mono">output_profile: "complete-within-budget"</span> prioritizes finishing every required section within the token cap (and uses low reasoning effort on gpt-oss). A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
           </tr>
           <tr>
+            <td><span class="badge mono">tokenize</span></td>
+            <td><span class="badge mono">{model, text}</span> returns exact raw-text token counts,
+              IDs and pieces from the selected llama.cpp tokenizer. Uses your model allow-list and
+              request rate limit, with no inference credit charge. Maximum 16,384 UTF-8 bytes;
+              no chat template or added special tokens. It may load the model through normal admission.
+              Unsupported runtimes return an error.</td>
+          </tr>
+          <tr>
             <td><span class="badge mono">record_adoption_evidence</span></td>
             <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. After 25 individual rows/day it coalesces later reports into bounded aggregates and marks the dashboard window incomplete. Telemetry limits never limit <span class="badge mono">ask</span>, code loops, models, credits, or owner inference. It accepts no prompt, response, path, repository, or identifier; adoption remains shadow-only and never changes routing.</td>
           </tr>
         </table>
+        <p><strong>Tokenization example:</strong> call <span class="badge mono">tokenize</span>
+          with <span class="badge mono">{"model":"mellum","text":"Hej världen!"}</span>, using a
+          model your key permits. Pieces are strings or byte arrays for tokens splitting a Unicode
+          character. If the tool is missing after an update, refresh or reconnect your MCP session.</p>
       </div>
 
       <hr class="section-divider" />

@@ -28,6 +28,7 @@ let upstream: Server;
 let upstreamPort = 0;
 let upstreamHits = 0;
 let lastUpstreamBody = "";
+let tokenizerReply: unknown = { tokens: [{ id: 1, piece: "Hej" }, { id: 2, piece: " " }, { id: 3, piece: [195] }, { id: 4, piece: [165] }] };
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -46,6 +47,11 @@ function startUpstream(): Promise<void> {
     req.on("end", () => {
       upstreamHits++;
       lastUpstreamBody = Buffer.concat(chunks).toString();
+      if (req.url?.startsWith("/upstream/") && req.url.endsWith("/tokenize")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(tokenizerReply));
+        return;
+      }
       // Test hook: the sentinel model id "boom-model" forces an upstream 5xx so the failure path
       // (outcome="error" + error_class="infra") can be exercised. Other model ids are unaffected.
       let reqModel = "";
@@ -237,6 +243,33 @@ function askCapability(tool: {
 }
 
 // ─── initialize ─────────────────────────────────────────────────────────────────────
+
+describe("MCP tokenize", () => {
+  const call = (args: unknown, key = openKey) => rpc({ jsonrpc: "2.0", id: 438, method: "tools/call", params: { name: "tokenize", arguments: args } }, key);
+  it("advertises a dedicated deterministic tool", async () => {
+    const body = await (await rpc({ jsonrpc: "2.0", id: 438, method: "tools/list" })).json();
+    expect(body.result.tools.find((tool: { name: string }) => tool.name === "tokenize")).toMatchObject({
+      inputSchema: { required: ["model", "text"], additionalProperties: false },
+      outputSchema: { type: "object", required: expect.arrayContaining(["model", "count", "tokens", "pieces"]) },
+    });
+  });
+  it("returns exact native IDs and byte pieces without generation or credit charges", async () => {
+    const before = lookupKey(creditKey)!.creditsUsed;
+    const body = await (await call({ model: "mellum", text: "Hej å" }, creditKey)).json();
+    expect(body.result.isError).toBe(false);
+    expect(body.result.structuredContent).toEqual({ model: "mellum", count: 4, tokens: [1, 2, 3, 4], pieces: ["Hej", " ", [195], [165]], add_special: false, parse_special: false });
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ content: "Hej å", add_special: false, parse_special: false, with_pieces: true });
+    expect(lookupKey(creditKey)!.creditsUsed).toBe(before);
+    expect(JSON.parse(body.result.content[0].text)).toEqual(body.result.structuredContent);
+  });
+  it("enforces the key model grant before contacting the backend", async () => {
+    const before = upstreamHits;
+    const body = await (await call({ model: "mellum", text: "Hej" }, scopedKey)).json();
+    expect(body.result.isError).toBe(true);
+    expect(body.result._meta.m5_code).toBe("model_not_allowed");
+    expect(upstreamHits).toBe(before);
+  });
+});
 
 describe("MCP initialize", () => {
   it("returns protocolVersion + capabilities.tools + serverInfo and an Mcp-Session-Id header", async () => {
