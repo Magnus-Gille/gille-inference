@@ -243,6 +243,82 @@ describe("runTokenize native backend contract", () => {
     expect(inflight.count()).toBe(0);
   });
 
+  it("allows a native reply beyond 60 seconds within the configured timeout", async () => {
+    vi.useFakeTimers();
+    const delayMs = 90_000;
+    vi.mocked(fetch).mockImplementation(async (_input, init) => new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(response(validNative)), delayMs);
+      init?.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    }));
+    const inflight = makeInflight();
+    const controller = makeController();
+    let settled = false;
+    const pending = runTokenize({ model: MODEL, text: "hello" }, {
+      cfg: cfg({ callTimeoutMs: 120_000 }),
+      principal,
+      controller,
+      inflight,
+    }).then(result => {
+      settled = true;
+      return result;
+    });
+
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(settled).toBe(false);
+    expect(controller.snapshot().inflight).toBe(1);
+    expect(inflight.count()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(delayMs - 60_001);
+    const result = await pending;
+    expect(result).toMatchObject({ isError: false, structuredContent: {
+      model: MODEL, count: 2, tokens: [7, 8], pieces: ["hello", [32, 119]], add_special: false, parse_special: false,
+    } });
+    expect(controller.snapshot().inflight).toBe(0);
+    expect(inflight.count()).toBe(0);
+    expect(mockedRecordUsage).toHaveBeenCalledWith(principal.alias, 0, expect.any(Number), expect.anything());
+  });
+
+  it("waits until the configured timeout beyond 60 seconds, then releases the slot", async () => {
+    vi.useFakeTimers();
+    const timeoutMs = 120_000;
+    vi.mocked(fetch).mockImplementation(async (_input, init) => {
+      const signal = init?.signal;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+    const inflight = makeInflight();
+    const controller = makeController();
+    let settled = false;
+    const pending = runTokenize({ model: MODEL, text: "hello" }, {
+      cfg: cfg({ callTimeoutMs: timeoutMs }),
+      principal,
+      controller,
+      inflight,
+    }).then(result => {
+      settled = true;
+      return result;
+    });
+
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(settled).toBe(false);
+    expect(controller.snapshot().inflight).toBe(1);
+    expect(inflight.count()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(timeoutMs - 60_001);
+    const result = await pending;
+    expect(result).toMatchObject({ isError: true, meta: { m5_code: "upstream_timeout" } });
+    expect(controller.snapshot().inflight).toBe(0);
+    expect(inflight.count()).toBe(0);
+    expect(mockedRecordUsage).toHaveBeenCalledWith(principal.alias, 0, expect.any(Number), expect.anything());
+  });
+
   it("rejects an oversized response before parsing", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response("x".repeat(1_048_577), { status: 200 }));
     const { result } = await call();

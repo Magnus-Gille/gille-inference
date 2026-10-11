@@ -322,7 +322,15 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   UTF-8 bytes. Empty text is allowed. Backend replies are bounded to 1 MiB, 32,768 tokens and
   128 KiB of pieces; malformed/unsupported replies return an error, never a partial estimate.
   Calls share key RPM, concurrency, maintenance and host-memory admission, and may load a model
-  through llama-swap. They add no inference token usage or credit charge. LM Studio, System One
+  through llama-swap. Cold starts can take several minutes; the native request, including model
+  loading and response-body consumption, uses `HOMESERVER_CALL_TIMEOUT_MS` (default 600,000 ms),
+  just like the configured upstream call deadline. Set the caller's MCP timeout to accommodate
+  that wait; smaller configured gateway deadlines still abort and release admission normally.
+  The stock `m5 ... mcp` stdio bridge still has a 30-second upstream deadline and does not accept
+  `--timeout-ms`; increasing only the outer MCP host timeout will not extend it. For a cold model,
+  use a direct MCP client with a sufficient timeout, or wait until the permitted model is loaded
+  before calling through that bridge.
+  They add no inference token usage or credit charge. LM Studio, System One
   and embedding backends are unsupported by this tool. Nothing is written to owner content logs
   or delegation evidence. No standalone gateway HTTP `/tokenize` endpoint is added.
 
