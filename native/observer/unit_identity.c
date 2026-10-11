@@ -50,7 +50,9 @@ static int gi_finish_variant(sd_bus_message *reply)
 {
     int result;
 
-    result = sd_bus_message_at_end(reply, 1);
+    /* complete=1 is false while any container is entered, even at its end.
+     * Check the variant first, leave it, then require the whole reply's end. */
+    result = sd_bus_message_at_end(reply, 0);
     if (result < 0) {
         return result;
     }
