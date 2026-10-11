@@ -88,6 +88,7 @@ import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, ru
 import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
+  SYSTEMONE_MAX_BODY_BYTES,
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
 import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
   embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
@@ -5118,7 +5119,7 @@ export async function handleRequest(
     // ─── Inference surface (through the spine) ───
     if (path === "/v1/systemone" && method === "POST") {
       res.setHeader("Cache-Control", "no-store");
-      const raw = await readBody(req, 8 * 1024);
+      const raw = await readBody(req, SYSTEMONE_MAX_BODY_BYTES);
       let parsed: SystemOneRequest;
       try {
         parsed = parseSystemOneBody(raw);
