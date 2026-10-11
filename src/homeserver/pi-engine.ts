@@ -16,7 +16,6 @@ import type {
   EngineOutcome,
   EngineRunOptions,
   EngineRunResult,
-  PiProcess,
   SpawnPiFn,
   CodeLoopAgentCheckAttempt,
   CodeLoopAgentCheckKind,

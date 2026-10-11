@@ -37,7 +37,7 @@ import { observeGpuLeaseMutex, type GpuMutexObservation } from "./gpu-lease-obse
 import { buildCageArgv } from "./code-loop-cage.js";
 import { codeLoopSecretPath, resolveNodeModulesDir, runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
