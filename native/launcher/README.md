@@ -12,7 +12,10 @@ lifetime, including idle and restoration, so competing broker instances never qu
 leases on the same inode. Keeping one broker's lock across idle avoids an unlock/reopen interval;
 installation and maintenance ownership are serialized inside that broker under a mutex.
 
-Every construction begins quarantined. Process exit releases file descriptors, but does not prove
+Every construction begins quarantined. The lock releases only after every reference to its open-file
+description closes. A forked child can retain it after broker exit and block a replacement broker.
+Therefore the broker must not fork after constructing this object; launch workloads through the
+service manager. `O_CLOEXEC` prevents inheritance across exec, not fork. Process exit does not prove
 that a surviving job or maintenance fence has been restored. Only the trusted host reconciler may
 call `acceptReconciliation`, after independently proving outstanding-work absence, protected-state
 restoration and restored maintenance/GPU/fence state. The function verifies the library's state and
@@ -40,7 +43,7 @@ independent mechanism. This primitive alone neither stops a process nor grants i
 
 The disposable hosted-Linux suite exercises both acquisition orders, simultaneous contenders, expired
 and foreign handles, restoration retention, owner-deadline capping, process exit without destructors,
-startup quarantine, inherited-object rejection and unsafe/changed paths. Fixture guards fail unless
+startup quarantine, inherited-object rejection, a surviving child retaining the lock, and unsafe/changed paths. Fixture guards fail unless
 running as root in explicitly identified ephemeral GitHub CI; fixtures refuse preexisting paths and
 remove only their own identities. A compiled startup-idle mutant must fail the behavioral regression.
 No dependencies are installed and no M5 host is contacted. See the Linux

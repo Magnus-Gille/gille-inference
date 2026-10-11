@@ -23,7 +23,10 @@ private:
 
 // Internal fixed-launcher primitive; NOT an RPC or admission API. Linux/root only.
 // The broker alone opens this object and must outlive every Lease. No caller may
-// receive the lock descriptor. Production integration must authenticate callers,
+// receive the lock descriptor. The broker must not fork after construction;
+// launch workloads through the service manager. A forked child inherits the flock
+// until its descriptor is closed, even though this API rejects its operations.
+// Production integration must authenticate callers,
 // verify reconciliation/restoration and independently enforce execution expiry.
 class Arbiter final {
 public:

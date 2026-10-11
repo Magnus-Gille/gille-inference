@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <atomic>
+#include <poll.h>
+#include <signal.h>
 #include <thread>
 
 namespace {
@@ -412,6 +414,42 @@ bool testForkedObjectIsRejected() {
     return true;
 }
 
+bool testSurvivingChildRetainsLock() {
+    int releasePipe[2];
+    CHECK(pipe(releasePipe) == 0);
+    pid_t child = -1;
+    {
+        Arbiter broker;
+        CHECK(makeIdle(broker));
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            close(releasePipe[1]);
+            struct pollfd input{releasePipe[0], POLLIN, 0};
+            int ready = poll(&input, 1, 3000);
+            char release = 0;
+            bool okay = ready > 0 && read(releasePipe[0], &release, 1) == 1 && release == 'x';
+            close(releasePipe[0]);
+            _exit(okay ? 0 : 13);
+        }
+        close(releasePipe[0]);
+    }
+    bool blocked = false;
+    {
+        Arbiter restart;
+        blocked = restart.check() == State::unavailable && restart.error() == Error::lock_busy;
+    }
+    const bool signalled = write(releasePipe[1], "x", 1) == 1;
+    close(releasePipe[1]);
+    int status = 0;
+    const bool reaped = waitpid(child, &status, 0) == child;
+    CHECK(blocked && signalled && reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    Arbiter afterChildExit;
+    CHECK(afterChildExit.check() == State::quarantined);
+    CHECK(!afterChildExit.acquire(Mode::installation, 1000, monotonicMs() + 3000));
+    return true;
+}
+
 bool environmentAllowsPrivilegedFixture() {
     const char* actions = std::getenv("GITHUB_ACTIONS");
     const char* runner = std::getenv("RUNNER_ENVIRONMENT");
@@ -443,5 +481,6 @@ int main() {
     if (!testIdentityDriftCannotRecoverInPlace()) return 1;
     if (!testInvalidBoundsAndConcurrentModes()) return 1;
     if (!testForkedObjectIsRejected()) return 1;
+    if (!testSurvivingChildRetainsLock()) return 1;
     return fixture.cleanup() ? 0 : 1;
 }
