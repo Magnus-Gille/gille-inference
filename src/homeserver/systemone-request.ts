@@ -32,6 +32,9 @@ const CHOICE_CRITERIA_HELP = 'Choice needs a criteria object with 2 to 26 named 
 /** The first serving contract fixes ctx=8192. */
 export const SYSTEMONE_MAX_TOKENS_PER_QUESTION = 8192;
 
+/** Maximum raw UTF-8 JSON request body accepted by the System One gateway surface. */
+export const SYSTEMONE_MAX_BODY_BYTES = 256 * 1024;
+
 export function systemOneTokenReservation(request: SystemOneRequest): number {
   // Clef reads all questions in one prompt. Other System One models may evaluate them separately.
   if (request.model === "clef-flash") return SYSTEMONE_MAX_TOKENS_PER_QUESTION;

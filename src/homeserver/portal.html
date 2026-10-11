@@ -303,6 +303,8 @@
     <h3 id="systemone-models-heading" style="margin-top:16px">System One decision models</h3>
     <p style="margin-bottom:8px;font-size:12.5px">
       Availability requires an activated runtime and roster entry plus an explicit key grant.
+      Requests accept up to 256&nbsp;KiB of UTF-8 JSON. The separate input context is
+      8,192 tokens per question/prompt, shared across questions for Clef.
     </p>
     <div class="model-table-scroll" role="region" aria-labelledby="systemone-models-heading" tabindex="0">
       <table class="decision-table" aria-label="Model use, API and access">
@@ -530,8 +532,12 @@
           near <span class="badge mono">0</span> means no, in
           <span class="badge mono">answers.urgent.noul</span>. You can also ask
           <span class="badge mono">choice</span> and <span class="badge mono">score</span> questions.
-          Decision models return typed decisions, not chat text. Up to 16 questions and 8&nbsp;KiB of
-          text/JSON request data per call; images and streaming are not enabled here. Successful
+          Decision models return typed decisions, not chat text. Up to 16 questions and 256&nbsp;KiB
+          (262,144 bytes) of UTF-8 JSON per call, including state, questions and formatting.
+          This byte limit is separate from the 8,192-token input context per question/prompt,
+          which includes instructions and runtime formatting; Clef shares one context across
+          all questions. Text that fits the byte limit can still exceed the token context.
+          Images and streaming are not enabled here. Successful
           calls use input-token credits. This is a separate endpoint from chat completions.
         </p>
 

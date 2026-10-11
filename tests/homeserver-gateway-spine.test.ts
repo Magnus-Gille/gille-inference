@@ -12,6 +12,7 @@ import {
   type ExposureReceiptEnvelope,
 } from "../src/homeserver/exposure-receipt-schema.js";
 import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admission.js";
+import { SYSTEMONE_MAX_BODY_BYTES } from "../src/homeserver/systemone-request.js";
 
 // The gateway reads config from env at startGateway() time. We must set env BEFORE
 // importing config/gateway, and isolate the DB before any keystore call. Tests drive a
@@ -306,6 +307,35 @@ function tableCount(table: string): number {
 
 const ADMIN = "admin-static-key";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+
+function systemOneBodyAtBytes(targetBytes: number): { value: Record<string, unknown>; raw: string } {
+  const value: Record<string, unknown> = {
+    model: "clef-flash",
+    state: "x",
+    questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+  };
+  const baseBytes = Buffer.byteLength(JSON.stringify(value));
+  value.state = "x".repeat(targetBytes - baseBytes + 1);
+  const raw = JSON.stringify(value);
+  expect(Buffer.byteLength(raw)).toBe(targetBytes);
+  return { value, raw };
+}
+
+function postChunkedSystemOne(raw: string, token: string): Promise<{ status: number }> {
+  const target = new URL(url("/v1/systemone"));
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(target, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    }, (res) => {
+      res.resume();
+      res.once("end", () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.once("error", reject);
+    req.write(raw.slice(0, 4096));
+    req.end(raw.slice(4096));
+  });
+}
 
 async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Promise<{
   principalId: string;
@@ -725,6 +755,51 @@ describe("gateway spine — HTTP integration", () => {
     expect(malformedUpstream.status).toBe(502);
     expect(upstreamInferenceRequestCount).toBe(2);
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
+  });
+
+  it("accepts System One bodies up to the raw-byte cap and rejects oversize bodies before billing", async () => {
+    expect(SYSTEMONE_MAX_BODY_BYTES).toBe(256 * 1024);
+    const minted = mintKey({
+      alias: `systemone-large-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const callRaw = (raw: string) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${minted.plaintextKey}` },
+      body: raw,
+    });
+
+    const unicode = {
+      model: "clef-flash",
+      state: "Ångström 🙂 är tillgänglig för kunder. ".repeat(400),
+      questions: { urgent: { type: "noul", instructions: "Är detta brådskande?" } },
+    };
+    const unicodeRaw = JSON.stringify(unicode);
+    expect(Buffer.byteLength(unicodeRaw)).toBeGreaterThan(8 * 1024);
+    const unicodeResponse = await callRaw(unicodeRaw);
+    expect(unicodeResponse.status).toBe(200);
+    expect(lastUpstreamBody).toBe(unicodeRaw);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    const exact = systemOneBodyAtBytes(SYSTEMONE_MAX_BODY_BYTES);
+    const exactResponse = await callRaw(exact.raw);
+    expect(exactResponse.status).toBe(200);
+    expect(lastUpstreamBody).toBe(exact.raw);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+
+    const oversized = systemOneBodyAtBytes(SYSTEMONE_MAX_BODY_BYTES + 1);
+    const beforeOversized = upstreamInferenceRequestCount;
+    const oversizedResponse = await callRaw(oversized.raw);
+    expect(oversizedResponse.status).toBe(413);
+    expect(upstreamInferenceRequestCount).toBe(beforeOversized);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+
+    const chunked = await postChunkedSystemOne(oversized.raw, minted.plaintextKey);
+    expect(chunked.status).toBe(413);
+    expect(upstreamInferenceRequestCount).toBe(beforeOversized);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
   });
 
   it("keeps Clef out of chat when the System One setting is absent", async () => {
