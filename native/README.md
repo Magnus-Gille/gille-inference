@@ -28,6 +28,34 @@ The library's caller must exit on any installation failure. It is not wired into
 
 ## Disposable Linux fixture
 
+### Producer receipt channel
+
+`observer/producer_receipt.c` decodes at most 2048 bytes with exactly ten unique fields,
+version 1, plain producer identifiers, lowercase SHA-256 identities and safe integer counters.
+Any null counter makes all activity unknown; malformed input clears the whole output.
+`observer/producer_client.c` consumes only `/run/llama-swap-observer/activity.sock` with
+a 500 ms monotonic budget. It requires the expected kernel peer UID/PID, process start ticks
+before and after the exchange, stable owned directory/socket metadata, expected producer
+identities and a freshly generated 256-bit challenge echoed by the receipt. Errors never
+become idle observations. The `requestNonceSha256` wire field carries that hex challenge,
+matching the existing producer protocol.
+
+The binding argument is internal trusted collector state, not a caller-facing request. A future
+collector must derive it from the accepted manifest and live executable, configuration, unit and
+invocation evidence in the correct host namespaces. Claimed build/configuration hashes are not
+proof of the executable or files. This client is not yet connected to an observer executable,
+MAC policy or admission decision, and does not establish complete traffic coverage.
+
+The separate `producer-channel` CI job compiles the exact owned Go endpoint and this C client
+without external Go modules. A root synthetic producer and UID 65534 client exercise busy,
+idle, unknown, wrong peer/identity/start ticks, replay, malformed/oversized replies, timeout and
+changed socket metadata. A compiled client with nonce checking removed must fail the replay
+regression. Only this disposable GitHub-hosted VM creates the fixed fixture directory; existing
+paths are refused and owned resources are removed. This tests protocol interoperability and
+kernel peer binding, not observer confinement or deployment readiness.
+
+### Observer confinement
+
 The `native-boundary` job uses a fresh GitHub-hosted Ubuntu 24.04 VM. It installs only the requested
 native development dependencies (`libsystemd-dev` and `libseccomp-dev`, with necessary distribution
 dependencies), records their resolved versions/compiler and hashes both fixture executables and the policy.
