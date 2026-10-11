@@ -304,7 +304,7 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 | `tools/call` | `{content:[{type:"text", text}], isError, structuredContent?}`. |
 | unknown / malformed | JSON-RPC `-32601` / `-32700` / `-32600` error (HTTP 200). |
 
-**Tools** (both scoped to the key's allow-list):
+**Tools** (model operations respect the key's allow-list):
 
 - `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. For
   structured-capable callers it returns `structuredContent.ask_capabilities`, the **live
@@ -312,6 +312,26 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
   `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
   text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
+- `tokenize` — `{model, text}` returns exact raw-text `{model, count, tokens, pieces,
+  add_special:false, parse_special:false}` in both `structuredContent` and JSON text. This is a
+  tool, not a separate model in `list_models`. It calls the selected llama.cpp runtime's native
+  tokenizer through llama-swap; it never asks a generative model to guess or substitutes a
+  tiktoken encoding. Pieces remain strings or raw byte arrays when a token splits a UTF-8
+  character. It does not add a chat template, BOS/EOS or interpret special-token spellings, so
+  these are raw-text counts rather than a complete chat request's usage. Maximum input: 16,384
+  UTF-8 bytes. Empty text is allowed. Backend replies are bounded to 1 MiB, 32,768 tokens and
+  128 KiB of pieces; malformed/unsupported replies return an error, never a partial estimate.
+  Calls share key RPM, concurrency, maintenance and host-memory admission, and may load a model
+  through llama-swap. They add no inference token usage or credit charge. LM Studio, System One
+  and embedding backends are unsupported by this tool. Nothing is written to owner content logs
+  or delegation evidence. No standalone gateway HTTP `/tokenize` endpoint is added.
+
+  Example MCP `tools/call` parameters (choose a model granted by your `list_models`):
+  `{"name":"tokenize","arguments":{"model":"mellum","text":"Hej världen!"}}`.
+  Compare with a second call using the same model and English text. Treat byte-array pieces as
+  bytes; decoding each separately can introduce replacement characters. The generic `m5` bridge
+  forwards this tool without a client upgrade. After gateway rollout, refresh/reconnect the MCP
+  session if the agent cached an older `tools/list` response.
 - `ask` — `{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
   local model. Successful calls keep the text in the content block and also attach
   `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always

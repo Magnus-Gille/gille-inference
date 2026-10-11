@@ -41,6 +41,7 @@ import { deriveEvidenceIdentity } from "./orchestrator.js";
 import { currentTraceHeaders } from "./tracing.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { isEmbeddingModel } from "./embedding-request.js";
+import { TOKENIZE_TOOL, runTokenize } from "./tokenize.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -465,6 +466,7 @@ export function isAdoptionEvidenceToolCall(rawBody: string): boolean {
 function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] {
   const filesCapability = askFilesCapability(principal, cfg);
   const base: McpToolDef[] = [
+    TOKENIZE_TOOL,
     {
       name: "list_models",
       description:
@@ -1422,6 +1424,7 @@ async function callTool(
   args: Record<string, unknown>,
   ctx: ToolCallContext
 ): Promise<{ text: string; isError: boolean; structuredContent?: unknown; meta?: Record<string, unknown>; trace?: McpTraceOverride }> {
+  if (name === "tokenize") return runTokenize(args, ctx);
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal, ctx.cfg);
     const structuredContent = buildListModelsStructuredContent(
