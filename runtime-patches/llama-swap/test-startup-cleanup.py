@@ -23,7 +23,7 @@ socket = runtime / 'activity.sock'
 try:
     with tempfile.TemporaryDirectory(prefix='gi-proxy-startup-') as scratch:
         config = Path(scratch) / 'config.yaml'
-        config.write_text('logToStdout: proxy\nmodels:\n  fixture:\n    cmd: /usr/bin/false\n')
+        config.write_text('logToStdout: proxy\nmodels:\n  fixture:\n    cmd: /usr/bin/false\n    proxy: http://127.0.0.1:1\n')
         for _ in range(1 if expect_stale else 2):
             result = subprocess.run([str(binary), '-config', str(config),
                 '-install-observer-uid', str(os.geteuid()), '-listen', 'invalid-listen-address'],
