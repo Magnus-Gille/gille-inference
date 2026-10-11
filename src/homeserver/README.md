@@ -332,7 +332,7 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   bytes; decoding each separately can introduce replacement characters. The generic `m5` bridge
   forwards this tool without a client upgrade. After gateway rollout, refresh/reconnect the MCP
   session if the agent cached an older `tools/list` response.
-- `ask` — `{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
+- `ask` — `{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?, include_reasoning?}` → runs a completion on the chosen
   local model. Successful calls keep the text in the content block and also attach
   `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always
   content-blind `true` for this tool; `usage` is content-blind prompt/input, completion/output,
@@ -355,6 +355,37 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   owner/cloud-agent callers should set it to the cloud brain that delegated the task so the
   content-blind savings ledger can estimate actual cloud spend avoided. It is not forwarded to the
   local model.
+
+#### Native reasoning (`include_reasoning`, issue #441) — OWNER-TIER ONLY
+
+An owner-tier caller can opt in with `include_reasoning:true`. Only this authenticated tier sees
+that parameter and the optional reasoning fields in the `ask` schemas. Guest opt-in is rejected
+before credits, quota, admission or upstream work. Omitted or `false` preserves the existing
+response: no reasoning fields. Non-boolean values are rejected.
+
+The opt-in adds two fields to `structuredContent`, alongside the unchanged final-answer `text`,
+`finish_reason`, `truncated`, and `usage`:
+
+- `reasoning_content`: the backend's actual `choices[0].message.reasoning_content` string, or
+  `null` when absent/non-string. Empty strings remain empty. No generated explanation substitutes
+  for missing native data.
+- `reasoning_truncated`: `true` if that field exceeded **16,384 UTF-8 bytes** and was clipped at a
+  whole Unicode code point, `false` when fully returned, or `null` when unavailable. This cap
+  applies to the additional returned field; existing final-answer and generation limits remain.
+  A `finish_reason:"length"` still indicates the generation stopped at its token limit, even if
+  `reasoning_truncated:false` because the returned reasoning field itself fit the byte cap.
+
+The content block still contains only the final answer (or its existing token-limit warning).
+The flag is not forwarded to the model and does not change reasoning effort, generation or
+metering. `usage.reasoning_tokens` comes only from backend usage metadata; it stays `null` when
+missing and is never computed from visible text or token differences. Reasoning is not added to
+owner content logs, request logs, metrics, task exposure or delegation evidence. Existing owner
+prompt/final-answer logging remains in effect. Malformed JSON/chat envelopes fail with a
+content-free upstream error; raw backend bytes are never used as a fallback final answer.
+
+See the [credential-safe live verification example](../../docs/m5-agent-client.md#native-reasoning-through-mcp)
+for a synthetic owner call. Source tests use fixtures; a successful approved deployment and a
+real backend response are required before claiming the current serving stack emits reasoning.
 
 #### Blind-context delegation (`files`, issue #128) — OWNER-TIER ONLY
 

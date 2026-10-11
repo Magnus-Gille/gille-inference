@@ -820,6 +820,36 @@ function normalizeOptionalFeedbackHandle(value) {
   throw new M5ClientError("malformed_mcp", "The gateway returned malformed feedback metadata.");
 }
 
+function normalizeOptionalReasoning(payload) {
+  const hasReasoningContent = Object.prototype.hasOwnProperty.call(payload, "reasoning_content");
+  const hasReasoningTruncated = Object.prototype.hasOwnProperty.call(payload, "reasoning_truncated");
+  if (!hasReasoningContent && !hasReasoningTruncated) return undefined;
+  if (!hasReasoningContent || !hasReasoningTruncated) {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+  }
+
+  const reasoningContent =
+    payload.reasoning_content === null
+      ? null
+      : typeof payload.reasoning_content === "string"
+        ? payload.reasoning_content
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+          })();
+  const reasoningTruncated =
+    payload.reasoning_truncated === null
+      ? null
+      : typeof payload.reasoning_truncated === "boolean"
+        ? payload.reasoning_truncated
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+          })();
+  if ((reasoningContent === null) !== (reasoningTruncated === null)) {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+  }
+  return { reasoning_content: reasoningContent, reasoning_truncated: reasoningTruncated };
+}
+
 function normalizeAskPayload(payload, fallbackModel) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
@@ -872,6 +902,7 @@ function normalizeAskPayload(payload, fallbackModel) {
             throw new M5ClientError("malformed_mcp", "The ask tool returned malformed metering metadata.");
           })();
   const feedbackHandle = normalizeOptionalFeedbackHandle(payload.feedback_handle);
+  const reasoning = normalizeOptionalReasoning(payload);
   return {
     model,
     text: payload.text,
@@ -879,6 +910,7 @@ function normalizeAskPayload(payload, fallbackModel) {
     truncated,
     metered,
     usage: normalizeAskUsage(payload.usage),
+    ...(reasoning === undefined ? {} : reasoning),
     ...(feedbackHandle === undefined ? {} : { feedback_handle: feedbackHandle }),
   };
 }

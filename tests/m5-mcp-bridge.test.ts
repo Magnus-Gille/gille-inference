@@ -118,6 +118,54 @@ describe("m5 stdio MCP conformance", () => {
     expect(JSON.stringify([initialize, list, call])).not.toContain(SECRET);
   });
 
+  it("forwards include_reasoning and keeps reasoning outside the answer text", async () => {
+    let upstreamRequest: Record<string, unknown> | undefined;
+    const reasoning = "The model's private trace is carried separately.";
+    const bridge = await makeBridge(async (_input, init) => {
+      upstreamRequest = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const id = upstreamRequest.id as number;
+      return rpcResponse(id, {
+        content: [{ type: "text", text: "answer" }],
+        isError: false,
+        structuredContent: {
+          model: "mellum",
+          text: "answer",
+          finish_reason: "stop",
+          truncated: false,
+          metered: true,
+          reasoning_content: reasoning,
+          reasoning_truncated: false,
+          usage: null,
+        },
+      });
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "ask",
+        arguments: { model: "mellum", prompt: "bounded", include_reasoning: true },
+      },
+    }));
+    const parsed = JSON.parse(response!);
+    const result = parsed.result;
+
+    expect((upstreamRequest?.params as { arguments?: unknown }).arguments).toEqual({
+      model: "mellum",
+      prompt: "bounded",
+      include_reasoning: true,
+    });
+    expect(result.structuredContent).toMatchObject({
+      text: "answer",
+      reasoning_content: reasoning,
+      reasoning_truncated: false,
+    });
+    expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+    expect(result.content[0].text).not.toContain(reasoning);
+  });
+
   it("handles 202/no-body notifications and rejects no-body request responses", async () => {
     const bridge = await makeBridge(async () => new Response(null, { status: 202 }));
 

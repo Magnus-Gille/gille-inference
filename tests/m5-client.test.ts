@@ -526,6 +526,129 @@ describe("secret-safe M5 client", () => {
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
   });
 
+  it("preserves optional reasoning metadata without changing answer text or usage", async () => {
+    const reasoning = "The bounded answer follows from the supplied evidence.";
+    let seenArguments: unknown;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          id: number;
+          params?: { arguments?: unknown };
+        };
+        seenArguments = request.params?.arguments;
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            metered: true,
+            reasoning_content: reasoning,
+            reasoning_truncated: false,
+            usage: {
+              prompt_tokens: 11,
+              completion_tokens: 4,
+              total_tokens: 15,
+              reasoning_tokens: 2,
+              cache_creation_input_tokens: null,
+              cache_read_input_tokens: 3,
+            },
+          },
+        });
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task", include_reasoning: true })).resolves.toEqual({
+      model: "mellum",
+      text: "answer",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      reasoning_content: reasoning,
+      reasoning_truncated: false,
+      usage: {
+        prompt_tokens: 11,
+        completion_tokens: 4,
+        total_tokens: 15,
+        reasoning_tokens: 2,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 3,
+      },
+    });
+    expect(seenArguments).toEqual({
+      model: "mellum",
+      prompt: "bounded task",
+      include_reasoning: true,
+    });
+  });
+
+  it("normalizes an unavailable reasoning pair to explicit nulls when the pair is present", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            usage: null,
+            reasoning_content: null,
+            reasoning_truncated: null,
+          },
+        });
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task", include_reasoning: true })).resolves.toMatchObject({
+      model: "mellum",
+      text: "answer",
+      reasoning_content: null,
+      reasoning_truncated: null,
+    });
+  });
+
+  it.each([
+    ["invalid types", { reasoning_content: 42, reasoning_truncated: "malformed reasoning carrier" }],
+    ["string with null", { reasoning_content: "trace", reasoning_truncated: null }],
+    ["null with true", { reasoning_content: null, reasoning_truncated: true }],
+    ["only reasoning content", { reasoning_content: "trace" }],
+    ["only reasoning truncation", { reasoning_truncated: false }],
+  ])("rejects malformed optional reasoning metadata without inventing a trace: %s", async (_name, reasoning) => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            metered: true,
+            ...reasoning,
+            usage: null,
+          },
+        });
+      },
+    });
+
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task", include_reasoning: true }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "malformed_mcp" });
+  });
+
   it("preserves a valid ask feedback handle while keeping absent handles omitted", async () => {
     const client = await createM5Client({
       gatewayUrl: "https://gateway.invalid",
