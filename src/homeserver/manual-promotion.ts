@@ -28,6 +28,7 @@ const SPEC_FIELDS = new Set([
   "gguf",
   "runtime_bin",
   "ctx",
+  "batch",
   "ngl",
   "ubatch",
   "np",
@@ -67,6 +68,7 @@ export interface LlamaServingSpec {
   gguf: string;
   runtimeBin: string;
   ctx: number;
+  batch: number | null;
   ngl: number;
   ubatch: number;
   np: number | null;
@@ -260,6 +262,7 @@ export function parseManualSpec(text: string): ManualServingSpec {
     gguf: absolutePath(get("gguf"), "gguf"),
     runtimeBin: absolutePath(get("runtime_bin"), "runtime_bin"),
     ctx: boundedInt(Number(get("ctx")), "ctx", 1024, 1048576),
+    batch: raw.has("batch") ? boundedInt(Number(get("batch")), "batch", 1, 1048576) : null,
     ngl: boundedInt(Number(get("ngl")), "ngl", 0, 999),
     ubatch: boundedInt(Number(get("ubatch")), "ubatch", 1, 8192),
     np: optInt("np"),
@@ -306,7 +309,9 @@ export function renderManualEntry(spec: ManualServingSpec): string {
   if (spec.mmproj !== null) lines.push(`      -mm ${spec.mmproj}`);
   if (spec.imageMinTokens !== null) lines.push(`      --image-min-tokens ${spec.imageMinTokens}`);
   lines.push(
-    `      -ngl ${spec.ngl} -ub ${spec.ubatch} -c ${spec.ctx}` +
+    `      -ngl ${spec.ngl}` +
+      (spec.batch !== null ? ` -b ${spec.batch}` : "") +
+      ` -ub ${spec.ubatch} -c ${spec.ctx}` +
       (spec.np !== null ? ` -np ${spec.np}` : "") +
       (spec.jinja ? " --jinja" : "") +
       ` -fa ${spec.fa}`,

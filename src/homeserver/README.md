@@ -789,6 +789,12 @@ means yes and near `0` means no. Unscoped guest keys cannot call or discover the
 They return typed decisions, not chat text, and do not participate in chat, MCP `ask`, or
 automatic delegation, even if the setting is lost.
 
+Clef's reviewed template pins both logical and physical batch sizes to 8192. The runtime caps
+the physical batch by the logical batch, so `-ub 8192` alone does not establish an 8192-token
+capacity. Applying the template to an existing service requires a separately approved roster
+change with long-input, memory and rollback verification; see the
+[System One release gate](../../docs/systemone-customer-access.md#release-gate).
+
 `qwen3-30b-instruct` is an existing ordinary chat model, not a native System One decider.
 Its appearance in an authenticated customer's `/v1/models` response verifies chat access;
 restricted customer keys can receive its exact ID through `/admin/keys/chat-grants` without
