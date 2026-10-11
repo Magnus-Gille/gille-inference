@@ -529,6 +529,63 @@
           calls use input-token credits. This is a separate endpoint from chat completions.
         </p>
 
+        <p><strong>Choice question example:</strong></p>
+        <pre id="systemone-choice-request">{
+  "model": "clef-flash",
+  "state": "The customer was charged twice for the same order.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this request?",
+      "criteria": {
+        "billing": "Payments, charges and refunds",
+        "support": "Technical product problems"
+      }
+    }
+  }
+}</pre>
+        <p>
+          Save that JSON as <span class="badge mono">choice.json</span>, or pass the same body inline.
+          The command below reads the bearer header from standard input, so the key is not placed in
+          the command arguments. Set <span class="badge mono">HS_KEY</span> in your shell first.
+        </p>
+        <pre>curl https://inference.example.com/v1/systemone \
+  --data-binary @choice.json \
+  -H @- &lt;&lt;EOF
+Authorization: Bearer ${HS_KEY}
+Content-Type: application/json
+EOF</pre>
+        <p>
+          A <span class="badge mono">choice</span> question needs a criteria <strong>object</strong>
+          with 2–26 named option keys. Each key must be 1–64 ASCII letters, numbers, hyphens or
+          underscores (<span class="badge mono">^[A-Za-z0-9_-]{1,64}$</span>); each description must
+          be a string or <span class="badge mono">null</span>. The question also needs non-empty
+          <span class="badge mono">instructions</span>. The answer contains the selected
+          <span class="badge mono">choice</span>, a matching <span class="badge mono">probabilities</span>
+          object, and <span class="badge mono">confidence</span>, all under
+          <span class="badge mono">answers.&lt;question-id&gt;</span>.
+        </p>
+        <pre aria-label="Illustrative choice response">{
+  "answers": {
+    "route": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": {"billing": 0.9, "support": 0.1},
+      "confidence": 0.8
+    }
+  },
+  "usage": {"input_tokens": 123, "output_tokens": 0}
+}</pre>
+        <p>
+          Example response; probabilities and token counts vary. A <span class="badge mono">400 invalid_request_error</span> means
+          local JSON/schema validation failed (common mistakes are an array instead of a criteria
+          object, fewer than 2 or more than 26 options, invalid option keys, empty instructions, or
+          unsupported fields). Other <span class="badge mono">400</span> envelopes, such as
+          <span class="badge mono">model_not_found</span>, have a different cause. A
+          <span class="badge mono">502</span> means the gateway could not return a valid upstream
+          decision; it does not by itself prove that the request JSON caused the failure.
+        </p>
+
         <p><strong>Text or code embeddings (after model-list check):</strong></p>
         <pre>curl https://inference.example.com/v1/embeddings \
   -H "Authorization: Bearer $HS_KEY" \

@@ -19,7 +19,7 @@ import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admissi
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
+let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let upstreamModelRequestCount = 0;
@@ -140,10 +140,22 @@ function startUpstream(): Promise<void> {
         return;
       }
       if (req.url?.endsWith("/systemone")) {
+        const choice = mockMode === "systemone-choice" || mockMode === "systemone-choice-malformed";
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
-          answers: { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
-          usage: { input_tokens: 18, output_tokens: 0 },
+          answers: choice
+            ? {
+                route: {
+                  type: "choice",
+                  choice: "billing",
+                  probabilities: mockMode === "systemone-choice-malformed"
+                    ? ["billing", "support"]
+                    : { billing: 0.9, support: 0.1 },
+                  confidence: 0.8,
+                },
+              }
+            : { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
+          usage: { input_tokens: choice ? 24 : 18, output_tokens: 0 },
         }));
         return;
       }
@@ -653,6 +665,66 @@ describe("gateway spine — HTTP integration", () => {
     const malformedUpstream = await call(body);
     expect(malformedUpstream.status).toBe(502);
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+  });
+
+  it("serves a configured System One choice question with exact forwarding and usage billing", async () => {
+    mockMode = "systemone-choice";
+    const minted = mintKey({
+      alias: `systemone-choice-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const body = {
+      model: "clef-flash",
+      state: "The customer was charged twice for the same order.",
+      questions: {
+        route: {
+          type: "choice",
+          instructions: "Which team should handle this request?",
+          criteria: {
+            billing: "Payments, charges and refunds",
+            support: "Technical product problems",
+          },
+        },
+      },
+    };
+    const call = (payload: unknown, token = minted.plaintextKey) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    const malformedRequest = { ...body, questions: { route: {
+      ...body.questions.route, criteria: ["Payments, charges and refunds", "Technical product problems"],
+    } } };
+    const malformed = await call(malformedRequest);
+    expect(malformed.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(0);
+
+    const success = await call(body);
+    expect(success.status).toBe(200);
+    expect(await success.json()).toEqual({
+      answers: {
+        route: {
+          type: "choice",
+          choice: "billing",
+          probabilities: { billing: 0.9, support: 0.1 },
+          confidence: 0.8,
+        },
+      },
+      usage: { input_tokens: 24, output_tokens: 0 },
+    });
+    expect(JSON.parse(lastUpstreamBody)).toEqual(body);
+    expect(upstreamInferenceRequestCount).toBe(1);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
+
+    mockMode = "systemone-choice-malformed";
+    const malformedUpstream = await call(body);
+    expect(malformedUpstream.status).toBe(502);
+    expect(upstreamInferenceRequestCount).toBe(2);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
   });
 
   it("keeps Clef out of chat when the System One setting is absent", async () => {
