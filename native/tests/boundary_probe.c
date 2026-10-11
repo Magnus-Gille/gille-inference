@@ -3,6 +3,7 @@
 #include "../observer/lockdown.h"
 #include "../observer/proc_stat.h"
 #include "../observer/counters.h"
+#include "../observer/service_census.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -95,11 +96,32 @@ static void check_bus(sd_bus *bus, bool control)
     sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
     r = sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
         "org.freedesktop.systemd1.Manager", "ListUnits", &error, &reply, "");
-    check("systemd-units", r >= 0);
+    static struct gi_systemd_units units;
+    bool units_ok = r >= 0 && gi_parse_systemd_units(reply, &units) == 0;
+    bool active_sentinel = false;
+    if (units_ok) for (size_t i = 0; i < units.count; ++i) {
+        const struct gi_systemd_unit *unit = &units.items[i];
+        if (strcmp(unit->name, "gi-observer-fixture-target.service") == 0 &&
+            strcmp(unit->load_state, "loaded") == 0 &&
+            strcmp(unit->active_state, "active") == 0 &&
+            strcmp(unit->sub_state, "running") == 0) active_sentinel = true;
+    }
+    check("systemd-units", units_ok);
+    check("systemd-active-cross-uid-service", active_sentinel);
     sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
     r = sd_bus_call_method(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
         "org.freedesktop.systemd1.Manager", "ListJobs", &error, &reply, "");
-    check("systemd-jobs", r >= 0);
+    static struct gi_systemd_jobs jobs;
+    bool jobs_ok = r >= 0 && gi_parse_systemd_jobs(reply, &jobs) == 0;
+    bool pending_sentinel = false;
+    if (jobs_ok) for (size_t i = 0; i < jobs.count; ++i) {
+        const struct gi_systemd_job *job = &jobs.items[i];
+        if (strcmp(job->unit_name, "gi-observer-fixture-waiting.service") == 0 &&
+            strcmp(job->type, "start") == 0 && strcmp(job->state, "waiting") == 0 &&
+            job->id > 0) pending_sentinel = true;
+    }
+    check("systemd-jobs", jobs_ok);
+    check("systemd-pending-job", pending_sentinel);
     sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
 
     /* Ping has no side effects and normally requires no polkit authorization.

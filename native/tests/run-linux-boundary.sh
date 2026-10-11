@@ -10,7 +10,7 @@ policy=/etc/apparmor.d/gi-observer-fixture
 polkit=/etc/polkit-1/rules.d/00-gi-observer-fixture.rules
 observer=gi-observer-ci
 sentinel=gi-sentinel-ci
-units=(gi-observer-fixture-target.service gi-observer-fixture-probe.service gi-observer-fixture-control.service gi-observer-fixture-canary.service gi-observer-fixture-sockets.service)
+units=(gi-observer-fixture-waiting.service gi-observer-fixture-blocker.service gi-observer-fixture-target.service gi-observer-fixture-probe.service gi-observer-fixture-control.service gi-observer-fixture-canary.service gi-observer-fixture-sockets.service)
 for path in "$fixture" "$policy" "$polkit"; do
   [[ ! -e $path && ! -L $path ]] || { echo 'refusing: fixture path already exists' >&2; exit 2; }
 done
@@ -36,6 +36,7 @@ cleanup() {
     systemctl stop "$unit" >/dev/null 2>&1 || cleanup_failed=1
     if [[ $(systemctl show "$unit" -p MainPID --value) != 0 ]]; then cleanup_failed=1; fi
     if [[ $(systemctl show "$unit" -p ControlPID --value) != 0 ]]; then cleanup_failed=1; fi
+    if [[ -n $(systemctl show "$unit" -p Job --value) ]]; then cleanup_failed=1; fi
     if [[ -n $group && -e /sys/fs/cgroup$group/cgroup.events ]]; then
       populated=$(awk '$1 == "populated" {print $2}' "/sys/fs/cgroup$group/cgroup.events")
       [[ $populated == 0 ]] || cleanup_failed=1
@@ -92,6 +93,34 @@ write_unit() {
   created_units+=("$unit")
   cat > "/etc/systemd/system/$unit"
 }
+# Created first so cleanup cancels the waiting job before stopping its dependency.
+write_unit gi-observer-fixture-waiting.service <<'UNIT'
+[Unit]
+Requires=gi-observer-fixture-blocker.service
+After=gi-observer-fixture-blocker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+User=gi-sentinel-ci
+Group=gi-sentinel-ci
+NoNewPrivileges=yes
+MemoryMax=32M
+TasksMax=1
+TimeoutStartSec=10
+TimeoutStopSec=2
+UNIT
+write_unit gi-observer-fixture-blocker.service <<'UNIT'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sleep 35
+User=gi-sentinel-ci
+Group=gi-sentinel-ci
+NoNewPrivileges=yes
+MemoryMax=32M
+TasksMax=1
+TimeoutStartSec=40
+TimeoutStopSec=2
+UNIT
 write_unit gi-observer-fixture-target.service <<'UNIT'
 [Service]
 ExecStart=/usr/bin/sleep infinity
@@ -171,6 +200,16 @@ done
 systemctl start gi-observer-fixture-target.service
 systemctl show gi-observer-fixture-target.service -p MainPID --value > "$fixture/target.pid"
 chmod 0644 "$fixture/target.pid"
+systemctl --no-block start gi-observer-fixture-waiting.service
+for ((attempt=0; attempt<100; attempt++)); do
+  if [[ $(systemctl show gi-observer-fixture-blocker.service -p ActiveState --value) == activating &&
+        -n $(systemctl show gi-observer-fixture-waiting.service -p Job --value) ]]; then break; fi
+  sleep 0.02
+done
+[[ $(systemctl show gi-observer-fixture-blocker.service -p ActiveState --value) == activating &&
+   -n $(systemctl show gi-observer-fixture-waiting.service -p Job --value) ]] || {
+  echo 'pending job fixture readiness failed' >&2; exit 1;
+}
 for mode in control probe; do
   unit="gi-observer-fixture-$mode.service"
   result=0
