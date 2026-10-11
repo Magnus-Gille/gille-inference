@@ -11,6 +11,15 @@ The observer uses C and the distribution's systemd library instead of implementi
 and start ticks. The input may contain a process name, including spaces and parentheses; no name
 is returned. It rejects overflow, malformed or oversized data without modifying its output.
 
+`observer/service_census.c` decodes complete sealed systemd `ListUnits` and `ListJobs`
+replies through libsystemd, preserving unit state/following and separate job type/state. It
+rewinds the reply, bounds entries and retained fields, rejects duplicate identities and
+clears the entire result on failure. Unit descriptions are validated then discarded. Synthetic
+unit tests use a private socket pair without a bus daemon; the Linux fixture additionally tests
+real replies under the existing method allowlist. These snapshots do not prove complete host
+coverage, absence of socket activation or activity between samples. Callers must treat any
+collection/decoding error as unknown, never an empty inventory.
+
 `observer/lockdown.c` installs a default-deny seccomp filter, requires no-new-privileges, limits new
 sockets to AF_UNIX streams and denies process creation/execution, tracing, process-memory calls,
 new executable mappings, namespaces and IP sockets. The filter alone cannot restrict file paths,
@@ -27,7 +36,7 @@ The existing digest-bound main CI workflow remains unchanged.
 
 The root fixture script refuses ordinary local invocation and pre-existing fixture paths, accounts,
 units or profile. These environment checks are accident guards, not an authentication boundary.
-Only invoke it in the named disposable CI job. It creates two dedicated service UIDs and five
+Only invoke it in the named disposable CI job. It creates two dedicated service UIDs and seven
 exact units under `gi-observer-fixture-`, one temporary profile, one observer-specific polkit deny
 rule, and files under `/run/gi-observer-fixture`. It performs no global procfs or ptrace changes.
 The observer test unit uses restricted procfs, only CAP_SYS_PTRACE, 128 MiB/no swap, 25% CPU,
@@ -41,7 +50,8 @@ The test executable is a deliberately bounded fixture probe, not the eventual ob
   are tested by open/close only, with no content read even if a policy is broken.
 - Known synthetic pathname and abstract Unix peers connect in the control and are denied by MAC.
 - Denied tracing, process memory, process creation, execution, new executable mappings and IP.
-- Successful fixed systemd property/unit/job reads; a harmless Ping control followed by denial
+- Successful fixed systemd property/unit/job reads, decoded loaded-unit and job tuples,
+  a known active cross-UID service and an ordered synthetic start job held in `waiting`; a harmless Ping control followed by denial
   under the method allowlist; denial of starting only the fixture's harmless canary unit.
 
 No real service is targeted by a negative mutation test. All probe output is fixed check names and
@@ -50,7 +60,8 @@ Properties.Get allowance cannot constrain the property-name argument; a future o
 that argument fixed in reviewed code, never expose caller-selected bus operations, and separately
 review the final unit-property surface. The fixture currently reads only Manager.Version.
 
-Cleanup stops only owned units and checks their PIDs and cgroup population before removing exact
+Cleanup cancels the owned pending job before its blocker, stops only owned units and checks
+their job absence, PIDs and cgroup population before removing exact
 files, unloading the owned profile and removing fixture identities. Unexpected cleanup state fails
 the job; the hosted VM is then discarded. There is no recursive cleanup or host-wide policy reset.
 
