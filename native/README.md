@@ -20,6 +20,16 @@ real replies under the existing method allowlist. These snapshots do not prove c
 coverage, absence of socket activation or activity between samples. Callers must treat any
 collection/decoding error as unknown, never an empty inventory.
 
+`observer/unit_identity.c` decodes only complete typed `Properties.Get` replies for active
+`InvocationID`, `MainPID`, `NRestarts` and canonical `ControlGroup`. Inactive/missing invocation or
+PID, wrong variant types, extra payload or malformed paths are unusable evidence; all failures clear
+output. These pure decoders neither authenticate a bus reply nor make several property reads atomic.
+The fixed fixture checks a synthetic active service's invocation before/after, exact main PID,
+cgroup and zero restarts under confinement. It requests individual constant properties; it never
+uses `GetAll`, which could retrieve process arguments or environment. Type contracts follow the
+[systemd v255 Unit implementation](https://github.com/systemd/systemd/blob/v255/src/core/dbus-unit.c)
+and [Service implementation](https://github.com/systemd/systemd/blob/v255/src/core/dbus-service.c).
+
 `observer/lockdown.c` installs a default-deny seccomp filter, requires no-new-privileges, limits new
 sockets to AF_UNIX streams and denies process creation/execution, tracing, process-memory calls,
 new executable mappings, namespaces and IP sockets. The filter alone cannot restrict file paths,
@@ -86,7 +96,10 @@ No real service is targeted by a negative mutation test. All probe output is fix
 pass/fail values; raw process, file and D-Bus reply/error contents are discarded. The profile's
 Properties.Get allowance cannot constrain the property-name argument; a future observer must keep
 that argument fixed in reviewed code, never expose caller-selected bus operations, and separately
-review the final unit-property surface. The fixture currently reads only Manager.Version.
+review the final unit-property surface. The fixture reads Manager.Version and the four named identity properties of one exact synthetic
+unit object. Its additional AppArmor rule permits only Properties.Get on that object; a harmless
+unit-object Ping succeeds in the control and must be denied under confinement. No generic unit path
+or service-control allowance is added. These tests do not prove activation/event continuity.
 
 Cleanup cancels the owned pending job before its blocker, stops only owned units and checks
 their job absence, PIDs and cgroup population before removing exact

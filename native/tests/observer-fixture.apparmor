@@ -38,5 +38,9 @@ profile gi-observer-fixture flags=(attach_disconnected) {
   dbus send bus=system path=/org/freedesktop/systemd1
     interface=org.freedesktop.DBus.Properties member=Get
     peer=(name=org.freedesktop.systemd1),
+  # One credential-free synthetic unit only; no additional manager mutation or generic unit surface.
+  dbus send bus=system path=/org/freedesktop/systemd1/unit/gi_2dobserver_2dfixture_2dtarget_2eservice
+    interface=org.freedesktop.DBus.Properties member=Get
+    peer=(name=org.freedesktop.systemd1),
   dbus receive bus=system peer=(name=org.freedesktop.systemd1),
 }

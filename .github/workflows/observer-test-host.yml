@@ -32,6 +32,8 @@ jobs:
         run: |
           mkdir "$RUNNER_TEMP/observer-native"
           bash native/tests/build.sh "$RUNNER_TEMP/observer-native"
+          ulimit -c 0
+          python3 native/tests/test-unit-identity-regression.py "$RUNNER_TEMP/observer-native"
           sha256sum "$RUNNER_TEMP/observer-native/boundary-probe" "$RUNNER_TEMP/observer-native/socket-listener" \
             native/observer/lockdown.c native/tests/socket_listener.c native/tests/observer-fixture.apparmor
       - name: Prove Linux MAC and syscall boundary with distinct UIDs

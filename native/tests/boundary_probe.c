@@ -4,6 +4,7 @@
 #include "../observer/proc_stat.h"
 #include "../observer/counters.h"
 #include "../observer/service_census.h"
+#include "../observer/unit_identity.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -85,7 +86,7 @@ static int fixed_bus(sd_bus **bus)
     return r;
 }
 
-static void check_bus(sd_bus *bus, bool control)
+static void check_bus(sd_bus *bus, bool control, uint32_t expected_pid)
 {
     sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *reply = NULL;
@@ -122,6 +123,47 @@ static void check_bus(sd_bus *bus, bool control)
     }
     check("systemd-jobs", jobs_ok);
     check("systemd-pending-job", pending_sentinel);
+    sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
+
+    /* Only reviewed constant properties of the credential-free fixture sentinel.
+     * Do not use GetAll: service properties can contain arguments/environment. */
+    static const char target_object[] = "/org/freedesktop/systemd1/unit/gi_2dobserver_2dfixture_2dtarget_2eservice";
+    struct gi_unit_invocation invocation_before, invocation_after;
+    struct gi_service_cgroup group;
+    uint32_t main_pid = 0, restarts = 0;
+    r = sd_bus_call_method(bus, "org.freedesktop.systemd1", target_object,
+        "org.freedesktop.DBus.Properties", "Get", &error, &reply, "ss",
+        "org.freedesktop.systemd1.Unit", "InvocationID");
+    bool invocation_ok = r >= 0 && gi_parse_unit_invocation(reply, &invocation_before) == 0;
+    check("systemd-active-invocation", invocation_ok);
+    sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
+    r = sd_bus_call_method(bus, "org.freedesktop.systemd1", target_object,
+        "org.freedesktop.DBus.Properties", "Get", &error, &reply, "ss",
+        "org.freedesktop.systemd1.Service", "MainPID");
+    check("systemd-bound-main-pid", r >= 0 && gi_parse_service_main_pid(reply, &main_pid) == 0 && main_pid == expected_pid);
+    sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
+    r = sd_bus_call_method(bus, "org.freedesktop.systemd1", target_object,
+        "org.freedesktop.DBus.Properties", "Get", &error, &reply, "ss",
+        "org.freedesktop.systemd1.Service", "NRestarts");
+    check("systemd-service-restarts", r >= 0 && gi_parse_service_restarts(reply, &restarts) == 0 && restarts == 0);
+    sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
+    r = sd_bus_call_method(bus, "org.freedesktop.systemd1", target_object,
+        "org.freedesktop.DBus.Properties", "Get", &error, &reply, "ss",
+        "org.freedesktop.systemd1.Service", "ControlGroup");
+    check("systemd-bound-cgroup", r >= 0 && gi_parse_service_cgroup(reply, &group) == 0 &&
+        strcmp(group.path, "/system.slice/gi-observer-fixture-target.service") == 0);
+    sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
+    r = sd_bus_call_method(bus, "org.freedesktop.systemd1", target_object,
+        "org.freedesktop.DBus.Properties", "Get", &error, &reply, "ss",
+        "org.freedesktop.systemd1.Unit", "InvocationID");
+    check("systemd-invocation-stable", r >= 0 && invocation_ok &&
+        gi_parse_unit_invocation(reply, &invocation_after) == 0 &&
+        memcmp(&invocation_before, &invocation_after, sizeof invocation_before) == 0);
+    sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
+    r = sd_bus_call_method(bus, "org.freedesktop.systemd1", target_object,
+        "org.freedesktop.DBus.Peer", "Ping", &error, &reply, "");
+    check("unit-bus-method-mediation", control ? r >= 0 :
+        r < 0 && sd_bus_error_has_name(&error, SD_BUS_ERROR_ACCESS_DENIED));
     sd_bus_message_unref(reply); reply = NULL; sd_bus_error_free(&error);
 
     /* Ping has no side effects and normally requires no polkit authorization.
@@ -205,7 +247,7 @@ int main(int argc, char **argv)
     sd_bus *bus = NULL;
     int r = fixed_bus(&bus);
     check("fixed-system-bus", r >= 0);
-    if (r >= 0) check_bus(bus, control);
+    if (r >= 0) check_bus(bus, control, target);
     sd_bus_flush_close_unref(bus);
     puts("qualifiesObserver: false");
     return failures ? 1 : 0;
