@@ -3,6 +3,11 @@ import os
 from pathlib import Path
 import subprocess
 
+actions = os.environ.get("GITHUB_ACTIONS", "")
+runner = os.environ.get("RUNNER_ENVIRONMENT", "")
+if actions != "true" or runner != "github-hosted":
+    raise SystemExit("requires a disposable GitHub-hosted runner")
+
 source = Path("native/launcher/arbiter.cpp").read_text()
 before = "state_ = State::quarantined;\n}\nArbiter::~Arbiter()"
 assert source.count(before) == 1
@@ -17,7 +22,7 @@ subprocess.run([
 ], check=True, timeout=30)
 result = subprocess.run([
     "sudo", "-n", "env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
-    "GITHUB_ACTIONS=true", "RUNNER_ENVIRONMENT=github-hosted", "timeout", "15", str(binary)
+    f"GITHUB_ACTIONS={actions}", f"RUNNER_ENVIRONMENT={runner}", "timeout", "15", str(binary)
 ], capture_output=True, text=True, timeout=20, check=False)
 if result.returncode != 1 or "arbiter.check() == State::quarantined" not in result.stderr:
     raise SystemExit("startup mutant did not fail the quarantine assertion")
