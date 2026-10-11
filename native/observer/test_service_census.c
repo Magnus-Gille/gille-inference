@@ -294,7 +294,9 @@ int main(void)
     test_wrong_signature_and_null_arguments();
     test_unit_cap_is_atomic();
     test_empty_or_overlong_job_state_is_atomic();
-    sd_bus_flush_close_unref(test_bus);
+    /* No messages were sent: do not wait for authentication to flush. */
+    sd_bus_close(test_bus);
+    sd_bus_unref(test_bus);
     close(peer_fd);
     (void)puts("service_census tests: ok");
     return 0;
