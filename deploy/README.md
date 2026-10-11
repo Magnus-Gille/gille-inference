@@ -587,6 +587,12 @@ content spot-check (sha256 of `src/homeserver/learning-task-contract.ts` and
 `src/homeserver/gateway.ts` against that commit in your local checkout), so a stale marker or a
 hand-edited file on the box shows up as an explicit `MISMATCH` instead of a false green.
 
+File identity does not prove which code the running process has loaded. When a release changes
+gateway behavior, also confirm that the gateway restarted after the payload update and verify
+the changed behavior through its client surface. For MCP tool changes, reconnect and inspect
+`tools/list` before making bounded functional calls. Missing new tools or fields fails acceptance
+even when the marker and file hashes match.
+
 ### Rollback
 
 The unit is not a git checkout, so "rollback" means **redeploy a known-good commit**, not
