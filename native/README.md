@@ -19,7 +19,7 @@ The library's caller must exit on any installation failure. It is not wired into
 
 The `native-boundary` job uses a fresh GitHub-hosted Ubuntu 24.04 VM. It installs only the requested
 native development dependencies (`libsystemd-dev` and `libseccomp-dev`, with necessary distribution
-dependencies), records their resolved versions/compiler and hashes the test executable and policy.
+dependencies), records their resolved versions/compiler and hashes both fixture executables and the policy.
 These receipts describe that CI candidate; they do not establish a reproducible M5 release.
 The existing digest-bound main CI workflow remains unchanged.
 
