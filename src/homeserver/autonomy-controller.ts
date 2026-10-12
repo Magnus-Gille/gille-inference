@@ -173,7 +173,6 @@ import {
   type WatchdogPolicyConfig,
   type WatchRunReport,
   type AdoptionWatchRecord,
-  type AdoptionProvenance,
 } from "./adoption-watchdog.js";
 import { wilsonInterval } from "./calibration-metrics.js";
 import type { CalibrationGateDecision } from "./calibration-gate.js";

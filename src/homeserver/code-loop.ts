@@ -1,4 +1,4 @@
-import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
+import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
 import { dirname, join, sep, resolve, isAbsolute, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
@@ -2075,41 +2075,6 @@ async function finalizeJobWithResult(
   recordCodeLoopRun(result.status);
 }
 
-/** Used only for the pre-run lease/spawn refusal (no engine result yet). */
-async function finalizeJob(
-  job: Job,
-  status: CodeLoopTerminalStatus,
-  detail: string,
-  check: CodeLoopResult["check"],
-  req: CodeLoopRequest,
-  deps: CodeLoopDeps
-): Promise<void> {
-  // #33: same ordering discipline as finalizeJobWithResult above.
-  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
-  job.status = status;
-  job.result = {
-    status,
-    completion_state: "unfinished",
-    diff: "",
-    diff_truncated: false,
-    changed_files: [],
-    scope_violations: [],
-    protected_violations: [],
-    summary: "",
-    check,
-    schema_grounding: skippedSchemaGrounding(job.schemaChecks),
-    usage: job.usage,
-    execution: codeLoopExecution(job),
-    telemetry: buildResultTelemetry(job, false),
-    agent_checks: codeLoopAgentChecks(job),
-    work_id: job.id,
-    detail: detail.slice(0, 400),
-  };
-  persistJobDurable(job);
-  recordCodeLoopRun(status);
-  writeLedger(job, status, req, deps, check, evidenceIdentity);
-}
-
 function persistJobDurable(job: Job): boolean {
   try {
     persistDurableCodeLoopRun(job.workroot, {
@@ -2135,7 +2100,7 @@ function persistJobDurable(job: Job): boolean {
 
 /**
  * `evidenceIdentity` is derived by the caller (deriveEvidenceIdentity, #33) BEFORE the job's
- * status/result are flipped to terminal — see finalizeJobWithResult/finalizeJob — so this stays a
+ * status/result are flipped to terminal — see finalizeJobWithResult — so this stays a
  * plain synchronous write, exactly like it was before #33. Reuses PR #32's exact derivation (the
  * same stamp-field join + live served-model observation as the delegate lane), tagged with THIS
  * lane's own identity ("code-loop") so a code_loop row can never be mistaken for (or copy) a

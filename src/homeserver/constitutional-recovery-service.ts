@@ -2,15 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import {
   chmodSync,
-  closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -193,25 +187,6 @@ interface RouteLease extends RouteFence {
 
 function registrationDigest(value: Omit<StoredRegistration, "registrationDigest" | "consumed" | "classification" | "actuationRequestDigest">): string {
   return sha(canonicalJson(value));
-}
-
-function atomic(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const fd = openSync(tmp, "wx", 0o600);
-  try {
-    writeFileSync(fd, `${canonicalJson(value)}\n`);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, path);
-  const directory = openSync(dirname(path), "r");
-  try {
-    fsyncSync(directory);
-  } finally {
-    closeSync(directory);
-  }
 }
 
 function exactRequest(stored: StoredRegistration, request: RecoveryActuationRequest): boolean {

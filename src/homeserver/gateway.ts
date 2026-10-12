@@ -60,7 +60,6 @@ import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
 import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, readHostMemory, readOomKillCount, type HostMemoryAdmissionDeps, type HostMemoryAdmissionMode, type HostMemoryReadResult, type ModelStartAdmission } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
-import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
@@ -86,7 +85,7 @@ import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
 import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
-import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
+import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image-request.js";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
   SYSTEMONE_MAX_BODY_BYTES,
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
@@ -114,7 +113,6 @@ import {
   REVIEW_LANE_KNOWN_TASK_TYPES,
   REVIEW_LANE_CAPABILITY_ENDPOINT,
   REVIEW_BOUNDED_CONTRACT_VERSION,
-  REVIEW_BOUNDED_TASK_TYPE,
   REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
   reviewerUsefulnessRecordingCapabilityForPrincipal,
@@ -852,47 +850,10 @@ export function clientIp(req: IncomingMessage, trustedProxies: string[]): string
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024): Promise<string> {
-  // Early rejection on a declared Content-Length over the cap (mirrors readBuffer) — do NOT destroy
-  // the socket: the caller must stay able to write the 413 response. resume() drains in-flight bytes.
-  const declared = Number(req.headers["content-length"]);
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    req.resume();
-    return Promise.reject(new BodyTooLargeError());
-  }
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    let settled = false;
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => {
-      if (settled) return;
-      size += c.length;
-      if (size > maxBytes) {
-        // #15 / Codex finding 2: typed so the top-level catch maps it to a uniform 413 envelope.
-        // Stop buffering and reject, but keep the connection WRITABLE so the 413 can be sent — the
-        // old req.destroy() here raced the response write and the client saw a connection reset.
-        // resume() drains the rest of the upload instead of destroying the socket.
-        settled = true;
-        chunks.length = 0;
-        req.resume();
-        reject(new BodyTooLargeError());
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => {
-      if (settled) return;
-      settled = true;
-      resolve(Buffer.concat(chunks).toString("utf-8"));
-    });
-    req.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
-  });
+  return (await readBuffer(req, maxBytes, null)).toString("utf-8");
 }
 
-/** Thrown by readBuffer when the body exceeds the size cap — caller maps it to HTTP 413. */
+/** Thrown when a request body exceeds the size cap — caller maps it to HTTP 413. */
 class BodyTooLargeError extends Error {
   constructor() {
     super("request body too large");
@@ -918,7 +879,7 @@ class BodyTooLargeError extends Error {
 async function readBuffer(
   req: IncomingMessage,
   maxBytes = 32 * 1024 * 1024,
-  idleMs = 30_000
+  idleMs: number | null = 30_000
 ): Promise<Buffer> {
   // Early rejection on a declared Content-Length over the cap — before buffering anything. We do
   // NOT destroy the socket here: the caller still has to write a 413 response, which requires the
@@ -940,6 +901,7 @@ async function readBuffer(
       }
     };
     const armIdle = (): void => {
+      if (idleMs === null) return; // Text routes retain their existing no-idle-timeout policy.
       clearIdle();
       idle = setTimeout(() => {
         if (settled) return;
@@ -1016,7 +978,6 @@ function parseChatBody(raw: string): ParsedChatBody {
  */
 async function admitAndMeterLogged(
   res: ServerResponse,
-  cfg: HomeserverConfig,
   controller: AdmissionController,
   principal: PrincipalContext,
   requestedModel: string | null,
@@ -5145,7 +5106,7 @@ export async function handleRequest(
       // Clef uses one shared prompt; other decision models may use one prompt per question.
       // Reserve full context(s); reconcile exact successful usage after the call.
       const estimatedTokens = systemOneTokenReservation(parsed);
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, estimatedTokens, lctx,
+      await admitAndMeterLogged(res, controller, principal, parsed.model, estimatedTokens, lctx,
         () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), "systemone");
       return;
     }
@@ -5203,7 +5164,7 @@ export async function handleRequest(
           return;
         }
         lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
-        await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
+        await admitAndMeterLogged(res, controller, principal, parsed.model,
           embeddingTokenReservation(parsed), lctx,
           () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
       } finally {
@@ -5290,7 +5251,7 @@ export async function handleRequest(
       // Floor at 1, ceiling at the per-request cap.
       const effectiveMax = clampMaxTokensForModel(cfg, parsed.model, parsed.requestedMax);
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, est, lctx, async () => {
+      await admitAndMeterLogged(res, controller, principal, parsed.model, est, lctx, async () => {
         const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps);
         traceOutcomeOverride = result.traceOutcome ?? null;
         traceErrorClassOverride = result.traceErrorClass ?? null;
@@ -5453,7 +5414,7 @@ export async function handleRequest(
         parsed.requestedMax
       );
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, null, est, lctx, () =>
+      await admitAndMeterLogged(res, controller, principal, null, est, lctx, () =>
         handleDelegate(
           parsed.params,
           res,
