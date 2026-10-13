@@ -24,6 +24,14 @@ import {
   unclassifiableKnownFailures,
 } from './lib/core.mjs';
 import {
+  attachUnusedConsumerEvidence,
+  buildUnusedReferenceAudit,
+  packageScriptPathsForEvidence,
+  qualifiedUnusedPayload,
+  validateUnusedCandidateRows,
+  validateUnusedScope,
+} from './lib/unused.mjs';
+import {
   buildFirstAttemptEvidence,
   ciPayload,
   enumerateWorkflowRuns,
@@ -390,6 +398,64 @@ async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, mod
   const resultPath = 'evidence/unused/knip.json';
   const findingsPath = 'evidence/unused/findings.json';
   const scopePath = 'evidence/unused/scope.json';
+  const auditPath = 'evidence/unused/reference-audit.json';
+  const configPath = 'research/code-health-402/knip-valid-v2.json';
+  const scopeManifestPath = 'research/code-health-402/unused-scope-v2.json';
+  const config = await readJson(path.resolve(ROOT, configPath));
+  const scope = await readJson(path.resolve(ROOT, scopeManifestPath));
+  const packageJson = await readJson(path.resolve(ROOT, 'package.json'));
+  const trackedFiles = await sourceFiles(deadline);
+  const scopeValidation = validateUnusedScope({ scope, config, packageJson, files: trackedFiles });
+  if (!scopeValidation.complete) throw new TypeError('unused-candidate scope manifest does not cover its declared roots and consumers');
+  const audit = await buildUnusedReferenceAudit({
+    scope,
+    files: trackedFiles,
+    completeInventory: !modified,
+    readSource: relative => readFile(path.resolve(ROOT, relative), 'utf8'),
+  });
+  await writeJson(outputRoot, auditPath, audit);
+  const graphQualified = audit.graph_qualified && scopeValidation.complete;
+  const graphReason = !audit.complete_source_inventory
+    ? 'The tracked source inventory is not a clean immutable worktree.'
+    : audit.graph_qualification_reason;
+  const operatorRootEvidence = scope.operator_root_evidence.map((evidence, index) => {
+    const sourceRef = refId(`unused-operator-root-evidence-${index + 1}`);
+    addSourceRef(evidenceRefs, sourceRef, evidence.source, evidence.line);
+    return { ...evidence, source_ref: sourceRef };
+  });
+  await writeJson(outputRoot, scopePath, {
+    schema_version: scope.schema_version,
+    scope_version: scope.scope_version,
+    knip_config: configPath,
+    knip_project_globs: config.project ?? [],
+    ignored_path_patterns: config.ignore ?? [],
+    configured_entrypoints: config.entry ?? [],
+    required_operator_roots: scope.required_operator_roots,
+    operator_root_evidence: operatorRootEvidence,
+    candidate_kinds: scope.candidate_kinds,
+    out_of_domain_issue_kinds: scope.out_of_domain_issue_kinds,
+    consumer_entry_globs: scope.consumer_entry_globs,
+    package_script_paths_covered: packageScriptPathsForEvidence(packageJson, config.entry ?? []),
+    scope_validation: scopeValidation,
+    inventory: audit.inventory,
+    reference_count: audit.reference_count,
+    reference_count_by_class: audit.reference_count_by_class,
+    unresolved_local_reference_count: audit.unresolved_local_reference_count,
+    unresolved_local_references: audit.unresolved_local_references,
+    dynamic_unknown_count: audit.dynamic_unknown_count,
+    reviewed_data_enumeration_count: audit.reviewed_data_enumeration_count,
+    reviewed_data_enumerations: audit.reviewed_data_enumerations,
+    dynamic_unknowns: audit.dynamic_unknowns,
+    graph_qualification: graphQualified ? 'qualified' : 'unqualified',
+    graph_qualification_reason: graphReason,
+    reference_audit: auditPath,
+  });
+  addArtifactRef(evidenceRefs, refId('unused-reference-audit'), auditPath);
+  addArtifactRef(evidenceRefs, refId('unused-scope-v2'), scopePath);
+  addSourceRef(evidenceRefs, refId('unused-scope-source-v2'), scopeManifestPath, 1);
+  addSourceRef(evidenceRefs, refId('unused-knip-config-v2'), configPath, 1);
+  addSourceRef(evidenceRefs, refId('unused-triage-source'), 'research/code-health-401/artifacts/knip-triage.json', 1);
+
   const command = path.resolve(ROOT, 'research/code-health-401/tooling/node_modules/.bin/knip');
   const knipVersion = await verifiedToolVersion(
     'research/code-health-401/tooling/package.json',
@@ -397,7 +463,7 @@ async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, mod
     'knip',
   );
   const args = [
-    '--config', 'research/code-health-401/knip-valid.json',
+    '--config', configPath,
     '--tsConfig', 'tsconfig.json',
     '--include', 'files', '--include', 'dependencies', '--include', 'exports',
     '--reporter', 'json', '--no-progress', '--no-exit-code',
@@ -426,17 +492,17 @@ async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, mod
     timed_out: run.timedOut,
   });
 
-  const config = await readJson(path.resolve(ROOT, 'research/code-health-401/knip-valid.json'));
   const priorTriage = await readJson(path.resolve(ROOT, 'research/code-health-401/artifacts/knip-triage.json'));
-  const findings = (rows ?? []).map((row, index) => {
+  const sourceLinkedRows = (rows ?? []).map((row, index) => {
     const candidateRef = refId(`knip-candidate-${index + 1}`);
     const sourcePathValue = row.file ? safeRelative(ROOT, row.file) : null;
-    const line = row.line;
-    if (sourcePathValue && Number.isSafeInteger(line) && line > 0) addSourceRef(evidenceRefs, candidateRef, sourcePathValue, line);
+    const line = Number.isSafeInteger(row.line) && row.line > 0 ? row.line : (row.kind === 'files' ? 1 : null);
+    if (sourcePathValue && line) addSourceRef(evidenceRefs, candidateRef, sourcePathValue, line);
     else addArtifactRef(evidenceRefs, candidateRef, findingsPath);
     return {
       ref: candidateRef,
       kind: row.kind,
+      file: sourcePathValue,
       path: sourcePathValue,
       name: row.name,
       line,
@@ -444,67 +510,93 @@ async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, mod
       parent_symbol: row.parent_symbol,
       triage: inferTriage({ ...row, file: sourcePathValue }, priorTriage),
       suppression_context: {
-        knip_config: 'research/code-health-401/knip-valid.json',
+        knip_config: configPath,
         ignored_path_patterns: config.ignore ?? [],
         output_row_was_filtered: false,
       },
     };
   });
-  const findingsEvidence = {
-    status: run.exitCode === 0 && rows !== null ? 'complete-unqualified-graph' : 'failed',
-    candidate_rows: rows === null ? null : findings,
-    candidate_count: rows === null ? null : findings.length,
-    graph_qualification: 'unqualified',
-    graph_qualification_reason: 'The accepted #401 review found omitted operational entrypoints, tests, and dynamic consumers; raw candidates are investigation leads only.',
-    prior_manual_triage: 'research/code-health-401/artifacts/knip-triage.json',
-    ignored_path_patterns: config.ignore ?? [],
-    configured_entrypoints: config.entry ?? [],
-  };
-  await writeJson(outputRoot, findingsPath, findingsEvidence);
-  await writeJson(outputRoot, scopePath, {
-    configured_entrypoints: config.entry ?? [],
-    include: ['src/**/*.ts', 'scripts/**/*.ts', 'client/**/*.mjs'],
-    ignored_path_patterns: config.ignore ?? [],
-    graph_qualification: 'unqualified',
-    excluded_consumer_classes: ['tests', 'operator entrypoints not validated by #401', 'dynamic consumers'],
-  });
-  const configHash = await configDigest([
-    'research/code-health-401/knip-valid.json',
-    'research/code-health-401/tooling/package-lock.json',
-    'research/code-health-401/tooling/package.json',
-  ], { parserConfig: 'normal-mode files,exports,dependencies; no production-only dead-code headline' });
-  const scopeHash = digest({
-    include: ['src/**/*.ts', 'scripts/**/*.ts', 'client/**/*.mjs'],
-    explicitEntrypoints: 'research/code-health-401/knip-valid.json',
-    excluded: config.ignore ?? [],
-    graph: 'unqualified-until-owner-validates-all-runtime-operator-test-dynamic-consumers',
-  });
+  const findingsWithConsumers = attachUnusedConsumerEvidence(sourceLinkedRows, audit, scope);
+  const findings = findingsWithConsumers.map(row => ({
+    ...row,
+    consumer_references: row.consumer_references.map(reference => {
+      const sourceRef = refId(`unused-consumer-${digest({ path: reference.path, line: reference.line, target: reference.target_path }).slice(0, 24)}`);
+      addSourceRef(evidenceRefs, sourceRef, reference.path, reference.line);
+      return { ...reference, source_ref: sourceRef };
+    }),
+  }));
+  const candidateRowValidation = validateUnusedCandidateRows(findings);
+  const qualifiedCandidates = findings.filter(row => row.candidate_state === 'candidate-in-qualified-graph');
   const analyzerComplete = analyzerStatus({
     exitCode: run.exitCode,
     parsed: rows !== null,
     truncated: run.stdoutTruncated || run.stderrTruncated,
     timedOut: run.timedOut,
   }) === 'complete';
+  const candidateScopeQualified = analyzerComplete && candidateRowValidation.complete;
+  const isQualified = !modified && graphQualified && candidateScopeQualified;
+  const findingsEvidence = {
+    status: !analyzerComplete ? 'failed' : !graphQualified ? 'complete-unqualified-graph'
+      : !candidateRowValidation.complete ? 'complete-invalid-candidate-evidence' : 'complete-qualified-graph',
+    candidate_rows: rows === null ? null : findings,
+    candidate_count: rows === null ? null : findings.length,
+    raw_candidate_count: rows === null ? null : findings.length,
+    qualified_candidate_count: isQualified ? qualifiedCandidates.length : null,
+    candidate_count_kind: 'raw-analyzer-rows-only',
+    candidate_kinds: scope.candidate_kinds,
+    out_of_domain_issue_kinds: scope.out_of_domain_issue_kinds,
+    graph_qualification: graphQualified ? 'qualified' : 'unqualified',
+    graph_qualification_reason: graphReason,
+    candidate_scope_qualification: candidateScopeQualified ? 'qualified' : 'unqualified',
+    candidate_scope_qualification_reason: candidateScopeQualified ? null : !analyzerComplete
+      ? 'The analyzer report is unavailable or incomplete.'
+      : `${candidateRowValidation.invalid_count} candidate rows lack valid tracked source evidence.`,
+    candidate_row_validation: candidateRowValidation,
+    prior_manual_triage: 'research/code-health-401/artifacts/knip-triage.json',
+    ignored_path_patterns: config.ignore ?? [],
+    configured_entrypoints: config.entry ?? [],
+    scope_version: scope.scope_version,
+    reference_audit: auditPath,
+  };
+  await writeJson(outputRoot, findingsPath, findingsEvidence);
+  const configHash = await configDigest([
+    configPath,
+    scopeManifestPath,
+    'research/code-health-402/lib/unused.mjs',
+    'research/code-health-401/tooling/package-lock.json',
+    'research/code-health-401/tooling/package.json',
+  ], { parserConfig: 'normal-mode files,exports,dependencies; no production-only dead-code headline' });
+  const scopeHash = digest({
+    scope_version: scope.scope_version,
+    config: configPath,
+    manifest: scopeManifestPath,
+    project: config.project ?? [],
+    entry: config.entry ?? [],
+    consumer_classes: scope.consumer_classes,
+    candidate_kinds: scope.candidate_kinds,
+    out_of_domain_issue_kinds: scope.out_of_domain_issue_kinds,
+    dynamic_resolution_rules: scope.dynamic_resolution_rules,
+  });
   const isValid = analyzerComplete && !modified;
   const slotValue = slot({
     name: 'unused_candidates', observedAt, unit: 'candidates',
-    status: isValid ? 'unknown' : 'failed',
-    reason: isValid ? REASON_TEXT.incompleteInput : (modified ? REASON_TEXT.incompleteInput : REASON_TEXT.producerError),
+    status: isQualified ? 'measured' : isValid ? 'unknown' : 'failed',
+    reason: isQualified ? null : isValid ? REASON_TEXT.incompleteInput : (modified ? REASON_TEXT.incompleteInput : REASON_TEXT.producerError),
+    payload: qualifiedUnusedPayload(findings, isQualified, scope),
     source: isValid ? makeMetricSource({
       collectionRef: refId(`${collectionRef.slice(4)}-knip`), attempt,
       toolName: 'knip', toolVersion: knipVersion, language: 'typescript',
       configDigestValue: configHash, scopeDigestValue: scopeHash,
-      metricVersion: 'unused-candidates-v1', scopeVersion: 'knip-explicit-entrypoints-v1',
+      metricVersion: 'unused-candidates-v2', scopeVersion: scope.scope_version,
     }) : null,
     population: isValid ? {
-      included_refs: [refId('inventory-unused-candidates')],
-      excluded_refs: [refId('scope-tests-dynamic-and-operator-entrypoints')],
+      included_refs: [refId('inventory-unused-candidates'), refId('unused-reference-audit')],
+      excluded_refs: [],
     } : null,
   });
   addArtifactRef(evidenceRefs, refId('inventory-unused-candidates'), findingsPath);
   addArtifactRef(evidenceRefs, refId(`${collectionRef.slice(4)}-knip`), resultPath);
   addArtifactRef(evidenceRefs, refId('scope-tests-dynamic-and-operator-entrypoints'), scopePath);
-  addSourceRef(evidenceRefs, refId('unused-triage-source'), 'research/code-health-401/artifacts/knip-triage.json', 1);
   return { slot: slotValue, elapsedMs: run.elapsedMs, status: slotValue.status };
 }
 
@@ -1026,7 +1118,7 @@ export function reportMarkdown({ objective, aggregate, sourceContextData, timing
     '| Metric | State | Evidence |',
     '| --- | --- | --- |',
     `| Complex functions | ${metrics.complex_functions.status} | ${staticRequested ? 'evidence/complexity/summary.json' : 'not collected (static cadence)'} |`,
-    `| Unused candidates | ${metrics.unused_candidates.status} | ${staticRequested ? 'evidence/unused/findings.json — graph remains unqualified' : 'not collected (static cadence)'} |`,
+    `| Unused candidates | ${metrics.unused_candidates.status} | ${staticRequested ? 'evidence/unused/findings.json and evidence/unused/reference-audit.json' : 'not collected (static cadence)'} |`,
     `| Scoped coverage | ${metrics.coverage.status} | ${staticRequested ? 'evidence/coverage/coverage-summary.json' : 'not collected (static cadence)'} |`,
     `| First-attempt main CI | ${metrics.ci_first_attempt.status} | evidence/ci/inventory.json |`,
     `| Confirmed regressions | ${metrics.confirmed_regressions.status} | evidence/release-regression-survey.json |`,
@@ -1080,7 +1172,7 @@ async function ensureArtifactOutput(outputRoot) {
   return resolved;
 }
 
-async function collectWithFallback({ name, unit, observedAt, outputRoot, evidenceRefs, collectMetric }) {
+export async function collectWithFallback({ name, unit, observedAt, outputRoot, evidenceRefs, collectMetric }) {
   const started = performance.now();
   try {
     return await collectMetric();
@@ -1099,6 +1191,10 @@ async function collectWithFallback({ name, unit, observedAt, outputRoot, evidenc
       status: 'failed',
     };
   }
+}
+
+export async function runConcurrentStaticCollectors(complexityTask, unusedTask) {
+  return Promise.all([complexityTask(), unusedTask()]);
 }
 
 export async function collect({
@@ -1155,22 +1251,24 @@ export async function collect({
     unusedMetric = uncollectedMetric('unused_candidates', observedAt, 'candidates');
     coverageMetric = uncollectedMetric('coverage', observedAt, 'lines');
   } else {
-    const complexity = await collectWithFallback({
-      name: 'complex_functions', unit: 'functions', observedAt, outputRoot, evidenceRefs,
-      collectMetric: () => collectComplexity({
-        files: tsFiles, outputRoot, observedAt, collectionRef, attempt, modified: !trackedClean, evidenceRefs, deadline: pilotDeadline,
+    const [complexity, unused] = await runConcurrentStaticCollectors(
+      () => collectWithFallback({
+        name: 'complex_functions', unit: 'functions', observedAt, outputRoot, evidenceRefs,
+        collectMetric: () => collectComplexity({
+          files: tsFiles, outputRoot, observedAt, collectionRef, attempt, modified: !trackedClean, evidenceRefs, deadline: pilotDeadline,
+        }),
       }),
-    });
+      () => collectWithFallback({
+        name: 'unused_candidates', unit: 'candidates', observedAt, outputRoot, evidenceRefs,
+        collectMetric: () => collectKnip({
+          outputRoot, observedAt, collectionRef, attempt, modified: !trackedClean, evidenceRefs, deadline: pilotDeadline,
+        }),
+      }),
+    );
     complexMetric = complexity.slot;
     timings.push({ name: 'ESLint and TypeScript function inventory', elapsed_ms: complexity.elapsedMs, status: complexity.status });
     if (complexity.status !== 'measured') errors.push(`Complexity collection state: ${complexity.status}.`);
 
-    const unused = await collectWithFallback({
-      name: 'unused_candidates', unit: 'candidates', observedAt, outputRoot, evidenceRefs,
-      collectMetric: () => collectKnip({
-        outputRoot, observedAt, collectionRef, attempt, modified: !trackedClean, evidenceRefs, deadline: pilotDeadline,
-      }),
-    });
     unusedMetric = unused.slot;
     timings.push({ name: 'Knip candidate exploration', elapsed_ms: unused.elapsedMs, status: unused.status });
     if (unused.status === 'failed') errors.push('Knip candidate extraction failed; raw graph output is retained where available.');

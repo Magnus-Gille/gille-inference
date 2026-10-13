@@ -27,7 +27,13 @@ import {
   fetchJsonWithRetry,
   getFirstAttempt,
 } from './lib/ci.mjs';
-import { checkVendorContract, collect, collectCi, inferTriage, newCollectionRef, reportMarkdown, runProcess } from './collect.mjs';
+import { checkVendorContract, collect, collectCi, collectWithFallback, inferTriage, newCollectionRef, reportMarkdown, runConcurrentStaticCollectors, runProcess } from './collect.mjs';
+import {
+  attachUnusedConsumerEvidence,
+  qualifiedUnusedPayload,
+  validateUnusedCandidateRows,
+  validateUnusedScope,
+} from './lib/unused.mjs';
 import { validateObjective } from '../../contracts/grimnir-code-health-v1/scripts/lib/code-health-objective.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -68,6 +74,65 @@ test('collection references are stable for GitHub artifacts and unique for local
   const second = newCollectionRef({ runId: null, attempt: 1 });
   assert.match(first, /^ref:collection-local-[0-9a-f-]+-attempt-1$/);
   assert.notEqual(first, second);
+});
+
+test('static collectors start concurrently and retain per-metric fallback evidence', async () => {
+  const outputRoot = await mkdtemp(path.join(os.tmpdir(), 'code-health-static-concurrency-'));
+  const evidenceRefs = {};
+  const started = [];
+  const finished = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let tasks;
+  try {
+    const isolatedTask = (name, collectMetric) => () => collectWithFallback({
+      name,
+      unit: name === 'complex_functions' ? 'functions' : 'candidates',
+      observedAt: '2026-10-11T00:00:00Z',
+      outputRoot,
+      evidenceRefs,
+      collectMetric,
+    });
+    tasks = runConcurrentStaticCollectors(
+      isolatedTask('complex_functions', async () => {
+        started.push('complex_functions');
+        await gate;
+        finished.push('complex_functions');
+        throw new Error('complexity parser failed');
+      }),
+      isolatedTask('unused_candidates', async () => {
+        started.push('unused_candidates');
+        await gate;
+        finished.push('unused_candidates');
+        return { slot: { status: 'measured' }, elapsedMs: 7, status: 'measured' };
+      }),
+    );
+
+    assert.deepEqual([...started].sort(), ['complex_functions', 'unused_candidates']);
+    assert.deepEqual(finished, [], 'neither task should finish before the shared gate opens');
+    release();
+    const [complexity, unused] = await tasks;
+    assert.equal(complexity.status, 'failed');
+    assert.equal(complexity.slot.slot_ref, 'ref:slot-complex-functions');
+    assert.equal(unused.status, 'measured');
+    assert.deepEqual([...finished].sort(), ['complex_functions', 'unused_candidates']);
+
+    const errorArtifact = JSON.parse(await readFile(path.join(outputRoot, 'evidence/complex_functions/collector-error.json'), 'utf8'));
+    assert.deepEqual(errorArtifact, {
+      status: 'failed',
+      error_name: 'Error',
+      error: 'complexity parser failed',
+    });
+    assert.deepEqual(evidenceRefs['ref:complex-functions-collector-error'], {
+      kind: 'artifact-file',
+      path: 'evidence/complex_functions/collector-error.json',
+    });
+    assert.equal(evidenceRefs['ref:unused-candidates-collector-error'], undefined);
+  } finally {
+    release();
+    if (tasks) await tasks;
+    await rm(outputRoot, { recursive: true, force: true });
+  }
 });
 
 async function listFiles(directory, prefix = '') {
@@ -509,6 +574,125 @@ test('manual Knip triage binds file, symbol, and line together', () => {
   assert.equal(inferTriage({ kind: 'exports', file: 'src/b.ts', name: 'keepMe', line: 12 }, prior).classification, 'unreviewed-candidate');
 });
 
+test('unused-candidate scope covers all consumers and requires operator-root source evidence', async () => {
+  const scope = JSON.parse(await readFile(path.join(ROOT, 'research/code-health-402/unused-scope-v2.json'), 'utf8'));
+  const config = JSON.parse(await readFile(path.join(ROOT, 'research/code-health-402/knip-valid-v2.json'), 'utf8'));
+  const packageJson = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'));
+  const files = [
+    'scripts/qualify-m3.ts',
+    'scripts/export-m5-adoption-evidence.ts',
+    'scripts/run-halogen-compatibility.ts',
+    'scripts/retention-cli.ts',
+    'scripts/gate-c-loadtest.mjs',
+    'scripts/monitor-mcp.mjs',
+    'src/homeserver/m3-qualification.ts',
+    'src/homeserver/adoption-evidence-bundle.ts',
+    'src/homeserver/halogen-host-operations.ts',
+    'src/homeserver/retention-registry.ts',
+    'src/homeserver/not-referenced.ts',
+    'tests/qualify-m3-cli.test.ts',
+    'tests/monitor-mcp.test.ts',
+    'tests/homeserver-adoption-evidence-bundle.test.ts',
+    'tests/halogen-host-operations.test.ts',
+    'tests/halogen-runtime-cli.test.ts',
+    'tests/homeserver-retention-registry.test.ts',
+    'benchmarks/real-agent/oracles/pi-telemetry.hidden.test.ts',
+    'scripts/pi-benchmark-telemetry.ts',
+    'scripts/gate-e-score.ts',
+    'scripts/gate-shadow-score.ts',
+    'gate-d/check-runtime-integrity.mjs',
+    'docs/migration-go-no-go-plan.md',
+    'deploy/README.md',
+    'scripts/gate-e-bench.ts',
+    'scripts/gate-shadow-measure.ts',
+    'client/m5-client.mjs',
+    'tests/computed-loader.test.ts',
+  ];
+  const configIssues = validateUnusedScope({ scope, config, packageJson, files });
+  assert.deepEqual(configIssues.missing_operator_roots, []);
+  assert.deepEqual(configIssues.missing_operator_entries, []);
+  assert.deepEqual(configIssues.missing_operator_evidence_roots, []);
+  assert.deepEqual(configIssues.invalid_operator_evidence, []);
+  assert.deepEqual(configIssues.missing_known_consumer_entries, []);
+  assert.deepEqual(configIssues.missing_audited_candidate_prefixes, []);
+  const missingOperatorConfig = {
+    ...config,
+    entry: config.entry.filter(entry => entry !== 'scripts/qualify-m3.ts!'),
+  };
+  const missingOperator = validateUnusedScope({ scope, config: missingOperatorConfig, packageJson, files });
+  assert.deepEqual(missingOperator.missing_operator_entries, ['scripts/qualify-m3.ts']);
+  assert.equal(missingOperator.complete, false);
+  const missingOperatorEvidence = validateUnusedScope({
+    scope: { ...scope, operator_root_evidence: scope.operator_root_evidence.slice(1) }, config, packageJson, files,
+  });
+  assert.deepEqual(missingOperatorEvidence.missing_operator_evidence_roots, ['scripts/qualify-m3.ts']);
+  assert.equal(missingOperatorEvidence.complete, false);
+  const unauditedCandidatePrefix = validateUnusedScope({
+    scope: { ...scope, audited_source_prefixes: scope.audited_source_prefixes.filter(prefix => prefix !== 'src/') },
+    config, packageJson, files,
+  });
+  assert.deepEqual(unauditedCandidatePrefix.missing_audited_candidate_prefixes, ['src/']);
+  assert.equal(unauditedCandidatePrefix.complete, false);
+  assert.deepEqual(configIssues.missing_package_script_paths, []);
+  assert.equal(configIssues.consumer_patterns_present.test, true);
+  assert.equal(configIssues.consumer_patterns_present.benchmark, true);
+  assert.equal(configIssues.consumer_patterns_present.gate, true);
+  const candidateSources = [
+    'src/unreviewed.ts', 'src/validated.ts', 'src/false-positive.ts', 'src/legacy-uncertain.ts',
+    'src/regular.ts', 'tests/tracked-consumer.test.ts',
+  ];
+  const candidateAudit = {
+    graph_qualified: true,
+    references: [],
+    inventory: {
+      source_paths: candidateSources,
+      source_line_counts: Object.fromEntries(candidateSources.map(file => [file, 1])),
+    },
+  };
+  const qualifiedRows = attachUnusedConsumerEvidence([
+    { kind: 'exports', file: 'src/unreviewed.ts', name: 'maybe', line: 1, triage: { classification: 'unreviewed-candidate' } },
+    { kind: 'exports', file: 'src/validated.ts', name: 'validated', line: 1, triage: { classification: 'validated-candidate' } },
+    { kind: 'exports', file: 'src/false-positive.ts', name: 'falsePositive', line: 1, triage: { classification: 'false-positive' } },
+    { kind: 'exports', file: 'src/legacy-uncertain.ts', name: 'legacy', line: 1, triage: { classification: 'uncertain' } },
+    { kind: 'exports', file: 'tests/tracked-consumer.test.ts', name: 'consumerOnly', line: 1, triage: { classification: 'unreviewed-candidate' } },
+    { kind: 'dependencies', file: 'package.json', name: 'tsx', triage: { classification: 'unreviewed-candidate' } },
+  ], candidateAudit, scope);
+  assert.equal(qualifiedRows[4].candidate_state, 'out-of-code-candidate-domain', 'tracked consumer-only source rows do not enter the code-candidate domain');
+  assert.equal(qualifiedRows[5].candidate_state, 'out-of-code-candidate-domain', 'dependency rows do not enter the code-candidate domain');
+  assert.deepEqual(qualifiedUnusedPayload(qualifiedRows, true, scope), {
+    graph_status: 'qualified',
+    candidate_count: 4,
+    validated_count: 1,
+    false_positive_count: 1,
+    uncertain_count: 2,
+    owner_validation_refs: ['ref:unused-triage-source'],
+    graph_qualification_ref: 'ref:unused-reference-audit',
+  }, 'unreviewed and legacy uncertain rows stay uncertain; validated, false-positive, and dependency rows retain distinct partitions');
+  assert.deepEqual(qualifiedUnusedPayload([qualifiedRows[2]], true, scope), {
+    graph_status: 'qualified',
+    candidate_count: 1,
+    validated_count: 0,
+    false_positive_count: 1,
+    uncertain_count: 0,
+    owner_validation_refs: [],
+    graph_qualification_ref: 'ref:unused-reference-audit',
+  }, 'false-positive triage is not an owner-validation reference');
+  const consumerOnlyPayload = qualifiedUnusedPayload(qualifiedRows.slice(4), true, scope);
+  assert.equal(consumerOnlyPayload.candidate_count, 0, 'tracked tests and dependencies remain outside the code-candidate count');
+  assert.deepEqual(validateUnusedCandidateRows(qualifiedRows), { complete: true, invalid_count: 0, invalid_rows: [] });
+
+  const invalidRows = attachUnusedConsumerEvidence([
+    { kind: 'exports', file: 'src/unreviewed.ts', line: 1, triage: { classification: 'unreviewed-candidate' } },
+    { kind: 'exports', file: 'src/unreviewed.ts', name: 'pastEnd', line: 2, triage: { classification: 'unreviewed-candidate' } },
+    { kind: 'files', file: 'src/not-tracked.ts', line: 1, triage: { classification: 'unreviewed-candidate' } },
+  ], candidateAudit, scope);
+  assert.equal(validateUnusedCandidateRows(invalidRows).complete, false, 'malformed and untracked in-domain rows block candidate qualification');
+  assert.equal(validateUnusedCandidateRows(invalidRows).invalid_count, 3);
+  assert.equal(qualifiedUnusedPayload(invalidRows, true, scope), null, 'invalid candidate rows cannot be silently filtered into a measured count');
+  assert.equal(qualifiedUnusedPayload([], true, scope).candidate_count, 0,
+    'zero is available only after the complete graph has qualified');
+});
+
 test('CI-only Markdown names only evidence the collector emits', () => {
   const metrics = Object.fromEntries([
     'complex_functions', 'unused_candidates', 'coverage', 'ci_first_attempt', 'confirmed_regressions',
@@ -554,7 +738,7 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
     } else {
       assert.equal(complexityMetric.payload, null, 'an unavailable complexity slot must not carry a measured payload');
     }
-    assert.ok(['failed', 'unknown'].includes(result.objective.metrics.unused_candidates.status));
+    assert.equal(result.objective.metrics.unused_candidates.status, 'measured', 'a clean fully qualified static smoke measures only qualified code candidates');
     const coverageMetric = result.objective.metrics.coverage;
     assert.equal(coverageMetric.status, 'measured', 'opt-in real smoke must exercise actual pinned coverage successfully');
     assert.equal(coverageMetric.payload.covered, 186);
@@ -598,6 +782,9 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
     const files = await listFiles(outputDir);
     assert.ok(files.includes('evidence/complexity/scan.json'));
     assert.ok(files.includes('evidence/unused/knip.json'));
+    assert.ok(files.includes('evidence/unused/findings.json'));
+    assert.ok(files.includes('evidence/unused/scope.json'));
+    assert.ok(files.includes('evidence/unused/reference-audit.json'));
     assert.ok(files.includes('evidence/coverage/run.json'));
     assert.ok(!files.some(file => file.startsWith('coverage/')), 'Vitest scratch output must stay outside the published artifact');
     const complexityInventory = JSON.parse(await readFile(path.join(outputDir, 'evidence/complexity/inventory.json'), 'utf8'));
@@ -628,6 +815,35 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
     const knipFindings = JSON.parse(await readFile(path.join(outputDir, 'evidence/unused/findings.json'), 'utf8'));
     assert.equal(knipFindings.candidate_count, normalizeKnipRows(knipRun.raw_report).length);
     assert.equal(knipFindings.candidate_rows.filter(row => row.kind === 'files').length, knipRun.raw_report.files.length);
+    assert.equal(knipFindings.raw_candidate_count, normalizeKnipRows(knipRun.raw_report).length);
+    assert.equal(knipFindings.candidate_count_kind, 'raw-analyzer-rows-only');
+    assert.deepEqual(knipFindings.candidate_kinds, ['files', 'exports']);
+    assert.deepEqual(knipFindings.out_of_domain_issue_kinds, ['dependencies', 'devDependencies', 'optionalPeerDependencies']);
+    assert.equal(knipFindings.candidate_scope_qualification, 'qualified');
+    assert.equal(knipFindings.candidate_row_validation.complete, true);
+    assert.equal(knipFindings.candidate_row_validation.invalid_count, 0);
+    const referenceAudit = JSON.parse(await readFile(path.join(outputDir, 'evidence/unused/reference-audit.json'), 'utf8'));
+    const unusedScope = JSON.parse(await readFile(path.join(outputDir, 'evidence/unused/scope.json'), 'utf8'));
+    assert.equal(unusedScope.graph_qualification, 'qualified');
+    assert.equal(unusedScope.dynamic_unknown_count, 0);
+    assert.equal(referenceAudit.complete_source_inventory, true);
+    assert.equal(referenceAudit.graph_qualified, true);
+    const codeCandidateRows = knipFindings.candidate_rows.filter(row => ['files', 'file', 'exports'].includes(row.kind)
+      && row.candidate_state === 'candidate-in-qualified-graph');
+    assert.equal(knipFindings.qualified_candidate_count, codeCandidateRows.length);
+    for (const candidate of codeCandidateRows) assert.equal(index.refs[candidate.ref].kind, 'source');
+    const unusedMetric = result.objective.metrics.unused_candidates;
+    assert.equal(unusedMetric.status, 'measured');
+    assert.equal(unusedMetric.payload.graph_status, 'qualified');
+    assert.equal(unusedMetric.payload.candidate_count, codeCandidateRows.length);
+    assert.equal(unusedMetric.payload.candidate_count,
+      unusedMetric.payload.validated_count + unusedMetric.payload.false_positive_count + unusedMetric.payload.uncertain_count);
+    assert.equal(unusedMetric.payload.validated_count,
+      codeCandidateRows.filter(row => row.triage.classification === 'validated-candidate').length);
+    assert.equal(unusedMetric.payload.false_positive_count,
+      codeCandidateRows.filter(row => row.triage.classification === 'false-positive').length);
+    assert.equal(unusedMetric.payload.uncertain_count, codeCandidateRows.filter(row =>
+      !['validated-candidate', 'false-positive'].includes(row.triage.classification)).length);
     const priorTriage = JSON.parse(await readFile(path.join(ROOT, 'research/code-health-401/artifacts/knip-triage.json'), 'utf8'));
     for (const candidate of priorTriage.candidates) {
       const fileCandidate = candidate.candidate_type === 'unused-file';
@@ -636,11 +852,23 @@ test('local static collection smoke emits a truthful partial artifact', { skip: 
       const file = fileCandidate ? candidate.path : candidate.path.slice(0, separator);
       const name = fileCandidate ? null : candidate.path.slice(separator + 1, at);
       const line = fileCandidate ? null : Number(candidate.path.slice(at + 1));
-      assert.ok(knipFindings.candidate_rows.some(row => row.path === file
-        && row.triage.classification === candidate.classification
-        && (fileCandidate ? row.kind === 'files' : row.kind === 'exports' && row.name === name && row.line === line)),
-      `manual triage was not retained for ${candidate.path}`);
+      const currentRows = knipFindings.candidate_rows.filter(row => row.file === file
+        && (fileCandidate ? row.kind === 'files' : row.kind === 'exports' && row.name === name && row.line === line));
+      for (const row of currentRows) {
+        assert.equal(row.triage.classification, candidate.classification,
+          `manual triage was not retained for current finding ${candidate.path}`);
+      }
     }
+    const m3File = 'src/homeserver/m3-qualification.ts';
+    assert.ok(priorTriage.candidates.some(candidate => candidate.path === m3File
+      && candidate.candidate_type === 'unused-file' && candidate.classification === 'false-positive'));
+    assert.ok(!knipRun.raw_report.files.includes(m3File), 'new operator and test roots remove the historically false-positive file row');
+    assert.ok(referenceAudit.references.some(reference => reference.path === 'scripts/qualify-m3.ts'
+      && reference.target_path === m3File && reference.consumer_class === 'operator'));
+    assert.ok(referenceAudit.references.some(reference => reference.path === 'tests/homeserver-m3-qualification.test.ts'
+      && reference.target_path === m3File && reference.consumer_class === 'test'));
+    assert.ok(referenceAudit.references.some(reference => reference.path === 'tests/qualify-m3-cli.test.ts'
+      && reference.target_path === m3File && reference.consumer_class === 'test'));
     for (const relative of files) {
       const filePath = path.join(outputDir, relative);
       const content = await readFile(filePath, 'utf8');

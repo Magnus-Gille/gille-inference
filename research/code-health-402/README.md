@@ -8,10 +8,20 @@ The collector emits one exact objective snapshot with all five metric slots, plu
 manifest and an evidence index. All references resolve within the artifact or to a bounded source
 path and line or numeric GitHub Actions run ID. The artifact contains JSON and Markdown evidence,
 not executable files or absolute paths. Analyzer diagnostics are sanitized to repository-relative
-paths. `unused_candidates` remains unknown because the #401 graph is unqualified; raw candidates
-and the existing manual triage are retained for investigation. Confirmed regressions remain
-unknown until a maintainer completes a release-window survey as specified in
+paths. `unused_candidates` uses the versioned `knip-consumer-audited-v2` scope in
+[`unused-scope-v2.json`](unused-scope-v2.json): it adds the six omitted operator roots and
+includes tests, benchmark tools, and gate tooling as consumers. The source-linked reference audit
+uses a complete tracked source inventory for those consumers and keeps unresolved or computed
+candidate-module loads unknown. Process-launch consumers imported from `child_process` or
+`node:child_process` remain unmodeled and keep qualification unknown until their launched source
+coverage is proven. Reviewed data enumeration is recorded separately. The code-candidate
+domain contains Knip file and export rows; dependency rows stay in raw analyzer evidence and do not
+enter the candidate count. A complete inventory with no unresolved candidate-module references can
+qualify the graph; otherwise raw Knip rows remain investigation leads and the objective slot stays
+unknown. Confirmed regressions remain unknown until a maintainer completes a release-window survey as specified in
 [`release-regression-record.md`](release-regression-record.md).
+
+The source-graph AST checks are part of the regular Vitest suite, which runs after dependency installation in main CI. The pre-install producer conformance suite remains dependency-free.
 
 ## Collection cadence and scope
 

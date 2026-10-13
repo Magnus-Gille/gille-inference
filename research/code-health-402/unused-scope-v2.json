@@ -1,0 +1,83 @@
+{
+  "schema_version": 2,
+  "scope_version": "knip-consumer-audited-v2",
+  "candidate_kinds": ["files", "exports"],
+  "out_of_domain_issue_kinds": ["dependencies", "devDependencies", "optionalPeerDependencies"],
+  "knip_config": "research/code-health-402/knip-valid-v2.json",
+  "knip_project_globs": [
+    "src/**/*.ts",
+    "scripts/**/*.ts",
+    "scripts/**/*.mjs",
+    "client/**/*.mjs",
+    "tests/**/*.ts",
+    "benchmarks/**/*.ts",
+    "benchmarks/**/*.mjs",
+    "gate-d/**/*.ts",
+    "gate-d/**/*.mjs",
+    "gate-d/**/*.mts"
+  ],
+  "required_operator_roots": [
+    "scripts/qualify-m3.ts",
+    "scripts/export-m5-adoption-evidence.ts",
+    "scripts/run-halogen-compatibility.ts",
+    "scripts/retention-cli.ts",
+    "scripts/gate-c-loadtest.mjs",
+    "scripts/monitor-mcp.mjs"
+  ],
+  "operator_root_evidence": [
+    { "root": "scripts/qualify-m3.ts", "source": "tests/qualify-m3-cli.test.ts", "line": 19, "pattern": "scripts/qualify-m3.ts" },
+    { "root": "scripts/export-m5-adoption-evidence.ts", "source": "tests/homeserver-adoption-evidence-bundle.test.ts", "line": 11, "pattern": "export-m5-adoption-evidence.js" },
+    { "root": "scripts/run-halogen-compatibility.ts", "source": "tests/halogen-runtime-cli.test.ts", "line": 16, "pattern": "run-halogen-compatibility.ts" },
+    { "root": "scripts/retention-cli.ts", "source": "scripts/retention-cli.ts", "line": 3, "pattern": "retention-cli.ts — the IO composition root" },
+    { "root": "scripts/gate-c-loadtest.mjs", "source": "docs/migration-go-no-go-plan.md", "line": 135, "pattern": "scripts/gate-c-loadtest.mjs" },
+    { "root": "scripts/monitor-mcp.mjs", "source": "deploy/README.md", "line": 157, "pattern": "scripts/monitor-mcp.mjs" }
+  ],
+  "consumer_entry_globs": {
+    "test": ["tests/**/*.ts!"],
+    "benchmark": ["benchmarks/**/*.ts!", "benchmarks/**/*.mjs!"],
+    "gate": ["gate-d/**/*.ts!", "gate-d/**/*.mjs!", "scripts/gate-e-bench.ts!", "scripts/gate-shadow-measure.ts!"]
+  },
+  "consumer_classes": [
+    { "class": "production-internal", "prefixes": ["src/"] },
+    { "class": "operator", "prefixes": ["scripts/", "client/"] },
+    { "class": "test", "prefixes": ["tests/"] },
+    { "class": "benchmark", "prefixes": ["benchmarks/"] },
+    { "class": "gate", "prefixes": ["gate-d/"] }
+  ],
+  "special_consumer_classes": {
+    "scripts/gate-e-bench.ts": "gate",
+    "scripts/gate-shadow-measure.ts": "gate"
+  },
+  "source_extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
+  "audited_source_prefixes": ["src/", "scripts/", "client/", "tests/", "benchmarks/", "gate-d/"],
+  "candidate_source_prefixes": ["src/", "scripts/", "client/"],
+  "reviewed_data_enumerations": [
+    {
+      "path": "client/m5-client.mjs",
+      "pattern": "readdir(spoolDir)",
+      "kind": "adoption-spool-data-pruning",
+      "reason": "This enumerates adoption JSON records only to prune records beyond the retention limit; it does not load or resolve source modules."
+    }
+  ],
+  "known_test_consumers": [
+    "tests/monitor-mcp.test.ts",
+    "tests/homeserver-m3-qualification.test.ts",
+    "tests/qualify-m3-cli.test.ts",
+    "tests/homeserver-adoption-evidence-bundle.test.ts",
+    "tests/halogen-host-operations.test.ts",
+    "tests/halogen-host-operations-cleanup.test.ts",
+    "tests/halogen-runtime-cli.test.ts",
+    "tests/homeserver-retention-registry.test.ts",
+    "tests/homeserver-retention-enforcement.test.ts"
+  ],
+  "known_benchmark_consumers": [
+    "benchmarks/real-agent/oracles/pi-telemetry.hidden.test.ts",
+    "scripts/gate-e-bench.ts",
+    "scripts/gate-shadow-measure.ts"
+  ],
+  "dynamic_resolution_rules": [
+    "literal relative imports, re-exports, require calls, and dynamic imports resolve against the complete tracked source inventory",
+    "the benchmark oracle pathToFileURL(resolve(process.cwd(), <literal tracked path>)) pattern resolves only when the literal target is tracked",
+    "non-literal dynamic imports, unresolved candidate-module imports, and aliases that may target candidate source stay unknown; reviewed non-code data enumeration is recorded separately"
+  ]
+}
