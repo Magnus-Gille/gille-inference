@@ -1,5 +1,12 @@
 # Native code-loop recovery fixture
 
+The native workflow uses the stock GitHub-hosted Ubuntu26 worker and its official
+`passt`/`bubblewrap` packages. It requires restricted unprivileged user namespaces to
+remain enabled and the vendor pasta AppArmor profile to be loaded in enforce mode.
+It does not install custom profiles or change sysctl values. Results establish this
+disposable worker's recovery behavior; they do not establish Ubuntu24 prerequisite
+compatibility or the current production/M5 state.
+
 This fixture is for disposable GitHub-hosted Ubuntu workers only. It is not an installer for M5.
 The accepted source uses the real gateway constructor, MCP dispatch, required-confinement runtime,
 systemd user-manager transport, pasta, bubblewrap and owner check command. Pi/model answers and
