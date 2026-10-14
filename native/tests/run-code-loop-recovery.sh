@@ -14,6 +14,22 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 SOURCE=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 NODE=$(command -v node)
 die() { echo "native-recovery: $*" >&2; exit 1; }
+require_unused_slice() {
+  local load fragment dropins active transient
+  load=$(systemctl show "$SLICE" -p LoadState --value) || die "cannot inspect fixture slice load state"
+  fragment=$(systemctl show "$SLICE" -p FragmentPath --value) || die "cannot inspect fixture slice configuration"
+  dropins=$(systemctl show "$SLICE" -p DropInPaths --value) || die "cannot inspect fixture slice drop-ins"
+  active=$(systemctl show "$SLICE" -p ActiveState --value) || die "cannot inspect fixture slice activity"
+  transient=$(systemctl show "$SLICE" -p Transient --value) || die "cannot inspect fixture slice ownership"
+  # systemd may load an inactive slice without a unit file. That implicit object
+  # is safe only when it has no configuration, cgroup or existing runtime work.
+  [[ "$load" = loaded || "$load" = not-found ]] || die "fixture slice load state is unsafe"
+  [[ -z "$fragment" && -z "$dropins" && "$active" = inactive && "$transient" = no ]] || die "fixture slice already configured or active"
+  [[ ! -e /sys/fs/cgroup/girecovery.slice ]] || die "fixture slice cgroup already exists"
+  for directory in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+    [[ ! -e "$directory/$SLICE" && ! -L "$directory/$SLICE" && ! -e "$directory/$SLICE.d" && ! -L "$directory/$SLICE.d" ]] || die "fixture slice files already exist"
+  done
+}
 require_host() {
   [[ "$EUID" = 0 ]] || die "only root on a disposable GitHub-hosted worker is authorized"
   [[ "$GITHUB_ACTIONS" = true && "$RUNNER_ENVIRONMENT" = github-hosted ]] || die "only disposable GitHub-hosted workers are authorized"
@@ -28,7 +44,8 @@ mkdir -p -- "$OUTPUT"
 ! getent passwd "$USER_NAME" >/dev/null || die "fixture account already exists"
 ! getent passwd "$TEST_UID" >/dev/null || die "fixture UID already exists"
 ! getent group "$USER_NAME" >/dev/null || die "fixture group already exists"
-for item in "$SLICE" "$GATEWAY" "$CANARY" "$DRIVER" "$MANAGER" "$RUNTIME"; do
+require_unused_slice
+for item in "$GATEWAY" "$CANARY" "$DRIVER" "$MANAGER" "$RUNTIME"; do
   [[ "$(systemctl show "$item" -p LoadState --value)" = not-found || "$item" = "$MANAGER" || "$item" = "$RUNTIME" ]] || die "named fixture unit already exists: $item"
 done
 [[ "$(systemctl show "$MANAGER" -p ActiveState --value)" = inactive ]] || die "fixture manager active"
