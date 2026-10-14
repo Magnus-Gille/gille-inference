@@ -4,6 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
+import { recordRequestLog } from "../src/homeserver/request-log.js";
 
 /**
  * Self-service portal suite: lifetime credit accounting, one-time invite lifecycle, and the
@@ -428,29 +429,36 @@ describe("GET /portal/stats", () => {
   it("503 + no-store when the DB query fails — never a zeroed 200 (Finding 2)", async () => {
     const { bustStatsCache } = await import("../src/homeserver/request-log.js");
     bustStatsCache();
+    const db = getDb();
+    const schema = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE tbl_name = 'request_log' AND type IN ('table', 'index') AND sql IS NOT NULL
+      ORDER BY CASE WHEN type = 'table' THEN 0 ELSE 1 END
+    `).all() as Array<{ sql: string }>;
 
     // Drop the request_log table to force the aggregate query to throw.
-    getDb().exec("DROP TABLE IF EXISTS request_log");
+    db.exec("DROP TABLE IF EXISTS request_log");
+    try {
+      const res = await fetch(url("/portal/stats"));
 
-    const res = await fetch(url("/portal/stats"));
+      // Must NOT be a silent zeroed 200.
+      expect(res.status).toBe(503);
 
-    // Must NOT be a silent zeroed 200.
-    expect(res.status).toBe(503);
+      // Must carry no-store so the failure is not cached by intermediaries.
+      const cc = res.headers.get("cache-control") ?? "";
+      expect(cc).toContain("no-store");
 
-    // Must carry no-store so the failure is not cached by intermediaries.
-    const cc = res.headers.get("cache-control") ?? "";
-    expect(cc).toContain("no-store");
-
-    // The body must be a proper error envelope, not a zeroed totals object.
-    const j = (await res.json()) as Record<string, unknown>;
-    expect(j).not.toHaveProperty("total_tokens");
-    expect(j).not.toHaveProperty("total_requests");
-    expect(j).toHaveProperty("error");
-
-    // Restore the table for subsequent tests.
-    const { ensureRequestLogSchema } = await import("../src/homeserver/request-log.js");
-    ensureRequestLogSchema();
-    bustStatsCache();
+      // The body must be a proper error envelope, not a zeroed totals object.
+      const j = (await res.json()) as Record<string, unknown>;
+      expect(j).not.toHaveProperty("total_tokens");
+      expect(j).not.toHaveProperty("total_requests");
+      expect(j).toHaveProperty("error");
+    } finally {
+      // ensureRequestLogSchema deliberately leaves a dropped live table untouched. Restore the
+      // exact table/index schema here so later portal tests cannot inherit this injected outage.
+      for (const { sql } of schema) db.exec(sql);
+      bustStatsCache();
+    }
   });
 });
 
@@ -498,11 +506,64 @@ describe("GET /portal/me", () => {
     expect(j.gateway.client_version).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
+  it("reports only an owner-visible historical inference observation", async () => {
+    recordRequestLog({
+      requestId: uniq("inference-observation"), alias: null, tier: "owner", keyHash: null,
+      model: "m1", node: "m5", route: "/v1/chat/completions", status: 200, outcome: "ok",
+      errorClass: null, promptTokens: null, completionTokens: null, totalTokens: null,
+      queueWaitMs: null, ttftMs: null, totalMs: 1, admission: "admitted",
+    });
+    const { plaintextKey: ownerKey } = mintKey(
+      { alias: uniq("observation-owner"), tier: "owner", scope: "agent" }, DEFAULTS
+    );
+    const { plaintextKey: guestKey } = mintKey(
+      { alias: uniq("observation-guest"), tier: "guest" }, DEFAULTS
+    );
+
+    const owner = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${ownerKey}` } });
+    expect(owner.status).toBe(200);
+    const ownerBody = await owner.json() as { inferenceObservation?: {
+      status: string; lastSuccessfulAt: string | null; source: string; scope: string;
+    } };
+    expect(ownerBody.inferenceObservation).toMatchObject({
+      status: "observed", source: "request_log", scope: "m5_global",
+      lastSuccessfulAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/),
+    });
+    expect(JSON.stringify(ownerBody.inferenceObservation)).not.toMatch(/alias|model|route|tokens/i);
+
+    const guest = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${guestKey}` } });
+    expect((await guest.json() as { inferenceObservation?: unknown }).inferenceObservation).toBeUndefined();
+  });
+
+  it("keeps owner discovery available when inference history cannot be read", async () => {
+    const { plaintextKey } = mintKey(
+      { alias: uniq("observation-unavailable"), tier: "owner", scope: "agent" }, DEFAULTS
+    );
+    const db = getDb();
+    const schema = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE tbl_name = 'request_log' AND type IN ('table', 'index') AND sql IS NOT NULL
+      ORDER BY CASE WHEN type = 'table' THEN 0 ELSE 1 END
+    `).all() as Array<{ sql: string }>;
+    db.exec("DROP TABLE request_log");
+    try {
+      const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+      expect(res.status).toBe(200);
+      expect((await res.json() as { inferenceObservation: unknown }).inferenceObservation).toEqual({
+        source: "request_log", scope: "m5_global", status: "unavailable", lastSuccessfulAt: null,
+      });
+    } finally {
+      for (const { sql } of schema) db.exec(sql);
+    }
+  });
+
   it("does not disclose owner metadata to owner inference keys", async () => {
     const { plaintextKey } = mintKey({ alias: uniq("owner-inference"), tier: "owner", scope: "inference" }, DEFAULTS);
     const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
     expect(res.status).toBe(200);
-    expect((await res.json() as { gateway?: unknown }).gateway).toBeUndefined();
+    const body = await res.json() as { gateway?: unknown; inferenceObservation?: unknown };
+    expect(body.gateway).toBeUndefined();
+    expect(body.inferenceObservation).toBeUndefined();
   });
 
   it("no key → 401 enveloped", async () => {
