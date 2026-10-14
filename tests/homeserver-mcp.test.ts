@@ -983,6 +983,7 @@ describe("MCP ask quota rejection detail", () => {
     };
     expect(secondBody.result.isError).toBe(true);
     expect(secondBody.result.content[0]?.text).toContain("Shared static-tier rpm limit reached");
+    expect(secondBody.result.content[0]?.text).toContain("the shared static-tier bucket");
     expect(secondBody.result._meta.quota).toMatchObject({
       reason: "rpm", scope: "shared_static_tier", window: "60s", limit: 1, requested: 1, counted: false,
     });
@@ -998,6 +999,7 @@ describe("MCP ask quota rejection detail", () => {
     };
     expect(collisionBody.result.isError).toBe(true);
     expect(collisionBody.result.content[0]?.text).toContain("Shared static-tier rpm limit reached");
+    expect(collisionBody.result.content[0]?.text).toContain("the shared static-tier bucket");
     expect(collisionBody.result._meta.quota).toMatchObject({ scope: "shared_static_tier", counted: false });
     expect(collisionBody.result._meta.quota).not.toHaveProperty("used_before");
   });
@@ -1028,8 +1030,22 @@ describe("MCP ask quota rejection detail", () => {
       result: { isError: boolean; content: Array<{ text: string }>; _meta?: Record<string, unknown>; structuredContent?: unknown };
     };
     expect(j.result.isError).toBe(true);
-    expect(j.result.content[0]?.text).toContain(`Per-key ${reason} limit reached`);
-    expect(j.result.content[0]?.text).toContain("This rejected request was not counted.");
+    const message = j.result.content[0]?.text ?? "";
+    expect(message).toContain(`Per-key ${reason} limit reached`);
+    expect(message).toContain("your own API key");
+    expect(message).toContain(reason === "rpm" ? "requests per minute" : reason === "tpm" ? "token per minute" : "token per UTC day");
+    expect(message).toContain("This rejected request was not counted.");
+    if (reason === "rpm") {
+      expect(message).toContain("contact the gateway operator");
+      expect(message).not.toMatch(/expiry|reset/i);
+      expect(message).not.toContain("retry after");
+    } else if (reason === "daily") {
+      expect(message).toContain("The UTC-day budget resets in");
+      expect(message).toContain("token per UTC day");
+    } else {
+      expect(message).toContain("The next quota-window expiry is in");
+      expect(message).not.toContain("The quota window resets");
+    }
     expect(j.result.structuredContent).toBeUndefined();
     expect(j.result._meta).toMatchObject({
       m5_code: "rate_limited",
@@ -1056,6 +1072,16 @@ describe("MCP ask quota rejection detail", () => {
     expect(j.result._meta).not.toHaveProperty("key");
     expect(j.result._meta).not.toHaveProperty("model");
     expect(j.result._meta).not.toHaveProperty("ip");
+    const quota = j.result._meta!.quota as { retry_after_seconds: number };
+    if (reason === "rpm") {
+      expect(message).toContain("contact the gateway operator");
+      expect(message).not.toContain("retry after");
+    } else {
+      expect(message).toContain(`retry after ${quota.retry_after_seconds} ${quota.retry_after_seconds === 1 ? "second" : "seconds"}`);
+    }
+    if (reason === "daily") {
+      expect(message).toContain(`UTC-day budget resets in ${quota.retry_after_seconds} ${quota.retry_after_seconds === 1 ? "second" : "seconds"}`);
+    }
   });
 });
 
