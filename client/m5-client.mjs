@@ -1382,6 +1382,9 @@ export async function createM5Client({
         body: JSON.stringify(message),
         signal: controller.signal,
       });
+      // Fetch resolving means response headers have arrived, even when an error-status body
+      // still needs inspection. Keep timeout diagnostics tied to the real response stage.
+      headersReceived = true;
 
       if ((response.status === 404 || response.status === 410) && sessionId !== null && retrySession) {
         sessionId = null;
@@ -1406,7 +1409,6 @@ export async function createM5Client({
       if (returnedSession) sessionId = returnedSession;
       // Keep the same abort deadline active through body consumption. Fetch resolving headers
       // is not completion: a peer can otherwise hold this sequential stdio bridge forever.
-      headersReceived = true;
       const text = await response.text();
       if (text.trim() === "") {
         if (message.id === undefined || message.id === null) return null;
