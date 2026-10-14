@@ -94,6 +94,9 @@ async function diagnose({
   const result = await diagnoseProfile({
     profile: "codex",
     profileConfig: PROFILE,
+    // Make private-route failure classification deterministic across hosts with and without
+    // a configured Tailscale CLI. These tests exercise the gateway transport, not host state.
+    localProbes: { tailnet: async () => "up" },
     credentialStore: {
       resolve: async () => {
         if (credential === null) {
