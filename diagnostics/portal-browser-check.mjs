@@ -344,7 +344,7 @@ async function capturePng(cdp, filename, width, height, { beyondViewport = false
   const imageWidth = png.readUInt32BE(16);
   const imageHeight = png.readUInt32BE(20);
   assert.equal(imageWidth, width, `${filename}: screenshot width did not match its viewport`);
-  if (beyondViewport) assert.ok(imageHeight >= height, `${filename}: full-page overview was shorter than its viewport`);
+  if (beyondViewport) assert.equal(imageHeight, clip.height, `${filename}: overview height did not match the complete page`);
   else assert.equal(imageHeight, height, `${filename}: screenshot height did not match its viewport`);
   return { filename, width: imageWidth, height: imageHeight, bytes: png.length, sha256: sha256(png), png };
 }
