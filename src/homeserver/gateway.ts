@@ -3991,6 +3991,18 @@ export function startGateway(
   } catch (err) {
     return Promise.reject(err);
   }
+  if (cfg.requestLog === "on") {
+    try {
+      // Initialize the enabled collector once before the first history read. Keep the
+      // read-only metadata route free of schema/index work on every doctor request.
+      ensureRequestLogSchema();
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      const reason = ["SQLITE_ERROR", "SQLITE_READONLY", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CANTOPEN", "SQLITE_IOERR", "SQLITE_CORRUPT"]
+        .includes(String(code)) ? String(code) : "unknown";
+      console.warn("Request-log initialization unavailable; inference history remains unavailable", { reason });
+    }
+  }
   const loopback =
     cfg.gatewayHost === "127.0.0.1" || cfg.gatewayHost === "localhost" || cfg.gatewayHost === "::1";
   // "No keys" now means no legacy keys AND no store keys.
@@ -5479,9 +5491,6 @@ export async function handleRequest(
           inferenceObservation = { ...base, status: "disabled", lastSuccessfulAt: null };
         } else {
           try {
-            // The enabled collector initializes/migrates lazily; establish its schema before
-            // the first history read. The timestamp query itself remains read-only.
-            ensureRequestLogSchema();
             const lastSuccessfulAt = queryLatestSuccessfulM5InferenceAt(getDb());
             inferenceObservation = {
               ...base,

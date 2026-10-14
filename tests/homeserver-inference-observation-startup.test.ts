@@ -10,14 +10,16 @@ import { startGateway } from "../src/homeserver/gateway.js";
 let stop: (() => Promise<void>) | null = null;
 afterEach(async () => { if (stop) await stop(); stop = null; });
 
-async function firstObservation(legacy: boolean, enabled = true) {
+async function firstObservation(legacy: boolean, enabled = true, broken = false) {
   const dir = mkdtempSync(join(tmpdir(), "observation-startup-"));
   initDb(join(dir, "fixture.sqlite"));
-  if (legacy) {
+  if (broken) {
+    getDb().exec("CREATE TABLE request_log (unexpected_column TEXT)");
+  } else if (legacy) {
     // An empty pre-node/filter-epoch collector table, before its existing lazy migration.
     getDb().exec("CREATE TABLE request_log (id TEXT PRIMARY KEY, ts INTEGER NOT NULL, alias TEXT, tier TEXT, key_hash TEXT, model TEXT NOT NULL, route TEXT NOT NULL, status INTEGER NOT NULL, outcome TEXT NOT NULL, error_class TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, queue_wait_ms INTEGER, ttft_ms INTEGER, total_ms INTEGER NOT NULL, admission TEXT)");
   }
-  expect(getDb().prepare("SELECT name FROM sqlite_master WHERE name = 'request_log'").get() !== undefined).toBe(legacy);
+  expect(getDb().prepare("SELECT name FROM sqlite_master WHERE name = 'request_log'").get() !== undefined).toBe(legacy || broken);
   process.env["LMSTUDIO_BASE_URL"] = "http://127.0.0.1:9";
   process.env["HOMESERVER_HOST"] = "127.0.0.1";
   process.env["HOMESERVER_PORT"] = "0";
@@ -52,5 +54,12 @@ describe("first owner inference-history observation", () => {
       source: "request_log", scope: "m5_global", status: "disabled", lastSuccessfulAt: null,
     });
     expect(getDb().prepare("SELECT name FROM sqlite_master WHERE name = 'request_log'").get()).toBeUndefined();
+  });
+
+  it("keeps the portal available and reports unknown when optional collector initialization fails", async () => {
+    const body = await firstObservation(false, true, true);
+    expect(body.inferenceObservation).toEqual({
+      source: "request_log", scope: "m5_global", status: "unavailable", lastSuccessfulAt: null,
+    });
   });
 });
