@@ -15,7 +15,9 @@ concurrency:
 jobs:
   code-loop-recovery:
     name: Real manager and cage recovery
-    runs-on: ubuntu-24.04
+    # This stock image supplies pasta's ABI4 AppArmor/userns profile. Keep vendor
+    # policy enabled; older images may refuse the required real cage preflight.
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -32,6 +34,13 @@ jobs:
           systemd --version | head -1
           pasta --version
           bwrap --version
+          dpkg-query -W -f='${Package} ${Version}\n' passt bubblewrap systemd apparmor
+          systemd-run --help | grep -F -- '--expand-environment='
+          # Read-only prerequisites: no sysctl writes, custom profile or MAC relaxation.
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          test -f /etc/apparmor.d/usr.bin.pasta
+          grep -q 'abi <abi/4.0>' /etc/apparmor.d/usr.bin.pasta
+          sudo -n cat /sys/kernel/security/apparmor/profiles | grep -E '^pasta \(enforce\)$'
       - name: Locked dependencies without lifecycle scripts
         run: |
           mkdir -p "$RUNNER_TEMP/recovery-deps-home"
