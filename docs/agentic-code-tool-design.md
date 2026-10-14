@@ -2,6 +2,8 @@
 
 **Issue:** #116 · **Acceptance (§11): ✅ PASSED 2026-07-02** — Gate D through code_loop: rounds 8/9/10 of 10, median 9 ≥ bar 9, same-day direct baseline 10/10 (`docs/gate-d-code-loop-acceptance-2026-07-02.md`) · **Status:** FINAL (synthesized from three candidate designs + three adversarial judge lenses) · **Date:** 2026-07-02
 
+> **Historical design and acceptance record.** The July 2 FINAL and Gate D acceptance above remain the dated record; they are not fresh verification of today's cage. Some design and review dispositions below were superseded as the implementation evolved. In particular, the `IPAddressDeny`/gateway-host allow disposition (S5) and tailnet `baseUrl` (O2) describe the historical design, not the current cage: systemd supplies resource limits, while `pasta` forwards an in-cage loopback port through the gateway relay. See the [current cage operations](../src/homeserver/README.md#code_loop--owner-agent-sandboxed-agentic-coding-116) and [cage implementation](../src/homeserver/code-loop-cage.ts).
+
 ---
 
 ## 1. Chosen architecture and why
