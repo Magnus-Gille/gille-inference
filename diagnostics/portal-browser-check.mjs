@@ -330,19 +330,23 @@ async function waitForApiResponses(cdp, responseStatuses, expected) {
   throw new Error(`browser API responses did not match expected state: ${JSON.stringify(responseStatuses)}`);
 }
 
-async function capturePng(cdp, filename, width, height) {
+async function capturePng(cdp, filename, width, height, { beyondViewport = false, clip } = {}) {
   const result = await cdp.command("Page.captureScreenshot", {
     format: "png",
     fromSurface: true,
-    captureBeyondViewport: false,
+    captureBeyondViewport: beyondViewport,
+    ...(clip ? { clip } : {}),
   });
   const png = Buffer.from(result.data ?? "", "base64");
   assert.ok(png.length > 1_000, `${filename}: screenshot was empty or unexpectedly small`);
   assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10], `${filename}: screenshot was not PNG data`);
   assert.equal(png.toString("ascii", 12, 16), "IHDR", `${filename}: PNG header was malformed`);
-  assert.equal(png.readUInt32BE(16), width, `${filename}: screenshot width did not match its viewport`);
-  assert.equal(png.readUInt32BE(20), height, `${filename}: screenshot height did not match its viewport`);
-  return { filename, width, height, bytes: png.length, sha256: sha256(png), png };
+  const imageWidth = png.readUInt32BE(16);
+  const imageHeight = png.readUInt32BE(20);
+  assert.equal(imageWidth, width, `${filename}: screenshot width did not match its viewport`);
+  if (beyondViewport) assert.ok(imageHeight >= height, `${filename}: full-page overview was shorter than its viewport`);
+  else assert.equal(imageHeight, height, `${filename}: screenshot height did not match its viewport`);
+  return { filename, width: imageWidth, height: imageHeight, bytes: png.length, sha256: sha256(png), png };
 }
 
 async function assertRenderedState(cdp, state, apiStatuses) {
@@ -438,6 +442,19 @@ async function runViewport(cdp, state, viewportName, origin, fixtureStatuses, sc
     await waitForPageLoaded(cdp, pageUrl);
     await waitForApiResponses(cdp, responseStatuses, fixtureStatuses);
     const ui = await assertRenderedState(cdp, state, responseStatuses);
+
+    await evaluate(cdp, "window.scrollTo(0, 0); new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
+    const layout = await cdp.command("Page.getLayoutMetrics");
+    const pageHeight = Math.ceil(layout.cssContentSize.height);
+    assert.ok(pageHeight >= viewport.height, "portal overview content was shorter than the viewport");
+    const overviewName = `portal-${state}-${viewportName}-overview.png`;
+    screenshotRecords.push({
+      ...await capturePng(cdp, overviewName, viewport.width, viewport.height, {
+        beyondViewport: true,
+        clip: { x: 0, y: 0, width: viewport.width, height: pageHeight, scale: 1 },
+      }),
+      section: "Portal overview (from page top)",
+    });
 
     const healthSection = await scrollToExplanation(cdp, "health-history");
     await evaluate(cdp, "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
@@ -593,6 +610,9 @@ async function main() {
   let complete = false;
   try {
     for (const state of states) cases.push(await runCase(state, browserBinary, tempRoot));
+    const expectedScreenshotCount = states.length * Object.keys(viewports).length * 3;
+    const capturedScreenshotCount = cases.reduce((count, item) => count + item.screenshots.length, 0);
+    assert.equal(capturedScreenshotCount, expectedScreenshotCount, "expected one overview and two history captures per state/viewport");
     for (const item of cases) {
       for (const screenshot of item.screenshots) {
         writeFileSync(join(outputDir, screenshot.filename), screenshot.png, { flag: "wx", mode: 0o600 });
