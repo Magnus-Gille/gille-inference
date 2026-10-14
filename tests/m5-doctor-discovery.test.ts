@@ -457,6 +457,29 @@ describe("m5 doctor model-discovery diagnostics", () => {
     expectNoTaintedContent(result);
   });
 
+  it("retains historical observations while a code-loop transport outage stays degraded", async () => {
+    const result = await diagnose({
+      publicTransport: "unavailable", privateTransport: "unavailable",
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "observed",
+        lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+      },
+      privateObservation: {
+        source: "request_log", scope: "m5_global", status: "none", lastSuccessfulAt: null,
+      },
+    });
+    expect(result).toMatchObject({
+      status: "degraded",
+      code_loop_transport: { public: "unavailable", private: "unavailable" },
+      inference: { public: "not_checked", private: "not_checked" },
+      inference_observation: {
+        public: { status: "observed", last_successful_at: "2026-10-08T12:34:56.000Z" },
+        private: { status: "none", last_successful_at: null },
+      },
+    });
+    expectNoTaintedContent(result);
+  });
+
   it("reports a dead code-loop transport without claiming inference was checked", async () => {
     const result = await diagnose({ publicTransport: "unavailable", privateTransport: "unavailable" });
     expect(result).toMatchObject({
