@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import { AdmissionController } from "../../src/homeserver/admission.js";
 import { loadConfig, resetConfig } from "../../src/homeserver/config.js";
@@ -31,9 +32,11 @@ export interface DirectGatewayHarness {
   invoke(args: DirectGatewayInvokeArgs): Promise<DirectGatewayResult>;
 }
 
-class MockServerResponse {
+class MockServerResponse extends EventEmitter {
   public statusCode = 200;
   public headersSent = false;
+  public writableEnded = false;
+  public destroyed = false;
   private readonly headers = new Map<string, string>();
   private readonly chunks: Buffer[] = [];
 
@@ -63,6 +66,9 @@ class MockServerResponse {
   end(chunk?: string | Buffer): this {
     if (chunk !== undefined) this.write(chunk);
     this.headersSent = true;
+    this.writableEnded = true;
+    this.emit("finish");
+    this.emit("close");
     return this;
   }
 
