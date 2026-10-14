@@ -20,7 +20,7 @@ import { SYSTEMONE_MAX_BODY_BYTES } from "../src/homeserver/systemone-request.js
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
+let mockMode: "ok" | "stall" | "queued-disconnect" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let upstreamModelRequestCount = 0;
@@ -56,10 +56,10 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", async () => {
-      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone") || req.url?.endsWith("/embeddings")) upstreamInferenceRequestCount += 1;
+      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone") || req.url?.endsWith("/embeddings") || req.url?.endsWith("/api/chat")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
       if (req.url === "/v1/models") upstreamModelRequestCount += 1;
-      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
+      if ((mockMode === "validrunning" || mockMode === "queued-disconnect" || mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ running: mockMode === "systemone-list" || mockMode === "embedding-list" ? [] : [
           { model: mockMode === "clef-running" ? "clef-flash" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "m1",
@@ -121,10 +121,15 @@ function startUpstream(): Promise<void> {
         res.end();
         return;
       }
-      if (mockMode === "stall") {
+      if (mockMode === "stall" || (mockMode === "queued-disconnect" && upstreamInferenceRequestCount === 1)) {
         await new Promise<void>((resolve) => {
           releaseStall = resolve;
         });
+      }
+      if (req.url?.endsWith("/api/chat")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: { content: "synthetic" }, prompt_eval_count: 3, eval_count: 4 }));
+        return;
       }
       if (mockMode === "embedding-stall" && req.url?.endsWith("/embeddings")) {
         await new Promise<void>((resolve) => { releaseStall = resolve; });
@@ -175,13 +180,17 @@ function startUpstream(): Promise<void> {
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          id: "cmpl-1",
-          choices: [{ message: { role: "assistant", content: "ok" } }],
-          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
-        })
-      );
+      res.end(JSON.stringify(mockMode === "queued-disconnect"
+        ? {
+            id: "cmpl-disconnect",
+            choices: [{ message: { role: "assistant", content: "synthetic" } }],
+            usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+          }
+        : {
+            id: "cmpl-1",
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+            usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+          }));
     });
   });
   return new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => {
@@ -195,6 +204,7 @@ let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let lookupKey: typeof import("../src/homeserver/keystore.js").lookupKey;
 let recordCreditUsage: typeof import("../src/homeserver/keystore.js").recordUsage;
 let loadConfig: typeof import("../src/homeserver/config.js").loadConfig;
+let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 let resetQuotaWindows: typeof import("../src/homeserver/quota.js").resetQuotaWindows;
 let taskTextFingerprint: typeof import("../src/homeserver/task-exposure.js").taskTextFingerprint;
 let taskFingerprintVersion: typeof import("../src/homeserver/task-exposure.js").TASK_FINGERPRINT_VERSION;
@@ -233,6 +243,8 @@ beforeAll(async () => {
   process.env["HOMESERVER_BUSY_RETRY_AFTER_S"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
   process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
+  process.env["HOMESERVER_ORIN_URL"] = `http://127.0.0.1:${upstreamPort}`;
+  process.env["HOMESERVER_ORIN_MODEL"] = "qwen2.5-coder:3b";
   process.env["HOMESERVER_EMBEDDING_MODELS"] = "embeddinggemma-2";
   process.env["HOMESERVER_EMBEDDING_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
   process.env["HOMESERVER_EMBEDDING_MEDIA_ENABLED"] = "true";
@@ -261,6 +273,7 @@ beforeAll(async () => {
   recordCreditUsage = ks.recordUsage;
   loadConfig = cfgMod.loadConfig;
   resetQuotaWindows = q.resetQuotaWindows;
+  resetConfig = cfgMod.resetConfig;
   taskTextFingerprint = exposure.taskTextFingerprint;
   taskFingerprintVersion = exposure.TASK_FINGERPRINT_VERSION;
 
@@ -276,6 +289,8 @@ afterAll(async () => {
   delete process.env["HOMESERVER_HOST_MEMORY_ADMISSION"];
   delete process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
   delete process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"];
+  delete process.env["HOMESERVER_ORIN_URL"];
+  delete process.env["HOMESERVER_ORIN_MODEL"];
 });
 
 beforeEach(() => {
@@ -307,6 +322,41 @@ function tableCount(table: string): number {
 
 const ADMIN = "admin-static-key";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+
+async function restartGatewayWithHostMemory(mode: "off" | "enforce"): Promise<void> {
+  if (stopGateway !== null) {
+    const stop = stopGateway;
+    stopGateway = null;
+    await stop();
+  }
+  process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = mode;
+  resetConfig();
+  const handle = await startGateway(memoryComposition());
+  gatewayPort = handle.port;
+  stopGateway = handle.stop;
+}
+
+async function gatewayAdmissionSnapshot(): Promise<{ inflight: number; ownerQueued: number }> {
+  const response = await fetch(url("/admin/maintenance"), {
+    headers: { authorization: `Bearer ${ADMIN}` },
+  });
+  expect(response.status).toBe(200);
+  return await response.json() as { inflight: number; ownerQueued: number };
+}
+
+async function waitForGatewayAdmission(
+  predicate: (snapshot: { inflight: number; ownerQueued: number }) => boolean,
+  timeoutMs = 1_500,
+): Promise<{ inflight: number; ownerQueued: number }> {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = await gatewayAdmissionSnapshot();
+  while (!predicate(snapshot) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    snapshot = await gatewayAdmissionSnapshot();
+  }
+  expect(predicate(snapshot), `admission snapshot did not reach the expected state: ${JSON.stringify(snapshot)}`).toBe(true);
+  return snapshot;
+}
 
 function systemOneBodyAtBytes(targetBytes: number): { value: Record<string, unknown>; raw: string } {
   const value: Record<string, unknown> = {
@@ -1309,6 +1359,85 @@ describe("gateway spine — HTTP integration", () => {
     if (releaseStall) releaseStall();
     const queued = await queuedP;
     expect(queued.status).toBe(200);
+  });
+
+  it.each(["m5", "orin"] as const)("cancels a disconnected queued owner before %s reaches upstream", async (node) => {
+    await restartGatewayWithHostMemory("off");
+    let heldP: Promise<Response> | null = null;
+    let queuedReq: ReturnType<typeof httpRequest> | null = null;
+    try {
+      mockMode = "queued-disconnect";
+      upstreamInferenceRequestCount = 0;
+      lastUpstreamBody = "";
+      const model = node === "orin" ? "qwen2.5-coder:3b" : "m1";
+      const owner = mintKey({
+        alias: `queued-disconnect-${node}-${randomUUID()}`,
+        tier: "owner",
+        scope: "admin",
+        modelAllowList: [model],
+        maxParallel: 2,
+        dailyTokenBudget: 100_000,
+        creditLimit: 100_000,
+      }, DEFAULTS);
+      const requestBody = JSON.stringify({
+        model,
+        node,
+        messages: [{ role: "user", content: `synthetic ${node} request` }],
+        max_tokens: 8,
+      });
+
+      heldP = chat(owner.plaintextKey, { model, node, messages: [{ role: "user", content: `synthetic ${node} request` }], max_tokens: 8 });
+      await waitForGatewayAdmission((snapshot) => snapshot.inflight === 1 && snapshot.ownerQueued === 0);
+      const firstCallDeadline = Date.now() + 1_500;
+      while (upstreamInferenceRequestCount !== 1 && Date.now() < firstCallDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(upstreamInferenceRequestCount).toBe(1);
+
+      const target = new URL(url("/v1/chat/completions"));
+      queuedReq = httpRequest(target, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${owner.plaintextKey}`,
+        },
+      });
+      queuedReq.on("error", () => {}); // The test intentionally destroys this waiting client.
+      const queuedClosed = new Promise<void>((resolve) => queuedReq!.once("close", resolve));
+      queuedReq.end(requestBody);
+      await waitForGatewayAdmission((snapshot) => snapshot.ownerQueued === 1);
+
+      queuedReq.destroy();
+      expect(await settlesWithin(queuedClosed, 1_000)).toBe(true);
+      const disconnected = await waitForGatewayAdmission((snapshot) => snapshot.inflight === 1 && snapshot.ownerQueued === 0);
+      expect(disconnected).toMatchObject({ inflight: 1, ownerQueued: 0 });
+      expect(upstreamInferenceRequestCount).toBe(1);
+
+      const releaseFirst = releaseStall;
+      releaseStall = null;
+      releaseFirst?.();
+      expect((await heldP).status).toBe(200);
+      heldP = null;
+      const idle = await waitForGatewayAdmission((snapshot) => snapshot.inflight === 0 && snapshot.ownerQueued === 0);
+      expect(idle).toMatchObject({ inflight: 0, ownerQueued: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(upstreamInferenceRequestCount).toBe(1);
+      expect(lookupKey(owner.plaintextKey)!.creditsUsed).toBe(7);
+      const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ?")
+        .get(owner.record.alias) as { tokens: number } | undefined;
+      expect(daily?.tokens ?? 0).toBe(7);
+      queuedReq = null;
+    } finally {
+      queuedReq?.destroy();
+      for (let i = 0; i < 4; i++) {
+        const release = releaseStall;
+        releaseStall = null;
+        release?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await heldP?.catch(() => undefined);
+      await restartGatewayWithHostMemory("enforce");
+    }
   });
 
   it("max_tokens cap: a request above the per-request cap is clamped before proxying", async () => {
