@@ -11,6 +11,38 @@ function workflowFixtureRoot(root = fs.mkdtempSync(path.join(os.tmpdir(), 'verif
   return root;
 }
 
+const PUBLISHED_CLIENT_WORKFLOW = `name: Client compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    name: Client Node \${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 22]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: \${{ matrix.node }}
+      - name: Verify packed client package
+        run: node scripts/verify-client-package.mjs
+      - name: Run dependency-free runtime fixtures
+        run: node --test client/tests/runtime-compatibility.mjs
+`;
+
 describe('local verification manifest', () => {
   it('keeps a spaced job display name as one raw check name', () => {
     const jobs = parseWorkflowJobs(`name: Example Workflow\non:\n  pull_request:\njobs:\n  example:\n    name: Check with several words\n    runs-on: ubuntu-latest\n`);
@@ -62,11 +94,60 @@ describe('local verification manifest', () => {
       workflowFixtureRoot(root);
       fs.writeFileSync(path.join(root, '.github/workflows/client-compatibility.yml'), `name: Client compatibility\non:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  client:\n    name: Client Node \${{ matrix.node }}\n    strategy:\n      matrix:\n        node: [18, 22]\n`);
       const manifest = buildManifest({ root, event: 'pull_request' });
-      expect(manifest.checks.map((check: any) => check.rawName)).toContain('Client Node 18');
-      expect(manifest.checks.map((check: any) => check.rawName)).toContain('Client Node 22');
+      expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
+        .toEqual(['Client Node 18', 'Client Node 22']);
       expect(manifest.checks).toHaveLength(13);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
+
+  it('accepts the published client compatibility workflow shape', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-client-published-'));
+    try {
+      workflowFixtureRoot(root);
+      fs.writeFileSync(path.join(root, '.github/workflows/client-compatibility.yml'), PUBLISHED_CLIENT_WORKFLOW);
+      const manifest = buildManifest({ root, event: 'pull_request' });
+      expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
+        .toEqual(['Client Node 18', 'Client Node 22']);
+      expect(manifest.checks).toHaveLength(13);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('rejects client strategy flags outside the mapped fail-fast setting', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-client-strategy-'));
+    try {
+      workflowFixtureRoot(root);
+      fs.writeFileSync(
+        path.join(root, '.github/workflows/client-compatibility.yml'),
+        PUBLISHED_CLIENT_WORKFLOW.replace('fail-fast: false', 'fail-fast: true'),
+      );
+      expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(/matrix changed/i);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['include case', 'node: [18, 22]\n        include:\n          - node: 20'],
+    ['exclude rule', 'node: [18, 22]\n        exclude:\n          - node: 22'],
+    ['additional dimension', 'node: [18, 22]\n        os: [ubuntu-latest]'],
+    ['unsupported node', 'node: [18, 20, 22]'],
+  ])('fails closed when the client matrix adds an unmapped %s', (_caseName, matrix) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-client-include-'));
+    try {
+      workflowFixtureRoot(root);
+      fs.writeFileSync(path.join(root, '.github/workflows/client-compatibility.yml'), `name: Client compatibility\non:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  client:\n    name: Client Node \${{ matrix.node }}\n    strategy:\n      matrix:\n        ${matrix}\n`);
+      expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(/matrix changed/i);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['Client Node', 'Client Node ${{ matrix.runtime }}', 'Client Node ${{ matrix.node }} (compatibility)'])(
+    'rejects unmapped client check display name %s', display => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-client-name-'));
+      try {
+        workflowFixtureRoot(root);
+        fs.writeFileSync(path.join(root, '.github/workflows/client-compatibility.yml'), `name: Client compatibility\non:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  client:\n    name: ${display}\n    strategy:\n      matrix:\n        node: [18, 22]\n`);
+        expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(/display name changed/i);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+  );
 
   it('requires successful completed receipts from the matching workflow and supplied head', () => {
     const manifest = { checks: [{ workflowName: 'CI', rawName: 'test', status: 'required' }] };
