@@ -148,7 +148,7 @@ KillMode=control-group
 ReadWritePaths=$ROOT/home
 BindReadOnlyPaths=/run/user/$TEST_UID
 PrivateDevices=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 EOF
 ( source "$ROOT/source/scripts/service-isolation.sh"; render_common ) >> /etc/systemd/system/"$GATEWAY"
 cat > /etc/systemd/system/"$CANARY" <<EOF

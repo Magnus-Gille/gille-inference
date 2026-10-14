@@ -26,6 +26,11 @@ const pidIdentity = (pid) => {
 };
 const gatewayIdentity = pidIdentity(Number(prop("gi-recovery-gateway.service", "MainPID")));
 assert.equal(gatewayIdentity.pid, client.pid);
+assert.deepEqual(prop("gi-recovery-gateway.service", "RestrictAddressFamilies").split(/\s+/).sort(),
+  ["AF_UNIX", "AF_INET", "AF_INET6"].sort(), "gateway address-family boundary differs from production");
+assert.equal(prop("gi-recovery-gateway.service", "NoNewPrivileges"), "yes");
+assert.equal(prop("gi-recovery-gateway.service", "PrivateDevices"), "yes");
+assert.equal(prop("gi-recovery-gateway.service", "CapabilityBoundingSet"), "");
 const canaryIdentity = pidIdentity(Number(prop("gi-recovery-canary.service", "MainPID")));
 const dirIdentity = statSync("/run/user/" + uid).ino;
 const initialManager = Number(prop(unit, "MainPID"));
