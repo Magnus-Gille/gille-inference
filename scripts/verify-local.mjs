@@ -79,6 +79,7 @@ function workflowInfo(root, definition) {
   const declaredName = source.match(/^name:\s*(.*?)\s*$/m)?.[1];
   if (declaredName !== expectedName) throw new Error(`${file} workflow name changed: expected ${expectedName}, got ${declaredName ?? 'missing'}`);
   const jobs = parseWorkflowJobs(source);
+  if (file === CLIENT_WORKFLOW[0]) validateClientCompatibilityMatrix(source, jobs);
   const expectedTriggers = file === 'code-health.yml' ? ['pull_request', 'schedule', 'workflow_dispatch'] : ['push', 'pull_request'];
   for (const trigger of expectedTriggers) {
     if (!new RegExp(`^  ${trigger}:\\s*$`, 'm').test(source)) throw new Error(`${file} is missing expected ${trigger} trigger`);
@@ -95,6 +96,47 @@ function workflowInfo(root, definition) {
     throw new Error(`${file} job coverage changed: expected ${expectedJobs.join(', ')}, found ${ids.join(', ')}`);
   }
   return { file, name: expectedName, jobs, source };
+}
+
+function validateClientCompatibilityMatrix(source, jobs) {
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
+  const start = lines.findIndex(line => /^  client:\s*$/.test(line));
+  if (start < 0) throw new Error('client-compatibility.yml has no client job');
+  let end = start + 1;
+  while (end < lines.length && !/^  [A-Za-z0-9_-]+:\s*$/.test(lines[end])) {
+    if (/^\S/.test(lines[end]) && lines[end].trim() !== '') break;
+    end++;
+  }
+  const block = lines.slice(start + 1, end);
+  const display = block.find(line => /^    name:\s*/.test(line))?.match(/^    name:\s*(.*?)\s*$/)?.[1];
+  if (display !== 'Client Node ${{ matrix.node }}') {
+    throw new Error('client-compatibility.yml display name changed: expected Client Node ${{ matrix.node }}');
+  }
+
+  const strategyIndexes = block.flatMap((line, index) => /^    strategy:\s*$/.test(line) ? [index] : []);
+  if (strategyIndexes.length !== 1) throw new Error('client compatibility matrix changed: expected exactly one strategy');
+  const strategyStart = strategyIndexes[0] + 1;
+  let strategyEnd = strategyStart;
+  while (strategyEnd < block.length && !/^    [A-Za-z0-9_-]+:\s*$/.test(block[strategyEnd])) strategyEnd++;
+  const strategy = block.slice(strategyStart, strategyEnd)
+    .map(line => line.trim())
+    .filter(line => line !== '' && !line.startsWith('#'));
+  const failFast = strategy.filter(line => line.startsWith('fail-fast:'));
+  const matrix = strategy.filter(line => line !== 'fail-fast: false');
+  if (
+    failFast.length > 1 ||
+    failFast.some(line => line !== 'fail-fast: false') ||
+    matrix.length !== 2 ||
+    matrix[0] !== 'matrix:' ||
+    !/^node:\s*\[\s*18\s*,\s*22\s*\]$/.test(matrix[1])
+  ) {
+    throw new Error('client compatibility matrix changed: expected optional fail-fast: false and only node: [18, 22]');
+  }
+
+  const actualNames = jobs.filter(job => job.id === 'client').map(job => job.name);
+  if (actualNames.length !== 2 || actualNames[0] !== 'Client Node 18' || actualNames[1] !== 'Client Node 22') {
+    throw new Error(`client compatibility expanded names changed: ${actualNames.join(', ') || 'none'}`);
+  }
 }
 
 function conditionsFor(workflow, job) {
