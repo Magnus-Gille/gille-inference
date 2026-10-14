@@ -1,0 +1,71 @@
+name: Native code-loop recovery
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-loop-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  code-loop-recovery:
+    name: Real manager and cage recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+      - name: Declared native cage prerequisites
+        run: |
+          sudo -n apt-get update -qq
+          sudo -n apt-get install --no-install-recommends -y passt bubblewrap dbus-user-session
+          systemd --version | head -1
+          pasta --version
+          bwrap --version
+      - name: Locked dependencies without lifecycle scripts
+        run: |
+          mkdir -p "$RUNNER_TEMP/recovery-deps-home"
+          TASK_PATH="$(dirname "$(command -v node)"):/usr/sbin:/usr/bin:/sbin:/bin"
+          env -i PATH="$TASK_PATH" HOME="$RUNNER_TEMP/recovery-deps-home" \
+            npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          # Inspect the one explicit native build before running the declared SQLite compiler.
+          node -e 'const p=require("./node_modules/better-sqlite3/package.json");if(p.scripts.install!=="prebuild-install || node-gyp rebuild --release")throw Error("SQLite build contract changed");'
+          NPM_ROOT="$(npm root -g)"
+          NODE_ROOT="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$NODE_ROOT/include/node/node.h"
+          env -i PATH="$TASK_PATH" HOME="$RUNNER_TEMP/recovery-deps-home" \
+            node "$NPM_ROOT/npm/node_modules/node-gyp/bin/node-gyp.js" \
+            rebuild --release --directory=node_modules/better-sqlite3 --nodedir="$NODE_ROOT"
+      - name: Exact candidate and fixture launch
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/recovery-source-sha.txt"
+          sha256sum native/tests/run-code-loop-recovery.sh tests/fixtures/code-loop-recovery-*.mjs tests/fixtures/code-loop-recovery-*.ts > "$RUNNER_TEMP/recovery-launcher-digests.txt"
+          TASK_PATH="$(dirname "$(command -v node)"):/usr/sbin:/usr/bin:/sbin:/bin"
+          sudo -n env -i PATH="$TASK_PATH" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_TEMP="$RUNNER_TEMP" \
+            timeout --signal=TERM --kill-after=15s 300 \
+            bash native/tests/run-code-loop-recovery.sh "$RUNNER_TEMP/code-loop-recovery-evidence"
+      - name: Verify completed cleanup and bind evidence
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/code-loop-recovery-evidence/cleanup.json"
+          node -e 'const fs=require("fs");const p=process.env.RUNNER_TEMP+"/code-loop-recovery-evidence/cleanup.json";if(JSON.parse(fs.readFileSync(p)).cleanup_complete!==true)throw Error("fixture cleanup incomplete");'
+          test ! -e /run/gi-code-loop-recovery-fixture
+          ! getent passwd gi-code-loop-ci
+          cp "$RUNNER_TEMP/recovery-source-sha.txt" "$RUNNER_TEMP/recovery-launcher-digests.txt" "$RUNNER_TEMP/code-loop-recovery-evidence/"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: native-code-loop-recovery
+          path: ${{ runner.temp }}/code-loop-recovery-evidence/
+          retention-days: 14
