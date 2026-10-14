@@ -74,6 +74,7 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import {
+  ensureRequestLogSchema,
   recordRequestLog,
   cachedRequestLogTotals,
   getLatestSuccessfulModelUse,
@@ -5478,6 +5479,9 @@ export async function handleRequest(
           inferenceObservation = { ...base, status: "disabled", lastSuccessfulAt: null };
         } else {
           try {
+            // The enabled collector initializes/migrates lazily; establish its schema before
+            // the first history read. The timestamp query itself remains read-only.
+            ensureRequestLogSchema();
             const lastSuccessfulAt = queryLatestSuccessfulM5InferenceAt(getDb());
             inferenceObservation = {
               ...base,
