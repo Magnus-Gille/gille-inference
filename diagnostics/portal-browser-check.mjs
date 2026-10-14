@@ -358,7 +358,7 @@ async function assertRenderedState(cdp, state, apiStatuses) {
       tokens: text(document.querySelector("#stat-tokens")),
       requests: text(document.querySelector("#stat-requests")),
       evaluationText: text(document.querySelector("#evals-rows")),
-      healthHistoryPresent: [...document.querySelectorAll("p")].some((p) => p.textContent.includes("historical evidence, it is not live readiness")),
+      healthHistoryPresent: [...document.querySelectorAll("p")].some((p) => p.textContent.includes("historical evidence, not live readiness")),
       doctorHistoryPresent: [...document.querySelectorAll("p")].some((p) => p.textContent.includes("a past success does not verify this route now")),
     };
   })()`);
@@ -389,7 +389,7 @@ async function assertRenderedState(cdp, state, apiStatuses) {
 async function scrollToExplanation(cdp, type) {
   const expression = type === "health-history"
     ? `(() => {
-        const target = [...document.querySelectorAll("p")].find((p) => p.textContent.includes("historical evidence, it is not live readiness"));
+        const target = [...document.querySelectorAll("p")].find((p) => p.textContent.includes("historical evidence, not live readiness"));
         if (!target) throw new Error("historical health explanation not found");
         target.scrollIntoView({ block: "center", behavior: "instant" });
         return { section: "What's running", text: target.textContent.trim() };
