@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
   realpathSync, rmSync, writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -579,7 +579,15 @@ async function main() {
     runnerScriptSha256: sha256(readFileSync(scriptPath)),
     browserBinary,
   };
-  const tempRoot = mkdtempSync(join(outputDir, ".portal-browser-check-"));
+  // Chrome's POSIX singleton socket has a short path limit. Keep private runtime state under
+  // the short system temp root, independent of a long artifact directory or inherited TMPDIR.
+  const tempRoot = mkdtempSync(join("/tmp", "pbc-"));
+  try {
+    chmodSync(tempRoot, 0o700);
+  } catch (error) {
+    rmSync(tempRoot, { recursive: true, force: true });
+    throw error;
+  }
   const screenshots = [];
   const cases = [];
   let complete = false;
