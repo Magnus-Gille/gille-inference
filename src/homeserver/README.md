@@ -647,7 +647,16 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
 2. **`max_tokens` cap** — every request's `max_tokens` is clamped to
    `min(request, HOMESERVER_PER_REQUEST_MAX_TOKENS)` before proxying.
 3. **Quota** — per-key sliding-window RPM/TPM (60s) + a persisted daily token budget.
-   Over-budget → `429 rate_limit_exceeded` with `Retry-After` + `X-RateLimit-*`.
+   Over-budget → `429 rate_limit_exceeded` with a plain-language reason (requests per minute,
+   tokens per minute, or tokens per UTC day), caller-key/shared-static scope, and retry or
+   UTC-day reset guidance; token requests are estimated separately. Zero RPM requires the
+   gateway operator to restore capacity. The body includes `error.quota` with the reason, scope, window,
+   applicable limit, requested amount, `counted:false`, and relative `retry_after_seconds`;
+   isolated keys also receive `used_before`, while shared static-tier buckets omit it. Headers
+   use the rejected dimension's limit; `Retry-After` and `X-RateLimit-Reset` are relative seconds
+   to the next rolling-window event expiry or daily reset, retaining the existing one-second
+   retry delay for an empty zero-RPM bucket. `X-RateLimit-Remaining` is omitted for shared buckets to avoid
+   disclosing other consumers' usage.
 4. **Admission (two lanes)** — a single GPU-slot budget (`HOMESERVER_MAX_INFLIGHT`) is
    shared. When the box is at capacity: **guest** requests get an immediate, honest
    `503 server_busy`; **owner** requests *queue* up to `HOMESERVER_OWNER_QUEUE_MAX_MS`

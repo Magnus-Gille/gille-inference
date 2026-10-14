@@ -44,6 +44,7 @@ import {
   type Tier,
 } from "./keystore.js";
 import { checkQuota, recordUsage, checkRateWindow, type QuotaLimits, type QuotaReservation } from "./quota.js";
+import { describeQuotaFailure } from "./quota-error.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -1095,7 +1096,7 @@ async function admitAndMeterLogged(
       const q = checkQuota(principal.alias, principal.limits, estTokens);
       if (!q.ok) {
         releaseReserve();
-        const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+        const failure = describeQuotaFailure(q, estTokens, principal);
         lctx.status = 429;
         lctx.outcome = "rate_limited";
         lctx.errorClass = "rate_limit_exceeded";
@@ -1106,12 +1107,9 @@ async function admitAndMeterLogged(
           res,
           makeError("rate_limit_exceeded", {
             retryAfterSeconds: q.retryAfterSeconds,
-            message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-            rateLimit: {
-              limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-              remaining: 0,
-              resetSeconds: q.snapshot.resetSeconds,
-            },
+            message: failure.message,
+            quota: failure.quota,
+            rateLimit: failure.rateLimit,
           }),
         );
         finishAdmissionTrace(lctx.outcome);
@@ -3096,7 +3094,7 @@ async function handleAudioTranscription(
   const q = checkQuota(principal.alias, principal.limits, quotaEst);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, quotaEst, principal);
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3107,12 +3105,9 @@ async function handleAudioTranscription(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;
@@ -3440,7 +3435,7 @@ async function handleImageGeneration(
   const q = checkQuota(principal.alias, principal.limits, parsed.n);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, parsed.n, principal);
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3451,12 +3446,9 @@ async function handleImageGeneration(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;

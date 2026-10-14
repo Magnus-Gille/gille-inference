@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import { createServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1277,6 +1277,90 @@ describe("gateway spine — HTTP integration", () => {
     expect(second.headers.get("x-ratelimit-limit")).toBeTruthy();
     const j = (await second.json()) as { error: { code: string } };
     expect(j.error.code).toBe("rate_limit_exceeded");
+  });
+
+  it.each([
+    { reason: "rpm", limits: { rpm: 0, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 1 }, limit: 0, phrase: "requests per minute" },
+    { reason: "tpm", limits: { rpm: 100, tpm: 2, dailyTokenBudget: 0, maxParallel: 1 }, limit: 2, phrase: "tokens per minute" },
+    { reason: "daily", limits: { rpm: 100, tpm: 1_000, dailyTokenBudget: 1, maxParallel: 1 }, limit: 1, phrase: "per UTC day" },
+  ])("quota 429 explains the caller's $reason limit and returns matching metadata", async ({ reason, limits, limit, phrase }) => {
+    const minted = mintKey({ alias: `quota-${reason}-${randomUUID()}`, tier: "guest" }, limits);
+    if (reason === "daily") {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-14T12:00:00.000Z"));
+    }
+    try {
+      const response = await chat(minted.plaintextKey, { max_tokens: 10 });
+      expect(response.status).toBe(429);
+      const retryAfter = Number(response.headers.get("retry-after"));
+      expect(retryAfter).toBeGreaterThan(0);
+      const body = await response.json() as { error: { code: string; message: string; quota?: Record<string, unknown> } };
+      expect(body.error.code).toBe("rate_limit_exceeded");
+      expect(body.error.message).toContain(`Per-key ${reason} limit reached`);
+      expect(body.error.message).toContain("your own API key");
+      expect(body.error.message).toContain(phrase);
+      if (reason === "rpm" && limit === 0) {
+        expect(body.error.message).toContain("contact the gateway operator");
+        expect(body.error.message).toContain("will not restore request capacity");
+        expect(body.error.message).not.toMatch(/expiry|reset/i);
+        expect(body.error.message).not.toContain("retry after");
+      } else if (reason === "daily") {
+        expect(body.error.message).toContain(`The UTC-day budget resets in ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).toContain(`retry after ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+      } else {
+        expect(body.error.message).toContain(`The next quota-window expiry is in ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).toContain(`retry after ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).not.toContain("The quota window resets");
+      }
+      if (reason === "daily") expect(body.error.message).toContain("1 token per UTC day");
+      expect(body.error.quota).toMatchObject({
+        reason,
+        scope: "key",
+        window: reason === "daily" ? "utc_day" : "60s",
+        limit,
+        requested: reason === "rpm" ? 1 : expect.any(Number),
+        counted: false,
+        retry_after_seconds: retryAfter,
+      });
+      expect(Object.keys(body.error.quota ?? {}).sort()).toEqual([
+        "counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "used_before", "window",
+      ]);
+      expect(body.error.message).not.toContain(minted.record.alias);
+      expect(body.error.message).not.toContain(minted.record.keyHash);
+      expect(body.error.message).not.toContain("model");
+      expect(body.error.message).not.toContain("ip");
+      expect(response.headers.get("x-ratelimit-limit")).toBe(String(limit));
+      expect(response.headers.get("x-ratelimit-remaining")).toBe(
+        String(Math.max(0, limit - Number(body.error.quota?.used_before))),
+      );
+      expect(response.headers.get("x-ratelimit-reset")).toBe(String(retryAfter));
+      expect(upstreamInferenceRequestCount).toBe(0);
+      if (reason === "daily") {
+        expect(retryAfter).toBe(43_200);
+        expect(body.error.quota?.window).toBe("utc_day");
+        const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?").get(minted.record.alias, "2026-10-14") as { tokens: number } | undefined;
+        expect(daily?.tokens ?? 0).toBe(0);
+      }
+    } finally {
+      if (reason === "daily") vi.useRealTimers();
+    }
+  });
+
+  it("quota 429 for a minted static-alias collision hides shared usage", async () => {
+    const minted = mintKey({ alias: "static:user", tier: "guest", rpm: 1 }, DEFAULTS);
+    expect((await chat(minted.plaintextKey, {})).status).toBe(200);
+    const response = await chat(minted.plaintextKey, {});
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(response.headers.get("x-ratelimit-remaining")).toBeNull();
+    const body = await response.json() as { error: { message: string; quota?: Record<string, unknown> } };
+    expect(body.error.message).toContain("Shared static-tier rpm limit reached");
+    expect(body.error.message).toContain("shared static-tier bucket");
+    expect(JSON.stringify(body.error)).not.toContain("static:user");
+    expect(Object.keys(body.error.quota ?? {}).sort()).toEqual([
+      "counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "window",
+    ]);
+    expect(body.error.quota).toMatchObject({ scope: "shared_static_tier", counted: false });
   });
 
   it("admission 503: guest is rejected while a slot is held; a queued owner succeeds on release", async () => {

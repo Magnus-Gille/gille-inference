@@ -1,4 +1,5 @@
 import type { ServerResponse } from "node:http";
+import type { QuotaFailureDetail } from "./quota-error.js";
 
 /**
  * Uniform OpenAI-shaped error envelope for the gateway.
@@ -31,7 +32,7 @@ export type ErrorCode =
   | "internal_error"; // 500 (generic, detail logged server-side only)
 
 export interface OpenAIError {
-  error: { message: string; type: string; code: ErrorCode; param: string | null };
+  error: { message: string; type: string; code: ErrorCode; param: string | null; quota?: QuotaFailureDetail };
 }
 
 export interface ErrorEnvelope {
@@ -182,7 +183,8 @@ export interface MakeErrorOptions {
   message?: string;
   param?: string | null;
   retryAfterSeconds?: number;
-  rateLimit?: { limit: number; remaining: number; resetSeconds: number };
+  rateLimit?: { limit: number; remaining?: number; resetSeconds: number };
+  quota?: QuotaFailureDetail;
 }
 
 /**
@@ -198,7 +200,9 @@ export function makeError(code: ErrorCode, opts: MakeErrorOptions = {}): ErrorEn
   }
   if (opts.rateLimit) {
     headers["X-RateLimit-Limit"] = String(opts.rateLimit.limit);
-    headers["X-RateLimit-Remaining"] = String(opts.rateLimit.remaining);
+    if (opts.rateLimit.remaining !== undefined) {
+      headers["X-RateLimit-Remaining"] = String(opts.rateLimit.remaining);
+    }
     headers["X-RateLimit-Reset"] = String(opts.rateLimit.resetSeconds);
   }
 
@@ -211,6 +215,7 @@ export function makeError(code: ErrorCode, opts: MakeErrorOptions = {}): ErrorEn
         type: spec.type,
         code,
         param: opts.param !== undefined ? opts.param : spec.param,
+        ...(opts.quota === undefined ? {} : { quota: opts.quota }),
       },
     },
   };
