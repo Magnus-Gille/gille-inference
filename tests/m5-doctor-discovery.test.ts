@@ -68,6 +68,8 @@ type DiagnoseOptions = {
   publicTools?: string[];
   privateTools?: string[];
   rejectPublic?: number;
+  publicObservation?: unknown;
+  privateObservation?: unknown;
 };
 
 function discoveryFailureForEndpoint(
@@ -85,6 +87,8 @@ async function diagnose({
   publicTools = REQUIRED_TOOLS,
   privateTools = publicTools,
   rejectPublic,
+  publicObservation,
+  privateObservation,
 }: DiagnoseOptions = {}) {
   let askCalls = 0;
   const result = await diagnoseProfile({
@@ -111,7 +115,12 @@ async function diagnose({
               })
             : new Response("", { status: rejectPublic });
         }
-        return jsonResponse({ alias: "doctor-agent", tier: "owner", scope: "agent" });
+        return jsonResponse({
+          alias: "doctor-agent", tier: "owner", scope: "agent",
+          ...((isPrivate ? privateObservation : publicObservation) === undefined ? {} : {
+            inferenceObservation: isPrivate ? privateObservation : publicObservation,
+          }),
+        });
       }
 
       const request = JSON.parse(String(init?.body)) as {
@@ -247,6 +256,61 @@ function expectSafeDiscoveryFailure(
 }
 
 describe("m5 doctor model-discovery diagnostics", () => {
+  it("labels historical successful inference without claiming current readiness", async () => {
+    const observation = {
+      source: "request_log", scope: "m5_global", status: "observed",
+      lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+    };
+    const result = await diagnose({ publicObservation: observation, privateObservation: observation });
+    expect(result).toMatchObject({
+      inference: { public: "not_checked", private: "not_checked" },
+      inference_observation: {
+        source: "request_log", scope: "m5_global",
+        public: { status: "observed", last_successful_at: observation.lastSuccessfulAt },
+        private: { status: "observed", last_successful_at: observation.lastSuccessfulAt },
+      },
+    });
+  });
+
+  it("does not echo malformed or absent inference observation metadata", async () => {
+    const result = await diagnose({
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "observed",
+        lastSuccessfulAt: `${LOCATOR}/${SECRET}`,
+      },
+    });
+    expect(result).toMatchObject({
+      inference_observation: {
+        public: { status: "invalid", last_successful_at: null },
+        private: { status: "not_supported", last_successful_at: null },
+      },
+    });
+    expectNoTaintedContent(result);
+
+    const inconsistent = await diagnose({
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "none",
+        lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+      },
+    });
+    expect(inconsistent.inference_observation.public).toEqual({ status: "invalid", last_successful_at: null });
+  });
+
+  it.each(["none", "disabled", "unavailable"] as const)(
+    "preserves a safe %s historical observation without inventing a timestamp",
+    async (status) => {
+      const observation = {
+        source: "request_log", scope: "m5_global", status, lastSuccessfulAt: null,
+      };
+      const result = await diagnose({ publicObservation: observation, privateObservation: observation });
+      expect(result.inference).toEqual({ public: "not_checked", private: "not_checked" });
+      expect(result.inference_observation).toMatchObject({
+        public: { status, last_successful_at: null },
+        private: { status, last_successful_at: null },
+      });
+    }
+  );
+
   it("retains the existing public top-level diagnosis and adds a safe refusal detail", async () => {
     const result = await diagnose({ failure: "public_refused" });
 
