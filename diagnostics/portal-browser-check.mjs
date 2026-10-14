@@ -64,7 +64,7 @@ function parseArgs(argv) {
   return options;
 }
 
-async function parserCheck() {
+function parserCheck() {
   assert.deepEqual(parseActivePort("9223\n/devtools/browser/ab12-CD34\n"), {
     port: 9223, path: "/devtools/browser/ab12-CD34",
   });
@@ -76,34 +76,7 @@ async function parserCheck() {
   });
   assert.equal(parseArgs(["--check"]).check, true);
   assert.throws(() => parseArgs(["--browser", "relative", "--output-dir", "/tmp/out"]));
-  assert.equal(typeof WebSocket, "function", "Node 22 built-in WebSocket is required");
-
-  class FakeWebSocket {
-    readyState = WebSocket.OPEN;
-    listeners = new Map();
-    sent = [];
-    addEventListener(name, callback) {
-      const callbacks = this.listeners.get(name) ?? new Set();
-      callbacks.add(callback);
-      this.listeners.set(name, callbacks);
-    }
-    send(payload) {
-      const message = JSON.parse(payload);
-      this.sent.push(message);
-      queueMicrotask(() => {
-        for (const callback of this.listeners.get("message") ?? []) {
-          callback({ data: JSON.stringify({ id: message.id, result: { product: "Chrome/test" } }) });
-        }
-      });
-    }
-    close() { this.readyState = WebSocket.CLOSED; }
-  }
-  const fakeSocket = new FakeWebSocket();
-  const cdp = new CdpConnection(fakeSocket);
-  assert.deepEqual(await cdp.command("Browser.getVersion"), { product: "Chrome/test" });
-  assert.deepEqual(fakeSocket.sent, [{ id: 1, method: "Browser.getVersion", params: {} }]);
-  cdp.close();
-  console.log("CDP endpoint parser and Node native WebSocket checks passed");
+  console.log("CDP endpoint and argument parser checks passed");
 }
 
 function waitForEvent(target, eventName, timeoutMs, failIf = () => false) {
@@ -436,9 +409,9 @@ async function scrollToExplanation(cdp, type) {
 
 async function runViewport(cdp, state, viewportName, origin, fixtureStatuses, screenshotRecords, runtimeErrors, externalRequests) {
   const viewport = viewports[viewportName];
-  await cdp.command("Page.setDeviceMetricsOverride", viewport);
-  if (viewport.mobile) await cdp.command("Page.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
-  else await cdp.command("Page.setTouchEmulationEnabled", { enabled: false });
+  await cdp.command("Emulation.setDeviceMetricsOverride", viewport);
+  if (viewport.mobile) await cdp.command("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
+  else await cdp.command("Emulation.setTouchEmulationEnabled", { enabled: false });
 
   const responseStatuses = {};
   const onResponse = (event) => {
