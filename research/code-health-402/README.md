@@ -24,7 +24,11 @@ later retry is green. An inaccessible attempt remains visible with unknown job o
 slot instead of a truncated measurement. Workflow-version checks resolve every distinct run SHA
 against its local Git tree in one batch, then hash each unique workflow blob; missing objects use
 the existing local resolver and fail closed if still unavailable. This reduces repeated Git
-process launches without changing run selection, workflow digest checks, or attempt evidence.
+process launches without changing run selection or workflow digest checks. After cohort selection,
+first-attempt and job retrieval use a fixed four-run pool. Per-run API calls remain sequential and
+retain the existing retry, page, timeout, and shared deadline limits; results and errors are written
+in enumeration order. Runs that cannot start before the deadline remain represented with unknown
+attempt evidence. The collector does not overlap these requests with static analysis or coverage.
 
 Scheduled collection is skipped unless the repository Actions variable
 `CODE_HEALTH_COLLECTION_ENABLED` is the exact string `true`. Pull requests still run only synthetic

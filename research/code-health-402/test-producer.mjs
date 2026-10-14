@@ -667,6 +667,223 @@ test('CI collector preserves every run version and first-attempt failure with th
   }
 });
 
+test('CI attempt pool is bounded, preserves enumeration order, and keeps failures and exclusions', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-ci-attempt-pool-'));
+  const expectedDigest = createHash('sha256')
+    .update(await readFile(path.join(ROOT, '.github/workflows/ci.yml')))
+    .digest('hex');
+  const runs = [
+    makeRun(81, { head_sha: 'a'.repeat(40), created_at: '2026-09-20T10:00:00Z' }),
+    makeRun(82, { head_sha: 'b'.repeat(40), created_at: '2026-09-21T10:00:00Z' }),
+    makeRun(83, { head_sha: 'c'.repeat(40), created_at: '2026-09-22T10:00:00Z', run_attempt: 2, conclusion: 'success' }),
+    makeRun(84, { head_sha: 'd'.repeat(40), created_at: '2026-09-23T10:00:00Z' }),
+    makeRun(85, { head_sha: 'e'.repeat(40), created_at: '2026-09-24T10:00:00Z' }),
+    makeRun(86, { head_sha: 'f'.repeat(40), created_at: '2026-09-25T10:00:00Z' }),
+    makeRun(87, { head_sha: '7'.repeat(40), created_at: '2026-09-26T10:00:00Z' }),
+  ];
+  let active = 0;
+  let maximumActive = 0;
+  let startCount = 0;
+  let signalFourStarted;
+  const fourStarted = new Promise(resolve => { signalFourStarted = resolve; });
+  let signal86Started;
+  const eightySixStarted = new Promise(resolve => { signal86Started = resolve; });
+  let signal86Finished;
+  const eightySixFinished = new Promise(resolve => { signal86Finished = resolve; });
+  let signal84Finished;
+  const eightyFourFinished = new Promise(resolve => { signal84Finished = resolve; });
+  const gates = new Map();
+  const failureCompletionOrder = [];
+  let releasePending = false;
+  let collectorPromise;
+  const awaitBoundedSignal = async (signal, description) => {
+    let timer;
+    const received = await Promise.race([
+      signal.then(() => true),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), 500); }),
+    ]);
+    clearTimeout(timer);
+    assert.equal(received, true, description);
+  };
+  try {
+    collectorPromise = collectCi({
+      outputRoot: path.join(temp, 'artifact'),
+      observedAt: '2026-10-09T12:00:00Z',
+      collectionRef: 'ref:collection-ci-attempt-pool',
+      attempt: 1,
+      token: 'synthetic-test-token',
+      evidenceRefs: {},
+      deadline: Date.now() + 10_000,
+      enumerateRuns: async () => ({
+        totalCount: runs.length, pageCount: 1, windowCount: runs.length, windowRuns: runs,
+        query: { start: '2026-09-11T12:00:00Z', end: '2026-10-09T12:00:00Z' },
+      }),
+      workflowDigestForCommit: async sha => sha === 'b'.repeat(40) ? 'f'.repeat(64) : expectedDigest,
+      fetchFirstAttempt: async ({ runId }) => {
+        const id = Number(runId);
+        startCount += 1;
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        if (startCount === 4) signalFourStarted();
+        if (id === 86) signal86Started();
+        try {
+          if (id !== 87) await new Promise(resolve => {
+            if (releasePending) resolve();
+            else gates.set(id, resolve);
+          });
+          if (id === 84) {
+            failureCompletionOrder.push(id);
+            throw null;
+          }
+          if (id === 86) {
+            failureCompletionOrder.push(id);
+            throw Object.assign(new Error('synthetic bounded failure'), { name: 'ApiError', status: 503 });
+          }
+          const failure = id === 83;
+          return {
+            runAttempt: 1,
+            status: 'completed',
+            conclusion: failure ? 'failure' : 'success',
+            jobs: [
+              { id: id * 10 + 1, name: 'Gitleaks', status: 'completed', conclusion: 'success' },
+              { id: id * 10 + 2, name: 'test', status: 'completed', conclusion: failure ? 'failure' : 'success' },
+            ],
+          };
+        } finally {
+          active -= 1;
+          if (id === 84) signal84Finished();
+          if (id === 86) signal86Finished();
+        }
+      },
+    });
+    await awaitBoundedSignal(fourStarted, 'four selected attempts enter the controlled gate without serial waiting');
+    assert.equal(maximumActive, 4, 'the pool reaches but does not exceed its fixed width');
+    assert.equal(startCount, 4, 'the fifth selected attempt has not begun before a controlled release');
+
+    gates.get(85)();
+    await awaitBoundedSignal(eightySixStarted, 'one released worker starts the fifth selected attempt');
+    assert.equal(startCount, 5);
+    assert.equal(maximumActive, 4);
+    gates.get(86)();
+    await awaitBoundedSignal(eightySixFinished, 'run 86 provider error completes before run 84 rejection');
+    assert.deepEqual(failureCompletionOrder, [86]);
+    gates.get(84)();
+    await awaitBoundedSignal(eightyFourFinished, 'run 84 null rejection completes after run 86');
+    assert.deepEqual(failureCompletionOrder, [86, 84]);
+
+    releasePending = true;
+    for (const release of gates.values()) release();
+
+    const result = await collectorPromise;
+    assert.equal(result.status, 'measured');
+    assert.deepEqual(result.slot.payload.runs.map(run => Number(run.run_ref.match(/gha-run-(\d+)-attempt-1/)?.[1])), [81, 83, 84, 85, 86, 87]);
+    assert.deepEqual(result.slot.payload.runs.map(run => run.attempt), [1, 1, 1, 1, 1, 1]);
+    assert.equal(result.slot.payload.runs[1].latest_attempt, 2, 'latest retry is retained only as context');
+    assert.equal(result.slot.payload.runs[1].overall_conclusion, 'failure', 'first-attempt failure remains authoritative');
+    const inventory = JSON.parse(await readFile(path.join(temp, 'artifact/evidence/ci/inventory.json'), 'utf8'));
+    assert.deepEqual(inventory.runs.map(run => run.run_id), [81, 83, 84, 85, 86, 87], 'evidence stays in enumeration order');
+    assert.deepEqual(inventory.workflow_config_cohorts.map(run => run.run_id), [82], 'excluded workflow version never enters the pool');
+    assert.deepEqual(inventory.first_attempt_fetch_errors, [
+      { run_id: 84, attempt: 1, error: 'ApiError', status: null },
+      { run_id: 86, attempt: 1, error: 'ApiError', status: 503 },
+    ], 'rejected null and ordinary API errors remain visible in enumeration order');
+    assert.equal(inventory.attempt_evidence_complete, false);
+    assert.equal(inventory.denominator, 4);
+  } finally {
+    releasePending = true;
+    for (const release of gates.values()) release();
+    if (collectorPromise) await collectorPromise.catch(() => {});
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('CI cached workflow digests preserve complete enumeration after attempt-time deadline expiry', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-ci-attempt-deadline-'));
+  const originalNow = Date.now;
+  const now = { value: 1_000 };
+  const expectedDigest = createHash('sha256')
+    .update(await readFile(path.join(ROOT, '.github/workflows/ci.yml')))
+    .digest('hex');
+  const runs = [
+    makeRun(91, { head_sha: '1'.repeat(40), created_at: '2026-09-20T10:00:00Z' }),
+    makeRun(92, { head_sha: '2'.repeat(40), created_at: '2026-09-21T10:00:00Z' }),
+    makeRun(93, { head_sha: '3'.repeat(40), created_at: '2026-09-22T10:00:00Z' }),
+  ];
+  Date.now = () => now.value;
+  try {
+    const fetched = [];
+    const result = await collectCi({
+      outputRoot: path.join(temp, 'artifact'),
+      observedAt: '2026-10-09T12:00:00Z',
+      collectionRef: 'ref:collection-ci-attempt-deadline',
+      attempt: 1,
+      token: 'synthetic-test-token',
+      evidenceRefs: {},
+      deadline: 2_000,
+      enumerateRuns: async () => ({
+        totalCount: runs.length, pageCount: 1, windowCount: runs.length, windowRuns: runs,
+        query: { start: '2026-09-11T12:00:00Z', end: '2026-10-09T12:00:00Z' },
+      }),
+      workflowDigestForCommit: async () => expectedDigest,
+      fetchFirstAttempt: async ({ runId }) => {
+        fetched.push(Number(runId));
+        now.value = 2_000;
+        throw Object.assign(new Error('synthetic deadline'), { name: 'TimeoutError' });
+      },
+    });
+    assert.deepEqual(fetched, [91], 'no new provider attempt starts after the deadline expires');
+    assert.equal(result.status, 'measured', 'cached workflow digests preserve the complete inventory');
+    assert.equal(result.slot.payload.expected_run_count, runs.length);
+    assert.deepEqual(result.slot.payload.runs.map(run => run.overall_conclusion), ['unknown', 'unknown', 'unknown']);
+    const inventory = JSON.parse(await readFile(path.join(temp, 'artifact/evidence/ci/inventory.json'), 'utf8'));
+    assert.equal(inventory.complete_run_enumeration, true);
+    assert.deepEqual(inventory.runs.map(run => run.run_id), [91, 92, 93]);
+    assert.deepEqual(inventory.runs.map(run => run.first_attempt_status), [null, null, null]);
+    assert.deepEqual(inventory.first_attempt_fetch_errors, [
+      { run_id: 91, attempt: 1, error: 'TimeoutError', status: null },
+      { run_id: 92, attempt: 1, error: 'TimeoutError', status: null },
+      { run_id: 93, attempt: 1, error: 'TimeoutError', status: null },
+    ]);
+    assert.equal(inventory.attempt_evidence_complete, false);
+  } finally {
+    Date.now = originalNow;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('CI deadline before the first uncached workflow digest still fails closed', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-ci-history-expired-'));
+  const originalNow = Date.now;
+  let resolverCalls = 0;
+  Date.now = () => 2_000;
+  try {
+    const result = await collectCi({
+      outputRoot: path.join(temp, 'artifact'),
+      observedAt: '2026-10-09T12:00:00Z',
+      collectionRef: 'ref:collection-ci-history-expired',
+      attempt: 1,
+      token: 'synthetic-test-token',
+      evidenceRefs: {},
+      deadline: 2_000,
+      enumerateRuns: async () => ({
+        totalCount: 1, pageCount: 1, windowCount: 1,
+        windowRuns: [makeRun(101, { head_sha: '4'.repeat(40), created_at: '2026-09-20T10:00:00Z' })],
+        query: { start: '2026-09-11T12:00:00Z', end: '2026-10-09T12:00:00Z' },
+      }),
+      workflowDigestForCommit: async () => { resolverCalls += 1; return 'a'.repeat(64); },
+    });
+    assert.equal(resolverCalls, 0, 'an uncached workflow lookup does not begin after the deadline');
+    assert.equal(result.status, 'failed');
+    const inventory = JSON.parse(await readFile(path.join(temp, 'artifact/evidence/ci/inventory.json'), 'utf8'));
+    assert.equal(inventory.complete_run_enumeration, false);
+    assert.equal(inventory.runs, null);
+    assert.match(inventory.reason, /time budget exhausted while verifying workflow history/);
+  } finally {
+    Date.now = originalNow;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('manual Knip triage binds file, symbol, and line together', () => {
   const prior = { candidates: [
     { path: 'src/a.ts', candidate_type: 'unused-file', classification: 'false-positive' },
