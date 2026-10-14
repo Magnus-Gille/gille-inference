@@ -73,6 +73,7 @@ jobs:
           test -f "$RUNNER_TEMP/code-loop-recovery-evidence/cleanup.json"
           node -e 'const fs=require("fs");const p=process.env.RUNNER_TEMP+"/code-loop-recovery-evidence/cleanup.json";if(JSON.parse(fs.readFileSync(p)).cleanup_complete!==true)throw Error("fixture cleanup incomplete");'
           test ! -e /run/gi-code-loop-recovery-fixture
+          test ! -e /etc/gille-inference
           ! getent passwd gi-code-loop-ci
           cp "$RUNNER_TEMP/recovery-source-sha.txt" "$RUNNER_TEMP/recovery-launcher-digests.txt" "$RUNNER_TEMP/code-loop-recovery-evidence/"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

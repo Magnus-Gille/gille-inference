@@ -41,6 +41,7 @@ OUTPUT=$1
 [[ "$OUTPUT" = "$RUNNER_TEMP"/code-loop-recovery-evidence ]] || die "unexpected evidence path"
 mkdir -p -- "$OUTPUT"
 [[ ! -e "$ROOT" ]] || die "fixture tree already exists"
+[[ ! -e /etc/gille-inference && ! -L /etc/gille-inference ]] || die "application mount target already exists"
 ! getent passwd "$USER_NAME" >/dev/null || die "fixture account already exists"
 ! getent passwd "$TEST_UID" >/dev/null || die "fixture UID already exists"
 ! getent group "$USER_NAME" >/dev/null || die "fixture group already exists"
@@ -57,6 +58,7 @@ CREATED_ACCOUNT=0
 CREATED_TREE=0
 CREATED_UNITS=0
 CREATED_LINGER=0
+CREATED_ETC_TARGET=0
 cleanup() {
   local status=$? cleanup_failed=0
   trap - EXIT TERM INT
@@ -80,6 +82,11 @@ cleanup() {
     chmod 0644 "$OUTPUT/gateway.log" "$OUTPUT/manager.log" || cleanup_failed=1
   fi
   if ((CREATED_LINGER)); then loginctl disable-linger "$USER_NAME" || cleanup_failed=1; fi
+  if ((CREATED_ETC_TARGET)) && ((cleanup_failed==0)); then
+    # Remove only the empty mount target created by this fixture; unexpected files
+    # cause failed restoration instead of deleting their contents.
+    rmdir /etc/gille-inference || cleanup_failed=1
+  fi
   if ((CREATED_UNITS)) && ((cleanup_failed==0)); then
     rm -f -- /etc/systemd/system/"$SLICE" /etc/systemd/system/"$GATEWAY" /etc/systemd/system/"$CANARY"
     rm -rf -- /etc/systemd/system/"$MANAGER".d /etc/systemd/system/"$RUNTIME".d
@@ -101,6 +108,10 @@ trap 'exit 130' INT
 mkdir -p "$ROOT"/{source,bin,home,gate}
 CREATED_TREE=1
 chmod 755 "$ROOT" "$ROOT/bin" "$ROOT/source"
+# The unchanged cage masks this canonical application directory after binding
+# /etc read-only. bwrap cannot create a missing target below a read-only mount.
+mkdir -m 0755 /etc/gille-inference
+CREATED_ETC_TARGET=1
 git -C "$SOURCE" archive HEAD | tar -x -C "$ROOT/source"
 cp -a "$SOURCE/node_modules" "$ROOT/source/node_modules"
 useradd --system --uid "$TEST_UID" --user-group --no-create-home --home-dir "$ROOT/home" --shell /usr/sbin/nologin "$USER_NAME"

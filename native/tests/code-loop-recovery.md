@@ -18,6 +18,7 @@ Declared resources before the reviewed workflow runs:
 | Resource | Exact fixture target |
 | --- | --- |
 | Tree | /run/gi-code-loop-recovery-fixture |
+| Empty application mount target | /etc/gille-inference; pre-existing path refuses, only fixture-created empty directory is removed with rmdir |
 | Account/UID | gi-code-loop-ci / 62056; existing identity refuses execution |
 | Parent slice | girecovery.slice; 2 GiB, no swap, two CPU quota, 128 tasks |
 | Manager/runtime | user@62056.service and user-runtime-dir@62056.service; only UID-specific drop-ins |
