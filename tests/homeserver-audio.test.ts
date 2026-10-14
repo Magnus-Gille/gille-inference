@@ -4,7 +4,7 @@ import { connect as netConnect } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { getOwnerLog } from "../src/homeserver/owner-log.js";
 import { renderMetrics } from "../src/homeserver/metrics.js";
@@ -27,6 +27,7 @@ let whisperPort = 0;
 // reconcile path (a valid duration) vs. the FAULT path (a bogus / zero / missing / over-cap value).
 // `undefined` here means the backend OMITS the top-level `duration` field entirely.
 let whisperDuration: number | undefined = KNOWN_DURATION;
+let whisperHits = 0;
 // Records what the gateway forwarded so we can assert response_format=verbose_json is always sent.
 let lastForwardedContentType = "";
 let lastForwardedBody = Buffer.alloc(0);
@@ -38,6 +39,7 @@ function startWhisper(): Promise<void> {
       res.end("not found");
       return;
     }
+    whisperHits++;
     lastForwardedContentType = String(req.headers["content-type"] ?? "");
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -146,6 +148,9 @@ afterAll(async () => {
 
 beforeEach(() => {
   whisperDuration = KNOWN_DURATION;
+  whisperHits = 0;
+  lastForwardedContentType = "";
+  lastForwardedBody = Buffer.alloc(0);
   resetQuotaWindows();
 });
 
@@ -464,10 +469,42 @@ describe("POST /v1/audio/transcriptions", () => {
     );
     const res = await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() });
     expect(res.status).toBe(429);
-    const j = (await res.json()) as { error: { code: string } };
+    const j = (await res.json()) as { error: { code: string; message: string; quota: Record<string, unknown> } };
     expect(j.error.code).toBe("rate_limit_exceeded");
+    expect(j.error.message).toContain("1 audio second per minute");
+    expect(j.error.message).toContain("worst-case request was estimated at 60 audio seconds");
+    expect(j.error.message).not.toContain("tokens");
+    expect(j.error.quota).toMatchObject({ reason: "tpm", limit: 1, requested: 60, counted: false });
+    expect(res.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(res.headers.get("x-ratelimit-remaining")).toBe("1");
+    expect(res.headers.get("x-ratelimit-reset")).toBe(res.headers.get("retry-after"));
     // Rejected before transcription → not charged.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect(whisperHits).toBe(0);
+    expect(lastForwardedBody).toHaveLength(0);
+  });
+
+  it("describes daily audio quota in audio-seconds and rolls back the rejected reservation", async () => {
+    const k = mintKey(
+      { alias: "aud-daily-units", tier: "guest", creditLimit: 1_000_000, rpm: 1000, tpm: 1_000, dailyTokenBudget: 10 },
+      { ...DEFAULTS, dailyTokenBudget: 10 }
+    );
+    const res = await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() });
+    expect(res.status).toBe(429);
+    const body = (await res.json()) as { error: { code: string; message: string; quota: Record<string, unknown> } };
+    expect(body.error.code).toBe("rate_limit_exceeded");
+    expect(body.error.message).toContain("10 audio seconds per UTC day");
+    expect(body.error.message).toContain("worst-case request was estimated at 60 audio seconds");
+    expect(body.error.message).not.toContain("tokens");
+    expect(body.error.quota).toMatchObject({ reason: "daily", window: "utc_day", limit: 10, requested: 60, counted: false });
+    expect(res.headers.get("x-ratelimit-limit")).toBe("10");
+    expect(res.headers.get("x-ratelimit-remaining")).toBe("10");
+    expect(res.headers.get("x-ratelimit-reset")).toBe(res.headers.get("retry-after"));
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect(whisperHits).toBe(0);
+    const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?")
+      .get("aud-daily-units", new Date().toISOString().slice(0, 10)) as { tokens: number } | undefined;
+    expect(daily?.tokens ?? 0).toBe(0);
   });
 
   // ── Upload hardening (DoS) ──────────────────────────────────────────────────────────
