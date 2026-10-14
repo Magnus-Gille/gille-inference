@@ -3,7 +3,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { getOwnerLog } from "../src/homeserver/owner-log.js";
 import { renderMetrics } from "../src/homeserver/metrics.js";
@@ -211,6 +211,46 @@ describe("POST /v1/images/generations — sync fast tier", () => {
     expect(r1.status).toBe(200);
     const r2 = await gen(port, k.plaintextKey, { prompt: "x", model: "image-fast" });
     expect(r2.status).toBe(429);
+  });
+
+  it("describes TPM refusal in image units and never dispatches the request", async () => {
+    const k = mintKey({ alias: "img-tpm-units", tier: "guest", creditLimit: 1_000_000, tpm: 1 }, { ...DEFAULTS, tpm: 1 });
+    const r = await gen(port, k.plaintextKey, { prompt: "x", model: "image-fast", n: 2 });
+    expect(r.status).toBe(429);
+    const body = (await r.json()) as { error: { code: string; message: string; quota: Record<string, unknown> } };
+    expect(body.error.code).toBe("rate_limit_exceeded");
+    expect(body.error.message).toContain("1 image unit per minute");
+    expect(body.error.message).toContain("request includes 2 image units");
+    expect(body.error.message).not.toContain("tokens");
+    expect(body.error.quota).toMatchObject({ reason: "tpm", limit: 1, requested: 2, counted: false });
+    expect(r.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(r.headers.get("x-ratelimit-remaining")).toBe("1");
+    expect(r.headers.get("x-ratelimit-reset")).toBe(r.headers.get("retry-after"));
+    expect(credits(k.plaintextKey)).toBe(0);
+    expect(sidecarHits).toBe(0);
+  });
+
+  it("describes daily image quota in image units and rolls back the rejected reservation", async () => {
+    const k = mintKey(
+      { alias: "img-daily-units", tier: "guest", creditLimit: 1_000_000, tpm: 1_000, dailyTokenBudget: 1 },
+      { ...DEFAULTS, tpm: 1_000, dailyTokenBudget: 1 },
+    );
+    const r = await gen(port, k.plaintextKey, { prompt: "x", model: "image-fast", n: 2 });
+    expect(r.status).toBe(429);
+    const body = (await r.json()) as { error: { code: string; message: string; quota: Record<string, unknown> } };
+    expect(body.error.code).toBe("rate_limit_exceeded");
+    expect(body.error.message).toContain("1 image unit per UTC day");
+    expect(body.error.message).toContain("request includes 2 image units");
+    expect(body.error.message).not.toContain("tokens");
+    expect(body.error.quota).toMatchObject({ reason: "daily", window: "utc_day", limit: 1, requested: 2, counted: false });
+    expect(r.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(r.headers.get("x-ratelimit-remaining")).toBe("1");
+    expect(r.headers.get("x-ratelimit-reset")).toBe(r.headers.get("retry-after"));
+    expect(credits(k.plaintextKey)).toBe(0);
+    expect(sidecarHits).toBe(0);
+    const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?")
+      .get("img-daily-units", new Date().toISOString().slice(0, 10)) as { tokens: number } | undefined;
+    expect(daily?.tokens ?? 0).toBe(0);
   });
 
   it("502 + full refund when the sidecar faults", async () => {

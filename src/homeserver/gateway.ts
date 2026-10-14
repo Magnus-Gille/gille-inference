@@ -3118,7 +3118,7 @@ async function handleAudioTranscription(
   const q = checkQuota(principal.alias, principal.limits, quotaEst);
   if (!q.ok) {
     releaseReserve();
-    const failure = describeQuotaFailure(q, quotaEst, principal);
+    const failure = describeQuotaFailure(q, quotaEst, principal, "audio_seconds");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3459,7 +3459,7 @@ async function handleImageGeneration(
   const q = checkQuota(principal.alias, principal.limits, parsed.n);
   if (!q.ok) {
     releaseReserve();
-    const failure = describeQuotaFailure(q, parsed.n, principal);
+    const failure = describeQuotaFailure(q, parsed.n, principal, "image_units");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
