@@ -71,10 +71,13 @@ cleanup() {
     fi
   fi
   if ((CREATED_TREE)); then
-    [[ ! -f "$ROOT/acceptance.json" ]] || cp -- "$ROOT/acceptance.json" "$OUTPUT/acceptance.json"
-    [[ ! -f "$ROOT/home/backend-count.json" ]] || cp -- "$ROOT/home/backend-count.json" "$OUTPUT/backend-count.json"
+    # Only these explicitly sanitized receipts cross from the private fixture to
+    # the CI artifact directory. Never export home/client.json or fixture keys.
+    [[ ! -f "$ROOT/acceptance.json" ]] || install -m 0644 -- "$ROOT/acceptance.json" "$OUTPUT/acceptance.json" || cleanup_failed=1
+    [[ ! -f "$ROOT/home/backend-count.json" ]] || install -m 0644 -- "$ROOT/home/backend-count.json" "$OUTPUT/backend-count.json" || cleanup_failed=1
     journalctl --no-pager -u "$GATEWAY" -n 100 > "$OUTPUT/gateway.log" 2>&1
     journalctl --no-pager -u "$MANAGER" -n 80 > "$OUTPUT/manager.log" 2>&1
+    chmod 0644 "$OUTPUT/gateway.log" "$OUTPUT/manager.log" || cleanup_failed=1
   fi
   if ((CREATED_LINGER)); then loginctl disable-linger "$USER_NAME" || cleanup_failed=1; fi
   if ((CREATED_UNITS)) && ((cleanup_failed==0)); then
@@ -88,6 +91,7 @@ cleanup() {
   fi
   if ((CREATED_TREE)) && ((cleanup_failed==0)); then rm -rf -- "$ROOT"; fi
   printf '{"cleanup_complete":%s}\n' "$([[ "$cleanup_failed" = 0 ]] && echo true || echo false)" > "$OUTPUT/cleanup.json"
+  chmod 0644 "$OUTPUT/cleanup.json" || cleanup_failed=1
   ((cleanup_failed==0)) || status=1
   exit "$status"
 }

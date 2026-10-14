@@ -42,7 +42,22 @@ assert.equal(prop("girecovery.slice", "MemorySwapMax"), "0");
 assert.equal(prop("girecovery.slice", "TasksMax"), "128");
 assert.equal(prop("girecovery.slice", "CPUQuotaPerSecUSec"), "2s");
 for (const name of [unit, "user-runtime-dir@" + uid + ".service", "gi-recovery-gateway.service", "gi-recovery-canary.service"]) {
-  assert(prop(name, "ControlGroup").startsWith("/girecovery.slice/"), name + " escaped fixture slice");
+  const state = {
+    slice: prop(name, "Slice"), controlGroup: prop(name, "ControlGroup"),
+    mainPid: Number(prop(name, "MainPID")), controlPid: Number(prop(name, "ControlPID")),
+    type: prop(name, "Type"), subState: prop(name, "SubState"),
+  };
+  assert.equal(state.slice, "girecovery.slice", name + " has a different configured slice");
+  // The stock runtime-directory helper is oneshot/RemainAfterExit: after its
+  // process exits, systemd can discard its empty cgroup while keeping it active.
+  if (name === "user-runtime-dir@" + uid + ".service" && state.controlGroup === "") {
+    assert.equal(state.type, "oneshot");
+    assert.equal(state.subState, "exited");
+    assert.equal(state.mainPid, 0);
+    assert.equal(state.controlPid, 0);
+  } else {
+    assert(state.controlGroup.startsWith("/girecovery.slice/"), name + " escaped fixture slice: " + JSON.stringify(state));
+  }
 }
 const health = async () => {
   const res = await fetch(url + "/healthz", { signal: AbortSignal.timeout(3000) });

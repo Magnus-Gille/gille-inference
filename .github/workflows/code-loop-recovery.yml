@@ -51,6 +51,8 @@ jobs:
           env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin bash native/tests/test-code-loop-recovery-preflight.sh
           git rev-parse HEAD > "$RUNNER_TEMP/recovery-source-sha.txt"
           sha256sum native/tests/run-code-loop-recovery.sh native/tests/test-code-loop-recovery-preflight.sh tests/fixtures/code-loop-recovery-*.mjs tests/fixtures/code-loop-recovery-*.ts > "$RUNNER_TEMP/recovery-launcher-digests.txt"
+          # Preserve runner ownership so it can bind source receipts after root cleanup.
+          mkdir -p "$RUNNER_TEMP/code-loop-recovery-evidence"
           TASK_PATH="$(dirname "$(command -v node)"):/usr/sbin:/usr/bin:/sbin:/bin"
           sudo -n env -i PATH="$TASK_PATH" \
             GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_TEMP="$RUNNER_TEMP" \
