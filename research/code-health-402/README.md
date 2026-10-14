@@ -21,7 +21,10 @@ run's commit, and includes only runs that use the current pinned workflow defini
 workflow versions are listed as explicit exclusions. Every included run uses attempt 1 even when a
 later retry is green. An inaccessible attempt remains visible with unknown job outcomes. More than
 1,000 runs, incomplete enumeration, or an unrecognized workflow config produces an unavailable
-slot instead of a truncated measurement.
+slot instead of a truncated measurement. Workflow-version checks resolve every distinct run SHA
+against its local Git tree in one batch, then hash each unique workflow blob; missing objects use
+the existing local resolver and fail closed if still unavailable. This reduces repeated Git
+process launches without changing run selection, workflow digest checks, or attempt evidence.
 
 Scheduled collection is skipped unless the repository Actions variable
 `CODE_HEALTH_COLLECTION_ENABLED` is the exact string `true`. Pull requests still run only synthetic
