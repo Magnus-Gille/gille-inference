@@ -64,6 +64,7 @@ import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mc
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
 import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
@@ -73,12 +74,14 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import {
+  ensureRequestLogSchema,
   recordRequestLog,
   cachedRequestLogTotals,
   getLatestSuccessfulModelUse,
   type LatestSuccessfulModelUse,
 } from "./request-log.js";
 import { queryM5UsageSummary } from "./usage-summary.js";
+import { queryLatestSuccessfulM5InferenceAt } from "./inference-freshness.js";
 import { getDb } from "../db.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
@@ -3936,6 +3939,8 @@ export interface GatewayComposition {
   rosterAdmissionDependencies?: RosterAdmissionDependencies;
   /** Injectable only for deterministic maintenance-window tests. Production uses the canonical lease. */
   maintenanceWindowDependencies?: MaintenanceWindowDependencies;
+  /** Test seam for the bounded, content-free dedicated user-bus transport probe. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
 }
 
 export interface GatewayRegistryInitializers {
@@ -3985,6 +3990,18 @@ export function startGateway(
     initializeGatewayRegistries();
   } catch (err) {
     return Promise.reject(err);
+  }
+  if (cfg.requestLog === "on") {
+    try {
+      // Initialize the enabled collector once before the first history read. Keep the
+      // read-only metadata route free of schema/index work on every doctor request.
+      ensureRequestLogSchema();
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      const reason = ["SQLITE_ERROR", "SQLITE_READONLY", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CANTOPEN", "SQLITE_IOERR", "SQLITE_CORRUPT"]
+        .includes(String(code)) ? String(code) : "unknown";
+      console.warn("Request-log initialization unavailable; inference history remains unavailable", { reason });
+    }
   }
   const loopback =
     cfg.gatewayHost === "127.0.0.1" || cfg.gatewayHost === "localhost" || cfg.gatewayHost === "::1";
@@ -4101,6 +4118,7 @@ export function startGateway(
       composition.rosterAdmissionDependencies,
       maintenanceWindow,
       hostMemoryDeps,
+      composition.codeLoopTransportProbe,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -4207,6 +4225,7 @@ export async function handleRequest(
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
   maintenanceWindow?: ExclusiveMaintenanceWindow,
   hostMemoryDeps: HostMemoryAdmissionDeps = { getRunning: getRunningSnapshot },
+  codeLoopTransportProbe: () => Promise<boolean> = probeCodeLoopTransport,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -4310,7 +4329,14 @@ export async function handleRequest(
     // Gate healthz logging behind the config toggle (default: off, to avoid noise).
     if (path === "/healthz" && method === "GET") {
       const orin = await probeOrin(cfg);
-      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin] });
+      // This is a transport observation, not an inference or cage-isolation probe.
+      // Legacy file binds can remain visible after user@UID restarts, so test a
+      // real listener. Keep overall liveness independent: ordinary inference can work
+      // while code_loop is unavailable.
+      const codeLoopTransport = cfg.codeLoop === "on"
+        ? await codeLoopTransportProbe().then((ready) => ready ? "available" : "unavailable", () => "unavailable")
+        : "disabled";
+      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin], codeLoopTransport });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -5452,8 +5478,35 @@ export async function handleRequest(
       // The dashboard's data source: the authenticated key reports its own limits + usage.
       // no-store: per-key usage data must not be cached by intermediaries (Fix #7).
       res.setHeader("cache-control", "no-store");
+      const ownerAgent = isCodeLoopOwner(principal);
+      let inferenceObservation: {
+        source: "request_log";
+        scope: "m5_global";
+        status: "observed" | "none" | "disabled" | "unavailable";
+        lastSuccessfulAt: string | null;
+      } | undefined;
+      if (ownerAgent) {
+        const base = { source: "request_log" as const, scope: "m5_global" as const };
+        if (cfg.requestLog === "off") {
+          inferenceObservation = { ...base, status: "disabled", lastSuccessfulAt: null };
+        } else {
+          try {
+            const lastSuccessfulAt = queryLatestSuccessfulM5InferenceAt(getDb());
+            inferenceObservation = {
+              ...base,
+              status: lastSuccessfulAt === null ? "none" : "observed",
+              lastSuccessfulAt,
+            };
+          } catch (error) {
+            // A telemetry read must never break key discovery. Report the gap without exposing
+            // database paths or treating a failed read as proof that no inference succeeded.
+            console.warn("[portal/me] inference observation unavailable:", error instanceof Error ? error.name : "unknown");
+            inferenceObservation = { ...base, status: "unavailable", lastSuccessfulAt: null };
+          }
+        }
+      }
       sendJson(res, 200, {
-        ...(isCodeLoopOwner(principal) ? { gateway: gatewayRelease } : {}),
+        ...(ownerAgent ? { gateway: gatewayRelease, inferenceObservation } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,

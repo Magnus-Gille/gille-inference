@@ -95,7 +95,7 @@ function runGatewayApplyFailureHarness(): string {
 LOG="$2"; BACKUP_ROOT="$3"; source "$1"
 record() { printf '%s\\n' "$1" >> "$LOG"; }
 root_only() { :; }; need() { :; }; show_value() { printf 'magnus\\n'; }
-preflight() { :; }; create_service_user() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; provision_gateway_codeloop_toolchain() { :; }; install() { :; }; stat() { printf '1\\n'; }
+preflight() { :; }; create_service_user() { :; }; require_gateway_manager_dropin_absent() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; provision_gateway_codeloop_toolchain() { :; }; install() { :; }; stat() { printf '1\\n'; }
 backup_unit() { mkdir -p "$3"; printf 'enabled\\n' > "$3/legacy-timer.enabled"; printf 'active\\n' > "$3/legacy-timer.active"; }
 disable_legacy_autonomy_timer() { record disable; }
 migrate_gateway_state() { record migrate; false; }
@@ -358,8 +358,32 @@ describe("service-isolation migration contract (#151)", () => {
       ],
       { cwd: root, encoding: "utf8" },
     );
-    expect(unit).toContain("[Unit]\nRequires=user@4242.service\nAfter=user@4242.service\n");
+    expect(unit).toContain("[Unit]\nWants=user@4242.service\nAfter=user@4242.service\n");
+    expect(unit).not.toContain("BindsTo=");
     expect(unit.indexOf("[Unit]")).toBeLessThan(unit.indexOf("[Service]"));
+  });
+
+  it("renders a dedicated manager recovery contract without changing other user managers", () => {
+    const unit = execFileSync("bash", ["-c", "source \"$1\"; render_gateway_manager_recovery", "--", script], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(unit).not.toContain("Wants=");
+    expect(unit).not.toContain("Upholds=");
+    expect(unit).toContain("Restart=on-failure");
+    expect(unit).toContain("OOMScoreAdjust=-500");
+    expect(unit).not.toContain("KillMode=");
+  });
+
+  it("verifies the exact manager recovery policy and effective OOM score", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-recovery-"));
+    const file = join(work, "50-gille-gateway-recovery.conf");
+    writeFileSync(file, execFileSync("bash", ["-c", "source \"$1\"; render_gateway_manager_recovery", "--", script], { encoding: "utf8" }));
+    const verify = `source "$1"; dropin="$3"; score="$4"; require_owner_group() { :; }; require_mode() { :; }; \
+show_value() { case "$2" in DropInPaths) printf '%s\\n' "$dropin" ;; Restart) printf 'on-failure\\n' ;; OOMScoreAdjust) printf '%s\\n' "$score" ;; Wants) printf 'user@4242.service\\n' ;; MainPID) printf '1234\\n' ;; esac; }; \
+effective_oom_score_adj() { printf '%s\\n' "$score"; }; \
+verify_gateway_manager_recovery 4242 "$2"`;
+    expect(() => execFileSync("bash", ["-c", verify, "--", script, file, file, "-500"], { encoding: "utf8" })).not.toThrow();
+    expect(() => execFileSync("bash", ["-c", verify, "--", script, file, file, "100"], { encoding: "utf8", stderr: "pipe" })).toThrow();
   });
 
   it("fails gateway startup unless both user-manager transports are visible inside its mount namespace", () => {
@@ -375,12 +399,12 @@ describe("service-isolation migration contract (#151)", () => {
     );
     expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/systemd/private");
     expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/bus");
-    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/systemd");
-    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242/bus");
+    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242\n");
+    expect(unit).not.toContain("BindReadOnlyPaths=/run/user/4242/bus");
     const source = readFileSync(script, "utf8");
     expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"');
     expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/bus"');
-    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd" "/run/user/$gateway_uid/bus"');
+    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid"');
   });
 
   it("keeps the isolated gateway off AF_NETLINK because pasta is manager-spawned", () => {
@@ -528,6 +552,148 @@ describe("service-isolation migration contract (#151)", () => {
     expect(output).toContain("verify:gateway 1 0 0 0 0 0");
     expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
     expect(output).not.toContain("AF_NETLINK");
+  });
+
+  it("removes a newly installed manager recovery drop-in when gateway refresh fails", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-refresh-rollback-"));
+    const backup = join(work, "backup");
+    mkdirSync(backup);
+    const gatewayDropin = join(work, "gateway.conf");
+    const managerDropin = join(work, "manager.conf");
+    writeFileSync(join(backup, "dropin.before.conf"), "[Unit]\nRequires=user@4242.service\n");
+    writeFileSync(gatewayDropin, "[Unit]\nBindsTo=user@4242.service\n");
+    writeFileSync(managerDropin, "[Unit]\nWants=home-gateway.service\n");
+    execFileSync("bash", ["-c", `source "$1"; REFRESH_BACKUP="$2"; REFRESH_DROPIN="$3"; REFRESH_MANAGER_DROPIN="$4"; REFRESH_MANAGER_EXISTED=0; REFRESH_UNIT=home-gateway.service; \
+restore_gateway_codeloop_config() { :; }; restore_gateway_codeloop_toolchain_pointer() { :; }; atomic_install_file() { cp "$1" "$2"; }; systemctl() { :; }; verify() { :; }; restore_isolation_refresh`, "--", script, backup, gatewayDropin, managerDropin], { encoding: "utf8" });
+    expect(existsSync(managerDropin)).toBe(false);
+    expect(readFileSync(gatewayDropin, "utf8")).toBe("[Unit]\nRequires=user@4242.service\n");
+  });
+
+  it("restarts the manager under its restored OOM policy before the gateway after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-refresh-live-rollback-"));
+    const backup = join(work, "backup");
+    mkdirSync(backup);
+    const gatewayDropin = join(work, "gateway.conf");
+    const managerDropin = join(work, "manager.conf");
+    writeFileSync(join(backup, "dropin.before.conf"), "[Unit]\nRequires=user@4242.service\n");
+    writeFileSync(gatewayDropin, "[Unit]\nWants=user@4242.service\n");
+    writeFileSync(managerDropin, "[Service]\nOOMScoreAdjust=-500\n");
+    const output = execFileSync("bash", ["-c", `
+source "$1"
+REFRESH_BACKUP="$2"
+REFRESH_DROPIN="$3"
+REFRESH_MANAGER_DROPIN="$4"
+REFRESH_MANAGER_EXISTED=0
+REFRESH_MANAGER_UID=4242
+REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=1
+REFRESH_UNIT=home-gateway.service
+live_score=-500
+restore_gateway_codeloop_config() { :; }
+restore_gateway_codeloop_toolchain_pointer() { :; }
+atomic_install_file() { cp "$1" "$2"; }
+show_value() { case "$2" in OOMScoreAdjust) printf '0\\n' ;; MainPID) printf '1234\\n' ;; esac; }
+effective_oom_score_adj() { printf '%s\\n' "$live_score"; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+systemctl() {
+  case "$*" in
+    'daemon-reload') printf 'reload\\n' ;;
+    'restart user@4242.service')
+      [ ! -e "$REFRESH_MANAGER_DROPIN" ] || return 1
+      live_score=0
+      printf 'manager-restart\\n'
+      ;;
+    'restart home-gateway.service')
+      [ "$live_score" = 0 ] || return 1
+      printf 'gateway-restart\\n'
+      ;;
+  esac
+}
+verify() { [ "$live_score" = 0 ] && printf 'verified\\n'; }
+restore_isolation_refresh
+`, "--", script, backup, gatewayDropin, managerDropin], { encoding: "utf8" });
+    expect(output).toMatch(/reload\nmanager-restart\ngateway-restart\nverified\n/);
+    expect(existsSync(managerDropin)).toBe(false);
+  });
+
+  it("reloads the legacy manager OOM policy before restarting the gateway during migration rollback", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-migration-rollback-"));
+    const fakeRoot = join(work, "root");
+    const fakeEtc = join(work, "etc");
+    const fakeTree = join(work, "tree");
+    const fakeSystemd = join(work, "systemd");
+    const backup = join(work, "backup");
+    const log = join(work, "order.log");
+    mkdirSync(join(fakeRoot, "gateway", "data"), { recursive: true });
+    mkdirSync(join(fakeEtc, "gateway"), { recursive: true });
+    mkdirSync(fakeTree);
+    mkdirSync(join(fakeSystemd, "home-gateway.service.d"), { recursive: true });
+    mkdirSync(join(fakeSystemd, "user@4242.service.d"), { recursive: true });
+    mkdirSync(backup);
+    writeFileSync(join(fakeEtc, "gateway", "gateway.env"), "fake=1\n");
+    writeFileSync(join(backup, "unit.before.txt"), "legacy unit\n");
+    writeFileSync(join(backup, "gateway-data.mode"), "0700\n");
+    writeFileSync(join(fakeSystemd, "home-gateway.service.d", "50-service-isolation.conf"), "isolation\n");
+    writeFileSync(join(fakeSystemd, "user@4242.service.d", "50-gille-gateway-recovery.conf"), "recovery\n");
+    const harness = join(work, "service-isolation-harness.sh");
+    writeFileSync(harness, readFileSync(script, "utf8")
+      .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+      .replace('readonly ETC="/etc/gille-inference"', `readonly ETC="${fakeEtc}"`)
+      .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`)
+      .replaceAll("/etc/systemd/system", fakeSystemd));
+    const command = `
+source "$1"
+LOG="$3"
+FAIL_MANAGER="$4"
+loaded_user="\${5:-magnus}"
+live_score=-500
+gateway_active=1
+root_only() { :; }
+need() { :; }
+id() { printf '4242\\n'; }
+rollback_feasible() { :; }
+capture_transaction_dependents() { :; }
+restore_transaction_dependents() { :; }
+restore_legacy_autonomy_timer() { printf 'timer-restored\\n' >> "$LOG"; }
+render_gateway_manager_recovery() { printf 'recovery\\n'; }
+chown() { :; }
+install() { cp "\${@: -2:1}" "\${@: -1}"; }
+show_value() { case "$2" in User) printf '%s\\n' "$loaded_user" ;; OOMScoreAdjust) printf '0\\n' ;; MainPID) printf '1234\\n' ;; esac; }
+effective_oom_score_adj() { printf '%s\\n' "$live_score"; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+systemctl() {
+  case "$*" in
+    'stop home-gateway.service') gateway_active=0 ;;
+    'is-active --quiet home-gateway.service') [ "$gateway_active" = 1 ] ;;
+    'is-active --quiet user@4242.service') : ;;
+    'daemon-reload') loaded_user=magnus; printf 'reload\\n' >> "$LOG" ;;
+    'restart user@4242.service')
+      if [ "$FAIL_MANAGER" = 1 ]; then printf 'manager-failed\\n' >> "$LOG"; return 1; fi
+      live_score=0
+      printf 'manager-restart\\n' >> "$LOG"
+      ;;
+    'restart home-gateway.service')
+      if [ "$FAIL_MANAGER" = 0 ]; then [ "$live_score" = 0 ] || return 1; fi
+      gateway_active=1
+      printf 'gateway-restart\\n' >> "$LOG"
+      ;;
+  esac
+}
+rollback gateway "$2"
+`;
+    expect(() => execFileSync("bash", ["-c", command, "--", harness, backup, log, "1"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+    expect(readFileSync(log, "utf8")).toBe("reload\nmanager-failed\ngateway-restart\ntimer-restored\n");
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(true);
+    expect(existsSync(join(fakeSystemd, "user@4242.service.d", "50-gille-gateway-recovery.conf"))).toBe(false);
+    mkdirSync(join(backup, "rollback-receipt"));
+    expect(() => execFileSync("bash", ["-c", command, "--", harness, backup, log, "0", "gille-gateway"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(true);
+    execFileSync("rmdir", [join(backup, "rollback-receipt")]);
+    const resumed = execFileSync("bash", ["-c", command, "--", harness, backup, log, "0", "gille-gateway"], { encoding: "utf8" });
+    expect(resumed).toContain("ROLLED BACK: gateway");
+    expect(readFileSync(log, "utf8")).toBe("reload\nmanager-failed\ngateway-restart\ntimer-restored\nreload\nmanager-restart\ngateway-restart\ntimer-restored\nreload\nmanager-restart\ngateway-restart\ntimer-restored\n");
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(false);
   });
 
   it("can restore and exactly verify the superseded netlink drop-in after a failed refresh", () => {

@@ -218,8 +218,12 @@
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
       content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
+      Minted owner-agent/admin keys can read a content-blind timestamp for the last successful
+      M5 inference observed in the request log; it is historical evidence, not live readiness.
       Optional host-memory protection checks gateway model starts, including owner delegation,
       coding jobs and admin loads; it stays off until the owner validates the memory budgets.
+      The optional owner code loop has a separate, content-free user-bus transport check in
+      <span class="badge mono">/healthz</span>; gateway liveness alone does not prove code-loop readiness.
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
@@ -628,6 +632,16 @@ EOF</pre>
           and is not eligible for joined learning-task evidence.
         </p>
 
+        <p><strong>Gateway and code-loop transport status (no key needed):</strong></p>
+        <pre>curl https://inference.example.com/healthz</pre>
+        <p>
+          <span class="badge mono">ok</span> reports gateway liveness. The content-free
+          <span class="badge mono">codeLoopTransport</span> field is
+          <span class="badge mono">available</span>, <span class="badge mono">unavailable</span>,
+          or <span class="badge mono">disabled</span>. It tests the dedicated user-bus socket
+          listener when code loops are enabled; it does not run a code loop or test inference.
+        </p>
+
         <p><strong>Public usage stats (no key needed):</strong></p>
         <pre>curl https://inference.example.com/portal/stats</pre>
         <p>
@@ -761,6 +775,12 @@ for chunk in stream:
           The same key, credit budget, and model allow-list apply as for the HTTP API.
           Basic tools are exposed to every permitted key. A real minted owner-agent key also gets
           the bounded code-loop tools and a content-free adoption-report tool:
+        </p>
+        <p>
+          <span class="badge mono">m5 doctor</span> reports catalogue reachability and, for a minted
+          owner-agent/admin key, the last observed successful M5 inference timestamp. Its
+          <span class="badge mono">inference</span> field remains
+          <span class="badge mono">not_checked</span>: a past success does not verify this route now.
         </p>
         <p>
           <strong>Exact owner feedback:</strong> set <span class="badge mono">traffic_purpose: "organic"</span>

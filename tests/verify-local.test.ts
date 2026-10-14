@@ -6,7 +6,7 @@ import { buildManifest, parseWorkflowJobs, runChecks, validateReceipt } from '..
 
 function workflowFixtureRoot(root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-fixture-'))) {
   fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
-  for (const file of ['ci.yml','cgroup-stop-proof.yml','code-health.yml','host-arbiter.yml','observer-test-host.yml','producer-activity.yml','producer-channel.yml','proxy-activity.yml','runtime-producer-channel.yml'])
+  for (const file of ['ci.yml','cgroup-stop-proof.yml','code-health.yml','code-loop-recovery.yml','host-arbiter.yml','observer-test-host.yml','producer-activity.yml','producer-channel.yml','proxy-activity.yml','portal-visual.yml','runtime-producer-channel.yml'])
     fs.copyFileSync(path.join(process.cwd(), `.github/workflows/${file}`), path.join(root, `.github/workflows/${file}`));
   return root;
 }
@@ -58,6 +58,26 @@ describe('local verification manifest', () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it.each(['code-loop-recovery.yml', 'portal-visual.yml'])('fails closed when the required %s workflow source is missing', file => {
+    const root = workflowFixtureRoot();
+    try {
+      fs.rmSync(path.join(root, '.github/workflows', file));
+      expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(new RegExp(`required workflow is missing: ${file}`));
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['code-loop-recovery.yml', 'name: Native code-loop recovery', 'name: Renamed code-loop recovery', /workflow name changed/i],
+    ['portal-visual.yml', 'name: Portal desktop and mobile states', 'name: Renamed portal visual check', /baseline workflow\/job\/raw-name mapping changed/i],
+  ])('fails closed when %s has a mismatched required workflow source', (file, expected, changed, error) => {
+    const root = workflowFixtureRoot();
+    try {
+      const workflowPath = path.join(root, '.github/workflows', file);
+      fs.writeFileSync(workflowPath, fs.readFileSync(workflowPath, 'utf8').replace(expected, changed));
+      expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(error);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('expands known workflow jobs for the event and marks CI-only proof unavailable', () => {
     const root = workflowFixtureRoot();
     try {
@@ -65,6 +85,9 @@ describe('local verification manifest', () => {
       expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('CI / Gitleaks');
       expect(manifest.checks.find(({ rawName }) => rawName === 'cgroup-stop-proof')?.status).toBe('unavailable');
       expect(manifest.checks.find(({ workflowName }) => workflowName === 'Informational code health')?.status).toBe('conformance-only');
+      expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('Native code-loop recovery / Real manager and cage recovery');
+      expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('Portal visual verification / Portal desktop and mobile states');
+      expect(manifest.checks).toHaveLength(13);
       expect(manifest.clientCompatibility).toEqual({ present: false, reason: 'workflow-absent-at-invoked-revision' });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -96,7 +119,7 @@ describe('local verification manifest', () => {
       const manifest = buildManifest({ root, event: 'pull_request' });
       expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
         .toEqual(['Client Node 18', 'Client Node 22']);
-      expect(manifest.checks).toHaveLength(13);
+      expect(manifest.checks).toHaveLength(15);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -108,7 +131,7 @@ describe('local verification manifest', () => {
       const manifest = buildManifest({ root, event: 'pull_request' });
       expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
         .toEqual(['Client Node 18', 'Client Node 22']);
-      expect(manifest.checks).toHaveLength(13);
+      expect(manifest.checks).toHaveLength(15);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -161,6 +184,25 @@ describe('local verification manifest', () => {
       expect(validateReceipt(manifest, { checkRuns: [{ ...base, conclusion }] }, 'a'.repeat(40)).valid).toBe(false);
     }
     expect(validateReceipt(manifest, { checkRuns: [{ ...base, status: 'queued' }] }, 'a'.repeat(40)).valid).toBe(false);
+  });
+
+  it('requires successful receipts for both newly qualified PR checks', () => {
+    const root = workflowFixtureRoot();
+    try {
+      const manifest = buildManifest({ root, event: 'pull_request' });
+      const head = 'a'.repeat(40);
+      const required = manifest.checks.filter((check: any) =>
+        ['Real manager and cage recovery', 'Portal desktop and mobile states'].includes(check.rawName));
+      expect(required).toHaveLength(2);
+      expect(required.every((check: any) => check.appliesToInvocation === true)).toBe(true);
+      const runs = required.map((check: any) => ({
+        name: check.rawName, workflowName: check.workflowName, head_sha: head, status: 'completed', conclusion: 'success',
+      }));
+      expect(validateReceipt({ checks: required }, { checkRuns: runs }, head).valid).toBe(true);
+      expect(validateReceipt({ checks: required }, { checkRuns: runs.slice(0, 1) }, head).valid).toBe(false);
+      expect(validateReceipt({ checks: required }, { checkRuns: runs.map((run: any) =>
+        run.name === 'Portal desktop and mobile states' ? { ...run, conclusion: 'failure' } : run) }, head).valid).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it('records command failure and continues with subsequent exact checks', async ({ skip }) => {

@@ -68,6 +68,10 @@ type DiagnoseOptions = {
   publicTools?: string[];
   privateTools?: string[];
   rejectPublic?: number;
+  publicTransport?: string;
+  privateTransport?: string;
+  publicObservation?: unknown;
+  privateObservation?: unknown;
 };
 
 function discoveryFailureForEndpoint(
@@ -85,11 +89,18 @@ async function diagnose({
   publicTools = REQUIRED_TOOLS,
   privateTools = publicTools,
   rejectPublic,
+  publicTransport = "available",
+  privateTransport = publicTransport,
+  publicObservation,
+  privateObservation,
 }: DiagnoseOptions = {}) {
   let askCalls = 0;
   const result = await diagnoseProfile({
     profile: "codex",
     profileConfig: PROFILE,
+    // Make private-route failure classification deterministic across hosts with and without
+    // a configured Tailscale CLI. These tests exercise the gateway transport, not host state.
+    localProbes: { tailnet: async () => "up" },
     credentialStore: {
       resolve: async () => {
         if (credential === null) {
@@ -111,7 +122,16 @@ async function diagnose({
               })
             : new Response("", { status: rejectPublic });
         }
-        return jsonResponse({ alias: "doctor-agent", tier: "owner", scope: "agent" });
+        return jsonResponse({
+          alias: "doctor-agent", tier: "owner", scope: "agent",
+          ...((isPrivate ? privateObservation : publicObservation) === undefined ? {} : {
+            inferenceObservation: isPrivate ? privateObservation : publicObservation,
+          }),
+        });
+      }
+      if (url.endsWith("/healthz")) {
+        expect(init?.headers).not.toHaveProperty("authorization");
+        return jsonResponse({ ok: true, codeLoopTransport: isPrivate ? privateTransport : publicTransport });
       }
 
       const request = JSON.parse(String(init?.body)) as {
@@ -247,6 +267,61 @@ function expectSafeDiscoveryFailure(
 }
 
 describe("m5 doctor model-discovery diagnostics", () => {
+  it("labels historical successful inference without claiming current readiness", async () => {
+    const observation = {
+      source: "request_log", scope: "m5_global", status: "observed",
+      lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+    };
+    const result = await diagnose({ publicObservation: observation, privateObservation: observation });
+    expect(result).toMatchObject({
+      inference: { public: "not_checked", private: "not_checked" },
+      inference_observation: {
+        source: "request_log", scope: "m5_global",
+        public: { status: "observed", last_successful_at: observation.lastSuccessfulAt },
+        private: { status: "observed", last_successful_at: observation.lastSuccessfulAt },
+      },
+    });
+  });
+
+  it("does not echo malformed or absent inference observation metadata", async () => {
+    const result = await diagnose({
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "observed",
+        lastSuccessfulAt: `${LOCATOR}/${SECRET}`,
+      },
+    });
+    expect(result).toMatchObject({
+      inference_observation: {
+        public: { status: "invalid", last_successful_at: null },
+        private: { status: "not_supported", last_successful_at: null },
+      },
+    });
+    expectNoTaintedContent(result);
+
+    const inconsistent = await diagnose({
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "none",
+        lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+      },
+    });
+    expect(inconsistent.inference_observation.public).toEqual({ status: "invalid", last_successful_at: null });
+  });
+
+  it.each(["none", "disabled", "unavailable"] as const)(
+    "preserves a safe %s historical observation without inventing a timestamp",
+    async (status) => {
+      const observation = {
+        source: "request_log", scope: "m5_global", status, lastSuccessfulAt: null,
+      };
+      const result = await diagnose({ publicObservation: observation, privateObservation: observation });
+      expect(result.inference).toEqual({ public: "not_checked", private: "not_checked" });
+      expect(result.inference_observation).toMatchObject({
+        public: { status, last_successful_at: null },
+        private: { status, last_successful_at: null },
+      });
+    }
+  );
+
   it("retains the existing public top-level diagnosis and adds a safe refusal detail", async () => {
     const result = await diagnose({ failure: "public_refused" });
 
@@ -374,10 +449,50 @@ describe("m5 doctor model-discovery diagnostics", () => {
       credential: "present",
       model_discovery: { public: "available", private: "available" },
       inference: { public: "not_checked", private: "not_checked" },
+      code_loop_transport: { public: "available", private: "available" },
       endpoints: { public: "healthy", private: "healthy" },
       connector: { status: "unsupported" },
     });
     expect(result).not.toHaveProperty("discovery_failure");
+    expectNoTaintedContent(result);
+  });
+
+  it("retains historical observations while a code-loop transport outage stays degraded", async () => {
+    const result = await diagnose({
+      publicTransport: "unavailable", privateTransport: "unavailable",
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "observed",
+        lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+      },
+      privateObservation: {
+        source: "request_log", scope: "m5_global", status: "none", lastSuccessfulAt: null,
+      },
+    });
+    expect(result).toMatchObject({
+      status: "degraded",
+      code_loop_transport: { public: "unavailable", private: "unavailable" },
+      inference: { public: "not_checked", private: "not_checked" },
+      inference_observation: {
+        public: { status: "observed", last_successful_at: "2026-10-08T12:34:56.000Z" },
+        private: { status: "none", last_successful_at: null },
+      },
+    });
+    expectNoTaintedContent(result);
+  });
+
+  it("reports a dead code-loop transport without claiming inference was checked", async () => {
+    const result = await diagnose({ publicTransport: "unavailable", privateTransport: "unavailable" });
+    expect(result).toMatchObject({
+      status: "degraded",
+      code_loop_transport: { public: "unavailable", private: "unavailable" },
+      inference: { public: "not_checked", private: "not_checked" },
+    });
+    expectNoTaintedContent(result);
+  });
+
+  it("does not trust an unknown transport label from the gateway", async () => {
+    const result = await diagnose({ publicTransport: `unavailable ${SECRET} ${LOCATOR}` });
+    expect(result).toMatchObject({ code_loop_transport: { public: "unknown", private: "unknown" } });
     expectNoTaintedContent(result);
   });
 

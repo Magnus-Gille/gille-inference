@@ -2215,10 +2215,34 @@ async function endpointDoctor({
       tier: identity?.tier,
       scope: identity?.scope,
     },
+    inference_observation: sanitizeInferenceObservation(identity),
     gateway_compatibility: classifyGatewayCompatibility(identity),
     tools,
     model_discovery: modelDiscovery,
+    code_loop_transport: await doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs),
   };
+}
+
+// /healthz is public and content-free. Treat missing/older/invalid responses as
+// unknown, never as proof of code-loop health. No credential or model prompt is sent.
+async function doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 1500));
+  try {
+    const response = await fetchImpl(`${baseUrl}/healthz`, {
+      redirect: "error",
+      headers: { accept: "application/json", "user-agent": `m5-cli/${M5_CLIENT_VERSION}` },
+      signal: controller.signal,
+    });
+    if (!response.ok) return "unknown";
+    const payload = JSON.parse(await readBoundedRegistryBody(response));
+    return ["available", "unavailable", "disabled"].includes(payload?.codeLoopTransport)
+      ? payload.codeLoopTransport : "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function modelCatalogueDigest(models) {
@@ -2265,6 +2289,28 @@ function sanitizeGatewayMetadata(identity) {
     contract_state: gatewayPresent && (!identity.gateway || typeof identity.gateway !== "object" || Array.isArray(identity.gateway)) ? "invalid"
       : !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
   };
+}
+
+/** A global request-log observation, never a live inference readiness claim. */
+function sanitizeInferenceObservation(identity) {
+  const unsupported = { status: "not_supported", last_successful_at: null };
+  if (!identity || typeof identity !== "object" || Array.isArray(identity) ||
+    !Object.prototype.hasOwnProperty.call(identity, "inferenceObservation")) return unsupported;
+  const value = identity.inferenceObservation;
+  const invalid = { status: "invalid", last_successful_at: null };
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    value.source !== "request_log" || value.scope !== "m5_global") return invalid;
+  if (value.status === "observed") {
+    const at = value.lastSuccessfulAt;
+    if (typeof at !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(at)) return invalid;
+    const parsed = Date.parse(at);
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== at) return invalid;
+    return { status: "observed", last_successful_at: at };
+  }
+  if (["none", "disabled", "unavailable"].includes(value.status) && value.lastSuccessfulAt === null) {
+    return { status: value.status, last_successful_at: null };
+  }
+  return invalid;
 }
 
 function classifyGatewayCompatibility(metadata) {
@@ -2462,6 +2508,11 @@ function doctorCredentialResult({ profile, status, credential, endpoints }) {
       : {}),
     model_discovery: { public: "not_checked", private: "not_checked" },
     inference: { public: "not_checked", private: "not_checked" },
+    inference_observation: {
+      source: "request_log", scope: "m5_global",
+      public: { status: "not_checked", last_successful_at: null },
+      private: { status: "not_checked", last_successful_at: null },
+    },
     gateway: { public: null, private: null },
     compatibility: { public: "unknown", private: "unknown" },
     endpoints,
@@ -2483,6 +2534,15 @@ function doctorCapabilityFields(
     },
     // Doctor never calls `ask`: that path is metered, so readiness remains explicitly unknown.
     inference: { public: "not_checked", private: "not_checked" },
+    code_loop_transport: {
+      public: publicProbe?.code_loop_transport ?? "unknown",
+      private: privateProbe?.code_loop_transport ?? "unknown",
+    },
+    inference_observation: {
+      source: "request_log", scope: "m5_global",
+      public: publicProbe?.inference_observation ?? { status: "not_checked", last_successful_at: null },
+      private: privateProbe?.inference_observation ?? { status: "not_checked", last_successful_at: null },
+    },
   };
 }
 
@@ -2630,7 +2690,7 @@ async function diagnoseProfileCore({
     const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
       .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
     const result = safeDoctorResult({
-      status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
+      status: knownCompatibilityMismatch || publicProbe.code_loop_transport === "unavailable" ? "degraded" : "mcp_reachable",
       profile,
       credential: "present",
       ...doctorCapabilityFields(publicProbe, null),
@@ -2705,7 +2765,8 @@ async function diagnoseProfileCore({
   const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
     .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
   const result = safeDoctorResult({
-    status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
+    status: knownCompatibilityMismatch || [publicProbe, privateProbe].some((probe) => probe.code_loop_transport === "unavailable")
+      ? "degraded" : "mcp_reachable",
     profile,
     credential: "present",
     identity: {
