@@ -9,11 +9,13 @@ const REQUIRED_WORKFLOWS = [
   ['cgroup-stop-proof.yml', 'Bound cgroup stop proof', ['cgroup-stop-proof']],
   ['ci.yml', 'CI', ['secret-scan', 'test']],
   ['code-health.yml', 'Informational code health', ['collect']],
+  ['code-loop-recovery.yml', 'Native code-loop recovery', ['code-loop-recovery']],
   ['host-arbiter.yml', 'Fixed host arbitration', ['host-arbiter']],
   ['observer-test-host.yml', 'Observer test-host prerequisites', ['native-boundary', 'preflight']],
   ['producer-activity.yml', 'Native producer activity', ['cpp-activity']],
   ['producer-channel.yml', 'Native producer channel', ['producer-channel']],
   ['proxy-activity.yml', 'Pinned proxy activity fixture', ['proxy-activity']],
+  ['portal-visual.yml', 'Portal visual verification', ['portal-visual']],
   ['runtime-producer-channel.yml', 'C++ runtime producer channel', ['runtime-producer-channel']],
 ];
 const CLIENT_WORKFLOW = ['client-compatibility.yml', 'Client compatibility', ['client']];
@@ -22,12 +24,14 @@ const EXPECTED_CHECKS = [
   ['Bound cgroup stop proof', 'cgroup-stop-proof', 'cgroup-stop-proof'],
   ['CI', 'secret-scan', 'Gitleaks'], ['CI', 'test', 'test'],
   ['Informational code health', 'collect', 'Collect report-only code health'],
+  ['Native code-loop recovery', 'code-loop-recovery', 'Real manager and cage recovery'],
   ['Fixed host arbitration', 'host-arbiter', 'host-arbiter'],
   ['Observer test-host prerequisites', 'native-boundary', 'native-boundary'],
   ['Observer test-host prerequisites', 'preflight', 'preflight'],
   ['Native producer activity', 'cpp-activity', 'cpp-activity'],
   ['Native producer channel', 'producer-channel', 'producer-channel'],
   ['Pinned proxy activity fixture', 'proxy-activity', 'proxy-activity'],
+  ['Portal visual verification', 'portal-visual', 'Portal desktop and mobile states'],
   ['C++ runtime producer channel', 'runtime-producer-channel', 'runtime-producer-channel'],
 ];
 const COMMANDS = [
