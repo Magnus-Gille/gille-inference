@@ -10,7 +10,8 @@ The optional `m5 build` command is a separate SSH-based, offline-first remote bu
 gateway inference route; see the [remote build guide](../docs/m5-remote-build.md). All
 `example.com` URLs below are reserved documentation examples; replace them with your deployment URL.
 
-Requires Node 18+ (uses built-in `fetch`). No external dependencies.
+Requires Node 18+ (uses built-in `fetch`). The dependency-free package gate and runtime fixtures
+run on Linux with Node 18 and 22 in CI. Windows support is not asserted here; see #266.
 
 ### Owner-client 1.5.x compatibility
 
