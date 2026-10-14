@@ -956,15 +956,14 @@ export async function collectCi({
       ? await gitWorkflowDigests(enumeration.windowRuns.map(run => run.head_sha), { deadline: collectionDeadline })
       : null;
     const configForCommit = async sha => {
+      if (configCache.has(sha)) return configCache.get(sha);
       if (Date.now() >= collectionDeadline) throw new Error('CI collection time budget exhausted while verifying workflow history');
-      if (!configCache.has(sha)) {
-        const value = usesDefaultWorkflowResolver
-          ? batchedWorkflowDigests.get(sha)
-          : await workflowDigestForCommit(sha, collectionDeadline);
-        if (!value) throw new Error(`pinned CI workflow is unavailable at ${sha}`);
-        configCache.set(sha, value);
-      }
-      return configCache.get(sha);
+      const value = usesDefaultWorkflowResolver
+        ? batchedWorkflowDigests.get(sha)
+        : await workflowDigestForCommit(sha, collectionDeadline);
+      if (!value) throw new Error(`pinned CI workflow is unavailable at ${sha}`);
+      configCache.set(sha, value);
+      return value;
     };
     const selectedForAttempts = [];
     const configurationExcluded = [];
@@ -975,14 +974,49 @@ export async function collectCi({
     }
     const attempts = new Map();
     const attemptErrors = [];
-    for (const run of selectedForAttempts) {
-      try {
-        attempts.set(Number(run.id), await fetchFirstAttempt({
-          token, owner: 'Magnus-Gille', repo: 'gille-inference', runId: run.id, deadline: collectionDeadline,
-        }));
-      } catch (error) {
-        attempts.set(Number(run.id), null);
-        attemptErrors.push({ run_id: Number(run.id), attempt: 1, error: error?.name ?? 'ApiError', status: Number.isInteger(error?.status) ? error.status : null });
+    const attemptResults = Array.from({ length: selectedForAttempts.length }, () => null);
+    let nextAttemptIndex = 0;
+    const fetchAttemptWorker = async () => {
+      while (true) {
+        const index = nextAttemptIndex;
+        nextAttemptIndex += 1;
+        if (index >= selectedForAttempts.length) return;
+        const run = selectedForAttempts[index];
+        if (Date.now() >= collectionDeadline) {
+          attemptResults[index] = {
+            ok: false,
+            error: Object.assign(new Error('CI collection time budget exhausted before fetching first attempt'), { name: 'TimeoutError' }),
+          };
+          continue;
+        }
+        try {
+          attemptResults[index] = {
+            ok: true,
+            attempt: await fetchFirstAttempt({
+              token, owner: 'Magnus-Gille', repo: 'gille-inference', runId: run.id, deadline: collectionDeadline,
+            }),
+          };
+        } catch (error) {
+          attemptResults[index] = { ok: false, error };
+        }
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(4, selectedForAttempts.length) },
+      () => fetchAttemptWorker(),
+    ));
+    for (let index = 0; index < selectedForAttempts.length; index += 1) {
+      const run = selectedForAttempts[index];
+      const result = attemptResults[index];
+      if (result === null) throw new Error('CI attempt worker omitted a selected run result');
+      attempts.set(Number(run.id), result.ok ? result.attempt : null);
+      if (!result.ok) {
+        attemptErrors.push({
+          run_id: Number(run.id),
+          attempt: 1,
+          error: result.error?.name ?? 'ApiError',
+          status: Number.isInteger(result.error?.status) ? result.error.status : null,
+        });
       }
     }
     const complete = await buildFirstAttemptEvidence({
