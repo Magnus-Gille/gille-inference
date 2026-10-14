@@ -7,6 +7,7 @@ TEST_UID=62056
 SLICE=girecovery.slice
 GATEWAY=gi-recovery-gateway.service
 CANARY=gi-recovery-canary.service
+DRIVER=gi-recovery-driver.service
 MANAGER=user@62056.service
 RUNTIME=user-runtime-dir@62056.service
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -27,7 +28,7 @@ mkdir -p -- "$OUTPUT"
 ! getent passwd "$USER_NAME" >/dev/null || die "fixture account already exists"
 ! getent passwd "$TEST_UID" >/dev/null || die "fixture UID already exists"
 ! getent group "$USER_NAME" >/dev/null || die "fixture group already exists"
-for item in "$SLICE" "$GATEWAY" "$CANARY" "$MANAGER" "$RUNTIME"; do
+for item in "$SLICE" "$GATEWAY" "$CANARY" "$DRIVER" "$MANAGER" "$RUNTIME"; do
   [[ "$(systemctl show "$item" -p LoadState --value)" = not-found || "$item" = "$MANAGER" || "$item" = "$RUNTIME" ]] || die "named fixture unit already exists: $item"
 done
 [[ "$(systemctl show "$MANAGER" -p ActiveState --value)" = inactive ]] || die "fixture manager active"
@@ -163,7 +164,7 @@ systemctl daemon-reload
 loginctl enable-linger "$USER_NAME"
 CREATED_LINGER=1
 systemctl start "$SLICE" "$MANAGER" "$CANARY" "$GATEWAY"
-systemd-run --quiet --wait --pipe --collect --unit=gi-recovery-driver.service --slice="$SLICE" \
+systemd-run --quiet --wait --pipe --collect --unit="$DRIVER" --slice="$SLICE" \
   -p RuntimeMaxSec=180 -p TimeoutStopSec=10 -p KillMode=control-group \
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   "$NODE" "$ROOT/source/tests/fixtures/code-loop-recovery-driver.mjs" "$TEST_UID"
