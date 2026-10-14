@@ -44,10 +44,11 @@ import {
   type Tier,
 } from "./keystore.js";
 import { checkQuota, recordUsage, checkRateWindow, type QuotaLimits, type QuotaReservation } from "./quota.js";
+import { describeQuotaFailure } from "./quota-error.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
+import { AdmissionCancelled, AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { acquireGpuLease } from "./gpu-lease.js";
 import {
   ExclusiveMaintenanceWindow,
@@ -1029,11 +1030,19 @@ async function admitAndMeterLogged(
       errorClass: lctx.errorClass ?? (outcome === "error" ? "internal_error" : undefined),
     });
   };
+  // Observe close before acquire: a completed request body is not a live response socket.
+  const admissionGone = new AbortController();
+  const onAdmissionClose = (): void => {
+    if (!res.writableEnded) admissionGone.abort();
+  };
+  res.once("close", onAdmissionClose);
+  if (res.destroyed && !res.writableEnded) admissionGone.abort();
   const admissionResult = await admissionTrace.run(async () => {
     let reservation: QuotaReservation | null = null;
     let release: (() => void) | null = null;
     let admissionThrew = false;
     try {
+      if (admissionGone.signal.aborted) throw new AdmissionCancelled();
       // Model allow-list check.
       if (surface === "systemone" && (requestedModel === null || !systemOneGranted(principal, requestedModel))) {
         releaseReserve();
@@ -1095,7 +1104,7 @@ async function admitAndMeterLogged(
       const q = checkQuota(principal.alias, principal.limits, estTokens);
       if (!q.ok) {
         releaseReserve();
-        const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+        const failure = describeQuotaFailure(q, estTokens, principal);
         lctx.status = 429;
         lctx.outcome = "rate_limited";
         lctx.errorClass = "rate_limit_exceeded";
@@ -1106,12 +1115,9 @@ async function admitAndMeterLogged(
           res,
           makeError("rate_limit_exceeded", {
             retryAfterSeconds: q.retryAfterSeconds,
-            message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-            rateLimit: {
-              limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-              remaining: 0,
-              resetSeconds: q.snapshot.resetSeconds,
-            },
+            message: failure.message,
+            quota: failure.quota,
+            rateLimit: failure.rateLimit,
           }),
         );
         finishAdmissionTrace(lctx.outcome);
@@ -1129,8 +1135,13 @@ async function admitAndMeterLogged(
           keyMaxParallel: principal.maxParallel,
           keyInflight: keyInflight.get(principal.alias) ?? 0,
           keyId: principal.alias,
-        }),
+        }, admissionGone.signal),
       );
+      // A grant and disconnect can meet before this continuation runs. Release that grant
+      // through the same rollback path instead of starting any M5 or Orin handler.
+      if (admissionGone.signal.aborted || (res.destroyed && !res.writableEnded)) {
+        throw new AdmissionCancelled();
+      }
       // queueWaitMs > 0 only when the owner had to wait (the acquire resolved via drainQueue).
       // For a direct admit it rounds to ~0ms, which we record as null (not meaningful).
       const waited = Date.now() - admitStart;
@@ -1139,6 +1150,17 @@ async function admitAndMeterLogged(
       finishAdmissionTrace("ok");
       return { admitted: true as const, release, reservation };
     } catch (err) {
+      if (err instanceof AdmissionCancelled) {
+        release?.();
+        releaseReserve();
+        if (reservation !== null) recordUsage(principal.alias, 0, Date.now(), reservation);
+        lctx.status = 499;
+        lctx.outcome = "client_closed";
+        lctx.errorClass = "client_closed";
+        lctx.admission = "n/a";
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
       if (err instanceof AdmissionRejected) {
         releaseReserve();
         // M1: the quota check already DEBITED the daily estimate; a request rejected at admission
@@ -1163,7 +1185,7 @@ async function admitAndMeterLogged(
     } finally {
       finishAdmissionTrace(admissionThrew ? "error" : (lctx.outcome === "ok" ? "ok" : lctx.outcome));
     }
-  });
+  }).finally(() => res.off("close", onAdmissionClose));
   if (!admissionResult.admitted) return;
   const { release, reservation } = admissionResult;
 
@@ -3096,7 +3118,7 @@ async function handleAudioTranscription(
   const q = checkQuota(principal.alias, principal.limits, quotaEst);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, quotaEst, principal, "audio_seconds");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3107,12 +3129,9 @@ async function handleAudioTranscription(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;
@@ -3440,7 +3459,7 @@ async function handleImageGeneration(
   const q = checkQuota(principal.alias, principal.limits, parsed.n);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, parsed.n, principal, "image_units");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3451,12 +3470,9 @@ async function handleImageGeneration(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;

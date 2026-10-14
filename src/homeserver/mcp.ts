@@ -5,6 +5,7 @@ import { listModels } from "./model-admin.js";
 import { admitHostMemory, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
 import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
+import { describeQuotaFailure, type QuotaFailureDetail } from "./quota-error.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
 import { recordOwnerRequest } from "./owner-log.js";
 import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
@@ -684,19 +685,7 @@ export type RunChatResult =
       traceErrorClass: string;
     };
 
-interface AskQuotaFailureCommon {
-  reason: "rpm" | "tpm" | "daily";
-  window: "60s" | "utc_day";
-  limit: number;
-  requested: number;
-  counted: false;
-  retry_after_seconds: number;
-}
-
-export type AskQuotaFailureDetail = AskQuotaFailureCommon & (
-  | { scope: "key"; used_before: number }
-  | { scope: "shared_static_tier"; used_before?: never }
-);
+export type AskQuotaFailureDetail = QuotaFailureDetail;
 
 /**
  * Machine-readable cause for a failed `ask`, sent in the MCP result's `_meta` (#349, #357). The
@@ -1005,38 +994,13 @@ export async function runChatCompletion(
     releaseReserve();
     recordRateLimited("quota");
     logInferenceFailure(429, "rate_limited", "rate_limit_exceeded", "n/a");
-    const quotaBase: AskQuotaFailureCommon = {
-      reason: q.reason,
-      window: q.reason === "daily" ? "utc_day" : "60s",
-      limit: q.reason === "rpm" ? q.snapshot.rpmLimit : q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.dailyLimit,
-      requested: q.reason === "rpm" ? 1 : estTokens,
-      counted: false,
-      retry_after_seconds: q.retryAfterSeconds,
-    };
-    // Legacy static tokens share one tier-wide alias. A minted key may also collide with that
-    // reserved alias, so decide from the actual quota bucket name as well as credential type.
-    // Such usage can include another consumer; never expose its exact count as per-key usage.
-    const sharedStaticBucket = principal.keyHash === null
-      || principal.alias === "static:user"
-      || principal.alias === "static:admin"
-      || principal.alias === "static:monitor";
-    const quota: AskQuotaFailureDetail = sharedStaticBucket
-      ? { ...quotaBase, scope: "shared_static_tier" }
-      : {
-          ...quotaBase,
-          scope: "key",
-          used_before: q.reason === "rpm"
-            ? q.snapshot.rpmUsed - 1
-            : q.reason === "tpm"
-              ? q.snapshot.tpmUsed - estTokens
-              : q.snapshot.dailyUsed,
-        };
+    const failure = describeQuotaFailure(q, estTokens, principal);
     return {
       ok: false,
       code: "rate_limited",
-      message: `${quota.scope === "key" ? "Per-key" : "Shared static-tier"} ${q.reason} limit reached (${quota.limit} ${q.reason === "rpm" ? "requests" : "estimated tokens"} per ${quota.window === "60s" ? "60s" : "UTC day"}). This rejected request was not counted. Retry after ${q.retryAfterSeconds}s.`,
+      message: failure.message,
       retryAfterSeconds: q.retryAfterSeconds,
-      quota,
+      quota: failure.quota,
       traceOutcome: "rate_limited",
       traceErrorClass: "rate_limit_exceeded",
     };

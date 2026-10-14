@@ -30,6 +30,17 @@ function reqFor(lane: "owner" | "guest", p: Partial<AdmissionRequest> = {}): Adm
   };
 }
 
+function acquireWithSignal(controller: AdmissionController, req: AdmissionRequest, signal?: AbortSignal) {
+  return controller.acquire(req, signal);
+}
+
+function within<T>(promise: Promise<T>, timeoutMs: number): Promise<{ settled: true; value: T } | { settled: false }> {
+  return Promise.race([
+    promise.then((value) => ({ settled: true as const, value })),
+    new Promise<{ settled: false }>((resolve) => setTimeout(() => resolve({ settled: false }), timeoutMs)),
+  ]);
+}
+
 describe("admit() pure decision", () => {
   it("admits both lanes when a slot is free", () => {
     expect(admit(state(), reqFor("owner"), CFG).decision).toBe("admit");
@@ -76,6 +87,107 @@ describe("admit() pure decision", () => {
 });
 
 describe("AdmissionController", () => {
+  it("cancels a queued owner, removes it from FIFO, and releases no slot or per-key capacity", async () => {
+    const ctrl = new AdmissionController({ maxInflight: 1, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
+    const releaseHolder = await ctrl.acquire(reqFor("owner", { keyId: "holder", keyMaxParallel: 1 }));
+    const cancelledSignal = new AbortController();
+    const cancelledResult = acquireWithSignal(
+      ctrl,
+      reqFor("owner", { keyId: "alice", keyMaxParallel: 1 }),
+      cancelledSignal.signal,
+    ).then(
+      (release) => { release(); return { kind: "resolved" as const }; },
+      (error: unknown) => ({ kind: "rejected" as const, error }),
+    );
+    const nextSameKey = acquireWithSignal(ctrl, reqFor("owner", { keyId: "alice", keyMaxParallel: 1 })).then(
+      (release) => { release(); return "admitted" as const; },
+      () => "rejected" as const,
+    );
+
+    try {
+      await Promise.resolve();
+      expect(ctrl.snapshot()).toMatchObject({ inflight: 1, ownerQueued: 2 });
+      cancelledSignal.abort();
+
+      const cancellation = await within(cancelledResult, 100);
+      expect(cancellation.settled).toBe(true);
+      if (cancellation.settled) {
+        expect(cancellation.value.kind).toBe("rejected");
+        if (cancellation.value.kind === "rejected") {
+          expect(cancellation.value.error).toBeInstanceOf(Error);
+          expect((cancellation.value.error as Error).name).toBe("AdmissionCancelled");
+        }
+      }
+      expect(ctrl.snapshot()).toMatchObject({ inflight: 1, ownerQueued: 1 });
+
+      releaseHolder();
+      expect(await within(nextSameKey, 250)).toMatchObject({ settled: true, value: "admitted" });
+      expect(ctrl.snapshot()).toMatchObject({ inflight: 0, ownerQueued: 0 });
+    } finally {
+      releaseHolder();
+    }
+  });
+
+  it("does not preempt background work for an already-aborted owner", async () => {
+    const ctrl = new AdmissionController({ maxInflight: 1, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
+    let abortCalls = 0;
+    const releaseBackground = ctrl.tryAcquireBackground(() => { abortCalls++; })!;
+    const signal = new AbortController();
+    signal.abort();
+    const acquisition = acquireWithSignal(ctrl, reqFor("owner"), signal.signal).then(
+      (release) => { release(); return { kind: "resolved" as const }; },
+      (error: unknown) => ({ kind: "rejected" as const, error }),
+    );
+
+    try {
+      const result = await within(acquisition, 100);
+      expect(result.settled).toBe(true);
+      if (result.settled) {
+        expect(result.value.kind).toBe("rejected");
+        if (result.value.kind === "rejected") {
+          expect((result.value.error as Error).name).toBe("AdmissionCancelled");
+        }
+      }
+      expect(abortCalls).toBe(0);
+      expect(ctrl.snapshot()).toMatchObject({ inflight: 1, ownerQueued: 0 });
+    } finally {
+      releaseBackground();
+      await within(acquisition, 100);
+    }
+  });
+
+  it("does not acquire after cancellation while draining background work", async () => {
+    const ctrl = new AdmissionController({ maxInflight: 1, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
+    let abortCalls = 0;
+    const releaseBackground = ctrl.tryAcquireBackground(() => { abortCalls++; })!;
+    const signal = new AbortController();
+    const acquisition = acquireWithSignal(ctrl, reqFor("owner"), signal.signal).then(
+      (release) => { release(); return { kind: "resolved" as const }; },
+      (error: unknown) => ({ kind: "rejected" as const, error }),
+    );
+
+    try {
+      await Promise.resolve();
+      expect(abortCalls).toBe(1);
+      expect(ctrl.snapshot().inflight).toBe(1);
+      signal.abort();
+      releaseBackground();
+
+      const result = await within(acquisition, 100);
+      expect(result.settled).toBe(true);
+      if (result.settled) {
+        expect(result.value.kind).toBe("rejected");
+        if (result.value.kind === "rejected") {
+          expect((result.value.error as Error).name).toBe("AdmissionCancelled");
+        }
+      }
+      expect(ctrl.snapshot()).toMatchObject({ inflight: 0, ownerQueued: 0 });
+    } finally {
+      releaseBackground();
+      await within(acquisition, 100);
+    }
+  });
+
   it("preempts and drains a background lease before admitting a real request", async () => {
     const ctrl = new AdmissionController({ maxInflight: 1, ownerQueueMaxMs: 5000, retryAfterAtCapSeconds: 2 });
     let aborts = 0;

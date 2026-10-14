@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,7 +27,7 @@ import {
   fetchJsonWithRetry,
   getFirstAttempt,
 } from './lib/ci.mjs';
-import { checkVendorContract, collect, collectCi, inferTriage, newCollectionRef, reportMarkdown, runProcess } from './collect.mjs';
+import { checkVendorContract, collect, collectCi, gitWorkflowDigests, inferTriage, newCollectionRef, reportMarkdown, runProcess } from './collect.mjs';
 import { validateObjective } from '../../contracts/grimnir-code-health-v1/scripts/lib/code-health-objective.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -167,6 +167,122 @@ test('a missing analyzer executable is recorded as a bounded failed process', as
   assert.equal(missing.errorName, 'ENOENT');
   assert.equal(missing.stdout, '');
   assert.equal(missing.timedOut, false);
+});
+
+test('workflow history batch hashes exact Git blobs with one inventory process and deduplicated reads', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-git-history-'));
+  const git = async (args, options = {}) => {
+    const result = await runProcess('git', args, { cwd: temp, sanitizeOutput: false, ...options });
+    assert.equal(result.exitCode, 0, `git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  const commit = async () => {
+    await git(['add', '-A']);
+    await git(['-c', 'user.name=Code Health Test', '-c', 'user.email=code-health-test@example.invalid', 'commit', '--quiet', '-m', 'fixture']);
+    return git(['rev-parse', 'HEAD']);
+  };
+  try {
+    await git(['init', '--quiet']);
+    await mkdir(path.join(temp, '.github/workflows'), { recursive: true });
+    await writeFile(path.join(temp, '.github/workflows/ci.yml'), 'name: first\n');
+    const commits = [await commit()];
+    await writeFile(path.join(temp, 'notes.txt'), 'one\n');
+    commits.push(await commit());
+    await writeFile(path.join(temp, 'notes.txt'), 'two\n');
+    commits.push(await commit());
+    await writeFile(path.join(temp, '.github/workflows/ci.yml'), 'name: second\n');
+    commits.push(await commit());
+    await writeFile(path.join(temp, 'notes.txt'), 'three\n');
+    commits.push(await commit());
+    await writeFile(path.join(temp, '.github/workflows/ci.yml'), '');
+    commits.push(await commit());
+
+    const processCalls = [];
+    const resolverRun = async (command, args, options) => {
+      processCalls.push([...args]);
+      return runProcess(command, args, { ...options, cwd: temp });
+    };
+    const digests = await gitWorkflowDigests([...commits, commits[2]], { cwd: temp, run: resolverRun });
+    assert.equal(digests.size, commits.length, 'duplicate commit inputs collapse to one map entry');
+    assert.equal(processCalls.filter(args => args[0] === 'cat-file' && args[1] === '--batch-check').length, 1);
+    assert.equal(processCalls.length, 4, 'six distinct commits use one inventory and three unique blob reads');
+    const uniqueDigests = new Set();
+    let priorResolverProcessCalls = 0;
+    for (const sha of commits) {
+      priorResolverProcessCalls += 1;
+      const expected = await runProcess('git', ['show', `${sha}:.github/workflows/ci.yml`], { cwd: temp, sanitizeOutput: false });
+      assert.equal(expected.exitCode, 0);
+      const expectedDigest = createHash('sha256').update(expected.stdout).digest('hex');
+      assert.equal(digests.get(sha), expectedDigest, `digest for ${sha} matches direct git show bytes`);
+      uniqueDigests.add(expectedDigest);
+    }
+    assert.equal(uniqueDigests.size, 3);
+    assert.equal(digests.get(commits[5]), createHash('sha256').update('').digest('hex'), 'an empty workflow blob hashes as empty bytes');
+    assert.equal(priorResolverProcessCalls, 6, 'the former per-commit resolver invokes git show once for each distinct SHA');
+    assert.ok(processCalls.length < priorResolverProcessCalls, 'batch inventory plus unique blobs uses fewer Git processes for repeated file versions');
+
+    const forcedMissingRun = async (command, args, options) => {
+      if (args[0] === 'cat-file' && args[1] === '--batch-check') {
+        const commitSha = commits[0];
+        return { exitCode: 0, stdout: `${commitSha}:.github/workflows/ci.yml missing\n`, stderr: '', timedOut: false };
+      }
+      return runProcess(command, args, { ...options, cwd: temp });
+    };
+    const fallbackDigests = await gitWorkflowDigests([commits[0]], { cwd: temp, run: forcedMissingRun });
+    assert.equal(fallbackDigests.get(commits[0]), digests.get(commits[0]), 'default fallback resolves against the injected checkout');
+
+    await git(['rm', '--quiet', '.github/workflows/ci.yml']);
+    const missingPathCommit = await commit();
+    const fallbackCalls = [];
+    const missingDigests = await gitWorkflowDigests([missingPathCommit], {
+      cwd: temp,
+      fallback: async (sha, deadline) => {
+        fallbackCalls.push({ sha, deadline });
+        return DIGEST;
+      },
+    });
+    assert.deepEqual(fallbackCalls, [{ sha: missingPathCommit, deadline: Number.POSITIVE_INFINITY }]);
+    assert.equal(missingDigests.get(missingPathCommit), DIGEST);
+    await assert.rejects(gitWorkflowDigests([missingPathCommit], {
+      cwd: temp,
+      fallback: async () => { throw new Error('missing locally'); },
+    }), /missing locally/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('workflow history batch rejects malformed, truncated, timed-out, and invalid blob responses', async () => {
+  const sha = 'c'.repeat(40);
+  const validOid = 'd'.repeat(40);
+  const cases = [
+    { name: 'nonzero exit', result: { exitCode: 1, stdout: '', stderr: '', timedOut: false }, pattern: /inventory failed/ },
+    { name: 'truncated stdout', result: { exitCode: 0, stdout: '', stderr: '', stdoutTruncated: true }, pattern: /inventory failed/ },
+    { name: 'timeout', result: { exitCode: 124, stdout: '', stderr: '', timedOut: true }, pattern: /inventory failed/ },
+    { name: 'missing row', result: { exitCode: 0, stdout: '', stderr: '' }, pattern: /unexpected row count/ },
+    { name: 'malformed row', result: { exitCode: 0, stdout: 'bad object row\n', stderr: '' }, pattern: /malformed or non-blob/ },
+    { name: 'unexpected type', result: { exitCode: 0, stdout: `${validOid} tree 1\n`, stderr: '' }, pattern: /malformed or non-blob/ },
+    { name: 'oversize', result: { exitCode: 0, stdout: `${validOid} blob 10000001\n`, stderr: '' }, pattern: /size is invalid/ },
+  ];
+  for (const fixture of cases) {
+    await assert.rejects(gitWorkflowDigests([sha], {
+      run: async () => ({ elapsedMs: 0, stdoutTruncated: false, stderrTruncated: false, errorName: null, ...fixture.result }),
+    }), fixture.pattern, fixture.name);
+  }
+  await assert.rejects(gitWorkflowDigests(['not-a-sha']), /full immutable commit SHAs/);
+  const emptyBlobDigest = await gitWorkflowDigests([sha], {
+    run: async (_command, args) => args[1] === '--batch-check'
+      ? { exitCode: 0, stdout: `${validOid} blob 0\n`, stderr: '' }
+      : { exitCode: 0, stdout: '', stderr: '' },
+  });
+  assert.equal(emptyBlobDigest.get(sha), createHash('sha256').update('').digest('hex'));
+  await assert.rejects(gitWorkflowDigests([sha], {
+    deadline: Date.now() - 1,
+    run: (command, args, options) => runProcess(command, args, options),
+  }), /inventory failed/);
+  await assert.rejects(gitWorkflowDigests([sha], {
+    run: async () => ({ exitCode: 0, stdout: `${validOid} blob 3\n`, stderr: '' }),
+  }), /blob read failed|size did not match/);
 });
 
 test('complexity is strictly greater than the threshold with the full function denominator', () => {
@@ -493,6 +609,59 @@ test('CI collector withholds the measured slot for unclassifiable known failures
       objective.metrics.ci_first_attempt = ciSlot;
       assert.equal(validateObjective(schema, objective).valid, true, `full objective schema for ${ciSlot.status} CI slot`);
     }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('CI collector preserves every run version and first-attempt failure with the injected resolver seam', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-ci-history-seam-'));
+  try {
+    const expectedDigest = createHash('sha256')
+      .update(await readFile(path.join(ROOT, '.github/workflows/ci.yml')))
+      .digest('hex');
+    const runs = [
+      makeRun(71, { head_sha: 'a'.repeat(40), created_at: '2026-09-20T10:00:00Z', conclusion: 'success' }),
+      makeRun(72, { head_sha: 'b'.repeat(40), created_at: '2026-09-21T10:00:00Z', conclusion: 'success' }),
+      makeRun(73, { head_sha: 'c'.repeat(40), created_at: '2026-09-22T10:00:00Z', conclusion: 'failure' }),
+    ];
+    const attemptsFetched = [];
+    const result = await collectCi({
+      outputRoot: path.join(temp, 'artifact'),
+      observedAt: '2026-10-09T12:00:00Z',
+      collectionRef: 'ref:collection-ci-history-seam',
+      attempt: 1,
+      token: 'synthetic-test-token',
+      evidenceRefs: {},
+      deadline: Date.now() + 10_000,
+      enumerateRuns: async () => ({
+        totalCount: runs.length, pageCount: 1, windowCount: runs.length, windowRuns: runs,
+        query: { start: '2026-09-11T12:00:00Z', end: '2026-10-09T12:00:00Z' },
+      }),
+      workflowDigestForCommit: async sha => sha === 'b'.repeat(40) ? 'f'.repeat(64) : expectedDigest,
+      fetchFirstAttempt: async ({ runId }) => {
+        attemptsFetched.push(Number(runId));
+        const failure = Number(runId) === 73;
+        return {
+          runAttempt: 1,
+          status: 'completed',
+          conclusion: failure ? 'failure' : 'success',
+          jobs: [
+            { id: Number(runId) * 10 + 1, name: 'Gitleaks', status: 'completed', conclusion: 'success' },
+            { id: Number(runId) * 10 + 2, name: 'test', status: 'completed', conclusion: failure ? 'failure' : 'success' },
+          ],
+        };
+      },
+    });
+    assert.deepEqual(attemptsFetched, [71, 73], 'only runs using the exact pinned workflow reach attempt retrieval');
+    assert.equal(result.status, 'measured');
+    const inventory = JSON.parse(await readFile(path.join(temp, 'artifact/evidence/ci/inventory.json'), 'utf8'));
+    assert.equal(inventory.complete_run_enumeration, true);
+    assert.deepEqual(inventory.runs.map(run => run.run_id), [71, 73]);
+    assert.deepEqual(inventory.workflow_config_cohorts.map(run => run.run_id), [72]);
+    assert.deepEqual(result.slot.payload.runs.map(run => run.overall_conclusion), ['success', 'failure']);
+    assert.deepEqual(result.slot.payload.runs.map(run => run.attempt), [1, 1]);
+    assert.equal(result.slot.payload.expected_run_count, 2);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

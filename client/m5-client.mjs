@@ -8,6 +8,8 @@ export const M5_CLIENT_VERSION = "1.5.3";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
 // the word of a remote peer.
 const MAX_RETRY_AFTER_SECONDS = 86_400;
+const QUOTA_REASONS = new Set(["rpm", "tpm", "daily"]);
+const QUOTA_WINDOWS = new Map([["rpm", "60s"], ["tpm", "60s"], ["daily", "utc_day"]]);
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
@@ -186,6 +188,13 @@ export class M5ClientError extends Error {
         options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
       this.retryAfterSeconds = options.retryAfterSeconds;
     }
+    if (code === "rate_limited" && options.retryable === true &&
+        Number.isInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 1 &&
+        options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS &&
+        options.quota?.retry_after_seconds === options.retryAfterSeconds) {
+      const quota = normalizeQuotaFailure(options.quota);
+      if (quota !== null) this.quota = quota;
+    }
     if (isValidEvidenceRecovery(options.evidenceRecovery)) {
       this.evidenceRecovery = { ...options.evidenceRecovery };
     }
@@ -208,6 +217,7 @@ export class M5ClientError extends Error {
     const remediation = CREDENTIAL_FAILURE_CODES.has(this.code)
       ? credentialRemediation(profile)
       : this.remediation;
+    const quota = this.code === "rate_limited" ? normalizeQuotaFailure(this.quota) : null;
     return {
       error: {
         code: this.code,
@@ -218,6 +228,7 @@ export class M5ClientError extends Error {
         ...(this.failureLayer === undefined ? {} : { failure_layer: this.failureLayer }),
         ...(this.retryable === undefined ? {} : { retryable: this.retryable }),
         ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
+        ...(quota === null ? {} : { quota }),
         ...(this.evidenceRecovery === undefined ? {} : { evidence_recovery: { ...this.evidenceRecovery } }),
         ...(remediation === undefined ? {} : { remediation }),
       },
@@ -481,6 +492,7 @@ function safeError(error, secrets, profile) {
       failureLayer: error.failureLayer,
       retryable: error.retryable,
       retryAfterSeconds: error.retryAfterSeconds,
+      quota: error.quota,
       remediation: error.remediation,
       evidenceRecovery: error.evidenceRecovery,
     }));
@@ -962,6 +974,30 @@ const ASK_BACKEND_MESSAGES = new Map([
 export function askRefusalFromMeta(result, text) {
   const meta = result?._meta;
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+  if (meta.m5_code === "rate_limited") {
+    const retryAfterSeconds = meta.retry_after_seconds;
+    const quota = normalizeQuotaFailure(meta.quota);
+    if (
+      quota === null ||
+      meta.retryable !== true ||
+      !Number.isSafeInteger(retryAfterSeconds) ||
+      retryAfterSeconds < 1 ||
+      retryAfterSeconds > MAX_RETRY_AFTER_SECONDS ||
+      retryAfterSeconds !== quota.retry_after_seconds
+    ) {
+      return {
+        code: "tool_error",
+        message: typeof text === "string" ? text.trim() : "The MCP tool reported an error.",
+      };
+    }
+    return {
+      code: "rate_limited",
+      retryable: true,
+      retryAfterSeconds,
+      quota,
+      message: quotaFailureMessage(quota),
+    };
+  }
   if (meta.m5_code === "upstream_error") {
     const generic = { code: "tool_error", message: "The model backend reported an error." };
     const message = ASK_BACKEND_MESSAGES.get(meta.reason);
@@ -988,6 +1024,56 @@ export function askRefusalFromMeta(result, text) {
     ...(retryable && Number.isInteger(seconds) && seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS ? { retryAfterSeconds: seconds } : {}),
     message: typeof text === "string" ? text.trim() : "",
   };
+}
+
+function normalizeQuotaFailure(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const { reason, scope, window, limit, requested, counted, retry_after_seconds } = value;
+  if (
+    !QUOTA_REASONS.has(reason) ||
+    QUOTA_WINDOWS.get(reason) !== window ||
+    !["key", "shared_static_tier"].includes(scope) ||
+    !Number.isSafeInteger(limit) || limit < 0 ||
+    !Number.isSafeInteger(requested) || requested < 0 ||
+    counted !== false ||
+    !Number.isSafeInteger(retry_after_seconds) || retry_after_seconds < 1 || retry_after_seconds > MAX_RETRY_AFTER_SECONDS
+  ) return null;
+  const expectedKeys = scope === "key"
+    ? ["counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "used_before", "window"]
+    : ["counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "window"];
+  expectedKeys.sort();
+  const actualKeys = Object.keys(value).sort();
+  if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) return null;
+  if (scope === "key" && (!Number.isSafeInteger(value.used_before) || value.used_before < 0)) return null;
+  return {
+    reason,
+    scope,
+    window,
+    limit,
+    ...(scope === "key" ? { used_before: value.used_before } : {}),
+    requested,
+    counted: false,
+    retry_after_seconds,
+  };
+}
+
+function quotaFailureMessage(quota) {
+  const shared = quota.scope === "shared_static_tier";
+  const prefix = shared ? "Shared static-tier" : "Per-key";
+  const subject = shared ? "the shared static-tier bucket" : "your own API key";
+  const basis = quota.reason === "rpm"
+    ? `${quota.limit} ${quota.limit === 1 ? "request" : "requests"} per minute`
+    : quota.reason === "tpm"
+      ? `${quota.limit} ${quota.limit === 1 ? "token" : "tokens"} per minute`
+      : `${quota.limit} ${quota.limit === 1 ? "token" : "tokens"} per UTC day`;
+  const estimate = quota.reason === "rpm" ? "" : ` The request was estimated at ${quota.requested} tokens.`;
+  const retryUnit = quota.retry_after_seconds === 1 ? "second" : "seconds";
+  const retryGuidance = quota.reason === "rpm" && quota.limit === 0
+    ? "The configured request allowance is zero; contact the gateway operator. A retry delay will not restore request capacity."
+    : quota.reason === "daily"
+      ? `The UTC-day budget resets in ${quota.retry_after_seconds} ${retryUnit}; retry after ${quota.retry_after_seconds} ${retryUnit}.`
+      : `The next quota-window expiry is in ${quota.retry_after_seconds} ${retryUnit}; retry after ${quota.retry_after_seconds} ${retryUnit}.`;
+  return `${prefix} ${quota.reason} limit reached. This applies to ${subject}, which permits ${basis}.${estimate} This rejected request was not counted. ${retryGuidance}`;
 }
 
 function toolResultText(result) {
@@ -1382,6 +1468,9 @@ export async function createM5Client({
         body: JSON.stringify(message),
         signal: controller.signal,
       });
+      // Fetch resolving means response headers have arrived, even when an error-status body
+      // still needs inspection. Keep timeout diagnostics tied to the real response stage.
+      headersReceived = true;
 
       if ((response.status === 404 || response.status === 410) && sessionId !== null && retrySession) {
         sessionId = null;
@@ -1406,7 +1495,6 @@ export async function createM5Client({
       if (returnedSession) sessionId = returnedSession;
       // Keep the same abort deadline active through body consumption. Fetch resolving headers
       // is not completion: a peer can otherwise hold this sequential stdio bridge forever.
-      headersReceived = true;
       const text = await response.text();
       if (text.trim() === "") {
         if (message.id === undefined || message.id === null) return null;
@@ -1786,6 +1874,7 @@ export async function createM5Client({
             retryable: refusal.retryable,
             failureLayer: refusal.failureLayer,
             retryAfterSeconds: refusal.retryAfterSeconds,
+            quota: refusal.quota,
           });
         }
         throw new M5ClientError(
