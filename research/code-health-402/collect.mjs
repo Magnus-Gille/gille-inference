@@ -140,10 +140,14 @@ async function validateEvidenceIndex(outputRoot, objective, evidenceRefs) {
 export async function runProcess(command, args, {
   cwd = ROOT,
   extraEnv = {},
+  stdin = null,
   timeoutMs = PROCESS_TIMEOUT_MS,
   deadline = Number.POSITIVE_INFINITY,
   sanitizeOutput = true,
 } = {}) {
+  if (stdin !== null && typeof stdin !== 'string' && !Buffer.isBuffer(stdin)) {
+    throw new TypeError('process stdin must be a string, Buffer, or null');
+  }
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) return {
     exitCode: 124,
@@ -172,7 +176,7 @@ export async function runProcess(command, args, {
     let stdoutTruncated = false;
     let stderrTruncated = false;
     let timedOut = false;
-    const child = spawn(command, args, { cwd, env: allowedEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env: allowedEnv, stdio: [stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => {
@@ -194,6 +198,10 @@ export async function runProcess(command, args, {
       }
     });
     child.on('error', error => { spawnError = error; });
+    if (stdin !== null) {
+      child.stdin.on('error', error => { spawnError = error; });
+      child.stdin.end(stdin);
+    }
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill('SIGTERM');
@@ -816,10 +824,85 @@ async function sourceContext({ files, outputRoot, observedAt, deadline }) {
   return { result };
 }
 
-async function gitWorkflowDigest(commit, deadline) {
-  const run = await runProcess('git', ['show', `${commit}:.github/workflows/ci.yml`], { sanitizeOutput: false, deadline });
+async function gitWorkflowDigest(commit, deadline, cwd = ROOT) {
+  const run = await runProcess('git', ['show', `${commit}:.github/workflows/ci.yml`], { cwd, sanitizeOutput: false, deadline });
   if (run.exitCode !== 0) throw new Error(`pinned CI workflow is absent at ${commit}`);
   return createHash('sha256').update(run.stdout).digest('hex');
+}
+
+export async function gitWorkflowDigests(commits, {
+  deadline = Number.POSITIVE_INFINITY,
+  cwd = ROOT,
+  run = runProcess,
+  fallback = null,
+} = {}) {
+  const uniqueCommits = [...new Set(commits)];
+  for (const commit of uniqueCommits) {
+    if (typeof commit !== 'string' || !/^[a-f0-9]{40}$/.test(commit)) {
+      throw new TypeError('workflow history requires full immutable commit SHAs');
+    }
+  }
+  if (!uniqueCommits.length) return new Map();
+
+  const objectSpecs = uniqueCommits.map(commit => `${commit}:.github/workflows/ci.yml`);
+  const inventory = await run('git', ['cat-file', '--batch-check'], {
+    cwd, deadline, stdin: `${objectSpecs.join('\n')}\n`, sanitizeOutput: false,
+  });
+  if (inventory.exitCode !== 0 || inventory.timedOut || inventory.stdoutTruncated || inventory.stderrTruncated || inventory.errorName) {
+    throw new Error('git cat-file workflow inventory failed or exceeded its process bounds');
+  }
+  const rows = inventory.stdout.split('\n');
+  if (rows.at(-1) === '') rows.pop();
+  if (rows.length !== uniqueCommits.length) throw new Error('git cat-file workflow inventory returned an unexpected row count');
+
+  const commitObjects = new Map();
+  const missingCommits = [];
+  const blobSizes = new Map();
+  for (let index = 0; index < uniqueCommits.length; index += 1) {
+    const commit = uniqueCommits[index];
+    const row = rows[index];
+    const objectSpec = objectSpecs[index];
+    if (row === `${objectSpec} missing`) {
+      missingCommits.push(commit);
+      continue;
+    }
+    const match = row.match(/^([a-f0-9]{40}|[a-f0-9]{64}) blob (\d+)$/);
+    if (!match) throw new Error('git cat-file workflow inventory returned a malformed or non-blob object');
+    const size = Number(match[2]);
+    if (!Number.isSafeInteger(size) || size > PROCESS_STDOUT_LIMIT) {
+      throw new Error('git cat-file workflow blob size is invalid or exceeds the process output bound');
+    }
+    commitObjects.set(commit, match[1]);
+    const knownSize = blobSizes.get(match[1]);
+    if (knownSize !== undefined && knownSize !== size) throw new Error('git cat-file returned inconsistent sizes for a workflow blob');
+    blobSizes.set(match[1], size);
+  }
+
+  const blobDigests = new Map();
+  for (const [objectId, expectedSize] of blobSizes) {
+    const blob = await run('git', ['cat-file', 'blob', objectId], { cwd, deadline, sanitizeOutput: false });
+    if (blob.exitCode !== 0 || blob.timedOut || blob.stdoutTruncated || blob.stderrTruncated || blob.errorName) {
+      throw new Error('git cat-file workflow blob read failed or exceeded its process bounds');
+    }
+    if (Buffer.byteLength(blob.stdout, 'utf8') !== expectedSize) throw new Error('git cat-file workflow blob size did not match its inventory');
+    blobDigests.set(objectId, createHash('sha256').update(blob.stdout).digest('hex'));
+  }
+
+  const result = new Map();
+  for (const commit of uniqueCommits) {
+    if (missingCommits.includes(commit)) {
+      const value = fallback
+        ? await fallback(commit, deadline)
+        : await gitWorkflowDigest(commit, deadline, cwd);
+      if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) throw new Error(`pinned CI workflow is unavailable at ${commit}`);
+      result.set(commit, value);
+      continue;
+    }
+    const value = blobDigests.get(commitObjects.get(commit));
+    if (!value) throw new Error('git cat-file omitted a verified workflow blob digest');
+    result.set(commit, value);
+  }
+  return result;
 }
 
 export async function collectCi({
@@ -868,9 +951,19 @@ export async function collectCi({
       deadline: collectionDeadline,
     });
     const configCache = new Map();
+    const usesDefaultWorkflowResolver = workflowDigestForCommit === gitWorkflowDigest;
+    const batchedWorkflowDigests = usesDefaultWorkflowResolver
+      ? await gitWorkflowDigests(enumeration.windowRuns.map(run => run.head_sha), { deadline: collectionDeadline })
+      : null;
     const configForCommit = async sha => {
       if (Date.now() >= collectionDeadline) throw new Error('CI collection time budget exhausted while verifying workflow history');
-      if (!configCache.has(sha)) configCache.set(sha, await workflowDigestForCommit(sha, collectionDeadline));
+      if (!configCache.has(sha)) {
+        const value = usesDefaultWorkflowResolver
+          ? batchedWorkflowDigests.get(sha)
+          : await workflowDigestForCommit(sha, collectionDeadline);
+        if (!value) throw new Error(`pinned CI workflow is unavailable at ${sha}`);
+        configCache.set(sha, value);
+      }
       return configCache.get(sha);
     };
     const selectedForAttempts = [];
