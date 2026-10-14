@@ -327,6 +327,118 @@ describe("secret-safe M5 client", () => {
     ).resolves.toMatchObject({ id: 2, result: { tools: [] } });
   });
 
+  it("classifies an aborted Cloudflare 530 body read as post-header timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 1_000,
+        fetch: async (_input, init) => {
+          attempts += 1;
+          return {
+            status: 530,
+            headers: new Headers({ server: "cloudflare" }),
+            body: {
+              getReader: () => ({
+                read: () => new Promise((_resolve, reject) => {
+                  init?.signal?.addEventListener("abort", () => reject(new DOMException("body aborted", "AbortError")), { once: true });
+                }),
+                cancel: async () => {},
+              }),
+            },
+          } as Response;
+        },
+      });
+      const pending = client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const assertion = expect(pending).rejects.toMatchObject({
+        code: "timeout",
+        message: expect.stringContaining("timed out while reading the gateway response after HTTP headers"),
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+      expect(attempts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a transport timeout before fetch headers classified as pre-header", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const client = await createM5Client({
+        gatewayUrl: "http://gateway.invalid",
+        profile: "codex",
+        endpoint: "private",
+        credentialStore: { resolve: async () => SECRET },
+        localProbes: { tailnet: async () => "down" },
+        timeoutMs: 1_000,
+        fetch: async (_input, init) => {
+          attempts += 1;
+          return new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("connect aborted", "AbortError")), { once: true });
+          });
+        },
+      });
+      const pending = client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const assertion = expect(pending).rejects.toMatchObject({
+        code: "timeout",
+        diagnosticCode: "connect_timeout",
+        failureLayer: "local_tailnet_unavailable",
+        message: expect.stringContaining("local tailnet is unavailable"),
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+      expect(attempts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([404, 410])("tears down a stale MCP session on HTTP %s and retries once with a fresh deadline", async (status) => {
+    vi.useFakeTimers();
+    try {
+      const calls: RequestInit[] = [];
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 1_000,
+        fetch: async (_input, init) => {
+          calls.push(init ?? {});
+          const request = JSON.parse(String(init?.body)) as { id: number };
+          if (calls.length === 1) {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: [] } }), {
+              status: 200,
+              headers: { "mcp-session-id": "session-1" },
+            });
+          }
+          if (calls.length === 2) {
+            await new Promise((resolve) => setTimeout(resolve, 600));
+            return new Response("stale session", { status });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 600));
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: [] } }), { status: 200 });
+        },
+      });
+
+      await expect(client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" })).resolves.toMatchObject({ id: 1 });
+      const pending = client.rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+      const assertion = expect(pending).resolves.toMatchObject({ id: 2, result: { tools: [] } });
+      await vi.advanceTimersByTimeAsync(1_200);
+      await assertion;
+
+      expect(calls).toHaveLength(3);
+      expect((calls[1]?.headers as Record<string, string>)?.["mcp-session-id"]).toBe("session-1");
+      expect((calls[2]?.headers as Record<string, string>)?.["mcp-session-id"]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // #154: bounded ask timeouts. Omission keeps the exact 30,000 ms default; an explicit
   // 1,000–600,000 ms bound reaches the single-request AbortSignal; anything else fails at
   // the library boundary before credential resolution or network access.
