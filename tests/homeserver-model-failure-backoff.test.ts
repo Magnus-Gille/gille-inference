@@ -86,6 +86,29 @@ describe("ModelFailureBackoff", () => {
     expect(backoff.observe("model-a")?.retry_after_seconds).toBe(30);
   });
 
+  it("keeps an active cooldown through a late success and recovers after its original deadline", () => {
+    let now = 1_000;
+    const backoff = new ModelFailureBackoff(["model-a"], () => now);
+    for (let index = 0; index < 3; index += 1) backoff.recordFailure("model-a", FAILURE);
+    const opened = backoff.observe("model-a");
+
+    now += 1_000;
+    backoff.recordSuccess("model-a");
+    expect(backoff.observe("model-a")).toEqual({
+      code: "model_temporarily_unavailable",
+      retry_after_seconds: 29,
+      unavailable_until: opened?.unavailable_until,
+    });
+
+    now += 29_000;
+    expect(backoff.observe("model-a")).toBeNull();
+    backoff.recordFailure("model-a", FAILURE);
+    expect(backoff.observe("model-a")).toBeNull();
+    backoff.recordFailure("model-a", FAILURE);
+    backoff.recordFailure("model-a", FAILURE);
+    expect(backoff.observe("model-a")?.retry_after_seconds).toBe(30);
+  });
+
   it("ignores refusals and returns only the documented safe fields", () => {
     let now = 10_000;
     const backoff = new ModelFailureBackoff(["model-a"], () => now);

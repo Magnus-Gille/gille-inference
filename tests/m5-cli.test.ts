@@ -478,7 +478,8 @@ describe("m5 command surface", () => {
           asks.push({ host: url.host, args: request.params?.arguments ?? {} });
           return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
             isError: false,
-            structuredContent: { model: "vendor/model:small", text: "UNSAFE_RESPONSE_SENTINEL" },
+            structuredContent: { model: "vendor/model:small", text: "UNSAFE_RESPONSE_SENTINEL",
+              finish_reason: "stop", truncated: false },
           } }));
         }
         const result = name === "list_models"

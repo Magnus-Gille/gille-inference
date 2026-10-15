@@ -15,6 +15,9 @@ let agent: string;
 let guest: string;
 let second: string;
 let runningState: string | undefined;
+let holdNext: boolean;
+let notifyHeld: (() => void) | undefined;
+let releaseHeld: (() => void) | undefined;
 let db: ReturnType<typeof import("../src/db.js").getDb>;
 const limits = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 10_000_000, maxParallel: 2 };
 
@@ -25,6 +28,9 @@ beforeEach(async () => {
   failing = true;
   attempts = 0;
   runningState = undefined;
+  holdNext = false;
+  notifyHeld = undefined;
+  releaseHeld = undefined;
   backend = createServer((req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.method === "GET") {
@@ -38,11 +44,18 @@ beforeEach(async () => {
     req.resume();
     req.on("end", () => {
       attempts++;
-      res.statusCode = failing ? 500 : 200;
-      res.end(JSON.stringify(failing ? { error: { message: "private-backend-detail" } } : {
-        choices: [{ message: { content: "OK" }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
-      }));
+      const finish = (failed: boolean) => {
+        res.statusCode = failed ? 500 : 200;
+        res.end(JSON.stringify(failed ? { error: { message: "private-backend-detail" } } : {
+          choices: [{ message: { content: "OK" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+        }));
+      };
+      if (holdNext) {
+        holdNext = false;
+        releaseHeld = () => finish(false);
+        notifyHeld?.();
+      } else finish(failing);
     });
   });
   await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
@@ -73,6 +86,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  releaseHeld?.();
   await stop?.();
   stop = undefined;
   await new Promise<void>((resolve) => backend.close(() => resolve()));
@@ -138,6 +152,27 @@ describe("reliability failure evidence and operator access", () => {
   it("does not share a key-model failure guard between unidentifiable static callers", async () => {
     for (let i = 0; i < 4; i++) expect((await chat("fixture-legacy")).status).toBe(502);
     expect(attempts).toBe(4);
+  });
+
+  it("keeps the fixed backoff when an earlier admitted request finishes successfully", async () => {
+    const held = new Promise<void>((resolve) => { notifyHeld = resolve; });
+    holdNext = true;
+    const earlierRequest = chat();
+    await held;
+    for (let i = 0; i < 3; i++) expect((await ask()).result.isError).toBe(true);
+    expect(attempts).toBe(4);
+    now += 1_000;
+    releaseHeld?.();
+    releaseHeld = undefined;
+    expect((await earlierRequest).status).toBe(200);
+    const blocked = await chat();
+    expect(blocked.status).toBe(503);
+    expect(blocked.headers.get("retry-after")).toBe("29");
+    expect(attempts).toBe(4);
+    now += 29_001;
+    failing = false;
+    expect((await chat()).status).toBe(200);
+    expect(attempts).toBe(5);
   });
 
   it("exposes bounded retained incident rows only to a minted owner-admin", async () => {

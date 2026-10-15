@@ -69,6 +69,11 @@ export class ModelFailureBackoff {
 
   recordSuccess(modelId: unknown): void {
     if (!isCanonicalModelId(modelId) || !this.approvedModels.has(modelId)) return;
+    const state = this.states.get(modelId);
+    if (state !== undefined && state.unavailableUntil !== null) {
+      const now = this.readNow();
+      if (now === null || now < state.unavailableUntil) return;
+    }
     this.states.delete(modelId);
   }
 

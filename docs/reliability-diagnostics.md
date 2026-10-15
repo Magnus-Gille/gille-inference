@@ -25,7 +25,9 @@ the other route is reported as `not_checked`. It sends one fixed synthetic promp
 most 16 output tokens, and has a 30-second bound. The client returns only sanitized probe
 metadata, never the answer text. The gateway's existing authenticated-owner logging policy applies.
 This is a real `ask`: normal authorization, admission, rate limits, and credits apply. A probe
-failure describes that attempt and does not establish a general or lasting model failure.
+failure describes that attempt and does not establish a general or lasting model failure. A
+truncated answer reports `token_limit_reached`; legacy or unknown completion metadata reports
+`completion_unconfirmed`. Neither is upgraded to a successful completed probe.
 
 The default doctor and explicit probe answer different questions:
 
