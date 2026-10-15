@@ -86,7 +86,9 @@ import { getDb } from "../db.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
 import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
-import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
+import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, getTrustedCatalogue, warmCatalogue } from "./catalogue.js";
+import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
+import { IncidentWindowOptionsError, queryIncidentWindow } from "./incident-window.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image-request.js";
@@ -5293,12 +5295,33 @@ export async function handleRequest(
       // Floor at 1, ceiling at the per-request cap.
       const effectiveMax = clampMaxTokensForModel(cfg, parsed.model, parsed.requestedMax);
       const est = estimateTokens(raw, effectiveMax);
+      // Backoff is keyed by authenticated caller and known model, never global.
+      const failureBackoff = lctx.node === "m5" && parsed.model !== null &&
+        (principal.modelAllowList.length === 0 || principal.modelAllowList.includes(parsed.model))
+        ? modelFailureBackoffFor(controller, principal) : undefined;
+      const backoff = failureBackoff?.observe(parsed.model);
+      if (backoff !== null && backoff !== undefined) {
+        lctx.status = 503; lctx.outcome = "model_temporarily_unavailable";
+        lctx.errorClass = "model_temporarily_unavailable"; lctx.admission = "n/a";
+        sendError(res, makeError("model_temporarily_unavailable", {
+          retryAfterSeconds: backoff.retry_after_seconds,
+          backoff: { scope: "key_model", retry_after_seconds: backoff.retry_after_seconds, unavailable_until: backoff.unavailable_until },
+        }));
+        return;
+      }
       await admitAndMeterLogged(res, controller, principal, parsed.model, est, lctx, async () => {
         const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps);
         traceOutcomeOverride = result.traceOutcome ?? null;
         traceErrorClassOverride = result.traceErrorClass ?? null;
         return result;
       });
+      if (lctx.status === 502 && ["upstream_error", "upstream_unavailable"].includes(lctx.errorClass ?? "")) {
+        failureBackoff?.recordFailure(parsed.model, "upstream_unavailable");
+      } else if (lctx.status === 504 && lctx.errorClass === "upstream_timeout") {
+        failureBackoff?.recordFailure(parsed.model, "upstream_timeout");
+      } else if (lctx.status !== null && lctx.status >= 200 && lctx.status < 300 && lctx.outcome === "ok") {
+        failureBackoff?.recordSuccess(parsed.model);
+      }
       return;
     }
     if (path === "/v1/audio/transcriptions" && method === "POST") {
@@ -5644,6 +5667,39 @@ export async function handleRequest(
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/ops/incidents" && method === "GET") {
+      // Same privacy floor as the task-exposure operator oracle: a real owner-admin only.
+      if (!principal.isAdmin || principal.tier !== "owner" || principal.keyHash === null) {
+        lctx.status = 403; lctx.outcome = "forbidden"; lctx.errorClass = "route_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("route_not_allowed", { message: "Incident windows require a minted owner-admin key." }));
+        return;
+      }
+      const query = parsedUrl.searchParams;
+      const allowed = new Set(["from", "to", "limit"]);
+      const unique = [...query.keys()];
+      const valid = unique.every((name) => allowed.has(name)) && new Set(unique).size === unique.length;
+      const from = query.get("from"); const to = query.get("to"); const limit = query.get("limit") ?? "100";
+      if (!valid || from === null || to === null || ![from, to, limit].every((v) => /^\d{1,16}$/.test(v))) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid incident window." }));
+        return;
+      }
+      let report;
+      try {
+        report = queryIncidentWindow(getDb(), { fromMs: Number(from), toMs: Number(to), limit: Number(limit),
+          requestLogEnabled: cfg.requestLog === "on", knownModelIds: getTrustedCatalogue() });
+      } catch (error) {
+        if (!(error instanceof IncidentWindowOptionsError)) throw error;
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid incident window." }));
+        return;
+      }
+      res.setHeader("cache-control", "private, no-store");
+      sendJson(res, 200, report);
+      lctx.status = 200; lctx.outcome = "ok"; lctx.admission = "n/a";
       return;
     }
     if (path === "/ops/summary" && method === "GET") {

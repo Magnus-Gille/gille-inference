@@ -1171,7 +1171,8 @@ describe("MCP M2a: model_not_allowed increments /metrics", () => {
     expect(j.result.content[0]!.text).toMatch(/not permitted/i);
     // #357: the cause is machine-readable in `_meta`, never in `structuredContent`, which is
     // reserved for the declared output shape of a successful ask.
-    expect(j.result._meta).toEqual({ m5_code: "model_not_allowed", retryable: false });
+    expect(j.result._meta).toEqual({ m5_code: "model_not_allowed", retryable: false,
+      request_id: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/) });
     expect(j.result.structuredContent).toBeUndefined();
 
     // Read metrics AFTER — the forbidden counter sum must have grown by exactly 1.

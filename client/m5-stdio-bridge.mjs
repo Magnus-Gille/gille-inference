@@ -127,6 +127,10 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
   if (!(error instanceof M5ClientError)) {
     return { message: "The MCP bridge request failed." };
   }
+  // Serialize through the client's closed projection before forwarding correlation or
+  // backoff metadata. Never read arbitrary gateway metadata or an error's custom fields.
+  const serializedError = M5ClientError.prototype.toJSON.call(error).error;
+  const modelBackoff = error.code === "model_temporarily_unavailable";
   const credentialFailure = error.code === "missing_credential" || error.code === "rejected_credential";
   const gatewayTransportFailure = error.code === "network_failure" || error.code === "timeout";
   const transportFailure = gatewayTransportFailure || error.code === "upstream_http_error";
@@ -169,6 +173,13 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
       ...(failureLayer === undefined ? {} : { failure_layer: failureLayer }),
       ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
       ...(error.retryable === undefined ? {} : { retryable: error.retryable }),
+      ...(serializedError.request_id === undefined ? {} : { request_id: serializedError.request_id }),
+      ...(modelBackoff && serializedError.retry_after_seconds !== undefined
+        ? { retry_after_seconds: serializedError.retry_after_seconds }
+        : {}),
+      ...(modelBackoff && serializedError.backoff !== undefined
+        ? { backoff: serializedError.backoff }
+        : {}),
       ...(remediation === undefined ? {} : { remediation }),
       ...(evidenceRecovery === undefined ? {} : { evidence_recovery: evidenceRecovery }),
       ...(isCodeLoopResult(message) && resultRetryAttempted

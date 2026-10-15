@@ -25,6 +25,7 @@ export type ErrorCode =
   | "rate_limit_exceeded" // 429
   | "credits_exhausted" // 402 (lifetime credit budget spent)
   | "server_busy" // 503
+  | "model_temporarily_unavailable" // 503, only this key/model's repeated failures
   | "insufficient_memory" // 503 (host cannot afford starting the requested model now; Retry-After)
   | "memory_admission_unavailable" // 503 (memory admission cannot decide; operator action needed)
   | "upstream_unavailable" // 502 (model backend refused / reset the connection)
@@ -32,7 +33,8 @@ export type ErrorCode =
   | "internal_error"; // 500 (generic, detail logged server-side only)
 
 export interface OpenAIError {
-  error: { message: string; type: string; code: ErrorCode; param: string | null; quota?: QuotaFailureDetail };
+  error: { message: string; type: string; code: ErrorCode; param: string | null; quota?: QuotaFailureDetail;
+    backoff?: { scope: "key_model"; retry_after_seconds: number; unavailable_until: string } };
 }
 
 export interface ErrorEnvelope {
@@ -137,6 +139,12 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
     message:
       "The server is busy serving other requests. This is not a problem with your request — please retry after a moment.",
   },
+  model_temporarily_unavailable: {
+    status: 503,
+    type: "server_error",
+    param: "model",
+    message: "Repeated backend failures paused this key/model briefly. Wait until the retry time before trying again; the underlying cause is not established.",
+  },
   insufficient_memory: {
     status: 503,
     type: "server_error",
@@ -185,6 +193,7 @@ export interface MakeErrorOptions {
   retryAfterSeconds?: number;
   rateLimit?: { limit: number; remaining?: number; resetSeconds: number };
   quota?: QuotaFailureDetail;
+  backoff?: { scope: "key_model"; retry_after_seconds: number; unavailable_until: string };
 }
 
 /**
@@ -216,6 +225,7 @@ export function makeError(code: ErrorCode, opts: MakeErrorOptions = {}): ErrorEn
         code,
         param: opts.param !== undefined ? opts.param : spec.param,
         ...(opts.quota === undefined ? {} : { quota: opts.quota }),
+        ...(opts.backoff === undefined ? {} : { backoff: opts.backoff }),
       },
     },
   };

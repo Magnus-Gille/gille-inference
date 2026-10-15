@@ -40,6 +40,17 @@ uses the fixed public npm endpoint and does not send credentials. An upgrade rec
 the exact gateway client pin and the installed rollback pin, but has no executable install command
 until the registry check confirms that the gateway pin is published.
 
+### Reliability diagnostics (1.5.4)
+
+The default `m5 --profile <name> doctor` remains catalogue and transport discovery only. Its
+historical inference timestamp is global past activity, not current route readiness. To request
+one real synthetic check, explicitly choose `--public` or `--private` and pass
+`--probe-inference MODEL`; this makes one fixed 16-token `ask` on that route with a 30-second
+bound. Normal admission, quotas, and credits apply, and answer text is not returned. The client
+is distributed as a local tarball, not an npm release. See the
+[reliability diagnostics guide](../docs/reliability-diagnostics.md) for probe semantics,
+`model_status`, temporary backoff, incident-window access, and evaluation guidance.
+
 ## Install
 
 ```bash
