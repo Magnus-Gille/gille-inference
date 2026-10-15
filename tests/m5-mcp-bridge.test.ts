@@ -915,6 +915,49 @@ describe("m5 stdio MCP conformance", () => {
     },
   );
 
+  it("projects only validated model backoff metadata from M5 client errors", async () => {
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          throw new M5ClientError("model_temporarily_unavailable", "ignored peer text", {
+            retryable: true,
+            retryAfterSeconds: 5,
+            requestId: "77777777-7777-4777-8777-777777777777",
+            backoff: {
+              scope: "key_model",
+              retry_after_seconds: 5,
+              unavailable_until: "2026-10-15T14:30:00.000Z",
+            },
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"tools/list"}',
+    );
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 15,
+      error: {
+        message: "This model is temporarily unavailable for your API key. Retry after the indicated delay.",
+        data: {
+          m5_code: "model_temporarily_unavailable",
+          request_id: "77777777-7777-4777-8777-777777777777",
+          retry_after_seconds: 5,
+          backoff: {
+            scope: "key_model",
+            retry_after_seconds: 5,
+            unavailable_until: "2026-10-15T14:30:00.000Z",
+          },
+        },
+      },
+    });
+    expect(response).not.toContain("ignored peer text");
+    expect(parsed.error.data).not.toHaveProperty("quota");
+  });
+
   it("rejects a mismatched upstream response id as malformed JSON-RPC", async () => {
     const bridge = await makeBridge(async () => rpcResponse(999, { tools: [] }));
 

@@ -65,6 +65,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 429 | `rate_limit_exceeded` | RPM/TPM/daily budget exceeded. The message names whether the limit is per-key or shared static-tier and gives a plain-language rate/window plus retry or UTC-day reset delay. TPM/daily messages use the route's metered units: tokens for chat/MCP, worst-case audio-seconds for transcription, and requested image units for image generation. `error.quota.requested` is the corresponding pre-admission estimate/count; machine quota values, header limits, resets, and accounting retain the existing quota behavior. Shared static-tier buckets keep their existing shared accounting. A zero-RPM allowance requires the gateway operator to restore capacity; waiting does not restore it. `error.quota` carries `{reason,scope,window,limit,requested,counted:false,retry_after_seconds}`; isolated keys also carry `used_before`, while shared buckets omit it. `X-RateLimit-Limit` is the rejected dimension's limit (including the daily limit for daily failures). `Retry-After` and `X-RateLimit-Reset` retain the quota engine's relative retry delay: next rolling-window event expiry for RPM/TPM, UTC midnight for daily, or the existing one-second delay for an empty zero-RPM bucket. `X-RateLimit-Remaining` is emitted only for isolated key buckets; it is omitted for shared static-tier buckets to avoid exposing other consumers' usage. |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
 | 503 | `server_busy` (admission) | Owner preempted the serial GPU; client should retry after `Retry-After` seconds |
+| 503 | `model_temporarily_unavailable` | Three eligible backend failures for one minted key/known model within 60s opened a fixed 30s cooldown. `Retry-After` and `error.backoff {scope:"key_model", retry_after_seconds, unavailable_until}` identify the refusal; no new quota/credit reservation or backend call. Other keys/models and legacy static policy are unaffected; underlying cause remains unknown. |
 | 503 | `insufficient_memory` | Whole-host memory admission (opt-in, `enforce` mode only): the host cannot afford starting the requested non-resident model now; carries `Retry-After`; nothing reached the backend and nothing was billed |
 | 503 | `memory_admission_unavailable` | Whole-host memory admission (opt-in, `enforce` mode only) cannot decide (no declared budget for the model, or host memory unreadable); no `Retry-After`, retrying will not help until the operator fixes it |
 | 504 | `upstream_timeout` | Backend exceeded the call timeout (often a cold model load); carries `Retry-After` |
@@ -74,6 +75,30 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 
 ---
 
+## Caller reliability observations
+
+MCP `model_status` accepts exactly `{model:string}` for one granted ordinary model. It performs
+read-only catalogue/running observations and returns `checked_at`, source,
+`residency: resident | not_resident | unknown | unavailable`, `inference:not_checked`,
+`loadable_now:unknown`, `protected:unknown`, `swap_cost_ms:null`, caller-only configured limits,
+and current key/model backoff or null. Loading/unloading does not establish non-residency.
+Limits expose scope (`key` or `shared_static_tier`), 60s RPM/TPM and UTC-day token budget, plus
+max parallel. Zero RPM or max parallel blocks; zero TPM/daily means unlimited. Quota-accepted
+backend failures count toward RPM; quota refusals do not; token usage is reconciled. No other
+caller usage, alias or key hash is returned. `list_models` retains its existing output schema.
+
+Validated MCP `ask` inference attempts include their correlation UUID in `_meta.request_id`, including failures.
+A temporary refusal adds `m5_code:model_temporarily_unavailable`, `retryable:true`,
+`retry_after_seconds:1..30`, and `backoff {scope:key_model, retry_after_seconds, unavailable_until}`.
+The UUID identifies the distinct `/mcp/ask` request-log row, not the outer `/mcp` transport row.
+Disabled/missing logging leaves correlation unresolvable; a UUID alone does not prove retention.
+
+Client 1.5.4's default doctor never submits inference. An explicitly selected public/private
+`doctor --probe-inference MODEL` makes one synthetic ask for at most 16 output tokens with a
+30s inference bound. Only a completed, nontruncated ask is a successful probe. Its sanitized
+result describes that route and attempt only; the other route remains unchecked. Existing owner
+logging, authorization, quota, admission and billing apply. See [reliability diagnostics](reliability-diagnostics.md).
+
 ## Endpoints
 
 | Method | Path | Tier | Purpose |
@@ -82,6 +107,7 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
 | POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. A failed `ask` (busy, rate limit, credits, model not allowed, host memory, upstream error) returns `isError:true` with the human sentence in `content` and the machine-readable cause in `_meta {m5_code, reason?, layer?, retryable?, retry_after_seconds?}`. Classified backend connection failures and timeouts retain `m5_code:"upstream_error"` and add only the sanitized `reason` (`upstream_connection_failed` or `upstream_timeout`), `layer:"model_backend"`, `retryable:true`, and the configured retry delay. Quota rejections identify the RPM, TPM, or daily reason in plain language, explain that the limit applies to the caller's key or a shared static-tier bucket, and say when to retry or when the UTC-day budget resets. They also carry `_meta.quota {reason, scope, window, limit, requested, counted:false, retry_after_seconds}`. Isolated minted-key buckets have `scope:"key"` and `used_before`; legacy static tokens and any minted alias colliding with a reserved `static:` bucket have `scope:"shared_static_tier"` and omit `used_before` to avoid disclosing another consumer's usage. No key identity is included. `requested` is 1 for RPM and the pre-admission estimated tokens for TPM/daily; `window` is `60s` for RPM/TPM and `utc_day` for daily. `retryable` is omitted when the gateway cannot tell, and `structuredContent` is not used for failures because it is reserved for the declared success shape. The truncated call is already metered, and any retry is a new billable call. Optional `output_profile: "complete-within-budget"` prioritizes structural completion inside `max_tokens`, tells bounded reviews to stop after the requested verdict, and requests low reasoning effort only for gpt-oss; it never masks or retries truncation, so `finish_reason="length"` remains `isError:true` with the paid partial content. |
 | GET | `/models/residency` | admin or monitor | Read-only, content-blind residency diagnostic |
+| GET | `/ops/incidents?from=EPOCH_MS&to=EPOCH_MS&limit=N` | minted owner-admin only | Read-only retained request metadata, maximum 24h/500 rows, default 100; private no-store. Closed projection excludes content/key hashes/backend messages. Labels `coverage:retained_rows_only`, `causality:not_established`, truncation and logging/schema gaps. Agent/guest/monitor/static/implicit callers denied; invalid windows 400. |
 | GET | `/ops/summary` | admin or monitor | Durable, content-blind M5 activity summary for Heimdall; includes `filterEpoch: "m5-admitted-compute-v2"` so pre-epoch route-only history is a documented historical break |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |

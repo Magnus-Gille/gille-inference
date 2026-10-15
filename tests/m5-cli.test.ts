@@ -422,6 +422,7 @@ describe("m5 command surface", () => {
   it("exits successfully when doctor reports MCP catalogue reachability", async () => {
     const output = sink();
     const error = sink();
+    let askCalls = 0;
     const exitCode = await main(["--profile", "codex", "doctor"], {
       input: Readable.from([]), output: output.stream, error: error.stream,
       configLoader: () => ({ version: 1, profiles: { codex: { publicGatewayUrl: PUBLIC_URL } } }),
@@ -431,6 +432,7 @@ describe("m5 command surface", () => {
           return new Response(JSON.stringify({ alias: "doctor-agent", tier: "owner", scope: "agent" }));
         }
         const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "ask") askCalls += 1;
         const result = request.params?.name === "list_models"
           ? { content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }], isError: false }
           : { tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name, inputSchema: { type: "object" } })) };
@@ -439,7 +441,104 @@ describe("m5 command surface", () => {
     });
     expect(exitCode).toBe(0);
     expect(JSON.parse(output.text())).toMatchObject({ status: "mcp_reachable" });
+    expect(JSON.parse(output.text()).inference).toEqual({ public: "not_checked", private: "not_checked" });
+    expect(askCalls).toBe(0);
     expect(error.text()).toBe("");
+  });
+
+  it("runs one sanitized inference probe on only the explicitly selected route", async () => {
+    const output = sink();
+    const error = sink();
+    const asks: Array<{ host: string; args: Record<string, unknown> }> = [];
+    const exitCode = await main([
+      "--profile", "codex", "--public", "--probe-inference", "vendor/model:small", "doctor",
+    ], {
+      input: Readable.from([]), output: output.stream, error: error.stream,
+      configLoader: () => ({ version: 1, profiles: { codex: {
+        publicGatewayUrl: PUBLIC_URL,
+        privateGatewayUrl: "http://private-gateway.invalid:8080",
+      } } }),
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/portal/me") {
+          return new Response(JSON.stringify({ alias: "doctor-agent", tier: "owner", scope: "agent" }));
+        }
+        if (url.pathname === "/healthz") return new Response(JSON.stringify({}));
+        const request = JSON.parse(String(init?.body)) as {
+          id: number; method: string; params?: { name?: string; arguments?: Record<string, unknown> };
+        };
+        if (request.method === "tools/list") {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+            tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name })),
+          } }));
+        }
+        const name = request.params?.name;
+        if (name === "ask") {
+          asks.push({ host: url.host, args: request.params?.arguments ?? {} });
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+            isError: false,
+            structuredContent: { model: "vendor/model:small", text: "UNSAFE_RESPONSE_SENTINEL",
+              finish_reason: "stop", truncated: false },
+          } }));
+        }
+        const result = name === "list_models"
+          ? { content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }], isError: false }
+          : {};
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+      },
+    });
+    const result = JSON.parse(output.text());
+    expect(exitCode).toBe(0);
+    expect(asks).toHaveLength(1);
+    expect(asks[0]).toMatchObject({
+      host: new URL(PUBLIC_URL).host,
+      args: {
+        model: "vendor/model:small",
+        prompt: "Reply with the single word OK.",
+        max_tokens: 16,
+        temperature: 0,
+        traffic_purpose: "synthetic",
+      },
+    });
+    expect(result).toMatchObject({
+      status: "mcp_reachable",
+      health_scope: "mcp_catalogue_and_inference_probe",
+      inference: { public: "succeeded", private: "not_checked" },
+      inference_probe: {
+        status: "succeeded", route: "public", model: "vendor/model:small",
+      },
+    });
+    expect(result.inference_probe.checked_at).toMatch(/^\d{4}-\d\d-\d\dT/);
+    expect(Number.isSafeInteger(result.inference_probe.elapsed_ms)).toBe(true);
+    expect(output.text()).not.toContain("UNSAFE_RESPONSE_SENTINEL");
+    expect(output.text()).not.toContain(SECRET);
+    expect(error.text()).toBe("");
+  });
+
+  it("rejects invalid inference-probe usage before config, credential, or network access", async () => {
+    for (const args of [
+      ["--profile", "codex", "--probe-inference", "model", "doctor"],
+      ["--profile", "codex", "--public", "--probe-inference", "bad model", "doctor"],
+      ["--profile", "codex", "--public", "--probe-inference", "model", "models"],
+    ]) {
+      let configCalls = 0;
+      let credentialCalls = 0;
+      let fetchCalls = 0;
+      const output = sink();
+      const error = sink();
+      const exitCode = await main(args, {
+        input: Readable.from([]), output: output.stream, error: error.stream,
+        configLoader: () => { configCalls += 1; throw new Error("must not load config"); },
+        credentialStore: { resolve: async () => { credentialCalls += 1; return SECRET; } },
+        fetch: async () => { fetchCalls += 1; throw new Error("must not fetch"); },
+      });
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(error.text())).toMatchObject({ error: { code: "invalid_args" } });
+      expect(configCalls).toBe(0);
+      expect(credentialCalls).toBe(0);
+      expect(fetchCalls).toBe(0);
+    }
   });
 
   it("requires an explicit profile before credential lookup", async () => {
@@ -647,6 +746,57 @@ describe("m5 command surface", () => {
       },
     });
     expect(error.text()).toBe("");
+  });
+
+  it("serializes only validated temporary model backoff metadata for direct ask", async () => {
+    const output = sink();
+    const error = sink();
+    const requestId = "55555555-5555-4555-8555-555555555555";
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            isError: true,
+            content: [{ type: "text", text: `untrusted response ${SECRET} private-alias` }],
+            _meta: {
+              m5_code: "model_temporarily_unavailable",
+              request_id: requestId,
+              retryable: true,
+              retry_after_seconds: 7,
+              backoff: {
+                scope: "key_model", retry_after_seconds: 7,
+                unavailable_until: "2026-10-15T14:30:00.000Z",
+              },
+            },
+          },
+        }));
+      },
+    });
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: {
+        code: "model_temporarily_unavailable",
+        retryable: true,
+        retry_after_seconds: 7,
+        request_id: requestId,
+        backoff: {
+          scope: "key_model", retry_after_seconds: 7,
+          unavailable_until: "2026-10-15T14:30:00.000Z",
+        },
+      },
+    });
+    expect(error.text()).not.toContain(SECRET);
+    expect(error.text()).not.toContain("private-alias");
+    expect(error.text()).not.toContain("untrusted response");
   });
 
   it("returns structured truncation metadata for ask instead of failing hard", async () => {

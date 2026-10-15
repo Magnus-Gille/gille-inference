@@ -30,6 +30,11 @@ export type QuotaMeterUnit = "tokens" | "audio_seconds" | "image_units";
 
 const SHARED_STATIC_ALIASES = new Set(["static:user", "static:admin", "static:monitor"]);
 
+/** The existing quota bucket identity; never includes another caller's usage. */
+export function quotaScopeForPrincipal(principal: QuotaFailurePrincipal): "key" | "shared_static_tier" {
+  return principal.keyHash === null || SHARED_STATIC_ALIASES.has(principal.alias) ? "shared_static_tier" : "key";
+}
+
 /** Build caller-safe HTTP/MCP details from the same failed quota decision. */
 export function describeQuotaFailure(
   failed: FailedQuota,
@@ -44,7 +49,7 @@ export function describeQuotaFailure(
       ? snapshot.tpmLimit
       : snapshot.dailyLimit;
   const requested = reason === "rpm" ? 1 : meteredAmount;
-  const shared = principal.keyHash === null || SHARED_STATIC_ALIASES.has(principal.alias);
+  const shared = quotaScopeForPrincipal(principal) === "shared_static_tier";
   const common: QuotaFailureCommon = {
     reason,
     window: reason === "daily" ? "utc_day" : "60s",
