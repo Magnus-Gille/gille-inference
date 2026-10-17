@@ -15,7 +15,7 @@ concurrency:
 jobs:
   cgroup-stop-proof:
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -44,3 +44,14 @@ jobs:
       - name: Prove a changed task limit cannot release the prepared gate
         run: |
           python3 native/tests/test-resource-limits-regression.py
+      - name: Exercise the unchanged build installer in disposable filesystem and network namespaces
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            timeout --signal=TERM --kill-after=5s 90 python3 native/tests/test_m5_build_installer.py
+      - name: Verify continue policy after a bounded local cgroup OOM
+        run: |
+          python3 -m unittest native.tests.test_service_oom_cancel -v
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            timeout --signal=TERM --kill-after=15s 35 python3 native/tests/test_service_oom_continue.py
