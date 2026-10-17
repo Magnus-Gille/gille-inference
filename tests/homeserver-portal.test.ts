@@ -557,6 +557,25 @@ describe("GET /portal/me", () => {
     }
   });
 
+  it.each([
+    ["chat allow-list", { modelAllowList: ["embeddinggemma-2"] }],
+    ["embedding grant", { embeddingModelAllowList: ["embeddinggemma-2"] }],
+  ] as const)("advertises release metadata, not owner telemetry, to guest keys with an explicit %s", async (_label, access) => {
+    const { plaintextKey } = mintKey(
+      { alias: uniq("embedding-release"), tier: "guest", scope: "inference", ...access }, DEFAULTS
+    );
+    const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const j = await res.json() as {
+      gateway?: { revision: string | null; client_version: string | null; result_contract: string };
+      inferenceObservation?: unknown;
+    };
+    expect(j.gateway).toBeDefined();
+    expect(j.gateway!.revision === null || /^[a-f0-9]{40}$/.test(j.gateway!.revision)).toBe(true);
+    expect(j.inferenceObservation).toBeUndefined();
+  });
+
   it("does not disclose owner metadata to owner inference keys", async () => {
     const { plaintextKey } = mintKey({ alias: uniq("owner-inference"), tier: "owner", scope: "inference" }, DEFAULTS);
     const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
