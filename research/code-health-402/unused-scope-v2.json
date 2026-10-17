@@ -30,7 +30,7 @@
     { "root": "scripts/run-halogen-compatibility.ts", "source": "tests/halogen-runtime-cli.test.ts", "line": 16, "pattern": "run-halogen-compatibility.ts" },
     { "root": "scripts/retention-cli.ts", "source": "scripts/retention-cli.ts", "line": 3, "pattern": "retention-cli.ts — the IO composition root" },
     { "root": "scripts/gate-c-loadtest.mjs", "source": "docs/migration-go-no-go-plan.md", "line": 135, "pattern": "scripts/gate-c-loadtest.mjs" },
-    { "root": "scripts/monitor-mcp.mjs", "source": "deploy/README.md", "line": 157, "pattern": "scripts/monitor-mcp.mjs" }
+    { "root": "scripts/monitor-mcp.mjs", "source": "deploy/README.md", "line": 162, "pattern": "scripts/monitor-mcp.mjs" }
   ],
   "consumer_entry_globs": {
     "test": ["tests/**/*.ts!"],
