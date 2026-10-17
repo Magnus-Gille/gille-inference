@@ -1,0 +1,419 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+import { validateSystemOneWarmupResponse } from "../scripts/promote-manual.js";
+import {
+  PROMOTION_DEFAULTS,
+  applyManualPromotion,
+  existingKeys,
+  modelsIsLastTopLevel,
+  parseManualSpec,
+  renderManualEntry,
+  manualWarmupRequest,
+  type ManualPromotionDeps,
+  type ManualServingSpec,
+} from "../src/homeserver/manual-promotion.js";
+
+const FULL_SPEC_TEXT = [
+  "key: manual-35b",
+  "gguf: /m/manual-35b.Q4_K_M.gguf",
+  "runtime_bin: /r/9b05354ec/bin/llama-server",
+  "ctx: 65536",
+  "ngl: 999",
+  "ubatch: 512",
+  "np: 1",
+  "jinja: true",
+  "fa: on",
+  "cache_ram_mib: 2048",
+  "ctk: q8_0",
+  "ctv: q8_0",
+  "mmproj: /m/mmproj-BF16.gguf",
+  "image_min_tokens: 1024",
+  "spec_type: draft-mtp",
+  "spec_draft_n_max: 2",
+  "reasoning_format: auto",
+  "reasoning: auto",
+  "ttl: 1800",
+].join("\n");
+
+const NATIVE_SPEC_TEXT = [
+  "key: bespoke-nimble-9b",
+  "api: systemone",
+  "runtime_kind: native",
+  "runtime_bin: /r/nimble/bin/python",
+  "server_script: /r/source/scripts/systemone-native-server.py",
+  "checkpoint: /m/Bespoke-Nimble-9B",
+  "ttl: 1800",
+].join("\n");
+
+const EXPECTED_ENTRY = [
+  '  "manual-35b":',
+  "    cmd: |",
+  "      /r/9b05354ec/bin/llama-server",
+  "      --host 127.0.0.1 --port ${PORT}",
+  "      -m /m/manual-35b.Q4_K_M.gguf",
+  "      -mm /m/mmproj-BF16.gguf",
+  "      --image-min-tokens 1024",
+  "      -ngl 999 -ub 512 -c 65536 -np 1 --jinja -fa on",
+  "      --spec-type draft-mtp --spec-draft-n-max 2",
+  "      --reasoning-format auto --reasoning auto",
+  "      --cache-ram 2048 -ctk q8_0 -ctv q8_0",
+  "    ttl: 1800",
+  "",
+].join("\n");
+
+const BASE_CONFIG = [
+  "health: ok",
+  "models:",
+  '  "qwen38-27b":',
+  "    cmd: |",
+  "      /bin/llama-server",
+  "    ttl: 1800",
+  "",
+].join("\n");
+
+describe("manual-promotion spec contract (#217)", () => {
+  it("renders the pinned native decision adapter without shell metacharacters", () => {
+    const spec = parseManualSpec(NATIVE_SPEC_TEXT);
+    expect(manualWarmupRequest(spec, spec.key).path).toBe("/v1/systemone");
+    expect(renderManualEntry(spec)).toContain(
+      "/r/nimble/bin/python /r/source/scripts/systemone-native-server.py --model bespoke-nimble-9b --checkpoint /m/Bespoke-Nimble-9B --port ${PORT}",
+    );
+    expect(renderManualEntry(spec)).toContain("checkEndpoint: /health");
+    expect(() => parseManualSpec(NATIVE_SPEC_TEXT.replace(
+      "/m/Bespoke-Nimble-9B", "/m/model;touch /tmp/unsafe",
+    ))).toThrow(/unsupported|absolute path/);
+  });
+  it("parses a full reviewed spec", () => {
+    expect(parseManualSpec(FULL_SPEC_TEXT)).toEqual({
+      key: "manual-35b",
+      api: "chat",
+      gguf: "/m/manual-35b.Q4_K_M.gguf",
+      runtimeBin: "/r/9b05354ec/bin/llama-server",
+      ctx: 65536,
+      batch: null,
+      ngl: 999,
+      ubatch: 512,
+      np: 1,
+      jinja: true,
+      fa: "on",
+      cacheRamMib: 2048,
+      ctk: "q8_0",
+      ctv: "q8_0",
+      mmproj: "/m/mmproj-BF16.gguf",
+      imageMinTokens: 1024,
+      specType: "draft-mtp",
+      specDraftNMax: 2,
+      reasoningFormat: "auto",
+      reasoning: "auto",
+      ttl: 1800,
+    });
+  });
+
+  it("accepts a minimal text-only spec with optionals absent", () => {
+    const spec = parseManualSpec(
+      [
+        "key: tiny-1b",
+        "gguf: /m/tiny.gguf",
+        "runtime_bin: /r/bin/llama-server",
+        "ctx: 8192",
+        "ngl: 0",
+        "ubatch: 512",
+        "fa: off",
+        "cache_ram_mib: 512",
+        "ctk: f16",
+        "ctv: f16",
+        "ttl: 900",
+      ].join("\n"),
+    );
+    expect(spec).toMatchObject({
+      np: null,
+      jinja: true,
+      mmproj: null,
+      imageMinTokens: null,
+      specType: null,
+      specDraftNMax: null,
+      reasoningFormat: null,
+      reasoning: null,
+    });
+    expect(renderManualEntry(spec)).toContain("-ngl 0 -ub 512 -c 8192 --jinja -fa off");
+    expect(renderManualEntry(spec)).not.toContain("-mm ");
+    expect(renderManualEntry(spec)).not.toContain("--spec-type");
+  });
+
+  it("records the System One API for a decision-model warm-up", () => {
+    const spec = parseManualSpec(FULL_SPEC_TEXT.replace("key: manual-35b", "key: clef-flash\napi: systemone"));
+    expect(spec.api).toBe("systemone");
+    expect(renderManualEntry(spec)).toContain('"clef-flash"');
+    expect(manualWarmupRequest(spec, "clef-flash")).toEqual({
+      path: "/v1/systemone",
+      body: { model: "clef-flash", state: "Hello", questions: {
+        greeting: { type: "noul", instructions: "Is this a greeting?" },
+      } },
+    });
+    expect(manualWarmupRequest(parseManualSpec(FULL_SPEC_TEXT), "manual-35b").path)
+      .toBe("/v1/chat/completions");
+  });
+
+  it("keeps the public Clef fixture on the typed System One serving path", () => {
+    const fixture = readFileSync(new URL("../deploy/specs/clef-flash.yaml", import.meta.url), "utf8");
+    const spec = parseManualSpec(fixture);
+
+    expect(spec).toMatchObject({
+      key: "clef-flash",
+      api: "systemone",
+      ctx: 8192,
+      batch: 8192,
+      ubatch: 8192,
+      ctk: "f16",
+      ctv: "f16",
+      ttl: 1800,
+    });
+
+    const warmup = manualWarmupRequest(spec, spec.key);
+    expect(warmup).toMatchObject({
+      path: "/v1/systemone",
+      body: {
+        model: "clef-flash",
+        questions: { greeting: { type: "noul" } },
+      },
+    });
+    expect(renderManualEntry(spec)).toContain("-b 8192 -ub 8192 -c 8192");
+  });
+
+  it("keeps batch optional for existing specs and preserves their exact rendering", () => {
+    const spec = parseManualSpec(FULL_SPEC_TEXT);
+
+    expect(spec.batch).toBeNull();
+    expect(renderManualEntry(spec)).toBe(EXPECTED_ENTRY);
+  });
+
+  it.each([
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["fractional", "1.5"],
+    ["above the context bound", "1048577"],
+  ])("rejects an invalid explicit batch (%s)", (_label, value) => {
+    expect(() => parseManualSpec(`${FULL_SPEC_TEXT}\nbatch: ${value}`)).toThrow(
+      /^\[manual-promotion\] spec field 'batch'/,
+    );
+  });
+
+  it.each([
+    ["unknown field", `${FULL_SPEC_TEXT}\n Englisch: yes`],
+    ["duplicate field", `${FULL_SPEC_TEXT}\nttl: 900`],
+    ["missing required", "key: x"],
+    ["unparseable line", "just some words"],
+    ["bad key charset", FULL_SPEC_TEXT.replace("key: manual-35b", "key: ornith;rm")],
+    ["relative gguf", FULL_SPEC_TEXT.replace("gguf: /m/", "gguf: m/")],
+    ["traversal gguf", FULL_SPEC_TEXT.replace("gguf: /m/", "gguf: /m/../")],
+    ["bad fa", FULL_SPEC_TEXT.replace("fa: on", "fa: sometimes")],
+    ["spec_type without draft max", FULL_SPEC_TEXT.replace("spec_draft_n_max: 2\n", "")],
+    ["reasoning without format", FULL_SPEC_TEXT.replace("reasoning_format: auto\n", "")],
+    ["out-of-range ctx", FULL_SPEC_TEXT.replace("ctx: 65536", "ctx: 16")],
+    ["bad kv quant", FULL_SPEC_TEXT.replace("ctk: q8_0", "ctk: mxfp4")],
+  ])("rejects a spec with %s", (_label, text) => {
+    expect(() => parseManualSpec(text)).toThrow(/manual-promotion/);
+  });
+
+  it("renders the exact house-format entry block", () => {
+    expect(renderManualEntry(parseManualSpec(FULL_SPEC_TEXT))).toBe(EXPECTED_ENTRY);
+  });
+
+  it("accepts dots in model keys", () => {
+    const spec = parseManualSpec(FULL_SPEC_TEXT.replace("key: manual-35b", "key: " + "dotted.1-5b"));
+    expect(spec.key).toBe("dotted.1-5b");
+  });
+
+  it("pins corrected box-layout defaults with no stale /srv family paths", () => {
+    expect(PROMOTION_DEFAULTS).toEqual({
+      configPath: "/etc/gille-inference/llama-swap/config.yaml",
+      llamaswapUrl: "http://127.0.0.1:8091",
+      maxServed: 12,
+      restartCommand: "sudo systemctl restart llama-swap",
+    });
+    expect(JSON.stringify(PROMOTION_DEFAULTS)).not.toContain("/srv/");
+    expect(JSON.stringify(PROMOTION_DEFAULTS)).not.toContain("/etc/llama-swap");
+    expect(JSON.stringify(PROMOTION_DEFAULTS)).not.toContain("/opt/llama.cpp");
+  });
+});
+
+describe("manual-promotion structural guards (#217)", () => {
+  it("reads served keys from config text", () => {
+    expect(existingKeys(BASE_CONFIG)).toEqual(new Set(["qwen38-27b"]));
+  });
+
+  it("accepts appends only when models: is the last top-level key", () => {
+    expect(modelsIsLastTopLevel(BASE_CONFIG)).toBe(true);
+    expect(modelsIsLastTopLevel(`${BASE_CONFIG}aliases:\n  x: y\n`)).toBe(false);
+    expect(modelsIsLastTopLevel("health: ok\n")).toBe(false);
+  });
+});
+
+describe("manual-promotion transaction (#217)", () => {
+  interface Harness {
+    deps: ManualPromotionDeps;
+    calls: { backups: string[]; applies: string[]; restores: string[]; commands: string[][] };
+    live: { text: string };
+  }
+
+  function harness(
+    configText: string,
+    options: {
+      files?: Set<string>;
+      listed?: string[];
+      restartCode?: number;
+      restartCodes?: number[];
+      corruptReadback?: boolean;
+    } = {},
+  ): Harness {
+    const files = options.files ?? new Set(["/m/manual-35b.Q4_K_M.gguf", "/m/mmproj-BF16.gguf"]);
+    const backups = new Map<string, string>();
+    const calls = { backups: [] as string[], applies: [] as string[], restores: [] as string[], commands: [] as string[][] };
+    const live = { text: configText };
+    const deps: ManualPromotionDeps = {
+      readConfig: () => live.text,
+      fileExists: (path) => files.has(path),
+      writeBackup: async (id, content) => {
+        calls.backups.push(id);
+        backups.set(id, content);
+      },
+      applyConfig: async (content) => {
+        calls.applies.push(content);
+        live.text = content;
+      },
+      readBackConfig: () => (options.corruptReadback ? `${live.text}#corrupt` : live.text),
+      restoreBackup: async (id) => {
+        calls.restores.push(id);
+        live.text = backups.get(id) as string;
+      },
+      runCommand: async (argv) => {
+        calls.commands.push(argv);
+        const code = options.restartCodes?.length
+          ? (options.restartCodes.shift() as number)
+          : (options.restartCode ?? 0);
+        return { code, stdout: "", stderr: "" };
+      },
+      modelsListed: async () => options.listed ?? ["manual-35b"],
+      warmupModel: async () => {},
+      sleep: async () => {},
+      now: () => new Date("2026-09-11T00:00:00.000Z"),
+    };
+    return { deps, calls, live };
+  }
+
+  function spec(): ManualServingSpec {
+    return parseManualSpec(FULL_SPEC_TEXT);
+  }
+
+  it("promotes exactly one entry with backup, verify, restart, and health check", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG);
+    const result = await applyManualPromotion(spec(), deps);
+    expect(result).toMatchObject({ key: "manual-35b", restored: false });
+    expect(calls.backups).toHaveLength(1);
+    expect(calls.applies).toHaveLength(1);
+    expect(calls.restores).toHaveLength(0);
+    expect(calls.commands).toEqual([["sudo", "systemctl", "restart", "llama-swap"]]);
+    expect(live.text).toBe(`${BASE_CONFIG}${EXPECTED_ENTRY}`);
+  });
+
+  it("refuses an existing key before any backup", async () => {
+    const { deps, calls } = harness(BASE_CONFIG);
+    await expect(
+      applyManualPromotion({ ...spec(), key: "qwen38-27b" }, deps),
+    ).rejects.toThrow(/additive only/);
+    expect(calls.backups).toHaveLength(0);
+    expect(calls.commands).toHaveLength(0);
+  });
+
+  it("refuses beyond the served-count ceiling before any backup", async () => {
+    const { deps, calls } = harness(BASE_CONFIG);
+    await expect(
+      applyManualPromotion(spec(), { ...deps, maxServed: 1 }),
+    ).rejects.toThrow(/ceiling/);
+    expect(calls.backups).toHaveLength(0);
+  });
+
+  it("refuses a structurally unsafe config before any backup", async () => {
+    const { deps, calls } = harness(`${BASE_CONFIG}aliases:\n  x: y\n`);
+    await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/top-level key/);
+    expect(calls.backups).toHaveLength(0);
+  });
+
+  it("refuses a missing GGUF before any backup", async () => {
+    const { deps, calls } = harness(BASE_CONFIG, { files: new Set() });
+    await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/not present on disk/);
+    expect(calls.backups).toHaveLength(0);
+  });
+
+  it("refuses a missing native checkpoint before touching the roster", async () => {
+    const files = new Set(["/r/nimble/bin/python", "/r/source/scripts/systemone-native-server.py"]);
+    const { deps, calls } = harness(BASE_CONFIG, { files });
+    await expect(applyManualPromotion(parseManualSpec(NATIVE_SPEC_TEXT), deps))
+      .rejects.toThrow(/checkpoint not present/);
+    expect(calls.backups).toHaveLength(0);
+    expect(calls.commands).toHaveLength(0);
+  });
+
+  it("transactionally restores after native model warm-up failure", async () => {
+    const files = new Set(["/r/nimble/bin/python", "/r/source/scripts/systemone-native-server.py",
+      "/m/Bespoke-Nimble-9B"]);
+    const { deps, calls, live } = harness(BASE_CONFIG, { files, listed: ["bespoke-nimble-9b"] });
+    deps.warmupModel = async () => { throw new Error("native typed warm-up failed"); };
+    await expect(applyManualPromotion(parseManualSpec(NATIVE_SPEC_TEXT), deps))
+      .rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.restores).toHaveLength(1);
+    expect(calls.commands).toHaveLength(2);
+  });
+
+  it("restores byte-identical config and restarts when health never lists the key", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG, { listed: ["qwen38-27b"] });
+    await expect(
+      applyManualPromotion(spec(), { ...deps, listTimeoutMs: 1 }),
+    ).rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.restores).toHaveLength(1);
+    expect(calls.commands).toHaveLength(2);
+  });
+
+  it("restores and restarts when the restart command exits nonzero", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG, { restartCodes: [1, 0] });
+    await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.commands).toHaveLength(2);
+  });
+
+  it("escalates when the restart after rollback also fails", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG, { restartCode: 1 });
+    await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(
+      /restart after rollback failed/,
+    );
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.commands).toHaveLength(2);
+  });
+
+  it("restores and restarts when applied bytes differ from the candidate", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG, { corruptReadback: true });
+    await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.commands).toHaveLength(1);
+  });
+
+  it("restores the prior roster when a System One warm-up returns malformed JSON", async () => {
+    const { deps, calls, live } = harness(BASE_CONFIG, { listed: ["clef-flash"] });
+    const systemOneSpec = parseManualSpec(FULL_SPEC_TEXT.replace("key: manual-35b", "key: clef-flash\napi: systemone"));
+    const malformedResponse = {
+      answers: { greeting: { noul: 0.5 } },
+      usage: { input_tokens: 1, output_tokens: 0 },
+    };
+    deps.warmupModel = async (modelId) => {
+      validateSystemOneWarmupResponse(malformedResponse, modelId, manualWarmupRequest(systemOneSpec, modelId).body);
+    };
+
+    await expect(applyManualPromotion(systemOneSpec, deps)).rejects.toThrow(/restored backup and restarted/);
+    expect(live.text).toBe(BASE_CONFIG);
+    expect(calls.restores).toHaveLength(1);
+    expect(calls.commands).toHaveLength(2);
+  });
+});

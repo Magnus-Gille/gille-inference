@@ -41,7 +41,7 @@ llama-swap was `qwen3-30b-instruct` — NOT `mellum`. This directly contradicts 
 assumption baked into this repo's own `CLAUDE.md` guidance ("prefer `mellum` (non-thinking)
 for latency-sensitive short tasks" — true of the *model*, but silently assumes mellum is
 *loaded*, which it frequently isn't, given nightly cron jobs (`gate-chat-replay` uses
-`qwen3-30b-instruct`, `weekly-model-scout` loads whatever candidate it's testing) and any
+`qwen3-30b-instruct`, and explicit model evaluations may load a selected artifact) and any
 other owner traffic routinely evict it.
 
 ## Why "just pin mellum, ttl:never-expire" is NOT the obvious fix
@@ -49,8 +49,8 @@ other owner traffic routinely evict it.
 The tempting fix — give mellum an effectively-infinite `ttl` — has a real cost that isn't
 obvious until you account for llama-swap's single-resident-model architecture: pinning
 mellum doesn't stop OTHER traffic from evicting it (a `qwen3-30b-instruct` chat request, a
-nightly cron job, a disagreement-gate secondary call to `qwen3-coder-next-80b`, a Model Scout
-benchmark) — it only stops mellum's OWN idle timer from evicting itself. The very next
+nightly cron job, a disagreement-gate secondary call to `qwen3-coder-next-80b`, or a manual
+model-evaluation run) — it only stops mellum's OWN idle timer from evicting itself. The very next
 non-mellum request still forces a swap away, and the request AFTER that (back to mellum) still
 pays the swap cost. Given the model breakdown shows real traffic to `qwen3-30b-instruct`
 (2864 calls), `qwen3-coder-next-80b` (865), `gemma4` (635), `qwen35-a3b` (561), and

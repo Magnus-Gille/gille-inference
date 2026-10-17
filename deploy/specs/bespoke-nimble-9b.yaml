@@ -1,0 +1,14 @@
+# Native ROCm System One adapter; paths are operator placeholders, not a live config.
+# Exact Apache-2.0 package: bespokelabs/Bespoke-Nimble-9B at
+# bd792f44ec8e265be861bfcdf4e05967ffe0e858 (release v3-12026).
+# Adapter SHA256: 29ef39b072dee97287947455337879c1e916705c2f727287922a2d81f5e2f20a.
+# Base: Qwen/Qwen3.5-9B at c202236235762e1c871ad0ccb60c8ee5ba337b9a.
+# Resolve a complete offline Python 3.12+/PyTorch-ROCm/Transformers/PEFT runtime,
+# pin its wheel and source hashes, and verify native BF16 inference before promotion.
+key: bespoke-nimble-9b
+api: systemone
+runtime_kind: native
+runtime_bin: /operator-resolve/nimble-runtime/bin/python
+server_script: /home/magnus/home-server-eval/scripts/systemone-native-server.py
+checkpoint: /operator-resolve/models/Bespoke-Nimble-9B
+ttl: 1800

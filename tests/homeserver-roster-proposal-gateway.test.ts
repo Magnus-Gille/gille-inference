@@ -180,6 +180,7 @@ beforeAll(async () => {
       digest: contentDigest("template"),
       origin: "server-observed",
     }),
+    // Preserve the historical Hugin evidence identity used by this compatibility fixture.
     harness: labelIdentity("model-scout", "operator-declared"),
     taxonomyVersion: labelIdentity("roster-v1", "operator-declared"),
     verifierRubric: labelIdentity("roster-evidence-v1", "operator-declared"),

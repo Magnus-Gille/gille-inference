@@ -21,7 +21,7 @@ import {
   commitKeyRotation,
   abortKeyRotation,
   listKeyRotations,
-  credentialInventory,
+  credentialInventoryReadOnly,
   listKeys,
   revokeKey,
   KeyAliasExistsError,
@@ -33,11 +33,11 @@ import {
 } from "./keystore.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
+import { observeGpuLeaseMutex, type GpuMutexObservation } from "./gpu-lease-observation.js";
 import { buildCageArgv } from "./code-loop-cage.js";
-import { runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
-import { existsSync } from "node:fs";
+import { codeLoopSecretPath, resolveNodeModulesDir, runCageSelfTestWithRelay, piVisibilityBinds } from "./code-loop-runtime.js";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -441,6 +441,37 @@ export function cmdLedger(): void {
 
 export function cmdKeys(args: ParsedArgs): void {
   const sub = args.positional[0];
+
+  // Inventory is deliberately separate from every mutating command: it must remain usable when
+  // the production database is mounted read-only, and it must not load static fallback values.
+  if (sub === "inventory") {
+    const allowed = new Set(["all", "stale-days", "json"]);
+    for (const name of Object.keys(args.flags)) {
+      if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
+    }
+    const report = credentialInventoryReadOnly({
+      includeRevoked: args.flags["all"] === true,
+      staleAfterDays: strictNumFlag(args.flags, "stale-days"),
+    });
+    if (args.flags["json"] === true) {
+      console.log(JSON.stringify({ ...report, legacyStaticCredentialCounts: "not_inspected" }, null, 2));
+      return;
+    }
+    console.log(
+      `${"ALIAS".padEnd(20)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ` +
+      `${"STATUS".padEnd(9)} ${"LAST USED".padEnd(24)} FINDINGS`
+    );
+    for (const key of report.keys) {
+      console.log(
+        `${key.alias.slice(0, 19).padEnd(20)} ${key.tier.padEnd(6)} ${key.scope.padEnd(10)} ` +
+        `${key.status.padEnd(9)} ${(key.lastUsedAt ?? "never").padEnd(24)} ${key.findings.join(",") || "none"}`
+      );
+    }
+    console.log(`summary: ${JSON.stringify(report.summary)}`);
+    console.log("legacy static credential counts: not inspected by read-only inventory");
+    return;
+  }
+
   const cfg = loadConfig();
 
   if (sub === "mint") {
@@ -633,39 +664,6 @@ export function cmdKeys(args: ParsedArgs): void {
     return;
   }
 
-  if (sub === "inventory") {
-    const allowed = new Set(["all", "stale-days", "json"]);
-    for (const name of Object.keys(args.flags)) {
-      if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
-    }
-    const report = credentialInventory({
-      includeRevoked: args.flags["all"] === true,
-      staleAfterDays: strictNumFlag(args.flags, "stale-days"),
-    });
-    const staticCounts = {
-      admin: cfg.adminApiKeys.length,
-      inference: cfg.apiKeys.length,
-      monitor: cfg.monitorApiKeys.length,
-    };
-    if (args.flags["json"] === true) {
-      console.log(JSON.stringify({ ...report, legacyStaticCounts: staticCounts }, null, 2));
-      return;
-    }
-    console.log(
-      `${"ALIAS".padEnd(20)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ` +
-      `${"STATUS".padEnd(9)} ${"LAST USED".padEnd(24)} FINDINGS`
-    );
-    for (const key of report.keys) {
-      console.log(
-        `${key.alias.slice(0, 19).padEnd(20)} ${key.tier.padEnd(6)} ${key.scope.padEnd(10)} ` +
-        `${key.status.padEnd(9)} ${(key.lastUsedAt ?? "never").padEnd(24)} ${key.findings.join(",") || "none"}`
-      );
-    }
-    console.log(`summary: ${JSON.stringify(report.summary)}`);
-    console.log(`legacy static credential counts (values never read): ${JSON.stringify(staticCounts)}`);
-    return;
-  }
-
   if (sub === "list") {
     const keys = listKeys({ includeRevoked: args.flags["all"] === true });
     if (keys.length === 0) {
@@ -773,21 +771,32 @@ export function parseDurationMs(raw: string | undefined): number | null {
 }
 
 /**
- * Render the GPU-lease queue as an aligned table for `gpu status`. Pure (takes a snapshot + a
- * clock) so it is unit-testable. `now` lets remaining-ETA be computed deterministically.
+ * Render the GPU-lease queue and the separately observed mkdir mutex for `gpu status`. Pure (takes
+ * snapshots + a clock) so it is unit-testable. `now` lets remaining-ETA be computed deterministically.
  */
-export function formatGpuStatus(sel: HolderSelection, now: number): string {
-  if (sel.live.length === 0) return "GPU is idle — no leases held or queued.";
+export function formatGpuStatus(sel: HolderSelection, now: number, mutex: GpuMutexObservation): string {
+  const mutexLine = (() => {
+    if (mutex.state === "occupied") {
+      if (mutex.owner) {
+        return `GPU mutex: occupied (recorded owner id=${mutex.owner.id} pid=${mutex.owner.pid} state=${mutex.ownerState})`;
+      }
+      return `GPU mutex: occupied (recorded owner unavailable state=${mutex.ownerState})`;
+    }
+    if (mutex.state === "absent") return "GPU mutex: absent (no mutex observed)";
+    return `GPU mutex: UNKNOWN (${mutex.reason})`;
+  })();
+  const note = "Note: ticket and mutex are separately sampled; owner* means the recorded owner ID matches a queued ticket, not a liveness claim.";
+  if (sel.live.length === 0) return [mutexLine, "GPU queue: empty.", note].join("\n");
   const fmtAgo = (ms: number) => (ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`);
   const lines = sel.live.map((t, i) => {
-    const role = i === 0 ? "HOLDING" : `queued#${i}`;
+    const role = mutex.state === "occupied" && mutex.owner?.id === t.id ? "owner*" : `queued#${i + 1}`;
     const held = fmtAgo(now - t.enqueuedAt);
     const eta =
       t.etaMs != null ? ` eta~${fmtAgo(Math.max(0, t.etaMs - (now - t.enqueuedAt)))}` : "";
     const purpose = t.purpose ? ` "${t.purpose}"` : "";
     return `  ${role.padEnd(9)} ${t.model.padEnd(22)} ${held.padStart(4)}${eta} [${t.host}/${t.pid}]${purpose}`;
   });
-  return [`GPU leases (${sel.live.length} live${sel.stale.length ? `, ${sel.stale.length} stale` : ""}):`, ...lines].join("\n");
+  return [mutexLine, `GPU leases (${sel.live.length} live${sel.stale.length ? `, ${sel.stale.length} stale` : ""}):`, ...lines, note].join("\n");
 }
 
 /**
@@ -802,7 +811,12 @@ async function cmdGpu(argv: string[]): Promise<void> {
   const staleMs = cfg.gpuLeaseStaleMs;
 
   if (sub === "status") {
-    console.log(formatGpuStatus(await gpuLeaseStatus(dir, { staleMs }), Date.now()));
+    const now = Date.now();
+    const [mutex, queue] = await Promise.all([
+      observeGpuLeaseMutex(dir, { staleMs }),
+      gpuLeaseStatus(dir, { staleMs }),
+    ]);
+    console.log(formatGpuStatus(queue, now, mutex));
     return;
   }
 
@@ -917,8 +931,7 @@ async function cmdCodeLoop(rawArgs: string[]): Promise<void> {
   }
   const cfg = loadConfig();
   const home = homedir();
-  const nmPath = join(process.cwd(), "node_modules");
-  const nm = existsSync(nmPath) ? nmPath : null;
+  const nm = resolveNodeModulesDir(cfg.codeLoopNodeModulesDir);
 
   // Resolve the gateway target: --gateway-url overrides HOMESERVER_HOST/PORT (the worktree has no
   // .env, so the config defaults to loopback; on the box the gateway binds the tailnet IP).
@@ -946,15 +959,27 @@ async function cmdCodeLoop(rawArgs: string[]): Promise<void> {
     piAgentDir: cfg.codeLoopPiAgentDir !== "" ? cfg.codeLoopPiAgentDir : null,
   };
   const cageBuildArgv = (sandboxDir: string, unitName: string): string[] =>
-    buildCageArgv({ sandboxDir, homeDir: home, forwardPort: cfg.codeLoopForwardPort, nodeModulesDir: nm, unitName, extraRoBinds });
+    buildCageArgv({
+      sandboxDir,
+      homeDir: home,
+      forwardPort: cfg.codeLoopForwardPort,
+      nodeModulesDir: nm,
+      unitName,
+      piAgentDir: cfg.codeLoopPiAgentDir,
+      innerPath: process.env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin",
+      runtimeMaxSec: Math.max(150, cfg.codeLoopCaps.wallSMax + 30),
+      extraRoBinds,
+    });
 
   const r = await runCageSelfTestWithRelay(
     cageBuildArgv,
-    join(process.cwd(), ".env"),
+    codeLoopSecretPath(process.cwd()),
     cfg.codeLoopForwardPort,
     gwHost,
     gwPort,
+    cfg.codeLoopApiKey,
     "required",
+    resolve(cfg.codeLoopWorkroot),
     runnability
   );
   if (r.ok) {

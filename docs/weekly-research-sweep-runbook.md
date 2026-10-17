@@ -72,7 +72,7 @@ fi
 ## Cron (on the box)
 
 ```cron
-# Weekly research sweep — Sundays 06:00 UTC (after the 04:00 model scout; both off-peak)
+# Weekly research sweep — Sundays 06:00 UTC (off-peak)
 0 6 * * 0 /home/inference/weekly-research-sweep.sh
 ```
 

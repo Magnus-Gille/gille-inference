@@ -1,8 +1,10 @@
-import { homedir, tmpdir } from "node:os";
+import { limitCodeLoopCageLifetime } from "./code-loop-deadline.js";
+import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import type { HomeserverConfig } from "./config.js";
-import type { CodeLoopDeps, CodeLoopRequest } from "./code-loop-types.js";
+import type { CodeLoopDeps, CodeLoopRequest, CodeLoopResult } from "./code-loop-types.js";
+import { ownsExecutionFeedback } from "./execution-feedback.js";
 import { startCodeLoop, getJobStatus, getJobResult, type CodeLoopStartConfig } from "./code-loop.js";
 import type { AgentEngine } from "./code-loop-types.js";
 import { makePiEngine, realSpawnPi, makeLlamaSwapReadinessProbe } from "./pi-engine.js";
@@ -11,10 +13,14 @@ import {
   runCageSelfTest,
   execCageCommand,
   startGatewayRelay,
+  stopTransientCodeLoopUnit,
   type CageRunnabilityProbe,
   type GatewayRelay,
 } from "./code-loop-cage.js";
 import { acquireGpuLease } from "./gpu-lease.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
+import { createModelStartAdmission, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
+import { getRunningSnapshot } from "./model-admin.js";
 import {
   LearningTaskContractError,
   parseHuginRequestStamp,
@@ -35,9 +41,21 @@ function deployRoot(): string {
   return process.cwd();
 }
 
-function nodeModulesDir(): string | null {
-  const nm = join(deployRoot(), "node_modules");
-  return existsSync(nm) ? nm : null;
+/** The exact secret path the live self-test must prove unreadable. */
+export function codeLoopSecretPath(
+  root: string,
+  env: NodeJS.ProcessEnv | Record<string, string> = process.env,
+): string {
+  return env["GILLE_AUTONOMY_ENV_FILE"] || join(root, ".env");
+}
+
+export function resolveNodeModulesDir(configured: string, root: string = deployRoot()): string | null {
+  const nm = configured !== "" ? configured : join(root, "node_modules");
+  // Keep an explicit stable mount path lexical: it sits directly above the dedicated workroot,
+  // so Node/npx can find it by normal parent walk-up. The service-isolation verifier proves the
+  // alias is root-owned and content-addressed. A missing explicit path remains fail-closed because
+  // bwrap receives it as a mandatory --ro-bind rather than silently omitting the toolchain.
+  return configured !== "" || existsSync(nm) ? nm : null;
 }
 
 /** llama-swap origin (serves both /v1 and /running) derived from the configured base. */
@@ -96,14 +114,16 @@ export interface CodeLoopRuntime {
 
 /**
  * Build the live runtime. `maintenanceMode` is injected (the gateway reads it from the admission
- * controller snapshot) so code_loop refuses during a model-scout window without importing the
+ * controller snapshot) so code_loop refuses during an explicit evaluation window without importing the
  * controller.
  */
 export interface CodeLoopGatewayContext {
+  feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
   authenticatedPrincipalId: string;
   authentication: "gateway-owner-auth" | "service-auth";
   gatewayRequestId: string;
   capabilityEpoch: LearningTaskCapabilityEpoch;
+  hostMemoryAdmissionDependencies?: Partial<HostMemoryAdmissionDeps>;
 }
 
 export function buildCodeLoopRuntime(
@@ -113,12 +133,22 @@ export function buildCodeLoopRuntime(
 ): CodeLoopRuntime {
   const confinement = cfg.codeLoopConfinement;
   const home = homedir();
-  const nm = nodeModulesDir();
-  const secretPath = join(deployRoot(), ".env");
+  const nm = resolveNodeModulesDir(cfg.codeLoopNodeModulesDir);
+  const secretPath = codeLoopSecretPath(deployRoot());
   const forwardPort = cfg.codeLoopForwardPort;
   // The gateway the per-run relay bridges to (the caged pi's ONLY reachable destination).
   const gatewayHost = cfg.gatewayHost;
   const gatewayPort = cfg.gatewayPort;
+  const workroot = resolve(cfg.codeLoopWorkroot);
+  const hostMemoryAdmissionDependencies: HostMemoryAdmissionDeps = {
+    getRunning: getRunningSnapshot,
+    ...(gatewayContext?.hostMemoryAdmissionDependencies ?? {}),
+  };
+  const beforeModelStart = createModelStartAdmission(
+    cfg.hostMemoryAdmission,
+    hostMemoryAdmissionDependencies,
+    () => cfg.codeLoopModel,
+  );
 
   // pi lives under $HOME (hidden by the cage tmpfs) — punch narrow ro holes for it, and have
   // the self-test PROVE runnability (not just confinement) at every job start.
@@ -135,22 +165,27 @@ export function buildCodeLoopRuntime(
       forwardPort,
       nodeModulesDir: nm,
       unitName,
+      piAgentDir: cfg.codeLoopPiAgentDir,
+      innerPath: process.env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin",
+      runtimeMaxSec: Math.max(150, cfg.codeLoopCaps.wallSMax + 30),
       extraRoBinds,
     });
 
-  const basePiEngine = makePiEngine(
+  const engineDeps = {
+    spawnPi: realSpawnPi,
+    readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
+    pollMs: 5_000,
+  };
+  const piEngine = (clientApiKey: string): AgentEngine => makePiEngine(
     {
       piBin: cfg.codeLoopPiBin,
       provider: "inference-local",
       piAgentDir: cfg.codeLoopPiAgentDir,
-      apiKey: cfg.codeLoopApiKey,
+      // Per-run capability for the loopback relay — never the real gateway bearer.
+      apiKey: clientApiKey,
       degeneracyRunThreshold: cfg.degeneracyRunThreshold,
     },
-    {
-      spawnPi: realSpawnPi,
-      readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
-      pollMs: 5_000,
-    }
+    engineDeps,
   );
 
   // Wrap the engine so the host-side gateway relay (127.0.0.1:forwardPort → gateway) is up for the
@@ -159,15 +194,12 @@ export function buildCodeLoopRuntime(
   const engine: AgentEngine = {
     run: async (opts) => {
       let relay: GatewayRelay | null = null;
-      if (confinement !== "off") {
-        try {
-          relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort);
-        } catch {
-          relay = null; // pi will simply fail to reach the gateway → the run surfaces the error
-        }
-      }
       try {
-        return await basePiEngine.run(opts);
+        if (confinement === "off") return await piEngine(cfg.codeLoopApiKey).run(opts);
+        // A fresh high-entropy client capability prevents this loopback listener from becoming
+        // an unauthenticated local proxy for the real gateway key.
+        relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort, cfg.codeLoopApiKey);
+        return await piEngine(relay.clientApiKey).run(opts);
       } finally {
         if (relay !== null) await relay.close();
       }
@@ -179,6 +211,11 @@ export function buildCodeLoopRuntime(
     spawnPi: realSpawnPi,
     now: Date.now,
     keyAlias: gatewayContext?.authenticatedPrincipalId ?? null,
+    feedbackOwner: gatewayContext?.feedbackOwner ?? null,
+    beforeModelStart,
+    // The offline fixture mode has no user manager; production confinement
+    // always probes the actual dedicated bus before new work is admitted.
+    ...(confinement === "required" ? { codeLoopTransportProbe: probeCodeLoopTransport } : {}),
     ...(gatewayContext === undefined
       ? {}
       : {
@@ -190,12 +227,15 @@ export function buildCodeLoopRuntime(
           },
         }),
     readinessProbe: makeLlamaSwapReadinessProbe(backendOrigin(cfg), cfg.codeLoopModel),
+    cleanupUnit: confinement === "off"
+      ? async () => {}
+      : (unit: string) => stopTransientCodeLoopUnit(unit),
     maintenanceMode,
     growthCapBytes: GROWTH_CAP_BYTES,
     pollMs: 5_000,
     retentionTtlMs: RETENTION_TTL_MS,
-    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env }),
-    acquireLease: async ({ model, timeoutMs, onLeaseLost }) => {
+    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env, signal: opts.signal }),
+    acquireLease: async ({ model, timeoutMs, onLeaseLost, signal }) => {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
       try {
@@ -204,7 +244,7 @@ export function buildCodeLoopRuntime(
           purpose: "code-loop",
           dir: cfg.gpuLeaseDir,
           staleMs: cfg.gpuLeaseStaleMs,
-          signal: ctrl.signal,
+          signal: signal ? AbortSignal.any([ctrl.signal, signal]) : ctrl.signal,
           onLeaseLost,
         });
         return { release: () => lease.release() };
@@ -218,14 +258,26 @@ export function buildCodeLoopRuntime(
     // unreadable, ro-mount writes denied, external egress blocked, gateway reachable (200) — at
     // EVERY job start when confinement=required. Starts the same gateway relay so the gateway arm
     // is genuinely tested end-to-end.
-    cageSelfTest: () => runCageSelfTestWithRelay(cageBuildArgv, secretPath, forwardPort, gatewayHost, gatewayPort, confinement, runnability),
+    cageSelfTest: (signal, remainingMs) => runCageSelfTestWithRelay(
+      cageBuildArgv,
+      secretPath,
+      forwardPort,
+      gatewayHost,
+      gatewayPort,
+      cfg.codeLoopApiKey,
+      confinement,
+      workroot,
+      runnability,
+      signal,
+      remainingMs,
+    ),
   };
 
   const startConfig: CodeLoopStartConfig = {
     enabled: cfg.codeLoop === "on",
     // Absolutize: the default is the RELATIVE ./data/code-loop-work, but sandbox paths flow into
     // startsWith containment checks and bwrap --bind args, both of which need absolute paths.
-    workroot: resolve(cfg.codeLoopWorkroot),
+    workroot,
     model: cfg.codeLoopModel,
     caps: cfg.codeLoopCaps,
     confinement,
@@ -248,33 +300,57 @@ export async function runCageSelfTestWithRelay(
   forwardPort: number,
   gatewayHost: string,
   gatewayPort: number,
+  gatewayApiKey: string,
   confinement: "required" | "off",
-  runnability?: CageRunnabilityProbe
+  probeRoot: string,
+  runnability?: CageRunnabilityProbe,
+  signal?: AbortSignal,
+  remainingMs?: number,
 ): Promise<{ ok: boolean; failures: string[] }> {
+  if (signal?.aborted) return { ok: false, failures: ["whole-job deadline reached"] };
   if (confinement === "off") return { ok: true, failures: [] };
+  // A missing source would make `cat` fail and could masquerade as successful concealment. Prove
+  // the exact production secret exists and is readable OUTSIDE the cage before testing denial.
+  try {
+    accessSync(secretPath, fsConstants.R_OK);
+  } catch {
+    return { ok: false, failures: [`secret source is not readable outside the cage: ${secretPath}`] };
+  }
   let probeDir: string;
   try {
-    probeDir = mkdtempSync(join(tmpdir(), "code-loop-cage-probe-"));
+    probeDir = createCageProbeDir(probeRoot);
   } catch (err) {
     return { ok: false, failures: [`could not create probe sandbox: ${(err as Error).message}`] };
   }
   let relay: GatewayRelay | null = null;
   try {
-    relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort);
+    relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort, gatewayApiKey);
   } catch (err) {
     try { rmSync(probeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     return { ok: false, failures: [`could not start gateway relay on 127.0.0.1:${forwardPort}: ${(err as Error).message}`] };
   }
   try {
     const r = await runCageSelfTest({
-      cageArgv: cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`),
+      cageArgv: remainingMs === undefined
+        ? cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`)
+        : limitCodeLoopCageLifetime(cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`), remainingMs),
+      signal,
       secretPath,
       // A write to the read-only toolchain mount MUST fail (a tmpfs-over-home write would succeed
       // harmlessly, so probing /usr is the meaningful "no rw escape" test).
       readonlyProbePath: "/usr/.code-loop-cage-write-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: forwardPort,
-      exec: execCageCommand,
+      userManagerSocketPath: `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/systemd/private`,
+      exec: (argv, timeoutMs) => execCageCommand(argv, timeoutMs, {
+        signal,
+        env: {
+          PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+          // The probe only calls unauthenticated /healthz; this non-secret value satisfies the
+          // transient service's environment-copy contract without exposing the real key.
+          HS_API_KEY: "code-loop-cage-probe-no-upstream",
+        },
+      }),
       runnability,
     });
     return { ok: r.ok, failures: r.failures };
@@ -282,6 +358,12 @@ export async function runCageSelfTestWithRelay(
     if (relay !== null) await relay.close();
     try { rmSync(probeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
+}
+
+/** Create the self-test sandbox where both the gateway and transient user unit can see it. */
+export function createCageProbeDir(probeRoot: string): string {
+  mkdirSync(probeRoot, { recursive: true });
+  return mkdtempSync(join(probeRoot, "code-loop-cage-probe-"));
 }
 
 // ─── MCP dispatch (owner-agent-gated; called from mcp.ts callTool) ──────────────────────
@@ -299,6 +381,18 @@ export async function handleCodeLoopTool(
   gatewayContext: CodeLoopGatewayContext,
 ): Promise<{ text: string; isError: boolean }> {
   const { startConfig, deps } = buildCodeLoopRuntime(cfg, maintenanceMode, gatewayContext);
+  const callerResult = (result: CodeLoopResult): CodeLoopResult => {
+    if (!result.feedback_handle) return result;
+    try {
+      if (ownsExecutionFeedback(result.feedback_handle, gatewayContext.feedbackOwner ?? null)) return result;
+    } catch {
+      // Feedback is advisory: an unavailable ownership store must hide the handle, not the
+      // completed result. Never log the handle, principal, or database exception content.
+      console.error("[execution-feedback] ownership lookup failed; completed output preserved, handle withheld");
+    }
+    const { feedback_handle: _privateHandle, ...rest } = result;
+    return rest;
+  };
 
   if (name === "code_loop_start") {
     if (Object.hasOwn(args, "client_run_id") && typeof args["client_run_id"] !== "string") {
@@ -322,11 +416,15 @@ export async function handleCodeLoopTool(
       }
     }
     const req: CodeLoopRequest = {
+      ...(Object.hasOwn(args, "traffic_purpose") ? { traffic_purpose: args["traffic_purpose"] as CodeLoopRequest["traffic_purpose"] } : {}),
       client_run_id: typeof args["client_run_id"] === "string" ? (args["client_run_id"] as string) : undefined,
       ...(learningTaskStamp === undefined ? {} : { learning_task_stamp: learningTaskStamp }),
       instruction: typeof args["instruction"] === "string" ? (args["instruction"] as string) : "",
       files: Array.isArray(args["files"]) ? (args["files"] as CodeLoopRequest["files"]) : [],
       check_cmd: typeof args["check_cmd"] === "string" ? (args["check_cmd"] as string) : undefined,
+      // Preserve malformed supplied values for fail-closed structural validation.
+      ...(Object.hasOwn(args, "schema_checks") ? { schema_checks: args["schema_checks"] as CodeLoopRequest["schema_checks"] } : {}),
+      writable: Array.isArray(args["writable"]) ? (args["writable"] as string[]) : undefined,
       protected: Array.isArray(args["protected"]) ? (args["protected"] as string[]) : undefined,
       task_type: typeof args["task_type"] === "string" ? (args["task_type"] as string) : undefined,
       caps: typeof args["caps"] === "object" && args["caps"] !== null ? (args["caps"] as CodeLoopRequest["caps"]) : undefined,
@@ -343,7 +441,7 @@ export async function handleCodeLoopTool(
           ...(r.learning_task_gateway_echo !== undefined
             ? { learning_task_gateway_echo: r.learning_task_gateway_echo }
             : {}),
-          ...(r.result !== undefined ? { result: r.result } : {}),
+          ...(r.result !== undefined ? { result: callerResult(r.result) } : {}),
           capabilities: r.capabilities,
         }),
         isError: false,
@@ -380,7 +478,7 @@ export async function handleCodeLoopTool(
         isError: true,
       };
     }
-    return { text: JSON.stringify(r.result), isError: false };
+    return { text: JSON.stringify(callerResult(r.result)), isError: false };
   }
 
   // Unreachable (mcp.ts only routes the three names here) — defensive.

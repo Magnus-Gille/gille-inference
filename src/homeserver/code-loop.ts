@@ -1,7 +1,12 @@
-import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync } from "node:fs";
-import { dirname, join, sep, resolve, isAbsolute } from "node:path";
+import {
+  CodeLoopDeadline, withCodeLoopDeadline, CODE_LOOP_TOTAL_WALL_MIN_S, CODE_LOOP_TOTAL_WALL_MAX_S,
+} from "./code-loop-deadline.js";
+import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
+import { dirname, join, sep, resolve, isAbsolute, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
+import { bindExecutionFeedback, publishDurableExecutionFeedback } from "./execution-feedback.js";
+import { parseExecutionTrafficPurpose } from "./execution-feedback-contract.js";
 import type {
   CodeLoopRequest,
   CodeLoopCaps,
@@ -22,6 +27,7 @@ import {
   compactDurableCodeLoopRunResult,
   codeLoopRequestFingerprint,
   isDurableCodeLoopWorkLive,
+  listDurableCodeLoopRunsPendingCleanup,
   markDurableCodeLoopRunOrphaned,
   markUnownedDurableCodeLoopRunsOrphaned,
   persistDurableCodeLoopRun,
@@ -55,6 +61,8 @@ import {
 // served-model observation, same fail-open-to-unknown discipline.
 import { deriveEvidenceIdentity, resolveTaskType } from "./orchestrator.js";
 import { TASK_TYPES } from "./taxonomy.js";
+import { validateSchemaChecks, skippedSchemaGrounding, isSchemaGroundingResult, type CodeLoopSchemaCheck, type CodeLoopSchemaGrounding } from "./code-loop-schema-checks.js";
+import { HostMemoryAdmissionError } from "./host-memory-admission.js";
 
 /**
  * code_loop harness (issue #116, docs/agentic-code-tool-design.md §5, §7, §9, §10).
@@ -70,19 +78,30 @@ import { TASK_TYPES } from "./taxonomy.js";
 export const CODE_LOOP_TOOL_NAMES = ["code_loop_start", "code_loop_status", "code_loop_result"] as const;
 
 /** Immutable wire/harness contract identifier reported in every #247 result. */
-export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-07-14-v6";
+export const CODE_LOOP_HARNESS_VERSION = "code-loop-pi-2026-09-05-v9";
 export const CODE_LOOP_CAPABILITIES = {
   start_idempotency: "client-run-id-v1",
   agent_checks: "pi-bash-events-v3",
+  result_scope: "writable-v1",
+  completion_accounting: "bounded-turns-v1",
 } as const;
+const TRUSTED_GIT_ROOT_NAME = ".code-loop-host-git";
 export const CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT =
   `contract[harness=${CODE_LOOP_HARNESS_VERSION};agent_checks=${CODE_LOOP_CAPABILITIES.agent_checks};` +
+  `result_scope=${CODE_LOOP_CAPABILITIES.result_scope};completion_accounting=${CODE_LOOP_CAPABILITIES.completion_accounting};` +
   `schema=3;max_attempts=${CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX}]`;
 
 const CODE_LOOP_TERMINAL_STATUS_ENUM = ["completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"] as const;
 const CODE_LOOP_JOB_STATUS_ENUM = ["running", ...CODE_LOOP_TERMINAL_STATUS_ENUM] as const;
+const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
+  "not-requested",
+  "harvest-untrusted",
+  "scope-violation",
+  "protected-violation",
+  "engine-failure",
+]);
 const CODE_LOOP_REFUSAL_ENUM = [
-  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery",
+  "deadline-exceeded", "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
 ] as const;
 
 const CODE_LOOP_START_OUTPUT_SCHEMA = {
@@ -110,13 +129,28 @@ const CODE_LOOP_START_OUTPUT_SCHEMA = {
 } as const;
 
 function isCurrentCodeLoopResult(result: CodeLoopResult): boolean {
-  return result.execution?.schema_version === 1 &&
+  return isSchemaGroundingResult(result.schema_grounding, result.diff, result.summary) &&
+    result.execution?.schema_version === 1 &&
     result.execution.harness_version === CODE_LOOP_HARNESS_VERSION &&
     result.execution.capabilities?.agent_checks === CODE_LOOP_CAPABILITIES.agent_checks &&
+    result.execution.capabilities?.result_scope === CODE_LOOP_CAPABILITIES.result_scope &&
+    result.execution.capabilities?.completion_accounting === CODE_LOOP_CAPABILITIES.completion_accounting &&
     result.agent_checks?.schema_version === 3 &&
     result.agent_checks.source === "pi-bash-events" &&
     Array.isArray(result.agent_checks.attempts) &&
-    result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX;
+    result.agent_checks.attempts.length <= CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX &&
+    Array.isArray(result.scope_violations) &&
+    (result.completion_state === "complete" || result.completion_state === "unfinished") &&
+    result.check !== null && typeof result.check === "object" &&
+    (result.check.ran === true
+      ? result.check.skip_reason === null
+      : result.check.ran === false && CODE_LOOP_CHECK_SKIP_REASONS.has(result.check.skip_reason as string)) &&
+    (result.status === "completed"
+      ? result.completion_state === "complete"
+      : result.completion_state === "unfinished") &&
+    Number.isInteger(result.usage?.turns) && result.usage.turns >= 0 &&
+    Number.isInteger(result.execution.effective_caps?.turns) &&
+    result.usage.turns <= result.execution.effective_caps.turns;
 }
 
 function failClosedIncompatibleResult(workroot: string, record: DurableCodeLoopRun): DurableCodeLoopRun {
@@ -142,7 +176,7 @@ export function codeLoopToolDefs(): unknown[] {
         "Returns a work_id immediately; poll code_loop_status and fetch " +
         "code_loop_result. The deliverable is a git diff vs the seed commit — the box never touches a " +
         "live checkout. Provide the files the task needs (≤64 / ≤2MB), the instruction, and optionally " +
-        `an owner-authored check_cmd + protected globs. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
+        `an owner-authored check_cmd + writable/protected globs. Omit writable for seeded-only scope. ${CODE_LOOP_TOOL_CONTRACT_ADVERTISEMENT}`,
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -159,6 +193,7 @@ export function codeLoopToolDefs(): unknown[] {
               "fresh authenticated preflight and is echoed only after durable admission",
           },
           instruction: { type: "string", minLength: 1, description: "the complete self-contained task prompt" },
+          traffic_purpose: { type: "string", enum: ["organic", "evaluation", "synthetic"] },
           files: {
             type: "array",
             description: "seed files (relative paths); required in Phase 1",
@@ -172,6 +207,19 @@ export function codeLoopToolDefs(): unknown[] {
             },
           },
           check_cmd: { type: "string", description: "owner-authored verification command run in the sandbox post-loop (120s cap)" },
+          schema_checks: {
+            type: "array", minItems: 1, maxItems: 8,
+            description: "Required for unit-test-gen: owner-authored behavioral checks of the supplied schema, not syntax checks. All must exit zero; failures withhold diff and summary. Shared 120s post-check budget. Protect verifier/reference files and keep them outside writable scope.",
+            items: { type: "object", additionalProperties: false, required: ["name", "command"], properties: {
+              name: { type: "string", pattern: "^[a-z0-9][a-z0-9._:-]{0,79}$" },
+              command: { type: "string", minLength: 1, maxLength: 8192 },
+            } },
+          },
+          writable: {
+            type: "array",
+            items: { type: "string" },
+            description: "enforceable returned-change paths/globs; omitted means exact seeded files only",
+          },
           protected: { type: "array", items: { type: "string" }, description: "globs whose modification is reported at exit" },
           task_type: { type: "string", enum: TASK_TYPES.map((task) => task.id), description: "optional canonical task vocabulary; omit to classify from instruction" },
           caps: {
@@ -181,6 +229,7 @@ export function codeLoopToolDefs(): unknown[] {
               wall_s: { type: "number" },
               turns: { type: "number" },
               completion_tokens: { type: "number" },
+              total_wall_s: { type: "integer", minimum: CODE_LOOP_TOTAL_WALL_MIN_S, maximum: CODE_LOOP_TOTAL_WALL_MAX_S, description: "optional whole-job budget from start admission through terminal cleanup; reserves 75s for cleanup and forbids later phases after the work cutoff" },
               edit_deadline_turn: {
                 type: "integer",
                 minimum: 1,
@@ -229,6 +278,7 @@ export function clampCaps(req: CodeLoopCapsRequest | undefined, c: CodeLoopCapsC
   const deadline = req?.edit_deadline_turn;
   return {
     wall_s: clampInt(req?.wall_s, c.wallSDefault, c.wallSMax),
+    ...(req?.total_wall_s === undefined ? {} : { total_wall_s: req.total_wall_s }),
     turns,
     completion_tokens: clampInt(req?.completion_tokens, c.tokensDefault, c.tokensMax),
     ...(typeof deadline === "number" && Number.isInteger(deadline) && deadline >= 1 && deadline <= turns
@@ -241,6 +291,85 @@ export function clampCaps(req: CodeLoopCapsRequest | undefined, c: CodeLoopCapsC
 
 const MAX_FILES = 64;
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024;
+const MAX_SCOPE_PATTERNS = 64;
+const MAX_SCOPE_PATTERN_BYTES = 512;
+
+const GENERATED_ARTIFACT_DIRS = new Set([
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".hypothesis",
+  ".tox",
+  ".nox",
+  ".cache",
+]);
+const GENERATED_ARTIFACT_EXTENSIONS = [".pyc", ".pyo", ".class", ".tsbuildinfo"] as const;
+
+/** Harness metadata is observable to protected-glob reporting but never caller deliverable. */
+function isCodeLoopInternalPath(path: string): boolean {
+  return path === ".meta.json";
+}
+
+/** Generated interpreter/build cache artifacts never enter a returned code-loop diff. */
+export function isGeneratedCodeLoopArtifact(path: string): boolean {
+  const components = path.split("/");
+  return components.some((component) => GENERATED_ARTIFACT_DIRS.has(component)) ||
+    components.some((component) => GENERATED_ARTIFACT_EXTENSIONS.some((extension) => component.endsWith(extension)));
+}
+
+function normalizeRelativeCodeLoopPath(value: string, label: string, allowGlob: boolean): string {
+  if (value.length === 0 || value.includes("\0")) {
+    throw new Error(`code-loop: ${label} must be a non-empty path without NUL bytes.`);
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_SCOPE_PATTERN_BYTES) {
+    throw new Error(`code-loop: ${label} is too long.`);
+  }
+  // The sandbox is POSIX. Refuse alternate separator and drive-letter spellings rather than let
+  // admission, filesystem materialization, and result matching interpret the same bytes differently.
+  if (value.includes("\\") || isAbsolute(value) || win32.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
+    throw new Error(`code-loop: ${label} must be a relative POSIX path.`);
+  }
+  const normalized: string[] = [];
+  for (const part of value.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (normalized.length === 0) throw new Error(`code-loop: ${label} escapes the sandbox.`);
+      normalized.pop();
+      continue;
+    }
+    if (!allowGlob && /[*?\[\]]/.test(part)) {
+      throw new Error(`code-loop: ${label} '${value}' must name a file, not a glob.`);
+    }
+    normalized.push(part);
+  }
+  if (normalized.length === 0) throw new Error(`code-loop: ${label} resolves to the sandbox root.`);
+  if (normalized.some((part) => part.toLowerCase() === ".git")) {
+    throw new Error(`code-loop: ${label} targets a .git directory.`);
+  }
+  return normalized.join("/");
+}
+
+function normalizeCodeLoopScopePattern(value: string, label: string): string {
+  // Do not give `..` glob components normalization semantics: an allowlist should be readable
+  // byte-for-byte and never rely on traversal before matching.
+  if (value.split("/").some((part) => part === "..")) {
+    throw new Error(`code-loop: ${label} contains a '..' component.`);
+  }
+  return normalizeRelativeCodeLoopPath(value, label, true);
+}
+
+function effectiveWritableGlobs(req: CodeLoopRequest): string[] {
+  return req.writable === undefined
+    ? req.files.map((file) => normalizeRelativeCodeLoopPath(file.path, "seed path", false))
+    : req.writable.map((pattern) => normalizeCodeLoopScopePattern(pattern, "writable scope"));
+}
+
+function normalizedProtectedGlobs(req: CodeLoopRequest): string[] {
+  return req.protected === undefined
+    ? []
+    : req.protected.map((pattern) => normalizeCodeLoopScopePattern(pattern, "protected scope"));
+}
 
 export type ValidateResult =
   | { ok: true; caps: CodeLoopCaps }
@@ -252,6 +381,9 @@ export type StructuralValidateResult =
 
 /** Immutable shape/size checks required before safely deriving the durable request identity. */
 export function validateCodeLoopRequestStructure(req: CodeLoopRequest): StructuralValidateResult {
+  if (!parseExecutionTrafficPurpose(req.traffic_purpose).ok) return { ok: false, message: "Invalid traffic_purpose." };
+  const schemaError = validateSchemaChecks(req.schema_checks);
+  if (schemaError !== null) return { ok: false, message: schemaError };
   try {
     validateClientRunId(req.client_run_id);
   } catch (err) {
@@ -272,12 +404,51 @@ export function validateCodeLoopRequestStructure(req: CodeLoopRequest): Structur
     if (typeof f.path !== "string" || typeof f.content !== "string") {
       return { ok: false, message: "Each seed file needs a string `path` and string `content`." };
     }
-    if (seenPaths.has(f.path)) return { ok: false, message: `Duplicate seed path '${f.path}'.` };
-    seenPaths.add(f.path);
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRelativeCodeLoopPath(f.path, "seed path", false);
+    } catch (err) {
+      return { ok: false, message: (err as Error).message };
+    }
+    if (seenPaths.has(normalizedPath)) return { ok: false, message: `Duplicate seed path '${f.path}'.` };
+    seenPaths.add(normalizedPath);
     total += Buffer.byteLength(f.content, "utf8");
   }
   if (total > MAX_TOTAL_BYTES) {
     return { ok: false, message: `Seed content too large (${total} bytes > ${MAX_TOTAL_BYTES}).` };
+  }
+  for (const field of ["writable", "protected"] as const) {
+    const patterns = req[field];
+    if (patterns === undefined) continue;
+    if (!Array.isArray(patterns)) {
+      return { ok: false, message: `\`${field}\` must be an array of relative paths or globs.` };
+    }
+    if (patterns.length > MAX_SCOPE_PATTERNS) {
+      return { ok: false, message: `Too many ${field} scope entries (${patterns.length} > ${MAX_SCOPE_PATTERNS}).` };
+    }
+    for (const pattern of patterns) {
+      if (typeof pattern !== "string") {
+        return { ok: false, message: `Each ${field} scope entry must be a string.` };
+      }
+      try {
+        normalizeCodeLoopScopePattern(pattern, `${field} scope`);
+      } catch (err) {
+        return { ok: false, message: (err as Error).message };
+      }
+    }
+  }
+  // With the safe default the seed is the writable contract. A seed that is unconditionally
+  // filtered from results makes that contract impossible, so refuse it before durable admission.
+  if (req.writable === undefined) {
+    for (const path of seenPaths) {
+      if (isGeneratedCodeLoopArtifact(path)) {
+        return { ok: false, message: `Seed path '${path}' is a generated cache/bytecode artifact and cannot be writable.` };
+      }
+    }
+  }
+  const totalWall = req.caps?.total_wall_s;
+  if (totalWall !== undefined && (typeof totalWall !== "number" || !Number.isInteger(totalWall) || totalWall < CODE_LOOP_TOTAL_WALL_MIN_S || totalWall > CODE_LOOP_TOTAL_WALL_MAX_S)) {
+    return { ok: false, message: `\`caps.total_wall_s\` must be an integer between ${CODE_LOOP_TOTAL_WALL_MIN_S} and ${CODE_LOOP_TOTAL_WALL_MAX_S}.` };
   }
   const rawDeadline = req.caps?.edit_deadline_turn;
   if (rawDeadline !== undefined) {
@@ -342,17 +513,16 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
   // refuse ALL seeds — found by the first live smoke, 2026-07-02.
   const baseAbs = resolve(sandboxDir);
   const baseReal = realpathSync(baseAbs);
+  assertNoPreexistingAgentGit(baseAbs);
   for (const f of files) {
-    const rel = f.path;
-    if (rel.includes("\0")) throw new Error(`code-loop: seed path contains a NUL byte — refusing.`);
-    if (isAbsolute(rel)) throw new Error(`code-loop: seed path '${rel}' is absolute — only relative paths are allowed.`);
+    const rel = normalizeRelativeCodeLoopPath(f.path, "seed path", false);
     // Lexical containment against the (non-realpath) base, mirroring resolveContained().
     const lexical = resolve(baseAbs, rel);
     if (lexical !== baseAbs && !lexical.startsWith(baseAbs + sep)) {
       throw new Error(`code-loop: seed path '${rel}' escapes the sandbox — refusing.`);
     }
     // Reject any component that is `.git` (protect the diff baseline + host git ops).
-    if (/(^|[\\/])\.git([\\/]|$)/.test(rel)) {
+    if (/(^|[\\/])\.git([\\/]|$)/i.test(rel)) {
       throw new Error(`code-loop: seed path '${rel}' targets a .git directory — refusing.`);
     }
     // Create parent dirs lexically, THEN realpath-verify the parent is still inside the sandbox.
@@ -374,6 +544,218 @@ export function seedSandbox(sandboxDir: string, files: Array<{ path: string; con
     } finally {
       closeSync(fd);
     }
+  }
+}
+
+/**
+ * The nested agent repository is compatibility state, never host authority. Refuse to run a
+ * host-side seed against a re-entered sandbox whose `.git` already exists: reading its config
+ * during `git add` could activate an agent-controlled clean filter, and `git commit` could run a
+ * post-commit hook. A fresh `mkdtemp` sandbox has no such entry; this is a fail-closed guard for
+ * recovery/re-entry and for direct callers of seedSandbox.
+ */
+function assertNoPreexistingAgentGit(sandboxDir: string): void {
+  const walk = (directory: string): void => {
+    for (const entry of readSandboxEntries(directory)) {
+      if (entry.name.toLowerCase() === ".git") {
+        throw new Error("code-loop: pre-existing agent Git metadata is not trusted — refusing to seed");
+      }
+      if (entry.stat.isSymbolicLink()) continue;
+      if (entry.stat.isDirectory()) walk(entry.absolutePath);
+    }
+  };
+  walk(sandboxDir);
+}
+
+interface AgentGitIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface WorktreeAttribute {
+  absolutePath: string;
+  relativePath: string;
+  mode: string;
+}
+
+function captureAgentGitIdentity(sandboxDir: string): AgentGitIdentity {
+  const gitPath = join(sandboxDir, ".git");
+  let stat: Stats;
+  try {
+    stat = lstatSync(gitPath);
+  } catch (err) {
+    throw new Error(`agent Git metadata is missing after seed: ${(err as Error).message}`);
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("agent Git metadata is not a real top-level directory after seed");
+  }
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function readSandboxEntries(directory: string): Array<{ name: string; absolutePath: string; stat: Stats }> {
+  let names: Dirent[];
+  try {
+    names = readdirSync(directory, { withFileTypes: true });
+  } catch (err) {
+    throw new Error(`cannot inspect sandbox path '${directory}': ${(err as Error).message}`);
+  }
+  const entries: Array<{ name: string; absolutePath: string; stat: Stats }> = [];
+  for (const entry of names) {
+    const absolutePath = join(directory, entry.name);
+    let stat: Stats;
+    try {
+      stat = lstatSync(absolutePath);
+    } catch (err) {
+      throw new Error(`cannot inspect sandbox path '${absolutePath}': ${(err as Error).message}`);
+    }
+    entries.push({ name: entry.name, absolutePath, stat });
+  }
+  return entries;
+}
+
+/**
+ * Agent Git metadata is compatibility state, but a nested repository is host-visible authority:
+ * `git add` can record it as a gitlink and thereby hide protected payloads below it. Walk the
+ * sandbox after the agent exits without following symlinks and allow only the exact top-level
+ * `.git` directory created by our seed. The inode check also rejects an agent replacing that
+ * compatibility directory in place.
+ */
+function assertNoAgentGitMetadata(sandboxDir: string, expected: AgentGitIdentity): void {
+  const topLevelGit = join(sandboxDir, ".git");
+  let topStat: Stats;
+  try {
+    topStat = lstatSync(topLevelGit);
+  } catch (err) {
+    throw new Error(`agent Git metadata is missing after run: ${(err as Error).message}`);
+  }
+  if (
+    !topStat.isDirectory() ||
+    topStat.isSymbolicLink() ||
+    topStat.dev !== expected.dev ||
+    topStat.ino !== expected.ino
+  ) {
+    throw new Error("agent replaced the known top-level Git metadata directory");
+  }
+
+  const walk = (directory: string, relativeDirectory: string): void => {
+    for (const entry of readSandboxEntries(directory)) {
+      const relativePath = relativeDirectory === "" ? entry.name : `${relativeDirectory}/${entry.name}`;
+      if (entry.name.toLowerCase() === ".git") {
+        const isKnownTopLevel = relativeDirectory === "" &&
+          entry.stat.isDirectory() &&
+          !entry.stat.isSymbolicLink() &&
+          entry.stat.dev === expected.dev &&
+          entry.stat.ino === expected.ino;
+        if (!isKnownTopLevel) {
+          throw new Error(`agent-created Git metadata at '${relativePath}' is not trusted`);
+        }
+      }
+      // lstatSync above deliberately inspects the link itself. Never recurse through a link,
+      // whose target may be outside the sandbox or may change during this validation.
+      if (entry.stat.isSymbolicLink()) continue;
+      if (entry.stat.isDirectory()) walk(entry.absolutePath, relativePath);
+    }
+  };
+  walk(sandboxDir, "");
+}
+
+function listWorktreeAttributes(sandboxDir: string): WorktreeAttribute[] {
+  const attributes: WorktreeAttribute[] = [];
+  const walk = (directory: string, relativeDirectory: string): void => {
+    for (const entry of readSandboxEntries(directory)) {
+      const relativePath = relativeDirectory === "" ? entry.name : `${relativeDirectory}/${entry.name}`;
+      if (relativeDirectory === "" && entry.name.toLowerCase() === ".git") continue;
+      if (entry.name.toLowerCase() === ".gitattributes") {
+        if (entry.stat.isSymbolicLink() || !entry.stat.isFile()) {
+          throw new Error(`sandbox .gitattributes path '${relativePath}' is not a regular file`);
+        }
+        attributes.push({
+          absolutePath: entry.absolutePath,
+          relativePath,
+          mode: (entry.stat.mode & 0o111) === 0 ? "100644" : "100755",
+        });
+      }
+      if (entry.stat.isSymbolicLink()) continue;
+      if (entry.stat.isDirectory()) walk(entry.absolutePath, relativePath);
+    }
+  };
+  walk(sandboxDir, "");
+  return attributes;
+}
+
+function pathExistsNoFollow(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+async function withWorktreeAttributesHidden<T>(
+  sandboxDir: string,
+  trustedGitDir: string,
+  fn: () => Promise<T>,
+): Promise<{ value: T; attributes: WorktreeAttribute[] }> {
+  const attributes = listWorktreeAttributes(sandboxDir);
+  if (attributes.length === 0) return { value: await fn(), attributes };
+  const temporaryRoot = mkdtempSync(join(dirname(trustedGitDir), ".code-loop-attrs-"));
+  const moved: Array<{ attribute: WorktreeAttribute; temporaryPath: string }> = [];
+  try {
+    for (const attribute of attributes) {
+      const temporaryPath = join(temporaryRoot, String(moved.length));
+      renameSync(attribute.absolutePath, temporaryPath);
+      moved.push({ attribute, temporaryPath });
+    }
+    const value = await fn();
+    return { value, attributes };
+  } finally {
+    let restoreError: unknown = null;
+    for (const { attribute, temporaryPath } of moved.reverse()) {
+      try {
+        if (pathExistsNoFollow(attribute.absolutePath)) {
+          throw new Error(`sandbox attribute path '${attribute.relativePath}' changed during Git operation`);
+        }
+        renameSync(temporaryPath, attribute.absolutePath);
+      } catch (err) {
+        restoreError ??= err;
+      }
+    }
+    try {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    } catch (err) {
+      restoreError ??= err;
+    }
+    if (restoreError !== null) throw restoreError;
+  }
+}
+
+async function stageWorktreeAttributes(
+  attributes: WorktreeAttribute[],
+  trustedOpts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+  deps: CodeLoopDeps,
+): Promise<void> {
+  for (const attribute of attributes) {
+    if (!pathExistsNoFollow(attribute.absolutePath)) continue;
+    const stat = lstatSync(attribute.absolutePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`sandbox .gitattributes path '${attribute.relativePath}' changed during Git operation`);
+    }
+    const blob = await requireGit(
+      ["hash-object", "-w", "--no-filters", "--", attribute.absolutePath],
+      trustedOpts,
+      deps,
+      "trusted Git attribute blob",
+    );
+    const oid = blob.stdout.trim();
+    if (!/^[a-f0-9]{40,64}$/.test(oid)) throw new Error("trusted Git returned an invalid attribute blob");
+    await requireGit(
+      ["update-index", "--add", "--cacheinfo", attribute.mode, oid, attribute.relativePath],
+      trustedOpts,
+      deps,
+      "trusted Git attribute index update",
+    );
   }
 }
 
@@ -426,6 +808,8 @@ interface Job {
   model: string;
   taskType: string;
   checkCmd: string | null;
+  schemaChecks: CodeLoopSchemaCheck[];
+  writableGlobs: string[];
   protectedGlobs: string[];
   startedAtMs: number;
   effectiveCaps: CodeLoopCaps;
@@ -441,6 +825,8 @@ interface Job {
   durableClientRunId: string;
   durableRequestFingerprint: string;
   learningTaskGatewayEcho: LearningTaskGatewayEcho | null;
+  /** Durable fail-closed marker cleared only after the transient service is verified absent. */
+  cleanupPending: boolean;
   /**
    * The full ADMITTED stamp (#33), carried alongside the gateway echo above. The echo is what's
    * persisted/returned to the caller; this is what `writeLedger` needs to derive evidence identity
@@ -452,9 +838,31 @@ interface Job {
 
 const jobs = new Map<string, Job>();
 let runningWorkId: string | null = null; // single-flight mutex
+// Keep live leases/heartbeat ownership while an exact manager stop is unproved. Durable
+// cleanup_pending blocks fresh admission after a process restart; this map retains this
+// process's release closures until the sweep proves the physical unit is absent.
+const cleanupResourceHolds = new Map<string, {
+  workroot: string;
+  absenceVerified: boolean;
+  release: () => Promise<void>;
+}>();
+
+async function releaseVerifiedCleanupResources(workroot: string, workId: string): Promise<void> {
+  const hold = cleanupResourceHolds.get(workId);
+  if (!hold || hold.workroot !== resolve(workroot) || !hold.absenceVerified) return;
+  await hold.release();
+  cleanupResourceHolds.delete(workId);
+  const job = jobs.get(workId);
+  if (job) job.cleanupPending = false;
+  if (runningWorkId === workId) {
+    runningWorkId = null;
+    setCodeLoopActive(false);
+  }
+}
 
 export function _resetCodeLoopStateForTests(): void {
   jobs.clear();
+  cleanupResourceHolds.clear();
   runningWorkId = null;
   setCodeLoopActive(false);
 }
@@ -473,6 +881,7 @@ interface MetaRecord {
   scope_unit: string;
   model: string;
   started_at_ms: number;
+  cleanup_pending?: boolean;
 }
 
 function writeMeta(sandboxDir: string, m: MetaRecord, writer: (path: string, content: string) => void = writeFileSync): void {
@@ -484,7 +893,7 @@ function writeMeta(sandboxDir: string, m: MetaRecord, writer: (path: string, con
 }
 
 /**
- * The transient scope unit a run creates is DETERMINISTICALLY `code-loop-<workId>`, and workId is
+ * The transient service unit a run creates is DETERMINISTICALLY `code-loop-<workId>`, and workId is
  * `cl-YYYYMMDD-<8 hex>` (newWorkId). The orphan sweep reads `scope_unit` from an in-sandbox
  * `.meta.json` that a hostile pi CAN overwrite (the sandbox is its only writable path), so the
  * sweep must only ever hand `systemctl --user stop` a name matching this exact shape — never an
@@ -500,13 +909,16 @@ export function isCodeLoopUnitName(unit: string): boolean {
 
 export function ledgerOutcome(
   status: CodeLoopTerminalStatus,
-  check: { ran: boolean; exit_code: number | null }
+  check: { ran: boolean; exit_code: number | null },
+  grounding?: CodeLoopSchemaGrounding,
 ): { outcome: Outcome; errorClass: ErrorClass | null } {
   // degeneracy = serving-layer pathology → infra (must not poison the model's capability verdict).
   if (status === "degenerate" || status === "orphaned") return { outcome: "error", errorClass: "infra" };
   if (status === "arm-error") return { outcome: "error", errorClass: "infra" };
   if (status === "cap-exceeded") return { outcome: "error", errorClass: "timeout" };
   // completed:
+  if (grounding?.state === "failed") return { outcome: "fail", errorClass: null };
+  if (grounding?.state === "skipped") return { outcome: "unverified", errorClass: null };
   if (check.ran) return check.exit_code === 0 ? { outcome: "pass", errorClass: null } : { outcome: "fail", errorClass: null };
   return { outcome: "unverified", errorClass: null };
 }
@@ -561,12 +973,41 @@ export async function startCodeLoop(
 ): Promise<CodeLoopStartResult> {
   const structural = validateCodeLoopRequestStructure(req);
   if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
+  if (req.caps?.total_wall_s === undefined) return startCodeLoopInner(req, cfg, deps);
+  const deadline = new CodeLoopDeadline(req.caps.total_wall_s);
+  try {
+    const result = await startCodeLoopInner(req, cfg, withCodeLoopDeadline(deps, deadline), deadline);
+    if (!result.ok && deadline.expired) {
+      return { ok: false, refusal: "deadline-exceeded", message: "Whole-job deadline reached during admission; no model job started." };
+    }
+    return result;
+  } finally {
+    if (!deadline.transferred) deadline.dispose();
+  }
+}
+
+async function startCodeLoopInner(
+  req: CodeLoopRequest,
+  cfg: CodeLoopStartConfig,
+  deps: CodeLoopDeps,
+  deadline?: CodeLoopDeadline,
+): Promise<CodeLoopStartResult> {
+  const structural = validateCodeLoopRequestStructure(req);
+  if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
+  // Scope is admission identity. Snapshot canonical values before the first await so an in-process
+  // caller cannot mutate request arrays after validation but before execution/harvest.
+  const writableGlobs = effectiveWritableGlobs(req);
+  const protectedGlobs = normalizedProtectedGlobs(req);
   const clientRunId = validateClientRunId(req.client_run_id);
   // #80: resolve through the SAME boundary /delegate uses (orchestrator.resolveTaskType) instead of
   // re-implementing it. The old inline guard trimmed only to test for emptiness and then passed the
   // RAW value on, so `"review-bounded "` recorded a whitespace-variant ledger bucket and missed the
   // #74 advisory-only guardrail's exact match.
   const taskType = resolveTaskType({ taskType: req.task_type, prompt: req.instruction });
+  if (taskType === "unit-test-gen" && req.schema_checks === undefined) {
+    return { ok: false, refusal: "invalid-request", message: "unit-test-gen requires owner-authored schema_checks: syntax compilation alone does not verify the supplied contract." };
+  }
+  const schemaChecks = (req.schema_checks ?? []).map(({ name, command }) => ({ name, command }));
   const requestFingerprint = clientRunId === null
     ? null
     : codeLoopRequestFingerprint(req);
@@ -735,10 +1176,19 @@ export async function startCodeLoop(
   }
 
   if (deps.maintenanceMode()) {
-    return { ok: false, refusal: "maintenance", message: "The box is in maintenance mode (a model-scout window is engaged). Try again shortly." };
+    return { ok: false, refusal: "maintenance", message: "The box is in maintenance mode for an explicit evaluation window. Try again shortly." };
+  }
+  if (deps.codeLoopTransportProbe !== undefined) {
+    const transportReady = await deps.codeLoopTransportProbe().catch(() => false);
+    if (!transportReady) {
+      return { ok: false, refusal: "cage-transport-unavailable", message: "The dedicated code_loop user bus is unavailable. Retry after the service recovers." };
+    }
   }
   if (runningWorkId !== null) {
     return { ok: false, refusal: "busy", message: "A code_loop run is already in progress (single-flight). Retry when it finishes." };
+  }
+  if (listDurableCodeLoopRunsPendingCleanup(cfg.workroot).length > 0) {
+    return { ok: false, refusal: "cage-unavailable", message: "A previous code_loop unit still awaits verified cleanup; refusing new work until its absence is proved." };
   }
 
   // Claim the single-flight mutex SYNCHRONOUSLY — before the cage self-test await below. The
@@ -782,6 +1232,24 @@ export async function startCodeLoop(
     }
     if (runningWorkId === workId) runningWorkId = null;
   };
+  // Resource admission must happen after the synchronous single-flight/durable lease claim (so an
+  // await cannot reopen the start race), but before any cage, seed, GPU lease, or engine work.
+  if (deps.beforeModelStart !== undefined) {
+    try {
+      await deps.beforeModelStart(cfg.model);
+    } catch (err) {
+      rollbackAdmission();
+      if (err instanceof HostMemoryAdmissionError) {
+        return {
+          ok: false,
+          refusal: err.rejection.code,
+          message: err.rejection.message,
+        };
+      }
+      if (deadline?.expired) return { ok: false, refusal: "deadline-exceeded", message: "Whole-job deadline reached during admission." };
+      throw err;
+    }
+  }
   // Cage self-test gate (design §6). With confinement=required, a failing probe refuses the job.
   if (cfg.confinement === "required") {
     let probe: { ok: boolean; failures: string[] };
@@ -918,6 +1386,7 @@ export async function startCodeLoop(
       usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
       result: null,
       started_at_ms: acceptedAt,
+      cleanup_pending: true,
       ...(learningTaskGatewayEcho !== null ? { learning_task_gateway_echo: learningTaskGatewayEcho } : {}),
     };
     try {
@@ -962,7 +1431,9 @@ export async function startCodeLoop(
     model: cfg.model,
     taskType,
     checkCmd: typeof req.check_cmd === "string" && req.check_cmd.trim() !== "" ? req.check_cmd : null,
-    protectedGlobs: Array.isArray(req.protected) ? req.protected.filter((g) => typeof g === "string") : [],
+    schemaChecks,
+    writableGlobs,
+    protectedGlobs,
     startedAtMs: acceptedAt,
     effectiveCaps: capPolicy.caps,
     usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
@@ -975,6 +1446,7 @@ export async function startCodeLoop(
     durableClientRunId,
     durableRequestFingerprint,
     learningTaskGatewayEcho,
+    cleanupPending: true,
     learningTaskStamp: validatedLearningStamp,
   };
   jobs.set(workId, job);
@@ -992,7 +1464,7 @@ export async function startCodeLoop(
   // from being scheduled (the durable record drives recovery/retention).
   writeMeta(
     sandboxDir,
-    { work_id: workId, status: "running", scope_unit: unitName, model: cfg.model, started_at_ms: acceptedAt },
+    { work_id: workId, status: "running", scope_unit: unitName, model: cfg.model, started_at_ms: acceptedAt, cleanup_pending: true },
     deps.writeMeta ?? writeFileSync
   );
 
@@ -1000,18 +1472,34 @@ export async function startCodeLoop(
 
   // Fire-and-forget the run; start returns immediately.
   setCodeLoopActive(true);
-  void runJob(job, req, deps, cageArgv, growthCapBytes, unitName, () => leaseLost)
+  let resourcesReleased = false;
+  const releaseResources = async (): Promise<void> => {
+    if (resourcesReleased) return;
+    await lease!.release();
+    processLease.release();
+    resourcesReleased = true;
+  };
+  if (deadline) deadline.transferred = true;
+  void runJob(job, req, deps, cageArgv, growthCapBytes, unitName, () => leaseLost, deadline, releaseResources)
     .finally(async () => {
+      if (job.cleanupPending) {
+        deadline?.dispose();
+        cleanupResourceHolds.set(workId, {
+          workroot: resolve(job.workroot), absenceVerified: false, release: releaseResources,
+        });
+        return;
+      }
       try {
-        await lease!.release();
+        if (!resourcesReleased) await lease!.release();
       } catch {
         /* lease already gone */
       }
       try {
-        processLease.release();
+        if (!resourcesReleased) processLease.release();
       } catch (err) {
         console.error(`code_loop durable process lease release failed for ${workId}: ${(err as Error).message}`);
       } finally {
+        deadline?.dispose();
         setCodeLoopActive(false);
         if (runningWorkId === workId) runningWorkId = null;
       }
@@ -1030,6 +1518,9 @@ export async function startCodeLoop(
 }
 
 function startResultFromRecord(record: DurableCodeLoopRun, recovered: boolean): Extract<CodeLoopStartResult, { ok: true }> {
+  if (record.result?.feedback_handle && isCurrentCodeLoopResult(record.result)) {
+    publishDurableExecutionFeedback(record.result.feedback_handle);
+  }
   return {
     ok: true,
     work_id: record.work_id,
@@ -1054,57 +1545,217 @@ async function runJob(
   cageArgv: string[],
   growthCapBytes: number,
   unitName: string,
-  leaseLost: () => boolean
+  leaseLost: () => boolean,
+  deadline?: CodeLoopDeadline,
+  releaseResources?: () => Promise<void>,
 ): Promise<void> {
   const caps = job.effectiveCaps;
-  const seedSha = await gitInitSeed(job.sandboxDir, deps);
-
-  let outcome: CodeLoopTerminalStatus;
+  let outcome: CodeLoopTerminalStatus = "arm-error";
   let detail = "";
+  let seedSha: string | null = null;
+  let knownAgentGit: AgentGitIdentity | null = null;
+  let trustedGitCreated = false;
+  let trustedGitDir: string | null = null;
   try {
-    const run = await deps.engine.run({
-      sandboxDir: job.sandboxDir,
-      instruction: applyEditDeadlinePolicy(req.instruction, caps.edit_deadline_turn),
-      model: job.model,
-      caps,
-      cageArgv,
-      growthCapBytes,
-    });
-    job.usage = run.usage;
-    job.engineTelemetry = run.telemetry ?? null;
-    detail = run.detail;
-    outcome = leaseLost() ? "arm-error" : run.outcome;
-    if (leaseLost()) detail = "GPU lease lost mid-run (preempted).";
-    job.summary = run.finalMessage;
+    trustedGitDir = trustedGitDirPath(job.workroot, job.id);
+    createTrustedGitDir(job.workroot, job.id);
+    trustedGitCreated = true;
+    const seededSha = await gitInitSeed(job.sandboxDir, trustedGitDir, deps);
+    const seededAgentGit = captureAgentGitIdentity(job.sandboxDir);
+    seedSha = seededSha;
+    knownAgentGit = seededAgentGit;
   } catch (err) {
     outcome = "arm-error";
-    detail = `engine error: ${(err as Error).message}`;
+    detail = `trusted Git seed failed: ${(err as Error).message}`;
+    job.summary = "";
+  }
+  if (seedSha !== null) {
+    try {
+      const run = await deps.engine.run({
+        sandboxDir: job.sandboxDir,
+        instruction: applyEditDeadlinePolicy(req.instruction, caps.edit_deadline_turn),
+        model: job.model,
+        caps,
+        cageArgv,
+        growthCapBytes,
+      });
+      job.usage = run.usage;
+      job.engineTelemetry = run.telemetry ?? null;
+      detail = run.detail;
+      outcome = leaseLost() ? "arm-error" : run.outcome;
+      if (leaseLost()) detail = "GPU lease lost mid-run (preempted).";
+      job.summary = run.finalMessage;
+    } catch (err) {
+      outcome = "arm-error";
+      detail = `engine error: ${(err as Error).message}`;
+      job.summary = "";
+    }
+  }
+
+  // A manager-spawned service is not a child of the gateway. Publish a terminal result only after
+  // an explicit stop/absence check; if the user bus is unavailable, preserve a durable retry bit
+  // so the periodic/startup sweep cannot forget a residual pasta/bwrap tree.
+  try {
+    if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
+    job.cleanupPending = false;
+  } catch (err) {
+    job.cleanupPending = true;
+    outcome = "arm-error";
+    detail = `transient cleanup pending: ${(err as Error).message}`;
     job.summary = "";
   }
 
-  // Harvest the diff from git (ground truth), on ALL terminal statuses (best-effort).
-  const harvest = await gitHarvest(job.sandboxDir, seedSha, deps);
-  const protectedViolations = harvest.changedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
-
-  // Run check_cmd inside the SAME cage (design §6) only on a completed run.
-  let check = { ran: false, exit_code: null as number | null, output_tail: "" };
-  let checkDurationMs: number | undefined;
-  if (outcome === "completed" && job.checkCmd !== null && protectedViolations.length === 0) {
-    const checkStartedAt = deps.now();
-    check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
-    checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
+  // A failed cleanup means the manager has not proved the model process tree is absent. Never
+  // publish a completed result with an empty/untrusted harvest in that state.
+  if (job.cleanupPending) {
+    outcome = "arm-error";
+    detail = detail === ""
+      ? "transient cleanup pending; trusted Git harvest refused"
+      : `${detail}; trusted Git harvest refused while cleanup is pending`;
+    job.summary = "";
   }
 
+  // Harvest only after the manager proves the model process tree is absent. The baseline/index
+  // live in a host-only Git directory outside the cage's one read-write bind; the agent's `.git`
+  // remains available for its own workflow but is never consumed as host authority.
+  let harvest: GitHarvest = { diff: "", allChangedFiles: [], changedFiles: [], scopeViolations: [] };
+  let harvestTrusted = false;
+  let agentGitValid = false;
+  // Validate immediately after cleanup proves the manager-spawned process tree is absent. A
+  // pre-cleanup scan would leave a race in which a residual process mutates the sandbox after the
+  // proof but before trusted harvest.
+  if (!deadline?.expired && !job.cleanupPending && seedSha !== null && trustedGitDir !== null && knownAgentGit !== null) {
+    try {
+      assertNoAgentGitMetadata(job.sandboxDir, knownAgentGit);
+      agentGitValid = true;
+    } catch (err) {
+      outcome = "arm-error";
+      detail = `agent Git metadata validation failed: ${(err as Error).message}`;
+      job.summary = "";
+    }
+  }
+  try {
+    if (seedSha !== null && trustedGitDir !== null && agentGitValid && !job.cleanupPending) {
+      harvest = await gitHarvest(job.sandboxDir, trustedGitDir, seedSha, deps, job.writableGlobs);
+      harvestTrusted = true;
+    }
+  } catch (err) {
+    outcome = "arm-error";
+    detail = `trusted Git harvest failed: ${(err as Error).message}`;
+    job.summary = "";
+  } finally {
+    if (trustedGitCreated && trustedGitDir !== null) {
+      try {
+        removeTrustedGitDir(job.workroot, job.id);
+      } catch (err) {
+        outcome = "arm-error";
+        detail = `trusted Git cleanup failed: ${(err as Error).message}`;
+        job.summary = "";
+        harvestTrusted = false;
+        harvest = { diff: "", allChangedFiles: [], changedFiles: [], scopeViolations: [] };
+      }
+    }
+  }
+  if (deadline?.expired) {
+    outcome = job.cleanupPending ? "arm-error" : "cap-exceeded";
+    detail = "whole-job deadline reached; further verification and output withheld";
+    job.summary = "";
+    harvestTrusted = false;
+  }
+  const protectedViolations = harvest.allChangedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
+
+  // The owner check has its own bounded runtime outside the agent's turn budget. A cleanly
+  // harvested cap-exceeded patch is unfinished but still useful to verify; infra/degeneracy
+  // outcomes remain ineligible.
+  const checkSkipReason = job.checkCmd === null
+    ? "not-requested" as const
+    : !harvestTrusted
+      ? "harvest-untrusted" as const
+      : harvest.scopeViolations.length > 0
+        ? "scope-violation" as const
+        : protectedViolations.length > 0
+          ? "protected-violation" as const
+          : outcome !== "completed" && outcome !== "cap-exceeded"
+            ? "engine-failure" as const
+            : null;
+  let check: CodeLoopResult["check"] = {
+    ran: false,
+    exit_code: null,
+    output_tail: "",
+    skip_reason: checkSkipReason,
+  };
+  let checkDurationMs: number | undefined;
+  if (checkSkipReason === null && job.checkCmd !== null) {
+    const checkStartedAt = deps.now();
+    try {
+      check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
+    } catch (err) {
+      if (!deadline?.expired) throw err;
+      check = { ran: true, exit_code: null, output_tail: "whole-job deadline reached", skip_reason: null };
+    }
+    checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
+    try {
+      if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
+      job.cleanupPending = false;
+    } catch (err) {
+      job.cleanupPending = true;
+      outcome = "arm-error";
+      detail = `transient check cleanup pending: ${(err as Error).message}`;
+      job.summary = "";
+    }
+  }
+
+  // Separate from the syntax/owner check and the exhausted agent budget. Commands are snapshotted
+  // owner input, run only inside the same cage after the relay has closed, never model assertions.
+  const schemaGrounding = skippedSchemaGrounding(job.schemaChecks);
+  if (!deadline?.expired && job.schemaChecks.length && harvestTrusted && !harvest.scopeViolations.length &&
+      !protectedViolations.length && !job.cleanupPending && (outcome === "completed" || outcome === "cap-exceeded")) {
+    const schemaDeadline = performance.now() + CHECK_TIMEOUT_MS;
+    schemaGrounding.state = "failed";
+    for (let index = 0; index < job.schemaChecks.length; index++) {
+      const remaining = Math.floor(schemaDeadline - performance.now());
+      if (remaining <= 0 || deadline?.expired) break;
+      const entry = job.schemaChecks[index]!;
+      try {
+        const verified = await runCheck(entry.command, job.sandboxDir, cageArgv, deps, remaining);
+        schemaGrounding.checks[index] = { name: entry.name, ran: verified.ran, exit_code: verified.exit_code, output_tail: verified.output_tail };
+      } catch (err) {
+        schemaGrounding.checks[index] = { name: entry.name, ran: true, exit_code: null, output_tail: `schema check execution failed: ${(err as Error).message}`.slice(-4096) };
+      }
+      try {
+        if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
+      } catch (err) {
+        job.cleanupPending = true;
+        outcome = "arm-error";
+        detail = `transient schema check cleanup pending: ${(err as Error).message}`;
+        schemaGrounding.checks[index]!.exit_code = null;
+        break;
+      }
+    }
+    if (!job.cleanupPending && schemaGrounding.checks.every(c => c.ran && c.exit_code === 0)) schemaGrounding.state = "passed";
+  }
+  const withhold = deadline?.expired || schemaGrounding.state === "failed" || schemaGrounding.state === "skipped";
+  if (deadline?.expired) {
+    outcome = job.cleanupPending ? "arm-error" : "cap-exceeded";
+    detail = job.cleanupPending
+      ? "whole-job deadline reached; transient cleanup pending; output withheld"
+      : "whole-job deadline reached; further verification and output withheld";
+    job.summary = "";
+  }
+  if (schemaGrounding.state === "failed" || schemaGrounding.state === "skipped") detail = `${detail ? `${detail}; ` : ""}schema grounding ${schemaGrounding.state}: ${schemaGrounding.checks.filter(c => !c.ran || c.exit_code !== 0).map(c => c.name).join(", ")}`;
   const telemetry = buildResultTelemetry(job, harvest.changedFiles.length > 0, checkDurationMs);
 
   const result: CodeLoopResult = {
     status: outcome,
-    diff: harvest.diff.slice(0, DIFF_MAX_BYTES),
-    diff_truncated: harvest.diff.length > DIFF_MAX_BYTES,
+    completion_state: outcome === "completed" ? "complete" : "unfinished",
+    diff: withhold ? "" : harvest.diff.slice(0, DIFF_MAX_BYTES),
+    diff_truncated: !withhold && harvest.diff.length > DIFF_MAX_BYTES,
     changed_files: harvest.changedFiles,
+    scope_violations: harvest.scopeViolations,
     protected_violations: protectedViolations,
-    summary: job.summary.slice(0, 2048),
+    summary: withhold ? "" : job.summary.slice(0, 2048),
     check,
+    schema_grounding: schemaGrounding,
     usage: job.usage,
     execution: codeLoopExecution(job),
     telemetry,
@@ -1114,7 +1765,7 @@ async function runJob(
     // an arm-error with empty everything cost a manual sandbox dig (live smoke, 2026-07-02).
     detail: detail.slice(0, 400),
   };
-  await finalizeJobWithResult(job, result, req, deps, unitName);
+  await finalizeJobWithResult(job, result, req, deps, unitName, deadline, releaseResources);
 }
 
 function codeLoopExecution(job: Job): CodeLoopResult["execution"] {
@@ -1185,31 +1836,281 @@ function buildResultTelemetry(
 
 // ─── git helpers (ground truth for the diff) ────────────────────────────────────────────
 
-const GIT_ENV = { GIT_AUTHOR_NAME: "code-loop", GIT_AUTHOR_EMAIL: "code-loop@local", GIT_COMMITTER_NAME: "code-loop", GIT_COMMITTER_EMAIL: "code-loop@local" };
+const GIT = "/usr/bin/git";
+const GIT_ENV = {
+  GIT_AUTHOR_NAME: "code-loop",
+  GIT_AUTHOR_EMAIL: "code-loop@local",
+  GIT_COMMITTER_NAME: "code-loop",
+  GIT_COMMITTER_EMAIL: "code-loop@local",
+};
+const CODE_LOOP_WORK_ID_RE = /^cl-\d{8}-[0-9a-f]{8}$/;
 
-async function gitInitSeed(sandboxDir: string, deps: CodeLoopDeps): Promise<string> {
-  const env = { ...gitBaseEnv(), ...GIT_ENV };
-  await deps.runCommand(["git", "init", "-q"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  await deps.runCommand(["git", "add", "-A"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  await deps.runCommand(["git", "commit", "-q", "-m", "seed", "--allow-empty"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const rev = await deps.runCommand(["git", "rev-parse", "HEAD"], { cwd: sandboxDir, env, timeoutMs: 10_000 });
-  return rev.stdout.trim();
+function trustedGitRootPath(workroot: string): string {
+  return join(realpathSync(resolve(workroot)), TRUSTED_GIT_ROOT_NAME);
 }
 
-async function gitHarvest(sandboxDir: string, seedSha: string, deps: CodeLoopDeps): Promise<{ diff: string; changedFiles: string[] }> {
-  const env = { ...gitBaseEnv(), ...GIT_ENV };
-  await deps.runCommand(["git", "add", "-A"], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const diffRes = await deps.runCommand(["git", "diff", "--cached", seedSha], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const namesRes = await deps.runCommand(["git", "diff", "--cached", "--name-only", seedSha], { cwd: sandboxDir, env, timeoutMs: 30_000 });
-  const changed = namesRes.stdout.split("\n").map((s) => s.trim()).filter((s) => s !== "");
-  // Re-validate changed-file paths for containment on the way out (design §5.4).
-  const contained = changed.filter((f) => !isAbsolute(f) && !f.split(/[\\/]/).includes(".."));
-  return { diff: diffRes.stdout, changedFiles: contained };
+function trustedGitDirPath(workroot: string, workId: string): string {
+  if (!CODE_LOOP_WORK_ID_RE.test(workId)) throw new Error("invalid trusted Git work id");
+  return join(trustedGitRootPath(workroot), workId);
+}
+
+function assertPrivateOwnedDirectory(path: string, expectedPath: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("trusted Git path is not a directory");
+  if (realpathSync(path) !== expectedPath) throw new Error("trusted Git path escaped its canonical location");
+  if ((stat.mode & 0o077) !== 0) throw new Error("trusted Git path permissions are not private");
+  const uid = process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) throw new Error("trusted Git path has the wrong owner");
+}
+
+function createTrustedGitDir(workroot: string, workId: string): string {
+  const root = trustedGitRootPath(workroot);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  assertPrivateOwnedDirectory(root, root);
+  const dir = trustedGitDirPath(workroot, workId);
+  mkdirSync(dir, { mode: 0o700 });
+  assertPrivateOwnedDirectory(dir, dir);
+  return dir;
+}
+
+function removeTrustedGitDir(workroot: string, workId: string): void {
+  const dir = trustedGitDirPath(workroot, workId);
+  if (!existsSync(dir)) return;
+  assertPrivateOwnedDirectory(dir, dir);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function sweepTrustedGitDirs(workroot: string): void {
+  if (!existsSync(resolve(workroot))) return;
+  const root = trustedGitRootPath(workroot);
+  if (!existsSync(root)) return;
+  assertPrivateOwnedDirectory(root, root);
+  for (const workId of readdirSync(root)) {
+    if (!CODE_LOOP_WORK_ID_RE.test(workId)) continue;
+    if (jobs.has(workId) || isDurableCodeLoopWorkLive(workroot, workId)) continue;
+    removeTrustedGitDir(workroot, workId);
+  }
+}
+
+async function requireGit(
+  argv: string[],
+  opts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+  deps: CodeLoopDeps,
+  operation: string
+): Promise<{ stdout: string; stderr: string }> {
+  const result = await deps.runCommand([GIT, ...GIT_SAFE_CONFIG, ...argv], opts);
+  if (result.code !== 0) {
+    const diagnostic = result.stderr.trim().replace(/[\r\n]+/g, " ").slice(-200);
+    throw new Error(`${operation} exited ${result.code === null ? "without a status" : String(result.code)}${diagnostic === "" ? "" : `: ${diagnostic}`}`);
+  }
+  return result;
+}
+
+async function trustedGitAdd(
+  sandboxDir: string,
+  trustedGitDir: string,
+  trustedOpts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+  deps: CodeLoopDeps,
+  operation: string,
+): Promise<void> {
+  // Worktree attributes are agent input. Hide them while Git discovers files so clean filters,
+  // text conversion, and other attribute-driven behavior cannot affect host staging. Restore and
+  // stage the attribute files as raw blobs afterward, preserving them in the delivered diff.
+  const staged = await withWorktreeAttributesHidden(sandboxDir, trustedGitDir, async () => {
+    await requireGit(["add", "-A", "-f"], trustedOpts, deps, operation);
+    return true;
+  });
+  await stageWorktreeAttributes(staged.attributes, trustedOpts, deps);
+}
+
+async function gitInitSeed(sandboxDir: string, trustedGitDir: string, deps: CodeLoopDeps): Promise<string> {
+  assertNoPreexistingAgentGit(sandboxDir);
+  const agentEnv = { ...gitBaseEnv(), ...GIT_ENV };
+  const agentOpts = { cwd: sandboxDir, env: agentEnv, timeoutMs: 30_000 };
+  // Preserve the nested repository expected by coding harnesses. It is agent workspace state only;
+  // host harvest never reads this directory or its configuration.
+  await requireGit(["init", "-q"], agentOpts, deps, "agent Git init");
+  await requireGit(["add", "-A", "-f"], agentOpts, deps, "agent Git seed add");
+  await requireGit(["commit", "-q", "-m", "seed", "--allow-empty", "--no-verify"], agentOpts, deps, "agent Git seed commit");
+
+  await requireGit(["init", "-q", "--bare", trustedGitDir], agentOpts, deps, "trusted Git init");
+  const trustedEnv = { ...gitBaseEnv(), ...GIT_ENV, GIT_DIR: trustedGitDir, GIT_WORK_TREE: sandboxDir };
+  const trustedOpts = { cwd: sandboxDir, env: trustedEnv, timeoutMs: 30_000 };
+  await trustedGitAdd(sandboxDir, trustedGitDir, trustedOpts, deps, "trusted Git seed add");
+  await requireGit(["commit", "-q", "-m", "seed", "--allow-empty", "--no-verify"], trustedOpts, deps, "trusted Git seed commit");
+  const rev = await requireGit(["rev-parse", "HEAD"], { ...trustedOpts, timeoutMs: 10_000 }, deps, "trusted Git seed revision");
+  const seedSha = rev.stdout.trim();
+  if (!/^[a-f0-9]{40,64}$/.test(seedSha)) throw new Error("trusted Git returned an invalid seed revision");
+  return seedSha;
+}
+
+interface GitHarvest {
+  /** Non-generated changed paths, including internal and later-rejected paths. */
+  allChangedFiles: string[];
+  /** Only paths whose complete logical Git change is admitted by the writable boundary. */
+  changedFiles: string[];
+  /** Non-generated paths omitted because their logical change crossed scope or safety policy. */
+  scopeViolations: string[];
+  diff: string;
+}
+
+interface GitLogicalChange {
+  status: string;
+  paths: string[];
+}
+
+function parseGitNameStatusZ(stdout: string): GitLogicalChange[] {
+  if (stdout === "") return [];
+  if (!stdout.endsWith("\0")) throw new Error("trusted Git returned malformed changed-file framing");
+  const fields = stdout.slice(0, -1).split("\0");
+  const changes: GitLogicalChange[] = [];
+  for (let cursor = 0; cursor < fields.length;) {
+    const status = fields[cursor++] ?? "";
+    if (!/^(?:[AMDTUXB]|[RC][0-9]{1,3})$/.test(status)) {
+      throw new Error("trusted Git returned an unsupported change status");
+    }
+    const pathCount = status.startsWith("R") || status.startsWith("C") ? 2 : 1;
+    if (cursor + pathCount > fields.length) {
+      throw new Error("trusted Git returned an incomplete logical change");
+    }
+    const paths = fields.slice(cursor, cursor + pathCount);
+    cursor += pathCount;
+    if (paths.some((path) => path === "" || path.includes("\0"))) {
+      throw new Error("trusted Git returned an empty changed-file path");
+    }
+    changes.push({ status, paths });
+  }
+  return changes;
+}
+
+function isSafeHarvestPath(sandboxDir: string, relativePath: string, sandboxReal: string): boolean {
+  const base = resolve(sandboxDir);
+  const lexical = resolve(base, relativePath);
+  if (lexical !== base && !lexical.startsWith(base + sep)) return false;
+  try {
+    const stat = lstatSync(lexical);
+    if (stat.isSymbolicLink()) return false;
+    const actual = realpathSync(lexical);
+    return actual === sandboxReal || actual.startsWith(sandboxReal + sep);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    // Deleted paths have no inode. Prove their nearest surviving parent still belongs to the
+    // sandbox so a deleted leaf below a replaced symlink cannot pass by lexical spelling alone.
+    let parent = dirname(lexical);
+    while (parent !== base && parent.startsWith(base + sep)) {
+      try {
+        const parentStat = lstatSync(parent);
+        if (parentStat.isSymbolicLink()) return false;
+        const parentReal = realpathSync(parent);
+        return parentReal === sandboxReal || parentReal.startsWith(sandboxReal + sep);
+      } catch (parentErr) {
+        if ((parentErr as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        parent = dirname(parent);
+      }
+    }
+    return parent === base;
+  }
+}
+
+function pushUnique(target: string[], value: string): void {
+  if (!target.includes(value)) target.push(value);
+}
+
+async function gitHarvest(
+  sandboxDir: string,
+  trustedGitDir: string,
+  seedSha: string,
+  deps: CodeLoopDeps,
+  writableGlobs: string[],
+): Promise<GitHarvest> {
+  const env = { ...gitBaseEnv(), ...GIT_ENV, GIT_DIR: trustedGitDir, GIT_WORK_TREE: sandboxDir };
+  const opts = { cwd: sandboxDir, env, timeoutMs: 30_000 };
+  await trustedGitAdd(sandboxDir, trustedGitDir, opts, deps, "trusted Git harvest add");
+  const attributeFreeWorktree = mkdtempSync(join(dirname(trustedGitDir), ".code-loop-diff-"));
+  try {
+    const diffOpts = {
+      cwd: attributeFreeWorktree,
+      env: { ...env, GIT_WORK_TREE: attributeFreeWorktree },
+      timeoutMs: 30_000,
+    };
+    const namesRes = await requireGit(
+      ["diff", "--cached", "--name-status", "-z", "--find-renames=50%", "--no-ext-diff", "--no-textconv", seedSha, "--"],
+      diffOpts,
+      deps,
+      "trusted Git harvest names"
+    );
+    const logicalChanges = parseGitNameStatusZ(namesRes.stdout);
+    const sandboxReal = realpathSync(sandboxDir);
+    const allChangedFiles: string[] = [];
+    const changedFiles: string[] = [];
+    const scopeViolations: string[] = [];
+    const admittedPathspecs: string[] = [];
+
+    for (const change of logicalChanges) {
+      let paths: string[];
+      try {
+        paths = change.paths.map((path) => normalizeRelativeCodeLoopPath(path, "harvested path", false));
+      } catch {
+        for (const rawPath of change.paths) pushUnique(scopeViolations, rawPath);
+        continue;
+      }
+      const visiblePaths = paths.filter((path) => !isGeneratedCodeLoopArtifact(path));
+      for (const path of visiblePaths) pushUnique(allChangedFiles, path);
+
+      // Generated-only and harness-internal changes are silent hygiene. A logical rename/copy that
+      // mixes one of those endpoints with deliverable content is rejected as a whole so content can
+      // never cross the boundary through Git's rename representation.
+      const deliverablePaths = paths.filter((path) =>
+        !isGeneratedCodeLoopArtifact(path) && !isCodeLoopInternalPath(path));
+      if (deliverablePaths.length === 0) continue;
+      const completeLogicalChangeIsDeliverable = deliverablePaths.length === paths.length &&
+        paths.every((path) =>
+          isSafeHarvestPath(sandboxDir, path, sandboxReal) && matchesAnyGlob(path, writableGlobs));
+      if (!completeLogicalChangeIsDeliverable) {
+        for (const path of deliverablePaths) pushUnique(scopeViolations, path);
+        continue;
+      }
+      for (const path of paths) {
+        pushUnique(changedFiles, path);
+        pushUnique(admittedPathspecs, `:(literal)${path}`);
+      }
+    }
+
+    const diff = admittedPathspecs.length === 0
+      ? ""
+      : (await requireGit(
+        ["diff", "--cached", "--text", "--find-renames=50%", "--no-ext-diff", "--no-textconv", seedSha, "--", ...admittedPathspecs],
+        diffOpts,
+        deps,
+        "trusted Git harvest diff",
+      )).stdout;
+    return { diff, allChangedFiles, changedFiles, scopeViolations };
+  } finally {
+    rmSync(attributeFreeWorktree, { recursive: true, force: true });
+  }
 }
 
 function gitBaseEnv(): Record<string, string> {
-  return { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_NOSYSTEM: "1" };
+  return {
+    PATH: "/usr/bin:/bin",
+    HOME: "/nonexistent",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PAGER: "/bin/cat",
+  };
 }
+
+// Command-scoped config wins over any local repository config that may have survived a re-entry.
+// The pre-existing `.git` guard remains mandatory because arbitrary local filter names cannot be
+// neutralized generically; explicit hooks/excludes settings close the remaining Git config
+// surfaces for every host and agent seed command.
+const GIT_SAFE_CONFIG = [
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.excludesFile=/dev/null",
+] as const;
 
 const CHECK_TIMEOUT_MS = 120_000;
 
@@ -1217,14 +2118,20 @@ async function runCheck(
   checkCmd: string,
   sandboxDir: string,
   cageArgv: string[],
-  deps: CodeLoopDeps
-): Promise<{ ran: boolean; exit_code: number | null; output_tail: string }> {
-  // check_cmd runs INSIDE the same cage with a minimal env (PATH/HOME only — not even HS_API_KEY).
-  const env = { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: sandboxDir };
+  deps: CodeLoopDeps,
+  timeoutMs = CHECK_TIMEOUT_MS,
+): Promise<CodeLoopResult["check"]> {
+  // check_cmd runs INSIDE the same cage with a minimal env. The fixed non-secret HS_API_KEY value
+  // only satisfies systemd-run's environment-copy contract; the relay is already closed.
+  const env = {
+    PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+    HOME: sandboxDir,
+    HS_API_KEY: "code-loop-check-no-upstream",
+  };
   const argv = [...cageArgv, "bash", "-c", checkCmd];
-  const r = await deps.runCommand(argv, { cwd: sandboxDir, env, timeoutMs: CHECK_TIMEOUT_MS });
+  const r = await deps.runCommand(argv, { cwd: sandboxDir, env, timeoutMs });
   const combined = `${r.stdout}\n${r.stderr}`;
-  return { ran: true, exit_code: r.code, output_tail: combined.slice(-4096) };
+  return { ran: true, exit_code: r.code, output_tail: combined.slice(-4096), skip_reason: null };
 }
 
 // ─── Finalization + ledger ──────────────────────────────────────────────────────────────
@@ -1234,62 +2141,78 @@ async function finalizeJobWithResult(
   result: CodeLoopResult,
   req: CodeLoopRequest,
   deps: CodeLoopDeps,
-  unitName: string
+  unitName: string,
+  deadline?: CodeLoopDeadline,
+  releaseResources?: () => Promise<void>,
 ): Promise<void> {
   // #33: derive evidence identity BEFORE flipping job.status/result to terminal — a caller polling
   // code_loop_status/code_loop_result must never observe "terminal" while the ledger write (now
   // async, since it joins a live served-model observation) is still in flight. This preserves the
   // pre-#33 atomicity: everything from the status flip onward stays synchronous, exactly like
   // before this change, with the one new async step ordered strictly earlier.
-  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
+  // A stamped identity lookup may wait on the serving backend. Bound this read-only lookup
+  // inside the cleanup reserve; missing provenance must remain unknown, never fabricated.
+  const evidenceIdentity = deadline
+    ? await boundedCodeLoopIdentity(job, 5_000)
+    : await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
+  // Keep the process lease through asynchronous evidence collection. For the opt-in whole-job
+  // contract, release both leases immediately before the synchronous terminal publication.
+  let resourcesReleased = false;
+  if (deadline && releaseResources && !job.cleanupPending) {
+    try {
+      await releaseResources();
+      resourcesReleased = true;
+    } catch (err) {
+      result.status = "arm-error";
+      result.completion_state = "unfinished";
+      result.diff = "";
+      result.summary = "";
+      result.diff_truncated = false;
+      result.detail = `resource release failed: ${(err as Error).message}`.slice(0, 400);
+    }
+  }
+  if (deadline?.expired) {
+    result.status = job.cleanupPending || !resourcesReleased ? "arm-error" : "cap-exceeded";
+    result.completion_state = "unfinished";
+    result.diff = "";
+    result.summary = "";
+    result.diff_truncated = false;
+    result.detail = job.cleanupPending
+      ? "whole-job deadline reached; transient cleanup pending; output withheld"
+      : "whole-job deadline reached; output withheld";
+  }
+  if (deadline) {
+    result.execution.whole_job = {
+      budget_s: deadline.totalWallS,
+      observed_before_persistence_ms: Math.max(0, Math.ceil(performance.now() - deadline.startedAt)),
+      cleanup_complete: !job.cleanupPending && resourcesReleased,
+    };
+  }
   job.status = result.status;
   job.result = result;
   job.usage = result.usage;
+  // Bind the exact ledger row before persisting the terminal result. A recovered start/result
+  // reads this same handle and never re-executes the job or appends another ledger row.
+  writeLedger(job, result.status, req, deps, result.check, evidenceIdentity);
   writeMeta(job.sandboxDir, {
     work_id: job.id,
     status: result.status,
     scope_unit: unitName,
     model: job.model,
     started_at_ms: job.startedAtMs,
+    cleanup_pending: job.cleanupPending,
   });
-  persistJobDurable(job);
+  if (persistJobDurable(job)) {
+    if (result.feedback_handle) publishDurableExecutionFeedback(result.feedback_handle);
+  } else {
+    // A prepared binding is not a completed/retrievable denominator. Recovery can publish it
+    // only if the authoritative terminal file actually committed before the write failure.
+    delete result.feedback_handle;
+  }
   recordCodeLoopRun(result.status);
-  writeLedger(job, result.status, req, deps, result.check, evidenceIdentity);
 }
 
-/** Used only for the pre-run lease/spawn refusal (no engine result yet). */
-async function finalizeJob(
-  job: Job,
-  status: CodeLoopTerminalStatus,
-  detail: string,
-  check: { ran: boolean; exit_code: number | null; output_tail: string },
-  req: CodeLoopRequest,
-  deps: CodeLoopDeps
-): Promise<void> {
-  // #33: same ordering discipline as finalizeJobWithResult above.
-  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
-  job.status = status;
-  job.result = {
-    status,
-    diff: "",
-    diff_truncated: false,
-    changed_files: [],
-    protected_violations: [],
-    summary: "",
-    check,
-    usage: job.usage,
-    execution: codeLoopExecution(job),
-    telemetry: buildResultTelemetry(job, false),
-    agent_checks: codeLoopAgentChecks(job),
-    work_id: job.id,
-    detail: detail.slice(0, 400),
-  };
-  persistJobDurable(job);
-  recordCodeLoopRun(status);
-  writeLedger(job, status, req, deps, check, evidenceIdentity);
-}
-
-function persistJobDurable(job: Job): void {
+function persistJobDurable(job: Job): boolean {
   try {
     persistDurableCodeLoopRun(job.workroot, {
       schema_version: 1,
@@ -1300,18 +2223,21 @@ function persistJobDurable(job: Job): void {
       usage: job.usage,
       result: job.result,
       started_at_ms: job.startedAtMs,
+      cleanup_pending: job.cleanupPending,
       ...(job.learningTaskGatewayEcho !== null
         ? { learning_task_gateway_echo: job.learningTaskGatewayEcho }
         : {}),
     });
+    return true;
   } catch (err) {
     console.error("[code-loop] durable idempotency update failed:", err);
+    return false;
   }
 }
 
 /**
  * `evidenceIdentity` is derived by the caller (deriveEvidenceIdentity, #33) BEFORE the job's
- * status/result are flipped to terminal — see finalizeJobWithResult/finalizeJob — so this stays a
+ * status/result are flipped to terminal — see finalizeJobWithResult — so this stays a
  * plain synchronous write, exactly like it was before #33. Reuses PR #32's exact derivation (the
  * same stamp-field join + live served-model observation as the delegate lane), tagged with THIS
  * lane's own identity ("code-loop") so a code_loop row can never be mistaken for (or copy) a
@@ -1327,9 +2253,9 @@ function writeLedger(
   check: { ran: boolean; exit_code: number | null },
   evidenceIdentity: Awaited<ReturnType<typeof deriveEvidenceIdentity>>
 ): void {
-  const { outcome, errorClass } = ledgerOutcome(status, check);
+  const { outcome, errorClass } = ledgerOutcome(status, check, job.result?.schema_grounding);
   try {
-    recordDelegation({
+    const ledgerId = recordDelegation({
       taskType: job.taskType,
       modelId: job.model,
       prompt: req.instruction,
@@ -1338,11 +2264,21 @@ function writeLedger(
       latencyMs: job.usage.wall_ms,
       promptTokens: job.usage.prompt_tokens || null,
       completionTokens: job.usage.completion_tokens || null,
-      verifier: job.checkCmd !== null ? "check-cmd" : null,
+      verifier: job.schemaChecks.length ? "owner-schema-checks-v1" : job.checkCmd !== null ? "check-cmd" : null,
       source: "code-loop",
       keyAlias: deps.keyAlias ?? null,
       evidenceIdentity,
     });
+    if (deps.feedbackOwner && job.result) {
+      const handle = bindExecutionFeedback({
+        ledgerId, owner: deps.feedbackOwner, surface: "code_loop",
+        trafficPurpose: req.traffic_purpose ?? "unknown",
+        deferAvailability: true,
+        outputAvailable: status === "completed" && !job.result.diff_truncated
+          && (job.result.diff.length > 0 || job.result.summary.length > 0),
+      });
+      if (handle) job.result.feedback_handle = handle;
+    }
   } catch (err) {
     // Never let a telemetry write break the run.
     console.error("[code-loop] ledger write failed (ignored):", err);
@@ -1373,7 +2309,10 @@ export function getJobResult(workId: string, workroot?: string): GetResultOutcom
   const durable = workroot === undefined ? null : readDurableCodeLoopRunByWork(workroot, workId);
   if (durable === null) return { kind: "unknown" };
   const compatible = workroot === undefined ? durable : failClosedIncompatibleResult(workroot, durable);
-  if (compatible.result !== null) return { kind: "result", result: compatible.result };
+  if (compatible.result !== null) {
+    if (compatible.result.feedback_handle) publishDurableExecutionFeedback(compatible.result.feedback_handle);
+    return { kind: "result", result: compatible.result };
+  }
   if (compatible.status === "running") return { kind: "running" };
   return { kind: "terminal-unavailable", status: compatible.status };
 }
@@ -1382,8 +2321,8 @@ export function getJobResult(workId: string, workroot?: string): GetResultOutcom
 
 /**
  * Scan the workroot at gateway startup. Any sandbox with a `.meta.json` status "running" and no
- * live in-memory job is orphaned (a restart killed its process) → best-effort stop its transient
- * scope unit, mark it orphaned. Any sandbox older than the TTL is reclaimed (rm -rf).
+ * live in-memory job is orphaned (a restart killed its process) → stop its transient service and
+ * only then mark it orphaned. Any sandbox older than the TTL is reclaimed (rm -rf).
  */
 export async function sweepCodeLoopSandboxes(
   cfg: { workroot: string; retentionTtlMs: number },
@@ -1392,6 +2331,40 @@ export async function sweepCodeLoopSandboxes(
   let orphaned = 0;
   let reclaimed = 0;
   const now = deps.now();
+  const cleanupVerifiedWorkIds = new Set<string>();
+  // Another gateway process may have cleared the durable pending bit after proving absence,
+  // but it cannot release this process's closures. Revisit every local hold independently of
+  // that bit and obtain our own exact-unit proof before releasing ownership. A prior release
+  // failure can retry without stopping again once this process has already proved absence.
+  for (const [workId, hold] of cleanupResourceHolds) {
+    if (hold.workroot !== resolve(cfg.workroot)) continue;
+    if (!hold.absenceVerified) {
+      await deps.stopUnit(`code-loop-${workId}`);
+      const record = readDurableCodeLoopRunByWork(cfg.workroot, workId);
+      if (record?.cleanup_pending) {
+        persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+      }
+      hold.absenceVerified = true;
+    }
+    await releaseVerifiedCleanupResources(cfg.workroot, workId);
+    cleanupVerifiedWorkIds.add(workId);
+  }
+  // Reap trusted cleanup obligations from the durable index first. A caged process owns and may
+  // delete its sandbox, so directory enumeration must never be the only path to a residual unit.
+  for (const record of listDurableCodeLoopRunsPendingCleanup(cfg.workroot)) {
+    if (
+      record.status === "running" && !cleanupResourceHolds.has(record.work_id) &&
+      (jobs.has(record.work_id) || isDurableCodeLoopWorkLive(cfg.workroot, record.work_id))
+    ) continue;
+    const unitName = `code-loop-${record.work_id}`;
+    if (!isCodeLoopUnitName(unitName)) continue;
+    await deps.stopUnit(unitName);
+    persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+    const hold = cleanupResourceHolds.get(record.work_id);
+    if (hold) hold.absenceVerified = true;
+    await releaseVerifiedCleanupResources(cfg.workroot, record.work_id);
+    cleanupVerifiedWorkIds.add(record.work_id);
+  }
   // Enforce source retention from the trusted caller record even when the sandbox or its
   // agent-writable metadata was deleted/corrupted. This is idempotent and safe to run periodically.
   compactExpiredDurableCodeLoopRuns(cfg.workroot, now, cfg.retentionTtlMs);
@@ -1402,6 +2375,14 @@ export async function sweepCodeLoopSandboxes(
   for (const [workId, job] of jobs) {
     if (resolve(job.workroot) === canonicalWorkroot && job.status !== "running" &&
         now - job.startedAtMs > cfg.retentionTtlMs) jobs.delete(workId);
+  }
+  // The trusted host index is intentionally outside the agent cage. A gateway crash can leave
+  // one behind, so reclaim it only after proving that neither this process nor a durable peer
+  // still owns the work id. Malformed entries are ignored rather than becoming recursive targets.
+  try {
+    sweepTrustedGitDirs(cfg.workroot);
+  } catch {
+    // A malformed/hostile trusted index must not prevent the ordinary sandbox/orphan sweep.
   }
   let entries: string[];
   try {
@@ -1458,17 +2439,34 @@ export async function sweepCodeLoopSandboxes(
       }
     }
     const startedAtMs = durable?.started_at_ms ?? meta?.started_at_ms ?? filesystemStartedAtMs;
+    const unitName = `code-loop-${workId}`;
+    let unitCleanupVerified = cleanupVerifiedWorkIds.has(workId);
+
+    // A terminal run may still carry a trusted durable cleanup obligation when the final user-bus
+    // stop failed. Retry it even though the public result is already arm-error. For a running run,
+    // only take ownership after its durable process identity is dead; never stop a rolling peer.
+    if (
+      durable?.cleanup_pending === true &&
+      isCodeLoopUnitName(unitName) &&
+      (status !== "running" || (!jobs.has(workId) && !isDurableCodeLoopWorkLive(cfg.workroot, workId)))
+    ) {
+      await deps.stopUnit(unitName);
+      unitCleanupVerified = true;
+      durable = { ...durable, cleanup_pending: false };
+      persistDurableCodeLoopRun(cfg.workroot, durable);
+      if (meta !== null) {
+        meta = { ...meta, work_id: workId, cleanup_pending: false };
+        writeMeta(dir, meta);
+      }
+    }
 
     // Orphan detection is anchored to the deterministic work id + durable process identity, not
     // the mutable metadata. A valid live lease survives rolling gateway overlap.
     if (status === "running" && !jobs.has(workId) && !isDurableCodeLoopWorkLive(cfg.workroot, workId)) {
-      const unitName = `code-loop-${workId}`;
       if (isCodeLoopUnitName(unitName)) {
-        try {
-          await deps.stopUnit(unitName);
-        } catch {
-          /* unit already gone */
-        }
+        // Propagate a real user-bus/stop failure. Marking the run orphaned while its manager-
+        // spawned pasta/bwrap tree is still active would permit a second concurrent run.
+        if (!unitCleanupVerified) await deps.stopUnit(unitName);
       }
       if (meta !== null) writeMeta(dir, { ...meta, work_id: workId, status: "orphaned" });
       markDurableCodeLoopRunOrphaned(cfg.workroot, workId);
@@ -1497,4 +2495,15 @@ export async function sweepCodeLoopSandboxes(
   for (let i = 0; i < durableOrphans; i++) recordCodeLoopRun("orphaned");
   orphaned += durableOrphans;
   return { orphaned, reclaimed };
+}
+
+
+async function boundedCodeLoopIdentity(job: Job, timeoutMs: number): Promise<Awaited<ReturnType<typeof deriveEvidenceIdentity>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop"),
+      new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), timeoutMs); }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
 }

@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "taskRevision": "halogen-synth-r1",
+  "taskKind": "synthetic-python-standard-library",
+  "id": "py-interval-report",
+  "fixtureRoot": "benchmarks/halogen/fixtures/py-interval-report",
+  "seedPaths": [
+    "app/__init__.py",
+    "app/intervals.py",
+    "app/report.py",
+    "app/cli.py"
+  ],
+  "instruction": "Implement the interval report in app/intervals.py, app/report.py, and app/cli.py. The input is a JSON list of integer half-open intervals [start, end], with start strictly less than end; reject booleans, nonintegers, malformed shapes, and reversed or zero-length intervals. Normalize the union by sorting and merging overlapping or adjacent ranges. The JSON report is exactly {\"intervals\": [[integer, integer], ...], \"totalDuration\": integer, \"peakConcurrency\": integer}; intervals are sorted and normalized, totalDuration is their covered length, and peakConcurrency is calculated from the original validated intervals, processing interval ends before starts at equal coordinates. The CLI invocation is app/cli.py INPUT|-; it writes one compact JSON report followed by LF on success and returns a clear nonzero error with no partial JSON for invalid input or file errors. Use Python standard library only and change only the declared app files.",
+  "allowedChangedPaths": [
+    "app/intervals.py",
+    "app/report.py",
+    "app/cli.py"
+  ],
+  "oracleFiles": [
+    {
+      "source": "benchmarks/halogen/oracles/py-interval-report.hidden.py",
+      "destination": "tests/py_interval_report_hidden.py"
+    }
+  ],
+  "checks": [
+    {
+      "id": "hidden-interval-report",
+      "command": "python3",
+      "args": [
+        "-B",
+        "tests/py_interval_report_hidden.py"
+      ],
+      "timeoutSeconds": 60
+    },
+    {
+      "id": "fixture-imports",
+      "command": "python3",
+      "args": [
+        "-B",
+        "-c",
+        "import sys; sys.path.insert(0, 'app'); import intervals, report, cli"
+      ],
+      "timeoutSeconds": 30
+    },
+    {
+      "id": "diff-check",
+      "command": "git",
+      "args": [
+        "diff",
+        "--check"
+      ],
+      "timeoutSeconds": 30
+    }
+  ],
+  "referenceValidation": {
+    "mode": "temporary-overlay",
+    "referenceMustRemainOutsideFixture": true,
+    "seedMustFailHiddenCheck": true
+  }
+}

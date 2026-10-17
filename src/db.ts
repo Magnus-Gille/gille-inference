@@ -1,6 +1,18 @@
 import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import {
+  closeSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { assertTestPathOutsideRepositoryData, isTestRuntime } from "./test-runtime-path.js";
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -44,16 +56,29 @@ CREATE INDEX IF NOT EXISTS idx_judge_records_run ON judge_records(run_id);
 // ─── Singleton ────────────────────────────────────────────────────────────────
 
 let _db: Database.Database | null = null;
+const readOnlySnapshotRoots = new WeakMap<Database.Database, string>();
+
+function configuredDbPath(dbPath?: string): string {
+  const configured = dbPath ?? process.env["EVAL_DB_PATH"];
+  if (!configured && isTestRuntime()) {
+    throw new Error(
+      "Refusing the implicit ./data/eval.db test database; pass an explicit initDb(path) or set EVAL_DB_PATH"
+    );
+  }
+  const resolved = resolve(configured ?? "./data/eval.db");
+  assertTestPathOutsideRepositoryData(resolved, "database");
+  return resolved;
+}
 
 /**
  * Open (and initialise) the SQLite database.
  * Creates the data directory and all tables if they do not yet exist.
  * Subsequent calls with no argument return the same instance.
+ * Test runtimes must provide an explicit path (or EVAL_DB_PATH); the production default is
+ * deliberately unavailable there so tests cannot mutate the repository's gitignored data tree.
  */
 export function initDb(dbPath?: string): Database.Database {
-  const resolvedPath = resolve(
-    dbPath ?? process.env["EVAL_DB_PATH"] ?? "./data/eval.db"
-  );
+  const resolvedPath = configuredDbPath(dbPath);
 
   // Ensure the parent directory exists
   mkdirSync(dirname(resolvedPath), { recursive: true });
@@ -112,6 +137,83 @@ export function initDb(dbPath?: string): Database.Database {
 }
 
 /**
+ * Open an existing database strictly for observation.
+ *
+ * This deliberately does not create its parent directory, initialise schema, run migrations, or
+ * set connection pragmas: operational diagnostics must work against a database mounted read-only
+ * and must never turn a failed inspection into a production mutation.
+ */
+export function openReadOnlyDb(dbPath?: string): Database.Database {
+  const resolvedPath = configuredDbPath(dbPath);
+  const walPath = `${resolvedPath}-wal`;
+  const assertNoActiveWal = (): void => {
+    try {
+      if (statSync(walPath).size > 0) {
+        throw new Error("cannot inspect a database with an active WAL sidecar");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  };
+  assertNoActiveWal();
+
+  // A read-only file connection can still try to create SQLite's WAL shared-memory sidecar.
+  // Copy the stable main-file bytes into a private temporary database instead, so inventory never
+  // opens the source database and cannot create source sidecars or run source DDL. Refuse a source
+  // that changes while copied; a concurrent writer must be observed through its WAL, not a stale
+  // or mixed snapshot.
+  const fd = openSync(resolvedPath, "r");
+  try {
+    const before = fstatSync(fd);
+    const snapshot = readFileSync(fd);
+    const after = fstatSync(fd);
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.ctimeMs !== after.ctimeMs
+    ) {
+      throw new Error("cannot inspect a database while its source file is changing");
+    }
+    assertNoActiveWal();
+    // A deserialized in-memory image retains the source's WAL mode and cannot prepare without
+    // sidecars. Materialise the bytes in a private temporary directory instead: SQLite may create
+    // WAL sidecars there, never beside the production database. query_only then forbids all writes
+    // through this connection.
+    const snapshotRoot = mkdtempSync(join(tmpdir(), "gille-readonly-db-"));
+    const snapshotPath = join(snapshotRoot, "snapshot.db");
+    try {
+      writeFileSync(snapshotPath, snapshot, { flag: "wx", mode: 0o600 });
+      const snapshotDb = new Database(snapshotPath);
+      try {
+        snapshotDb.pragma("query_only = ON");
+      } catch (error) {
+        snapshotDb.close();
+        throw error;
+      }
+      readOnlySnapshotRoots.set(snapshotDb, snapshotRoot);
+      return snapshotDb;
+    } catch (error) {
+      rmSync(snapshotRoot, { recursive: true, force: true });
+      throw error;
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Close a diagnostic snapshot and remove its private temporary SQLite files. */
+export function closeReadOnlyDb(db: Database.Database): void {
+  const snapshotRoot = readOnlySnapshotRoots.get(db);
+  try {
+    db.close();
+  } finally {
+    if (snapshotRoot) rmSync(snapshotRoot, { recursive: true, force: true });
+  }
+}
+
+/**
  * Return the existing singleton database instance.
  * Calls initDb() with default settings if not yet initialised.
  */
@@ -120,4 +222,17 @@ export function getDb(): Database.Database {
     return initDb();
   }
   return _db;
+}
+
+/**
+ * Close and clear the process singleton.
+ *
+ * Test suites that own a temporary database should call this before removing its directory so
+ * SQLite has flushed WAL state and no later operation can accidentally reuse a closed handle.
+ * Production callers are unaffected unless they explicitly invoke this lifecycle helper.
+ */
+export function closeDb(): void {
+  const db = _db;
+  _db = null;
+  if (db?.open) db.close();
 }

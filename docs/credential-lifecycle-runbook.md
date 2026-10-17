@@ -15,7 +15,7 @@ they can authenticate during a staged migration, but `keys inventory` flags them
 |---|---|---:|---|
 | Human owner break-glass or an operator route that genuinely requires admin | `owner/admin` | 30 days | Admin is explicit and exceptional; a new owner key defaults to `agent`. |
 | Claude, Codex, Pi, code-loop, or another bounded owner harness | `owner/agent` | 90 days | Preserves owner privacy/admission while denying `/admin/*`, `/delegate`, and `/ledger`. |
-| Heimdall or another read-only observer | `guest/monitor` | 365 days | Only successful `GET /healthz`, `/models`, `/metrics`, and `/ledger*` requests are allowed. |
+| Heimdall or another read-only observer | `guest/monitor` | 365 days | Only successful `GET /healthz`, `/models*`, `/metrics`, `/ledger*`, and `/ops/summary` requests are allowed. |
 | Ordinary inference client | `guest/inference` | 365 days | No operator or evidence-reading authority. |
 
 A service that temporarily needs an existing admin-only API is still `owner/admin`, limited to 30
@@ -32,12 +32,14 @@ npx tsx src/homeserver/cli.ts keys inventory --stale-days 30
 npx tsx src/homeserver/cli.ts keys inventory --stale-days 30 --all --json
 ```
 
-The report contains aliases, lifecycle timestamps, use counts, and findings, but no plaintext or
-hash. `unused` means the running gateway has never completed an allowed request for that minted
-key; `stale` means its last successful request is older than the threshold. `over_scoped` is a
-conservative review flag on active admin keys. Static fallback credentials cannot carry lifecycle
-metadata, so the CLI reports only their counts. Migrate them to minted scoped keys, then remove the
-static values from runtime configuration through the normal backed-up deployment procedure.
+The command opens the existing SQLite store read-only: it does not create directories, initialise
+schema, run migrations, or inspect `.env`/static fallback values. The report contains aliases,
+lifecycle timestamps, use counts, and findings, but no plaintext or hash. `unused` means the
+running gateway has never completed an allowed request for that minted key; `stale` means its last
+successful request is older than the threshold. `over_scoped` is a conservative review flag on
+active admin keys. Static fallback credentials cannot carry lifecycle metadata and are deliberately
+reported as `not_inspected`; migrate them to minted scoped keys through the normal backed-up
+deployment procedure without copying their values into an inventory command.
 
 ## Staged consumer migration
 
@@ -104,3 +106,55 @@ password-manager/Keychain item through its prompt, run both approved `m5-auth --
 checks, run `keys preflight`, and only then commit. If either transport reaches a different gateway
 or fails, abort the staged plan and restore the prior selector before investigating. Issue #98's
 retired-key `401` proof remains required after commit.
+
+## Provisioning a new owner-agent profile (issue #184)
+
+A missing named profile (for example the `codex` credential in issue #242) is repaired through
+the guided `m5 provision` ceremony — never by copying a bearer between configs, keychains, or
+machines. The ceremony owns the public-profile configuration, the correct live-key mint path,
+Keychain persistence, and final verification in one owner-attended flow:
+
+```bash
+m5 --profile <name> \
+  --public-gateway-url https://inference.example.com \
+  --m5-host <user>@<m5-host> \
+  provision
+```
+
+Prerequisites: macOS with the `m5` client, a non-interactive owner-authorized SSH path to the M5
+host that permits the fixed live-gateway key command, and an HTTPS public gateway URL. The SSH
+target must be a simple host or `user@host` value; anything else is rejected before any state
+changes.
+
+What the ceremony does, in order:
+
+1. Validates the profile name and the public HTTPS gateway URL and writes only the non-secret
+   profile to the local `m5` config (atomically, preserving the existing file mode). An existing
+   profile with a different public URL is refused rather than silently replaced.
+2. Refuses when the `gille-inference` / `gateway-agent-<profile>` Keychain item already exists.
+   Reconcile ownership of the existing item through the staged migration above first; the
+   ceremony never overwrites or merges credentials.
+3. Mints exactly one distinct `tier=owner`, `scope=agent` credential (90-day maximum lifetime
+   per the table above) inside the live gateway mount namespace — not the SSH login shell's
+   default data directory — over the fixed remote command. The bearer travels only on process
+   stdin into the Keychain prompt path; it never appears in argv, environment, config, files,
+   terminal output, logs, or diagnostics, and the ceremony returns no bearer or alias.
+4. Any mint, output-validation, or Keychain-store failure revokes the exact fresh alias with
+   bounded retries. A `*_revocation_unknown` outcome means revocation could not be confirmed:
+   list recent `agent-<profile>-<stamp>` aliases through the redacted live inventory and revoke
+   any orphan before retrying. No failure mode leaves an unreported credential.
+5. Finishes by running `m5 --profile <name> doctor` and reporting only the structured, redacted
+   result. Provisioning is complete only when `doctor` reports `healthy`.
+
+Collision and failure recovery: `keychain_item_exists` means another credential already owns
+the profile — stop, determine which consumer it serves via the redacted inventory, and either
+keep it or migrate it through the staged workflow before retrying. `mint_failed_*` and
+`keychain_store_failed_*` outcomes state whether the fresh alias was revoked; for any
+`*_revocation_unknown` outcome, confirm on the live host that the timestamped
+`agent-<profile>-<stamp>` alias is gone before retrying. `profile_url_conflict` means the
+local profile points at a different gateway; change it explicitly outside provisioning.
+
+The public `m5-auth --check` requires an explicitly configured `M5_GATEWAY_URL`,
+`M5_OPENAI_BASE_URL`, or legacy `M5_BASE_URL`; missing configuration exits `2`
+before credential access and must not be treated as evidence of a stale key.
+The separate `m5-auth --check --tailnet` selects the private route explicitly.

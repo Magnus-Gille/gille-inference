@@ -7,7 +7,7 @@
  * heimdall/src/panel-ingest.js: stat | timeseries | table | status (+ optional nested detail
  * table on any kind). See scripts/post-offloadability-panel.ts for the original reference.
  *
- * This module factors out the POST so every poster (offloadability, model-scout, research)
+ * This module factors out the POST so every poster (offloadability, adoption, research)
  * shares the same bounded, never-logs-the-token, best-effort sender.
  */
 

@@ -1,0 +1,486 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-09",
+  "trialValidity": "valid-bounded-trials; report-only decisions; no-runtime-adoption",
+  "environmentStatus": "Node22.23.3-root-npm-ci-restored; valid-Knip-rerun-complete; selected-TypeScript-coverage-passed-with-scope-caveat",
+  "knipValidConfig": "knip-valid.json; normal mode for files/exports, separate production mode for dependencies",
+  "validRerun": {
+    "node": "22.23.3",
+    "rootInstall": "npm ci restored; no root manifests changed",
+    "knipNormal": {
+      "exit": 0,
+      "elapsedSeconds": 4.4,
+      "candidateFiles": 101,
+      "candidateRows": 453
+    },
+    "knipProductionDependencies": {
+      "exit": 0,
+      "elapsedSeconds": 4.4,
+      "rows": [
+        "better-sqlite3",
+        "openai",
+        "tsx",
+        "zod"
+      ],
+      "classification": "unknown/configuration-sensitive; source/package scripts confirm use"
+    },
+    "coverage": "final explicit-config TypeScript/Vitest run passed; report-only adoption",
+    "typescriptCoverage": {
+      "node": "22.23.3",
+      "vitest": "3.2.7",
+      "provider": "@vitest/coverage-v8@3.2.7",
+      "tests": {
+        "files": 2,
+        "passed": 34,
+        "exit": 0
+      },
+      "elapsedSeconds": 7.2,
+      "selectedSubtotal": {
+        "lines": {
+          "total": 246,
+          "covered": 186,
+          "pct": 75.6
+        },
+        "branches": {
+          "total": 26,
+          "covered": 25,
+          "pct": 96.15
+        },
+        "functions": {
+          "total": 8,
+          "covered": 6,
+          "pct": 75
+        }
+      },
+      "selectedFiles": {
+        "src/homeserver/errors.ts": {
+          "lines": {
+            "total": 175,
+            "covered": 172,
+            "pct": 98.28
+          }
+        },
+        "src/homeserver/task-type-identity.ts": {
+          "lines": {
+            "total": 20,
+            "covered": 14,
+            "pct": 70
+          }
+        },
+        "src/homeserver/image-sidecar.ts": {
+          "lines": {
+            "total": 51,
+            "covered": 0,
+            "pct": 0
+          },
+          "eligibleUnimported": true
+        }
+      },
+      "reportWideObserved": null,
+      "decision": "adopt bounded report-only trial; adjust source/test inventory before any CI gate",
+      "config": "vitest.coverage.config.mjs",
+      "scope": "exact two test files; exact three eligible source files"
+    },
+    "coverageTooling": "coverage-tooling/package.json + package-lock.json (provider installed by root in isolated task-only directory; no runtime lock change)"
+  },
+  "scope": {
+    "baselineSha": "7a169653afb67cc55284126f7602c257bd04591f",
+    "sourceRoots": [
+      "src/**/*.ts",
+      "scripts/**/*.ts",
+      "client/**/*.mjs",
+      "scripts/**/*.mjs"
+    ],
+    "sourceCounts": {
+      "ts": 271,
+      "sh": 11,
+      "py": 10,
+      "mjs": 10
+    },
+    "complexityBaselineWarnings": 429,
+    "complexityCorrectionWarnings": 152,
+    "correctionThreshold": 20,
+    "knipBaseline": {
+      "files": 0,
+      "issues": 1,
+      "rows": [
+        {
+          "kind": "dependency",
+          "file": "package.json",
+          "name": "tsx",
+          "line": 50
+        }
+      ]
+    },
+    "knipCorrection": {
+      "files": 0,
+      "issues": 27,
+      "rows": [
+        {
+          "kind": "dependency",
+          "file": "package.json",
+          "name": "better-sqlite3",
+          "line": 48
+        },
+        {
+          "kind": "dependency",
+          "file": "package.json",
+          "name": "openai",
+          "line": 49
+        },
+        {
+          "kind": "dependency",
+          "file": "package.json",
+          "name": "tsx",
+          "line": 50
+        },
+        {
+          "kind": "dependency",
+          "file": "package.json",
+          "name": "zod",
+          "line": 51
+        },
+        {
+          "kind": "export",
+          "file": "client/m5.mjs",
+          "name": "defaultConfigPath",
+          "line": 30
+        },
+        {
+          "kind": "export",
+          "file": "client/m5.mjs",
+          "name": "loadM5Config",
+          "line": 34
+        },
+        {
+          "kind": "export",
+          "file": "client/m5.mjs",
+          "name": "main",
+          "line": 275
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "loadConfig",
+          "line": 43
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "saveConfig",
+          "line": 57
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "redeem",
+          "line": 89
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "login",
+          "line": 113
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "listModels",
+          "line": 122
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "ask",
+          "line": 150
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "usage",
+          "line": 292
+        },
+        {
+          "kind": "export",
+          "file": "client/hs.mjs",
+          "name": "main",
+          "line": 391
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "shareBlock",
+          "line": 71
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "formatInvitesTable",
+          "line": 91
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "parseArgs",
+          "line": 114
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "strictNumFlag",
+          "line": 157
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "strictScopeFlag",
+          "line": 179
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "formatUnpricedDelegatorWarnings",
+          "line": 335
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "extractResidencyOutput",
+          "line": 352
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "formatResidencyOutput",
+          "line": 372
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "cmdLedger",
+          "line": 411
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "cmdKeys",
+          "line": 441
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "parseDurationMs",
+          "line": 762
+        },
+        {
+          "kind": "export",
+          "file": "src/homeserver/cli.ts",
+          "name": "formatGpuStatus",
+          "line": 776
+        }
+      ]
+    },
+    "coverage": {
+      "evidenceStatus": "tooling-sanity-only-mjs-fixture",
+      "allFiles": {
+        "lines": {
+          "total": 12,
+          "covered": 7,
+          "skipped": 0,
+          "pct": 58.33
+        },
+        "statements": {
+          "total": 12,
+          "covered": 7,
+          "skipped": 0,
+          "pct": 58.33
+        },
+        "functions": {
+          "total": 2,
+          "covered": 1,
+          "skipped": 0,
+          "pct": 50
+        },
+        "branches": {
+          "total": 5,
+          "covered": 3,
+          "skipped": 0,
+          "pct": 60
+        },
+        "branchesTrue": {
+          "total": 0,
+          "covered": 0,
+          "skipped": 0,
+          "pct": "Unknown"
+        }
+      },
+      "unimportedEligible": {
+        "lines": {
+          "total": 4,
+          "covered": 0,
+          "skipped": 0,
+          "pct": 0
+        },
+        "functions": {
+          "total": 1,
+          "covered": 0,
+          "skipped": 0,
+          "pct": 0
+        },
+        "statements": {
+          "total": 4,
+          "covered": 0,
+          "skipped": 0,
+          "pct": 0
+        },
+        "branches": {
+          "total": 1,
+          "covered": 0,
+          "skipped": 0,
+          "pct": 0
+        }
+      }
+    },
+    "nativeAndScriptChecks": {
+      "pythonFilesParsed": 10,
+      "shellcheckExit": 1,
+      "shellcheckDiagnostics": 4,
+      "nativeRuntimeDependency": "better-sqlite3"
+    },
+    "complexityProcessedRows": 275,
+    "complexityAnalyzedTypeScriptFiles": 271,
+    "javascriptInventory": {
+      "client": 6,
+      "scripts": 4
+    }
+  },
+  "tools": {
+    "@typescript-eslint/eslint-plugin": "8.62.1",
+    "@typescript-eslint/parser": "8.62.1",
+    "better-sqlite3": "12.8.0",
+    "c8": "10.1.3",
+    "eslint": "9.39.1",
+    "knip": "5.46.0",
+    "openai": "4.104.0",
+    "tsx": "4.19.0",
+    "typescript": "5.7.3",
+    "vitest": "3.2.7",
+    "zod": "3.23.8",
+    "@vitest/coverage-v8": "3.2.7"
+  },
+  "lockfileVersion": 3,
+  "timingsSeconds": {
+    "eslintBaseline": 1.98,
+    "eslintCorrection": 1.92,
+    "knipBaseline": 0.93,
+    "knipCorrection": 0.79,
+    "c8Coverage": 0.3,
+    "vitestSelected": 7.2
+  },
+  "artifactBytes": {
+    "research/code-health-401/artifacts/raw/eslint-baseline.json": 4190224,
+    "research/code-health-401/artifacts/raw/eslint-correction.json": 2979864,
+    "research/code-health-401/artifacts/raw/knip-baseline.json": 122,
+    "research/code-health-401/artifacts/raw/knip-correction.json": 1702,
+    "research/code-health-401/artifacts/ci-runs-sanitized.json": 8094,
+    "research/code-health-401/artifacts/correction/ts-coverage-scoped/coverage-summary.json": 1321,
+    "research/code-health-401/artifacts/correction/ts-coverage-scoped/stdout.txt": 1095
+  },
+  "complexityTop10": [
+    {
+      "file": "src/homeserver/gateway.ts",
+      "line": 4404,
+      "column": 36,
+      "complexity": 312,
+      "message": "Async arrow function has a complexity of 312. Maximum allowed is 20.",
+      "status": "false-positive-structural"
+    },
+    {
+      "file": "src/homeserver/autonomy-contract-v1.ts",
+      "line": 270,
+      "column": 1,
+      "complexity": 153,
+      "message": "Function 'validateJournal' has a complexity of 153. Maximum allowed is 20.",
+      "status": "unknown-needs-owner-review"
+    },
+    {
+      "file": "src/homeserver/autonomy-controller.ts",
+      "line": 1508,
+      "column": 8,
+      "complexity": 117,
+      "message": "Async function 'runAutonomyTick' has a complexity of 117. Maximum allowed is 20.",
+      "status": "unknown-needs-owner-review"
+    },
+    {
+      "file": "src/homeserver/m3-qualification.ts",
+      "line": 810,
+      "column": 1,
+      "complexity": 104,
+      "message": "Function 'validateCandidate' has a complexity of 104. Maximum allowed is 20.",
+      "status": "useful-triage"
+    },
+    {
+      "file": "src/homeserver/roster-proposal.ts",
+      "line": 1196,
+      "column": 1,
+      "complexity": 102,
+      "message": "Function 'semanticDecision' has a complexity of 102. Maximum allowed is 20.",
+      "status": "unknown-needs-owner-review"
+    },
+    {
+      "file": "src/homeserver/gateway.ts",
+      "line": 3978,
+      "column": 8,
+      "complexity": 101,
+      "message": "Async function 'handleRequest' has a complexity of 101. Maximum allowed is 20.",
+      "status": "useful-triage"
+    },
+    {
+      "file": "src/homeserver/model-registry.ts",
+      "line": 75,
+      "column": 8,
+      "complexity": 94,
+      "message": "Function 'isRegistryEntry' has a complexity of 94. Maximum allowed is 20.",
+      "status": "unknown-needs-owner-review"
+    },
+    {
+      "file": "src/homeserver/code-loop.ts",
+      "line": 938,
+      "column": 8,
+      "complexity": 90,
+      "message": "Async function 'startCodeLoop' has a complexity of 90. Maximum allowed is 20.",
+      "status": "useful-triage"
+    },
+    {
+      "file": "src/homeserver/mcp.ts",
+      "line": 827,
+      "column": 8,
+      "complexity": 88,
+      "message": "Async function 'runChatCompletion' has a complexity of 88. Maximum allowed is 20.",
+      "status": "useful-triage"
+    },
+    {
+      "file": "src/homeserver/cli.ts",
+      "line": 441,
+      "column": 8,
+      "complexity": 85,
+      "message": "Function 'cmdKeys' has a complexity of 85. Maximum allowed is 20.",
+      "status": "unknown-needs-owner-review"
+    }
+  ],
+  "decisions": {
+    "complexity": "adjust: keep as review-only report; do not make a CI gate from one threshold",
+    "knip": "defer snapshot adoption: explicit entrypoint graph still produces known-used dependency false positives; candidates require manual triage, no dead-code count",
+    "coverage": "adopt: explicit Vitest config covers the bounded source set and includes unimported image-sidecar.ts; report-only, no CI gate",
+    "nativePythonShell": "adopt as separate inventories; shellcheck currently reports existing diagnostics and Python AST parse is clean"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "machine": "arm64",
+    "osVersion": "27.0.1",
+    "node": "22.23.3",
+    "npm": "11.20.0",
+    "execution": "local isolated worktree; runner overhead not measured",
+    "sourceRevision": "7a169653afb67cc55284126f7602c257bd04591f"
+  }
+}

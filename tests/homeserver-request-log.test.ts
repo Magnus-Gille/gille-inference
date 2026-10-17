@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
+import { COMPUTE_REQUEST_FILTER_EPOCH } from "../src/homeserver/compute-request-filter.js";
 
 /**
  * Unit tests for the CONTENT-BLIND, PSEUDONYMOUS durable request_log.
@@ -79,9 +80,66 @@ describe("request_log — content-blind schema", () => {
       expect(cols).not.toContain(banned);
     }
     // Sanity: the metadata columns we DO expect are present.
-    for (const expected of ["id", "ts", "alias", "tier", "key_hash", "model", "route", "status", "outcome", "ttft_ms", "total_ms"]) {
+    for (const expected of ["id", "ts", "alias", "tier", "key_hash", "model", "node", "route", "status", "outcome", "ttft_ms", "total_ms", "compute_filter_epoch"]) {
       expect(cols).toContain(expected);
     }
+  });
+
+  it("stamps the current compute-filter epoch and ignores a caller extra property", () => {
+    const callerRow = Object.assign(row({ requestId: "req-filter-epoch" }), {
+      computeFilterEpoch: "caller-controlled-epoch",
+    }) as Parameters<typeof recordRequestLog>[0];
+
+    recordRequestLog(callerRow);
+
+    const stored = getDb()
+      .prepare("SELECT compute_filter_epoch FROM request_log WHERE id = 'req-filter-epoch'")
+      .get() as { compute_filter_epoch: string | null };
+    expect(stored.compute_filter_epoch).toBe(COMPUTE_REQUEST_FILTER_EPOCH);
+  });
+
+  it("adds the epoch column to a legacy schema without rewriting old rows and is idempotent", () => {
+    getDb().exec(`
+      DROP TABLE IF EXISTS request_log;
+      CREATE TABLE request_log (
+        id TEXT PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        alias TEXT,
+        tier TEXT,
+        key_hash TEXT,
+        model TEXT NOT NULL,
+        node TEXT NOT NULL DEFAULT 'm5',
+        route TEXT NOT NULL,
+        status INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        error_class TEXT,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        queue_wait_ms INTEGER,
+        ttft_ms INTEGER,
+        total_ms INTEGER NOT NULL,
+        admission TEXT
+      );
+      INSERT INTO request_log
+        (id, ts, alias, tier, key_hash, model, node, route, status, outcome, total_ms, admission)
+      VALUES
+        ('legacy-epoch-row', 1, 'legacy', 'guest', NULL, 'm1', 'm5', '/healthz', 200, 'ok', 1, 'n/a');
+    `);
+
+    ensureRequestLogSchema();
+    ensureRequestLogSchema();
+
+    const columns = requestLogColumns().map((column) => column.toLowerCase());
+    expect(columns).toContain("compute_filter_epoch");
+    expect(
+      (getDb().prepare("SELECT compute_filter_epoch FROM request_log WHERE id = 'legacy-epoch-row'").get() as { compute_filter_epoch: string | null }).compute_filter_epoch,
+    ).toBeNull();
+
+    recordRequestLog(row({ requestId: "post-migration-epoch-row" }));
+    expect(
+      (getDb().prepare("SELECT compute_filter_epoch FROM request_log WHERE id = 'post-migration-epoch-row'").get() as { compute_filter_epoch: string | null }).compute_filter_epoch,
+    ).toBe(COMPUTE_REQUEST_FILTER_EPOCH);
   });
 
   it("migrates the composite index used by the latest-node-and-model lookup", () => {

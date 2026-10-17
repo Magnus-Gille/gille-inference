@@ -4,7 +4,7 @@
  * Written BEFORE the implementation (red→green). Issue #145: the routing table had readers
  * (routing-table.ts) but no writers — it was a hand-edited snapshot. This generator emits the
  * table from the evidence the system already collects (ledger verdicts + cartography runs +
- * model-scout registry), with a freshness stamp and a source manifest.
+ * manual model-evaluation registry), with a freshness stamp and a source manifest.
  *
  * The loader (routing-table.ts) is the CONTRACT: whatever this generator emits MUST be consumable
  * by loadRoutingTable()/routingTarget(). The round-trip test below pins that seam.
@@ -136,6 +136,14 @@ describe("generateRoutingTable — per-task-type selection", () => {
     expect(doc.routing["reason-hard"]?.model).toBe("qwen3-coder-next-80b");
   });
 
+  it("classifies Qwen3.8 as a thinking multimodal candidate without promoting it", () => {
+    expect(MODEL_META["qwen38-27b"]).toMatchObject({
+      thinking: true,
+      unsafeFor: [],
+    });
+    expect(MODEL_META["qwen38-27b"]?.role).toContain("multimodal");
+  });
+
   it("does not route to a model with stale evidence when it is not currently servable", () => {
     const inputs = baseInputs([
       row("reason-math", "qwen35-a3b", {
@@ -222,7 +230,7 @@ describe("generateRoutingTable — missing evidence is surfaced, never guessed",
     expect(prof?.note ?? "").toMatch(/pending|insufficient|evidence/i);
   });
 
-  it("fills a model profile overallPass from the Model Scout registry when the ledger is thin (consume, don't race)", () => {
+  it("fills a model profile overallPass from the manual evaluation registry when the ledger is thin", () => {
     const inputs = baseInputs([]);
     inputs.registry = [
       {

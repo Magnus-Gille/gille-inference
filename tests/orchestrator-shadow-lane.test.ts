@@ -11,6 +11,7 @@
  *   4. the lane is OFF by default — no second model call, no extra ledger row.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { createModelStartAdmission } from "../src/homeserver/host-memory-admission.js";
 
 const lmInferenceMock = vi.fn();
 vi.mock("../src/runner/lmstudio-client.js", () => ({
@@ -22,6 +23,15 @@ const frontierMock = vi.fn();
 vi.mock("../src/runner/openrouter-client.js", () => ({
   runInference: (modelId: string, prompt: string, opts: unknown) => frontierMock(modelId, prompt, opts),
 }));
+
+const recordTaskExposureMock = vi.fn();
+vi.mock("../src/homeserver/task-exposure.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/homeserver/task-exposure.js")>("../src/homeserver/task-exposure.js");
+  return {
+    ...actual,
+    recordTaskExposureBestEffort: (input: unknown) => recordTaskExposureMock(input),
+  };
+});
 
 vi.mock("../src/homeserver/model-admin.js", () => ({
   getLoaded: async () => [{ key: "mellum" }],
@@ -156,6 +166,50 @@ describe("shadow lane — evidence on an escalated leaf", () => {
     expect(row["escalated"]).toBe(true);
   });
 
+  it("runs the real shadow admission factory content-blind before permitting the candidate", async () => {
+    shadowOn();
+    const admissionLog = vi.fn();
+    const beforeModelStart = createModelStartAdmission(
+      {
+        mode: "shadow",
+        modelBudgetBytes: new Map([[SHADOW_MODEL, 1 * 2 ** 30]]),
+        modelReclaimBytes: new Map(),
+        reserveBytes: 1 * 2 ** 30,
+        retryAfterSeconds: 9,
+      },
+      {
+        getRunning: async () => [],
+        readMemory: async () => ({
+          ok: true as const,
+          memory: {
+            memTotalBytes: 32 * 2 ** 30,
+            memAvailableBytes: 20 * 2 ** 30,
+            cmaFreeBytes: null,
+            gttUsedBytes: null,
+            gttTotalBytes: null,
+          },
+        }),
+        log: admissionLog,
+      },
+    );
+
+    const out = await delegate({ ...escalatedTask(), beforeModelStart });
+    await shadowLaneIdle();
+
+    expect(out.escalate).toBe(true);
+    expect(lmInferenceMock).toHaveBeenCalledTimes(1);
+    expect(admissionLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: "host_memory_admission",
+      mode: "shadow",
+      outcome: "allow",
+      model: "unknown",
+      enforced: false,
+    }));
+    const logged = admissionLog.mock.calls[0]![0] as Record<string, unknown>;
+    expect(logged).not.toHaveProperty("prompt");
+    expect(logged).not.toHaveProperty("response");
+  });
+
   it("a shadow answer that DISAGREES with the frontier is recorded as a fail (not silently dropped)", async () => {
     shadowOn();
     lmInferenceMock.mockResolvedValue(lmOk("No issues found."));
@@ -176,6 +230,59 @@ describe("shadow lane — evidence on an escalated leaf", () => {
     const rows = shadowRows();
     expect(rows.length).toBe(1);
     expect(rows[0]!["outcome"]).toBe("error");
+  });
+
+  it("an enforce memory refusal skips the shadow model, exposure, and quality row", async () => {
+    shadowOn();
+    const beforeModelStart = createModelStartAdmission(
+      {
+        mode: "enforce",
+        modelBudgetBytes: new Map([[SHADOW_MODEL, 1 * 2 ** 30]]),
+        modelReclaimBytes: new Map(),
+        reserveBytes: 1 * 2 ** 30,
+        retryAfterSeconds: 9,
+      },
+      {
+        getRunning: async () => [],
+        readMemory: async () => ({
+          ok: true as const,
+          memory: {
+            memTotalBytes: 32 * 2 ** 30,
+            memAvailableBytes: 1 * 2 ** 30,
+            cmaFreeBytes: null,
+            gttUsedBytes: null,
+            gttTotalBytes: null,
+          },
+        }),
+      },
+    );
+
+    const out = await delegate({ ...escalatedTask(), keyAlias: "owner", beforeModelStart });
+    await shadowLaneIdle();
+
+    expect(out.escalate).toBe(true);
+    expect(frontierMock).toHaveBeenCalledTimes(1);
+    expect(lmInferenceMock).not.toHaveBeenCalled();
+    expect(recordTaskExposureMock).not.toHaveBeenCalled();
+    expect(recordDelegationMock).not.toHaveBeenCalled();
+  });
+
+  it("starts the shadow timeout after slow model-start admission", async () => {
+    shadowOn({ timeoutMs: 20 });
+    lmInferenceMock.mockResolvedValue(lmOk("FRONTIER ANSWER: the bug is an off-by-one"));
+    const beforeModelStart = vi.fn(async (model: string) => {
+      if (model === SHADOW_MODEL) {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+    });
+
+    await delegate({ ...escalatedTask(), beforeModelStart });
+    await shadowLaneIdle();
+
+    expect(lmInferenceMock).toHaveBeenCalledTimes(1);
+    const rows = shadowRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!["outcome"]).toBe("pass");
   });
 });
 

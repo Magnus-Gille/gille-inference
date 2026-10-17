@@ -4,6 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
+import { recordRequestLog } from "../src/homeserver/request-log.js";
 
 /**
  * Self-service portal suite: lifetime credit accounting, one-time invite lifecycle, and the
@@ -428,29 +429,36 @@ describe("GET /portal/stats", () => {
   it("503 + no-store when the DB query fails — never a zeroed 200 (Finding 2)", async () => {
     const { bustStatsCache } = await import("../src/homeserver/request-log.js");
     bustStatsCache();
+    const db = getDb();
+    const schema = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE tbl_name = 'request_log' AND type IN ('table', 'index') AND sql IS NOT NULL
+      ORDER BY CASE WHEN type = 'table' THEN 0 ELSE 1 END
+    `).all() as Array<{ sql: string }>;
 
     // Drop the request_log table to force the aggregate query to throw.
-    getDb().exec("DROP TABLE IF EXISTS request_log");
+    db.exec("DROP TABLE IF EXISTS request_log");
+    try {
+      const res = await fetch(url("/portal/stats"));
 
-    const res = await fetch(url("/portal/stats"));
+      // Must NOT be a silent zeroed 200.
+      expect(res.status).toBe(503);
 
-    // Must NOT be a silent zeroed 200.
-    expect(res.status).toBe(503);
+      // Must carry no-store so the failure is not cached by intermediaries.
+      const cc = res.headers.get("cache-control") ?? "";
+      expect(cc).toContain("no-store");
 
-    // Must carry no-store so the failure is not cached by intermediaries.
-    const cc = res.headers.get("cache-control") ?? "";
-    expect(cc).toContain("no-store");
-
-    // The body must be a proper error envelope, not a zeroed totals object.
-    const j = (await res.json()) as Record<string, unknown>;
-    expect(j).not.toHaveProperty("total_tokens");
-    expect(j).not.toHaveProperty("total_requests");
-    expect(j).toHaveProperty("error");
-
-    // Restore the table for subsequent tests.
-    const { ensureRequestLogSchema } = await import("../src/homeserver/request-log.js");
-    ensureRequestLogSchema();
-    bustStatsCache();
+      // The body must be a proper error envelope, not a zeroed totals object.
+      const j = (await res.json()) as Record<string, unknown>;
+      expect(j).not.toHaveProperty("total_tokens");
+      expect(j).not.toHaveProperty("total_requests");
+      expect(j).toHaveProperty("error");
+    } finally {
+      // ensureRequestLogSchema deliberately leaves a dropped live table untouched. Restore the
+      // exact table/index schema here so later portal tests cannot inherit this injected outage.
+      for (const { sql } of schema) db.exec(sql);
+      bustStatsCache();
+    }
   });
 });
 
@@ -468,6 +476,7 @@ describe("GET /portal/me", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store"); // Fix #7
     const j = (await res.json()) as {
+      gateway?: { revision: string | null; client_version: string | null; result_contract: string };
       alias: string;
       tier: string;
       scope: string;
@@ -482,7 +491,98 @@ describe("GET /portal/me", () => {
     expect(j.creditLimit).toBe(9000);
     expect(j.creditsUsed).toBe(1234);
     expect(j.models).toEqual(["m1"]);
+    expect(j.gateway).toBeUndefined();
     expect(typeof j.rpm).toBe("number");
+  });
+
+  it.each(["agent", "admin"] as const)("advertises release metadata to minted owner %s keys", async (scope) => {
+    const { plaintextKey } = mintKey({ alias: uniq("owner-release"), tier: "owner", scope }, DEFAULTS);
+    const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const j = await res.json() as { gateway: { revision: string | null; client_version: string; result_contract: string } };
+    expect(j.gateway.revision === null || /^[a-f0-9]{40}$/.test(j.gateway.revision)).toBe(true);
+    expect(j.gateway.result_contract).toBe("code-loop-pi-2026-09-05-v9");
+    expect(j.gateway.client_version).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("reports only an owner-visible historical inference observation", async () => {
+    recordRequestLog({
+      requestId: uniq("inference-observation"), alias: null, tier: "owner", keyHash: null,
+      model: "m1", node: "m5", route: "/v1/chat/completions", status: 200, outcome: "ok",
+      errorClass: null, promptTokens: null, completionTokens: null, totalTokens: null,
+      queueWaitMs: null, ttftMs: null, totalMs: 1, admission: "admitted",
+    });
+    const { plaintextKey: ownerKey } = mintKey(
+      { alias: uniq("observation-owner"), tier: "owner", scope: "agent" }, DEFAULTS
+    );
+    const { plaintextKey: guestKey } = mintKey(
+      { alias: uniq("observation-guest"), tier: "guest" }, DEFAULTS
+    );
+
+    const owner = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${ownerKey}` } });
+    expect(owner.status).toBe(200);
+    const ownerBody = await owner.json() as { inferenceObservation?: {
+      status: string; lastSuccessfulAt: string | null; source: string; scope: string;
+    } };
+    expect(ownerBody.inferenceObservation).toMatchObject({
+      status: "observed", source: "request_log", scope: "m5_global",
+      lastSuccessfulAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/),
+    });
+    expect(JSON.stringify(ownerBody.inferenceObservation)).not.toMatch(/alias|model|route|tokens/i);
+
+    const guest = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${guestKey}` } });
+    expect((await guest.json() as { inferenceObservation?: unknown }).inferenceObservation).toBeUndefined();
+  });
+
+  it("keeps owner discovery available when inference history cannot be read", async () => {
+    const { plaintextKey } = mintKey(
+      { alias: uniq("observation-unavailable"), tier: "owner", scope: "agent" }, DEFAULTS
+    );
+    const db = getDb();
+    const schema = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE tbl_name = 'request_log' AND type IN ('table', 'index') AND sql IS NOT NULL
+      ORDER BY CASE WHEN type = 'table' THEN 0 ELSE 1 END
+    `).all() as Array<{ sql: string }>;
+    db.exec("DROP TABLE request_log");
+    try {
+      const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+      expect(res.status).toBe(200);
+      expect((await res.json() as { inferenceObservation: unknown }).inferenceObservation).toEqual({
+        source: "request_log", scope: "m5_global", status: "unavailable", lastSuccessfulAt: null,
+      });
+    } finally {
+      for (const { sql } of schema) db.exec(sql);
+    }
+  });
+
+  it.each([
+    ["chat allow-list", { modelAllowList: ["embeddinggemma-2"] }],
+    ["embedding grant", { embeddingModelAllowList: ["embeddinggemma-2"] }],
+  ] as const)("advertises release metadata, not owner telemetry, to guest keys with an explicit %s", async (_label, access) => {
+    const { plaintextKey } = mintKey(
+      { alias: uniq("embedding-release"), tier: "guest", scope: "inference", ...access }, DEFAULTS
+    );
+    const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const j = await res.json() as {
+      gateway?: { revision: string | null; client_version: string | null; result_contract: string };
+      inferenceObservation?: unknown;
+    };
+    expect(j.gateway).toBeDefined();
+    expect(j.gateway!.revision === null || /^[a-f0-9]{40}$/.test(j.gateway!.revision)).toBe(true);
+    expect(j.inferenceObservation).toBeUndefined();
+  });
+
+  it("does not disclose owner metadata to owner inference keys", async () => {
+    const { plaintextKey } = mintKey({ alias: uniq("owner-inference"), tier: "owner", scope: "inference" }, DEFAULTS);
+    const res = await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${plaintextKey}` } });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { gateway?: unknown; inferenceObservation?: unknown };
+    expect(body.gateway).toBeUndefined();
+    expect(body.inferenceObservation).toBeUndefined();
   });
 
   it("no key → 401 enveloped", async () => {
@@ -631,7 +731,7 @@ describe("portal page content", () => {
     // Hardware facts
     expect(body).toContain("Strix Halo");
     expect(body).toContain("128");
-    // All eight publicly advertised chat-model IDs
+    // All twelve publicly advertised chat-model IDs
     expect(body).toContain("mellum");
     expect(body).toContain("gemma4");
     expect(body).toContain("qwen36-a3b");
@@ -640,6 +740,10 @@ describe("portal page content", () => {
     expect(body).toContain("qwen3-coder-next-80b");
     expect(body).toContain("gpt-oss-120b");
     expect(body).toContain("qwen35-122b-a10b");
+    expect(body).toContain("muse-glimmer-30b");
+    expect(body).toContain("nemotron-3.5-lightning-30b-a3b");
+    expect(body).toContain("qwen38-27b");
+    expect(body).toContain("ornith-1.5-35b");
     // Quant and context facts
     expect(body).toContain("Q4_K_M");
     expect(body).toContain("Q8_0");
@@ -647,6 +751,7 @@ describe("portal page content", () => {
     expect(body).toContain("40&#8211;70s");
     expect(body).toContain("131,072");
     expect(body).toContain("65,536");
+    expect(body).toContain("native MTP");
     // External-user examples document VibeThinker's full sampler profile and higher explicit cap.
     expect(body).toContain('extra_body={"top_k": 0, "min_p": 0}');
     expect(body).toContain("Ordinary models cap");
@@ -654,6 +759,60 @@ describe("portal page content", () => {
     // Concurrency / sharing note
     expect(body).toContain("Sharing the box");
     expect(body).toContain("one at a time");
+  });
+
+  it("GET /portal lists each System One model in a separate decision table", async () => {
+    const res = await fetch(url("/portal"));
+    const body = await res.text();
+    const chatTable = body.match(/<h3>Chat and general models<\/h3>[\s\S]*?<\/table>/)?.[0] ?? "";
+    const decisionTable = body.match(/<table class="decision-table" aria-label="Model use, API and access">[\s\S]*?<\/table>/)?.[0] ?? "";
+    const decisionRows = decisionTable.match(/<tbody>[\s\S]*?<\/tbody>/)?.[0] ?? "";
+    const accessNote = body.match(/Availability requires an activated runtime[\s\S]*?<\/p>/)?.[0] ?? "";
+    const decisionCopy = body.match(/These models return typed probabilities[\s\S]*?<\/p>/)?.[0] ?? "";
+    const systemOneDocs = body.match(/<p><strong>System One decision[\s\S]*?separate endpoint from chat completions\.\s*<\/p>/)?.[0] ?? "";
+
+    expect(body).toMatch(/<h3 id="systemone-models-heading"[^>]*>System One decision models<\/h3>[\s\S]*?<div class="model-table-scroll" role="region" aria-labelledby="systemone-models-heading" tabindex="0">[\s\S]*?<table class="decision-table" aria-label="Model use, API and access">/);
+    expect(accessNote).toContain("explicit key grant");
+    expect(accessNote).toContain("roster entry");
+    expect(chatTable).toContain("qwen3-30b-instruct");
+    expect(decisionTable).toContain("<th>Use</th><th>API</th><th>Access</th>");
+    expect(decisionTable).not.toContain("qwen3-30b-instruct");
+    expect(decisionRows.match(/<tr>/g)).toHaveLength(3);
+    for (const [model, name, provider] of [
+      ["clef-flash", "Clef Flash", "Cloudflare"],
+      ["bespoke-nimble-9b", "Bespoke Nimble", "Bespoke"],
+      ["pplx-decider-v1-27b", "Perplexity Decider", "Perplexity"],
+    ]) {
+      expect(chatTable).not.toContain(model);
+      const row = decisionRows.split("<tr>").find((fragment) => fragment.includes(model)) ?? "";
+      expect(row).toContain('<th scope="row"><strong>' + name + '</strong>');
+      expect(row).toContain("by " + provider);
+      expect(row.match(/<td>/g)).toHaveLength(3);
+      expect(row).toContain("Typed decisions");
+      expect(row).toContain("POST<br><span class=\"mono api-path\">/v1/systemone</span>");
+      expect(row).toContain("Explicit key grant<br>Ordinary credits");
+    }
+    expect(decisionCopy).toContain("authenticated");
+    expect(decisionCopy).toContain("/v1/models");
+    expect(decisionCopy).toContain("POST /v1/systemone");
+    expect(decisionCopy).toContain("<span class=\"badge mono\">1</span>");
+    expect(decisionCopy).toContain("means yes");
+    expect(decisionCopy).toContain("not chat text");
+    expect(decisionCopy).toContain("ordinary credits and rate limits");
+    expect(systemOneDocs).toContain("If it is missing");
+    expect(systemOneDocs).toContain("separate endpoint from chat completions");
+  });
+
+  it("GET /portal presents EmbeddingGemma 2 in a distinct embedding table with an API example", async () => {
+    const body = await (await fetch(url("/portal"))).text();
+    const embeddingTable = body.match(/<table class="decision-table" aria-label="Embedding model use, API and access">[\s\S]*?<\/table>/)?.[0] ?? "";
+    expect(embeddingTable).toContain("EmbeddingGemma 2");
+    expect(embeddingTable).toContain("embeddinggemma-2");
+    expect(embeddingTable).toContain("/v1/embeddings");
+    expect(embeddingTable).toContain("Explicit key grant");
+    expect(embeddingTable).not.toContain("/v1/chat/completions");
+    expect(body).toContain('"dimensions":256');
+    expect(body).toContain("Image, audio and");
   });
 
   it("key warning is inside the redeem card, not in a standalone footer", async () => {
@@ -728,7 +887,7 @@ describe("hs.mjs User-Agent constant", () => {
   });
 });
 
-// ─── GET /portal/model-evals.json (PUBLIC, content-blind model-scout feed) ──────────
+// ─── GET /portal/model-evals.json (PUBLIC, content-blind manual-evaluation feed) ───
 
 describe("GET /portal/model-evals.json", () => {
   it("is reachable UNAUTHENTICATED and returns only content-blind eval fields", async () => {

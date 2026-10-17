@@ -45,12 +45,17 @@ Prereqs: a real gateway key (`bin/invite`), and the harness pointed at the box �
 - **pi:** add the `inference-gille` provider to `~/.pi/agent/models.json` (see the plan doc)
 - **aider:** uses `OPENAI_API_BASE`/`OPENAI_API_KEY` + the YAML/JSON config here
 - **opencode:** add the `homebox` provider to `opencode.json` (see the plan doc)
+- **qwen-code:** `npm i -g @qwen-code/qwen-code` (validated on 0.21.15). The arm passes
+  `OPENAI_BASE_URL`/`OPENAI_API_KEY`/`OPENAI_MODEL` plus `-m`, `--yolo` and `--max-tool-calls`;
+  it also needs `security.auth.selectedType: "openai"` in `~/.qwen/settings.json` or it aborts
+  with "Operation cancelled". `qwen` has no `--dir`, so the arm `cd`s into the work dir like pi.
 
 ```bash
 export GW=https://inference.example.com/v1 GW_KEY=<real-key> MODEL=qwen3-coder-next-80b CAP_S=600
 bash gate-d/run.sh pi all          # arm A7
 bash gate-d/run.sh aider 03-impl-fn-across-2-files
 bash gate-d/run.sh opencode all    # arm A5
+bash gate-d/run.sh qwen-code all   # arm A9
 # `all` means pinned r1 (01–10). This conspicuous opt-in consumes the fresh r2 holdouts:
 GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/run.sh pi all
 # → rows include corpusRevision, taskRevision, and holdout
@@ -121,3 +126,13 @@ different model's runs:
 ```bash
 GATE_D_OUT="$PWD/data/gate-d-ornith-20260707.jsonl" MODEL=ornith SEEDS=3 ARMS=pi bash gate-d/sweep.sh
 ```
+
+For the Pi arm, each JSONL result also records content-blind agent telemetry: turns, tool calls,
+prompt tokens, completion/generated tokens, unparseable event lines, observed model-turn time, and
+post-first-event assistant stream time. `modelTurnMs` runs from Pi's `turn_start` through the
+assistant `message_end`, so it includes client/gateway/queue/prefill/decode latency but excludes
+subsequent tool execution. `assistantStreamMs` begins only at Pi's first assistant event and must
+not be called TTFT or total inference time. Either field remains `null` when its event pair is not
+observable; `wallS` is never relabelled as model-only time. Raw Pi events, stderr, and tool/model
+content stay inside the throwaway work directory and are deleted after the deterministic grader
+unless `KEEP_WORK=1` is set for bounded diagnosis.

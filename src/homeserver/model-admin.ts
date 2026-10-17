@@ -50,8 +50,10 @@ export function getRunningCmd(modelId: string): Promise<string | null> {
 }
 
 /** Return the active backend's sanitized read-only running observation. */
-export function getRunningSnapshot(): Promise<import("./lmstudio-admin.js").RunningSnapshotEntry[]> {
-  return backend().getRunningSnapshot();
+export function getRunningSnapshot(
+  signal?: AbortSignal,
+): Promise<import("./lmstudio-admin.js").RunningSnapshotEntry[]> {
+  return backend().getRunningSnapshot(signal);
 }
 
 export function loadModel(

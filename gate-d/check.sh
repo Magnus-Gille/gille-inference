@@ -36,7 +36,7 @@ EXPECTED_NODE_MODULES="$(cd "$(dirname "$0")/.." && pwd -P)/node_modules"
 [ -L "$WORK/node_modules" ] && [ "$(readlink "$WORK/node_modules")" = "$EXPECTED_NODE_MODULES" ] \
   || fail G0-toolchain "node_modules must remain the harness-owned symlink to $EXPECTED_NODE_MODULES"
 while IFS= read -r f; do [ -z "$f" ] && continue
-  case "$f" in .arm.log|.check.log) continue;; esac
+  case "$f" in .arm.log|.arm.stderr.log|.arm-telemetry.json|.check.log) continue;; esac
   [ -n "$HIDDEN" ] && [ "$f" = "$ORACLE" ] && continue
   if [ -L "$SEED/$f" ] || [ -L "$WORK/$f" ]; then
     [ -L "$SEED/$f" ] && [ -L "$WORK/$f" ] &&

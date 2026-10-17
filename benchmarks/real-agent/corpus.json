@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "corpusRevision": "strix-real-r1",
+  "tasks": [
+    {
+      "id": "pi-telemetry-contract",
+      "source": {
+        "repository": "Magnus-Gille/gille-inference",
+        "baseCommit": "4f32c119a1ccd59fd7572da3fba127bdb23db1e4",
+        "referenceCommit": "0ff110b0026ef51a3a6fbe868280c914f906fff6",
+        "seedPaths": [
+          "package.json",
+          "tsconfig.json",
+          "tsconfig.constitutional.json",
+          "gate-d"
+        ]
+      },
+      "instruction": "Gate D's Pi arm currently records only pass/fail and total wall time. Add content-blind Pi NDJSON telemetry without retaining prompts, model text, tool arguments, tool output, paths, or credentials. Record turns, tool-call count, prompt tokens, completion tokens, unparseable lines, observed model-turn time from turn_start through assistant message_end, and post-first-event assistant stream time from assistant message_start through assistant message_end. Include coverage counts and use null when a timing span is not observable. Do not call either span pure on-device inference time. Integrate the recorder into gate-d/run.sh so Pi stdout is recorded and summarized while stderr remains separate, pipeline failure is preserved, temporary files are mode 0600, and raw content is deleted with the throwaway work directory by default. Add focused TypeScript tests and update gate-d/README.md. You may change only gate-d/README.md, gate-d/run.sh, scripts/pi-benchmark-telemetry.ts, and tests/pi-benchmark-telemetry.test.ts. Run the focused tests, TypeScript checks, Bash syntax check, and git diff --check before finishing.",
+      "allowedChangedPaths": [
+        "gate-d/README.md",
+        "gate-d/run.sh",
+        "scripts/pi-benchmark-telemetry.ts",
+        "tests/pi-benchmark-telemetry.test.ts"
+      ],
+      "oracleFiles": [
+        {
+          "source": "benchmarks/real-agent/oracles/pi-telemetry.hidden.test.ts",
+          "destination": "tests/pi-telemetry.hidden.test.ts"
+        }
+      ],
+      "checks": [
+        {
+          "id": "hidden-telemetry",
+          "command": "npm",
+          "args": ["test", "--", "tests/pi-telemetry.hidden.test.ts"],
+          "timeoutSeconds": 120
+        },
+        {
+          "id": "typecheck",
+          "command": "npx",
+          "args": [
+            "--no-install",
+            "tsc",
+            "--noEmit",
+            "--strict",
+            "--target", "ES2022",
+            "--module", "Node16",
+            "--moduleResolution", "Node16",
+            "--skipLibCheck",
+            "scripts/pi-benchmark-telemetry.ts"
+          ],
+          "timeoutSeconds": 120
+        },
+        {
+          "id": "bash-syntax",
+          "command": "bash",
+          "args": ["-n", "gate-d/run.sh"],
+          "timeoutSeconds": 30
+        },
+        {
+          "id": "diff-check",
+          "command": "git",
+          "args": ["diff", "--check"],
+          "timeoutSeconds": 30
+        }
+      ]
+    }
+  ]
+}

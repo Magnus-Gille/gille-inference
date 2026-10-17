@@ -1,5 +1,5 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -119,6 +119,31 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     expect(() => cmdKeys(args)).toThrow(/unknown.*scpoe/i);
     expect(lookupKey(original.plaintextKey)).toMatchObject({ alias, scope: "agent" });
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
+  });
+
+  it("runs inventory through the read-only path and leaves static fallback values uninspected", () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "hs-inventory-cli-")), "inventory.db");
+    initDb(dbPath);
+    mintKey({ alias: "inventory-cli", tier: "owner", scope: "agent" }, DEFAULTS);
+    getDb().close();
+    chmodSync(dbPath, 0o444);
+    const previousDbPath = process.env["EVAL_DB_PATH"];
+    const previousAdminKeys = process.env["HOMESERVER_ADMIN_API_KEYS"];
+    process.env["EVAL_DB_PATH"] = dbPath;
+    process.env["HOMESERVER_ADMIN_API_KEYS"] = "must-not-be-reported";
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      cmdKeys(parseArgs(["inventory", "--json"]));
+      const output = log.mock.calls.flat().join("\n");
+      expect(output).toContain('"legacyStaticCredentialCounts": "not_inspected"');
+      expect(output).not.toContain("must-not-be-reported");
+    } finally {
+      log.mockRestore();
+      if (previousDbPath === undefined) delete process.env["EVAL_DB_PATH"];
+      else process.env["EVAL_DB_PATH"] = previousDbPath;
+      if (previousAdminKeys === undefined) delete process.env["HOMESERVER_ADMIN_API_KEYS"];
+      else process.env["HOMESERVER_ADMIN_API_KEYS"] = previousAdminKeys;
+    }
   });
 });
 

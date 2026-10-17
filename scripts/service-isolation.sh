@@ -17,15 +17,27 @@ readonly LLAMA_MODELS="/home/magnus/models"
 readonly LLAMA_RUNTIME="/home/magnus/llama.cpp"
 readonly LLAMA_GPU_RENDER_DEVICE="${LLAMA_GPU_RENDER_DEVICE:-/dev/dri/renderD128}"
 readonly LLAMA_GPU_CARD_DEVICE="${LLAMA_GPU_CARD_DEVICE:-/dev/dri/card0}"
+readonly LLAMA_ROCM_DROPIN="/etc/systemd/system/llama-swap.service.d/60-systemone-rocm.conf"
+readonly LLAMA_ROCM_TEMPLATE="$(dirname "${BASH_SOURCE[0]}")/../deploy/systemd/llama-swap-rocm-device.conf"
 readonly GATEWAY_ISOLATION_MARKER="$ROOT/gateway/isolation-marker"
 APPLY_BACKUP=""
 APPLY_SERVICE=""
 APPLY_BACKUP_REPORTED=0
+REFRESH_BACKUP=""
+REFRESH_DROPIN=""
+REFRESH_UNIT=""
+REFRESH_MANAGER_DROPIN=""
+REFRESH_MANAGER_EXISTED=0
+REFRESH_MANAGER_UID=""
+REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=0
+REFRESH_TOOLCHAIN_CURRENT=""
+REFRESH_CODELOOP_CONFIG=""
+REFRESH_ACTIVE=0
 gateway_home() { printf '%s\n' "$ROOT/$GATEWAY_USER"; }
 
 usage() {
   cat <<'EOF'
-Usage: scripts/service-isolation.sh <render|preflight|apply|verify|rollback|refresh-autonomy> --service <gateway|cloudflared|llama-swap> [options]
+Usage: scripts/service-isolation.sh <render|preflight|apply|verify|rollback|refresh-isolation|refresh-autonomy> --service <gateway|cloudflared|llama-swap> [options]
 
 No command accepts "all": migrate, verify, and roll back exactly one service
 at a time. `apply` and `rollback` require root and an explicit acknowledgement.
@@ -37,6 +49,8 @@ Commands:
              restart it, and verify its local contract. Requires --ack-service-restart.
   verify     Read-only post-migration identity, sandbox, path, and listener checks.
   rollback   Restore the most recent recorded backup for one service. Requires --ack-rollback.
+  refresh-isolation  Re-render an already-isolated gateway drop-in, restart, and verify it.
+                     Restores the prior drop-in automatically on failure. Requires --ack-service-restart.
   refresh-autonomy  Re-render the isolated gateway autonomy hook/unit after a source deploy (root-only).
 
 Options:
@@ -153,21 +167,46 @@ UMask=0077
 EOF
 }
 
+# This drop-in is installed only for the dedicated gille-gateway user@UID.service.
+# The model runtime has the highest OOM score; the small user manager must survive
+# collateral pressure and restart after an unexpected kill. The gateway binds
+# the runtime directory so a replacement socket is visible without restarting
+# the gateway or undoing an intentional stop during maintenance.
+render_gateway_manager_recovery() {
+  cat <<'EOF'
+[Service]
+Restart=on-failure
+OOMScoreAdjust=-500
+EOF
+}
+
 render_dropin() {
-  local service="$1"
-  printf '[Service]\n'
+  local service="$1" gateway_uid
   case "$service" in
     gateway)
+      gateway_uid="$(id -u "$GATEWAY_USER")" || die "cannot render gateway ordering without the $GATEWAY_USER UID"
       cat <<EOF
+[Unit]
+Wants=user@$gateway_uid.service
+After=user@$gateway_uid.service
+
+[Service]
 User=$GATEWAY_USER
 Group=$GATEWAY_USER
+ExecStartPre=/usr/bin/test -S /run/user/$gateway_uid/systemd/private
+ExecStartPre=/usr/bin/test -S /run/user/$gateway_uid/bus
 EnvironmentFile=$ETC/gateway/gateway.env
 Environment=AUTONOMY_NOTIFY_CMD=$ROOT/gateway/bin/autonomy-notify.sh
 Environment=GILLE_AUTONOMY_ENV_FILE=$ETC/gateway/gateway.env
-Environment=HOMESERVER_CODE_LOOP_WORKROOT=$ROOT/gateway/data/code-loop-work
-Environment=HOMESERVER_CODE_LOOP_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
-Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_WORKROOT=$ROOT/gateway/data/code-loop-work
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN=$ROOT/$GATEWAY_USER/.local/bin/pi
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR=$ROOT/$GATEWAY_USER/.pi-code-loop
+Environment=HOMESERVER_CODE_LOOP_RUNTIME_NODE_MODULES_DIR=$ROOT/gateway/node_modules
 BindReadOnlyPaths=$GATEWAY_TREE
+# Bind the dedicated manager's runtime directory rather than individual socket
+# inodes. After a manager restart, the gateway resolves replacement sockets in
+# this directory without restarting. The inner model cage receives no host /run.
+BindReadOnlyPaths=/run/user/$gateway_uid
 BindPaths=$ROOT/gateway/data:$GATEWAY_DATA
 ReadOnlyPaths=$GATEWAY_TREE
 InaccessiblePaths=-$GATEWAY_TREE/.claude
@@ -176,6 +215,8 @@ InaccessiblePaths=-$GATEWAY_TREE/.ssh
 InaccessiblePaths=-$GATEWAY_TREE/.git
 InaccessiblePaths=-$GATEWAY_TREE/.pi-code-loop
 ReadWritePaths=$ROOT/gateway/data
+# pasta is spawned by the dedicated user manager, not inside this outer service namespace.
+# Keep the gateway itself on the narrow reviewed socket-family allowlist.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 PrivateDevices=true
 EOF
@@ -183,6 +224,7 @@ EOF
       ;;
     cloudflared)
       cat <<EOF
+[Service]
 User=$TUNNEL_USER
 Group=$TUNNEL_USER
 ExecStart=
@@ -196,6 +238,7 @@ EOF
       ;;
     llama-swap)
       cat <<EOF
+[Service]
 User=$LLAMA_USER
 Group=$LLAMA_USER
 SupplementaryGroups=render video
@@ -229,6 +272,10 @@ render() {
   mkdir -p "$output_dir"
   render_dropin "$service" >"$output_dir/$service.conf"
   note "Rendered $output_dir/$service.conf"
+  if [ "$service" = gateway ]; then
+    render_gateway_manager_recovery >"$output_dir/gateway-user-manager-recovery.conf"
+    note "Rendered $output_dir/gateway-user-manager-recovery.conf"
+  fi
 }
 
 render_gateway_autonomy_service() {
@@ -307,6 +354,97 @@ require_show_exact_set() {
   expected="$(printf '%s\n' "$@" | normalize_show_set)"
   [ "$actual" = "$expected" ] || die "$unit effective $property differs from the reviewed allowlist"
 }
+show_has_token() {
+  local unit="$1" property="$2" token="$3"
+  [[ " $(show_value "$unit" "$property") " == *" $token "* ]]
+}
+reviewed_gateway_soft_fragment() {
+  local unit="$1" fragment="${2:-}" requirements wants
+  if [ -z "$fragment" ]; then
+    fragment="$(show_value "$unit" FragmentPath)"
+    [ "$fragment" = /etc/systemd/system/home-gateway.service ] || die "gateway base fragment is not the reviewed path"
+  fi
+  [ -f "$fragment" ] && [ ! -L "$fragment" ] || die "gateway base fragment is not a regular file"
+  require_owner_group "$fragment" root root
+  require_mode "$fragment" 644
+  requirements="$(awk '/^\[/{in_unit=($0=="[Unit]")} in_unit && /^Requires=/{print}' "$fragment")"
+  wants="$(awk '/^\[/{in_unit=($0=="[Unit]")} in_unit && /^Wants=/{print}' "$fragment")"
+  if [ -z "$requirements" ] && printf '%s\n' "$wants" | grep -Eq '(=|[[:space:]])llama-swap[.]service([[:space:]]|$)'; then
+    return 0
+  fi
+  [ "$requirements" = 'Requires=llama-swap.service' ] || die "gateway base backend dependency is neither the reviewed old nor new form"
+  ! printf '%s\n' "$wants" | grep -Eq '(=|[[:space:]])llama-swap[.]service([[:space:]]|$)' || die "gateway base contains redundant backend want"
+  return 1
+}
+require_gateway_backend_dependency() {
+  local unit="$1" gateway_uid="$2"
+  if reviewed_gateway_soft_fragment "$unit"; then
+    if [ -e "/etc/systemd/system/user@$gateway_uid.service.d/50-gille-gateway-recovery.conf" ]; then
+      show_has_token "$unit" Wants "user@$gateway_uid.service" || die "gateway user-manager start dependency was lost"
+    else
+      show_has_token "$unit" Requires "user@$gateway_uid.service" || die "gateway legacy user-manager dependency was lost"
+    fi
+    ! show_has_token "$unit" Requires llama-swap.service || die "gateway hard backend dependency remains"
+    show_has_token "$unit" Wants llama-swap.service || die "gateway soft backend dependency is absent"
+    show_has_token "$unit" After llama-swap.service || die "gateway backend ordering is absent"
+    show_has_token "$unit" After "user@$gateway_uid.service" || die "gateway user-manager ordering was lost"
+  else
+    show_has_token "$unit" Requires llama-swap.service || die "gateway backend dependency is absent"
+  fi
+}
+
+# A manager restart must leave the current, admission-fenced gateway process alive.
+require_gateway_manager_restart_safe() {
+  local unit="$1" manager="user@$2.service" property observed
+  observed="$(show_value "$unit" Wants)" || die "could not observe gateway manager start dependency"
+  [[ " $observed " == *" $manager "* ]] || die "gateway manager start dependency is absent"
+  for property in Requires BindsTo PartOf; do
+    observed="$(show_value "$unit" "$property")" || die "could not observe gateway $property"
+    [[ " $observed " != *" $manager "* ]] \
+      || die "gateway $property would propagate a manager stop before admission is reopened safely"
+  done
+  observed="$(show_value "$manager" PropagatesStopTo)" || die "could not observe manager stop propagation"
+  [[ " $observed " != *" $unit "* ]] || die "dedicated manager propagates its stop to the gateway"
+}
+
+effective_oom_score_adj() { cat "/proc/$1/oom_score_adj"; }
+verify_manager_live_oom_policy() {
+  local manager="$1" expected pid
+  expected="$(show_value "$manager" OOMScoreAdjust)" || return 1
+  [[ "$expected" =~ ^-?[0-9]+$ ]] || return 1
+  pid="$(show_value "$manager" MainPID)" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [ "$(effective_oom_score_adj "$pid")" = "$expected" ]
+}
+
+restart_gateway_user_manager_with_loaded_policy() {
+  local uid="$1" manager="user@$1.service"
+  systemctl restart "$manager" || return 1
+  systemctl is-active --quiet "$manager" || return 1
+  verify_manager_live_oom_policy "$manager" || return 1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if gateway_user_bus_ready "$uid" && gateway_user_default_target_active "$uid"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+verify_gateway_manager_recovery() {
+  local uid="$1" manager="user@$1.service" dropin="${2:-/etc/systemd/system/user@$1.service.d/50-gille-gateway-recovery.conf}" manager_pid
+  [ -f "$dropin" ] && [ ! -L "$dropin" ] || die "dedicated manager recovery drop-in is absent or unsafe"
+  require_owner_group "$dropin" root root
+  require_mode "$dropin" 644
+  cmp -s <(render_gateway_manager_recovery) "$dropin" || die "dedicated manager recovery drop-in differs from the reviewed template"
+  require_show_contains "$manager" DropInPaths "$dropin"
+  [ "$(show_value "$manager" Restart)" = on-failure ] || die "$manager restart policy is not on-failure"
+  [ "$(show_value "$manager" OOMScoreAdjust)" = -500 ] || die "$manager OOM score differs from the reviewed value"
+  show_has_token home-gateway.service Wants "$manager" || die "gateway does not start its dedicated manager"
+  manager_pid="$(show_value "$manager" MainPID)"
+  [[ "$manager_pid" =~ ^[1-9][0-9]*$ ]] || die "$manager has no running main process"
+  [ "$(effective_oom_score_adj "$manager_pid")" = -500 ] || die "$manager effective OOM score has not taken effect"
+}
 require_show_exact_device_allow() {
   local unit="$1" actual expected
   shift
@@ -315,18 +453,36 @@ require_show_exact_device_allow() {
   expected="$(printf '%s\n' "$@" | LC_ALL=C sort -u)"
   [ "$actual" = "$expected" ] || die "$unit effective DeviceAllow differs from the reviewed allowlist"
 }
+reviewed_llama_rocm_dropin() {
+  local unit="$1" dropin="${2:-$LLAMA_ROCM_DROPIN}" template="${3:-$LLAMA_ROCM_TEMPLATE}" paths
+  if [ ! -e "$dropin" ] && [ ! -L "$dropin" ]; then
+    return 1
+  fi
+  [ -f "$dropin" ] && [ ! -L "$dropin" ] || die "llama-swap ROCm drop-in is not a regular file"
+  require_owner_group "$dropin" root root
+  require_mode "$dropin" 644
+  cmp -s "$template" "$dropin" || die "llama-swap ROCm drop-in differs from the reviewed template"
+  paths="$(show_value "$unit" DropInPaths)"
+  [[ " $paths " == *" $dropin "* ]] || die "llama-swap ROCm drop-in is not loaded by systemd"
+}
 require_llama_device_allow() {
   local unit="$1"
+  local -a expected=(
+    "/dev/null:rw"
+    "/dev/urandom:r"
+    "/dev/random:r"
+    "$LLAMA_GPU_RENDER_DEVICE:rw"
+    "$LLAMA_GPU_CARD_DEVICE:rw"
+    "char-rtc:r"
+  )
   # ProtectClock=true implicitly adds the abstract `char-rtc r` rule to the
   # effective DeviceAllow set. Keep that protection enabled and accept only
   # this documented systemd-derived rule plus the source-authored allowlist.
-  require_show_exact_device_allow "$unit" \
-    "/dev/null:rw" \
-    "/dev/urandom:r" \
-    "/dev/random:r" \
-    "$LLAMA_GPU_RENDER_DEVICE:rw" \
-    "$LLAMA_GPU_CARD_DEVICE:rw" \
-    "char-rtc:r"
+  # The sole optional device requires an exact, loaded, root-owned drop-in.
+  if reviewed_llama_rocm_dropin "$unit"; then
+    expected+=("/dev/kfd:rw")
+  fi
+  require_show_exact_device_allow "$unit" "${expected[@]}"
 }
 assert_unit_prerequisites() {
   local service="$1" unit user actual_user fragment execstart
@@ -432,12 +588,6 @@ gateway_codeloop_enabled() {
   awk -F= '$1 == "HOMESERVER_CODE_LOOP" { v=$2 } END { exit !(v == "on") }' "$(gateway_env_file)"
 }
 
-gateway_codeloop_source_dir() {
-  # The path is operational metadata, not emitted. The ownership/mode checks below are the only
-  # observable result. A missing explicit setting is fail-closed while code_loop is enabled.
-  awk -F= '$1 == "HOMESERVER_CODE_LOOP_PI_AGENT_DIR" { print substr($0, index($0, "=") + 1); exit }' "$(gateway_env_file)"
-}
-
 gateway_codeloop_source_pi() {
   awk -F= '$1 == "HOMESERVER_CODE_LOOP_PI_BIN" { print substr($0, index($0, "=") + 1); exit }' "$(gateway_env_file)"
 }
@@ -540,7 +690,16 @@ restore_transaction_dependents() {
 }
 
 gateway_user_bus_ready() {
-  [ -S "/run/user/$1/bus" ]
+  [ -S "/run/user/$1/bus" ] || [ -S "/run/user/$1/systemd/private" ]
+}
+
+gateway_user_default_target_active() {
+  local uid="$1"
+  if [ -S "/run/user/$uid/bus" ]; then
+    runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null
+  else
+    runuser -u "$GATEWAY_USER" -- env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active default.target >/dev/null
+  fi
 }
 
 prepare_gateway_user_manager() {
@@ -553,22 +712,69 @@ prepare_gateway_user_manager() {
   # its runtime bus rather than racing logind's asynchronous startup.
   systemctl start "user@$uid.service" || die "could not start user@$uid.service for gille-gateway"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if gateway_user_bus_ready "$uid" && runuser -u "$GATEWAY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user is-active default.target >/dev/null; then
+    if gateway_user_bus_ready "$uid" && gateway_user_default_target_active "$uid"; then
       return 0
     fi
     sleep 1
   done
-  die "gille-gateway user manager did not become ready after 10s (user@$uid.service and /run/user/$uid/bus); inspect journalctl -u user@$uid.service before retrying"
+  die "gille-gateway user manager did not become ready after 10s (user@$uid.service and its runtime transport); inspect journalctl -u user@$uid.service before retrying"
+}
+
+gateway_codeloop_config_template() {
+  printf '%s\n' "$GATEWAY_TREE/deploy/pi-models.json.example"
+}
+
+atomic_install_gateway_codeloop_config() {
+  local source="$1" destination="$2" dir tmp
+  dir="${destination%/*}"
+  tmp="$(mktemp "$dir/.${destination##*/}.XXXXXX")" || return 1
+  if ! install -m 0600 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$source" "$tmp" \
+    || ! mv "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+provision_gateway_codeloop_config() {
+  local home template destination
+  gateway_codeloop_enabled || return 0
+  home="$(gateway_home)"
+  template="$(gateway_codeloop_config_template)"
+  destination="$home/.pi-code-loop/models.json"
+  [ -f "$template" ] && [ ! -L "$template" ] || die "reviewed code_loop Pi config template is absent or unsafe"
+  install -d -m 0700 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$home/.pi-code-loop"
+  atomic_install_gateway_codeloop_config "$template" "$destination" \
+    || die "could not atomically install the reviewed code_loop Pi config"
+}
+
+verify_gateway_codeloop_config() {
+  local home template destination
+  home="$(gateway_home)"
+  template="$(gateway_codeloop_config_template)"
+  destination="$home/.pi-code-loop/models.json"
+  [ -f "$template" ] && [ ! -L "$template" ] || die "reviewed code_loop Pi config template is absent or unsafe"
+  [ -f "$destination" ] && [ ! -L "$destination" ] || die "dedicated Pi models.json is absent or unsafe"
+  require_mode "$destination" 600
+  require_owner_group "$destination" "$GATEWAY_USER" "$GATEWAY_USER"
+  cmp -s "$template" "$destination" || die "dedicated Pi models.json differs from the reviewed template"
+  [ ! -e "$home/.pi-code-loop/auth.json" ] || die "dedicated Pi runtime must not hold auth.json"
+}
+
+restore_gateway_codeloop_config() {
+  local backup
+  [ -n "$REFRESH_CODELOOP_CONFIG" ] || return 0
+  backup="$REFRESH_BACKUP/models.json.before"
+  [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+  atomic_install_gateway_codeloop_config "$backup" "$REFRESH_CODELOOP_CONFIG" || return 1
+  cmp -s "$backup" "$REFRESH_CODELOOP_CONFIG" || return 1
 }
 
 provision_gateway_codeloop_runtime() {
-  local home source_pi source_agent resolved_pi package version
+  local home source_pi resolved_pi package version
   gateway_codeloop_enabled || return 0
   home="$(gateway_home)"
   source_pi="$(gateway_codeloop_source_pi)"
-  source_agent="$(gateway_codeloop_source_dir)"
   [ -n "$source_pi" ] && [ -x "$source_pi" ] || die "code_loop is enabled but HOMESERVER_CODE_LOOP_PI_BIN is not an executable"
-  [ -n "$source_agent" ] && [ -f "$source_agent/models.json" ] || die "code_loop is enabled but its models.json is absent"
   resolved_pi="$(readlink -f "$source_pi")" || die "could not resolve code_loop Pi binary"
   package="$(gateway_codeloop_package_from_resolved_path "$resolved_pi")"
   version="$($source_pi --version 2>/dev/null | head -n 1 | tr -cd '0-9.')"
@@ -576,10 +782,142 @@ provision_gateway_codeloop_runtime() {
   install -d -m 0700 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$home/.pi-code-loop"
   # A dedicated pinned Pi runtime; do not copy the owner's ~/.local tree or auth.json.
   runuser -u "$GATEWAY_USER" -- env HOME="$home" NPM_CONFIG_PREFIX="$home/.local" npm install --global "$package@$version" >/dev/null
-  install -m 0600 -o "$GATEWAY_USER" -g "$GATEWAY_USER" "$source_agent/models.json" "$home/.pi-code-loop/models.json"
+  provision_gateway_codeloop_config
   [ -x "$home/.local/bin/pi" ] || die "dedicated Pi runtime was not installed"
   [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json was not installed"
   [ ! -e "$home/.pi-code-loop/auth.json" ] || die "refusing to proceed: dedicated Pi runtime contains auth.json"
+}
+
+verify_gateway_codeloop_toolchain() {
+  local expected_digest="${1:-}" base versions current digest resolved version marker marker_value
+  base="$ROOT/gateway/code-loop-toolchain"
+  versions="$base/versions"
+  current="$ROOT/gateway/node_modules"
+  [ -L "$current" ] || die "code_loop toolchain current pointer is absent or unsafe"
+  resolved="$(readlink -f "$current")" || die "could not resolve code_loop toolchain current pointer"
+  if [ -n "$expected_digest" ]; then
+    digest="$expected_digest"
+  else
+    digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"
+    digest="${digest%% *}"
+  fi
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || die "could not derive code_loop toolchain identity"
+  version="$versions/$digest"
+  [ "$resolved" = "$version/node_modules" ] || die "code_loop toolchain does not match the deployed lockfile"
+  [ -f "$version/package-lock.sha256" ] && [ ! -L "$version/package-lock.sha256" ] \
+    || die "code_loop toolchain identity marker is absent or unsafe"
+  marker="$version/package-lock.sha256"
+  marker_value="$(cat "$marker")"
+  [ "$marker_value" = "$digest" ] || die "code_loop toolchain identity marker does not match"
+  [ -d "$current" ] || die "code_loop toolchain node_modules is absent or unsafe"
+  [ "$(stat -c '%U:%G:%a' "$base")" = "root:$GATEWAY_USER:750" ] \
+    || die "code_loop toolchain root ownership or mode drifted"
+  [ -d "$versions" ] && [ ! -L "$versions" ] \
+    && [ "$(stat -c '%U:%G:%a' "$versions")" = "root:$GATEWAY_USER:750" ] \
+    || die "code_loop toolchain versions ownership or mode drifted"
+  [ -d "$version" ] && [ ! -L "$version" ] \
+    && [ "$(stat -c '%U:%G:%a' "$version")" = "root:$GATEWAY_USER:750" ] \
+    || die "code_loop toolchain version ownership or mode drifted"
+  [ "$(stat -c '%U:%G:%a' "$marker")" = "root:$GATEWAY_USER:440" ] \
+    || die "code_loop toolchain identity marker ownership or mode drifted"
+  [ "$(stat -c '%U' "$current")" = root ] \
+    || die "code_loop toolchain current pointer ownership drifted"
+  if find "$resolved" \( -type d -o -type f \) \( ! -user root -o ! -group "$GATEWAY_USER" -o -perm /022 \) -print -quit | grep -q .; then
+    die "code_loop toolchain contains writable or foreign-owned entries"
+  fi
+  if find "$resolved" -type l \( ! -user root -o ! -group "$GATEWAY_USER" \) -print -quit | grep -q .; then
+    die "code_loop toolchain contains foreign-owned links"
+  fi
+  validate_gateway_codeloop_toolchain_links "$resolved" \
+    || die "code_loop toolchain contains an escaping or broken link"
+  runuser -u "$GATEWAY_USER" -- test -r "$current" \
+    || die "code_loop toolchain is not readable by the gateway account"
+  runuser -u "$GATEWAY_USER" -- test ! -w "$current" \
+    || die "code_loop toolchain is writable by the gateway account"
+}
+
+validate_gateway_codeloop_toolchain_links() {
+  local root="$1" link resolved
+  while IFS= read -r -d '' link; do
+    resolved="$(readlink -f "$link")" || return 1
+    case "$resolved" in "$root"/*) ;; *) return 1 ;; esac
+  done < <(find "$root" -type l -print0)
+}
+
+provision_gateway_codeloop_toolchain() {
+  local base versions digest version staging current temp_link
+  gateway_codeloop_enabled || return 0
+  [ -d "$GATEWAY_TREE/node_modules" ] && [ ! -L "$GATEWAY_TREE/node_modules" ] \
+    || die "code_loop toolchain source is absent or unsafe"
+  [ -f "$GATEWAY_TREE/package-lock.json" ] && [ ! -L "$GATEWAY_TREE/package-lock.json" ] \
+    || die "code_loop package lock is absent or unsafe"
+  digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || die "could not derive code_loop toolchain identity"
+  base="$ROOT/gateway/code-loop-toolchain"
+  versions="$base/versions"
+  version="$versions/$digest"
+  install -d -m 0750 -o root -g "$GATEWAY_USER" "$ROOT/gateway" "$base" "$versions"
+  if [ ! -e "$version" ]; then
+    staging="$(mktemp -d "$versions/.${digest}.XXXXXX")" || die "could not stage code_loop toolchain"
+    if ! cp -a "$GATEWAY_TREE/node_modules" "$staging/node_modules"; then
+      rm -rf -- "$staging"
+      die "could not copy code_loop toolchain"
+    fi
+    if ! validate_gateway_codeloop_toolchain_links "$staging"; then
+      rm -rf -- "$staging"
+      die "code_loop toolchain copy contains an escaping or broken link"
+    fi
+    chown -R root:"$GATEWAY_USER" "$staging" || { rm -rf -- "$staging"; die "could not own code_loop toolchain"; }
+    find "$staging" -type d -exec chmod 0750 {} + || { rm -rf -- "$staging"; die "could not restrict code_loop toolchain directories"; }
+    find "$staging" -type f -perm /111 -exec chmod 0550 {} + || { rm -rf -- "$staging"; die "could not restrict code_loop toolchain executables"; }
+    find "$staging" -type f ! -perm /111 -exec chmod 0440 {} + || { rm -rf -- "$staging"; die "could not restrict code_loop toolchain files"; }
+    install -m 0440 -o root -g "$GATEWAY_USER" /dev/stdin "$staging/package-lock.sha256" <<<"$digest"
+    if ! mv -T "$staging" "$version"; then
+      rm -rf -- "$staging"
+      die "could not publish code_loop toolchain"
+    fi
+  fi
+  [ -d "$version" ] && [ ! -L "$version" ] || die "code_loop toolchain version is unsafe"
+  current="$ROOT/gateway/node_modules"
+  [ ! -e "$current" ] || [ -L "$current" ] || die "code_loop toolchain current pointer is unsafe"
+  temp_link="$base/.current.$$.tmp"
+  [ ! -e "$temp_link" ] && [ ! -L "$temp_link" ] || die "code_loop toolchain temporary pointer already exists"
+  ln -s "$version/node_modules" "$temp_link" || die "could not stage code_loop toolchain pointer"
+  if ! mv -Tf "$temp_link" "$current"; then
+    rm -f -- "$temp_link"
+    die "could not publish code_loop toolchain pointer"
+  fi
+  verify_gateway_codeloop_toolchain
+}
+
+restore_gateway_codeloop_toolchain_pointer() {
+  local prior_target expected_digest temp_link
+  [ -n "$REFRESH_TOOLCHAIN_CURRENT" ] || return 0
+  if [ -f "$REFRESH_BACKUP/toolchain-current.before" ] \
+    && [ ! -L "$REFRESH_BACKUP/toolchain-current.before" ]; then
+    prior_target="$(cat "$REFRESH_BACKUP/toolchain-current.before")" || return 1
+    if [[ ! "$prior_target" =~ ^$ROOT/gateway/code-loop-toolchain/versions/([a-f0-9]{64})/node_modules$ ]]; then
+      return 1
+    fi
+    expected_digest="${BASH_REMATCH[1]}"
+    [ -d "$prior_target" ] && [ ! -L "${prior_target%/node_modules}" ] || return 1
+    temp_link="$ROOT/gateway/code-loop-toolchain/.restore-current.$$.tmp"
+    [ ! -e "$temp_link" ] && [ ! -L "$temp_link" ] || return 1
+    ln -s "$prior_target" "$temp_link" || return 1
+    if ! mv -Tf "$temp_link" "$REFRESH_TOOLCHAIN_CURRENT"; then
+      rm -f -- "$temp_link"
+      return 1
+    fi
+    verify_gateway_codeloop_toolchain "$expected_digest" || return 1
+  elif [ -f "$REFRESH_BACKUP/toolchain-current.absent" ] \
+    && [ ! -L "$REFRESH_BACKUP/toolchain-current.absent" ]; then
+    [ ! -e "$REFRESH_TOOLCHAIN_CURRENT" ] || [ -L "$REFRESH_TOOLCHAIN_CURRENT" ] || return 1
+    rm -f -- "$REFRESH_TOOLCHAIN_CURRENT" || return 1
+    [ ! -e "$REFRESH_TOOLCHAIN_CURRENT" ] && [ ! -L "$REFRESH_TOOLCHAIN_CURRENT" ] || return 1
+  else
+    return 1
+  fi
 }
 
 backup_unit() {
@@ -793,17 +1131,213 @@ migrate_llama_state() {
 }
 
 install_dropin() {
-  local service="$1" unit dir
+  local service="$1" unit dir uid manager_dir manager_dropin manager_tmp
   unit="$(unit_for "$service")"; dir="/etc/systemd/system/$unit.d"
   install -d -m 0755 -o root -g root "$dir"
+  if [ "$service" = gateway ]; then
+    uid="$(id -u "$GATEWAY_USER")"
+    manager_dir="/etc/systemd/system/user@$uid.service.d"
+    manager_dropin="$manager_dir/50-gille-gateway-recovery.conf"
+    [ ! -e "$manager_dropin" ] && [ ! -L "$manager_dropin" ] || die "dedicated manager recovery drop-in already exists; refuse to replace it during apply"
+    install -d -m 0755 -o root -g root "$manager_dir"
+    manager_tmp="$(mktemp "$manager_dir/.50-gille-gateway-recovery.conf.XXXXXX")"
+    if ! render_gateway_manager_recovery >"$manager_tmp" \
+      || ! chmod 0644 "$manager_tmp" \
+      || ! mv "$manager_tmp" "$manager_dropin"; then
+      rm -f -- "$manager_tmp"
+      die "could not atomically install dedicated manager recovery drop-in"
+    fi
+  fi
   render_dropin "$service" >"$dir/50-service-isolation.conf"
   chmod 0644 "$dir/50-service-isolation.conf"
   systemctl daemon-reload
 }
 
+require_gateway_manager_dropin_absent() {
+  local uid destination
+  uid="$(id -u "$GATEWAY_USER")"
+  destination="/etc/systemd/system/user@$uid.service.d/50-gille-gateway-recovery.conf"
+  [ ! -e "$destination" ] && [ ! -L "$destination" ] \
+    || die "dedicated manager recovery drop-in already exists; refuse gateway migration before moving state"
+}
+
+atomic_install_file() {
+  local source="$1" destination="$2" dir tmp
+  dir="${destination%/*}"
+  tmp="$(mktemp "$dir/.${destination##*/}.XXXXXX")" || return 1
+  if ! install -m 0644 -o root -g root "$source" "$tmp" || ! mv "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+atomic_render_dropin() {
+  local service="$1" destination="$2" dir tmp
+  dir="${destination%/*}"
+  tmp="$(mktemp "$dir/.${destination##*/}.XXXXXX")" || return 1
+  if ! render_dropin "$service" >"$tmp" \
+    || ! chown root:root "$tmp" \
+    || ! chmod 0644 "$tmp" \
+    || ! mv "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  systemctl daemon-reload
+}
+
+restore_isolation_refresh() {
+  local restore_gateway_netlink=0 restore_gateway_user_manager_order=0 restore_gateway_session_bus=0
+  [ -n "$REFRESH_BACKUP" ] && [ -n "$REFRESH_DROPIN" ] && [ -n "$REFRESH_UNIT" ] || return 1
+  # One superseded issue-197 candidate briefly added AF_NETLINK. Automatic restoration must
+  # verify either exact prior shape without weakening the new default.
+  if grep -Eq '^RestrictAddressFamilies=.*(^|[[:space:]])AF_NETLINK([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_netlink=1
+  fi
+  # Preserve the exact prior issue-197 user-manager transport shape too. The AF_NETLINK candidate
+  # already carried this bind/order contract; verifying it as legacy would reject a successful
+  # byte-for-byte restore and obscure the original refresh failure.
+  if grep -Eq '^BindReadOnlyPaths=.*/run/user/.*/systemd([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf" \
+    && grep -Eq '^Requires=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf" \
+    && grep -Eq '^After=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_user_manager_order=1
+  elif grep -Eq '^BindReadOnlyPaths=/run/user/[0-9]+([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf" \
+    && grep -Eq '^Wants=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf" \
+    && grep -Eq '^After=user@[0-9]+\.service([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_user_manager_order=1
+  fi
+  # The ordinary session bus was added after the private manager transport. Preserve whether
+  # the backed-up drop-in exposed that exact socket so automatic rollback can verify both shapes.
+  if grep -Eq '^BindReadOnlyPaths=.*/run/user/[0-9]+/bus([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_session_bus=1
+  elif grep -Eq '^BindReadOnlyPaths=/run/user/[0-9]+([[:space:]]|$)' "$REFRESH_BACKUP/dropin.before.conf"; then
+    restore_gateway_session_bus=2
+  fi
+  restore_gateway_codeloop_config || return 1
+  restore_gateway_codeloop_toolchain_pointer || return 1
+  if [ -n "$REFRESH_MANAGER_DROPIN" ]; then
+    if [ "$REFRESH_MANAGER_EXISTED" = 1 ]; then
+      atomic_install_file "$REFRESH_BACKUP/manager.before.conf" "$REFRESH_MANAGER_DROPIN" || return 1
+    else
+      rm -f -- "$REFRESH_MANAGER_DROPIN" || return 1
+    fi
+  fi
+  atomic_install_file "$REFRESH_BACKUP/dropin.before.conf" "$REFRESH_DROPIN" || return 1
+  systemctl daemon-reload || return 1
+  if [ "$REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED" = 1 ]; then
+    [ -n "$REFRESH_MANAGER_UID" ] || return 1
+    restart_gateway_user_manager_with_loaded_policy "$REFRESH_MANAGER_UID" || return 1
+  fi
+  systemctl restart "$REFRESH_UNIT" || return 1
+  ( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 0 ) || return 1
+}
+
+refresh_exit_handler() {
+  local status="$1"
+  if [ "$REFRESH_ACTIVE" = 1 ]; then
+    REFRESH_ACTIVE=0
+    if restore_isolation_refresh; then
+      note "Refresh failed; the prior gateway drop-in was restored and verified. Backup: $REFRESH_BACKUP"
+    else
+      note "CRITICAL: refresh failed and automatic gateway restoration did not verify. Backup: $REFRESH_BACKUP"
+    fi
+  fi
+  exit "$status"
+}
+
+refresh_isolation() {
+  local service="$1" backup_root="$2" unit dropin stamp backup prior_target prior_digest home uid manager_dropin manager_dir gateway_pid
+  root_only; need systemctl; need install; need mktemp; need loginctl; need runuser; need mv; need rm; need chown; need chmod; need cp; need find; need sha256sum; need ln; need readlink; need cmp
+  [ "$service" = gateway ] || die "refresh-isolation currently applies only to gateway"
+  unit="$(unit_for "$service")"
+  [ "$(show_value "$unit" User)" = "$GATEWAY_USER" ] || die "$unit is not already isolated; use apply instead"
+  [ -f "$GATEWAY_ISOLATION_MARKER" ] && [ ! -L "$GATEWAY_ISOLATION_MARKER" ] || die "gateway isolation marker is absent or unsafe"
+  dropin="/etc/systemd/system/$unit.d/50-service-isolation.conf"
+  [ -f "$dropin" ] && [ ! -L "$dropin" ] || die "gateway isolation drop-in is absent or unsafe"
+
+  # Ensure the dependency target is healthy before changing the gateway unit. The refreshed
+  # drop-in then orders every future start (including boot) after this exact user manager.
+  prepare_gateway_user_manager
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  umask 077
+  mkdir -p "$backup_root"
+  backup="$(mktemp -d "$backup_root/$stamp-$service-refresh.XXXXXX")"
+  install -m 0644 -o root -g root "$dropin" "$backup/dropin.before.conf"
+  uid="$(id -u "$GATEWAY_USER")"
+  manager_dir="/etc/systemd/system/user@$uid.service.d"
+  manager_dropin="$manager_dir/50-gille-gateway-recovery.conf"
+  [ ! -L "$manager_dropin" ] || die "dedicated manager drop-in is a symlink"
+  if [ -e "$manager_dropin" ]; then
+    [ -f "$manager_dropin" ] || die "dedicated manager drop-in is not regular"
+    require_owner_group "$manager_dropin" root root
+    require_mode "$manager_dropin" 644
+    cmp -s <(render_gateway_manager_recovery) "$manager_dropin" || die "dedicated manager drop-in has unexpected existing content"
+    install -m 0644 -o root -g root "$manager_dropin" "$backup/manager.before.conf"
+    REFRESH_MANAGER_EXISTED=1
+  fi
+  render_gateway_manager_recovery >"$backup/manager.new.conf"
+  systemctl show "$unit" -p User -p ActiveState -p SubState -p MainPID -p Requires -p After --no-pager >"$backup/unit.before.show"
+  if gateway_codeloop_enabled; then
+    home="$(gateway_home)"
+    REFRESH_CODELOOP_CONFIG="$home/.pi-code-loop/models.json"
+    [ -f "$REFRESH_CODELOOP_CONFIG" ] && [ ! -L "$REFRESH_CODELOOP_CONFIG" ] \
+      || die "dedicated Pi models.json is absent or unsafe"
+    install -m 0600 -o root -g root "$REFRESH_CODELOOP_CONFIG" "$backup/models.json.before"
+    cmp -s "$REFRESH_CODELOOP_CONFIG" "$backup/models.json.before" \
+      || die "could not record the prior dedicated Pi config exactly"
+  fi
+  REFRESH_TOOLCHAIN_CURRENT="$ROOT/gateway/node_modules"
+  if [ -L "$REFRESH_TOOLCHAIN_CURRENT" ]; then
+    prior_target="$(readlink "$REFRESH_TOOLCHAIN_CURRENT")" \
+      || die "could not read the prior code_loop toolchain pointer"
+    if [[ ! "$prior_target" =~ ^$ROOT/gateway/code-loop-toolchain/versions/([a-f0-9]{64})/node_modules$ ]]; then
+      die "prior code_loop toolchain pointer is not safely restorable"
+    fi
+    prior_digest="${BASH_REMATCH[1]}"
+    verify_gateway_codeloop_toolchain "$prior_digest"
+    printf '%s\n' "$prior_target" >"$backup/toolchain-current.before" \
+      || die "could not record the prior code_loop toolchain pointer"
+  elif [ ! -e "$REFRESH_TOOLCHAIN_CURRENT" ]; then
+    : >"$backup/toolchain-current.absent"
+  else
+    die "code_loop toolchain current pointer is unsafe"
+  fi
+
+  REFRESH_BACKUP="$backup"
+  REFRESH_DROPIN="$dropin"
+  REFRESH_UNIT="$unit"
+  REFRESH_MANAGER_DROPIN="$manager_dropin"
+  REFRESH_MANAGER_UID="$uid"
+  REFRESH_ACTIVE=1
+  trap 'refresh_exit_handler "$?"' EXIT
+  provision_gateway_codeloop_config
+  provision_gateway_codeloop_toolchain
+  install -d -m 0755 -o root -g root "$manager_dir"
+  REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=1
+  atomic_install_file "$backup/manager.new.conf" "$manager_dropin" || die "could not install dedicated manager recovery drop-in"
+  atomic_render_dropin "$service" "$dropin" || die "could not atomically install refreshed gateway isolation drop-in"
+  # The caller's drained maintenance fence belongs to the current gateway process. Keep that
+  # process alive until the last manager mutation; restarting it first would reopen admission
+  # and allow a new code job to be killed by the subsequent manager restart.
+  require_gateway_manager_restart_safe "$unit" "$uid"
+  gateway_pid="$(show_value "$unit" MainPID)"
+  [[ "$gateway_pid" =~ ^[1-9][0-9]*$ ]] || die "gateway has no running main process before manager refresh"
+  restart_gateway_user_manager_with_loaded_policy "$uid" || die "dedicated manager did not restart with its recovery policy and transport"
+  [ "$(show_value "$unit" MainPID)" = "$gateway_pid" ] || die "gateway restarted when its dedicated manager restarted"
+  systemctl restart "$unit" || die "refreshed gateway unit did not restart"
+  ( verify "$service" ) || die "refreshed gateway unit did not verify"
+  printf 'service=%s\nunit=%s\nbackup=%s\nverified_at=%s\n' "$service" "$unit" "$backup" "$(date -u +%FT%TZ)" >"$backup/refresh-receipt" \
+    || die "could not write gateway isolation refresh receipt"
+  REFRESH_ACTIVE=0
+  REFRESH_TOOLCHAIN_CURRENT=""
+  REFRESH_CODELOOP_CONFIG=""
+  REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=0
+  trap - EXIT
+  note "REFRESHED: $service isolation. Prior drop-in: $backup/dropin.before.conf"
+}
+
 verify() {
-  local service="$1" require_marker="${2:-1}" unit user actual_user
-  need systemctl; need ss
+  local service="$1" require_marker="${2:-1}" require_user_manager_order="${3:-1}" require_gateway_netlink="${4:-0}" require_gateway_session_bus="${5:-2}" require_gateway_toolchain="${6:-1}" require_gateway_codeloop_config="${7:-1}" unit user actual_user
+  need systemctl; need ss; need sha256sum; need readlink; need runuser; need cmp
   unit="$(unit_for "$service")"; user="$(user_for "$service")"
   actual_user="$(show_value "$unit" User)"
   [ "$actual_user" = "$user" ] || die "$unit still runs as '$actual_user', expected '$user'"
@@ -814,7 +1348,11 @@ verify() {
   [ "$(show_value "$unit" UMask)" = 0077 ] || die "$unit UMask is not 0077"
   require_show_empty "$unit" CapabilityBoundingSet
   require_show_empty "$unit" AmbientCapabilities
-  require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6
+  if [ "$service" = gateway ] && [ "$require_gateway_netlink" = 1 ]; then
+    require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6 AF_NETLINK
+  else
+    require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6
+  fi
   case "$service" in
     gateway)
       require_mode "$ROOT/gateway" 750
@@ -837,24 +1375,53 @@ verify() {
       if gateway_codeloop_enabled; then
         [ -d "$ROOT/gateway/data/code-loop-work" ] || die "gateway code-loop work state was not preserved"
         require_owner_group "$ROOT/gateway/data/code-loop-work" "$GATEWAY_USER" "$GATEWAY_USER"
+        [ "$require_gateway_toolchain" = 0 ] || verify_gateway_codeloop_toolchain
       fi
       require_mode "$ROOT/gateway/bin" 750
       require_owner_group "$ROOT/gateway/bin" root "$GATEWAY_USER"
       require_mode "$ROOT/gateway/bin/autonomy-notify.sh" 750
       require_owner_group "$ROOT/gateway/bin/autonomy-notify.sh" root "$GATEWAY_USER"
       [ "$(show_value "$unit" PrivateDevices)" = yes ] || die "$unit PrivateDevices is not enabled"
-      require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE"
+      local gateway_uid
+      gateway_uid="$(id -u "$GATEWAY_USER")"
+      require_gateway_backend_dependency "$unit" "$gateway_uid"
+      if [ -e "/etc/systemd/system/user@$gateway_uid.service.d/50-gille-gateway-recovery.conf" ]; then
+        verify_gateway_manager_recovery "$gateway_uid"
+      fi
+      if [ "$require_user_manager_order" = 1 ] && [ "$require_gateway_session_bus" = 2 ]; then
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid"
+      elif [ "$require_user_manager_order" = 1 ] && [ "$require_gateway_session_bus" = 1 ]; then
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd" "/run/user/$gateway_uid/bus"
+      elif [ "$require_user_manager_order" = 1 ]; then
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid/systemd"
+      else
+        require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE"
+      fi
       require_show_exact_set "$unit" BindPaths "$ROOT/gateway/data:$GATEWAY_DATA"
       require_show_exact_set "$unit" ReadWritePaths "$ROOT/gateway/data"
       require_show_exact_set "$unit" InaccessiblePaths "-$GATEWAY_TREE/.claude" "-$GATEWAY_TREE/.codex" "-$GATEWAY_TREE/.ssh" "-$GATEWAY_TREE/.git" "-$GATEWAY_TREE/.pi-code-loop"
       if gateway_codeloop_enabled; then
-        local home uid
-        home="$(gateway_home)"; uid="$(id -u "$GATEWAY_USER")"
+        local home uid user_unit
+        home="$(gateway_home)"; uid="$gateway_uid"
+        user_unit="user@$uid.service"
         [ "$(loginctl show-user "$GATEWAY_USER" -p Linger --value)" = yes ] || die "gille-gateway lingering is disabled"
-        [ -S "/run/user/$uid/bus" ] || die "gille-gateway user bus is absent"
+        gateway_user_bus_ready "$uid" || die "gille-gateway user-manager transport is absent"
+        if [ "$require_user_manager_order" = 1 ]; then
+          if [ "$require_gateway_session_bus" = 2 ]; then
+            require_show_contains "$unit" Wants "$user_unit"
+          else
+            require_show_contains "$unit" Requires "$user_unit"
+          fi
+          require_show_contains "$unit" After "$user_unit"
+          require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"
+          if [ "$require_gateway_session_bus" != 0 ]; then
+            require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/bus"
+          fi
+        fi
         [ -x "$home/.local/bin/pi" ] || die "dedicated Pi binary is absent"
         [ -f "$home/.pi-code-loop/models.json" ] || die "dedicated Pi models.json is absent"
         [ ! -e "$home/.pi-code-loop/auth.json" ] || die "dedicated Pi runtime must not hold auth.json"
+        [ "$require_gateway_codeloop_config" = 0 ] || verify_gateway_codeloop_config
       fi
       wait_for_gateway_health "$unit"
       systemctl is-active --quiet gille-autonomy-tick.timer || die "isolated autonomy timer is not active"
@@ -908,7 +1475,7 @@ verify() {
 apply() {
   local service="$1" backup_root="$2" unit stamp backup dependent_state_file
   root_only; need useradd; need install; need systemctl; need curl; need ss; need grep; need sed; need sudo; need runuser; need mktemp; need mv; need chown; need chmod; need find; need readlink
-  if [ "$service" = gateway ]; then need awk; need loginctl; need npm; fi
+  if [ "$service" = gateway ]; then need awk; need loginctl; need npm; need cp; need sha256sum; need ln; fi
   unit="$(unit_for "$service")"
   if [ "$(show_value "$unit" User)" = "$(user_for "$service")" ]; then
     verify "$service"
@@ -918,8 +1485,10 @@ apply() {
   preflight "$service"
   create_service_user "$(user_for "$service")" "$service"
   if [ "$service" = gateway ]; then
+    require_gateway_manager_dropin_absent
     prepare_gateway_user_manager
     provision_gateway_codeloop_runtime
+    provision_gateway_codeloop_toolchain
   fi
   unit="$(unit_for "$service")"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   if [ "$service" = gateway ]; then
@@ -958,6 +1527,9 @@ apply() {
   # the automatic gateway error handler.
   rollback_feasible "$service"
   install_dropin "$service"
+  if [ "$service" = gateway ]; then
+    systemctl restart "user@$(id -u "$GATEWAY_USER").service" || die "dedicated manager did not restart with its recovery policy"
+  fi
   if ! systemctl restart "$unit"; then
     report_apply_backup "Restart failed; use rollback with --ack-rollback."
     exit 1
@@ -982,8 +1554,27 @@ apply() {
   note "APPLIED: $service. Backup/rollback evidence: $backup"
 }
 
+finish_pending_gateway_rollback() {
+  local backup="$1" unit="$2" uid="$3" manager_recovered=1
+  systemctl daemon-reload || die "could not reload restored legacy units"
+  [ "$(show_value "$unit" User)" = magnus ] || die "rollback did not load the legacy magnus unit identity"
+  if ! restart_gateway_user_manager_with_loaded_policy "$uid"; then
+    manager_recovered=0
+    note "Dedicated manager recovery is incomplete; restoring the legacy gateway and timer before reporting failure"
+  fi
+  systemctl restart "$unit" || die "legacy gateway did not restart after rollback"
+  restore_legacy_autonomy_timer "$backup"
+  [ "$(show_value "$unit" User)" = magnus ] || die "rollback did not restore the legacy magnus unit identity"
+  systemctl is-active --quiet "$unit" || die "legacy unit did not recover after rollback"
+  [ "$manager_recovered" = 1 ] || die "legacy gateway and timer recovered, but dedicated manager policy/transport did not; retry rollback from $backup"
+  printf 'service=gateway\nbackup=%s\nrolled_back_at=%s\n' "$backup" "$(date -u +%FT%TZ)" >"$backup/rollback-receipt" \
+    || die "could not record completed gateway rollback"
+  rm -f -- "$backup/rollback-pending-manager" || die "could not clear pending gateway rollback marker"
+  note "ROLLED BACK: gateway. The unused dedicated account/runtime is retained mode-restricted for forensic recovery; remove it only through a separate owner-approved cleanup."
+}
+
 rollback() {
-  local service="$1" backup_root="$2" unit backup dropin dependent_state_file
+  local service="$1" backup_root="$2" unit backup dropin dependent_state_file manager_dropin gateway_uid
   root_only; need systemctl; need install; need mv; need chown; need chmod; need find; need sed; need grep; need runuser
   unit="$(unit_for "$service")"
   if [ -f "$backup_root/unit.before.txt" ]; then
@@ -993,6 +1584,17 @@ rollback() {
   fi
   [ -n "$backup" ] || die "no recorded backup found for $service"
   [ -f "$backup/unit.before.txt" ] || die "backup is incomplete: $backup"
+  if [ -e "$backup/rollback-pending-manager" ] || [ -L "$backup/rollback-pending-manager" ]; then
+    [ "$service" = gateway ] && [ -f "$backup/rollback-pending-manager" ] && [ ! -L "$backup/rollback-pending-manager" ] \
+      || die "rollback pending marker is unsafe or belongs to another service"
+    gateway_uid="$(id -u "$GATEWAY_USER")"
+    [ -d "$GATEWAY_DATA" ] && [ -f "$GATEWAY_TREE/.env" ] \
+      || die "pending rollback does not have intact legacy gateway state"
+    [ ! -e "/etc/systemd/system/user@$gateway_uid.service.d/50-gille-gateway-recovery.conf" ] \
+      || die "pending rollback still has a manager recovery drop-in"
+    finish_pending_gateway_rollback "$backup" "$unit" "$gateway_uid"
+    return 0
+  fi
   if [ -f "$backup/rollback-receipt" ]; then
     [ "$(show_value "$unit" User)" = magnus ] || die "rollback receipt exists but legacy unit identity is not restored"
     systemctl is-active --quiet "$unit" || die "rollback receipt exists but legacy unit is not active"
@@ -1000,6 +1602,11 @@ rollback() {
       gateway)
         [ -d "$GATEWAY_DATA" ] && [ -f "$GATEWAY_TREE/.env" ] || die "rollback receipt exists but gateway legacy paths are absent"
         [ ! -e "$GATEWAY_ISOLATION_MARKER" ] && [ ! -e /etc/systemd/system/gille-autonomy-tick.service ] && [ ! -e /etc/systemd/system/gille-autonomy-tick.timer ] || die "rollback receipt exists but isolation artifacts remain"
+        [ ! -e "/etc/systemd/system/user@$(id -u "$GATEWAY_USER").service.d/50-gille-gateway-recovery.conf" ] || die "rollback receipt exists but manager recovery drop-in remains"
+        if systemctl is-active --quiet "user@$(id -u "$GATEWAY_USER").service"; then
+          verify_manager_live_oom_policy "user@$(id -u "$GATEWAY_USER").service" \
+            || die "rollback receipt exists but the manager still runs with a stale OOM policy"
+        fi
         assert_legacy_autonomy_timer_state "$backup"
         ;;
       cloudflared) [ -d "$TUNNEL_SOURCE" ] || die "rollback receipt exists but cloudflared legacy path is absent" ;;
@@ -1027,6 +1634,12 @@ rollback() {
   fi
   dropin="/etc/systemd/system/$unit.d/50-service-isolation.conf"
   if [ "$service" = gateway ]; then
+    gateway_uid="$(id -u "$GATEWAY_USER")"
+    manager_dropin="/etc/systemd/system/user@$gateway_uid.service.d/50-gille-gateway-recovery.conf"
+    if [ -e "$manager_dropin" ] || [ -L "$manager_dropin" ]; then
+      [ -f "$manager_dropin" ] && [ ! -L "$manager_dropin" ] || die "dedicated manager recovery drop-in is unsafe; refusing rollback"
+      cmp -s <(render_gateway_manager_recovery) "$manager_dropin" || die "dedicated manager recovery drop-in differs from template; refusing rollback"
+    fi
     if [ -e /etc/systemd/system/gille-autonomy-tick.timer ]; then
       systemctl disable --now gille-autonomy-tick.timer || die "could not stop isolated autonomy timer"
       ! systemctl is-active --quiet gille-autonomy-tick.timer || die "isolated autonomy timer stayed active"
@@ -1064,7 +1677,16 @@ rollback() {
       ;;
   esac
   rm -f "$dropin"
+  if [ "$service" = gateway ] && [ -e "$manager_dropin" ]; then
+    rm -f -- "$manager_dropin"
+    rmdir "/etc/systemd/system/user@$gateway_uid.service.d" 2>/dev/null || true
+  fi
   rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
+  if [ "$service" = gateway ]; then
+    : >"$backup/rollback-pending-manager" || die "could not record resumable gateway rollback"
+    finish_pending_gateway_rollback "$backup" "$unit" "$gateway_uid"
+    return 0
+  fi
   systemctl daemon-reload
   systemctl restart "$unit"
   restore_transaction_dependents "$service" "$dependent_state_file"
@@ -1103,6 +1725,7 @@ main() {
     apply) [ "$ack_restart" = 1 ] || die "apply requires --ack-service-restart"; apply "$service" "$backup_dir" ;;
     verify) verify "$service" ;;
     rollback) [ "$ack_rollback" = 1 ] || die "rollback requires --ack-rollback"; rollback "$service" "$backup_dir" ;;
+    refresh-isolation) [ "$ack_restart" = 1 ] || die "refresh-isolation requires --ack-service-restart"; refresh_isolation "$service" "$backup_dir" ;;
     refresh-autonomy) [ "$service" = gateway ] || die "refresh-autonomy only applies to gateway"; root_only; install_gateway_autonomy_timer ;;
     *) usage >&2; die "unknown command: $command" ;;
   esac

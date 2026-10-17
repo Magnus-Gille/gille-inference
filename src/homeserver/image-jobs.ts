@@ -374,7 +374,7 @@ export function startImageWorker(
   const existing = workers.get(controller);
   if (existing) return { stop: () => stopWorker(controller) };
 
-  recoverOrphans(cfg);
+  recoverOrphans();
 
   const ctx: WorkerCtx = {
     cfg,
@@ -385,7 +385,7 @@ export function startImageWorker(
     stopped: false,
     sweepTimer: null,
   };
-  const sweep = setInterval(() => sweepExpired(cfg), Math.min(cfg.imageResultTtlMs, 60_000));
+  const sweep = setInterval(sweepExpired, Math.min(cfg.imageResultTtlMs, 60_000));
   if (typeof sweep.unref === "function") sweep.unref();
   ctx.sweepTimer = sweep;
   workers.set(controller, ctx);
@@ -423,7 +423,7 @@ function refundOrphanRow(row: ImageJobDbRow): void {
 }
 
 /** Restart recovery: a queued/running row from a prior process has no in-memory spec → fail+refund. */
-function recoverOrphans(cfg: HomeserverConfig): void {
+function recoverOrphans(): void {
   const orphans = db()
     .prepare(`SELECT * FROM image_jobs WHERE status IN ('queued','running')`)
     .all() as ImageJobDbRow[];
@@ -552,7 +552,7 @@ async function processJob(ctx: WorkerCtx, id: string): Promise<void> {
       : err instanceof ImageSidecarError
         ? err.kind
         : "internal_error";
-    finalizeFailure(ctx, id, spec, errorClass, Date.now() - start);
+    finalizeFailure(id, spec, errorClass, Date.now() - start);
   } finally {
     clearTimeout(timer);
     if (release) release();
@@ -596,7 +596,7 @@ function finalizeSuccess(ctx: WorkerCtx, id: string, spec: JobSpec, b64: string[
   }
 }
 
-function finalizeFailure(ctx: WorkerCtx, id: string, spec: JobSpec, errorClass: string, durationMs: number): void {
+function finalizeFailure(id: string, spec: JobSpec, errorClass: string, durationMs: number): void {
   const sub = spec.submission;
   const won = db()
     .prepare(`UPDATE image_jobs SET status = 'failed', error_class = @errorClass WHERE id = @id AND status = 'running'`)
@@ -621,6 +621,7 @@ function logCompletion(
     alias: sub.alias,
     tier: sub.lane,
     keyHash: sub.keyHash,
+    node: "m5",
     model: sub.parsed.model,
     route: "image",
     status,
@@ -637,7 +638,7 @@ function logCompletion(
 }
 
 /** Sweep finished jobs past their TTL: delete the bytes + mark expired so GET stops returning data. */
-function sweepExpired(cfg: HomeserverConfig): void {
+function sweepExpired(): void {
   const now = Date.now();
   const stale = db()
     .prepare(`SELECT * FROM image_jobs WHERE status = 'succeeded' AND expires_at IS NOT NULL AND expires_at < ?`)

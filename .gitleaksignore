@@ -1,0 +1,4 @@
+# Exact false positives for benign Gate D telemetry terminology in gate-d/README.md.
+# Keep these fingerprint-scoped so new token-shaped findings still fail CI.
+4787ed7e4771f457a1bfafec92ee06c8f745dfb5:gate-d/README.md:generic-api-key:126
+76474f130edfcf12661fb513446d227a36c571ed:gate-d/README.md:generic-api-key:126

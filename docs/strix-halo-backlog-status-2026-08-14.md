@@ -1,0 +1,64 @@
+# Strix Halo 128 GB backlog execution status
+
+**Status date:** 15 August 2026
+
+This is the execution ledger for the 25-ticket handoff. `Implemented` means the repository-owned
+tooling is present and deterministically tested. It does **not** mean the hardware experiment has
+passed. `Measured` requires reproducible Strix Halo evidence under the durable GPU lease and, where
+needed, the exclusive maintenance fence tracked in issue #196.
+
+## Current blockers
+
+1. Qwen3.8 source staging, conversion, reference parity, isolated Vulkan runtime, direct
+   benchmarks, native-MTP canaries, Q8-KV selection, multimodal serving, and explicit authenticated
+   production promotion have passed. The immutable release evidence is in
+   `docs/qwen38-27b-release-decision-2026-08-14.md`.
+2. T20's matched Gate D comparison is complete. Qwen3.6 remains the fast coding default at 1.73
+   correct runs/minute; Qwen3.8 is the quality/broad-edit escalation at 30/30 correctness and 0.86
+   correct runs/minute. No automatic route changed.
+3. The first fresh real-history task and content-blind runner are implemented. Live comparison is
+   blocked safely: direct Pi would inherit the bearer credential without an OS cage, and the caged
+   code-loop contract cannot select Qwen3.6 versus Qwen3.8 per run.
+
+## Ticket matrix
+
+| Ticket | State | Repository evidence / remaining proof |
+|---:|---|---|
+| T01 benchmark harness | **Implemented; first release measurements complete** | Direct `llama-bench` plus streaming server runners emit JSON/Markdown and cover PP, TG, TTFT, cache, speculation, concurrency, hashes, system/runtime fields, and useful completions/minute. Qwen3.8 pp512/tg128, pp8192, direct/MTP, and server canaries now provide the first controlled release evidence. Real power should come from a wall meter; hwmon is labelled explicitly. |
+| T02 Qwen3-Coder baseline | **Blocked for measurement** | Harness ready. Exact 30B-A3B GGUFs/builds are not staged or verified in this session; live verification of #196 is still missing. |
+| T03 Qwen3.6 direct baseline | **Prefix-cache measured; mmap A/B prepared** | The live Q4_K_M Vulkan profile now has immutable model/binary/argv provenance and a 26.8–27.2K populated-context cache measurement on llama.cpp `8086439`: cold prefill was 33.5–33.9 s, exact warm controls 110–111 ms. A fail-closed ABBA runner now compares explicit mmap/no-mmap on that same runtime and restores pre-run llama-swap residency; the hardware run requires a fresh exact maintenance confirmation. Direct context/KV/ROCmFP4 arms remain. |
+| T04 native MTP | **Measured for Qwen3.8** | Native MTP depth 2 passed in the pinned Vulkan runtime: 21.68 tok/s with F16 KV and 23.21 tok/s with Q8 KV versus 12.84 tok/s direct in the matched short server workload. Draft acceptance was workload-dependent (57.6–66.1%). Broader adaptive-depth evidence remains T05. |
+| T05 adaptive MTP | **Offline policy synthesis implemented; live matrix pending** | A content-blind synthesizer consumes one direct report plus multiple speculative-depth reports and selects per workload/concurrency cell only when quality is non-inferior, acceptance is observable in every raw batch, aggregate useful completions/minute clears an explicit margin, at least three paired repetitions exist, counters are internally consistent integers, exposure matches direct, every paired greedy output hash is identical, the non-speculation argv invariant matches, and no repetition loses quality or useful work; otherwise it fails closed. This directly guards the quantized-target losslessness risk reported upstream in llama.cpp #25618, but is not an online rolling controller or a confidence interval. Exact mirrored direct/depth-1/depth-2/deeper traces across the intended concurrency matrix remain required. |
+| T06 Vulkan vs HIP | **Comparison implemented; experiment blocked** | One-axis comparator enforces controlled provenance. Actual bake-off belongs to issue #129 and requires isolated builds plus deployed/verified #196. |
+| T07 ROCmFPX | **Not integrated** | Requires reviewing/pinning the current external fork, compatible artifacts, and isolated Vulkan/HIP builds. No live runtime change is authorized. |
+| T08 quant matrix | **Runner/comparator implemented; artifacts blocked** | `quant` is a controlled comparison axis; real Pareto evidence needs identical source revision, converted quants, and Gate D quality runs. |
+| T09 KV matrix | **First Qwen3.8 F16/Q8 arm measured; Qwen3.6 candidate and combined runner prepared** | Q8 direct TG was within measurement noise of F16 (12.83 vs 12.87 tok/s), with similar pp512 (357.48 vs 361.40 tok/s), and won the sampled MTP canary (23.21 vs 21.68 tok/s). Q8 is selected for the 64K release profile. An exact-production backport of the Strix-reported Vulkan Q8 KV dequantize-once patch builds on M5. The fail-closed combined runner hashes every artifact before mutation, runs focused backend correctness, compares stock/patched Q8 across a deterministic content-blind 4K generation, then runs two mirrored F16 / stock-Q8 / patched-Q8 cycles, automatically rejects regressions, records failures, and restores exact residency. Hardware execution awaits fresh exact maintenance confirmation. BF16/Q4 and broader model/context arms remain. |
+| T10 persistent prefix cache | **Production-shaped short and checkpoint-stress measurements complete** | The short control measured 304–305× cold-to-exact-warm server-prefill improvement at 26.8–27.2K actual tokens. The stronger control ran sixteen tool cycles and 7,786 generated tokens (16/16 crossed the 256-token interval); its final 18,466-token exact prompt cached 18,419 tokens and evaluated only 47 in 219 ms. No progressive invalidation reproduced, so unreviewed upstream #24891 is rejected for this profile absent a future red organic/exact control. Cache survival across process replacement remains intentionally unclaimed. |
+| T11 DFlash | **Upstream path verified; static deep policy rejected** | Current llama.cpp documents `draft-dflash`; runner can capture workload acceptance and speed. Exact gfx1151 issue #27117 reports depth-15 concurrency collapse below direct at 16 active requests while depth 1 recovers strongly, so any future run must cover depth and concurrency through the fail-closed policy synthesizer. Exact target-specific drafter and M5 run remain. Glimmer tracking: issue #181. |
+| T12 DSpark/DeepSpec | **Research premise updated; prototype not run** | Current llama.cpp already documents `draft-dspark`, so a new line-for-line CUDA port is no longer the first step. Benchmark the upstream backend path before writing AMD kernels. |
+| T13 gfx1151 verification kernel | **Not started** | Only justified after T11/T12 profiling proves target verification is the bottleneck. Premature kernel work is explicitly deferred. |
+| T14 HIP launch gaps | **Not started** | Requires paired rocprof/kernel-wall traces from isolated HIP build under issue #129. |
+| T15 BF16 Flash Attention | **Exact-hardware upstream candidate identified; not local-measured** | Open llama.cpp PR #26856 reports Strix pp1024 gains of +13.5% at 8K and +11.4% at 16K with generation parity and native gfx1151 BF16 instructions. Runtime/feature revision must still be pinned and compared on production models through the HIP KV/context matrix. |
+| T16 Qwen3.8 ingest | **Implemented; release archived** | Official revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` is public and ungated. Archived controls identify a dense multimodal `Qwen3_5ForConditionalGeneration` model with 27,781,427,952 BF16 parameters, hybrid linear/full attention, native MTP, and 262K context. The staging command remains fail-closed and non-live. |
+| T17 Qwen3.8 conversion | **Complete for release artifacts** | All official source files were staged and hash-verified twice. BF16, Q8_0, Q6_K, Q5_K_M, Q4_K_M, and the separate BF16 mmproj were produced from the immutable revision with a pinned runtime. Transformers/BF16/Q4 parity produced the same deterministic final text; Q4_K_M and mmproj hashes are recorded in the release decision. |
+| T18 first Qwen3.8 benchmark | **Measured** | Vulkan/RADV Q4_K_M produced 361.40 pp512 and 12.87 tg128 tok/s with F16 KV; Q8 produced 357.48/12.83. pp8192 measured 308.76 tok/s. The exact 64K server profile passed text, image, thinking, and non-thinking API canaries. |
+| T19 Qwen3.8 speculation | **Native MTP measured and selected** | Native MTP depth 2 produced 21.68–23.21 tok/s in short text canaries and 21.33–23.68 tok/s in the final 64K text/vision profile, with 57.6–71.2% draft acceptance. It is selected for explicit production qualification; workload-aware/adaptive policy remains T05. |
+| T20 Qwen3.8 vs Qwen3.6 | **Measured; routed recommendation recorded** | The matched Gate D r1 comparison ran ten tasks × three seeds per live profile. Qwen3.6 passed 26/30 at 1.73 correct runs/minute; Qwen3.8 passed 30/30 at 0.86/minute and uniquely closed the broad four-file rename. Keep Qwen3.6 fast/default and Qwen3.8 quality/escalation; no automatic route promotion. See `docs/qwen38-vs-qwen36-gate-d-2026-08-15.md`. |
+| T21 Glimmer specialist | **Candidate only** | Existing gateway already passes multimodal `image_url` content and serves Gemma4+mmproj. Glimmer qualification/discovery remains issue #181; roster promotion is not authorized. |
+| T22 model router | **Implemented as evidence-gated routing; profile qualification blocked** | The gateway/orchestrator already performs task-aware routing through the generated capability table and fails safe to the frontier for unsupported lanes. FAST/BALANCED/DEEP/VISION/MAX remain descriptive product tiers rather than static aliases: assigning them before the issue #124 model/profile experiments would bypass the repository's evidence-before-autonomy invariant. Glimmer/MAX qualification remains separate roster work. |
+| T23 coding-agent suite | **Real-history runner implemented; live A/B safety-blocked** | Gate D has 14 isolated fixtures, and `strix-real-r1` adds a preregistered real-history seed/reference/hidden-oracle task with committed Pi model configuration. The runner captures content-blind turns, tools, tokens, timing spans, hashes, and provenance. A fake-Pi end-to-end smoke and 4,246-test full suite pass. Direct live Pi was rejected before execution because the bearer would reach an uncaged shell-capable agent; the existing cage has no allow-listed per-run model selector. |
+| T24 concurrent agents | **Runner implemented; measurement blocked** | Streaming runner covers 1/2/4/8 and useful work/minute. Existing Gate C remains the admission/preemption/soak control. Requires M5 access/window. |
+| T25 OS/power/memory profile | **Read-only capture implemented; Strix A/B blocked** | `npm run benchmark:strix-host` emits mode-0600 JSON/Markdown with the operator-observed BIOS UMA setting, kernel/Mesa/ROCm, memory, allow-listed AMD/TTM parameters, power profile, governor, DRM memory/clocks, and labelled hwmon observations. Missing sensors remain `null`, and raw kernel argv is never retained. A local non-Strix smoke test and deterministic tests prove the capture path; issue #195 still owns the one-variable M5 A/B after #196 is deployed and verified. BIOS/kernel/driver changes remain explicitly outside this branch. |
+
+## Work order from this state
+
+1. With explicit approval, add and independently review an allow-listed per-run model selector for
+   the OS-caged code-loop path; then run `strix-real-r1` on Qwen3.6 and Qwen3.8 before considering
+   any automatic route change.
+2. Run T02/T03/T06 and the remaining T09 arms under the controlled maintenance path.
+3. Use the expanded traces to decide whether T05/T13/T14 kernel/runtime work is justified.
+4. Qualify Glimmer through issue #181 before any separate T21/T22 production route change.
+5. In one explicitly approved exclusive window, run the exact-runtime mmap/no-mmap ABBA and the
+   focused Vulkan backend test plus F16 / stock-Q8 / patched-Q8 matrix. Keep their evidence and
+   promotion decisions separate; neither candidate may advance without two positive cycles and
+   representative agent-workload evidence.

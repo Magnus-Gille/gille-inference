@@ -1,16 +1,16 @@
 /**
- * scout-gate.ts — safety gate between "the probe battery liked this model" and "auto-serve it into
- * live llama-swap unattended." (#176)
+ * scout-gate.ts — safety checks between "the probe battery liked this model" and "the evidence is
+ * ready for human review." (#176)
  *
- * The incident: the weekly Model Scout auto-promoted `gemma-4-12B-agentic-fable5-composer2.5-v2-
+ * The incident: an earlier autonomous path promoted `gemma-4-12B-agentic-fable5-composer2.5-v2-
  * 3.5x-tau2-GGUF` — a trending community fine-tune — into production because the only gate was
  * `passRate >= 0.7 && avgTokPerSec >= MIN_TOKPS`. It scored 1.0 on BOTH `sql` and `code-review`,
  * the two task types where even the 80B struggles: a textbook benchmark-gamed model (its own name
  * advertises τ²-bench / a "3.5x" claim / a distill of another family). One aggregate pass-rate
  * cannot tell "genuinely capable" from "tuned to the probe phrasing."
  *
- * This module adds two cheap, PURE checks over data the scout already has, so a suspicious winner is
- * FLAGGED (→ not auto-served; a human can still promote it manually) instead of silently going live:
+ * This module adds cheap, PURE checks over evaluation evidence, so a suspicious winner is FLAGGED
+ * for human review instead of silently being treated as roster-ready:
  *
  *   1. Capability plausibility — implausibly-high scores on the KNOWN-HARD task types (sql /
  *      code-review / reason-hard, the universal local gaps). A small trending fine-tune that is
@@ -19,19 +19,18 @@
  *      multiplier like "3.5x", "composer", "fable", named benchmarks). A tell in the name is not
  *      proof, but it is exactly the signal to require a human look before serving.
  *
- * Both only DELAY auto-serve (raise a flag), never hard-reject — a false flag costs a manual ack,
- * an unflagged gamed model costs a bad production model routed to real traffic. Conservative by
- * design. The gate operates on `scoresByTaskType` (a plain Record) so it is identical whether called
- * from the scout (rich summary in hand) or the promoter (only the durable RegistryEntry).
+ * Both raise evidence flags, never hard-reject — a false flag costs a manual review, while an
+ * unflagged gamed model could mislead a later roster decision. Conservative by design. The gate
+ * operates on `scoresByTaskType` (a plain Record) so it remains identical for live evaluation rows
+ * and historical RegistryEntry rows.
  *
- * Designed to COMPOSE with #158's promotion-misconfig gate (HTTP-error / empty-output / truncation
- * rate): both populate the same additive `RegistryEntry.gateFlags: string[]`, and the promoter
- * refuses to auto-serve any winner whose gateFlags is non-empty — so the two issues add checks
- * without re-threading each other's fields.
+ * Designed to COMPOSE with #158's evidence-quality gate (HTTP-error / empty-output / truncation
+ * rate): both populate the same additive `RegistryEntry.gateFlags: string[]`, preserving one
+ * review surface without re-threading each other's fields.
  */
 
 export interface ScoutGateConfig {
-  /** Task types where a top score is implausible for a small trending model (universal local gaps). */
+  /** Task types where a top score is implausible for a small candidate (universal local gaps). */
   hardTaskTypes: string[];
   /** A per-hard-type score at/above this counts as "implausibly high". */
   suspiciousScore: number;
@@ -39,17 +38,17 @@ export interface ScoutGateConfig {
   minSuspiciousHardTypes: number;
   /** Repo-name patterns that advertise benchmark-gaming / marketing claims. */
   nameTells: ReadonlyArray<RegExp>;
-  /** #158: probe error rate at/above this flags the candidate as misconfigured/broken (not served). */
+  /** #158: probe error rate at/above this flags the evidence as misconfigured/broken. */
   maxErrorRate: number;
-  /** #158: empty assistant-content rate at/above this blocks unattended serving. */
+  /** #158: empty assistant-content rate at/above this requires evidence review. */
   maxEmptyOutputRate: number;
-  /** #158: finish_reason=length rate at/above this blocks unattended serving. */
+  /** #158: finish_reason=length rate at/above this requires evidence review. */
   maxTruncationRate: number;
-  /** #158: minimum seeded-bug recall required for unattended serving. */
+  /** #158: minimum seeded-bug recall required for trustworthy review evidence. */
   minReviewRecall: number;
-  /** #158: minimum finding precision required for unattended serving. */
+  /** #158: minimum finding precision required for trustworthy review evidence. */
   minReviewPrecision: number;
-  /** #158: maximum clean-control confabulation rate allowed for unattended serving. */
+  /** #158: maximum clean-control confabulation rate allowed for trustworthy review evidence. */
   maxReviewCleanConfabulationRate: number;
 }
 
@@ -81,7 +80,7 @@ export const DEFAULT_SCOUT_GATE_CONFIG: ScoutGateConfig = {
   maxReviewCleanConfabulationRate: 0.25,
 };
 
-/** Env-driven override of the gate config (used by the scout + promoter scripts). */
+/** Env-driven override of the gate config used by the explicit evaluator and registry consumers. */
 export function loadScoutGateConfig(env: NodeJS.ProcessEnv = process.env): ScoutGateConfig {
   const hard = env["SCOUT_HARD_TASK_TYPES"];
   const hardTaskTypes = hard
@@ -268,7 +267,7 @@ export function reviewQualityFlags(
  * evidence, or the promoter cannot vouch that "passed the battery" and "will behave the same way
  * once served" are the same claim. A legacy row, a hand-written row, or any writer that skips this
  * bookkeeping is held for manual review — the same pattern as the #158 missing-review-ground-truth
- * fallback in promote-model.ts's partitionServableWinners.
+ * fallback in the manual-evaluation registry consumer.
  */
 export function servingConfigFlags(entry: {
   evalServingConfig?: { ctx: number; repeats: number; ngl?: number; flashAttn?: string } | undefined;
@@ -284,29 +283,28 @@ export function servingConfigFlags(entry: {
     cfg.repeats > 0;
   if (!valid) {
     return [
-      "missing-serving-config: no exact eval serving configuration (ctx/repeats) recorded — cannot verify what configuration was actually tested, not auto-served",
+      "missing-serving-config: no exact eval serving configuration (ctx/repeats) recorded — cannot verify what configuration was actually tested, requires review",
     ];
   }
   return [];
 }
 
 export interface GateResult {
-  /** True when nothing tripped — safe to auto-serve. */
-  autoServable: boolean;
+  /** True when nothing tripped — evidence passes the structural safety checks. */
+  passesSafetyChecks: boolean;
   /** Human-readable reasons the candidate was gated (empty ⇒ clean). */
   flags: string[];
 }
 
 /**
- * Evaluate the full auto-serve gate for a candidate. A "winner" (met the probe thresholds) is only
- * auto-servable when this returns `autoServable: true`. Any flag routes it to human review instead.
+ * Evaluate the full evidence safety gate for a candidate. Any flag routes it to human review.
  */
 export function evaluateScoutGate(
   entry: { id: string; scoresByTaskType: Record<string, number> },
   cfg: ScoutGateConfig = DEFAULT_SCOUT_GATE_CONFIG
 ): GateResult {
   const flags = [...plausibilityFlags(entry.scoresByTaskType, cfg), ...nameTellFlags(entry.id, cfg)];
-  return { autoServable: flags.length === 0, flags };
+  return { passesSafetyChecks: flags.length === 0, flags };
 }
 
 /**

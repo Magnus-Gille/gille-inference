@@ -11,7 +11,7 @@ Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-rou
 ## Base & transport
 
 - **Base URL:** `http://<m5-host>:8080`. The gateway binds via `HOMESERVER_HOST` (default `127.0.0.1`) and `HOMESERVER_PORT` (default `8080`). On the M5 this is the single runtime entry Hugin macro-routes to. (Clients such as Hugin's executor point at it via their own `HOMESERVER_GATEWAY_URL` — that is a client-side var, *not* read by the gateway.)
-- **Authenticated harness bases:** `eval "$(m5-auth --env)"` exports `M5_GATEWAY_URL` at the gateway root and `M5_OPENAI_BASE_URL` at that root plus `/v1`; it also retains `M5_BASE_URL` as an OpenAI-base compatibility alias. The helper refuses inconsistent overrides before reading the token: after trailing-slash normalization, the OpenAI base must equal the gateway root plus `/v1`. Compose routes exactly as `"$M5_GATEWAY_URL/delegate"`, `"$M5_GATEWAY_URL/ledger"`, and `"$M5_OPENAI_BASE_URL/chat/completions"`. Do not append `/delegate` or `/ledger` to either OpenAI-base variable: that produces the non-route `/v1/delegate` or `/v1/ledger`. `--tailnet` changes both bases to the authenticated tailnet gateway, never to loopback. Before a consequential call, `m5-auth --check` (or `m5-auth --check --tailnet`) performs a non-emitting authenticated preflight; see the rotation and recovery runbook in [`../deploy/README.md`](../deploy/README.md#credential-preflight-and-owner-recovery).
+- **Authenticated harness bases:** `eval "$(m5-auth --env)"` exports `M5_GATEWAY_URL` at the gateway root and `M5_OPENAI_BASE_URL` at that root plus `/v1`; it also retains `M5_BASE_URL` as an OpenAI-base compatibility alias. Public mode requires at least one of those base variables to be explicitly configured and fails before Keychain access when none is set; it never guesses a loopback public route. The helper also refuses empty or inconsistent overrides before reading the token: after trailing-slash normalization, the OpenAI base must equal the gateway root plus `/v1`. Compose routes exactly as `"$M5_GATEWAY_URL/delegate"`, `"$M5_GATEWAY_URL/ledger"`, and `"$M5_OPENAI_BASE_URL/chat/completions"`. Do not append `/delegate` or `/ledger` to either OpenAI-base variable: that produces the non-route `/v1/delegate` or `/v1/ledger`. `--tailnet` changes both bases to the authenticated tailnet gateway, never to loopback. Before a consequential call, `m5-auth --check` (or `m5-auth --check --tailnet`) performs a non-emitting authenticated preflight; see the rotation and recovery runbook in [`../deploy/README.md`](../deploy/README.md#credential-preflight-and-owner-recovery).
 
 | Supplied environment | Result |
 |---|---|
@@ -35,14 +35,14 @@ privacy/admission tier, route scope, and model allow-list:
 | Scope | `admin` | Operator routes plus agent/inference surfaces. Explicit for new keys; legacy null-scope owner rows retain it compatibly. |
 | Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
 | Scope | `inference` | Ordinary inference only. Legacy guest-key default. |
-| Scope | `monitor` | Read-only `GET /healthz`, `/models`, `/metrics`, and `/ledger*`; no inference or mutation. |
+| Scope | `monitor` | Read-only `GET /healthz`, `/models*`, `/metrics`, `/ledger*`, and `/ops/summary`; no inference or mutation. |
 
 Tier does not imply admin authority. New owner credentials default to `agent`; admin must be
 explicit. New credentials are lifetime-bounded (admin 30 days, agent 90 days, inference/monitor
 365 days). Existing owner rows without a stored scope resolve compatibly to `admin` so they can be
 migrated through the staged lifecycle in `docs/credential-lifecycle-runbook.md`.
 
-Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
+Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Error messages name the request units already metered by each route: chat/MCP use tokens, transcription uses worst-case audio-seconds, and image generation uses image units. Shared static-tier buckets retain their existing shared accounting across callers and routes. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
 
 ## Error envelope (OpenAI-shaped)
 
@@ -62,9 +62,12 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 404 | `not_found` | Unknown route / no such resource |
 | 409 | `learning_task_conflict`, `reviewer_usefulness_conflict` | A stamped request reuses an admitted idempotency, task-attempt, or request identity; OR a reviewer-usefulness write failed closed because the row is the wrong task type, shadow/current-ineligible, lacks a verifier, or is already recorded differently |
 | 413 | `payload_too_large` | Request body exceeds the size cap |
-| 429 | quota codes | RPM/TPM/daily budget exceeded |
+| 429 | `rate_limit_exceeded` | RPM/TPM/daily budget exceeded. The message names whether the limit is per-key or shared static-tier and gives a plain-language rate/window plus retry or UTC-day reset delay. TPM/daily messages use the route's metered units: tokens for chat/MCP, worst-case audio-seconds for transcription, and requested image units for image generation. `error.quota.requested` is the corresponding pre-admission estimate/count; machine quota values, header limits, resets, and accounting retain the existing quota behavior. Shared static-tier buckets keep their existing shared accounting. A zero-RPM allowance requires the gateway operator to restore capacity; waiting does not restore it. `error.quota` carries `{reason,scope,window,limit,requested,counted:false,retry_after_seconds}`; isolated keys also carry `used_before`, while shared buckets omit it. `X-RateLimit-Limit` is the rejected dimension's limit (including the daily limit for daily failures). `Retry-After` and `X-RateLimit-Reset` retain the quota engine's relative retry delay: next rolling-window event expiry for RPM/TPM, UTC midnight for daily, or the existing one-second delay for an empty zero-RPM bucket. `X-RateLimit-Remaining` is emitted only for isolated key buckets; it is omitted for shared static-tier buckets to avoid exposing other consumers' usage. |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
 | 503 | `server_busy` (admission) | Owner preempted the serial GPU; client should retry after `Retry-After` seconds |
+| 503 | `model_temporarily_unavailable` | Three eligible backend failures for one minted key/known model within 60s opened a fixed 30s cooldown. `Retry-After` and `error.backoff {scope:"key_model", retry_after_seconds, unavailable_until}` identify the refusal; no new quota/credit reservation or backend call. Other keys/models and legacy static policy are unaffected; underlying cause remains unknown. |
+| 503 | `insufficient_memory` | Whole-host memory admission (opt-in, `enforce` mode only): the host cannot afford starting the requested non-resident model now; carries `Retry-After`; nothing reached the backend and nothing was billed |
+| 503 | `memory_admission_unavailable` | Whole-host memory admission (opt-in, `enforce` mode only) cannot decide (no declared budget for the model, or host memory unreadable); no `Retry-After`, retrying will not help until the operator fixes it |
 | 504 | `upstream_timeout` | Backend exceeded the call timeout (often a cold model load); carries `Retry-After` |
 | 500 | `internal_error` | Uniform envelope; raw detail (SQLite/stack) is logged server-side, never leaked |
 
@@ -72,14 +75,40 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 
 ---
 
+## Caller reliability observations
+
+MCP `model_status` accepts exactly `{model:string}` for one granted ordinary model. It performs
+read-only catalogue/running observations and returns `checked_at`, source,
+`residency: resident | not_resident | unknown | unavailable`, `inference:not_checked`,
+`loadable_now:unknown`, `protected:unknown`, `swap_cost_ms:null`, caller-only configured limits,
+and current key/model backoff or null. Loading/unloading does not establish non-residency.
+Limits expose scope (`key` or `shared_static_tier`), 60s RPM/TPM and UTC-day token budget, plus
+max parallel. Zero RPM or max parallel blocks; zero TPM/daily means unlimited. Quota-accepted
+backend failures count toward RPM; quota refusals do not; token usage is reconciled. No other
+caller usage, alias or key hash is returned. `list_models` retains its existing output schema.
+
+Validated MCP `ask` inference attempts include their correlation UUID in `_meta.request_id`, including failures.
+A temporary refusal adds `m5_code:model_temporarily_unavailable`, `retryable:true`,
+`retry_after_seconds:1..30`, and `backoff {scope:key_model, retry_after_seconds, unavailable_until}`.
+The UUID identifies the distinct `/mcp/ask` request-log row, not the outer `/mcp` transport row.
+Disabled/missing logging leaves correlation unresolvable; a UUID alone does not prove retention.
+
+Client 1.5.5's default doctor never submits inference. An explicitly selected public/private
+`doctor --probe-inference MODEL` makes one synthetic ask for at most 16 output tokens with a
+30s inference bound. Only a completed, nontruncated ask is a successful probe. Its sanitized
+result describes that route and attempt only; the other route remains unchecked. Existing owner
+logging, authorization, quota, admission and billing apply. See [reliability diagnostics](reliability-diagnostics.md).
+
 ## Endpoints
 
 | Method | Path | Tier | Purpose |
 |--------|------|------|---------|
 | GET | `/healthz` | none | Liveness for routers/uptime checks |
 | GET | `/models` | any | Capability discovery (what's on disk + loaded) |
-| POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. The truncated call is already metered, and any retry is a new billable call. |
+| POST | `/mcp` | any | MCP Streamable-HTTP tools. `ask` returns text plus `structuredContent {model,text,finish_reason,truncated,metered,usage}`; token-limit truncation returns `isError:true`, preserves the paid partial text in `content`, and keeps the same structured payload so callers can retry explicitly. A failed `ask` (busy, rate limit, credits, model not allowed, host memory, upstream error) returns `isError:true` with the human sentence in `content` and the machine-readable cause in `_meta {m5_code, reason?, layer?, retryable?, retry_after_seconds?}`. Classified backend connection failures and timeouts retain `m5_code:"upstream_error"` and add only the sanitized `reason` (`upstream_connection_failed` or `upstream_timeout`), `layer:"model_backend"`, `retryable:true`, and the configured retry delay. Quota rejections identify the RPM, TPM, or daily reason in plain language, explain that the limit applies to the caller's key or a shared static-tier bucket, and say when to retry or when the UTC-day budget resets. They also carry `_meta.quota {reason, scope, window, limit, requested, counted:false, retry_after_seconds}`. Isolated minted-key buckets have `scope:"key"` and `used_before`; legacy static tokens and any minted alias colliding with a reserved `static:` bucket have `scope:"shared_static_tier"` and omit `used_before` to avoid disclosing another consumer's usage. No key identity is included. `requested` is 1 for RPM and the pre-admission estimated tokens for TPM/daily; `window` is `60s` for RPM/TPM and `utc_day` for daily. `retryable` is omitted when the gateway cannot tell, and `structuredContent` is not used for failures because it is reserved for the declared success shape. The truncated call is already metered, and any retry is a new billable call. Optional `output_profile: "complete-within-budget"` prioritizes structural completion inside `max_tokens`, tells bounded reviews to stop after the requested verdict, and requests low reasoning effort only for gpt-oss; it never masks or retries truncation, so `finish_reason="length"` remains `isError:true` with the paid partial content. |
 | GET | `/models/residency` | admin or monitor | Read-only, content-blind residency diagnostic |
+| GET | `/ops/incidents?from=EPOCH_MS&to=EPOCH_MS&limit=N` | minted owner-admin only | Read-only retained request metadata, maximum 24h/500 rows, default 100; private no-store. Closed projection excludes content/key hashes/backend messages. Labels `coverage:retained_rows_only`, `causality:not_established`, truncation and logging/schema gaps. Agent/guest/monitor/static/implicit callers denied; invalid windows 400. |
+| GET | `/ops/summary` | admin or monitor | Durable, content-blind M5 activity summary for Heimdall; includes `filterEpoch: "m5-admitted-compute-v2"` so pre-epoch route-only history is a documented historical break |
 | GET | `/v1/capabilities/learning-task` | owner or guest | LearningTaskContract v1 preflight for Hugin's stamped task handoff |
 | POST | `/v1/roster-proposals` | minted `service:hugin` owner | Validate and persist one content-blind roster proposal; no actuator |
 | GET | `/v1/roster-proposals/:proposalId` | authenticated owner | Read only that principal's durable proposal |
@@ -87,11 +116,61 @@ Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the ga
 | GET | `/ledger` | admin or monitor | Capability KB — per-(task_type,model) verdicts + recent delegations |
 | GET | `/ledger/{id}` | admin or monitor | Single evidence row for a `ledgerId` (join target, #227) |
 | PUT | `/ledger/{id}/reviewer-usefulness` | minted owner-admin | Record reviewer usefulness for one validated `review-bounded` ledger row by exact `ledgerId`; requires a non-empty authenticated logical alias, exact retries are idempotent, differing overwrites 409 |
-| POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio) |
+| PUT | `/execution-feedback/{handle}` | same minted owner-agent/admin key that ran the task | Exact organic execution usefulness (`pass`, `partial`, `redo`, `wrong`); 201 first write, 200 identical retry, 409 conflicting/ineligible write, 404 unknown/other-key handle. Separate from the reviewer overlay and routing; see [contract](execution-feedback.md). |
+| POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio/llama.cpp). The gateway forces ordinary exact-prefix prompt caching and strips client-directed `id_slot`/`n_cache_reuse`; slot/cache lifecycle remains server-owned. |
+| POST | `/v1/systemone` | owner key or guest key explicitly granted the model | Typed decision API for explicitly enabled llama-swap models. Credits, quota, GPU queue, and host-memory admission match chat; an empty guest model allow-list does not grant decision models. 256 KiB UTF-8 JSON body limit (262,144 bytes including state, questions and formatting), text/JSON-object state, 1–16 `noul`/`choice`/`score` questions, no images or streaming. The separate served input context remains 8,192 tokens per question/prompt (one shared context for Clef), including instructions and runtime formatting. Successful upstream `usage.input_tokens` is billed; failures bill zero. See [customer contract](systemone-customer-access.md). |
+| POST | `/v1/embeddings` | owner or guest key with exact model access | OpenAI-shaped vectors for enabled `embeddinggemma-2`. Text: one string or 1–16 strings, 32 KiB body cap. With `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` and verified projector: bounded wrapped text/image/audio/video inputs, 8 MiB body cap (details below). Optional `dimensions` 128/256/512/768, `encoding_format:"float"` or `"base64"`, and `user`. Uses ordinary admission, quota and credits; bills successful upstream `usage.prompt_tokens`, failures zero. An owner with an empty ordinary allow-list has access by default; an owner with a restricted list needs the exact model ID or explicit embedding grant. An empty ordinary guest model list does not grant embedding access. No streaming, chat or MCP `ask`. |
 | POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
 | POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
 | POST | `/admin/models/unload` | admin scope | Unload one/all models |
 | POST | `/admin/models/download` | admin scope | Download a model (fire-and-forget; modelKey **syntax** validated) |
+| POST | `/admin/keys/embedding-grants` | admin scope | Atomically grant `embeddinggemma-2` to exact active guest/inference aliases without rotating keys or changing chat access, credits or quotas. |
+
+### POST `/v1/embeddings`
+
+The first EmbeddingGemma 2 contract accepts text or code as a JSON string or an array of up to
+16 strings, each at most 16,384 Unicode characters. The request body is capped at 32 KiB; the
+runtime context is 8,192 tokens, so very dense inputs can still be rejected upstream. `dimensions`
+may be 128, 256, 512 or 768
+(default 768); `encoding_format` may be `float` (default) or `base64` (little-endian Float32). An
+optional non-empty `user` string of at most 256 characters is accepted for SDK compatibility and
+is not forwarded to the model runtime. The gateway validates the upstream
+768-dimensional vectors, truncates to the requested size, and L2-normalizes each result. The
+response has OpenAI's `object:"list"`, ordered `data[{object:"embedding",index,embedding}]`,
+`model`, and `usage{prompt_tokens,total_tokens}` fields. Successful input tokens consume the
+key's ordinary credits. A malformed upstream response returns 502 and consumes no credits.
+
+```json
+{"model":"embeddinggemma-2","input":"title: none | text: A short document","dimensions":256}
+```
+
+Google's retrieval prefixes distinguish a query (`task: search result | query: `) from a document
+(`title: none | text: `). Keep output dimensions consistent within an index. Media is disabled by
+default. Once the BF16 projector and `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` are activated,
+the gateway permits an 8 MiB JSON body; wrapped input is forwarded only while the sidecar
+reports image, audio and video support. With the flag off, text requests retain the 32 KiB cap.
+`input` may contain 1–4 objects, each with `content` of 1–4 typed parts. Each object yields one
+vector; only one video may appear in a request. Accepted parts are text, inline PNG/JPEG image
+data URI (at most 2 MiB and 2048×2048), base64 PCM WAV audio with `format:"wav"` (at most 3 MiB
+and 30 seconds), and base64 MP4 video with `format:"mp4"` (at most 4 MiB, 10 seconds and 64
+frames). Mixed text/media parts share one vector. URLs, file paths, unknown fields, malformed
+files and unsupported formats are rejected before forwarding. For example:
+
+```json
+{"model":"embeddinggemma-2","input":[{"content":[{"type":"text","text":"A red square"},{"type":"image_url","image_url":{"url":"data:image/png;base64,<PNG_BASE64>"}}]}],"dimensions":256}
+```
+
+For audio use `{ "type":"input_audio", "input_audio":{ "data":"<WAV_BASE64>", "format":"wav" } }`;
+for video use `{ "type":"input_video", "input_video":{ "data":"<MP4_BASE64>", "format":"mp4" } }`.
+The `format` field is checked by the gateway and omitted upstream. Wrapped requests reserve the model's
+8192-token context per vector against ordinary quotas and credits, then reconcile to successful
+upstream `usage.prompt_tokens`; failed requests consume zero credits. Authenticated `/v1/models`
+advertises media only when the gateway flag and sidecar modality metadata both confirm it. The model appears only after the
+dedicated CPU sidecar and gateway setting are active, its health check passes, and the caller has
+access. Customer keys need an explicit embedding grant or the exact ID in a restricted allow-list;
+owner keys with an empty ordinary model allow-list have access by default. A grant can be added to an existing open or restricted customer
+key through `/admin/keys/embedding-grants`. Calls share the gateway's ordinary inflight slots and
+credit policy; the sidecar is not a second GPU model in llama-swap.
 
 ### GET `/healthz`
 
@@ -129,14 +208,26 @@ interface ModelInfo {
 
 Read-only, content-blind operator diagnostics. Requires an admin key or a read-only monitor
 key. A monitor response omits `lastUse.alias`; an admin response may include that safe alias
-field. The endpoint returns only the fields shown below: model identity and state, the observed
-TTL, a coarse residency classification, and safe last-use metadata. It never returns prompts,
-responses, tokens, keys, key hashes, raw backend commands, backend addresses/IPs, or other
-content-bearing or credential-bearing fields.
+field. The endpoint returns model identity and state, the observed TTL, a coarse residency
+classification, safe last-use metadata, a best-effort host-memory snapshot, and resource evidence. Host memory
+includes total RAM, `MemAvailable`, free CMA, and (when DRM exposes both counters) GTT used/total
+bytes. GTT accounting is explicitly `unattributed`: these device-wide counters do not identify
+which model or process owns the memory, including when models are resident. Missing DRM counters
+are `null` with `gttAccounting: "unknown"`; an unreadable host-memory snapshot returns null values
+and `status: "unknown"`. The endpoint never returns prompts, responses, tokens, keys, key hashes,
+raw backend commands, backend addresses/IPs, or other content-bearing or credential-bearing fields.
 
-**Response 200:** `{ "models": ResidencyModel[] }` when the snapshot is available.
+**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory, "resourceEvidence": ResourceEvidence }` when the model
+snapshot is available. An unknown host-memory observation is returned inside `hostMemory` with
+null values, without making model residency unavailable. The additive `resourceEvidence` object
+reports the configured host-memory admission mode and a best-effort host-wide cumulative
+`/proc/vmstat` `oom_kill` counter. `oomKillCount` is a cumulative count observed at `observedAt`,
+not a recent delta and not an inference-readiness or model-quality signal. Missing, malformed, or
+unreadable OOM evidence is returned as `status: "unknown"`, `oomKillCount: null`, and
+`observedAt: null`. `admissionMode: "shadow"` observes and reports the mode but does not enforce
+admission decisions.
 
-**Response 503:** `{ "status": "unavailable" }` when the backend snapshot cannot be obtained.
+**Response 503:** `{ "status": "unavailable", "resourceEvidence": ResourceEvidence }` when the backend snapshot cannot be obtained. Local OOM evidence is read independently and remains available during a backend outage; it does not establish the outage's cause.
 The unavailable response deliberately has no `models` array, so callers cannot interpret an empty
 array as evidence that no models are resident.
 
@@ -154,6 +245,27 @@ interface ResidencyModel {
     alias?: string | null;
   } | null;
 }
+
+interface HostMemory {
+  status: "available" | "unknown";
+  memTotalBytes: number | null;
+  memAvailableBytes: number | null;
+  cmaFreeBytes: number | null;
+  gttUsedBytes: number | null;
+  gttTotalBytes: number | null;
+  gttAccounting: "unattributed" | "unknown";
+}
+
+interface ResourceEvidence {
+  admissionMode: "off" | "shadow" | "enforce";
+  oom: {
+    status: "available" | "unknown";
+    oomKillCount: number | null;
+    observedAt: string | null;
+  };
+}
+
+// Successful response: { models: ResidencyModel[], hostMemory: HostMemory, resourceEvidence: ResourceEvidence }
 ```
 
 ### GET `/v1/capabilities/learning-task`
@@ -644,3 +756,18 @@ explicitly ineligible for joined learning-task evidence.
 Interactive L1/client access does not require Hugin. Authorized clients may use the raw OpenAI or
 MCP surfaces directly when they already own the surrounding lifecycle. Hugin is the path for
 durable, macro-routed tasks, not a mandatory inference proxy.
+
+### Gateway release advertisement
+
+For a minted owner key with `agent` or `admin` scope, or any key with an explicit
+`embeddinggemma-2` grant (embedding grant or exact chat allow-list entry), authenticated
+`GET /portal/me` includes `gateway.revision`, `gateway.client_version`
+and `gateway.result_contract`. These contain only a full source SHA (or `null`), the
+bundled client version (or `null`), and the code-loop result contract identifier.
+The SHA is substituted by `git archive` at the accepted immutable release, then
+held by the running process; an ordinary checkout reports `null`. It is source
+identity, not proof that deployment probes passed. The mutable `.deployed-commit`
+remains the deployment acceptance marker. Embedding clients pin this revision before each
+call. Other guests and inference-scoped keys (including owner inference keys whose access is only
+the implicit empty-allow-list grant), implicit admins and legacy static admins receive no
+`gateway` field. `inferenceObservation` stays limited to owner agent/admin keys. `Cache-Control: no-store` applies; no inference or administrative log access is needed.

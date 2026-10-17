@@ -37,7 +37,7 @@ function parseIso(value: string): number {
 export class ConstitutionalRoutingJournal {
   private readonly path: string;
   private readonly lockPath: string;
-  constructor(private readonly dataDir: string, private readonly table: RouteTableStore, private readonly nowIso: () => string) {
+  constructor(dataDir: string, private readonly table: RouteTableStore, private readonly nowIso: () => string) {
     this.path = join(dataDir, "autonomy-constitution", "micro-routing-journal.json");
     this.lockPath = `${this.path}.lock`;
   }

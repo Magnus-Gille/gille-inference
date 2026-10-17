@@ -266,7 +266,7 @@ async function cmdReview(args: string[]): Promise<void> {
       note: "ledgerReport(policy) — see scripts/generate-routing-table.ts for the canonical generator IO",
     },
     {
-      source: "model-scout registry (JSONL)",
+      source: "manual model-evaluation registry (JSONL)",
       path: DEFAULT_REGISTRY_PATH,
       present: existsSync(DEFAULT_REGISTRY_PATH),
       records: registry.length,

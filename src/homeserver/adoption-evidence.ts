@@ -61,9 +61,30 @@ export interface AdoptionEvidenceReport {
   eligibleOpportunities: number;
 }
 
+export type AdoptionEvidenceWireField =
+  | "harness"
+  | "execution_mode"
+  | "traffic_purpose"
+  | "result"
+  | "deterministic_check"
+  | "reviewer_usefulness"
+  | "fallback_reason"
+  | "eligible_opportunities";
+
+export type AdoptionEvidenceInvariant =
+  | "completed_requires_no_fallback"
+  | "noncompleted_requires_fallback"
+  | "unobserved_result_requires_unobserved_assessment";
+
+export type AdoptionEvidenceParseError =
+  | { code: "invalid_shape" }
+  | { code: "unknown_field" }
+  | { code: "invalid_field"; field: AdoptionEvidenceWireField }
+  | { code: "invalid_invariant"; invariant: AdoptionEvidenceInvariant };
+
 export type ParseAdoptionEvidenceResult =
   | { ok: true; value: AdoptionEvidenceReport }
-  | { ok: false };
+  | { ok: false; error: AdoptionEvidenceParseError };
 
 export const ADOPTION_EVIDENCE_COLUMNS = [
   "recorded_day",
@@ -77,7 +98,41 @@ export const ADOPTION_EVIDENCE_COLUMNS = [
   "eligible_opportunities",
 ] as const;
 
-/** Hard aggregate bound: enough for a small weekly trial, never an unbounded telemetry sink. */
+/** Columns retained by the historical bounded post-cap aggregate; its original schema is immutable. */
+export const ADOPTION_EVIDENCE_OVERFLOW_COLUMNS = [
+  "recorded_day",
+  "traffic_purpose",
+  "result",
+  "deterministic_check",
+  "reviewer_usefulness",
+  "fallback_reason",
+  "report_count",
+  "eligible_opportunities",
+  "unknown_opportunity_reports",
+] as const;
+
+/**
+ * Columns retained by the versioned post-cap aggregate. The closed harness and execution-mode
+ * dimensions preserve the attribution needed by new reports without introducing identity, precise
+ * time, or task content. The legacy overflow table above remains available for historical rows.
+ */
+export const ADOPTION_EVIDENCE_OVERFLOW_V2_COLUMNS = [
+  "recorded_day",
+  "harness",
+  "execution_mode",
+  "traffic_purpose",
+  "result",
+  "deterministic_check",
+  "reviewer_usefulness",
+  "fallback_reason",
+  "report_count",
+  "eligible_opportunities",
+  "unknown_opportunity_reports",
+] as const;
+
+export type AdoptionEvidenceRetention = "retained" | "aggregated";
+
+/** Hard retained-row bound: enough for a small weekly trial, never an unbounded telemetry sink. */
 export const MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY = 25;
 /** Transient, per-minted-key flood bound. The key hash is never written to adoption_evidence. */
 export const MAX_ADOPTION_REPORTS_PER_PRINCIPAL_WINDOW = 8;
@@ -104,7 +159,64 @@ function ensureSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_recorded_day ON adoption_evidence(recorded_day);
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_purpose ON adoption_evidence(traffic_purpose, recorded_day);
     CREATE INDEX IF NOT EXISTS idx_adoption_evidence_harness ON adoption_evidence(harness, recorded_day);
+
+    CREATE TABLE IF NOT EXISTS adoption_evidence_overflow (
+      recorded_day           TEXT NOT NULL,
+      traffic_purpose        TEXT NOT NULL,
+      result                 TEXT NOT NULL,
+      deterministic_check    TEXT NOT NULL,
+      reviewer_usefulness    TEXT NOT NULL,
+      fallback_reason        TEXT NOT NULL,
+      report_count           INTEGER NOT NULL,
+      eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (
+        recorded_day,
+        traffic_purpose,
+        result,
+        deterministic_check,
+        reviewer_usefulness,
+        fallback_reason
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_adoption_evidence_overflow_recorded_day
+      ON adoption_evidence_overflow(recorded_day);
+
+    CREATE TABLE IF NOT EXISTS adoption_evidence_overflow_v2 (
+      recorded_day           TEXT NOT NULL,
+      harness                TEXT NOT NULL,
+      execution_mode         TEXT NOT NULL,
+      traffic_purpose        TEXT NOT NULL,
+      result                 TEXT NOT NULL,
+      deterministic_check    TEXT NOT NULL,
+      reviewer_usefulness    TEXT NOT NULL,
+      fallback_reason        TEXT NOT NULL,
+      report_count           INTEGER NOT NULL,
+      eligible_opportunities INTEGER NOT NULL,
+      unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (
+        recorded_day,
+        harness,
+        execution_mode,
+        traffic_purpose,
+        result,
+        deterministic_check,
+        reviewer_usefulness,
+        fallback_reason
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_adoption_evidence_overflow_v2_recorded_day
+      ON adoption_evidence_overflow_v2(recorded_day);
   `);
+  const overflowColumns = new Set(
+    (db.prepare("PRAGMA table_info(adoption_evidence_overflow)").all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!overflowColumns.has("unknown_opportunity_reports")) {
+    db.exec("ALTER TABLE adoption_evidence_overflow ADD COLUMN unknown_opportunity_reports INTEGER NOT NULL DEFAULT 0");
+    // A legacy row with no eligible opportunities necessarily consists entirely of unknown
+    // denominators. Mixed legacy aggregates cannot be split from their old sufficient statistics.
+    db.exec("UPDATE adoption_evidence_overflow SET unknown_opportunity_reports = report_count WHERE eligible_opportunities = 0");
+  }
   initializedDb = db;
 }
 
@@ -130,6 +242,20 @@ function ownEnum<T extends readonly string[]>(raw: Record<string, unknown>, key:
  * (or a future internal import), so this repeats the closed-schema and outcome invariants after
  * MCP parsing rather than relying on a caller's `as` assertion.
  */
+function invalidInvariant(report: AdoptionEvidenceReport): AdoptionEvidenceInvariant | null {
+  if (report.result === "completed") {
+    return report.fallbackReason === "none" ? null : "completed_requires_no_fallback";
+  }
+  if (report.fallbackReason === "none") return "noncompleted_requires_fallback";
+  if (
+    (report.result === "refused" || report.result === "not_attempted") &&
+    (report.deterministicCheck !== "not_run" || report.reviewerUsefulness !== "not_reported")
+  ) {
+    return "unobserved_result_requires_unobserved_assessment";
+  }
+  return null;
+}
+
 function isValidAdoptionEvidenceReport(report: AdoptionEvidenceReport): boolean {
   if (
     !(ADOPTION_HARNESSES as readonly string[]).includes(report.harness) ||
@@ -146,11 +272,7 @@ function isValidAdoptionEvidenceReport(report: AdoptionEvidenceReport): boolean 
     return false;
   }
 
-  return report.result === "completed"
-    ? report.fallbackReason === "none"
-    : report.deterministicCheck === "not_run" &&
-      report.reviewerUsefulness === "not_reported" &&
-      report.fallbackReason !== "none";
+  return invalidInvariant(report) === null;
 }
 
 /**
@@ -158,9 +280,11 @@ function isValidAdoptionEvidenceReport(report: AdoptionEvidenceReport): boolean 
  * malformed callers must not turn their instruction or path into an access log or MCP response.
  */
 export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: { code: "invalid_shape" } };
+  }
   const value = raw as Record<string, unknown>;
-  const allowed = new Set([
+  const allowed = new Set<AdoptionEvidenceWireField>([
     "harness",
     "execution_mode",
     "traffic_purpose",
@@ -170,30 +294,37 @@ export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult
     "fallback_reason",
     "eligible_opportunities",
   ]);
-  if (Object.keys(value).some((key) => !allowed.has(key))) return { ok: false };
+  // Never echo an unknown key: it may itself contain a path, identity, or task content.
+  if (Object.keys(value).some((key) => !allowed.has(key as AdoptionEvidenceWireField))) {
+    return { ok: false, error: { code: "unknown_field" } };
+  }
 
   const harness = ownEnum(value, "harness", ADOPTION_HARNESSES);
+  if (!harness) return { ok: false, error: { code: "invalid_field", field: "harness" } };
   const executionMode = ownEnum(value, "execution_mode", ADOPTION_EXECUTION_MODES);
+  if (!executionMode) return { ok: false, error: { code: "invalid_field", field: "execution_mode" } };
   const trafficPurpose = ownEnum(value, "traffic_purpose", ADOPTION_TRAFFIC_PURPOSES);
+  if (!trafficPurpose) return { ok: false, error: { code: "invalid_field", field: "traffic_purpose" } };
   const result = ownEnum(value, "result", ADOPTION_RESULTS);
+  if (!result) return { ok: false, error: { code: "invalid_field", field: "result" } };
   const deterministicCheck = ownEnum(value, "deterministic_check", ADOPTION_CHECK_OUTCOMES);
+  if (!deterministicCheck) {
+    return { ok: false, error: { code: "invalid_field", field: "deterministic_check" } };
+  }
   const reviewerUsefulness = ownEnum(value, "reviewer_usefulness", ADOPTION_USEFULNESS);
+  if (!reviewerUsefulness) {
+    return { ok: false, error: { code: "invalid_field", field: "reviewer_usefulness" } };
+  }
   const fallbackReason = ownEnum(value, "fallback_reason", ADOPTION_FALLBACK_REASONS);
+  if (!fallbackReason) return { ok: false, error: { code: "invalid_field", field: "fallback_reason" } };
   const eligibleOpportunities = value["eligible_opportunities"];
   if (
-    !harness ||
-    !executionMode ||
-    !trafficPurpose ||
-    !result ||
-    !deterministicCheck ||
-    !reviewerUsefulness ||
-    !fallbackReason ||
     typeof eligibleOpportunities !== "number" ||
     !Number.isInteger(eligibleOpportunities) ||
     eligibleOpportunities < 0 ||
     eligibleOpportunities > 10_000
   ) {
-    return { ok: false };
+    return { ok: false, error: { code: "invalid_field", field: "eligible_opportunities" } };
   }
 
   const report: AdoptionEvidenceReport = {
@@ -206,7 +337,8 @@ export function parseAdoptionEvidence(raw: unknown): ParseAdoptionEvidenceResult
     fallbackReason,
     eligibleOpportunities,
   };
-  if (!isValidAdoptionEvidenceReport(report)) return { ok: false };
+  const invariant = invalidInvariant(report);
+  if (invariant) return { ok: false, error: { code: "invalid_invariant", invariant } };
 
   return {
     ok: true,
@@ -234,27 +366,75 @@ export function allowAdoptionEvidenceReportForPrincipal(keyHash: string, nowMs =
 
 /**
  * Write one already-validated, content-free evidence report with only its server-derived UTC day.
- * Returns false when the bounded daily aggregate is full; it never generates a report/event id.
+ * The first retained-row bound is preserved verbatim; later reports are reduced into a bounded,
+ * content-free aggregate keyed only by day and low-cardinality harness, execution-mode, and
+ * outcome dimensions. New post-cap reports use the versioned overflow table; the legacy overflow
+ * table is retained unchanged for historical data and is never backfilled or dual-written.
  */
-export function recordAdoptionEvidence(report: AdoptionEvidenceReport): boolean {
+export function recordAdoptionEvidenceWithOutcome(report: AdoptionEvidenceReport): AdoptionEvidenceRetention {
   if (!isValidAdoptionEvidenceReport(report)) {
     throw new Error("Invalid content-blind adoption report.");
   }
   const db = evidenceDb();
   const recordedDay = new Date().toISOString().slice(0, 10);
-  const count = db
-    .prepare("SELECT COUNT(*) AS count FROM adoption_evidence WHERE recorded_day = ?")
-    .get(recordedDay) as { count: number };
-  if (count.count >= MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY) return false;
-  db
-    .prepare(
-      `INSERT INTO adoption_evidence
-         (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
-          reviewer_usefulness, fallback_reason, eligible_opportunities)
-       VALUES
-         (@recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
-          @reviewerUsefulness, @fallbackReason, @eligibleOpportunities)`
-    )
-    .run({ recordedDay, ...report });
+  const write = db.transaction((): AdoptionEvidenceRetention => {
+    // The conditional INSERT and the overflow fallback share one immediate transaction. This
+    // acquires SQLite's writer lock before the count is evaluated, so separate gateway processes
+    // cannot both observe a slot and push the retained-row bound above 25.
+    const retained = db
+      .prepare(
+        `INSERT INTO adoption_evidence
+           (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+            reviewer_usefulness, fallback_reason, eligible_opportunities)
+         SELECT
+           @recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
+           @reviewerUsefulness, @fallbackReason, @eligibleOpportunities
+         WHERE (
+           SELECT COUNT(*) FROM adoption_evidence WHERE recorded_day = @recordedDay
+         ) < @maxRows`
+      )
+      .run({ recordedDay, ...report, maxRows: MAX_ADOPTION_EVIDENCE_ROWS_PER_DAY });
+    if (retained.changes === 1) return "retained";
+
+    db
+      .prepare(
+        `INSERT INTO adoption_evidence_overflow_v2
+           (recorded_day, harness, execution_mode, traffic_purpose, result, deterministic_check,
+            reviewer_usefulness, fallback_reason, report_count, eligible_opportunities,
+            unknown_opportunity_reports)
+         VALUES
+           (@recordedDay, @harness, @executionMode, @trafficPurpose, @result, @deterministicCheck,
+            @reviewerUsefulness, @fallbackReason, 1, @eligibleOpportunities, @unknownOpportunityReports)
+         ON CONFLICT (
+           recorded_day,
+           harness,
+           execution_mode,
+           traffic_purpose,
+           result,
+           deterministic_check,
+           reviewer_usefulness,
+           fallback_reason
+         ) DO UPDATE SET
+           report_count = report_count + 1,
+           eligible_opportunities = eligible_opportunities + excluded.eligible_opportunities,
+           unknown_opportunity_reports = unknown_opportunity_reports + excluded.unknown_opportunity_reports`
+      )
+      .run({
+        recordedDay,
+        ...report,
+        unknownOpportunityReports: report.eligibleOpportunities === 0 ? 1 : 0,
+      });
+    return "aggregated";
+  });
+  return write.immediate();
+}
+
+/**
+ * Backward-compatible boolean facade for internal callers that only need to know whether the
+ * report was durably recorded. Both an individual row and an overflow aggregate are successful;
+ * the MCP surface uses the explicit outcome function above when it needs the distinction.
+ */
+export function recordAdoptionEvidence(report: AdoptionEvidenceReport): boolean {
+  recordAdoptionEvidenceWithOutcome(report);
   return true;
 }

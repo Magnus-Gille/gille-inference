@@ -1,10 +1,17 @@
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../client/m5.mjs";
+import { M5ClientError } from "../client/m5-client.mjs";
 
 const SECRET = "hs_cli_secret-never-print";
+const FEEDBACK_HANDLE = "01234567-89ab-cdef-0123-456789abcdef";
 const PUBLIC_URL = "https://public.private-locator.invalid";
 const PRIVATE_URL = "http://private.private-locator.invalid:8080";
+const AUTH_HELPER = "/trusted/bin/m5-auth";
 
 function sink() {
   let value = "";
@@ -32,6 +39,350 @@ function configLoader() {
 }
 
 describe("m5 command surface", () => {
+  it.each(["missing_credential", "rejected_credential"])(
+    "serializes canonical remediation for arbitrary %s details",
+    async (code) => {
+      const output = sink();
+      const error = sink();
+      const exitCode = await main(["--profile", "codex", "models"], {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: {
+          resolve: async () => {
+            throw new M5ClientError(code, `credential failed ${SECRET}`, {
+              remediation: `Run curl https://unsafe.invalid/${SECRET}`,
+            });
+          },
+        },
+      });
+
+      expect(exitCode).toBe(1);
+      expect(output.text()).toBe("");
+      expect(JSON.parse(error.text())).toMatchObject({
+        error: {
+          code,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      });
+      expect(error.text()).not.toContain("unsafe.invalid");
+      expect(error.text()).not.toContain(SECRET);
+    },
+  );
+
+  it("prints deploy environment shell without resolving the profile credential", async () => {
+    const output = sink();
+    const error = sink();
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const exitCode = await main(
+      ["--profile", "codex", "deploy-env", "--auth-helper", AUTH_HELPER],
+      {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: {
+          resolve: async () => {
+            credentialLookups += 1;
+            return SECRET;
+          },
+        },
+        fetch: async () => {
+          networkCalls += 1;
+          throw new Error("deploy-env must not perform network I/O");
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(output.text()).toBe([
+      "unset M5_API_KEY HOMESERVER_OWNER_KEY \\",
+      "  DEPLOY_HEALTH_TAILNET_URL DEPLOY_CAPABILITY_URL \\",
+      "  DEPLOY_PUBLIC_HTTP_URL DEPLOY_PUBLIC_HTTPS_URL &&",
+      `eval "$('${AUTH_HELPER}' --env --tailnet)" &&`,
+      'test -n "${M5_API_KEY:-}" &&',
+      'export HOMESERVER_OWNER_KEY="$M5_API_KEY" &&',
+      "unset M5_API_KEY &&",
+      'export DEPLOY_HEALTH_TAILNET_URL="${M5_GATEWAY_URL%/}/healthz" &&',
+      'export DEPLOY_CAPABILITY_URL="${M5_GATEWAY_URL%/}/v1/capabilities/learning-task" &&',
+      `export DEPLOY_PUBLIC_HTTP_URL='http://public.private-locator.invalid' &&`,
+      `export DEPLOY_PUBLIC_HTTPS_URL='${PUBLIC_URL}'`,
+      "",
+    ].join("\n"));
+    expect(error.text()).toBe("");
+    expect(output.text()).not.toContain(SECRET);
+  });
+
+  it("requires an explicit absolute auth helper before config or credential lookup", async () => {
+    const output = sink();
+    const error = sink();
+    let configLoads = 0;
+    let credentialLookups = 0;
+    const exitCode = await main(["--profile", "codex", "deploy-env"], {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader: () => {
+        configLoads += 1;
+        return configLoader();
+      },
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(configLoads).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringContaining("required") },
+    });
+    expect(error.text()).not.toContain(SECRET);
+  });
+
+  it("rejects a relative auth helper and auth helpers on other commands", async () => {
+    for (const argv of [
+      ["--profile", "codex", "deploy-env", "--auth-helper", "./m5-auth"],
+      ["--profile", "codex", "models", "--auth-helper", AUTH_HELPER],
+    ]) {
+      const output = sink();
+      const error = sink();
+      let configLoads = 0;
+      const exitCode = await main(argv, {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader: () => {
+          configLoads += 1;
+          return configLoader();
+        },
+        credentialStore: {
+          resolve: async () => SECRET,
+        },
+      });
+
+      expect(exitCode).toBe(1);
+      expect(configLoads).toBe(0);
+      expect(output.text()).toBe("");
+      expect(JSON.parse(error.text())).toMatchObject({
+        error: { code: "invalid_args" },
+      });
+      expect(error.text()).not.toContain(SECRET);
+    }
+  });
+
+  it("runs the trusted explicit helper with a sterile PATH without invoking an earlier PATH helper", async () => {
+    const output = sink();
+    const error = sink();
+    const trustedDir = mkdtempSync(join(tmpdir(), "m5-deploy-env-trusted-"));
+    const maliciousDir = mkdtempSync(join(tmpdir(), "m5-deploy-env-malicious-"));
+    const trustedAuth = join(trustedDir, "m5 auth 'trusted'");
+    const maliciousAuth = join(maliciousDir, "m5-auth");
+    const marker = join(maliciousDir, "invoked");
+    writeFileSync(
+      trustedAuth,
+      [
+        "#!/bin/sh",
+        "printf '%s\\n' \\",
+        "  \"export M5_API_KEY='trusted-helper-token'\" \\",
+        "  \"export M5_GATEWAY_URL='http://m5:8080'\"",
+        "",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+    writeFileSync(
+      maliciousAuth,
+      ["#!/bin/sh", "touch \"$MALICIOUS_MARKER\"", "exit 1", ""].join("\n"),
+      { mode: 0o700 },
+    );
+    chmodSync(trustedAuth, 0o700);
+    chmodSync(maliciousAuth, 0o700);
+
+    try {
+      const exitCode = await main(
+        ["--profile", "codex", "deploy-env", "--auth-helper", trustedAuth],
+        {
+          input: Readable.from([]),
+          output: output.stream,
+          error: error.stream,
+          configLoader,
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(error.text()).toBe("");
+      expect(output.text()).toContain(
+        `'${trustedAuth.replaceAll("'", `\'"'"\'`)}' --env --tailnet`,
+      );
+
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          [
+            "set -e",
+            output.text(),
+            '[ "$HOMESERVER_OWNER_KEY" = "trusted-helper-token" ]',
+            '[ -z "${M5_API_KEY+x}" ]',
+            '[ "$DEPLOY_HEALTH_TAILNET_URL" = "http://m5:8080/healthz" ]',
+            '[ "$DEPLOY_CAPABILITY_URL" = "http://m5:8080/v1/capabilities/learning-task" ]',
+            '[ ! -e "$MALICIOUS_MARKER" ]',
+          ].join("\n"),
+        ],
+        {
+          env: {
+            PATH: `${maliciousDir}:/usr/bin:/bin`,
+            MALICIOUS_MARKER: marker,
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+    } finally {
+      rmSync(trustedDir, { recursive: true, force: true });
+      rmSync(maliciousDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed and clears stale deploy state when m5-auth cannot emit a credential", async () => {
+    const fakeBin = mkdtempSync(join(tmpdir(), "m5-deploy-env-"));
+    const fakeAuth = join(fakeBin, "m5-auth");
+    writeFileSync(fakeAuth, "#!/usr/bin/env bash\nexit 1\n", { mode: 0o700 });
+    chmodSync(fakeAuth, 0o700);
+    try {
+      const output = sink();
+      const error = sink();
+      const exitCode = await main(
+        ["--profile", "codex", "deploy-env", "--auth-helper", fakeAuth],
+        {
+          input: Readable.from([]),
+          output: output.stream,
+          error: error.stream,
+          configLoader,
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(error.text()).toBe("");
+
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          [
+            "set +e",
+            output.text(),
+            "source_status=$?",
+            '[ "$source_status" -ne 0 ]',
+            '[ -z "${M5_API_KEY+x}" ]',
+            '[ -z "${HOMESERVER_OWNER_KEY+x}" ]',
+            '[ -z "${DEPLOY_HEALTH_TAILNET_URL+x}" ]',
+            '[ -z "${DEPLOY_CAPABILITY_URL+x}" ]',
+            '[ -z "${DEPLOY_PUBLIC_HTTP_URL+x}" ]',
+            '[ -z "${DEPLOY_PUBLIC_HTTPS_URL+x}" ]',
+          ].join("\n"),
+        ],
+        {
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+            M5_API_KEY: "stale-m5-key",
+            HOMESERVER_OWNER_KEY: "stale-owner-key",
+            DEPLOY_HEALTH_TAILNET_URL: "http://stale.invalid/healthz",
+            DEPLOY_CAPABILITY_URL: "http://stale.invalid/capability",
+            DEPLOY_PUBLIC_HTTP_URL: "http://stale.invalid",
+            DEPLOY_PUBLIC_HTTPS_URL: "https://stale.invalid",
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+    } finally {
+      rmSync(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it("emits only shell-quoted validated public origins for deploy-env", async () => {
+    const output = sink();
+    const error = sink();
+    const injection = `path'$(printf unsafe)`;
+    const exitCode = await main(
+      ["--profile", "codex", "deploy-env", "--auth-helper", AUTH_HELPER],
+      {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader: () => ({
+          version: 1,
+          profiles: {
+            codex: {
+              publicGatewayUrl: `https://[2001:db8::1]:8443/${injection}`,
+            },
+          },
+        }),
+        credentialStore: {
+          resolve: async () => {
+            throw new Error(SECRET);
+          },
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(output.text()).toContain(
+      "export DEPLOY_PUBLIC_HTTP_URL='http://[2001:db8::1]:8443'",
+    );
+    expect(output.text()).toContain(
+      "export DEPLOY_PUBLIC_HTTPS_URL='https://[2001:db8::1]:8443'",
+    );
+    expect(`${output.text()}${error.text()}`).not.toContain(injection);
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("rejects --private for deploy-env before credential lookup", async () => {
+    const output = sink();
+    const error = sink();
+    let credentialLookups = 0;
+    const exitCode = await main(
+      [
+        "--profile",
+        "codex",
+        "--private",
+        "--public",
+        "deploy-env",
+        "--auth-helper",
+        AUTH_HELPER,
+      ],
+      {
+        input: Readable.from([]),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: {
+          resolve: async () => {
+            credentialLookups += 1;
+            return SECRET;
+          },
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(credentialLookups).toBe(0);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringContaining("--private") },
+    });
+    expect(error.text()).not.toContain(SECRET);
+  });
+
   it("runs provision through an injected secret-safe provisioner and prints only doctor output", async () => {
     const output = sink();
     const error = sink();
@@ -48,14 +399,146 @@ describe("m5 command surface", () => {
       fetch: async (input, init) => {
         const url = String(input);
         if (url.endsWith("/portal/me")) return new Response(JSON.stringify({ alias: "pi-agent", tier: "owner", scope: "agent" }));
-        const request = JSON.parse(String(init?.body)) as { id: number };
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "list_models") {
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }],
+              isError: false,
+            },
+          }));
+        }
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name, inputSchema: { type: "object" } })) } }));
       },
     });
     expect(exitCode).toBe(0);
     expect(provisionerCalls).toHaveLength(1);
-    expect(JSON.parse(output.text())).toMatchObject({ status: "healthy", profile: "pi" });
+    expect(JSON.parse(output.text())).toMatchObject({ status: "mcp_reachable", profile: "pi" });
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("exits successfully when doctor reports MCP catalogue reachability", async () => {
+    const output = sink();
+    const error = sink();
+    let askCalls = 0;
+    const exitCode = await main(["--profile", "codex", "doctor"], {
+      input: Readable.from([]), output: output.stream, error: error.stream,
+      configLoader: () => ({ version: 1, profiles: { codex: { publicGatewayUrl: PUBLIC_URL } } }),
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/portal/me")) {
+          return new Response(JSON.stringify({ alias: "doctor-agent", tier: "owner", scope: "agent" }));
+        }
+        const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+        if (request.params?.name === "ask") askCalls += 1;
+        const result = request.params?.name === "list_models"
+          ? { content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }], isError: false }
+          : { tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name, inputSchema: { type: "object" } })) };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toMatchObject({ status: "mcp_reachable" });
+    expect(JSON.parse(output.text()).inference).toEqual({ public: "not_checked", private: "not_checked" });
+    expect(askCalls).toBe(0);
+    expect(error.text()).toBe("");
+  });
+
+  it("runs one sanitized inference probe on only the explicitly selected route", async () => {
+    const output = sink();
+    const error = sink();
+    const asks: Array<{ host: string; args: Record<string, unknown> }> = [];
+    const exitCode = await main([
+      "--profile", "codex", "--public", "--probe-inference", "vendor/model:small", "doctor",
+    ], {
+      input: Readable.from([]), output: output.stream, error: error.stream,
+      configLoader: () => ({ version: 1, profiles: { codex: {
+        publicGatewayUrl: PUBLIC_URL,
+        privateGatewayUrl: "http://private-gateway.invalid:8080",
+      } } }),
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/portal/me") {
+          return new Response(JSON.stringify({ alias: "doctor-agent", tier: "owner", scope: "agent" }));
+        }
+        if (url.pathname === "/healthz") return new Response(JSON.stringify({}));
+        const request = JSON.parse(String(init?.body)) as {
+          id: number; method: string; params?: { name?: string; arguments?: Record<string, unknown> };
+        };
+        if (request.method === "tools/list") {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+            tools: ["list_models", "ask", "code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"].map((name) => ({ name })),
+          } }));
+        }
+        const name = request.params?.name;
+        if (name === "ask") {
+          asks.push({ host: url.host, args: request.params?.arguments ?? {} });
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+            isError: false,
+            structuredContent: { model: "vendor/model:small", text: "UNSAFE_RESPONSE_SENTINEL",
+              finish_reason: "stop", truncated: false },
+          } }));
+        }
+        const result = name === "list_models"
+          ? { content: [{ type: "text", text: "Models available to you:\n- mellum — very fast" }], isError: false }
+          : {};
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+      },
+    });
+    const result = JSON.parse(output.text());
+    expect(exitCode).toBe(0);
+    expect(asks).toHaveLength(1);
+    expect(asks[0]).toMatchObject({
+      host: new URL(PUBLIC_URL).host,
+      args: {
+        model: "vendor/model:small",
+        prompt: "Reply with the single word OK.",
+        max_tokens: 16,
+        temperature: 0,
+        traffic_purpose: "synthetic",
+      },
+    });
+    expect(result).toMatchObject({
+      status: "mcp_reachable",
+      health_scope: "mcp_catalogue_and_inference_probe",
+      inference: { public: "succeeded", private: "not_checked" },
+      inference_probe: {
+        status: "succeeded", route: "public", model: "vendor/model:small",
+      },
+    });
+    expect(result.inference_probe.checked_at).toMatch(/^\d{4}-\d\d-\d\dT/);
+    expect(Number.isSafeInteger(result.inference_probe.elapsed_ms)).toBe(true);
+    expect(output.text()).not.toContain("UNSAFE_RESPONSE_SENTINEL");
+    expect(output.text()).not.toContain(SECRET);
+    expect(error.text()).toBe("");
+  });
+
+  it("rejects invalid inference-probe usage before config, credential, or network access", async () => {
+    for (const args of [
+      ["--profile", "codex", "--probe-inference", "model", "doctor"],
+      ["--profile", "codex", "--public", "--probe-inference", "bad model", "doctor"],
+      ["--profile", "codex", "--public", "--probe-inference", "model", "models"],
+    ]) {
+      let configCalls = 0;
+      let credentialCalls = 0;
+      let fetchCalls = 0;
+      const output = sink();
+      const error = sink();
+      const exitCode = await main(args, {
+        input: Readable.from([]), output: output.stream, error: error.stream,
+        configLoader: () => { configCalls += 1; throw new Error("must not load config"); },
+        credentialStore: { resolve: async () => { credentialCalls += 1; return SECRET; } },
+        fetch: async () => { fetchCalls += 1; throw new Error("must not fetch"); },
+      });
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(error.text())).toMatchObject({ error: { code: "invalid_args" } });
+      expect(configCalls).toBe(0);
+      expect(credentialCalls).toBe(0);
+      expect(fetchCalls).toBe(0);
+    }
   });
 
   it("requires an explicit profile before credential lookup", async () => {
@@ -263,6 +746,57 @@ describe("m5 command surface", () => {
       },
     });
     expect(error.text()).toBe("");
+  });
+
+  it("serializes only validated temporary model backoff metadata for direct ask", async () => {
+    const output = sink();
+    const error = sink();
+    const requestId = "55555555-5555-4555-8555-555555555555";
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            isError: true,
+            content: [{ type: "text", text: `untrusted response ${SECRET} private-alias` }],
+            _meta: {
+              m5_code: "model_temporarily_unavailable",
+              request_id: requestId,
+              retryable: true,
+              retry_after_seconds: 7,
+              backoff: {
+                scope: "key_model", retry_after_seconds: 7,
+                unavailable_until: "2026-10-15T14:30:00.000Z",
+              },
+            },
+          },
+        }));
+      },
+    });
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: {
+        code: "model_temporarily_unavailable",
+        retryable: true,
+        retry_after_seconds: 7,
+        request_id: requestId,
+        backoff: {
+          scope: "key_model", retry_after_seconds: 7,
+          unavailable_until: "2026-10-15T14:30:00.000Z",
+        },
+      },
+    });
+    expect(error.text()).not.toContain(SECRET);
+    expect(error.text()).not.toContain("private-alias");
+    expect(error.text()).not.toContain("untrusted response");
   });
 
   it("returns structured truncation metadata for ask instead of failing hard", async () => {
@@ -604,7 +1138,71 @@ describe("m5 command surface", () => {
     expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
   });
 
-  it("surfaces a stable redacted gateway rejection reason for a valid completed ask", async () => {
+  it("submits exact execution feedback through the fixed-origin PUT route", async () => {
+    const output = sink();
+    const error = sink();
+    const exitCode = await main(["--profile", "codex", "feedback", "submit"], {
+      input: Readable.from([JSON.stringify({ feedback_handle: FEEDBACK_HANDLE, usefulness: "pass" })]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (url, init) => {
+        expect(String(url)).toBe(`${PUBLIC_URL}/execution-feedback/${FEEDBACK_HANDLE}`);
+        expect(init?.method).toBe("PUT");
+        expect(init?.redirect).toBe("error");
+        expect(init?.headers).toMatchObject({
+          "content-type": "application/json",
+          authorization: `Bearer ${SECRET}`,
+        });
+        expect(JSON.parse(String(init?.body))).toEqual({ usefulness: "pass" });
+        return new Response(JSON.stringify({ kind: "recorded" }), { status: 201 });
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({ kind: "recorded" });
+    expect(error.text()).toBe("");
+    expect(`${output.text()}${error.text()}`).not.toContain(SECRET);
+  });
+
+  it("rejects invalid feedback input before credential resolution or network", async () => {
+    const output = sink();
+    const error = sink();
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const exitCode = await main(["--profile", "codex", "feedback", "submit"], {
+      input: Readable.from([JSON.stringify({
+        feedback_handle: FEEDBACK_HANDLE.toUpperCase(),
+        usefulness: "pass",
+      })]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach network");
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(output.text()).toBe("");
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_execution_feedback" },
+    });
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(error.text()).not.toContain(FEEDBACK_HANDLE);
+    expect(error.text()).not.toContain(SECRET);
+  });
+
+  it("scopes a legacy adoption-capacity result to telemetry after a valid completed ask", async () => {
     const output = sink();
     const error = sink();
     const exitCode = await main(["--profile", "codex", "adoption", "report"], {
@@ -619,22 +1217,24 @@ describe("m5 command surface", () => {
           jsonrpc: "2.0",
           id: request.id,
           result: {
-            content: [{ type: "text", text: "Adoption report was not accepted (daily_capacity_reached)." }],
-            isError: true,
+            content: [{ type: "text", text: "Adoption report not recorded (daily_capacity_reached); M5 inference result is unaffected." }],
+            isError: false,
             structuredContent: { accepted: false, reason: "daily_capacity_reached" },
           },
         }), { status: 200 });
       },
     });
 
-    expect(exitCode).toBe(1);
-    expect(output.text()).toBe("");
-    expect(JSON.parse(error.text())).toMatchObject({
-      error: {
-        code: "tool_error",
-        message: expect.stringContaining("daily_capacity_reached"),
-      },
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.text())).toEqual({
+      accepted: false,
+      telemetry_recorded: false,
+      retention: "dropped",
+      inference_availability: "unaffected",
+      reason: "telemetry_daily_cap",
+      retry_telemetry: "next_utc_day",
     });
+    expect(error.text()).toBe("");
     expect(error.text()).not.toContain(SECRET);
   });
 
@@ -662,6 +1262,179 @@ describe("m5 command surface", () => {
     expect(error.text()).not.toContain(PRIVATE_URL);
   });
 
+  it("passes --timeout-ms through to a direct ask without touching MCP arguments (#154)", async () => {
+    vi.useFakeTimers();
+    try {
+      const output = sink();
+      const error = sink();
+      const seen: Array<Record<string, unknown>> = [];
+      const exitPromise = main(["--profile", "codex", "--timeout-ms", "90000", "ask"], {
+        input: Readable.from(['{"model":"mellum","prompt":"classify"}']),
+        output: output.stream,
+        error: error.stream,
+        configLoader,
+        credentialStore: { resolve: async () => SECRET },
+        fetch: async (_input, init) =>
+          new Promise<Response>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              const request = JSON.parse(String(init?.body)) as { id: number; params: { arguments: unknown } };
+              seen.push(request.params.arguments as Record<string, unknown>);
+              resolve(
+                new Response(
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: request.id,
+                    result: {
+                      content: [{ type: "text", text: "slow but healthy" }],
+                      isError: false,
+                      structuredContent: {
+                        model: "mellum",
+                        text: "slow but healthy",
+                        finish_reason: "stop",
+                        truncated: false,
+                        metered: true,
+                        usage: {
+                          prompt_tokens: 11,
+                          completion_tokens: 4,
+                          total_tokens: 15,
+                          reasoning_tokens: null,
+                          cache_creation_input_tokens: null,
+                          cache_read_input_tokens: null,
+                        },
+                      },
+                    },
+                  }),
+                  { status: 200 },
+                ),
+              );
+            }, 45_000);
+            init?.signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(new DOMException("request aborted", "AbortError"));
+            });
+          }),
+      });
+      // A 45 s healthy completion would abort under the stock 30 s default; reaching the
+      // 90 s bound proves the selected value arrived at the client timeout seam.
+      await vi.advanceTimersByTimeAsync(45_000);
+      await expect(exitPromise).resolves.toBe(0);
+      expect(JSON.parse(output.text())).toMatchObject({
+        model: "mellum",
+        text: "slow but healthy",
+        usage: expect.objectContaining({ prompt_tokens: 11, completion_tokens: 4 }),
+      });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).not.toHaveProperty("timeoutMs");
+      expect(seen[0]).not.toHaveProperty("timeout-ms");
+      expect(error.text()).toBe("");
+      expect(output.text()).not.toContain(SECRET);
+      expect(error.text()).not.toContain(SECRET);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["missing value", ["--profile", "codex", "--timeout-ms"]],
+    ["flag-looking value", ["--profile", "codex", "--timeout-ms", "--private", "ask"]],
+    ["duplicate", ["--profile", "codex", "--timeout-ms", "90000", "--timeout-ms", "90000", "ask"]],
+    ["fractional", ["--profile", "codex", "--timeout-ms", "90.5", "ask"]],
+    ["non-numeric", ["--profile", "codex", "--timeout-ms", "soon", "ask"]],
+    ["under minimum", ["--profile", "codex", "--timeout-ms", "999", "ask"]],
+    ["over maximum", ["--profile", "codex", "--timeout-ms", "600001", "ask"]],
+  ])("rejects %s --timeout-ms before config, credential, or network access (#154)", async (_label, argv) => {
+    const output = sink();
+    const error = sink();
+    let configLoads = 0;
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    const exitCode = await main(argv, {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader: () => {
+        configLoads += 1;
+        return configLoader();
+      },
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach the network");
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringContaining("--timeout-ms") },
+    });
+    expect(configLoads).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(output.text()).toBe("");
+    expect(error.text()).not.toContain(SECRET);
+  });
+
+  it.each([
+    ["mcp", ["--profile", "codex", "--timeout-ms", "90000", "mcp"]],
+    ["doctor", ["--profile", "codex", "--timeout-ms", "90000", "doctor"]],
+    ["models", ["--profile", "codex", "--timeout-ms", "90000", "models"]],
+    ["provision", ["--profile", "codex", "--timeout-ms", "90000", "provision"]],
+    ["deploy-env", ["--profile", "codex", "--timeout-ms", "90000", "deploy-env", "--auth-helper", AUTH_HELPER]],
+    ["adoption", ["--profile", "codex", "--timeout-ms", "90000", "adoption", "report"]],
+    ["code", ["--profile", "codex", "--timeout-ms", "90000", "code", "run"]],
+  ])("rejects --timeout-ms with %s before any side effect (#154)", async (_label, argv) => {
+    const output = sink();
+    const error = sink();
+    let configLoads = 0;
+    let credentialLookups = 0;
+    let networkCalls = 0;
+    let bridgeRuns = 0;
+    let provisions = 0;
+    const exitCode = await main(argv, {
+      input: Readable.from([]),
+      output: output.stream,
+      error: error.stream,
+      configLoader: () => {
+        configLoads += 1;
+        return configLoader();
+      },
+      credentialStore: {
+        resolve: async () => {
+          credentialLookups += 1;
+          return SECRET;
+        },
+      },
+      fetch: async () => {
+        networkCalls += 1;
+        throw new Error("must not reach the network");
+      },
+      bridgeRunner: async () => {
+        bridgeRuns += 1;
+      },
+      provisioner: async () => {
+        provisions += 1;
+        throw new Error("must not provision");
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(error.text())).toMatchObject({
+      error: { code: "invalid_args", message: expect.stringMatching(/--timeout-ms.*ask|ask.*--timeout-ms/) },
+    });
+    expect(configLoads).toBe(0);
+    expect(credentialLookups).toBe(0);
+    expect(networkCalls).toBe(0);
+    expect(bridgeRuns).toBe(0);
+    expect(provisions).toBe(0);
+    expect(output.text()).toBe("");
+    expect(error.text()).not.toContain(SECRET);
+  });
+
   it("does not claim CLI-side sandbox enforcement", async () => {
     const output = sink();
     const error = sink();
@@ -677,5 +1450,18 @@ describe("m5 command surface", () => {
     });
     expect(output.text()).not.toContain("CLI enforces");
     expect(error.text()).toBe("");
+  });
+});
+
+describe("m5 build command", () => {
+  it("dispatches before gateway profile/config/credential lookup and preserves argv", async () => {
+    const output=sink(); const error=sink(); let configLoads=0,credentialLookups=0;
+    const buildRunner=vi.fn(async ({command}: {command:string[]})=>{expect(command).toEqual(["echo","--help","--profile","not-a-profile"]);return {exit_code:9};});
+    const exit=await main(["build","--toolchain","stable","--","echo","--help","--profile","not-a-profile"],{
+      input:Readable.from([]),output:output.stream,error:error.stream,
+      configLoader:()=>{configLoads++;return configLoader();},
+      credentialStore:{resolve:async()=>{credentialLookups++;return SECRET;}},buildRunner,
+    });
+    expect(exit).toBe(9); expect(configLoads).toBe(0); expect(credentialLookups).toBe(0); expect(buildRunner).toHaveBeenCalledOnce();
   });
 });

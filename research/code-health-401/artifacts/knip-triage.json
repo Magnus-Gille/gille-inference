@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "method": {
+    "artifact": "gille-inference/research/code-health-401/artifacts/raw/knip-valid-normal-node22.json",
+    "config": "gille-inference/research/code-health-401/knip-valid.json",
+    "selection": "Ten source/runtime-sensitive rows selected from Knip's candidate files/export rows, prioritizing recent churn and operational reachability over the artifact's alphabetical script ordering.",
+    "manual_checks": [
+      "Inspected exact import and call sites with rg and numbered source excerpts under src, scripts, tests, and package.json.",
+      "Compared recent file churn with git log --since=2026-09-01 --numstat.",
+      "Checked package scripts and the explicit Knip entry list; tests are ignored and several operational scripts are not entries.",
+      "Did not inspect .env files, secrets, private data, or external state; made no repository edits."
+    ],
+    "limitation": "The analyzer graph is configuration-sensitive: a reported file can still be imported by an omitted operational script or ignored test, and an export can be used internally or only by tests. These rows are triage evidence, not deletion recommendations."
+  },
+  "candidates": [
+    {
+      "path": "src/homeserver/m3-qualification.ts",
+      "candidate_type": "unused-file",
+      "classification": "false-positive",
+      "impact": "M3 qualification and first-canary decision logic.",
+      "recent_churn": "1380 lines changed since 2026-09-01 (1354 additions, 26 deletions); latest d132af7 on 2026-09-09.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:.files reports this path.",
+        "scripts/qualify-m3.ts:4-12 imports evaluateM3Qualification, evaluateM3FirstCanaryQualification, and contract constants from this module.",
+        "tests/homeserver-m3-qualification.test.ts:16 and tests/qualify-m3-cli.test.ts:16 import the evaluator for regression coverage.",
+        "package.json:scripts has no qualify-m3 entry, and knip-valid.json:entry does not include scripts/qualify-m3.ts; that omission explains the file finding."
+      ],
+      "assessment": "The evaluator is reachable through the explicit qualification CLI and tests. Keep; do not treat the Knip row as an unused runtime file."
+    },
+    {
+      "path": "src/homeserver/adoption-evidence-bundle.ts",
+      "candidate_type": "unused-file",
+      "classification": "false-positive",
+      "impact": "Content-blind adoption evidence export used for M2/M5 measurement.",
+      "recent_churn": "1034 lines changed since 2026-09-01 (962 additions, 72 deletions); latest 551600d on 2026-09-08.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:.files reports this path.",
+        "scripts/export-m5-adoption-evidence.ts:14-19 imports buildAdoptionEvidenceBundle and its bundle types.",
+        "tests/homeserver-adoption-evidence-bundle.test.ts:9 imports the module and exercises the v2 contract.",
+        "scripts/export-m5-adoption-evidence.ts is not an entry in knip-valid.json, while tests/** is explicitly ignored."
+      ],
+      "assessment": "The report exporter and tests prove intentional use. False positive caused by entry/test scope; keep."
+    },
+    {
+      "path": "src/homeserver/ask-grounding.ts",
+      "candidate_type": "unused-file",
+      "classification": "uncertain",
+      "impact": "Grounding checker for the ask/recovery benchmark and semantic evidence checks.",
+      "recent_churn": "939 lines changed since 2026-09-01 (796 additions, 143 deletions); latest 034e38b on 2026-09-21.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:.files reports this path.",
+        "tests/ask-grounding.test.ts:6-11 imports askGroundingFixtureSchema, checkAskGrounding, and checkVerifyAgainstSource.",
+        "src/homeserver/ask-grounding.ts:35,568,629 defines the fixture schema and the two checker functions.",
+        "No src/**, scripts/**, or package.json runtime/operational import was found beyond the test; benchmarks/ask-grounding is referenced by tests/ask-grounding.test.ts:17."
+      ],
+      "assessment": "This looks intentionally benchmark/test-only, but the absence of an operational consumer means ownership intent is unresolved. Do not delete without confirming the benchmark contract; no evidence of a production runtime path."
+    },
+    {
+      "path": "src/homeserver/halogen-host-operations.ts",
+      "candidate_type": "unused-file",
+      "classification": "false-positive",
+      "impact": "Pinned Halogen host plan, cleanup, and contained execution operations.",
+      "recent_churn": "541 lines changed since 2026-09-01 (514 additions, 27 deletions); latest a2f2f33 on 2026-09-20.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:.files reports this path.",
+        "scripts/run-halogen-compatibility.ts:7 imports halogenHostPlanSchema, createHalogenHostOperations, and fileSha256.",
+        "tests/halogen-host-operations.test.ts:148 and tests/halogen-host-operations-cleanup.test.ts:123 dynamically import the module.",
+        "tests/halogen-runtime-cli.test.ts:204 references the module's runtime bundle boundary; scripts/run-halogen-compatibility.ts is not a configured Knip entry."
+      ],
+      "assessment": "The operator script and focused tests are concrete consumers. False positive from omitted script/test graph; keep."
+    },
+    {
+      "path": "src/homeserver/retention-registry.ts",
+      "candidate_type": "unused-file",
+      "classification": "false-positive",
+      "impact": "Authoritative registry for retention and erasure store descriptors.",
+      "recent_churn": "54 lines changed since 2026-09-01; latest 551600d on 2026-09-08.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:.files reports this path.",
+        "src/homeserver/retention-enforcement.ts:19-23 imports HARVEST_STORE_REGISTRY and prunableHarvestStores.",
+        "src/homeserver/retention-prune-gate.ts:40 imports getHarvestStoreDescriptor, and src/homeserver/retention-erasure.ts:43 imports HARVEST_STORE_REGISTRY and getHarvestStoreDescriptor.",
+        "tests/homeserver-retention-registry.test.ts:10 and tests/homeserver-retention-enforcement.test.ts:25 import the registry; scripts/retention-cli.ts imports the owning operations."
+      ],
+      "assessment": "This is a live internal dependency of retention dry-run/prune/erasure paths, not an unused file. False positive; keep."
+    },
+    {
+      "path": "src/homeserver/strix-benchmark.ts:normalizeLlamaBenchRows@265",
+      "candidate_type": "unused-export",
+      "classification": "false-positive",
+      "export_usage": "test-only-export; implementation is runtime-reachable internally",
+      "impact": "Normalizes llama-bench rows before benchmark reports are emitted.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:issues reports export normalizeLlamaBenchRows at line 265.",
+        "src/homeserver/strix-benchmark.ts:308 calls normalizeLlamaBenchRows from makeStrixBenchmarkReport, which is imported by scripts/strix-benchmark.ts:30-39.",
+        "tests/strix-benchmark.test.ts:6 and :161-170 import and directly exercise the export.",
+        "No non-test external import of this symbol was found; the export exists to support focused tests."
+      ],
+      "assessment": "Test-only export, not unreachable code. Removing export would break tests; no deletion recommendation."
+    },
+    {
+      "path": "src/homeserver/strix-combined-experiment.ts:buildStrixKvRunPlans@385",
+      "candidate_type": "unused-export",
+      "classification": "false-positive",
+      "export_usage": "test-only-export; implementation is runtime-reachable internally",
+      "impact": "Builds the mirrored KV experiment run plan used by the combined experiment.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:issues reports buildStrixKvRunPlans at line 385.",
+        "src/homeserver/strix-combined-experiment.ts:448 calls it from executeStrixCombinedExperiment, which is imported by scripts/strix-combined-experiment.ts:26.",
+        "tests/strix-combined-experiment.test.ts:7 and :21,34 import and directly exercise the export.",
+        "No non-test external import of this symbol was found."
+      ],
+      "assessment": "Test-only export; code is reachable through the production/operator experiment path. Not unreachable."
+    },
+    {
+      "path": "src/homeserver/model-release-staging.ts:buildModelStagePlan@278",
+      "candidate_type": "unused-export",
+      "classification": "false-positive",
+      "export_usage": "test-only-export; implementation is runtime-reachable internally",
+      "impact": "Validates immutable public model metadata and produces a staging plan.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:issues reports buildModelStagePlan at line 278.",
+        "src/homeserver/model-release-staging.ts:416 calls it from collectPublicStagePlan, which is imported by scripts/stage-model-release.ts:12-17.",
+        "tests/model-release-staging.test.ts:8 and :92-200 import and directly exercise buildModelStagePlan.",
+        "No non-test external import of this symbol was found."
+      ],
+      "assessment": "Test-only export; staging behavior is reachable through the release CLI. Not unreachable."
+    },
+    {
+      "path": "src/homeserver/model-release-ingestion.ts:buildReleaseArchive@464",
+      "candidate_type": "unused-export",
+      "classification": "false-positive",
+      "export_usage": "test-only-export; implementation is runtime-reachable internally",
+      "impact": "Creates the immutable release archive and inspection/report files.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:issues reports buildReleaseArchive at line 464.",
+        "src/homeserver/model-release-ingestion.ts:481-507 calls it from the archive-building path; :633 calls it from writeReleaseArchive, which is imported by scripts/ingest-model-release.ts:20-22.",
+        "tests/model-release-ingestion.test.ts:7-12 and :210-325 import and directly exercise buildReleaseArchive.",
+        "No non-test external import of this symbol was found."
+      ],
+      "assessment": "Test-only export; the implementation is reached by the release ingestion CLI through writeReleaseArchive. Not unreachable."
+    },
+    {
+      "path": "src/homeserver/strix-combined-experiment.ts:assertExpectedStrixResidency@426",
+      "candidate_type": "unused-export",
+      "classification": "uncertain",
+      "export_usage": "internal-only-export; no direct test or external import found",
+      "impact": "Enforces the serial-GPU residency invariant around the combined experiment.",
+      "evidence": [
+        "research/code-health-401/artifacts/raw/knip-valid-normal-node22.json:issues reports assertExpectedStrixResidency at line 426.",
+        "src/homeserver/strix-combined-experiment.ts:442,446,483 calls it inside executeStrixCombinedExperiment, which is imported by scripts/strix-combined-experiment.ts:26.",
+        "No tests/** or other src/**/scripts/** import of this symbol was found; the callers in the same module make the implementation reachable.",
+        "The symbol is exported despite having no observed external consumer; that is an export-surface question, not evidence of unreachable code."
+      ],
+      "assessment": "Uncertain export cleanup candidate. Preserve because it enforces a safety invariant on the live experiment path; confirm public/test API intent before changing export visibility."
+    }
+  ],
+  "graph_sanity": {
+    "classification": "unknown",
+    "evidence": [
+      "src/homeserver/cli.ts:15 imports startGateway from ./gateway.js and :990-992 calls startGateway() for the serve command.",
+      "src/homeserver/gateway.ts:3871-3889 creates the server and dispatches requests to handleRequest; the entry chain is concrete even though many gateway dependencies are not Knip file candidates.",
+      "Runtime dependencies are declared in package.json:dependencies (better-sqlite3, openai, tsx, zod) and have direct source imports, including src/db.ts:1 (better-sqlite3), src/runner/openrouter-client.ts:1 (openai), src/homeserver/roster-proposal.ts:12 (zod), and src/homeserver/cli.ts:15 (gateway).",
+      "The report's separate production dependency rows therefore cannot justify dependency removal; the configured entry/project graph remains unsuitable for deletion decisions without a broader validated runtime and operational entry inventory."
+    ],
+    "conclusion": "Known cli-to-gateway reachability and runtime dependency imports keep the analyzer graph failure/configuration gap unknown."
+  },
+  "acceptance": {
+    "triages": 10,
+    "evidence_references": true,
+    "test_only_exports_identified": true,
+    "truly_unreachable_implementations_found": false,
+    "deletion_or_refactor_performed": false
+  }
+}

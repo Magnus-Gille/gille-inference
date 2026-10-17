@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,14 +28,30 @@ let upstream: Server;
 let upstreamPort = 0;
 let upstreamHits = 0;
 let lastUpstreamBody = "";
+let tokenizerReply: unknown = { tokens: [{ id: 1, piece: "Hej" }, { id: 2, piece: " " }, { id: 3, piece: [195] }, { id: 4, piece: [165] }] };
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.method === "GET" && req.url === "/running") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ running: [] }));
+      return;
+    }
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: "mellum", object: "model" }] }));
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       upstreamHits++;
       lastUpstreamBody = Buffer.concat(chunks).toString();
+      if (req.url?.startsWith("/upstream/") && req.url.endsWith("/tokenize")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(tokenizerReply));
+        return;
+      }
       // Test hook: the sentinel model id "boom-model" forces an upstream 5xx so the failure path
       // (outcome="error" + error_class="infra") can be exercised. Other model ids are unaffected.
       let reqModel = "";
@@ -153,11 +169,11 @@ beforeAll(async () => {
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
-  process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
+  process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_REDEEM_RPM"] = "10000";
   process.env["HOMESERVER_DELEGATION_COST_LOG"] = "on";
-  delete process.env["HOMESERVER_API_KEYS"];
+  process.env["HOMESERVER_API_KEYS"] = "test-legacy-static-a,test-legacy-static-b";
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
 
   const ks = await import("../src/homeserver/keystore.js");
@@ -227,6 +243,33 @@ function askCapability(tool: {
 }
 
 // ─── initialize ─────────────────────────────────────────────────────────────────────
+
+describe("MCP tokenize", () => {
+  const call = (args: unknown, key = openKey) => rpc({ jsonrpc: "2.0", id: 438, method: "tools/call", params: { name: "tokenize", arguments: args } }, key);
+  it("advertises a dedicated deterministic tool", async () => {
+    const body = await (await rpc({ jsonrpc: "2.0", id: 438, method: "tools/list" })).json();
+    expect(body.result.tools.find((tool: { name: string }) => tool.name === "tokenize")).toMatchObject({
+      inputSchema: { required: ["model", "text"], additionalProperties: false },
+      outputSchema: { type: "object", required: expect.arrayContaining(["model", "count", "tokens", "pieces"]) },
+    });
+  });
+  it("returns exact native IDs and byte pieces without generation or credit charges", async () => {
+    const before = lookupKey(creditKey)!.creditsUsed;
+    const body = await (await call({ model: "mellum", text: "Hej å" }, creditKey)).json();
+    expect(body.result.isError).toBe(false);
+    expect(body.result.structuredContent).toEqual({ model: "mellum", count: 4, tokens: [1, 2, 3, 4], pieces: ["Hej", " ", [195], [165]], add_special: false, parse_special: false });
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ content: "Hej å", add_special: false, parse_special: false, with_pieces: true });
+    expect(lookupKey(creditKey)!.creditsUsed).toBe(before);
+    expect(JSON.parse(body.result.content[0].text)).toEqual(body.result.structuredContent);
+  });
+  it("enforces the key model grant before contacting the backend", async () => {
+    const before = upstreamHits;
+    const body = await (await call({ model: "mellum", text: "Hej" }, scopedKey)).json();
+    expect(body.result.isError).toBe(true);
+    expect(body.result._meta.m5_code).toBe("model_not_allowed");
+    expect(upstreamHits).toBe(before);
+  });
+});
 
 describe("MCP initialize", () => {
   it("returns protocolVersion + capabilities.tools + serverInfo and an Mcp-Session-Id header", async () => {
@@ -443,6 +486,100 @@ describe("MCP tools/call list_models", () => {
 // ─── tools/call ask (valid model) ────────────────────────────────────────────────────
 
 describe("MCP tools/call ask", () => {
+  it("advertises and applies the complete-within-budget profile for gpt-oss", async () => {
+    const listed = await rpc({ jsonrpc: "2.0", id: 39, method: "tools/list" });
+    const listedJson = (await listed.json()) as {
+      result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }> };
+    };
+    const ask = listedJson.result.tools.find((tool) => tool.name === "ask")!;
+    expect(ask.inputSchema.properties["output_profile"]).toEqual({
+      type: "string",
+      enum: ["complete-within-budget"],
+      description: expect.stringMatching(/section|structure|budget/i),
+    });
+
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 39.1,
+        method: "tools/call",
+        params: {
+          name: "ask",
+          arguments: {
+            model: "gpt-oss-120b",
+            prompt: "Return exactly three compact sections within 700 words.",
+            system: "Use plain text.",
+            max_tokens: 1200,
+            output_profile: "complete-within-budget",
+          },
+        },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(lastUpstreamBody) as {
+      reasoning_effort?: string;
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(sent.reasoning_effort).toBe("low");
+    expect(sent.messages).toHaveLength(2);
+    expect(sent.messages[0]).toMatchObject({ role: "system" });
+    expect(sent.messages[0]!.content).toContain("Use plain text.");
+    expect(sent.messages[0]!.content).toMatch(/complete every explicitly requested section/i);
+    expect(sent.messages[0]!.content).toMatch(/compress/i);
+    expect(sent.messages[0]!.content).toMatch(/stop immediately.*do not re-evaluate/i);
+    expect(sent.messages[0]!.content.indexOf("Use plain text.")).toBeLessThan(
+      sent.messages[0]!.content.indexOf("Output contract:")
+    );
+    expect(sent.messages[1]).toEqual({
+      role: "user",
+      content: "Return exactly three compact sections within 700 words.",
+    });
+  });
+
+  it("rejects unknown output profiles before admission or upstream work", async () => {
+    const before = upstreamHits;
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 39.2,
+        method: "tools/call",
+        params: {
+          name: "ask",
+          arguments: { model: "any-model", prompt: "hello", output_profile: "verbose" },
+        },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { result: { isError: boolean; content: Array<{ text: string }> } };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toMatch(/output_profile.*complete-within-budget/i);
+    expect(upstreamHits).toBe(before);
+  });
+
+  it("does not enable model-specific reasoning controls for misleading non-gpt-oss model ids", async () => {
+    const res = await rpc(
+      {
+        jsonrpc: "2.0",
+        id: 39.3,
+        method: "tools/call",
+        params: {
+          name: "ask",
+          arguments: {
+            model: "not-gpt-oss-fake",
+            prompt: "Return both requested sections.",
+            output_profile: "complete-within-budget",
+          },
+        },
+      },
+      openKey
+    );
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(lastUpstreamBody) as Record<string, unknown>;
+    expect(sent).not.toHaveProperty("reasoning_effort");
+  });
+
   it("forwards explicit sampler controls and the VibeThinker token allowance", async () => {
     const res = await rpc(
       {
@@ -649,6 +786,7 @@ describe("MCP tools/call ask", () => {
     expect(j.result.isError).toBe(false);
     expect(j.result.structuredContent).toEqual({
       model: "null-usage-model",
+      feedback_handle: expect.any(String),
       text: "NULL USAGE",
       finish_reason: "stop",
       truncated: false,
@@ -832,6 +970,168 @@ describe("MCP auth + method", () => {
   });
 });
 
+describe("MCP ask quota rejection detail", () => {
+  it("does not expose shared usage from another legacy static token", async () => {
+    const call = { jsonrpc: "2.0", id: 348, method: "tools/call", params: { name: "ask", arguments: { model: "any-model", prompt: "1234", max_tokens: 10 } } };
+    const first = await rpc(call, "test-legacy-static-a");
+    const firstBody = (await first.json()) as { result: { isError: boolean } };
+    expect(firstBody.result.isError).toBe(false);
+
+    const second = await rpc(call, "test-legacy-static-b");
+    const secondBody = (await second.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }>; _meta: { quota?: Record<string, unknown> } };
+    };
+    expect(secondBody.result.isError).toBe(true);
+    expect(secondBody.result.content[0]?.text).toContain("Shared static-tier rpm limit reached");
+    expect(secondBody.result.content[0]?.text).toContain("the shared static-tier bucket");
+    expect(secondBody.result._meta.quota).toMatchObject({
+      reason: "rpm", scope: "shared_static_tier", window: "60s", limit: 1, requested: 1, counted: false,
+    });
+    expect(secondBody.result._meta.quota).not.toHaveProperty("used_before");
+
+    const collidingKey = mintKey(
+      { alias: "static:user", tier: "guest" },
+      { rpm: 1, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 2 }
+    ).plaintextKey;
+    const collision = await rpc(call, collidingKey);
+    const collisionBody = (await collision.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }>; _meta: { quota?: Record<string, unknown> } };
+    };
+    expect(collisionBody.result.isError).toBe(true);
+    expect(collisionBody.result.content[0]?.text).toContain("Shared static-tier rpm limit reached");
+    expect(collisionBody.result.content[0]?.text).toContain("the shared static-tier bucket");
+    expect(collisionBody.result._meta.quota).toMatchObject({ scope: "shared_static_tier", counted: false });
+    expect(collisionBody.result._meta.quota).not.toHaveProperty("used_before");
+  });
+
+  it.each([
+    {
+      reason: "rpm",
+      limits: { rpm: 0, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 2 },
+      expected: { window: "60s", limit: 0, used_before: 0, requested: 1 },
+    },
+    {
+      reason: "tpm",
+      limits: { rpm: 100, tpm: 1, dailyTokenBudget: 0, maxParallel: 2 },
+      expected: { window: "60s", limit: 1, used_before: 0, requested: 11 },
+    },
+    {
+      reason: "daily",
+      limits: { rpm: 100, tpm: 1_000, dailyTokenBudget: 1, maxParallel: 2 },
+      expected: { window: "utc_day", limit: 1, used_before: 0, requested: 11 },
+    },
+  ])("returns safe $reason quota details for an uncounted rejection", async ({ reason, limits, expected }) => {
+    const key = mintKey({ alias: `mcp-quota-${reason}`, tier: "guest" }, limits).plaintextKey;
+    const res = await rpc(
+      { jsonrpc: "2.0", id: 349, method: "tools/call", params: { name: "ask", arguments: { model: "any-model", prompt: "1234", max_tokens: 10 } } },
+      key
+    );
+    const j = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }>; _meta?: Record<string, unknown>; structuredContent?: unknown };
+    };
+    expect(j.result.isError).toBe(true);
+    const message = j.result.content[0]?.text ?? "";
+    expect(message).toContain(`Per-key ${reason} limit reached`);
+    expect(message).toContain("your own API key");
+    expect(message).toContain(reason === "rpm" ? "requests per minute" : reason === "tpm" ? "token per minute" : "token per UTC day");
+    expect(message).toContain("This rejected request was not counted.");
+    if (reason === "rpm") {
+      expect(message).toContain("contact the gateway operator");
+      expect(message).not.toMatch(/expiry|reset/i);
+      expect(message).not.toContain("retry after");
+    } else if (reason === "daily") {
+      expect(message).toContain("The UTC-day budget resets in");
+      expect(message).toContain("token per UTC day");
+    } else {
+      expect(message).toContain("The next quota-window expiry is in");
+      expect(message).not.toContain("The quota window resets");
+    }
+    expect(j.result.structuredContent).toBeUndefined();
+    expect(j.result._meta).toMatchObject({
+      m5_code: "rate_limited",
+      retryable: true,
+      quota: {
+        reason,
+        scope: "key",
+        ...expected,
+        counted: false,
+        retry_after_seconds: expect.any(Number),
+      },
+    });
+    expect(Object.keys(j.result._meta!.quota as Record<string, unknown>).sort()).toEqual([
+      "counted",
+      "limit",
+      "reason",
+      "requested",
+      "retry_after_seconds",
+      "scope",
+      "used_before",
+      "window",
+    ]);
+    expect(j.result._meta).not.toHaveProperty("alias");
+    expect(j.result._meta).not.toHaveProperty("key");
+    expect(j.result._meta).not.toHaveProperty("model");
+    expect(j.result._meta).not.toHaveProperty("ip");
+    const quota = j.result._meta!.quota as { retry_after_seconds: number };
+    if (reason === "rpm") {
+      expect(message).toContain("contact the gateway operator");
+      expect(message).not.toContain("retry after");
+    } else {
+      expect(message).toContain(`retry after ${quota.retry_after_seconds} ${quota.retry_after_seconds === 1 ? "second" : "seconds"}`);
+    }
+    if (reason === "daily") {
+      expect(message).toContain(`UTC-day budget resets in ${quota.retry_after_seconds} ${quota.retry_after_seconds === 1 ? "second" : "seconds"}`);
+    }
+  });
+});
+
+// ─── #357: machine-readable ask failure cause ────────────────────────────────────────
+describe("askFailureMeta", () => {
+  const base = { ok: false as const, message: "m", traceOutcome: "o", traceErrorClass: "c" };
+  it("names the code, says whether a retry can help, and carries the delay when known", async () => {
+    const { askFailureMeta } = await import("../src/homeserver/mcp.js");
+    expect(askFailureMeta({ ...base, code: "insufficient_memory", retryAfterSeconds: 30 })).toEqual({
+      m5_code: "insufficient_memory", retryable: true, retry_after_seconds: 30,
+    });
+    expect(askFailureMeta({ ...base, code: "memory_admission_unavailable" })).toEqual({
+      m5_code: "memory_admission_unavailable", retryable: false,
+    });
+    expect(askFailureMeta({ ...base, code: "server_busy", retryAfterSeconds: 5 })).toEqual({
+      m5_code: "server_busy", retryable: true, retry_after_seconds: 5,
+    });
+    expect(askFailureMeta({ ...base, code: "rate_limited", retryAfterSeconds: 48 })).toMatchObject({ retryable: true, retry_after_seconds: 48 });
+    expect(askFailureMeta({ ...base, code: "credits_exhausted" })).toEqual({ m5_code: "credits_exhausted", retryable: false });
+    // The gateway cannot tell whether an upstream model error is transient, so it does not claim to.
+    expect(askFailureMeta({ ...base, code: "upstream_error" })).toEqual({ m5_code: "upstream_error" });
+    expect(askFailureMeta({
+      ...base,
+      code: "upstream_error",
+      reason: "upstream_connection_failed",
+      layer: "model_backend",
+      retryAfterSeconds: 2,
+    })).toEqual({
+      m5_code: "upstream_error",
+      reason: "upstream_connection_failed",
+      layer: "model_backend",
+      retryable: true,
+      retry_after_seconds: 2,
+    });
+    expect(askFailureMeta({
+      ...base,
+      code: "upstream_error",
+      reason: "upstream_timeout",
+      layer: "model_backend",
+      retryAfterSeconds: 7,
+    })).toEqual({
+      m5_code: "upstream_error",
+      reason: "upstream_timeout",
+      layer: "model_backend",
+      retryable: true,
+      retry_after_seconds: 7,
+    });
+  });
+});
+
 // ─── M2a: model_not_allowed increments /metrics ───────────────────────────────────────
 // Codex MEDIUM finding: a disallowed-model rejection was invisible in /metrics (only the
 // outer transport /mcp row with model="none"/outcome="ok" reached Prometheus). After the
@@ -864,9 +1164,16 @@ describe("MCP M2a: model_not_allowed increments /metrics", () => {
       scopedKey
     );
     expect(res.status).toBe(200);
-    const j = (await res.json()) as { result: { isError: boolean; content: Array<{ type: string; text: string }> } };
+    const j = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ type: string; text: string }>; _meta?: Record<string, unknown>; structuredContent?: unknown };
+    };
     expect(j.result.isError).toBe(true);
     expect(j.result.content[0]!.text).toMatch(/not permitted/i);
+    // #357: the cause is machine-readable in `_meta`, never in `structuredContent`, which is
+    // reserved for the declared output shape of a successful ask.
+    expect(j.result._meta).toEqual({ m5_code: "model_not_allowed", retryable: false,
+      request_id: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/) });
+    expect(j.result.structuredContent).toBeUndefined();
 
     // Read metrics AFTER — the forbidden counter sum must have grown by exactly 1.
     const metricsAfter = await fetch(`http://127.0.0.1:${gatewayPort}/metrics`, {
@@ -948,6 +1255,14 @@ describe("MCP M2b: credits_exhausted outcome alignment", () => {
 // minted-key ONLY (mirrors owner-log) so no GUEST content is ever excerpted. These rows are
 // usage-only — outcome "unverified" — so they never affect capability VERDICT math.
 describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
+  // Only these cost fixtures need a historical date; other MCP scopes stay real.
+  // Row queries use insertion order because earlier scopes have real timestamps.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
   beforeAll(() => {
     ensureLedgerSchema();
     ensureDelegationCostSchema();
@@ -993,7 +1308,7 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
     expect(mcpAskDelegations()).toBe(before + 1);
 
     const row = getDb()
-      .prepare("SELECT task_type, model_id, outcome, source, completion_tokens FROM delegations WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1")
+      .prepare("SELECT task_type, model_id, outcome, source, completion_tokens FROM delegations WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1")
       .get() as { task_type: string; model_id: string; outcome: string; source: string; completion_tokens: number | null };
     expect(row.source).toBe("mcp-ask");
     expect(row.outcome).toBe("unverified");
@@ -1026,7 +1341,7 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
 
     const row = getDb()
       .prepare(
-        "SELECT source, delegator_model, delegator_model_source, cost_status, actual_baseline_cost_usd, potential_savings_actual_usd, delegate_policy_mode, delegate_policy_action FROM delegation_costs WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1"
+        "SELECT source, delegator_model, delegator_model_source, cost_status, actual_baseline_cost_usd, potential_savings_actual_usd, delegate_policy_mode, delegate_policy_action FROM delegation_costs WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1"
       )
       .get() as {
         source: string;
@@ -1073,7 +1388,7 @@ describe("MCP ask → delegations ledger (owner usage telemetry)", () => {
     expect(mcpAskDelegations()).toBe(before + 1);
 
     const row = getDb()
-      .prepare("SELECT task_type, model_id, outcome, error_class FROM delegations WHERE source = 'mcp-ask' ORDER BY ts DESC LIMIT 1")
+      .prepare("SELECT task_type, model_id, outcome, error_class FROM delegations WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1")
       .get() as { task_type: string; model_id: string; outcome: string; error_class: string | null };
     expect(row.model_id).toBe("boom-model");
     expect(row.outcome).toBe("error");

@@ -245,18 +245,20 @@ export async function ask({ prompt, model, system, maxTokens, temperature, topP,
 
   while (!done) {
     const { done: streamDone, value } = await reader.read();
-    if (streamDone) break;
+    if (streamDone) {
+      buf += decoder.decode();
+      break;
+    }
 
     buf += decoder.decode(value, { stream: true });
 
-    // SSE events are delimited by double newline (\n\n or \r\n\r\n)
-    // We split on \n\n and process complete events
-    const parts = buf.split(/\n\n/);
-    // The last part may be incomplete — keep it in buf
+    // A blank line ends an SSE event. Keep the trailing partial event so a
+    // delimiter split across arbitrary network chunks is handled correctly.
+    const parts = buf.split(/\r?\n\r?\n/);
     buf = parts.pop() ?? "";
 
     for (const event of parts) {
-      for (const line of event.split("\n")) {
+      for (const line of event.split(/\r?\n/)) {
         const trimmed = line.startsWith("data: ") ? line.slice(6) : null;
         if (trimmed === null) continue;
         if (handleData(trimmed.trim()) === "done") { done = true; break; }
@@ -265,12 +267,13 @@ export async function ask({ prompt, model, system, maxTokens, temperature, topP,
     }
   }
 
-  // Process any remaining buffer content after stream ends
+  // A final event may omit its trailing blank line. Process it at EOF, but
+  // require an explicit [DONE] marker before treating the stream as complete.
   if (!done && buf) {
-    for (const line of buf.split("\n")) {
+    for (const line of buf.split(/\r?\n/)) {
       const trimmed = line.startsWith("data: ") ? line.slice(6) : null;
       if (trimmed === null) continue;
-      if (handleData(trimmed.trim()) === "done") break;
+      if (handleData(trimmed.trim()) === "done") { done = true; break; }
     }
   }
 
@@ -280,6 +283,7 @@ export async function ask({ prompt, model, system, maxTokens, temperature, topP,
   if (streamError) {
     throw Object.assign(new Error(streamError.message), { code: streamError.code, midStream: true });
   }
+  if (!done) throw new Error("Incomplete response stream: missing [DONE] marker.");
 
   return accumulated;
 }
@@ -502,6 +506,11 @@ export async function main(argv) {
       process.stderr.write(`Credits exhausted: ${err.message}\n`);
     } else if (status === 429) {
       process.stderr.write(`Rate limited: ${err.message}${retry}\n`);
+    } else if (status === 503 && err.code === "memory_admission_unavailable") {
+      // Operator-fixable (#357): no Retry-After is sent and retrying will not help.
+      process.stderr.write(`Memory admission unavailable (operator action needed, do not retry): ${err.message}\n`);
+    } else if (status === 503 && err.code === "insufficient_memory") {
+      process.stderr.write(`Not enough host memory to start this model right now: ${err.message}${retry}\n`);
     } else if (status === 503) {
       // Box busy — distinct, transient, retryable.
       process.stderr.write(`Server busy: ${err.message}${retry}\n`);

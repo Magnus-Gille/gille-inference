@@ -6,10 +6,60 @@ This package contains two deliberately separate zero-dependency clients:
 - `m5` is the profile-based, Keychain-backed owner-agent client and stdio MCP bridge.
 
 The box-local operator CLI remains `src/homeserver/cli.ts`; neither packaged client replaces it.
-All `example.com` URLs below are reserved documentation examples; replace them with your
-deployment URL.
+The optional `m5 build` command is a separate SSH-based, offline-first remote build bridge, not a
+gateway inference route; see the [remote build guide](../docs/m5-remote-build.md). All
+`example.com` URLs below are reserved documentation examples; replace them with your deployment URL.
 
-Requires Node 18+ (uses built-in `fetch`). No external dependencies.
+Requires Node 18+ (uses built-in `fetch`). The dependency-free package gate and runtime fixtures
+run on Linux with Node 18 and 22 in CI. Windows support is not asserted here; see #266.
+
+### Owner-client 1.5.x compatibility
+
+The 1.5.x `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+Its doctor reports MCP catalogue reachability without calling metered inference and checks the
+installed client against the gateway's advertised result contract; bridge errors
+also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
+For minted owner agent/admin keys, `inference_observation` reports the last successful admitted
+M5 inference recorded in the gateway's content-blind request log. It is global historical evidence,
+not a public/private route probe: `inference` stays `not_checked` even when a timestamp exists.
+Older gateways report `not_supported`; an unavailable or disabled log cannot establish that no
+inference succeeded.
+Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
+interchangeable. Restart/reconnect long-lived MCP bridge processes after installing the
+accepted package. The `hs` friend-facing API is unchanged. Publication, installation, and
+gateway deployment are separate operations; source documentation does not prove any occurred.
+
+`m5 doctor` keeps older gateways with missing compatibility metadata in the existing reachability
+status, while a known contract or version mismatch reports `status: "degraded"` and exits nonzero.
+It also checks the public, content-free `/healthz` code-loop transport field without a bearer.
+`unavailable` reports degraded; a missing or invalid field reports `unknown`. This socket check
+does not prove that the caged code loop or inference can complete.
+It includes only validated gateway revision, client version, and result contract fields. Use
+`m5 --profile <name> doctor --check-latest` only when an explicit registry check is needed; this
+uses the fixed public npm endpoint and does not send credentials. An upgrade recommendation names
+the exact gateway client pin and the installed rollback pin, but has no executable install command
+until the registry check confirms that the gateway pin is published.
+
+### Reliability diagnostics (1.5.5)
+
+Version 1.5.5 lets the content-free code-loop transport check wait up to 3.5 seconds
+(within the caller's timeout), accommodating `/healthz`'s bounded peer check. It remains separate
+from inference readiness. `code run` accepts optional `caps.total_wall_s` (90–900 seconds) only
+when the live gateway schema advertises that budget; otherwise it refuses before sending the
+seed files. The shared budget reserves 75 seconds for cleanup. A 180-second request therefore
+allows up to 105 seconds of admission, coding and verification. Its terminal result reports
+`execution.whole_job`; its `observed_before_persistence_ms` excludes final synchronous
+persistence. External dispatch-to-terminal timing and proved cleanup are required for acceptance.
+Omitting the field preserves the separate engine/check limits.
+
+The default `m5 --profile <name> doctor` remains catalogue and transport discovery only. Its
+historical inference timestamp is global past activity, not current route readiness. To request
+one real synthetic check, explicitly choose `--public` or `--private` and pass
+`--probe-inference MODEL`; this makes one fixed 16-token `ask` on that route with a 30-second
+bound. Normal admission, quotas, and credits apply, and answer text is not returned. The client
+is distributed as a local tarball, not an npm release. See the
+[reliability diagnostics guide](../docs/reliability-diagnostics.md) for probe semantics,
+`model_status`, temporary backoff, incident-window access, and evaluation guidance.
 
 ## Install
 
@@ -73,6 +123,83 @@ m5 --profile codex mcp
 `m5 ask` prints structured JSON including `finish_reason`, explicit `truncated`, and content-blind
 `usage`. A token-limit finish returns `truncated:true` so scripts can retry with a higher
 `max_tokens` instead of mistaking an empty or partial answer for a clean completion.
+A direct ask applies a 30,000 ms single-request timeout by default; `--timeout-ms <integer>`
+selects a bounded 1,000–600,000 ms alternative for that call only:
+
+```bash
+printf '%s' '{"model":"mellum","prompt":"Summarize this."}' \
+  | m5 --profile codex --timeout-ms 90000 ask
+```
+
+A longer client bound does not raise server caps or guarantee completion.
+
+With a gateway and client containing #441, owner callers may add `"include_reasoning":true` to
+an `ask` input. The JSON result then preserves separate `reasoning_content` and
+`reasoning_truncated` fields; missing native data is `null`, and the gateway caps the text at
+16 KiB of UTF-8. Defaults omit both fields. The generic MCP bridge passes the same input and
+structured output without changing the final-answer text. See the
+[synthetic MCP example](../docs/m5-agent-client.md#native-reasoning-through-mcp); no credential
+export is needed and reasoning-token usage must never be inferred from the text.
+
+For a real owner execution, set `traffic_purpose` to `organic` in the `ask` or code request.
+The structured `ask` or `code_loop_result` output may then include a `feedback_handle`. After
+reviewing the real result, submit one exact usefulness judgment with the same profile that ran it:
+
+```bash
+printf '%s' '{"feedback_handle":"01234567-89ab-cdef-0123-456789abcdef","usefulness":"pass"}' \
+  | m5 --profile codex feedback submit
+```
+
+The command sends only the selected usefulness value and returns `recorded` or `unchanged`.
+Usefulness is supplied by the reviewer after execution; the client never infers it from
+structural verification or other automatic signals.
+
+The MCP bridge returns stable, redacted transport diagnostics (`failure_layer`,
+`diagnostic_code`, `retryable`, and fixed remediation) for DNS, routing, connection, TLS, timeout,
+gateway-health, and authentication failures. Three local layers name failures before any
+network access: `public_route_unconfigured` / `private_route_unconfigured` (the profile has no route — configure it, never
+substitute loopback), `local_tailnet_unavailable` (private path with the tailnet down —
+start Tailscale, then rerun doctor), and the already-emitted `connector_transport`. A missing
+profile routes to the secret-safe provision flow. Adoption reports return a scoped acknowledgement:
+`retention: "retained"` means the row was stored, `retention: "aggregated"` means the bounded
+telemetry cap was reached but the observation was folded into a safe aggregate, and
+`retention: "dropped"` identifies a telemetry-only refusal. A telemetry cap is never an M5
+inference limit: `inference_availability: "unaffected"`, and only the report should wait until
+the next UTC day. A connector/transport failure spools the content-free report locally under
+`~/.config/m5/adoption-spool/` (redacted, `0600`, newest 100 retained) and reports
+`evidence_recovery: {"status":"spooled","spool_id":…,"action":"retry_same_tool_call"}`; if the
+spool write itself fails the status is `spool_failed` with the same retry action, and with no
+spool configured the legacy `not_recorded` shape is kept. Recovery is deterministic: retry the
+same report tool call after the gateway recovers — the spool file is the backstop, not a queue.
+
+On the public path, a Cloudflare HTTP 530 page containing 1033 reports
+`cloudflare_tunnel_unavailable` and directs the operator to `cloudflared` and tunnel connections.
+Another Cloudflare 530 reports `cloudflare_origin_unresolved`; inspect its 1xxx code before
+attributing a more precise cause. HTTP 502 reports the upstream route failure while explicitly
+leaving its specific cause unknown. The client never copies an error-page body into its output.
+No report payload is echoed, and no locator or credential ever enters diagnostics.
+
+`code_loop_result` is safe to repeat for the same durable work id. The bridge automatically retries
+that one read-only tool call once after a retryable transport or gateway-health failure, using the
+same JSON-RPC request and work id. If both attempts fail, `result_recovery` reports
+`retry_exhausted`; it tells the caller to retry the same work id only when the final error remains
+retryable, otherwise to follow that error's remediation. Structured `unknown work_id` and
+`terminal result unavailable after restart` responses are returned unchanged and are never
+treated as transport failures.
+
+### Memory refusals and `build_run` errors (1.5.1)
+
+`m5 ask` reports the gateway's host-memory refusals with stable codes in its error object:
+`insufficient_memory` (`retryable: true`, plus `retry_after_seconds` when the gateway named one)
+and `memory_admission_unavailable` (`retryable: false`; the operator must fix it, retrying will
+not help). The client reads the cause from the gateway's `_meta` when present and falls back to
+the gateway's fixed sentences for older gateways. The MCP bridge adds the same fields as `_meta` on the unchanged `ask` result, and `hs`
+labels the direct-HTTP 503 by its code. Over MCP, `build_run` refusals arrive with the build
+client's own message and `data.m5_code` (`build_macos_only`, `build_invalid_request`,
+`build_timeout`, `build_worker_failure`, `build_protocol_error`). Any other local failure arrives
+as `build_failed` with a fixed message, because its real text can contain a local path; run the
+same command with `m5 build` in a terminal to see it. Remote worker text is never forwarded. A
+retry delay above one day is treated as not given.
 
 ### Provisioning a new owner-agent profile
 
@@ -97,4 +224,11 @@ See the
 [`m5` agent client guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-agent-client.md)
 for the profile schema, Keychain account mapping, structured code commands, `claude-config`
 installation/versioning contract, and security boundary. The server-side cage and diff-only result
-are authoritative; the client never applies a returned diff.
+are authoritative; the client never applies a returned diff. See the [remote build guide](../docs/m5-remote-build.md)
+for the optional local MCP `build_run` tool and dedicated-worker contract.
+
+`m5 build status` and the optional local MCP `build_status` expose content-free filesystem
+capacity without a worktree snapshot or gateway credential. Inspect free bytes against the
+reported warning threshold before a large build. New builds below the reported minimum fail
+with `build_capacity_low`; idle target directories are reclaimable after seven days, while
+whole idle worktrees retain the fourteen-day policy. See the [build guide](https://github.com/Magnus-Gille/gille-inference/blob/main/docs/m5-remote-build.md).

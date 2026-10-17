@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -9,25 +9,82 @@ const script = join(root, "scripts", "service-isolation.sh");
 
 function render(service: string): string {
   const out = mkdtempSync(join(tmpdir(), "gille-isolation-render-"));
-  execFileSync("bash", [script, "render", "--service", service, "--output-dir", out], {
-    cwd: root,
-    encoding: "utf8",
-  });
+  if (service === "gateway") {
+    execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render \"$2\" gateway",
+        "--",
+        script,
+        out,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+  } else {
+    execFileSync("bash", [script, "render", "--service", service, "--output-dir", out], {
+      cwd: root,
+      encoding: "utf8",
+    });
+  }
   return readFileSync(join(out, `${service}.conf`), "utf8");
 }
 
-function verifyLlamaDeviceAllow(effective: string): string {
+function verifyLlamaDeviceAllow(effective: string, reviewedRocmDropin = false): string {
   return execFileSync(
     "bash",
     [
       "-c",
-      "source \"$1\"; effective=\"$2\"; show_value() { printf '%s\\n' \"$effective\"; }; require_llama_device_allow llama-swap.service",
+      "source \"$1\"; effective=\"$2\"; reviewed=\"$3\"; show_value() { printf '%s\\n' \"$effective\"; }; reviewed_llama_rocm_dropin() { [ \"$reviewed\" = yes ]; }; require_llama_device_allow llama-swap.service",
       "--",
       script,
       effective,
+      reviewedRocmDropin ? "yes" : "no",
     ],
     { cwd: root, encoding: "utf8", stderr: "pipe" },
   );
+}
+
+function verifyReviewedRocmDropin(path: string, loadedPath: string, ownerIsRoot = true): string {
+  const observedMode = (statSync(path).mode & 0o777).toString(8);
+  return execFileSync("bash", [
+    "-c",
+    "source \"$1\"; fake_dropin_paths=\"$3\"; owner=\"$5\"; observed_mode=\"$6\"; " +
+      "show_value() { printf '%s\\n' \"$fake_dropin_paths\"; }; " +
+      "require_owner_group() { [ \"$owner\" = yes ] && [ \"$2:$3\" = root:root ]; }; " +
+      "require_mode() { [ \"$observed_mode\" = \"$2\" ] || die \"$1 mode is $observed_mode, expected $2\"; }; " +
+      "reviewed_llama_rocm_dropin llama-swap.service \"$2\" \"$4\"",
+    "--", script, path, loadedPath,
+    join(root, "deploy/systemd/llama-swap-rocm-device.conf"), ownerIsRoot ? "yes" : "no", observedMode,
+  ], { cwd: root, encoding: "utf8", stderr: "pipe" });
+}
+
+function verifyGatewayBackendRelations(
+  requires: string,
+  wants: string,
+  after: string,
+  reviewedFragment: boolean,
+): string {
+  return execFileSync("bash", [
+    "-c",
+    "source \"$1\"; requires=\"$2\"; wants=\"$3\"; after=\"$4\"; reviewed=\"$5\"; " +
+      "show_value() { case \"$2\" in Requires) printf '%s\\n' \"$requires\" ;; Wants) printf '%s\\n' \"$wants\" ;; After) printf '%s\\n' \"$after\" ;; esac; }; " +
+      "reviewed_gateway_soft_fragment() { [ \"$reviewed\" = yes ]; }; " +
+      "require_gateway_backend_dependency home-gateway.service 999",
+    "--", script, requires, wants, after, reviewedFragment ? "yes" : "no",
+  ], { cwd: root, encoding: "utf8", stderr: "pipe" });
+}
+
+function verifyReviewedGatewayFragment(fragment: string, ownerIsRoot = true): string {
+  const observedMode = (statSync(fragment).mode & 0o777).toString(8);
+  return execFileSync("bash", [
+    "-c",
+    "source \"$1\"; fragment=\"$2\"; owner=\"$3\"; observed_mode=\"$4\"; " +
+      "require_owner_group() { [ \"$owner\" = yes ] && [ \"$2:$3\" = root:root ]; }; " +
+      "require_mode() { [ \"$observed_mode\" = \"$2\" ] || die \"$1 mode is $observed_mode, expected $2\"; }; " +
+      "reviewed_gateway_soft_fragment home-gateway.service \"$fragment\"",
+    "--", script, fragment, ownerIsRoot ? "yes" : "no", observedMode,
+  ], { cwd: root, encoding: "utf8", stderr: "pipe" });
 }
 
 function runGatewayApplyFailureHarness(): string {
@@ -38,7 +95,7 @@ function runGatewayApplyFailureHarness(): string {
 LOG="$2"; BACKUP_ROOT="$3"; source "$1"
 record() { printf '%s\\n' "$1" >> "$LOG"; }
 root_only() { :; }; need() { :; }; show_value() { printf 'magnus\\n'; }
-preflight() { :; }; create_service_user() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; install() { :; }; stat() { printf '1\\n'; }
+preflight() { :; }; create_service_user() { :; }; require_gateway_manager_dropin_absent() { :; }; prepare_gateway_user_manager() { :; }; provision_gateway_codeloop_runtime() { :; }; provision_gateway_codeloop_toolchain() { :; }; install() { :; }; stat() { printf '1\\n'; }
 backup_unit() { mkdir -p "$3"; printf 'enabled\\n' > "$3/legacy-timer.enabled"; printf 'active\\n' > "$3/legacy-timer.active"; }
 disable_legacy_autonomy_timer() { record disable; }
 migrate_gateway_state() { record migrate; false; }
@@ -71,6 +128,34 @@ prepare_gateway_user_manager
 `, { mode: 0o755 });
   try {
     return { status: 0, output: execFileSync("bash", [harness, script], { cwd: root, encoding: "utf8", stderr: "pipe" }) };
+  } catch (error: any) {
+    return { status: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
+  }
+}
+
+function runGatewayCodeLoopConfigHarness(actualContent: string): { status: number; output: string } {
+  const work = mkdtempSync(join(tmpdir(), "gille-code-loop-config-harness-"));
+  const fakeRoot = join(work, "var-lib");
+  const fakeTree = join(work, "gateway-tree");
+  const template = readFileSync(join(root, "deploy", "pi-models.json.example"), "utf8");
+  mkdirSync(join(fakeRoot, "gille-gateway", ".pi-code-loop"), { recursive: true });
+  mkdirSync(join(fakeTree, "deploy"), { recursive: true });
+  writeFileSync(join(fakeTree, "deploy", "pi-models.json.example"), template);
+  writeFileSync(join(fakeRoot, "gille-gateway", ".pi-code-loop", "models.json"), actualContent);
+  const harness = join(work, "service-isolation-harness.sh");
+  writeFileSync(
+    harness,
+    readFileSync(script, "utf8")
+      .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+      .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`),
+  );
+  try {
+    const output = execFileSync(
+      "bash",
+      ["-c", "source \"$1\"; require_mode() { :; }; require_owner_group() { :; }; verify_gateway_codeloop_config", "--", harness],
+      { cwd: root, encoding: "utf8", stderr: "pipe" },
+    );
+    return { status: 0, output };
   } catch (error: any) {
     return { status: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
   }
@@ -262,6 +347,587 @@ esac
 }
 
 describe("service-isolation migration contract (#151)", () => {
+  it("orders the isolated gateway after its dedicated user manager", () => {
+    const unit = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render_dropin gateway",
+        "--",
+        script,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(unit).toContain("[Unit]\nWants=user@4242.service\nAfter=user@4242.service\n");
+    expect(unit).not.toContain("BindsTo=");
+    expect(unit.indexOf("[Unit]")).toBeLessThan(unit.indexOf("[Service]"));
+  });
+
+  it("renders a dedicated manager recovery contract without changing other user managers", () => {
+    const unit = execFileSync("bash", ["-c", "source \"$1\"; render_gateway_manager_recovery", "--", script], {
+      cwd: root, encoding: "utf8",
+    });
+    expect(unit).not.toContain("Wants=");
+    expect(unit).not.toContain("Upholds=");
+    expect(unit).toContain("Restart=on-failure");
+    expect(unit).toContain("OOMScoreAdjust=-500");
+    expect(unit).not.toContain("KillMode=");
+  });
+
+  it("verifies the exact manager recovery policy and effective OOM score", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-recovery-"));
+    const file = join(work, "50-gille-gateway-recovery.conf");
+    writeFileSync(file, execFileSync("bash", ["-c", "source \"$1\"; render_gateway_manager_recovery", "--", script], { encoding: "utf8" }));
+    const verify = `source "$1"; dropin="$3"; score="$4"; require_owner_group() { :; }; require_mode() { :; }; \
+show_value() { case "$2" in DropInPaths) printf '%s\\n' "$dropin" ;; Restart) printf 'on-failure\\n' ;; OOMScoreAdjust) printf '%s\\n' "$score" ;; Wants) printf 'user@4242.service\\n' ;; MainPID) printf '1234\\n' ;; esac; }; \
+effective_oom_score_adj() { printf '%s\\n' "$score"; }; \
+verify_gateway_manager_recovery 4242 "$2"`;
+    expect(() => execFileSync("bash", ["-c", verify, "--", script, file, file, "-500"], { encoding: "utf8" })).not.toThrow();
+    expect(() => execFileSync("bash", ["-c", verify, "--", script, file, file, "100"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+  });
+
+  it("fails gateway startup unless both user-manager transports are visible inside its mount namespace", () => {
+    const unit = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render_dropin gateway",
+        "--",
+        script,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/systemd/private");
+    expect(unit).toContain("ExecStartPre=/usr/bin/test -S /run/user/4242/bus");
+    expect(unit).toContain("BindReadOnlyPaths=/run/user/4242\n");
+    expect(unit).not.toContain("BindReadOnlyPaths=/run/user/4242/bus");
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/systemd/private"');
+    expect(source).toContain('require_show_contains "$unit" ExecStartPre "/usr/bin/test -S /run/user/$uid/bus"');
+    expect(source).toContain('require_show_exact_set "$unit" BindReadOnlyPaths "$GATEWAY_TREE" "/run/user/$gateway_uid"');
+  });
+
+  it("keeps the isolated gateway off AF_NETLINK because pasta is manager-spawned", () => {
+    const unit = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; id() { if [ \"$1\" = -u ] && [ \"$2\" = gille-gateway ]; then printf '4242\\n'; else command id \"$@\"; fi; }; render_dropin gateway",
+        "--",
+        script,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(unit).not.toContain("AF_NETLINK");
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('require_show_exact_set "$unit" RestrictAddressFamilies AF_UNIX AF_INET AF_INET6');
+  });
+
+  it("requires an explicit restart acknowledgement and traps every post-mutation refresh failure", () => {
+    expect(() =>
+      execFileSync("bash", [script, "refresh-isolation", "--service", "gateway"], {
+        cwd: root,
+        encoding: "utf8",
+        stderr: "pipe",
+      }),
+    ).toThrow(/refresh-isolation requires --ack-service-restart/);
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('atomic_render_dropin "$service" "$dropin"');
+    expect(source).toContain("trap 'refresh_exit_handler \"$?\"' EXIT");
+    expect(source).toContain("restore_gateway_netlink=0");
+    expect(source).toContain("restore_gateway_user_manager_order=0");
+    expect(source).toContain("restore_gateway_session_bus=0");
+    expect(source).toContain('( verify gateway 1 "$restore_gateway_user_manager_order" "$restore_gateway_netlink" "$restore_gateway_session_bus" 0 0 )');
+    const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
+    expect(refresh.indexOf('readlink "$REFRESH_TOOLCHAIN_CURRENT"')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
+    expect(refresh.indexOf('verify_gateway_codeloop_toolchain "$prior_digest"')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
+    expect(refresh.indexOf("REFRESH_ACTIVE=1")).toBeLessThan(refresh.indexOf("provision_gateway_codeloop_toolchain"));
+  });
+
+  it("keeps the original gateway alive through manager restart, then restarts the gateway last", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-order-"));
+    const fakeRoot = join(work, "root");
+    const fakeEtc = join(work, "etc");
+    const fakeTree = join(work, "tree");
+    const fakeSystemd = join(work, "systemd");
+    const backup = join(work, "backup");
+    const marker = join(fakeRoot, "gateway", "isolation-marker");
+    const dropin = join(fakeSystemd, "home-gateway.service.d", "50-service-isolation.conf");
+    mkdirSync(join(fakeRoot, "gateway"), { recursive: true });
+    mkdirSync(join(fakeTree, "deploy"), { recursive: true });
+    mkdirSync(join(fakeSystemd, "home-gateway.service.d"), { recursive: true });
+    writeFileSync(marker, "isolated\n");
+    writeFileSync(dropin, "[Unit]\nWants=user@4242.service\nAfter=user@4242.service\n");
+
+    const harness = join(work, "service-isolation-refresh-harness.sh");
+    writeFileSync(
+      harness,
+      readFileSync(script, "utf8")
+        .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+        .replace('readonly ETC="/etc/gille-inference"', `readonly ETC="${fakeEtc}"`)
+        .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`)
+        .replaceAll("/etc/systemd/system", fakeSystemd) + `
+LOG="$2"
+live_gateway_pid=1000
+record() { printf '%s\\n' "$1" >> "$LOG"; }
+root_only() { :; }
+need() { :; }
+id() { printf '4242\\n'; }
+prepare_gateway_user_manager() { :; }
+gateway_codeloop_enabled() { return 1; }
+provision_gateway_codeloop_config() { :; }
+provision_gateway_codeloop_toolchain() { :; }
+verify_manager_live_oom_policy() { :; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+sleep() { :; }
+install() {
+  if [[ " $* " == *" -d "* ]]; then mkdir -p "\${@: -1}"; else cp "\${@: -2:1}" "\${@: -1}"; fi
+}
+chown() { :; }
+chmod() { :; }
+atomic_install_file() { cp "$1" "$2"; }
+atomic_render_dropin() { render_dropin "$1" >/dev/null; record reload; }
+show_value() {
+  case "$2" in
+    Wants) record soft-graph-observed; printf 'user@4242.service\\n' ;;
+    User) printf 'gille-gateway\\n' ;;
+    MainPID) printf '%s\\n' "$live_gateway_pid" ;;
+  esac
+}
+systemctl() {
+  case "$*" in
+    'show home-gateway.service '*) : ;;
+    'restart user@4242.service') record "manager-restart:$live_gateway_pid" ;;
+    'is-active --quiet user@4242.service') : ;;
+    'restart home-gateway.service') record "gateway-restart:$live_gateway_pid"; live_gateway_pid=2000 ;;
+    'is-active --quiet home-gateway.service') : ;;
+  esac
+}
+verify() { record verified; }
+refresh_isolation gateway "$3"
+`,
+      { mode: 0o755 },
+    );
+    const log = join(work, "order.log");
+    let output = "";
+    try {
+      output = execFileSync("bash", ["-c", "source \"$1\"", "--", harness, log, backup], { cwd: root, encoding: "utf8", stderr: "pipe" });
+    } catch (error: any) {
+      output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+    }
+    expect(output).toContain("REFRESHED: gateway isolation");
+    expect(readFileSync(log, "utf8")).toBe(
+      "reload\nsoft-graph-observed\nmanager-restart:1000\ngateway-restart:1000\nverified\n",
+    );
+  });
+
+  it("accepts the soft gateway-to-manager graph before a manager restart", () => {
+    expect(() => execFileSync("bash", ["-c", `
+source "$1"
+show_value() {
+  case "$1:$2" in
+    home-gateway.service:Wants) printf 'user@4242.service\\n' ;;
+    home-gateway.service:Requires|home-gateway.service:BindsTo|home-gateway.service:PartOf) ;;
+    user@4242.service:PropagatesStopTo) ;;
+  esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script], { cwd: root, encoding: "utf8", stderr: "pipe" })).not.toThrow();
+  });
+
+  it.each(["Requires", "BindsTo", "PartOf"])(
+    "rejects a direct gateway %s edge to the dedicated manager before restart",
+    (property) => {
+      expect(() => execFileSync("bash", ["-c", `
+source "$1"
+show_value() {
+  case "$1:$2" in
+    home-gateway.service:Wants) printf 'user@4242.service\\n' ;;
+    home-gateway.service:${property}) printf 'user@4242.service\\n' ;;
+    user@4242.service:PropagatesStopTo) ;;
+  esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script], { cwd: root, encoding: "utf8", stderr: "pipe" })).toThrow();
+    },
+  );
+
+  it.each(["Wants", "Requires", "BindsTo", "PartOf", "PropagatesStopTo"])(
+    "refuses manager restart when the %s observation fails",
+    (property) => {
+      expect(() => execFileSync("bash", ["-c", `
+source "$1"
+failed_property="$2"
+show_value() {
+  [ "$2" != "$failed_property" ] || return 1
+  case "$1:$2" in home-gateway.service:Wants) printf 'user@4242.service\\n' ;; esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script, property], { cwd: root, encoding: "utf8", stderr: "pipe" })).toThrow();
+    },
+  );
+
+  it("rejects manager stop propagation to the gateway before restart", () => {
+    expect(() => execFileSync("bash", ["-c", `
+source "$1"
+show_value() {
+  case "$1:$2" in
+    home-gateway.service:Wants) printf 'user@4242.service\\n' ;;
+    home-gateway.service:Requires|home-gateway.service:BindsTo|home-gateway.service:PartOf) ;;
+    user@4242.service:PropagatesStopTo) printf 'home-gateway.service\\n' ;;
+  esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script], { cwd: root, encoding: "utf8", stderr: "pipe" })).toThrow();
+  });
+
+  it("accepts only the reviewed Pi provider config in the dedicated runtime", () => {
+    const canonical = readFileSync(join(root, "deploy", "pi-models.json.example"), "utf8");
+    const legacy = canonical
+      .replace('"apiKey": "$HS_API_KEY"', '"apiKey": "HS_API_KEY"')
+      .replace('      "authHeader": true,\n', "");
+
+    expect(runGatewayCodeLoopConfigHarness(canonical)).toEqual({ status: 0, output: "" });
+    const stale = runGatewayCodeLoopConfigHarness(legacy);
+    expect(stale.status).not.toBe(0);
+    expect(stale.output).toContain("differs from the reviewed template");
+  });
+
+  it("backs up, canonicalizes, and restores the Pi provider config within refresh-isolation", () => {
+    const source = readFileSync(script, "utf8");
+    const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
+    expect(refresh).toContain('models.json.before');
+    expect(refresh.indexOf('models.json.before')).toBeLessThan(refresh.indexOf("REFRESH_ACTIVE=1"));
+    expect(refresh.indexOf("REFRESH_ACTIVE=1")).toBeLessThan(refresh.indexOf("provision_gateway_codeloop_config"));
+    expect(source).toContain("restore_gateway_codeloop_config || return 1");
+  });
+
+  it("restores the exact prior Pi provider config after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-pi-config-"));
+    const backup = join(work, "backup");
+    const destination = join(work, "models.json");
+    mkdirSync(backup);
+    writeFileSync(join(backup, "models.json.before"), "legacy-provider-config\n");
+    writeFileSync(destination, "reviewed-provider-config\n");
+
+    execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_CODELOOP_CONFIG=\"$3\"; atomic_install_gateway_codeloop_config() { cp \"$1\" \"$2\"; }; restore_gateway_codeloop_config",
+        "--",
+        script,
+        backup,
+        destination,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(readFileSync(destination, "utf8")).toBe("legacy-provider-config\n");
+  });
+
+  it("atomically restores the exact prior toolchain pointer recorded before refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-toolchain-pointer-"));
+    const fakeRoot = join(work, "var-lib");
+    const backup = join(work, "backup");
+    const digestBefore = "a".repeat(64);
+    const digestAfter = "b".repeat(64);
+    const before = join(fakeRoot, "gateway", "code-loop-toolchain", "versions", digestBefore, "node_modules");
+    const after = join(fakeRoot, "gateway", "code-loop-toolchain", "versions", digestAfter, "node_modules");
+    const current = join(fakeRoot, "gateway", "node_modules");
+    mkdirSync(before, { recursive: true });
+    mkdirSync(after, { recursive: true });
+    mkdirSync(backup);
+    symlinkSync(after, current);
+    writeFileSync(join(backup, "toolchain-current.before"), `${before}\n`);
+    const harness = join(work, "service-isolation-harness.sh");
+    writeFileSync(
+      harness,
+      readFileSync(script, "utf8").replace(
+        'readonly ROOT="/var/lib/gille-inference"',
+        `readonly ROOT="${fakeRoot}"`,
+      ),
+    );
+
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_TOOLCHAIN_CURRENT=\"$3\"; chown() { :; }; mv() { if [ \"$(uname -s)\" = Darwin ]; then command mv -fh \"$2\" \"$3\"; else command mv -Tf \"$2\" \"$3\"; fi; }; verify_gateway_codeloop_toolchain() { printf 'toolchain-verify:%s\\n' \"$1\"; }; restore_gateway_codeloop_toolchain_pointer",
+        "--",
+        harness,
+        backup,
+        current,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain(`toolchain-verify:${digestBefore}`);
+    expect(readlinkSync(current)).toBe(before);
+  });
+
+  it("restores and verifies a pre-netlink gateway drop-in after refresh failure", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-legacy-dropin-"));
+    const backup = join(work, "backup");
+    const dropin = join(work, "50-service-isolation.conf");
+    execFileSync("mkdir", ["-p", backup]);
+    writeFileSync(
+      join(backup, "dropin.before.conf"),
+      "[Service]\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n",
+    );
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 0 0 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "--",
+        script,
+        backup,
+        dropin,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain("verify:gateway 1 0 0 0 0 0");
+    expect(output).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n");
+    expect(output).not.toContain("AF_NETLINK");
+  });
+
+  it("removes a newly installed manager recovery drop-in when gateway refresh fails", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-refresh-rollback-"));
+    const backup = join(work, "backup");
+    mkdirSync(backup);
+    const gatewayDropin = join(work, "gateway.conf");
+    const managerDropin = join(work, "manager.conf");
+    writeFileSync(join(backup, "dropin.before.conf"), "[Unit]\nRequires=user@4242.service\n");
+    writeFileSync(gatewayDropin, "[Unit]\nBindsTo=user@4242.service\n");
+    writeFileSync(managerDropin, "[Unit]\nWants=home-gateway.service\n");
+    execFileSync("bash", ["-c", `source "$1"; REFRESH_BACKUP="$2"; REFRESH_DROPIN="$3"; REFRESH_MANAGER_DROPIN="$4"; REFRESH_MANAGER_EXISTED=0; REFRESH_UNIT=home-gateway.service; \
+restore_gateway_codeloop_config() { :; }; restore_gateway_codeloop_toolchain_pointer() { :; }; atomic_install_file() { cp "$1" "$2"; }; systemctl() { :; }; verify() { :; }; restore_isolation_refresh`, "--", script, backup, gatewayDropin, managerDropin], { encoding: "utf8" });
+    expect(existsSync(managerDropin)).toBe(false);
+    expect(readFileSync(gatewayDropin, "utf8")).toBe("[Unit]\nRequires=user@4242.service\n");
+  });
+
+  it("restarts the manager under its restored OOM policy before the gateway after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-refresh-live-rollback-"));
+    const backup = join(work, "backup");
+    mkdirSync(backup);
+    const gatewayDropin = join(work, "gateway.conf");
+    const managerDropin = join(work, "manager.conf");
+    writeFileSync(join(backup, "dropin.before.conf"), "[Unit]\nRequires=user@4242.service\n");
+    writeFileSync(gatewayDropin, "[Unit]\nWants=user@4242.service\n");
+    writeFileSync(managerDropin, "[Service]\nOOMScoreAdjust=-500\n");
+    const output = execFileSync("bash", ["-c", `
+source "$1"
+REFRESH_BACKUP="$2"
+REFRESH_DROPIN="$3"
+REFRESH_MANAGER_DROPIN="$4"
+REFRESH_MANAGER_EXISTED=0
+REFRESH_MANAGER_UID=4242
+REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=1
+REFRESH_UNIT=home-gateway.service
+live_score=-500
+restore_gateway_codeloop_config() { :; }
+restore_gateway_codeloop_toolchain_pointer() { :; }
+atomic_install_file() { cp "$1" "$2"; }
+show_value() { case "$2" in OOMScoreAdjust) printf '0\\n' ;; MainPID) printf '1234\\n' ;; esac; }
+effective_oom_score_adj() { printf '%s\\n' "$live_score"; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+systemctl() {
+  case "$*" in
+    'daemon-reload') printf 'reload\\n' ;;
+    'restart user@4242.service')
+      [ ! -e "$REFRESH_MANAGER_DROPIN" ] || return 1
+      live_score=0
+      printf 'manager-restart\\n'
+      ;;
+    'restart home-gateway.service')
+      [ "$live_score" = 0 ] || return 1
+      printf 'gateway-restart\\n'
+      ;;
+  esac
+}
+verify() { [ "$live_score" = 0 ] && printf 'verified\\n'; }
+restore_isolation_refresh
+`, "--", script, backup, gatewayDropin, managerDropin], { encoding: "utf8" });
+    expect(output).toMatch(/reload\nmanager-restart\ngateway-restart\nverified\n/);
+    expect(existsSync(managerDropin)).toBe(false);
+  });
+
+  it("reloads the legacy manager OOM policy before restarting the gateway during migration rollback", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-manager-migration-rollback-"));
+    const fakeRoot = join(work, "root");
+    const fakeEtc = join(work, "etc");
+    const fakeTree = join(work, "tree");
+    const fakeSystemd = join(work, "systemd");
+    const backup = join(work, "backup");
+    const log = join(work, "order.log");
+    mkdirSync(join(fakeRoot, "gateway", "data"), { recursive: true });
+    mkdirSync(join(fakeEtc, "gateway"), { recursive: true });
+    mkdirSync(fakeTree);
+    mkdirSync(join(fakeSystemd, "home-gateway.service.d"), { recursive: true });
+    mkdirSync(join(fakeSystemd, "user@4242.service.d"), { recursive: true });
+    mkdirSync(backup);
+    writeFileSync(join(fakeEtc, "gateway", "gateway.env"), "fake=1\n");
+    writeFileSync(join(backup, "unit.before.txt"), "legacy unit\n");
+    writeFileSync(join(backup, "gateway-data.mode"), "0700\n");
+    writeFileSync(join(fakeSystemd, "home-gateway.service.d", "50-service-isolation.conf"), "isolation\n");
+    writeFileSync(join(fakeSystemd, "user@4242.service.d", "50-gille-gateway-recovery.conf"), "recovery\n");
+    const harness = join(work, "service-isolation-harness.sh");
+    writeFileSync(harness, readFileSync(script, "utf8")
+      .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+      .replace('readonly ETC="/etc/gille-inference"', `readonly ETC="${fakeEtc}"`)
+      .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`)
+      .replaceAll("/etc/systemd/system", fakeSystemd));
+    const command = `
+source "$1"
+LOG="$3"
+FAIL_MANAGER="$4"
+loaded_user="\${5:-magnus}"
+live_score=-500
+gateway_active=1
+root_only() { :; }
+need() { :; }
+id() { printf '4242\\n'; }
+rollback_feasible() { :; }
+capture_transaction_dependents() { :; }
+restore_transaction_dependents() { :; }
+restore_legacy_autonomy_timer() { printf 'timer-restored\\n' >> "$LOG"; }
+render_gateway_manager_recovery() { printf 'recovery\\n'; }
+chown() { :; }
+install() { cp "\${@: -2:1}" "\${@: -1}"; }
+show_value() { case "$2" in User) printf '%s\\n' "$loaded_user" ;; OOMScoreAdjust) printf '0\\n' ;; MainPID) printf '1234\\n' ;; esac; }
+effective_oom_score_adj() { printf '%s\\n' "$live_score"; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+systemctl() {
+  case "$*" in
+    'stop home-gateway.service') gateway_active=0 ;;
+    'is-active --quiet home-gateway.service') [ "$gateway_active" = 1 ] ;;
+    'is-active --quiet user@4242.service') : ;;
+    'daemon-reload') loaded_user=magnus; printf 'reload\\n' >> "$LOG" ;;
+    'restart user@4242.service')
+      if [ "$FAIL_MANAGER" = 1 ]; then printf 'manager-failed\\n' >> "$LOG"; return 1; fi
+      live_score=0
+      printf 'manager-restart\\n' >> "$LOG"
+      ;;
+    'restart home-gateway.service')
+      if [ "$FAIL_MANAGER" = 0 ]; then [ "$live_score" = 0 ] || return 1; fi
+      gateway_active=1
+      printf 'gateway-restart\\n' >> "$LOG"
+      ;;
+  esac
+}
+rollback gateway "$2"
+`;
+    expect(() => execFileSync("bash", ["-c", command, "--", harness, backup, log, "1"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+    expect(readFileSync(log, "utf8")).toBe("reload\nmanager-failed\ngateway-restart\ntimer-restored\n");
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(true);
+    expect(existsSync(join(fakeSystemd, "user@4242.service.d", "50-gille-gateway-recovery.conf"))).toBe(false);
+    mkdirSync(join(backup, "rollback-receipt"));
+    expect(() => execFileSync("bash", ["-c", command, "--", harness, backup, log, "0", "gille-gateway"], { encoding: "utf8", stderr: "pipe" })).toThrow();
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(true);
+    execFileSync("rmdir", [join(backup, "rollback-receipt")]);
+    const resumed = execFileSync("bash", ["-c", command, "--", harness, backup, log, "0", "gille-gateway"], { encoding: "utf8" });
+    expect(resumed).toContain("ROLLED BACK: gateway");
+    expect(readFileSync(log, "utf8")).toBe("reload\nmanager-failed\ngateway-restart\ntimer-restored\nreload\nmanager-restart\ngateway-restart\ntimer-restored\nreload\nmanager-restart\ngateway-restart\ntimer-restored\n");
+    expect(existsSync(join(backup, "rollback-pending-manager"))).toBe(false);
+  });
+
+  it("can restore and exactly verify the superseded netlink drop-in after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-netlink-dropin-"));
+    const backup = join(work, "backup");
+    const dropin = join(work, "50-service-isolation.conf");
+    execFileSync("mkdir", ["-p", backup]);
+    writeFileSync(
+      join(backup, "dropin.before.conf"),
+      [
+        "[Unit]",
+        "Requires=user@991.service",
+        "After=user@991.service",
+        "[Service]",
+        "BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd",
+        "ExecStartPre=/usr/bin/test -S /run/user/991/systemd/private",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        "",
+      ].join("\n"),
+    );
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 1 0 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "--",
+        script,
+        backup,
+        dropin,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain("verify:gateway 1 1 1 0 0 0");
+    expect(output).toContain("AF_NETLINK");
+    expect(output).toContain("BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd");
+    expect(output).toContain("Requires=user@991.service");
+  });
+
+  it("can restore and exactly verify a prior session-bus drop-in after a failed refresh", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-session-bus-dropin-"));
+    const backup = join(work, "backup");
+    const dropin = join(work, "50-service-isolation.conf");
+    execFileSync("mkdir", ["-p", backup]);
+    writeFileSync(
+      join(backup, "dropin.before.conf"),
+      [
+        "[Unit]",
+        "Requires=user@991.service",
+        "After=user@991.service",
+        "[Service]",
+        "BindReadOnlyPaths=/home/gille-gateway/home-server-eval /run/user/991/systemd /run/user/991/bus",
+        "ExecStartPre=/usr/bin/test -S /run/user/991/systemd/private",
+        "ExecStartPre=/usr/bin/test -S /run/user/991/bus",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "",
+      ].join("\n"),
+    );
+    const output = execFileSync(
+      "bash",
+      [
+        "-c",
+        "source \"$1\"; REFRESH_BACKUP=\"$2\"; REFRESH_DROPIN=\"$3\"; REFRESH_UNIT=home-gateway.service; atomic_install_file() { cp \"$1\" \"$2\"; }; systemctl() { :; }; verify() { printf 'verify:%s\\n' \"$*\"; [ \"$*\" = 'gateway 1 1 0 1 0 0' ]; }; restore_isolation_refresh; cat \"$3\"",
+        "--",
+        script,
+        backup,
+        dropin,
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(output).toContain("verify:gateway 1 1 0 1 0 0");
+    expect(output).toContain("/run/user/991/bus");
+  });
+
+  it("runs the refresh restoration hook and preserves the failing exit status", () => {
+    let status: number | null = null;
+    let output = "";
+    try {
+      execFileSync(
+        "bash",
+        [
+          "-c",
+          "source \"$1\"; REFRESH_ACTIVE=1; REFRESH_BACKUP=/safe/backup; REFRESH_DROPIN=/safe/dropin; REFRESH_UNIT=home-gateway.service; restore_isolation_refresh() { printf 'restore-called\\n'; }; refresh_exit_handler 23",
+          "--",
+          script,
+        ],
+        { cwd: root, encoding: "utf8", stderr: "pipe" },
+      );
+    } catch (error: any) {
+      status = error.status ?? null;
+      output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+    }
+    expect(status).toBe(23);
+    expect(output).toContain("restore-called");
+    expect(output).toContain("prior gateway drop-in was restored and verified");
+  });
+
   it("waits for delayed gateway health but times out fail-closed without printing its locator", () => {
     const delayed = execFileSync("bash", ["-c", `source "$1"; count=0; systemctl(){ return 0; }; gateway_health_url(){ printf 'private-locator'; }; curl(){ count=$((count+1)); [ "$count" -ge 3 ]; }; sleep(){ :; }; wait_for_gateway_health home-gateway.service; printf '%s' "$count"`, "--", script], { encoding: "utf8" });
     expect(delayed).toBe("3");
@@ -280,6 +946,12 @@ describe("service-isolation migration contract (#151)", () => {
     const result = runUserManagerHarness(3);
     expect(result.status).toBe(0);
     expect(result.output).toContain("started:user@4242.service");
+  });
+
+  it("uses the private systemd transport when the session-bus socket is absent", () => {
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain('env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active default.target');
+    expect(source).toContain('if [ -S "/run/user/$uid/bus" ]');
   });
 
   it("fails closed with actionable user-manager context when the bus never becomes ready", () => {
@@ -324,10 +996,24 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("InaccessiblePaths=-/home/magnus/home-server-eval/.claude");
     expect(unit).toContain("InaccessiblePaths=-/home/magnus/home-server-eval/.ssh");
     expect(unit).not.toContain("BindReadOnlyPaths=/home/magnus\n");
-    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_WORKROOT=/var/lib/gille-inference/gateway/data/code-loop-work");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_WORKROOT=/var/lib/gille-inference/gateway/data/code-loop-work");
+    expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_WORKROOT=");
     expect(unit).not.toContain("/var/lib/gille-inference/gateway/code-loop-work");
-    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_PI_BIN=/var/lib/gille-inference/gille-gateway/.local/bin/pi");
-    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=/var/lib/gille-inference/gille-gateway/.pi-code-loop");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_BIN=/var/lib/gille-inference/gille-gateway/.local/bin/pi");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_PI_AGENT_DIR=/var/lib/gille-inference/gille-gateway/.pi-code-loop");
+    expect(unit).toContain("Environment=HOMESERVER_CODE_LOOP_RUNTIME_NODE_MODULES_DIR=/var/lib/gille-inference/gateway/node_modules");
+    expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_PI_BIN=");
+    expect(unit).not.toContain("Environment=HOMESERVER_CODE_LOOP_PI_AGENT_DIR=");
+    const source = readFileSync(script, "utf8");
+    expect(source).toContain("provision_gateway_codeloop_toolchain");
+    expect(source).toContain('digest="$(sha256sum "$GATEWAY_TREE/package-lock.json")"');
+    expect(source).toContain('runuser -u "$GATEWAY_USER" -- test ! -w "$current"');
+    expect(source).toContain('validate_gateway_codeloop_toolchain_links "$resolved"');
+    expect(source).toContain('[ "$(stat -c \'%U\' "$current")" = root ]');
+    expect(source).not.toContain('stat -c \'%U:%G\' "$current"');
+    const refresh = source.slice(source.indexOf("refresh_isolation()"), source.indexOf("verify() {"));
+    expect(refresh.indexOf("provision_gateway_codeloop_toolchain")).toBeGreaterThan(-1);
+    expect(refresh.indexOf("provision_gateway_codeloop_toolchain")).toBeLessThan(refresh.indexOf('atomic_render_dropin "$service" "$dropin"'));
   });
 
   it("allows cloudflared only the network and files it requires", () => {
@@ -336,6 +1022,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("ExecStart=/usr/bin/cloudflared --config /etc/gille-inference/cloudflared/config.yml --no-autoupdate tunnel run m5-inference");
     expect(unit).toContain("ReadOnlyPaths=/etc/gille-inference/cloudflared");
     expect(unit).toContain("MemoryDenyWriteExecute=true");
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(unit).not.toContain("AF_NETLINK");
   });
 
   it("keeps llama-swap loopback-only and explicitly grants the render device group", () => {
@@ -350,6 +1038,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(unit).toContain("IPAddressDeny=any");
     expect(unit).toContain("IPAddressAllow=127.0.0.0/8");
     expect(unit).toContain("IPAddressAllow=::1/128");
+    expect(unit).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+    expect(unit).not.toContain("AF_NETLINK");
     expect(unit.indexOf("DeviceAllow=\n")).toBeLessThan(unit.indexOf("DeviceAllow=/dev/null rw"));
   });
 
@@ -378,6 +1068,103 @@ describe("service-isolation migration contract (#151)", () => {
     expect(() => verifyLlamaDeviceAllow(effective)).toThrow(/effective DeviceAllow differs from the reviewed allowlist/);
   });
 
+  it("accepts only the reviewed ROCm variant with exactly /dev/kfd added", () => {
+    const base = [
+      "/dev/null rw", "/dev/urandom r", "/dev/random r",
+      "/dev/dri/renderD128 rw", "/dev/dri/card0 rw", "char-rtc r",
+    ];
+    const rocm = [...base, "/dev/kfd rw"].join(" ");
+    expect(verifyLlamaDeviceAllow(rocm, true)).toBe("");
+    expect(() => verifyLlamaDeviceAllow(rocm, false)).toThrow(/reviewed allowlist/);
+    expect(() => verifyLlamaDeviceAllow(base.join(" "), true)).toThrow(/reviewed allowlist/);
+    expect(() => verifyLlamaDeviceAllow([...base, "/dev/kfd rw", "/dev/mem r"].join(" "), true))
+      .toThrow(/reviewed allowlist/);
+  });
+
+  it("requires the ROCm drop-in's exact bytes, mode, root owner and loaded path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gille-rocm-dropin-"));
+    const dropin = join(dir, "60-systemone-rocm.conf");
+    const template = readFileSync(join(root, "deploy/systemd/llama-swap-rocm-device.conf"));
+    writeFileSync(dropin, template);
+    chmodSync(dropin, 0o644);
+    expect(verifyReviewedRocmDropin(dropin, dropin)).toBe("");
+    expect(() => verifyReviewedRocmDropin(dropin, `${dropin}.other`)).toThrow(/not loaded/);
+    expect(() => verifyReviewedRocmDropin(dropin, dropin, false)).toThrow();
+    chmodSync(dropin, 0o600);
+    expect(() => verifyReviewedRocmDropin(dropin, dropin)).toThrow(/mode is 600/);
+    chmodSync(dropin, 0o644);
+    writeFileSync(dropin, Buffer.concat([template, Buffer.from("# drift\n")]));
+    expect(() => verifyReviewedRocmDropin(dropin, dropin)).toThrow(/differs from the reviewed template/);
+    writeFileSync(dropin, template);
+    const symlink = join(dir, "link.conf");
+    symlinkSync(dropin, symlink);
+    expect(() => verifyReviewedRocmDropin(symlink, symlink)).toThrow(/not a regular file/);
+  });
+
+  it("retains the isolated user-manager requirement while softening only the backend restart dependency", () => {
+    expect(verifyGatewayBackendRelations(
+      "llama-swap.service user@999.service system.slice",
+      "network-online.target",
+      "llama-swap.service user@999.service",
+      false,
+    )).toBe("");
+    const requires = "user@999.service system.slice sysinit.target";
+    const wants = "llama-swap.service network-online.target";
+    const after = "llama-swap.service user@999.service network-online.target";
+    expect(verifyGatewayBackendRelations(requires, wants, after, true)).toBe("");
+    expect(() => verifyGatewayBackendRelations(`${requires} llama-swap.service`, wants, after, true))
+      .toThrow(/hard backend dependency/);
+    expect(() => verifyGatewayBackendRelations("system.slice", wants, after, true))
+      .toThrow(/user-manager dependency/);
+    expect(() => verifyGatewayBackendRelations(requires, "network-online.target", after, true))
+      .toThrow(/soft backend dependency/);
+    expect(() => verifyGatewayBackendRelations(requires, wants, "user@999.service", true))
+      .toThrow(/backend ordering/);
+    expect(readFileSync(script, "utf8")).toContain('require_gateway_backend_dependency "$unit" "$gateway_uid"');
+  });
+
+  it("recognizes only the old or new base dependency form", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gille-gateway-backend-"));
+    const fragment = join(dir, "home-gateway.service");
+    writeFileSync(fragment, "[Unit]\nAfter=llama-swap.service\nWants=network-online.target\nRequires=llama-swap.service\n[Service]\n");
+    chmodSync(fragment, 0o644);
+    expect(() => verifyReviewedGatewayFragment(fragment)).toThrow();
+    writeFileSync(fragment, "[Unit]\nAfter=llama-swap.service\nWants=network-online.target\nWants=llama-swap.service\n[Service]\n");
+    expect(verifyReviewedGatewayFragment(fragment)).toBe("");
+    expect(() => verifyReviewedGatewayFragment(fragment, false)).toThrow();
+    chmodSync(fragment, 0o600);
+    expect(() => verifyReviewedGatewayFragment(fragment)).toThrow(/mode is 600/);
+    chmodSync(fragment, 0o644);
+    writeFileSync(fragment, "[Unit]\nRequires=llama-swap.service\nRequires=other-critical.service\n[Service]\n");
+    expect(() => verifyReviewedGatewayFragment(fragment)).toThrow(/neither the reviewed/);
+    const symlink = join(dir, "link.conf");
+    symlinkSync(fragment, symlink);
+    expect(() => verifyReviewedGatewayFragment(symlink)).toThrow(/not a regular file/);
+  });
+
+  it("stages an exact one-line, hash-gated full-unit replacement", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gille-gateway-unit-patch-"));
+    const source = join(dir, "source.service");
+    const output = join(dir, "staged.service");
+    const old = "[Unit]\nAfter=llama-swap.service network.target\nWants=network-online.target\nRequires=llama-swap.service\n[Service]\nEnvironment=EXAMPLE_VALUE\n";
+    writeFileSync(source, old);
+    const digest = execFileSync("shasum", ["-a", "256", source], { encoding: "utf8" }).split(" ")[0];
+    const patcher = join(root, "scripts/soften-gateway-backend-unit.py");
+    const run = (hash: string, from = source, to = output) => execFileSync("python3", [
+      patcher, "--source", from, "--output", to, "--expected-sha256", hash,
+    ], { cwd: root, encoding: "utf8", stderr: "pipe" });
+    expect(() => run("0".repeat(64))).toThrow(/differs from approved baseline/);
+    expect(existsSync(output)).toBe(false);
+    expect(run(digest)).toContain("output_sha256=");
+    expect(readFileSync(output, "utf8")).toBe(old.replace("Requires=llama-swap.service", "Wants=llama-swap.service"));
+    expect((statSync(output).mode & 0o777)).toBe(0o600);
+    expect(() => run(digest)).toThrow(/File exists/);
+    const drift = join(dir, "drift.service");
+    writeFileSync(drift, old.replace("Requires=llama-swap.service", "Requires=llama-swap.service other.service"));
+    const driftHash = execFileSync("shasum", ["-a", "256", drift], { encoding: "utf8" }).split(" ")[0];
+    expect(() => run(driftHash, drift, join(dir, "drift-output"))).toThrow(/unexpected \[Unit\]/);
+  });
+
   it("rejects unknown services and does not silently apply all services", () => {
     expect(() => execFileSync("bash", [script, "render", "--service", "all"], { cwd: root, encoding: "utf8" }))
       .toThrow(/unknown service/i);
@@ -388,6 +1175,8 @@ describe("service-isolation migration contract (#151)", () => {
     expect(source).toContain("loginctl enable-linger");
     expect(source).toContain("DBUS_SESSION_BUS_ADDRESS");
     expect(source).toContain("dedicated Pi runtime contains auth.json");
+    expect(source).toContain('$GATEWAY_TREE/deploy/pi-models.json.example');
+    expect(source).not.toContain("gateway_codeloop_source_dir");
     expect(source).toContain("[ ! -e \"$home/.pi-code-loop/auth.json\" ]");
     expect(source).not.toContain("BindReadOnlyPaths=/home/magnus\n");
     expect(source).toContain("InaccessiblePaths=-$GATEWAY_TREE/.claude");

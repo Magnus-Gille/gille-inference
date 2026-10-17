@@ -1,11 +1,200 @@
-import { M5ClientError, redactText } from "./m5-client.mjs";
+import { isAbsolute } from "node:path";
+import { getBuildStatus, runBuild } from "./m5-build.mjs";
+import {
+  M5ClientError,
+  classifyAskRefusal,
+  createFileAdoptionSpool,
+  credentialRemediation,
+  gatewayHttpRemediation,
+  localTailnetRemediation,
+  redactText,
+  spoolAdoptionOutageReport,
+  transportRemediation,
+} from "./m5-client.mjs";
 
-function rpcError(id, code, message) {
+function rpcError(id, code, message, data) {
   return JSON.stringify({
     jsonrpc: "2.0",
     id,
-    error: { code, message: redactText(message) },
+    error: {
+      code,
+      message: redactText(message),
+      ...(data === undefined ? {} : { data: redactValue(data) }),
+    },
   });
+}
+
+function redactValue(value) {
+  if (typeof value === "string") return redactText(value);
+  if (Array.isArray(value)) return value.map((entry) => redactValue(entry));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactValue(entry)]));
+  }
+  return value;
+}
+
+function isAdoptionReport(message) {
+  return message?.method === "tools/call" &&
+    message?.params?.name === "record_adoption_evidence";
+}
+
+const BUILD_CODES = new Set([
+  "build_capacity_low", "build_macos_only", "build_invalid_request", "build_timeout", "build_worker_failure", "build_protocol_error",
+]);
+const BUILD_FAILED_MESSAGE =
+  "The local build client could not run this build. Run the same command with `m5 build` in a terminal to see the reason.";
+
+// The gateway's ask refusals for host-memory admission carry only fixed text (#350). Expose the
+// machine-readable code beside the untouched result so a caller can branch without parsing prose.
+function annotateAskRefusal(message, response) {
+  const result = response?.result;
+  if (message?.method !== "tools/call" || message?.params?.name !== "ask" ||
+      !result || typeof result !== "object" || result.isError !== true ||
+      result.structuredContent !== undefined) return response;
+  const text = Array.isArray(result.content) ? result.content.find(entry => entry?.type === "text")?.text : undefined;
+  // A newer gateway already says so itself; leave its `_meta` as sent.
+  if (result._meta && typeof result._meta === "object" && typeof result._meta.m5_code === "string") return response;
+  const refusal = classifyAskRefusal(text);
+  if (refusal === null) return response;
+  return {
+    ...response,
+    result: {
+      ...result,
+      _meta: {
+        ...(result._meta && typeof result._meta === "object" && !Array.isArray(result._meta) ? result._meta : {}),
+        m5_code: refusal.code,
+        retryable: refusal.retryable,
+        ...(refusal.retryAfterSeconds === undefined ? {} : { retry_after_seconds: refusal.retryAfterSeconds }),
+      },
+    },
+  };
+}
+
+function isCodeLoopResult(message) {
+  return message?.method === "tools/call" &&
+    message?.params?.name === "code_loop_result";
+}
+
+function isRetryableResultTransport(error) {
+  return error instanceof M5ClientError &&
+    error.retryable === true &&
+    (error.code === "network_failure" || error.code === "timeout" || error.code === "upstream_http_error");
+}
+
+// Some MCP hosts render only error.message and discard JSON-RPC error.data. Keep
+// the actionable diagnosis in both places, with a closed vocabulary so an upstream
+// response cannot put arbitrary content or a locator into the visible message.
+const VISIBLE_DIAGNOSTICS = new Set([
+  "dns_failure", "connection_refused", "route_unreachable", "connection_reset",
+  "connect_timeout", "tls_failure", "network_failure", "gateway_http_error",
+  "cloudflare_tunnel_unavailable", "cloudflare_origin_unresolved",
+]);
+const VISIBLE_LAYERS = new Set([
+  "authentication", "gateway_transport", "gateway_health", "gateway_protocol",
+  "connector_transport", "local_tailnet_unavailable", "public_route_unconfigured",
+  "private_route_unconfigured",
+]);
+
+function visibleFailureSuffix(error, failureLayer) {
+  if (!VISIBLE_DIAGNOSTICS.has(error.diagnosticCode) && !VISIBLE_LAYERS.has(failureLayer)) {
+    return "";
+  }
+  const diagnostic = VISIBLE_DIAGNOSTICS.has(error.diagnosticCode)
+    ? error.diagnosticCode : "unknown";
+  const layer = VISIBLE_LAYERS.has(failureLayer) ? failureLayer : "unknown";
+  return ` [diagnostic_code=${diagnostic}; failure_layer=${layer}; retryable=${error.retryable === true}]`;
+}
+
+// Closed copy of the client's evidence-recovery shape (#242). Only a valid spooled /
+// spool-failed outcome travels; anything else falls back to the legacy contract so a
+// malformed carrier can never smuggle a locator or free-form text into bridge output.
+function validEvidenceRecovery(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (value.action !== "retry_same_tool_call") return undefined;
+  if (value.status === "spooled") {
+    if (typeof value.spool_id !== "string" || !/^adoption-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$/.test(value.spool_id)) {
+      return undefined;
+    }
+    return { status: "spooled", spool_id: value.spool_id, action: "retry_same_tool_call" };
+  }
+  if (value.status === "spool_failed") {
+    return { status: "spool_failed", action: "retry_same_tool_call" };
+  }
+  return undefined;
+}
+
+async function bridgeError(error, profile, message, { resultRetryAttempted = false, adoptionSpool } = {}) {
+  if (!(error instanceof M5ClientError)) {
+    return { message: "The MCP bridge request failed." };
+  }
+  // Serialize through the client's closed projection before forwarding correlation or
+  // backoff metadata. Never read arbitrary gateway metadata or an error's custom fields.
+  const serializedError = M5ClientError.prototype.toJSON.call(error).error;
+  const modelBackoff = error.code === "model_temporarily_unavailable";
+  const credentialFailure = error.code === "missing_credential" || error.code === "rejected_credential";
+  const gatewayTransportFailure = error.code === "network_failure" || error.code === "timeout";
+  const transportFailure = gatewayTransportFailure || error.code === "upstream_http_error";
+  const remediation = credentialFailure
+    ? credentialRemediation(profile)
+    : error.code === "upstream_http_error"
+      ? gatewayHttpRemediation(profile, error.diagnosticCode)
+      : error.failureLayer === "local_tailnet_unavailable"
+        ? localTailnetRemediation(profile)
+      : gatewayTransportFailure
+      ? transportRemediation(profile)
+      : error.remediation;
+  const failureLayer = gatewayTransportFailure && error.failureLayer !== "local_tailnet_unavailable"
+    ? "connector_transport"
+    : error.failureLayer;
+  // A spooled adoption report survives the outage it reports on (#242): prefer the
+  // client's closed recovery shape, else spool the caller's own content-free arguments
+  // here, else keep the legacy contract. Nothing but the closed shape ever travels.
+  let evidenceRecovery;
+  if (isAdoptionReport(message) && transportFailure) {
+    evidenceRecovery =
+      validEvidenceRecovery(error.evidenceRecovery) ??
+      (await spoolAdoptionOutageReport(adoptionSpool, {
+        profile,
+        report: message?.params?.arguments,
+        failure: { code: error.code, diagnosticCode: error.diagnosticCode },
+      })) ?? {
+        status: "not_recorded",
+        action: "retry_same_tool_call",
+      };
+  }
+  const visibleMessage = credentialFailure
+    ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
+    : error.message;
+  return {
+    message: `${visibleMessage}${visibleFailureSuffix(error, failureLayer)}`,
+    data: {
+      m5_code: error.code,
+      ...(error.diagnosticCode === undefined ? {} : { diagnostic_code: error.diagnosticCode }),
+      ...(failureLayer === undefined ? {} : { failure_layer: failureLayer }),
+      ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
+      ...(error.retryable === undefined ? {} : { retryable: error.retryable }),
+      ...(serializedError.request_id === undefined ? {} : { request_id: serializedError.request_id }),
+      ...(modelBackoff && serializedError.retry_after_seconds !== undefined
+        ? { retry_after_seconds: serializedError.retry_after_seconds }
+        : {}),
+      ...(modelBackoff && serializedError.backoff !== undefined
+        ? { backoff: serializedError.backoff }
+        : {}),
+      ...(remediation === undefined ? {} : { remediation }),
+      ...(evidenceRecovery === undefined ? {} : { evidence_recovery: evidenceRecovery }),
+      ...(isCodeLoopResult(message) && resultRetryAttempted
+        ? {
+            result_recovery: {
+              status: "retry_exhausted",
+              automatic_retries: 1,
+              action: isRetryableResultTransport(error)
+                ? "retry_same_work_id"
+                : "follow_error_remediation",
+            },
+          }
+        : {}),
+    },
+  };
 }
 
 function validMessage(message) {
@@ -22,7 +211,7 @@ function validMessage(message) {
   );
 }
 
-export function createMcpStdioBridge({ client }) {
+export function createMcpStdioBridge({ client, profile, adoptionSpool = createFileAdoptionSpool(), buildConfig, buildRunner = runBuild, buildStatusRunner = getBuildStatus }) {
   return Object.freeze({
     async handleLine(line) {
       let message;
@@ -35,9 +224,64 @@ export function createMcpStdioBridge({ client }) {
         return rpcError(null, -32600, "Invalid Request");
       }
       const notification = message.id === undefined || message.id === null;
+      let resultRetryAttempted = false;
       try {
-        const response = await client.rpc(message);
+        let response;
+        if (message.method === "tools/call" && message.params?.name === "build_status") {
+          if (notification) return null;
+          if (!buildConfig) throw new M5ClientError("build_unavailable", "Local build is not configured.");
+          const args = message.params.arguments ?? {};
+          if (typeof args !== "object" || args === null || Array.isArray(args) || Object.keys(args).length) {
+            throw new M5ClientError("invalid_args", "build_status accepts no arguments.");
+          }
+          let capacity;
+          try { capacity = await buildStatusRunner({ config: buildConfig }); }
+          catch (error) {
+            if (error?.buildCode === "build_timeout") throw new M5ClientError("build_timeout", "Remote build status timed out; check dedicated worker availability.");
+            if (error?.buildCode === "build_worker_failure") throw new M5ClientError("build_worker_failure", "Build status worker refused the request; verify dedicated worker provisioning.");
+            if (error?.buildCode === "build_protocol_error") throw new M5ClientError("build_protocol_error", "Invalid remote build status protocol; verify dedicated worker provisioning.");
+            throw new M5ClientError("build_failed", "Build capacity status unavailable; verify dedicated worker provisioning.");
+          }
+          response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(capacity) }], isError: false } };
+        } else if (message.method === "tools/call" && message.params?.name === "build_run") {
+          if (notification) return null;
+          if (!buildConfig) throw new M5ClientError("build_unavailable", "Local build is not configured.");
+          const args = message.params.arguments;
+          if (!args || typeof args !== "object" || Array.isArray(args) || typeof args.cwd !== "string" || !isAbsolute(args.cwd) ||
+              Object.keys(args).some(key => !["cwd", "command", "pull", "toolchain"].includes(key)) ||
+              !Array.isArray(args.command) || args.command.length === 0 || args.command.some(value => typeof value !== "string") ||
+              (args.pull !== undefined && (!Array.isArray(args.pull) || args.pull.some(value => typeof value !== "string"))) ||
+              (args.toolchain !== undefined && typeof args.toolchain !== "string")) {
+            throw new M5ClientError("invalid_args", "build_run requires absolute cwd, command string array, optional toolchain, and optional pull paths.");
+          }
+          const quiet = { write() { return true; } };
+          let result;
+          try {
+            result = await buildRunner({ cwd: args.cwd, command: args.command, toolchain: args.toolchain, pull: args.pull ?? [], config: buildConfig, stdout: quiet, stderr: quiet, outputLimit: 1024 * 1024, captureOutput: true });
+          } catch (error) {
+            // Pass the build client's own refusal through, as the CLI prints it (#357), but only
+            // for errors it tagged with a code: those messages are fixed sentences. Anything else
+            // can carry a local path or subprocess diagnostic (for example the filesystem helper's
+            // stderr), so it gets a fixed message and the generic code.
+            if (error instanceof M5ClientError || !(error instanceof Error)) throw error;
+            if (BUILD_CODES.has(error.buildCode)) throw new M5ClientError(error.buildCode, error.message);
+            throw new M5ClientError("build_failed", BUILD_FAILED_MESSAGE);
+          }
+          response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
+        } else {
+          try {
+            response = await client.rpc(message);
+        } catch (error) {
+          if (!notification && isCodeLoopResult(message) && isRetryableResultTransport(error)) {
+            resultRetryAttempted = true;
+            response = await client.rpc(message);
+          } else {
+            throw error;
+          }
+          }
+        }
         if (notification) return null;
+        response = annotateAskRefusal(message, response);
         if (response === null) {
           return rpcError(
             message.id,
@@ -45,14 +289,29 @@ export function createMcpStdioBridge({ client }) {
             "The MCP gateway returned an empty response for a request.",
           );
         }
+        if (message.method === "tools/list" && buildConfig && response?.result?.tools && !response.result.tools.some(tool => tool.name === "build_run")) {
+          response.result.tools = [...response.result.tools, {
+            name: "build_run",
+            description: "Run a local M5 build over the configured SSH build worker; never uses gateway credentials.",
+            inputSchema: { type: "object", additionalProperties: false, required: ["cwd", "command"], properties: {
+              cwd: { type: "string", description: "Absolute local git worktree path." },
+              command: { type: "array", items: { type: "string" }, description: "Literal command argv." },
+              toolchain: { type: "string" }, pull: { type: "array", items: { type: "string" } },
+            } },
+          }];
+        }
+        if (message.method === "tools/list" && buildConfig && response?.result?.tools && !response.result.tools.some(tool => tool.name === "build_status")) {
+          response.result.tools = [...response.result.tools, {
+            name: "build_status",
+            description: "Read-only build filesystem capacity; no snapshot, build or cleanup.",
+            inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          }];
+        }
         return JSON.stringify(response);
       } catch (error) {
         if (notification) return null;
-        const messageText =
-          error instanceof M5ClientError
-            ? error.message
-            : "The MCP bridge request failed.";
-        return rpcError(message.id, -32603, messageText);
+        const failure = await bridgeError(error, profile, message, { resultRetryAttempted, adoptionSpool });
+        return rpcError(message.id, -32603, failure.message, failure.data);
       }
     },
   });

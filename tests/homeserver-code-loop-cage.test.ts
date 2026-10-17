@@ -1,12 +1,17 @@
 import { describe, it, expect } from "vitest";
+import { EventEmitter } from "node:events";
 import net from "node:net";
 import http from "node:http";
 import {
   buildCageArgv,
   buildCageProbeScript,
+  execCageCommand,
   parseCageProbeOutput,
+  requestTransientCodeLoopUnitStop,
   runCageSelfTest,
   startGatewayRelay,
+  stopTransientCodeLoopUnit,
+  transientCodeLoopUnitFromArgv,
   type CageArgvOptions,
 } from "../src/homeserver/code-loop-cage.js";
 
@@ -27,7 +32,8 @@ const OPTS: CageArgvOptions = {
   homeDir: "/home/inference",
   forwardPort: 18080,
   nodeModulesDir: "/srv/gille-inference/node_modules",
-  unitName: "code-loop-cl-x",
+  unitName: "code-loop-cl-20260815-abcdef12",
+  piAgentDir: "/home/inference/.pi-code-loop",
 };
 
 function pairIndex(argv: string[], a: string, b: string): number {
@@ -37,14 +43,20 @@ function pairIndex(argv: string[], a: string, b: string): number {
   return -1;
 }
 
-describe("buildCageArgv — systemd scope (resource confinement ONLY)", () => {
-  it("runs a transient user scope with --collect and the job unit name", () => {
+describe("buildCageArgv — manager-spawned transient service (resource confinement ONLY)", () => {
+  it("runs a synchronous transient user service with exact startup and cleanup controls", () => {
     const argv = buildCageArgv(OPTS);
     expect(argv[0]).toBe("systemd-run");
     expect(argv).toContain("--user");
-    expect(argv).toContain("--scope");
+    expect(argv).not.toContain("--scope");
+    expect(argv).toContain("--wait");
+    expect(argv).toContain("--pipe");
+    expect(argv).toContain("--service-type=exec");
+    expect(argv).toContain("--expand-environment=no");
     expect(argv).toContain("--collect");
     expect(argv).toContain(`--unit=${OPTS.unitName}`);
+    expect(pairIndex(argv, "-p", "RuntimeMaxSec=150")).toBeGreaterThan(-1);
+    expect(pairIndex(argv, "-p", "KillMode=control-group")).toBeGreaterThan(-1);
   });
 
   it("bounds the subprocess tree: MemoryMax=8G and TasksMax=256 by default", () => {
@@ -58,10 +70,55 @@ describe("buildCageArgv — systemd scope (resource confinement ONLY)", () => {
     expect(argv).not.toContain("IPAddressDeny");
     expect(argv).not.toContain("IPAddressAllow");
   });
+
+  it("only extracts exact code-loop job/probe units for bounded cleanup", () => {
+    expect(transientCodeLoopUnitFromArgv(buildCageArgv(OPTS))).toBe(OPTS.unitName);
+    expect(transientCodeLoopUnitFromArgv(buildCageArgv({ ...OPTS, unitName: "code-loop-cage-probe-4242" }))).toBe("code-loop-cage-probe-4242");
+    expect(transientCodeLoopUnitFromArgv(["systemd-run", "--unit=home-gateway.service", "--", "true"])).toBeNull();
+  });
+
+  it("stops only a validated transient unit through the native user-manager transport", async () => {
+    const calls: Array<{ args: string[]; env: Record<string, string> }> = [];
+    await stopTransientCodeLoopUnit("code-loop-cl-20260815-abcdef12", { PATH: "/usr/bin", HS_API_KEY: "ephemeral-secret" }, async (args, env) => {
+      calls.push({ args, env });
+      return { code: 0, stdout: "", stderr: "" };
+    }, { uid: 4242, socketExists: () => false });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(["--user", "stop", "code-loop-cl-20260815-abcdef12"]);
+    expect(calls[0]!.env["XDG_RUNTIME_DIR"]).toBe("/run/user/4242");
+    expect(calls[0]!.env).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
+    expect(calls[0]!.env).not.toHaveProperty("HS_API_KEY");
+    await expect(stopTransientCodeLoopUnit("home-gateway.service", {}, async () => {
+      throw new Error("must not run");
+    })).rejects.toThrow(/refusing/);
+  });
+
+  it("routes an engine kill to the exact manager-spawned service, never an argv-chosen unit", async () => {
+    const stopped: string[] = [];
+    const env = { PATH: "/usr/bin" };
+    await requestTransientCodeLoopUnitStop(buildCageArgv(OPTS), env, async (unit, seenEnv) => {
+      stopped.push(unit);
+      expect(seenEnv).toBe(env);
+    });
+    expect(stopped).toEqual([OPTS.unitName]);
+    expect(requestTransientCodeLoopUnitStop(["systemd-run", "--unit=ssh.service"], env, async () => {
+      throw new Error("must not run");
+    })).toBeNull();
+  });
+
+  it("copies the per-run relay capability from the client environment without putting it in argv", () => {
+    const argv = buildCageArgv(OPTS);
+    const capability = "ephemeral-client-capability-0123456789abcdef";
+    expect(argv).not.toContain(capability);
+    expect(argv).toContain("--setenv=HS_API_KEY");
+    const shim = argv[argv.indexOf("/bin/sh") + 2]!;
+    expect(shim).toContain("/usr/bin/env -i");
+    expect(shim).toContain('HS_API_KEY="$HS_API_KEY"');
+  });
 });
 
 describe("buildCageArgv — pasta (network confinement)", () => {
-  it("chains pasta after the scope, forwarding ONLY the loopback port (no --config-net)", () => {
+  it("chains pasta after the transient service wrapper, forwarding ONLY the loopback port (no --config-net)", () => {
     const argv = buildCageArgv(OPTS);
     const pasta = argv.indexOf("pasta");
     expect(pasta).toBeGreaterThan(argv.indexOf("systemd-run"));
@@ -100,6 +157,14 @@ describe("buildCageArgv — bwrap (filesystem confinement)", () => {
     expect(rw).toEqual([OPTS.sandboxDir]);
   });
 
+  it("masks the migrated gateway secret directory after the broad /etc bind", () => {
+    const argv = buildCageArgv(OPTS);
+    const etcBind = pairIndex(argv, "--ro-bind-try", "/etc");
+    const secretMask = pairIndex(argv, "--tmpfs", "/etc/gille-inference");
+    expect(etcBind).toBeGreaterThan(-1);
+    expect(secretMask).toBeGreaterThan(etcBind);
+  });
+
   it("mount ORDER: tmpfs over $HOME first, then ro node_modules, then the rw sandbox bind", () => {
     const argv = buildCageArgv(OPTS);
     const tmpfsHome = pairIndex(argv, "--tmpfs", OPTS.homeDir);
@@ -110,11 +175,18 @@ describe("buildCageArgv — bwrap (filesystem confinement)", () => {
     expect(sandbox).toBeGreaterThan(nm);
   });
 
-  it("sets cwd + HOME to the sandbox inside the cage", () => {
+  it("uses a static env -i shim so only the reviewed environment reaches the model process", () => {
     const argv = buildCageArgv(OPTS);
     expect(pairIndex(argv, "--chdir", OPTS.sandboxDir)).toBeGreaterThan(-1);
-    const i = argv.indexOf("--setenv");
-    expect(argv.slice(i, i + 3)).toEqual(["--setenv", "HOME", OPTS.sandboxDir]);
+    const bw = argv.indexOf("bwrap");
+    const shell = argv.indexOf("/bin/sh");
+    expect(shell).toBeGreaterThan(bw);
+    const shim = argv[shell + 2]!;
+    expect(shim).toContain("/usr/bin/env -i");
+    expect(shim).toContain(`HOME='${OPTS.sandboxDir}'`);
+    expect(shim).toContain(`PI_CODING_AGENT_DIR='${OPTS.piAgentDir}'`);
+    expect(shim).toContain('HS_API_KEY="$HS_API_KEY"');
+    expect(argv.join(" ")).not.toContain("gateway-owner-key");
   });
 
   it("omits the node_modules bind when none is configured", () => {
@@ -192,12 +264,27 @@ describe("buildCageProbeScript — gateway arm does a real HTTP GET requiring a 
       readonlyProbePath: "/usr/.cage-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
     });
     expect(s).toContain("/dev/tcp/127.0.0.1/18080");
     expect(s).toContain("GET /healthz");
     expect(s).toContain(" 200 ");
     expect(s).toContain("/dev/tcp/1.1.1.1/443");
     expect(s).toContain("/usr/.cage-probe");
+  });
+
+  it("fails closed before confinement probes when timeout is unavailable or broken", () => {
+    const s = buildCageProbeScript({
+      secretPath: "/srv/gille-inference/.env",
+      readonlyProbePath: "/usr/.cage-probe",
+      externalProbe: { host: "1.1.1.1", port: 443 },
+      gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
+    });
+    const guard = "if ! command -v timeout >/dev/null 2>&1 || ! timeout 1 true >/dev/null 2>&1; then exit 127; fi";
+    expect(s.startsWith(guard)).toBe(true);
+    expect(s.indexOf(guard)).toBeLessThan(s.indexOf("cage-probe:secret="));
+    expect(parseCageProbeOutput("").ok).toBe(false); // the guard exits before any marker
   });
 });
 
@@ -207,6 +294,7 @@ describe("buildCageProbeScript — optional pi runnability arm (job-runnability,
     readonlyProbePath: "/usr/.cage-probe",
     externalProbe: { host: "1.1.1.1", port: 443 },
     gatewayForwardPort: 18080,
+    userManagerSocketPath: "/run/user/4242/systemd/private",
   };
 
   it("asserts piBin exists (-e) and the agent dir's models.json FILE exists (-e), each with its own marker", () => {
@@ -239,9 +327,10 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     "cage-probe:outside-write=denied",
     "cage-probe:egress=blocked",
     "cage-probe:gateway=ok",
+    "cage-probe:user-manager=denied",
   ].join("\n");
 
-  it("all four probes passing → ok", () => {
+  it("all five base probes passing → ok", () => {
     const r = parseCageProbeOutput(PASS);
     expect(r.ok).toBe(true);
     expect(r.failures).toEqual([]);
@@ -269,6 +358,12 @@ describe("parseCageProbeOutput — fail-closed verdict parsing", () => {
     const r = parseCageProbeOutput(PASS.replace("gateway=ok", "gateway=unreachable"));
     expect(r.ok).toBe(false);
     expect(r.failures.join(" ")).toContain("gateway");
+  });
+
+  it("a visible user-manager control socket fails the cage", () => {
+    const r = parseCageProbeOutput(PASS.replace("user-manager=denied", "user-manager=VISIBLE"));
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain("user-manager");
   });
 
   it("a MISSING marker is a failure, never a silent pass (fail-closed)", () => {
@@ -323,6 +418,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     "cage-probe:outside-write=denied",
     "cage-probe:egress=blocked",
     "cage-probe:gateway=ok",
+    "cage-probe:user-manager=denied",
   ].join("\n");
 
   function opts(exec: (argv: string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>) {
@@ -332,6 +428,7 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
       readonlyProbePath: "/usr/.cage-probe",
       externalProbe: { host: "1.1.1.1", port: 443 },
       gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
       exec,
     };
   }
@@ -345,18 +442,28 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
       })
     );
     expect(r.ok).toBe(true);
-    expect(seen.slice(0, 3)).toEqual(["systemd-run", "--user", "--scope"]);
+    expect(seen.slice(0, 3)).toEqual(["systemd-run", "--user", "--wait"]);
     expect(seen).toContain("pasta");
     expect(seen).toContain("bwrap");
     const bash = seen.indexOf("bash");
     expect(bash).toBeGreaterThan(-1);
     expect(seen[bash + 1]).toBe("-c");
+    expect(seen[bash + 2]).toContain("cage-probe:user-manager=denied");
   });
 
   it("a failing probe yields ok=false with the failures listed", async () => {
     const r = await runCageSelfTest(opts(async () => ({ code: 0, stdout: PASS_OUT.replace("secret=denied", "secret=READABLE"), stderr: "" })));
     expect(r.ok).toBe(false);
     expect(r.failures.join(" ")).toContain("secret");
+  });
+
+  it.each([
+    [null, "probe exited by timeout/signal"],
+    [1, "probe exited 1"],
+  ] as const)("complete markers with exit code %s fail closed", async (code, diagnostic) => {
+    const r = await runCageSelfTest(opts(async () => ({ code, stdout: PASS_OUT, stderr: "probe failed" })));
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain(diagnostic);
   });
 
   it("an exec failure (cage tooling missing) is ok=false, never a pass (fail-closed)", async () => {
@@ -385,13 +492,129 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
   });
 });
 
+describe("cage cancellation", () => {
+  it("pre-aborted self-test returns a failure without invoking the exec seam", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const r = await runCageSelfTest({
+      cageArgv: buildCageArgv(OPTS),
+      secretPath: "/srv/gille-inference/.env",
+      readonlyProbePath: "/usr/.cage-probe",
+      externalProbe: { host: "1.1.1.1", port: 443 },
+      gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
+      signal: controller.signal,
+      exec: async () => { throw new Error("must not spawn"); },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.failures).toEqual(["cage probe aborted before spawn"]);
+  });
+
+  it("pre-aborted execCageCommand does not spawn a child", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const r = await execCageCommand(
+      [process.execPath, "-e", "throw new Error('must not spawn')"],
+      5_000,
+      { signal: controller.signal },
+    );
+    expect(r.code).toBeNull();
+    expect(r.stderr).toContain("aborted");
+    expect(r.stderr).not.toContain("must not spawn");
+  });
+
+  it("actively aborts a harmless host child and waits for its exec completion", async () => {
+    const controller = new AbortController();
+    const started = new Promise<void>((resolve) => setTimeout(resolve, 25));
+    const result = execCageCommand(
+      [process.execPath, "-e", "setTimeout(() => {}, 10_000)"],
+      30_000,
+      { signal: controller.signal },
+    );
+    await started;
+    controller.abort();
+    const r = await result;
+    expect(r.code).toBeNull();
+    expect(r.stderr).toContain("aborted");
+  });
+
+  it("waits for inherited stdout to close after abort before resolving", async () => {
+    const controller = new AbortController();
+    const child = new EventEmitter() as EventEmitter & { killed: boolean; kill: (signal?: NodeJS.Signals | number) => boolean };
+    child.killed = false;
+    child.kill = () => {
+      child.killed = true;
+      setTimeout(() => child.emit("close", null, "SIGKILL"), 100);
+      return true;
+    };
+    const fakeExecFile = ((_file: string, _args: string[], _options: object, callback: (err: Error & { code?: string } | null, stdout: string, stderr: string) => void) => {
+      setTimeout(() => callback(Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" }), "", ""), 0);
+      return child;
+    }) as typeof import("node:child_process").execFile;
+    const result = execCageCommand(
+      [process.execPath, "-e", "setTimeout(() => {}, 10_000)"],
+      5_000,
+      { signal: controller.signal, execFile: fakeExecFile },
+    );
+    controller.abort();
+    const abortedAt = Date.now();
+    const r = await result;
+    expect(Date.now() - abortedAt).toBeGreaterThanOrEqual(80);
+    expect(child.killed).toBe(true);
+    expect(r.code).toBeNull();
+    expect(r.stderr).toContain("aborted");
+  });
+
+  it("uses its own timeout to kill a long-running child and settles", async () => {
+    const startedAt = Date.now();
+    const r = await execCageCommand(
+      [process.execPath, "-e", "setTimeout(() => {}, 10_000)"],
+      40,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(r.code).toBeNull();
+  });
+
+  it("passes the signal through the optional exec seam and never returns ok after abort", async () => {
+    const controller = new AbortController();
+    let seenSignal: AbortSignal | undefined;
+    const r = await runCageSelfTest({
+      cageArgv: buildCageArgv(OPTS),
+      secretPath: "/srv/gille-inference/.env",
+      readonlyProbePath: "/usr/.cage-probe",
+      externalProbe: { host: "1.1.1.1", port: 443 },
+      gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
+      signal: controller.signal,
+      exec: async (_argv, _timeoutMs, opts) => {
+        seenSignal = opts?.signal;
+        controller.abort();
+        return {
+          code: 0,
+          stdout: [
+            "cage-probe:secret=denied",
+            "cage-probe:outside-write=denied",
+            "cage-probe:egress=blocked",
+            "cage-probe:gateway=ok",
+            "cage-probe:user-manager=denied",
+          ].join("\\n"),
+          stderr: "",
+        };
+      },
+    });
+    expect(seenSignal).toBe(controller.signal);
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain("aborted");
+  });
+});
+
 describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exposure fix)", () => {
   // A stub upstream 'gateway' that records the requests it receives and echoes a marker. The
   // security property under test: ONLY the allowlisted paths reach it; everything else is refused
   // at the relay WITHOUT any upstream connection.
   interface Stub {
     port: number;
-    hits: Array<{ method: string; url: string; body: string }>;
+    hits: Array<{ method: string; url: string; body: string; authorization: string | undefined }>;
     close: () => Promise<void>;
   }
   async function startStub(): Promise<Stub> {
@@ -400,7 +623,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c as Buffer));
       req.on("end", () => {
-        hits.push({ method: req.method ?? "", url: req.url ?? "", body: Buffer.concat(chunks).toString() });
+        hits.push({ method: req.method ?? "", url: req.url ?? "", body: Buffer.concat(chunks).toString(), authorization: req.headers.authorization });
         if ((req.url ?? "").startsWith("/v1/chat/completions")) {
           // Stream two SSE-ish frames to exercise streaming passthrough.
           res.writeHead(200, { "content-type": "text/event-stream", "x-stub": "chat" });
@@ -424,10 +647,11 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
     port: number,
     method: string,
     path: string,
-    body?: string
+    body?: string,
+    authorization?: string,
   ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
     return new Promise((resolve, reject) => {
-      const req = http.request({ host: "127.0.0.1", port, method, path }, (res) => {
+      const req = http.request({ host: "127.0.0.1", port, method, path, headers: authorization === undefined ? {} : { authorization } }, (res) => {
         let buf = "";
         res.on("data", (d) => (buf += d.toString()));
         res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: buf }));
@@ -441,14 +665,15 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("forwards POST /v1/chat/completions verbatim, streaming the body and the SSE response", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "POST", "/v1/chat/completions", JSON.stringify({ model: "m", messages: [] }));
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "POST", "/v1/chat/completions", JSON.stringify({ model: "m", messages: [] }), `Bearer ${relay.clientApiKey}`);
     expect(r.status).toBe(200);
     expect(r.headers["x-stub"]).toBe("chat");
     expect(r.body).toBe("data: one\n\ndata: two\n\n");
     expect(stub.hits).toHaveLength(1);
     expect(stub.hits[0]!.method).toBe("POST");
     expect(stub.hits[0]!.body).toContain('"model":"m"'); // request body streamed through
+    expect(stub.hits[0]!.authorization).toBe("Bearer upstream-test-key");
     await relay.close();
     await stub.close();
   });
@@ -456,8 +681,8 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("forwards GET /v1/models (read-only, content-blind)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "GET", "/v1/models");
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "GET", "/v1/models", undefined, `Bearer ${relay.clientApiKey}`);
     expect(r.status).toBe(200);
     expect(stub.hits.map((h) => h.url)).toContain("/v1/models");
     await relay.close();
@@ -467,10 +692,22 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("forwards GET /healthz (the cage self-test reachability arm)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "GET", "/healthz");
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "GET", "/healthz", undefined, "Bearer forged-health-header");
     expect(r.status).toBe(200);
     expect(stub.hits.map((h) => h.url)).toContain("/healthz");
+    expect(stub.hits[0]!.authorization).toBeUndefined();
+    await relay.close();
+    await stub.close();
+  });
+
+  it("requires the per-run capability on authenticated routes and never forwards a forged bearer", async () => {
+    const stub = await startStub();
+    const fwd = await freePort();
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    expect((await request(fwd, "GET", "/v1/models")).status).toBe(401);
+    expect((await request(fwd, "GET", "/v1/models", undefined, "Bearer forged-local-token")).status).toBe(401);
+    expect(stub.hits).toHaveLength(0);
     await relay.close();
     await stub.close();
   });
@@ -478,7 +715,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("REFUSES POST /admin/keys with 403 and NEVER forwards upstream (the escalated finding)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     const r = await request(fwd, "POST", "/admin/keys", JSON.stringify({ alias: "x", tier: "owner" }));
     expect(r.status).toBe(403);
     expect(r.body).toContain("code_loop relay: path not allowed");
@@ -490,7 +727,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("REFUSES a method mismatch (GET /v1/chat/completions) with 403, no upstream hit", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     const r = await request(fwd, "GET", "/v1/chat/completions");
     expect(r.status).toBe(403);
     expect(stub.hits).toHaveLength(0);
@@ -501,7 +738,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("REFUSES other admin/model-management routes (unload, maintenance, revoke)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     for (const [m, p] of [["POST", "/admin/unload"], ["POST", "/admin/maintenance"], ["POST", "/admin/keys/revoke"]] as const) {
       const r = await request(fwd, m, p);
       expect(r.status).toBe(403);
@@ -514,8 +751,8 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("path-allowlist matches the PATHNAME, ignoring query strings", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
-    const r = await request(fwd, "GET", "/v1/models?verbose=1");
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    const r = await request(fwd, "GET", "/v1/models?verbose=1", undefined, `Bearer ${relay.clientApiKey}`);
     expect(r.status).toBe(200);
     const r2 = await request(fwd, "POST", "/admin/keys?x=/v1/chat/completions");
     expect(r2.status).toBe(403);
@@ -527,7 +764,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   it("closes the connection on non-HTTP / garbage traffic (never forwards)", async () => {
     const stub = await startStub();
     const fwd = await freePort();
-    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port);
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
     await new Promise<void>((resolve) => {
       const c = net.connect(fwd, "127.0.0.1", () => c.write("this is not valid http\r\n\r\n"));
       c.on("close", () => resolve());
@@ -558,15 +795,29 @@ function freePort(): Promise<number> {
 import { withUserBusEnv } from "../src/homeserver/code-loop-cage.js";
 
 describe("withUserBusEnv", () => {
-  it("defaults both bus pointers from the uid when missing", () => {
-    const uid = process.getuid!();
-    const out = withUserBusEnv({ PATH: "/usr/bin" });
+  it("uses the native private transport when the session-bus socket is absent", () => {
+    const uid = 4242;
+    const out = withUserBusEnv(
+      { PATH: "/usr/bin" },
+      { uid, socketExists: (path) => path === `/run/user/${uid}/systemd/private` },
+    );
     expect(out["XDG_RUNTIME_DIR"]).toBe(`/run/user/${uid}`);
-    expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe(`unix:path=/run/user/${uid}/bus`);
+    expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe(`unix:path=/run/user/${uid}/systemd/private`);
     expect(out["PATH"]).toBe("/usr/bin");
   });
+  it("leaves the bus address unset when neither reviewed transport is visible", () => {
+    const out = withUserBusEnv({}, { uid: 4242, socketExists: () => false });
+    expect(out).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
+  });
+  it("sets the session-bus address only when its socket exists", () => {
+    const out = withUserBusEnv({}, { uid: 4242, socketExists: (path) => path === "/run/user/4242/bus" });
+    expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/4242/bus");
+  });
   it("preserves caller-provided values over the defaults", () => {
-    const out = withUserBusEnv({ XDG_RUNTIME_DIR: "/run/user/999", DBUS_SESSION_BUS_ADDRESS: "unix:path=/x" });
+    const out = withUserBusEnv(
+      { XDG_RUNTIME_DIR: "/run/user/999", DBUS_SESSION_BUS_ADDRESS: "unix:path=/x" },
+      { uid: 4242, socketExists: () => false },
+    );
     expect(out["XDG_RUNTIME_DIR"]).toBe("/run/user/999");
     expect(out["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/x");
   });

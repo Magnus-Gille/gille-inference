@@ -1,0 +1,10 @@
+[Unit]
+Description=Check authenticated M5 MCP tool path every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=m5-mcp-monitor.service
+
+[Install]
+WantedBy=timers.target

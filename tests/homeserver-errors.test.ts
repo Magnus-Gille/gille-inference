@@ -25,6 +25,37 @@ describe("error envelope", () => {
     expect(env.headers["X-RateLimit-Reset"]).toBe("12");
   });
 
+  it("rate_limit_exceeded: carries shared quota details without a shared remaining count", () => {
+    const env = makeError("rate_limit_exceeded", {
+      retryAfterSeconds: 43_200,
+      message: "Shared static-tier daily limit reached.",
+      quota: {
+        reason: "daily",
+        scope: "shared_static_tier",
+        window: "utc_day",
+        limit: 1,
+        requested: 12,
+        counted: false,
+        retry_after_seconds: 43_200,
+      },
+      rateLimit: { limit: 1, resetSeconds: 43_200 },
+    });
+
+    expect(env.body.error.quota).toEqual({
+      reason: "daily",
+      scope: "shared_static_tier",
+      window: "utc_day",
+      limit: 1,
+      requested: 12,
+      counted: false,
+      retry_after_seconds: 43_200,
+    });
+    expect(env.headers["Retry-After"]).toBe("43200");
+    expect(env.headers["X-RateLimit-Limit"]).toBe("1");
+    expect(env.headers["X-RateLimit-Reset"]).toBe("43200");
+    expect(env.headers["X-RateLimit-Remaining"]).toBeUndefined();
+  });
+
   it("upstream_unavailable: 502 server_error, generic retry-shortly message", () => {
     const env = makeError("upstream_unavailable");
     expect(env.status).toBe(502);
@@ -112,6 +143,18 @@ describe("error envelope", () => {
     // mapped it to upstream_timeout was a bug (M1 fix).
     const e = Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_CONNECT_TIMEOUT" } });
     expect(classifyUpstreamError(e)).toBe("upstream_unavailable");
+  });
+
+  it("classifyUpstreamError: Undici response timeouts → upstream_timeout", () => {
+    for (const code of ["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]) {
+      const e = Object.assign(new TypeError("fetch failed"), { cause: { code } });
+      expect(classifyUpstreamError(e), code).toBe("upstream_timeout");
+    }
+  });
+
+  it("classifyUpstreamError: an unknown fetch cause code is not classified", () => {
+    const e = Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_UNKNOWN" } });
+    expect(classifyUpstreamError(e)).toBeNull();
   });
 
   it("classifyUpstreamError: TimeoutError / AbortError still → upstream_timeout (AbortSignal.timeout fired)", () => {

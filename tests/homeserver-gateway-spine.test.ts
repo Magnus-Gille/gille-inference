@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
+import { createServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,8 @@ import {
   SUBSCRIPTION_NOT_INDEPENDENT_NOTE,
   type ExposureReceiptEnvelope,
 } from "../src/homeserver/exposure-receipt-schema.js";
+import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admission.js";
+import { SYSTEMONE_MAX_BODY_BYTES } from "../src/homeserver/systemone-request.js";
 
 // The gateway reads config from env at startGateway() time. We must set env BEFORE
 // importing config/gateway, and isolate the DB before any keystore call. Tests drive a
@@ -18,10 +20,12 @@ import {
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "nonjson" | "reset" | "length" = "ok";
+let mockMode: "ok" | "stall" | "queued-disconnect" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
+let upstreamModelRequestCount = 0;
 let releaseStall: (() => void) | null = null;
+let hostMemoryAvailableGib = 90;
 // Keep this below HOMESERVER_OWNER_QUEUE_MAX_MS (3000ms in this file): a wrongly queued owner
 // must NOT be able to "pass" by timing out while we still hold the only slot.
 const BUSY_RECOVERY_SETTLE_BUDGET_MS = 2_500;
@@ -52,18 +56,47 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", async () => {
-      if (req.url?.endsWith("/chat/completions")) upstreamInferenceRequestCount += 1;
+      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone") || req.url?.endsWith("/embeddings") || req.url?.endsWith("/api/chat")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
+      if (req.url === "/v1/models") upstreamModelRequestCount += 1;
+      if ((mockMode === "validrunning" || mockMode === "queued-disconnect" || mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ running: mockMode === "systemone-list" || mockMode === "embedding-list" ? [] : [
+          { model: mockMode === "clef-running" ? "clef-flash" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "m1",
+            state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 },
+        ] }));
+        return;
+      }
+      if ((mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "embedding-error500" || mockMode === "embedding-error413" || mockMode === "embedding-stall" || mockMode === "embedding-malformed" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "embedding-list-absent" ? "other" : mockMode.startsWith("embedding-") ? "embeddinggemma-2" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash",
+          ...(mockMode === "embedding-list" ? { architecture: { input_modalities: ["text", "image", "audio", "video"] } } : {}) }] }));
+        return;
+      }
       if (mockMode === "notfound") {
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "model not found" } }));
         return;
       }
-      if (mockMode === "error500") {
+      if (mockMode === "error500" || (mockMode === "embedding-error500" && req.url?.endsWith("/embeddings"))) {
         // An upstream failure AFTER a successful 200-route lookup (i.e. not a 404). Carries a
         // usage frame in the body to prove the gateway does NOT read it on a non-2xx (Fix #1).
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "boom" }, usage: { total_tokens: 9999 } }));
+        return;
+      }
+      if (mockMode === "embedding-error413" && req.url?.endsWith("/embeddings")) {
+        res.writeHead(413, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "do not relay this upstream message" } }));
+        return;
+      }
+      if (mockMode === "format500" && req.url?.endsWith("/chat/completions")) {
+        // The first local inference reaches upstream, then the retry admission observes the
+        // deliberately lowered snapshot and refuses. This exercises the stamped claim boundary
+        // after an inference attempt without contacting a live model service.
+        hostMemoryAvailableGib = 10;
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "does not match the expected peg-native format" } }));
         return;
       }
       if (mockMode === "reset") {
@@ -88,10 +121,18 @@ function startUpstream(): Promise<void> {
         res.end();
         return;
       }
-      if (mockMode === "stall") {
+      if (mockMode === "stall" || (mockMode === "queued-disconnect" && upstreamInferenceRequestCount === 1)) {
         await new Promise<void>((resolve) => {
           releaseStall = resolve;
         });
+      }
+      if (req.url?.endsWith("/api/chat")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: { content: "synthetic" }, prompt_eval_count: 3, eval_count: 4 }));
+        return;
+      }
+      if (mockMode === "embedding-stall" && req.url?.endsWith("/embeddings")) {
+        await new Promise<void>((resolve) => { releaseStall = resolve; });
       }
       if (mockMode === "length") {
         res.writeHead(200, { "content-type": "application/json" });
@@ -104,14 +145,52 @@ function startUpstream(): Promise<void> {
         );
         return;
       }
+      if (req.url?.endsWith("/systemone")) {
+        const choice = mockMode === "systemone-choice" || mockMode === "systemone-choice-malformed";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          answers: choice
+            ? {
+                route: {
+                  type: "choice",
+                  choice: "billing",
+                  probabilities: mockMode === "systemone-choice-malformed"
+                    ? ["billing", "support"]
+                    : { billing: 0.9, support: 0.1 },
+                  confidence: 0.8,
+                },
+              }
+            : { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
+          usage: { input_tokens: choice ? 24 : 18, output_tokens: 0 },
+        }));
+        return;
+      }
+      if (req.url?.endsWith("/embeddings")) {
+        const body = JSON.parse(lastUpstreamBody) as { input: string | string[] };
+        const count = Array.isArray(body.input) ? body.input.length : 1;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          object: "list", model: "embeddinggemma-2",
+          data: Array.from({ length: count }, (_, index) => ({
+            object: "embedding", index,
+            embedding: Array.from({ length: mockMode === "embedding-malformed" ? 767 : 768 }, (_, i) => i === 0 ? 3 : i === 1 ? 4 : 0),
+          })),
+          usage: { prompt_tokens: 3, total_tokens: 3 },
+        }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          id: "cmpl-1",
-          choices: [{ message: { role: "assistant", content: "ok" } }],
-          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
-        })
-      );
+      res.end(JSON.stringify(mockMode === "queued-disconnect"
+        ? {
+            id: "cmpl-disconnect",
+            choices: [{ message: { role: "assistant", content: "synthetic" } }],
+            usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+          }
+        : {
+            id: "cmpl-1",
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+            usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+          }));
     });
   });
   return new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => {
@@ -125,11 +204,31 @@ let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let lookupKey: typeof import("../src/homeserver/keystore.js").lookupKey;
 let recordCreditUsage: typeof import("../src/homeserver/keystore.js").recordUsage;
 let loadConfig: typeof import("../src/homeserver/config.js").loadConfig;
+let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 let resetQuotaWindows: typeof import("../src/homeserver/quota.js").resetQuotaWindows;
 let taskTextFingerprint: typeof import("../src/homeserver/task-exposure.js").taskTextFingerprint;
 let taskFingerprintVersion: typeof import("../src/homeserver/task-exposure.js").TASK_FINGERPRINT_VERSION;
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
+
+function memoryComposition() {
+  return {
+    hostMemoryAdmissionDependencies: {
+      getRunning: async () => [],
+      readMemory: async (): Promise<HostMemoryReadResult> => ({
+        ok: true,
+        memory: {
+          memTotalBytes: 100 * 1024 ** 3,
+          memAvailableBytes: hostMemoryAvailableGib * 1024 ** 3,
+          cmaFreeBytes: null,
+          gttUsedBytes: null,
+          gttTotalBytes: null,
+        },
+      }),
+      log: () => {},
+    },
+  };
+}
 
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), "hs-spine-test-"));
@@ -143,8 +242,18 @@ beforeAll(async () => {
   process.env["HOMESERVER_OWNER_QUEUE_MAX_MS"] = "3000";
   process.env["HOMESERVER_BUSY_RETRY_AFTER_S"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
+  process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
+  process.env["HOMESERVER_ORIN_URL"] = `http://127.0.0.1:${upstreamPort}`;
+  process.env["HOMESERVER_ORIN_MODEL"] = "qwen2.5-coder:3b";
+  process.env["HOMESERVER_EMBEDDING_MODELS"] = "embeddinggemma-2";
+  process.env["HOMESERVER_EMBEDDING_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
+  process.env["HOMESERVER_EMBEDDING_MEDIA_ENABLED"] = "true";
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
+  process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
+  process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] =
+    "m1=60,m2=60,clef-flash=20,qwen3-30b-instruct=60,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
+  process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"] = "7";
   process.env["HOMESERVER_REVIEW_CASCADE"] = "shadow";
   process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] = "gpt-oss-120b";
   process.env["HOMESERVER_REVIEW_CASCADE_QWEN_MODEL"] = "qwen35-122b-a10b";
@@ -164,10 +273,11 @@ beforeAll(async () => {
   recordCreditUsage = ks.recordUsage;
   loadConfig = cfgMod.loadConfig;
   resetQuotaWindows = q.resetQuotaWindows;
+  resetConfig = cfgMod.resetConfig;
   taskTextFingerprint = exposure.taskTextFingerprint;
   taskFingerprintVersion = exposure.TASK_FINGERPRINT_VERSION;
 
-  const handle = await startGateway();
+  const handle = await startGateway(memoryComposition());
   // startGateway resolves with a stop handle + the bound port (spec: returns control).
   gatewayPort = handle.port;
   stopGateway = handle.stop;
@@ -176,12 +286,19 @@ beforeAll(async () => {
 afterAll(async () => {
   if (stopGateway) await stopGateway();
   await new Promise<void>((r) => upstream.close(() => r()));
+  delete process.env["HOMESERVER_HOST_MEMORY_ADMISSION"];
+  delete process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
+  delete process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"];
+  delete process.env["HOMESERVER_ORIN_URL"];
+  delete process.env["HOMESERVER_ORIN_MODEL"];
 });
 
 beforeEach(() => {
   mockMode = "ok";
   releaseStall = null;
   upstreamInferenceRequestCount = 0;
+  upstreamModelRequestCount = 0;
+  hostMemoryAvailableGib = 90;
   resetQuotaWindows();
 });
 
@@ -197,8 +314,78 @@ async function chat(token: string, body: Record<string, unknown>): Promise<Respo
   });
 }
 
+function tableCount(table: string): number {
+  const present = getDb().prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+  if (present === undefined) return 0;
+  return (getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+}
+
 const ADMIN = "admin-static-key";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+
+async function restartGatewayWithHostMemory(mode: "off" | "enforce"): Promise<void> {
+  if (stopGateway !== null) {
+    const stop = stopGateway;
+    stopGateway = null;
+    await stop();
+  }
+  process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = mode;
+  resetConfig();
+  const handle = await startGateway(memoryComposition());
+  gatewayPort = handle.port;
+  stopGateway = handle.stop;
+}
+
+async function gatewayAdmissionSnapshot(): Promise<{ inflight: number; ownerQueued: number }> {
+  const response = await fetch(url("/admin/maintenance"), {
+    headers: { authorization: `Bearer ${ADMIN}` },
+  });
+  expect(response.status).toBe(200);
+  return await response.json() as { inflight: number; ownerQueued: number };
+}
+
+async function waitForGatewayAdmission(
+  predicate: (snapshot: { inflight: number; ownerQueued: number }) => boolean,
+  timeoutMs = 1_500,
+): Promise<{ inflight: number; ownerQueued: number }> {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = await gatewayAdmissionSnapshot();
+  while (!predicate(snapshot) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    snapshot = await gatewayAdmissionSnapshot();
+  }
+  expect(predicate(snapshot), `admission snapshot did not reach the expected state: ${JSON.stringify(snapshot)}`).toBe(true);
+  return snapshot;
+}
+
+function systemOneBodyAtBytes(targetBytes: number): { value: Record<string, unknown>; raw: string } {
+  const value: Record<string, unknown> = {
+    model: "clef-flash",
+    state: "x",
+    questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+  };
+  const baseBytes = Buffer.byteLength(JSON.stringify(value));
+  value.state = "x".repeat(targetBytes - baseBytes + 1);
+  const raw = JSON.stringify(value);
+  expect(Buffer.byteLength(raw)).toBe(targetBytes);
+  return { value, raw };
+}
+
+function postChunkedSystemOne(raw: string, token: string): Promise<{ status: number }> {
+  const target = new URL(url("/v1/systemone"));
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(target, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    }, (res) => {
+      res.resume();
+      res.once("end", () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.once("error", reject);
+    req.write(raw.slice(0, 4096));
+    req.end(raw.slice(4096));
+  });
+}
 
 async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Promise<{
   principalId: string;
@@ -249,6 +436,495 @@ async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Prom
 }
 
 describe("gateway spine — HTTP integration", () => {
+  it("serves EmbeddingGemma through explicit guest grants, validates vectors, and meters actual usage", async () => {
+    mockMode = "embedding-list";
+    const scoped = mintKey({ alias: `embedding-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const unscoped = mintKey({ alias: `embedding-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const body = { model: "embeddinggemma-2", input: ["hello", "world"], dimensions: 128 };
+    const call = (token: string | null, payload: unknown) => fetch(url("/v1/embeddings"), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+    });
+
+    expect((await call(null, body)).status).toBe(401);
+    expect((await call(unscoped.plaintextKey, body)).status).toBe(403);
+    expect((await call(scoped.plaintextKey, { ...body, input: [] })).status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const success = await call(scoped.plaintextKey, body);
+    expect(success.status).toBe(200);
+    const payload = await success.json() as { data: Array<{ index: number; embedding: number[] }>; usage: { total_tokens: number } };
+    expect(payload.data.map((item) => item.index)).toEqual([0, 1]);
+    expect(payload.data[0]!.embedding).toHaveLength(128);
+    expect(payload.data[0]!.embedding.slice(0, 2)).toEqual([0.6, 0.8]);
+    expect(payload.usage.total_tokens).toBe(3);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2", input: body.input, encoding_format: "float" });
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+
+    expect((await chat(scoped.plaintextKey, { model: "embeddinggemma-2" })).status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    mockMode = "embedding-error500";
+    expect((await call(scoped.plaintextKey, body)).status).toBe(502);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    mockMode = "embedding-malformed";
+    expect((await call(scoped.plaintextKey, body)).status).toBe(502);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    mockMode = "embedding-error413";
+    const oversized = await call(scoped.plaintextKey, body);
+    expect(oversized.status).toBe(413);
+    expect(JSON.stringify(await oversized.json())).not.toContain("do not relay");
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("accepts bounded typed media for an existing embedding grant and charges actual successful usage", async () => {
+    mockMode = "embedding-list";
+    const portal = await (await fetch(url("/portal"))).text();
+    expect(portal).toContain("PNG/JPEG images");
+    expect(portal).toContain("remote and local URLs are rejected");
+    expect(portal).not.toContain("EMBEDDING_MEDIA_EXAMPLE");
+    const sidecarReads = upstreamModelRequestCount;
+    expect((await fetch(url("/portal"))).status).toBe(200);
+    expect(upstreamModelRequestCount).toBe(sidecarReads);
+    const scoped = mintKey({ alias: `embedding-media-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 10_000 }, DEFAULTS);
+    const discovery = await fetch(url("/v1/models"), {
+      headers: { authorization: `Bearer ${scoped.plaintextKey}` },
+    });
+    expect(discovery.status).toBe(200);
+    const listed = await discovery.json() as { data: Array<{ id: string; architecture?: { input_modalities: string[] } }> };
+    expect(listed.data.find((item) => item.id === "embeddinggemma-2")?.architecture?.input_modalities)
+      .toEqual(["text", "image", "audio", "video"]);
+    const wav = Buffer.alloc(46);
+    wav.write("RIFF", 0); wav.writeUInt32LE(38, 4); wav.write("WAVEfmt ", 8);
+    wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(8_000, 24); wav.writeUInt32LE(16_000, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+    wav.write("data", 36); wav.writeUInt32LE(2, 40);
+    const call = (input: unknown) => fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${scoped.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input, dimensions: 256 }) });
+    const priorCalls = upstreamInferenceRequestCount;
+    const invalid = await call([{ content: [{ type: "image_url", image_url: { url: "http://example.invalid/a.png" } }] }]);
+    expect(invalid.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(priorCalls);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(0);
+    const success = await call([{ content: [{ type: "input_audio", input_audio: {
+      data: wav.toString("base64"), format: "wav",
+    } }] }]);
+    expect(success.status).toBe(200);
+    expect((await success.json() as { data: Array<{ embedding: number[] }> }).data[0]?.embedding).toHaveLength(256);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2",
+      input: [{ content: [{ type: "input_audio", input_audio: { data: wav.toString("base64") } }] }],
+      encoding_format: "float" });
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    const beforeWrapped = upstreamInferenceRequestCount;
+    mockMode = "embedding-error500"; // Model metadata omits the media projector.
+    const wrappedText = await call([{ content: [{ type: "text", text: "A short document" }] }]);
+    expect(wrappedText.status).toBe(502);
+    expect(upstreamInferenceRequestCount).toBe(beforeWrapped);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("caps CPU embedding work at one request before consuming another gateway slot", async () => {
+    mockMode = "embedding-stall";
+    releaseStall = null;
+    const guest = mintKey({ alias: `embedding-cap-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const ungranted = mintKey({ alias: `embedding-cap-ungranted-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const call = () => fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+    const first = call();
+    try {
+      for (let attempt = 0; attempt < 100 && releaseStall === null; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(releaseStall).not.toBeNull();
+      const reservedCredits = lookupKey(guest.plaintextKey)!.creditsUsed;
+      const ungrantedResponse = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ungranted.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+      expect(ungrantedResponse.status).toBe(403);
+      const second = await call();
+      expect(second.status).toBe(503);
+      const malformedConcurrent = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: [{ unsupported: "value" }] }) });
+      expect(malformedConcurrent.status).toBe(503);
+      expect(upstreamInferenceRequestCount).toBe(1);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(reservedCredits);
+    } finally {
+      releaseStall?.();
+      releaseStall = null;
+    }
+    expect((await first).status).toBe(200);
+    expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("does not let an unfinished authorized upload hold the embedding slot", async () => {
+    mockMode = "embedding-list";
+    const guest = mintKey({ alias: `embedding-upload-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const unfinished = httpRequest(url("/v1/embeddings"), { method: "POST", headers: {
+      authorization: `Bearer ${guest.plaintextKey}`, "content-type": "application/json",
+    } });
+    unfinished.on("error", () => undefined);
+    try {
+      await new Promise<void>((resolve) => unfinished.write('{"model":"embeddinggemma-2","input":"', resolve));
+      const response = await fetch(url("/v1/embeddings"), { method: "POST", headers: {
+        authorization: `Bearer ${guest.plaintextKey}`, "content-type": "application/json",
+      }, body: JSON.stringify({ model: "embeddinggemma-2", input: "another request" }) });
+      expect(response.status).toBe(200);
+      expect(upstreamInferenceRequestCount).toBe(1);
+    } finally {
+      unfinished.destroy();
+    }
+  });
+
+  it("accepts the OpenAI SDK base64 format and user field without forwarding user", async () => {
+    mockMode = "embedding-list";
+    const guest = mintKey({ alias: `embedding-sdk-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const response = await fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document",
+        dimensions: 128, encoding_format: "base64", user: "sdk-user" }) });
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { data: Array<{ embedding: string }> };
+    expect(Buffer.from(payload.data[0]!.embedding, "base64")).toHaveLength(128 * 4);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2",
+      input: "A short document", encoding_format: "float" });
+    expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("hides embedding models from open guest discovery and when disabled", async () => {
+    mockMode = "embedding-list";
+    const open = mintKey({ alias: `embedding-list-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const scoped = mintKey({ alias: `embedding-list-scoped-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["embeddinggemma-2"] }, DEFAULTS);
+    const owner = mintKey({ alias: `embedding-list-owner-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const models = async (token: string, path: "/models" | "/v1/models") => {
+      const response = await fetch(url(path), { headers: { authorization: `Bearer ${token}` } });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+      const payload = await response.json() as { data?: Array<{ id: string }>; models?: Array<{ key: string; type: string }> };
+      return path === "/models" ? payload.models!.map((item) => item.key) : payload.data!.map((item) => item.id);
+    };
+    for (const path of ["/models", "/v1/models"] as const) {
+      expect(await models(open.plaintextKey, path)).not.toContain("embeddinggemma-2");
+      expect(await models(scoped.plaintextKey, path)).toContain("embeddinggemma-2");
+      expect(await models(owner.plaintextKey, path)).toContain("embeddinggemma-2");
+    }
+    const cfg = loadConfig();
+    const enabled = cfg.embeddingModels;
+    cfg.embeddingModels = [];
+    try {
+      expect(await models(scoped.plaintextKey, "/v1/models")).not.toContain("embeddinggemma-2");
+      expect((await chat(scoped.plaintextKey, { model: "embeddinggemma-2" })).status).toBe(400);
+      const disabled = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${scoped.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "hello" }) });
+      expect(disabled.status).toBe(400);
+      expect(upstreamInferenceRequestCount).toBe(0);
+    } finally {
+      cfg.embeddingModels = enabled;
+    }
+  });
+
+  it("omits an unavailable embedding sidecar from discovery and refuses inference without billing", async () => {
+    const guest = mintKey({ alias: `embedding-unready-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 100 }, DEFAULTS);
+    const headers = { authorization: `Bearer ${guest.plaintextKey}` };
+    for (const mode of ["embedding-list-absent"]) {
+      mockMode = mode;
+      for (const path of ["/models", "/v1/models"]) {
+        const response = await fetch(url(path), { headers });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("private, no-store");
+        expect(JSON.stringify(await response.json())).not.toContain("embeddinggemma-2");
+      }
+      const call = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "hello" }) });
+      expect(call.status).toBe(502);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(0);
+    }
+  });
+
+  it("atomically grants the embedding model to existing open customer keys without changing credits", async () => {
+    mockMode = "embedding-list";
+    const first = mintKey({ alias: `embedding-grant-a-${randomUUID()}`, tier: "guest",
+      creditLimit: 1_000 }, DEFAULTS);
+    const second = mintKey({ alias: `embedding-grant-b-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["m1"], creditLimit: 1_000 }, DEFAULTS);
+    const owner = mintKey({ alias: `embedding-grant-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin" }, DEFAULTS);
+    const grant = (aliases: string[], token = "admin-static-key") => fetch(url("/admin/keys/embedding-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", aliases }),
+    });
+    const before = lookupKey(first.plaintextKey)!.creditsUsed;
+    expect((await grant([first.record.alias, second.record.alias], first.plaintextKey)).status).toBe(403);
+    expect((await grant([first.record.alias, "missing-customer"])).status).toBe(400);
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+    expect((await grant([first.record.alias, owner.record.alias])).status).toBe(400);
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+
+    const response = await grant([first.record.alias, second.record.alias]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ model: "embeddinggemma-2",
+      changed: [first.record.alias, second.record.alias], unchanged: [] });
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual(["embeddinggemma-2"]);
+    expect(lookupKey(first.plaintextKey)!.modelAllowList).toEqual([]);
+    expect(lookupKey(first.plaintextKey)!.creditsUsed).toBe(before);
+    expect((await grant([first.record.alias])).status).toBe(200);
+
+    const list = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${first.plaintextKey}` } });
+    const models = await list.json() as { data: Array<{ id: string }> };
+    expect(models.data.map((entry) => entry.id)).toContain("embeddinggemma-2");
+  });
+
+  it("serves a configured System One model through guest auth, admission, and exact usage billing", async () => {
+    const minted = mintKey({
+      alias: `systemone-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const body = {
+      model: "clef-flash",
+      state: "The checkout is unavailable for all customers.",
+      questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+    };
+    const call = (payload: unknown, token = minted.plaintextKey) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    const unauthenticated = await fetch(url("/v1/systemone"), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    expect(unauthenticated.status).toBe(401);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const unscopedGuest = mintKey({ alias: `systemone-unscoped-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const unscopedAttempt = await call(body, unscopedGuest.plaintextKey);
+    expect(unscopedAttempt.status).toBe(403);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const denied = await call({ ...body, model: "m1" });
+    expect(denied.status).toBe(403);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const malformed = await call({ ...body, questions: {} });
+    expect(malformed.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const success = await call(body);
+    expect(success.status).toBe(200);
+    expect(await success.json()).toMatchObject({ answers: { urgent: { noul: 0.92 } } });
+    expect(JSON.parse(lastUpstreamBody)).toEqual(body);
+    expect(upstreamInferenceRequestCount).toBe(1);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    const wrongSurface = await chat(minted.plaintextKey, { model: "clef-flash" });
+    expect(wrongSurface.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    mockMode = "error500";
+    const failure = await call(body);
+    expect(failure.status).toBe(502);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    mockMode = "systemone-malformed";
+    const malformedUpstream = await call(body);
+    expect(malformedUpstream.status).toBe(502);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+  });
+
+  it("serves a configured System One choice question with exact forwarding and usage billing", async () => {
+    mockMode = "systemone-choice";
+    const minted = mintKey({
+      alias: `systemone-choice-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const body = {
+      model: "clef-flash",
+      state: "The customer was charged twice for the same order.",
+      questions: {
+        route: {
+          type: "choice",
+          instructions: "Which team should handle this request?",
+          criteria: {
+            billing: "Payments, charges and refunds",
+            support: "Technical product problems",
+          },
+        },
+      },
+    };
+    const call = (payload: unknown, token = minted.plaintextKey) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    const malformedRequest = { ...body, questions: { route: {
+      ...body.questions.route, criteria: ["Payments, charges and refunds", "Technical product problems"],
+    } } };
+    const malformed = await call(malformedRequest);
+    expect(malformed.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(0);
+
+    const success = await call(body);
+    expect(success.status).toBe(200);
+    expect(await success.json()).toEqual({
+      answers: {
+        route: {
+          type: "choice",
+          choice: "billing",
+          probabilities: { billing: 0.9, support: 0.1 },
+          confidence: 0.8,
+        },
+      },
+      usage: { input_tokens: 24, output_tokens: 0 },
+    });
+    expect(JSON.parse(lastUpstreamBody)).toEqual(body);
+    expect(upstreamInferenceRequestCount).toBe(1);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
+
+    mockMode = "systemone-choice-malformed";
+    const malformedUpstream = await call(body);
+    expect(malformedUpstream.status).toBe(502);
+    expect(upstreamInferenceRequestCount).toBe(2);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
+  });
+
+  it("accepts System One bodies up to the raw-byte cap and rejects oversize bodies before billing", async () => {
+    expect(SYSTEMONE_MAX_BODY_BYTES).toBe(256 * 1024);
+    const minted = mintKey({
+      alias: `systemone-large-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const callRaw = (raw: string) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${minted.plaintextKey}` },
+      body: raw,
+    });
+
+    const unicode = {
+      model: "clef-flash",
+      state: "Ångström 🙂 är tillgänglig för kunder. ".repeat(400),
+      questions: { urgent: { type: "noul", instructions: "Är detta brådskande?" } },
+    };
+    const unicodeRaw = JSON.stringify(unicode);
+    expect(Buffer.byteLength(unicodeRaw)).toBeGreaterThan(8 * 1024);
+    const unicodeResponse = await callRaw(unicodeRaw);
+    expect(unicodeResponse.status).toBe(200);
+    expect(lastUpstreamBody).toBe(unicodeRaw);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    const exact = systemOneBodyAtBytes(SYSTEMONE_MAX_BODY_BYTES);
+    const exactResponse = await callRaw(exact.raw);
+    expect(exactResponse.status).toBe(200);
+    expect(lastUpstreamBody).toBe(exact.raw);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+
+    const oversized = systemOneBodyAtBytes(SYSTEMONE_MAX_BODY_BYTES + 1);
+    const beforeOversized = upstreamInferenceRequestCount;
+    const oversizedResponse = await callRaw(oversized.raw);
+    expect(oversizedResponse.status).toBe(413);
+    expect(upstreamInferenceRequestCount).toBe(beforeOversized);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+
+    const chunked = await postChunkedSystemOne(oversized.raw, minted.plaintextKey);
+    expect(chunked.status).toBe(413);
+    expect(upstreamInferenceRequestCount).toBe(beforeOversized);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+  });
+
+  it("keeps Clef out of chat when the System One setting is absent", async () => {
+    const cfg = loadConfig();
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      const guest = mintKey({ alias: `systemone-drift-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+      const response = await chat(guest.plaintextKey, { model: "clef-flash" });
+      expect(response.status).toBe(400);
+      expect(upstreamInferenceRequestCount).toBe(0);
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
+  it("does not forward model-less chat to a resident Clef after config loss", async () => {
+    mockMode = "clef-running";
+    const cfg = loadConfig();
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      const guest = mintKey({ alias: `systemone-resident-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+      const response = await chat(guest.plaintextKey, { model: undefined });
+      expect(response.status).toBe(200);
+      expect(JSON.parse(lastUpstreamBody)).toMatchObject({ model: "m1" });
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
+  it("lists Clef only when enabled and explicitly granted to a guest", async () => {
+    mockMode = "systemone-list";
+    const cfg = loadConfig();
+    const unscopedGuest = mintKey({ alias: `systemone-list-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const scopedGuest = mintKey({ alias: `systemone-list-scoped-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["clef-flash"] }, DEFAULTS);
+    const owner = mintKey({ alias: `systemone-list-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin" }, DEFAULTS);
+    const scopedOwner = mintKey({ alias: `systemone-list-scoped-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin", modelAllowList: ["m1"] }, DEFAULTS);
+    const modelsFor = async (token: string): Promise<string[]> => {
+      const response = await fetch(url("/v1/models"), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { data: Array<{ id: string }> };
+      return body.data.map((model) => model.id);
+    };
+    const legacyModelsFor = async (token: string): Promise<string[]> => {
+      const response = await fetch(url("/models"), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { models: Array<{ key: string }> };
+      return body.models.map((model) => model.key);
+    };
+    expect(await modelsFor(unscopedGuest.plaintextKey)).not.toContain("clef-flash");
+    expect(await legacyModelsFor(unscopedGuest.plaintextKey)).not.toContain("clef-flash");
+    expect(await modelsFor(scopedGuest.plaintextKey)).toContain("clef-flash");
+    expect(await legacyModelsFor(scopedGuest.plaintextKey)).toContain("clef-flash");
+    expect(await modelsFor(owner.plaintextKey)).toContain("clef-flash");
+    expect(await modelsFor(scopedOwner.plaintextKey)).not.toContain("clef-flash");
+    expect(await legacyModelsFor(scopedOwner.plaintextKey)).not.toContain("clef-flash");
+    const enabledModels = cfg.systemOneModels;
+    cfg.systemOneModels = [];
+    try {
+      expect(await modelsFor(scopedGuest.plaintextKey)).not.toContain("clef-flash");
+      expect(await modelsFor(owner.plaintextKey)).not.toContain("clef-flash");
+      expect(await legacyModelsFor(owner.plaintextKey)).not.toContain("clef-flash");
+    } finally {
+      cfg.systemOneModels = enabledModels;
+    }
+  });
+
   it("observes rejected promises without creating a second unhandled rejection", async () => {
     const rejectingPromise = Promise.reject(new Error("boom"));
 
@@ -418,7 +1094,7 @@ describe("gateway spine — HTTP integration", () => {
     // A real restart rotates the private capability epoch. That invalidates new sends, but an
     // already-admitted exact retry must still recover its original echo without inference.
     await stopGateway?.();
-    const restarted = await startGateway();
+    const restarted = await startGateway(memoryComposition());
     gatewayPort = restarted.port;
     stopGateway = restarted.stop;
     const callsBeforeRestartRecovery = upstreamInferenceRequestCount;
@@ -631,6 +1307,7 @@ describe("gateway spine — HTTP integration", () => {
   });
 
   it("model allow-list: an empty allow-list (owner) MAY omit the model", async () => {
+    mockMode = "validrunning";
     const owner = mintKey({ alias: "allow-list-owner-omit", tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/v1/chat/completions"), {
       method: "POST",
@@ -650,6 +1327,90 @@ describe("gateway spine — HTTP integration", () => {
     expect(second.headers.get("x-ratelimit-limit")).toBeTruthy();
     const j = (await second.json()) as { error: { code: string } };
     expect(j.error.code).toBe("rate_limit_exceeded");
+  });
+
+  it.each([
+    { reason: "rpm", limits: { rpm: 0, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 1 }, limit: 0, phrase: "requests per minute" },
+    { reason: "tpm", limits: { rpm: 100, tpm: 2, dailyTokenBudget: 0, maxParallel: 1 }, limit: 2, phrase: "tokens per minute" },
+    { reason: "daily", limits: { rpm: 100, tpm: 1_000, dailyTokenBudget: 1, maxParallel: 1 }, limit: 1, phrase: "per UTC day" },
+  ])("quota 429 explains the caller's $reason limit and returns matching metadata", async ({ reason, limits, limit, phrase }) => {
+    const minted = mintKey({ alias: `quota-${reason}-${randomUUID()}`, tier: "guest" }, limits);
+    if (reason === "daily") {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-14T12:00:00.000Z"));
+    }
+    try {
+      const response = await chat(minted.plaintextKey, { max_tokens: 10 });
+      expect(response.status).toBe(429);
+      const retryAfter = Number(response.headers.get("retry-after"));
+      expect(retryAfter).toBeGreaterThan(0);
+      const body = await response.json() as { error: { code: string; message: string; quota?: Record<string, unknown> } };
+      expect(body.error.code).toBe("rate_limit_exceeded");
+      expect(body.error.message).toContain(`Per-key ${reason} limit reached`);
+      expect(body.error.message).toContain("your own API key");
+      expect(body.error.message).toContain(phrase);
+      if (reason === "rpm" && limit === 0) {
+        expect(body.error.message).toContain("contact the gateway operator");
+        expect(body.error.message).toContain("will not restore request capacity");
+        expect(body.error.message).not.toMatch(/expiry|reset/i);
+        expect(body.error.message).not.toContain("retry after");
+      } else if (reason === "daily") {
+        expect(body.error.message).toContain(`The UTC-day budget resets in ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).toContain(`retry after ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+      } else {
+        expect(body.error.message).toContain(`The next quota-window expiry is in ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).toContain(`retry after ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).not.toContain("The quota window resets");
+      }
+      if (reason === "daily") expect(body.error.message).toContain("1 token per UTC day");
+      expect(body.error.quota).toMatchObject({
+        reason,
+        scope: "key",
+        window: reason === "daily" ? "utc_day" : "60s",
+        limit,
+        requested: reason === "rpm" ? 1 : expect.any(Number),
+        counted: false,
+        retry_after_seconds: retryAfter,
+      });
+      expect(Object.keys(body.error.quota ?? {}).sort()).toEqual([
+        "counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "used_before", "window",
+      ]);
+      expect(body.error.message).not.toContain(minted.record.alias);
+      expect(body.error.message).not.toContain(minted.record.keyHash);
+      expect(body.error.message).not.toContain("model");
+      expect(body.error.message).not.toContain("ip");
+      expect(response.headers.get("x-ratelimit-limit")).toBe(String(limit));
+      expect(response.headers.get("x-ratelimit-remaining")).toBe(
+        String(Math.max(0, limit - Number(body.error.quota?.used_before))),
+      );
+      expect(response.headers.get("x-ratelimit-reset")).toBe(String(retryAfter));
+      expect(upstreamInferenceRequestCount).toBe(0);
+      if (reason === "daily") {
+        expect(retryAfter).toBe(43_200);
+        expect(body.error.quota?.window).toBe("utc_day");
+        const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?").get(minted.record.alias, "2026-10-14") as { tokens: number } | undefined;
+        expect(daily?.tokens ?? 0).toBe(0);
+      }
+    } finally {
+      if (reason === "daily") vi.useRealTimers();
+    }
+  });
+
+  it("quota 429 for a minted static-alias collision hides shared usage", async () => {
+    const minted = mintKey({ alias: "static:user", tier: "guest", rpm: 1 }, DEFAULTS);
+    expect((await chat(minted.plaintextKey, {})).status).toBe(200);
+    const response = await chat(minted.plaintextKey, {});
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(response.headers.get("x-ratelimit-remaining")).toBeNull();
+    const body = await response.json() as { error: { message: string; quota?: Record<string, unknown> } };
+    expect(body.error.message).toContain("Shared static-tier rpm limit reached");
+    expect(body.error.message).toContain("shared static-tier bucket");
+    expect(JSON.stringify(body.error)).not.toContain("static:user");
+    expect(Object.keys(body.error.quota ?? {}).sort()).toEqual([
+      "counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "window",
+    ]);
+    expect(body.error.quota).toMatchObject({ scope: "shared_static_tier", counted: false });
   });
 
   it("admission 503: guest is rejected while a slot is held; a queued owner succeeds on release", async () => {
@@ -682,6 +1443,85 @@ describe("gateway spine — HTTP integration", () => {
     if (releaseStall) releaseStall();
     const queued = await queuedP;
     expect(queued.status).toBe(200);
+  });
+
+  it.each(["m5", "orin"] as const)("cancels a disconnected queued owner before %s reaches upstream", async (node) => {
+    await restartGatewayWithHostMemory("off");
+    let heldP: Promise<Response> | null = null;
+    let queuedReq: ReturnType<typeof httpRequest> | null = null;
+    try {
+      mockMode = "queued-disconnect";
+      upstreamInferenceRequestCount = 0;
+      lastUpstreamBody = "";
+      const model = node === "orin" ? "qwen2.5-coder:3b" : "m1";
+      const owner = mintKey({
+        alias: `queued-disconnect-${node}-${randomUUID()}`,
+        tier: "owner",
+        scope: "admin",
+        modelAllowList: [model],
+        maxParallel: 2,
+        dailyTokenBudget: 100_000,
+        creditLimit: 100_000,
+      }, DEFAULTS);
+      const requestBody = JSON.stringify({
+        model,
+        node,
+        messages: [{ role: "user", content: `synthetic ${node} request` }],
+        max_tokens: 8,
+      });
+
+      heldP = chat(owner.plaintextKey, { model, node, messages: [{ role: "user", content: `synthetic ${node} request` }], max_tokens: 8 });
+      await waitForGatewayAdmission((snapshot) => snapshot.inflight === 1 && snapshot.ownerQueued === 0);
+      const firstCallDeadline = Date.now() + 1_500;
+      while (upstreamInferenceRequestCount !== 1 && Date.now() < firstCallDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(upstreamInferenceRequestCount).toBe(1);
+
+      const target = new URL(url("/v1/chat/completions"));
+      queuedReq = httpRequest(target, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${owner.plaintextKey}`,
+        },
+      });
+      queuedReq.on("error", () => {}); // The test intentionally destroys this waiting client.
+      const queuedClosed = new Promise<void>((resolve) => queuedReq!.once("close", resolve));
+      queuedReq.end(requestBody);
+      await waitForGatewayAdmission((snapshot) => snapshot.ownerQueued === 1);
+
+      queuedReq.destroy();
+      expect(await settlesWithin(queuedClosed, 1_000)).toBe(true);
+      const disconnected = await waitForGatewayAdmission((snapshot) => snapshot.inflight === 1 && snapshot.ownerQueued === 0);
+      expect(disconnected).toMatchObject({ inflight: 1, ownerQueued: 0 });
+      expect(upstreamInferenceRequestCount).toBe(1);
+
+      const releaseFirst = releaseStall;
+      releaseStall = null;
+      releaseFirst?.();
+      expect((await heldP).status).toBe(200);
+      heldP = null;
+      const idle = await waitForGatewayAdmission((snapshot) => snapshot.inflight === 0 && snapshot.ownerQueued === 0);
+      expect(idle).toMatchObject({ inflight: 0, ownerQueued: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(upstreamInferenceRequestCount).toBe(1);
+      expect(lookupKey(owner.plaintextKey)!.creditsUsed).toBe(7);
+      const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ?")
+        .get(owner.record.alias) as { tokens: number } | undefined;
+      expect(daily?.tokens ?? 0).toBe(7);
+      queuedReq = null;
+    } finally {
+      queuedReq?.destroy();
+      for (let i = 0; i < 4; i++) {
+        const release = releaseStall;
+        releaseStall = null;
+        release?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await heldP?.catch(() => undefined);
+      await restartGatewayWithHostMemory("enforce");
+    }
   });
 
   it("max_tokens cap: a request above the per-request cap is clamped before proxying", async () => {
@@ -858,14 +1698,15 @@ describe("gateway spine — HTTP integration", () => {
       model_ids: ["m1"],
       harness_ids: ["openai-chat"],
     });
-    expect(body.results.find((row) => row.fingerprint_sha256 === legacyOwnerChatHash)).toMatchObject({
+    const legacyExposure = body.results.find((row) => row.fingerprint_sha256 === legacyOwnerChatHash)!;
+    expect(legacyExposure).toMatchObject({
       seen: true,
       lanes: ["chat"],
-      // The static principal has no trusted per-key catalogue identity, so exposure is retained
-      // without inventing model metadata.
-      model_ids: [],
       harness_ids: ["openai-chat"],
     });
+    // The implicit model may be resolved from a prior discovery cache. The static principal's
+    // exposure must never invent any ID beyond the mock backend's actual m1 model.
+    expect([[], ["m1"]]).toContainEqual(legacyExposure.model_ids);
     expect(body.results.find((row) => row.fingerprint_sha256 === delegateHash)).toMatchObject({
       seen: true,
       lanes: ["delegate"],
@@ -984,6 +1825,89 @@ describe("gateway spine — HTTP integration", () => {
     // fail-safe behaviour resolveServedModelIdentity is built for.
     expect(snapshot!.bundle.modelArtifact.kind).toBe("unknown");
     expect(snapshot!.bundle.configEpoch.kind).toBe("unknown");
+  });
+
+  it("releases a first-attempt stamped claim on memory refusal, then recovers the successful retry", async () => {
+    const owner = mintKey({ alias: `stamped-memory-first-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    requestBody.taskType = "other";
+    requestBody.learningTaskStamp.task_type.id = "other";
+    hostMemoryAvailableGib = 10;
+
+    const { ensureLearningTaskAdmissionSchema } = await import("../src/homeserver/learning-task-admission-store.js");
+    ensureLearningTaskAdmissionSchema();
+    const admissionsBefore = tableCount("learning_task_admissions");
+    const qualityEvidenceBefore = tableCount("delegations");
+    const refused = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(refused.status).toBe(503);
+    expect(refused.headers.get("retry-after")).toBe("7");
+    expect((await refused.json()) as { error: { code: string } }).toMatchObject({ error: { code: "insufficient_memory" } });
+    expect(upstreamInferenceRequestCount).toBe(0);
+    expect(tableCount("learning_task_admissions")).toBe(admissionsBefore);
+    expect(tableCount("delegations")).toBe(qualityEvidenceBefore);
+
+    hostMemoryAvailableGib = 90;
+    const accepted = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(accepted.status).toBe(200);
+    const acceptedBody = await accepted.json() as { ledgerId?: string; learningTaskGatewayEcho?: unknown };
+    expect(acceptedBody.ledgerId).toEqual(expect.any(String));
+    expect(acceptedBody.learningTaskGatewayEcho).toBeDefined();
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    const replay = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      outcome: "error",
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+    });
+    expect(upstreamInferenceRequestCount).toBe(1);
+  });
+
+  it("preserves a stamped claim when format retry is refused after inference began", async () => {
+    const owner = mintKey({ alias: `stamped-memory-retry-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const { requestBody } = await makeStampedDelegateRequest(owner);
+    requestBody.taskType = "other";
+    requestBody.learningTaskStamp.task_type.id = "other";
+    mockMode = "format500";
+    const qualityEvidenceBefore = tableCount("delegations");
+
+    const refusedRetry = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(refusedRetry.status).toBe(503);
+    expect(refusedRetry.headers.get("retry-after")).toBeNull();
+    expect((await refusedRetry.json()) as { error: { code: string } }).toMatchObject({ error: { code: "insufficient_memory" } });
+    const callsAfterPriorInference = upstreamInferenceRequestCount;
+    expect(callsAfterPriorInference).toBeGreaterThan(0);
+    expect(tableCount("delegations")).toBe(qualityEvidenceBefore);
+
+    hostMemoryAvailableGib = 90;
+    mockMode = "ok";
+    const replay = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify(requestBody),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      outcome: "error",
+      learningTaskAdmission: { recovered: true, outcomeAvailable: false },
+    });
+    expect(upstreamInferenceRequestCount).toBe(callsAfterPriorInference);
   });
 
   it("task exposure lookup denies guest and identity-less static admin keys", async () => {
@@ -1267,6 +2191,20 @@ describe("gateway spine — HTTP integration", () => {
     expect(res.status).toBe(200);
     const sent = JSON.parse(lastUpstreamBody) as { n?: number };
     expect(sent.n).toBe(1);
+  });
+
+  it("keeps prompt caching server-owned and strips client-directed slot/cache-reuse controls", async () => {
+    const minted = mintKey({ alias: "cache-policy", tier: "guest" }, DEFAULTS);
+    const res = await chat(minted.plaintextKey, {
+      cache_prompt: false,
+      id_slot: 0,
+      n_cache_reuse: 1,
+    });
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(lastUpstreamBody) as Record<string, unknown>;
+    expect(sent["cache_prompt"]).toBe(true);
+    expect(sent).not.toHaveProperty("id_slot");
+    expect(sent).not.toHaveProperty("n_cache_reuse");
   });
 
   // ─── #7 — GET /ledger is admin-gated (no guest data exposure) ─────────────────────────
@@ -1684,5 +2622,99 @@ describe("gateway spine — HTTP integration", () => {
 
     // Billing invariant: a failed upstream call (no successful completion) must charge 0.
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(0);
+  });
+
+  it("grants Clef to an existing open guest key without taking away ordinary chat", async () => {
+    mockMode = "systemone-list";
+    const key = mintKey({ alias: `clef-open-${randomUUID()}`, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const adminGrant = (aliases: string[]) => fetch(url("/admin/keys/systemone-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer admin-static-key" },
+      body: JSON.stringify({ model: "clef-flash", aliases }),
+    });
+    for (const invalidBody of ["null", "{"]) {
+      const invalid = await fetch(url("/admin/keys/systemone-grants"), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer admin-static-key" },
+        body: invalidBody,
+      });
+      expect(invalid.status).toBe(400);
+    }
+    const before = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    const beforeModels = (await before.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id);
+    expect(beforeModels).toContain("m1");
+    expect(beforeModels).not.toContain("clef-flash");
+
+    const forbidden = await fetch(url("/admin/keys/systemone-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key.plaintextKey}` },
+      body: JSON.stringify({ model: "clef-flash", aliases: [key.record.alias] }),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(lookupKey(key.plaintextKey)!.systemOneModelAllowList).toEqual([]);
+
+    const rejected = await adminGrant([key.record.alias, "missing-key"]);
+    expect(rejected.status).toBe(400);
+    expect(lookupKey(key.plaintextKey)!.systemOneModelAllowList).toEqual([]);
+    const maximalAliases = Array.from({ length: 128 }, (_, index) =>
+      "x".repeat(125) + String(index).padStart(3, "0"));
+    expect((await adminGrant(maximalAliases)).status).toBe(400);
+
+    const grant = await adminGrant([key.record.alias]);
+    expect(grant.status).toBe(200);
+    expect(await grant.json()).toMatchObject({ changed: [key.record.alias], unchanged: [] });
+    const duplicate = await adminGrant([key.record.alias]);
+    expect(await duplicate.json()).toMatchObject({ changed: [], unchanged: [key.record.alias] });
+    expect(lookupKey(key.plaintextKey)!.modelAllowList).toEqual([]);
+
+    const after = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    const afterModels = (await after.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id);
+    expect(afterModels).toContain("m1");
+    expect(afterModels).toContain("clef-flash");
+    expect((await chat(key.plaintextKey, {
+      model: "m1", messages: [{ role: "user", content: `Clef grant test ${randomUUID()}` }],
+    })).status).toBe(200);
+    const decision = await fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key.plaintextKey}` },
+      body: JSON.stringify({
+        model: "clef-flash",
+        state: "The checkout is unavailable for all customers.",
+        questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+      }),
+    });
+    expect(decision.status).toBe(200);
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+  });
+
+  it("grants the existing Qwen chat model only to exact active customer keys", async () => {
+    mockMode = "qwen-list";
+    const key = mintKey({ alias: `qwen-customer-${randomUUID()}`, tier: "guest", scope: "inference",
+      modelAllowList: ["m1"], creditLimit: 1_000_000 }, DEFAULTS);
+    const grant = (aliases: string[], auth = "Bearer admin-static-key") => fetch(url("/admin/keys/chat-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: auth },
+      body: JSON.stringify({ model: "qwen3-30b-instruct", aliases }),
+    });
+    const before = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    expect((await before.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id))
+      .toEqual(["m1"]);
+    expect((await grant([key.record.alias], `Bearer ${key.plaintextKey}`)).status).toBe(403);
+    expect((await grant([key.record.alias, "missing"])).status).toBe(400);
+    expect(lookupKey(key.plaintextKey)!.modelAllowList).toEqual(["m1"]);
+    expect(await (await grant([key.record.alias])).json()).toMatchObject({
+      model: "qwen3-30b-instruct", changed: [key.record.alias], unchanged: [],
+    });
+    expect(await (await grant([key.record.alias])).json()).toMatchObject({
+      changed: [], unchanged: [key.record.alias],
+    });
+    const after = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${key.plaintextKey}` } });
+    expect((await after.json() as { data: Array<{ id: string }> }).data.map((entry) => entry.id))
+      .toContain("qwen3-30b-instruct");
+    expect(lookupKey(key.plaintextKey)!.creditLimit).toBe(1_000_000);
+    expect((await chat(key.plaintextKey, {
+      model: "qwen3-30b-instruct", messages: [{ role: "user", content: "Short greeting" }],
+    })).status).toBe(200);
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
   });
 });

@@ -1,6 +1,6 @@
 /** Append-only incumbent-audit evidence reader and current-identity eligibility gate (#11). */
 import { existsSync, readFileSync } from "node:fs";
-import { evidenceIdentityFromServedModelCmd, type EvidenceIdentityBundle } from "./evidence-identity.js";
+import { evidenceIdentityFromServedModelCmd } from "./evidence-identity.js";
 import type { IncumbentAuditRecord } from "./incumbent-audit.js";
 
 export function readIncumbentAudits(path: string): IncumbentAuditRecord[] {

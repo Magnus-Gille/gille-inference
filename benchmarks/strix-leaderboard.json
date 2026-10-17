@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-15",
+  "machine": {
+    "cpu": "AMD Ryzen AI Max+ 395",
+    "gpu": "Radeon 8060S / gfx1151",
+    "memoryGiB": 128,
+    "memoryBandwidthTheoreticalGBps": 256,
+    "os": "Linux"
+  },
+  "policy": {
+    "primaryMetric": "completed useful agentic work per observed minute",
+    "configuredContextIsNotPopulatedContext": true,
+    "nullMeaning": "not captured by the cited artifact; never inferred from configured capacity"
+  },
+  "categories": {
+    "fastestUsefulModel": {
+      "winner": "mellum",
+      "scope": "narrow verified local leaves, not multi-file coding-agent work"
+    },
+    "fastestStrongCodingModel": {
+      "winner": "qwen36-a3b",
+      "scope": "fresh three-seed Gate D comparison of deployed Qwen3.6 and Qwen3.8 profiles"
+    },
+    "bestCodingAgent": {
+      "winner": "qwen36-a3b",
+      "scope": "completed correct Gate D runs per observed minute; Qwen3.8 remains the broad-edit escalation"
+    },
+    "strongestInteractiveModel": {
+      "winner": "qwen38-27b",
+      "scope": "correctness on the matched Gate D comparison; latency is materially worse"
+    },
+    "bestLongContextModel": {
+      "winner": "gpt-oss-120b",
+      "scope": "qualified 64K cold-context profile among locally measured candidates"
+    },
+    "bestVlm": {
+      "winner": null,
+      "scope": "Qwen3.8 passed a vision transport/grounding canary, but no repeatable VLM task score exists"
+    },
+    "bestMaximumCapabilityModel": {
+      "winner": "gpt-oss-120b",
+      "scope": "current standard large-model lane; task-dependent and not the preferred coding-agent driver"
+    }
+  },
+  "entries": [
+    {
+      "id": "mellum",
+      "model": "Mellum2-12B-A2.5B-Instruct",
+      "architecture": "MoE, approximately 2.5B active",
+      "quant": "Q4_K_M",
+      "backend": "production llama.cpp profile; backend was not restamped in the routing artifact",
+      "configuredContextTokens": 131072,
+      "actualPopulatedContextTokens": null,
+      "promptTokensPerSecond": null,
+      "generationTokensPerSecond": 123.62,
+      "speculation": "none recorded",
+      "ramGiB": null,
+      "quality": {
+        "metric": "verifier-backed overall pass rate",
+        "score": 0.94,
+        "attempts": 276,
+        "limits": "fast narrow workhorse; weak at math and multi-constraint work"
+      },
+      "evidenceLabel": "LOCAL-MEASURED",
+      "sources": ["docs/m5-routing.json", "deploy/llama-swap-config.yaml"]
+    },
+    {
+      "id": "qwen36-a3b",
+      "model": "Qwen3.6-35B-A3B",
+      "architecture": "sparse MoE, approximately 3B active",
+      "quant": "Q4_K_M",
+      "backend": "deployed llama.cpp profile; backend was not restamped in the Gate D artifact",
+      "configuredContextTokens": 131072,
+      "actualPopulatedContextTokens": null,
+      "promptTokensPerSecond": null,
+      "generationTokensPerSecond": null,
+      "speculation": "none recorded; thinking disabled",
+      "ramGiB": null,
+      "quality": {
+        "metric": "Gate D r1, 10 tasks x 3 seeds",
+        "score": 0.8667,
+        "passes": 26,
+        "attempts": 30,
+        "taskClassMajorities": "9/10",
+        "correctRunsPerObservedMinute": 1.73,
+        "medianWallSeconds": 29.5,
+        "p95WallSeconds": 49
+      },
+      "evidenceLabel": "LOCAL-MEASURED",
+      "sources": [
+        "docs/qwen38-vs-qwen36-gate-d-2026-08-15.md",
+        "docs/evidence/gate-d-qwen36-vs-qwen38-2026-08-15.jsonl",
+        "deploy/llama-swap-config.yaml"
+      ]
+    },
+    {
+      "id": "qwen38-27b",
+      "model": "Qwen3.8-27B",
+      "architecture": "dense multimodal, 27.78B parameters, hybrid attention, one native MTP layer",
+      "quant": "Q4_K_M weights plus BF16 multimodal projector",
+      "backend": "llama.cpp Vulkan / Mesa RADV",
+      "configuredContextTokens": 65536,
+      "actualPopulatedContextTokens": null,
+      "promptTokensPerSecond": 95.82,
+      "generationTokensPerSecond": 23.21,
+      "speculation": "native MTP depth 2; 66.1% acceptance in the cited short Q8-KV canary",
+      "ramGiB": null,
+      "quality": {
+        "metric": "Gate D r1, 10 tasks x 3 seeds",
+        "score": 1.0,
+        "passes": 30,
+        "attempts": 30,
+        "taskClassMajorities": "10/10",
+        "correctRunsPerObservedMinute": 0.86,
+        "medianWallSeconds": 55.5,
+        "p95WallSeconds": 112,
+        "maxWallSeconds": 378
+      },
+      "evidenceLabel": "LOCAL-MEASURED",
+      "sources": [
+        "docs/qwen38-27b-release-decision-2026-08-14.md",
+        "docs/qwen38-vs-qwen36-gate-d-2026-08-15.md",
+        "docs/evidence/gate-d-qwen36-vs-qwen38-2026-08-15.jsonl"
+      ]
+    },
+    {
+      "id": "qwen3-coder-next-80b",
+      "model": "Qwen3-Coder-Next-80B",
+      "architecture": "sparse coding MoE",
+      "quant": "Q4_K_M",
+      "backend": "production llama.cpp profile; backend was not restamped in the routing artifact",
+      "configuredContextTokens": 131072,
+      "actualPopulatedContextTokens": null,
+      "promptTokensPerSecond": null,
+      "generationTokensPerSecond": 62.4,
+      "speculation": "none recorded",
+      "ramGiB": null,
+      "quality": {
+        "metric": "verifier-backed overall pass rate",
+        "score": 0.93,
+        "attempts": 93,
+        "limits": "not a matched arm in the 2026-08-15 three-seed comparison"
+      },
+      "evidenceLabel": "LOCAL-MEASURED",
+      "sources": ["docs/m5-routing.json", "deploy/llama-swap-config.yaml"]
+    },
+    {
+      "id": "gpt-oss-120b",
+      "model": "gpt-oss-120B",
+      "architecture": "sparse MoE, approximately 5.1B active",
+      "quant": "MXFP4",
+      "backend": "pinned llama.cpp production-candidate runtime; backend was not restamped in the decision artifact",
+      "configuredContextTokens": 65536,
+      "actualPopulatedContextTokens": {
+        "matrix": "80% and 92% of each tested window",
+        "maxApproxTokens": 60293
+      },
+      "promptTokensPerSecond": null,
+      "generationTokensPerSecond": 52.2,
+      "speculation": "none recorded; native reasoning in the primary arm",
+      "ramGiB": 58.9,
+      "quality": {
+        "metric": "74 deterministic probes x 3 repeats",
+        "score": 0.631,
+        "strictPasses": 140,
+        "attempts": 222,
+        "passOrPartial": 0.865,
+        "reviewRecall": 0.892,
+        "reviewPrecision": 0.684,
+        "longContext64KPasses": "12/12",
+        "longContext64KGenerationTokensPerSecond": 35.1
+      },
+      "evidenceLabel": "LOCAL-MEASURED",
+      "sources": ["docs/gpt-oss-qwen35-production-decision-2026-07-28.md"]
+    }
+  ]
+}

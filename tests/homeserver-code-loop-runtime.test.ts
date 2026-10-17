@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { piVisibilityBinds } from "../src/homeserver/code-loop-runtime.js";
+import { codeLoopSecretPath, createCageProbeDir, piVisibilityBinds, resolveNodeModulesDir, runCageSelfTestWithRelay } from "../src/homeserver/code-loop-runtime.js";
 
 /**
  * piVisibilityBinds — derives the narrow ro-binds that make the pi install visible inside the
@@ -93,5 +93,72 @@ describe("piVisibilityBinds", () => {
   it("empty piBin / piAgentDir contribute nothing (unprovisioned box)", () => {
     expect(piVisibilityBinds("", "")).toEqual([]);
     expect(piVisibilityBinds("", join(base, ".pi-code-loop"))).toEqual([join(base, ".pi-code-loop", "models.json")]);
+  });
+});
+
+describe("codeLoopSecretPath", () => {
+  it("probes the migrated root-owned environment file when the isolated service declares it", () => {
+    expect(codeLoopSecretPath("/deploy", { GILLE_AUTONOMY_ENV_FILE: "/etc/gille-inference/gateway/gateway.env" }))
+      .toBe("/etc/gille-inference/gateway/gateway.env");
+  });
+
+  it("falls back to the legacy deploy .env outside isolated production", () => {
+    expect(codeLoopSecretPath("/deploy", {})).toBe("/deploy/.env");
+  });
+
+  it("fails before the cage when the outside secret source is absent", async () => {
+    const result = await runCageSelfTestWithRelay(
+      () => [],
+      join(base, "missing-gateway.env"),
+      18080,
+      "127.0.0.1",
+      8080,
+      "upstream-test-key",
+      "required",
+      base,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.failures.join(" ")).toContain("not readable outside the cage");
+  });
+});
+
+describe("createCageProbeDir", () => {
+  it("creates the probe inside the shared code-loop workroot", () => {
+    const workroot = join(base, "code-loop-work");
+
+    const probeDir = createCageProbeDir(workroot);
+
+    expect(dirname(probeDir)).toBe(workroot);
+    expect(probeDir).toContain(`${workroot}/code-loop-cage-probe-`);
+  });
+});
+
+describe("resolveNodeModulesDir", () => {
+  it("keeps the root-owned stable mount path so Node can find it by workroot parent walk-up", () => {
+    const version = join(base, "toolchain", "versions", "abc", "node_modules");
+    mkdirSync(version, { recursive: true });
+    const current = join(base, "gateway", "node_modules");
+    mkdirSync(join(base, "gateway"), { recursive: true });
+    symlinkSync(version, current);
+
+    expect(resolveNodeModulesDir(current, "/unused")).toBe(current);
+  });
+
+  it("keeps an explicit missing runtime path fail-closed for bwrap instead of silently omitting it", () => {
+    const missing = join(base, "missing-toolchain", "node_modules");
+    expect(resolveNodeModulesDir(missing, "/unused")).toBe(missing);
+  });
+
+  it("retains the legacy deploy-root fallback when no runtime mirror is configured", () => {
+    const root = join(base, "deploy");
+    mkdirSync(join(root, "node_modules"), { recursive: true });
+    expect(resolveNodeModulesDir("", root)).toBe(join(root, "node_modules"));
+    expect(resolveNodeModulesDir("", join(base, "unprovisioned"))).toBeNull();
+  });
+
+  it("is also used by the administrative cage test instead of process.cwd()", () => {
+    const cli = readFileSync(new URL("../src/homeserver/cli.ts", import.meta.url), "utf8");
+    expect(cli).toContain("resolveNodeModulesDir(cfg.codeLoopNodeModulesDir)");
+    expect(cli).not.toContain('join(process.cwd(), "node_modules")');
   });
 });

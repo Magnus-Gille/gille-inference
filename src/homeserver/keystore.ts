@@ -1,6 +1,8 @@
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import type Database from "better-sqlite3";
-import { getDb } from "../db.js";
+import { closeReadOnlyDb, getDb, openReadOnlyDb } from "../db.js";
+import { isSystemOneDecisionModel } from "./systemone-request.js";
+import { isEmbeddingModel } from "./embedding-request.js";
 
 /**
  * Per-key auth store.
@@ -43,6 +45,10 @@ export interface ApiKeyRecord {
   tier: Tier;
   scope: KeyScope;
   modelAllowList: string[]; // [] = all models allowed
+  /** Explicit decision-model grants; [] = no System One access for guests. */
+  systemOneModelAllowList: string[];
+  /** Explicit embedding-model grants; [] = no embedding access for guests. */
+  embeddingModelAllowList: string[];
   rpm: number;
   tpm: number;
   dailyTokenBudget: number; // 0 = unlimited
@@ -77,6 +83,8 @@ export interface MintOptions {
   tier: Tier;
   scope?: KeyScope;
   modelAllowList?: string[];
+  systemOneModelAllowList?: string[];
+  embeddingModelAllowList?: string[];
   rpm?: number;
   tpm?: number;
   dailyTokenBudget?: number;
@@ -133,6 +141,28 @@ export class InvalidScopeError extends Error {
       + (tier === "guest" ? "; use scope 'inference' or 'monitor' for guest keys" : "")
     );
     this.name = "InvalidScopeError";
+  }
+}
+
+export class InvalidSystemOneGrantError extends Error {
+  constructor() {
+    super("unknown decision model or missing, duplicate, revoked, or expired key alias");
+    this.name = "InvalidSystemOneGrantError";
+  }
+}
+
+export class InvalidEmbeddingGrantError extends Error {
+  constructor() {
+    super("unknown embedding model or missing, duplicate, non-customer, revoked, or expired key alias");
+    this.name = "InvalidEmbeddingGrantError";
+  }
+}
+
+/** A requested ordinary-chat grant was not the reviewed model/customer set. */
+export class InvalidExistingChatModelGrantError extends Error {
+  constructor() {
+    super("invalid existing chat model grant");
+    this.name = "InvalidExistingChatModelGrantError";
   }
 }
 
@@ -193,6 +223,8 @@ function ensureSchema(db: Database.Database): void {
       tier               TEXT NOT NULL,
       scope              TEXT,
       model_allow_list   TEXT NOT NULL DEFAULT '[]',
+      system_one_model_allow_list TEXT NOT NULL DEFAULT '[]',
+      embedding_model_allow_list TEXT NOT NULL DEFAULT '[]',
       rpm                INTEGER NOT NULL,
       tpm                INTEGER NOT NULL,
       daily_token_budget INTEGER NOT NULL DEFAULT 0,
@@ -249,6 +281,12 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("use_count")) {
       db.exec(`ALTER TABLE api_keys ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0`);
     }
+    if (!names.has("system_one_model_allow_list")) {
+      db.exec(`ALTER TABLE api_keys ADD COLUMN system_one_model_allow_list TEXT NOT NULL DEFAULT '[]'`);
+    }
+    if (!names.has("embedding_model_allow_list")) {
+      db.exec(`ALTER TABLE api_keys ADD COLUMN embedding_model_allow_list TEXT NOT NULL DEFAULT '[]'`);
+    }
     // The index backs rotateKey's family lookup (no full scan under the write lock). Created
     // UNCONDITIONALLY (IF NOT EXISTS) — NOT only alongside the column-add — so a DB that already
     // has the column but is missing the index (partial/manual migration) still gets it. (Codex #99.)
@@ -304,6 +342,8 @@ interface KeyRow {
   tier: string;
   scope: string | null;
   model_allow_list: string;
+  system_one_model_allow_list: string;
+  embedding_model_allow_list: string;
   rpm: number;
   tpm: number;
   daily_token_budget: number;
@@ -326,6 +366,8 @@ function rowToRecord(r: KeyRow): ApiKeyRecord {
     tier,
     scope: storedScope(tier, r.scope),
     modelAllowList: JSON.parse(r.model_allow_list) as string[],
+    systemOneModelAllowList: JSON.parse(r.system_one_model_allow_list) as string[],
+    embeddingModelAllowList: JSON.parse(r.embedding_model_allow_list ?? "[]") as string[],
     rpm: r.rpm,
     tpm: r.tpm,
     dailyTokenBudget: r.daily_token_budget,
@@ -363,6 +405,20 @@ export function mintKey(opts: MintOptions, defaults: KeyDefaults): MintResult {
 
 /** Internal clock-injected mint used to keep staged plan and replacement timestamps coherent. */
 function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintResult {
+  if (opts.systemOneModelAllowList !== undefined &&
+      (!Array.isArray(opts.systemOneModelAllowList) ||
+        new Set(opts.systemOneModelAllowList).size !== opts.systemOneModelAllowList.length ||
+        opts.systemOneModelAllowList.some((model) =>
+          typeof model !== "string" || !isSystemOneDecisionModel(model, [])))) {
+    throw new InvalidSystemOneGrantError();
+  }
+  if (opts.embeddingModelAllowList !== undefined &&
+      (!Array.isArray(opts.embeddingModelAllowList) ||
+        new Set(opts.embeddingModelAllowList).size !== opts.embeddingModelAllowList.length ||
+        opts.embeddingModelAllowList.some((model) =>
+          typeof model !== "string" || !isEmbeddingModel(model)))) {
+    throw new InvalidEmbeddingGrantError();
+  }
   // Reject non-integer / negative numeric limits BEFORE touching the DB. A negative
   // creditLimit is the dangerous case (it would read as "unlimited" in isCreditExhausted).
   assertNonNegativeInt("creditLimit", opts.creditLimit);
@@ -393,6 +449,8 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
     tier: opts.tier,
     scope,
     modelAllowList: opts.modelAllowList ?? [],
+    systemOneModelAllowList: opts.systemOneModelAllowList ?? [],
+    embeddingModelAllowList: opts.embeddingModelAllowList ?? [],
     rpm: opts.rpm ?? defaults.rpm,
     tpm: opts.tpm ?? defaults.tpm,
     dailyTokenBudget: opts.dailyTokenBudget ?? defaults.dailyTokenBudget,
@@ -410,11 +468,11 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
   try {
     db.prepare(
       `INSERT INTO api_keys
-         (alias, key_hash, tier, scope, model_allow_list, rpm, tpm, daily_token_budget,
+         (alias, key_hash, tier, scope, model_allow_list, system_one_model_allow_list, embedding_model_allow_list, rpm, tpm, daily_token_budget,
           max_parallel, credit_limit, credits_used, expires_at, created_at, revoked_at, logical_alias,
           last_used_at, use_count)
        VALUES
-         (@alias, @keyHash, @tier, @scope, @modelAllowList, @rpm, @tpm, @dailyTokenBudget,
+         (@alias, @keyHash, @tier, @scope, @modelAllowList, @systemOneModelAllowList, @embeddingModelAllowList, @rpm, @tpm, @dailyTokenBudget,
           @maxParallel, @creditLimit, @creditsUsed, @expiresAt, @createdAt, @revokedAt, @logicalAlias,
           @lastUsedAt, @useCount)`
     ).run({
@@ -423,6 +481,8 @@ function mintKeyAt(opts: MintOptions, defaults: KeyDefaults, now: Date): MintRes
       tier: record.tier,
       scope: record.scope,
       modelAllowList: JSON.stringify(record.modelAllowList),
+      systemOneModelAllowList: JSON.stringify(record.systemOneModelAllowList),
+      embeddingModelAllowList: JSON.stringify(record.embeddingModelAllowList),
       rpm: record.rpm,
       tpm: record.tpm,
       dailyTokenBudget: record.dailyTokenBudget,
@@ -610,6 +670,8 @@ export function rotateKey(
         tier,
         scope,
         modelAllowList: opts.modelAllowList ?? current?.modelAllowList,
+        systemOneModelAllowList: opts.systemOneModelAllowList ?? current?.systemOneModelAllowList,
+        embeddingModelAllowList: opts.embeddingModelAllowList ?? current?.embeddingModelAllowList,
         rpm: opts.rpm ?? current?.rpm,
         tpm: opts.tpm ?? current?.tpm,
         dailyTokenBudget: opts.dailyTokenBudget ?? current?.dailyTokenBudget,
@@ -764,6 +826,8 @@ export function stageKeyRotation(
         tier,
         scope,
         modelAllowList: opts.modelAllowList ?? current.modelAllowList,
+        systemOneModelAllowList: opts.systemOneModelAllowList ?? current.systemOneModelAllowList,
+        embeddingModelAllowList: opts.embeddingModelAllowList ?? current.embeddingModelAllowList,
         rpm: opts.rpm ?? current.rpm,
         tpm: opts.tpm ?? current.tpm,
         dailyTokenBudget: opts.dailyTokenBudget ?? current.dailyTokenBudget,
@@ -965,6 +1029,118 @@ export function listKeys(opts: { includeRevoked?: boolean } = {}): ApiKeyPublic[
   return rows.map((r) => toPublic(rowToRecord(r)));
 }
 
+/** Grant a reviewed decision model to an existing active key without rotating its credential. */
+export function grantSystemOneModel(alias: string, model: string, now: Date = new Date()): boolean {
+  return grantSystemOneModelToKeys([alias], model, now).changed.includes(alias);
+}
+
+/** Atomically grant one decision model to an exact set of existing active aliases. */
+export function grantSystemOneModelToKeys(
+  aliases: string[], model: string, now: Date = new Date()
+): { changed: string[]; unchanged: string[] } {
+  if (!isSystemOneDecisionModel(model, [])) throw new InvalidSystemOneGrantError();
+  if (aliases.length === 0 || new Set(aliases).size !== aliases.length ||
+      aliases.some((alias) => typeof alias !== "string" || alias.length === 0)) {
+    throw new InvalidSystemOneGrantError();
+  }
+  const db = ksDb();
+  return db.transaction(() => {
+    const changed: string[] = [];
+    const unchanged: string[] = [];
+    for (const alias of aliases) {
+      const row = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(alias) as KeyRow | undefined;
+      if (!row || row.revoked_at !== null || (row.expires_at !== null && row.expires_at <= now.toISOString())) {
+        throw new InvalidSystemOneGrantError();
+      }
+      const grants = JSON.parse(row.system_one_model_allow_list) as string[];
+      if (grants.includes(model)) {
+        unchanged.push(alias);
+        continue;
+      }
+      db.prepare(`UPDATE api_keys SET system_one_model_allow_list = ? WHERE alias = ?`)
+        .run(JSON.stringify([...grants, model]), alias);
+      changed.push(alias);
+    }
+    return { changed, unchanged };
+  })();
+}
+
+/** Atomically add one reviewed embedding model to exact active customer keys. */
+export function grantEmbeddingModelToCustomerKeys(
+  aliases: string[], model: string, now: Date = new Date()
+): { changed: string[]; unchanged: string[] } {
+  if (!isEmbeddingModel(model) || aliases.length === 0 ||
+      new Set(aliases).size !== aliases.length ||
+      aliases.some((alias) => typeof alias !== "string" || alias.length === 0)) {
+    throw new InvalidEmbeddingGrantError();
+  }
+  const db = ksDb();
+  return db.transaction(() => {
+    const changed: string[] = [];
+    const unchanged: string[] = [];
+    for (const alias of aliases) {
+      const row = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(alias) as KeyRow | undefined;
+      if (!row || row.revoked_at !== null ||
+          (row.expires_at !== null && row.expires_at <= now.toISOString())) {
+        throw new InvalidEmbeddingGrantError();
+      }
+      const key = rowToRecord(row);
+      if (key.tier !== "guest" || key.scope !== "inference") throw new InvalidEmbeddingGrantError();
+      const staged = db.prepare(
+        `SELECT 1 FROM key_rotation_plans WHERE logical_alias = ? AND status = 'staged' LIMIT 1`
+      ).get(key.logicalAlias ?? key.alias);
+      if (staged) throw new InvalidEmbeddingGrantError();
+      if (key.embeddingModelAllowList.includes(model)) {
+        unchanged.push(alias);
+        continue;
+      }
+      db.prepare(`UPDATE api_keys SET embedding_model_allow_list = ? WHERE alias = ?`)
+        .run(JSON.stringify([...key.embeddingModelAllowList, model]), alias);
+      changed.push(alias);
+    }
+    return { changed, unchanged };
+  })();
+}
+
+/**
+ * Grant the already-served Qwen chat model to an exact set of customer keys. An empty ordinary
+ * allow-list already means all chat models, so leave it empty. Never rotate credentials or reset
+ * credits/quotas to expand a restricted customer allow-list.
+ */
+export function grantExistingChatModelToCustomerKeys(
+  aliases: string[], model: string, now: Date = new Date()
+): { changed: string[]; unchanged: string[] } {
+  if (model !== "qwen3-30b-instruct" || aliases.length === 0 ||
+      new Set(aliases).size !== aliases.length ||
+      aliases.some((alias) => typeof alias !== "string" || alias.length === 0)) {
+    throw new InvalidExistingChatModelGrantError();
+  }
+  const db = ksDb();
+  return db.transaction(() => {
+    const changed: string[] = [];
+    const unchanged: string[] = [];
+    for (const alias of aliases) {
+      const row = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(alias) as KeyRow | undefined;
+      if (!row || row.revoked_at !== null ||
+          (row.expires_at !== null && row.expires_at <= now.toISOString())) {
+        throw new InvalidExistingChatModelGrantError();
+      }
+      const key = rowToRecord(row);
+      if (key.tier !== "guest" || key.scope !== "inference") {
+        throw new InvalidExistingChatModelGrantError();
+      }
+      if (key.modelAllowList.length === 0 || key.modelAllowList.includes(model)) {
+        unchanged.push(alias);
+        continue;
+      }
+      db.prepare(`UPDATE api_keys SET model_allow_list = ? WHERE alias = ?`)
+        .run(JSON.stringify([...key.modelAllowList, model]), alias);
+      changed.push(alias);
+    }
+    return { changed, unchanged };
+  })();
+}
+
 /** Record a successful authenticated use without accepting or exposing token material. */
 export function recordKeyUse(alias: string, now: Date = new Date()): boolean {
   const ts = now.toISOString();
@@ -1007,21 +1183,24 @@ export interface CredentialInventoryReport {
   keys: CredentialInventoryEntry[];
 }
 
-/**
- * Build a conservative, secret-safe inventory. Admin credentials are deliberately reported as
- * over-scoped review candidates: the operator must prove an owner-only administrative purpose;
- * service and harness consumers should migrate to agent, monitor, or inference scope.
- */
-export function credentialInventory(opts: {
+export interface CredentialInventoryOptions {
   now?: Date;
   staleAfterDays?: number;
   includeRevoked?: boolean;
-} = {}): CredentialInventoryReport {
+}
+
+function credentialInventoryFromDb(
+  db: Database.Database,
+  opts: CredentialInventoryOptions = {}
+): CredentialInventoryReport {
   const now = opts.now ?? new Date();
   const staleAfterDays = opts.staleAfterDays ?? 30;
   assertNonNegativeInt("staleAfterDays", staleAfterDays);
   const staleCutoffMs = now.getTime() - staleAfterDays * 24 * 60 * 60 * 1000;
-  const source = listKeys({ includeRevoked: true });
+  const sql = opts.includeRevoked
+    ? `SELECT * FROM api_keys ORDER BY created_at`
+    : `SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`;
+  const source = (db.prepare(sql).all() as KeyRow[]).map(rowToRecord);
 
   const all = source.map((key): CredentialInventoryEntry => {
     const expired = key.expiresAt !== null && Date.parse(key.expiresAt) <= now.getTime();
@@ -1038,7 +1217,7 @@ export function credentialInventory(opts: {
         findings.push("stale");
       }
     }
-    return { ...key, status, findings };
+    return { ...toPublic(key), status, findings };
   });
   const keys = opts.includeRevoked ? all : all.filter((key) => key.status !== "revoked");
   const findingNames: CredentialFinding[] = [
@@ -1058,6 +1237,30 @@ export function credentialInventory(opts: {
     },
     keys,
   };
+}
+
+/**
+ * Build a conservative, secret-safe inventory. Admin credentials are deliberately reported as
+ * over-scoped review candidates: the operator must prove an owner-only administrative purpose;
+ * service and harness consumers should migrate to agent, monitor, or inference scope.
+ */
+export function credentialInventory(opts: CredentialInventoryOptions = {}): CredentialInventoryReport {
+  return credentialInventoryFromDb(ksDb(), opts);
+}
+
+/**
+ * Build the same inventory through a temporary SQLite connection that cannot mutate the source.
+ * The database must already contain the credential schema; schema setup is intentionally forbidden.
+ */
+export function credentialInventoryReadOnly(
+  opts: CredentialInventoryOptions & { dbPath?: string } = {}
+): CredentialInventoryReport {
+  const db = openReadOnlyDb(opts.dbPath);
+  try {
+    return credentialInventoryFromDb(db, opts);
+  } finally {
+    closeReadOnlyDb(db);
+  }
 }
 
 // ─── Credit accounting (lifetime, non-resetting) ────────────────────────────────────

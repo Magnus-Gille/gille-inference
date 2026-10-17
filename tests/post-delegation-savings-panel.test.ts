@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,8 +26,13 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  // Keep tariff and SQL time-window fixtures aligned without faking timers.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-09-01T12:00:00.000Z"));
   getDb().prepare(`DELETE FROM delegation_costs`).run();
 });
+
+afterEach(() => vi.useRealTimers());
 
 function insertTrace(over: {
   taskType?: string;

@@ -33,7 +33,8 @@ set -euo pipefail
 #             never fire against a gateway that is still mid-restart), then stamp
 #             .deployed-commit with the exact 40-char SHA ONLY after every check passes.
 #   verify    Read-only. Reports the marker commit plus a content spot-check against the local
-#             tree. Never touches rsync, the unit, or the marker.
+#             tree and proves registry appendability as the evaluator runtime identity. Never
+#             touches rsync, the unit, the roster, a model, or the marker.
 #   dry-run <full-expected-sha>
 #             Prints the exact plan (path check, rsync command, restart decision, probes) without
 #             running rsync, restarting the unit, or writing the marker. Still performs the
@@ -95,6 +96,8 @@ DEPLOY_UNIT="${DEPLOY_UNIT:-home-gateway.service}"
 # always-required probe of the box's real listener is DEPLOY_HEALTH_TAILNET_URL, unchanged.
 DEPLOY_HEALTH_LOCAL_URL="${DEPLOY_HEALTH_LOCAL_URL:-}"
 DEPLOY_HEALTH_TAILNET_URL="${DEPLOY_HEALTH_TAILNET_URL:-}"
+# An explicitly empty value is invalid, not a request to use the default.
+DEPLOY_HEALTH_READY_TIMEOUT_S="${DEPLOY_HEALTH_READY_TIMEOUT_S-30}"
 DEPLOY_CAPABILITY_URL="${DEPLOY_CAPABILITY_URL:-}"
 DEPLOY_CAPABILITY_KEY_ENV="${DEPLOY_CAPABILITY_KEY_ENV:-HOMESERVER_OWNER_KEY}"
 # Cloudflare's edge, not the HTTP Tunnel origin, owns HTTPS redirects and HSTS. The public
@@ -364,6 +367,83 @@ probe_health() {
   echo "  OK: $label healthy ($url)"
 }
 
+# Only deployment listener readiness is retried. Authentication, public-edge, source and
+# marker checks remain independent gates. Never print the URL or response body here.
+probe_tailnet_readiness() {
+  local deadline remaining attempt_timeout http_code curl_status
+  deadline=$((SECONDS + DEPLOY_HEALTH_READY_TIMEOUT_S))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    remaining=$((deadline - SECONDS))
+    # Crossing a clock tick between the loop check and this read must not give curl 0
+    # (which means no timeout), or a negative timeout.
+    if [ "$remaining" -le 0 ]; then break; fi
+    attempt_timeout=3
+    if [ "$remaining" -lt "$attempt_timeout" ]; then attempt_timeout="$remaining"; fi
+    # -q must be first: a user's curlrc must not enable redirects, retries, or output files.
+    if http_code="$(curl -q -sS -o /dev/null -w '%{http_code}' \
+      --max-time "$attempt_timeout" -- "$DEPLOY_HEALTH_TAILNET_URL" 2>/dev/null)"; then
+      curl_status=0
+    else
+      curl_status=$?
+    fi
+    if [[ ! "$http_code" =~ ^[0-9]{3}$ ]]; then
+      echo "ERROR: tailnet readiness returned an invalid HTTP status; refusing certification." >&2
+      return 1
+    fi
+    if [ "$curl_status" -eq 0 ] && [ "$http_code" = 200 ] && [ "$SECONDS" -lt "$deadline" ]; then
+      echo "  OK: tailnet healthy (HTTP 200 within readiness budget)"
+      return 0
+    fi
+    case "$curl_status:$http_code" in
+      7:*|28:*|0:503) ;; # Refused/not-yet-listening, timeout, or explicit unavailable.
+      0:200) break ;; # A late response cannot certify a missed deadline.
+      *)
+        echo "ERROR: tailnet readiness failed (curl=$curl_status, HTTP=$http_code); not retryable." >&2
+        return 1
+        ;;
+    esac
+    if [ "$SECONDS" -lt "$deadline" ]; then sleep 1; fi
+  done
+  echo "ERROR: tailnet readiness budget exhausted (${DEPLOY_HEALTH_READY_TIMEOUT_S}s; last curl=${curl_status:-none}, HTTP=${http_code:-none}); refusing certification." >&2
+  return 1
+}
+
+# Validate every certification input that a real deploy will need before materializing the
+# payload or touching the remote. Keep this pure: it must not probe the network, expand or print
+# the credential value, or otherwise have side effects. The local health URL is intentionally
+# absent here because that probe remains best-effort/optional (issue #30).
+validate_deploy_probe_config() {
+  local missing=0
+  local key_env="$DEPLOY_CAPABILITY_KEY_ENV"
+
+  if [[ ! "$DEPLOY_HEALTH_READY_TIMEOUT_S" =~ ^([1-9]|[1-5][0-9]|60)$ ]]; then
+    echo "ERROR: DEPLOY_HEALTH_READY_TIMEOUT_S must be an integer from 1 through 60 — refusing before any remote mutation." >&2
+    missing=1
+  fi
+
+  if [ -z "$DEPLOY_HEALTH_TAILNET_URL" ]; then
+    echo "ERROR: DEPLOY_HEALTH_TAILNET_URL is not set — refusing before any remote mutation." >&2
+    missing=1
+  fi
+  if [ -z "$DEPLOY_CAPABILITY_URL" ]; then
+    echo "ERROR: DEPLOY_CAPABILITY_URL is not set — refusing before any remote mutation." >&2
+    missing=1
+  fi
+  if [[ ! "$key_env" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+    echo "ERROR: DEPLOY_CAPABILITY_KEY_ENV is not a valid environment-variable name — refusing before any remote mutation." >&2
+    missing=1
+  elif [ -z "${!key_env:-}" ]; then
+    echo "ERROR: \$$key_env is not set — refusing before any remote mutation." >&2
+    missing=1
+  fi
+  if [ -z "${DEPLOY_PUBLIC_EDGE_VERIFY_CMD:-}" ] && { [ -z "$DEPLOY_PUBLIC_HTTP_URL" ] || [ -z "$DEPLOY_PUBLIC_HTTPS_URL" ]; }; then
+    echo "ERROR: DEPLOY_PUBLIC_HTTP_URL and DEPLOY_PUBLIC_HTTPS_URL must both be set when DEPLOY_PUBLIC_EDGE_VERIFY_CMD is unset — refusing before any remote mutation." >&2
+    missing=1
+  fi
+
+  return "$missing"
+}
+
 # Validate the Cloudflare-facing view from the release operator. cloudflared intentionally
 # connects to the gateway over HTTP, so an origin-side redirect would loop for public HTTPS.
 verify_public_edge() {
@@ -606,12 +686,40 @@ probe_capability() {
     echo "ERROR: \$$key_env is not set — cannot run the authenticated capability probe." >&2
     return 1
   fi
-  code="$(curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${key}" "$url" 2>/dev/null || true)"
+  # curl argv is visible to local processes. Supply the header via stdin, not -H text.
+  # Reject line breaks rather than allowing an environment value to add extra headers.
+  case "$key" in *$'\r'*|*$'\n'*) echo "ERROR: invalid capability bearer format." >&2; return 1 ;; esac
+  code="$(printf 'Authorization: Bearer %s\n' "$key" | curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' -H @- "$url" 2>/dev/null || true)"
   if [ "$code" != "200" ]; then
     echo "ERROR: authenticated capability probe returned HTTP ${code:-<no response>}." >&2
     return 1
   fi
   echo "  OK: authenticated capability probe passed ($url -> 200)"
+}
+
+# Establish only data/model-scout-registry.jsonl and its immediate parent for the unprivileged
+# operator identity that launches controlled model evaluations. The reviewed helper performs no
+# recursive ownership or mode change, and preserves existing registry bytes.
+prepare_model_evaluation_registry() {
+  local remote_dir="$1"
+  if ! remote_run DEPLOY_MODEL_REGISTRY_PREPARE_CMD \
+    "uid=\$(id -u) && gid=\$(id -g) && '$remote_dir/scripts/prepare-model-evaluation-registry.sh' --root '$remote_dir' --uid \"\$uid\" --gid \"\$gid\""; then
+    echo "ERROR: could not prepare the manual-evaluation registry for the evaluator identity." >&2
+    return 1
+  fi
+  echo "  OK: manual-evaluation registry target prepared without recursive data/ changes"
+}
+
+# Read-only runtime-identity verification: evaluator code opens the existing target for append and
+# checks parent write/search permission, but does not write a row, touch the roster, or load a model.
+verify_model_evaluation_registry() {
+  local remote_dir="$1"
+  if ! remote_run DEPLOY_MODEL_REGISTRY_VERIFY_CMD \
+    "cd '$remote_dir' && EVAL_MODEL_REGISTRY='$remote_dir/data/model-scout-registry.jsonl' node_modules/.bin/tsx scripts/evaluate-model.ts --registry-verify-only"; then
+    echo "ERROR: manual-evaluation registry is not appendable by the effective evaluator identity." >&2
+    return 1
+  fi
+  echo "  OK: effective evaluator identity can append the manual-evaluation registry"
 }
 
 # ── modes ────────────────────────────────────────────────────────────────────────────────────
@@ -643,6 +751,7 @@ cmd_dry_run() {
   echo "PLAN: rsync -a --delete -i ${RSYNC_EXCLUDES[*]} <immutable-payload>/ $(rsync_dest)"
   echo "PLAN: seed docs/m5-routing.json copy-if-absent (rsync --ignore-existing; never overwrites an adopted table -- issue #44)"
   echo "PLAN: remote install: ${DEPLOY_INSTALL_CMD:-cd '<remote_dir>' && npm ci --omit=dev}"
+  echo "PLAN: prepare only data/model-scout-registry.jsonl + its parent for the remote evaluator uid/gid, then verify appendability as that identity without loading a model or mutating the roster"
   echo "PLAN: if restarting: preflight the ExecStart interpreter first, refuse the restart if it is missing (issue #30)"
   echo "PLAN: restart $DEPLOY_UNIT only if rsync reports changes (or DEPLOY_FORCE_RESTART=1)"
   echo "PLAN: probe local health at ${DEPLOY_HEALTH_LOCAL_URL:-<unset - best-effort/non-blocking, issue #30>}"
@@ -692,6 +801,8 @@ cmd_verify() {
       status=1
     fi
   done
+  echo "==> Verifying manual-evaluation registry runtime identity + appendability..."
+  verify_model_evaluation_registry "$remote_dir" || status=1
   echo "==> Verifying public HTTPS edge..."
   verify_public_edge || status=1
   return "$status"
@@ -725,6 +836,10 @@ cmd_deploy() (
   fi
   echo "==> Deploy source clean at $sha"
 
+  echo "==> Validating mandatory deployment certification configuration..."
+  validate_deploy_probe_config || return 1
+  echo "  OK: mandatory deployment certification configuration is present"
+
   echo "==> Materializing immutable payload from accepted commit $sha..."
   if ! payload_parent="$(mktemp -d "${TMPDIR:-/tmp}/gille-deploy-payload.XXXXXX")"; then
     echo "ERROR: could not create a private temporary deploy-payload directory." >&2
@@ -752,9 +867,11 @@ cmd_deploy() (
   # attribute/timestamp-only line) even when nothing inside changed, so a naive "output
   # non-empty" check would restart on every single deploy. An itemize line's first column is
   # "." when only attributes changed and the file itself was not transferred; a real content
-  # transfer, creation, hardlink, or deletion uses '>' / 'c' / 'h' / '*' instead. Only THOSE
+  # transfer, creation, hardlink, or deletion uses '<' / '>' / 'c' / 'h' / '*' instead. Only THOSE
   # lines mean the payload actually changed.
-  if printf '%s\n' "$rsync_out" | grep -qE '^[^.]'; then payload_changed=1; fi
+  # Consume the entire receipt: grep -q can close the pipe early and give printf
+  # SIGPIPE for large deployments. Under pipefail that would hide real changes.
+  if printf '%s\n' "$rsync_out" | grep -E '^[^.]' >/dev/null; then payload_changed=1; fi
 
   # Close the TOCTOU window between the initial check and rsync reading the tree (mirrors
   # hugin/scripts/deploy-pi.sh's post-sync re-check): if source changed mid-sync, the payload no
@@ -771,6 +888,11 @@ cmd_deploy() (
   echo "==> Installing dependencies on the remote (native modules must build for its own platform)..."
   remote_run DEPLOY_INSTALL_CMD "cd '$remote_dir' && npm ci --omit=dev"
 
+  echo "==> Preparing manual-evaluation registry ownership + modes..."
+  prepare_model_evaluation_registry "$remote_dir" || return 1
+  echo "==> Verifying registry appendability as the effective evaluator identity..."
+  verify_model_evaluation_registry "$remote_dir" || return 1
+
   if [ "$payload_changed" = 1 ] || [ "$DEPLOY_FORCE_RESTART" = 1 ]; then
     echo "==> Preflighting ExecStart interpreter before restart (issue #30)..."
     preflight_interpreter || return 1
@@ -778,7 +900,7 @@ cmd_deploy() (
     echo "    NOTE: the gateway also serves /mcp -- this drops live MCP transports (clients"
     echo "    reconnect on next call); in-flight async code_loop jobs survive via the durable"
     echo "    SQLite store, not the process."
-    remote_run DEPLOY_RESTART_CMD "sudo systemctl restart '$DEPLOY_UNIT' && sleep 2 && systemctl is-active '$DEPLOY_UNIT'"
+    remote_run DEPLOY_RESTART_CMD "sudo systemctl restart '$DEPLOY_UNIT' && systemctl is-active '$DEPLOY_UNIT'"
   else
     echo "==> Skipping restart -- rsync reported no changes and DEPLOY_FORCE_RESTART is not set."
   fi
@@ -786,7 +908,7 @@ cmd_deploy() (
   echo "==> Probing local health..."
   probe_health "$DEPLOY_HEALTH_LOCAL_URL" "local" 0 || return 1
   echo "==> Probing tailnet health..."
-  probe_health "$DEPLOY_HEALTH_TAILNET_URL" "tailnet" || return 1
+  probe_tailnet_readiness || return 1
   echo "==> Probing authenticated capability endpoint..."
   probe_capability || return 1
   echo "==> Verifying public HTTPS edge..."
@@ -815,7 +937,8 @@ Usage:
 Modes:
   deploy    Bind this physical checkout to the explicit accepted revision, then sync + install +
             restart-if-needed + probe + stamp .deployed-commit.
-  verify    Read-only: report the currently deployed commit plus a content spot-check.
+  verify    Read-only: report the deployed commit, content spot-check, and evaluator-identity
+            registry appendability without loading a model or mutating the roster.
   dry-run   Bind this physical checkout to the explicit accepted revision, then print the plan
             without syncing, restarting, or writing the marker.
 
@@ -829,6 +952,7 @@ Key env vars (see deploy/README.md, "Live deployment (authoritative)"):
   DEPLOY_HEALTH_LOCAL_URL     (default: unset -- best-effort/non-blocking; the gateway binds only
                               the tailnet interface, so loopback has nothing to probe by default)
   DEPLOY_HEALTH_TAILNET_URL   Required for `deploy` (no safe default -- never hardcode the IP)
+  DEPLOY_HEALTH_READY_TIMEOUT_S  Tailnet readiness budget in seconds (default: 30; integer 1–60)
   DEPLOY_CAPABILITY_URL       Authenticated capability probe URL, required for `deploy`
   DEPLOY_CAPABILITY_KEY_ENV   Name of the env var holding the bearer key (default: HOMESERVER_OWNER_KEY)
   DEPLOY_PUBLIC_HTTP_URL      Required public HTTP origin to validate (no committed hostname default)

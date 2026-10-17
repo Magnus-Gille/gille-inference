@@ -53,6 +53,10 @@ const admissionRejectionsTotal: LabelMap = new Map();
 // homeserver_rate_limited_total{surface}
 const rateLimitedTotal: LabelMap = new Map();
 
+// homeserver_host_memory_admission_total{mode, outcome, reason} — whole-host memory admission
+// decisions (#350). Content-blind and low-cardinality: no model label.
+const hostMemoryAdmissionTotal: LabelMap = new Map();
+
 // homeserver_audio_seconds_total{model} — total seconds of audio transcribed (speech-to-text).
 // Content-blind: the only label is the canonical model. The TRANSCRIPT TEXT is never recorded here.
 const audioSecondsTotal: LabelMap = new Map();
@@ -129,6 +133,7 @@ const ttftHistogram: HistogramState = {
 // admission controller's acquire/release. homeserver_inflight_by_lane{lane} is the per-lane split.
 // No per-user labels — lane is "owner"|"guest" (or "unknown"), content-blind by construction.
 let inflightTotal = 0;
+let inflightM5 = 0;
 const inflightByLane: Map<string, number> = new Map();
 // Whether the gauge has ever been touched — so renderMetrics() stays "" on a truly empty registry
 // (the gauge can legitimately read 0 after balanced acquire/release, which must still render).
@@ -231,21 +236,28 @@ export function recordReviewCascade(row: {
  * ("owner"|"guest"); any other value is coerced to a safe label. No per-user labels — the
  * per-user dimension lives in the SQLite request_log, never in Prometheus.
  */
-export function inflightInc(lane: string | null | undefined): void {
+export function inflightInc(lane: string | null | undefined, node: "m5" | "orin" = "m5"): void {
   inflightTouched = true;
   inflightTotal++;
+  if (node === "m5") inflightM5++;
   const l = sanitizeLabel(lane && lane.trim() !== "" ? lane : "unknown");
   inflightByLane.set(l, (inflightByLane.get(l) ?? 0) + 1);
 }
 
 /** Decrement the in-flight gauge on admission release. Floored at 0 (never goes negative). */
-export function inflightDec(lane: string | null | undefined): void {
+export function inflightDec(lane: string | null | undefined, node: "m5" | "orin" = "m5"): void {
   inflightTouched = true;
   inflightTotal = Math.max(0, inflightTotal - 1);
+  if (node === "m5") inflightM5 = Math.max(0, inflightM5 - 1);
   const l = sanitizeLabel(lane && lane.trim() !== "" ? lane : "unknown");
   const next = (inflightByLane.get(l) ?? 0) - 1;
   if (next <= 0) inflightByLane.delete(l);
   else inflightByLane.set(l, next);
+}
+
+/** Current aggregate inference activity for the small operator summary. */
+export function currentM5InflightRequests(): number {
+  return inflightM5;
 }
 
 /**
@@ -329,6 +341,14 @@ export function recordAdmissionRejection(lane: string): void {
  */
 export function recordRateLimited(surface: string): void {
   incCounter(rateLimitedTotal, labelKey({ surface: sanitizeLabel(surface) }));
+}
+
+/** Record one host-memory admission decision (#350). Never labelled by model. */
+export function recordHostMemoryAdmission(mode: string, outcome: string, reason: string): void {
+  incCounter(
+    hostMemoryAdmissionTotal,
+    labelKey({ mode: sanitizeLabel(mode), outcome: sanitizeLabel(outcome), reason: sanitizeLabel(reason) }),
+  );
 }
 
 // ─── Text exposition ──────────────────────────────────────────────────────────
@@ -436,6 +456,11 @@ export function renderMetrics(): string {
       rateLimitedTotal
     ),
     renderCounter(
+      "homeserver_host_memory_admission_total",
+      "Whole-host memory admission decisions by mode, outcome, and reason",
+      hostMemoryAdmissionTotal
+    ),
+    renderCounter(
       "homeserver_audio_seconds_total",
       "Total seconds of audio transcribed (speech-to-text) by model",
       audioSecondsTotal
@@ -511,6 +536,7 @@ export function resetMetrics(): void {
   creditsTotal.clear();
   admissionRejectionsTotal.clear();
   rateLimitedTotal.clear();
+  hostMemoryAdmissionTotal.clear();
   audioSecondsTotal.clear();
   imagesTotal.clear();
   poisonClearTotal.clear();
@@ -529,6 +555,7 @@ export function resetMetrics(): void {
   ttftHistogram.sum.clear();
   ttftHistogram.count.clear();
   inflightTotal = 0;
+  inflightM5 = 0;
   inflightByLane.clear();
   inflightTouched = false;
 }

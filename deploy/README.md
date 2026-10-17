@@ -50,6 +50,10 @@ actually true:
 
 ## Build vs configure
 
+For bounded CPU installation preflight and watchdog tooling, see
+[`docs/controlled-install.md`](../docs/controlled-install.md). Its activity/resource predicate
+requires an explicitly approved host adapter; it does not change the live deployment gates below.
+
 | Layer | How | Notes |
 |---|---|---|
 | Transport / TLS / DDoS | **configure** Cloudflare Tunnel | `cloudflared`, see `cloudflared/config.example.yml` |
@@ -123,7 +127,7 @@ up to date. Every other document (`AGENTS.md`'s "Deploying the M5 gateway" secti
 `docs/`) points here instead of repeating these facts — if you find a stale copy elsewhere, fix it
 to point here rather than re-describing the topology.
 
-**Live facts** (verified 2026-07-19/20, issue #23):
+**Live facts** (topology verified 2026-07-19/20, issue #23; deployment receipt last updated 2026-10-04):
 
 - systemd unit: `home-gateway.service`
 - `WorkingDirectory`: `/home/magnus/home-server-eval`
@@ -132,14 +136,43 @@ to point here rather than re-describing the topology.
   `git -C /home/magnus/home-server-eval rev-parse` fails with "not a git repository". There is no
   local history to diff against on the box; `.deployed-commit` (below) is the only record of
   deployed identity.
-- Current baseline: commit **`8caf400`** ("feat: add LearningTaskContract gateway handshake
-  (#20)"), content-verified against `canonical/main` by sha256-comparing
-  `src/homeserver/learning-task-contract.ts` and `src/homeserver/gateway.ts` on 2026-07-19.
+- Deployed commit: **`df898714d2dc376f48d15a5ae4f1cd45914ca057`**, accepted 2026-10-04 with every
+  deploy probe passing and the content check matching. This line is a convenience and goes stale;
+  `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
+- Paired client: **`1.5.3`**, installed from a verified local tarball. npm publication remains
+  blocked by the existing registry authentication failure. Both this client and retained client
+  `1.5.1` passed a bounded (60-second) offline dispatch smoke (`true`); this does not establish
+  compiler or model readiness.
+- The separately installed worker at `df898714d2dc376f48d15a5ae4f1cd45914ca057` supplies
+  capacity/status records and idle
+  cleanup: 7 days for `target` directories, 14 days for whole idle worktrees. See [`docs/m5-remote-build.md`](../docs/m5-remote-build.md).
 - `/srv/gille-inference` — previously documented in `AGENTS.md` as the live path — **does not
   exist** on the box and is not this unit's `WorkingDirectory`. That claim was wrong; this section
   is now the source of truth. (`CONTRIBUTING.md` also uses `/srv/gille-inference` as a *reserved
   placeholder path* for docs/tests, the same way it uses `example.com` — that usage is intentional
   and unrelated to this correction.)
+
+### MCP tool-path monitor
+
+`scripts/monitor-mcp.mjs` submits an authenticated, content-free
+`tools/call(list_models)` request to both configured public and private `/mcp` routes. It
+checks the JSON-RPC result and exits nonzero if either path fails, distinguishing HTTP status,
+transport failure, and MCP tool error without logging a key, route locator, model list, or response
+body. This tests the tool path that `/healthz` cannot cover; it deliberately does not establish
+model inference readiness or load a model. The operator can run it from a network with access to
+both routes using `M5_PROBE_PUBLIC_URL`, `M5_PROBE_PRIVATE_URL`, and `M5_PROBE_KEY` in the process
+environment. The public URL must be an HTTPS origin; the private URL may use HTTP on the trusted private network. Neither URL may contain a path or userinfo. Use an existing least-privilege
+key permitted to call `list_models`; keep the key in a private secret store, never in Git or a
+command argument.
+
+The installable `deploy/systemd/m5-mcp-monitor.service` and `.timer` run the check every five
+minutes on M5. Install the reviewed script bytes from the accepted release at
+`/usr/local/libexec/gille-inference/monitor-mcp.mjs` with root ownership and mode `0644`, and
+verify their hash against the release before enabling the timer. The unit reads
+`/etc/gille-inference/mcp-monitor.env` (root-owned, mode `0600`); its `ProtectHome=true` isolation does not expose the live
+checkout or any home directory. Installing/enabling the units and provisioning the private env
+file are separate owner-attended production changes; a gateway source deploy does not perform them.
+A timer on M5 cannot detect loss of the entire host and its private check does not prove that a remote tailnet caller can connect. Run the same probe off-host for those failure modes and connect the timer or off-host runner to an operator alert path. Compare the two route statuses on failure; verify a real synthetic inference request only inside an approved resource window. Journal output contains only the route labels and closed status codes.
 
 ### Deploying llama-swap roster changes
 
@@ -150,6 +183,15 @@ state, canary commands, and rollback execution belong in the private Grimnir ope
 The public
 [`llama-swap-large-models.example.yaml`](./llama-swap-large-models.example.yaml) is a reviewable
 settings example, not a live-config mirror or directly deployable file.
+
+For a reviewed roster release where the model entry is hand-picked (no registry winner),
+apply it with the transactional promoter instead of editing by hand — it renders the reviewed
+`deploy/specs/<key>.yaml` contract, then performs the backup → apply → verify-bytes → restart →
+health-check sequence with automatic restore + restart on any failure:
+
+```bash
+tsx scripts/promote-manual.ts --key <model-key> --spec deploy/specs/<model-key>.yaml --dry-run
+```
 
 For a reviewed roster release:
 
@@ -166,11 +208,51 @@ For a reviewed roster release:
    configuration, and verify the applied bytes without copying them into the public ticket.
 4. Install the [`systemd/llama-swap-memory.conf`](./systemd/llama-swap-memory.conf) limits, reload
    systemd, and verify the effective `MemoryMax`, `MemorySwapMax`, and `OOMPolicy`.
+   Native ROCm System One models also require `/dev/kfd` in the private unit's closed device
+   policy. Install the additive, reviewed
+   [`systemd/llama-swap-rocm-device.conf`](./systemd/llama-swap-rocm-device.conf) at
+   `/etc/systemd/system/llama-swap.service.d/60-systemone-rocm.conf` as a separate
+   owner-approved service change; preserve the existing render-node allow-list and verify the
+   effective `DevicePolicy=closed` and `DeviceAllow` entries before starting a model. A successful
+   import under the service user does not prove GPU device access. Qualify one typed System One
+   request in an exclusive maintenance window before changing the customer roster or grants.
+   The transactional promoter restarts `llama-swap.service`. If the gateway's base unit has
+   `Requires=llama-swap.service`, systemd also restarts the gateway and destroys its process-local
+   exclusive-window token. A drop-in cannot remove a `Requires=` dependency. In a separately
+   approved service change, back up the full `/etc/systemd/system/home-gateway.service` unit and
+   use [`soften-gateway-backend-unit.py`](../scripts/soften-gateway-backend-unit.py) with the exact
+   approved baseline SHA-256 to stage a private replacement. Review that the only changed line is
+   `Requires=llama-swap.service` to `Wants=llama-swap.service`, without printing any private unit
+   contents. Install the replacement as root:root mode 0644, run `systemctl daemon-reload`, and
+   verify the effective dependencies: no hard llama-swap requirement, a soft llama-swap want, and
+   unchanged `After=llama-swap.service` plus the isolated `user@<gateway-uid>.service` requirement.
+   Verify gateway service isolation again. In the private rollout, first prove that one bounded
+   llama-swap restart leaves the gateway and exclusive window alive; restore prior model residency
+   after the restart. On rollback, restore the exact backed-up unit and dependency set before
+   resuming normal service.
 5. Restart llama-swap, verify model readiness, then issue one explicit owner-only completion
    against the new model. A roster addition is not an automatic route change.
 6. Apply only the non-secret shadow/canary routing settings from the accepted release, restart the
    gateway, and verify private-network health plus the authenticated model list.
 7. Roll back through the private ticket's recorded backups and re-run the same health checks.
+
+For a System One decision model, use a spec with `api: systemone` so the transactional
+promoter warms `/v1/systemone` and verifies a typed probability rather than sending a chat
+completion. The [customer System One contract](../docs/systemone-customer-access.md) records
+the public artifact identities and runtime requirements. Public specs have placeholder paths and
+cannot be applied unchanged. Since the current roster already has
+13 entries (twelve text models plus Clef-flash), the historical Clef transaction used
+`PROMOTE_MAX_SERVED=13`. The two proposed native follow-on specs,
+[`bespoke-nimble-9b.yaml`](./specs/bespoke-nimble-9b.yaml) and
+[`pplx-decider-v1-27b.yaml`](./specs/pplx-decider-v1-27b.yaml), are reviewable placeholders and
+remain pending isolated M5 runtime, memory, quality, and rollback checks. If approved, apply them
+as separate transactions: Nimble at `PROMOTE_MAX_SERVED=14`, then Decider at
+`PROMOTE_MAX_SERVED=15`. Verify the resulting roster and the existing-model rollback path after
+each transaction. Append each exact reviewed ID to the gateway's `HOMESERVER_SYSTEMONE_MODELS`
+setting while retaining Clef and any previously promoted decision models before its roster transaction;
+otherwise a model can appear in `/v1/models` before its
+decision endpoint is enabled. Existing customer keys receive access only through an explicit
+System One grant and continue using their ordinary credits and quotas.
 
 The 2026-07-28 `qwen35-122b-a10b` release uses a pinned llama.cpp `9a3bf2b84` runtime, 32K
 context, reasoning off, F16 KV, a 2 GiB prompt cache, one slot, and the service-level 96 GiB/no-swap
@@ -181,6 +263,16 @@ The origin-relative production rebuild's `llama-server` SHA-256 is
 `7e1fa95bf414d8491166d9976a028555b2ebf12c481868a5582d63256865ee22`; its runtime
 dependencies must all resolve inside the rendered
 `<runtime-root>/releases/9a3bf2b84/bin`.
+
+The 2026-08-14 `qwen38-27b` release candidate uses official model revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and pinned llama.cpp
+`9b05354ec6fb58b4e665e9a39ebc40285c015638`. Its reviewed serving contract is 64K context,
+Q4_K_M weights plus the BF16 multimodal projector, Q8 KV, one slot, a 2 GiB prompt cache,
+Flash Attention, native MTP depth 2, and per-request thinking control. The release measurements,
+artifact identities, and limitations are in
+[`docs/qwen38-27b-release-decision-2026-08-14.md`](../docs/qwen38-27b-release-decision-2026-08-14.md).
+This candidate supersedes the stale public roster claim for `qwen35-122b-a10b`; it does not erase
+the historical Qwen3.5 comparison or create an automatic Qwen route.
 
 ### Deploying
 
@@ -203,7 +295,10 @@ worktree edits cannot enter the deployed bytes. The temporary snapshot is remove
 The source-binding check is an additional outer gate. All existing checks remain: the script
 refuses a dirty or non-addressable source tree, refuses when the live unit's `WorkingDirectory`
 doesn't match what it's about to sync into, seeds `docs/m5-routing.json` copy-if-absent without ever
-overwriting a live/adopted table (issue #44), preflights the ExecStart interpreter before
+overwriting a live/adopted table (issue #44), prepares only the historical manual-evaluation
+registry and its immediate parent for the unprivileged operator identity (`0600`/`0700`, never a
+recursive `data/` permission change), verifies appendability under that effective identity without
+loading a model or touching the roster (issue #263), preflights the ExecStart interpreter before
 restarting (issue #30 — see below), restarts the unit only when the payload actually changed,
 probes local health (best-effort) and tailnet health plus an authenticated capability endpoint,
 and writes `.deployed-commit` with the exact 40-char SHA **only** after every check passes — any
@@ -222,9 +317,21 @@ deployment it did not actually probe):
 `DEPLOY_HEALTH_LOCAL_URL` has **no default** (issue #30 — the gateway binds only the tailnet
 interface, so a default loopback probe could never legitimately answer); set it explicitly only if
 something in your environment actually listens on loopback. `DEPLOY_HEALTH_TAILNET_URL` above is
-the mandatory probe of the box's real listener and is unaffected. The public-edge verification is
+the mandatory probe of the box's real listener. The public-edge verification is
 also mandatory, but runs from the release operator rather than the box so it validates Cloudflare,
 not merely the Tunnel origin.
+
+During `deploy`, tailnet listener readiness requires HTTP **200** within
+`DEPLOY_HEALTH_READY_TIMEOUT_S` (default **30** seconds; integer **1–60**, validated before any
+remote mutation, including when explicitly empty). The script retries only connection refusal
+(curl 7), timeout (curl 28), and HTTP 503, with one-second spacing and each request capped at
+three seconds or the remaining budget, whichever is smaller. Bash's elapsed-second clock has
+one-second granularity; this budget covers readiness polling, not the complete deployment.
+Redirects and other HTTP/transport errors fail immediately; a late success cannot certify a
+missed deadline. Readiness diagnostics omit response bodies and private URLs. This replaces the
+fixed post-restart sleep, not the separate authenticated capability, public-edge, interpreter,
+source-identity or marker gates. On failure, no new marker is written and the later autonomy
+installation steps are not run. No model inference or load is part of readiness polling.
 
 `DEPLOY_REMOTE_HOST` defaults to the `m5` ssh alias and `DEPLOY_REMOTE_DIR` defaults to
 `/home/magnus/home-server-eval`; override either if the live topology ever changes. Run
@@ -423,6 +530,79 @@ available even if the restart or verification fails. Record in the private opera
   restart interrupted MCP traffic; and
 - a result of `verify` plus the public-edge verifier for a gateway change.
 
+If an already-isolated gateway predates the reviewed user-manager ordering (issue #197), deploy
+the accepted source revision first, then refresh only its isolation drop-in:
+
+```bash
+sudo scripts/service-isolation.sh refresh-isolation --service gateway --ack-service-restart
+sudo scripts/service-isolation.sh verify --service gateway
+```
+
+The refresh requires the dedicated lingered user manager to be healthy before mutation, backs up
+the exact prior drop-in, orders `home-gateway.service` after the resolved
+`user@<gille-gateway-uid>.service`, then restarts both units and verifies that a user-manager
+transport is visible inside the gateway's mount namespace. It binds the dedicated manager's
+runtime directory read-only, so replacement socket paths resolve after the manager restarts;
+`systemd-run --pipe` needs the ordinary session bus to pass stdio file descriptors. The
+dedicated user manager spawns each transient code-loop service, so `pasta` can
+construct its namespace without granting `AF_NETLINK`, TUN, or weaker
+`NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
+receives no host `/run` mounts or session-bus access. Isolation-only runtime variables also take
+precedence over legacy owner-home Pi paths retained in the migrated secret file, so rollback does
+not require rewriting that file and the cage binds only the dedicated service-account runtime.
+The refresh also copies the deployed check toolchain into a root-owned, lockfile-addressed mirror
+under `/var/lib/gille-inference/gateway`; the cage binds its stable `node_modules` pointer read-only
+directly above the dedicated workroot, preserving normal Node/npx parent lookup without requiring
+any traversal of the owner home. It also replaces the dedicated Pi provider file with the reviewed
+committed template, verifies it byte-for-byte, and transactionally restores the prior file if the
+refresh fails. This prevents a legacy literal `HS_API_KEY` value or missing `authHeader:true` from
+bypassing the ephemeral per-run relay capability. Existing toolchain versions remain immutable for
+already-running jobs. If restart or
+verification fails, it restores the prior drop-in and verifies the recovered gateway before
+returning failure. This fixes the boot race
+without weakening the code-loop cage or treating a host-visible bus as proof that the service
+namespace can reach it. Complete recovery with one harmless owner-agent `ask` and one harmless
+seed-file `code_loop` smoke from a supported client; the latter must still prove every cage marker
+before inference begins.
+
+The initial gateway migration and recovery refresh install a reviewed drop-in for that exact
+dedicated `user@UID.service`: `Restart=on-failure` and `OOMScoreAdjust=-500`.
+A release that restarts the gateway and then changes its manager requires an exclusive fence
+that survives gateway restarts. Open the canonical exclusive maintenance window and let work
+drain first. Before the first gateway restart, install a temporary root-owned systemd runtime
+override setting `HOMESERVER_STARTUP_EXCLUSIVE_UNTIL` to the approved window's **same fixed**
+canonical UTC ISO timestamp (at most 30 minutes ahead). The accepted gateway must support this
+setting before any manager refresh. It overrides both inference lanes across process restarts;
+closing a process-local window or posting `{on:false}` does not clear it. It does not acquire a
+GPU lease, so it supplements the canonical window rather than replacing the initial drain.
+
+Read back `/admin/maintenance` as `maintenance:true,mode:"exclusive"` after each gateway restart
+and before any manager mutation or recovery. Confirm sufficient remaining window time and bound
+the complete refresh command, including restoration, to finish before that deadline. A timed-out
+`systemctl` client does not cancel an accepted manager job: reconcile the operation's exact
+systemd jobs and prove they have settled before releasing the fence. An expired
+fence or lease-loss/restore anomaly stops further mutation; do not silently extend the window.
+Refresh verifies the loaded soft dependency graph, restarts the manager with its new OOM score,
+checks that the current gateway PID stayed unchanged, then restarts the gateway last. Its
+post-restart verification and any automatic unit restoration must still run under the startup
+fence. On failure, restore units/manager while that accepted gateway is fenced; restore an older
+gateway without startup-fence support only **after** all manager changes are complete. In that
+recovery branch, remove the temporary override and reload systemd while the current process is
+still fenced, then redeploy the older code as the actual final gateway restart.
+
+When the release and any recovery are verified, remove only the temporary runtime override,
+reload systemd and restart the gateway as the last mutation to restore normal admission. Read
+back normal admission and the absent startup override. The fixed fence also expires automatically
+at its original deadline; a stale override never extends it after restart. A later manager recovery should
+leave the gateway process running while its directory mount sees replacement bus sockets.
+An intentional gateway stop does not trigger a restart. The refresh backs up and restores both
+unit drop-ins together on failure; it rejects an existing manager drop-in whose contents differ
+from the reviewed template. Gateway migration rollback removes the owned manager drop-in.
+Before owner-attended rollout, verify the resolved systemd dependencies, exercise an unexpected
+manager failure on a non-production unit, and check ordinary inference plus a caged code-loop
+smoke. `/healthz.codeLoopTransport` and `m5 doctor` report only the content-free socket-listener
+observation, not end-to-end code-loop readiness.
+
 Rollback is likewise one service at a time and explicit:
 
 ```bash
@@ -430,7 +610,8 @@ sudo scripts/service-isolation.sh rollback --service gateway --ack-rollback
 ```
 
 It stops the selected service, restores only its moved source paths, removes the isolation
-drop-in (leaving other pre-existing drop-ins intact), reloads systemd, and demands a recovered
+drop-in and its exact owned manager recovery drop-in (leaving other pre-existing drop-ins intact),
+reloads systemd, and demands a recovered
 legacy `magnus` unit. It refuses any merge with a non-empty original state directory. The
 dedicated inactive account/runtime is retained, mode-restricted, for forensic recovery; delete it
 only in a separate owner-approved cleanup.
@@ -446,21 +627,55 @@ content spot-check (sha256 of `src/homeserver/learning-task-contract.ts` and
 `src/homeserver/gateway.ts` against that commit in your local checkout), so a stale marker or a
 hand-edited file on the box shows up as an explicit `MISMATCH` instead of a false green.
 
+File identity does not prove which code the running process has loaded. When a release changes
+gateway behavior, also confirm that the gateway restarted after the payload update and verify
+the changed behavior through its client surface. For MCP tool changes, reconnect and inspect
+`tools/list` before making bounded functional calls. Missing new tools or fields fails acceptance
+even when the marker and file hashes match.
+
 ### Rollback
 
 The unit is not a git checkout, so "rollback" means **redeploy a known-good commit**, not
 `git revert` on the box:
 
 ```bash
-git worktree add /tmp/gille-rollback <known-good-sha>   # e.g. 8caf400, the current baseline
+(
+umask 022  # archived public source must remain readable by the isolated service account
+git worktree add /tmp/gille-rollback <known-good-sha>   # the previous accepted commit, see below
 cd /tmp/gille-rollback
 npm ci
 scripts/deploy-gateway.sh deploy <known-good-full-sha>
+scripts/deploy-gateway.sh verify
+)  # preserve the caller's umask for private operator files
+# On each client machine, restore the matching, retained verified package:
+npm install --global --ignore-scripts <approved-paired-client.tgz>
+m5 --profile codex doctor
+m5 --profile claude doctor
 ```
 
-The current known-good baseline is **`8caf400`**. Update this line whenever a new deploy is
-accepted (i.e. whenever `.deployed-commit` changes on the box), so a future rollback always has a
-concrete target without needing to reconstruct one — the box itself keeps no deploy history.
+The rollback target is the **previous accepted gateway commit**, currently
+**`c45c1f295758dc013e8f81b763ee9ec471be4d9a`**, paired with client **`1.5.2`**. That pairing was
+accepted and verified on both configured routes on 2026-10-04 before the final release. Restore
+both gateway and client: client 1.5.2 and newer report version drift; the older 1.5.1 doctor
+predates that compatibility check. Retain the verified client tarballs
+from those accepted source revisions; versions 1.5.2/1.5.3 were installed locally and are not yet
+published to npm. This gateway/client rollback leaves the separately installed build worker at
+`df898714d2dc376f48d15a5ae4f1cd45914ca057`; worker recovery uses its own exact installer backup and
+acceptance procedure in [`docs/m5-remote-build.md`](../docs/m5-remote-build.md).
+
+The older fallback **`bb6afa8946ba2d5fd94c3b0f66fd864e9951dbeb`** with client **`1.5.1`** was
+exercised and verified on 2026-10-04. Its runtime matches the previously deployed
+`b80b617c6898187e5d552f24ae3bbc7defc9ca3a`, with a safe stdin-header deploy probe added. Earlier
+deploy tooling put the bearer in argv; use these reviewed deploy-tool revisions for recovery.
+Keep private operator logs separately permission-restricted; `umask 077` during archive
+materialization makes the public source unreadable to the isolated service account.
+
+Update the accepted and rollback gateway revisions, paired client, publication status and separate
+worker receipt whenever a new deploy is accepted (i.e. whenever
+`.deployed-commit` changes on the box), so a future rollback always has a concrete target without
+needing to reconstruct one — the box itself keeps no deploy history. If these lines and
+`scripts/deploy-gateway.sh verify` disagree about the gateway, the script is right and this file is
+stale; verify client and worker identity separately.
 
 ### MCP-restart caveat
 
@@ -472,7 +687,49 @@ transport, not the job, is dropped. The bound deploy mode restarts only when rsy
 actually transferred a content change (or `DEPLOY_FORCE_RESTART=1`), specifically to avoid
 unnecessary MCP churn on a no-op deploy.
 
+For a separately reviewed backend executable replacement, use the
+[`llama-swap backend upgrade runbook`](../docs/llama-swap-upgrade.md). It is a distinct operation
+from `deploy-gateway.sh`: replacing llama-swap can restart or cycle the gateway, its MCP transport,
+and other transitive dependents through effective `Requires`, `PartOf`, `BindsTo`, and start/stop
+propagation edges. Inspect the full dependency impact inventory, derive and approve the precise
+propagation stop/restart set with baseline states, and preserve ordering-only or unrelated units
+before any backend stop or file replacement; the MCP interruption may therefore be broader than the
+gateway deploy caveat above. The gateway's process-local `ActiveWindow` does not by itself authorize
+or survive this restart-spanning operation. Do not treat the public roster example as live
+configuration or copy it over the live config as part of an executable upgrade.
+
 ### Credential-safe authenticated capability smoke test
+
+Before credential preflight, a repository checkout with Node.js 20+ can inspect local
+route prerequisites without reading Keychain or contacting the gateway:
+
+```bash
+node bin/m5-network-doctor.mjs
+```
+
+This separate command emits one redacted JSON object (`schema_version: 1`). It
+checks the `m5-auth` public-base environment variables and reads only the local
+Tailscale backend state via `tailscale status --json` (three-second timeout,
+bounded output). Both observations are reported even when one fails: for example,
+`public_route: "unconfigured"` and `tailscale: "stopped"` can appear together.
+It never invokes `m5-auth`, `security`, `curl`, login, or service start/stop commands.
+It does not load named-profile configuration, credentials, or connector settings.
+
+Public configuration is `configured`, `unconfigured`, or `invalid_configuration`;
+explicit empty bases and inconsistent first-class pairs are invalid, matching
+`m5-auth`. Tailscale is `running`, `stopped`, `needs_login`, `needs_machine_auth`,
+`starting`, `unknown`, `unavailable`, or `timeout`. Only the allowlisted
+`BackendState` field determines a state; failed commands do not prove Tailscale is
+stopped. Raw status JSON, peer data, authentication URLs, locators, and stderr are
+never emitted or persisted by the diagnostic. Backend state values follow
+[Tailscale's status definition](https://github.com/tailscale/tailscale/blob/main/ipn/ipnstate/ipnstate.go).
+
+Exit `0` means the diagnostic completed, **not** that a route is usable; inspect
+both fields and the fixed `remediation` messages. Invalid arguments exit `2`.
+`gateway_reachability` and `credential` remain `not_checked`, and
+`connector_session` remains `not_inspected`. In particular, a `running` backend
+does not establish peer reachability, authentication, or inference readiness.
+This is a repository-local command, not a newly installed npm or global command.
 
 The bound deploy mode's capability probe calls
 `GET /v1/capabilities/learning-task` with `Authorization: Bearer $HOMESERVER_OWNER_KEY` (the env
@@ -480,7 +737,11 @@ var name is configurable via `DEPLOY_CAPABILITY_KEY_ENV`) and checks only the HT
 key is read from the environment, never placed on the command line, and never appears in the
 script's stdout/stderr (covered by a regression test in `tests/deploy-gateway.test.ts`). From a
 provisioned macOS owner workstation, use the canonical Keychain-backed check instead of composing
-a bearer-bearing `curl` command:
+a bearer-bearing `curl` command. For the public check, first configure the intended
+`M5_GATEWAY_URL` (gateway root), `M5_OPENAI_BASE_URL`, or legacy `M5_BASE_URL`
+(OpenAI bases ending in `/v1`) in the caller's environment. Without one, public mode
+exits `2` before Keychain or network access; it does not default to loopback.
+The explicit `--tailnet` check selects its own private base:
 
 ```bash
 m5-auth --check
@@ -509,18 +770,19 @@ not reuse a routing-lifecycle key, a guest key, or a different service's key. Pe
 owner-only ceremony from a private terminal with history/transcript capture disabled; record only
 sanitized aliases, timestamps, HTTP status, and deployed revision in the private operations record.
 
-Run the configured/default and tailnet path checks separately. Their messages and exit codes are
+Run the explicitly configured public and tailnet path checks separately. Their messages and exit codes are
 deliberately content-free:
 
 | Exit | State | Operator action |
 |---:|---|---|
 | `0` | credential accepted | Continue. |
 | `1` | Keychain credential missing | Restore the intended item selectors or provision the item through the prompt-only step below. |
+| `2` | Invalid arguments or missing/invalid public base configuration | Configure the intended public base or explicitly select `--tailnet`; no credential check occurred. |
 | `3` | gateway unreachable | Check transport, DNS/Tailscale, and service health; authentication was not evaluated. |
 | `4` | credential present but rejected (`401`) | Reconcile the gateway target first, then rotate if the authoritative active key is actually stale/revoked. |
 | `5` | gateway reachable but preflight inconclusive | Inspect gateway service logs; do not infer that the credential is valid or invalid. |
 
-If the configured/default check succeeds while the tailnet check returns `4` (or vice versa), do **not** rotate
+If the configured public check succeeds while the tailnet check returns `4` (or vice versa), do **not** rotate
 blindly. Production is intended to expose one gateway process on both paths, backed by one
 keystore. Verify that the Cloudflare Tunnel origin and the resolved tailnet target reach the same
 running service, deployment revision, working directory, and configured keystore. A path routed to

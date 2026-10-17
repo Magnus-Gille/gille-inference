@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import {
   MAX_KEY_LIFETIME_SECONDS,
   abortKeyRotation,
   commitKeyRotation,
   credentialInventory,
+  credentialInventoryReadOnly,
   listKeyRotations,
   lookupKey,
   mintKey,
@@ -84,6 +85,41 @@ describe("secret-safe credential inventory (#152)", () => {
     expect(serialized).not.toContain(secret);
     expect(serialized).not.toMatch(/keyHash|key_hash/i);
     expect(Object.keys(legacy ?? {})).not.toContain("keyHash");
+  });
+
+  it("uses a read-only connection without schema setup or database mutation", () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "hs-credential-readonly-")), "inventory.db");
+    initDb(dbPath);
+    const minted = mintKey({ alias: "read-only", tier: "owner", scope: "agent" }, DEFAULTS);
+    getDb().close();
+    // The production database stays in WAL mode, but its sidecars may be absent from a
+    // read-only snapshot. SQLite otherwise tries to create -shm while starting the SELECT.
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+    chmodSync(dbPath, 0o444);
+    chmodSync(dirname(dbPath), 0o555);
+
+    try {
+      const report = credentialInventoryReadOnly({ dbPath });
+
+      expect(report.summary).toMatchObject({ total: 1, active: 1 });
+      expect(report.keys).toMatchObject([{ alias: "read-only", scope: "agent" }]);
+      expect(JSON.stringify(report)).not.toContain(minted.plaintextKey);
+      expect(existsSync(`${dbPath}-wal`)).toBe(false);
+      expect(existsSync(`${dbPath}-shm`)).toBe(false);
+    } finally {
+      chmodSync(dirname(dbPath), 0o755);
+    }
+  });
+
+  it("refuses an active WAL snapshot instead of omitting pending frames", () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "hs-credential-wal-")), "inventory.db");
+    initDb(dbPath);
+    mintKey({ alias: "wal-pending", tier: "owner", scope: "agent" }, DEFAULTS);
+
+    expect(statSync(`${dbPath}-wal`).size).toBeGreaterThan(0);
+    expect(() => credentialInventoryReadOnly({ dbPath })).toThrow(/active WAL sidecar/i);
+    getDb().close();
   });
 });
 
