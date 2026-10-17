@@ -368,3 +368,17 @@ it('tracked AST inventory is complete, deterministic, and source-links all opera
   'only process-launch consumers may keep candidate modules unresolved');
   assert.equal(audit.reviewed_data_enumeration_count, 1);
 });
+
+// Exercise each acquisition alone so a different unknown cannot mask a missed form.
+it('each computed builtin acquisition independently prevents qualification', async () => {
+  const scope = { audited_source_prefixes: ['src/'], candidate_source_prefixes: ['src/'], source_extensions: ['.mjs'], consumer_classes: [{ class: 'operator', prefixes: ['src/'] }], reviewed_data_enumerations: [] };
+  for (const source of [
+    "process['getBuiltinModule']('child_process').execFile('node', [process.env.SCRIPT]);",
+    "const load = process['getBuiltinModule']; load('child_process');",
+    "const { getBuiltinModule: load } = process; load('child_process');",
+  ]) {
+    const audit = await buildUnusedReferenceAudit({ scope, files: ['src/loader.mjs'], readSource: async () => source });
+    assert.equal(audit.graph_qualified, false, source);
+    assert.ok(audit.dynamic_unknowns.some(item => item.kind === 'unsupported-process-builtin-module'), source);
+  }
+});

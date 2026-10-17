@@ -340,7 +340,7 @@ function findSourceReferences(ts, scope, file, source, targets) {
       || (ts.isElementAccessExpression(node) && isStringLiteralLike(ts, node.argumentExpression)
         && node.argumentExpression.text === 'getBuiltinModule');
     const directBuiltinModuleCall = parent && ts.isCallExpression(parent) && parent.expression === node;
-    if (builtinModuleProperty && !directBuiltinModuleCall) {
+    if (builtinModuleProperty && (!directBuiltinModuleCall || ts.isElementAccessExpression(node))) {
       dynamicUnknowns.push({
         path: file,
         line: lineAt(source, node.getStart(sourceFile)),
