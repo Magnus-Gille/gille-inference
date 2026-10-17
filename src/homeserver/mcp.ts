@@ -20,7 +20,8 @@ import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmis
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
 import { bindExecutionFeedback, executionFeedbackOwner } from "./execution-feedback.js";
-import { parseExecutionTrafficPurpose, type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
+import { type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
+import { normalizeAskArgs } from "./mcp-ask-arguments.js";
 import { buildDelegationCostTrace, tryRecordDelegationCost } from "./delegation-cost.js";
 import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
@@ -1468,62 +1469,23 @@ async function callTool(
         meta: { m5_code: "route_not_allowed", retryable: false },
         trace: { traceOutcome: "forbidden", traceErrorClass: "route_not_allowed" } };
     }
-    const model = typeof args["model"] === "string" ? (args["model"] as string) : "";
-    const prompt = typeof args["prompt"] === "string" ? (args["prompt"] as string) : "";
-    const system = typeof args["system"] === "string" ? (args["system"] as string) : undefined;
-    const rawOutputProfile = args["output_profile"];
-    if (rawOutputProfile !== undefined && rawOutputProfile !== COMPLETE_WITHIN_BUDGET_PROFILE) {
-      return {
-        text: `'output_profile' must be '${COMPLETE_WITHIN_BUDGET_PROFILE}' when supplied.`,
-        isError: true,
-        trace: badRequestTrace(),
-      };
+    const normalized = normalizeAskArgs(args, COMPLETE_WITHIN_BUDGET_PROFILE);
+    if (!normalized.ok) {
+      return { text: normalized.message, isError: true, trace: badRequestTrace() };
     }
-    const outputProfile = rawOutputProfile === COMPLETE_WITHIN_BUDGET_PROFILE
-      ? COMPLETE_WITHIN_BUDGET_PROFILE
-      : undefined;
-    const rawDelegatorModelId = args["delegator_model_id"] ?? args["delegatorModelId"];
-    if (
-      rawDelegatorModelId !== undefined &&
-      (typeof rawDelegatorModelId !== "string" || rawDelegatorModelId.trim() === "")
-    ) {
-      return {
-        text: "'delegator_model_id' must be a non-empty string when supplied.",
-        isError: true,
-        trace: badRequestTrace(),
-      };
-    }
-    const delegatorModelId = typeof rawDelegatorModelId === "string" ? rawDelegatorModelId : undefined;
-    const trafficPurpose = parseExecutionTrafficPurpose(args["traffic_purpose"]);
-    if (!trafficPurpose.ok) {
-      return { text: "Invalid traffic_purpose.", isError: true, trace: badRequestTrace() };
-    }
-    if (model === "" || prompt === "") {
-      return { text: "Both 'model' and 'prompt' are required.", isError: true, trace: badRequestTrace() };
-    }
-    const samplerSpecs = [
-      ["temperature", 0, 2, false],
-      ["top_p", 0, 1, false],
-      ["top_k", 0, Number.MAX_SAFE_INTEGER, true],
-      ["min_p", 0, 1, false],
-    ] as const;
-    for (const [field, min, max, integer] of samplerSpecs) {
-      const value = args[field];
-      if (value === undefined) continue;
-      if (
-        typeof value !== "number" ||
-        !Number.isFinite(value) ||
-        value < min ||
-        value > max ||
-        (integer && !Number.isInteger(value))
-      ) {
-        return {
-          text: `'${field}' must be ${integer ? "an integer" : "a number"} in [${min}, ${max}].`,
-          isError: true,
-          trace: badRequestTrace(),
-        };
-      }
-    }
+    const {
+      model,
+      prompt,
+      system,
+      outputProfile,
+      delegatorModelId,
+      trafficPurpose,
+      files,
+      temperature,
+      topP,
+      topK,
+      minP,
+    } = normalized.value;
 
     // #128 (blind-context delegation): `files` is OWNER-TIER ONLY, enforced HERE — the earliest
     // point in the request that has BOTH the resolved principal tier (ctx.principal, set by the
@@ -1532,21 +1494,6 @@ async function callTool(
     // never inspects per-tool params). A guest key carrying `files` is NEVER silently ignored: it
     // is rejected before any credit reservation / quota / admission work runs, using the same
     // OpenAI-shaped error vocabulary (errors.ts) as the rest of the gateway.
-    let files: string[] | undefined;
-    if (args["files"] !== undefined) {
-      const raw = args["files"];
-      // `raw.length > 0` matters: `[].every(...)` is vacuously true, so without it an empty
-      // array would slip through as a SILENT no-op — for a guest that would contradict the
-      // "supplying `files` is never silently ignored" contract this error message states.
-      if (!Array.isArray(raw) || raw.length === 0 || !raw.every((f) => typeof f === "string" && f.length > 0)) {
-        return {
-          text: "'files' must be a non-empty array of absolute path strings.",
-          isError: true,
-          trace: badRequestTrace(),
-        };
-      }
-      files = raw as string[];
-    }
     if (files !== undefined && files.length > 0 && !isAskFilesOwner(ctx.principal)) {
       const env = makeError("route_not_allowed", {
         message: "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
@@ -1590,13 +1537,13 @@ async function callTool(
       messages,
       exposureTaskText: prompt,
       ...(includeReasoning === true ? { includeReasoning: true } : {}),
-      trafficPurpose: trafficPurpose.value,
+      trafficPurpose,
       maxTokens,
       delegatorModelId,
-      temperature: args["temperature"] as number | undefined,
-      topP: args["top_p"] as number | undefined,
-      topK: args["top_k"] as number | undefined,
-      minP: args["min_p"] as number | undefined,
+      temperature,
+      topP,
+      topK,
+      minP,
       reasoningEffort:
         outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE && supportsReasoningEffort(model)
           ? "low"
