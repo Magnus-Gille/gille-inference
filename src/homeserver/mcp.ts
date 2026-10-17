@@ -1,3 +1,11 @@
+import {
+  ASK_REASONING_MAX_BYTES,
+  ASK_TRUNCATION_FINISH_REASON,
+  InvalidAskResponse,
+  parseAskChatResponse,
+  type AskReasoning,
+  type AskUsageMetadata,
+} from "./mcp-chat-response.js";
 import type { ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { clampMaxTokensForModel, type HomeserverConfig } from "./config.js";
@@ -277,26 +285,7 @@ const ASK_OUTPUT_SCHEMA = {
   required: ["model", "text", "finish_reason", "truncated", "metered", "usage"],
 } as const;
 
-/** Only the separately requested reasoning field is capped; generation/usage is unchanged. */
-export const ASK_REASONING_MAX_BYTES = 16_384;
-class InvalidAskResponse extends Error {}
-interface AskReasoning {
-  content: string | null;
-  truncated: boolean | null;
-}
-function boundedAskReasoning(raw: unknown): AskReasoning {
-  if (typeof raw !== "string") return { content: null, truncated: null };
-  let bytes = 0;
-  let end = 0;
-  // Stop at a complete Unicode code point. Never decode a sliced UTF-8 byte sequence.
-  for (const character of raw) {
-    const next = Buffer.byteLength(character, "utf8");
-    if (bytes + next > ASK_REASONING_MAX_BYTES) return { content: raw.slice(0, end), truncated: true };
-    bytes += next;
-    end += character.length;
-  }
-  return { content: raw, truncated: false };
-}
+export { ASK_REASONING_MAX_BYTES } from "./mcp-chat-response.js";
 const ASK_OWNER_OUTPUT_SCHEMA = {
   ...ASK_OUTPUT_SCHEMA,
   properties: {
@@ -647,15 +636,6 @@ export interface RunChatArgs {
   trafficPurpose?: ExecutionTrafficPurpose;
 }
 
-interface AskUsageMetadata {
-  promptTokens: number | null;
-  completionTokens: number | null;
-  totalTokens: number | null;
-  reasoningTokens: number | null;
-  cacheCreationInputTokens: number | null;
-  cacheReadInputTokens: number | null;
-}
-
 export type RunChatResult =
   | {
       ok: true;
@@ -729,27 +709,6 @@ export function askFailureMeta(failure: Extract<RunChatResult, { ok: false }>): 
   };
 }
 
-const ASK_TRUNCATION_FINISH_REASON = "length";
-
-function emptyAskUsageMetadata(): AskUsageMetadata {
-  return {
-    promptTokens: null,
-    completionTokens: null,
-    totalTokens: null,
-    reasoningTokens: null,
-    cacheCreationInputTokens: null,
-    cacheReadInputTokens: null,
-  };
-}
-
-function nonNegativeIntegerOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
-}
-
-function askTruncatedOfFinishReason(finishReason: string | null): boolean | null {
-  return finishReason === null ? null : finishReason === ASK_TRUNCATION_FINISH_REASON;
-}
-
 function isAskTokenLimitTruncation(result: Extract<RunChatResult, { ok: true }>): boolean {
   return result.truncated === true && result.finishReason === ASK_TRUNCATION_FINISH_REASON;
 }
@@ -762,54 +721,6 @@ function askTruncationWarningText(partialText: string): string {
     "Partial response follows:",
   ].join("\n");
   return partialText.length > 0 ? `${prefix}\n\n${partialText}` : prefix;
-}
-
-function parseAskUsageMetadata(rawUsage: unknown): AskUsageMetadata {
-  if (rawUsage === null || rawUsage === undefined) {
-    return emptyAskUsageMetadata();
-  }
-  if (typeof rawUsage !== "object" || Array.isArray(rawUsage)) {
-    return emptyAskUsageMetadata();
-  }
-  const usage = rawUsage as {
-    prompt_tokens?: unknown;
-    input_tokens?: unknown;
-    completion_tokens?: unknown;
-    output_tokens?: unknown;
-    total_tokens?: unknown;
-    reasoning_tokens?: unknown;
-    cache_creation_input_tokens?: unknown;
-    cache_read_input_tokens?: unknown;
-    prompt_tokens_details?: {
-      cached_tokens?: unknown;
-      cache_read_input_tokens?: unknown;
-      cache_creation_input_tokens?: unknown;
-    };
-    completion_tokens_details?: {
-      reasoning_tokens?: unknown;
-    };
-  };
-  const promptTokens =
-    nonNegativeIntegerOrNull(usage.prompt_tokens) ?? nonNegativeIntegerOrNull(usage.input_tokens);
-  const completionTokens =
-    nonNegativeIntegerOrNull(usage.completion_tokens) ?? nonNegativeIntegerOrNull(usage.output_tokens);
-  return {
-    promptTokens,
-    completionTokens,
-    totalTokens:
-      nonNegativeIntegerOrNull(usage.total_tokens) ??
-      (promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null),
-    reasoningTokens:
-      nonNegativeIntegerOrNull(usage.reasoning_tokens) ??
-      nonNegativeIntegerOrNull(usage.completion_tokens_details?.reasoning_tokens),
-    cacheCreationInputTokens:
-      nonNegativeIntegerOrNull(usage.cache_creation_input_tokens) ??
-      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cache_creation_input_tokens),
-    cacheReadInputTokens:
-      nonNegativeIntegerOrNull(usage.cache_read_input_tokens) ??
-      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cache_read_input_tokens) ??
-      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cached_tokens),
-  };
 }
 
 function toAskStructuredContent(
@@ -1190,37 +1101,12 @@ export async function runChatCompletion(
       };
     }
 
-    let content = "";
     // Recheck tier at the shared helper boundary; never mix reasoning into final text or logs.
     const includeReasoning = args.includeReasoning === true && principal.tier === "owner";
-    let reasoning = includeReasoning ? boundedAskReasoning(undefined) : undefined;
-    let promptTokens: number | null = null;
-    let completionTokens: number | null = null;
-    let usageMetadata = emptyAskUsageMetadata();
-    let finishReason: string | null = null;
-    let truncated: boolean | null = null;
+    let parsed: ReturnType<typeof parseAskChatResponse>;
     try {
-      const json = JSON.parse(text) as {
-        choices?: Array<{ message?: { content?: string; reasoning_content?: unknown }; finish_reason?: string | null }>;
-        usage?: unknown;
-      };
-      if (json === null || typeof json !== "object" || Array.isArray(json) ||
-          (json.choices != null && !Array.isArray(json.choices))) throw new InvalidAskResponse();
-      const message = json.choices?.[0]?.message;
-      if (message != null && (typeof message !== "object" || Array.isArray(message) ||
-          (message.content != null && typeof message.content !== "string"))) throw new InvalidAskResponse();
-      content = message?.content ?? "";
-      if (includeReasoning) reasoning = boundedAskReasoning(message?.reasoning_content);
-      usageMetadata = parseAskUsageMetadata(json.usage);
-      promptTokens = usageMetadata.promptTokens;
-      completionTokens = usageMetadata.completionTokens;
-      finishReason = typeof json.choices?.[0]?.finish_reason === "string" ? json.choices[0].finish_reason : null;
-      truncated = askTruncatedOfFinishReason(finishReason);
-      actualTokens =
-        usageMetadata.totalTokens ??
-        (promptTokens !== null && completionTokens !== null
-          ? promptTokens + completionTokens
-          : Math.ceil(promptChars / 4));
+      parsed = parseAskChatResponse(text, { includeReasoning, promptChars });
+      actualTokens = parsed.actualTokens;
     } catch (error) {
       if (!(error instanceof SyntaxError) && !(error instanceof InvalidAskResponse)) throw error;
       // A malformed envelope may contain reasoning bytes. Never reflect it as a final answer
@@ -1229,6 +1115,8 @@ export async function runChatCompletion(
       return { ok: false, requestId: inferenceRequestId, code: "upstream_error", message: "The model backend returned an invalid chat response.",
         traceOutcome: "error", traceErrorClass: "upstream_error" };
     }
+    const { content, reasoning, usage: usageMetadata, finishReason, truncated } = parsed;
+    const { promptTokens, completionTokens } = usageMetadata;
     metricPrompt = promptTokens;
     metricCompletion = completionTokens;
     // C3 / M1: the model label is canonModel (computed once at the top via canonicalizeModelTrusted,
