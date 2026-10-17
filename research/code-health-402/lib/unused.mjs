@@ -309,6 +309,17 @@ function findSourceReferences(ts, scope, file, source, targets) {
           may_target_candidate: true,
         });
       }
+    } else if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+      && node.expression.name.text === 'getBuiltinModule') {
+      const argument = node.arguments[0];
+      dynamicUnknowns.push({
+        path: file,
+        line: lineAt(source, node.getStart(sourceFile)),
+        kind: 'unsupported-process-builtin-module',
+        target: argument && isStringLiteralLike(ts, unwrapExpression(ts, argument))
+          ? unwrapExpression(ts, argument).text : '<computed>',
+        may_target_candidate: true,
+      });
     } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
       if (node.arguments.length > 0 && isStringLiteralLike(ts, unwrapExpression(ts, node.arguments[0]))) {
         resolveNode(unwrapExpression(ts, node.arguments[0]), 'require-literal');
@@ -323,6 +334,51 @@ function findSourceReferences(ts, scope, file, source, targets) {
     } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
       && node.moduleReference.expression && isStringLiteralLike(ts, node.moduleReference.expression)) {
       resolveNode(node.moduleReference.expression, 'require-literal');
+    }
+    const parent = node.parent;
+    const builtinModuleProperty = (ts.isPropertyAccessExpression(node) && node.name.text === 'getBuiltinModule')
+      || (ts.isElementAccessExpression(node) && isStringLiteralLike(ts, node.argumentExpression)
+        && node.argumentExpression.text === 'getBuiltinModule');
+    const directBuiltinModuleCall = parent && ts.isCallExpression(parent) && parent.expression === node;
+    if (builtinModuleProperty && !directBuiltinModuleCall) {
+      dynamicUnknowns.push({
+        path: file,
+        line: lineAt(source, node.getStart(sourceFile)),
+        kind: 'unsupported-process-builtin-module',
+        target: '<property>',
+        may_target_candidate: true,
+      });
+    }
+    const harmlessRequirePropertyName = parent && (ts.isPropertyAccessExpression(parent) && parent.name === node
+      || ts.isPropertyAssignment(parent) && parent.name === node
+      || ts.isMethodDeclaration(parent) && parent.name === node
+      || ts.isMethodSignature(parent) && parent.name === node
+      || ts.isPropertyDeclaration(parent) && parent.name === node
+      || ts.isPropertySignature(parent) && parent.name === node
+      || ts.isBindingElement(parent) && parent.propertyName === node
+      || ts.isImportSpecifier(parent) && parent.propertyName === node
+      || ts.isExportSpecifier(parent) && parent.propertyName === node);
+    const destructuredBuiltinModuleName = parent && ts.isBindingElement(parent) && parent.propertyName === node;
+    if (ts.isIdentifier(node) && node.text === 'getBuiltinModule'
+      && (!harmlessRequirePropertyName || destructuredBuiltinModuleName)) {
+      dynamicUnknowns.push({
+        path: file,
+        line: lineAt(source, node.getStart(sourceFile)),
+        kind: 'unsupported-process-builtin-module',
+        target: '<alias>',
+        may_target_candidate: true,
+      });
+    }
+    const directRequireCallee = parent && ts.isCallExpression(parent) && parent.expression === node;
+    if (ts.isIdentifier(node) && node.text === 'require'
+      && !harmlessRequirePropertyName && !directRequireCallee) {
+      dynamicUnknowns.push({
+        path: file,
+        line: lineAt(source, node.getStart(sourceFile)),
+        kind: 'unsupported-escaped-require',
+        target: 'require',
+        may_target_candidate: true,
+      });
     }
     ts.forEachChild(node, visit);
   };

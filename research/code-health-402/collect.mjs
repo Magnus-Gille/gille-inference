@@ -402,6 +402,25 @@ export function inferTriage(row, priorTriage) {
   } : { classification: 'unreviewed-candidate', source_path: null };
 }
 
+export function parseKnipReport(stdout) {
+  let report;
+  try {
+    report = JSON.parse(stdout);
+    if (!report || Array.isArray(report) || !Array.isArray(report.files) || !Array.isArray(report.issues)) {
+      throw new TypeError('Knip report requires complete files and issues arrays');
+    }
+    const rows = normalizeKnipRows(report);
+    if (rows.length > 5000) throw new RangeError('Knip result exceeds the 5,000-row artifact bound');
+    return { report, rows, parseError: null };
+  } catch (error) {
+    return {
+      report: null,
+      rows: null,
+      parseError: error?.message ?? 'Knip output could not be parsed',
+    };
+  }
+}
+
 async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, modified, evidenceRefs, deadline }) {
   const resultPath = 'evidence/unused/knip.json';
   const findingsPath = 'evidence/unused/findings.json';
@@ -478,21 +497,15 @@ async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, mod
   ];
   const startedAt = isoSecond();
   const run = await runProcess(command, args, { deadline });
-  let rows = null;
-  let parseError = null;
-  try {
-    rows = normalizeKnipRows(JSON.parse(run.stdout));
-    if (rows.length > 5000) throw new RangeError('Knip result exceeds the 5,000-row artifact bound');
-  } catch (error) {
-    parseError = error?.message ?? 'Knip output could not be parsed';
-  }
+  const parsedKnip = parseKnipReport(run.stdout);
+  const { report, rows, parseError } = parsedKnip;
   await writeJson(outputRoot, resultPath, {
     command: ['knip', ...args],
     exit_code: run.exitCode,
     elapsed_ms: run.elapsedMs,
     started_at: startedAt,
     parse_error: parseError,
-    raw_report: rows === null ? null : sanitizeJson(JSON.parse(run.stdout)),
+    raw_report: report === null ? null : sanitizeJson(report),
     stderr: run.stderr,
     spawn_error: run.errorName,
     stdout_truncated: run.stdoutTruncated,
@@ -537,7 +550,7 @@ async function collectKnip({ outputRoot, observedAt, collectionRef, attempt, mod
   const qualifiedCandidates = findings.filter(row => row.candidate_state === 'candidate-in-qualified-graph');
   const analyzerComplete = analyzerStatus({
     exitCode: run.exitCode,
-    parsed: rows !== null,
+    parsed: rows !== null && parseError === null,
     truncated: run.stdoutTruncated || run.stderrTruncated,
     timedOut: run.timedOut,
   }) === 'complete';

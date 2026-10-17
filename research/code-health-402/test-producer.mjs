@@ -35,6 +35,7 @@ import {
   gitWorkflowDigests,
   inferTriage,
   newCollectionRef,
+  parseKnipReport,
   reportMarkdown,
   runConcurrentStaticCollectors,
   runProcess,
@@ -118,9 +119,29 @@ test('empty, failing, malformed, and truncated analyzer outputs never imply a ze
   assert.equal(analyzerStatus({ exitCode: 0, parsed: true, truncated: true }), 'failed');
   assert.throws(() => parseEslintReport('{malformed'), SyntaxError);
   assert.throws(() => parseEslintReport('[{"filePath":"src/a.ts"}]'), /invalid file report/);
-  assert.deepEqual(normalizeKnipRows({ files: [], exports: [] }), []);
+  assert.deepEqual(normalizeKnipRows({ files: [], issues: [] }), []);
+  assert.throws(() => normalizeKnipRows({ summary: {} }), /no recognized issue groups/);
+  assert.throws(() => normalizeKnipRows({ meta: {} }), /no recognized issue groups/);
+  assert.throws(() => normalizeKnipRows({ files: [] }), /requires both files and issues arrays/);
   assert.throws(() => normalizeKnipRows({ unrecognized: [] }), /unknown issue group/);
-  assert.throws(() => normalizeKnipRows({ files: [{ note: 'not a source candidate' }] }), /no source path or symbol/);
+  assert.throws(() => normalizeKnipRows({ files: [], issues: [{ file: 'src/a.ts', mysteries: [] }] }), /unknown kind/);
+});
+
+test('Knip qualification requires a complete bounded report and accepts a valid empty report', () => {
+  const empty = parseKnipReport(JSON.stringify({ files: [], issues: [] }));
+  assert.deepEqual(empty.rows, []);
+  assert.equal(empty.parseError, null);
+  for (const malformed of [{ summary: {} }, { meta: {} }, { files: [] }, { exports: [] }]) {
+    const result = parseKnipReport(JSON.stringify(malformed));
+    assert.equal(result.rows, null);
+    assert.match(result.parseError, /Knip report requires complete files and issues arrays/);
+  }
+  const oversized = parseKnipReport(JSON.stringify({
+    files: Array.from({ length: 5001 }, (_, index) => `src/unused-${index}.ts`),
+    issues: [],
+  }));
+  assert.equal(oversized.rows, null);
+  assert.match(oversized.parseError, /exceeds the 5,000-row artifact bound/);
 });
 
 test('tool provenance accepts only an installed version matching its declared pin', () => {

@@ -162,6 +162,72 @@ it('keeps an aliased computed createRequire loader unresolved', async () => {
   assert.equal(audit.graph_qualified, false, 'computed require aliases stay outside the qualified graph');
 });
 
+it('keeps global require aliases and process builtin-module acquisition unresolved', async () => {
+  const scope = {
+    scope_version: 'fixture-loader-forms-v1',
+    audited_source_prefixes: ['src/', 'tests/'],
+    candidate_source_prefixes: ['src/'],
+    source_extensions: ['.ts', '.cjs'],
+    candidate_kinds: ['files', 'exports'],
+    consumer_classes: [{ class: 'test', prefixes: ['tests/'] }],
+    reviewed_data_enumerations: [],
+  };
+  const sources = new Map([
+    ['tests/aliased-require.test.cjs', [
+      'const load = require;',
+      'load(modulePath);',
+      'use(require);',
+      'const escaped = { load: require };',
+      '(0, require)(modulePath);',
+      "const direct = require('../src/module.js');",
+      'void direct;',
+    ].join('\n')],
+    ['tests/builtin-loader.test.ts', [
+      "const { execFile } = process.getBuiltinModule('node:child_process');",
+      "execFile(process.execPath, ['scripts/a.ts']);",
+    ].join('\n')],
+    ['tests/computed-builtin-loader.test.ts', [
+      'const builtinName = process.env.BUILTIN_NAME;',
+      'process.getBuiltinModule(builtinName);',
+    ].join('\n')],
+    ['tests/aliased-builtin-loader.test.ts', [
+      'const loadBuiltin = process.getBuiltinModule;',
+      'loadBuiltin(builtinName);',
+      'const { getBuiltinModule: loadDestructured } = process;',
+      'loadDestructured(builtinName);',
+    ].join('\n')],
+  ]);
+  const files = ['src/module.ts', ...sources.keys()];
+  const audit = await buildUnusedReferenceAudit({
+    scope,
+    files,
+    readSource: async file => sources.get(file) ?? 'export const present = true;\n',
+  });
+  assert.ok(audit.dynamic_unknowns.some(item => item.path === 'tests/aliased-require.test.cjs'
+    && item.kind === 'unsupported-escaped-require'));
+  assert.ok(audit.dynamic_unknowns.some(item => item.path === 'tests/builtin-loader.test.ts'
+    && item.kind === 'unsupported-process-builtin-module'
+    && item.target === 'node:child_process'));
+  assert.ok(audit.dynamic_unknowns.some(item => item.path === 'tests/computed-builtin-loader.test.ts'
+    && item.kind === 'unsupported-process-builtin-module'
+    && item.target === '<computed>'));
+  assert.ok(audit.dynamic_unknowns.some(item => item.path === 'tests/aliased-builtin-loader.test.ts'
+    && item.kind === 'unsupported-process-builtin-module'
+    && item.target === '<property>'));
+  assert.ok(audit.dynamic_unknowns.some(item => item.path === 'tests/aliased-builtin-loader.test.ts'
+    && item.kind === 'unsupported-process-builtin-module'
+    && item.target === '<alias>'));
+  assert.ok(audit.references.some(reference => reference.path === 'tests/aliased-require.test.cjs'
+    && reference.target_path === 'src/module.ts'
+    && reference.reference_type === 'require-literal'));
+  assert.equal(audit.graph_qualified, false, 'unmodeled loader acquisition keeps the graph unknown');
+  const candidates = attachUnusedConsumerEvidence([
+    { kind: 'exports', file: 'src/module.ts', name: 'present', line: 1 },
+  ], audit, scope);
+  assert.equal(candidates[0].candidate_state, 'retained-by-source-reference');
+  assert.equal(qualifiedUnusedPayload(candidates, audit.graph_qualified, scope), null);
+});
+
 it('keeps node:module loader aliases and builtin require forms unresolved', async () => {
   const scope = {
     scope_version: 'fixture-node-module-v1',
