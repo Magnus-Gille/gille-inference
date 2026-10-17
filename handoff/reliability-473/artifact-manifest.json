@@ -1,0 +1,64 @@
+{
+  "kind": "accepted-client-artifact handoff copy; no npm publication or deployment",
+  "accepted_gateway_release_sha": "d14a132d3ed132340ca38092f01fe0063f2fbb4c",
+  "accepted_pr_head": "57f531510b31bbcef95be4869c3f0884c3bc87a3",
+  "client_version": "1.5.4",
+  "artifact": "gille-inference-1.5.4.tgz",
+  "sha256": "00d28af593ed6bc0baa924d0c9aef346fb3b4d504476459a8bd967842806ba39",
+  "source_repository": "Magnus-Gille/gille-inference",
+  "source_member_check": "Every packaged byte matched the corresponding already-published client file at the accepted release. No credentials, config, operator state or logs are included.",
+  "source_members": [
+    {
+      "path": "LICENSE",
+      "sha256": "9837f8599b4fb3127c35e01b67a33b442418b599e13cd17e2094a0c96a314c10",
+      "bytes": 1069
+    },
+    {
+      "path": "package.json",
+      "sha256": "5dc0b586818983210c8a66281b6338a9fb64f69b2fd3e21be65fdac357274b49",
+      "bytes": 682
+    },
+    {
+      "path": "README.md",
+      "sha256": "b9d10e8fa2ecfee8c4312b4a83ab3c1e479dee658cf619639e1db0cf443fc53d",
+      "bytes": 12794
+    },
+    {
+      "path": "hs.mjs",
+      "sha256": "619cd19d4be440c66702d2ecfa3347e22e65942abd036bf0321d4b0a5fdf3b70",
+      "bytes": 20207
+    },
+    {
+      "path": "m5-build.mjs",
+      "sha256": "6fb5c3f03d8562d7763609835a0547cda968d3d7c7e61dc940b4f10decfa8552",
+      "bytes": 20256
+    },
+    {
+      "path": "m5-client.mjs",
+      "sha256": "9edf7d8dd6be0e6c547633dd48f1f0f34477e4c191b754d8f45ff7497a9e97ad",
+      "bytes": 123048
+    },
+    {
+      "path": "m5-provision.mjs",
+      "sha256": "ead4a9f1e2886715ccd6d974022375ed93d40377f03144bc15ed6a3326c17367",
+      "bytes": 11998
+    },
+    {
+      "path": "m5-stdio-bridge.mjs",
+      "sha256": "d28fca062230816c5ebfa28d912e74bb50970aace5fd121ab175e75c83e5c9f3",
+      "bytes": 16590
+    },
+    {
+      "path": "m5.mjs",
+      "sha256": "172c2d4ba7b05651fd6fa2aca2958bcd21964982afcb79fdd41b5fea2b13e58d",
+      "bytes": 17981
+    },
+    {
+      "path": "m5-build-files.py",
+      "sha256": "88fb528554751713dd99446d0ed4716443ad418e020953e33511174baa5542a8",
+      "bytes": 9733
+    }
+  ],
+  "deployment_status": "not performed by this session; requires current operator verification and release gates",
+  "related_issue": "https://github.com/Magnus-Gille/brokkr/issues/142"
+}
