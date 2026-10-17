@@ -1334,7 +1334,22 @@ export async function collectWithFallback({ name, unit, observedAt, outputRoot, 
 }
 
 export async function runConcurrentStaticCollectors(complexityTask, unusedTask) {
-  return Promise.all([complexityTask(), unusedTask()]);
+  const [complexityResult, unusedResult] = await Promise.allSettled([
+    Promise.resolve().then(complexityTask),
+    Promise.resolve().then(unusedTask),
+  ]);
+  if (complexityResult.status === 'rejected') throw complexityResult.reason;
+  if (unusedResult.status === 'rejected') throw unusedResult.reason;
+  return [complexityResult.value, unusedResult.value];
+}
+
+export async function runConcurrentStaticAndCiCollectors(complexityTask, unusedTask, ciTask) {
+  const staticPromise = runConcurrentStaticCollectors(complexityTask, unusedTask);
+  const ciPromise = Promise.resolve().then(ciTask);
+  const [staticResult, ciResult] = await Promise.allSettled([staticPromise, ciPromise]);
+  if (staticResult.status === 'rejected') throw staticResult.reason;
+  if (ciResult.status === 'rejected') throw ciResult.reason;
+  return [staticResult.value, ciResult.value];
 }
 
 export async function collect({
@@ -1386,12 +1401,13 @@ export async function collect({
   let complexMetric;
   let unusedMetric;
   let coverageMetric;
+  let ci;
   if (!collectStatic) {
     complexMetric = uncollectedMetric('complex_functions', observedAt, 'functions');
     unusedMetric = uncollectedMetric('unused_candidates', observedAt, 'candidates');
     coverageMetric = uncollectedMetric('coverage', observedAt, 'lines');
   } else {
-    const [complexity, unused] = await runConcurrentStaticCollectors(
+    const [[complexity, unused], ciResult] = await runConcurrentStaticAndCiCollectors(
       () => collectWithFallback({
         name: 'complex_functions', unit: 'functions', observedAt, outputRoot, evidenceRefs,
         collectMetric: () => collectComplexity({
@@ -1404,6 +1420,7 @@ export async function collect({
           outputRoot, observedAt, collectionRef, attempt, modified: !trackedClean, evidenceRefs, deadline: pilotDeadline,
         }),
       }),
+      () => collectCi({ outputRoot, observedAt, collectionRef, attempt, token, evidenceRefs, deadline: pilotDeadline }),
     );
     complexMetric = complexity.slot;
     timings.push({ name: 'ESLint and TypeScript function inventory', elapsed_ms: complexity.elapsedMs, status: complexity.status });
@@ -1412,9 +1429,13 @@ export async function collect({
     unusedMetric = unused.slot;
     timings.push({ name: 'Knip candidate exploration', elapsed_ms: unused.elapsedMs, status: unused.status });
     if (unused.status === 'failed') errors.push('Knip candidate extraction failed; raw graph output is retained where available.');
+
+    ci = ciResult;
   }
 
-  const ci = await collectCi({ outputRoot, observedAt, collectionRef, attempt, token, evidenceRefs, deadline: pilotDeadline });
+  if (!collectStatic) {
+    ci = await collectCi({ outputRoot, observedAt, collectionRef, attempt, token, evidenceRefs, deadline: pilotDeadline });
+  }
   timings.push({ name: 'GitHub Actions 28-day first-attempt cohort', elapsed_ms: ci.elapsedMs, status: ci.status });
   if (ci.status !== 'measured') errors.push(`CI collection state: ${ci.status}.`);
   const staticMetadataElapsedMs = Math.round(performance.now() - pilotStarted);

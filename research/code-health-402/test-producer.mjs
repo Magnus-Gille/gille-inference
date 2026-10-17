@@ -38,6 +38,7 @@ import {
   parseKnipReport,
   reportMarkdown,
   runConcurrentStaticCollectors,
+  runConcurrentStaticAndCiCollectors,
   runProcess,
 } from './collect.mjs';
 import { validateObjective } from '../../contracts/grimnir-code-health-v1/scripts/lib/code-health-objective.mjs';
@@ -219,6 +220,80 @@ test('static collectors start together and preserve the complexity/unused result
     { slot: { name: 'complex_functions' }, elapsedMs: 10, status: 'measured' },
     { slot: { name: 'unused_candidates' }, elapsedMs: 11, status: 'unknown' },
   ]);
+});
+
+test('CI metadata starts before blocked static collectors complete and result order stays stable', async () => {
+  let complexityResolve;
+  let unusedResolve;
+  const started = [];
+  const complexity = new Promise(resolve => { complexityResolve = resolve; });
+  const unused = new Promise(resolve => { unusedResolve = resolve; });
+  const pending = runConcurrentStaticAndCiCollectors(
+    async () => { started.push('complexity'); return complexity; },
+    async () => { started.push('unused'); return unused; },
+    async () => { started.push('ci'); return { status: 'measured', elapsedMs: 7 }; },
+  );
+  await new Promise(resolve => queueMicrotask(resolve));
+  assert.deepEqual(started, ['complexity', 'unused', 'ci']);
+  complexityResolve({ slot: { name: 'complex_functions' }, elapsedMs: 10, status: 'measured' });
+  unusedResolve({ slot: { name: 'unused_candidates' }, elapsedMs: 11, status: 'unknown' });
+  assert.deepEqual(await pending, [[
+    { slot: { name: 'complex_functions' }, elapsedMs: 10, status: 'measured' },
+    { slot: { name: 'unused_candidates' }, elapsedMs: 11, status: 'unknown' },
+  ], { status: 'measured', elapsedMs: 7 }]);
+});
+
+test('concurrent static/CI orchestration observes both branches before propagating errors', async () => {
+  let releaseCi;
+  let ciSettled = false;
+  const ciGate = new Promise(resolve => { releaseCi = resolve; });
+  const pending = runConcurrentStaticAndCiCollectors(
+    async () => { throw new Error('synthetic static failure'); },
+    async () => ({ slot: { name: 'unused_candidates' }, elapsedMs: 1, status: 'measured' }),
+    async () => { await ciGate; ciSettled = true; return { status: 'measured' }; },
+  );
+  await new Promise(resolve => queueMicrotask(resolve));
+  assert.equal(ciSettled, false, 'CI branch remains observed while the static failure is pending');
+  releaseCi();
+  await assert.rejects(pending, /synthetic static failure/);
+  assert.equal(ciSettled, true, 'CI branch is awaited even after a static rejection');
+});
+
+test('concurrent static/CI orchestration waits for blocked unused work after complexity rejects', async () => {
+  let releaseUnused;
+  let releaseCi;
+  let unusedSettled = false;
+  let ciSettled = false;
+  const unusedGate = new Promise(resolve => { releaseUnused = resolve; });
+  const ciGate = new Promise(resolve => { releaseCi = resolve; });
+  const pending = runConcurrentStaticAndCiCollectors(
+    async () => { throw new Error('synthetic complexity failure'); },
+    async () => { await unusedGate; unusedSettled = true; return { slot: { name: 'unused_candidates' } }; },
+    async () => { await ciGate; ciSettled = true; return { status: 'measured' }; },
+  );
+  await new Promise(resolve => queueMicrotask(resolve));
+  assert.equal(unusedSettled, false);
+  assert.equal(ciSettled, false);
+  releaseCi();
+  await new Promise(resolve => queueMicrotask(resolve));
+  assert.equal(ciSettled, true, 'CI is awaited independently of the blocked static branch');
+  assert.equal(unusedSettled, false, 'complexity rejection does not short-circuit unused work');
+  releaseUnused();
+  await assert.rejects(pending, /synthetic complexity failure/);
+  assert.equal(unusedSettled, true);
+});
+
+test('concurrent static/CI orchestration propagates a CI rejection after static completion', async () => {
+  let staticSettled = false;
+  await assert.rejects(
+    runConcurrentStaticAndCiCollectors(
+      async () => { staticSettled = true; return { slot: { name: 'complex_functions' } }; },
+      async () => ({ slot: { name: 'unused_candidates' } }),
+      async () => { throw new Error('synthetic CI failure'); },
+    ),
+    /synthetic CI failure/,
+  );
+  assert.equal(staticSettled, true, 'static branches are awaited before a CI rejection is propagated');
 });
 
 test('collector fallback records a bounded failure and evidence reference', async () => {
@@ -992,6 +1067,31 @@ test('CI-only Markdown names only evidence the collector emits', () => {
   const paths = [...report.matchAll(/(?:evidence\/[A-Za-z0-9_./-]+|evidence-index\.json)/g)]
     .map(match => match[0].replace(/[.,;:]+$/, ''));
   assert.deepEqual([...new Set(paths)], ['evidence/ci/inventory.json', 'evidence/release-regression-survey.json', 'evidence-index.json']);
+});
+
+test('CI-only collection keeps static slots uncollected and uses the shared pilot budget', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-ci-only-'));
+  const outputDir = path.join(temp, 'artifact');
+  try {
+    const result = await collect({
+      outputDir,
+      collectStatic: false,
+      token: null,
+      now: new Date('2026-10-09T12:00:00Z'),
+      runId: null,
+      attempt: 1,
+    });
+    for (const name of ['complex_functions', 'unused_candidates', 'coverage']) {
+      assert.equal(result.objective.metrics[name].status, 'unknown', `${name} remains uncollected`);
+    }
+    assert.equal(result.objective.metrics.ci_first_attempt.status, 'unknown');
+    assert.equal(result.staticMetadataElapsedMs <= 30_000, true, 'CI-only path keeps the 30 second pilot budget');
+    const files = await listFiles(outputDir);
+    assert.ok(files.includes('evidence/ci/inventory.json'));
+    assert.equal(files.some(file => /evidence\/(complexity|unused|coverage)\//.test(file)), false);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test('local static collection smoke emits a truthful partial artifact', { skip: process.env.CODE_HEALTH_REAL_SMOKE !== 'true' }, async () => {
