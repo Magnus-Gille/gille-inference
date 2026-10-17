@@ -1,5 +1,5 @@
 /**
- * Bounded, content-safe diagnostics for Strix failures.
+ * Bounded, sanitized diagnostics for Strix failures.
  *
  * Error.cause and AggregateError.errors are not enumerable in a reliable way, so
  * this module walks those fields explicitly. The returned object contains only
@@ -49,19 +49,37 @@ function safeProperty(value: object, key: string): { present: boolean; value?: u
   }
 }
 
-function diagnosticType(value: unknown): string {
+function isError(value: unknown): value is Error {
   try {
-    if (typeof AggregateError !== "undefined" && value instanceof AggregateError) return "AggregateError";
-    if (value instanceof Error) return typeof value.name === "string" && value.name !== "" ? value.name : "Error";
+    return value instanceof Error;
   } catch {
-    return "object";
+    return false;
+  }
+}
+
+function isAggregateError(value: unknown): value is AggregateError {
+  try {
+    return typeof AggregateError !== "undefined" && value instanceof AggregateError;
+  } catch {
+    return false;
+  }
+}
+
+function diagnosticType(value: unknown): string {
+  if (isAggregateError(value)) return "AggregateError";
+  if (isError(value)) {
+    try {
+      return typeof value.name === "string" && value.name !== "" ? value.name : "Error";
+    } catch {
+      return "Error";
+    }
   }
   return value === null ? "null" : typeof value;
 }
 
 function diagnosticMessage(value: unknown): string {
-  if (value instanceof Error) {
-    try { return value.message; } catch { return "[unreadable message]"; }
+  if (isError(value)) {
+    try { return safeString(value.message); } catch { return "[unreadable message]"; }
   }
   return safeString(value);
 }
@@ -142,7 +160,7 @@ export function failureDiagnostic(error: unknown): FailureDiagnostic {
 
     const aggregateErrors = (() => {
       try {
-        if (typeof AggregateError === "undefined" || !(value instanceof AggregateError)) return undefined;
+        if (!isAggregateError(value)) return undefined;
         const candidate = (value as { errors?: unknown }).errors;
         return Array.isArray(candidate) ? candidate : [];
       } catch {
@@ -171,4 +189,4 @@ export function failureDiagnostic(error: unknown): FailureDiagnostic {
   return boundOutput(visit(error, 0));
 }
 
-// End of bounded diagnostic module.
+export {};
