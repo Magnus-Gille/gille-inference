@@ -308,9 +308,19 @@ npm run maintenance:run -- \
     --config data/strix-benchmarks/qwen38-mtp-experiment.json \
     --out-dir data/strix-benchmarks/qwen38-mtp-latin \
     --expected-resident-model qwen38-27b \
-    --max-runtime-seconds 13800 \
+    --max-runtime-seconds 12000 \
     --ack-exclusive-window
 ```
+
+The wrapper supplies its TTL-clamped absolute child deadline without the maintenance credential.
+The runner refuses a missing deadline and ends work at the earlier of `--max-runtime-seconds`
+(measured from entry, including artifact preflight) and 1,800 seconds before that outer deadline.
+This reserves the complete bounded child stop and residency restoration path (about 1,578 seconds including an already in-flight unload,
+plus 222 seconds headroom). The example leaves further margin for wrapper startup. Artifact hashing
+is abortable; synchronous probes use a hard kill and the remaining work budget, with an absolute
+deadline check after each probe before any unload.
+Cleanup can continue after the work deadline; an externally killed or suspended process still
+requires operator verification and cannot promise restoration.
 
 The config must keep `status=hardware-validation-pending` and
 `promotionGate.deploymentStatus=not-authorized-by-evidence`; the validator rejects any promotion

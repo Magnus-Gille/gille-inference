@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   childEnvironmentWithoutMaintenanceKey,
   parseMaintenanceWindowArgs,
@@ -99,6 +99,20 @@ describe("maintenance window client", () => {
       M5_MAINTENANCE_KEY: "do-not-inherit",
       PATH: "/usr/bin",
     })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("passes a TTL-clamped absolute deadline to the child", async () => {
+    const runChild = vi.fn(async () => 0);
+    const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST" && JSON.parse(String(init.body)).action === "open") {
+        return json(201, { token: "token", evidence: { mode: "exclusive", startedAt: "x",
+          expiresAt: "2099-01-01T00:00:00.000Z", runningModels: [] } });
+      }
+      return json(200, { active: false });
+    });
+    await runMaintenanceWindowCommand({ baseUrl: "http://m5", ttlSeconds: 3600,
+      drainTimeoutSeconds: 5, command: ["test"] }, { apiKey: "key", fetch, runChild, now: () => 1000 });
+    expect(runChild.mock.calls[0]?.[3]).toBe(3596000);
   });
 
   it("aborts child work before the server-owned TTL can release exclusion", async () => {

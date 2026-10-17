@@ -18,6 +18,7 @@ import {
   type StrixSpeculationExperimentConfig,
   type StrixSpeculationRunPlan,
 } from "../src/homeserver/strix-speculation-experiment.js";
+import { failureDiagnostic } from "../src/homeserver/strix-failure-diagnostic.js";
 import type { StrixResidentEntry } from "../src/homeserver/strix-combined-experiment.js";
 import {
   renderStrixSpeculationPolicyMarkdown,
@@ -34,6 +35,10 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_REPORT_BYTES = 16 * 1024 * 1024;
 const MAX_SERVER_LOG_BYTES = 8 * 1024 * 1024;
 const READY_TIMEOUT_MS = 600_000;
+// Stop 35s + unload <=161s + restore request 600s + ready polling <=611s + final
+// snapshot 10s = 1417s, plus <=161s for an already in-flight initial unload.
+// Reserve another 222s before the wrapper's own abort deadline.
+const CLEANUP_RESERVE_MS = 1_800_000;
 let activeChild: ChildProcess | null = null;
 let activeStop: Promise<void> | null = null;
 
@@ -103,21 +108,22 @@ function assertSameArtifactPreflight(before: ArtifactPreflight, after: ArtifactP
   }
 }
 
-async function sha256File(path: string): Promise<string> {
+async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   const stat = statSync(path);
   if (!stat.isFile() || stat.size <= 0) throw new Error(`artifact is not a non-empty regular file: ${path}`);
   return await new Promise<string>((resolveHash, reject) => {
     const hash = createHash("sha256");
-    const stream = createReadStream(path);
+    const stream = createReadStream(path, { signal });
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
     stream.on("end", () => resolveHash(hash.digest("hex")));
   });
 }
 
-function commandOutput(command: string, args: string[], overrides: NodeJS.ProcessEnv = {}): string | null {
+function commandOutput(command: string, args: string[], overrides: NodeJS.ProcessEnv = {}, deadlineAt = Infinity): string | null {
   const result = spawnSync(command, args, {
-    encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024,
+    encoding: "utf8", timeout: Math.max(1, Math.min(30_000, deadlineAt - Date.now())), killSignal: "SIGKILL", maxBuffer: 256 * 1024,
     env: buildStrixChildEnvironment(process.env, overrides),
   });
   if (result.error || result.status !== 0) return null;
@@ -137,16 +143,23 @@ export async function preflightStrixSpeculationArtifacts(
     version: (path) => commandOutput(path, ["--version"], {
       GGML_VK_VISIBLE_DEVICES: "0",
       LD_LIBRARY_PATH: [dirname(config.runtime.vulkanLibraryPath), process.env["LD_LIBRARY_PATH"]].filter(Boolean).join(":"),
-    }),
+    }, deadlineAt),
     devices: (path) => commandOutput(path, ["--list-devices"], {
       GGML_VK_VISIBLE_DEVICES: "0",
       LD_LIBRARY_PATH: [dirname(config.runtime.vulkanLibraryPath), process.env["LD_LIBRARY_PATH"]].filter(Boolean).join(":"),
-    }),
+    }, deadlineAt),
     kernel: () => readFileSync("/proc/sys/kernel/osrelease", "utf8").trim(),
-    mesa: () => commandOutput("vulkaninfo", ["--summary"]),
-    rocm: () => commandOutput("rocminfo", ["--version"]),
+    mesa: () => commandOutput("vulkaninfo", ["--summary"], {}, deadlineAt),
+    rocm: () => commandOutput("rocminfo", ["--version"], {}, deadlineAt),
   },
+  signal?: AbortSignal,
+  deadlineAt = Infinity,
 ): Promise<ArtifactPreflight> {
+  const checkBudget = (): void => {
+    signal?.throwIfAborted();
+    if (Date.now() >= deadlineAt) throw new Error("artifact preflight exceeded work deadline");
+  };
+  checkBudget();
   const binary = statSync(config.runtime.binaryPath);
   if (!binary.isFile() || (binary.mode & 0o111) === 0) throw new Error("runtime binary is not an executable regular file");
   const artifacts: Array<[string, string, string]> = [
@@ -158,25 +171,36 @@ export async function preflightStrixSpeculationArtifacts(
   if (config.model.mmprojPath !== null) artifacts.push(["mmproj", config.model.mmprojPath, config.model.mmprojSha256!]);
   const hashes: Record<string, string> = {};
   for (const [label, path, expected] of artifacts) {
-    const observed = await sha256File(path);
+    checkBudget();
+    const observed = await sha256File(path, signal);
+    checkBudget();
     if (observed !== expected) throw new Error(`${label} hash differs from the reviewed config`);
     hashes[label] = observed;
   }
+  checkBudget();
   const runtimeVersion = probes.version(config.runtime.binaryPath);
   if (runtimeVersion === null || !runtimeVersion.includes(config.runtime.commit)) {
     throw new Error("runtime --version does not prove the configured immutable commit");
   }
+  checkBudget();
   const runtimeDevices = probes.devices(config.runtime.binaryPath);
   if (runtimeDevices === null || !runtimeDevices.includes(config.server.device) || !/vulkan/i.test(runtimeDevices)) {
     throw new Error("runtime --list-devices does not prove the configured Vulkan device");
   }
+  checkBudget();
+  const kernel = probes.kernel();
+  checkBudget();
+  const mesaVersion = probes.mesa();
+  checkBudget();
+  const rocmVersion = probes.rocm();
+  checkBudget();
   return {
     hashes,
     runtimeVersion,
     runtimeDevicesSha256: createHash("sha256").update(runtimeDevices).digest("hex"),
-    kernel: probes.kernel(),
-    mesaVersion: probes.mesa(),
-    rocmVersion: probes.rocm(),
+    kernel,
+    mesaVersion,
+    rocmVersion,
   };
 }
 
@@ -249,11 +273,6 @@ function readBoundedJson(path: string): unknown {
   return JSON.parse(readFileSync(path, "utf8")) as unknown;
 }
 
-function failureDiagnostic(error: unknown): { type: string; message: string } {
-  const type = error instanceof AggregateError ? "AggregateError" : error instanceof Error ? error.name : typeof error;
-  const raw = error instanceof Error ? error.message : String(error);
-  return { type, message: raw.replace(/[\r\n\0]+/g, " ").slice(0, 512) };
-}
 
 function readyIdentityMatches(snapshot: StrixResidentEntry[], expected: string | null): boolean {
   if (expected === null) return snapshot.length === 0;
@@ -346,15 +365,41 @@ export async function runArm(
   return { plan, report: readBoundedJson(reportPath), reportPath, provenancePath, logSha256: logHash.digest("hex"), logBytes };
 }
 
-export async function runStrixSpeculationExperiment(argv: string[]): Promise<number> {
+interface StrixExperimentCliDependencies {
+  platform: NodeJS.Platform;
+  environment: NodeJS.ProcessEnv;
+  preflight: typeof preflightStrixSpeculationArtifacts;
+  snapshot: typeof runningSnapshot;
+  unload: typeof unloadAll;
+  stop: typeof stopActiveChild;
+  restore: typeof restoreResidency;
+  runArm: typeof runArm;
+}
+
+export async function runStrixSpeculationExperiment(
+  argv: string[],
+  overrides: Partial<StrixExperimentCliDependencies> = {},
+): Promise<number> {
+  const startedAtMs = Date.now();
+  const dependencies: StrixExperimentCliDependencies = {
+    platform: process.platform, environment: process.env,
+    preflight: preflightStrixSpeculationArtifacts, snapshot: runningSnapshot,
+    unload: unloadAll, stop: stopActiveChild, restore: restoreResidency, runArm,
+    ...overrides,
+  };
   if (activeChild !== null) throw new Error("previous ephemeral child termination is unverified");
   const args = parseStrixSpeculationExperimentArgs(argv);
-  if (process.platform !== "linux") throw new Error("Strix speculation experiment requires Linux");
+  if (dependencies.platform !== "linux") throw new Error("Strix speculation experiment requires Linux");
+  const outerDeadlineAt = Number(dependencies.environment["M5_MAINTENANCE_CHILD_DEADLINE_AT"]);
+  if (!Number.isSafeInteger(outerDeadlineAt) || outerDeadlineAt <= startedAtMs) {
+    throw new Error("valid maintenance child deadline required; run inside maintenance:run");
+  }
+  const workDeadlineAt = Math.min(startedAtMs + args.maxRuntimeSeconds * 1000, outerDeadlineAt - CLEANUP_RESERVE_MS);
+  if (workDeadlineAt <= startedAtMs) throw new Error("maintenance deadline has insufficient cleanup reserve");
   const configText = readFileSync(args.configPath, "utf8");
   if (Buffer.byteLength(configText) > MAX_CONFIG_BYTES) throw new Error("config exceeds 64 KiB");
   const config = validateStrixSpeculationExperimentConfig(JSON.parse(configText) as unknown);
   const outputRoot = prepareFreshStrixOutputDirectory(args.outDir);
-  const host = await preflightStrixSpeculationArtifacts(config); // Hash everything before unloading.
   let interruptedBy: NodeJS.Signals | "deadline" | null = null;
   let forcedStopError: unknown;
   let restorationBlockedByUnverifiedChild = false;
@@ -366,44 +411,56 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
   const interrupt = (reason: NodeJS.Signals | "deadline"): void => {
     interruptedBy ??= reason;
     if (!interruption.signal.aborted) interruption.abort(new Error(`speculation experiment interrupted by ${reason}`));
-    void stopActiveChild().catch((error: unknown) => { forcedStopError ??= error; });
+    void dependencies.stop().catch((error: unknown) => { forcedStopError ??= error; });
   };
   const onSignal = (signal: NodeJS.Signals): void => {
     interrupt(signal);
   };
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
   for (const signal of signals) process.on(signal, onSignal);
-  const timer = setTimeout(() => interrupt("deadline"), args.maxRuntimeSeconds * 1_000);
+  const enforceDeadline = (): void => {
+    if (Date.now() >= workDeadlineAt) interrupt("deadline");
+    interruption.signal.throwIfAborted();
+  };
+  const timer = setTimeout(() => interrupt("deadline"), Math.max(0, workDeadlineAt - Date.now()));
   timer.unref();
-  const startedAt = new Date().toISOString();
+  const startedAt = new Date(startedAtMs).toISOString();
   try {
+    enforceDeadline();
+    const host = await dependencies.preflight(config, undefined, interruption.signal, workDeadlineAt);
+    enforceDeadline(); // Includes synchronous artifact probes that can delay timer delivery.
     const execution = await executeStrixSpeculationExperiment(config, args, {
       snapshot: async () => {
-        const snapshot = await runningSnapshot(args.llamaSwapOrigin);
+        const snapshot = await dependencies.snapshot(args.llamaSwapOrigin);
         if (restorationCompleted) finalReadyIdentityVerified = readyIdentityMatches(snapshot, args.expectedResidentModel);
         return snapshot;
       },
-      unload: async () => await unloadAll(args.llamaSwapOrigin),
+      unload: async () => { enforceDeadline(); await dependencies.unload(args.llamaSwapOrigin); },
       runArm: async (plan) => {
-        const result = await runArm(config, plan, host, interruption.signal);
+        const result = await dependencies.runArm(config, plan, host, interruption.signal);
         executions.push(result);
         return { cycle: plan.cycle, position: plan.position, sequence: plan.sequence, armId: plan.arm.id, reportPath: result.reportPath };
       },
       confirmStopped: async () => {
-        try { await stopActiveChild(); } catch (error) {
+        try { await dependencies.stop(); } catch (error) {
           restorationBlockedByUnverifiedChild = true;
           throw error;
         }
       },
       restore: async (initial) => {
         restorationAttempted = true;
-        await restoreResidency(args.llamaSwapOrigin, initial);
+        await dependencies.restore(args.llamaSwapOrigin, initial);
         restorationCompleted = true;
       },
-      interruptedBy: () => interruptedBy,
+      interruptedBy: () => {
+        if (Date.now() >= workDeadlineAt) interrupt("deadline");
+        return interruptedBy;
+      },
     });
     if (forcedStopError !== undefined) throw forcedStopError;
-    const postflight = await preflightStrixSpeculationArtifacts(config);
+    enforceDeadline();
+    const postflight = await dependencies.preflight(config, undefined, interruption.signal, workDeadlineAt);
+    enforceDeadline();
     assertSameArtifactPreflight(host, postflight);
     if (interruptedBy !== null) throw new Error(`speculation experiment interrupted by ${interruptedBy}`);
     const armMap = new Map(executions.map((item) => [item.plan.arm.id, item.plan.arm]));
@@ -459,6 +516,7 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
     console.log(JSON.stringify({ status: "complete", runs: executions.length, deploymentStatus: "not-authorized-by-evidence" }));
     return 0;
   } catch (error) {
+    if (Date.now() >= workDeadlineAt) interrupt("deadline");
     const incomplete = {
       schemaVersion: 1,
       status: "incomplete",
@@ -493,6 +551,6 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runStrixSpeculationExperiment(process.argv.slice(2)).then(
     (code) => { process.exitCode = code; },
-    (error) => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; },
+    (error) => { console.error(JSON.stringify(failureDiagnostic(error))); process.exitCode = 1; },
   );
 }

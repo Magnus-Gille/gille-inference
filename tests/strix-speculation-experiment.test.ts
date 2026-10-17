@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,7 @@ import {
   preflightStrixSpeculationArtifacts,
   prepareFreshStrixOutputDirectory,
   runArm,
+  runStrixSpeculationExperiment,
   stopChild,
   waitHealthy,
 } from "../scripts/strix-speculation-experiment.js";
@@ -134,6 +135,23 @@ describe("Strix speculation experiment contract", () => {
         devices: () => "Vulkan0: AMD Radeon 8060S (Vulkan)",
         kernel: () => "test-kernel", mesa: () => "test-mesa", rocm: () => null,
       })).resolves.toMatchObject({ hashes: { model: digest("model"), fixtures: digest("fixtures") }, kernel: "test-kernel" });
+      const expired = new AbortController();
+      expired.abort(new Error("preflight cancelled"));
+      const unusedProbe = vi.fn();
+      await expect(preflightStrixSpeculationArtifacts(config, {
+        version: unusedProbe, devices: unusedProbe, kernel: unusedProbe, mesa: unusedProbe, rocm: unusedProbe,
+      }, expired.signal)).rejects.toThrow(/preflight cancelled/);
+      expect(unusedProbe).not.toHaveBeenCalled();
+      const budget = Date.now() + 300000;
+      const now = vi.spyOn(Date, "now");
+      const devices = vi.fn(() => "Vulkan0 (Vulkan)");
+      try {
+        await expect(preflightStrixSpeculationArtifacts(config, {
+          version: () => { now.mockReturnValue(budget); return config.runtime.commit; },
+          devices, kernel: () => "test", mesa: () => null, rocm: () => null,
+        }, undefined, budget)).rejects.toThrow(/work deadline/);
+        expect(devices).not.toHaveBeenCalled();
+      } finally { now.mockRestore(); }
       raw.model.artifactSha256 = "0".repeat(64);
       await expect(preflightStrixSpeculationArtifacts(validateStrixSpeculationExperimentConfig(raw), {
         version: () => `llama.cpp ${config.runtime.commit}`,
@@ -554,5 +572,113 @@ describe("speculation child lifecycle", () => {
     })).rejects.toThrow(/interrupted by deadline/i);
     expect(unload).not.toHaveBeenCalled();
     expect(restore).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("speculation CLI deadline and receipt integration", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  function setup(workSeconds = 13800, outerSeconds = 14395) {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const root = mkdtempSync(join(tmpdir(), "strix-spec-cli-"));
+    roots.push(root);
+    const configPath = join(root, "config.json");
+    writeFileSync(configPath, JSON.stringify(fixture()));
+    const outDir = join(root, "output");
+    const argv = ["--config", configPath, "--out-dir", outDir,
+      "--expected-resident-model", "qwen38-27b", "--max-runtime-seconds", String(workSeconds),
+      "--ack-exclusive-window"];
+    const dependencies = {
+      platform: "linux" as const,
+      environment: { M5_MAINTENANCE_CHILD_DEADLINE_AT: String(outerSeconds * 1000) },
+      preflight: vi.fn(async () => ({ hashes: {}, runtimeVersion: "test", runtimeDevicesSha256: "test",
+        kernel: "test", mesaVersion: null, rocmVersion: null })),
+      snapshot: vi.fn(async () => [{ model: "qwen38-27b", state: "ready" }]),
+      unload: vi.fn(async () => {}),
+      stop: vi.fn(async () => {}),
+      restore: vi.fn(async () => {}),
+      runArm: vi.fn(async () => { throw new Error("arm failed"); }),
+    };
+    return { argv, dependencies, outDir };
+  }
+
+  it("counts slow artifact preflight and never unloads after the deadline", async () => {
+    const { argv, dependencies, outDir } = setup(300, 3000);
+    dependencies.preflight.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 301000));
+      return { hashes: {}, runtimeVersion: "test", runtimeDevicesSha256: "test", kernel: "test", mesaVersion: null, rocmVersion: null };
+    });
+    const result = runStrixSpeculationExperiment(argv, dependencies);
+    const rejected = expect(result).rejects.toThrow(/deadline/);
+    await vi.advanceTimersByTimeAsync(301000);
+    await rejected;
+    expect(dependencies.unload).not.toHaveBeenCalled();
+    expect(dependencies.snapshot).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(outDir, "incomplete.json"), "utf8"))).toMatchObject({
+      interruptedBy: "deadline", restoration: { attempted: false },
+    });
+  });
+
+  it("reserves complete stop and slow restoration time inside the outer fence", async () => {
+    const { argv, dependencies, outDir } = setup();
+    dependencies.runArm.mockImplementation(async (_config, _plan, _host, signal) => {
+      await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      throw new Error("unreachable");
+    });
+    dependencies.stop.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 35000)); });
+    dependencies.restore.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 1370000)); });
+    const result = runStrixSpeculationExperiment(argv, dependencies);
+    const rejected = expect(result).rejects.toThrow(/deadline/);
+    await vi.advanceTimersByTimeAsync(14395000);
+    await rejected;
+    const receipt = JSON.parse(readFileSync(join(outDir, "incomplete.json"), "utf8"));
+    expect(receipt.restoration).toMatchObject({ attempted: true, completed: true });
+    expect(Date.parse(receipt.finishedAt)).toBeLessThan(14395000);
+    expect(dependencies.restore).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves time for an in-flight unload followed by full restoration", async () => {
+    const { argv, dependencies, outDir } = setup(300, 2200);
+    dependencies.preflight.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 299000));
+      return { hashes: {}, runtimeVersion: "test", runtimeDevicesSha256: "test", kernel: "test", mesaVersion: null, rocmVersion: null };
+    });
+    dependencies.unload.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 161000)); });
+    dependencies.restore.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 1371000)); });
+    const result = runStrixSpeculationExperiment(argv, dependencies);
+    const rejected = expect(result).rejects.toThrow(/deadline/);
+    await vi.advanceTimersByTimeAsync(2200000);
+    await rejected;
+    expect(dependencies.runArm).not.toHaveBeenCalled();
+    const receipt = JSON.parse(readFileSync(join(outDir, "incomplete.json"), "utf8"));
+    expect(receipt.restoration).toMatchObject({ attempted: true, completed: true });
+    expect(Date.parse(receipt.finishedAt)).toBeLessThan(2200000);
+  });
+
+  it("rejects missing or expired outer deadlines before preflight or unload", async () => {
+    const { argv, dependencies } = setup(300, 1400);
+    await expect(runStrixSpeculationExperiment(argv, dependencies)).rejects.toThrow(/maintenance.*deadline|cleanup reserve/i);
+    expect(dependencies.preflight).not.toHaveBeenCalled();
+    expect(dependencies.unload).not.toHaveBeenCalled();
+    await expect(runStrixSpeculationExperiment(argv, { ...dependencies, environment: {} })).rejects.toThrow(/maintenance.*deadline/i);
+  });
+
+  it("publishes both arm and restoration diagnostics in the incomplete receipt", async () => {
+    const { argv, dependencies, outDir } = setup();
+    dependencies.restore.mockRejectedValue(new Error("restore HTTP 503\nretry later"));
+    await expect(runStrixSpeculationExperiment(argv, dependencies)).rejects.toThrow(/both failed/);
+    const receipt = JSON.parse(readFileSync(join(outDir, "incomplete.json"), "utf8"));
+    expect(receipt.failure.errors).toEqual([
+      { type: "Error", message: "arm failed" },
+      { type: "Error", message: "restore HTTP 503 retry later" },
+    ]);
+    expect(receipt.restoration).toMatchObject({ attempted: true, completed: false });
   });
 });

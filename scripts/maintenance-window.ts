@@ -15,12 +15,15 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   await rename(temporary, path);
 }
 
-async function runChild(command: string[], _opened: unknown, signal: AbortSignal): Promise<number> {
+async function runChild(command: string[], _opened: unknown, signal: AbortSignal, childDeadlineAt: number): Promise<number> {
   return new Promise((resolve, reject) => {
     let abortKillTimer: NodeJS.Timeout | undefined;
     const child = spawn(command[0]!, command.slice(1), {
       stdio: "inherit",
-      env: childEnvironmentWithoutMaintenanceKey(process.env),
+      env: {
+        ...childEnvironmentWithoutMaintenanceKey(process.env),
+        M5_MAINTENANCE_CHILD_DEADLINE_AT: String(childDeadlineAt),
+      },
     });
     const forward = (signal: NodeJS.Signals): void => {
       if (!child.killed) child.kill(signal);
