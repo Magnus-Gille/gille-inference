@@ -31,9 +31,9 @@ async function runWith(
 ) {
   const createMock = vi.fn().mockResolvedValue(stream);
   vi.doMock("openai", () => ({
-    default: vi.fn().mockImplementation(() => ({
-      chat: { completions: { create: createMock } },
-    })),
+    default: vi.fn().mockImplementation(function () {
+      return { chat: { completions: { create: createMock } } };
+    }),
   }));
   const { runLmStudioInference } = await import("../src/runner/lmstudio-client.js");
   const res = await runLmStudioInference("gpt-oss-120b", "triage this", opts);
