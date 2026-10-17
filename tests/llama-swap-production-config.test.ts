@@ -9,6 +9,10 @@ const memory = readFileSync(
   new URL("../deploy/systemd/llama-swap-memory.conf", import.meta.url),
   "utf8"
 );
+const rocmDevice = readFileSync(
+  new URL("../deploy/systemd/llama-swap-rocm-device.conf", import.meta.url),
+  "utf8"
+);
 
 describe("tracked llama-swap production contract", () => {
   it("uses public placeholders rather than live operator paths", () => {
@@ -33,6 +37,13 @@ describe("tracked llama-swap production contract", () => {
   it("bounds the shared llama-swap cgroup without swap", () => {
     expect(memory).toContain("MemoryMax=96G");
     expect(memory).toContain("MemorySwapMax=0");
+  });
+
+  it("allows only the ROCm compute device required by native System One models", () => {
+    const setting = (key: string) => rocmDevice.split("\n").filter((line) => line.startsWith(`${key}=`));
+    expect(rocmDevice).toContain("[Service]");
+    expect(setting("DeviceAllow")).toEqual(["DeviceAllow=/dev/kfd rw"]);
+    expect(setting("DevicePolicy")).toEqual([]);
   });
 
   // Issue #354: GPU memory is attributed to no process on this host, so the kernel picks an OOM

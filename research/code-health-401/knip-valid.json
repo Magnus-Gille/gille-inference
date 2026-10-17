@@ -1,0 +1,42 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/homeserver/cli.ts!",
+    "src/runner/index.ts!",
+    "src/judge/index.ts!",
+    "src/analysis/index.ts!",
+    "scripts/ox-agent.ts!",
+    "scripts/autonomy-tick-cli.ts!",
+    "scripts/capture-served-provenance.ts!",
+    "scripts/capture-strix-host-profile.ts!",
+    "scripts/capture-strix-provenance.ts!",
+    "scripts/check-m5-delegated-contexts.mjs!",
+    "scripts/check-model-runtime-compatibility.ts!",
+    "scripts/compare-strix-benchmarks.ts!",
+    "scripts/constitutional-routing-cli.ts!",
+    "scripts/ingest-model-release.ts!",
+    "scripts/maintenance-window.ts!",
+    "scripts/real-agent-benchmark.ts!",
+    "scripts/stage-model-release.ts!",
+    "scripts/strix-benchmark.ts!",
+    "scripts/strix-server-benchmark.ts!",
+    "scripts/strix-combined-experiment.ts!",
+    "scripts/strix-mmap-ab.ts!",
+    "scripts/strix-prefix-cache-probe.ts!",
+    "scripts/synthesize-strix-speculation-policy.ts!",
+    "scripts/verify-client-package.mjs!",
+    "client/hs.mjs!",
+    "client/m5.mjs!"
+  ],
+  "project": ["src/**/*.ts", "scripts/**/*.ts", "client/**/*.mjs"],
+  "ignore": [
+    "research/code-health-401/**",
+    "tests/**",
+    "gate-d/**",
+    "benchmarks/**",
+    "vitest.config.ts"
+  ],
+  "vitest": false,
+  "eslint": false,
+  "tsx": false
+}

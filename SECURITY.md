@@ -25,3 +25,17 @@ database, owner log, model file, key store, or tunnel credential.
 
 The code-loop cage depends on Linux namespaces and Bubblewrap. Treat it as defense in depth, review
 its documented assumptions, and do not expose tool-running routes to untrusted users.
+
+## Evaluation execution
+
+The model-evaluation path (`scripts/evaluate-model.ts`, `homeserver probe`, and the `tsGate`/`sqlExec`
+verifiers) executes model-generated code. Grader children receive an allowlisted environment (no
+`.env` values, no `HOMESERVER_*`/`M5_*` secrets, no `NODE_OPTIONS`/`NODE_PATH`), a scratch
+`HOME`/`TMPDIR`, the scratch directory as their working directory, and `tsGate` refuses to run as
+root.
+
+That is containment of the environment, not a sandbox of the process: a child can still read any
+file the running identity can reach by absolute path. Run evaluations as the dedicated unprivileged
+evaluator identity prepared by `scripts/prepare-model-evaluation-registry.sh` — never as the gateway
+service user or root, and with no access to `.env`, `data/`, or gateway runtime state. Unlike the
+code-loop cage, probe execution has no namespace or Bubblewrap confinement.

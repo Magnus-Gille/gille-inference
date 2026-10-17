@@ -26,11 +26,19 @@ so any OpenAI-compatible client (and the bundled `hs` CLI) can read it uniformly
 | **402** | `credits_exhausted` | Lifetime credit budget spent (does **not** reset) | `Credits exhausted: …` | No — contact the operator |
 | **429** | `rate_limit_exceeded` | RPM / TPM / daily-token budget hit, or public-surface throttle | `Rate limited: … (retry in Ns)` | **Yes** — wait `Retry-After` seconds |
 | **503** | `server_busy` | GPU is busy serving others (guest preempted by owner) | `Server busy: … (retry in Ns)` | **Yes** — wait `Retry-After` seconds |
+| **503** | `model_temporarily_unavailable` | Three eligible backend failures for this minted key/model within 60 seconds opened a fixed 30-second cooldown | Repeated backend failures paused this key/model; the underlying cause remains unknown | **Yes** — wait `Retry-After`; another key/model has independent state |
 | **502** | `upstream_unavailable` | Model backend (LM Studio / llama-swap) refused/reset the connection — i.e. it's down, **or it returned a non-404 error** (its status + body are normalized to this, never echoed — they could carry internal detail) | `Backend unavailable: …` | **Yes** — retry once it's back up |
 | **504** | `upstream_timeout` | Backend exceeded the call timeout — most often a **cold model load** swapping into VRAM | `Backend timeout: … (retry in Ns)` | **Yes** — wait `Retry-After` seconds, then retry |
 | **500** | `internal_error` | Unexpected gateway fault | `Error: internal error` | Maybe — report it |
 
 `429`, `503`, and `504` carry a **`Retry-After`** header (seconds); the `hs` CLI shows it as `(retry in Ns)`. `502` carries none by default — "the backend is down" isn't a "wait exactly N seconds" condition; retry once it recovers.
+
+The temporary model refusal includes `backoff {scope:"key_model", retry_after_seconds,
+unavailable_until}`. It does not call the backend or reserve quota/credits. An already in-flight
+success cannot shorten the cooldown. Static/implicit identities retain their existing shared
+policy and do not participate in this per-key guard. MCP exposes the same closed fields in
+`_meta`, with the inference request UUID for retained operator correlation. See
+[reliability diagnostics](reliability-diagnostics.md) for limits and incident-window access.
 
 ## Mid-stream failure (streaming `stream:true`)
 

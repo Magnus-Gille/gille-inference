@@ -63,10 +63,6 @@ interface RunRow {
   response: string | null;
 }
 
-interface JudgeExistsRow {
-  cnt: number;
-}
-
 function getCompletedRuns(
   db: ReturnType<typeof initDb>,
   batchId: string,

@@ -98,6 +98,65 @@ describe("gateway-supplied cause in _meta is preferred over the sentence (#357)"
       expect(error).toMatchObject({ code: "tool_error" });
     }
   });
+
+  it("classifies allowlisted model-backend reasons with safe fixed text", async () => {
+    const raw = "backend https://model.internal/v1 failed with secret hs_backend_value";
+    const error = await askWith(raw, {
+      m5_code: "upstream_error",
+      reason: "upstream_connection_failed",
+      layer: "model_backend",
+      retryable: false,
+      retry_after_seconds: 17,
+    });
+    expect(error).toMatchObject({
+      code: "upstream_error",
+      failureLayer: "model_backend",
+      retryable: true,
+      retryAfterSeconds: 17,
+      message: "The model backend is unavailable — please retry shortly.",
+    });
+    expect(error.message).not.toContain(raw);
+    expect(error.toJSON().error).not.toHaveProperty("diagnostic_code");
+  });
+
+  it.each([
+    ["upstream_connection_failed", "The model backend is unavailable — please retry shortly."],
+    ["upstream_timeout", "The model backend timed out (it may be loading a model) — please retry in a few seconds."],
+  ])("classifies %s as retryable", async (reason, message) => {
+    const error = await askWith("untrusted backend details", {
+      m5_code: "upstream_error", reason, layer: "model_backend", retry_after_seconds: 86_400,
+    });
+    expect(error).toMatchObject({ code: "upstream_error", failureLayer: "model_backend", retryable: true, retryAfterSeconds: 86_400, message });
+  });
+
+  it("drops an out-of-range backend delay", async () => {
+    const error = await askWith("untrusted backend details", {
+      m5_code: "upstream_error", reason: "upstream_timeout", layer: "model_backend", retry_after_seconds: 86_401,
+    });
+    expect(error).toMatchObject({ code: "upstream_error", failureLayer: "model_backend", retryable: true });
+    expect(error).not.toHaveProperty("retryAfterSeconds");
+  });
+
+  it("keeps unknown or malformed backend metadata generic without exposing backend details", async () => {
+    const raw = "backend https://model.internal/v1 leaked detail";
+    for (const meta of [
+      { m5_code: "upstream_error", reason: "upstream_connection_failed", layer: "gateway_transport" },
+      { m5_code: "upstream_error", reason: "backend_error", layer: "model_backend" },
+      { m5_code: "upstream_error", layer: "model_backend" },
+      { m5_code: "upstream_error", reason: "upstream_timeout", layer: "model_backend", retry_after_seconds: "soon" },
+      { m5_code: "upstream_error", reason: "upstream_timeout", layer: "model_backend", retry_after_seconds: null },
+    ]) {
+      const error = await askWith(raw, meta);
+      expect(error).toMatchObject({ code: "tool_error", message: "The model backend reported an error." });
+      expect(error).not.toHaveProperty("retryable");
+      expect(JSON.stringify(error.toJSON())).not.toContain(raw);
+    }
+  });
+
+  it("preserves older gateway errors without backend metadata", async () => {
+    const error = await askWith("The MCP tool reported an error.", undefined);
+    expect(error).toMatchObject({ code: "tool_error", message: "The MCP tool reported an error." });
+  });
 });
 
 describe("host-memory admission refusals on ask (#357)", () => {

@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import type { TaskDefinition, JudgeScores, ScoreLevel } from "../types.js";
+import type { TaskDefinition, ScoreLevel } from "../types.js";
 import { buildJudgePrompt, JUDGE_SYSTEM_PROMPT } from "./rubric.js";
 import type { JudgeResult } from "./opus-judge.js";
 

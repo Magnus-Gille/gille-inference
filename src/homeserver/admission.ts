@@ -131,10 +131,18 @@ export class AdmissionRejected extends Error {
   }
 }
 
+export class AdmissionCancelled extends Error {
+  constructor() {
+    super("client_closed");
+    this.name = "AdmissionCancelled";
+  }
+}
+
 interface Waiter {
   resolve: (release: () => void) => void;
-  reject: (err: AdmissionRejected) => void;
+  reject: (err: AdmissionRejected | AdmissionCancelled) => void;
   timer: ReturnType<typeof setTimeout>;
+  cleanup: () => void;
   keyId: string | undefined; // carried for per-key re-check in drainQueue
   keyMaxParallel: number; // cap at enqueue time
 }
@@ -152,6 +160,8 @@ export class AdmissionController {
   private activeModel: string | null = null;
   private maintenanceMode: boolean;
   private maintenanceScope: MaintenanceScope = "guest";
+  /** Separate from process-local window ownership: shutdown/close cannot clear this fence. */
+  private readonly startupExclusiveUntilMs: number | null;
   /**
    * Auto-expiry safety net (#105 follow-up): if a batch job that engaged maintenance mode dies
    * uncleanly (crash, OOM, SIGKILL) before turning it back off, a plain boolean would stay stuck
@@ -173,6 +183,7 @@ export class AdmissionController {
     retryAfterAtCapSeconds: number;
     maintenanceRetryAfterSeconds?: number;
     maintenanceMode?: boolean;
+    startupExclusiveUntilMs?: number;
     /** Injectable clock (tests). Defaults to Date.now. */
     now?: () => number;
   }) {
@@ -183,10 +194,19 @@ export class AdmissionController {
       cfg.maintenanceRetryAfterSeconds ?? MAINTENANCE_RETRY_AFTER_DEFAULT;
     this.maintenanceMode = cfg.maintenanceMode ?? false;
     this.now = cfg.now ?? Date.now;
+    if (cfg.startupExclusiveUntilMs !== undefined && !Number.isSafeInteger(cfg.startupExclusiveUntilMs)) {
+      throw new Error("startupExclusiveUntilMs must be an integer epoch timestamp");
+    }
+    this.startupExclusiveUntilMs = cfg.startupExclusiveUntilMs ?? null;
   }
 
-  /** Effective maintenance state: engaged AND (no TTL set OR TTL not yet elapsed). */
+  /** The operator deadline survives process reconstruction without extending its duration. */
+  private startupExclusiveActive(): boolean {
+    return this.startupExclusiveUntilMs !== null && this.now() < this.startupExclusiveUntilMs;
+  }
+
   private effectiveMaintenanceMode(): boolean {
+    if (this.startupExclusiveActive()) return true;
     if (!this.maintenanceMode) return false;
     if (this.maintenanceExpiresAtMs !== null && this.now() > this.maintenanceExpiresAtMs) {
       return false;
@@ -195,21 +215,38 @@ export class AdmissionController {
   }
 
   private effectiveMaintenanceScope(): MaintenanceScope | "off" {
+    if (this.startupExclusiveActive()) return "exclusive";
     return this.effectiveMaintenanceMode() ? this.maintenanceScope : "off";
   }
 
   /**
    * Resolves with a release() fn on admit; throws AdmissionRejected on guest-busy or
-   * owner-queue-timeout. release() is idempotent.
+   * owner-queue-timeout, or AdmissionCancelled when its caller leaves. release() is idempotent.
    */
-  async acquire(req: AdmissionRequest): Promise<() => void> {
+  async acquire(req: AdmissionRequest, signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw new AdmissionCancelled();
     // A real request always wins. Abort and drain background work before applying its ordinary
     // owner/guest admission decision; this prevents a shadow job from causing a 503 or GPU swap.
     if (this.background !== null) {
       const background = this.background;
       background.abort();
-      await background.drained;
+      if (signal === undefined) {
+        await background.drained;
+      } else {
+        let cancel!: () => void;
+        const cancelled = new Promise<never>((_resolve, reject) => {
+          cancel = () => reject(new AdmissionCancelled());
+        });
+        signal.addEventListener("abort", cancel, { once: true });
+        try {
+          if (signal.aborted) cancel();
+          await Promise.race([background.drained, cancelled]);
+        } finally {
+          signal.removeEventListener("abort", cancel);
+        }
+      }
     }
+    if (signal?.aborted) throw new AdmissionCancelled();
     const decision = admit(this.state(), req, {
       ownerQueueMaxMs: this.ownerQueueMaxMs,
       retryAfterAtCapSeconds: this.retryAfterAtCapSeconds,
@@ -226,12 +263,31 @@ export class AdmissionController {
     }
     // queue (owner only)
     return new Promise<() => void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const idx = this.ownerWaiters.findIndex((w) => w.timer === timer);
-        if (idx >= 0) this.ownerWaiters.splice(idx, 1);
-        reject(new AdmissionRejected(Math.max(1, Math.ceil(this.ownerQueueMaxMs / 1000))));
-      }, decision.maxWaitMs);
-      this.ownerWaiters.push({ resolve, reject, timer, keyId: req.keyId, keyMaxParallel: req.keyMaxParallel });
+      let waiter!: Waiter;
+      const discard = (error: AdmissionRejected | AdmissionCancelled): void => {
+        const idx = this.ownerWaiters.indexOf(waiter);
+        if (idx < 0) return; // Already admitted or settled.
+        this.ownerWaiters.splice(idx, 1);
+        waiter.cleanup();
+        reject(error);
+        this.drainQueue();
+      };
+      const cancel = () => discard(new AdmissionCancelled());
+      const timer = setTimeout(() => discard(
+        new AdmissionRejected(Math.max(1, Math.ceil(this.ownerQueueMaxMs / 1000))),
+      ), decision.maxWaitMs);
+      waiter = {
+        resolve, reject, timer,
+        cleanup: () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", cancel);
+        },
+        keyId: req.keyId,
+        keyMaxParallel: req.keyMaxParallel,
+      };
+      this.ownerWaiters.push(waiter);
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
     });
   }
 
@@ -300,7 +356,7 @@ export class AdmissionController {
       }
       // Admit this waiter.
       this.ownerWaiters.splice(i, 1);
-      clearTimeout(w.timer);
+      w.cleanup();
       this.inflight++;
       this.incKeyInflight(w.keyId);
       w.resolve(this.makeRelease(w.keyId));
@@ -308,13 +364,14 @@ export class AdmissionController {
   }
 
   private state(): AdmissionState {
+    const scope = this.effectiveMaintenanceScope();
     return {
       maxInflight: this.maxInflight,
       inflight: this.inflight,
       ownerQueued: this.ownerWaiters.length,
       activeModel: this.activeModel,
-      maintenanceMode: this.effectiveMaintenanceMode(),
-      maintenanceScope: this.effectiveMaintenanceScope() === "off" ? undefined : this.maintenanceScope,
+      maintenanceMode: scope !== "off",
+      maintenanceScope: scope === "off" ? undefined : scope,
     };
   }
 

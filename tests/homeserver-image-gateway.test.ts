@@ -3,7 +3,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { getDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { getOwnerLog } from "../src/homeserver/owner-log.js";
 import { renderMetrics } from "../src/homeserver/metrics.js";
@@ -140,6 +140,13 @@ function gen(p: number, token: string | null, body: unknown): Promise<Response> 
   if (token !== null) headers["authorization"] = `Bearer ${token}`;
   return fetch(`http://127.0.0.1:${p}/v1/images/generations`, { method: "POST", headers, body: JSON.stringify(body) });
 }
+function setMaintenance(on: boolean): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/admin/maintenance`, {
+    method: "POST",
+    headers: { authorization: "Bearer admin-static-key", "content-type": "application/json" },
+    body: JSON.stringify({ on, mode: on ? "exclusive" : undefined, ttlSeconds: on ? 60 : undefined }),
+  });
+}
 function jobReq(method: string, token: string, id: string): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/v1/images/generations/jobs/${id}`, {
     method,
@@ -213,6 +220,46 @@ describe("POST /v1/images/generations — sync fast tier", () => {
     expect(r2.status).toBe(429);
   });
 
+  it("describes TPM refusal in image units and never dispatches the request", async () => {
+    const k = mintKey({ alias: "img-tpm-units", tier: "guest", creditLimit: 1_000_000, tpm: 1 }, { ...DEFAULTS, tpm: 1 });
+    const r = await gen(port, k.plaintextKey, { prompt: "x", model: "image-fast", n: 2 });
+    expect(r.status).toBe(429);
+    const body = (await r.json()) as { error: { code: string; message: string; quota: Record<string, unknown> } };
+    expect(body.error.code).toBe("rate_limit_exceeded");
+    expect(body.error.message).toContain("1 image unit per minute");
+    expect(body.error.message).toContain("request includes 2 image units");
+    expect(body.error.message).not.toContain("tokens");
+    expect(body.error.quota).toMatchObject({ reason: "tpm", limit: 1, requested: 2, counted: false });
+    expect(r.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(r.headers.get("x-ratelimit-remaining")).toBe("1");
+    expect(r.headers.get("x-ratelimit-reset")).toBe(r.headers.get("retry-after"));
+    expect(credits(k.plaintextKey)).toBe(0);
+    expect(sidecarHits).toBe(0);
+  });
+
+  it("describes daily image quota in image units and rolls back the rejected reservation", async () => {
+    const k = mintKey(
+      { alias: "img-daily-units", tier: "guest", creditLimit: 1_000_000, tpm: 1_000, dailyTokenBudget: 1 },
+      { ...DEFAULTS, tpm: 1_000, dailyTokenBudget: 1 },
+    );
+    const r = await gen(port, k.plaintextKey, { prompt: "x", model: "image-fast", n: 2 });
+    expect(r.status).toBe(429);
+    const body = (await r.json()) as { error: { code: string; message: string; quota: Record<string, unknown> } };
+    expect(body.error.code).toBe("rate_limit_exceeded");
+    expect(body.error.message).toContain("1 image unit per UTC day");
+    expect(body.error.message).toContain("request includes 2 image units");
+    expect(body.error.message).not.toContain("tokens");
+    expect(body.error.quota).toMatchObject({ reason: "daily", window: "utc_day", limit: 1, requested: 2, counted: false });
+    expect(r.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(r.headers.get("x-ratelimit-remaining")).toBe("1");
+    expect(r.headers.get("x-ratelimit-reset")).toBe(r.headers.get("retry-after"));
+    expect(credits(k.plaintextKey)).toBe(0);
+    expect(sidecarHits).toBe(0);
+    const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?")
+      .get("img-daily-units", new Date().toISOString().slice(0, 10)) as { tokens: number } | undefined;
+    expect(daily?.tokens ?? 0).toBe(0);
+  });
+
   it("502 + full refund when the sidecar faults", async () => {
     mode = "fault";
     const k = mintKey({ alias: "img-502", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
@@ -223,6 +270,28 @@ describe("POST /v1/images/generations — sync fast tier", () => {
 });
 
 describe("async balanced/high tiers + jobs", () => {
+  it("exclusive maintenance rejects an owner async image before credits, queue, or sidecar work", async () => {
+    const owner = mintKey({ alias: "img-owner-exclusive", tier: "owner", scope: "admin", creditLimit: 1_000_000 }, DEFAULTS);
+    const engaged = await setMaintenance(true);
+    expect(engaged.status).toBe(200);
+
+    try {
+      const response = await gen(port, owner.plaintextKey, { prompt: "x", model: "image-balanced" });
+      const body = await response.json() as { error?: { code?: string } };
+      const queued = getDb().prepare("SELECT COUNT(*) AS count FROM image_jobs WHERE alias = ?")
+        .get("img-owner-exclusive") as { count: number };
+
+      expect(response.status).toBe(503);
+      expect(body.error?.code).toBe("server_busy");
+      expect(credits(owner.plaintextKey)).toBe(0);
+      expect(queued.count).toBe(0);
+      expect(sidecarHits).toBe(0);
+    } finally {
+      const restored = await setMaintenance(false);
+      expect(restored.status).toBe(200);
+    }
+  });
+
   it("202 → poll → succeeded with bytes; debits after completion", async () => {
     const k = mintKey({ alias: "img-async", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
     const r = await gen(port, k.plaintextKey, { prompt: "x", model: "image-balanced", n: 2 });

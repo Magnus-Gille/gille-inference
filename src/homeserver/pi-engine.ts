@@ -16,7 +16,6 @@ import type {
   EngineOutcome,
   EngineRunOptions,
   EngineRunResult,
-  PiProcess,
   SpawnPiFn,
   CodeLoopAgentCheckAttempt,
   CodeLoopAgentCheckKind,
@@ -483,6 +482,26 @@ async function runPiOnce(
   priorMutationToolCall = false
 ): Promise<SingleRun> {
   const started = now();
+  const signal = opts.signal;
+  if (signal?.aborted) {
+    return {
+      exitCode: null,
+      killedFor: "wall",
+      usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
+      finalMessage: "",
+      unparseableLines: 0,
+      rawTail: "",
+      erroredTurn: null,
+      startedAtMs: started,
+      endedAtMs: started,
+      firstEditTurn: null,
+      firstEditAtMs: null,
+      mutationToolCall: false,
+      discoveryToolCalls: 0,
+      agentChecks: [],
+      agentCheckCoverageLossEvents: 0,
+    };
+  }
   const proc = spawnPi(argv, { cwd: opts.sandboxDir, env });
 
   let turns = 0;
@@ -518,6 +537,12 @@ async function runPiOnce(
     // Don't hold the event loop open for the escalation timer.
     killTimer.unref?.();
   };
+
+  const onAbort = (): void => kill("wall");
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // Close the spawn/subscribe race: an abort between the pre-spawn check and listener
+  // registration still kills the process, while a pre-aborted signal never spawns.
+  if (signal?.aborted) onAbort();
 
   // Wall-clock cap.
   const wallTimer = setTimeout(() => kill("wall"), opts.caps.wall_s * 1000);
@@ -671,6 +696,7 @@ async function runPiOnce(
   proc.stderr.on("data", (chunk: Buffer | string) => appendTail(String(chunk)));
 
   const exitCode = await proc.exited;
+  signal?.removeEventListener("abort", onAbort);
   const ended = now();
   for (const start of checkStarts.values()) {
     const { failureAttributionAmbiguous: _internal, ...visibleStart } = start;
@@ -769,7 +795,13 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
       const redact = (s: string): string =>
         cfg.apiKey.length >= 8 ? s.split(cfg.apiKey).join("[redacted]") : s;
 
-      const toResult = (run: SingleRun, extra: SingleRun | null, outcome: EngineOutcome, detail: string): EngineRunResult => {
+      const toResult = (
+        run: SingleRun,
+        extra: SingleRun | null,
+        outcome: EngineOutcome,
+        detail: string,
+        forcedCapReason: SingleRun["killedFor"] = null,
+      ): EngineRunResult => {
         const last = extra ?? run;
         const usage: CodeLoopUsage = extra
           ? {
@@ -788,7 +820,7 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         const firstEditTurn = editRun?.firstEditTurn ?? null;
         const editStartMs = firstEditAtMs === null ? undefined : Math.max(0, firstEditAtMs - run.startedAtMs);
         const mutationToolCall = run.mutationToolCall || (extra?.mutationToolCall ?? false);
-        const capReason = extra?.killedFor ?? run.killedFor;
+        const capReason = forcedCapReason ?? extra?.killedFor ?? run.killedFor;
         // #240: the non-convergence terminal path returns cap-exceeded WITHOUT a kill (the
         // process already exited cleanly with no mutation), so capReason is null there. Every
         // other cap-exceeded path carries a killedFor; every non-cap outcome keeps null.
@@ -895,7 +927,42 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         );
       }
 
-      const ready = await deps.readinessProbe(readinessBudgetMs);
+      const waitForReadiness = async (): Promise<{ ready: boolean; aborted: boolean }> => {
+        const signal = opts.signal;
+        if (signal === undefined) return { ready: await deps.readinessProbe(readinessBudgetMs), aborted: false };
+        if (signal.aborted) return { ready: false, aborted: true };
+        return await new Promise<{ ready: boolean; aborted: boolean }>((resolve, reject) => {
+          let settled = false;
+          const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+          const onAbort = (): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve({ ready: false, aborted: true });
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          deps.readinessProbe(readinessBudgetMs).then(
+            (ready) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve({ ready, aborted: false });
+            },
+            (error: unknown) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(error);
+            },
+          );
+          if (signal.aborted) onAbort();
+        });
+      };
+      const readiness = await waitForReadiness();
+      if (readiness.aborted || opts.signal?.aborted) {
+        return toResult(first, null, "cap-exceeded", "cap breached: wall", "wall");
+      }
+      const ready = readiness.ready;
       if (!ready) {
         return toResult(first, null, "degenerate", "degeneracy suspected; model never became ready for the retry");
       }

@@ -4,6 +4,7 @@ import { mkdirSync, chmodSync, copyFileSync, readFileSync, mkdtempSync, renameSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { SERVED_PROVENANCE_REASONS } from "../src/homeserver/served-provenance-collector.js";
 import {
   captureServedProcess,
   type ServedArtifactStat,
@@ -314,7 +315,9 @@ describe("captureServedProcess", () => {
 
       const result = captureServedProcess(pid);
 
-      expect(result.freshness).toBe("fresh");
+      expect(result.freshness, `collector reason codes: ${result.reasons
+        .filter((reason) => SERVED_PROVENANCE_REASONS.includes(reason))
+        .join(", ") || "(none)"}`).toBe("fresh");
       expect(result.reasons).toEqual([]);
       expect(result.weights).toEqual([{ sha256: digest(modelPath), binding: "unproven" }]);
       expect(result.runtimeSha256).toBe(digest(runtimePath));

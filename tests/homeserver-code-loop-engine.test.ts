@@ -171,7 +171,7 @@ describe("completion-pressure policy", () => {
 
 // ─── Fake spawn: replay canned NDJSON through the engine monitor ─────────────────────────
 
-function makeFakeProc(lines: string[], opts: { exitCode?: number | null; waitForKill?: boolean; stderr?: string } = {}): PiProcess {
+function makeFakeProc(lines: string[], opts: { exitCode?: number | null; waitForKill?: boolean; stderr?: string; killSignals?: NodeJS.Signals[] } = {}): PiProcess {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   let resolveExit!: (code: number | null) => void;
@@ -194,7 +194,8 @@ function makeFakeProc(lines: string[], opts: { exitCode?: number | null; waitFor
     stdout,
     stderr,
     pid: 4321,
-    kill() {
+    kill(signal) {
+      opts.killSignals?.push(signal);
       try { stdout.end(); } catch { /* */ }
       try { stderr.end(); } catch { /* */ }
       resolveExit(null);
@@ -825,6 +826,81 @@ describe("makePiEngine — monitored runs", () => {
     const r = await engine.run(engineOpts(dir));
     expect(r.outcome).toBe("degenerate");
     expect(call).toBe(1);
+  });
+
+  it("pre-aborted signal does not spawn and returns the existing wall-cap shape", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const controller = new AbortController();
+    controller.abort();
+    let spawnCalls = 0;
+    let readinessCalls = 0;
+    const engine = makePiEngine(CFG, {
+      spawnPi: () => { spawnCalls++; return makeFakeProc([]); },
+      readinessProbe: async () => { readinessCalls++; return true; },
+      pollMs: 10_000,
+    });
+    const r = await engine.run(engineOpts(dir, { signal: controller.signal } as Partial<EngineRunOptions>));
+    expect(spawnCalls).toBe(0);
+    expect(readinessCalls).toBe(0);
+    expect(r).toMatchObject({
+      outcome: "cap-exceeded",
+      detail: "cap breached: wall",
+      telemetry: { failure_kind: "wall-cap" },
+    });
+  });
+
+  it("aborting an active process kills it as wall-cap and freezes the run", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const controller = new AbortController();
+    const killSignals: NodeJS.Signals[] = [];
+    let spawnCalls = 0;
+    const engine = makePiEngine(CFG, {
+      spawnPi: () => { spawnCalls++; return makeFakeProc([], { waitForKill: true, killSignals }); },
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    });
+    const running = engine.run(engineOpts(dir, { signal: controller.signal } as Partial<EngineRunOptions>));
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    controller.abort();
+    const r = await running;
+    expect(spawnCalls).toBe(1);
+    expect(killSignals).toEqual(["SIGTERM"]);
+    expect(r).toMatchObject({
+      outcome: "cap-exceeded",
+      detail: "cap breached: wall",
+      telemetry: { failure_kind: "wall-cap" },
+    });
+    controller.abort();
+    expect(killSignals).toEqual(["SIGTERM"]);
+  });
+
+  it("aborting a stalled readiness wait prevents the late retry spawn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cl-eng-"));
+    const controller = new AbortController();
+    const degenerateFinal = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "?".repeat(500) }] } });
+    let spawnCalls = 0;
+    let readinessCalls = 0;
+    let resolveReadiness!: (ready: boolean) => void;
+    const readiness = new Promise<boolean>((resolve) => { resolveReadiness = resolve; });
+    const engine = makePiEngine(CFG, {
+      spawnPi: () => { spawnCalls++; return makeFakeProc([degenerateFinal], { exitCode: 1 }); },
+      readinessProbe: async () => { readinessCalls++; return readiness; },
+      pollMs: 10_000,
+    });
+    const running = engine.run(engineOpts(dir, { signal: controller.signal } as Partial<EngineRunOptions>));
+    while (readinessCalls === 0) await Promise.resolve();
+    controller.abort();
+    const r = await running;
+    expect(readinessCalls).toBe(1);
+    expect(spawnCalls).toBe(1);
+    expect(r).toMatchObject({
+      outcome: "cap-exceeded",
+      detail: "cap breached: wall",
+      telemetry: { failure_kind: "wall-cap" },
+    });
+    resolveReadiness(true);
+    await Promise.resolve();
+    expect(spawnCalls).toBe(1);
   });
 
   it("clean nonzero exit (not degenerate) → arm-error, no retry", async () => {

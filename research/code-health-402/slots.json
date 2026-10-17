@@ -1,0 +1,49 @@
+{
+  "contract_version": "1.0",
+  "repository": {
+    "owner": "Magnus-Gille",
+    "name": "gille-inference"
+  },
+  "slots": [
+    {
+      "slot_ref": "ref:slot-complex-functions",
+      "metric": "complex_functions",
+      "language": "typescript",
+      "platform": "linux-x64",
+      "freshness_days": 10,
+      "scope_version": "ts-executable-functions-v1"
+    },
+    {
+      "slot_ref": "ref:slot-unused-candidates",
+      "metric": "unused_candidates",
+      "language": "typescript",
+      "platform": "linux-x64",
+      "freshness_days": 10,
+      "scope_version": "knip-explicit-entrypoints-v1"
+    },
+    {
+      "slot_ref": "ref:slot-coverage",
+      "metric": "coverage",
+      "language": "typescript",
+      "platform": "linux-x64",
+      "freshness_days": 10,
+      "scope_version": "code-health-401-selected-typescript-scope-v1"
+    },
+    {
+      "slot_ref": "ref:slot-ci-first-attempt",
+      "metric": "ci_first_attempt",
+      "language": "typescript",
+      "platform": "linux-x64",
+      "freshness_hours": 48,
+      "scope_version": "main-push-ci-v1"
+    },
+    {
+      "slot_ref": "ref:slot-confirmed-regressions",
+      "metric": "confirmed_regressions",
+      "language": "typescript",
+      "platform": "linux-x64",
+      "freshness_days": 10,
+      "scope_version": "reviewed-release-survey-v1"
+    }
+  ]
+}
