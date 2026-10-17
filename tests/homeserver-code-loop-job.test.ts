@@ -3406,8 +3406,8 @@ describe("optional whole-job deadline", () => {
     }
   });
 
-  for (const cleanupFails of [false, true]) {
-    it(`aborts the engine and retains resources until cleanup is proved (failure=${cleanupFails})`, async () => {
+  for (const [cleanupFails, peerClearsPending] of [[false, false], [true, false], [true, true]] as const) {
+    it(`retains resources until exact cleanup, including peer-cleared durable state (failure=${cleanupFails}, peer=${peerClearsPending})`, async () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
       const deps = fakeDeps();
       const release = vi.fn(async () => {});
@@ -3450,10 +3450,18 @@ describe("optional whole-job deadline", () => {
             { now: Date.now, stopUnit: async () => { throw new Error("still unavailable"); } },
           )).rejects.toThrow("still unavailable");
           expect(release).not.toHaveBeenCalled();
+          if (peerClearsPending) {
+            // A new gateway process has its own memory table: it can prove absence and clear
+            // the durable bit without owning this process's lease-release closures.
+            const record = readDurableCodeLoopRunByWork(workroot, started.work_id)!;
+            codeLoopStore.persistDurableCodeLoopRun(workroot, { ...record, cleanup_pending: false });
+          }
+          const stopUnit = vi.fn(async () => {});
           await sweepCodeLoopSandboxes(
             { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
-            { now: Date.now, stopUnit: async () => {} },
+            { now: Date.now, stopUnit },
           );
+          expect(stopUnit).toHaveBeenCalledWith(`code-loop-${started.work_id}`);
           expect(release).toHaveBeenCalledTimes(1);
           expect(await startCodeLoop(next, startCfg(), fakeDeps({ lease: "unavailable" }))).toMatchObject({ ok: false, refusal: "lease-unavailable" });
         }

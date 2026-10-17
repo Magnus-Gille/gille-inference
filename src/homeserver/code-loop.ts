@@ -2332,12 +2332,22 @@ export async function sweepCodeLoopSandboxes(
   let reclaimed = 0;
   const now = deps.now();
   const cleanupVerifiedWorkIds = new Set<string>();
-  // A lease-release filesystem failure can occur after absence was already proved and the
-  // durable cleanup bit cleared. Retain and retry that local release without stopping peers.
+  // Another gateway process may have cleared the durable pending bit after proving absence,
+  // but it cannot release this process's closures. Revisit every local hold independently of
+  // that bit and obtain our own exact-unit proof before releasing ownership. A prior release
+  // failure can retry without stopping again once this process has already proved absence.
   for (const [workId, hold] of cleanupResourceHolds) {
-    if (hold.workroot === resolve(cfg.workroot) && hold.absenceVerified) {
-      await releaseVerifiedCleanupResources(cfg.workroot, workId);
+    if (hold.workroot !== resolve(cfg.workroot)) continue;
+    if (!hold.absenceVerified) {
+      await deps.stopUnit(`code-loop-${workId}`);
+      const record = readDurableCodeLoopRunByWork(cfg.workroot, workId);
+      if (record?.cleanup_pending) {
+        persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+      }
+      hold.absenceVerified = true;
     }
+    await releaseVerifiedCleanupResources(cfg.workroot, workId);
+    cleanupVerifiedWorkIds.add(workId);
   }
   // Reap trusted cleanup obligations from the durable index first. A caged process owns and may
   // delete its sandbox, so directory enumeration must never be the only path to a residual unit.
