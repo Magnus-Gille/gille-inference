@@ -640,6 +640,7 @@ describe("secret-safe M5 client", () => {
 
   it.each(["rpm", "tpm", "daily"] as const)("preserves validated %s quota details from MCP ask refusals", async (reason) => {
     const retryAfter = reason === "daily" ? 43_200 : 60;
+    const requestId = "44444444-4444-4444-8444-444444444444";
     const quota = {
       reason,
       scope: "key",
@@ -659,7 +660,7 @@ describe("secret-safe M5 client", () => {
         return rpcResult(request.id, {
           isError: true,
           content: [{ type: "text", text: "peer supplied alias=private-alias keyHash=private-hash" }],
-          _meta: { m5_code: "rate_limited", retryable: true, retry_after_seconds: retryAfter, quota },
+          _meta: { m5_code: "rate_limited", request_id: requestId, retryable: true, retry_after_seconds: retryAfter, quota },
         });
       },
     });
@@ -670,7 +671,7 @@ describe("secret-safe M5 client", () => {
     );
     const serialized = failure.toJSON().error;
     expect(failure).toMatchObject({ code: "rate_limited", retryable: true, retryAfterSeconds: retryAfter, quota });
-    expect(serialized).toMatchObject({ code: "rate_limited", retryable: true, retry_after_seconds: retryAfter, quota });
+    expect(serialized).toMatchObject({ code: "rate_limited", retryable: true, retry_after_seconds: retryAfter, request_id: requestId, quota });
     expect(serialized.message).toContain(`Per-key ${reason} limit reached`);
     if (reason === "daily") {
       expect(serialized.message).toContain("The UTC-day budget resets in");
@@ -684,6 +685,210 @@ describe("secret-safe M5 client", () => {
     expect(JSON.stringify(serialized)).not.toContain(SECRET);
     expect(JSON.stringify(serialized)).not.toContain("private-alias");
     expect(JSON.stringify(serialized)).not.toContain("private-hash");
+  });
+
+  it("normalizes a strict per-key/model temporary-unavailability backoff", async () => {
+    const requestId = "11111111-1111-4111-8111-111111111111";
+    const backoff = {
+      scope: "key_model",
+      retry_after_seconds: 7,
+      unavailable_until: "2026-10-15T14:30:00.000Z",
+    };
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `raw peer text ${SECRET} private-alias keyHash=abc123` }],
+          _meta: {
+            m5_code: "model_temporarily_unavailable",
+            request_id: requestId,
+            retryable: true,
+            retry_after_seconds: 7,
+            backoff,
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected temporary model unavailability"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure).toMatchObject({
+      code: "model_temporarily_unavailable",
+      retryable: true,
+      retryAfterSeconds: 7,
+      requestId,
+      backoff,
+    });
+    expect(failure.message).toBe("This model is temporarily unavailable for your API key. Retry after the indicated delay.");
+    expect(failure.toJSON().error).toMatchObject({
+      code: "model_temporarily_unavailable",
+      retryable: true,
+      retry_after_seconds: 7,
+      request_id: requestId,
+      backoff,
+    });
+    expect(JSON.stringify(failure.toJSON())).not.toContain(SECRET);
+    expect(JSON.stringify(failure.toJSON())).not.toContain("private-alias");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("abc123");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("raw peer text");
+  });
+
+  it.each([
+    ["mismatched retry", {
+      scope: "key_model", retry_after_seconds: 8, unavailable_until: "2026-10-15T14:30:00.000Z",
+    }, {}],
+    ["extra alias", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z", alias: "private-alias",
+    }, {}],
+    ["extra key hash", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z", key_hash: "private-hash",
+    }, {}],
+    ["unsafe timestamp", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-02-30T14:30:00.000Z",
+    }, {}],
+    ["top-level alias", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z",
+    }, { alias: "private-alias" }],
+    ["top-level key hash", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z",
+    }, { key_hash: "private-hash" }],
+  ] as const)("drops malformed temporary-unavailability metadata: %s", async (_caseName, backoff, extraMeta) => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `raw peer text ${SECRET} private-alias private-hash` }],
+          _meta: {
+            m5_code: "model_temporarily_unavailable",
+            request_id: "11111111-1111-4111-8111-111111111111",
+            retryable: true,
+            retry_after_seconds: 7,
+            backoff,
+            ...extraMeta,
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected generic fallback"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.code).toBe("tool_error");
+    expect(failure.toJSON().error.message).toBe("The model backend reported an error.");
+    expect(failure.toJSON().error).not.toHaveProperty("backoff");
+    expect(failure.toJSON().error).not.toHaveProperty("retry_after_seconds");
+    expect(failure.toJSON().error).not.toHaveProperty("request_id");
+    expect(JSON.stringify(failure.toJSON())).not.toContain(SECRET);
+    expect(JSON.stringify(failure.toJSON())).not.toContain("private-alias");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("private-hash");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("raw peer text");
+  });
+
+  it("passes only a valid request UUID through generic upstream errors", async () => {
+    const requestId = "22222222-2222-4222-8222-222222222222";
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `peer correlator ${SECRET}` }],
+          _meta: {
+            m5_code: "upstream_error", reason: "unknown_reason", layer: "unknown",
+            request_id: requestId,
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected generic upstream fallback"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.code).toBe("tool_error");
+    expect(failure.toJSON().error).toMatchObject({
+      message: "The model backend reported an error.", request_id: requestId,
+    });
+    expect(JSON.stringify(failure.toJSON())).not.toContain("peer correlator");
+    expect(JSON.stringify(failure.toJSON())).not.toContain(SECRET);
+  });
+
+  it("drops an invalid UUID without discarding otherwise valid backoff metadata", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: "ignored peer text" }],
+          _meta: {
+            m5_code: "model_temporarily_unavailable",
+            request_id: "not-a-uuid",
+            retryable: true,
+            retry_after_seconds: 2,
+            backoff: {
+              scope: "key_model", retry_after_seconds: 2,
+              unavailable_until: "2026-10-15T14:30:00.000Z",
+            },
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected temporary model unavailability"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.code).toBe("model_temporarily_unavailable");
+    expect(failure.toJSON().error).toHaveProperty("backoff");
+    expect(failure.toJSON().error).not.toHaveProperty("request_id");
+  });
+
+  it("only serializes validated backoff and UUID values from M5ClientError options", () => {
+    const valid = new M5ClientError("model_temporarily_unavailable", "safe", {
+      retryable: true,
+      retryAfterSeconds: 3,
+      requestId: "33333333-3333-4333-8333-333333333333",
+      backoff: {
+        scope: "key_model", retry_after_seconds: 3,
+        unavailable_until: "2026-10-15T14:30:00.000Z",
+      },
+    });
+    expect(valid.toJSON().error).toMatchObject({
+      retryable: true,
+      retry_after_seconds: 3,
+      request_id: "33333333-3333-4333-8333-333333333333",
+      backoff: {
+        scope: "key_model", retry_after_seconds: 3,
+        unavailable_until: "2026-10-15T14:30:00.000Z",
+      },
+    });
+    const invalid = new M5ClientError("model_temporarily_unavailable", "safe", {
+      retryable: true,
+      retryAfterSeconds: 3,
+      requestId: "not-a-uuid",
+      backoff: {
+        scope: "key_model", retry_after_seconds: 4,
+        unavailable_until: "2026-10-15T14:30:00.000Z",
+      },
+    });
+    expect(invalid.toJSON().error).not.toHaveProperty("request_id");
+    expect(invalid.toJSON().error).not.toHaveProperty("backoff");
+    expect(invalid.toJSON().error).not.toHaveProperty("retry_after_seconds");
+    expect(invalid.toJSON().error).not.toHaveProperty("retryable");
+    const invalidGenericId = new M5ClientError("tool_error", "safe", { requestId: "invalid" });
+    expect(invalidGenericId.toJSON().error).not.toHaveProperty("request_id");
   });
 
   it("advises the operator for a zero-RPM quota without promising a useful retry", async () => {
