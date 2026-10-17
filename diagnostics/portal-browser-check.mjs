@@ -411,6 +411,23 @@ async function scrollToExplanation(cdp, type) {
   return evaluate(cdp, expression);
 }
 
+async function scrollToRow(cdp, token, section) {
+  return evaluate(cdp, `(async () => {
+    const token = ${JSON.stringify(token)};
+    const row = [...document.querySelectorAll("tr")].find((candidate) =>
+      [...candidate.querySelectorAll("td")].some((cell) => cell.textContent?.trim() === token),
+    );
+    if (!row) throw new Error("row for " + token + " not found");
+    row.scrollIntoView({ block: "center", behavior: "instant" });
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const rect = row.getBoundingClientRect();
+    if (rect.top < 0 || rect.bottom > window.innerHeight) {
+      throw new Error("row for " + token + " is not vertically visible");
+    }
+    return { section: ${JSON.stringify(section)}, text: token };
+  })()`);
+}
+
 async function runViewport(cdp, state, viewportName, origin, fixtureStatuses, screenshotRecords, runtimeErrors, externalRequests) {
   const viewport = viewports[viewportName];
   await cdp.command("Emulation.setDeviceMetricsOverride", viewport);
@@ -466,6 +483,15 @@ async function runViewport(cdp, state, viewportName, origin, fixtureStatuses, sc
     const doctorName = `portal-${state}-${viewportName}-doctor-history.png`;
     screenshotRecords.push({ ...await capturePng(cdp, doctorName, viewport.width, viewport.height), section: doctorSection.section });
     if (!doctorSection.disclosureClicked) throw new Error("doctor history disclosure was not clicked");
+
+    for (const { token, suffix, section } of [
+      { token: "model_status", suffix: "model-status", section: "MCP (Claude Code)" },
+      { token: "model_temporarily_unavailable", suffix: "temporary-refusal", section: "Errors — what they mean and what to do" },
+    ]) {
+      const rowSection = await scrollToRow(cdp, token, section);
+      const rowName = `portal-${state}-${viewportName}-${suffix}.png`;
+      screenshotRecords.push({ ...await capturePng(cdp, rowName, viewport.width, viewport.height), section: rowSection.section });
+    }
 
     if (runtimeErrors.length > 0) {
       throw new Error(`browser runtime exceptions in ${state}/${viewportName}: ${JSON.stringify(runtimeErrors.slice(0, 3))}`);
@@ -610,9 +636,9 @@ async function main() {
   let complete = false;
   try {
     for (const state of states) cases.push(await runCase(state, browserBinary, tempRoot));
-    const expectedScreenshotCount = states.length * Object.keys(viewports).length * 3;
+    const expectedScreenshotCount = states.length * Object.keys(viewports).length * 5;
     const capturedScreenshotCount = cases.reduce((count, item) => count + item.screenshots.length, 0);
-    assert.equal(capturedScreenshotCount, expectedScreenshotCount, "expected one overview and two history captures per state/viewport");
+    assert.equal(capturedScreenshotCount, expectedScreenshotCount, "expected one overview, two history, and two row captures per state/viewport");
     for (const item of cases) {
       for (const screenshot of item.screenshots) {
         writeFileSync(join(outputDir, screenshot.filename), screenshot.png, { flag: "wx", mode: 0o600 });
