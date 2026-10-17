@@ -212,9 +212,12 @@ export function normalizeKnipRows(report) {
       }
     }
   } else if (report && typeof report === 'object' && !Array.isArray(report)) {
+    if (Object.hasOwn(report, 'files') || Object.hasOwn(report, 'issues')) {
+      throw new TypeError('Knip grouped output requires both files and issues arrays');
+    }
     const keys = Object.keys(report).filter(kind => kind !== 'meta' && kind !== 'summary');
     if (keys.some(kind => !recognizedKinds.has(kind))) throw new TypeError('Knip output contains an unknown issue group');
-    if (keys.length === 0 && !(report.meta || report.summary)) throw new TypeError('Knip output has no recognized issue groups');
+    if (keys.length === 0) throw new TypeError('Knip output has no recognized issue groups');
     for (const [kind, value] of Object.entries(report)) {
       if (kind === 'meta' || kind === 'summary') continue;
       add(kind, value);
