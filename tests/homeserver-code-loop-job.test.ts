@@ -143,7 +143,7 @@ function fakeDeps(over: {
     growthCapBytes: 50 * 1024 * 1024,
     pollMs: 10_000,
     retentionTtlMs: 24 * 60 * 60 * 1000,
-    runCommand: over.runCommand ?? ((argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env })),
+    runCommand: over.runCommand ?? ((argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env, signal: opts.signal })),
     acquireLease: async () => (over.lease === "unavailable" ? null : { release: async () => {} }),
     cageSelfTest: async () => ({ ok: over.cageOk !== false, failures: over.cageOk === false ? ["forced fail"] : [] }),
     cleanupUnit: over.cleanupUnit ?? (async () => {}),
@@ -3378,5 +3378,121 @@ describe("sweepCodeLoopSandboxes", () => {
     );
     expect(result.reclaimed).toBe(0);
     expect(getJobResult(started.work_id, workroot)).toEqual({ kind: "terminal-unavailable", status: "completed" });
+  });
+});
+
+
+describe("optional whole-job deadline", () => {
+  it("stops an admission probe and never acquires a GPU lease after the shared deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const deps = fakeDeps();
+    deps.acquireLease = vi.fn(deps.acquireLease);
+    deps.engine.run = vi.fn(deps.engine.run);
+    let probeResolve!: () => void;
+    const probeStarted = { promise: new Promise<void>(resolve => { probeResolve = resolve; }), resolve: () => probeResolve() };
+    deps.cageSelfTest = async (signal?: AbortSignal) => {
+      probeStarted.resolve();
+      return new Promise(resolve => signal?.addEventListener("abort", () => resolve({ ok: false, failures: ["deadline"] }), { once: true }));
+    };
+    try {
+      const started = startCodeLoop({ instruction: "fix x", files: [{ path: "a.ts", content: "x" }], caps: { total_wall_s: 180 } }, startCfg({ confinement: "required" }), deps);
+      await Promise.race([probeStarted.promise, started.then(result => { throw new Error(`Admission finished before the probe: ${JSON.stringify(result)}`); })]);
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(await started).toMatchObject({ ok: false, refusal: "deadline-exceeded" });
+      expect(deps.acquireLease).not.toHaveBeenCalled();
+      expect(deps.engine.run).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  for (const cleanupFails of [false, true]) {
+    it(`aborts the admitted engine, skips owner checks, releases leases and retains cleanup failure=${cleanupFails}`, async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const deps = fakeDeps();
+      const release = vi.fn(async () => {});
+      deps.acquireLease = async () => ({ release });
+      let engineEntered!: () => void;
+      const entered = new Promise<void>(resolve => { engineEntered = resolve; });
+      let observedSignal: AbortSignal | undefined;
+      deps.engine.run = async options => {
+        observedSignal = options.signal;
+        engineEntered();
+        return await new Promise(resolve => options.signal?.addEventListener("abort", () => resolve({
+          outcome: "cap-exceeded", usage: { turns: 0, wall_ms: 105_000, prompt_tokens: 0, completion_tokens: 0 },
+          finalMessage: "withhold this", unparseableLines: 0, detail: "aborted",
+        }), { once: true }));
+      };
+      const ownerCheck = vi.fn();
+      const runCommand = deps.runCommand;
+      deps.runCommand = async (argv, options) => {
+        if (argv.includes("OWNER_CHECK")) ownerCheck();
+        return runCommand(argv, options);
+      };
+      deps.cleanupUnit = async () => { if (cleanupFails) throw new Error("manager unavailable"); };
+      try {
+        const started = await startCodeLoop({ instruction: "fix x", files: [{ path: "a.ts", content: "x" }], check_cmd: "OWNER_CHECK", caps: { wall_s: 120, total_wall_s: 180 } }, startCfg(), deps);
+        if (!started.ok) throw new Error(JSON.stringify(started));
+        await entered;
+        expect(getJobStatus(started.work_id)?.status).toBe("running");
+        await vi.advanceTimersByTimeAsync(105_000);
+        expect(observedSignal?.aborted).toBe(true);
+        const terminal = getJobResult(started.work_id);
+        expect(terminal).toMatchObject({ kind: "result", result: { status: cleanupFails ? "arm-error" : "cap-exceeded", diff: "", summary: "", check: { ran: false }, execution: { effective_caps: { total_wall_s: 180 }, whole_job: { budget_s: 180, cleanup_complete: !cleanupFails } } } });
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(ownerCheck).not.toHaveBeenCalled();
+        expect(readDurableCodeLoopRunByWork(workroot, started.work_id)?.cleanup_pending).toBe(cleanupFails);
+      } finally { vi.useRealTimers(); }
+    });
+  }
+
+  it("releases a lease granted after admission expiry without starting the engine", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const deps = fakeDeps();
+    const release = vi.fn(async () => {});
+    let enteredLease!: () => void;
+    const entered = new Promise<void>(resolve => { enteredLease = resolve; });
+    let grant!: (lease: { release: () => Promise<void> }) => void;
+    deps.acquireLease = async () => { enteredLease(); return await new Promise(resolve => { grant = resolve; }); };
+    deps.engine.run = vi.fn(deps.engine.run);
+    try {
+      const started = startCodeLoop({ instruction: "x", files: [{ path: "a.ts", content: "x" }], caps: { total_wall_s: 180 } }, startCfg(), deps);
+      await entered;
+      await vi.advanceTimersByTimeAsync(120_000);
+      grant({ release });
+      expect(await started).toMatchObject({ ok: false, refusal: "deadline-exceeded" });
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(deps.engine.run).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("aborts an active owner verifier and forbids subsequent schema checks", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const deps = fakeDeps();
+    let enteredCheck!: () => void;
+    const entered = new Promise<void>(resolve => { enteredCheck = resolve; });
+    const runCommand = deps.runCommand;
+    const laterCheck = vi.fn();
+    deps.runCommand = async (argv, options) => {
+      if (argv.includes("OWNER_CHECK")) {
+        enteredCheck();
+        return await new Promise(resolve => options.signal?.addEventListener("abort", () => resolve({ code: null, stdout: "", stderr: "aborted" }), { once: true }));
+      }
+      if (argv.includes("SCHEMA_CHECK")) laterCheck();
+      return runCommand(argv, options);
+    };
+    try {
+      const started = await startCodeLoop({ instruction: "x", files: [{ path: "a.ts", content: "x" }], check_cmd: "OWNER_CHECK", schema_checks: [{ name: "later", command: "SCHEMA_CHECK" }], caps: { total_wall_s: 180 } }, startCfg(), deps);
+      if (!started.ok) throw new Error(JSON.stringify(started));
+      await entered;
+      await vi.advanceTimersByTimeAsync(105_000);
+      expect(getJobResult(started.work_id)).toMatchObject({ kind: "result", result: { status: "cap-exceeded", diff: "", summary: "", check: { ran: true, exit_code: null }, schema_grounding: { state: "skipped" } } });
+      expect(laterCheck).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("binds an explicit whole-job deadline without changing deployed legacy fingerprints", () => {
+    const request = { instruction: "x", files: [{ path: "a.ts", content: "x" }], caps: { wall_s: 30 } };
+    expect(codeLoopRequestFingerprint({ ...request, caps: { ...request.caps, total_wall_s: 180 } })).not.toBe(codeLoopRequestFingerprint(request));
   });
 });

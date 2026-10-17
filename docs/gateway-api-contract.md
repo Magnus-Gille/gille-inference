@@ -93,7 +93,7 @@ A temporary refusal adds `m5_code:model_temporarily_unavailable`, `retryable:tru
 The UUID identifies the distinct `/mcp/ask` request-log row, not the outer `/mcp` transport row.
 Disabled/missing logging leaves correlation unresolvable; a UUID alone does not prove retention.
 
-Client 1.5.4's default doctor never submits inference. An explicitly selected public/private
+Client 1.5.5's default doctor never submits inference. An explicitly selected public/private
 `doctor --probe-inference MODEL` makes one synthetic ask for at most 16 output tokens with a
 30s inference bound. Only a completed, nontruncated ask is a successful probe. Its sanitized
 result describes that route and attempt only; the other route remains unchecked. Existing owner

@@ -4,6 +4,7 @@ import http from "node:http";
 import {
   buildCageArgv,
   buildCageProbeScript,
+  execCageCommand,
   parseCageProbeOutput,
   requestTransientCodeLoopUnitStop,
   runCageSelfTest,
@@ -270,6 +271,20 @@ describe("buildCageProbeScript — gateway arm does a real HTTP GET requiring a 
     expect(s).toContain("/dev/tcp/1.1.1.1/443");
     expect(s).toContain("/usr/.cage-probe");
   });
+
+  it("fails closed before confinement probes when timeout is unavailable or broken", () => {
+    const s = buildCageProbeScript({
+      secretPath: "/srv/gille-inference/.env",
+      readonlyProbePath: "/usr/.cage-probe",
+      externalProbe: { host: "1.1.1.1", port: 443 },
+      gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
+    });
+    const guard = "if ! command -v timeout >/dev/null 2>&1 || ! timeout 1 true >/dev/null 2>&1; then exit 127; fi";
+    expect(s.startsWith(guard)).toBe(true);
+    expect(s.indexOf(guard)).toBeLessThan(s.indexOf("cage-probe:secret="));
+    expect(parseCageProbeOutput("").ok).toBe(false); // the guard exits before any marker
+  });
 });
 
 describe("buildCageProbeScript — optional pi runnability arm (job-runnability, not just confinement)", () => {
@@ -464,6 +479,85 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     expect(script).toContain("cage-probe:models=");
     expect(r.ok).toBe(false); // fail-closed: markers missing from output
     expect(r.failures.join(" ")).toContain("pi");
+  });
+});
+
+describe("cage cancellation", () => {
+  it("pre-aborted self-test returns a failure without invoking the exec seam", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const r = await runCageSelfTest({
+      cageArgv: buildCageArgv(OPTS),
+      secretPath: "/srv/gille-inference/.env",
+      readonlyProbePath: "/usr/.cage-probe",
+      externalProbe: { host: "1.1.1.1", port: 443 },
+      gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
+      signal: controller.signal,
+      exec: async () => { throw new Error("must not spawn"); },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.failures).toEqual(["cage probe aborted before spawn"]);
+  });
+
+  it("pre-aborted execCageCommand does not spawn a child", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const r = await execCageCommand(
+      [process.execPath, "-e", "throw new Error('must not spawn')"],
+      5_000,
+      { signal: controller.signal },
+    );
+    expect(r.code).toBeNull();
+    expect(r.stderr).toContain("aborted");
+    expect(r.stderr).not.toContain("must not spawn");
+  });
+
+  it("actively aborts a harmless host child and waits for its exec completion", async () => {
+    const controller = new AbortController();
+    const started = new Promise<void>((resolve) => setTimeout(resolve, 25));
+    const result = execCageCommand(
+      [process.execPath, "-e", "setTimeout(() => {}, 10_000)"],
+      30_000,
+      { signal: controller.signal },
+    );
+    await started;
+    controller.abort();
+    const r = await result;
+    expect(r.code).toBeNull();
+    expect(r.stderr).toContain("aborted");
+  });
+
+  it("passes the signal through the optional exec seam and never returns ok after abort", async () => {
+    const controller = new AbortController();
+    let seenSignal: AbortSignal | undefined;
+    const r = await runCageSelfTest({
+      cageArgv: buildCageArgv(OPTS),
+      secretPath: "/srv/gille-inference/.env",
+      readonlyProbePath: "/usr/.cage-probe",
+      externalProbe: { host: "1.1.1.1", port: 443 },
+      gatewayForwardPort: 18080,
+      userManagerSocketPath: "/run/user/4242/systemd/private",
+      signal: controller.signal,
+      exec: async (_argv, _timeoutMs, opts) => {
+        seenSignal = opts?.signal;
+        controller.abort();
+        return {
+          code: 0,
+          stdout: [
+            "cage-probe:secret=denied",
+            "cage-probe:outside-write=denied",
+            "cage-probe:egress=blocked",
+            "cage-probe:gateway=ok",
+            "cage-probe:user-manager=denied",
+          ].join("\\n"),
+          stderr: "",
+        };
+      },
+    });
+    expect(seenSignal).toBe(controller.signal);
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain("aborted");
   });
 });
 

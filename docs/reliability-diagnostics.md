@@ -7,7 +7,7 @@ task.
 
 ## Owner client checks
 
-`m5` client 1.5.4 is distributed as a local tarball; it is not an npm release. The default
+`m5` client 1.5.5 is distributed as a local tarball; it is not an npm release. The default
 `m5 --profile codex doctor` checks the configured route's MCP catalogue and transport, plus
 content-blind historical evidence when available. It does not call `ask`. Its global
 `inference_observation` timestamp means that some owner inference succeeded at that time; it is
@@ -87,3 +87,18 @@ resident on the backend. Check the caller's limits and `model_status` first, res
 bypass current policy to keep a batch moving. If the caller or batch needs repair, make that
 change in its owning repository and resume only after it is corrected. These diagnostics and
 synthetic probes do not qualify a model for inference tasks or establish an evaluation result.
+
+
+## Whole-job code smoke bound
+
+Client 1.5.5 requires the live `code_loop_start` schema to advertise an explicitly supplied
+`caps.total_wall_s` before sending seed content. This is a shared server budget (90–900 seconds),
+including admission, coding, verification and reserved cleanup time. Engine `caps.wall_s` and a
+client wait timeout are separate bounds. The server reserves 75 seconds for process/unit stop,
+lease release and evidence finalization; expired runs withhold output, and unproved cleanup is
+an error retained for recovery. Record external dispatch, terminal and cleanup times alongside
+`execution.whole_job`; cleanup failure or a whole-job overrun fails acceptance.
+
+The content-free doctor health probe allows up to 3.5 seconds within the caller's timeout.
+`/healthz` also waits for its bounded peer observation, so its response can legitimately take
+more than 1.5 seconds even while the local code-loop user-manager transport is available.

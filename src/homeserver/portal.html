@@ -228,6 +228,8 @@
       coding jobs and admin loads; it stays off until the owner validates the memory budgets.
       The optional owner code loop has a separate, content-free user-bus transport check in
       <span class="badge mono">/healthz</span>; gateway liveness alone does not prove code-loop readiness.
+      Owner coding jobs may opt into a shared time budget covering admission, execution,
+      verification and cleanup; this is separate from the model's own time limit.
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
@@ -780,6 +782,13 @@ for chunk in stream:
           The same key, credit budget, and model allow-list apply as for the HTTP API.
           Basic tools are exposed to every permitted key. A real minted owner-agent key also gets
           the bounded code-loop tools and a content-free adoption-report tool:
+        </p>
+        <p>
+          <strong>Owner coding time budget:</strong> after checking the live tool schema supports it,
+          set <span class="badge mono">caps.total_wall_s</span> (90&#8211;900 seconds) for one shared
+          job budget. It reserves 75 seconds for cleanup, so 180 seconds allows up to 105 seconds
+          for admission, coding and verification. Expired jobs withhold their output; unresolved
+          cleanup is reported as a failure. A client timeout alone does not stop a server job.
         </p>
         <p>
           <span class="badge mono">m5 doctor</span> reports catalogue reachability and, for a minted

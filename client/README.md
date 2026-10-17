@@ -40,7 +40,16 @@ uses the fixed public npm endpoint and does not send credentials. An upgrade rec
 the exact gateway client pin and the installed rollback pin, but has no executable install command
 until the registry check confirms that the gateway pin is published.
 
-### Reliability diagnostics (1.5.4)
+### Reliability diagnostics (1.5.5)
+
+Version 1.5.5 lets the content-free code-loop transport check wait up to 3.5 seconds
+(within the caller's timeout), accommodating `/healthz`'s bounded peer check. It remains separate
+from inference readiness. `code run` accepts optional `caps.total_wall_s` (90–900 seconds) only
+when the live gateway schema advertises that budget; otherwise it refuses before sending the
+seed files. The shared budget reserves 75 seconds for cleanup. A 180-second request therefore
+allows up to 105 seconds of admission, coding and verification. Its terminal result reports
+`execution.whole_job`; failed cleanup or excess observed elapsed time fails acceptance.
+Omitting the field preserves the separate engine/check limits.
 
 The default `m5 --profile <name> doctor` remains catalogue and transport discovery only. Its
 historical inference timestamp is global past activity, not current route readiness. To request

@@ -1,3 +1,4 @@
+import { limitCodeLoopCageLifetime } from "./code-loop-deadline.js";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -233,8 +234,8 @@ export function buildCodeLoopRuntime(
     growthCapBytes: GROWTH_CAP_BYTES,
     pollMs: 5_000,
     retentionTtlMs: RETENTION_TTL_MS,
-    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env }),
-    acquireLease: async ({ model, timeoutMs, onLeaseLost }) => {
+    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env, signal: opts.signal }),
+    acquireLease: async ({ model, timeoutMs, onLeaseLost, signal }) => {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
       try {
@@ -243,7 +244,7 @@ export function buildCodeLoopRuntime(
           purpose: "code-loop",
           dir: cfg.gpuLeaseDir,
           staleMs: cfg.gpuLeaseStaleMs,
-          signal: ctrl.signal,
+          signal: signal ? AbortSignal.any([ctrl.signal, signal]) : ctrl.signal,
           onLeaseLost,
         });
         return { release: () => lease.release() };
@@ -257,7 +258,7 @@ export function buildCodeLoopRuntime(
     // unreadable, ro-mount writes denied, external egress blocked, gateway reachable (200) — at
     // EVERY job start when confinement=required. Starts the same gateway relay so the gateway arm
     // is genuinely tested end-to-end.
-    cageSelfTest: () => runCageSelfTestWithRelay(
+    cageSelfTest: (signal, remainingMs) => runCageSelfTestWithRelay(
       cageBuildArgv,
       secretPath,
       forwardPort,
@@ -267,6 +268,8 @@ export function buildCodeLoopRuntime(
       confinement,
       workroot,
       runnability,
+      signal,
+      remainingMs,
     ),
   };
 
@@ -300,8 +303,11 @@ export async function runCageSelfTestWithRelay(
   gatewayApiKey: string,
   confinement: "required" | "off",
   probeRoot: string,
-  runnability?: CageRunnabilityProbe
+  runnability?: CageRunnabilityProbe,
+  signal?: AbortSignal,
+  remainingMs?: number,
 ): Promise<{ ok: boolean; failures: string[] }> {
+  if (signal?.aborted) return { ok: false, failures: ["whole-job deadline reached"] };
   if (confinement === "off") return { ok: true, failures: [] };
   // A missing source would make `cat` fail and could masquerade as successful concealment. Prove
   // the exact production secret exists and is readable OUTSIDE the cage before testing denial.
@@ -325,7 +331,10 @@ export async function runCageSelfTestWithRelay(
   }
   try {
     const r = await runCageSelfTest({
-      cageArgv: cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`),
+      cageArgv: remainingMs === undefined
+        ? cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`)
+        : limitCodeLoopCageLifetime(cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`), remainingMs),
+      signal,
       secretPath,
       // A write to the read-only toolchain mount MUST fail (a tmpfs-over-home write would succeed
       // harmlessly, so probing /usr is the meaningful "no rw escape" test).
@@ -334,6 +343,7 @@ export async function runCageSelfTestWithRelay(
       gatewayForwardPort: forwardPort,
       userManagerSocketPath: `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/systemd/private`,
       exec: (argv, timeoutMs) => execCageCommand(argv, timeoutMs, {
+        signal,
         env: {
           PATH: process.env["PATH"] ?? "/usr/bin:/bin",
           // The probe only calls unauthenticated /healthz; this non-secret value satisfies the

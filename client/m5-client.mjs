@@ -4,7 +4,7 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.5.4";
+export const M5_CLIENT_VERSION = "1.5.5";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
 // the word of a remote peer.
 const MAX_RETRY_AFTER_SECONDS = 86_400;
@@ -2081,6 +2081,24 @@ export async function createM5Client({
         );
       }
       const { wait, ...requestInput } = input;
+      if (requestInput.caps?.total_wall_s !== undefined) {
+        const budget = requestInput.caps.total_wall_s;
+        if (!Number.isInteger(budget) || budget < 90 || budget > 900) {
+          throw new M5ClientError("invalid_input", "caps.total_wall_s must be an integer between 90 and 900 seconds.");
+        }
+        // An older gateway may silently ignore a new optional cap. Require its live schema
+        // before sending task content; a client polling timeout cannot enforce a server budget.
+        const catalogue = await client.rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
+        const tools = catalogue?.result?.tools;
+        const schema = Array.isArray(tools)
+          ? tools.find(tool => tool?.name === "code_loop_start")?.inputSchema?.properties?.caps?.properties?.total_wall_s
+          : null;
+        if (catalogue?.error || schema?.type !== "integer" ||
+            !Number.isFinite(schema.minimum) || schema.minimum > budget ||
+            !Number.isFinite(schema.maximum) || schema.maximum < budget) {
+          throw new M5ClientError("whole_job_deadline_unsupported", "The gateway does not advertise the requested whole-job deadline; no job was dispatched.");
+        }
+      }
       const started = await client.tool("code_loop_start", requestInput);
       if (!started || typeof started !== "object") {
         throw new M5ClientError(
@@ -2322,7 +2340,7 @@ async function endpointDoctor({
 // unknown, never as proof of code-loop health. No credential or model prompt is sent.
 async function doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 1500));
+  const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 3500));
   try {
     const response = await fetchImpl(`${baseUrl}/healthz`, {
       redirect: "error",

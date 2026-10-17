@@ -500,6 +500,19 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   cap; a successful first-attempt mutation satisfies the deadline globally and exempts the
   degeneracy retry. Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  An optional integer `caps.total_wall_s` (90–900 seconds) adds a shared deadline starting
+  before asynchronous admission. It reserves 75 seconds for process/unit cleanup, lease release
+  and bounded evidence finalization; a 180-second budget therefore permits at most 105 seconds
+  of admission, Git, engine and verifier work combined. It aborts active commands/engine work,
+  forbids later phases and tightens each transient unit's `RuntimeMaxSec` to the remaining work
+  time. Admission expiry returns `deadline-exceeded`; admitted expiry withholds diff/summary and
+  returns `cap-exceeded`, or `arm-error` when cleanup/release cannot be proved. Unresolved unit
+  cleanup remains durable for recovery. Opted-in results include `execution.whole_job` with the
+  budget, observed monotonic elapsed time and cleanup status. A cleanup failure or elapsed time
+  beyond the budget fails operational acceptance. Omission preserves the separate legacy caps.
+  Reconnect and verify that the live `code_loop_start` input schema advertises `total_wall_s`
+  before using it; older gateways do not enforce this optional field. Engine `usage.wall_ms`
+  and a client wait timeout are not whole-job timing evidence.
   Harness v9 additionally requires `schema_checks` for the resolved `unit-test-gen` task type;
   compile-only requests are refused before admission. Supply 1–8 owner-authored
   `{name, command}` behavioral oracles, each expecting exit zero. Names are unique lowercase
