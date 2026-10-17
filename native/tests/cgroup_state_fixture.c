@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 /* Own synthetic cgroups in a fresh hosted VM only. This is not a production stop API. */
 #include "../launcher/cgroup_state.h"
+#include "../launcher/resource_limits.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -76,8 +77,36 @@ int main(void) {
     CHECK(tree >= 0 && fstat(tree, &identity) == 0);
     binding = (struct gi_cgroup_binding){(uint64_t)identity.st_dev, (uint64_t)identity.st_ino};
     CHECK(expect_population(tree, &binding, 0) == 0);
+    const struct gi_resource_limits limits = {67108864, 8, {25000, 100000}};
+    /* Only this newly owned group is configured; never enable host-wide controllers. */
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &limits) != 0);
+    CHECK(write_fixed(tree, "memory.max", "67108864", 8) == 0);
+    CHECK(write_fixed(tree, "memory.swap.max", "0", 1) == 0);
+    CHECK(write_fixed(tree, "pids.max", "8", 1) == 0);
+    CHECK(write_fixed(tree, "memory.oom.group", "1", 1) == 0);
+    CHECK(write_fixed(tree, "cpu.max", "25000 100000", 12) == 0);
+    CHECK(write_fixed(tree, "cpu.max.burst", "0", 1) == 0);
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &limits) == 0);
+    struct gi_resource_limits wrong_limits = limits; wrong_limits.tasks_max = 16;
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &wrong_limits) != 0);
+    wrong_limits = limits; wrong_limits.cpu.quota_us = 50000;
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &wrong_limits) != 0);
+    wrong_limits = limits; wrong_limits.cpu.period_us = 200000;
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &wrong_limits) != 0);
+    wrong_limits = limits; wrong_limits.memory_max_bytes = 33554432;
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &wrong_limits) != 0);
+    CHECK(write_fixed(tree, "memory.swap.max", "4096", 4) == 0);
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &limits) != 0);
+    CHECK(write_fixed(tree, "memory.swap.max", "0", 1) == 0);
+    CHECK(write_fixed(tree, "memory.oom.group", "0", 1) == 0);
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &limits) != 0);
+    CHECK(write_fixed(tree, "memory.oom.group", "1", 1) == 0);
+    CHECK(write_fixed(tree, "cpu.max.burst", "1000", 4) == 0);
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &limits) != 0);
+    CHECK(write_fixed(tree, "cpu.max.burst", "0", 1) == 0);
     struct gi_cgroup_binding wrong = binding; ++wrong.inode;
     CHECK(unknown(tree, &wrong));
+    CHECK(gi_verify_bound_resource_limits(tree, &wrong, &limits) != 0);
     CHECK(mkdir(fake_path, 0700) == 0); fake_created = 1;
     fake = open(fake_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     CHECK(fake >= 0 && fstat(fake, &fake_identity) == 0);
@@ -88,6 +117,7 @@ int main(void) {
     close(forged); CHECK(forged_ok);
     struct gi_cgroup_binding fake_binding = {(uint64_t)fake_identity.st_dev, (uint64_t)fake_identity.st_ino};
     CHECK(unknown(fake, &fake_binding));
+    CHECK(gi_verify_bound_resource_limits(fake, &fake_binding, &limits) != 0);
     CHECK(mkdirat(tree, "nested", 0755) == 0); nested = 1;
     leaf = openat(tree, "nested", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     CHECK(leaf >= 0 && fstat(leaf, &leaf_identity) == 0);
@@ -111,6 +141,8 @@ int main(void) {
     char pid_text[32]; int length = snprintf(pid_text, sizeof pid_text, "%ld", (long)child);
     CHECK(length > 0 && (size_t)length < sizeof pid_text);
     CHECK(write_fixed(leaf, "cgroup.procs", pid_text, (size_t)length) == 0);
+    /* Child is still blocked on the gate; release only after rereading actual limits. */
+    CHECK(gi_verify_bound_resource_limits(tree, &binding, &limits) == 0);
     CHECK(write(gate[1], "x", 1) == 1); close(gate[1]); gate[1] = -1;
     struct pollfd ready = {receipt[0], POLLIN, 0};
     CHECK(poll(&ready, 1, 2000) > 0);
@@ -124,7 +156,7 @@ int main(void) {
     CHECK(same_inode(tree, &identity));
     CHECK(write_fixed(tree, "cgroup.kill", "1", 1) == 0);
     CHECK(expect_population(tree, &binding, 0) == 0);
-    puts("owned subtree: populated with descendant work, known empty after cgroup kill");
+    puts("owned subtree: exact resource limits before gate, descendant work, known empty after kill");
     result = 0;
 cleanup:
     if (child > 0 && tree >= 0 && same_inode(tree, &identity))

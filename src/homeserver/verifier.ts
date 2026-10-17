@@ -2,7 +2,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Outcome, ErrorClass } from "./ledger.js";
 
 /**
@@ -315,6 +316,40 @@ export function all(verifiers: Verifier[]): Verifier {
 
 // ─── TypeScript compile + run gate ───────────────────────────────────────────────
 
+/** Repository root, resolved from this module rather than the caller's cwd. */
+const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+
+/** Repo-local tool shim — the deterministic `npx --no-install` equivalent without npm's state. */
+function localBin(name: string): string {
+  return join(REPO_ROOT, "node_modules", ".bin", name);
+}
+
+/** Pin tsc's @types resolution independently of the child's (scratch) cwd. */
+const TYPES_ROOT = join(REPO_ROOT, "node_modules", "@types");
+
+/**
+ * Environment for gate children that execute model-authored artifacts (tsGate's tsc/tsx, sqlExec's
+ * node). Allowlist only: gateway secrets (`M5_MAINTENANCE_KEY`, `HOMESERVER_*`, `.env` values) and
+ * tool-injection variables (`NODE_OPTIONS`, `NODE_PATH`) must not reach code the model authored.
+ * HOME/TMPDIR point at a scratch directory, and PATH keeps the running node first so the
+ * repo-local shims resolve a known interpreter.
+ *
+ * This contains the environment, not the process: a child can still read any file the running
+ * identity can reach by absolute path. Run evaluations as the unprivileged evaluator identity —
+ * see SECURITY.md, "Evaluation execution".
+ */
+export function verifierChildEnvironment(scratchDir: string): NodeJS.ProcessEnv {
+  const path = process.env["PATH"];
+  const env: NodeJS.ProcessEnv = {
+    HOME: scratchDir,
+    TMPDIR: scratchDir,
+    PATH: path ? `${dirname(process.execPath)}${delimiter}${path}` : dirname(process.execPath),
+  };
+  const lang = process.env["LANG"];
+  if (lang) env["LANG"] = lang;
+  return env;
+}
+
 export interface TsGateOptions {
   /** Test harness appended after the candidate code. Use `throw` to signal failure. */
   harness: string;
@@ -331,9 +366,21 @@ export interface TsGateOptions {
  * with tsc, then executed with tsx. tsx exit 0 → pass. Type error but runtime pass →
  * partial (the F6 "one-line type slip with correct logic underneath" case). Runtime
  * throw → fail. Tooling/invocation failure → infra error (not the model's fault).
+ *
+ * Sandbox policy: the candidate is model-generated code. Both children run with the allowlisted
+ * environment from verifierChildEnvironment, the scratch directory as cwd, and tsGate refuses to
+ * run as root. That is containment, not a sandbox — see SECURITY.md, "Evaluation execution".
  */
 export function tsGate(opts: TsGateOptions): Verifier {
   return async (out) => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      return {
+        outcome: "error",
+        score: 0,
+        errorClass: "infra",
+        notes: "refusing to execute model-generated code as root — run evaluations as the unprivileged evaluator identity (see SECURITY.md)",
+      };
+    }
     const code = extractCodeBlock(out, opts.langs ?? ["typescript", "ts", "js", "javascript"]);
     if (!code) return { outcome: "error", score: 0, errorClass: "empty", notes: "no code block" };
 
@@ -342,6 +389,7 @@ export function tsGate(opts: TsGateOptions): Verifier {
     const source = `${code}\n\n// ── harness ──\n${opts.harness}\n`;
     writeFileSync(file, source, "utf-8");
     const timeout = opts.timeoutMs ?? 30_000;
+    const env = verifierChildEnvironment(dir);
 
     try {
       let typeOk = true;
@@ -349,9 +397,9 @@ export function tsGate(opts: TsGateOptions): Verifier {
       if (opts.typecheck !== false) {
         try {
           await execFileAsync(
-            "npx",
-            ["--no-install", "tsc", "--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022", "--moduleDetection", "force", "--module", "preserve", file],
-            { timeout, cwd: process.cwd() }
+            localBin("tsc"),
+            ["--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022", "--moduleDetection", "force", "--module", "preserve", "--typeRoots", TYPES_ROOT, file],
+            { timeout, cwd: dir, env }
           );
         } catch (err: unknown) {
           // tsc exits non-zero on type errors; distinguish "tsc not found" (infra).
@@ -364,7 +412,7 @@ export function tsGate(opts: TsGateOptions): Verifier {
 
       // Runtime execution
       try {
-        await execFileAsync("npx", ["--no-install", "tsx", file], { timeout, cwd: process.cwd() });
+        await execFileAsync(localBin("tsx"), [file], { timeout, cwd: dir, env });
       } catch (err: unknown) {
         const e = err as { code?: string; killed?: boolean; signal?: string; stderr?: string; message?: string };
         if (e.code === "ENOENT") return { outcome: "error", score: 0, errorClass: "infra", notes: "tsx not available" };
@@ -469,9 +517,13 @@ async function runSqlExecChild(input: {
 }, timeoutMs: number): Promise<SqlChildResult | "timeout" | "infra-error"> {
   const arg = Buffer.from(JSON.stringify(input), "utf8").toString("base64");
   try {
+    // Same allowlisted environment policy as tsGate. cwd is left alone: `node -e` resolves
+    // better-sqlite3 from the caller's tree. The child runs only the static SQL_EXEC_CHILD
+    // source — the model contributes an SQL string, never JS.
     const { stdout } = await execFileAsync(process.execPath, ["-e", SQL_EXEC_CHILD, arg], {
       timeout: timeoutMs,
       maxBuffer: 1_000_000,
+      env: verifierChildEnvironment(tmpdir()),
     });
     return JSON.parse(stdout.trim()) as SqlChildResult;
   } catch (e) {
