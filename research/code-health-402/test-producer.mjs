@@ -27,7 +27,18 @@ import {
   fetchJsonWithRetry,
   getFirstAttempt,
 } from './lib/ci.mjs';
-import { checkVendorContract, collect, collectCi, gitWorkflowDigests, inferTriage, newCollectionRef, reportMarkdown, runProcess } from './collect.mjs';
+import {
+  checkVendorContract,
+  collect,
+  collectCi,
+  collectWithFallback,
+  gitWorkflowDigests,
+  inferTriage,
+  newCollectionRef,
+  reportMarkdown,
+  runConcurrentStaticCollectors,
+  runProcess,
+} from './collect.mjs';
 import { validateObjective } from '../../contracts/grimnir-code-health-v1/scripts/lib/code-health-objective.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -167,6 +178,56 @@ test('a missing analyzer executable is recorded as a bounded failed process', as
   assert.equal(missing.errorName, 'ENOENT');
   assert.equal(missing.stdout, '');
   assert.equal(missing.timedOut, false);
+});
+
+test('static collectors start together and preserve the complexity/unused result order', async () => {
+  let complexityResolve;
+  let unusedResolve;
+  const started = [];
+  const complexity = new Promise(resolve => { complexityResolve = resolve; });
+  const unused = new Promise(resolve => { unusedResolve = resolve; });
+  const pending = runConcurrentStaticCollectors(
+    async () => { started.push('complexity'); return complexity; },
+    async () => { started.push('unused'); return unused; },
+  );
+  await new Promise(resolve => queueMicrotask(resolve));
+  assert.deepEqual(started, ['complexity', 'unused']);
+  complexityResolve({ slot: { name: 'complex_functions' }, elapsedMs: 10, status: 'measured' });
+  unusedResolve({ slot: { name: 'unused_candidates' }, elapsedMs: 11, status: 'unknown' });
+  assert.deepEqual(await pending, [
+    { slot: { name: 'complex_functions' }, elapsedMs: 10, status: 'measured' },
+    { slot: { name: 'unused_candidates' }, elapsedMs: 11, status: 'unknown' },
+  ]);
+});
+
+test('collector fallback records a bounded failure and evidence reference', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'code-health-402-fallback-'));
+  const outputRoot = path.join(temp, 'artifact');
+  const evidenceRefs = {};
+  try {
+    const result = await collectWithFallback({
+      name: 'unused_candidates',
+      unit: 'candidates',
+      observedAt: '2026-10-17T12:00:00Z',
+      outputRoot,
+      evidenceRefs,
+      collectMetric: async () => { throw Object.assign(new Error('synthetic analyzer failure'), { name: 'SyntheticError' }); },
+    });
+    assert.equal(result.status, 'failed');
+    assert.equal(result.slot.status, 'failed');
+    assert.equal(result.slot.reason, 'producer-error');
+    assert.deepEqual(evidenceRefs['ref:unused-candidates-collector-error'], {
+      kind: 'artifact-file',
+      path: 'evidence/unused_candidates/collector-error.json',
+    });
+    assert.deepEqual(JSON.parse(await readFile(path.join(outputRoot, 'evidence/unused_candidates/collector-error.json'))), {
+      status: 'failed',
+      error_name: 'SyntheticError',
+      error: 'synthetic analyzer failure',
+    });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test('workflow history batch hashes exact Git blobs with one inventory process and deduplicated reads', async () => {

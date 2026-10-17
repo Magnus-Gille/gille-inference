@@ -19,7 +19,7 @@
       "language": "typescript",
       "platform": "linux-x64",
       "freshness_days": 10,
-      "scope_version": "knip-explicit-entrypoints-v1"
+      "scope_version": "knip-consumer-audited-v2"
     },
     {
       "slot_ref": "ref:slot-coverage",
