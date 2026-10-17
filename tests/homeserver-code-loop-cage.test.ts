@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { EventEmitter } from "node:events";
 import net from "node:net";
 import http from "node:http";
 import {
@@ -526,6 +527,43 @@ describe("cage cancellation", () => {
     const r = await result;
     expect(r.code).toBeNull();
     expect(r.stderr).toContain("aborted");
+  });
+
+  it("waits for inherited stdout to close after abort before resolving", async () => {
+    const controller = new AbortController();
+    const child = new EventEmitter() as EventEmitter & { killed: boolean; kill: (signal?: NodeJS.Signals | number) => boolean };
+    child.killed = false;
+    child.kill = () => {
+      child.killed = true;
+      setTimeout(() => child.emit("close", null, "SIGKILL"), 100);
+      return true;
+    };
+    const fakeExecFile = ((_file: string, _args: string[], _options: object, callback: (err: Error & { code?: string } | null, stdout: string, stderr: string) => void) => {
+      setTimeout(() => callback(Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" }), "", ""), 0);
+      return child;
+    }) as typeof import("node:child_process").execFile;
+    const result = execCageCommand(
+      [process.execPath, "-e", "setTimeout(() => {}, 10_000)"],
+      5_000,
+      { signal: controller.signal, execFile: fakeExecFile },
+    );
+    controller.abort();
+    const abortedAt = Date.now();
+    const r = await result;
+    expect(Date.now() - abortedAt).toBeGreaterThanOrEqual(80);
+    expect(child.killed).toBe(true);
+    expect(r.code).toBeNull();
+    expect(r.stderr).toContain("aborted");
+  });
+
+  it("uses its own timeout to kill a long-running child and settles", async () => {
+    const startedAt = Date.now();
+    const r = await execCageCommand(
+      [process.execPath, "-e", "setTimeout(() => {}, 10_000)"],
+      40,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(r.code).toBeNull();
   });
 
   it("passes the signal through the optional exec seam and never returns ok after abort", async () => {
