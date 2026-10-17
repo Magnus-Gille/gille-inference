@@ -44,10 +44,11 @@ import {
   type Tier,
 } from "./keystore.js";
 import { checkQuota, recordUsage, checkRateWindow, type QuotaLimits, type QuotaReservation } from "./quota.js";
+import { describeQuotaFailure } from "./quota-error.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
+import { AdmissionCancelled, AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { acquireGpuLease } from "./gpu-lease.js";
 import {
   ExclusiveMaintenanceWindow,
@@ -60,10 +61,10 @@ import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
 import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, readHostMemory, readOomKillCount, type HostMemoryAdmissionDeps, type HostMemoryAdmissionMode, type HostMemoryReadResult, type ModelStartAdmission } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
-import { execFile } from "node:child_process";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
 import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
@@ -73,21 +74,26 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import {
+  ensureRequestLogSchema,
   recordRequestLog,
   cachedRequestLogTotals,
   getLatestSuccessfulModelUse,
   type LatestSuccessfulModelUse,
 } from "./request-log.js";
 import { queryM5UsageSummary } from "./usage-summary.js";
+import { queryLatestSuccessfulM5InferenceAt } from "./inference-freshness.js";
 import { getDb } from "../db.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
 import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
-import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
+import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, getTrustedCatalogue, warmCatalogue } from "./catalogue.js";
+import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
+import { IncidentWindowOptionsError, queryIncidentWindow } from "./incident-window.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
-import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
+import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image-request.js";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
+  SYSTEMONE_MAX_BODY_BYTES,
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
 import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
   embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
@@ -113,7 +119,6 @@ import {
   REVIEW_LANE_KNOWN_TASK_TYPES,
   REVIEW_LANE_CAPABILITY_ENDPOINT,
   REVIEW_BOUNDED_CONTRACT_VERSION,
-  REVIEW_BOUNDED_TASK_TYPE,
   REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
   reviewerUsefulnessRecordingCapabilityForPrincipal,
@@ -851,47 +856,10 @@ export function clientIp(req: IncomingMessage, trustedProxies: string[]): string
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024): Promise<string> {
-  // Early rejection on a declared Content-Length over the cap (mirrors readBuffer) — do NOT destroy
-  // the socket: the caller must stay able to write the 413 response. resume() drains in-flight bytes.
-  const declared = Number(req.headers["content-length"]);
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    req.resume();
-    return Promise.reject(new BodyTooLargeError());
-  }
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    let settled = false;
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => {
-      if (settled) return;
-      size += c.length;
-      if (size > maxBytes) {
-        // #15 / Codex finding 2: typed so the top-level catch maps it to a uniform 413 envelope.
-        // Stop buffering and reject, but keep the connection WRITABLE so the 413 can be sent — the
-        // old req.destroy() here raced the response write and the client saw a connection reset.
-        // resume() drains the rest of the upload instead of destroying the socket.
-        settled = true;
-        chunks.length = 0;
-        req.resume();
-        reject(new BodyTooLargeError());
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => {
-      if (settled) return;
-      settled = true;
-      resolve(Buffer.concat(chunks).toString("utf-8"));
-    });
-    req.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
-  });
+  return (await readBuffer(req, maxBytes, null)).toString("utf-8");
 }
 
-/** Thrown by readBuffer when the body exceeds the size cap — caller maps it to HTTP 413. */
+/** Thrown when a request body exceeds the size cap — caller maps it to HTTP 413. */
 class BodyTooLargeError extends Error {
   constructor() {
     super("request body too large");
@@ -917,7 +885,7 @@ class BodyTooLargeError extends Error {
 async function readBuffer(
   req: IncomingMessage,
   maxBytes = 32 * 1024 * 1024,
-  idleMs = 30_000
+  idleMs: number | null = 30_000
 ): Promise<Buffer> {
   // Early rejection on a declared Content-Length over the cap — before buffering anything. We do
   // NOT destroy the socket here: the caller still has to write a 413 response, which requires the
@@ -939,6 +907,7 @@ async function readBuffer(
       }
     };
     const armIdle = (): void => {
+      if (idleMs === null) return; // Text routes retain their existing no-idle-timeout policy.
       clearIdle();
       idle = setTimeout(() => {
         if (settled) return;
@@ -1015,7 +984,6 @@ function parseChatBody(raw: string): ParsedChatBody {
  */
 async function admitAndMeterLogged(
   res: ServerResponse,
-  cfg: HomeserverConfig,
   controller: AdmissionController,
   principal: PrincipalContext,
   requestedModel: string | null,
@@ -1067,11 +1035,19 @@ async function admitAndMeterLogged(
       errorClass: lctx.errorClass ?? (outcome === "error" ? "internal_error" : undefined),
     });
   };
+  // Observe close before acquire: a completed request body is not a live response socket.
+  const admissionGone = new AbortController();
+  const onAdmissionClose = (): void => {
+    if (!res.writableEnded) admissionGone.abort();
+  };
+  res.once("close", onAdmissionClose);
+  if (res.destroyed && !res.writableEnded) admissionGone.abort();
   const admissionResult = await admissionTrace.run(async () => {
     let reservation: QuotaReservation | null = null;
     let release: (() => void) | null = null;
     let admissionThrew = false;
     try {
+      if (admissionGone.signal.aborted) throw new AdmissionCancelled();
       // Model allow-list check.
       if (surface === "systemone" && (requestedModel === null || !systemOneGranted(principal, requestedModel))) {
         releaseReserve();
@@ -1133,7 +1109,7 @@ async function admitAndMeterLogged(
       const q = checkQuota(principal.alias, principal.limits, estTokens);
       if (!q.ok) {
         releaseReserve();
-        const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+        const failure = describeQuotaFailure(q, estTokens, principal);
         lctx.status = 429;
         lctx.outcome = "rate_limited";
         lctx.errorClass = "rate_limit_exceeded";
@@ -1144,12 +1120,9 @@ async function admitAndMeterLogged(
           res,
           makeError("rate_limit_exceeded", {
             retryAfterSeconds: q.retryAfterSeconds,
-            message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-            rateLimit: {
-              limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-              remaining: 0,
-              resetSeconds: q.snapshot.resetSeconds,
-            },
+            message: failure.message,
+            quota: failure.quota,
+            rateLimit: failure.rateLimit,
           }),
         );
         finishAdmissionTrace(lctx.outcome);
@@ -1167,8 +1140,13 @@ async function admitAndMeterLogged(
           keyMaxParallel: principal.maxParallel,
           keyInflight: keyInflight.get(principal.alias) ?? 0,
           keyId: principal.alias,
-        }),
+        }, admissionGone.signal),
       );
+      // A grant and disconnect can meet before this continuation runs. Release that grant
+      // through the same rollback path instead of starting any M5 or Orin handler.
+      if (admissionGone.signal.aborted || (res.destroyed && !res.writableEnded)) {
+        throw new AdmissionCancelled();
+      }
       // queueWaitMs > 0 only when the owner had to wait (the acquire resolved via drainQueue).
       // For a direct admit it rounds to ~0ms, which we record as null (not meaningful).
       const waited = Date.now() - admitStart;
@@ -1177,6 +1155,17 @@ async function admitAndMeterLogged(
       finishAdmissionTrace("ok");
       return { admitted: true as const, release, reservation };
     } catch (err) {
+      if (err instanceof AdmissionCancelled) {
+        release?.();
+        releaseReserve();
+        if (reservation !== null) recordUsage(principal.alias, 0, Date.now(), reservation);
+        lctx.status = 499;
+        lctx.outcome = "client_closed";
+        lctx.errorClass = "client_closed";
+        lctx.admission = "n/a";
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
       if (err instanceof AdmissionRejected) {
         releaseReserve();
         // M1: the quota check already DEBITED the daily estimate; a request rejected at admission
@@ -1201,7 +1190,7 @@ async function admitAndMeterLogged(
     } finally {
       finishAdmissionTrace(admissionThrew ? "error" : (lctx.outcome === "ok" ? "ok" : lctx.outcome));
     }
-  });
+  }).finally(() => res.off("close", onAdmissionClose));
   if (!admissionResult.admitted) return;
   const { release, reservation } = admissionResult;
 
@@ -3134,7 +3123,7 @@ async function handleAudioTranscription(
   const q = checkQuota(principal.alias, principal.limits, quotaEst);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, quotaEst, principal, "audio_seconds");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3145,12 +3134,9 @@ async function handleAudioTranscription(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;
@@ -3435,10 +3421,12 @@ async function handleImageGeneration(
 
   // Bench/maintenance mode (#108): refuse GUEST image work outright. This covers the ASYNC
   // (balanced/high) path — which otherwise returns 202 and runs later on the shared GPU slot,
-  // bypassing the admission gate — as well as the sync path. Owners are unaffected. Placed
-  // BEFORE any credit/quota reservation so there is nothing to refund. Same server_busy
-  // envelope + maintenance Retry-After as the chat/audio admission rejection.
-  if (controller.isMaintenanceMode() && principal.tier !== "owner") {
+  // bypassing the admission gate — as well as the sync path. Exclusive windows (including
+  // the startup fence) refuse owner submissions too, before credit/quota reservation or queueing.
+  // Guest-only maintenance keeps the existing owner behavior. Same server_busy envelope and
+  // maintenance Retry-After as chat/audio admission rejection.
+  const maintenance = controller.snapshot();
+  if (maintenance.maintenanceMode && (principal.tier !== "owner" || maintenance.maintenanceScope === "exclusive")) {
     const retryAfterSeconds = cfg.maintenanceRetryAfterSeconds;
     lctx.status = 503;
     lctx.outcome = "busy";
@@ -3478,7 +3466,7 @@ async function handleImageGeneration(
   const q = checkQuota(principal.alias, principal.limits, parsed.n);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, parsed.n, principal, "image_units");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -3489,12 +3477,9 @@ async function handleImageGeneration(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;
@@ -3958,6 +3943,8 @@ export interface GatewayComposition {
   rosterAdmissionDependencies?: RosterAdmissionDependencies;
   /** Injectable only for deterministic maintenance-window tests. Production uses the canonical lease. */
   maintenanceWindowDependencies?: MaintenanceWindowDependencies;
+  /** Test seam for the bounded, content-free dedicated user-bus transport probe. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
 }
 
 export interface GatewayRegistryInitializers {
@@ -4008,6 +3995,18 @@ export function startGateway(
   } catch (err) {
     return Promise.reject(err);
   }
+  if (cfg.requestLog === "on") {
+    try {
+      // Initialize the enabled collector once before the first history read. Keep the
+      // read-only metadata route free of schema/index work on every doctor request.
+      ensureRequestLogSchema();
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      const reason = ["SQLITE_ERROR", "SQLITE_READONLY", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CANTOPEN", "SQLITE_IOERR", "SQLITE_CORRUPT"]
+        .includes(String(code)) ? String(code) : "unknown";
+      console.warn("Request-log initialization unavailable; inference history remains unavailable", { reason });
+    }
+  }
   const loopback =
     cfg.gatewayHost === "127.0.0.1" || cfg.gatewayHost === "localhost" || cfg.gatewayHost === "::1";
   // "No keys" now means no legacy keys AND no store keys.
@@ -4041,6 +4040,7 @@ export function startGateway(
     retryAfterAtCapSeconds: cfg.busyRetryAfterSeconds,
     maintenanceRetryAfterSeconds: cfg.maintenanceRetryAfterSeconds,
     maintenanceMode: cfg.maintenanceModeAtStart,
+    startupExclusiveUntilMs: cfg.startupExclusiveUntilMs,
   });
   const maintenanceWindow = new ExclusiveMaintenanceWindow(
     controller,
@@ -4056,7 +4056,9 @@ export function startGateway(
       observeRunning: getRunningSnapshot,
     },
   );
-  if (cfg.maintenanceModeAtStart) {
+  if (cfg.startupExclusiveUntilMs !== undefined && Date.now() < cfg.startupExclusiveUntilMs) {
+    console.warn("Startup exclusive maintenance fence engaged; all inference admission refused until operator deadline.");
+  } else if (cfg.maintenanceModeAtStart) {
     console.warn("⚠  bench/maintenance mode ENGAGED at startup — guest admission is refused (#108).");
   }
 
@@ -4123,6 +4125,7 @@ export function startGateway(
       composition.rosterAdmissionDependencies,
       maintenanceWindow,
       hostMemoryDeps,
+      composition.codeLoopTransportProbe,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -4229,6 +4232,7 @@ export async function handleRequest(
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
   maintenanceWindow?: ExclusiveMaintenanceWindow,
   hostMemoryDeps: HostMemoryAdmissionDeps = { getRunning: getRunningSnapshot },
+  codeLoopTransportProbe: () => Promise<boolean> = probeCodeLoopTransport,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -4332,7 +4336,14 @@ export async function handleRequest(
     // Gate healthz logging behind the config toggle (default: off, to avoid noise).
     if (path === "/healthz" && method === "GET") {
       const orin = await probeOrin(cfg);
-      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin] });
+      // This is a transport observation, not an inference or cage-isolation probe.
+      // Legacy file binds can remain visible after user@UID restarts, so test a
+      // real listener. Keep overall liveness independent: ordinary inference can work
+      // while code_loop is unavailable.
+      const codeLoopTransport = cfg.codeLoop === "on"
+        ? await codeLoopTransportProbe().then((ready) => ready ? "available" : "unavailable", () => "unavailable")
+        : "disabled";
+      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin], codeLoopTransport });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -5118,7 +5129,7 @@ export async function handleRequest(
     // ─── Inference surface (through the spine) ───
     if (path === "/v1/systemone" && method === "POST") {
       res.setHeader("Cache-Control", "no-store");
-      const raw = await readBody(req, 8 * 1024);
+      const raw = await readBody(req, SYSTEMONE_MAX_BODY_BYTES);
       let parsed: SystemOneRequest;
       try {
         parsed = parseSystemOneBody(raw);
@@ -5144,7 +5155,7 @@ export async function handleRequest(
       // Clef uses one shared prompt; other decision models may use one prompt per question.
       // Reserve full context(s); reconcile exact successful usage after the call.
       const estimatedTokens = systemOneTokenReservation(parsed);
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, estimatedTokens, lctx,
+      await admitAndMeterLogged(res, controller, principal, parsed.model, estimatedTokens, lctx,
         () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), "systemone");
       return;
     }
@@ -5202,7 +5213,7 @@ export async function handleRequest(
           return;
         }
         lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
-        await admitAndMeterLogged(res, cfg, controller, principal, parsed.model,
+        await admitAndMeterLogged(res, controller, principal, parsed.model,
           embeddingTokenReservation(parsed), lctx,
           () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
       } finally {
@@ -5289,12 +5300,33 @@ export async function handleRequest(
       // Floor at 1, ceiling at the per-request cap.
       const effectiveMax = clampMaxTokensForModel(cfg, parsed.model, parsed.requestedMax);
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, est, lctx, async () => {
+      // Backoff is keyed by authenticated caller and known model, never global.
+      const failureBackoff = lctx.node === "m5" && parsed.model !== null &&
+        (principal.modelAllowList.length === 0 || principal.modelAllowList.includes(parsed.model))
+        ? modelFailureBackoffFor(controller, principal) : undefined;
+      const backoff = failureBackoff?.observe(parsed.model);
+      if (backoff !== null && backoff !== undefined) {
+        lctx.status = 503; lctx.outcome = "model_temporarily_unavailable";
+        lctx.errorClass = "model_temporarily_unavailable"; lctx.admission = "n/a";
+        sendError(res, makeError("model_temporarily_unavailable", {
+          retryAfterSeconds: backoff.retry_after_seconds,
+          backoff: { scope: "key_model", retry_after_seconds: backoff.retry_after_seconds, unavailable_until: backoff.unavailable_until },
+        }));
+        return;
+      }
+      await admitAndMeterLogged(res, controller, principal, parsed.model, est, lctx, async () => {
         const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps);
         traceOutcomeOverride = result.traceOutcome ?? null;
         traceErrorClassOverride = result.traceErrorClass ?? null;
         return result;
       });
+      if (lctx.status === 502 && ["upstream_error", "upstream_unavailable"].includes(lctx.errorClass ?? "")) {
+        failureBackoff?.recordFailure(parsed.model, "upstream_unavailable");
+      } else if (lctx.status === 504 && lctx.errorClass === "upstream_timeout") {
+        failureBackoff?.recordFailure(parsed.model, "upstream_timeout");
+      } else if (lctx.status !== null && lctx.status >= 200 && lctx.status < 300 && lctx.outcome === "ok") {
+        failureBackoff?.recordSuccess(parsed.model);
+      }
       return;
     }
     if (path === "/v1/audio/transcriptions" && method === "POST") {
@@ -5452,7 +5484,7 @@ export async function handleRequest(
         parsed.requestedMax
       );
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, null, est, lctx, () =>
+      await admitAndMeterLogged(res, controller, principal, null, est, lctx, () =>
         handleDelegate(
           parsed.params,
           res,
@@ -5474,8 +5506,41 @@ export async function handleRequest(
       // The dashboard's data source: the authenticated key reports its own limits + usage.
       // no-store: per-key usage data must not be cached by intermediaries (Fix #7).
       res.setHeader("cache-control", "no-store");
+      const ownerAgent = isCodeLoopOwner(principal);
+      let inferenceObservation: {
+        source: "request_log";
+        scope: "m5_global";
+        status: "observed" | "none" | "disabled" | "unavailable";
+        lastSuccessfulAt: string | null;
+      } | undefined;
+      if (ownerAgent) {
+        const base = { source: "request_log" as const, scope: "m5_global" as const };
+        if (cfg.requestLog === "off") {
+          inferenceObservation = { ...base, status: "disabled", lastSuccessfulAt: null };
+        } else {
+          try {
+            const lastSuccessfulAt = queryLatestSuccessfulM5InferenceAt(getDb());
+            inferenceObservation = {
+              ...base,
+              status: lastSuccessfulAt === null ? "none" : "observed",
+              lastSuccessfulAt,
+            };
+          } catch (error) {
+            // A telemetry read must never break key discovery. Report the gap without exposing
+            // database paths or treating a failed read as proof that no inference succeeded.
+            console.warn("[portal/me] inference observation unavailable:", error instanceof Error ? error.name : "unknown");
+            inferenceObservation = { ...base, status: "unavailable", lastSuccessfulAt: null };
+          }
+        }
+      }
+      // Embedding clients pin the gateway revision before each call, so an explicit embedding
+      // grant also sees release metadata. Owner telemetry stays owner-agent only, and the
+      // implicit owner grant (empty allow-list) does not count as explicit.
+      const explicitEmbeddingGrant = principal.embeddingModelAllowList.includes(EMBEDDING_MODEL_ID) ||
+        principal.modelAllowList.includes(EMBEDDING_MODEL_ID);
       sendJson(res, 200, {
-        ...(isCodeLoopOwner(principal) ? { gateway: gatewayRelease } : {}),
+        ...(ownerAgent || explicitEmbeddingGrant ? { gateway: gatewayRelease } : {}),
+        ...(ownerAgent ? { inferenceObservation } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,
@@ -5613,6 +5678,39 @@ export async function handleRequest(
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/ops/incidents" && method === "GET") {
+      // Same privacy floor as the task-exposure operator oracle: a real owner-admin only.
+      if (!principal.isAdmin || principal.tier !== "owner" || principal.keyHash === null) {
+        lctx.status = 403; lctx.outcome = "forbidden"; lctx.errorClass = "route_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("route_not_allowed", { message: "Incident windows require a minted owner-admin key." }));
+        return;
+      }
+      const query = parsedUrl.searchParams;
+      const allowed = new Set(["from", "to", "limit"]);
+      const unique = [...query.keys()];
+      const valid = unique.every((name) => allowed.has(name)) && new Set(unique).size === unique.length;
+      const from = query.get("from"); const to = query.get("to"); const limit = query.get("limit") ?? "100";
+      if (!valid || from === null || to === null || ![from, to, limit].every((v) => /^\d{1,16}$/.test(v))) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid incident window." }));
+        return;
+      }
+      let report;
+      try {
+        report = queryIncidentWindow(getDb(), { fromMs: Number(from), toMs: Number(to), limit: Number(limit),
+          requestLogEnabled: cfg.requestLog === "on", knownModelIds: getTrustedCatalogue() });
+      } catch (error) {
+        if (!(error instanceof IncidentWindowOptionsError)) throw error;
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid incident window." }));
+        return;
+      }
+      res.setHeader("cache-control", "private, no-store");
+      sendJson(res, 200, report);
+      lctx.status = 200; lctx.outcome = "ok"; lctx.admission = "n/a";
       return;
     }
     if (path === "/ops/summary" && method === "GET") {

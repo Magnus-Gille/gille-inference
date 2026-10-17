@@ -231,16 +231,6 @@ export type ExperimentImportRejectionReason =
   | "superseded"
   | "conflicting";
 
-export class ExperimentImportRejectedError extends Error {
-  constructor(
-    public readonly reason: ExperimentImportRejectionReason,
-    message: string
-  ) {
-    super(message);
-    this.name = "ExperimentImportRejectedError";
-  }
-}
-
 function toIdentityField(w: z.infer<typeof identityFieldSchema>): IdentityField {
   switch (w.kind) {
     case "digest":

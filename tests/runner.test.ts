@@ -342,4 +342,104 @@ describe('Batch runner', () => {
     expect(row!.cost_usd).toBeGreaterThan(0);
     expect(row!.provider).toBe('openrouter');
   });
+
+  it('runs local items sequentially and unloads each model before the next warm', async () => {
+    const events: string[] = [];
+    let activeRuns = 0;
+    let overlappingRuns = false;
+    const mockRunLocalInference = vi.fn().mockImplementation(async (modelName: string) => {
+      events.push(`run:${modelName}`);
+      activeRuns += 1;
+      overlappingRuns ||= activeRuns > 1;
+      await Promise.resolve();
+      activeRuns -= 1;
+      events.push(`run-end:${modelName}`);
+      return {
+        ok: true,
+        response: `${modelName} response`,
+        promptTokens: 10,
+        completionTokens: 20,
+        durationMs: 5,
+        ttftMs: 1,
+        tokensPerSecond: 4,
+        provider: 'local-ollama',
+      };
+    });
+    const mockWarmModel = vi.fn().mockImplementation(async (modelName: string) => {
+      events.push(`warm:${modelName}`);
+      return 1;
+    });
+    const mockUnloadModel = vi.fn().mockImplementation(async (modelName: string) => {
+      events.push(`unload:${modelName}`);
+    });
+
+    vi.doMock('../src/runner/openrouter-client.js', () => ({ runInference: vi.fn() }));
+    vi.doMock('../src/runner/lmstudio-client.js', () => ({ runLmStudioInference: vi.fn() }));
+    vi.doMock('../src/runner/local-client.js', () => ({
+      runLocalInference: mockRunLocalInference,
+      warmModel: mockWarmModel,
+      unloadModel: mockUnloadModel,
+    }));
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        response TEXT,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        duration_ms INTEGER,
+        cost_usd REAL,
+        provider TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        ttft_ms INTEGER,
+        tokens_per_second REAL,
+        UNIQUE(batch_id, task_id, model_id)
+      )
+    `);
+    vi.doMock('../src/db.js', () => ({ getDb: () => db }));
+
+    const { runBatch } = await import('../src/runner/run-batch.js');
+    try {
+      const result = await runBatch({
+        batchId: 'local-sequential-batch',
+        modelIds: ['google/gemma-4-e2b', 'google/gemma-4-12b'],
+        taskIds: ['simple-001', 'simple-002'],
+        provider: 'local',
+        concurrency: 2,
+        localModelMap: {
+          'google/gemma-4-e2b': 'first-model',
+          'google/gemma-4-12b': 'second-model',
+        },
+      });
+
+      expect(result).toEqual({ completed: 4, failed: 0, skipped: 0 });
+      expect(overlappingRuns).toBe(false);
+      expect(events).toEqual([
+        'warm:first-model',
+        'run:first-model',
+        'run-end:first-model',
+        'run:first-model',
+        'run-end:first-model',
+        'unload:first-model',
+        'warm:second-model',
+        'run:second-model',
+        'run-end:second-model',
+        'run:second-model',
+        'run-end:second-model',
+        'unload:second-model',
+      ]);
+      expect(mockRunLocalInference).toHaveBeenCalledTimes(4);
+    } finally {
+      db.close();
+    }
+  });
 });

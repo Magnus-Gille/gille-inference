@@ -7,19 +7,28 @@
  *     macro-router uses) reflect the change in this same live process.
  *   • a corrupt table on disk is a 500, never a process crash — the gateway keeps serving other
  *     routes afterward.
- * Runs in its own process (vitest isolates files); this is the one test file allowed to temporarily
- * mutate the REAL docs/m5-routing.json (routing-table.ts's loader has no path-override env, so the
- * live default-path reload this endpoint exists to prove can only be exercised against the real
- * file) — every test restores the original bytes in `finally`/`afterAll`, and the module-level
- * table cache is reset afterward too, so no other test file is affected.
+ * The default-path file read is redirected to a real private temporary file in this test worker.
+ * Reload and corrupt-file handling use the real loader and HTTP endpoint while parallel suites
+ * can continue reading the committed routing table. No production path override is introduced.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { initDb } from "../src/db.js";
 
 const REAL_TABLE_PATH = resolve(__dirname, "../docs/m5-routing.json");
+const routingFiles = vi.hoisted(() => ({ real: "", fixture: "" }));
+vi.mock("node:fs", async () => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  return { ...actual, readFileSync: new Proxy(actual.readFileSync, {
+    apply(target, thisArg, args) {
+      if (routingFiles.fixture !== "" && args[0] === routingFiles.real) args[0] = routingFiles.fixture;
+      return Reflect.apply(target, thisArg, args);
+    },
+  }) };
+});
 
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
@@ -31,6 +40,9 @@ beforeAll(async () => {
   originalBytes = readFileSync(REAL_TABLE_PATH, "utf8");
 
   const dir = mkdtempSync(join(tmpdir(), "hs-routing-reload-gw-test-"));
+  routingFiles.real = REAL_TABLE_PATH;
+  routingFiles.fixture = join(dir, "m5-routing.json");
+  writeFileSync(routingFiles.fixture, originalBytes, "utf8");
   initDb(join(dir, "test.db"));
 
   process.env["LMSTUDIO_BASE_URL"] = "http://127.0.0.1:1/v1"; // unused by this route
@@ -55,10 +67,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  writeFileSync(REAL_TABLE_PATH, originalBytes, "utf8");
+  writeFileSync(routingFiles.fixture, originalBytes, "utf8");
   const rt = await import("../src/homeserver/routing-table.js");
   rt.resetRoutingTable();
   if (stopGateway) await stopGateway();
+  routingFiles.fixture = "";
 });
 
 function url(path: string): string {
@@ -89,7 +102,7 @@ describe("POST /admin/routing-table/reload (#7)", () => {
         "routing-reload-canary-probe": { model: "mellum", passRate: 1, tokPerSec: 100, verdict: "delegate-local", attempts: 1 },
       },
     };
-    writeFileSync(REAL_TABLE_PATH, JSON.stringify(modified, null, 2) + "\n", "utf8");
+    writeFileSync(routingFiles.fixture, JSON.stringify(modified, null, 2) + "\n", "utf8");
 
     try {
       const res = await postReload(ownerKey);
@@ -101,7 +114,7 @@ describe("POST /admin/routing-table/reload (#7)", () => {
       // the new task type, in THIS SAME live process, with no restart between the write and here.
       expect(rt.routingTarget("routing-reload-canary-probe")).toBe("mellum");
     } finally {
-      writeFileSync(REAL_TABLE_PATH, originalBytes, "utf8");
+      writeFileSync(routingFiles.fixture, originalBytes, "utf8");
       rt.resetRoutingTable();
       await postReload(ownerKey); // restore the live process's view too
     }
@@ -109,18 +122,20 @@ describe("POST /admin/routing-table/reload (#7)", () => {
 
   it("a corrupt table on disk is a 500, never a process crash — the gateway keeps serving", async () => {
     const rt = await import("../src/homeserver/routing-table.js");
-    writeFileSync(REAL_TABLE_PATH, "{ not valid json", "utf8");
+    writeFileSync(routingFiles.fixture, "{ not valid json", "utf8");
     try {
       const res = await postReload(ownerKey);
       expect(res.status).toBe(500);
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe("internal_error");
+      // Parallel readers must never see this test's intentionally broken bytes.
+      expect(await readFile(REAL_TABLE_PATH, "utf8")).toBe(originalBytes);
 
       // The gateway process itself is still alive and serving other admin routes.
       const health = await fetch(url("/admin/keys"), { headers: auth(ownerKey) });
       expect(health.status).toBe(200);
     } finally {
-      writeFileSync(REAL_TABLE_PATH, originalBytes, "utf8");
+      writeFileSync(routingFiles.fixture, originalBytes, "utf8");
       rt.resetRoutingTable();
       await postReload(ownerKey);
     }

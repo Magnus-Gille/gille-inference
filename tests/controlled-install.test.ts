@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   evaluateControlledInstall,
+  evaluateControlledInstallRestoration,
   runControlledInstall,
 } from "../src/homeserver/controlled-install.js";
 
@@ -339,6 +340,81 @@ describe("controlled install admission policy", () => {
   });
 });
 
+describe("controlled install restoration policy", () => {
+  const nowMs = Date.parse("2026-10-10T12:00:00.000Z");
+
+  function finalEvidence(overrides: Partial<Observation> = {}): Observation {
+    return makeObservation({ observedAt: new Date(nowMs).toISOString(), ...overrides });
+  }
+
+  it("accepts new customer activity after the owned workload is independently stopped", () => {
+    const customerActivity = finalEvidence({
+      gateway: { active: 1, queued: 0, leaseHeld: false },
+      backend: { coverage: "unknown", active: null, queued: null },
+    });
+
+    const decision = evaluateControlledInstallRestoration(
+      makePlan({ expiresAt: new Date(nowMs + 5_000).toISOString() }),
+      customerActivity,
+      finalEvidence(),
+      nowMs,
+    );
+
+    expect(decision).toMatchObject({ admit: true, source: "host-probe-v1" });
+  });
+
+  it.each([
+    ["stale evidence", { observedAt: new Date(nowMs - 1_001).toISOString() }, "observation-not-fresh"],
+    ["identity drift", { releaseSha: "c".repeat(40) }, "identity-mismatch"],
+    ["unknown OOM counter", { oomKills: null }, "oom-unknown"],
+    ["maintenance overlap", { maintenanceActive: true }, "maintenance-not-idle"],
+    ["unknown maintenance", { maintenanceActive: null }, "maintenance-not-idle"],
+    ["protected health drift", { protectedServices: [{ ...makeObservation().protectedServices[0], active: false }] }, "protected-service-unhealthy"],
+  ])("rejects final restoration evidence with %s", (_label, change, reason) => {
+    const plan = makePlan({ expiresAt: new Date(nowMs + 5_000).toISOString() });
+    const decision = evaluateControlledInstallRestoration(
+      plan,
+      finalEvidence(change),
+      finalEvidence(),
+      nowMs,
+    );
+
+    expect(decision.admit).toBe(false);
+    expect(decision.reasons).toContain(reason);
+  });
+
+  it.each([
+    ["OOM drift", { oomKills: 1 }, "oom-drift"],
+    ["protected invocation drift", { protectedServices: [{ ...makeObservation().protectedServices[0], invocationId: "invocation-2" }] }, "protected-service-drift"],
+    ["residency drift", { residentModels: ["model-b"] }, "residency-drift"],
+  ])("rejects final restoration evidence with %s", (_label, change, reason) => {
+    const baseline = finalEvidence();
+    const decision = evaluateControlledInstallRestoration(
+      makePlan({ expiresAt: new Date(nowMs + 5_000).toISOString() }),
+      finalEvidence(change),
+      baseline,
+      nowMs,
+    );
+
+    expect(decision.admit).toBe(false);
+    expect(decision.reasons).toContain(reason);
+  });
+
+  it("fails closed for an invalid clock or expired approval", () => {
+    const evidence = finalEvidence();
+    const baseline = finalEvidence();
+    const expired = evaluateControlledInstallRestoration(
+      makePlan({ expiresAt: new Date(nowMs - 1).toISOString() }), evidence, baseline, nowMs,
+    );
+    const invalidClock = evaluateControlledInstallRestoration(
+      makePlan({ expiresAt: new Date(nowMs + 5_000).toISOString() }), evidence, baseline, Number.NaN,
+    );
+
+    expect(expired.reasons).toContain("approval-expired");
+    expect(invalidClock.reasons).toContain("invalid-clock");
+  });
+});
+
 type Operations = {
   observe: (signal: AbortSignal) => Promise<unknown>;
   run: (signal: AbortSignal) => Promise<void>;
@@ -453,8 +529,9 @@ describe("controlled install lifecycle", () => {
 
     const result = await runControlledInstall(makePlan(), operations);
 
-    expect(result.status).toBe("restoration-failed");
+    expect(result.status).toBe("stopped");
     expect(result.reasons).toContain("gateway-busy");
+    expect(result.restored).toBe(true);
     expect(operations.stopCalls).toBe(1);
     expect(operations.cleanupCalls).toBe(1);
   });
@@ -523,7 +600,10 @@ describe("controlled install lifecycle", () => {
   });
 
   it("skips cleanup when stop fails", async () => {
-    const operations = makeOperations();
+    const operations = makeOperations([
+      makeObservation(),
+      makeObservation({ gateway: { active: 1, queued: 0, leaseHeld: false } }),
+    ]);
     operations.stop = async (_signal) => {
       operations.stopCalls += 1;
       throw new Error("stop failed");

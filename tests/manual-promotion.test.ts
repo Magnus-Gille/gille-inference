@@ -91,6 +91,7 @@ describe("manual-promotion spec contract (#217)", () => {
       gguf: "/m/manual-35b.Q4_K_M.gguf",
       runtimeBin: "/r/9b05354ec/bin/llama-server",
       ctx: 65536,
+      batch: null,
       ngl: 999,
       ubatch: 512,
       np: 1,
@@ -162,6 +163,7 @@ describe("manual-promotion spec contract (#217)", () => {
       key: "clef-flash",
       api: "systemone",
       ctx: 8192,
+      batch: 8192,
       ubatch: 8192,
       ctk: "f16",
       ctv: "f16",
@@ -176,6 +178,25 @@ describe("manual-promotion spec contract (#217)", () => {
         questions: { greeting: { type: "noul" } },
       },
     });
+    expect(renderManualEntry(spec)).toContain("-b 8192 -ub 8192 -c 8192");
+  });
+
+  it("keeps batch optional for existing specs and preserves their exact rendering", () => {
+    const spec = parseManualSpec(FULL_SPEC_TEXT);
+
+    expect(spec.batch).toBeNull();
+    expect(renderManualEntry(spec)).toBe(EXPECTED_ENTRY);
+  });
+
+  it.each([
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["fractional", "1.5"],
+    ["above the context bound", "1048577"],
+  ])("rejects an invalid explicit batch (%s)", (_label, value) => {
+    expect(() => parseManualSpec(`${FULL_SPEC_TEXT}\nbatch: ${value}`)).toThrow(
+      /^\[manual-promotion\] spec field 'batch'/,
+    );
   });
 
   it.each([

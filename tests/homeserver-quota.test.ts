@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { closeDb, initDb } from "../src/db.js";
 import {
   checkQuota,
   recordUsage,
@@ -10,9 +10,17 @@ import {
   type QuotaLimits,
 } from "../src/homeserver/quota.js";
 
+const testDirs: string[] = [];
+
 beforeAll(() => {
   const dir = mkdtempSync(join(tmpdir(), "hs-quota-test-"));
+  testDirs.push(dir);
   initDb(join(dir, "test.db"));
+});
+
+afterAll(() => {
+  closeDb();
+  for (const dir of testDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 beforeEach(() => {
@@ -27,6 +35,41 @@ function alias(): string {
 const T0 = 1_700_000_000_000; // fixed base ms
 
 describe("quota sliding windows", () => {
+  it("initializes the daily table for each replacement database", () => {
+    closeDb();
+    const dirA = mkdtempSync(join(tmpdir(), "hs-quota-db-a-"));
+    testDirs.push(dirA);
+    const dbA = initDb(join(dirA, "test.db"));
+    const a = alias();
+    const limits: QuotaLimits = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 1000 };
+
+    expect(checkQuota(a, limits, 17, T0).ok).toBe(true);
+    expect(
+      dbA.prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?")
+        .get(a, "2023-11-14"),
+    ).toEqual({ tokens: 17 });
+    expect(
+      dbA.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get("key_usage_daily"),
+    ).toEqual({ name: "key_usage_daily" });
+
+    closeDb();
+    const dirB = mkdtempSync(join(tmpdir(), "hs-quota-db-b-"));
+    testDirs.push(dirB);
+    const dbB = initDb(join(dirB, "test.db"));
+    resetQuotaWindows();
+
+    expect(checkQuota(a, limits, 23, T0).ok).toBe(true);
+    expect(
+      dbB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get("key_usage_daily"),
+    ).toEqual({ name: "key_usage_daily" });
+    expect(
+      dbB.prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?")
+        .get(a, "2023-11-14"),
+    ).toEqual({ tokens: 23 });
+  });
+
   it("RPM: blocks the 3rd request in-window, frees after 60s slide", () => {
     const a = alias();
     const limits: QuotaLimits = { rpm: 2, tpm: 1_000_000, dailyTokenBudget: 0 };

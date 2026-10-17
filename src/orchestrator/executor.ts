@@ -3,7 +3,7 @@ import { performance } from "node:perf_hooks";
 import { getDb } from "../db.js";
 import { runInference } from "../runner/openrouter-client.js";
 import { runLocalInference } from "../runner/local-client.js";
-import type { CompoundTaskDefinition, SubTaskDefinition, SubTaskResult, StrategyConfig } from "./types.js";
+import type { CompoundTaskDefinition, SubTaskResult, StrategyConfig } from "./types.js";
 
 // ─── Pricing lookup (USD per million tokens) ──────────────────────────────────
 // Used to compute cost_usd for cloud sub-tasks.

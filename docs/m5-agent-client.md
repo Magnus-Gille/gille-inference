@@ -496,3 +496,42 @@ automatically forwarded to a redirect target.
 agent library into it would break that installation contract. The narrower `m5-client.mjs` library
 is shared by all `m5` commands and the stdio bridge so their route, timeout, session, tool-result,
 and redaction semantics do not fork.
+
+## Native reasoning through MCP
+
+After an approved gateway rollout of #441, refresh the existing owner MCP connection and inspect
+`tools/list`: `ask` should advertise `include_reasoning`. The generic stdio bridge already forwards
+these arguments and structured results; no credential needs to be extracted from its configuration.
+A direct `m5 ask` call needs client code containing the #441 result-normalization update; an older
+client may discard the optional reasoning fields even when the server sends them.
+
+For the same-call prompt, native reasoning, final answer and token evidence, make **one synthetic,
+metered** `tools/call` through the working owner MCP connector, using these parameters:
+
+```json
+{
+  "name": "ask",
+  "arguments": {
+    "model": "gpt-oss-120b",
+    "prompt": "Du är en biljettkalkylator. En biljett kostar 149 kr. Tre biljetter får 15 procent rabatt på totalsumman. Vad blir slutpriset? Svara med exakt en kort mening på svenska, utan uträkning.",
+    "max_tokens": 512,
+    "traffic_purpose": "synthetic",
+    "include_reasoning": true
+  }
+}
+```
+
+Use a reasoning model your existing key permits. Inspect `result.structuredContent` from this
+single response: `reasoning_content` is the backend's raw reasoning text (or `null`), `text` is
+the final answer, `usage` contains the backend token fields, and `reasoning_truncated` reports
+the 16 KiB UTF-8 cap. Keep these alongside the exact synthetic prompt when demonstrating the
+result. Do not label a later request for public calculation steps as the first call's trace.
+A null reasoning field or token count is evidence of unavailable data, not a zero or an estimate.
+A token-limit refusal retains the same paid partial result and is not silently retried.
+
+For live verification, confirm the deployed revision separately with the deployment runbook, then
+check that the final answer and native reasoning are separate. A second synthetic call with the
+flag omitted must omit both reasoning fields. If the backend supplies no reasoning text, record
+that limit rather than declaring live reasoning support proven. Do not copy a key from connector
+configuration, change authentication, or rotate credentials for this example; a working MCP
+connector is sufficient. No real M5 call is part of the source-only test suite.
