@@ -150,6 +150,7 @@ Requires=user@$uid.service
 Type=oneshot
 User=gille-build
 Group=gille-build
+Slice=user-$uid.slice
 ExecStart=/usr/local/libexec/m5-build-worker --cleanup
 UMask=0077
 NoNewPrivileges=yes
