@@ -108,7 +108,7 @@ issues and focused documents under `docs/`.
 ## Development and validation
 
 Runtime-only serving retains Node.js 20+ support. Development and tests require npm and a Node.js
-version supported by Vitest 5: 22.12+ on the 22.x line, 24.x, or 26+. The codebase is strict
+version supported by both Vitest 5 and SQLite: 22.12+ on the 22.x line or 24.x. The codebase is strict
 TypeScript/ESM, run through `tsx`; use
 `.js` extensions in TypeScript imports. SQLite is synchronous via `better-sqlite3` with WAL where
 configured. Tests use Vitest.
