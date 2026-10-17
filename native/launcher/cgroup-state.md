@@ -32,3 +32,27 @@ launch/restart/migration paths remain fenced. A parsed empty snapshot alone does
 cleanup or restoration. The integrated independent deadman must stop only owned work, bound its
 wait, verify identity/whole-cgroup absence and keep arbitration quarantined on uncertainty. The byte
 bound and nonblocking opens do not replace an independent operation deadline if the kernel stalls.
+
+## Prepared resource check
+
+`resource_limits.c` checks the same bound root-owned cgroup before a trusted caller releases a
+prepared workload. It reads only six constant kernel files: finite `memory.max`, zero
+`memory.swap.max`, finite `pids.max`, grouped OOM, and an exact finite CPU quota/period with zero
+burst. It repeats the complete check and verifies file/directory identities around every read.
+The pure parsers reject unlimited, malformed, overflowing or truncated values; the supported CPU
+period is 1,000–1,000,000 microseconds. No paths, unit properties or commands come from a request.
+
+The hosted fixture configures only its newly owned cgroup. It refuses missing controllers instead
+of enabling host-wide controllers. The child remains blocked on its pipe while the parent verifies
+the actual limits, then the fixture releases its harmless work. Mismatched memory, task or CPU
+limits, swap, OOM grouping and burst are tested before release; a compiled mutant ignoring the task
+limit must fail. The verifier itself neither configures limits nor releases a gate.
+
+This is a bound local-limit snapshot, not a complete containment verdict. The fixed service launcher
+still must stage the real non-root workload, bind its invocation/payload/cgroup membership and prove
+device, filesystem, network, syscall and scheduler restrictions. The
+[kernel contract](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html) limits CPU quota
+enforcement to supported scheduler classes, and stricter ancestor limits can also apply. Two reads
+are not atomic against a privileged writer: only the trusted launcher may change this group, and
+operator changes invalidate the accepted packet. Independent expiry and ongoing observation remain
+mandatory; a successful resource check is not an installation permit.
