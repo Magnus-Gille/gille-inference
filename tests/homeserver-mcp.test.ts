@@ -17,7 +17,7 @@ import {
 /**
  * MCP Streamable-HTTP transport suite. Mirrors the portal-test harness: a controllable stub
  * upstream (so no real model is needed), keystore-only mode (a key is minted before
- * startGateway so the gateway does not bootstrap implicit-admin), and an ephemeral port.
+ * startGateway), and an ephemeral port.
  *
  * Covers: initialize / notifications/initialized / ping / tools/list / tools/call (both
  * tools), auth (401 with no key), method (405 on GET), allow-list enforcement, and that the

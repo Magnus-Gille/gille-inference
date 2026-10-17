@@ -20,7 +20,7 @@ Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-rou
 | Legacy `M5_BASE_URL` only | Treats it as the OpenAI base and derives the gateway root. |
 | Both first-class variables | Requires `M5_OPENAI_BASE_URL=$M5_GATEWAY_URL/v1`. |
 | Empty, path/query/fragment gateway, non-HTTP(S) gateway, or an inconsistent pair | Fails closed before reading or emitting the bearer token. |
-- **Bind / implicit-admin:** the gateway freezes its implicit-admin posture once at startup from the actual bind host (`isImplicitAdminAllowed`). Implicit admin (no-token bootstrap) requires **all** of: a loopback bind, zero `HOMESERVER_API_KEYS`, zero `HOMESERVER_ADMIN_API_KEYS`, and zero active keystore keys at startup. If any key exists, every request must authenticate. For LAN/external use, configure keys.
+- **Bind / authentication:** a keyless gateway may bind loopback for local setup, but every protected route always requires a valid bearer credential, including when the keystore is empty or the last key is revoked or expires. A non-loopback bind still fails startup with no configured or minted key. Mint the first credential directly through the local CLI; new owner keys default to `agent`, so pass `--scope admin` when HTTP operator routes are required. There is no anonymous HTTP bootstrap route.
 - **Content type:** `application/json` for all bodies and responses (except `/v1/chat/completions` streaming, which is `text/event-stream`).
 
 ## Auth model
@@ -424,7 +424,7 @@ enforces this identically regardless of what this endpoint reports — the endpo
 discovery, not the enforcement point. `reviewerUsefulnessRecording` is also advisory: it tells a
 caller whether reviewer-usefulness recording is available for the CURRENT authenticated principal,
 what closed values the route accepts, and that the mutation requires a minted owner-tier admin key.
-Guest, owner-agent, identity-less static admin, and the implicit admin path all report
+Guest, owner-agent, and identity-less static admin callers all report
 `available:false` with a stable `availabilityReason` enum:
 `requires_owner_admin`, `requires_minted_owner_admin`, or `missing_reviewer_identity`.
 Monitor-scope keys do not reach this endpoint at all: the global read-only monitor fence returns
@@ -619,8 +619,8 @@ read/validate/conditional-update sequence inside one SQLite immediate transactio
 partially overwrite or double-record the reviewer-usefulness columns. The content-blind
 `request_log` row is written afterward, best-effort, in a separate durability path.
 
-**Errors:** unknown `id` → `404 not_found`; guest / monitor / owner-agent / static admin /
-implicit-admin → `403 route_not_allowed`; bad content type, JSON, enum, notes, or extra field →
+**Errors:** unknown `id` → `404 not_found`; guest / monitor / owner-agent / static admin →
+`403 route_not_allowed`; no bearer → `401 invalid_api_key`; bad content type, JSON, enum, notes, or extra field →
 `400 invalid_request_error`; oversized body → `413 payload_too_large`; wrong task type, shadow,
 superseded, missing verifier, or differing overwrite → `409 reviewer_usefulness_conflict`.
 
@@ -769,5 +769,5 @@ held by the running process; an ordinary checkout reports `null`. It is source
 identity, not proof that deployment probes passed. The mutable `.deployed-commit`
 remains the deployment acceptance marker. Embedding clients pin this revision before each
 call. Other guests and inference-scoped keys (including owner inference keys whose access is only
-the implicit empty-allow-list grant), implicit admins and legacy static admins receive no
+the implicit empty-allow-list grant), and legacy static admins receive no
 `gateway` field. `inferenceObservation` stays limited to owner agent/admin keys. `Cache-Control: no-store` applies; no inference or administrative log access is needed.

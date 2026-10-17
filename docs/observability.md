@@ -242,7 +242,7 @@ it is captured **only** for the operator's own real, deliberately-minted owner k
 tier === "owner" && keyHash !== null
 ```
 
-which excludes implicit-admin and legacy static admins (both `keyHash === null`) and **never** logs
+which excludes legacy static admins (`keyHash === null`) and **never** logs
 guests. Gate: `HOMESERVER_OWNER_REQUEST_LOG` (`on` | `off`, default `on`). The observability layer
 does not change this guard or widen content capture. MCP `ask` owner opt-in native reasoning
 (`#441`) is returned separately and is not added to any content log, metrics, request log or

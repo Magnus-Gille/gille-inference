@@ -57,23 +57,28 @@ requires an explicitly approved host adapter; it does not change the live deploy
 | Layer | How | Notes |
 |---|---|---|
 | Transport / TLS / DDoS | **configure** Cloudflare Tunnel | `cloudflared`, see `cloudflared/config.example.yml` |
-| Edge rate-limit | **configure** Cloudflare WAF rules on `/v1/*` **and** `/portal/redeem` | free tier; blunt per-IP volumetric cap. `/portal/redeem` is the unauthenticated invite surface — see step 5 |
+| Edge rate-limit | **configure** Cloudflare WAF rules on `/v1/*` **and** `/portal/redeem` | free tier; blunt per-IP volumetric cap. `/portal/redeem` is the unauthenticated invite surface — see step 6 |
 | Identity + quota + admission | **built** — `src/homeserver/gateway.ts` | per-key bearer, owner≻guest, 429/503 |
 | Model serving / hot-swap | **deployed** llama-swap → llama-server | binds loopback; gateway is the stable serving seam |
 
 ## Order of operations
 
-1. **Run the gateway** (configured listener): `tsx src/homeserver/cli.ts serve`
-   - Configure it first via env — see `env.example`. Copy to `.env`, `chmod 600`.
-2. **Mint the first owner key for yourself** (loopback bootstrap):
+1. **Configure the gateway** via env — see `env.example`. Copy to `.env`, `chmod 600`.
+2. **Mint the first owner/admin key locally** before starting a non-loopback gateway or using
+   protected HTTP administration:
    ```bash
-   tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner
+   tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner --scope admin
    ```
-   The plaintext key is shown **once**; only its SHA-256 hash is stored.
-3. **Mint a guest key per friend** (see `ONBOARDING.md`).
-4. **Stand up the Tunnel**: `cloudflared tunnel create llm`, route DNS
+   The plaintext key is shown **once**; only its SHA-256 hash is stored. Owner keys default to
+   `agent` scope, which cannot call `/admin/*`; use `--scope admin` explicitly when operator routes
+   are required. A keyless loopback listener can start for setup, but every protected HTTP route
+   still requires a bearer key. The CLI mints directly into the local keystore and is the bootstrap
+   path; no anonymous HTTP admin/bootstrap route exists.
+3. **Run the gateway** (configured listener): `tsx src/homeserver/cli.ts serve`.
+4. **Mint a guest key per friend** (see `ONBOARDING.md`).
+5. **Stand up the Tunnel**: `cloudflared tunnel create llm`, route DNS
    `inference.example.com`, point ingress at `http://127.0.0.1:8080`, run as a service.
-5. **Add the WAF rate-limit rules** (REQUIRED) + enable Bot Fight Mode in the
+6. **Add the WAF rate-limit rules** (REQUIRED) + enable Bot Fight Mode in the
    Cloudflare dashboard. Add **two** rules:
    - `/v1/*` — blunt per-IP volumetric cap on the inference surface.
    - `/portal/redeem` — e.g. **>10 requests / 10 min per IP → block**. This is the
@@ -851,12 +856,13 @@ fail-closed rollback with zero production impact** — issues #37 and #38 fixed 
      already set to the box's tailnet interface (issue #23), so this now resolves the REAL listener
      automatically instead of defaulting to `http://127.0.0.1:8080` while the gateway binds only the
      tailnet address.
-   - **Admin key** — `ROUTING_LIFECYCLE_ADMIN_KEY` is checked first; `HOMESERVER_OWNER_KEY` (the same
-     owner-tier bearer-key convention this runbook already uses for the capability smoke test above)
-     is the fallback. **Neither is guaranteed to be present in the deployed gateway `.env` today** —
-     confirm on the box and add whichever is missing:
+   - **Admin key** — `ROUTING_LIFECYCLE_ADMIN_KEY` is checked first; `HOMESERVER_OWNER_KEY` can be
+     the fallback only when it contains an owner-tier key with `admin` scope. Owner-tier keys default
+     to `agent` scope, which cannot call `/admin/*`.
+     **Neither is guaranteed to be present in the deployed gateway `.env` today** — confirm on the
+     box and add whichever is missing:
      ```bash
-     tsx src/homeserver/cli.ts keys mint --alias routing-lifecycle-cli --tier owner
+     tsx src/homeserver/cli.ts keys mint --alias routing-lifecycle-cli --tier owner --scope admin
      # add the printed key to /home/magnus/home-server-eval/.env as ROUTING_LIFECYCLE_ADMIN_KEY=<key>
      # (or reuse an existing HOMESERVER_OWNER_KEY value already exported for deploy-gateway.sh)
      ```
@@ -864,7 +870,7 @@ fail-closed rollback with zero production impact** — issues #37 and #38 fixed 
      hardcoded/fabricated key, and never a silent skip of authentication.
 
 **What the deployed `.env` must contain for a zero-flag/cron `adopt`:** `ROUTING_LIFECYCLE_ADMIN_KEY`
-(or `HOMESERVER_OWNER_KEY`) set to an owner-tier bearer key, and `HOMESERVER_HOST` set to the box's
+(or `HOMESERVER_OWNER_KEY`) set to an owner-tier `admin`-scope bearer key, and `HOMESERVER_HOST` set to the box's
 tailnet interface (already true per the "Access-control posture" note above this file). Nothing else
 is required — `--gateway-url` and `--calibration-gate` remain available as explicit overrides for a
 one-off or non-standard run.

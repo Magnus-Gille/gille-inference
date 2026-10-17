@@ -70,8 +70,7 @@ beforeAll(async () => {
   // High per-IP public throttle so this suite's many same-IP redeem/GET hits aren't throttled;
   // the throttle's 429 behaviour is exercised in its own isolated suite with a low limit.
   process.env["HOMESERVER_REDEEM_RPM"] = "10000";
-  // Keystore-only: no static keys. A store key is minted before startGateway so listKeys()
-  // is non-empty at bind time (otherwise loopback bootstraps implicit-admin).
+  // Keystore-only: no static keys. Seed an explicit key before starting the gateway.
   delete process.env["HOMESERVER_API_KEYS"];
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
 
@@ -84,7 +83,7 @@ beforeAll(async () => {
   redeemInvite = ks.redeemInvite;
   InviteInvalidError = ks.InviteInvalidError;
 
-  // Seed a key so the gateway does not fall into implicit-admin bootstrap.
+  // Seed a key for authenticated portal administration cases.
   mintKey({ alias: "portal-seed-owner", tier: "owner" }, DEFAULTS);
 
   const gw = await import("../src/homeserver/gateway.js");

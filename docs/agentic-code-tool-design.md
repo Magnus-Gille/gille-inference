@@ -280,7 +280,7 @@ Sandbox lifecycle:
 
 | Control | Mechanism | Where |
 |---|---|---|
-| Owner-agent only | `principal.tier === "owner" && principal.keyHash !== null && principal.scope ∈ {"agent","admin"}`. Tier/key identity preserves the owner-content boundary; scope supplies route authority. Implicit-admin and legacy static keys remain excluded. | `mcp.ts` — both `toolDefs(principal)` filtering **and** `callTool()` dispatch |
+| Owner-agent only | `principal.tier === "owner" && principal.keyHash !== null && principal.scope ∈ {"agent","admin"}`. Tier/key identity preserves the owner-content boundary; scope supplies route authority. Legacy static keys remain excluded. | `mcp.ts` — both `toolDefs(principal)` filtering **and** `callTool()` dispatch |
 | Invisibility | Guests never see the tools in `tools/list`; direct `tools/call` returns the **byte-identical unknown-tool error** (never "forbidden", which leaks existence) | `mcp.ts:515` dispatch |
 | Feature flag | `HOMESERVER_CODE_LOOP=off` default — a deploy without box provisioning is inert | `config.ts` |
 | Seed containment | Hardened lexical + realpath + `wx` checks (§5) | `code-loop.ts` |

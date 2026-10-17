@@ -306,10 +306,10 @@ describe("MCP ask exact execution feedback handles", () => {
     });
   });
 
-  it("does not mint a handle for loopback implicit-admin", async () => {
+  it("requires a bearer after the last key is revoked on a keyless loopback listener", async () => {
     if (stopGateway !== null) await stopGateway();
     // Keep the existing connection: quota's process-local schema guard is intentionally
-    // one-shot, while the gateway restart still exercises the frozen implicit-admin posture.
+    // one-shot, while the gateway restart exercises the no-key protected-route boundary.
     const { revokeKey } = await import("../src/homeserver/keystore.js");
     revokeKey("feedback-mcp-agent");
     revokeKey("feedback-mcp-admin");
@@ -322,8 +322,17 @@ describe("MCP ask exact execution feedback handles", () => {
     gatewayPort = handle.port;
     stopGateway = handle.stop;
 
-    const result = await ask(undefined, "implicit-model", "implicit prompt");
-    expect(result.result.isError).toBe(false);
-    expect(result.result.structuredContent?.feedback_handle).toBeUndefined();
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "anonymous-ask",
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "no-token-model", prompt: "no-token prompt" } },
+      }),
+    });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_api_key" } });
   });
 });

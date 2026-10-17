@@ -56,7 +56,7 @@ beforeAll(async () => {
 
   const ks = await import("../src/homeserver/keystore.js");
   mintKey = ks.mintKey;
-  // Seed a store key so the gateway does not bootstrap implicit-admin on loopback.
+  // Seed a store key for authenticated feedback cases.
   mintKey({ alias: "feedback-seed-owner", tier: "owner" }, DEFAULTS);
 
   const quota = await import("../src/homeserver/quota.js");

@@ -40,8 +40,9 @@ rendered prompt (with Hugin's wrapping applied) never appears anywhere in the lo
 
 ## Lookup API
 
-`POST /admin/task-exposures/lookup` requires a real minted owner key. Guest, monitor, legacy static
-admin, and implicit-admin principals are denied. The route is read-only: schema migration and
+`POST /admin/task-exposures/lookup` requires a real minted owner key. Guest, monitor, and legacy
+static admin principals are denied; requests without a bearer key receive `401 invalid_api_key`.
+The route is read-only: schema migration and
 historical import happen before the gateway binds its port.
 
 Request — `fingerprints` (0–100 unique rendered-prompt labels) and/or `canonical` (0–100 canonical

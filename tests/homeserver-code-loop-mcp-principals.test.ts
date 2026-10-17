@@ -157,23 +157,20 @@ describe("code_loop MCP principal boundaries (#137)", () => {
     expect(direct).toBe(list);
   });
 
-  it("keeps loopback implicit-admin outside MCP visibility and direct code_loop calls", async () => {
-    // A separate zero-credential loopback startup is the only posture where implicit admin exists.
+  it("requires a bearer for MCP on a zero-credential loopback startup", async () => {
     if (stopGateway !== null) await stopGateway();
     initDb(join(mkdtempSync(join(tmpdir(), "hs-code-loop-implicit-")), "test.db"));
     delete process.env["HOMESERVER_MONITOR_API_KEYS"];
     const { resetConfig } = await import("../src/homeserver/config.js");
     resetConfig();
     const { startGateway } = await import("../src/homeserver/gateway.js");
-    const implicit = await startGateway();
-    gatewayPort = implicit.port;
-    stopGateway = implicit.stop;
+    const keyless = await startGateway();
+    gatewayPort = keyless.port;
+    stopGateway = keyless.stop;
 
     const list = await rpcRaw(gatewayPort, { jsonrpc: "2.0", id: 4, method: "tools/list" });
     const direct = await rpcRaw(gatewayPort, callBody(5, "code_loop_start"));
-    expect(list).not.toContain("code_loop");
-    expect(direct.replace("code_loop_start", "§")).toBe(
-      (await rpcRaw(gatewayPort, callBody(5, "zz_no_such_tool"))).replace("zz_no_such_tool", "§"),
-    );
+    expect(JSON.parse(list)).toMatchObject({ error: { code: "invalid_api_key" } });
+    expect(JSON.parse(direct)).toMatchObject({ error: { code: "invalid_api_key" } });
   });
 });

@@ -10,8 +10,7 @@ import { initDb } from "../src/db.js";
  *
  * This file deliberately runs the gateway in the *keystore-only* configuration:
  * HOMESERVER_API_KEYS / HOMESERVER_ADMIN_API_KEYS are UNSET, but at least one store key is
- * minted. In that configuration an unauthenticated request must NOT be granted implicit
- * admin — the implicit-admin bootstrap is only safe when there are truly zero credentials.
+ * minted. Protected routes still require an explicit bearer credential.
  *
  * It must use its own process (env + DB + module graph), because config is read once and
  * cached at first import, and the env here is incompatible with the spine suite's env.
@@ -87,7 +86,7 @@ function url(path: string): string {
 }
 
 describe("gateway auth bypass — keystore-only config (Fix #1)", () => {
-  it("no-token request to /admin/keys is 401, NOT implicit admin", async () => {
+  it("no-token request to /admin/keys is 401", async () => {
     const res = await fetch(url("/admin/keys"), { method: "GET" });
     expect(res.status).toBe(401);
     const j = (await res.json()) as { error: { code: string } };

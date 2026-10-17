@@ -8,7 +8,7 @@ import { initDb, getDb } from "../src/db.js";
 /**
  * OWNER-ONLY full request log suite. Mirrors the portal/mcp-test harness: a controllable stub
  * upstream (non-streaming AND SSE-streaming, chosen by the request's `stream` flag), keystore-
- * only mode (keys minted before startGateway so the gateway does not bootstrap implicit-admin),
+ * only mode (keys minted before startGateway),
  * and an ephemeral port.
  *
  * Asserts the privacy guard end-to-end:

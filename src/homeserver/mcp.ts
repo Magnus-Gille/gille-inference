@@ -313,8 +313,8 @@ const CODE_LOOP_OWNER_INSTRUCTIONS =
 
 /**
  * The code_loop owner-agent gate. A real minted owner key preserves the deliberate
- * owner-content/privacy boundary; agent or admin scope supplies route authority. Implicit-admin,
- * legacy static admins (both keyHash === null), inference scope, and guests are excluded.
+ * owner-content/privacy boundary; agent or admin scope supplies route authority. Legacy static
+ * admins (keyHash === null), inference scope, and guests are excluded.
  */
 export function isCodeLoopOwner(principal: McpPrincipal): boolean {
   return (
@@ -1111,7 +1111,7 @@ export async function runChatCompletion(
   }
 
   // OWNER-ONLY full request log. Strictly owner-tier AND a real minted key (keyHash !== null) —
-  // EXCLUDES implicit-admin / legacy static admins, and NEVER logs guests. See owner-log.ts.
+  // EXCLUDES legacy static admins, and NEVER logs guests. See owner-log.ts.
   // Owner-own content gate: the owner's minted-key traffic only (NOT guests, NOT legacy/implicit
   // admin). Reused for the owner-log AND the usage-telemetry delegation write below.
   const isOwnerContent = principal.tier === "owner" && principal.keyHash !== null;

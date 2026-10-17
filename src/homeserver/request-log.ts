@@ -39,7 +39,7 @@ export interface RequestLogRow {
   alias: string | null;
   /** "owner" | "guest" | null (non-inference / unauthenticated). */
   tier: string | null;
-  /** sha256(token) for a minted store key; null for legacy static / implicit-admin / no-key. */
+  /** sha256(token) for a minted store key; null for legacy static or no-key requests. */
   keyHash: string | null;
   /** Canonical model label — caller passes "none"/"unknown"/<catalogue id>, never a raw string. */
   model: string;
