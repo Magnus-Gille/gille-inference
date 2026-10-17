@@ -82,7 +82,7 @@ const DOCTOR_INFERENCE_PROBE_ERROR_CODES = new Set([
   "invalid_input", "malformed_mcp", "tool_error", "timeout", "network_failure",
   "upstream_error", "upstream_connection_failed", "upstream_timeout", "rate_limited",
   "quota_exhausted", "model_not_allowed", "model_unavailable", "model_temporarily_unavailable",
-  "budget_exceeded",
+  "budget_exceeded", "token_limit_reached", "completion_unconfirmed",
 ]);
 const DOCTOR_INFERENCE_PROBE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
@@ -2846,13 +2846,19 @@ async function runDoctorInferenceProbe(client, request) {
   try {
     // The client returns only sanitized probe metadata. The gateway's existing
     // authenticated-owner logging policy still applies to this synthetic ask.
-    await client.ask({
+    const result = await client.ask({
       model: request.model,
       prompt: "Reply with the single word OK.",
       max_tokens: 16,
       temperature: 0,
       traffic_purpose: "synthetic",
     });
+    if (result?.truncated === true) {
+      throw new M5ClientError("token_limit_reached", "The inference probe reached its token limit.");
+    }
+    if (result?.truncated !== false) {
+      throw new M5ClientError("completion_unconfirmed", "The inference probe completion was not confirmed.");
+    }
     return {
       status: "succeeded",
       route: request.route,

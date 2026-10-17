@@ -75,6 +75,8 @@ type DiagnoseOptions = {
   inferenceProbe?: { route: "public" | "private"; model: string };
   askFailure?: boolean;
   askSuccess?: boolean;
+  askTruncated?: boolean;
+  askUnknownCompletion?: boolean;
   askTemporaryFailure?: boolean;
   profileConfig?: { publicGatewayUrl: string; privateGatewayUrl?: string };
   visitedEndpoints?: string[];
@@ -103,6 +105,8 @@ async function diagnose({
   inferenceProbe,
   askFailure = false,
   askSuccess = false,
+  askTruncated = false,
+  askUnknownCompletion = false,
   askTemporaryFailure = false,
   profileConfig = PROFILE,
   visitedEndpoints,
@@ -169,10 +173,42 @@ async function diagnose({
       if (name === "ask") {
         askCalls += 1;
         askEndpoints.push(endpoint);
+        if (askUnknownCompletion) {
+          return rpcResult(request.id, {
+            isError: false,
+            content: [{ type: "text", text: "legacy partial answer must not escape" }],
+          });
+        }
+        if (askTruncated) {
+          return rpcResult(request.id, {
+            isError: true,
+            content: [{ type: "text", text: "The model response was truncated. Please retry." }],
+            structuredContent: {
+              model: inferenceProbe?.model ?? "safe-model",
+              text: "partial answer must not escape",
+              finish_reason: "length",
+              truncated: true,
+              metered: true,
+              usage: {
+                prompt_tokens: 5,
+                completion_tokens: 64,
+                total_tokens: 69,
+                reasoning_tokens: 17,
+                cache_creation_input_tokens: null,
+                cache_read_input_tokens: 9,
+              },
+            },
+          });
+        }
         if (askSuccess) {
           return rpcResult(request.id, {
             isError: false,
-            structuredContent: { model: inferenceProbe?.model ?? "safe-model", text: "OK" },
+            structuredContent: {
+              model: inferenceProbe?.model ?? "safe-model",
+              text: "OK",
+              finish_reason: "stop",
+              truncated: false,
+            },
           });
         }
         if (askTemporaryFailure) {
@@ -254,8 +290,12 @@ async function diagnose({
       });
     },
   });
-  expect(askCalls).toBe(askFailure || askSuccess || askTemporaryFailure ? 1 : 0);
-  if (askFailure || askSuccess || askTemporaryFailure) expect(askEndpoints).toEqual([inferenceProbe?.route]);
+  expect(askCalls).toBe(
+    askFailure || askSuccess || askTruncated || askUnknownCompletion || askTemporaryFailure ? 1 : 0,
+  );
+  if (askFailure || askSuccess || askTruncated || askUnknownCompletion || askTemporaryFailure) {
+    expect(askEndpoints).toEqual([inferenceProbe?.route]);
+  }
   return result;
 }
 
@@ -425,6 +465,45 @@ describe("m5 doctor model-discovery diagnostics", () => {
       },
     });
     expect(Number.isSafeInteger(result.inference_probe.elapsed_ms)).toBe(true);
+    expectNoTaintedContent(result);
+  });
+
+  it("fails an explicit inference probe when ask returns a token-limited partial answer", async () => {
+    const result = await diagnose({
+      inferenceProbe: { route: "private", model: "safe-model" },
+      askTruncated: true,
+    });
+    expect(result).toMatchObject({
+      status: "degraded",
+      inference: { public: "not_checked", private: "failed" },
+      inference_probe: {
+        status: "failed", route: "private", model: "safe-model",
+        diagnostic_code: "token_limit_reached",
+      },
+    });
+    expect(result.inference_probe).not.toHaveProperty("text");
+    expect(result.inference_probe).not.toHaveProperty("usage");
+    expect(result.inference_probe).not.toHaveProperty("reasoning_content");
+    expect(JSON.stringify(result)).not.toContain("partial answer must not escape");
+    expectNoTaintedContent(result);
+  });
+
+  it("does not treat legacy ask output with unknown completion as a successful probe", async () => {
+    const result = await diagnose({
+      inferenceProbe: { route: "private", model: "safe-model" },
+      askUnknownCompletion: true,
+    });
+    expect(result).toMatchObject({
+      status: "degraded",
+      inference: { public: "not_checked", private: "failed" },
+      inference_probe: {
+        status: "failed", route: "private", model: "safe-model",
+        diagnostic_code: "completion_unconfirmed",
+      },
+    });
+    expect(result.inference_probe).not.toHaveProperty("text");
+    expect(result.inference_probe).not.toHaveProperty("usage");
+    expect(JSON.stringify(result)).not.toContain("legacy partial answer must not escape");
     expectNoTaintedContent(result);
   });
 
