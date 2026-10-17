@@ -54,6 +54,7 @@ import { currentTraceHeaders } from "./tracing.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { isEmbeddingModel } from "./embedding-request.js";
 import { TOKENIZE_TOOL, runTokenize } from "./tokenize.js";
+import { parseMcpEnvelope, type JsonRpcRequest } from "./mcp-envelope.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -96,13 +97,6 @@ interface McpPostResult {
 }
 
 // ─── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────────────
-
-interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id?: string | number | null;
-  method?: unknown;
-  params?: unknown;
-}
 
 const PROTOCOL_VERSION = "2025-06-18";
 
@@ -1607,19 +1601,17 @@ async function callTool(
  * Always resolves; never throws to the gateway's top-level handler.
  */
 export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: ToolCallContext): Promise<McpPostResult> {
-  let msg: JsonRpcRequest;
-  try {
-    msg = JSON.parse(rawBody) as JsonRpcRequest;
-  } catch {
+  const parsed = parseMcpEnvelope(rawBody);
+  if (!parsed.ok) {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcError(null, PARSE_ERROR, "Parse error"));
+    if (parsed.kind === "parse") {
+      res.end(rpcError(null, PARSE_ERROR, "Parse error"));
+    } else {
+      res.end(rpcError(null, INVALID_REQUEST, "Invalid Request"));
+    }
     return { trace: badRequestTrace() };
   }
-  if (typeof msg !== "object" || msg === null || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcError(null, INVALID_REQUEST, "Invalid Request"));
-    return { trace: badRequestTrace() };
-  }
+  const msg = parsed.message;
 
   const method = msg.method;
   const isNotification = msg.id === undefined || msg.id === null;
