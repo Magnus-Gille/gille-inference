@@ -1,0 +1,82 @@
+name: Dependency compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vitest-coverage:
+    name: Vitest coverage compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install isolated coverage provider
+        run: npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts
+
+      - name: Verify Vitest and coverage provider versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          root_version="$(node -p "require('./node_modules/vitest/package.json').version")"
+          provider_version="$(node -p "require('./research/code-health-401/coverage-tooling/node_modules/@vitest/coverage-v8/package.json').version")"
+          if [[ "$root_version" != "$provider_version" ]]; then
+            echo "Vitest $root_version does not match @vitest/coverage-v8 $provider_version" >&2
+            exit 1
+          fi
+          echo "Vitest and @vitest/coverage-v8 are both $root_version"
+
+      - name: Link isolated coverage provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/@vitest
+          provider_link='../../research/code-health-401/coverage-tooling/node_modules/@vitest/coverage-v8'
+          provider_target='node_modules/@vitest/coverage-v8'
+          if [[ -e "$provider_target" || -L "$provider_target" ]]; then
+            if [[ ! -L "$provider_target" || "$(readlink "$provider_target")" != "$provider_link" ]]; then
+              echo 'unexpected existing Vitest coverage provider; refusing to replace it' >&2
+              exit 1
+            fi
+          else
+            ln -s "$provider_link" "$provider_target"
+          fi
+
+      - name: Run scoped Vitest coverage
+        run: ./node_modules/.bin/vitest run --config research/code-health-401/vitest.coverage.config.mjs
+
+      - name: Verify unimported image sidecar coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const summaryPath = 'research/code-health-401/artifacts/correction/ts-coverage-scoped/coverage-summary.json';
+          const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+          const expectedSourcePath = path.resolve('src/homeserver/image-sidecar.ts');
+          const matchingKeys = Object.keys(summary).filter((key) => key === expectedSourcePath);
+          if (matchingKeys.length !== 1) {
+            throw new Error(`coverage summary must include exactly one entry for ${expectedSourcePath}`);
+          }
+          const imageSidecar = summary[matchingKeys[0]];
+          const lines = imageSidecar?.lines;
+          if (!lines || lines.covered !== 0 || !Number.isFinite(lines.total) || lines.total <= 0) {
+            throw new Error(`coverage summary must report ${expectedSourcePath} with zero covered lines and a positive total`);
+          }
+          console.log(`verified ${summaryPath}: image-sidecar.ts has ${lines.total} lines and 0 covered`);
+          NODE
