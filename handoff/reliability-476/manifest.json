@@ -1,0 +1,11 @@
+{
+  "artifact": "gille-inference-1.5.5.tgz",
+  "version": "1.5.5",
+  "sha256": "ab57791e70bb20ca329b49d34a1c9b3dd87f06ad6451f19770ee79a3609e799f",
+  "accepted_source": "52a73e52fa578636f508151f5e26b6a86e5021d8",
+  "reviewed_source": "e901e5856f035bc33138a4c50b0bd78f0c45c36a",
+  "source_tree": "43a351973a9d9e5b631c861864e03ba1dfa2c999",
+  "all_10_members_equal_accepted_source": true,
+  "distribution": "exact local client package; no npm publication/global installation",
+  "scope": "artifact preservation only; this branch is not a gateway release candidate"
+}
