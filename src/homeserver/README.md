@@ -181,6 +181,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /models` | user | Models on disk + loaded. Decision and embedding models appear only when enabled and explicitly granted to guest keys. |
 | `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
 | `GET /ops/summary` | **admin or monitor** | Small, durable M5 activity summary for Heimdall: current in-flight count, last-use time, trailing-24-hour and seven-day request/time totals, plus seven UTC-calendar days newest-first. Counts only admitted M5 compute rows and excludes the outer `/mcp` transport row, so one MCP ask is never counted twice. Includes the content-blind `filterEpoch` (`m5-admitted-compute-v2`) so pre-epoch route-only history is treated as a historical break. No aliases, keys, tokens, content, or per-model dimensions. |
+| `GET /ops/incidents?from=EPOCH_MS&to=EPOCH_MS&limit=N` | **minted owner-admin** | Read-only, content-blind retained request metadata for a window up to 24 hours and 500 rows. Other scopes, static-admin, and implicit legacy admin callers are denied. Responses explicitly report retained-row coverage and do not establish causality. See the [reliability diagnostics guide](../../docs/reliability-diagnostics.md). |
 | `scripts/export-m5-adoption-evidence.ts` | local operator | Read-only JSON evidence bundle for an exact full-UTC-day `[from, throughExclusive)` window. Uses the shared `m5-admitted-compute-v2` predicate, UTC-day/tier/route/node/model and exclusion reconciliation, closed adoption dimensions, a bounded current M5 task×model×verifier×source×outcome matrix, exclusive delegation state counts, current/stale/missing judge-policy coverage, cost/attribution/calibration coverage, finite privacy buckets, evidence-only maturity labels, explicit threshold states, promotion readiness, and a deterministic next action. Refuses active WAL/live snapshots and missing schema; writes only to stdout. |
 | `GET /ledger` | **admin or monitor** | The learning report + recent delegations (`recent[]` rows carry `id`, #227). Read-only monitors (e.g. Heimdall) via `HOMESERVER_MONITOR_API_KEYS`. |
 | `GET /ledger/{id}` | **admin or monitor** | The single evidence row for a `ledgerId` (`recordDelegation`'s return value, echoed by `POST /delegate` as `costTrace.delegationId`) — the join target so a caller can retrieve its exact row without timestamp matching (#227). Stamped delegate rows add the exact non-null `evidenceIdentityHash`, `learningTaskBinding:"bound"`, server admission id, and immutable `taskInstanceId` / `attemptId`; legacy rows expose an explicit `legacy` + null binding (#61). Same auth as `GET /ledger`; unknown id → bare non-reflecting `404 not_found`. Admin reads include raw `reviewerUsefulnessNotes` plus `reviewerUsefulnessNotesPresent` / `reviewerUsefulnessNoteChars`; monitor projections stay content-blind by forcing `reviewerUsefulnessNotes:null` while preserving those presence/count summaries. Populated-but-hidden legacy/ineligible reviewer-usefulness state is surfaced only as bounded `reviewerUsefulnessHidden:true` plus those note presence/count summaries; the verdict, identity, timestamp, and note bytes remain null. |
@@ -305,6 +306,11 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 | unknown / malformed | JSON-RPC `-32601` / `-32700` / `-32600` error (HTTP 200). |
 
 **Tools** (model operations respect the key's allow-list):
+
+- `model_status` — accepts one granted model and reports its content-blind residency from the
+  backend's running snapshot plus the caller's configured limits. This is read-only: it does not
+  load or infer with the model. Unknown snapshot facts stay `unknown`; see the
+  [reliability diagnostics guide](../../docs/reliability-diagnostics.md).
 
 - `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. For
   structured-capable callers it returns `structuredContent.ask_capabilities`, the **live
@@ -769,6 +775,9 @@ Everything is the OpenAI API + portal under the hood; the `hs` wrapper just hand
 SSE stream parsing, and config persistence.
 
 ## Agent client (`m5`) — secret-safe MCP and automation surface
+
+For default doctor semantics, an explicit metered inference probe, and the reliability evidence
+surfaces, see the [reliability diagnostics guide](../../docs/reliability-diagnostics.md).
 
 `client/m5.mjs` is the separate owner-agent client for Claude, Codex, and structured shell
 automation. It resolves a mandatory named profile from macOS Keychain, bridges stdio JSON-RPC only

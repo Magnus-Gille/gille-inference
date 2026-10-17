@@ -220,6 +220,10 @@
       monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
       Minted owner-agent/admin keys can read a content-blind timestamp for the last successful
       M5 inference observed in the request log; it is historical evidence, not live readiness.
+      The owner <span class="badge mono">m5 doctor</span> checks catalogue and transport by default;
+      an inference check happens only when explicitly requested for a chosen route and model. That
+      check sends one fixed synthetic request of up to 16 tokens, uses normal admission and billing,
+      and does not return the answer. An unknown or historical status is not a health guarantee.
       Optional host-memory protection checks gateway model starts, including owner delegation,
       coding jobs and admin loads; it stays off until the owner validates the memory budgets.
       The optional owner code loop has a separate, content-free user-bus transport check in
@@ -781,6 +785,8 @@ for chunk in stream:
           owner-agent/admin key, the last observed successful M5 inference timestamp. Its
           <span class="badge mono">inference</span> field remains
           <span class="badge mono">not_checked</span>: a past success does not verify this route now.
+          An owner may explicitly request one synthetic inference check for one route and model;
+          it uses normal credits, quotas, and admission and returns no answer text.
         </p>
         <p>
           <strong>Exact owner feedback:</strong> set <span class="badge mono">traffic_purpose: "organic"</span>
