@@ -16,6 +16,8 @@ import {
   waitHealthy,
 } from "../scripts/strix-speculation-experiment.js";
 
+import { hashServerArgsInvariant } from "../scripts/capture-strix-provenance.js";
+
 import {
   buildStrixSpeculationRunPlans,
   executeStrixSpeculationExperiment,
@@ -74,7 +76,7 @@ function fixture(): Record<string, unknown> {
   };
 }
 
-function cycleReport(serverArgsSha256: string, speculation: "none" | "draft-mtp", draftDepth: number | null, wallMs: number): Record<string, unknown> {
+function cycleReport(serverArgsSha256: string, speculation: "none" | "draft-mtp", draftDepth: number | null, wallMs: number, serverArgsInvariantSha256: string): Record<string, unknown> {
   const request = {
     ok: true, oraclePass: true, ttftMs: 10, totalMs: wallMs,
     promptTokens: 10, completionTokens: 10, promptTokensPerSecond: 100,
@@ -93,7 +95,7 @@ function cycleReport(serverArgsSha256: string, speculation: "none" | "draft-mtp"
     fixtureSha256: "f".repeat(64), provenanceSha256: "8".repeat(64),
     provenance: {
       schemaVersion: 1, modelArtifactSha256: "d".repeat(64), runtimeCommit: "a".repeat(40),
-      runtimeBinarySha256: "b".repeat(64), serverArgsSha256, backend: "vulkan", quant: "Q4_K_M",
+      runtimeBinarySha256: "b".repeat(64), serverArgsSha256, serverArgsInvariantSha256, backend: "vulkan", quant: "Q4_K_M",
       kernel: "test", mesaVersion: "test", rocmVersion: null, contextSize: 65_536,
       kvTypeK: "q8_0", kvTypeV: "q8_0", flashAttention: "on", batch: 2_048,
       ubatch: 512, parallelism: 1, speculation, draftDepth, cacheRamMiB: 2_048,
@@ -222,6 +224,13 @@ describe("Strix speculation experiment contract", () => {
       "-fa", "on", "-b", "2048", "-ub", "512", "-np", "1", "--cache-ram", "2048", "--metrics",
     ]));
     expect(depthOne.serverArgsSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(new Set(plans.map((plan) => plan.serverArgsInvariantSha256))).toEqual(new Set([direct.serverArgsSha256]));
+    for (const plan of plans) {
+      expect(plan.serverArgsInvariantSha256).toBe(hashServerArgsInvariant(Buffer.from(plan.serverArgv.join("\0") + "\0")));
+    }
+    const changed = structuredClone(config);
+    changed.server.batch = 1024;
+    expect(buildStrixSpeculationRunPlans(changed, "/evidence")[0]!.serverArgsInvariantSha256).not.toBe(direct.serverArgsInvariantSha256);
     expect(depthOne.outPrefix).toBe("/evidence/cycle-00-position-01-draft-mtp-1");
   });
 
@@ -298,7 +307,7 @@ describe("Strix speculation experiment contract", () => {
     const arm = plans.find((plan) => plan.arm.id === "draft-mtp-1")!.arm;
     const sha = plans.find((plan) => plan.arm.id === arm.id)!.serverArgsSha256;
     const merged = mergeStrixSpeculationCycleReports(config, arm, [0, 1, 2].map((cycle) => ({
-      cycle, armId: arm.id, report: cycleReport(sha, "draft-mtp", 1, 1_000 + cycle * 100),
+      cycle, armId: arm.id, report: cycleReport(sha, "draft-mtp", 1, 1_000 + cycle * 100, plans[0]!.serverArgsInvariantSha256),
     })));
 
     expect(merged.batches.map((batch) => batch.repetition)).toEqual([0, 1, 2]);
@@ -310,7 +319,7 @@ describe("Strix speculation experiment contract", () => {
     const config = validateStrixSpeculationExperimentConfig(fixture());
     const plans = buildStrixSpeculationRunPlans(config, "/evidence");
     const arm = plans[0]!.arm;
-    const report = cycleReport(plans[0]!.serverArgsSha256, "none", null, 1_000);
+    const report = cycleReport(plans[0]!.serverArgsSha256, "none", null, 1_000, plans[0]!.serverArgsInvariantSha256);
     expect(() => mergeStrixSpeculationCycleReports(config, arm, [
       { cycle: 0, armId: arm.id, report }, { cycle: 1, armId: arm.id, report },
     ])).toThrow(/exactly 3/i);
@@ -320,6 +329,16 @@ describe("Strix speculation experiment contract", () => {
     expect(() => mergeStrixSpeculationCycleReports(config, arm, [
       { cycle: 0, armId: arm.id, report }, { cycle: 1, armId: arm.id, report: bad }, { cycle: 2, armId: arm.id, report },
     ])).toThrow(/controlled.*provenance/i);
+    const missingInvariant = structuredClone(report) as any;
+    delete missingInvariant.provenance.serverArgsInvariantSha256;
+    expect(() => mergeStrixSpeculationCycleReports(config, arm, [0, 1, 2].map((cycle) => ({
+      cycle, armId: arm.id, report: missingInvariant,
+    })))).toThrow(/provenance.*fixture digest/);
+    const changedInvariant = structuredClone(report) as any;
+    changedInvariant.provenance.serverArgsInvariantSha256 = "8".repeat(64);
+    expect(() => mergeStrixSpeculationCycleReports(config, arm, [0, 1, 2].map((cycle) => ({
+      cycle, armId: arm.id, report: changedInvariant,
+    })))).toThrow(/provenance.*fixture digest/);
     const wrongFixture = structuredClone(report) as any;
     wrongFixture.fixtureSha256 = "7".repeat(64);
     expect(() => mergeStrixSpeculationCycleReports(config, arm, [0, 1, 2].map((cycle) => ({
@@ -668,6 +687,36 @@ describe("speculation CLI deadline and receipt integration", () => {
     expect(dependencies.preflight).not.toHaveBeenCalled();
     expect(dependencies.unload).not.toHaveBeenCalled();
     await expect(runStrixSpeculationExperiment(argv, { ...dependencies, environment: {} })).rejects.toThrow(/maintenance.*deadline/i);
+  });
+
+  it("completes all rotated arms and publishes a policy under the current provenance contract", async () => {
+    const { argv, dependencies, outDir } = setup(300, 3000);
+    dependencies.runArm.mockImplementation(async (_config, plan) => ({
+      plan, report: cycleReport(plan.serverArgsSha256, plan.arm.speculation, plan.arm.draftDepth, 1000, plan.serverArgsInvariantSha256),
+      reportPath: `${plan.outPrefix}.json`, provenancePath: "test", logSha256: "0".repeat(64), logBytes: 0,
+    }));
+    await expect(runStrixSpeculationExperiment(argv, dependencies)).resolves.toBe(0);
+    expect(dependencies.runArm).toHaveBeenCalledTimes(9);
+    const receipt = JSON.parse(readFileSync(join(outDir, "receipt.json"), "utf8"));
+    expect(receipt.restoration).toMatchObject({ completed: true, readyModelIdentityVerified: true });
+    expect(receipt.deploymentStatus).toBe("not-authorized-by-evidence");
+    const policy = JSON.parse(readFileSync(receipt.policyPath, "utf8"));
+    expect(policy.cells).toHaveLength(1);
+    expect(policy.candidateServerArgsSha256).toHaveLength(2);
+  });
+
+  it("refuses complete evidence when synchronous report merging crosses the work deadline", async () => {
+    const { argv, dependencies, outDir } = setup(300, 3000);
+    dependencies.runArm.mockImplementation(async (_config, plan) => {
+      const report = cycleReport(plan.serverArgsSha256, plan.arm.speculation, plan.arm.draftDepth, 1000, plan.serverArgsInvariantSha256);
+      const batches = report.batches;
+      Object.defineProperty(report, "batches", { get: () => { vi.setSystemTime(301000); return batches; } });
+      return { plan, report, reportPath: `${plan.outPrefix}.json`, provenancePath: "test",
+        logSha256: "0".repeat(64), logBytes: 0 };
+    });
+    await expect(runStrixSpeculationExperiment(argv, dependencies)).rejects.toThrow(/deadline/);
+    const receipt = JSON.parse(readFileSync(join(outDir, "incomplete.json"), "utf8"));
+    expect(receipt).toMatchObject({ interruptedBy: "deadline", restoration: { completed: true } });
   });
 
   it("publishes both arm and restoration diagnostics in the incomplete receipt", async () => {

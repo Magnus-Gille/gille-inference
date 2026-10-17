@@ -286,6 +286,7 @@ function provenance(config: StrixSpeculationExperimentConfig, plan: StrixSpecula
     runtimeCommit: config.runtime.commit,
     runtimeBinarySha256: config.runtime.binarySha256,
     serverArgsSha256: plan.serverArgsSha256,
+    serverArgsInvariantSha256: plan.serverArgsInvariantSha256,
     backend: "vulkan",
     quant: config.model.quant,
     kernel: host.kernel,
@@ -462,7 +463,7 @@ export async function runStrixSpeculationExperiment(
     const postflight = await dependencies.preflight(config, undefined, interruption.signal, workDeadlineAt);
     enforceDeadline();
     assertSameArtifactPreflight(host, postflight);
-    if (interruptedBy !== null) throw new Error(`speculation experiment interrupted by ${interruptedBy}`);
+    enforceDeadline();
     const armMap = new Map(executions.map((item) => [item.plan.arm.id, item.plan.arm]));
     const merged = new Map<string, StrixMergedSpeculationReport>();
     for (const arm of armMap.values()) {
@@ -482,13 +483,13 @@ export async function runStrixSpeculationExperiment(
       config.benchmark.minimumUsefulWorkGainPercent / 100,
       armMap.size,
     );
-    if (interruptedBy !== null) throw new Error(`speculation experiment interrupted by ${interruptedBy}`);
+    enforceDeadline();
     const policyPrefix = `${outputRoot}/speculation-policy`;
     writeArtifactPair(
       `${policyPrefix}.json`, `${JSON.stringify(policy, null, 2)}\n`,
       `${policyPrefix}.md`, renderStrixSpeculationPolicyMarkdown(policy),
     );
-    if (interruptedBy !== null) throw new Error(`speculation experiment interrupted by ${interruptedBy}`);
+    enforceDeadline();
     atomicWrite(`${outputRoot}/receipt.json`, `${JSON.stringify({
       schemaVersion: 1,
       startedAt,
@@ -507,7 +508,7 @@ export async function runStrixSpeculationExperiment(
       },
       runs: executions.map((item) => ({
         cycle: item.plan.cycle, position: item.plan.position, armId: item.plan.arm.id,
-        serverArgsSha256: item.plan.serverArgsSha256, reportPath: item.reportPath,
+        serverArgsSha256: item.plan.serverArgsSha256, serverArgsInvariantSha256: item.plan.serverArgsInvariantSha256, reportPath: item.reportPath,
         provenancePath: item.provenancePath, serverStderrSha256: item.logSha256, serverStderrBytes: item.logBytes,
       })),
       policyPath: `${policyPrefix}.json`,

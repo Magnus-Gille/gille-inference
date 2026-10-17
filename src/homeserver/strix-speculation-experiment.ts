@@ -79,6 +79,7 @@ export interface StrixSpeculationRunPlan {
   arm: StrixSpeculationArm;
   serverArgv: string[];
   serverArgsSha256: string;
+  serverArgsInvariantSha256: string;
   outPrefix: string;
 }
 
@@ -421,6 +422,10 @@ function serverArgv(config: StrixSpeculationExperimentConfig, arm: StrixSpeculat
 export function buildStrixSpeculationRunPlans(config: StrixSpeculationExperimentConfig, outDir: string): StrixSpeculationRunPlan[] {
   const experimentArms = arms(config);
   const outputRoot = resolve(outDir);
+  // The controlled direct argv contains exactly the shared non-speculation tokens.
+  const invariantSha = createHash("sha256").update(JSON.stringify(serverArgv(config, {
+    id: "direct", speculation: "none", draftDepth: null,
+  }))).digest("hex");
   const plans: StrixSpeculationRunPlan[] = [];
   let sequence = 0;
   for (let cycle = 0; cycle < experimentArms.length; cycle++) {
@@ -434,6 +439,7 @@ export function buildStrixSpeculationRunPlans(config: StrixSpeculationExperiment
         arm,
         serverArgv: argv,
         serverArgsSha256: createHash("sha256").update(JSON.stringify(argv)).digest("hex"),
+        serverArgsInvariantSha256: invariantSha,
         outPrefix: `${outputRoot}/cycle-${String(cycle).padStart(2, "0")}-position-${String(position).padStart(2, "0")}-${arm.id}`,
       });
       sequence++;
@@ -457,6 +463,9 @@ export function mergeStrixSpeculationCycleReports(
   if (reports.length !== expectedCycles) throw new Error(`${arm.id} requires exactly ${expectedCycles} cycle reports`);
   const ordered = [...reports].sort((left, right) => left.cycle - right.cycle);
   const expectedArgvSha = createHash("sha256").update(JSON.stringify(serverArgv(config, arm))).digest("hex");
+  const expectedInvariantSha = createHash("sha256").update(JSON.stringify(serverArgv(config, {
+    id: "direct", speculation: "none", draftDepth: null,
+  }))).digest("hex");
   let canonical: ReturnType<typeof validateComparableServerReport> | null = null;
   let firstRaw: Record<string, unknown> | null = null;
   const batches: StrixServerBatch[] = [];
@@ -468,6 +477,7 @@ export function mergeStrixSpeculationCycleReports(
     const comparable = validateComparableServerReport(raw, `${arm.id}[${cycle}]`);
     if (comparable.fixtureSha256 !== config.benchmark.fixturesSha256 ||
         comparable.provenance.serverArgsSha256 !== expectedArgvSha ||
+        comparable.provenance.serverArgsInvariantSha256 !== expectedInvariantSha ||
         comparable.provenance.speculation !== arm.speculation ||
         comparable.provenance.draftDepth !== arm.draftDepth) {
       throw new Error(`${arm.id} report provenance or fixture digest does not match its reviewed arm`);
