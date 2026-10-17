@@ -1,6 +1,7 @@
 # Local verification and hosted check manifest
 
-Run `node scripts/verify-local.mjs` with Node.js 20 or newer from the repository root. It executes
+Run `node scripts/verify-local.mjs` with Node.js 22.12+ on the 22.x line or Node.js 24.x from the
+repository root. These versions satisfy both Vitest 5 and the pinned SQLite package. It executes
 these five repository checks in order, continuing after a failure:
 
 1. `npm run typecheck`
@@ -25,7 +26,7 @@ The manifest is derived from the checked-in workflow sources and validates each 
 workflow name, trigger, and job set. It fails closed when a baseline workflow or known job is
 missing, a workflow identity changes, a new unaccounted workflow appears, or the optional client
 workflow has an unrecognized matrix. Check identity is represented by `workflowName` plus
-`rawName`; display names containing spaces remain intact. The baseline contains eleven checks:
+`rawName`; display names containing spaces remain intact. The baseline contains fourteen checks:
 
 | Workflow | Raw check name | Event scope |
 | --- | --- | --- |
@@ -33,6 +34,9 @@ workflow has an unrecognized matrix. Check identity is represented by `workflowN
 | CI | `Gitleaks` | `main` or `aider-eval/base` push, pull request |
 | CI | `test` | `main` or `aider-eval/base` push, pull request |
 | Informational code health | `Collect report-only code health` | gated schedule; pull-request conformance; `main` dispatch |
+| Dependency compatibility | `Vitest coverage compatibility` | `main` push, pull request |
+| Native code-loop recovery | `Real manager and cage recovery` | `main` push, pull request |
+| Portal visual verification | `Portal desktop and mobile states` | `main` push, pull request |
 | Fixed host arbitration | `host-arbiter` | `main` push, pull request |
 | Observer test-host prerequisites | `native-boundary` | `main` push, pull request |
 | Observer test-host prerequisites | `preflight` | `main` push, pull request |
@@ -55,7 +59,12 @@ an omitted cron is marked not applicable. Monday static collection or a `main` d
 on hosted analyzer tools. Unknown or uncollected metric
 slots remain unavailable; they are never rendered as a fresh green measurement.
 
-To inspect a manifest without running commands:
+The dependency-compatibility check installs the locked root runner and isolated provider, verifies
+their matching versions, and runs the scoped coverage consumer, including the eligible unimported
+sidecar. A passing ordinary test suite does not replace this check.
+
+Manifest-only inspection does not invoke Vitest and retains Node.js 20 compatibility. To inspect a
+manifest without running commands:
 
 ```sh
 node scripts/verify-local.mjs --manifest-only --event pull_request
