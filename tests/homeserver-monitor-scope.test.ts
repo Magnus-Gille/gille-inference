@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { closeDb, initDb } from "../src/db.js";
 import {
   commitKeyRotation,
   mintKey,
@@ -11,6 +11,7 @@ import {
   stageKeyRotation,
   type KeyDefaults,
 } from "../src/homeserver/keystore.js";
+import { COMPUTE_REQUEST_FILTER_EPOCH } from "../src/homeserver/compute-request-filter.js";
 
 /**
  * Read-only MONITOR scope (gille-inference#35).
@@ -61,14 +62,16 @@ const ADMIN_KEY = "admin-key-monitor-test";
 const USER_KEY = "user-key-monitor-test";
 const MONITOR_KEY = "monitor-key-monitor-test";
 const DEFAULTS: KeyDefaults = { rpm: 1_000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+const ORIGINAL_FEEDBACK_FILE = process.env["HOMESERVER_FEEDBACK_FILE"];
 let MINTED_MONITOR_KEY = "";
 
 let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
+let runtimeDir = "";
 
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), "hs-monitor-test-"));
-  initDb(join(dir, "test.db"));
+  runtimeDir = mkdtempSync(join(tmpdir(), "hs-monitor-test-"));
+  initDb(join(runtimeDir, "test.db"));
   await startUpstream();
 
   process.env["LMSTUDIO_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
@@ -76,6 +79,8 @@ beforeAll(async () => {
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
+  // Public feedback is exercised below; keep its append-only store isolated from repository data.
+  process.env["HOMESERVER_FEEDBACK_FILE"] = join(runtimeDir, "feedback.jsonl");
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   // Static keys across all three tiers — config is read once at first import, so set before it.
@@ -96,6 +101,10 @@ beforeAll(async () => {
 afterAll(async () => {
   if (stopGateway) await stopGateway();
   await new Promise<void>((r) => upstream.close(() => r()));
+  closeDb();
+  rmSync(runtimeDir, { recursive: true, force: true });
+  if (ORIGINAL_FEEDBACK_FILE === undefined) delete process.env["HOMESERVER_FEEDBACK_FILE"];
+  else process.env["HOMESERVER_FEEDBACK_FILE"] = ORIGINAL_FEEDBACK_FILE;
 });
 
 function url(path: string): string {
@@ -297,6 +306,25 @@ describe("read-only monitor scope (#35)", () => {
     const body = (await res.json()) as { models?: unknown };
     expect(body).toHaveProperty("models");
     expect(Array.isArray(body.models)).toBe(true);
+  });
+
+  it("monitor key CAN read the content-blind M5 usage summary", async () => {
+    const res = await fetch(url("/ops/summary"), { headers: auth(MONITOR_KEY) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toHaveProperty("generatedAt");
+    expect(body).toHaveProperty("activeRequests");
+    expect(body).toHaveProperty("last24Hours");
+    expect(body).toHaveProperty("last24HoursByTier");
+    expect(body).toHaveProperty("last7Days");
+    expect(body).toHaveProperty("daily");
+    expect(body).toHaveProperty("filterEpoch", COMPUTE_REQUEST_FILTER_EPOCH);
+    expect(JSON.stringify(body)).not.toMatch(/alias|key_hash|prompt|response|content/i);
+  });
+
+  it("guest/user and anonymous callers cannot read the usage summary", async () => {
+    expect((await fetch(url("/ops/summary"), { headers: auth(USER_KEY) })).status).toBe(403);
+    expect((await fetch(url("/ops/summary"))).status).toBe(401);
   });
 
   it("monitor key still CANNOT hit a non-allowed route — GET /admin/keys stays 403", async () => {

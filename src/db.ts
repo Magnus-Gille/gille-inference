@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { assertTestPathOutsideRepositoryData, isTestRuntime } from "./test-runtime-path.js";
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -57,15 +58,27 @@ CREATE INDEX IF NOT EXISTS idx_judge_records_run ON judge_records(run_id);
 let _db: Database.Database | null = null;
 const readOnlySnapshotRoots = new WeakMap<Database.Database, string>();
 
+function configuredDbPath(dbPath?: string): string {
+  const configured = dbPath ?? process.env["EVAL_DB_PATH"];
+  if (!configured && isTestRuntime()) {
+    throw new Error(
+      "Refusing the implicit ./data/eval.db test database; pass an explicit initDb(path) or set EVAL_DB_PATH"
+    );
+  }
+  const resolved = resolve(configured ?? "./data/eval.db");
+  assertTestPathOutsideRepositoryData(resolved, "database");
+  return resolved;
+}
+
 /**
  * Open (and initialise) the SQLite database.
  * Creates the data directory and all tables if they do not yet exist.
  * Subsequent calls with no argument return the same instance.
+ * Test runtimes must provide an explicit path (or EVAL_DB_PATH); the production default is
+ * deliberately unavailable there so tests cannot mutate the repository's gitignored data tree.
  */
 export function initDb(dbPath?: string): Database.Database {
-  const resolvedPath = resolve(
-    dbPath ?? process.env["EVAL_DB_PATH"] ?? "./data/eval.db"
-  );
+  const resolvedPath = configuredDbPath(dbPath);
 
   // Ensure the parent directory exists
   mkdirSync(dirname(resolvedPath), { recursive: true });
@@ -131,9 +144,7 @@ export function initDb(dbPath?: string): Database.Database {
  * and must never turn a failed inspection into a production mutation.
  */
 export function openReadOnlyDb(dbPath?: string): Database.Database {
-  const resolvedPath = resolve(
-    dbPath ?? process.env["EVAL_DB_PATH"] ?? "./data/eval.db"
-  );
+  const resolvedPath = configuredDbPath(dbPath);
   const walPath = `${resolvedPath}-wal`;
   const assertNoActiveWal = (): void => {
     try {
@@ -211,4 +222,17 @@ export function getDb(): Database.Database {
     return initDb();
   }
   return _db;
+}
+
+/**
+ * Close and clear the process singleton.
+ *
+ * Test suites that own a temporary database should call this before removing its directory so
+ * SQLite has flushed WAL state and no later operation can accidentally reuse a closed handle.
+ * Production callers are unaffected unless they explicitly invoke this lifecycle helper.
+ */
+export function closeDb(): void {
+  const db = _db;
+  _db = null;
+  if (db?.open) db.close();
 }

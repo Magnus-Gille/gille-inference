@@ -1,5 +1,5 @@
 {
-  "_comment": "Evidence-based routing table AUTO-GENERATED from the capability ledger (delegations table, populated by cartography + nightly delegations) and the weekly Model Scout registry. 'escalate-frontier' = no reliable local model. A null model with attempts=0 is a pending hole awaiting fresh evidence, not a characterized gap.",
+  "_comment": "Evidence-based routing table AUTO-GENERATED from the capability ledger (delegations table, populated by cartography + nightly delegations) and the manual model-evaluation registry. 'escalate-frontier' = no reliable local model. A null model with attempts=0 is a pending hole awaiting fresh evidence, not a characterized gap.",
   "_generator": "scripts/generate-routing-table.ts — DO NOT hand-edit; re-run the generator. Curated safety overrides live in src/homeserver/routing-table-generator.ts (MODEL_META.unsafeFor).",
   "generatedAt": "2026-07-07T13:51:20.065Z",
   "sources": [
@@ -27,12 +27,12 @@
       "latest": "2026-07-07T13:37:13.430Z"
     },
     {
-      "source": "model-scout registry (JSONL)",
-      "path": "/srv/gille-inference/data/model-scout-registry.jsonl",
+      "source": "manual model-evaluation registry (JSONL)",
+      "path": "data/model-scout-registry.jsonl",
       "present": true,
       "records": 3,
       "latest": "2026-07-05T04:39:19.908Z",
-      "note": "fills a model's overallPass when the ledger is too thin (consume, don't race the scout)"
+      "note": "fills a model's overallPass when the ledger is too thin (consume manually collected evidence; no scheduled discovery)"
     }
   ],
   "globalRule": "Prefer NON-THINKING models, then higher pass-rate, then faster decode. Curated safety override: mellum is never selected for reason-math/reason-hard (documented math weakness) even on a passing probe. Escalate to a frontier model when no local model is viable or the evidence is still pending.",
@@ -51,7 +51,7 @@
       "tokPerSec": null,
       "verdict": "escalate-frontier",
       "attempts": 4,
-      "note": "insufficient evidence — best mellum has 1 < 3 attempts; escalating, pending more (Model Scout cron fills it)"
+      "note": "insufficient evidence — best mellum has 1 < 3 attempts; escalating, pending more evidence (manual evaluation may be requested)"
     },
     "code-review": {
       "model": null,
@@ -59,7 +59,7 @@
       "tokPerSec": null,
       "verdict": "escalate-frontier",
       "attempts": 0,
-      "note": "insufficient evidence — best mellum has 0 < 3 attempts; escalating, pending more (Model Scout cron fills it)"
+      "note": "insufficient evidence — best mellum has 0 < 3 attempts; escalating, pending more evidence (manual evaluation may be requested)"
     },
     "unit-test-gen": {
       "model": "mellum",
@@ -171,7 +171,7 @@
       "tokPerSec": null,
       "verdict": "escalate-frontier",
       "attempts": 0,
-      "note": "no ledger evidence yet — escalating to frontier; pending cartography (Model Scout cron fills it)"
+      "note": "no ledger evidence yet — escalating to frontier; pending cartography or an explicit manual evaluation"
     }
   },
   "escalateToFrontier": [
@@ -217,7 +217,7 @@
       "thinking": false,
       "role": "",
       "attempts": 0,
-      "note": "overallPass from Model Scout registry (2026-07-05); ledger has 0 attempt(s)"
+      "note": "overallPass from manual model-evaluation registry (2026-07-05); ledger has 0 attempt(s)"
     },
     "gemma4": {
       "overallPass": 0.88,
@@ -267,7 +267,7 @@
       "thinking": false,
       "role": "Qwen3.6-35B-A3B non-thinking MoE workhorse (2026-07-02 upgrade of 3.5).",
       "attempts": 0,
-      "note": "overallPass pending — no ledger evidence and no Model Scout eval yet"
+      "note": "overallPass pending — no ledger evidence and no manual model evaluation yet"
     }
   }
 }

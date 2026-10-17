@@ -139,15 +139,19 @@ describe("acquireGpuLease — FIFO ordering & lifecycle", () => {
     await lease.release();
   });
 
-  it("GUARANTEES mutual exclusion under concurrent contention (the mkdir lock)", { timeout: 30_000 }, async () => {
+  it("GUARANTEES mutual exclusion under concurrent contention (the mkdir lock)", { timeout: 60_000 }, async () => {
     // The crux of issue #88: N jobs racing for the GPU must NEVER both hold. Each acquirer, on
     // gaining the lease, asserts the shared holder-count is 0, bumps it, does a little async work,
     // then drops it and releases. If exclusion ever broke, `holders` would exceed 1.
+    // pollMs/heartbeatMs are kept modest: each poll does a readdir + a read per ticket, so 8 waiters
+    // polling every 3ms thrash the filesystem and starve each other on a loaded runner (#358). The
+    // 8 racers and the 6ms hold still force real overlap attempts; heartbeatMs stays far below the
+    // 3s staleMs floor so no live ticket is ever misjudged stale.
     let holders = 0;
     let maxHolders = 0;
     let completed = 0;
     const worker = async () => {
-      const lease = await acquireGpuLease({ model: "m", dir, pollMs: 3, heartbeatMs: 8 });
+      const lease = await acquireGpuLease({ model: "m", dir, pollMs: 15, heartbeatMs: 100 });
       holders++;
       maxHolders = Math.max(maxHolders, holders);
       await new Promise((r) => setTimeout(r, 6)); // hold briefly so overlaps would be observed

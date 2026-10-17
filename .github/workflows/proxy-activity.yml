@@ -1,0 +1,100 @@
+name: Pinned proxy activity fixture
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxy-activity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proxy-activity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: https://proxy.golang.org
+      GOSUMDB: sum.golang.org
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+      - name: Test private channel and counter without external modules
+        run: |
+          GOPROXY=off GO111MODULE=off go test -race ./runtime-patches/llama-swap/overlay/internal/installactivity
+          GOPROXY=off GO111MODULE=off go vet ./runtime-patches/llama-swap/overlay/internal/installactivity
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: mostlygeek/llama-swap
+          ref: 079c35ae82fb2816d319f7bd16936675597b262d
+          path: upstream
+          persist-credentials: false
+      - name: Verify exact source and stage owned overlay
+        working-directory: upstream
+        run: |
+          test "$(git rev-parse HEAD)" = 079c35ae82fb2816d319f7bd16936675597b262d
+          test "$(git rev-parse 'HEAD^{tree}')" = a568316518dcb9d773728555c8cde000fe5f3328
+          test ! -e internal/installactivity
+          cp -R ../runtime-patches/llama-swap/overlay/. .
+          git apply --check ../runtime-patches/llama-swap/instrumentation.patch
+      - name: Build required synthetic process fixture
+        working-directory: upstream
+        run: |
+          mkdir -p build
+          go build -mod=readonly -o build/simple-responder_linux_amd64 cmd/simple-responder/simple-responder.go
+          test -x build/simple-responder_linux_amd64
+      - name: Prove regression tests reject uninstrumented upstream
+        working-directory: upstream
+        run: |
+          if go test -mod=readonly -run '^TestInstall' ./internal/server ./internal/process ./internal/event > "$RUNNER_TEMP/proxy-red.log" 2>&1; then
+            echo 'Uninstrumented upstream unexpectedly passed'; exit 1
+          fi
+          # Require a behavioral assertion; compiler/dependency errors are not red evidence.
+          grep -F 'accepted body/handler waiting is not accounted before dispatch' "$RUNNER_TEMP/proxy-red.log"
+      - name: Apply patch and verify instrumentation and existing contracts
+        working-directory: upstream
+        run: |
+          git apply ../runtime-patches/llama-swap/instrumentation.patch
+          go test -mod=readonly -race -run '^TestInstall' ./internal/server ./internal/process ./internal/event
+          go test -mod=readonly -race -skip '^TestInstall' ./internal/installactivity ./internal/event ./internal/router/... ./internal/process ./internal/server
+      - name: Build complete candidate including pinned UI dependencies
+        working-directory: upstream
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          npm run build --prefix ui
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -tags embed_ui \
+            -ldflags='-X main.version=v262-gille-observation -X main.commit=079c35ae82fb2816d319f7bd16936675597b262d -X main.date=2026-10-11T00:00:00Z' \
+            -o "$RUNNER_TEMP/llama-swap-observer" .
+          sha256sum "$RUNNER_TEMP/llama-swap-observer" ../runtime-patches/llama-swap/instrumentation.patch go.sum ui/package-lock.json
+          echo 'Candidate build only; no observer qualification or deployment.'
+      - name: Prove fatal startup cleanup with built candidate and regression mutation
+        working-directory: upstream
+        run: |
+          cp llama-swap.go "$RUNNER_TEMP/llama-swap-reviewed.go"
+          trap 'cp "$RUNNER_TEMP/llama-swap-reviewed.go" llama-swap.go' EXIT
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('llama-swap.go')
+          s = p.read_text()
+          before = '\t\tcloseObserver()\n\t\tos.Exit(code)'
+          assert s.count(before) == 1
+          p.write_text(s.replace(before, '\t\tos.Exit(code)'))
+          PYCODE
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -tags embed_ui -o "$RUNNER_TEMP/llama-swap-stale-mutant" .
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            python3 ../runtime-patches/llama-swap/test-startup-cleanup.py "$RUNNER_TEMP/llama-swap-stale-mutant" --expect-stale
+          cp "$RUNNER_TEMP/llama-swap-reviewed.go" llama-swap.go
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            python3 ../runtime-patches/llama-swap/test-startup-cleanup.py "$RUNNER_TEMP/llama-swap-observer"

@@ -2,6 +2,8 @@
 
 **Issue:** #116 · **Acceptance (§11): ✅ PASSED 2026-07-02** — Gate D through code_loop: rounds 8/9/10 of 10, median 9 ≥ bar 9, same-day direct baseline 10/10 (`docs/gate-d-code-loop-acceptance-2026-07-02.md`) · **Status:** FINAL (synthesized from three candidate designs + three adversarial judge lenses) · **Date:** 2026-07-02
 
+> **Historical design and acceptance record.** The July 2 FINAL and Gate D acceptance above remain the dated record; they are not fresh verification of today's cage. Some design and review dispositions below were superseded as the implementation evolved. In particular, the `IPAddressDeny`/gateway-host allow disposition (S5) and tailnet `baseUrl` (O2) describe the historical design, not the current cage: systemd supplies resource limits, while `pasta` forwards an in-cage loopback port through the gateway relay. See the [current cage operations](../src/homeserver/README.md#code_loop--owner-agent-sandboxed-agentic-coding-116) and [cage implementation](../src/homeserver/code-loop-cage.ts).
+
 ---
 
 ## 1. Chosen architecture and why
@@ -93,6 +95,7 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   "instruction": "string (required — the task prompt)",
   "files": [{"path": "src/x.ts", "content": "..."}],
   "check_cmd": "npx --no-install tsx test/oracle.ts",
+  "writable": ["src/**"],
   "protected": ["test/**", "tsconfig.json"],
   "task_type": "code-implement",
   "caps": {"wall_s": 480, "turns": 24, "completion_tokens": 60000, "edit_deadline_turn": 6}
@@ -110,8 +113,29 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   singleton provides the separate cross-process paid-run lease: `BEGIN IMMEDIATE` makes dead-owner
   takeover atomic, and release deletes only its matching owner token/work id.
 - `check_cmd`: optional, owner-authored (never model-generated), run in the sandbox **inside the same cage** post-loop, 120 s cap.
+- `schema_checks`: v9 requires 1–8 named owner behavioral oracles for resolved `unit-test-gen`.
+  Each `{name, command}` expects exit zero. Commands are snapshotted before async admission,
+  included in durable request identity, and run inside the same cage with a shared additional
+  120-second budget. The original check still runs independently, including eligible cap exits.
+  Failed/skipped `schema_grounding` withholds diff/summary and prevents ledger pass. Owners must
+  protect reference/oracle files and supply actual behavioral checks, including mutant rejection;
+  command presence or source keywords alone cannot prove schema grounding. Reconstructed #260
+  fixtures are labelled as such: the original historical output was unavailable after restart.
+- `writable`: optional enforceable relative POSIX path/glob allowlist for returned changes. Omission
+  means exact seeded files only. Admission rejects traversal, alternate separators, `.git`,
+  overlong/unbounded scope lists, and ambiguous seed spellings before a durable claim.
 - `protected`: optional globs; violations detected at exit (§6), never silently passed.
-- `caps` are clamped to hard maxima `wall_s ≤ 900`, `turns ≤ 40`, `completion_tokens ≤ 120000`. Default wall-clock is 480 s (delivery-lens must-fix), sized to tolerate 1–2 mid-loop model swaps (§8). `edit_deadline_turn` is optional, strictly positive, and must be ≤ effective `turns`; omission preserves the original prompt/behavior. When present, a stable policy wrapper asks for the first edit/write by that overall turn and the monitor deterministically returns `cap-exceeded` + `failure_kind:edit-deadline` if no successful mutation event arrives.
+- `caps` are clamped to hard maxima `wall_s ≤ 900`, `turns ≤ 40`, `completion_tokens ≤ 120000`. Default wall-clock is 480 s (delivery-lens must-fix), sized to tolerate 1–2 mid-loop model swaps (§8). The turn budget is global across a serving-degeneracy retry and reported usage never includes the over-cap `turn_start` enforcement signal. A stable completion-pressure wrapper asks the agent to begin wrapping up two turns early. `edit_deadline_turn` is optional, strictly positive, and must be ≤ effective `turns`; omission preserves the edit-deadline behavior. When present, a stable policy wrapper asks for the first edit/write by that overall turn and the monitor deterministically returns `cap-exceeded` + `failure_kind:edit-deadline` if no successful mutation event arrives. A clean exit with no successful mutation is the same non-converging outcome (never a silent `completed` with an empty diff); the detail carries a stable `no relevant edit attempted` prefix plus content-blind discovery/turn counts, while `failure_kind:edit-deadline` + `mutation_evidence:none` stays the machine-readable reason distinguishing it from a patch that failed verification (#240). Enforcement fires when the deadline turn ends (a stalled run cannot consume the wall cap), and a successful first-attempt mutation satisfies the deadline globally, exempting the degeneracy retry.
+- Optional `caps.total_wall_s` is a strict integer 90–900 seconds, measured from the gateway's
+  start invocation before asynchronous admission. Its shared work cutoff reserves the final
+  75 seconds for TERM/KILL, exact-unit stop/absence, lease release and bounded provenance lookup.
+  Each subsequent engine/check invocation receives a newly tightened cgroup lifetime and the
+  same stop signal. No new verifier or retry starts after cutoff; an acquired late lease is
+  released. Timeout output is withheld, cleanup uncertainty is durable and never a successful
+  completion. `execution.whole_job` reports a monotonic pre-persistence observation and cleanup status; acceptance
+  also measures dispatch-to-terminal/cleanup externally, including transport and polling time.
+  Verify the live input schema supports this optional field before dispatch. A client timeout
+  alone neither cancels an accepted job nor proves cleanup.
 
 Returns immediately with `work_id`, `status`, `client_run_id`, `request_fingerprint`, `recovered`,
 and versioned capabilities. A terminal idempotent retry also carries the original `result`. A new
@@ -130,19 +154,22 @@ an ambiguous retry never starts or spends twice.
 ```json
 {
   "status": "completed" | "cap-exceeded" | "degenerate" | "arm-error" | "orphaned",
+  "completion_state": "complete" | "unfinished",
   "diff": "unified git diff vs seed commit, ≤200KB (truncated flag if over)",
   "changed_files": ["src/x.ts"],
+  "scope_violations": [],
   "protected_violations": [],
   "summary": "pi's final assistant message (≤2KB)",
-  "check": {"ran": true, "exit_code": 0, "output_tail": "last 4KB"} ,
+  "check": {"ran": true, "exit_code": 0, "output_tail": "last 4KB", "skip_reason": null} ,
+  "schema_grounding": {"schema_version": 1, "state": "not-requested", "checks": []},
   "usage": {"turns": 7, "wall_ms": 183000, "prompt_tokens": 41200, "completion_tokens": 21384},
   "execution": {
     "schema_version": 1,
     "model": "qwen3-coder-next-80b",
     "engine": "pi",
-    "harness_version": "code-loop-pi-2026-07-14-v6",
+    "harness_version": "code-loop-pi-2026-09-05-v9",
     "effective_caps": {"wall_s": 480, "turns": 24, "completion_tokens": 60000, "edit_deadline_turn": 6},
-    "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3"}
+    "capabilities": {"start_idempotency": "client-run-id-v1", "agent_checks": "pi-bash-events-v3", "result_scope": "writable-v1", "completion_accounting": "bounded-turns-v1"}
   },
   "telemetry": {
     "schema_version": 1,
@@ -175,10 +202,22 @@ an ambiguous retry never starts or spends twice.
 
 Semantics:
 - The owner-visible `code_loop_start` tools/list description advertises the exact pre-paid
-  contract `contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
+  contract `contract[harness=code-loop-pi-2026-09-05-v9;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`, so an orchestrator can fail before inference against an old gateway.
 - **The diff is the deliverable** (hard constraint 5). The caller reviews and applies it (`git apply`) to its own checkout. Nothing on the box ever touches a live repo.
-- Ground truth for the diff is always git (`git add -A && git diff --cached <seed-sha>` in the sandbox), never pi's event claims.
+- Ground truth is the host-owned trusted Git baseline, never the agent-writable repository or pi's
+  event claims. Rename pairs are parsed as one logical change and both endpoints must be writable;
+  a rejected logical change never contributes bytes to the returned diff.
+- Generated cache/bytecode is omitted as hygiene without becoming a scope violation or suppressing
+  `check_cmd`. Harness metadata is never returned, but remains visible to `protected` reporting.
 - First-edit timing is taken from the pinned pi NDJSON `tool_execution_start` for `edit`/`write`, but becomes trusted only when the matching `tool_execution_end` succeeds. A git diff without that pair is reported as `mutation_evidence:"diff-only"`; timing fields stay absent. Retry turns and elapsed time are aggregated from the original attempt, while `phase_ms.check` measures only the M5-side owner check.
+  A shell-created diff does **not** satisfy `edit_deadline_turn`: that policy requires a
+  successful `edit`/`write` event, not merely changed bytes at harvest. Therefore a clean early
+  exit can return `cap-exceeded` / `edit-deadline` alongside a valid diff and passed owner/schema
+  checks. This is a policy failure, not proof that the wall-clock limit elapsed. The diagnostic's
+  `no relevant edit attempted` prefix refers to observed edit/write events; it must not be read
+  as proof that the filesystem stayed unchanged. Missing events alone do not prove which tool
+  actually changed the file.
+
 - `agent_checks` is immutable, content-blind **agent-side** evidence from actual pi `bash`
   `tool_execution_start`/`tool_execution_end` pairs. It records only a normalized kind, command
   digest, relative timing, order, result status, and observed exit code. Pi 0.70.2 does not emit a
@@ -194,7 +233,28 @@ Semantics:
   exposes command text, paths, source, prompt, stdout/stderr, or secrets. The gateway-owned
   post-loop `check_cmd` remains the separate `check` field.
 - On every non-`completed` terminal status the diff is still harvested best-effort — a partial diff is data and possibly still useful.
-- `status` describes the *run*; verification lives in `check`. There is deliberately no `"pass"` status: `completed` + `check.exit_code === 0` is the only pass signal, and absence of a `check_cmd` can never be reported as verified (this fixes free-choice's self-contradicting status enum).
+- `status` describes the *run*; verification lives in `check` and `schema_grounding`.
+  There is deliberately no `"pass"` status. Ledger pass requires completed + successful
+  `check_cmd` and, when requested, successful schema checks. Missing `check_cmd` remains
+  unverified; failed/skipped schema checks cannot be overridden by syntax-check success.
+
+### Synthetic schema-release compatibility controls
+
+[`buildSchemaReleaseSmoke`](../tests/fixtures/code-loop-release-smoke.ts) builds local-only
+positive/negative request fixtures; it does not submit jobs or grant operational authority.
+It explicitly requests the `write` tool for an exact `smoke.txt` marker rather than the ambiguous
+instruction "append", which a model can implement using shell redirection. Both arms protect the
+same reconstructed implementation and suite paths and differ only in the deliberate oracle control
+and caller-supplied durable run ID. They retain the edit deadline, scope restrictions and bounded
+caps. A new instruction is a new request: do not reuse an old durable ID with changed bytes or
+silently retry an already accepted operational envelope.
+
+The positive control requires `completed`, the exact marker diff, and successful compile/schema
+checks. The negative control must compile but fail the behavioral oracle by assertion, withholding
+diff and summary. A cap outcome is never a positive-control pass, even if the checks pass.
+Keep the release acceptance validator strict. These controls test synthetic compatibility, not
+organic usefulness or model-generated test quality. Deterministic simulated bash/write event
+tests establish the contract but are not a reconstruction of a captured live event stream.
 
 ---
 
@@ -225,6 +285,7 @@ Sandbox lifecycle:
 | Feature flag | `HOMESERVER_CODE_LOOP=off` default — a deploy without box provisioning is inert | `config.ts` |
 | Seed containment | Hardened lexical + realpath + `wx` checks (§5) | `code-loop.ts` |
 | Runtime containment | The OS cage (below) — **not** lexical checks; pi's `write`/`edit`/`bash` are unmediated subprocess operations, so containment must be at the OS layer | `code-loop-cage.ts` |
+| Writable result scope | Independent `writable` path/glob allowlist (seeded-only when omitted); host-owned harvest returns only complete logical changes whose paths all pass scope and containment, and reports rejected paths as `scope_violations` | `code-loop.ts` |
 | Protected paths | Exit-time diff of `protected` globs against the seed commit → any touch lands in `protected_violations` and disqualifies `check` pass (native-driver's belt-and-braces, adapted: with pi we cannot mediate writes in-process, so exit verification is the honest enforcement point) | `code-loop.ts` |
 | Env scrubbing | pi is spawned with a minimal env: `PATH`, `HOME=<sandbox>`, `PI_CODING_AGENT_DIR`, `HS_API_KEY=<service key>`. No `OPENROUTER_API_KEY`, no gateway `.env` inheritance. `--no-session` ⇒ no pi session artifacts. `check_cmd` gets `PATH`/`HOME` only — not even `HS_API_KEY` | `pi-engine.ts` |
 | Key blast radius | Service and harness keys are owner-tier with `scope=agent`, model-allow-listed, quota-bounded, independently aliased, and independently revocable. They retain owner logging/priority but cannot use `/admin/*` or `/ledger`. | keystore |
@@ -266,15 +327,18 @@ pi's four tools are `read`/`write`/`edit`/`bash`; the read→edit→**run** loop
 | Subprocess memory / tasks | 8 G / 256 | — | systemd scope `MemoryMax`/`TasksMax` |
 | Concurrency | exactly 1 run | — | Module-level mutex; second `start` → `busy` (no parallel spawns — 2026-07-01 OOM lesson) |
 
-Cap breach ⇒ `cap-exceeded`, diff still harvested, sandbox retained.
+Cap breach ⇒ `cap-exceeded` + `completion_state:"unfinished"` + a machine-readable
+`telemetry.failure_kind`; the diff is still harvested and a scope-clean owner `check_cmd` still
+runs within its separate 120-second cage budget. `check.skip_reason` explains every skipped check.
 
 ---
 
 ## 8. GPU + admission integration
 
-- **GPU lease (whole run):** `acquireGpuLease({model, purpose: "code-loop", …})` (`gpu-lease.ts:318`) wraps the entire run with a 60 s acquire timeout (else `lease-unavailable`); `onLeaseLost` → SIGTERM the process group → `arm-error`, diff harvested. This sequences correctly against the 03:00 nightly gate-chat-replay and Sunday scout/sweep crons — the only coherent lease story among the candidates (ops lens). The serving path never acquires the lease, so there is **no deadlock** taking it in-process (free-choice's contrary claim was fact-checked false).
+- **GPU lease (whole run):** `acquireGpuLease({model, purpose: "code-loop", …})` (`gpu-lease.ts:318`) wraps the entire run with a 60 s acquire timeout (else `lease-unavailable`); `onLeaseLost` → SIGTERM the process group → `arm-error`, diff harvested. This sequences correctly against the 03:00 nightly gate-chat-replay and research-sweep jobs — the only coherent lease story among the candidates (ops lens). The serving path never acquires the lease, so there is **no deadlock** taking it in-process (free-choice's contrary claim was fact-checked false).
 - **No outer admission hold:** the `code_loop_start` call itself is never wrapped in `runChatCompletion`/admission — at `maxParallel=1` (`config.ts:313`) that would deadlock against pi's own inner turns, and holding a slot for a whole run would 503 all guests for minutes (native-driver's fatal availability flaw). Instead, **each inner pi turn rides normal owner-lane admission per call** — guests are preempted per-turn, bounded and fair.
-- **Maintenance mode:** `start` refuses (`maintenance`) when bench/maintenance mode is engaged (the model-scout window; hook the same flag the gateway consults, `gateway.ts:2371-2372`).
+- **Maintenance mode:** `start` refuses (`maintenance`) when an explicit bench/evaluation window is
+  engaged (hook the same flag the gateway consults, `gateway.ts:2371-2372`).
 - **Swap-thrash policy (decided + documented, per ops must-fix):** the GPU lease does not gate *interactive* gateway traffic, so an interleaved `ask` to mellum mid-loop causes an 80b↔mellum swap pair. Phase 1 **accepts** this: the default 480 s wall-clock is sized for 1–2 swaps; a `homeserver_code_loop_active` gauge plus a counter of other-model requests admitted while a loop is active make the cost visible in metrics; the owner's practical rule is "don't fire mellum asks during a run you care about." A prefer-no-swap admission affinity is Later.
 - All loop turns hit one model through one serial pipeline — no swap thrash from the loop itself, matching the serial GPU.
 
@@ -283,7 +347,16 @@ Cap breach ⇒ `cap-exceeded`, diff still harvested, sandbox retained.
 ## 9. Logging / data collection (RQ6/RQ7 — first-class goal)
 
 - **Per turn, for free (verified by two judge lenses):** every pi→gateway call lands in `request_log` (content-blind: alias/tier/model/ttft/tokens) and **`owner_request_log`** (full prompt + completion — `gateway.ts:791` fires because the service key is a real keystore owner key with `keyHash !== null`) under the `code-loop-<ts>` alias. This is the Claude→local agentic-delegation dataset the project exists to collect, cleanly separable from interactive `ask` traffic, with zero new logging code and zero drift risk.
-- **Per run:** one `recordDelegation()` row (`ledger.ts:152`): `task_type` from the request, `model_id`, `source: "code-loop"` (so `getVerdict()` learns agentic-loop capability as a separate evidence lane from single-shot), tokens/latency aggregated from NDJSON events, `verifier: "check-cmd"` when supplied. Outcome mapping: `check_cmd` exit 0 → `pass`; nonzero → `fail`; no `check_cmd` → `unverified`; cap kill → `error/timeout`; spawn/lease/cage failure → `error/infra`; **degeneracy abort → `error/infra`** (serving-layer pathology — must not poison the 80b's capability verdict).
+- **Per run:** one `recordDelegation()` row: resolved `task_type`, `model_id`,
+  `source: "code-loop"`, and aggregated tokens/latency. The verifier is
+  `owner-schema-checks-v1` when schema checks are configured; otherwise `check-cmd` when
+  an owner check is supplied, or null. Non-completed runs retain their existing outcome:
+  cap kill → `error/timeout`; spawn/lease/cage failure or degeneracy → `error/infra`.
+  For completed runs, failed grounding → `fail`, skipped grounding → `unverified`, and
+  either state withholds diff/summary. Only after grounding passes (or was not requested)
+  can a successful owner `check_cmd` produce `pass`; a nonzero check produces `fail` and
+  an absent check remains `unverified`. Schema-check diagnostics remain in the owner-only
+  result; the ledger verifier is a fixed label, not an owner-supplied name or command.
 - **Per run artifacts:** pi's NDJSON event log + `.meta.json` retained in the sandbox for the TTL window (post-mortems, fixture mining).
 - **Metrics:** `homeserver_code_loop_runs_total{status}`, `homeserver_code_loop_active`, interleaved-other-model counter (§8) — content-blind, consistent with `metrics.ts` discipline.
 - Once ≥8 verified runs exist: add the `code-implement`-agentic vs single-shot comparison to `docs/m5-routing.json` — the actual RQ7 payoff.

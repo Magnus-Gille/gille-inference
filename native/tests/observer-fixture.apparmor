@@ -1,0 +1,46 @@
+abi <abi/4.0>,
+
+# CI fixture policy, not a deployable M5 profile. No broad base abstraction.
+profile gi-observer-fixture flags=(attach_disconnected) {
+  /run/gi-observer-fixture/probe mr,
+  /run/gi-observer-fixture/probe ix,
+  /run/gi-observer-fixture/target.pid r,
+  /etc/ld.so.cache r,
+  /{,usr/}lib{,32,64}/** mr,
+  /etc/machine-id r,
+  /var/lib/dbus/machine-id r,
+  /proc/sys/kernel/random/boot_id r,
+  /proc/[0-9]*/{stat,exe} r,
+  /proc/{meminfo,vmstat} r,
+  /sys/fs/cgroup/system.slice/gi-observer-fixture-target.service/memory.events r,
+  /run/dbus/system_bus_socket rw,
+  /dev/null rw,
+  capability sys_ptrace,
+  ptrace (read) peer=unconfined,
+  deny ptrace (trace),
+  signal (receive) peer=unconfined,
+  # Pathname peers are separately mediated by file rules. No abstract peer access.
+  unix (create, getattr, shutdown, getopt, setopt) type=stream addr=none,
+  deny network inet,
+  deny network inet6,
+  deny /run/gi-observer-fixture/forbidden r,
+  deny /proc/*/{cmdline,environ,mem} rw,
+  deny /proc/*/root{,/**} rw,
+  deny /run/systemd/private rw,
+
+  dbus send bus=system path=/org/freedesktop/DBus
+    interface=org.freedesktop.DBus member={Hello,GetId,GetNameOwner}
+    peer=(name=org.freedesktop.DBus),
+  dbus receive bus=system peer=(name=org.freedesktop.DBus),
+  dbus send bus=system path=/org/freedesktop/systemd1
+    interface=org.freedesktop.systemd1.Manager member={ListUnits,ListJobs}
+    peer=(name=org.freedesktop.systemd1),
+  dbus send bus=system path=/org/freedesktop/systemd1
+    interface=org.freedesktop.DBus.Properties member=Get
+    peer=(name=org.freedesktop.systemd1),
+  # One credential-free synthetic unit only; no additional manager mutation or generic unit surface.
+  dbus send bus=system path=/org/freedesktop/systemd1/unit/gi_2dobserver_2dfixture_2dtarget_2eservice
+    interface=org.freedesktop.DBus.Properties member=Get
+    peer=(name=org.freedesktop.systemd1),
+  dbus receive bus=system peer=(name=org.freedesktop.systemd1),
+}

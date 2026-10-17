@@ -7,18 +7,23 @@
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
+  M5_ASK_TIMEOUT_MS_DEFAULT,
+  M5_ASK_TIMEOUT_MS_MAX,
+  M5_ASK_TIMEOUT_MS_MIN,
   M5_CLIENT_VERSION,
   M5ClientError,
   createKeychainCredentialStore,
   createM5Client,
   diagnoseProfile,
+  provisionRemediation,
   redactText,
   validateProfileConfig,
 } from "./m5-client.mjs";
 import { provisionProfile } from "./m5-provision.mjs";
 import { createMcpStdioBridge, runMcpStdioBridge } from "./m5-stdio-bridge.mjs";
+import { getBuildStatus, loadBuildConfig, parseBuildArgs, runBuild } from "./m5-build.mjs";
 
 const MAX_STDIN_BYTES = 3 * 1024 * 1024;
 
@@ -55,8 +60,14 @@ function parseGlobalArgs(argv) {
   let profile;
   let endpoint = "public";
   let privateRequested = false;
+  let publicRequested = false;
+  let routeFlagCount = 0;
   let publicGatewayUrl;
   let sshTarget;
+  let authHelper;
+  let timeoutMsRaw;
+  let checkLatest = false;
+  let probeInferenceModel;
   const positional = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -70,8 +81,21 @@ function parseGlobalArgs(argv) {
     } else if (arg === "--private") {
       endpoint = "private";
       privateRequested = true;
+      routeFlagCount += 1;
     } else if (arg === "--public") {
       endpoint = "public";
+      publicRequested = true;
+      routeFlagCount += 1;
+    } else if (arg === "--probe-inference") {
+      if (probeInferenceModel !== undefined) {
+        throw new M5ClientError("invalid_args", "--probe-inference may be specified only once.");
+      }
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError("invalid_args", "--probe-inference requires a model identifier.");
+      }
+      probeInferenceModel = value;
+      index += 1;
     } else if (arg === "--public-gateway-url") {
       const value = argv[index + 1];
       if (!value || value.startsWith("-")) {
@@ -86,6 +110,43 @@ function parseGlobalArgs(argv) {
       }
       sshTarget = value;
       index += 1;
+    } else if (arg === "--auth-helper") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper requires an absolute path to m5-auth.",
+        );
+      }
+      if (authHelper !== undefined) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper may be specified only once.",
+        );
+      }
+      authHelper = value;
+      index += 1;
+    } else if (arg === "--timeout-ms") {
+      const value = argv[index + 1];
+      if (timeoutMsRaw !== undefined) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--timeout-ms may be specified only once.",
+        );
+      }
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--timeout-ms requires an integer number of milliseconds.",
+        );
+      }
+      timeoutMsRaw = value;
+      index += 1;
+    } else if (arg === "--check-latest") {
+      if (checkLatest) {
+        throw new M5ClientError("invalid_args", "--check-latest may be specified only once.");
+      }
+      checkLatest = true;
     } else if (arg === "--help" || arg === "-h") {
       positional.push("help");
     } else if (arg === "--version" || arg === "-v") {
@@ -94,7 +155,47 @@ function parseGlobalArgs(argv) {
       positional.push(arg);
     }
   }
-  return { profile, endpoint, privateRequested, positional, publicGatewayUrl, sshTarget };
+  return {
+    profile,
+    endpoint,
+    privateRequested,
+    publicRequested,
+    routeFlagCount,
+    positional,
+    publicGatewayUrl,
+    sshTarget,
+    authHelper,
+    timeoutMsRaw,
+    checkLatest,
+    probeInferenceModel,
+  };
+}
+
+/**
+ * Direct-ask request timeout (#154): a strict integer in M5_ASK_TIMEOUT_MS_MIN..
+ * M5_ASK_TIMEOUT_MS_MAX. Fractional, non-numeric, and out-of-range values are rejected
+ * before config or credential access. The value travels only into createM5Client — never
+ * into MCP arguments, profile config, environment, logs, or telemetry.
+ */
+function parseAskTimeoutMs(raw) {
+  if (!/^\d+$/.test(raw)) {
+    throw new M5ClientError(
+      "invalid_args",
+      `--timeout-ms must be an integer number of milliseconds from ${M5_ASK_TIMEOUT_MS_MIN} to ${M5_ASK_TIMEOUT_MS_MAX}.`,
+    );
+  }
+  const parsed = Number(raw);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < M5_ASK_TIMEOUT_MS_MIN ||
+    parsed > M5_ASK_TIMEOUT_MS_MAX
+  ) {
+    throw new M5ClientError(
+      "invalid_args",
+      `--timeout-ms must be an integer number of milliseconds from ${M5_ASK_TIMEOUT_MS_MIN} to ${M5_ASK_TIMEOUT_MS_MAX}.`,
+    );
+  }
+  return parsed;
 }
 
 async function readBoundedInput(input) {
@@ -127,14 +228,15 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-function writeDeployEnv(stream, publicGatewayUrl) {
+function writeDeployEnv(stream, publicGatewayUrl, authHelper) {
   const publicHttpUrl = new URL(publicGatewayUrl);
   publicHttpUrl.protocol = "http:";
+  const authCommand = shellQuote(authHelper);
   stream.write([
     "unset M5_API_KEY HOMESERVER_OWNER_KEY \\",
     "  DEPLOY_HEALTH_TAILNET_URL DEPLOY_CAPABILITY_URL \\",
     "  DEPLOY_PUBLIC_HTTP_URL DEPLOY_PUBLIC_HTTPS_URL &&",
-    'eval "$(m5-auth --env --tailnet)" &&',
+    `eval "$(${authCommand} --env --tailnet)" &&`,
     'test -n "${M5_API_KEY:-}" &&',
     'export HOMESERVER_OWNER_KEY="$M5_API_KEY" &&',
     "unset M5_API_KEY &&",
@@ -151,12 +253,16 @@ function help() {
     name: "m5",
     version: M5_CLIENT_VERSION,
     usage: [
-      "m5 --profile <claude|codex> doctor",
-      "eval \"$(m5 --profile <name> deploy-env)\"",
+      "m5 build status",
+      "m5 build [--pull relative/file] [--toolchain version] -- command args",
+      "m5 --profile <claude|codex> doctor [--check-latest]",
+      "m5 --profile <claude|codex> [--public|--private] doctor --probe-inference <model>",
+      "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
-      "printf '%s' '<json>' | m5 --profile <claude|codex> ask",
+      "printf '%s' '<json>' | m5 --profile <claude|codex> [--timeout-ms <1000-600000>] ask",
       "printf '%s' '<content-free-json>' | m5 --profile <claude|codex> adoption report",
+      "printf '%s' '{\"feedback_handle\":\"<uuid>\",\"usefulness\":\"pass\"}' | m5 --profile <claude|codex> feedback submit",
       "printf '%s' '<json>' | m5 --profile <claude|codex> code run",
       "m5 --profile <claude|codex> code status <work_id>",
       "m5 --profile <claude|codex> code result <work_id>",
@@ -180,6 +286,7 @@ function selectedProfile(config, profile) {
     throw new M5ClientError(
       "unknown_profile",
       "The selected profile is not present in m5 config.",
+      { remediation: provisionRemediation(profile) },
     );
   }
   return validateProfileConfig(raw);
@@ -196,20 +303,93 @@ export async function main(
     fetch: fetchImpl = globalThis.fetch,
     bridgeRunner = runMcpStdioBridge,
     provisioner = provisionProfile,
+    buildRunner = runBuild,
+    buildStatusRunner = getBuildStatus,
   } = {},
 ) {
   let selectedProfileName;
   try {
+    if (argv[0] === "build") {
+      if (argv[1] === "status") {
+        if (argv.length !== 2) throw new M5ClientError("invalid_args", "m5 build status accepts no arguments.");
+        writeJson(output, await buildStatusRunner());
+        return 0;
+      }
+      const parsed = parseBuildArgs(argv.slice(1));
+      const result = await buildRunner({ ...parsed, stdout: output, stderr: error });
+      return result.exit_code;
+    }
     const {
       profile,
       endpoint,
       privateRequested,
+      publicRequested,
+      routeFlagCount,
       positional,
       publicGatewayUrl,
       sshTarget,
+      authHelper,
+      timeoutMsRaw,
+      checkLatest,
+      probeInferenceModel,
     } = parseGlobalArgs(argv);
     selectedProfileName = profile;
     const command = positional[0];
+    // Scope before value: the flag is meaningless outside a direct ask, and both
+    // rejections must land before config loading, credential lookup, or any I/O.
+    if (timeoutMsRaw !== undefined && command !== "ask") {
+      throw new M5ClientError(
+        "invalid_args",
+        "--timeout-ms is only valid with ask.",
+      );
+    }
+    if (checkLatest && command !== "doctor") {
+      throw new M5ClientError("invalid_args", "--check-latest is only valid with doctor.");
+    }
+    let inferenceProbe;
+    if (probeInferenceModel !== undefined) {
+      if (command !== "doctor") {
+        throw new M5ClientError("invalid_args", "--probe-inference is only valid with doctor.");
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(probeInferenceModel)) {
+        throw new M5ClientError("invalid_args", "--probe-inference requires a valid model identifier.");
+      }
+      if (routeFlagCount !== 1 || publicRequested === privateRequested) {
+        throw new M5ClientError("invalid_args", "--probe-inference requires exactly one of --public or --private.");
+      }
+      inferenceProbe = {
+        route: privateRequested ? "private" : "public",
+        model: probeInferenceModel,
+      };
+    }
+    const askTimeoutMs =
+      timeoutMsRaw === undefined ? M5_ASK_TIMEOUT_MS_DEFAULT : parseAskTimeoutMs(timeoutMsRaw);
+    if (authHelper !== undefined && command !== "deploy-env") {
+      throw new M5ClientError(
+        "invalid_args",
+        "--auth-helper is only valid with deploy-env.",
+      );
+    }
+    if (command === "deploy-env") {
+      if (positional.length !== 1) {
+        throw new M5ClientError(
+          "invalid_args",
+          "deploy-env does not accept positional arguments.",
+        );
+      }
+      if (authHelper === undefined) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper is required with deploy-env.",
+        );
+      }
+      if (!isAbsolute(authHelper)) {
+        throw new M5ClientError(
+          "invalid_args",
+          "--auth-helper requires an absolute path to m5-auth.",
+        );
+      }
+    }
     if (!command || command === "help") {
       writeJson(output, help());
       return 0;
@@ -236,7 +416,7 @@ export async function main(
         fetch: fetchImpl,
       });
       writeJson(output, result);
-      return result.status === "healthy" ? 0 : 1;
+      return result.status === "mcp_reachable" ? 0 : 1;
     }
     if (publicGatewayUrl !== undefined || sshTarget !== undefined) {
       throw new M5ClientError("invalid_args", "--public-gateway-url and --m5-host are only valid with provision.");
@@ -251,7 +431,7 @@ export async function main(
           "--private is not valid with deploy-env; tailnet URLs come from m5-auth.",
         );
       }
-      writeDeployEnv(output, profileConfig.publicGatewayUrl);
+      writeDeployEnv(output, profileConfig.publicGatewayUrl, authHelper);
       return 0;
     }
     if (command === "doctor") {
@@ -260,9 +440,11 @@ export async function main(
         profileConfig,
         credentialStore,
         fetch: fetchImpl,
+        checkLatest,
+        inferenceProbe,
       });
       writeJson(output, result);
-      return result.status === "healthy" ? 0 : 1;
+      return result.status === "mcp_reachable" ? 0 : 1;
     }
 
     const gatewayUrl =
@@ -273,6 +455,11 @@ export async function main(
       throw new M5ClientError(
         "endpoint_not_configured",
         "The selected profile does not configure that gateway path.",
+        {
+          failureLayer: endpoint === "private" ? "private_route_unconfigured" : "public_route_unconfigured",
+          retryable: false,
+          remediation: `Configure the ${endpoint} gateway path for the profile, then verify it: m5 --profile ${/^[a-z][a-z0-9_-]{0,31}$/i.test(profile ?? "") ? profile : "selected"} doctor. Never point a profile at a loopback address as a substitute for a configured route.`,
+        },
       );
     }
     const client = await createM5Client({
@@ -281,10 +468,13 @@ export async function main(
       profile,
       credentialStore,
       fetch: fetchImpl,
+      timeoutMs: askTimeoutMs,
     });
 
     if (command === "mcp") {
-      const bridge = createMcpStdioBridge({ client, profile });
+      let buildConfig;
+      try { buildConfig = await loadBuildConfig(); } catch { /* Build is omitted unless locally configured. */ }
+      const bridge = createMcpStdioBridge({ client, profile, buildConfig });
       await bridgeRunner({ bridge, input, output });
       return 0;
     }
@@ -301,6 +491,13 @@ export async function main(
         throw new M5ClientError("invalid_args", "adoption requires: report.");
       }
       writeJson(output, await client.reportAdoption(await readBoundedInput(input)));
+      return 0;
+    }
+    if (command === "feedback") {
+      if (positional[1] !== "submit" || positional.length !== 2) {
+        throw new M5ClientError("invalid_args", "feedback requires: submit.");
+      }
+      writeJson(output, await client.recordExecutionFeedback(await readBoundedInput(input)));
       return 0;
     }
     if (command === "code") {
@@ -332,7 +529,7 @@ export async function main(
             redactText(caught instanceof Error ? caught.message : "m5 failed."),
           );
     writeJson(error, safe.toJSON(selectedProfileName));
-    return 1;
+    return argv[0] === "build" ? 125 : 1;
   }
 }
 

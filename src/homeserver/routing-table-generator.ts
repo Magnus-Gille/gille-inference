@@ -4,8 +4,9 @@
  * Background: `routing-table.ts` LOADS the evidence-based task_type → model map, and the T3
  * macro-router consumes it via `routingTarget()`. But the JSON it reads was a hand-edited
  * snapshot with zero writers — it never learned from the evidence the system already collects
- * (the capability ledger, nightly delegations, the weekly Model Scout). This module closes that
- * loop: it turns ledger verdicts + the Model-Scout registry into a fresh, schema-compatible
+ * (the capability ledger, nightly delegations, and explicitly requested model evaluations). This
+ * module closes that loop: it turns ledger verdicts + the model-evaluation registry into a fresh,
+ * schema-compatible
  * routing table with a `generatedAt` freshness stamp and a `sources` provenance manifest.
  *
  * This module is PURE (no fs / no DB): it takes already-loaded evidence and returns a document.
@@ -20,8 +21,9 @@
  *    surfaced in the manifest; they are the only non-evidence input.
  *  - MISSING DATA IS SURFACED, NEVER GUESSED. A routable task type with no evidence, or a model
  *    whose overall pass-rate cannot be asserted (< minSamples), emits an explicit null + a reason
- *    (e.g. the qwen36-a3b `overallPass` hole pending a fresh cartography). The weekly scout fills
- *    it later — this generator consumes that evidence, it does not race it.
+ *    (e.g. the qwen36-a3b `overallPass` hole pending a fresh cartography). An operator may add a
+ *    fresh manual evaluation later — this generator consumes that evidence and never schedules or
+ *    mutates an evaluation.
  *  - FAIL-SAFE: an unknown/absent route escalates to a frontier model, never a blank local id.
  */
 
@@ -202,7 +204,7 @@ export interface RoutingTableDoc {
 export interface GenerateInputs {
   /** Per-(task_type, model) rows from ledger.ledgerReport(policy). */
   verdicts: LedgerReportRow[];
-  /** Durable Model-Scout registry entries (model-registry.readRegistry()). */
+  /** Durable manual model-evaluation registry entries (model-registry.readRegistry()). */
   registry: RegistryEntry[];
   /** Provenance manifest assembled by the IO layer (ledger / cartography / registry). */
   sources: SourceManifestEntry[];
@@ -298,7 +300,7 @@ export function selectRoutingEntry(
       tokPerSec: null,
       verdict: "escalate-frontier",
       attempts: 0,
-      note: "no ledger evidence yet — escalating to frontier; pending cartography (Model Scout cron fills it)",
+      note: "no ledger evidence yet — escalating to frontier; pending cartography or an explicit manual evaluation",
     };
   }
 
@@ -355,7 +357,7 @@ export function selectRoutingEntry(
   }
 
   // A thin lucky pass must not hide independently measured negative evidence. This makes a
-  // null route a characterized capability gap instead of promising that the scout will fill it.
+  // null route a characterized capability gap instead of promising that a future job will fill it.
   const measuredGap = safe.filter((r) => r.recommendation === "escalate-frontier" && r.attempts >= minSamples);
   if (measuredGap.length > 0) {
     const best = rankCandidates(measuredGap, meta)[0]!;
@@ -380,7 +382,7 @@ export function selectRoutingEntry(
     verdict: "escalate-frontier",
     attempts: forType.reduce((s, r) => s + r.attempts, 0),
     note: thin
-      ? `insufficient evidence — best ${bestSeen.modelId} has ${bestSeen.attempts} < ${minSamples} attempts; escalating, pending more (Model Scout cron fills it)${excludedNote}${unavailableNote(forTypeAll, bestSeen.modelId)}`
+      ? `insufficient evidence — best ${bestSeen.modelId} has ${bestSeen.attempts} < ${minSamples} attempts; escalating, pending more evidence (manual evaluation may be requested)${excludedNote}${unavailableNote(forTypeAll, bestSeen.modelId)}`
       : `no viable local model (best: ${bestSeen.modelId} ${round2(bestSeen.successRate)})${excludedNote}${unavailableNote(forTypeAll, bestSeen.modelId)}`,
   };
 }
@@ -435,19 +437,19 @@ function buildModelProfile(
     return base;
   }
 
-  // Ledger too thin to assert an overall pass-rate — fall back to the Model-Scout registry if it
-  // has a full-battery number for this served alias (consume the scout's evidence, don't race it).
+  // Ledger too thin to assert an overall pass-rate — fall back to the manual model-evaluation
+  // registry if it has a full-battery number for this served alias.
   const reg = registryAlias.get(modelId);
   if (reg) {
     base.overallPass = round2(reg.passRate);
-    base.note = `overallPass from Model Scout registry (${reg.evaluatedAt.slice(0, 10)}); ledger has ${totalAttempts} attempt(s)`;
+    base.note = `overallPass from manual model-evaluation registry (${reg.evaluatedAt.slice(0, 10)}); ledger has ${totalAttempts} attempt(s)`;
     return base;
   }
 
   base.note =
     totalAttempts === 0
-      ? "overallPass pending — no ledger evidence and no Model Scout eval yet"
-      : `overallPass pending — insufficient ledger evidence (${totalAttempts} < ${minSamples} attempts); Model Scout cron fills it`;
+      ? "overallPass pending — no ledger evidence and no manual model evaluation yet"
+      : `overallPass pending — insufficient ledger evidence (${totalAttempts} < ${minSamples} attempts); request a manual evaluation when appropriate`;
   return base;
 }
 
@@ -494,7 +496,7 @@ export function generateRoutingTable(inputs: GenerateInputs): RoutingTableDoc {
   return {
     _comment:
       "Evidence-based routing table AUTO-GENERATED from the capability ledger (delegations table, " +
-      "populated by cartography + nightly delegations) and the weekly Model Scout registry. " +
+      "populated by cartography + nightly delegations) and the manual model-evaluation registry. " +
       "'escalate-frontier' = no reliable local model. A null model with attempts=0 is a pending " +
       "hole awaiting fresh evidence, not a characterized gap.",
     _generator:

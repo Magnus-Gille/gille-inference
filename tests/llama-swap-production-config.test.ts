@@ -9,6 +9,10 @@ const memory = readFileSync(
   new URL("../deploy/systemd/llama-swap-memory.conf", import.meta.url),
   "utf8"
 );
+const rocmDevice = readFileSync(
+  new URL("../deploy/systemd/llama-swap-rocm-device.conf", import.meta.url),
+  "utf8"
+);
 
 describe("tracked llama-swap production contract", () => {
   it("uses public placeholders rather than live operator paths", () => {
@@ -33,6 +37,25 @@ describe("tracked llama-swap production contract", () => {
   it("bounds the shared llama-swap cgroup without swap", () => {
     expect(memory).toContain("MemoryMax=96G");
     expect(memory).toContain("MemorySwapMax=0");
-    expect(memory).toContain("OOMPolicy=kill");
+  });
+
+  it("allows only the ROCm compute device required by native System One models", () => {
+    const setting = (key: string) => rocmDevice.split("\n").filter((line) => line.startsWith(`${key}=`));
+    expect(rocmDevice).toContain("[Service]");
+    expect(setting("DeviceAllow")).toEqual(["DeviceAllow=/dev/kfd rw"]);
+    expect(setting("DevicePolicy")).toEqual([]);
+  });
+
+  // Issue #354: GPU memory is attributed to no process on this host, so the kernel picks an OOM
+  // victim by score alone. A protective score on the model service made it the last candidate
+  // and bystanders died without freeing anything (2026-10-01). The model runtime must rank first,
+  // and only the killed process may die.
+  it("makes the model runtime the preferred OOM victim and keeps the proxy running", () => {
+    const setting = (key: string) => memory.split("\n").filter((line) => line.startsWith(`${key}=`));
+    expect(setting("OOMPolicy")).toEqual(["OOMPolicy=continue"]);
+    const score = setting("OOMScoreAdjust");
+    expect(score).toHaveLength(1);
+    // Above every other service score in use on the host (the highest was 700).
+    expect(Number(score[0]!.split("=")[1])).toBeGreaterThanOrEqual(800);
   });
 });

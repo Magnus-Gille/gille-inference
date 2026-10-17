@@ -16,10 +16,10 @@ import type {
   EngineOutcome,
   EngineRunOptions,
   EngineRunResult,
-  PiProcess,
   SpawnPiFn,
   CodeLoopAgentCheckAttempt,
   CodeLoopAgentCheckKind,
+  CodeLoopFailureKind,
 } from "./code-loop-types.js";
 
 /**
@@ -316,6 +316,27 @@ export function buildPiArgv(cfg: Pick<PiEngineConfig, "piBin" | "provider">, mod
   return [cfg.piBin, "--provider", cfg.provider, "--model", model, "--no-session", "--print", "--mode", "json", instruction];
 }
 
+const COMPLETION_PRESSURE_POLICY_VERSION = 1;
+const COMPLETION_RESERVE_TURNS = 2;
+
+/** Stable runtime-owned reminder that preserves the last turns for convergence and disclosure. */
+export function applyCompletionPressurePolicy(instruction: string, turnCap: number, turnOffset = 0): string {
+  const remainingTurns = Math.max(0, turnCap - turnOffset);
+  const wrapUpTurn = Math.max(turnOffset + 1, turnCap - COMPLETION_RESERVE_TURNS);
+  const wrapUpGuidance = remainingTurns <= COMPLETION_RESERVE_TURNS
+    ? "Begin wrapping up immediately."
+    : `Begin wrapping up by overall agent turn ${wrapUpTurn}.`;
+  const turnLabel = remainingTurns === 1 ? "turn" : "turns";
+  return (
+    `[code_loop completion-pressure policy v${COMPLETION_PRESSURE_POLICY_VERSION}]\n` +
+    `You have ${remainingTurns} agent ${turnLabel} remaining within the global cap of ${turnCap}. Complete core edits early. ${wrapUpGuidance} ` +
+    `Before the final turn, stop editing, run any useful focused checks, and either summarize completion or state clearly what remains unfinished. ` +
+    "The owner-authored gateway check runs separately after your process exits.\n" +
+    "[/code_loop completion-pressure policy]\n\n" +
+    instruction
+  );
+}
+
 /**
  * The scrubbed pi environment (§6): NO gateway .env inheritance, no OPENROUTER_API_KEY.
  * HOME points into the sandbox so any dotfile writes stay contained even without the cage.
@@ -432,6 +453,13 @@ interface SingleRun {
   firstEditTurn: number | null;
   firstEditAtMs: number | null;
   mutationToolCall: boolean;
+  /**
+   * Content-blind discovery volume (#240): every in-turn `tool_execution_start` that is NOT
+   * an edit/write mutation attempt (read/search/shell baselining, …), counted by the
+   * (type, toolName) pair only — args, paths, queries, and results are never inspected.
+   * Reported solely as a count in the no-edit diagnostic; never emitted per-tool.
+   */
+  discoveryToolCalls: number;
   agentChecks: CodeLoopAgentCheckAttempt[];
   /** Count only; refused candidates and unmatched bash events never expose command content. */
   agentCheckCoverageLossEvents: number;
@@ -448,9 +476,32 @@ async function runPiOnce(
   pollMs: number,
   now: () => number,
   turnOffset: number,
-  checkOrderOffset: number
+  checkOrderOffset: number,
+  // #240: a successful first-attempt mutation satisfies the global edit deadline, so the
+  // degeneracy retry must not re-enforce it. Defaults to false for the initial attempt.
+  priorMutationToolCall = false
 ): Promise<SingleRun> {
   const started = now();
+  const signal = opts.signal;
+  if (signal?.aborted) {
+    return {
+      exitCode: null,
+      killedFor: "wall",
+      usage: { turns: 0, wall_ms: 0, prompt_tokens: 0, completion_tokens: 0 },
+      finalMessage: "",
+      unparseableLines: 0,
+      rawTail: "",
+      erroredTurn: null,
+      startedAtMs: started,
+      endedAtMs: started,
+      firstEditTurn: null,
+      firstEditAtMs: null,
+      mutationToolCall: false,
+      discoveryToolCalls: 0,
+      agentChecks: [],
+      agentCheckCoverageLossEvents: 0,
+    };
+  }
   const proc = spawnPi(argv, { cwd: opts.sandboxDir, env });
 
   let turns = 0;
@@ -463,6 +514,7 @@ async function runPiOnce(
   let firstEditTurn: number | null = null;
   let firstEditAtMs: number | null = null;
   let mutationToolCall = false;
+  let discoveryToolCalls = 0;
   const mutationStarts = new Map<string, { turn: number; atMs: number }>();
   const checkStarts = new Map<string, Omit<CodeLoopAgentCheckAttempt, "ended_ms" | "status" | "exit_code"> & {
     failureAttributionAmbiguous: boolean;
@@ -486,6 +538,12 @@ async function runPiOnce(
     killTimer.unref?.();
   };
 
+  const onAbort = (): void => kill("wall");
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // Close the spawn/subscribe race: an abort between the pre-spawn check and listener
+  // registration still kills the process, while a pre-aborted signal never spawns.
+  if (signal?.aborted) onAbort();
+
   // Wall-clock cap.
   const wallTimer = setTimeout(() => kill("wall"), opts.caps.wall_s * 1000);
   // Growth cap poll.
@@ -496,23 +554,35 @@ async function runPiOnce(
   const rl = createInterface({ input: proc.stdout });
   rl.on("line", (line) => {
     appendTail(line.slice(-2048) + "\n");
+    // SIGTERM cannot retract bytes already buffered by the OS/readline. Preserve those bytes in
+    // the bounded diagnostic tail, but freeze all semantic evidence at the first kill decision.
+    if (killedFor !== null) return;
     const ev = parsePiLine(line);
     if (ev === null) {
       if (line.trim() !== "") unparseable++;
       return;
     }
     if (isTurnStart(ev)) {
-      turns++;
-      const overallTurn = turnOffset + turns;
+      if (killedFor !== null) return;
+      const overallTurn = turnOffset + turns + 1;
+      // Preserve the more specific deadline reason when one event crosses both limits.
+      // A prior-attempt mutation exempts the retry: the deadline is global to the run.
       if (
         opts.caps.edit_deadline_turn !== undefined &&
+        !priorMutationToolCall &&
         !mutationToolCall &&
         overallTurn > opts.caps.edit_deadline_turn
       ) {
         kill("edit-deadline");
         return;
       }
-      if (turns > opts.caps.turns) kill("turns");
+      // A turn_start beyond the accepted budget is the enforcement signal, not billable/usable
+      // work. Kill before incrementing so reported usage can never exceed the caller's cap.
+      if (overallTurn > opts.caps.turns) {
+        kill("turns");
+        return;
+      }
+      turns++;
       return;
     }
     const mutationStart = mutationToolStartOf(ev);
@@ -528,6 +598,22 @@ async function runPiOnce(
         firstEditAtMs = start.atMs;
       }
       return;
+    }
+    // #240 non-convergence signal: non-mutation tool activity inside an observed turn,
+    // counted before any successful mutation (including a prior attempt's, which already
+    // satisfied the global deadline). Deliberately type-only (no args inspection), and
+    // suppressed once killed so post-kill stream stragglers cannot inflate the count.
+    // Falls through so check attribution below still sees the same event.
+    if (
+      ev.type === "tool_execution_start" &&
+      typeof ev.toolCallId === "string" &&
+      turns > 0 &&
+      killedFor === null &&
+      !priorMutationToolCall &&
+      !mutationToolCall &&
+      mutationToolStartOf(ev) === null
+    ) {
+      discoveryToolCalls++;
     }
     const checkStart = agentCheckStartOf(ev);
     if (checkStart !== null) {
@@ -583,7 +669,25 @@ async function runPiOnce(
     if (usage !== null) {
       promptTokens += usage.prompt;
       completionTokens += usage.completion;
-      if (completionTokens > opts.caps.completion_tokens) kill("tokens");
+    }
+    if (ev.type === "turn_end") {
+      // #240: enforce the deadline when the deadline turn ENDS without any completed mutation,
+      // even when pi omits or malforms usage, so a stalled process cannot consume the wall cap.
+      // Clean turn ends only — an errored turn keeps its §10 degeneracy/arm-error routing. The
+      // specific no-edit reason wins if the same event also crosses the completion-token cap.
+      // The next-turn_start check above remains as a defensive backstop.
+      if (
+        turnErr === null &&
+        turns > 0 &&
+        opts.caps.edit_deadline_turn !== undefined &&
+        !priorMutationToolCall &&
+        !mutationToolCall &&
+        turnOffset + turns >= opts.caps.edit_deadline_turn
+      ) {
+        kill("edit-deadline");
+      } else if (usage !== null && completionTokens > opts.caps.completion_tokens) {
+        kill("tokens");
+      }
       return;
     }
     const text = assistantTextOf(ev);
@@ -592,6 +696,7 @@ async function runPiOnce(
   proc.stderr.on("data", (chunk: Buffer | string) => appendTail(String(chunk)));
 
   const exitCode = await proc.exited;
+  signal?.removeEventListener("abort", onAbort);
   const ended = now();
   for (const start of checkStarts.values()) {
     const { failureAttributionAmbiguous: _internal, ...visibleStart } = start;
@@ -601,6 +706,7 @@ async function runPiOnce(
   if (
     killedFor === null &&
     opts.caps.edit_deadline_turn !== undefined &&
+    !priorMutationToolCall &&
     !mutationToolCall &&
     turnOffset + turns >= opts.caps.edit_deadline_turn
   ) {
@@ -624,6 +730,7 @@ async function runPiOnce(
     firstEditTurn,
     firstEditAtMs,
     mutationToolCall,
+    discoveryToolCalls,
     agentChecks,
     agentCheckCoverageLossEvents,
   };
@@ -653,16 +760,29 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
     async run(opts: EngineRunOptions): Promise<EngineRunResult> {
       const env = buildPiEnv(cfg, opts.sandboxDir);
 
-      const attempt = (instruction: string, turnOffset: number, checkOrderOffset: number) =>
+      const attempt = (
+        instruction: string,
+        turnOffset: number,
+        checkOrderOffset: number,
+        priorMutationToolCall = false
+      ) =>
         runPiOnce(
           deps.spawnPi,
-          [...opts.cageArgv, ...buildPiArgv(cfg, opts.model, instruction)],
+          [
+            ...opts.cageArgv,
+            ...buildPiArgv(
+              cfg,
+              opts.model,
+              applyCompletionPressurePolicy(instruction, opts.caps.turns, turnOffset),
+            ),
+          ],
           env,
           opts,
           deps.pollMs,
           now,
           turnOffset,
-          checkOrderOffset
+          checkOrderOffset,
+          priorMutationToolCall
         );
 
       const first = await attempt(opts.instruction, 0, 0);
@@ -675,7 +795,13 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
       const redact = (s: string): string =>
         cfg.apiKey.length >= 8 ? s.split(cfg.apiKey).join("[redacted]") : s;
 
-      const toResult = (run: SingleRun, extra: SingleRun | null, outcome: EngineOutcome, detail: string): EngineRunResult => {
+      const toResult = (
+        run: SingleRun,
+        extra: SingleRun | null,
+        outcome: EngineOutcome,
+        detail: string,
+        forcedCapReason: SingleRun["killedFor"] = null,
+      ): EngineRunResult => {
         const last = extra ?? run;
         const usage: CodeLoopUsage = extra
           ? {
@@ -693,8 +819,22 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         const firstEditAtMs = editRun?.firstEditAtMs ?? null;
         const firstEditTurn = editRun?.firstEditTurn ?? null;
         const editStartMs = firstEditAtMs === null ? undefined : Math.max(0, firstEditAtMs - run.startedAtMs);
-        const missedDeadline = run.killedFor === "edit-deadline" || extra?.killedFor === "edit-deadline";
         const mutationToolCall = run.mutationToolCall || (extra?.mutationToolCall ?? false);
+        const capReason = forcedCapReason ?? extra?.killedFor ?? run.killedFor;
+        // #240: the non-convergence terminal path returns cap-exceeded WITHOUT a kill (the
+        // process already exited cleanly with no mutation), so capReason is null there. Every
+        // other cap-exceeded path carries a killedFor; every non-cap outcome keeps null.
+        const failureKind: CodeLoopFailureKind | null = capReason === null
+          ? (outcome === "cap-exceeded" && opts.caps.edit_deadline_turn !== undefined && !mutationToolCall
+            ? "edit-deadline"
+            : null)
+          : ({
+              turns: "turn-cap",
+              tokens: "token-cap",
+              wall: "wall-cap",
+              growth: "growth-cap",
+              "edit-deadline": "edit-deadline",
+            } as const)[capReason];
         const combinedAgentChecks = [...run.agentChecks, ...(extra?.agentChecks ?? [])];
         const agentChecks = combinedAgentChecks.slice(0, CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX);
         const droppedAgentChecks = combinedAgentChecks.length - agentChecks.length;
@@ -718,7 +858,7 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
             agent_check_unparseable_lines: run.unparseableLines + (extra?.unparseableLines ?? 0),
             agent_check_coverage_loss_events:
               run.agentCheckCoverageLossEvents + (extra?.agentCheckCoverageLossEvents ?? 0) + droppedAgentChecks,
-            ...(missedDeadline ? { failure_kind: "edit-deadline" as const } : {}),
+            ...(failureKind !== null ? { failure_kind: failureKind } : {}),
             agent_checks: agentChecks.map((attempt, index) => ({
               ...attempt,
               order: index + 1,
@@ -729,14 +869,36 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         };
       };
 
+      // #240 explicit no-edit diagnostic: stable prefix + content-blind counts only (turn
+      // and discovery volumes are low-cardinality budgets, never paths/queries/prompts/source
+      // text). failure_kind:edit-deadline + mutation_evidence:none is the machine-readable
+      // reason distinguishing "no relevant edit attempted" from a patch that failed
+      // verification (completed + mutation evidence + a ran check with a nonzero exit).
+      const deadlineTurn = opts.caps.edit_deadline_turn;
+      const editDeadlineDetail = (observedTurns: number, discoveryCalls: number): string =>
+        `no relevant edit attempted (edit-deadline): ${discoveryCalls} discovery tool calls ` +
+        `across ${observedTurns} turns with no completed edit/write by turn ${deadlineTurn}`;
+
       if (first.killedFor !== null) {
-        return toResult(first, null, "cap-exceeded", `cap breached: ${first.killedFor}`);
+        const detail = first.killedFor === "edit-deadline" && deadlineTurn !== undefined
+          ? editDeadlineDetail(first.usage.turns, first.discoveryToolCalls)
+          : `cap breached: ${first.killedFor}`;
+        return toResult(first, null, "cap-exceeded", detail);
       }
       // Clean completion requires ALL of: zero exit, no errored turn, no degenerate char-run. The
       // erroredTurn check is the §10 must-fix: pi records a mid-stream gateway abort as a turn_end
       // with stopReason:"error" while STILL exiting 0, so exit-code + char-run alone would silently
       // accept a truncated turn as "completed" (verified live 2026-07-03).
-      if (first.exitCode === 0 && first.erroredTurn === null && !hasDegenerateRun(first.finalMessage, cfg.degeneracyRunThreshold)) {
+      const firstClean = first.exitCode === 0 && first.erroredTurn === null &&
+        !hasDegenerateRun(first.finalMessage, cfg.degeneracyRunThreshold);
+      // #240: a clean exit with a configured deadline but zero successful mutations is a
+      // non-converging run, not a completion — otherwise the conductor receives a silent
+      // "completed" with an empty diff and no signal to reclaim/re-route the leaf. Without a
+      // deadline the historical completed-without-mutation behavior is preserved byte-for-byte.
+      if (firstClean && deadlineTurn !== undefined && !first.mutationToolCall) {
+        return toResult(first, null, "cap-exceeded", editDeadlineDetail(first.usage.turns, first.discoveryToolCalls));
+      }
+      if (firstClean) {
         return toResult(first, null, "completed", "");
       }
 
@@ -765,16 +927,75 @@ export function makePiEngine(cfg: PiEngineConfig, deps: PiEngineDeps): AgentEngi
         );
       }
 
-      const ready = await deps.readinessProbe(readinessBudgetMs);
+      const waitForReadiness = async (): Promise<{ ready: boolean; aborted: boolean }> => {
+        const signal = opts.signal;
+        if (signal === undefined) return { ready: await deps.readinessProbe(readinessBudgetMs), aborted: false };
+        if (signal.aborted) return { ready: false, aborted: true };
+        return await new Promise<{ ready: boolean; aborted: boolean }>((resolve, reject) => {
+          let settled = false;
+          const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+          const onAbort = (): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve({ ready: false, aborted: true });
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          deps.readinessProbe(readinessBudgetMs).then(
+            (ready) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve({ ready, aborted: false });
+            },
+            (error: unknown) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(error);
+            },
+          );
+          if (signal.aborted) onAbort();
+        });
+      };
+      const readiness = await waitForReadiness();
+      if (readiness.aborted || opts.signal?.aborted) {
+        return toResult(first, null, "cap-exceeded", "cap breached: wall", "wall");
+      }
+      const ready = readiness.ready;
       if (!ready) {
         return toResult(first, null, "degenerate", "degeneracy suspected; model never became ready for the retry");
       }
 
-      const second = await attempt(CONTINUATION_PREFIX + opts.instruction, first.usage.turns, first.agentChecks.length);
+      // The retry inherits the first attempt's successful mutation, if any: the edit
+      // deadline is satisfied globally and must not be re-enforced against the retry.
+      const second = await attempt(CONTINUATION_PREFIX + opts.instruction, first.usage.turns, first.agentChecks.length, first.mutationToolCall);
       if (second.killedFor !== null) {
-        return toResult(first, second, "cap-exceeded", `cap breached on retry: ${second.killedFor}`);
+        const detail = second.killedFor === "edit-deadline" && deadlineTurn !== undefined
+          ? editDeadlineDetail(
+            first.usage.turns + second.usage.turns,
+            first.discoveryToolCalls + second.discoveryToolCalls,
+          )
+          : `cap breached on retry: ${second.killedFor}`;
+        return toResult(first, second, "cap-exceeded", detail);
       }
-      if (second.exitCode === 0 && second.erroredTurn === null && !hasDegenerateRun(second.finalMessage, cfg.degeneracyRunThreshold)) {
+      const secondClean = second.exitCode === 0 && second.erroredTurn === null &&
+        !hasDegenerateRun(second.finalMessage, cfg.degeneracyRunThreshold);
+      // #240: the same non-convergence rule spans the retry — a clean recovery with no
+      // successful mutation anywhere in the global budget is cap-exceeded, never a completed
+      // empty diff. A mutation in either attempt still completes normally.
+      if (secondClean && deadlineTurn !== undefined && !first.mutationToolCall && !second.mutationToolCall) {
+        return toResult(
+          first,
+          second,
+          "cap-exceeded",
+          editDeadlineDetail(
+            first.usage.turns + second.usage.turns,
+            first.discoveryToolCalls + second.discoveryToolCalls,
+          ),
+        );
+      }
+      if (secondClean) {
         return toResult(first, second, "completed", "recovered after a degeneracy retry");
       }
       return toResult(first, second, "degenerate", "second attempt after degeneracy also failed — terminal");

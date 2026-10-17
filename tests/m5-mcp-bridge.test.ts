@@ -13,7 +13,7 @@ function rpcResponse(id: number, result: unknown, headers?: HeadersInit): Respon
 
 function makeBridge(
   fetch: typeof globalThis.fetch,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; adoptionSpool?: unknown } = {},
 ) {
   return createM5Client({
     gatewayUrl: "https://gateway.invalid",
@@ -21,7 +21,26 @@ function makeBridge(
     credentialStore: { resolve: async () => SECRET },
     fetch,
     timeoutMs: options.timeoutMs,
-  }).then((client) => createMcpStdioBridge({ client }));
+    ...(options.adoptionSpool === undefined ? {} : { adoptionSpool: options.adoptionSpool as never }),
+  }).then((client) => createMcpStdioBridge({
+    client,
+    profile: "codex",
+    ...(options.adoptionSpool === undefined ? {} : { adoptionSpool: options.adoptionSpool as never }),
+  }));
+}
+
+function memorySpool({ fail = false } = {}) {
+  const saved: unknown[] = [];
+  return {
+    saved,
+    spool: {
+      save: async (entry: unknown) => {
+        if (fail) throw new Error("spool disk full");
+        saved.push(entry);
+        return "adoption-20260911T000000-deadbeef";
+      },
+    },
+  };
 }
 
 describe("m5 stdio MCP conformance", () => {
@@ -99,6 +118,54 @@ describe("m5 stdio MCP conformance", () => {
     expect(JSON.stringify([initialize, list, call])).not.toContain(SECRET);
   });
 
+  it("forwards include_reasoning and keeps reasoning outside the answer text", async () => {
+    let upstreamRequest: Record<string, unknown> | undefined;
+    const reasoning = "The model's private trace is carried separately.";
+    const bridge = await makeBridge(async (_input, init) => {
+      upstreamRequest = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const id = upstreamRequest.id as number;
+      return rpcResponse(id, {
+        content: [{ type: "text", text: "answer" }],
+        isError: false,
+        structuredContent: {
+          model: "mellum",
+          text: "answer",
+          finish_reason: "stop",
+          truncated: false,
+          metered: true,
+          reasoning_content: reasoning,
+          reasoning_truncated: false,
+          usage: null,
+        },
+      });
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "ask",
+        arguments: { model: "mellum", prompt: "bounded", include_reasoning: true },
+      },
+    }));
+    const parsed = JSON.parse(response!);
+    const result = parsed.result;
+
+    expect((upstreamRequest?.params as { arguments?: unknown }).arguments).toEqual({
+      model: "mellum",
+      prompt: "bounded",
+      include_reasoning: true,
+    });
+    expect(result.structuredContent).toMatchObject({
+      text: "answer",
+      reasoning_content: reasoning,
+      reasoning_truncated: false,
+    });
+    expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+    expect(result.content[0].text).not.toContain(reasoning);
+  });
+
   it("handles 202/no-body notifications and rejects no-body request responses", async () => {
     const bridge = await makeBridge(async () => new Response(null, { status: 202 }));
 
@@ -149,7 +216,8 @@ describe("m5 stdio MCP conformance", () => {
         const request = JSON.parse(String(init?.body)) as { id: number };
         return rpcResponse(request.id, { tools: [] });
       },
-      { timeoutMs: 5 },
+      // #154 lower bound: the same abort-driven redaction path with a valid timeout.
+      { timeoutMs: 1_000 },
     );
 
     const failed = await bridge.handleLine(
@@ -161,13 +229,603 @@ describe("m5 stdio MCP conformance", () => {
 
     expect(JSON.parse(failed!)).toMatchObject({
       id: 10,
-      error: { code: -32603, message: expect.stringMatching(/timed out/i) },
+      error: {
+        code: -32603,
+        message: expect.stringMatching(/timed out/i),
+        data: {
+          m5_code: "timeout",
+          diagnostic_code: "connect_timeout",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      },
     });
+    expect(JSON.parse(failed!).error.message).toContain("public M5 gateway request timed out before any HTTP response");
     expect(failed).not.toContain(SECRET);
     expect(JSON.parse(recovered!)).toMatchObject({
       id: 11,
       result: { tools: [] },
     });
+  });
+
+  it("reports a redacted list_models connector timeout after fetch observes abort", async () => {
+    let observedAbort = false;
+    const bridge = await makeBridge(
+      async (_input, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          observedAbort = true;
+          reject(new Error(`request timed out with Bearer ${SECRET} at https://timeout.invalid/raw`));
+        });
+      }),
+      // Keep this on the supported lower bound while exercising the real AbortController path.
+      { timeoutMs: 1_000 },
+    );
+    const request = {
+      jsonrpc: "2.0",
+      id: 24,
+      method: "tools/call",
+      params: {
+        name: "list_models",
+        arguments: {
+          credential: SECRET,
+          locator: "https://timeout.invalid/raw",
+          request_tag: "raw-list-models-timeout-params",
+        },
+      },
+    };
+
+    const response = await bridge.handleLine(JSON.stringify(request));
+    const parsed = JSON.parse(response!);
+    expect(observedAbort).toBe(true);
+    expect(parsed).toMatchObject({
+      id: 24,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "timeout",
+          diagnostic_code: "connect_timeout",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation:
+            "Retry the same operation once. If it still fails, run m5 --profile codex doctor; the standalone doctor tests the configured profile path and explicitly reports that it cannot inspect the host connector session itself.",
+        },
+      },
+    });
+    expect(response).not.toContain(SECRET);
+    expect(response).not.toContain("timeout.invalid");
+    expect(response).not.toContain("raw-list-models-timeout-params");
+    expect(parsed.error.data).not.toHaveProperty("params");
+  });
+
+  it("retries code_loop_result once with the same work id after a transient transport failure", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const bridge = await makeBridge(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }),
+        });
+      }
+      return rpcResponse(Number(request.id), {
+        content: [{ type: "text", text: "{}" }],
+        isError: false,
+        structuredContent: {
+          status: "cap-exceeded",
+          work_id: "cl-terminal",
+          diff: "",
+          check: { ran: false },
+        },
+      });
+    });
+    const message = {
+      jsonrpc: "2.0",
+      id: 19,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    };
+
+    const response = await bridge.handleLine(JSON.stringify(message));
+
+    expect(requests).toEqual([message, message]);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 19,
+      result: {
+        isError: false,
+        structuredContent: { status: "cap-exceeded", work_id: "cl-terminal" },
+      },
+    });
+  });
+
+  it("reports exhausted code_loop_result recovery separately from an unknown or lost result", async () => {
+    let calls = 0;
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          calls += 1;
+          throw new M5ClientError("network_failure", "temporary result fetch failure", {
+            diagnosticCode: "connection_reset",
+            failureLayer: "gateway_transport",
+            retryable: true,
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(2);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 20,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "network_failure",
+          retryable: true,
+          result_recovery: {
+            status: "retry_exhausted",
+            automatic_retries: 1,
+            action: "retry_same_work_id",
+          },
+        },
+      },
+    });
+  });
+
+  it("reports an exhausted automatic retry when the second failure changes category", async () => {
+    let calls = 0;
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          calls += 1;
+          if (calls === 1) {
+            throw new M5ClientError("network_failure", "temporary result fetch failure", {
+              diagnosticCode: "connection_reset",
+              failureLayer: "gateway_transport",
+              retryable: true,
+            });
+          }
+          throw new M5ClientError("rejected_credential", "credential rotated", {
+            failureLayer: "authentication",
+            retryable: false,
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(2);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 22,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "rejected_credential",
+          retryable: false,
+          result_recovery: {
+            status: "retry_exhausted",
+            automatic_retries: 1,
+            action: "follow_error_remediation",
+          },
+        },
+      },
+    });
+  });
+
+  it("does not retry a non-retryable first code_loop_result failure", async () => {
+    let calls = 0;
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          calls += 1;
+          throw new M5ClientError("rejected_credential", "credential rejected", {
+            failureLayer: "authentication",
+            retryable: false,
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(1);
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 23,
+      error: {
+        code: -32603,
+        data: { m5_code: "rejected_credential", retryable: false },
+      },
+    });
+    expect(parsed.error.data).not.toHaveProperty("result_recovery");
+  });
+
+  it.each([
+    {
+      label: "unknown",
+      payload: { error: "unknown work_id", work_id: "cl-terminal" },
+    },
+    {
+      label: "lost",
+      payload: {
+        status: "cap-exceeded",
+        work_id: "cl-terminal",
+        error: "terminal result unavailable after restart",
+      },
+    },
+  ])("does not transport-retry a structured $label result", async ({ payload }) => {
+    let calls = 0;
+    const bridge = await makeBridge(async (_input, init) => {
+      calls += 1;
+      const request = JSON.parse(String(init?.body)) as { id: number };
+      return rpcResponse(request.id, {
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+        isError: true,
+        structuredContent: payload,
+      });
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: { name: "code_loop_result", arguments: { work_id: "cl-terminal" } },
+    }));
+
+    expect(calls).toBe(1);
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 21,
+      result: { isError: true, structuredContent: payload },
+    });
+  });
+
+  it.each([
+    ["dns_failure", "ENOTFOUND"],
+    ["dns_failure", "EAI_AGAIN"],
+    ["connection_refused", "ECONNREFUSED"],
+    ["route_unreachable", "ENETUNREACH"],
+    ["tls_failure", "CERT_HAS_EXPIRED"],
+  ])("returns a redacted connector-layer %s diagnostic", async (diagnosticCode, causeCode) => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError(`fetch failed ${SECRET}`), {
+        cause: Object.assign(new Error(`transport failed at https://private.invalid/${SECRET}`), {
+          code: causeCode,
+        }),
+      });
+    });
+
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"ask","arguments":{"model":"mellum","prompt":"bounded"}}}',
+    );
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 15,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: diagnosticCode,
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      },
+    });
+    expect(response).not.toContain(SECRET);
+    expect(response).not.toContain("private.invalid");
+  });
+
+  it("reports a redacted list_models DNS cause as a connector transport failure", async () => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError(`fetch failed with Bearer ${SECRET}`), {
+        cause: Object.assign(
+          new Error(`getaddrinfo ENOTFOUND dns-only.invalid/${SECRET}`),
+          { code: "ENOTFOUND" },
+        ),
+      });
+    });
+    const request = {
+      jsonrpc: "2.0",
+      id: 25,
+      method: "tools/call",
+      params: {
+        name: "list_models",
+        arguments: {
+          credential: SECRET,
+          locator: "https://dns-only.invalid/raw",
+          request_tag: "raw-list-models-dns-params",
+        },
+      },
+    };
+
+    const response = await bridge.handleLine(JSON.stringify(request));
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 25,
+      error: {
+        code: -32603,
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "dns_failure",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation:
+            "Retry the same operation once. If it still fails, run m5 --profile codex doctor; the standalone doctor tests the configured profile path and explicitly reports that it cannot inspect the host connector session itself.",
+        },
+      },
+    });
+    expect(response).not.toContain(SECRET);
+    expect(response).not.toContain("dns-only.invalid");
+    expect(response).not.toContain("raw-list-models-dns-params");
+    expect(parsed.error.data).not.toHaveProperty("params");
+  });
+
+  it("bounds malformed cyclic cause traversal and returns the residual category", async () => {
+    const cyclic = Object.assign(new TypeError("fetch failed"), { code: "UNKNOWN_TRANSPORT" }) as Error & {
+      cause?: unknown;
+    };
+    cyclic.cause = cyclic;
+    const bridge = await makeBridge(async () => { throw cyclic; });
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":18,"method":"tools/list"}',
+    );
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "network_failure",
+          failure_layer: "connector_transport",
+        },
+      },
+    });
+  });
+
+  it("spools an adoption-report outage with a stable failing layer instead of losing it", async () => {
+    const { saved, spool } = memorySpool();
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: spool });
+    const report = {
+      harness: "codex_app",
+      execution_mode: "ask",
+      traffic_purpose: "organic",
+      result: "failed",
+      deterministic_check: "not_run",
+      reviewer_usefulness: "not_reported",
+      fallback_reason: "m5_unreachable",
+      eligible_opportunities: 7,
+    };
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 16,
+      method: "tools/call",
+      params: { name: "record_adoption_evidence", arguments: report },
+    }));
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "route_unreachable",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+          evidence_recovery: {
+            status: "spooled",
+            spool_id: "adoption-20260911T000000-deadbeef",
+            action: "retry_same_tool_call",
+          },
+        },
+      },
+    });
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ profile: "codex", report });
+    expect(response).not.toContain("codex_app");
+    expect(response).not.toContain("eligible_opportunities");
+  });
+
+  it("keeps the legacy not_recorded contract when no spool is configured", async () => {
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: null });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 116,
+      method: "tools/call",
+      params: {
+        name: "record_adoption_evidence",
+        arguments: {
+          harness: "codex_app",
+          execution_mode: "ask",
+          traffic_purpose: "organic",
+          result: "failed",
+          deterministic_check: "not_run",
+          reviewer_usefulness: "not_reported",
+          fallback_reason: "m5_unreachable",
+          eligible_opportunities: 7,
+        },
+      },
+    }));
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          evidence_recovery: { status: "not_recorded", action: "retry_same_tool_call" },
+        },
+      },
+    });
+  });
+
+  it("reports spool_failed without changing the transport diagnosis", async () => {
+    const { spool } = memorySpool({ fail: true });
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: spool });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 216,
+      method: "tools/call",
+      params: {
+        name: "record_adoption_evidence",
+        arguments: {
+          harness: "codex_app",
+          execution_mode: "ask",
+          traffic_purpose: "organic",
+          result: "failed",
+          deterministic_check: "not_run",
+          reviewer_usefulness: "not_reported",
+          fallback_reason: "m5_unreachable",
+          eligible_opportunities: 7,
+        },
+      },
+    }));
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "route_unreachable",
+          failure_layer: "connector_transport",
+          evidence_recovery: { status: "spool_failed", action: "retry_same_tool_call" },
+        },
+      },
+    });
+  });
+
+  it("returns a deterministic failing layer for list_models on a dead connector route", async () => {
+    const { saved, spool } = memorySpool();
+    const bridge = await makeBridge(async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("unreachable"), { code: "ENETUNREACH" }),
+      });
+    }, { adoptionSpool: spool });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 316,
+      method: "tools/call",
+      params: { name: "list_models", arguments: {} },
+    }));
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        data: {
+          m5_code: "network_failure",
+          diagnostic_code: "route_unreachable",
+          failure_layer: "connector_transport",
+          retryable: true,
+          remediation: expect.stringContaining("m5 --profile codex doctor"),
+        },
+      },
+    });
+    expect(saved).toHaveLength(0);
+  });
+
+  it("distinguishes gateway health failures from connector transport failures", async () => {
+    const bridge = await makeBridge(async () => new Response("", { status: 503 }));
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":17,"method":"tools/list"}',
+    );
+    expect(JSON.parse(response!)).toMatchObject({
+      error: {
+        message: expect.stringContaining("gateway_http_error"),
+        data: {
+          m5_code: "upstream_http_error",
+          diagnostic_code: "gateway_http_error",
+          failure_layer: "gateway_health",
+          http_status: 503,
+          retryable: true,
+        },
+      },
+    });
+  });
+
+  it("explains a Cloudflare 1033 tunnel failure in the visible MCP error", async () => {
+    const bridge = await makeBridge(async () => new Response(
+      "<html><title>Error 1033</title><p>private data must not echo</p></html>",
+      { status: 530, headers: { server: "cloudflare", "content-type": "text/html" } },
+    ));
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":18,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("Cloudflare Tunnel");
+    expect(response.error.message).toContain("cloudflared");
+    expect(response.error.message).not.toContain("private data");
+    expect(response.error.data).toMatchObject({
+      diagnostic_code: "cloudflare_tunnel_unavailable",
+      http_status: 530,
+      failure_layer: "gateway_transport",
+    });
+  });
+
+  it("explains a 502 without inventing a specific upstream cause", async () => {
+    const bridge = await makeBridge(async () => new Response("internal secret", { status: 502 }));
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":19,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("HTTP 502");
+    expect(response.error.message).toContain("specific cause is unknown");
+    expect(response.error.message).not.toContain("internal secret");
+    expect(response.error.data).toMatchObject({
+      diagnostic_code: "gateway_http_error",
+      http_status: 502,
+      failure_layer: "gateway_health",
+    });
+  });
+
+  it("does not call every Cloudflare 530 a tunnel outage", async () => {
+    const bridge = await makeBridge(async () => new Response(
+      "<title>Error 1016</title>", { status: 530, headers: { server: "cloudflare" } },
+    ));
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":20,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("HTTP 530");
+    expect(response.error.message).not.toContain("no healthy cloudflared");
+    expect(response.error.data.diagnostic_code).toBe("cloudflare_origin_unresolved");
+  });
+
+  it("preserves a confirmed private tailnet failure in the visible bridge error", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "http://private.invalid:8080",
+      endpoint: "private",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      timeoutMs: 1_000,
+      localProbes: { tailnet: async () => "down" },
+      fetch: (_input, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }),
+    });
+    const bridge = createMcpStdioBridge({ client, profile: "codex" });
+    const response = JSON.parse((await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":21,"method":"tools/list"}',
+    ))!);
+    expect(response.error.message).toContain("local tailnet is unavailable");
+    expect(response.error.data.failure_layer).toBe("local_tailnet_unavailable");
+    expect(response.error.data.remediation).toContain("Tailscale");
   });
 
   it("reconnects once without a stale HTTP MCP session", async () => {
@@ -257,6 +915,49 @@ describe("m5 stdio MCP conformance", () => {
     },
   );
 
+  it("projects only validated model backoff metadata from M5 client errors", async () => {
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          throw new M5ClientError("model_temporarily_unavailable", "ignored peer text", {
+            retryable: true,
+            retryAfterSeconds: 5,
+            requestId: "77777777-7777-4777-8777-777777777777",
+            backoff: {
+              scope: "key_model",
+              retry_after_seconds: 5,
+              unavailable_until: "2026-10-15T14:30:00.000Z",
+            },
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"tools/list"}',
+    );
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 15,
+      error: {
+        message: "This model is temporarily unavailable for your API key. Retry after the indicated delay.",
+        data: {
+          m5_code: "model_temporarily_unavailable",
+          request_id: "77777777-7777-4777-8777-777777777777",
+          retry_after_seconds: 5,
+          backoff: {
+            scope: "key_model",
+            retry_after_seconds: 5,
+            unavailable_until: "2026-10-15T14:30:00.000Z",
+          },
+        },
+      },
+    });
+    expect(response).not.toContain("ignored peer text");
+    expect(parsed.error.data).not.toHaveProperty("quota");
+  });
+
   it("rejects a mismatched upstream response id as malformed JSON-RPC", async () => {
     const bridge = await makeBridge(async () => rpcResponse(999, { tools: [] }));
 
@@ -289,5 +990,17 @@ describe("m5 stdio MCP conformance", () => {
       id: 13,
       error: { code: -32603, message: expect.stringMatching(/malformed JSON-RPC/i) },
     });
+  });
+});
+
+describe("local build_run MCP tool", () => {
+  it("advertises and executes build_run locally without forwarding it", async () => {
+    const calls: unknown[]=[];
+    const bridge=createMcpStdioBridge({client:{rpc:async (message:unknown)=>{calls.push(message);return {jsonrpc:"2.0",id:1,result:{tools:[]}};}},profile:"codex",buildConfig:{version:1,sshTarget:"m5-build"},buildRunner:async (options:any)=>({exit_code:4,truncated:{stdout:false,stderr:false},stdout:"out",stderr:"err",cwd:options.cwd,command:options.command})} as any);
+    const listed=JSON.parse((await bridge.handleLine('{"jsonrpc":"2.0","id":1,"method":"tools/list"}'))!);
+    expect(listed.result.tools).toContainEqual(expect.objectContaining({name:"build_run"}));
+    const called=JSON.parse((await bridge.handleLine(JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"build_run",arguments:{cwd:"/tmp/worktree",command:["echo","--help"],toolchain:"stable",pull:[]}}})))!);
+    expect(called.result.content[0].text).toContain('"exit_code":4');
+    expect(calls).toHaveLength(1); expect(JSON.stringify(calls)).not.toContain("build_run");
   });
 });

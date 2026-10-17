@@ -1,9 +1,9 @@
 /**
- * model-evals-portal.ts — shape the scout registry for the public portal's
+ * model-evals-portal.ts — shape the manual model-evaluation registry for the public portal's
  * "New model evaluations" section (served by GET /portal/model-evals.json).
  *
  * Content-blind: only model id / quant / size / scores / verdict / served — no prompts, no
- * per-user data. Reads the same durable registry the weekly scout + Heimdall poster use.
+ * per-user data. Reads the durable registry written by explicitly requested evaluations.
  */
 import { DEFAULT_REGISTRY_PATH, latestByModel, readRegistry } from "./model-registry.js";
 import type { RegistryEntry } from "./scout-types.js";

@@ -137,6 +137,10 @@ const COST_COLUMNS = [
   "notes",
 ] as const;
 
+export const DELEGATION_M5_COST_VALUE_COLUMNS = COST_COLUMNS.filter(
+  (column) => column.startsWith("m5_") && column.endsWith("_cost_usd")
+);
+
 let _costInitDb: Database.Database | null = null;
 
 function tableColumns(db: Database.Database, table: string): Set<string> {

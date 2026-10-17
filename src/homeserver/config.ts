@@ -1,4 +1,5 @@
 import { loadEnv } from "../env.js";
+import { isEmbeddingModel } from "./embedding-request.js";
 import { MAX_BLIND_CONTEXT_ROOTS } from "./blind-context.js";
 import type { ShadowLaneConfig } from "./shadow-lane.js";
 import {
@@ -6,6 +7,11 @@ import {
   type ReviewCascadeShadowConfig,
 } from "./review-cascade-shadow.js";
 import { sanitizeTraceIdentity } from "./tracing.js";
+import {
+  parseHostMemoryBudgets,
+  parseHostMemoryMode,
+  type HostMemoryAdmissionConfig,
+} from "./host-memory-admission.js";
 
 export type { ShadowLaneConfig };
 export type { ReviewCascadeShadowConfig };
@@ -62,7 +68,7 @@ export interface PolicyConfig {
    * #156's structural blacklist). For a judgment-quality task type, a ledger row is admissible as
    * verdict evidence IFF its (base-named) verifier is in this set. A whitelist is strictly stronger
    * than #156's blacklist and subsumes it: #156 could exclude KNOWN-structural verifiers, but it
-   * still admitted opaque/non-adversarial checks (the model-scout's own `predicate` code-review
+   * still admitted opaque/non-adversarial checks (the historical evaluation `predicate` code-review
    * probe, `matches`) that pass while finding ~6% of real seeded bugs (2026-07-05 ground-truth
    * sweep). Only positively-trusted evidence should be able to move a judgment verdict.
    *
@@ -238,6 +244,14 @@ export interface HomeserverConfig {
    * silently reactivate the deprecated adapter.
    */
   backend: "lmstudio" | "llamaswap";
+  /** Explicitly enabled decision-model IDs served through POST /v1/systemone. Empty disables it. */
+  systemOneModels: string[];
+  /** Explicitly enabled embedding-model IDs served through POST /v1/embeddings. */
+  embeddingModels: string[];
+  /** Optional dedicated loopback embedding server's OpenAI-compatible /v1 base. */
+  embeddingBaseUrl: string;
+  /** Enable reviewed inline media inputs only after the projector is active and probed. */
+  embeddingMediaEnabled: boolean;
   /** Explicit remote small-model backend. Empty URL keeps the gateway M5-only. */
   orin: {
     url: string;
@@ -311,6 +325,8 @@ export interface HomeserverConfig {
   maintenanceRetryAfterSeconds: number;
   /** Whether the gateway starts in bench/maintenance mode (guests refused). Default: off. */
   maintenanceModeAtStart: boolean;
+  /** Absolute operator maintenance fence, retained across process restarts; at most 30 minutes ahead. */
+  startupExclusiveUntilMs?: number;
   /** Hard cap applied (via min()) to every request's max_tokens. */
   perRequestMaxTokens: number;
   /** Exact model id → explicit-request max_tokens ceiling; CSV env `model=limit,...`. */
@@ -326,6 +342,11 @@ export interface HomeserverConfig {
   harvestExcludedTaskTypes: string[];
   policy: PolicyConfig;
   delegatePolicy: DelegatePolicyConfig;
+  /**
+   * #350: whole-host memory admission before a llama-swap model start. Default OFF; `shadow`
+   * observes only. Budgets are operator-declared, not calibrated.
+   */
+  hostMemoryAdmission: HostMemoryAdmissionConfig;
   /** #234: background candidate-evidence lane on router-escalated leaves. Default OFF. */
   shadowLane: ShadowLaneConfig;
   /** #132: owner-only GPT-OSS → Qwen review measurement lane. Default OFF. */
@@ -568,6 +589,27 @@ function envNum(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+let hostMemoryBudgetsWarned = false;
+
+function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
+  const { budgets, reclaim, invalid } = parseHostMemoryBudgets(process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"]);
+  if (invalid.length > 0 && !hostMemoryBudgetsWarned) {
+    hostMemoryBudgetsWarned = true;
+    console.warn(
+      `[host-memory-admission] ignoring invalid HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB entries: ${invalid.join(", ")}`,
+    );
+  }
+  const reserveGib = envNum("HOMESERVER_HOST_MEMORY_RESERVE_GIB", 12);
+  const retryAfter = envNum("HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS", 30);
+  return {
+    mode: parseHostMemoryMode(process.env["HOMESERVER_HOST_MEMORY_ADMISSION"]),
+    modelBudgetBytes: budgets,
+    modelReclaimBytes: reclaim,
+    reserveBytes: Math.round(Math.max(0, reserveGib) * 1024 ** 3),
+    retryAfterSeconds: Math.max(1, Math.round(retryAfter)),
+  };
+}
+
 /** Parse `model=positive_integer,...`; malformed entries are ignored rather than weakening caps. */
 export function parseModelMaxTokens(raw: string | undefined): Record<string, number> {
   if (raw === undefined) return { ...DEFAULT_MODEL_MAX_TOKENS };
@@ -616,6 +658,16 @@ function envColonList(name: string): string[] {
     .filter(Boolean);
 }
 
+function startupExclusiveUntilMs(): number | undefined {
+  const raw = process.env["HOMESERVER_STARTUP_EXCLUSIVE_UNTIL"];
+  if (raw === undefined) return undefined;
+  const until = Date.parse(raw);
+  if (!Number.isSafeInteger(until) || new Date(until).toISOString() !== raw || until - Date.now() > 30 * 60_000) {
+    throw new Error("HOMESERVER_STARTUP_EXCLUSIVE_UNTIL must be canonical UTC ISO time at most 30 minutes ahead");
+  }
+  return until;
+}
+
 let _config: HomeserverConfig | null = null;
 
 export function loadConfig(): HomeserverConfig {
@@ -626,6 +678,33 @@ export function loadConfig(): HomeserverConfig {
   const lmBase = (process.env["LMSTUDIO_BASE_URL"] ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
   const origin = lmBase.replace(/\/v1$/, "");
   const blindContextRoots = envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS");
+  const embeddingModels = envList("HOMESERVER_EMBEDDING_MODELS");
+  if (embeddingModels.some((model) => !isEmbeddingModel(model)) ||
+      new Set(embeddingModels).size !== embeddingModels.length) {
+    throw new Error("HOMESERVER_EMBEDDING_MODELS may contain only the reviewed embeddinggemma-2 ID once.");
+  }
+  const embeddingBaseUrl = (process.env["HOMESERVER_EMBEDDING_BASE_URL"] ?? "").replace(/\/$/, "");
+  const embeddingMediaSetting = process.env["HOMESERVER_EMBEDDING_MEDIA_ENABLED"] ?? "false";
+  if (embeddingMediaSetting !== "true" && embeddingMediaSetting !== "false") {
+    throw new Error("HOMESERVER_EMBEDDING_MEDIA_ENABLED must be true or false.");
+  }
+  const embeddingMediaEnabled = embeddingMediaSetting === "true";
+  if (embeddingMediaEnabled && embeddingModels.length === 0) {
+    throw new Error("HOMESERVER_EMBEDDING_MEDIA_ENABLED requires an enabled embedding model.");
+  }
+  if (embeddingModels.length > 0) {
+    let parsed: URL;
+    try {
+      parsed = new URL(embeddingBaseUrl);
+    } catch {
+      throw new Error("HOMESERVER_EMBEDDING_BASE_URL must be an explicit loopback /v1 URL when embeddings are enabled.");
+    }
+    if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" ||
+        !parsed.port || parsed.pathname !== "/v1" || parsed.username || parsed.password ||
+        parsed.search || parsed.hash || embeddingBaseUrl !== `${parsed.origin}/v1`) {
+      throw new Error("HOMESERVER_EMBEDDING_BASE_URL must be an explicit loopback /v1 URL when embeddings are enabled.");
+    }
+  }
   if (blindContextRoots.length > MAX_BLIND_CONTEXT_ROOTS) {
     throw new Error(
       `HOMESERVER_BLIND_CONTEXT_ROOTS may list at most ${MAX_BLIND_CONTEXT_ROOTS} entries.`
@@ -639,6 +718,10 @@ export function loadConfig(): HomeserverConfig {
     lmStudioBaseUrl: lmBase,
     lmStudioRestUrl: `${origin}/api/v1`,
     backend: (process.env["HOMESERVER_BACKEND"] === "lmstudio" ? "lmstudio" : "llamaswap"),
+    systemOneModels: envList("HOMESERVER_SYSTEMONE_MODELS"),
+    embeddingModels,
+    embeddingBaseUrl,
+    embeddingMediaEnabled,
     orin: {
       // Tailscale address belongs in deployment env, never source. Unset = disabled.
       url: (process.env["HOMESERVER_ORIN_URL"] ?? "").replace(/\/$/, ""),
@@ -670,6 +753,7 @@ export function loadConfig(): HomeserverConfig {
     busyRetryAfterSeconds: envNum("HOMESERVER_BUSY_RETRY_AFTER_S", 2),
     maintenanceRetryAfterSeconds: envNum("HOMESERVER_MAINTENANCE_RETRY_AFTER_S", 30),
     maintenanceModeAtStart: (process.env["HOMESERVER_MAINTENANCE_MODE"] ?? "off") === "on",
+    startupExclusiveUntilMs: startupExclusiveUntilMs(),
     perRequestMaxTokens: envNum("HOMESERVER_PER_REQUEST_MAX_TOKENS", envNum("HOMESERVER_MAX_TOKENS", 12288)),
     modelMaxTokens: parseModelMaxTokens(process.env["HOMESERVER_MODEL_MAX_TOKENS"]),
     keyDefaults: {
@@ -721,6 +805,7 @@ export function loadConfig(): HomeserverConfig {
         1
       ),
     },
+    hostMemoryAdmission: loadHostMemoryAdmissionConfig(),
     delegatePolicy: {
       mode: (() => {
         const v = process.env["HOMESERVER_DELEGATE_POLICY"];

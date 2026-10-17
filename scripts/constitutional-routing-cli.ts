@@ -13,12 +13,9 @@ import {
   constants,
   existsSync,
   fstatSync,
-  fsyncSync,
   lstatSync,
   openSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir, uptime } from "node:os";
 import { isAbsolute, dirname, resolve } from "node:path";
@@ -281,24 +278,6 @@ function authorityReader(config: AuthorityConfig): ProtectedAuthorityReader {
       return value as unknown as { config: string; evidence: string; policy: string; postconditions: string };
     },
   };
-}
-
-function atomicWrite(path: string, value: string): void {
-  const temporary = `${path}.${process.pid}.tmp`;
-  const fd = openSync(temporary, "wx", 0o660);
-  try {
-    writeFileSync(fd, value, "utf8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temporary, path);
-  const directory = openSync(dirname(path), "r");
-  try {
-    fsyncSync(directory);
-  } finally {
-    closeSync(directory);
-  }
 }
 
 function boundedTargetRead(path: string, maxBytes = 1_000_000): string {

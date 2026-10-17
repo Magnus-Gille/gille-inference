@@ -45,12 +45,17 @@ Prereqs: a real gateway key (`bin/invite`), and the harness pointed at the box �
 - **pi:** add the `inference-gille` provider to `~/.pi/agent/models.json` (see the plan doc)
 - **aider:** uses `OPENAI_API_BASE`/`OPENAI_API_KEY` + the YAML/JSON config here
 - **opencode:** add the `homebox` provider to `opencode.json` (see the plan doc)
+- **qwen-code:** `npm i -g @qwen-code/qwen-code` (validated on 0.21.15). The arm passes
+  `OPENAI_BASE_URL`/`OPENAI_API_KEY`/`OPENAI_MODEL` plus `-m`, `--yolo` and `--max-tool-calls`;
+  it also needs `security.auth.selectedType: "openai"` in `~/.qwen/settings.json` or it aborts
+  with "Operation cancelled". `qwen` has no `--dir`, so the arm `cd`s into the work dir like pi.
 
 ```bash
 export GW=https://inference.example.com/v1 GW_KEY=<real-key> MODEL=qwen3-coder-next-80b CAP_S=600
 bash gate-d/run.sh pi all          # arm A7
 bash gate-d/run.sh aider 03-impl-fn-across-2-files
 bash gate-d/run.sh opencode all    # arm A5
+bash gate-d/run.sh qwen-code all   # arm A9
 # `all` means pinned r1 (01–10). This conspicuous opt-in consumes the fresh r2 holdouts:
 GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/run.sh pi all
 # → rows include corpusRevision, taskRevision, and holdout

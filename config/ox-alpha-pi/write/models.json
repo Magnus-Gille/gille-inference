@@ -1,0 +1,37 @@
+{
+  "providers": {
+    "nous": {
+      "baseUrl": "https://inference-api.nousresearch.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$NOUS_API_KEY",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "stealth/ox-alpha",
+          "name": "Ox Alpha (Nous)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "compat": {
+            "supportsDeveloperRole": true,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": true,
+            "supportsStrictMode": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}

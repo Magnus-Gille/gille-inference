@@ -42,4 +42,4 @@ operator handoffs are intentionally not tracked in this repository.
 - Deep-research pipeline and citation trust anchor.
 - Shadow harvest, disagreement, delegate-policy, and cost-accounting mechanisms.
 - Agentic OpenAI array-of-parts message ingestion with a stamped loader-policy epoch (#222/#223).
-- Weekly model scout and guarded auto-promotion.
+- Manual, maintenance-protected model evaluation and operator-reviewed roster changes.

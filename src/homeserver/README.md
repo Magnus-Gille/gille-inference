@@ -158,26 +158,31 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 
 | Method + path | Auth | Purpose |
 |---|---|---|
-| `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks). |
+| `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks), plus content-free `codeLoopTransport: "available" \| "unavailable" \| "disabled"`. This checks the dedicated user-bus socket listener only when code loops are enabled. Overall `ok` remains independent of this field because ordinary inference can work while code loops cannot. It does not prove that a caged job can run. |
 | `GET /` · `GET /portal` | none | Serves the self-service portal page (HTML; `nosniff` + restrictive CSP + `no-store`). Per-IP throttled. |
 | `POST /portal/redeem` | none (the **code** is the credential) | `{code}` → `200 {key, alias, model, models, creditLimit}` (`Cache-Control: no-store`). Trades a one-time invite code for a freshly minted key. Uniform `409 invite_invalid` for an unknown **or** already-used code (identical body — no enumeration oracle); `400` for a missing code. Per-IP throttled (`HOMESERVER_REDEEM_RPM`, default 10 / 10 min) → `429`. |
-| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` (`Cache-Control: no-store`). |
+| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` plus `gateway` release metadata for minted owner agent/admin keys and keys with an explicit `embeddinggemma-2` grant, and `inferenceObservation` only for minted owner agent/admin keys (`Cache-Control: no-store`). The latter is a global, content-blind request-log timestamp for the last observed successful admitted M5 inference, or `none`/`disabled`/`unavailable`; it does not establish current inference health or the health of either ingress route. |
 | `GET /portal/stats` | none | **PUBLIC, content-blind grand aggregate** powering the portal's "Served so far" card → `200 {total_tokens, total_requests, since}` (`Cache-Control: public, max-age=30`). Summed from the **durable** `request_log` (survives restarts — the honest "served so far"), NOT the in-memory Prometheus counters. Exposes ONLY fleet-wide totals — never any per-user / per-key / per-alias / per-model / content dimension. Per-IP throttled (shares the redeem window). Deliberately distinct from authed `/metrics`. |
-| `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the weekly Model Scout's registry (`model-registry.ts`, `docs/weekly-model-scout-runbook.md`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
+| `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the historical manual model-evaluation registry (`model-registry.ts`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. Prompt caching is server-owned and forced on for the ordinary exact-common-prefix path; client-supplied `id_slot` and `n_cache_reuse` are stripped so one principal cannot select a shared slot or alter the reviewed cache policy. A changed message/file prefix naturally diverges and its suffix is re-evaluated; the gateway stores no repository path or prompt cache. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
+| `POST /v1/systemone` | user | Typed `noul`/`choice`/`score` decisions for explicitly configured llama-swap models (`HOMESERVER_SYSTEMONE_MODELS`); text or JSON-object state, 1–16 questions, 256 KiB UTF-8 JSON body cap (262,144 bytes, including state, questions and formatting), no images/streaming/keep-alive. The separate served input context remains 8,192 tokens per question/prompt including instructions and runtime formatting; Clef shares one context across all questions. Guest keys need an explicit model grant, even when their ordinary chat allow-list is empty. Shares lifetime credits, quotas, GPU and host-memory admission with chat. Charges successful `usage.input_tokens`; failures charge zero. Decision models cannot be called through chat or MCP `ask`. See [customer contract](../../docs/systemone-customer-access.md). |
+| `POST /v1/embeddings` | user | OpenAI-shaped EmbeddingGemma 2 vectors for explicitly enabled `embeddinggemma-2` (`HOMESERVER_EMBEDDING_MODELS`). Text accepts one string or 1–16 strings and at most 32 KiB JSON. When `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` is activated with a verified projector, bounded wrapped text/image/audio/video inputs are also accepted (8 MiB JSON cap; contract below). `encoding_format` is `float` or `base64`; optional `user` and `dimensions` 128/256/512/768. Vectors are validated and L2-normalized after truncation. Guest keys require an explicit embedding grant or exact ID in their restricted ordinary allow-list. Shares admission, quotas and ordinary credits with chat; successful `usage.prompt_tokens` is charged, failures zero. Embedding models are excluded from chat, MCP `ask`, and automatic delegation. |
 | `GET /v1/capabilities/learning-task` | user | **LearningTaskContract v1 preflight.** Returns the closed four-feature capability advertisement, `service:gille-inference` identity, exact observation/expiry clocks, and an opaque advertisement ID bound to the current process/configuration epoch (`Cache-Control: private, max-age=900`). Hugin must carry this exact fresh response for every new stamped `/delegate` or `code_loop_start` claim; stale, downgraded, cross-principal, or cross-epoch new claims fail closed. Exact authenticated durable admission recovery remains available after expiry/restart without executing new work. |
 | `POST /v1/roster-proposals` | minted logical `service:hugin` owner | Content-blind roster-proposal validation and durable admission only. This rotation-family credential is route-scoped before generic owner dispatch and receives `403` everywhere except proposal submit and exact own-read. No apply/re-arm/widen/model-admin operation. Production rejects until the atomic five-state roster observer, common provider fence/mutator lock, and all restore/template/canary registries are configured; see `docs/roster-proposal-contract.md`. |
 | `GET /v1/roster-proposals/:proposalId` | owner | Principal-scoped durable proposal read; no list surface. |
 | `GET /v1/capabilities/review-lane` | user | **Review-lane preflight (#74).** No-I/O, content-blind lookup of which lane a review task TYPE will get — `code-review` is always `frontier-only` (unchanged); `review-bounded` (the three bounded subtasks: classify-findings / detect-anti-pattern / verify-output-shape) is `local-advisory` and reports `advisoryOnly`/`promoted`. The response also advertises reviewer-usefulness recording truthfully for the CURRENT caller: only a minted owner-tier admin key with a non-empty logical alias reports `available:true`; guest, owner-agent, static admin, and implicit-admin callers get `available:false` with the stable enums `requires_owner_admin`, `requires_minted_owner_admin`, or `missing_reviewer_identity` as applicable. Monitor-scope keys are outside this endpoint entirely and get `403 route_not_allowed` from the read-only monitor fence. Lets an orchestrator decide before spending a `/delegate` round trip, so it never waits on a local review result that will not come. See `docs/review-bounded-lane.md`. |
-| `POST /v1/audio/transcriptions` | user | **OpenAI Whisper-compatible speech-to-text.** Multipart `file` (required) + `model` / `language` / `response_format` / `temperature` / `prompt`. Forwards the audio to whisper-server (`HOMESERVER_WHISPER_URL`, default `http://127.0.0.1:8092`) `POST /inference`, always requesting `verbose_json` so the backend's top-level `duration` is available. **Metered by audio-seconds with RESERVE→RECONCILE billing (mirrors the chat path):** before transcribing, the worst case `ceil(HOMESERVER_AUDIO_MAX_SECONDS) * HOMESERVER_AUDIO_CREDITS_PER_SECOND` is reserved **atomically** against the lifetime credit cap — insufficient budget ⇒ `402 credits_exhausted` and **no transcription** (closes the TOCTOU + overdraft). After the backend returns, a **valid** `duration` (finite, `0 < d ≤ audioMaxSeconds`) reconciles **down** to `ceil(duration) * rate`; a **missing / 0 / non-finite / over-cap** duration on a 2xx is a backend FAULT and is charged the **clamped worst case** (never 0). Enforces per-key **RPM/TPM/daily** quota → `429` + `Retry-After` (no rate-limit bypass). Upload hardened: a declared `Content-Length` over `HOMESERVER_AUDIO_MAX_BYTES` (default 32 MiB) is rejected **`413 payload_too_large`** before buffering; an idle/socket read timeout (`HOMESERVER_AUDIO_READ_IDLE_MS`, default 30 s) drops slow-loris clients. `400` for a missing file or an out-of-range `temperature` (must be in `[0,1]`); `502/504` on backend unavailable/timeout (full refund — charge 0). Returns the client's `response_format` (`json` → `{text}`, `verbose_json` → full object, `text` → plain body). Content-blind: the transcript is **never** in request_log / metrics; owner-logged **only** under the owner guard (`tier===owner && keyHash!==null`). |
-| `POST /v1/images/generations` | user | **OpenAI-compatible text→image.** Three advertised models, each a tier: `image-fast` (synchronous → `200 {created, data:[{b64_json}]}`), `image-balanced` + `image-high` (asynchronous → `202 {id:"imgjob_…", status:"queued", …}`). **Inert** unless `HOMESERVER_IMAGE_URL` is set (else `404`). **Metered like the audio path:** worst-case `n × per-image credits` reserved up-front (`402` on overdraft, before any work), `n` image-units against the per-key quota (`429`), both reconciled to the **delivered** count; **full refund** on failure/timeout/cancel. A dedicated **single-slot diffusion worker** acquires the shared admission slot only around the sidecar dispatch (owner chat can still preempt; an honest guest at cap gets `503`). `403 model_not_allowed` off the allow-list; `502/504` on sidecar fault. Content-blind: the prompt + bytes are **never** in `image_jobs` / request_log / metrics; owner-logged **only** under the owner guard. Forwards to an sd-server-style sidecar (`HOMESERVER_IMAGE_URL`, e.g. `http://127.0.0.1:8093`) `POST /v1/images/generations`. |
+| `POST /v1/audio/transcriptions` | user | **OpenAI Whisper-compatible speech-to-text.** Multipart `file` (required) + `model` / `language` / `response_format` / `temperature` / `prompt`. Forwards the audio to whisper-server (`HOMESERVER_WHISPER_URL`, default `http://127.0.0.1:8092`) `POST /inference`, always requesting `verbose_json` so the backend's top-level `duration` is available. **Metered by audio-seconds with RESERVE→RECONCILE billing (mirrors the chat path):** before transcribing, the worst case `ceil(HOMESERVER_AUDIO_MAX_SECONDS) * HOMESERVER_AUDIO_CREDITS_PER_SECOND` is reserved **atomically** against the lifetime credit cap — insufficient budget ⇒ `402 credits_exhausted` and **no transcription** (closes the TOCTOU + overdraft). After the backend returns, a **valid** `duration` (finite, `0 < d ≤ audioMaxSeconds`) reconciles **down** to `ceil(duration) * rate`; a **missing / 0 / non-finite / over-cap** duration on a 2xx is a backend FAULT and is charged the **clamped worst case** (never 0). Enforces per-key **RPM/TPM/daily** quota → `429` + `Retry-After`; TPM/daily rejection messages state limits and estimates in audio-seconds. Upload hardened: a declared `Content-Length` over `HOMESERVER_AUDIO_MAX_BYTES` (default 32 MiB) is rejected **`413 payload_too_large`** before buffering; an idle/socket read timeout (`HOMESERVER_AUDIO_READ_IDLE_MS`, default 30 s) drops slow-loris clients. `400` for a missing file or an out-of-range `temperature` (must be in `[0,1]`); `502/504` on backend unavailable/timeout (full refund — charge 0). Returns the client's `response_format` (`json` → `{text}`, `verbose_json` → full object, `text` → plain body). Content-blind: the transcript is **never** in request_log / metrics; owner-logged **only** under the owner guard (`tier===owner && keyHash!==null`). |
+| `POST /v1/images/generations` | user | **OpenAI-compatible text→image.** Three advertised models, each a tier: `image-fast` (synchronous → `200 {created, data:[{b64_json}]}`), `image-balanced` + `image-high` (asynchronous → `202 {id:"imgjob_…", status:"queued", …}`). **Inert** unless `HOMESERVER_IMAGE_URL` is set (else `404`). **Metered like the audio path:** worst-case `n × per-image credits` reserved up-front (`402` on overdraft, before any work), `n` image-units against the per-key quota (`429`), both reconciled to the **delivered** count; **full refund** on failure/timeout/cancel. TPM/daily rejection messages state limits and request counts in image units. A dedicated **single-slot diffusion worker** acquires the shared admission slot only around the sidecar dispatch (owner chat can still preempt; an honest guest at cap gets `503`). `403 model_not_allowed` off the allow-list; `502/504` on sidecar fault. Content-blind: the prompt + bytes are **never** in `image_jobs` / request_log / metrics; owner-logged **only** under the owner guard. Forwards to an sd-server-style sidecar (`HOMESERVER_IMAGE_URL`, e.g. `http://127.0.0.1:8093`) `POST /v1/images/generations`. |
 | `GET /v1/images/generations/jobs/{id}` | user | Poll an async job (scoped to the creator; bare `404` otherwise). `succeeded` returns `data:[{b64_json}]` until the result TTL sweeps it (`expired`). |
 | `DELETE /v1/images/generations/jobs/{id}` | user | Cancel + refund a job, **idempotent**; scoped to the creator. |
-| `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys) and, for a real minted owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` plus `record_adoption_evidence` (invisible + unknown-tool-shaped error otherwise, #116/#136). The adoption tool accepts only a closed, content-free evidence shape; its weekly **MEASURED** dashboard is separate from evaluation/synthetic lab traffic and remains **SHADOW** for routing. Accepted and refused owner-agent report calls suppress normal per-request correlation logs, are transiently rate-limited and day-capped, and return only stable content-free rejection reason codes when bounded or invalid. `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). Its structured result exposes `finish_reason`, explicit `truncated`, content-blind `usage`, and `metered:true`; a token-limit finish returns `isError:true`, keeps the paid partial answer in the content block behind a loud warning, and means any retry is a new billable call. `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
+| `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys) and, for a real minted owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` plus `record_adoption_evidence` (invisible + unknown-tool-shaped error otherwise, #116/#136). The adoption tool accepts only a closed, content-free evidence shape; its weekly dashboard is separate from evaluation/synthetic lab traffic and remains **SHADOW** for routing. Report calls suppress normal per-request correlation logs and are transiently telemetry-rate-limited. The first 25 valid reports per server day retain individual low-cardinality rows; later reports are coalesced into bounded content-free v2 aggregates preserving closed harness and execution-mode attribution. Legacy aggregates remain unchanged; windows with legacy or malformed attribution stay **INCOMPLETE**. Both overflow tables retain 90 days. Its structured acknowledgement distinguishes `retained`, `aggregated`, and `dropped`, uses telemetry-scoped limit reasons, and explicitly says inference availability is unaffected. Retry guidance applies only to `record_adoption_evidence`, never `ask`, `code_loop`, model access, credits, or owner inference. `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). Its structured result exposes `finish_reason`, explicit `truncated`, content-blind `usage`, and `metered:true`; a token-limit finish returns `isError:true`, keeps the paid partial answer in the content block behind a loud warning, and means any retry is a new billable call. `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
 | `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
 | `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
-| `GET /models` | user | Models on disk + loaded. |
-| `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable"}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
+| `GET /models` | user | Models on disk + loaded. Decision and embedding models appear only when enabled and explicitly granted to guest keys. |
+| `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
+| `GET /ops/summary` | **admin or monitor** | Small, durable M5 activity summary for Heimdall: current in-flight count, last-use time, trailing-24-hour and seven-day request/time totals, plus seven UTC-calendar days newest-first. Counts only admitted M5 compute rows and excludes the outer `/mcp` transport row, so one MCP ask is never counted twice. Includes the content-blind `filterEpoch` (`m5-admitted-compute-v2`) so pre-epoch route-only history is treated as a historical break. No aliases, keys, tokens, content, or per-model dimensions. |
+| `GET /ops/incidents?from=EPOCH_MS&to=EPOCH_MS&limit=N` | **minted owner-admin** | Read-only, content-blind retained request metadata for a window up to 24 hours and 500 rows. Other scopes, static-admin, and implicit legacy admin callers are denied. Responses explicitly report retained-row coverage and do not establish causality. See the [reliability diagnostics guide](../../docs/reliability-diagnostics.md). |
+| `scripts/export-m5-adoption-evidence.ts` | local operator | Read-only JSON evidence bundle for an exact full-UTC-day `[from, throughExclusive)` window. Uses the shared `m5-admitted-compute-v2` predicate, UTC-day/tier/route/node/model and exclusion reconciliation, closed adoption dimensions, a bounded current M5 task×model×verifier×source×outcome matrix, exclusive delegation state counts, current/stale/missing judge-policy coverage, cost/attribution/calibration coverage, finite privacy buckets, evidence-only maturity labels, explicit threshold states, promotion readiness, and a deterministic next action. Refuses active WAL/live snapshots and missing schema; writes only to stdout. |
 | `GET /ledger` | **admin or monitor** | The learning report + recent delegations (`recent[]` rows carry `id`, #227). Read-only monitors (e.g. Heimdall) via `HOMESERVER_MONITOR_API_KEYS`. |
 | `GET /ledger/{id}` | **admin or monitor** | The single evidence row for a `ledgerId` (`recordDelegation`'s return value, echoed by `POST /delegate` as `costTrace.delegationId`) — the join target so a caller can retrieve its exact row without timestamp matching (#227). Stamped delegate rows add the exact non-null `evidenceIdentityHash`, `learningTaskBinding:"bound"`, server admission id, and immutable `taskInstanceId` / `attemptId`; legacy rows expose an explicit `legacy` + null binding (#61). Same auth as `GET /ledger`; unknown id → bare non-reflecting `404 not_found`. Admin reads include raw `reviewerUsefulnessNotes` plus `reviewerUsefulnessNotesPresent` / `reviewerUsefulnessNoteChars`; monitor projections stay content-blind by forcing `reviewerUsefulnessNotes:null` while preserving those presence/count summaries. Populated-but-hidden legacy/ineligible reviewer-usefulness state is surfaced only as bounded `reviewerUsefulnessHidden:true` plus those note presence/count summaries; the verdict, identity, timestamp, and note bytes remain null. |
 | `PUT /ledger/{id}/reviewer-usefulness` | **minted owner-admin** | Owner-authenticated write for one **genuinely graded, current** `review-bounded` row by exact `ledgerId` (#112). `recordReviewerUsefulness()` itself enforces the row-level narrowing: `task_type='review-bounded'`; `shadow=0`; `superseded_at IS NULL`; and a **quality-bearing** verifier (for example `reviewBoundedVerifier`, `exact`, `predicate`) rather than an ungraded or structural sentinel such as `none` / `None` / `nonEmpty(0)`. Legacy malformed live reviewer-usefulness columns are quarantined additively and cleared before the first valid write, so they no longer surface as current evidence or permanently block a later real first write. The HTTP route adds auth, JSON/content-type validation, alias binding, and the error envelope. Requires a minted owner-tier admin key with a non-empty logical alias; static env admin keys and the implicit no-key loopback admin path are denied. Uses the authenticated logical alias as reviewer identity, accepts only closed `pass|partial|redo|wrong`, requires `Content-Type: application/json`, keeps notes as bounded structured `key:value` tokens, makes exact retries idempotent, and rejects differing overwrites with structured `409 reviewer_usefulness_conflict` details. |
@@ -187,19 +192,39 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /admin/models/download` | **admin** | `{modelKey, wait?}`. |
 | `POST /admin/keys` | **admin** | Mint a key: `{alias, tier, scope?, modelAllowList?, rpm?, tpm?, dailyTokenBudget?, maxParallel?, creditLimit?, ttlSeconds?}` → `201 {plaintextKey, record}` (plaintext returned **only here**). New keys are lifetime-bounded and least-scope by default: owner→`agent`, guest→`inference`; admin must be explicit. Guest keys may carry only `inference` or read-only `monitor`. |
 | `GET /admin/keys` | **admin** | List keys as `ApiKeyPublic` (no hashes). |
+| `POST /admin/keys/systemone-grants` | **admin** | Atomically grant a reviewed System One model to an exact set of active minted keys: `{model:"<decision-model-id>",aliases:["..."]}` → `200 {model,changed,unchanged}`. Missing, expired, revoked, or duplicate aliases reject the entire batch. Existing plaintext, hashes, ordinary model access, quotas, credits, expiry, and counters stay intact. Legacy static environment keys have no keystore row and are outside this operation. |
+| `POST /admin/keys/embedding-grants` | **admin** | Atomically grant `embeddinggemma-2` to an exact set of active minted guest/inference customer keys: `{model:"embeddinggemma-2",aliases:["..."]}` → `200 {model,changed,unchanged}`. Also works for open chat allow-lists without widening chat access. Missing, expired, revoked, duplicate, or non-customer aliases reject the entire batch; credentials, ordinary model access, quotas and credits remain intact. |
+| `POST /admin/keys/chat-grants` | **admin** | Atomically grant the already-served `qwen3-30b-instruct` chat model to an exact set of active guest/inference keys: `{model:"qwen3-30b-instruct",aliases:["..."]}` → `200 {model,changed,unchanged}`. Restricted lists gain only that ID; empty lists already grant all ordinary chat models and stay empty. Missing, expired, revoked, duplicate, or non-customer aliases reject the batch. Credentials, credits, quotas, expiry, and counters stay intact. |
 | `DELETE /admin/keys/:alias` | **admin** | Soft-revoke a key → `200 {revoked:true}` or `404`. Malformed percent-encoding in `:alias` → `400 invalid_request_error` rather than a 500; route metrics/logs are always labelled the templated `/admin/keys/:alias`, never the raw request path (incl. the non-admin `403` case) (#229). |
 | `GET /admin/maintenance` | **admin** | Current bench/maintenance state → `{maintenance, mode, inflight, ownerQueued, maxInflight}`. `mode` is `off`, `guest`, or `exclusive`. |
 | `POST /admin/maintenance` | **admin** | Toggle bench/maintenance mode: `{on: true\|false, mode?: "guest"\|"exclusive", ttlSeconds?: number}` → same status body. Default `guest` mode refuses guests while owners remain unaffected. Explicit `exclusive` mode refuses both lanes and requires `ttlSeconds`. The TTL auto-expires either mode if nobody calls `{on:false}` (#105, #196). This admission fence does not itself acquire the filesystem GPU lease or prove llama-swap idle; it is one component of the reviewed maintenance-window workflow. |
 | `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
 | `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
-`GET /models/residency` returns `200 {models:[...]}` when the backend snapshot is available. Each
-row contains only `model`, `state`, `ttl`, `classification` (`serving`, `ttl_retained`,
-`unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`). Admin output may
-also contain `lastUse.alias`; monitor output deliberately omits it. If the snapshot is
-unavailable, the safe response is `503 {status:"unavailable"}` with no `models` array. This
-endpoint is read-only and content-blind: it does not expose prompts, responses, token counts, keys,
-key hashes, raw backend commands, backend addresses/IPs, or other unsafe fields.
+For `choice`, supply `criteria` as an object with 2–26 named options, for example
+`{"billing":"Payment issue","support":"Technical issue"}`. Read the selected key from
+`answers.<question-id>.choice`; `probabilities` uses the same keys. The portal and
+[customer contract](../../docs/systemone-customer-access.md) include a complete request,
+illustrative response and troubleshooting for invalid criteria and upstream failures.
+
+
+`GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...}}` when the backend snapshot is
+available. Each model row contains only `model`, `state`, `ttl`, `classification` (`serving`,
+`ttl_retained`, `unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
+Admin output may also contain `lastUse.alias`; monitor output deliberately omits it. The content-blind
+`hostMemory` object reports total RAM, `MemAvailable`, free CMA, and best-effort DRM GTT used/total
+bytes. GTT counters are device-wide and always marked `unattributed` when present; they cannot say
+which model or process owns the allocation, even with resident models. Missing DRM counters are
+explicit `null` values and `gttAccounting:"unknown"`. If the memory snapshot itself cannot be read,
+the object reports `status:"unknown"` and null values. If the model snapshot is unavailable, the
+safe response remains `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. This endpoint is
+read-only and content-blind: it does not expose prompts, responses, token counts, keys, key hashes,
+raw backend commands, backend addresses/IPs, or other unsafe fields. `resourceEvidence` reports the
+configured host-memory `admissionMode` and a best-effort host-wide cumulative `/proc/vmstat`
+`oom_kill` count with its observation timestamp. The count is cumulative, not a recent delta or an
+inference-readiness signal. Missing, malformed, or unreadable OOM evidence is explicit
+`status:"unknown"` with null count and timestamp. During a model-snapshot outage, the 503 response still includes `resourceEvidence` but no `models` array; the counter does not identify the outage's cause. `shadow` mode reports observations but does not
+enforce admission decisions.
 
 **Credits vs. daily budget.** `creditLimit` is a **lifetime, non-resetting** total-token cap
 (0 = unlimited) — when `creditsUsed >= creditLimit` the key is refused with `402
@@ -231,6 +256,14 @@ named guest-tier key and treat the alias as the tenant identity. Example:
 ```bash
 tsx src/homeserver/cli.ts keys mint --alias codex-cli --tier guest --models qwen3-coder --rpm 30 --daily 200000
 ```
+
+Exact organic usefulness is recorded separately through `PUT /execution-feedback/{handle}`
+using the same minted owner-agent/admin key that received the result. Declare purpose before
+execution: `trafficPurpose` on `/delegate`, `traffic_purpose` on MCP `ask` / `code_loop_start`.
+Eligible results expose `feedbackHandle` on `/delegate` and `feedback_handle` on MCP results;
+omission remains unknown, never retrospectively organic. This adds no `/delegate` or `/ledger`
+permission to agent keys. See [the exact feedback contract](../../docs/execution-feedback.md)
+for retries, durable recovery, exclusions and the read-only report exporter.
 
 `POST /delegate` is owner-admin only; tenant validation runs that need that route should
 use a named admin-scope owner key rather than the shared static owner key. `GET /ledger` exposes
@@ -272,7 +305,12 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
 | `tools/call` | `{content:[{type:"text", text}], isError, structuredContent?}`. |
 | unknown / malformed | JSON-RPC `-32601` / `-32700` / `-32600` error (HTTP 200). |
 
-**Tools** (both scoped to the key's allow-list):
+**Tools** (model operations respect the key's allow-list):
+
+- `model_status` — accepts one granted model and reports its content-blind residency from the
+  backend's running snapshot plus the caller's configured limits. This is read-only: it does not
+  load or infer with the model. Unknown snapshot facts stay `unknown`; see the
+  [reliability diagnostics guide](../../docs/reliability-diagnostics.md).
 
 - `list_models` — lists the model ids THIS key may use, each with a one-line strength hint. For
   structured-capable callers it returns `structuredContent.ask_capabilities`, the **live
@@ -280,7 +318,35 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
   `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
   text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
-- `ask` — `{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?}` → runs a completion on the chosen
+- `tokenize` — `{model, text}` returns exact raw-text `{model, count, tokens, pieces,
+  add_special:false, parse_special:false}` in both `structuredContent` and JSON text. This is a
+  tool, not a separate model in `list_models`. It calls the selected llama.cpp runtime's native
+  tokenizer through llama-swap; it never asks a generative model to guess or substitutes a
+  tiktoken encoding. Pieces remain strings or raw byte arrays when a token splits a UTF-8
+  character. It does not add a chat template, BOS/EOS or interpret special-token spellings, so
+  these are raw-text counts rather than a complete chat request's usage. Maximum input: 16,384
+  UTF-8 bytes. Empty text is allowed. Backend replies are bounded to 1 MiB, 32,768 tokens and
+  128 KiB of pieces; malformed/unsupported replies return an error, never a partial estimate.
+  Calls share key RPM, concurrency, maintenance and host-memory admission, and may load a model
+  through llama-swap. Cold starts can take several minutes; the native request, including model
+  loading and response-body consumption, uses `HOMESERVER_CALL_TIMEOUT_MS` (default 600,000 ms),
+  just like the configured upstream call deadline. Set the caller's MCP timeout to accommodate
+  that wait; smaller configured gateway deadlines still abort and release admission normally.
+  The stock `m5 ... mcp` stdio bridge still has a 30-second upstream deadline and does not accept
+  `--timeout-ms`; increasing only the outer MCP host timeout will not extend it. For a cold model,
+  use a direct MCP client with a sufficient timeout, or wait until the permitted model is loaded
+  before calling through that bridge.
+  They add no inference token usage or credit charge. LM Studio, System One
+  and embedding backends are unsupported by this tool. Nothing is written to owner content logs
+  or delegation evidence. No standalone gateway HTTP `/tokenize` endpoint is added.
+
+  Example MCP `tools/call` parameters (choose a model granted by your `list_models`):
+  `{"name":"tokenize","arguments":{"model":"mellum","text":"Hej världen!"}}`.
+  Compare with a second call using the same model and English text. Treat byte-array pieces as
+  bytes; decoding each separately can introduce replacement characters. The generic `m5` bridge
+  forwards this tool without a client upgrade. After gateway rollout, refresh/reconnect the MCP
+  session if the agent cached an older `tools/list` response.
+- `ask` — `{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?, include_reasoning?}` → runs a completion on the chosen
   local model. Successful calls keep the text in the content block and also attach
   `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always
   content-blind `true` for this tool; `usage` is content-blind prompt/input, completion/output,
@@ -292,10 +358,48 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   (`finish_reason="length"`) also returns `isError:true`, keeps the paid partial answer in the
   content block behind a loud warning, preserves the same structured payload, and means any retry
   is a new billable call. `max_tokens` uses the same fleet/per-model ceiling as raw chat.
+  `output_profile: "complete-within-budget"` is an opt-in profile for bounded multi-section work:
+  it adds a hard structural-completion instruction and requests low reasoning effort from
+  `gpt-oss` so required sections retain output budget. Other models receive only the completion
+  instruction, appended after any caller-supplied system text. The profile never hides
+  `finish_reason="length"`: truncation still returns `isError:true` with the paid partial content,
+  and it never retries a metered call. For bounded reviews it also requires the model to emit the
+  requested verdict and stop, rather than repeatedly reopening a candidate it already resolved.
   `delegator_model_id` is optional telemetry:
   owner/cloud-agent callers should set it to the cloud brain that delegated the task so the
   content-blind savings ledger can estimate actual cloud spend avoided. It is not forwarded to the
   local model.
+
+#### Native reasoning (`include_reasoning`, issue #441) — OWNER-TIER ONLY
+
+An owner-tier caller can opt in with `include_reasoning:true`. Only this authenticated tier sees
+that parameter and the optional reasoning fields in the `ask` schemas. Guest opt-in is rejected
+before credits, quota, admission or upstream work. Omitted or `false` preserves the existing
+response: no reasoning fields. Non-boolean values are rejected.
+
+The opt-in adds two fields to `structuredContent`, alongside the unchanged final-answer `text`,
+`finish_reason`, `truncated`, and `usage`:
+
+- `reasoning_content`: the backend's actual `choices[0].message.reasoning_content` string, or
+  `null` when absent/non-string. Empty strings remain empty. No generated explanation substitutes
+  for missing native data.
+- `reasoning_truncated`: `true` if that field exceeded **16,384 UTF-8 bytes** and was clipped at a
+  whole Unicode code point, `false` when fully returned, or `null` when unavailable. This cap
+  applies to the additional returned field; existing final-answer and generation limits remain.
+  A `finish_reason:"length"` still indicates the generation stopped at its token limit, even if
+  `reasoning_truncated:false` because the returned reasoning field itself fit the byte cap.
+
+The content block still contains only the final answer (or its existing token-limit warning).
+The flag is not forwarded to the model and does not change reasoning effort, generation or
+metering. `usage.reasoning_tokens` comes only from backend usage metadata; it stays `null` when
+missing and is never computed from visible text or token differences. Reasoning is not added to
+owner content logs, request logs, metrics, task exposure or delegation evidence. Existing owner
+prompt/final-answer logging remains in effect. Malformed JSON/chat envelopes fail with a
+content-free upstream error; raw backend bytes are never used as a fallback final answer.
+
+See the [credential-safe live verification example](../../docs/m5-agent-client.md#native-reasoning-through-mcp)
+for a synthetic owner call. Source tests use fixtures; a successful approved deployment and a
+real backend response are required before claiming the current serving stack emits reasoning.
 
 #### Blind-context delegation (`files`, issue #128) — OWNER-TIER ONLY
 
@@ -354,7 +458,7 @@ scope check supplies route authority; legacy static / implicit-admin are exclude
 A non-owner never sees them, and a direct `tools/call` on one returns the **byte-identical
 unknown-tool error** a nonexistent tool would (invisible, not merely forbidden). See
 *code_loop* below. The owner-visible `code_loop_start` description carries the stable pre-paid
-advertisement `contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]`.
+advertisement `contract[harness=code-loop-pi-2026-09-05-v9;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]`.
 
 ### code_loop — owner-agent sandboxed agentic coding (#116)
 
@@ -366,10 +470,11 @@ checkout. Every loop turn transits the gateway spine (admission, `owner_request_
 poison-clear, the degeneracy watchdog), so it is the Claude→local **agentic-delegation
 dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE_LOOP=off`).
 
-- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, protected?, task_type?, caps?}`
+- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?}`
   → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, capabilities}`
   immediately, or a structured refusal (`disabled` / `busy` / `maintenance` /
-  `lease-unavailable` / `cage-unavailable` / `invalid-request` / `conflict` /
+  `lease-unavailable` / `cage-unavailable` / `cage-transport-unavailable` /
+  `invalid-request` / `conflict` /
   `admission-recovery`). Optional
   `client_run_id` activates `client-run-id-v1`: an exclusive durable binding to the canonical
   request digest is committed before execution; same id+request recovers the original
@@ -386,8 +491,55 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   `caps.edit_deadline_turn` must be a positive integer no greater than effective `turns`; when
   present, the versioned policy requires the first completed `edit`/`write` tool call by that
   overall agent turn and otherwise terminates as `cap-exceeded` / `failure_kind:edit-deadline`.
-  Omitting it preserves the original instruction and harness behavior. `check_cmd` is owner-authored,
+  A clean exit with no successful mutation is the same non-converging outcome, never a
+  silent `completed` with an empty diff: the detail carries a stable `no relevant edit
+  attempted` prefix plus content-blind discovery/turn counts (never paths, queries, prompts,
+  or source text), while `failure_kind:edit-deadline` + `mutation_evidence:none` remains the
+  machine-readable reason distinguishing it from a patch that failed verification.
+  Enforcement fires when the deadline turn ends, so a stalled run cannot consume the wall
+  cap; a successful first-attempt mutation satisfies the deadline globally and exempts the
+  degeneracy retry. Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  An optional integer `caps.total_wall_s` (90–900 seconds) adds a shared deadline starting
+  before asynchronous admission. It reserves 75 seconds for process/unit cleanup, lease release
+  and bounded evidence finalization; a 180-second budget therefore permits at most 105 seconds
+  of admission, Git, engine and verifier work combined. It aborts active commands/engine work,
+  forbids later phases and tightens each transient unit's `RuntimeMaxSec` to the remaining work
+  time. Admission expiry returns `deadline-exceeded`; admitted expiry withholds diff/summary and
+  returns `cap-exceeded`, or `arm-error` when cleanup/release cannot be proved. Unresolved unit
+  cleanup remains durable for recovery. Opted-in results include `execution.whole_job` with the
+  budget, monotonic `observed_before_persistence_ms` and cleanup status. This observation precedes
+  synchronous terminal persistence; it is not dispatch-to-terminal timing proof. A cleanup failure or elapsed time
+  beyond the budget fails operational acceptance. Omission preserves the separate legacy caps.
+  Reconnect and verify that the live `code_loop_start` input schema advertises `total_wall_s`
+  before using it; older gateways do not enforce this optional field. Engine `usage.wall_ms`
+  and a client wait timeout are not whole-job timing evidence.
+  Harness v9 additionally requires `schema_checks` for the resolved `unit-test-gen` task type;
+  compile-only requests are refused before admission. Supply 1–8 owner-authored
+  `{name, command}` behavioral oracles, each expecting exit zero. Names are unique lowercase
+  identifiers (1–80 characters); commands have an 8192-byte individual and 32768-byte total
+  limit. These checks share a separate 120-second execution budget after `check_cmd`, including
+  eligible capped runs. A timeout, launch error, or nonzero result is not a pass.
+  `schema_grounding` records version 1, state (`not-requested`, `passed`, `failed`, `skipped`)
+  and named check results. Failed/skipped grounding withholds `diff` and `summary`; diagnostic
+  changed paths remain visible. Old durable results are not upgraded to v9 evidence.
+  The owner must supply a meaningful behavioral oracle (accept the reference and reject
+  contract-breaking mutants), not merely repeat compilation or search for field-name text.
+  Keep reference/verifier files protected and outside writable scope. This is enforcement of
+  owner-selected checks, not automatic understanding of arbitrary natural-language schemas or
+  proof against adversarial generated test code. A passing schema check does not turn a capped
+  run into completed work or override a failed `check_cmd`.
+  The turn cap is global across a degeneracy retry, never reports the rejected over-cap start as
+  usage, and injects a stable two-turn completion-pressure reminder. A scope-clean `cap-exceeded`
+  diff still receives the separately budgeted owner check; `completion_state`,
+  `telemetry.failure_kind`, and `check.skip_reason` distinguish unfinished work and any skipped
+  verification without treating it as a completed/pass outcome.
+  `writable` is an enforceable relative POSIX path/glob allowlist for returned changes; omission
+  permits exact seeded files only. The host-owned Git harvest treats rename pairs as one logical
+  change and requires every endpoint to pass scope and containment. Rejected paths appear in
+  `scope_violations` and suppress `check_cmd`; generated cache/bytecode is silently omitted without
+  suppressing verification. Harness metadata never enters the diff but remains observable to
+  `protected`, which is still reporting-only.
   A `learning_task_stamp` opts into the accepted Grimnir LearningTaskContract v1. It requires the
   exact fresh response from authenticated `GET /v1/capabilities/learning-task`, a minted-key alias
   matching `expected_transport_principal_id`, `client_run_id === idempotency_key`, and a matching
@@ -410,8 +562,10 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   defines delivery accounting and lifecycle/compaction. The actual Hugin one-shot lane is stamped
   `/delegate`; its #240 real serializer fixture is byte-pinned and consumed by this repo's tests.
 - `code_loop_status` — `{work_id}` → `{status, usage}`.
-- `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), `changed_files`,
-  `protected_violations`, pi's `summary`, the `check` result, `usage`, immutable effective
+- `code_loop_result` — `{work_id}` → the git diff (≤200 KB + `diff_truncated`), permitted
+  `changed_files`, machine-readable `scope_violations`, `protected_violations`, pi's `summary`,
+  `completion_state`, the `check` result (including `skip_reason`), named `schema_grounding`
+  results, bounded `usage`, immutable effective
   `execution`, content-blind `telemetry`, and immutable agent-side `agent_checks`. The latter is
   derived only from real pi bash tool start/end events and exposes normalized check kind, command
   fingerprint, relative timing, order, status, and observed exit code—never command text, paths,
@@ -433,8 +587,11 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   mtime. Cached results from an older/incompatible evidence contract fail closed as
   `terminal-unavailable` instead of being stamped with current capabilities.
   `status ∈ completed | cap-exceeded | degenerate |
-  arm-error | orphaned` — there is deliberately **no** `pass` status; `completed` +
-  `check.exit_code === 0` is the only pass signal.
+  arm-error | orphaned` — there is deliberately **no** `pass` status. Ledger pass requires
+  `completed`, a run `check` with `exit_code === 0`, and `schema_grounding.state` equal to
+  `passed` or `not-requested`. Failed/skipped grounding withholds `diff` and `summary` and
+  prevents pass; named check diagnostics remain visible. The resolved `unit-test-gen` type
+  requires grounding checks at admission, so it cannot take the `not-requested` path.
 
 **The OS cage (Phase-1 ship gate).** pi's `bash` and `check_cmd` (which imports model-edited
 source — RCE by construction) run as the gateway uid, which owns `.env` + `data/eval.db`. Both
@@ -504,11 +661,23 @@ Minted keys are stored as **sha256 hashes only** (plaintext is returned once at 
 and never persisted); lookup is timing-safe. Each request then passes the spine:
 
 1. **Model allow-list** — a key with a non-empty `modelAllowList` requesting any other
-   model gets `403 model_not_allowed`.
+   ordinary model gets `403 model_not_allowed`. System One uses a separate, explicit
+   `systemOneModelAllowList` grant so granting Clef to an open guest key does not narrow
+   its chat access. Existing keys that explicitly list Clef in `modelAllowList` retain
+   that System One grant for compatibility.
 2. **`max_tokens` cap** — every request's `max_tokens` is clamped to
    `min(request, HOMESERVER_PER_REQUEST_MAX_TOKENS)` before proxying.
 3. **Quota** — per-key sliding-window RPM/TPM (60s) + a persisted daily token budget.
-   Over-budget → `429 rate_limit_exceeded` with `Retry-After` + `X-RateLimit-*`.
+   Over-budget → `429 rate_limit_exceeded` with a plain-language reason (requests per minute,
+   tokens per minute, or tokens per UTC day), caller-key/shared-static scope, and retry or
+   UTC-day reset guidance; token requests are estimated separately. Zero RPM requires the
+   gateway operator to restore capacity. The body includes `error.quota` with the reason, scope, window,
+   applicable limit, requested amount, `counted:false`, and relative `retry_after_seconds`;
+   isolated keys also receive `used_before`, while shared static-tier buckets omit it. Headers
+   use the rejected dimension's limit; `Retry-After` and `X-RateLimit-Reset` are relative seconds
+   to the next rolling-window event expiry or daily reset, retaining the existing one-second
+   retry delay for an empty zero-RPM bucket. `X-RateLimit-Remaining` is omitted for shared buckets to avoid
+   disclosing other consumers' usage.
 4. **Admission (two lanes)** — a single GPU-slot budget (`HOMESERVER_MAX_INFLIGHT`) is
    shared. When the box is at capacity: **guest** requests get an immediate, honest
    `503 server_busy`; **owner** requests *queue* up to `HOMESERVER_OWNER_QUEUE_MAX_MS`
@@ -523,8 +692,8 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    `curl -X POST http://<m5>:8080/admin/maintenance -H "Authorization: Bearer $(m5-auth)" -d '{"on":true}'`.
    Optionally pass `{"on":true,"ttlSeconds":7200}` — the mode then self-expires past the deadline
    even if the job dies uncleanly (crash/OOM/SIGKILL) before it can call `{on:false}`, so guests
-   can never be locked out forever with no recovery path. The weekly Model Scout uses this around
-   its ephemeral candidate-evaluation window (`docs/weekly-model-scout-runbook.md`).
+   can never be locked out forever with no recovery path. Explicit model evaluations use this around
+   their ephemeral candidate-evaluation window.
 6. **Exclusive maintenance window (#196)** — `npm run maintenance:run -- --base-url <actual-gateway-origin>
    --ttl-seconds 7200 --drain-timeout-seconds 60 --evidence data/maintenance/window.json -- <command…>`.
    The admin credential comes only from `M5_MAINTENANCE_KEY`; never place it in argv. The isolated
@@ -533,6 +702,68 @@ and never persisted); lookup is timing-safe. Each request then passes the spine:
    token. The client runs the supplied command with the caller's unchanged authority, restores in a
    `finally` path, forwards `SIGINT`, `SIGTERM`, and `SIGHUP`, verifies the window is closed, and emits
    content-blind evidence. Server TTL remains the recovery backstop for `SIGKILL` or a lost client.
+
+7. **Whole-host memory admission (#350, #353, default OFF)** — GPU memory on the unified-memory host is not
+   charged to the model service's cgroup, so starting a large non-resident model can exhaust the whole
+   host. Before a gateway model start, the gateway checks
+   `GET /running`: a model that is `ready` or `starting` is forwarded untouched; any other state is
+   checked like an absent model. Otherwise it needs a declared budget and a readable `/proc/meminfo`, and the request is
+   allowed only if `usable available memory + eviction credit >= budget + reserve`. Usable available
+   memory is `MemAvailable` minus `CmaFree` (free CMA pages are counted in `MemAvailable` but ordinary
+   allocations cannot use them). Eviction credit is the summed declared *reclaim estimates* of the
+   other models that are `ready` (llama-swap would evict them), capped at the host memory currently in
+   use (`MemTotal - MemAvailable`). A reclaim estimate is a conservative lower bound on what evicting
+   that model releases; a peak start budget is not such a bound, so an unknown residency or a resident
+   model without a declared reclaim estimate gives no credit. The two observations (residency,
+   then host memory) share one 750 ms deadline, because the check runs while the request holds an
+   admission slot; an expired observation is cancelled and counts as unavailable. A caller that
+   disconnects during the observation is not forwarded. The shared log carries only the gateway's canonical
+   model label (`unknown` for an id the trusted catalogue does not list), never the raw requested
+   string. GTT counters are
+   recorded in the decision log for calibration but do not affect the decision. The default is `off`
+   (no `/running` fetch, no file read). `shadow` logs one content-free `host_memory_admission` JSON line
+   for each request that would need a model start (a resident model adds a metric count but no log
+   line and no host read) and never rejects. `enforce` rejects only a `refuse` decision: `503 insufficient_memory`
+   with `Retry-After` when memory is short, or `503 memory_admission_unavailable` (no `Retry-After`;
+   the model has no declared budget or host memory is unreadable) — a refused request never reaches the
+   model backend and is not billed. Budgets are operator-declared; the [#352 measurements](https://github.com/Magnus-Gille/gille-inference/issues/352)
+   do not yet qualify production budgets or the reserve. A request
+   whose model alias the roster does not list under `/running` is treated as needing a start.
+   `MemAvailable` also counts page cache that the model service's `MemoryMin` protects from reclaim,
+   so the reserve must cover that as well.
+
+   Covered paths are chat (`/v1/chat/completions`, MCP `ask`), every M5 inference inside `/delegate`
+   (primary, format retry, disagreement secondary and escalation shadow), its background review
+   cascade, the owner admin load endpoint, and `code_loop` job launch. The caged agent's relay calls
+   the gateway, so each inference rechecks admission if another job has evicted its model. An enforced
+   launch refusal returns `insufficient_memory` or `memory_admission_unavailable` before creating the
+   cage or launching the engine; its admission claim is released. An HTTP delegation refusal uses the
+   same 503 error codes, without recording a model quality failure. Refused secondary and shadow starts
+   are skipped without quality evidence or a task-exposure event. Delegation model-call timeouts start after
+   admission observation. A stamped task refused before any
+   inference may retry; once an inference may have started, the claim stays reserved against replay
+   and a refused retry has no `Retry-After`. Its exact replay recovers admission without rerunning.
+   Shadow mode observes these starts and allows execution. Internal admission callbacks cannot be
+   supplied by request JSON.
+
+   Gateway escalation shadows and review cascades share one idle background slot, skip during maintenance,
+   and are preempted by foreground requests. The escalation shadow is scheduled first; the first lane ready
+   to acquire the idle slot runs, and a competing lane skips without queuing. The shadow releases its slot
+   after inference, before deterministic grading. Refused or preempted background attempts are skipped
+   rather than counted as model failures; a cascade retains completed first-stage counts.
+   These are observations per admission check: code-loop launch and relay can each observe the same
+   cold start, so decision counts are not unique starts. Log labels use the trusted catalogue and
+   finite server-configured model IDs, including declared budget IDs; other requested IDs stay `unknown`.
+
+   Admin model loads also hold a gateway request slot, respect per-key `maxParallel` and exclusive
+   maintenance exclusion, and remain unmetered. These admin controls apply even with memory admission
+   `off`; standalone maintenance/benchmark scripts use direct backend controls and are unaffected. A context-changing LM Studio reload is checked before unloading, even when the model is
+   already resident; the model cannot contribute its own eviction credit to that check.
+
+   Deliberately **unchecked** paths are standalone operator load/ensure commands, CLI probes and
+   experiment runners that call the backend directly, and other direct backend clients. These bypass
+   the gateway and must be operated under their own resource controls. A probe sent through the gateway
+   inherits the checks above; there is no separate gateway probe endpoint.
 
 Every auth / inference error uses a uniform OpenAI-shaped envelope:
 `{ error: { message, type, code, param } }` with the right status (401/403/400/429/503)
@@ -559,6 +790,9 @@ SSE stream parsing, and config persistence.
 
 ## Agent client (`m5`) — secret-safe MCP and automation surface
 
+For default doctor semantics, an explicit metered inference probe, and the reliability evidence
+surfaces, see the [reliability diagnostics guide](../../docs/reliability-diagnostics.md).
+
 `client/m5.mjs` is the separate owner-agent client for Claude, Codex, and structured shell
 automation. It resolves a mandatory named profile from macOS Keychain, bridges stdio JSON-RPC only
 to `/mcp`, and exposes JSON `doctor`, `models`, `ask`, and `code run|status|result` commands.
@@ -567,19 +801,86 @@ configuration in the parent harness. Claude and Codex map to independently revoc
 accounts.
 
 The client never applies a code-loop diff and does not claim to enforce a local sandbox. The
-gateway's principal scope, OS cage, caps, protected paths, and diff-only result are authoritative.
+gateway's principal scope, OS cage, caps, writable result scope, protected paths, and diff-only
+result are authoritative.
 See [`../../docs/m5-agent-client.md`](../../docs/m5-agent-client.md) for installation, versioning,
 profile configuration, diagnostics, and transport behavior.
 
 ### Production text roster
 
-llama-swap serves one of eight text models at a time. `gpt-oss-120b` remains the standard large
-reasoning model and a preferred 64K tier. `qwen38-27b` is a 64K dense, multimodal Q4_K_M model
-served with Q8 KV and native MTP; thinking is on by default and can be disabled per request with
-`chat_template_kwargs.enable_thinking=false`. Adding it to the roster does not make it a default
-or an enforced route. The other served IDs are `mellum`,
-`qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`, and
-`qwen3-coder-next-80b`.
+llama-swap serves one model at a time. The latest verified production roster has
+15 entries: the twelve chat models below plus three separately gated System One entries. The chat roster IDs are `mellum`,
+`qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`,
+`qwen3-coder-next-80b`, `gpt-oss-120b`, `qwen35-122b-a10b`, `muse-glimmer-30b`,
+`nemotron-3.5-lightning-30b-a3b`, `qwen38-27b`, and `ornith-1.5-35b`.
+The `clef-flash`, `bespoke-nimble-9b`, and `pplx-decider-v1-27b` System One decision models
+are separate, gated roster additions. Customer availability is conditional: the runtime, roster,
+and `HOMESERVER_SYSTEMONE_MODELS` setting must be verified, and the customer's key must receive
+an explicit grant. The requested ID must then appear in the authenticated `GET /v1/models`
+response before calling `POST /v1/systemone`. For a `noul` question, a probability near `1`
+means yes and near `0` means no. Unscoped guest keys cannot call or discover these models.
+They return typed decisions, not chat text, and do not participate in chat, MCP `ask`, or
+automatic delegation, even if the setting is lost.
+
+Clef's reviewed template pins both logical and physical batch sizes to 8192. The runtime caps
+the physical batch by the logical batch, so `-ub 8192` alone does not establish an 8192-token
+capacity. Applying the template to an existing service requires a separately approved roster
+change with long-input, memory and rollback verification; see the
+[System One release gate](../../docs/systemone-customer-access.md#release-gate).
+
+`qwen3-30b-instruct` is an existing ordinary chat model, not a native System One decider.
+Its appearance in an authenticated customer's `/v1/models` response verifies chat access;
+restricted customer keys can receive its exact ID through `/admin/keys/chat-grants` without
+rotation or credit reset. A customer should call it through `/v1/chat/completions`, using the
+same ordinary credits and quotas.
+
+`embeddinggemma-2` is a separate embedding service, available only when its compatible CPU
+sidecar, gateway release, and explicit customer key grant are verified. The initial serving
+contract uses the BF16 GGUF for text/code only. A separate `HOMESERVER_EMBEDDING_MEDIA_ENABLED` flag defaults to
+false; enable it only after an immutable projector installation and real image/audio/video probes.
+The gateway accepts 128/256/512/768 output dimensions and normalizes
+after truncation. Google's documented retrieval prefixes distinguish queries (`task: search result | query: `)
+from documents (`title: none | text: `). The non-deployable service template is
+`deploy/systemd/gille-embeddinggemma2.service` for text. The separate reviewed
+`deploy/systemd/gille-embeddinggemma2-multimodal.service` template adds the projector only
+during an approved media activation. Its runtime, model and projector placeholders must be resolved
+to immutable, checksum-verified artifacts under root-owned `/opt` paths. It listens only on
+loopback, uses CPU only, runs as a dedicated dynamic user without home or host-device access, and has
+an 8 GiB memory cap. It does not request a llama-swap model change.
+The pinned pooled embedding runtime must process each input in one physical batch, so the
+template sets both batch sizes to the 8192-token context length. A 512-token physical batch
+passed short probes but returned a server error for a longer synthetic input; the corrected
+batch size requires a fresh bounded M5 memory and long-input check before activation.
+Before enabling it, include up to 8 GiB of sidecar growth in the host-memory reserve for future
+chat loads and verify real headroom. Embedding calls still use ordinary gateway admission and can
+occupy an inflight slot. Only one embedding call per gateway instance may be in flight; concurrent
+calls receive a retryable 503 without a credit charge. A public template does not prove deployment.
+The pinned GGUF is `ggml-org/embeddinggemma-2-GGUF` revision
+`bfcd298762cc34d0357ece5ebdd31791a3a374d8`, file `embeddinggemma-2-BF16.gguf`
+(557,950,176 bytes, SHA-256 `68bae29d62fb8c7d23e98d21fd4662753ddd636e6b62b8a70dfe059a9844f216`).
+The BF16 multimodal projector at that revision is 982,074,784 bytes,
+SHA-256 `d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766`.
+The compatible installed M5 llama.cpp source revision is
+`4f92965a7bfa9e8eb6519908ff962e23c2cb7b93`; the installed CPU launcher SHA-256 is
+`cc8c82a86e130280e8ec1ffde47890d96c5bc4e6c98e975390d90942f3d6b6d3`.
+Builds must use `-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` to avoid fetching mutable
+UI assets; verify the complete installed runtime bundle and record the exact launcher hash.
+The text sidecar and customer gateway are active from release
+`e6a86a45aa15fc4a25dd95d53746e7e944ef05a9`. A multimodal projector changes the sidecar
+unit as well as the gateway contract; installation and activation require separate exact
+production approval and real modality probes. Check memory cap and chat residency at activation.
+The portal copy in this release describes access through authenticated model discovery; deploy
+it only with the verified sidecar and gateway settings, then verify the rendered page.
+The authenticated `GET /v1/models` response is the customer-facing availability check.
+
+`gpt-oss-120b` remains the standard large reasoning model and a preferred 64K tier.
+`qwen38-27b` and `ornith-1.5-35b` are 64K multimodal Q4_K_M models served with Q8 KV and native
+MTP; thinking is on by default and can be disabled per request with
+`chat_template_kwargs.enable_thinking=false`. `qwen35-122b-a10b` is a 32K reasoning-off precision
+specialist. `muse-glimmer-30b` and `nemotron-3.5-lightning-30b-a3b` remain reversible canaries;
+Glimmer delegation requires a grounded task plus an explicit deterministic verifier, and Nemotron
+is served reasoning-off. A model being present in this roster does not make it a default or an
+enforced route.
 
 ## Coordinating heavy GPU jobs — `gpu` (issue #88)
 
@@ -642,7 +943,7 @@ HOMESERVER_HOST=127.0.0.1                     # set 0.0.0.0 to serve the LAN
 HOMESERVER_PORT=8080
 HOMESERVER_API_KEYS=key1,key2                 # bearer tokens for normal endpoints
 HOMESERVER_ADMIN_API_KEYS=adminkey            # bearer tokens for /admin/* (model mgmt)
-HOMESERVER_MONITOR_API_KEYS=monitorkey        # read-only monitor keys — GET /healthz,/ledger,/ledger/{id},/metrics,/models only
+HOMESERVER_MONITOR_API_KEYS=monitorkey        # read-only monitor keys — GET /healthz,/ledger*,/metrics,/models*,/ops/summary only
 HOMESERVER_MIN_CONTEXT=32768                  # context floor the orchestrator enforces
 HOMESERVER_MAX_TOKENS=12288                   # default per-call token budget
 HOMESERVER_CALL_TIMEOUT_MS=600000             # per-call wall-clock guard (spiral cap)
@@ -656,11 +957,21 @@ HOMESERVER_USD_TO_SEK=10.5                    # dashboard conversion for savings
 HOMESERVER_MAX_INFLIGHT=2                      # GPU slot budget (concurrent requests)
 HOMESERVER_OWNER_QUEUE_MAX_MS=5000            # how long an owner may queue for a slot
 HOMESERVER_BUSY_RETRY_AFTER_S=2               # Retry-After on a guest 503 at capacity
+HOMESERVER_HOST_MEMORY_ADMISSION=off          # whole-host memory check before a model start (#350): off (default) | shadow (log only, never rejects) | enforce
+HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[:reclaimGiB] (decimals ok): peak host memory a start may need, and optionally a conservative lower bound on what evicting the model releases (<= peak; absent = no eviction credit); invalid entries, and every entry for a model id listed twice, are dropped and named at startup; uncalibrated
+HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
+HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108
+# HOMESERVER_STARTUP_EXCLUSIVE_UNTIL=<canonical UTC ISO timestamp, at most 30 minutes ahead>
+# Optional operator restart fence: refuses BOTH lanes until that fixed absolute deadline.
+# Reapplied at every startup; cannot be cleared through the process-local maintenance API.
 HOMESERVER_MAINTENANCE_RETRY_AFTER_S=30       # Retry-After on a guest 503 caused by maintenance mode
 HOMESERVER_PER_REQUEST_MAX_TOKENS=12288       # fleet default and ordinary-model cap
 HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768 # exact-model explicit-request ceilings; empty disables
 HOMESERVER_RECURRENT_MODEL_IDS=qwen3-coder-next-80b  # recurrent models that poison-clear (unload) on abrupt disconnect; "" disables. Default qwen3-coder-next-80b.
+HOMESERVER_SYSTEMONE_MODELS=                  # comma-separated enabled decision-model IDs; empty disables /v1/systemone, but known Clef remains excluded from chat/delegation. Stage before roster entry; issue explicit guest grants only after live checks.
+HOMESERVER_EMBEDDING_MODELS=                  # comma-separated enabled embedding IDs; empty disables /v1/embeddings. Known embedding IDs stay excluded from chat/delegation even while disabled.
+HOMESERVER_EMBEDDING_BASE_URL=                # required when embedding models are enabled; exact loopback http://127.0.0.1:<port>/v1 of the dedicated CPU sidecar
 HOMESERVER_POISON_CLEAR_COOLDOWN_MS=60000     # ≤1 recurrent-model unload per window (recovery-latency dial; see docs/m5-qwen3next-recurrent-degeneration-2026-06-24.md)
 HOMESERVER_DEGENERACY_RUN_THRESHOLD=400       # Fix #2 silent backstop: ≥N consecutive identical non-ws chars in a recurrent model's SSE stream → abort + poison-clear (the no-disconnect "?????" case). 0 disables.
 HOMESERVER_KEY_DEFAULT_RPM=60                 # default requests/min for a new key
@@ -744,3 +1055,14 @@ To run it on the box: install LM Studio (or `llama-server`), point `LMSTUDIO_BAS
 at it, set `HOMESERVER_HOST=0.0.0.0` + API keys, and run `tsx src/homeserver/cli.ts serve`
 under a process supervisor (launchd/systemd). A future v2 can split this into its own
 package with a real `llama-server` backend (per the deep-research Tier-A recommendation).
+
+`m5 doctor` reports client/gateway versions and result-contract compatibility from
+an authenticated, content-free `GET /portal/me` using a minted owner agent/admin key.
+It also reads the public, content-free `/healthz` transport field without sending a key. An
+unavailable code-loop transport degrades doctor; missing or older fields remain `unknown`.
+Doctor still does not execute a code loop or a metered inference request.
+When the dedicated user bus is absent, a new `code_loop_start` refuses before model admission
+with `cage-transport-unavailable`. An exact idempotent retry may still recover its earlier run.
+Guests and inference keys receive no release metadata. Gateway source SHA is embedded by
+`git archive`; development checkouts report unknown. Version compatibility does
+not establish inference readiness. See [gateway release advertisement](../../docs/gateway-api-contract.md#gateway-release-advertisement).

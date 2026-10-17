@@ -1,8 +1,10 @@
+import { limitCodeLoopCageLifetime } from "./code-loop-deadline.js";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import type { HomeserverConfig } from "./config.js";
-import type { CodeLoopDeps, CodeLoopRequest } from "./code-loop-types.js";
+import type { CodeLoopDeps, CodeLoopRequest, CodeLoopResult } from "./code-loop-types.js";
+import { ownsExecutionFeedback } from "./execution-feedback.js";
 import { startCodeLoop, getJobStatus, getJobResult, type CodeLoopStartConfig } from "./code-loop.js";
 import type { AgentEngine } from "./code-loop-types.js";
 import { makePiEngine, realSpawnPi, makeLlamaSwapReadinessProbe } from "./pi-engine.js";
@@ -16,6 +18,9 @@ import {
   type GatewayRelay,
 } from "./code-loop-cage.js";
 import { acquireGpuLease } from "./gpu-lease.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
+import { createModelStartAdmission, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
+import { getRunningSnapshot } from "./model-admin.js";
 import {
   LearningTaskContractError,
   parseHuginRequestStamp,
@@ -109,14 +114,16 @@ export interface CodeLoopRuntime {
 
 /**
  * Build the live runtime. `maintenanceMode` is injected (the gateway reads it from the admission
- * controller snapshot) so code_loop refuses during a model-scout window without importing the
+ * controller snapshot) so code_loop refuses during an explicit evaluation window without importing the
  * controller.
  */
 export interface CodeLoopGatewayContext {
+  feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
   authenticatedPrincipalId: string;
   authentication: "gateway-owner-auth" | "service-auth";
   gatewayRequestId: string;
   capabilityEpoch: LearningTaskCapabilityEpoch;
+  hostMemoryAdmissionDependencies?: Partial<HostMemoryAdmissionDeps>;
 }
 
 export function buildCodeLoopRuntime(
@@ -133,6 +140,15 @@ export function buildCodeLoopRuntime(
   const gatewayHost = cfg.gatewayHost;
   const gatewayPort = cfg.gatewayPort;
   const workroot = resolve(cfg.codeLoopWorkroot);
+  const hostMemoryAdmissionDependencies: HostMemoryAdmissionDeps = {
+    getRunning: getRunningSnapshot,
+    ...(gatewayContext?.hostMemoryAdmissionDependencies ?? {}),
+  };
+  const beforeModelStart = createModelStartAdmission(
+    cfg.hostMemoryAdmission,
+    hostMemoryAdmissionDependencies,
+    () => cfg.codeLoopModel,
+  );
 
   // pi lives under $HOME (hidden by the cage tmpfs) — punch narrow ro holes for it, and have
   // the self-test PROVE runnability (not just confinement) at every job start.
@@ -195,6 +211,11 @@ export function buildCodeLoopRuntime(
     spawnPi: realSpawnPi,
     now: Date.now,
     keyAlias: gatewayContext?.authenticatedPrincipalId ?? null,
+    feedbackOwner: gatewayContext?.feedbackOwner ?? null,
+    beforeModelStart,
+    // The offline fixture mode has no user manager; production confinement
+    // always probes the actual dedicated bus before new work is admitted.
+    ...(confinement === "required" ? { codeLoopTransportProbe: probeCodeLoopTransport } : {}),
     ...(gatewayContext === undefined
       ? {}
       : {
@@ -213,8 +234,8 @@ export function buildCodeLoopRuntime(
     growthCapBytes: GROWTH_CAP_BYTES,
     pollMs: 5_000,
     retentionTtlMs: RETENTION_TTL_MS,
-    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env }),
-    acquireLease: async ({ model, timeoutMs, onLeaseLost }) => {
+    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env, signal: opts.signal }),
+    acquireLease: async ({ model, timeoutMs, onLeaseLost, signal }) => {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
       try {
@@ -223,7 +244,7 @@ export function buildCodeLoopRuntime(
           purpose: "code-loop",
           dir: cfg.gpuLeaseDir,
           staleMs: cfg.gpuLeaseStaleMs,
-          signal: ctrl.signal,
+          signal: signal ? AbortSignal.any([ctrl.signal, signal]) : ctrl.signal,
           onLeaseLost,
         });
         return { release: () => lease.release() };
@@ -237,7 +258,7 @@ export function buildCodeLoopRuntime(
     // unreadable, ro-mount writes denied, external egress blocked, gateway reachable (200) — at
     // EVERY job start when confinement=required. Starts the same gateway relay so the gateway arm
     // is genuinely tested end-to-end.
-    cageSelfTest: () => runCageSelfTestWithRelay(
+    cageSelfTest: (signal, remainingMs) => runCageSelfTestWithRelay(
       cageBuildArgv,
       secretPath,
       forwardPort,
@@ -247,6 +268,8 @@ export function buildCodeLoopRuntime(
       confinement,
       workroot,
       runnability,
+      signal,
+      remainingMs,
     ),
   };
 
@@ -280,8 +303,11 @@ export async function runCageSelfTestWithRelay(
   gatewayApiKey: string,
   confinement: "required" | "off",
   probeRoot: string,
-  runnability?: CageRunnabilityProbe
+  runnability?: CageRunnabilityProbe,
+  signal?: AbortSignal,
+  remainingMs?: number,
 ): Promise<{ ok: boolean; failures: string[] }> {
+  if (signal?.aborted) return { ok: false, failures: ["whole-job deadline reached"] };
   if (confinement === "off") return { ok: true, failures: [] };
   // A missing source would make `cat` fail and could masquerade as successful concealment. Prove
   // the exact production secret exists and is readable OUTSIDE the cage before testing denial.
@@ -305,7 +331,10 @@ export async function runCageSelfTestWithRelay(
   }
   try {
     const r = await runCageSelfTest({
-      cageArgv: cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`),
+      cageArgv: remainingMs === undefined
+        ? cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`)
+        : limitCodeLoopCageLifetime(cageBuildArgv(probeDir, `code-loop-cage-probe-${process.pid}`), remainingMs),
+      signal,
       secretPath,
       // A write to the read-only toolchain mount MUST fail (a tmpfs-over-home write would succeed
       // harmlessly, so probing /usr is the meaningful "no rw escape" test).
@@ -314,6 +343,7 @@ export async function runCageSelfTestWithRelay(
       gatewayForwardPort: forwardPort,
       userManagerSocketPath: `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/systemd/private`,
       exec: (argv, timeoutMs) => execCageCommand(argv, timeoutMs, {
+        signal,
         env: {
           PATH: process.env["PATH"] ?? "/usr/bin:/bin",
           // The probe only calls unauthenticated /healthz; this non-secret value satisfies the
@@ -351,6 +381,18 @@ export async function handleCodeLoopTool(
   gatewayContext: CodeLoopGatewayContext,
 ): Promise<{ text: string; isError: boolean }> {
   const { startConfig, deps } = buildCodeLoopRuntime(cfg, maintenanceMode, gatewayContext);
+  const callerResult = (result: CodeLoopResult): CodeLoopResult => {
+    if (!result.feedback_handle) return result;
+    try {
+      if (ownsExecutionFeedback(result.feedback_handle, gatewayContext.feedbackOwner ?? null)) return result;
+    } catch {
+      // Feedback is advisory: an unavailable ownership store must hide the handle, not the
+      // completed result. Never log the handle, principal, or database exception content.
+      console.error("[execution-feedback] ownership lookup failed; completed output preserved, handle withheld");
+    }
+    const { feedback_handle: _privateHandle, ...rest } = result;
+    return rest;
+  };
 
   if (name === "code_loop_start") {
     if (Object.hasOwn(args, "client_run_id") && typeof args["client_run_id"] !== "string") {
@@ -374,11 +416,15 @@ export async function handleCodeLoopTool(
       }
     }
     const req: CodeLoopRequest = {
+      ...(Object.hasOwn(args, "traffic_purpose") ? { traffic_purpose: args["traffic_purpose"] as CodeLoopRequest["traffic_purpose"] } : {}),
       client_run_id: typeof args["client_run_id"] === "string" ? (args["client_run_id"] as string) : undefined,
       ...(learningTaskStamp === undefined ? {} : { learning_task_stamp: learningTaskStamp }),
       instruction: typeof args["instruction"] === "string" ? (args["instruction"] as string) : "",
       files: Array.isArray(args["files"]) ? (args["files"] as CodeLoopRequest["files"]) : [],
       check_cmd: typeof args["check_cmd"] === "string" ? (args["check_cmd"] as string) : undefined,
+      // Preserve malformed supplied values for fail-closed structural validation.
+      ...(Object.hasOwn(args, "schema_checks") ? { schema_checks: args["schema_checks"] as CodeLoopRequest["schema_checks"] } : {}),
+      writable: Array.isArray(args["writable"]) ? (args["writable"] as string[]) : undefined,
       protected: Array.isArray(args["protected"]) ? (args["protected"] as string[]) : undefined,
       task_type: typeof args["task_type"] === "string" ? (args["task_type"] as string) : undefined,
       caps: typeof args["caps"] === "object" && args["caps"] !== null ? (args["caps"] as CodeLoopRequest["caps"]) : undefined,
@@ -395,7 +441,7 @@ export async function handleCodeLoopTool(
           ...(r.learning_task_gateway_echo !== undefined
             ? { learning_task_gateway_echo: r.learning_task_gateway_echo }
             : {}),
-          ...(r.result !== undefined ? { result: r.result } : {}),
+          ...(r.result !== undefined ? { result: callerResult(r.result) } : {}),
           capabilities: r.capabilities,
         }),
         isError: false,
@@ -432,7 +478,7 @@ export async function handleCodeLoopTool(
         isError: true,
       };
     }
-    return { text: JSON.stringify(r.result), isError: false };
+    return { text: JSON.stringify(callerResult(r.result)), isError: false };
   }
 
   // Unreachable (mcp.ts only routes the three names here) — defensive.

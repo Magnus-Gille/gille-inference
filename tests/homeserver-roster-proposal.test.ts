@@ -89,6 +89,7 @@ const evidenceBundle = buildEvidenceIdentityBundle({
     digest: contentDigest("template"),
     origin: "server-observed",
   }),
+  // This bundle is part of the byte-verified historical Hugin producer contract.
   harness: labelIdentity("model-scout", "operator-declared"),
   taxonomyVersion: labelIdentity("roster-v1", "operator-declared"),
   verifierRubric: labelIdentity("roster-evidence-v1", "operator-declared"),

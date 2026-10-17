@@ -42,15 +42,15 @@ export type ModelTokenPriceStatus =
   | { kind: "unavailable"; entry: UnavailableModelTokenPrice }
   | { kind: "missing" };
 
-export const DEFAULT_COST_CATALOG_VERSION = "2026-07-26";
+export const DEFAULT_COST_CATALOG_VERSION = "2026-08-29";
 
 export const DEFAULT_PREMIUM_BASELINE_MODEL_ID = "claude-fable-5";
 
 const ANTHROPIC_PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing";
 const OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing";
 const QWEN3_30B_MODEL_CARD_URL = "https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507";
-const CATALOG_CHECKED_AT = "2026-07-26";
-const CATALOG_VALID_UNTIL = "2026-08-25";
+const CATALOG_CHECKED_AT = "2026-08-29";
+const CATALOG_VALID_UNTIL = "2026-09-28";
 
 function priced(
   modelId: string,
@@ -84,10 +84,7 @@ export const DEFAULT_MODEL_TOKEN_PRICES: readonly ModelTokenPrice[] = [
     ...priced("claude-opus-4.5", "anthropic", 5, 25, ANTHROPIC_PRICING_URL),
   },
   {
-    ...priced("claude-sonnet-5", "anthropic", 2, 10, ANTHROPIC_PRICING_URL, "Introductory price through 2026-08-31; catalog expires before that change."),
-  },
-  {
-    ...priced("claude-sonnet-5-standard", "anthropic", 3, 15, ANTHROPIC_PRICING_URL, "Scheduled standard price from 2026-09-01; catalog expires before that change.", "2026-09-01"),
+    ...priced("claude-sonnet-5", "anthropic", 2, 10, ANTHROPIC_PRICING_URL, "The launch tariff is now the standard price; the previously announced 2026-09-01 increase was cancelled."),
   },
   {
     ...priced("claude-sonnet-4.6", "anthropic", 3, 15, ANTHROPIC_PRICING_URL),
@@ -99,21 +96,15 @@ export const DEFAULT_MODEL_TOKEN_PRICES: readonly ModelTokenPrice[] = [
     ...priced("gpt-5", "openai", 1.25, 10, "https://developers.openai.com/api/docs/models/gpt-5"),
   },
   {
-    ...priced("gpt-5.6-sol", "openai", 5, 30, OPENAI_PRICING_URL, "OpenAI Standard processing, short-context (<270K) input/output tariff."),
+    ...priced("gpt-5.6-sol", "openai", 4, 20, "https://developers.openai.com/api/docs/models/gpt-5.6-sol", "Promotional Standard-processing tariff, guaranteed by OpenAI at least through 2026-11-21; prompts above 272K input tokens use the documented long-context multiplier."),
   },
+  { ...priced("gpt-5.6", "openai", 4, 20, "https://developers.openai.com/api/docs/models/gpt-5.6-sol", "Official alias of gpt-5.6-sol; the same promotional and long-context conditions apply.") },
   { ...priced("gpt-5.5", "openai", 5, 30, OPENAI_PRICING_URL) },
   { ...priced("gpt-5.4", "openai", 2.5, 15, OPENAI_PRICING_URL) },
   { ...priced("gpt-5.4-mini", "openai", 0.75, 4.5, OPENAI_PRICING_URL) },
 ];
 
 export const DEFAULT_UNAVAILABLE_MODEL_TOKEN_PRICES: readonly UnavailableModelTokenPrice[] = [
-  {
-    modelId: "gpt-5.6",
-    provider: "openai",
-    sourceUrl: OPENAI_PRICING_URL,
-    checkedAt: CATALOG_CHECKED_AT,
-    reason: "OpenAI publishes distinct gpt-5.6-sol/terra/luna rates, not a base gpt-5.6 model rate.",
-  },
   {
     modelId: "qwen3-30b-instruct",
     provider: "local",

@@ -139,6 +139,20 @@
   table {
     width: 100%; border-collapse: collapse; font-size: 12.5px;
   }
+  .model-table-scroll { max-width: 100%; overflow-x: auto; }
+  .decision-table { min-width: 500px; table-layout: fixed; }
+  .decision-table th:nth-child(1) { width: 29%; }
+  .decision-table th:nth-child(2) { width: 27%; }
+  .decision-table th:nth-child(3) { width: 24%; }
+  .decision-table th:nth-child(4) { width: 20%; }
+  .decision-table td { overflow-wrap: anywhere; }
+  .decision-table .model-id { font-size: 11px; color: var(--muted); }
+  .decision-table .api-path { white-space: nowrap; font-size: 11px; }
+  .decision-table th[scope="row"] {
+    text-align: left; font-size: 12.5px; text-transform: none; letter-spacing: normal;
+    color: var(--text); font-weight: 400; vertical-align: top; padding: 7px 8px;
+  }
+  .decision-table tr:last-child th[scope="row"] { border-bottom: 0; }
   th {
     text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border);
@@ -186,19 +200,41 @@
        so a portal-only edit requires a gateway restart to take effect. See CLAUDE.md → "Keep the portal in sync". -->
   <div class="info-card">
     <h2>What&#8217;s running</h2>
+    <p><strong>Tokenizer:</strong> the MCP <span class="badge mono">tokenize</span> tool returns exact
+      raw-text token counts and pieces for supported llama.cpp models. It is a utility, not a
+      separate model, and charges no inference credits. The first call may take several minutes
+      while the model loads.</p>
+    <p><strong>Owner reasoning:</strong> MCP <span class="badge mono">ask</span> can optionally return
+      native reasoning text separately from the answer. This is owner-only and off by default.</p>
     <p>
       <strong>Hardware:</strong> BosGame M5 &#8212; AMD Ryzen AI Max+ 395 &#8220;Strix Halo&#8221;,
       128&nbsp;GB unified LPDDR5X memory shared between CPU and GPU,
       Radeon 8060S integrated GPU. One home box, one GPU.
     </p>
     <p>
-      <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) serving each model via
-      llama-server, hot-swapped by llama-swap, behind an authenticating &amp; metering gateway,
+      <strong>Software:</strong> Ubuntu Server, llama.cpp (Vulkan) for the existing roster and
+      an isolated native ROCm path for qualified decision models, hot-swapped by llama-swap,
+      behind an authenticating &amp; metering gateway,
       exposed over a Cloudflare Tunnel. Speaks the standard OpenAI API and an authenticated,
-      content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation.
+      content-blind LearningTaskContract preflight for the owner&#8217;s Hugin automation. A separate
+      monitor/admin-only usage summary powers the operator dashboard without exposing content or identities.
+      Minted owner-agent/admin keys can read a content-blind timestamp for the last successful
+      M5 inference observed in the request log; it is historical evidence, not live readiness.
+      The owner <span class="badge mono">m5 doctor</span> checks catalogue and transport by default;
+      an inference check happens only when explicitly requested for a chosen route and model. That
+      check sends one fixed synthetic request for up to 16 output tokens, uses normal admission and billing,
+      and does not return the answer. An unknown or historical status is not a health guarantee.
+      Optional host-memory protection checks gateway model starts, including owner delegation,
+      coding jobs and admin loads; it stays off until the owner validates the memory budgets.
+      The optional owner code loop has a separate, content-free user-bus transport check in
+      <span class="badge mono">/healthz</span>; gateway liveness alone does not prove code-loop readiness.
+      Owner coding jobs may opt into a shared time budget covering admission, execution,
+      verification and cleanup; this is separate from the model's own time limit.
+      Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
+      key-bound feedback endpoint; this does not change routing or guest telemetry.
     </p>
-    <p style="margin-bottom:8px"><strong>Models</strong> (mostly Q4_K_M; VibeThinker uses Q8_0;
-      gpt-oss uses MXFP4):</p>
+    <h3>Chat and general models</h3>
+    <p style="margin-bottom:8px">Mostly Q4_K_M; VibeThinker uses Q8_0; gpt-oss uses MXFP4.</p>
     <table>
       <tr><th>Model</th><th>What it is</th><th>Best for</th><th>~tok/s</th></tr>
       <tr>
@@ -244,12 +280,99 @@
         <td>~30</td>
       </tr>
       <tr>
+        <td><span class="badge mono">qwen35-122b-a10b</span></td>
+        <td>Qwen3.5-122B-A10B — large MoE served reasoning-off (Q4_K_M)</td>
+        <td>High-precision review and triage where stable direct answers matter more than latency</td>
+        <td>~26</td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">muse-glimmer-30b</span></td>
+        <td>Meta Muse Glimmer 30B — reasoning model with DFlash draft decoding</td>
+        <td>Grounded code/data canary with an explicit verifier; not a broad chat default</td>
+        <td>~25<br><span style="font-size:11px;color:var(--muted)">short canary</span></td>
+      </tr>
+      <tr>
+        <td><span class="badge mono">nemotron-3.5-lightning-30b-a3b</span></td>
+        <td>NVIDIA Nemotron 3.5 Lightning 30B-A3B — reasoning-off Q4_K_M canary</td>
+        <td>Fast direct answers and structured work; begin with moderate context on Strix Halo</td>
+        <td>~52<br><span style="font-size:11px;color:var(--muted)">sustained decode</span></td>
+      </tr>
+      <tr>
         <td><span class="badge mono">qwen38-27b</span></td>
         <td>Qwen3.8-27B — dense Q4_K_M, multimodal, thinking-capable, native MTP</td>
         <td>New-generation coding, reasoning, image understanding and release evaluation</td>
         <td>~21&#8211;25 MTP<br><span style="font-size:11px;color:var(--muted)">~13 direct</span></td>
       </tr>
+      <tr>
+        <td><span class="badge mono">ornith-1.5-35b</span></td>
+        <td>Ornith-1.5-35B — multimodal Q4_K_M MoE, thinking-capable, native MTP</td>
+        <td>Fast explicit coding, reasoning and image work; still evaluation-only for routing</td>
+        <td>~75<br><span style="font-size:11px;color:var(--muted)">served canary</span></td>
+      </tr>
     </table>
+    <h3 id="systemone-models-heading" style="margin-top:16px">System One decision models</h3>
+    <p style="margin-bottom:8px;font-size:12.5px">
+      Availability requires an activated runtime and roster entry plus an explicit key grant.
+      Requests accept up to 256&nbsp;KiB of UTF-8 JSON. The separate input context is
+      8,192 tokens per question/prompt, shared across questions for Clef.
+    </p>
+    <div class="model-table-scroll" role="region" aria-labelledby="systemone-models-heading" tabindex="0">
+      <table class="decision-table" aria-label="Model use, API and access">
+        <thead><tr><th>Model</th><th>Use</th><th>API</th><th>Access</th></tr></thead>
+        <tbody>
+          <tr>
+            <th scope="row"><strong>Clef Flash</strong><br><span class="mono model-id">clef-flash</span><br>by Cloudflare</th>
+            <td>Typed decisions</td>
+            <td>POST<br><span class="mono api-path">/v1/systemone</span></td>
+            <td>Explicit key grant<br>Ordinary credits</td>
+          </tr>
+          <tr>
+            <th scope="row"><strong>Bespoke Nimble</strong><br><span class="mono model-id">bespoke-nimble-9b</span><br>by Bespoke</th>
+            <td>Typed decisions</td>
+            <td>POST<br><span class="mono api-path">/v1/systemone</span></td>
+            <td>Explicit key grant<br>Ordinary credits</td>
+          </tr>
+          <tr>
+            <th scope="row"><strong>Perplexity Decider</strong><br><span class="mono model-id">pplx-decider-v1-27b</span><br>by Perplexity</th>
+            <td>Typed decisions</td>
+            <td>POST<br><span class="mono api-path">/v1/systemone</span></td>
+            <td>Explicit key grant<br>Ordinary credits</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:10px;font-size:12.5px">
+      These models return typed probabilities, not chat text. Confirm that a model appears in your
+      authenticated <span class="badge mono">/v1/models</span> response before calling
+      <span class="badge mono">POST /v1/systemone</span>; if it is absent, it is not available for
+      your key yet. For a <span class="badge mono">noul</span> question, a probability near
+      <span class="badge mono">1</span> means yes and near <span class="badge mono">0</span> means no.
+      They share your ordinary credits and rate limits. Published benchmark scores do not establish
+      accuracy on your own task.
+    </p>
+    <h3 id="embedding-models-heading" style="margin-top:16px">Embedding models</h3>
+    <p style="margin-bottom:8px;font-size:12.5px">EmbeddingGemma 2 serves customer keys that see it in their authenticated model list. Check your access before calling the API.</p>
+    <div class="model-table-scroll" role="region" aria-labelledby="embedding-models-heading" tabindex="0">
+      <table class="decision-table" aria-label="Embedding model use, API and access">
+        <thead><tr><th>Model</th><th>Use</th><th>API</th><th>Access</th></tr></thead>
+        <tbody><tr>
+          <th scope="row"><strong>EmbeddingGemma 2</strong><br><span class="mono model-id">embeddinggemma-2</span><br>by Google</th>
+          <td><!-- EMBEDDING_USES --></td>
+          <td>POST<br><span class="mono api-path">/v1/embeddings</span></td>
+          <td>Explicit key grant<br>Ordinary credits<br>Check /v1/models</td>
+        </tr></tbody>
+      </table>
+    </div>
+    <p style="margin-top:10px;font-size:12.5px">
+      <!-- EMBEDDING_DESC -->
+    </p>
+    <p style="margin-top:10px;font-size:12.5px">
+      The existing <span class="badge mono">qwen3-30b-instruct</span> model is for ordinary chat.
+      It is not a native System One
+      decision model. If it appears in your authenticated <span class="badge mono">/v1/models</span>
+      response, use it through <span class="badge mono">POST /v1/chat/completions</span> with your
+      normal credits and rate limits.
+    </p>
     <p style="margin-top:10px;font-size:12.5px">
       Speeds are generation tok/s on short prompts; expect roughly half on long contexts.
       Models load on first use and unload after 30&nbsp;min idle. Cold loads are roughly 6&#8211;15s
@@ -259,9 +382,10 @@
       Context window: 131,072 tokens for <span class="badge mono">mellum</span>,
       <span class="badge mono">gemma4</span>, <span class="badge mono">qwen36-a3b</span>,
       <span class="badge mono">qwen3-30b-instruct</span>, and
-      <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>
-      <span class="badge mono">gpt-oss-120b</span>, and <span class="badge mono">qwen38-27b</span>
-      provide 65,536 per request. Prompt and completion
+      <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>,
+      <span class="badge mono">gpt-oss-120b</span>, <span class="badge mono">qwen38-27b</span>, and
+      <span class="badge mono">ornith-1.5-35b</span> provide 65,536 per request;
+      <span class="badge mono">qwen35-122b-a10b</span> provides 32,768. Prompt and completion
       tokens share that window; the output limits documented below still apply. VibeThinker works best on
       answer-verifiable reasoning with sampling enabled: <span class="badge mono">temperature: 1.0</span>,
       <span class="badge mono">top_p: 0.95</span>, <span class="badge mono">top_k: 0</span>, and
@@ -269,6 +393,14 @@
       32,768 completion tokens; omitted <span class="badge mono">max_tokens</span> keeps the safer fleet default.
       Qwen3.8 thinking is on by default; callers can request a direct answer with
       <span class="badge mono">chat_template_kwargs: {"enable_thinking": false}</span>.
+    </p>
+    <p style="margin-top:4px;font-size:12.5px">
+      <span class="badge mono">muse-glimmer-30b</span> and
+      <span class="badge mono">nemotron-3.5-lightning-30b-a3b</span> are reversible canaries;
+      Glimmer production delegation requires a grounded task and explicit deterministic verifier,
+      while Nemotron is served reasoning-off. <span class="badge mono">ornith-1.5-35b</span> and
+      <span class="badge mono">qwen35-122b-a10b</span> are explicit authenticated choices, not
+      automatic routes. Canary speeds above are directional measurements rather than a capacity guarantee.
     </p>
     <p style="margin-top:10px;font-size:12.5px">
       <strong>Speech-to-text:</strong> <span class="badge mono">whisper-1</span>
@@ -286,25 +418,26 @@
     </p>
   </div>
 
-  <!-- NEW MODEL EVALUATIONS — populated client-side from GET /portal/model-evals.json (the
-       weekly Model Scout's content-blind registry). Hidden until the fetch returns ≥1 row, so the
-       page degrades cleanly before the first scout run. Data-driven: NO gateway restart needed to
-       refresh (unlike the hand-maintained "What's running" table above). -->
+  <!-- NEW MODEL EVALUATIONS — populated client-side from the content-blind manual evaluation
+       registry. Hidden until the fetch returns ≥1 row, so the page degrades cleanly when no
+       operator evaluation has been recorded. Data-driven: NO gateway restart needed to refresh
+       (unlike the hand-maintained "What's running" table above). -->
   <div id="evals-card" class="info-card hide">
     <h2>New model evaluations</h2>
     <p style="margin-bottom:8px">
-      Every week the box looks at trending new models on Hugging&nbsp;Face, downloads the ones that
-      fit, and benchmarks them against a fixed battery of tasks. Clear winners get auto-added to the
-      line-up above. Latest results (<span class="badge mono">pass%</span> = share of probe tasks
-      passed; higher is better):
+      Operators can explicitly evaluate an already-staged local model against a fixed battery of
+      tasks. Evaluations are evidence only; changing the served line-up remains a separate,
+      owner-reviewed operation. Latest results (<span class="badge mono">pass%</span> = share of
+      probe tasks passed; higher is better):
     </p>
     <table>
       <tr><th>Model</th><th>Quant</th><th>Size</th><th>pass%</th><th>~tok/s</th><th>Verdict</th></tr>
       <tbody id="evals-rows"></tbody>
     </table>
     <p style="margin-top:10px;font-size:12.5px">
-      Each candidate is tested on a throwaway server, isolated from the live model line-up and run
-      off-peak. A &#8220;winner&#8221; beats or complements the current line-up and is promoted automatically.
+      Each candidate is tested on a throwaway server under the GPU lease and maintenance guard,
+      isolated from the live model line-up. A &#8220;winner&#8221; is a measured result for operator review,
+      never an automatic roster change.
     </p>
   </div>
 
@@ -387,6 +520,110 @@
         <pre>curl https://inference.example.com/v1/models \
   -H "Authorization: Bearer $HS_KEY"</pre>
 
+        <p><strong>System One decision (after explicit activation and model-list check):</strong></p>
+        <pre>curl https://inference.example.com/v1/systemone \
+  -H "Authorization: Bearer $HS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "clef-flash",
+    "state": "Checkout is down for all customers.",
+    "questions": {
+      "urgent": {"type": "noul", "instructions": "Is this urgent?"}
+    }
+  }'</pre>
+        <p>
+          Use this only after an authenticated <span class="badge mono">/v1/models</span> response
+          for your explicitly granted key includes the requested model. Set
+          <span class="badge mono">model</span> to <span class="badge mono">clef-flash</span>,
+          <span class="badge mono">bespoke-nimble-9b</span>, or
+          <span class="badge mono">pplx-decider-v1-27b</span> only when that ID is listed.
+          If it is missing, your key grant or the runtime/roster activation may still be pending. A
+          <span class="badge mono">noul</span> result near <span class="badge mono">1</span> means yes;
+          near <span class="badge mono">0</span> means no, in
+          <span class="badge mono">answers.urgent.noul</span>. You can also ask
+          <span class="badge mono">choice</span> and <span class="badge mono">score</span> questions.
+          Decision models return typed decisions, not chat text. Up to 16 questions and 256&nbsp;KiB
+          (262,144 bytes) of UTF-8 JSON per call, including state, questions and formatting.
+          This byte limit is separate from the 8,192-token input context per question/prompt,
+          which includes instructions and runtime formatting; Clef shares one context across
+          all questions. Text that fits the byte limit can still exceed the token context.
+          Images and streaming are not enabled here. Successful
+          calls use input-token credits. This is a separate endpoint from chat completions.
+        </p>
+
+        <p><strong>Choice question example:</strong></p>
+        <pre id="systemone-choice-request">{
+  "model": "clef-flash",
+  "state": "The customer was charged twice for the same order.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this request?",
+      "criteria": {
+        "billing": "Payments, charges and refunds",
+        "support": "Technical product problems"
+      }
+    }
+  }
+}</pre>
+        <p>
+          Save that JSON as <span class="badge mono">choice.json</span>, or pass the same body inline.
+          The command below reads the bearer header from standard input, so the key is not placed in
+          the command arguments. Set <span class="badge mono">HS_KEY</span> in your shell first.
+        </p>
+        <pre>curl https://inference.example.com/v1/systemone \
+  --data-binary @choice.json \
+  -H @- &lt;&lt;EOF
+Authorization: Bearer ${HS_KEY}
+Content-Type: application/json
+EOF</pre>
+        <p>
+          A <span class="badge mono">choice</span> question needs a criteria <strong>object</strong>
+          with 2–26 named option keys. Each key must be 1–64 ASCII letters, numbers, hyphens or
+          underscores (<span class="badge mono">^[A-Za-z0-9_-]{1,64}$</span>); each description must
+          be a string or <span class="badge mono">null</span>. The question also needs non-empty
+          <span class="badge mono">instructions</span>. The answer contains the selected
+          <span class="badge mono">choice</span>, a matching <span class="badge mono">probabilities</span>
+          object, and <span class="badge mono">confidence</span>, all under
+          <span class="badge mono">answers.&lt;question-id&gt;</span>.
+        </p>
+        <pre aria-label="Illustrative choice response">{
+  "answers": {
+    "route": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": {"billing": 0.9, "support": 0.1},
+      "confidence": 0.8
+    }
+  },
+  "usage": {"input_tokens": 123, "output_tokens": 0}
+}</pre>
+        <p>
+          Example response; probabilities and token counts vary. A <span class="badge mono">400 invalid_request_error</span> means
+          local JSON/schema validation failed (common mistakes are an array instead of a criteria
+          object, fewer than 2 or more than 26 options, invalid option keys, empty instructions, or
+          unsupported fields). Other <span class="badge mono">400</span> envelopes, such as
+          <span class="badge mono">model_not_found</span>, have a different cause. A
+          <span class="badge mono">502</span> means the gateway could not return a valid upstream
+          decision; it does not by itself prove that the request JSON caused the failure.
+        </p>
+
+        <p><strong>Text or code embeddings (after model-list check):</strong></p>
+        <pre>curl https://inference.example.com/v1/embeddings \
+  -H "Authorization: Bearer $HS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"embeddinggemma-2","input":"title: none | text: A short document","dimensions":256}'</pre>
+        <p>
+          The response is OpenAI-shaped: <span class="badge mono">data[0].embedding</span> is a
+          normalized numeric vector. Use the same dimension for stored documents and queries,
+          with the appropriate prefix for each. Supported dimensions are 128, 256, 512 and 768; 768 is the
+          default. For retrieval, Google's model card recommends a query prefix
+          <span class="badge mono">task: search result | query: </span> and a document prefix
+          <span class="badge mono">title: none | text: </span>. Up to 16 text inputs may be sent in
+          one call. Successful calls use input-token credits; failed calls cost zero.
+        </p>
+        <!-- EMBEDDING_MEDIA_EXAMPLE -->
+
         <p><strong>Learning-task capability preflight (automation clients):</strong></p>
         <pre>curl https://inference.example.com/v1/capabilities/learning-task \
   -H "Authorization: Bearer $HS_KEY"</pre>
@@ -401,6 +638,16 @@
           and is not eligible for joined learning-task evidence.
         </p>
 
+        <p><strong>Gateway and code-loop transport status (no key needed):</strong></p>
+        <pre>curl https://inference.example.com/healthz</pre>
+        <p>
+          <span class="badge mono">ok</span> reports gateway liveness. The content-free
+          <span class="badge mono">codeLoopTransport</span> field is
+          <span class="badge mono">available</span>, <span class="badge mono">unavailable</span>,
+          or <span class="badge mono">disabled</span>. It tests the dedicated user-bus socket
+          listener when code loops are enabled; it does not run a code loop or test inference.
+        </p>
+
         <p><strong>Public usage stats (no key needed):</strong></p>
         <pre>curl https://inference.example.com/portal/stats</pre>
         <p>
@@ -408,6 +655,15 @@
           <span class="badge mono">{total_tokens, total_requests, since}</span> — summed across
           everything the box has ever served (survives restarts). No per-user, per-key, or
           per-model detail is exposed. This powers the &#8220;Served so far&#8221; card above.
+        </p>
+
+        <p><strong>Operator M5 usage summary (monitor/admin key):</strong></p>
+        <pre>curl https://inference.example.com/ops/summary \
+  -H "Authorization: Bearer $HS_MONITOR_KEY"</pre>
+        <p>
+          Returns current M5 request activity plus a content-blind, newest-first seven-day history.
+          It includes no content, identity, key, token, or per-model fields. Reported request time is
+          gateway wall-clock time, not a claim about GPU utilization.
         </p>
 
         <p><strong>Chat completions (streaming — recommended):</strong></p>
@@ -461,6 +717,13 @@ for chunk in stream:
           <span class="badge mono">min_p</span> as extra request-body fields, as above.
         </p>
 
+        <p>
+          When host-memory protection is enabled, a request that cannot safely start its model is
+          refused before that start. A refused start is not billed. Admin loads may also receive
+          <span class="badge">503 server_busy</span> during exclusive maintenance, when request slots are occupied, or when the same key
+          already has its maximum number of parallel requests. These admin limits apply even when
+          host-memory protection is off.
+        </p>
         <p><strong>Speech-to-text (transcription):</strong></p>
         <pre>curl https://inference.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $HS_KEY" \
@@ -486,6 +749,9 @@ for chunk in stream:
           <tr><td><span class="badge">403</span></td><td><span class="badge mono">model_not_allowed</span></td><td>Your key is restricted to specific models and the requested model is not in its allow-list</td><td>Use a model from <span class="badge mono">GET /v1/models</span></td></tr>
           <tr><td><span class="badge">429</span></td><td><span class="badge mono">rate_limit_exceeded</span></td><td>You hit your RPM, TPM, or daily budget</td><td>Retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
           <tr><td><span class="badge">503</span></td><td><span class="badge mono">server_busy</span></td><td>Box is busy — owner&#8217;s work has priority</td><td>Normal — retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
+          <tr><td><span class="badge">503</span></td><td><span class="badge mono">model_temporarily_unavailable</span></td><td>Repeated backend failures paused this key/model for 30 seconds; the underlying cause is unknown</td><td>Wait for <span class="badge mono">Retry-After</span> before trying the same key/model again</td></tr>
+          <tr><td><span class="badge">503</span></td><td><span class="badge mono">insufficient_memory</span></td><td>Not enough host memory to start the requested model right now</td><td>Retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
+          <tr><td><span class="badge">503</span></td><td><span class="badge mono">memory_admission_unavailable</span></td><td>The host cannot approve starting the requested model</td><td>Retrying will not help until the owner fixes it (no <span class="badge mono">Retry-After</span> is sent)</td></tr>
           <tr><td><span class="badge">502</span></td><td><span class="badge mono">upstream_unavailable</span></td><td>Model backend is not reachable</td><td>Retry shortly (no <span class="badge mono">Retry-After</span> is sent)</td></tr>
           <tr><td><span class="badge">504</span></td><td><span class="badge mono">upstream_timeout</span></td><td>Model took too long to respond</td><td>Retry after the <span class="badge mono">Retry-After</span> seconds</td></tr>
           <tr><td colspan="4" style="font-size:12px;color:var(--muted);padding-top:8px">Mid-stream failure: if a streaming response is cut short, a terminal error frame is sent so your client knows the stream was truncated — not cleanly finished. Retry the request.</td></tr>
@@ -517,21 +783,73 @@ for chunk in stream:
           Basic tools are exposed to every permitted key. A real minted owner-agent key also gets
           the bounded code-loop tools and a content-free adoption-report tool:
         </p>
+        <p>
+          <strong>Owner coding time budget:</strong> after checking the live tool schema supports it,
+          set <span class="badge mono">caps.total_wall_s</span> (90&#8211;900 seconds) for one shared
+          job budget. It reserves 75 seconds for cleanup, so 180 seconds allows up to 105 seconds
+          for admission, coding and verification. Expired jobs withhold their output; unresolved
+          cleanup is reported as a failure. A client timeout alone does not stop a server job.
+        </p>
+        <p>
+          <span class="badge mono">m5 doctor</span> reports catalogue reachability and, for a minted
+          owner-agent/admin key, the last observed successful M5 inference timestamp. Its
+          <span class="badge mono">inference</span> field remains
+          <span class="badge mono">not_checked</span>: a past success does not verify this route now.
+          An owner may explicitly request one synthetic inference check for one route and model;
+          it uses normal credits, quotas, and admission and returns no answer text.
+        </p>
+        <p>
+          <strong>Exact owner feedback:</strong> set <span class="badge mono">traffic_purpose: "organic"</span>
+          before an <span class="badge mono">ask</span> or <span class="badge mono">code_loop_start</span> run.
+          Eligible completed results include <span class="badge mono">feedback_handle</span>.
+          With the same owner key, send <span class="badge mono">PUT /execution-feedback/{handle}</span>
+          and JSON <span class="badge mono">{"usefulness":"pass"}</span> (or
+          <span class="badge mono">partial</span>, <span class="badge mono">redo</span>,
+          <span class="badge mono">wrong</span>). Identical retries are safe; conflicting judgments are rejected.
+          Omitted purpose remains unknown, and evaluation/synthetic runs do not count as organic evidence.
+        </p>
         <table>
           <tr><th>Tool</th><th>What it does</th></tr>
           <tr>
             <td><span class="badge mono">list_models</span></td>
-            <td>Returns the models your key may use (same as <span class="badge mono">GET /v1/models</span>), each with a one-line strength hint and the current content-blind <span class="badge mono">ask.files</span> discovery state.</td>
+            <td>Returns the chat models your key may use with <span class="badge mono">ask</span>, each with a one-line strength hint and the current content-blind <span class="badge mono">ask.files</span> discovery state. Decision models use the HTTP API above.</td>
+          </tr>
+          <tr>
+            <td><span class="badge mono">model_status</span></td>
+            <td><span class="badge mono">{model}</span> reports one allowed model&#8217;s observed residency and your configured request, token and concurrency limits without inference. Loadability and protection remain unknown when unproven; this is not a readiness guarantee.</td>
           </tr>
           <tr>
             <td><span class="badge mono">ask</span></td>
-            <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
+            <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. For bounded multi-section work, <span class="badge mono">output_profile: "complete-within-budget"</span> prioritizes finishing every required section within the token cap (and uses low reasoning effort on gpt-oss). A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
+          </tr>
+          <tr>
+            <td><span class="badge mono">tokenize</span></td>
+            <td><span class="badge mono">{model, text}</span> returns exact raw-text token counts,
+              IDs and pieces from the selected llama.cpp tokenizer. Uses your model allow-list and
+              request rate limit, with no inference credit charge. Maximum 16,384 UTF-8 bytes;
+              no chat template or added special tokens. It may load the model through normal admission;
+              cold starts can take several minutes. Allow enough time in your MCP client for the
+              configured gateway call timeout. The stock <span class="badge mono">m5 ... mcp</span>
+              bridge has a 30-second upstream limit: use an already loaded model your key permits,
+              or a direct MCP client with a longer timeout for cold starts.
+              Unsupported runtimes return an error.</td>
           </tr>
           <tr>
             <td><span class="badge mono">record_adoption_evidence</span></td>
-            <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. It accepts no prompt, response, path, repository, or identifier; measured adoption remains shadow-only and never changes routing.</td>
+            <td><strong>Owner-agent only.</strong> Records a fixed, content-free adoption outcome for the private operator dashboard. After 25 individual rows/day it coalesces later reports into bounded aggregates and marks the dashboard window incomplete. Telemetry limits never limit <span class="badge mono">ask</span>, code loops, models, credits, or owner inference. It accepts no prompt, response, path, repository, or identifier; adoption remains shadow-only and never changes routing.</td>
           </tr>
         </table>
+        <p><strong>Owner reasoning:</strong> add <span class="badge mono">include_reasoning: true</span>
+          to <span class="badge mono">ask</span> to receive native
+          <span class="badge mono">reasoning_content</span> in its structured result, separately
+          from the final answer. Missing backend data is <span class="badge mono">null</span>;
+          <span class="badge mono">reasoning_truncated</span> reports clipping at 16 KiB of UTF-8.
+          Guest opt-in is rejected. Defaults omit these fields. This remains a metered inference
+          call, and token counts are never inferred from the reasoning text.</p>
+        <p><strong>Tokenization example:</strong> call <span class="badge mono">tokenize</span>
+          with <span class="badge mono">{"model":"mellum","text":"Hej världen!"}</span>, using a
+          model your key permits. Pieces are strings or byte arrays for tokens splitting a Unicode
+          character. If the tool is missing after an update, refresh or reconnect your MCP session.</p>
       </div>
 
       <hr class="section-divider" />
@@ -603,6 +921,11 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
   var LS_KEY = "inference_portal_key";
   var $ = function (id) { return document.getElementById(id); };
   var origin = window.location.origin;
+
+  // Keep private hostnames out of the public source while showing visitors copyable URLs.
+  document.querySelectorAll("#docs-section pre, #docs-section span.badge.mono").forEach(function (node) {
+    node.textContent = node.textContent.split("https://inference.example.com").join(origin);
+  });
 
   function show(view) {
     $("redeem-view").classList.toggle("hide", view !== "redeem");
@@ -739,7 +1062,7 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
     .then(function (s) { if (s) renderStats(s); })
     .catch(function () { /* leave the card hidden on any error */ });
 
-  // ── New model evaluations (weekly scout) ───────────────────────────────────────────
+  // ── New model evaluations (manual registry) ───────────────────────────────────────
   function renderEvals(payload) {
     var models = (payload && payload.models) || [];
     if (!models.length) return; // keep the card hidden until there's something to show
@@ -747,8 +1070,8 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
     var rows = models.map(function (m) {
       var pct = Math.round((m.passRate || 0) * 1000) / 10;
       var tok = (m.tokPerSec == null) ? "—" : Math.round(m.tokPerSec);
-      var verdict = m.served ? "served ✓" : esc(m.verdict || "");
-      var vcolor = m.served ? "var(--ok)" : (m.verdict === "winner" ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)"));
+      var verdict = m.served ? "served ✓" : (m.verdict === "winner" ? "winner · manual review" : esc(m.verdict || ""));
+      var vcolor = m.served ? "var(--ok)" : (m.verdict === "load_failed" ? "var(--bad)" : "var(--muted)");
       return "<tr><td><span class=\"badge mono\">" + esc(m.id) + "</span></td>"
         + "<td>" + esc(m.quant || "—") + "</td>"
         + "<td>" + (m.sizeGB || "—") + "&nbsp;GB</td>"

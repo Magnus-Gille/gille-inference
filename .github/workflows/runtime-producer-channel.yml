@@ -1,0 +1,48 @@
+name: C++ runtime producer channel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-producer-channel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime-producer-channel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Compile bounded receipt and private endpoint tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined \
+            -c native/observer/producer_receipt.c -o "$RUNNER_TEMP/c-receipt.o"
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/producer/receipt.cpp native/producer/test_receipt.cpp "$RUNNER_TEMP/c-receipt.o" \
+            -o "$RUNNER_TEMP/cpp-receipt-tests"
+          timeout 15 "$RUNNER_TEMP/cpp-receipt-tests"
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/producer/activity.cpp native/producer/receipt.cpp native/producer/endpoint.cpp \
+            native/producer/test_endpoint.cpp "$RUNNER_TEMP/c-receipt.o" -o "$RUNNER_TEMP/cpp-endpoint-tests"
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/producer/activity.cpp native/producer/receipt.cpp native/producer/endpoint.cpp \
+            native/tests/runtime_channel_fixture.cpp -o "$RUNNER_TEMP/runtime-channel-fixture"
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -D_FORTIFY_SOURCE=2 -O2 -fstack-protector-strong \
+            native/observer/producer_client.c native/observer/producer_receipt.c native/observer/proc_stat.c \
+            native/tests/producer_client_probe.c -o "$RUNNER_TEMP/runtime-native-probe"
+      - name: Verify bounded transport, cleanup and cross-UID receipts in disposable host
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            timeout 15 "$RUNNER_TEMP/cpp-endpoint-tests"
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            timeout 15 "$RUNNER_TEMP/runtime-channel-fixture" "$RUNNER_TEMP/runtime-native-probe"
+      - name: Prove cross-UID regression rejects missing authorization
+        run: |
+          python3 native/tests/test-runtime-channel-regression.py

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,7 @@ let binDirRejected: string;
 let binDirUnreachable: string;
 let binDirMissing: string;
 let binDirEmpty: string;
+let binDirMustNotTouchCredential: string;
 
 /** Write an executable mock script and mark it +x. */
 function writeMock(dir: string, name: string, body: string): void {
@@ -56,8 +57,8 @@ beforeAll(() => {
     `#!/usr/bin/env bash\n[[ "$*" != *'${SENTINEL}'* ]] || exit 66\nIFS= read -r header\n[ "$header" = 'Authorization: Bearer ${SENTINEL}' ] || exit 65\nprintf '200'\n`
   );
 
-  // A second mock dir whose `tailscale` FAILS (non-zero, no stdout) — so resolve_m5_host
-  // must fall back to the generic MagicDNS name `m5` cleanly under `set -euo pipefail`.
+  // A failed resolution still permits the configured MagicDNS fallback; it does not prove
+  // that the local daemon is stopped.
   binDirNoTs = mkdtempSync(join(tmpdir(), "m5-auth-noTS-"));
   writeMock(binDirNoTs, "security", securityMock);
   writeMock(binDirNoTs, "tailscale", `#!/usr/bin/env bash\nexit 1\n`);
@@ -77,18 +78,37 @@ beforeAll(() => {
   binDirEmpty = mkdtempSync(join(tmpdir(), "m5-auth-empty-"));
   writeMock(binDirEmpty, "security", `#!/usr/bin/env bash\nexit 0\n`);
   writeMock(binDirEmpty, "curl", `#!/usr/bin/env bash\necho 'curl must not run' >&2\nexit 99\n`);
+
+  binDirMustNotTouchCredential = mkdtempSync(join(tmpdir(), "m5-auth-no-credential-touch-"));
+  writeMock(
+    binDirMustNotTouchCredential,
+    "security",
+    `#!/usr/bin/env bash\ntouch "$0.called"\nexit 99\n`,
+  );
+  writeMock(
+    binDirMustNotTouchCredential,
+    "curl",
+    `#!/usr/bin/env bash\ntouch "$0.called"\nexit 99\n`,
+  );
 });
+
+function isolatedEnv(dir: string, extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  for (const key of ["M5_GATEWAY_URL", "M5_OPENAI_BASE_URL", "M5_BASE_URL", "GILLE_TAILSCALE_HOST",
+    "GILLE_KEYCHAIN_SERVICE", "GILLE_KEYCHAIN_ACCOUNT"]) delete env[key];
+  return { ...env, ...extraEnv };
+}
 
 function run(args: string[], dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
   // Prepend the mock dir so our fake `security`/`tailscale` shadow the system ones, making
   // --tailnet resolution deterministic and independent of whether the host is on the tailnet.
-  const env = { ...process.env, ...extraEnv, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  const env = isolatedEnv(dir, extraEnv);
   const r = spawnSync("bash", [SCRIPT, ...args], { env, encoding: "utf8" });
   return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 function loadEnvAndCompose(dir: string = binDir, extraEnv: NodeJS.ProcessEnv = {}) {
-  const env = { ...process.env, ...extraEnv, PATH: `${dir}:${process.env.PATH ?? ""}` };
+  const env = isolatedEnv(dir, extraEnv);
   const script = [
     'eval "$("$1" --env)"',
     'printf "%s\\n" "$M5_GATEWAY_URL/delegate" "$M5_GATEWAY_URL/ledger" "$M5_OPENAI_BASE_URL/chat/completions"',
@@ -105,7 +125,7 @@ describe("m5-auth — documented token-emitting paths still work", () => {
   });
 
   it("--env prints export lines incl. the token, exit 0", () => {
-    const { code, stdout } = run(["--env"]);
+    const { code, stdout } = run(["--env"], binDir, { M5_GATEWAY_URL: "https://configured.example" });
     expect(code).toBe(0);
     expect(stdout).toContain("export M5_API_KEY=");
     expect(stdout).toContain("export M5_OPENAI_BASE_URL=");
@@ -115,11 +135,11 @@ describe("m5-auth — documented token-emitting paths still work", () => {
   });
 
   it("--env keeps M5_BASE_URL as the OpenAI-base compatibility alias and emits a gateway-root URL", () => {
-    const { code, stdout } = run(["--env"]);
+    const { code, stdout } = run(["--env"], binDir, { M5_GATEWAY_URL: "https://configured.example" });
     expect(code).toBe(0);
-    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*:8080\/v1/);
-    expect(stdout).toMatch(/export M5_BASE_URL=.*:8080\/v1/);
-    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*:8080(?:['"])?\n/);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=https:\/\/configured\.example\/v1/);
+    expect(stdout).toMatch(/export M5_BASE_URL=https:\/\/configured\.example\/v1/);
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=https:\/\/configured\.example(?:['"])?\n/);
     expect(stdout).not.toMatch(/export M5_GATEWAY_URL=.*\/v1/);
   });
 });
@@ -146,15 +166,16 @@ describe("m5-auth — --tailnet (gille-inference#109)", () => {
     });
   }
 
-  it("--env --tailnet falls back to the MagicDNS name when tailscale is unavailable", () => {
-    // tailscale fails (binDirNoTs) → use the configured generic host, not abort under pipefail.
-    const { code, stdout } = run(["--env", "--tailnet"], binDirNoTs);
+  it("--env --tailnet preserves the MagicDNS fallback when resolution is unavailable", () => {
+    const { code, stdout } = run(["--env", "--tailnet"], binDirNoTs, {
+      M5_GATEWAY_URL: "https://configured.example",
+    });
     expect(code).toBe(0);
     expect(stdout).toContain(SENTINEL);
-    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=.*\bhttp:\/\/m5:8080\/v1/);
-    expect(stdout).toMatch(/export M5_BASE_URL=.*\bhttp:\/\/m5:8080\/v1/);
-    expect(stdout).toMatch(/export M5_GATEWAY_URL=.*\bhttp:\/\/m5:8080(?:['"])?\n/);
-    expect(stdout).not.toContain("inference.example.com");
+    expect(stdout).toMatch(/export M5_GATEWAY_URL=http:\/\/m5:8080\n/);
+    expect(stdout).toMatch(/export M5_OPENAI_BASE_URL=http:\/\/m5:8080\/v1/);
+    expect(stdout).toMatch(/export M5_BASE_URL=http:\/\/m5:8080\/v1/);
+    expect(stdout).not.toContain("configured.example");
   });
 
   it("--tailnet WITHOUT --env is rejected (it only sets M5_BASE_URL), no token, non-zero exit", () => {
@@ -190,7 +211,7 @@ describe("m5-auth — authenticated preflight (gille-inference#110)", () => {
   });
 
   it("distinguishes a missing Keychain credential and never attempts the request", () => {
-    const { code, stdout, stderr } = run(["--check"], binDirMissing);
+    const { code, stdout, stderr } = run(["--check"], binDirMissing, { M5_GATEWAY_URL: "https://configured.example" });
     expect(code).toBe(1);
     expect(stdout).toBe("");
     expect(stderr).toMatch(/no token|missing credential/i);
@@ -198,7 +219,7 @@ describe("m5-auth — authenticated preflight (gille-inference#110)", () => {
   });
 
   it("treats an empty Keychain item as missing and never attempts the request", () => {
-    const { code, stdout, stderr } = run(["--check"], binDirEmpty);
+    const { code, stdout, stderr } = run(["--check"], binDirEmpty, { M5_GATEWAY_URL: "https://configured.example" });
     expect(code).toBe(1);
     expect(stdout).toBe("");
     expect(stderr).toMatch(/missing credential/i);
@@ -244,6 +265,20 @@ describe("m5-auth — authenticated base URL contract (#71)", () => {
       { M5_GATEWAY_URL: "https://gateway.example", M5_OPENAI_BASE_URL: "https://other.example/v1" },
     ],
   ];
+
+  it.each([["--env"], ["--check"]])(
+    "%j fails closed when no public route is configured, before credential or network access",
+    (...args) => {
+      const { code, stdout, stderr } = run(args, binDirMustNotTouchCredential);
+      expect(code).toBe(2);
+      expect(stdout).toBe("");
+      expect(stderr).toMatch(/public.*gateway.*not configured/i);
+      expect(stderr).toMatch(/M5_GATEWAY_URL|M5_OPENAI_BASE_URL|M5_BASE_URL/);
+      expect(stderr).not.toContain("127.0.0.1");
+      expect(existsSync(join(binDirMustNotTouchCredential, "security.called"))).toBe(false);
+      expect(existsSync(join(binDirMustNotTouchCredential, "curl.called"))).toBe(false);
+    },
+  );
 
   it.each(badOverrides)("rejects %s without reading or echoing sensitive values", (_label, extraEnv) => {
     const { code, stdout, stderr } = run(["--env"], binDir, extraEnv);

@@ -54,6 +54,20 @@ increment the matching `/metrics` counter (`homeserver_rate_limited_total{surfac
 `homeserver_admission_rejections_total{lane}`). A failed `ask` is therefore never hidden behind the
 transport's HTTP 200.
 
+### M5 compute-utilization filter epoch (#244)
+
+The Heimdall utilization poster and the authenticated `/ops/summary` use the same closed,
+content-blind predicate from `src/homeserver/compute-request-filter.ts`. Filter epoch
+`m5-admitted-compute-v2` counts exactly one row for each admitted M5 inference request:
+`/mcp/ask` and the internal async image-worker `image` route are included, while the outer
+`/mcp` transport, image-job submission row, discovery/monitor routes, `model='none'`, non-M5 rows,
+and pre-admission refusals are excluded. Daily utilization, the recent headline, and per-model
+rollups all use this predicate and therefore reconcile.
+
+This epoch creates a historical break. Panels or summaries generated before it used route-only or
+otherwise inconsistent filters and must not be compared directly with epoch-v2 values; republish
+the current panels before treating a trend as continuous.
+
 ```sql
 -- MCP inference outcomes (NOT the transport envelope)
 SELECT outcome, COUNT(*) FROM request_log WHERE route = '/mcp/ask' GROUP BY outcome;
@@ -89,6 +103,13 @@ New series in this layer:
 
 ## 3. `adoption_evidence` (SQLite) — declared M5-agent adoption, content-blind
 
+The separate private [`execution_feedback` overlay](execution-feedback.md) joins an exact
+completed execution to one owner judgment. It contains opaque row handles and the originating
+key hash; these are never added to this coarse adoption table or exported reports. Its closed
+report counts explicit organic, current, non-shadow, available results and missing judgments,
+not opportunities or automatic routing quality. Prepared async bindings stay excluded until a
+trusted durable result exists. Existing coarse adoption retention and aggregation remain unchanged.
+
 `src/homeserver/adoption-evidence.ts`. This is a narrow, opt-in observation written by the
 owner-agent MCP tool `record_adoption_evidence` (or `m5 adoption report`). It exists because a
 healthy gateway/request count does **not** prove that eligible implementation work actually used
@@ -107,18 +128,43 @@ Every report has only these closed, low-cardinality fields:
 | `fallback_reason` | closed reason enum, including **separate** `m5_tool_missing` and `m5_auth_unavailable` |
 | `eligible_opportunities` | non-negative L1-declared count; `0` means the denominator was unknown, never inferred from raw call volume |
 
+The closed cross-field contract is:
+
+- `completed` uses `fallback_reason=none`.
+- `failed` uses a non-`none` fallback and may retain an observed deterministic-check or reviewer
+  outcome. This is how an unreachable attempt with a separately verified fallback, or a metered
+  but unusable partial review, remains visible.
+- `refused` and `not_attempted` use a non-`none` fallback with
+  `deterministic_check=not_run` and `reviewer_usefulness=not_reported`, because no local result was
+  available to assess.
+
 **Never stored or accepted:** prompt/output text, file paths, repository names, aliases, key hashes,
 user/session IDs, free-text notes, or caller-provided timestamps. The writer rejects unknown fields
 before storage. It has no event ID or precise timestamp: the server derives only a UTC calendar day
 for the rolling-week query. Accepted and rejected authenticated report calls deliberately suppress
 the normal per-request access/request/owner logs, so this table cannot be correlated to a principal
-or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot;
-it is bounded by a transient per-key rate limit and a 25-row server-day cap. Rejections expose only
-the stable content-free reason codes `invalid_report`, `principal_rate_limited`,
-`daily_capacity_reached`, or `storage_unavailable`; they never echo input or expose a credential,
-principal, request, database, or path detail.
+or an exact transport time. This makes the reporting tool a deliberate narrow audit blind spot.
+It is bounded by a transient per-key telemetry rate limit and a 25-row server-day limit on
+individually attributed rows. Later valid reports are coalesced into `adoption_evidence_overflow_v2`,
+keyed by day and closed harness, execution-mode, purpose, result, check, usefulness, and fallback
+enums. Repeated buckets increment counters rather than append events. Both overflow tables have
+a 90-day retention policy. No principal, request, precise time, or content is stored. Legacy
+`adoption_evidence_overflow` rows remain unchanged and lack harness and mode attribution. The acknowledgement distinguishes
+`retained`, `aggregated`, and `dropped`, scopes limit reasons to telemetry, and states that inference
+availability is unaffected. A `telemetry_daily_cap` aggregate is non-fatal and only the telemetry
+write must not be retried until the next UTC day. Invalid, transiently telemetry-rate-limited, or
+unavailable writes remain visible as dropped hard tool errors without echoing input or exposing a
+credential, principal, request, database, or path detail.
 
-The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels:
+An `invalid_report` response also carries one fixed content-blind diagnostic: `invalid_shape`,
+`unknown_field`, `invalid_field` plus a known schema field, or `invalid_invariant` plus one of the
+documented fixed invariant codes. Unknown caller keys are never returned, because a key could
+itself contain a path, identity, or task text.
+
+The weekly Heimdall poster (`scripts/post-m5-adoption-panel.ts`) has four separate panels. A window
+containing legacy overflow or malformed attribution is explicitly labelled **INCOMPLETE**. Valid
+v2 aggregates preserve harness and mode; the poster counts individual, legacy, and v2 reports
+once each. Retention completeness does not imply complete opportunity or assessment coverage:
 
 - **MEASURED — organic M5 agent adoption:** only `traffic_purpose=organic`, by harness.
 - **MEASURED — organic M5 agent adoption by harness:** closed, content-free per-harness rows
@@ -136,11 +182,56 @@ Use the maturity labels literally:
 - **SHADOW** means adoption measurement itself does not route, block, or authorize work. It cannot
   prove quality, production autonomy, cost savings, or a routing policy change.
 
+The repository's local `data/` directory is gitignored scratch space, not production evidence.
+Tests and local experiments must write to explicitly named, isolated temporary stores; files left
+under `data/` are private working artifacts and are not valid evidence until they have passed the
+applicable provenance, retention, and review gates.
+
 The initial review is deliberately not a raw-call target: by **2026-08-28**, review whether at
 least **20 known organic eligible opportunities** have been reported and whether useful completions
 (`pass` or `partial`, without a deterministic-check failure) are at least **60% of attempted
 delegations**. Reconsider the measure and the adoption path then; do not optimize the number of
 reports.
+
+### Local evidence bundle export (#245)
+
+The read-only local report
+`tsx scripts/export-m5-adoption-evidence.ts --from <UTC-day-start> --through-exclusive <UTC-day-start>`
+produces one deterministic JSON bundle for an exact half-open time window. Add `--db <path>` to
+inspect a specific `EVAL_DB_PATH`, and `--generated-at <timestamp>` when a reproducible artifact
+timestamp is required. Bounds must be full UTC calendar days because `adoption_evidence` stores
+only a server-derived UTC day; request, delegation, and cost rows use the exact same
+`[from, throughExclusive)` bounds. The command opens a private query-only snapshot through the
+existing read-only DB helper, refuses an active WAL or missing required schema, and writes only to
+stdout.
+
+Bundle contract v2 reports separate legacy and attributed aggregate counts, preserves new
+post-cap harness/mode breakdowns, and leaves historical missing attribution unknown. Missing
+checks or judgments still block threshold acceptance and promotion, even when retention is
+complete. The bundle carries the shared `m5-admitted-compute-v2` filter epoch plus UTC-day/tier/route/node/
+model utilization and exclusion reconciliations; closed adoption dimensions (purpose, harness, mode,
+result, usefulness, and fallback); a bounded current M5 task×model×verifier×source×outcome matrix;
+cost, delegator-attribution, token, and local-calibration coverage; content-blind identity/policy/
+LearningTask coverage plus exclusive current-M5/shadow/superseded/non-M5/invalid state counts and
+retention-window coverage; and explicit `pass`/`fail`/`unknowable` threshold states. Current-policy
+applicability is reported only as current/stale/missing counts using `HARVEST_JUDGE_POLICY`; raw
+policy stamps are never exported. New request-log writes stamp `compute_filter_epoch` from the
+server's shared compute-filter constant, never from caller input. The additive migration leaves
+historical rows null; exporting an older schema does not migrate it. Among exact-window,
+current-filter matches, `historicalApplicability` counts `currentRows`, `missingRows`, and
+`otherRows`, with `ambiguousRows = missingRows + otherRows`. It reports `current`, `mixed`,
+`unknown`, or `no-evidence`; arbitrary stored epoch labels are never exported. Only a nonempty,
+all-current sample clears the historical-metric gate. Mixed and legacy samples remain ambiguous;
+stamping does not repair past evidence or clear any other promotion requirement. Cost reconciliation separately
+reports missing links and duplicate links/rows; exactly one complete cost row per current delegation
+is required for promotion. LearningTask binding is required across the full current-M5 population.
+The promotion-readiness gate also requires complete current-M5 identity, applicable LearningTask
+binding, reviewer and cost coverage, reconciliation, and no ambiguous historical comparison. The bundle's maturity labels are evidence-only (`measured` when
+rows exist, otherwise `aspirational`); they do not infer deployment state. It never exports prompts, responses, excerpts, hashes,
+aliases, key material, IDs, notes, paths, repositories, or raw unbounded labels; unknown dimensions
+collapse to a bounded bucket and missing evidence remains unknown rather than zero. The report also
+emits one deterministic smallest next action: `improve_agent_access`, `repair_measurement`,
+`keep_routing_shadow`, or `propose_separately_reviewed_lane_promotion`.
 
 ## 4. `owner_request_log` (SQLite) — the ONLY content sink, owner-only
 
@@ -153,7 +244,9 @@ tier === "owner" && keyHash !== null
 
 which excludes implicit-admin and legacy static admins (both `keyHash === null`) and **never** logs
 guests. Gate: `HOMESERVER_OWNER_REQUEST_LOG` (`on` | `off`, default `on`). The observability layer
-does not change this guard or widen content capture.
+does not change this guard or widen content capture. MCP `ask` owner opt-in native reasoning
+(`#441`) is returned separately and is not added to any content log, metrics, request log or
+delegation evidence; the existing prompt and final-answer logging contract is unchanged.
 
 ## Trusted-catalogue model labels
 

@@ -1,0 +1,13 @@
+# Native ROCm System One adapter; paths are operator placeholders, not a live config.
+# Exact Apache-2.0 package: perplexity-ai/pplx-decider-v1-27b at
+# 5117a6c7fe73b19308dc1a6b0fb529a40c2ecad4. Preserve the trained
+# readout.safetensors, decision_config.json temperature, tokenizer and source.
+# Approx. 49 GiB BF16 weights plus working memory; verify measured M5 peak and
+# a compatible offline Python 3.12+/PyTorch-ROCm/Transformers runtime first.
+key: pplx-decider-v1-27b
+api: systemone
+runtime_kind: native
+runtime_bin: /operator-resolve/decider-runtime/bin/python
+server_script: /home/magnus/home-server-eval/scripts/systemone-native-server.py
+checkpoint: /operator-resolve/models/pplx-decider-v1-27b
+ttl: 1800

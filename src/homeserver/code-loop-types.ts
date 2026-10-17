@@ -3,6 +3,8 @@ import type {
   LearningTaskCapabilityEpoch,
   LearningTaskGatewayEcho,
 } from "./learning-task-contract.js";
+import type { CodeLoopSchemaCheck, CodeLoopSchemaGrounding } from "./code-loop-schema-checks.js";
+import type { ModelStartAdmission } from "./host-memory-admission.js";
 
 /**
  * code_loop — frozen type contract (issue #116, docs/agentic-code-tool-design.md).
@@ -25,6 +27,8 @@ export interface CodeLoopSeedFile {
 /** Caller-supplied caps; every field optional, clamped to the configured hard maxima. */
 export interface CodeLoopCapsRequest {
   wall_s?: number;
+  /** Optional whole invocation budget, including admission and reserved cleanup (90–900s). */
+  total_wall_s?: number;
   turns?: number;
   completion_tokens?: number;
   /** Optional first-mutation deadline. Strictly validated; never silently clamped. */
@@ -34,6 +38,7 @@ export interface CodeLoopCapsRequest {
 /** Effective caps after clamping — always fully populated. */
 export interface CodeLoopCaps {
   wall_s: number;
+  total_wall_s?: number;
   turns: number;
   completion_tokens: number;
   /** Omitted preserves the pre-#247 harness behavior byte-for-byte. */
@@ -51,6 +56,7 @@ export interface CodeLoopCapsConfig {
 }
 
 export interface CodeLoopRequest {
+  traffic_purpose?: "organic" | "evaluation" | "synthetic";
   /** Optional durable idempotency key. Same id + same canonical request returns the same run. */
   client_run_id?: string;
   /** Optional dual-read LearningTaskContract v1 stamp; validated before any new admission. */
@@ -61,6 +67,13 @@ export interface CodeLoopRequest {
   files: CodeLoopSeedFile[];
   /** Owner-authored verification command, run in the sandbox INSIDE the cage post-loop (120 s cap). */
   check_cmd?: string;
+  /** Required for unit-test-gen. Owner-authored behavioral oracles; all must exit zero. */
+  schema_checks?: CodeLoopSchemaCheck[];
+  /**
+   * Enforceable returned-change path/glob allowlist. Omission limits the result to exact seeded
+   * files. This is distinct from `protected`, which remains reporting-only.
+   */
+  writable?: string[];
   /** Globs whose modification is detected at exit and reported — never silently passed. */
   protected?: string[];
   /** Ledger task type; defaults to the classifier's verdict on the instruction. */
@@ -72,11 +85,15 @@ export interface CodeLoopRequest {
 
 /** Immediate structured refusals from code_loop_start (design §4). */
 export type CodeLoopRefusal =
+  | "deadline-exceeded"
   | "disabled"
   | "busy"
   | "maintenance"
   | "lease-unavailable"
   | "cage-unavailable"
+  | "cage-transport-unavailable"
+  | "insufficient_memory"
+  | "memory_admission_unavailable"
   | "invalid-request"
   | "conflict"
   | "admission-recovery";
@@ -99,6 +116,8 @@ export interface CodeLoopCheck {
   exit_code: number | null;
   /** Last 4 KB of the check command's combined output. */
   output_tail: string;
+  /** Machine-readable reason an owner check did not run; null when it ran. */
+  skip_reason: "not-requested" | "harvest-untrusted" | "scope-violation" | "protected-violation" | "engine-failure" | null;
 }
 
 export interface CodeLoopExecution {
@@ -108,9 +127,12 @@ export interface CodeLoopExecution {
   /** Immutable harness contract identifier, not a mutable deployment label. */
   harness_version: string;
   effective_caps: CodeLoopCaps;
+  whole_job?: { budget_s: number; observed_before_persistence_ms: number; cleanup_complete: boolean };
   capabilities: {
     start_idempotency: "client-run-id-v1";
     agent_checks: "pi-bash-events-v3";
+    result_scope: "writable-v1";
+    completion_accounting: "bounded-turns-v1";
   };
 }
 
@@ -143,6 +165,7 @@ export interface CodeLoopAgentChecks {
 }
 
 export type CodeLoopMutationEvidence = "tool-call" | "diff-only" | "none";
+export type CodeLoopFailureKind = "turn-cap" | "token-cap" | "wall-cap" | "growth-cap" | "edit-deadline";
 
 export interface CodeLoopTelemetry {
   schema_version: 1;
@@ -161,19 +184,26 @@ export interface CodeLoopTelemetry {
   mutation_evidence: CodeLoopMutationEvidence;
   /** 1 = event stream and git agree; 0.5 = git proves a diff but no trusted mutation event. */
   observability_coverage: number;
-  failure_kind?: "edit-deadline";
+  failure_kind?: CodeLoopFailureKind;
 }
 
 export interface CodeLoopResult {
+  /** Exact owner-bound feedback identity; survives durable result recovery. */
+  feedback_handle?: string;
   status: CodeLoopTerminalStatus;
+  /** Whether the agent reached a clean completion before a terminal limit/failure. */
+  completion_state: "complete" | "unfinished";
   /** Unified git diff vs the seed commit, ≤200 KB (see diff_truncated). Ground truth is git. */
   diff: string;
   diff_truncated: boolean;
   changed_files: string[];
+  /** Changed paths omitted because their logical change crossed the writable/safety boundary. */
+  scope_violations: string[];
   protected_violations: string[];
   /** pi's final assistant message (≤2 KB). */
   summary: string;
   check: CodeLoopCheck;
+  schema_grounding: CodeLoopSchemaGrounding;
   usage: CodeLoopUsage;
   /** Additive #247 fields: immutable effective execution plus content-blind phase evidence. */
   execution: CodeLoopExecution;
@@ -203,6 +233,8 @@ export type CodeLoopStartResult =
       capabilities: {
         start_idempotency: "client-run-id-v1";
         agent_checks: "pi-bash-events-v3";
+        result_scope: "writable-v1";
+        completion_accounting: "bounded-turns-v1";
       };
     }
   | {
@@ -219,6 +251,8 @@ export type CodeLoopStartResult =
 export type EngineOutcome = "completed" | "cap-exceeded" | "degenerate" | "arm-error";
 
 export interface EngineRunOptions {
+  /** Shared whole-job stop signal; an aborted signal forbids any new subprocess/retry. */
+  signal?: AbortSignal;
   sandboxDir: string;
   instruction: string;
   model: string;
@@ -245,7 +279,7 @@ export interface EngineRunResult {
     phase_ms: { inspect?: number; edit?: number };
     mutation_evidence: "tool-call" | "none";
     observability_coverage: number;
-    failure_kind?: "edit-deadline";
+    failure_kind?: CodeLoopFailureKind;
     agent_checks?: Array<{
       order: number;
       kind: CodeLoopAgentCheckKind;
@@ -295,24 +329,30 @@ export interface CodeLoopDeps {
   };
   /** Authenticated key alias persisted on the derived capability-ledger row. */
   keyAlias?: string | null;
+  feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
+  /** Optional pre-start resource admission; invoked before cage, seed, GPU lease, or engine work. */
+  beforeModelStart?: ModelStartAdmission;
+  /** Content-free reachability of the dedicated user-bus listener before new work. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
   /** Poll gateway/model readiness after a suspected degeneracy abort; resolves ready?. */
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */
-  cageSelfTest: () => Promise<{ ok: boolean; failures: string[] }>;
+  cageSelfTest: (signal?: AbortSignal, remainingMs?: number) => Promise<{ ok: boolean; failures: string[] }>;
   /** Verify the deterministic transient service is stopped before publishing a terminal result. */
   cleanupUnit?: (unit: string) => Promise<void>;
-  /** Live maintenance-mode flag (the model-scout window). */
+  /** Live maintenance-mode flag (an explicit evaluation window). */
   maintenanceMode: () => boolean;
   /** Acquire the GPU lease (60 s budget); null ⇒ refuse the job (lease-unavailable). */
   acquireLease: (opts: {
     model: string;
     timeoutMs: number;
     onLeaseLost: () => void;
+    signal?: AbortSignal;
   }) => Promise<{ release: () => Promise<void> } | null>;
   /** Run a host-side command (git harvest, caged check_cmd). Never throws; returns code null on timeout. */
   runCommand: (
     argv: string[],
-    opts: { cwd: string; env: Record<string, string>; timeoutMs: number }
+    opts: { cwd: string; env: Record<string, string>; timeoutMs: number; signal?: AbortSignal }
   ) => Promise<{ code: number | null; stdout: string; stderr: string }>;
   /** Sandbox growth cap (bytes). Default 50 MB; overridable for tests. */
   growthCapBytes: number;

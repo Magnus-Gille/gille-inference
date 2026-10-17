@@ -7,6 +7,7 @@ import {
   jsonValid,
   matches,
   containsAll,
+  requiredAnchors,
   containsNone,
   predicate,
   all,
@@ -118,7 +119,7 @@ interface TriageCase {
 export const TRIAGE_CASES: readonly TriageCase[] = [
   { id: "triage-ready-hugin-issue", message: "Solve hugin #190 and open a draft PR", context: "Hugin is active at repo:hugin. Issue #190 is pending-task starvation.", action: "ready" },
   { id: "triage-ready-current-pr", message: "Run the tests and fix the failing check on the current PR", context: "Current project is repo:gille-inference, PR #242 has one failing Vitest check.", action: "ready" },
-  { id: "triage-ready-swedish", message: "Lägg till ett regressionstest för tomma modellsvar", context: "Active project repo:gille-inference; weekly scout work is in progress.", action: "ready" },
+  { id: "triage-ready-swedish", message: "Lägg till ett regressionstest för tomma modellsvar", context: "Active project repo:gille-inference; a manual model evaluation is in progress.", action: "ready" },
   { id: "triage-ready-research", message: "Compare the three local models on this benchmark and write a short report", context: "No repository changes requested. M5 benchmark endpoints are available.", action: "ready" },
   { id: "triage-ready-reply", message: "run this again", context: "No Hugin task is currently running.", replyContext: "The user is replying to the result for task \"mcp-m5-123\". That message said: \"Rebuild the Hugin service completed.\"", action: "ready" },
   { id: "triage-ready-terse", message: "fix the pagination boundary bug", context: "Only active bug is Hugin #190: Munin inclusive-until pagination boundary.", action: "ready" },
@@ -131,7 +132,7 @@ export const TRIAGE_CASES: readonly TriageCase[] = [
   { id: "triage-answer-status", message: "what is running right now?", context: "No Hugin tasks are running. The queue is empty.", action: "answer" },
   { id: "triage-answer-greeting", message: "hej", context: "No task context is needed.", action: "answer" },
   { id: "triage-answer-merged", message: "did #190 merge?", context: "Hugin #190 is open and draft PR #193 is not merged.", action: "answer" },
-  { id: "triage-answer-schedule", message: "when does the model scout run?", context: "Weekly model scout runs Sundays at 04:00 UTC.", action: "answer" },
+  { id: "triage-answer-evaluation-policy", message: "how are new models evaluated?", context: "New models are evaluated only through an explicit operator-requested, maintenance-protected run; there is no discovery schedule.", action: "answer" },
   { id: "triage-answer-swedish", message: "vilken modell kör triage?", context: "Ratatoskr triage currently uses mellum.", action: "answer" },
   { id: "triage-answer-quick-fact", message: "what port is Hugin on?", context: "Hugin health endpoint uses port 3032.", action: "answer" },
 ] as const;
@@ -150,7 +151,7 @@ interface ReviewCase {
 
 /**
  * 12 mutant diffs (34 seeded defects) + 6 clean controls. Findings are stable line ids, which lets
- * the scout compute recall/precision/confabulation locally without an LLM judge.
+ * the evaluation battery compute recall/precision/confabulation locally without an LLM judge.
  */
 export const REVIEW_CASES: readonly ReviewCase[] = [
   {
@@ -481,6 +482,114 @@ export const PROBES: Probe[] = [
     maxTokens: 12288,
     verifier: tsGate({ harness: "" }), // the model's own assertions are the test
     verifierName: "tsGate",
+  },
+  {
+    id: "test-usage-event-schema",
+    taskType: "unit-test-gen",
+    prompt: `Write self-contained TypeScript regression tests for an existing extractUsage function.
+
+Return only this exported function (no imports and no implementation of extractUsage):
+
+export function runTests(
+  extractUsage: (events: unknown[], fromIso: string) => unknown[]
+): void
+
+The input contract is exact:
+- Every relevant event has top-level { type: "event_msg", payload: { ... } }.
+- payload.type is "token_count".
+- payload.info.last_token_usage contains input_tokens, cached_input_tokens, and reasoning_output_tokens.
+- payload.session_meta.session_id identifies the session.
+- payload.turn_context.call_id identifies one model call.
+- payload.turn_context.source.subagent.thread_spawn identifies the spawning thread.
+- payload.timestamp is an ISO timestamp. Ignore events before fromIso.
+
+extractUsage returns ONE record per token_count CALL, not one per session. Each record has exactly
+session_id, call_id, timestamp, fresh_input_tokens (input_tokens minus cached_input_tokens),
+cached_input_tokens, reasoning_output_tokens, and source_thread_spawn. Results are sorted by
+timestamp and then call_id. It never returns a legacy record.input_tokens field.
+
+Your tests must use at least two sessions, at least two calls in the same session, out-of-order
+events, and one event before fromIso. Use plain if (...) throw new Error(...) assertions.`,
+    maxTokens: 12288,
+    verifier: all([
+      requiredAnchors([
+        { label: "top-level type=event_msg", needles: ["type", "event_msg"] },
+        { label: "payload.type=token_count", needles: ["payload", "token_count"] },
+        { label: "payload.info.last_token_usage", needles: ["info", "last_token_usage"] },
+        { label: "session_meta.session_id", needles: ["session_meta", "session_id"] },
+        { label: "turn_context.call_id", needles: ["turn_context", "call_id"] },
+        { label: "input/cache/reasoning token fields", needles: ["input_tokens", "cached_input_tokens", "reasoning_output_tokens"] },
+        { label: "source.subagent.thread_spawn", needles: ["source", "subagent", "thread_spawn"] },
+        { label: "timestamp filter", needles: ["timestamp", "fromIso"] },
+        { label: "per-call fresh/cache output", needles: ["fresh_input_tokens", "cached_input_tokens", "call_id"] },
+      ]),
+      tsGate({
+        harness: `
+type UsageExtractor = (events: unknown[], fromIso: string) => unknown[];
+
+const correctExtractor: UsageExtractor = (events, fromIso) => (events as any[])
+  .filter((event) => event?.type === "event_msg" && event.payload?.type === "token_count" && event.payload.timestamp >= fromIso)
+  .map((event) => ({
+    session_id: event.payload.session_meta.session_id,
+    call_id: event.payload.turn_context.call_id,
+    timestamp: event.payload.timestamp,
+    fresh_input_tokens: event.payload.info.last_token_usage.input_tokens - event.payload.info.last_token_usage.cached_input_tokens,
+    cached_input_tokens: event.payload.info.last_token_usage.cached_input_tokens,
+    reasoning_output_tokens: event.payload.info.last_token_usage.reasoning_output_tokens,
+    source_thread_spawn: event.payload.turn_context.source.subagent.thread_spawn,
+  }))
+  .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.call_id.localeCompare(b.call_id));
+
+const topLevelFabrication: UsageExtractor = (events, fromIso) => (events as any[])
+  .filter((event) => event?.event === "token_count" && event.timestamp >= fromIso)
+  .map((event) => ({ session_id: event.session_id, input_tokens: event.info?.input_tokens }));
+
+const onePerSession: UsageExtractor = (events, fromIso) => {
+  const seen = new Set<string>();
+  return (correctExtractor(events, fromIso) as any[]).filter((record) => {
+    if (seen.has(record.session_id)) return false;
+    seen.add(record.session_id);
+    return true;
+  });
+};
+
+const legacyTokenShape: UsageExtractor = (events, fromIso) => (correctExtractor(events, fromIso) as any[])
+  .map(({ fresh_input_tokens, cached_input_tokens, ...record }) => ({
+    ...record,
+    input_tokens: fresh_input_tokens + cached_input_tokens,
+  }));
+
+const wrongSessionNesting: UsageExtractor = (events, fromIso) => (correctExtractor(events, fromIso) as any[])
+  .map(({ session_id: _sessionId, ...record }) => ({ ...record, session_id: undefined }));
+const wrongCallNesting: UsageExtractor = (events, fromIso) => (correctExtractor(events, fromIso) as any[])
+  .map(({ call_id: _callId, ...record }) => ({ ...record, call_id: undefined }));
+const dropsReasoningTokens: UsageExtractor = (events, fromIso) => (correctExtractor(events, fromIso) as any[])
+  .map(({ reasoning_output_tokens: _reasoning, ...record }) => record);
+const dropsThreadSpawn: UsageExtractor = (events, fromIso) => (correctExtractor(events, fromIso) as any[])
+  .map(({ source_thread_spawn: _threadSpawn, ...record }) => record);
+
+const ignoresTimestampFilter: UsageExtractor = (events, _fromIso) => correctExtractor(events, "");
+const reverseOrder: UsageExtractor = (events, fromIso) => [...correctExtractor(events, fromIso)].reverse();
+
+runTests(correctExtractor);
+const mustReject = (label: string, extractor: UsageExtractor): void => {
+  let rejected = false;
+  try { runTests(extractor); } catch { rejected = true; }
+  if (!rejected) throw new Error("schema grounding: generated tests missed " + label);
+};
+mustReject("top-level type/payload nesting", topLevelFabrication);
+mustReject("one-record-per-call cardinality", onePerSession);
+mustReject("fresh/cache/reasoning output fields", legacyTokenShape);
+mustReject("session_meta.session_id nesting", wrongSessionNesting);
+mustReject("turn_context.call_id nesting", wrongCallNesting);
+mustReject("reasoning_output_tokens", dropsReasoningTokens);
+mustReject("source.subagent.thread_spawn", dropsThreadSpawn);
+mustReject("timestamp filtering", ignoresTimestampFilter);
+mustReject("deterministic ordering", reverseOrder);
+`,
+      }),
+    ]),
+    verifierName: "requiredAnchors+tsGate(schema-mutants-v1)",
   },
 
   // ── rewrite (×3 — original at 2048 tok to reproduce spiral; two new at 12288 to test budget hypothesis) ──

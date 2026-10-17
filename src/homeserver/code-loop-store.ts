@@ -222,8 +222,13 @@ export function codeLoopRequestFingerprint(
   const canonical = {
     schema_version: 1,
     instruction: req.instruction,
+    ...(req.traffic_purpose === undefined ? {} : { traffic_purpose: req.traffic_purpose }),
     files: req.files.map((f) => ({ path: f.path, content: f.content })),
     check_cmd: req.check_cmd ?? null,
+    ...(req.schema_checks === undefined ? {} : { schema_checks: req.schema_checks.map(({ name, command }) => ({ name, command })) }),
+    // Omission preserves the pre-scope-contract fingerprint for durable legacy retries. An
+    // explicit scope is new request identity and must never recover a differently bounded run.
+    ...(req.writable === undefined ? {} : { writable: [...req.writable] }),
     protected: req.protected === undefined ? null : [...req.protected],
     task_type: req.task_type ?? null,
     caps: req.caps === undefined
@@ -233,6 +238,7 @@ export function codeLoopRequestFingerprint(
           turns: req.caps.turns ?? null,
           completion_tokens: req.caps.completion_tokens ?? null,
           edit_deadline_turn: req.caps.edit_deadline_turn ?? null,
+          ...(req.caps.total_wall_s === undefined ? {} : { total_wall_s: req.caps.total_wall_s }),
         },
     // Preserve the exact pre-LearningTaskContract serialization for unstamped callers. Adding a
     // trailing null here would invalidate every durable client_run_id created before the rollout.

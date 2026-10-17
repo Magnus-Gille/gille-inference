@@ -10,11 +10,13 @@ import {
   getRunningSnapshot,
   RunningSnapshotUnavailableError,
 } from "./model-admin.js";
-import { delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
+import { currentModel, delegate, getDelegateTelemetryModel, resolveTaskType, type DelegationOutcome } from "./orchestrator.js";
 import type { Verifier } from "./verifier.js";
 import { buildVerifier, isVerifierBuildError } from "./verifier-registry.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
 import { ledgerReport, recentDelegations, getDelegationById, recordReviewerUsefulness } from "./ledger.js";
+import { bindExecutionFeedback, executionFeedbackOwner, recordExecutionFeedback, type ExecutionFeedbackOwner } from "./execution-feedback.js";
+import { parseExecutionFeedback, parseExecutionTrafficPurpose, type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
 import { resetRoutingTable, loadRoutingTable } from "./routing-table.js";
 import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
@@ -22,6 +24,9 @@ import {
   mintKey,
   revokeKey,
   listKeys,
+  grantSystemOneModelToKeys,
+  grantEmbeddingModelToCustomerKeys,
+  grantExistingChatModelToCustomerKeys,
   redeemInvite,
   reserveCredits,
   reconcileCredits,
@@ -31,15 +36,19 @@ import {
   InviteInvalidError,
   InvalidParamError,
   InvalidScopeError,
+  InvalidSystemOneGrantError,
+  InvalidEmbeddingGrantError,
+  InvalidExistingChatModelGrantError,
   KeyLifetimePolicyError,
   type KeyScope,
   type Tier,
 } from "./keystore.js";
 import { checkQuota, recordUsage, checkRateWindow, type QuotaLimits, type QuotaReservation } from "./quota.js";
+import { describeQuotaFailure } from "./quota-error.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
+import { AdmissionCancelled, AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { acquireGpuLease } from "./gpu-lease.js";
 import {
   ExclusiveMaintenanceWindow,
@@ -50,11 +59,13 @@ import {
 } from "./maintenance-window.js";
 import { makeError, sendError, classifyUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
-import { handleMcpPost, isAdoptionEvidenceToolCall } from "./mcp.js";
-import { execFile } from "node:child_process";
+import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, readHostMemory, readOomKillCount, type HostMemoryAdmissionDeps, type HostMemoryAdmissionMode, type HostMemoryReadResult, type ModelStartAdmission } from "./host-memory-admission.js";
+import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
 import { sweepCodeLoopSandboxes } from "./code-loop.js";
+import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
-import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, renderMetrics } from "./metrics.js";
+import { probeCodeLoopTransport } from "./code-loop-transport.js";
+import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
@@ -63,18 +74,30 @@ import { recordOwnerRequest } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import {
+  ensureRequestLogSchema,
   recordRequestLog,
   cachedRequestLogTotals,
   getLatestSuccessfulModelUse,
   type LatestSuccessfulModelUse,
 } from "./request-log.js";
+import { queryM5UsageSummary } from "./usage-summary.js";
+import { queryLatestSuccessfulM5InferenceAt } from "./inference-freshness.js";
+import { getDb } from "../db.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
 import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
-import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, warmCatalogue } from "./catalogue.js";
+import { canonicalizeModelFromTrustedCatalogue, canonicalizeModelTrusted, getTrustedCatalogue, warmCatalogue } from "./catalogue.js";
+import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
+import { IncidentWindowOptionsError, queryIncidentWindow } from "./incident-window.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
-import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS, type ParsedImageRequest } from "./image-request.js";
+import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image-request.js";
+import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
+  SYSTEMONE_MAX_BODY_BYTES,
+  validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
+import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
+  embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
+import { EmbeddingVideoProbeError, validateEmbeddingVideoBitstream } from "./embedding-video-probe.js";
 import { generateImages, ImageSidecarError } from "./image-sidecar.js";
 import {
   startImageWorker,
@@ -96,7 +119,6 @@ import {
   REVIEW_LANE_KNOWN_TASK_TYPES,
   REVIEW_LANE_CAPABILITY_ENDPOINT,
   REVIEW_BOUNDED_CONTRACT_VERSION,
-  REVIEW_BOUNDED_TASK_TYPE,
   REVIEWER_USEFULNESS_ROUTE_SUFFIX,
   reviewLaneCapability,
   reviewerUsefulnessRecordingCapabilityForPrincipal,
@@ -122,6 +144,7 @@ import {
 import {
   claimLearningTaskAdmission,
   lookupLearningTaskAdmission,
+  releaseLearningTaskAdmission,
 } from "./learning-task-admission-store.js";
 import {
   ROSTER_PROPOSAL_PRINCIPAL,
@@ -173,6 +196,8 @@ interface PrincipalContext {
   /** Read-only monitoring principal — limited to GET /healthz, /ledger, /metrics, /models*. */
   isMonitor?: boolean;
   modelAllowList: string[];
+  systemOneModelAllowList: string[];
+  embeddingModelAllowList: string[];
   limits: QuotaLimits;
   maxParallel: number;
   /**
@@ -235,6 +260,8 @@ function resolvePrincipal(
         scope: "admin",
         isAdmin: true,
         modelAllowList: [],
+        systemOneModelAllowList: [],
+        embeddingModelAllowList: [],
         limits: keyLimits(cfg),
         maxParallel: cfg.keyDefaults.maxParallel,
         keyHash: null,
@@ -256,6 +283,8 @@ function resolvePrincipal(
       isAdmin: rec.scope === "admin",
       isMonitor: rec.scope === "monitor",
       modelAllowList: rec.modelAllowList,
+      systemOneModelAllowList: rec.systemOneModelAllowList,
+      embeddingModelAllowList: rec.embeddingModelAllowList,
       limits: { rpm: rec.rpm, tpm: rec.tpm, dailyTokenBudget: rec.dailyTokenBudget },
       maxParallel: rec.maxParallel,
       keyHash: rec.keyHash,
@@ -273,6 +302,8 @@ function resolvePrincipal(
       scope: "admin",
       isAdmin: true,
       modelAllowList: [],
+      systemOneModelAllowList: [],
+      embeddingModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -290,6 +321,8 @@ function resolvePrincipal(
       scope: "inference",
       isAdmin: false,
       modelAllowList: [],
+      systemOneModelAllowList: [],
+      embeddingModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -310,6 +343,8 @@ function resolvePrincipal(
       isAdmin: false,
       isMonitor: true,
       modelAllowList: [],
+      systemOneModelAllowList: [],
+      embeddingModelAllowList: [],
       limits: keyLimits(cfg),
       maxParallel: cfg.keyDefaults.maxParallel,
       keyHash: null,
@@ -332,6 +367,9 @@ function keyLimits(cfg: HomeserverConfig): QuotaLimits {
 // ─── Per-key in-flight tracking ──────────────────────────────────────────────────────
 
 const keyInflight = new Map<string, number>();
+// One CPU embedding call per gateway instance matches the sidecar's single server slot and
+// prevents queued sidecar calls from occupying every shared GPU admission slot.
+const embeddingInFlight = new WeakSet<AdmissionController>();
 
 function incInflight(alias: string): void {
   keyInflight.set(alias, (keyInflight.get(alias) ?? 0) + 1);
@@ -543,11 +581,91 @@ interface ModelResidencyResponseRow {
 }
 
 type ModelResidencyResponse =
-  | { models: ModelResidencyResponseRow[]; status?: never }
-  | { status: "unavailable"; models?: never };
+  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; resourceEvidence: ResourceEvidence; status?: never }
+  | { status: "unavailable"; resourceEvidence: ResourceEvidence; models?: never };
+
+interface ResourceEvidence {
+  admissionMode: HostMemoryAdmissionMode;
+  oom: {
+    status: "available" | "unknown";
+    oomKillCount: number | null;
+    observedAt: string | null;
+  };
+}
+
+interface HostMemoryResponse {
+  status: "available" | "unknown";
+  memTotalBytes: number | null;
+  memAvailableBytes: number | null;
+  cmaFreeBytes: number | null;
+  gttUsedBytes: number | null;
+  gttTotalBytes: number | null;
+  /** Device-wide counters cannot be attributed to external models from these observations. */
+  gttAccounting: "unattributed" | "unknown";
+}
+
+function narrowHostMemory(result: HostMemoryReadResult): HostMemoryResponse {
+  if (!result.ok) {
+    return {
+      status: "unknown",
+      memTotalBytes: null,
+      memAvailableBytes: null,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+      gttAccounting: "unknown",
+    };
+  }
+  const { memory } = result;
+  const hasGttCounters = memory.gttUsedBytes !== null && memory.gttTotalBytes !== null;
+  return {
+    status: "available",
+    memTotalBytes: memory.memTotalBytes,
+    memAvailableBytes: memory.memAvailableBytes,
+    cmaFreeBytes: memory.cmaFreeBytes,
+    gttUsedBytes: memory.gttUsedBytes,
+    gttTotalBytes: memory.gttTotalBytes,
+    gttAccounting: hasGttCounters ? "unattributed" : "unknown",
+  };
+}
+
+async function readHostMemoryForResidency(reader: () => Promise<HostMemoryReadResult>): Promise<HostMemoryResponse> {
+  try {
+    return narrowHostMemory(await reader());
+  } catch (err) {
+    // Diagnostics must remain content-blind and available even if the best-effort reader throws.
+    const name = err instanceof Error ? err.name : typeof err;
+    console.warn("[model-residency] host memory reader failed", /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown");
+    return narrowHostMemory({ ok: false, error: "host memory reader failed" });
+  }
+}
+
+async function readResourceEvidence(
+  admissionMode: HostMemoryAdmissionMode,
+  reader: () => Promise<number | null>,
+): Promise<ResourceEvidence> {
+  try {
+    const oomKillCount = await reader();
+    if (oomKillCount !== null && Number.isSafeInteger(oomKillCount) && oomKillCount >= 0) {
+      return {
+        admissionMode,
+        oom: { status: "available", oomKillCount, observedAt: new Date().toISOString() },
+      };
+    }
+  } catch {
+    // OOM evidence is best effort and must not expose reader failures through HTTP or logs.
+  }
+  return { admissionMode, oom: { status: "unknown", oomKillCount: null, observedAt: null } };
+}
 
 /** Read and narrow the content-blind model-residency diagnostic for the HTTP surface. */
-async function readModelResidency(includeAlias: boolean): Promise<ModelResidencyResponse> {
+async function readModelResidency(
+  includeAlias: boolean,
+  readMemory: () => Promise<HostMemoryReadResult>,
+  admissionMode: HostMemoryAdmissionMode,
+  readOom: () => Promise<number | null>,
+): Promise<ModelResidencyResponse> {
+  const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
   try {
     running = await getRunningSnapshot();
@@ -555,7 +673,7 @@ async function readModelResidency(includeAlias: boolean): Promise<ModelResidency
     if (error instanceof RunningSnapshotUnavailableError) {
       // An unavailable observation is not an idle backend. Keep the response safe and
       // explicit so consumers do not infer that no models are resident.
-      return { status: "unavailable" };
+      return { status: "unavailable", resourceEvidence };
     }
     throw error;
   }
@@ -590,22 +708,45 @@ async function readModelResidency(includeAlias: boolean): Promise<ModelResidency
             : { ts: use.ts, route: use.route, outcome: use.outcome },
     };
   });
-  return { models: modelsOutput };
+  const hostMemory = await readHostMemoryForResidency(readMemory);
+  return { models: modelsOutput, hostMemory, resourceEvidence };
 }
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
 
 const PORTAL_HTML_PATH = join(dirname(fileURLToPath(import.meta.url)), "portal.html");
 let _portalHtml: string | null = null;
+const portalByEmbeddingMedia = new Map<boolean, string>();
 
 /**
  * Load the portal page. Cached after the first read (it is a static asset that ships with
  * the gateway). The page is fully self-contained — inline CSS/JS, no external assets — so it
  * works behind Tailscale / Cloudflare with no CDN dependency.
  */
-function portalHtml(): string {
+function portalHtml(embeddingMediaEnabled = false): string {
   if (_portalHtml === null) _portalHtml = readFileSync(PORTAL_HTML_PATH, "utf-8");
-  return _portalHtml;
+  const cached = portalByEmbeddingMedia.get(embeddingMediaEnabled);
+  if (cached !== undefined) return cached;
+  const rendered = _portalHtml
+    .replace("<!-- EMBEDDING_USES -->", embeddingMediaEnabled
+      ? "Text, code, PNG/JPEG images, PCM WAV audio and MP4 video vectors<br>768, 512, 256 or 128 dimensions"
+      : "Text and code vectors<br>768, 512, 256 or 128 dimensions")
+    .replace("<!-- EMBEDDING_DESC -->", embeddingMediaEnabled
+      ? "EmbeddingGemma 2 accepts bounded inline images, audio, video and mixed text/media as well as text/code. Confirm that the model appears in your authenticated /v1/models response; the runtime and your key grant must both be active. Successful calls use ordinary input-token credits and rate limits."
+      : "The first EmbeddingGemma 2 serving path accepts text and code. Confirm that embeddinggemma-2 appears in your authenticated /v1/models response; the runtime and your key grant must both be active. Successful calls use ordinary input-token credits and rate limits. Image, audio and video embeddings are not enabled on this endpoint.")
+    .replace("<!-- EMBEDDING_MEDIA_EXAMPLE -->", embeddingMediaEnabled
+      ? `<p><strong>Inline media embeddings (after model-list check):</strong></p>
+        <pre>{"model":"embeddinggemma-2","input":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,&lt;BASE64&gt;"}}]}],"dimensions":256}</pre>
+        <p>Use the same wrapped <span class="badge mono">content</span> shape with
+          <span class="badge mono">input_audio:{data,format:"wav"}</span> or
+          <span class="badge mono">input_video:{data,format:"mp4"}</span>. The data is raw base64 for WAV/MP4.
+          You may mix up to four text/media parts per vector. PNG/JPEG images are limited to 2 MiB and
+          2048×2048 pixels; PCM WAV to 3 MiB and 30 seconds; MP4 to 4 MiB, 10 seconds and 64 frames.
+          Up to four wrapped vectors per request, with one video total. Media must be inline;
+          remote and local URLs are rejected. Failed calls cost zero.</p>`
+      : "");
+  portalByEmbeddingMedia.set(embeddingMediaEnabled, rendered);
+  return rendered;
 }
 
 // ─── hs CLI (client/hs.mjs — served unauthenticated so friends can install before they have a key) ──
@@ -715,47 +856,10 @@ export function clientIp(req: IncomingMessage, trustedProxies: string[]): string
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024): Promise<string> {
-  // Early rejection on a declared Content-Length over the cap (mirrors readBuffer) — do NOT destroy
-  // the socket: the caller must stay able to write the 413 response. resume() drains in-flight bytes.
-  const declared = Number(req.headers["content-length"]);
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    req.resume();
-    return Promise.reject(new BodyTooLargeError());
-  }
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    let settled = false;
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => {
-      if (settled) return;
-      size += c.length;
-      if (size > maxBytes) {
-        // #15 / Codex finding 2: typed so the top-level catch maps it to a uniform 413 envelope.
-        // Stop buffering and reject, but keep the connection WRITABLE so the 413 can be sent — the
-        // old req.destroy() here raced the response write and the client saw a connection reset.
-        // resume() drains the rest of the upload instead of destroying the socket.
-        settled = true;
-        chunks.length = 0;
-        req.resume();
-        reject(new BodyTooLargeError());
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => {
-      if (settled) return;
-      settled = true;
-      resolve(Buffer.concat(chunks).toString("utf-8"));
-    });
-    req.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
-  });
+  return (await readBuffer(req, maxBytes, null)).toString("utf-8");
 }
 
-/** Thrown by readBuffer when the body exceeds the size cap — caller maps it to HTTP 413. */
+/** Thrown when a request body exceeds the size cap — caller maps it to HTTP 413. */
 class BodyTooLargeError extends Error {
   constructor() {
     super("request body too large");
@@ -781,7 +885,7 @@ class BodyTooLargeError extends Error {
 async function readBuffer(
   req: IncomingMessage,
   maxBytes = 32 * 1024 * 1024,
-  idleMs = 30_000
+  idleMs: number | null = 30_000
 ): Promise<Buffer> {
   // Early rejection on a declared Content-Length over the cap — before buffering anything. We do
   // NOT destroy the socket here: the caller still has to write a 413 response, which requires the
@@ -803,6 +907,7 @@ async function readBuffer(
       }
     };
     const armIdle = (): void => {
+      if (idleMs === null) return; // Text routes retain their existing no-idle-timeout policy.
       clearIdle();
       idle = setTimeout(() => {
         if (settled) return;
@@ -879,13 +984,13 @@ function parseChatBody(raw: string): ParsedChatBody {
  */
 async function admitAndMeterLogged(
   res: ServerResponse,
-  cfg: HomeserverConfig,
   controller: AdmissionController,
   principal: PrincipalContext,
   requestedModel: string | null,
   estTokens: number,
   lctx: LogCtx,
-  handler: () => Promise<MeteredResult>
+  handler: () => Promise<MeteredResult>,
+  surface: "chat" | "systemone" | "embedding" = "chat",
 ): Promise<void> {
   // Lifetime credit cap (non-resetting). Refuse BEFORE any inference if the key has spent
   // its budget. Distinct from the daily-resetting quota below: this never frees up on its own.
@@ -930,13 +1035,41 @@ async function admitAndMeterLogged(
       errorClass: lctx.errorClass ?? (outcome === "error" ? "internal_error" : undefined),
     });
   };
+  // Observe close before acquire: a completed request body is not a live response socket.
+  const admissionGone = new AbortController();
+  const onAdmissionClose = (): void => {
+    if (!res.writableEnded) admissionGone.abort();
+  };
+  res.once("close", onAdmissionClose);
+  if (res.destroyed && !res.writableEnded) admissionGone.abort();
   const admissionResult = await admissionTrace.run(async () => {
     let reservation: QuotaReservation | null = null;
     let release: (() => void) | null = null;
     let admissionThrew = false;
     try {
+      if (admissionGone.signal.aborted) throw new AdmissionCancelled();
       // Model allow-list check.
-      if (principal.modelAllowList.length > 0) {
+      if (surface === "systemone" && (requestedModel === null || !systemOneGranted(principal, requestedModel))) {
+        releaseReserve();
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
+      if (surface === "embedding" && (requestedModel === null || !embeddingGranted(principal, requestedModel))) {
+        releaseReserve();
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
+      if (surface === "chat" && principal.modelAllowList.length > 0) {
         if (requestedModel === null) {
           releaseReserve();
           lctx.status = 403;
@@ -976,7 +1109,7 @@ async function admitAndMeterLogged(
       const q = checkQuota(principal.alias, principal.limits, estTokens);
       if (!q.ok) {
         releaseReserve();
-        const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+        const failure = describeQuotaFailure(q, estTokens, principal);
         lctx.status = 429;
         lctx.outcome = "rate_limited";
         lctx.errorClass = "rate_limit_exceeded";
@@ -987,12 +1120,9 @@ async function admitAndMeterLogged(
           res,
           makeError("rate_limit_exceeded", {
             retryAfterSeconds: q.retryAfterSeconds,
-            message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-            rateLimit: {
-              limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-              remaining: 0,
-              resetSeconds: q.snapshot.resetSeconds,
-            },
+            message: failure.message,
+            quota: failure.quota,
+            rateLimit: failure.rateLimit,
           }),
         );
         finishAdmissionTrace(lctx.outcome);
@@ -1010,8 +1140,13 @@ async function admitAndMeterLogged(
           keyMaxParallel: principal.maxParallel,
           keyInflight: keyInflight.get(principal.alias) ?? 0,
           keyId: principal.alias,
-        }),
+        }, admissionGone.signal),
       );
+      // A grant and disconnect can meet before this continuation runs. Release that grant
+      // through the same rollback path instead of starting any M5 or Orin handler.
+      if (admissionGone.signal.aborted || (res.destroyed && !res.writableEnded)) {
+        throw new AdmissionCancelled();
+      }
       // queueWaitMs > 0 only when the owner had to wait (the acquire resolved via drainQueue).
       // For a direct admit it rounds to ~0ms, which we record as null (not meaningful).
       const waited = Date.now() - admitStart;
@@ -1020,6 +1155,17 @@ async function admitAndMeterLogged(
       finishAdmissionTrace("ok");
       return { admitted: true as const, release, reservation };
     } catch (err) {
+      if (err instanceof AdmissionCancelled) {
+        release?.();
+        releaseReserve();
+        if (reservation !== null) recordUsage(principal.alias, 0, Date.now(), reservation);
+        lctx.status = 499;
+        lctx.outcome = "client_closed";
+        lctx.errorClass = "client_closed";
+        lctx.admission = "n/a";
+        finishAdmissionTrace(lctx.outcome);
+        return { admitted: false as const };
+      }
       if (err instanceof AdmissionRejected) {
         releaseReserve();
         // M1: the quota check already DEBITED the daily estimate; a request rejected at admission
@@ -1044,13 +1190,13 @@ async function admitAndMeterLogged(
     } finally {
       finishAdmissionTrace(admissionThrew ? "error" : (lctx.outcome === "ok" ? "ok" : lctx.outcome));
     }
-  });
+  }).finally(() => res.off("close", onAdmissionClose));
   if (!admissionResult.admitted) return;
   const { release, reservation } = admissionResult;
 
   incInflight(principal.alias);
   // Content-blind concurrency gauge: increment on admission acquire, decrement on release (below).
-  inflightInc(principal.tier);
+  inflightInc(principal.tier, lctx.node === "orin" ? "orin" : "m5");
   // C2 (HIGH): start at 0, NOT estTokens. The real usage is assigned only after handler()
   // RESOLVES successfully; if the upstream throws (timeout / connection reset / stream error)
   // actualTokens stays 0, so the finally block reconciles the credit reservation and the quota
@@ -1092,7 +1238,7 @@ async function admitAndMeterLogged(
   } finally {
     release();
     decInflight(principal.alias);
-    inflightDec(principal.tier);
+    inflightDec(principal.tier, lctx.node === "orin" ? "orin" : "m5");
     // M1: reconcile the EXACT admitted quota event + daily delta via the reservation handle.
     recordUsage(principal.alias, actualTokens, Date.now(), reservation);
     // Settle the lifetime credit ledger for minted store keys (keyHash present). Legacy
@@ -1150,7 +1296,7 @@ function gatewayTraceTaskType(route: string): string {
 function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" | "degraded" | "failed" | "unknown" {
   if (outcome === "client_closed") return "unknown";
   if (outcome === "bad_request" || outcome === "forbidden" || outcome === "credits_exhausted") return "unknown";
-  if (outcome === "busy" || outcome === "rate_limited") return "degraded";
+  if (outcome === "busy" || outcome === "rate_limited" || outcome === "memory_refused") return "degraded";
   if (
     outcome === "stream_failed"
     || outcome === "degenerate"
@@ -1183,6 +1329,255 @@ function estimatePromptTokens(rawBody: string): number {
 /** A metered result that charges nothing (errored / non-2xx upstream). */
 const ZERO_RESULT: MeteredResult = { totalTokens: 0, promptTokens: null, completionTokens: null, canonicalModel: null, ttftMs: null };
 
+function systemOneGranted(principal: PrincipalContext, modelId: string): boolean {
+  return principal.systemOneModelAllowList.includes(modelId) ||
+    principal.modelAllowList.includes(modelId) ||
+    (principal.tier === "owner" && principal.modelAllowList.length === 0);
+}
+
+function embeddingGranted(principal: PrincipalContext, modelId: string): boolean {
+  // An empty guest chat allow-list does not grant a newly staged embedding model.
+  return principal.embeddingModelAllowList.includes(modelId) || principal.modelAllowList.includes(modelId) ||
+    (principal.tier === "owner" && principal.modelAllowList.length === 0);
+}
+
+function modelVisibleInDiscovery(modelId: string, cfg: HomeserverConfig, principal: PrincipalContext): boolean {
+  if (isEmbeddingModel(modelId)) {
+    return cfg.embeddingModels.includes(modelId) && embeddingGranted(principal, modelId);
+  }
+  if (!isSystemOneDecisionModel(modelId, cfg.systemOneModels)) return true;
+  return cfg.systemOneModels.includes(modelId) && systemOneGranted(principal, modelId);
+}
+
+async function embeddingSidecarInputModalities(cfg: HomeserverConfig, signal?: AbortSignal): Promise<string[] | null> {
+  if (!cfg.embeddingModels.includes(EMBEDDING_MODEL_ID) || cfg.embeddingBaseUrl === "") return null;
+  try {
+    const response = await fetch(`${cfg.embeddingBaseUrl}/models`, {
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(2_000), signal]) : AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return null;
+    }
+    const payload = await response.json() as unknown;
+    if (typeof payload !== "object" || payload === null ||
+        !Array.isArray((payload as { data?: unknown }).data)) return null;
+    const entry = (payload as { data: unknown[] }).data.find((candidate) =>
+      typeof candidate === "object" && candidate !== null &&
+      (candidate as { id?: unknown }).id === EMBEDDING_MODEL_ID);
+    if (typeof entry !== "object" || entry === null) return null;
+    const architecture = (entry as { architecture?: unknown }).architecture;
+    const modalities = typeof architecture === "object" && architecture !== null
+      ? (architecture as { input_modalities?: unknown }).input_modalities : undefined;
+    // Older sidecars can omit capability metadata; treat that as text-only.
+    return Array.isArray(modalities) && modalities.every((item) => typeof item === "string")
+      ? modalities as string[] : ["text"];
+  } catch {
+    return null;
+  }
+}
+
+async function embeddingSidecarReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
+  return await embeddingSidecarInputModalities(cfg, signal) !== null;
+}
+
+async function embeddingMediaReady(cfg: HomeserverConfig, signal?: AbortSignal): Promise<boolean> {
+  if (!cfg.embeddingMediaEnabled) return false;
+  const modalities = await embeddingSidecarInputModalities(cfg, signal);
+  return modalities !== null && ["image", "audio", "video"].every((item) => modalities.includes(item));
+}
+
+const portalMediaSnapshots = new Map<string, {
+  value: boolean; expiresAt: number; inFlight?: Promise<boolean>;
+}>();
+
+/** Keep public portal loads independent of a sidecar round trip while refreshing capability. */
+async function portalEmbeddingMediaReady(cfg: HomeserverConfig): Promise<boolean> {
+  if (!cfg.embeddingMediaEnabled) return false;
+  const key = cfg.embeddingBaseUrl;
+  const cached = portalMediaSnapshots.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached?.inFlight) return await cached.inFlight;
+  const inFlight = embeddingMediaReady(cfg).then((value) => {
+    portalMediaSnapshots.set(key, { value, expiresAt: Date.now() + 10_000 });
+    return value;
+  });
+  portalMediaSnapshots.set(key, { value: false, expiresAt: 0, inFlight });
+  return await inFlight;
+}
+
+async function handleEmbeddingProxy(
+  request: EmbeddingRequest,
+  res: ServerResponse,
+  cfg: HomeserverConfig,
+  lctx: LogCtx,
+): Promise<MeteredResult> {
+  if (cfg.embeddingBaseUrl === "" || !cfg.embeddingModels.includes(request.model)) {
+    lctx.status = 400;
+    lctx.outcome = "bad_request";
+    lctx.errorClass = "model_not_found";
+    sendError(res, makeError("model_not_found", { param: "model" }));
+    return modelNotFoundResult();
+  }
+  const clientGone = new AbortController();
+  let clientAborted = false;
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientAborted = true;
+      clientGone.abort();
+    }
+  });
+  try {
+    const wrappedInput = Array.isArray(request.input) && typeof request.input[0] !== "string";
+    if (!await embeddingSidecarReady(cfg, clientGone.signal) ||
+        (wrappedInput && !await embeddingMediaReady(cfg, clientGone.signal))) {
+      if (clientAborted) {
+        lctx.status = 499;
+        lctx.outcome = "client_closed";
+        lctx.errorClass = "client_closed";
+        return ZERO_RESULT;
+      }
+      lctx.status = 502;
+      lctx.outcome = "upstream_unavailable";
+      lctx.errorClass = "upstream_unavailable";
+      sendError(res, makeError("upstream_unavailable"));
+      return ZERO_RESULT;
+    }
+    if (wrappedInput) {
+      try {
+        await validateEmbeddingVideoBitstream(request.input as import("./embedding-media.js").EmbeddingMediaItem[]);
+      } catch (err) {
+        if (!(err instanceof EmbeddingVideoProbeError)) throw err;
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: "input",
+          message: "Video bitstream validation failed." }));
+        return ZERO_RESULT;
+      }
+    }
+    const upstream = await fetch(`${cfg.embeddingBaseUrl}/embeddings`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
+      body: JSON.stringify(request.upstreamBody),
+      signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
+    });
+    if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => undefined);
+      const invalidInput = upstream.status === 400 || upstream.status === 413;
+      const unknownModel = upstream.status === 404;
+      lctx.status = invalidInput ? upstream.status : unknownModel ? 400 : 502;
+      lctx.outcome = invalidInput || unknownModel ? "bad_request" : "upstream_unavailable";
+      const code = unknownModel ? "model_not_found" : upstream.status === 413 ? "payload_too_large" :
+        invalidInput ? "invalid_request_error" : "upstream_unavailable";
+      lctx.errorClass = code;
+      sendError(res, makeError(code));
+      return ZERO_RESULT;
+    }
+    const shaped = validateAndShapeEmbeddingResponse(await upstream.json() as unknown, request);
+    sendJson(res, 200, shaped.body);
+    lctx.status = 200;
+    lctx.outcome = "ok";
+    return { totalTokens: shaped.inputTokens, promptTokens: shaped.inputTokens, completionTokens: 0,
+      canonicalModel: request.model, ttftMs: null };
+  } catch (err) {
+    if (clientAborted) {
+      lctx.status = 499;
+      lctx.outcome = "client_closed";
+      lctx.errorClass = "client_closed";
+      return ZERO_RESULT;
+    }
+    const kind = classifyUpstreamError(err);
+    if (kind !== "upstream_timeout" && kind !== "upstream_unavailable" &&
+      !(err instanceof SyntaxError) && !(err instanceof EmbeddingResponseError)) throw err;
+    lctx.status = kind === "upstream_timeout" ? 504 : 502;
+    lctx.outcome = kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable";
+    lctx.errorClass = lctx.outcome;
+    sendError(res, makeError(kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable", {
+      ...(kind === "upstream_timeout" ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {}),
+    }));
+    return ZERO_RESULT;
+  }
+}
+
+async function handleSystemOneProxy(
+  req: SystemOneRequest,
+  res: ServerResponse,
+  cfg: HomeserverConfig,
+  lctx: LogCtx,
+  memoryDeps: HostMemoryAdmissionDeps,
+): Promise<MeteredResult> {
+  if (cfg.backend !== "llamaswap" || !cfg.systemOneModels.includes(req.model)) {
+    lctx.status = 400;
+    lctx.outcome = "bad_request";
+    lctx.errorClass = "model_not_found";
+    sendError(res, makeError("model_not_found", { param: "model" }));
+    return modelNotFoundResult();
+  }
+  const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, req.model, memoryDeps, req.model);
+  if (memoryRejection !== null) {
+    lctx.status = 503;
+    lctx.outcome = "memory_refused";
+    lctx.errorClass = memoryRejection.code;
+    if (memoryRejection.retryAfterSeconds !== null) lctx.retryAfterS = memoryRejection.retryAfterSeconds;
+    sendError(res, makeError(memoryRejection.code, {
+      message: memoryRejection.message,
+      ...(memoryRejection.retryAfterSeconds !== null
+        ? { retryAfterSeconds: memoryRejection.retryAfterSeconds }
+        : {}),
+    }));
+    return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: memoryRejection.code };
+  }
+  const clientGone = new AbortController();
+  let clientAborted = false;
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientAborted = true;
+      clientGone.abort();
+    }
+  });
+  try {
+    const upstream = await fetch(`${cfg.lmStudioBaseUrl}/systemone`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...currentTraceHeaders() },
+      body: JSON.stringify(req.body),
+      signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
+    });
+    // Never forward an upstream error body: it may contain local model paths or runtime details.
+    if (!upstream.ok) {
+      lctx.status = upstream.status === 404 ? 400 : 502;
+      lctx.outcome = upstream.status === 404 ? "bad_request" : "upstream_unavailable";
+      lctx.errorClass = upstream.status === 404 ? "model_not_found" : "upstream_unavailable";
+      sendError(res, makeError(upstream.status === 404 ? "model_not_found" : "upstream_unavailable"));
+      return ZERO_RESULT;
+    }
+    const payload = await upstream.json() as unknown;
+    const inputTokens = validateSystemOneResponse(payload, req);
+    sendJson(res, 200, payload);
+    lctx.status = 200;
+    lctx.outcome = "ok";
+    return { totalTokens: inputTokens, promptTokens: inputTokens, completionTokens: 0,
+      canonicalModel: req.model, ttftMs: null };
+  } catch (err) {
+    if (clientAborted) {
+      lctx.status = 499;
+      lctx.outcome = "client_closed";
+      lctx.errorClass = "client_closed";
+      return ZERO_RESULT;
+    }
+    const kind = classifyUpstreamError(err);
+    if (kind !== "upstream_timeout" && kind !== "upstream_unavailable" &&
+      !(err instanceof SyntaxError) && !(err instanceof SystemOneResponseError)) throw err;
+    lctx.status = kind === "upstream_timeout" ? 504 : 502;
+    lctx.outcome = kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable";
+    lctx.errorClass = lctx.outcome;
+    sendError(res, makeError(kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable", {
+      ...(kind === "upstream_timeout" ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {}),
+    }));
+    return ZERO_RESULT;
+  }
+}
+
 function modelNotFoundResult(): MeteredResult {
   return {
     ...ZERO_RESULT,
@@ -1210,6 +1605,8 @@ const HANDLER_OWNED_OUTCOMES = new Set([
   // the original delegation outcome. The handler returns a truthful 200/error envelope so Hugin
   // can preserve the join evidence without triggering another model call.
   "learning_task_admission_recovered",
+  // #350: host-memory admission refused a model start (503); nothing reached upstream, billed 0.
+  "memory_refused",
 ]);
 
 async function handleChatProxy(
@@ -1219,7 +1616,8 @@ async function handleChatProxy(
   cfg: HomeserverConfig,
   effectiveMax: number,
   lctx: LogCtx,
-  principal: PrincipalContext
+  principal: PrincipalContext,
+  memoryDeps: HostMemoryAdmissionDeps,
 ): Promise<MeteredResult> {
   // C3: the model is safe to label only after upstream returns 2xx for it. We thread the
   // already-canonicalized lctx.model (set at the route) through as the canonicalModel.
@@ -1373,6 +1771,42 @@ async function handleChatProxy(
         ttftMs: null,
       };
     });
+  }
+
+  // #350: whole-host memory admission, immediately before the M5 upstream call (the Orin branch
+  // above never reaches llama-swap). A refusal never reaches upstream and returns ZERO_RESULT, so
+  // the spine releases the admission slot and reconciles credits/quota to 0 like any failed call.
+  // The raw requested model string is what llama-swap would start, so it is what we check.
+  if (parsed.model !== null) {
+    const memoryRejection = await admitHostMemory(cfg.hostMemoryAdmission, parsed.model, memoryDeps, lctx.model);
+    // The disconnect listener below is registered after this wait and a missed 'close' is not
+    // replayed, so a caller that left during the observation is detected here. Nothing reached
+    // upstream, so there is no model start and no recurrent state to clear. (In `off` mode the
+    // check does no I/O and cannot span a disconnect, so the existing flow is left untouched.)
+    if (cfg.hostMemoryAdmission.mode !== "off" && res.destroyed && !res.writableEnded) {
+      lctx.status = 499;
+      lctx.outcome = "client_closed";
+      lctx.errorClass = "client_closed";
+      emitResponseTrace("client_closed");
+      return ZERO_RESULT;
+    }
+    if (memoryRejection !== null) {
+      lctx.status = 503;
+      lctx.outcome = "memory_refused";
+      lctx.errorClass = memoryRejection.code;
+      if (memoryRejection.retryAfterSeconds !== null) lctx.retryAfterS = memoryRejection.retryAfterSeconds;
+      emitResponseTrace(lctx.outcome);
+      sendError(
+        res,
+        makeError(memoryRejection.code, {
+          message: memoryRejection.message,
+          ...(memoryRejection.retryAfterSeconds !== null
+            ? { retryAfterSeconds: memoryRejection.retryAfterSeconds }
+            : {}),
+        }),
+      );
+      return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: memoryRejection.code };
+    }
   }
 
   // TTFT clock: ms from the upstream call start to the first CONTENT chunk we receive (streaming).
@@ -2026,6 +2460,7 @@ function recordOwnerChat(
 /** Validated /delegate params (the verifier is already built from its spec). */
 interface DelegateParams {
   prompt: string;
+  trafficPurpose: ExecutionTrafficPurpose;
   taskType?: string;
   systemPrompt?: string;
   modelId?: string;
@@ -2115,6 +2550,11 @@ function parseDelegateBody(rawBody: string): DelegateParse {
   } catch {
     return { ok: false, param: null, message: "Request body must be valid JSON." };
   }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, param: null, message: "Request body must be an object." };
+  }
+  const trafficPurpose = parseExecutionTrafficPurpose(body["trafficPurpose"]);
+  if (!trafficPurpose.ok) return { ok: false, param: "trafficPurpose", message: "Invalid traffic purpose." };
   if (typeof body["prompt"] !== "string" || (body["prompt"] as string).length === 0) {
     return { ok: false, param: "prompt", message: "Missing required field 'prompt'." };
   }
@@ -2204,6 +2644,7 @@ function parseDelegateBody(rawBody: string): DelegateParse {
     requestedMax: typeof body["maxTokens"] === "number" ? (body["maxTokens"] as number) : null,
     params: {
       prompt: body["prompt"] as string,
+      trafficPurpose: trafficPurpose.value,
       taskType: body["taskType"] as string | undefined,
       systemPrompt: body["systemPrompt"] as string | undefined,
       modelId: body["modelId"] as string | undefined,
@@ -2244,6 +2685,28 @@ function sendLearningTaskAdmissionRecovery(
   });
 }
 
+function gatewayModelStartAdmission(cfg: HomeserverConfig, deps: HostMemoryAdmissionDeps): ModelStartAdmission {
+  const configuredIds = [...configuredDelegateModelIds(cfg), cfg.codeLoopModel,
+    cfg.disagreementGateModel, cfg.shadowLane.model, cfg.reviewCascadeShadow.gptModel,
+    cfg.reviewCascadeShadow.qwenModel, ...cfg.hostMemoryAdmission.modelBudgetBytes.keys()];
+  return createModelStartAdmission(cfg.hostMemoryAdmission, deps,
+    (model) => canonicalizeModelFromTrustedCatalogue(model, configuredIds));
+}
+
+function sendModelStartRefusal(res: ServerResponse, lctx: LogCtx, err: HostMemoryAdmissionError, allowRetry = true): MeteredResult {
+  const rejection = err.rejection;
+  lctx.status = 503;
+  lctx.outcome = "memory_refused";
+  lctx.errorClass = rejection.code;
+  if (allowRetry && rejection.retryAfterSeconds !== null) lctx.retryAfterS = rejection.retryAfterSeconds;
+  sendError(res, makeError(rejection.code, {
+    message: allowRetry ? rejection.message
+      : "Memory admission refused this task. Its admission remains reserved; an exact replay recovers the existing admission without repeating inference.",
+    ...(allowRetry && rejection.retryAfterSeconds !== null ? { retryAfterSeconds: rejection.retryAfterSeconds } : {}),
+  }));
+  return { ...ZERO_RESULT, traceOutcome: "memory_refused", traceErrorClass: rejection.code };
+}
+
 async function handleDelegate(
   params: DelegateParams,
   res: ServerResponse,
@@ -2253,6 +2716,8 @@ async function handleDelegate(
   cfg: HomeserverConfig,
   controller: AdmissionController,
   lctx: LogCtx,
+  feedbackOwner: ExecutionFeedbackOwner | null,
+  memoryDeps: HostMemoryAdmissionDeps,
 ): Promise<MeteredResult> {
   let learningTaskGatewayEcho: LearningTaskGatewayEcho | undefined;
   let learningTaskAdmissionId: string | undefined;
@@ -2298,7 +2763,17 @@ async function handleDelegate(
     }
     learningTaskAdmissionId = claim.record.admissionRecordId;
   }
+  const beforeModelStart = gatewayModelStartAdmission(cfg, memoryDeps);
+  let inferenceMayHaveStarted = false;
   const runDelegate = () => delegate({
+    acquireBackground: (abort) => controller.snapshot().maintenanceMode
+      ? null : controller.tryAcquireBackground(abort),
+    beforeModelStart: async (model, options) => {
+      await beforeModelStart(model, options);
+      // From here an upstream attempt may occur. Preserve the stamped claim on any later
+      // retry refusal; only a first pre-inference refusal proves replay remains safe.
+      inferenceMayHaveStarted = true;
+    },
     prompt: params.prompt,
     taskType: params.taskType,
     systemPrompt: params.systemPrompt,
@@ -2333,10 +2808,39 @@ async function handleDelegate(
   // after the upstream model has already answered (for example while persisting its ledger row),
   // so no exception from this point proves that replay is safe. Preserve the claim on every
   // failure; an exact retry will recover its echo with outcomeUnavailable instead of inferring
-  // twice. All pre-model credit/quota/GPU refusals occur before handleDelegate and create no claim.
-  const result = await runDelegate();
+  // twice. A typed first-attempt memory refusal proves no inference began, so that claim alone
+  // can be released safely. Later retry refusals preserve it.
+  let result: DelegationOutcome;
+  try {
+    result = await runDelegate();
+  } catch (err) {
+    if (!(err instanceof HostMemoryAdmissionError)) throw err;
+    let allowRetry: boolean = learningTaskAdmissionId === undefined || !inferenceMayHaveStarted;
+    if (learningTaskAdmissionId !== undefined && !inferenceMayHaveStarted) {
+      try {
+        releaseLearningTaskAdmission(learningTaskAdmissionId);
+      } catch {
+        // Preserve the ambiguous durable claim, and don't advertise a replay that cannot execute.
+        console.warn("[delegate] refused task admission could not be released; claim preserved");
+        allowRetry = false;
+      }
+    }
+    return sendModelStartRefusal(res, lctx, err, allowRetry);
+  }
+  let feedbackHandle: string | null = null;
+  try {
+    if (feedbackOwner && result.ledgerId) {
+      feedbackHandle = bindExecutionFeedback({ ledgerId: result.ledgerId, owner: feedbackOwner, surface: "delegate",
+        trafficPurpose: params.trafficPurpose,
+        outputAvailable: result.delegated && result.truncated === false && typeof result.output === "string" && result.output.length > 0 });
+    }
+  } catch {
+    // Advisory feedback must not discard completed inference or prevent normal metering.
+    console.error("[execution-feedback] delegate binding failed; completed output preserved");
+  }
   sendJson(res, 200, {
     ...result,
+    ...(feedbackHandle === null ? {} : { feedbackHandle }),
     ...(learningTaskGatewayEcho === undefined
       ? {}
       : { learningTaskGatewayEcho }),
@@ -2344,7 +2848,7 @@ async function handleDelegate(
   // #132 is attached only after the caller response *and* its foreground admission lease are
   // complete. Otherwise its own queue-depth gate can see the just-finished request and skip.
   const afterRelease = ownerContent && result.nodeId === "m5" && !result.delegated && result.escalate
-    ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller)
+    ? () => scheduleReviewCascadeAfterDelegate(params.prompt, keyAlias, result, cfg, controller, beforeModelStart)
     : undefined;
   lctx.node = result.nodeId;
   // C3/#179: the orchestrator bound one server-computed safe identity to this exact result before
@@ -2372,15 +2876,25 @@ function scheduleReviewCascadeAfterDelegate(
   keyAlias: string,
   outcome: DelegationOutcome,
   cfg: HomeserverConfig,
-  controller: AdmissionController
+  controller: AdmissionController,
+  beforeModelStart: ModelStartAdmission,
 ): void {
   scheduleReviewCascadeShadow(
     { taskType: outcome.taskType, ownerContent: true, source },
     {
       config: cfg.reviewCascadeShadow,
       queueDepth: () => controller.snapshot().inflight,
-      acquireBackground: (abort) => controller.tryAcquireBackground(abort),
+      acquireBackground: (abort) => controller.snapshot().maintenanceMode
+        ? null : controller.tryAcquireBackground(abort),
       infer: async (modelId, prompt, cascadeCfg, signal) => {
+        if (signal.aborted) return { ok: false, cancelled: true };
+        try {
+          await beforeModelStart(modelId);
+        } catch (error) {
+          if (error instanceof HostMemoryAdmissionError) return { ok: false, resourceRefused: true };
+          throw error;
+        }
+        if (signal.aborted) return { ok: false, cancelled: true };
         const call = new AbortController();
         const propagate = () => call.abort();
         signal.addEventListener("abort", propagate, { once: true });
@@ -2392,10 +2906,12 @@ function scheduleReviewCascadeAfterDelegate(
             responseFormat: { type: "json_object" },
             signal: call.signal,
           });
+          if (signal.aborted) return { ok: false, cancelled: true, latencyMs: result.durationMs };
           return result.ok
             ? { ok: true, response: result.response, latencyMs: result.durationMs }
             : { ok: false, error: result.error, latencyMs: result.durationMs };
         } catch (error) {
+          if (signal.aborted) return { ok: false, cancelled: true };
           return { ok: false, error: error instanceof Error ? error.message : String(error) };
         } finally {
           clearTimeout(timer);
@@ -2607,7 +3123,7 @@ async function handleAudioTranscription(
   const q = checkQuota(principal.alias, principal.limits, quotaEst);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, quotaEst, principal, "audio_seconds");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -2618,12 +3134,9 @@ async function handleAudioTranscription(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;
@@ -2908,10 +3421,12 @@ async function handleImageGeneration(
 
   // Bench/maintenance mode (#108): refuse GUEST image work outright. This covers the ASYNC
   // (balanced/high) path — which otherwise returns 202 and runs later on the shared GPU slot,
-  // bypassing the admission gate — as well as the sync path. Owners are unaffected. Placed
-  // BEFORE any credit/quota reservation so there is nothing to refund. Same server_busy
-  // envelope + maintenance Retry-After as the chat/audio admission rejection.
-  if (controller.isMaintenanceMode() && principal.tier !== "owner") {
+  // bypassing the admission gate — as well as the sync path. Exclusive windows (including
+  // the startup fence) refuse owner submissions too, before credit/quota reservation or queueing.
+  // Guest-only maintenance keeps the existing owner behavior. Same server_busy envelope and
+  // maintenance Retry-After as chat/audio admission rejection.
+  const maintenance = controller.snapshot();
+  if (maintenance.maintenanceMode && (principal.tier !== "owner" || maintenance.maintenanceScope === "exclusive")) {
     const retryAfterSeconds = cfg.maintenanceRetryAfterSeconds;
     lctx.status = 503;
     lctx.outcome = "busy";
@@ -2951,7 +3466,7 @@ async function handleImageGeneration(
   const q = checkQuota(principal.alias, principal.limits, parsed.n);
   if (!q.ok) {
     releaseReserve();
-    const windowLabel = q.reason === "daily" ? "the daily token budget" : `the ${q.reason} window`;
+    const failure = describeQuotaFailure(q, parsed.n, principal, "image_units");
     lctx.status = 429;
     lctx.outcome = "rate_limited";
     lctx.errorClass = "rate_limit_exceeded";
@@ -2962,12 +3477,9 @@ async function handleImageGeneration(
       res,
       makeError("rate_limit_exceeded", {
         retryAfterSeconds: q.retryAfterSeconds,
-        message: `Rate limit reached for ${windowLabel}. Retry after ${q.retryAfterSeconds}s.`,
-        rateLimit: {
-          limit: q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.rpmLimit,
-          remaining: 0,
-          resetSeconds: q.snapshot.resetSeconds,
-        },
+        message: failure.message,
+        quota: failure.quota,
+        rateLimit: failure.rateLimit,
       })
     );
     return;
@@ -3173,7 +3685,10 @@ function handleImageJobCancel(
   sendJson(res, 200, { id, status: out.status ?? "cancelled" });
 }
 
-async function handleAdminLoad(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleAdminLoad(req: IncomingMessage, res: ServerResponse,
+  controller: AdmissionController, principal: PrincipalContext, lctx: LogCtx,
+  beforeModelStart: ModelStartAdmission,
+): Promise<void> {
   const body = JSON.parse(await readBody(req)) as {
     modelKey?: string;
     contextLength?: number;
@@ -3185,13 +3700,37 @@ async function handleAdminLoad(req: IncomingMessage, res: ServerResponse): Promi
     sendError(res, makeError("invalid_request_error", { param: "modelKey", message: "Missing required field 'modelKey'." }));
     return;
   }
-  const r = await loadModel(body.modelKey, {
-    contextLength: body.contextLength,
-    parallel: body.parallel,
-    gpu: body.gpu,
-    ttlSeconds: body.ttlSeconds,
-  });
-  sendJson(res, r.ok ? 200 : 500, r);
+  let release: (() => void) | undefined;
+  try {
+    // Model loading is unmetered admin work, but it shares inference slots and maintenance
+    // exclusion. Check memory only after the slot is held, immediately before backend start.
+    release = await controller.acquire({ lane: principal.tier as Lane,
+      requestedModel: body.modelKey, keyId: principal.alias,
+      keyMaxParallel: principal.maxParallel, keyInflight: keyInflight.get(principal.alias) ?? 0 });
+    lctx.admission = "admitted";
+    incInflight(principal.alias);
+    const r = await loadModel(body.modelKey, {
+      contextLength: body.contextLength,
+      parallel: body.parallel,
+      gpu: body.gpu,
+      ttlSeconds: body.ttlSeconds,
+      beforeModelStart,
+    });
+    sendJson(res, r.ok ? 200 : 500, r);
+  } catch (err) {
+    if (err instanceof HostMemoryAdmissionError) {
+      sendModelStartRefusal(res, lctx, err);
+    } else if (err instanceof AdmissionRejected) {
+      lctx.status = 503; lctx.outcome = "busy"; lctx.errorClass = "server_busy";
+      lctx.admission = "busy"; lctx.retryAfterS = err.retryAfterSeconds;
+      sendError(res, makeError("server_busy", { retryAfterSeconds: err.retryAfterSeconds }));
+    } else throw err;
+  } finally {
+    if (release !== undefined) {
+      decInflight(principal.alias);
+      release();
+    }
+  }
 }
 
 async function handleAdminUnload(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -3295,6 +3834,95 @@ async function handleKeysMint(
   sendJson(res, 201, result);
 }
 
+async function handleSystemOneKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendError(res, makeError("payload_too_large"));
+      return;
+    }
+    if (!(err instanceof SyntaxError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body) ||
+      typeof body["model"] !== "string" || !Array.isArray(body["aliases"]) ||
+      body["aliases"].length === 0 || body["aliases"].length > 128 ||
+      body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
+    sendError(res, makeError("invalid_request_error", { message: "Require model and 1–128 key aliases." }));
+    return;
+  }
+  try {
+    const result = grantSystemOneModelToKeys(body["aliases"] as string[], body["model"]);
+    sendJson(res, 200, { model: body["model"], ...result });
+  } catch (err) {
+    if (!(err instanceof InvalidSystemOneGrantError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Unknown model or inactive, duplicate, or missing key alias." }));
+  }
+}
+
+async function handleEmbeddingKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendError(res, makeError("payload_too_large"));
+      return;
+    }
+    if (!(err instanceof SyntaxError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((key) => key !== "model" && key !== "aliases") ||
+      !isEmbeddingModel(body["model"] as string) || !Array.isArray(body["aliases"]) ||
+      body["aliases"].length === 0 || body["aliases"].length > 128 ||
+      body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
+    sendError(res, makeError("invalid_request_error", {
+      message: "Require the reviewed embedding model and 1–128 customer key aliases.",
+    }));
+    return;
+  }
+  try {
+    const result = grantEmbeddingModelToCustomerKeys(body["aliases"] as string[], body["model"] as string);
+    sendJson(res, 200, { model: body["model"], ...result });
+  } catch (err) {
+    if (!(err instanceof InvalidEmbeddingGrantError)) throw err;
+    sendError(res, makeError("invalid_request_error", {
+      message: "Unknown model or inactive, duplicate, non-customer, or missing key alias.",
+    }));
+  }
+}
+
+async function handleExistingChatKeyGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req, 128 * 1024)) as Record<string, unknown>;
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Require a JSON object." }));
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((key) => key !== "model" && key !== "aliases") ||
+      body["model"] !== "qwen3-30b-instruct" || !Array.isArray(body["aliases"]) ||
+      body["aliases"].length === 0 || body["aliases"].length > 128 ||
+      body["aliases"].some((alias) => typeof alias !== "string" || alias.length === 0 || alias.length > 128)) {
+    sendError(res, makeError("invalid_request_error", { message: "Require the reviewed Qwen model and 1–128 customer key aliases." }));
+    return;
+  }
+  try {
+    const result = grantExistingChatModelToCustomerKeys(body["aliases"] as string[], body["model"]);
+    sendJson(res, 200, { model: body["model"], ...result });
+  } catch (err) {
+    if (!(err instanceof InvalidExistingChatModelGrantError)) throw err;
+    sendError(res, makeError("invalid_request_error", { message: "Inactive, duplicate, non-customer, or missing key alias." }));
+  }
+}
+
 // ─── Server ──────────────────────────────────────────────────────────────────────────
 
 export interface GatewayHandle {
@@ -3305,6 +3933,8 @@ export interface GatewayHandle {
 }
 
 export interface GatewayComposition {
+  /** Test seam for the whole-host memory admission readers/log sink (#350). Production uses real host files. */
+  hostMemoryAdmissionDependencies?: Partial<HostMemoryAdmissionDeps>;
   /**
    * Protected local provider for server-owned roster observations and registries.
    * The default is deliberately empty/fail-closed; deployment wrappers may inject
@@ -3313,6 +3943,8 @@ export interface GatewayComposition {
   rosterAdmissionDependencies?: RosterAdmissionDependencies;
   /** Injectable only for deterministic maintenance-window tests. Production uses the canonical lease. */
   maintenanceWindowDependencies?: MaintenanceWindowDependencies;
+  /** Test seam for the bounded, content-free dedicated user-bus transport probe. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
 }
 
 export interface GatewayRegistryInitializers {
@@ -3363,6 +3995,18 @@ export function startGateway(
   } catch (err) {
     return Promise.reject(err);
   }
+  if (cfg.requestLog === "on") {
+    try {
+      // Initialize the enabled collector once before the first history read. Keep the
+      // read-only metadata route free of schema/index work on every doctor request.
+      ensureRequestLogSchema();
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      const reason = ["SQLITE_ERROR", "SQLITE_READONLY", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CANTOPEN", "SQLITE_IOERR", "SQLITE_CORRUPT"]
+        .includes(String(code)) ? String(code) : "unknown";
+      console.warn("Request-log initialization unavailable; inference history remains unavailable", { reason });
+    }
+  }
   const loopback =
     cfg.gatewayHost === "127.0.0.1" || cfg.gatewayHost === "localhost" || cfg.gatewayHost === "::1";
   // "No keys" now means no legacy keys AND no store keys.
@@ -3386,12 +4030,17 @@ export function startGateway(
     setDefaultLogger(createAccessLogger(() => { /* no-op */ }));
   }
 
+  const hostMemoryDeps: HostMemoryAdmissionDeps = {
+    getRunning: getRunningSnapshot,
+    ...composition.hostMemoryAdmissionDependencies,
+  };
   const controller = new AdmissionController({
     maxInflight: cfg.maxInflight,
     ownerQueueMaxMs: cfg.ownerQueueMaxMs,
     retryAfterAtCapSeconds: cfg.busyRetryAfterSeconds,
     maintenanceRetryAfterSeconds: cfg.maintenanceRetryAfterSeconds,
     maintenanceMode: cfg.maintenanceModeAtStart,
+    startupExclusiveUntilMs: cfg.startupExclusiveUntilMs,
   });
   const maintenanceWindow = new ExclusiveMaintenanceWindow(
     controller,
@@ -3407,7 +4056,9 @@ export function startGateway(
       observeRunning: getRunningSnapshot,
     },
   );
-  if (cfg.maintenanceModeAtStart) {
+  if (cfg.startupExclusiveUntilMs !== undefined && Date.now() < cfg.startupExclusiveUntilMs) {
+    console.warn("Startup exclusive maintenance fence engaged; all inference admission refused until operator deadline.");
+  } else if (cfg.maintenanceModeAtStart) {
     console.warn("⚠  bench/maintenance mode ENGAGED at startup — guest admission is refused (#108).");
   }
 
@@ -3473,6 +4124,8 @@ export function startGateway(
       learningTaskCapabilityEpoch,
       composition.rosterAdmissionDependencies,
       maintenanceWindow,
+      hostMemoryDeps,
+      composition.codeLoopTransportProbe,
     ).catch((err) => {
       // Never leak raw error detail (SQLite internals, stack traces, etc.) to the client.
       // Log the detail server-side; return a generic uniform envelope.
@@ -3558,6 +4211,7 @@ function decodePathSegmentOrSend(raw: string, res: ServerResponse, lctx: LogCtx)
 }
 
 function normalizeLoggedRoute(method: string, path: string): string {
+  if (path.startsWith("/execution-feedback/")) return "/execution-feedback/:handle";
   if (path.startsWith("/ledger/")) {
     if (method === "PUT" && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
       return "/ledger/:id/reviewer-usefulness";
@@ -3577,6 +4231,8 @@ export async function handleRequest(
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch,
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
   maintenanceWindow?: ExclusiveMaintenanceWindow,
+  hostMemoryDeps: HostMemoryAdmissionDeps = { getRunning: getRunningSnapshot },
+  codeLoopTransportProbe: () => Promise<boolean> = probeCodeLoopTransport,
 ): Promise<void> {
   const startMs = Date.now();
   // Create lctx and logThis BEFORE any parsing — so a URL-parse failure is still logged.
@@ -3637,7 +4293,7 @@ export async function handleRequest(
     if (principal?.isMonitor) {
       const monitorOk =
         method === "GET" &&
-        (path === "/ledger" || path.startsWith("/ledger/") || path === "/healthz" || path === "/metrics" || path === "/models" || path === "/models/residency");
+        (path === "/ledger" || path.startsWith("/ledger/") || path === "/healthz" || path === "/metrics" || path === "/models" || path === "/models/residency" || path === "/ops/summary");
       if (!monitorOk) {
         lctx.status = 403;
         lctx.outcome = "forbidden";
@@ -3646,7 +4302,7 @@ export async function handleRequest(
           res,
           makeError("route_not_allowed", {
             param: null,
-            message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models and /models/residency).",
+            message: "This is a read-only monitor key (allowed: GET /healthz, /ledger, /metrics, /models, /models/residency and /ops/summary).",
           })
         );
         return;
@@ -3680,7 +4336,14 @@ export async function handleRequest(
     // Gate healthz logging behind the config toggle (default: off, to avoid noise).
     if (path === "/healthz" && method === "GET") {
       const orin = await probeOrin(cfg);
-      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin] });
+      // This is a transport observation, not an inference or cage-isolation probe.
+      // Legacy file binds can remain visible after user@UID restarts, so test a
+      // real listener. Keep overall liveness independent: ordinary inference can work
+      // while code_loop is unavailable.
+      const codeLoopTransport = cfg.codeLoop === "on"
+        ? await codeLoopTransportProbe().then((ready) => ready ? "available" : "unavailable", () => "unavailable")
+        : "disabled";
+      sendJson(res, 200, { ok: true, nodes: [{ id: "m5", ok: true }, orin], codeLoopTransport });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -3729,7 +4392,7 @@ export async function handleRequest(
     if ((path === "/portal" || path === "/") && method === "GET") {
       lctx.route = "/portal";
       if (!throttlePublic()) return;
-      sendHtml(res, 200, portalHtml());
+      sendHtml(res, 200, portalHtml(await portalEmbeddingMediaReady(cfg)));
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -4448,6 +5111,7 @@ export async function handleRequest(
         gatewayRequestId: `opaque:${lctx.requestId}`,
         userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
         learningTaskCapabilityEpoch,
+        hostMemoryAdmission: hostMemoryDeps,
         inflight: {
           inc: incInflight,
           dec: decInflight,
@@ -4463,9 +5127,137 @@ export async function handleRequest(
     }
 
     // ─── Inference surface (through the spine) ───
+    if (path === "/v1/systemone" && method === "POST") {
+      res.setHeader("Cache-Control", "no-store");
+      const raw = await readBody(req, SYSTEMONE_MAX_BODY_BYTES);
+      let parsed: SystemOneRequest;
+      try {
+        parsed = parseSystemOneBody(raw);
+      } catch (err) {
+        if (!(err instanceof SystemOneRequestError)) throw err;
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { param: err.param, message: err.message }));
+        return;
+      }
+      // Guest access to a decision model requires an explicit grant. Ordinary open guest keys
+      // must not gain a new model merely because the operator stages it in the roster.
+      if (!systemOneGranted(principal, parsed.model)) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        return;
+      }
+      lctx.model = cfg.systemOneModels.includes(parsed.model) ? parsed.model : "unknown";
+      // Clef uses one shared prompt; other decision models may use one prompt per question.
+      // Reserve full context(s); reconcile exact successful usage after the call.
+      const estimatedTokens = systemOneTokenReservation(parsed);
+      await admitAndMeterLogged(res, controller, principal, parsed.model, estimatedTokens, lctx,
+        () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), "systemone");
+      return;
+    }
+    if (path === "/v1/embeddings" && method === "POST") {
+      res.setHeader("Cache-Control", "no-store");
+      // Reject ungranted callers before accepting inline media. An unfinished upload must
+      // not hold the single CPU embedding slot; take it after the bounded body arrives.
+      if (!embeddingGranted(principal, EMBEDDING_MODEL_ID)) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "model_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("model_not_allowed", { param: "model" }));
+        return;
+      }
+      let rawEmbeddingBody: string;
+      try {
+        rawEmbeddingBody = await readBody(req, cfg.embeddingMediaEnabled ? 8 * 1024 * 1024 : 32 * 1024);
+      } catch (err) {
+        if (!(err instanceof BodyTooLargeError)) throw err;
+        lctx.status = 413;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "payload_too_large";
+        sendError(res, makeError("payload_too_large"));
+        return;
+      }
+      if (embeddingInFlight.has(controller)) {
+        lctx.status = 503;
+        lctx.outcome = "busy";
+        lctx.errorClass = "server_busy";
+        lctx.retryAfterS = cfg.busyRetryAfterSeconds;
+        lctx.admission = "busy";
+        sendError(res, makeError("server_busy", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
+        return;
+      }
+      embeddingInFlight.add(controller);
+      try {
+        let parsed: EmbeddingRequest;
+        try {
+          parsed = parseEmbeddingBody(rawEmbeddingBody, cfg.embeddingMediaEnabled);
+        } catch (err) {
+          if (!(err instanceof EmbeddingRequestError)) throw err;
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "invalid_request_error";
+          sendError(res, makeError("invalid_request_error", { param: err.param, message: err.message }));
+          return;
+        }
+        if (!cfg.embeddingModels.includes(parsed.model) || cfg.embeddingBaseUrl === "") {
+          lctx.status = 400;
+          lctx.outcome = "bad_request";
+          lctx.errorClass = "model_not_found";
+          lctx.admission = "n/a";
+          sendError(res, makeError("model_not_found", { param: "model" }));
+          return;
+        }
+        lctx.model = cfg.embeddingModels.includes(parsed.model) ? parsed.model : "unknown";
+        await admitAndMeterLogged(res, controller, principal, parsed.model,
+          embeddingTokenReservation(parsed), lctx,
+          () => handleEmbeddingProxy(parsed, res, cfg, lctx), "embedding");
+      } finally {
+        embeddingInFlight.delete(controller);
+      }
+      return;
+    }
     if (path === "/v1/chat/completions" && method === "POST") {
       const raw = await readBody(req);
       const parsed = parseChatBody(raw);
+      if (parsed.model === null && principal.modelAllowList.length === 0 &&
+        cfg.backend === "llamaswap" && parsed.node !== "orin") {
+        let chatModel: string | undefined | null = await currentModel(undefined, cfg.systemOneModels);
+        if (chatModel === null) {
+          try {
+            chatModel = (await listModels()).find((candidate) =>
+              !isSystemOneDecisionModel(candidate.key, cfg.systemOneModels) &&
+              !isEmbeddingModel(candidate.key))?.key;
+          } catch {
+            chatModel = null;
+          }
+        }
+        if (chatModel === undefined || chatModel === null) {
+          lctx.status = 503; lctx.outcome = "upstream_unavailable"; lctx.errorClass = "upstream_unavailable";
+          sendError(res, makeError("upstream_unavailable"));
+          return;
+        }
+        parsed.model = chatModel;
+        parsed.obj["model"] = chatModel;
+      }
+      if (parsed.model !== null && isSystemOneDecisionModel(parsed.model, cfg.systemOneModels)) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", {
+          param: "model", message: "Decision models use POST /v1/systemone.",
+        }));
+        return;
+      }
+      if (parsed.model !== null && isEmbeddingModel(parsed.model)) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", {
+          param: "model", message: "Embedding models use POST /v1/embeddings.",
+        }));
+        return;
+      }
       if (parsed.node !== undefined && !isComputeNodeId(parsed.node)) {
         lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
         sendError(res, makeError("invalid_request_error", { param: "node", message: "'node' must be 'm5' or 'orin'." }));
@@ -4508,12 +5300,33 @@ export async function handleRequest(
       // Floor at 1, ceiling at the per-request cap.
       const effectiveMax = clampMaxTokensForModel(cfg, parsed.model, parsed.requestedMax);
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, parsed.model, est, lctx, async () => {
-        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal);
+      // Backoff is keyed by authenticated caller and known model, never global.
+      const failureBackoff = lctx.node === "m5" && parsed.model !== null &&
+        (principal.modelAllowList.length === 0 || principal.modelAllowList.includes(parsed.model))
+        ? modelFailureBackoffFor(controller, principal) : undefined;
+      const backoff = failureBackoff?.observe(parsed.model);
+      if (backoff !== null && backoff !== undefined) {
+        lctx.status = 503; lctx.outcome = "model_temporarily_unavailable";
+        lctx.errorClass = "model_temporarily_unavailable"; lctx.admission = "n/a";
+        sendError(res, makeError("model_temporarily_unavailable", {
+          retryAfterSeconds: backoff.retry_after_seconds,
+          backoff: { scope: "key_model", retry_after_seconds: backoff.retry_after_seconds, unavailable_until: backoff.unavailable_until },
+        }));
+        return;
+      }
+      await admitAndMeterLogged(res, controller, principal, parsed.model, est, lctx, async () => {
+        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps);
         traceOutcomeOverride = result.traceOutcome ?? null;
         traceErrorClassOverride = result.traceErrorClass ?? null;
         return result;
       });
+      if (lctx.status === 502 && ["upstream_error", "upstream_unavailable"].includes(lctx.errorClass ?? "")) {
+        failureBackoff?.recordFailure(parsed.model, "upstream_unavailable");
+      } else if (lctx.status === 504 && lctx.errorClass === "upstream_timeout") {
+        failureBackoff?.recordFailure(parsed.model, "upstream_timeout");
+      } else if (lctx.status !== null && lctx.status >= 200 && lctx.status < 300 && lctx.outcome === "ok") {
+        failureBackoff?.recordSuccess(parsed.model);
+      }
       return;
     }
     if (path === "/v1/audio/transcriptions" && method === "POST") {
@@ -4671,7 +5484,7 @@ export async function handleRequest(
         parsed.requestedMax
       );
       const est = estimateTokens(raw, effectiveMax);
-      await admitAndMeterLogged(res, cfg, controller, principal, null, est, lctx, () =>
+      await admitAndMeterLogged(res, controller, principal, null, est, lctx, () =>
         handleDelegate(
           parsed.params,
           res,
@@ -4681,6 +5494,8 @@ export async function handleRequest(
           cfg,
           controller,
           lctx,
+          executionFeedbackOwner(principal),
+          hostMemoryDeps,
         )
       );
       return;
@@ -4691,7 +5506,41 @@ export async function handleRequest(
       // The dashboard's data source: the authenticated key reports its own limits + usage.
       // no-store: per-key usage data must not be cached by intermediaries (Fix #7).
       res.setHeader("cache-control", "no-store");
+      const ownerAgent = isCodeLoopOwner(principal);
+      let inferenceObservation: {
+        source: "request_log";
+        scope: "m5_global";
+        status: "observed" | "none" | "disabled" | "unavailable";
+        lastSuccessfulAt: string | null;
+      } | undefined;
+      if (ownerAgent) {
+        const base = { source: "request_log" as const, scope: "m5_global" as const };
+        if (cfg.requestLog === "off") {
+          inferenceObservation = { ...base, status: "disabled", lastSuccessfulAt: null };
+        } else {
+          try {
+            const lastSuccessfulAt = queryLatestSuccessfulM5InferenceAt(getDb());
+            inferenceObservation = {
+              ...base,
+              status: lastSuccessfulAt === null ? "none" : "observed",
+              lastSuccessfulAt,
+            };
+          } catch (error) {
+            // A telemetry read must never break key discovery. Report the gap without exposing
+            // database paths or treating a failed read as proof that no inference succeeded.
+            console.warn("[portal/me] inference observation unavailable:", error instanceof Error ? error.name : "unknown");
+            inferenceObservation = { ...base, status: "unavailable", lastSuccessfulAt: null };
+          }
+        }
+      }
+      // Embedding clients pin the gateway revision before each call, so an explicit embedding
+      // grant also sees release metadata. Owner telemetry stays owner-agent only, and the
+      // implicit owner grant (empty allow-list) does not count as explicit.
+      const explicitEmbeddingGrant = principal.embeddingModelAllowList.includes(EMBEDDING_MODEL_ID) ||
+        principal.modelAllowList.includes(EMBEDDING_MODEL_ID);
       sendJson(res, 200, {
+        ...(ownerAgent || explicitEmbeddingGrant ? { gateway: gatewayRelease } : {}),
+        ...(ownerAgent ? { inferenceObservation } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,
@@ -4707,7 +5556,14 @@ export async function handleRequest(
       return;
     }
     if (path === "/models" && method === "GET") {
-      sendJson(res, 200, { models: await listModels() });
+      res.setHeader("Cache-Control", "private, no-store");
+      const models = (await listModels()).filter((model) =>
+        !isEmbeddingModel(model.key) && modelVisibleInDiscovery(model.key, cfg, principal));
+      if (embeddingGranted(principal, EMBEDDING_MODEL_ID) && await embeddingSidecarReady(cfg)) {
+        models.push({ key: EMBEDDING_MODEL_ID, type: "embedding", displayName: "EmbeddingGemma 2",
+          loaded: true, loadedContext: 8192 });
+      }
+      sendJson(res, 200, { models });
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
@@ -4727,7 +5583,12 @@ export async function handleRequest(
         );
         return;
       }
-      const residency = await readModelResidency(principal.isAdmin);
+      const residency = await readModelResidency(
+        principal.isAdmin,
+        hostMemoryDeps.readMemory ?? readHostMemory,
+        cfg.hostMemoryAdmission.mode,
+        hostMemoryDeps.readOomKillCount ?? readOomKillCount,
+      );
       const status = residency.status === "unavailable" ? 503 : 200;
       sendJson(res, status, residency);
       lctx.status = status;
@@ -4736,12 +5597,33 @@ export async function handleRequest(
       return;
     }
     if (path === "/v1/models" && method === "GET") {
+      res.setHeader("Cache-Control", "private, no-store");
       // OpenAI-compatible model list (so OpenAI SDKs / LiteLLM / IDE plugins that probe
-      // /v1/models work). Filtered to the key's allow-list — empty allow-list = all models.
-      const all = await listModels();
+      // /v1/models work). An empty allow-list includes ordinary models; decision models
+      // require an explicit guest grant and an active endpoint setting.
+      const all = (await listModels()).filter((model) => !isEmbeddingModel(model.key));
       const allow = principal.modelAllowList;
-      const visible = allow.length === 0 ? all : all.filter((m) => allow.includes(m.key));
-      const data = visible.map((m) => ({ id: m.key, object: "model", created: 0, owned_by: "home-gateway" }));
+      const visible = all.filter((m) => {
+        if (!isSystemOneDecisionModel(m.key, cfg.systemOneModels) && !isEmbeddingModel(m.key) &&
+            allow.length > 0 && !allow.includes(m.key)) return false;
+        return modelVisibleInDiscovery(m.key, cfg, principal);
+      });
+      const data = visible.map((m) => ({
+        id: m.key, object: "model", created: 0,
+        owned_by: cfg.systemOneModels.includes(m.key) ? "home-gateway-systemone" :
+          isEmbeddingModel(m.key) ? "home-gateway-embedding" : "home-gateway",
+      }));
+      const embeddingModalities = embeddingGranted(principal, EMBEDDING_MODEL_ID)
+        ? await embeddingSidecarInputModalities(cfg) : null;
+      if (embeddingModalities !== null) {
+        const activeModalities = cfg.embeddingMediaEnabled &&
+          ["image", "audio", "video"].every((item) => embeddingModalities.includes(item))
+          ? ["text", "image", "audio", "video"] : ["text"];
+        const embeddingEntry = { id: EMBEDDING_MODEL_ID, object: "model", created: 0,
+          owned_by: "home-gateway-embedding",
+          architecture: { input_modalities: activeModalities, output_modalities: ["embedding"] } };
+        data.push(embeddingEntry);
+      }
       // Advertise the speech-to-text model alongside the chat models (empty allow-list = visible;
       // otherwise only when the key is permitted the whisper model). So OpenAI SDKs that probe
       // /v1/models can discover the transcription endpoint's model id.
@@ -4798,6 +5680,64 @@ export async function handleRequest(
       lctx.admission = "n/a";
       return;
     }
+    if (path === "/ops/incidents" && method === "GET") {
+      // Same privacy floor as the task-exposure operator oracle: a real owner-admin only.
+      if (!principal.isAdmin || principal.tier !== "owner" || principal.keyHash === null) {
+        lctx.status = 403; lctx.outcome = "forbidden"; lctx.errorClass = "route_not_allowed";
+        lctx.admission = "n/a";
+        sendError(res, makeError("route_not_allowed", { message: "Incident windows require a minted owner-admin key." }));
+        return;
+      }
+      const query = parsedUrl.searchParams;
+      const allowed = new Set(["from", "to", "limit"]);
+      const unique = [...query.keys()];
+      const valid = unique.every((name) => allowed.has(name)) && new Set(unique).size === unique.length;
+      const from = query.get("from"); const to = query.get("to"); const limit = query.get("limit") ?? "100";
+      if (!valid || from === null || to === null || ![from, to, limit].every((v) => /^\d{1,16}$/.test(v))) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid incident window." }));
+        return;
+      }
+      let report;
+      try {
+        report = queryIncidentWindow(getDb(), { fromMs: Number(from), toMs: Number(to), limit: Number(limit),
+          requestLogEnabled: cfg.requestLog === "on", knownModelIds: getTrustedCatalogue() });
+      } catch (error) {
+        if (!(error instanceof IncidentWindowOptionsError)) throw error;
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid incident window." }));
+        return;
+      }
+      res.setHeader("cache-control", "private, no-store");
+      sendJson(res, 200, report);
+      lctx.status = 200; lctx.outcome = "ok"; lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/ops/summary" && method === "GET") {
+      if (!principal.isAdmin && !principal.isMonitor) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        lctx.admission = "n/a";
+        sendError(
+          res,
+          makeError("route_not_allowed", {
+            param: null,
+            message: "The operations summary requires an owner/admin or monitor key.",
+          }),
+        );
+        return;
+      }
+      const summary = queryM5UsageSummary(getDb(), {
+        activeRequests: currentM5InflightRequests(),
+      });
+      res.setHeader("cache-control", "private, no-store");
+      sendJson(res, 200, summary);
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
     if (path.startsWith("/ledger/") && method === "GET") {
       // #227: id-addressable read — the join target for a `ledgerId` returned by POST /delegate
       // (echoed as costTrace.delegationId). Same auth gate as GET /ledger — this exposes the same
@@ -4830,6 +5770,51 @@ export async function handleRequest(
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
+      return;
+    }
+    if (method === "PUT" && path.startsWith("/execution-feedback/")) {
+      lctx.route = "/execution-feedback/:handle";
+      lctx.admission = "n/a";
+      const owner = executionFeedbackOwner(principal);
+      if (!owner) {
+        lctx.status = 403;
+        lctx.outcome = "forbidden";
+        lctx.errorClass = "route_not_allowed";
+        sendError(res, makeError("route_not_allowed", { message: "Execution feedback requires a minted owner agent or admin key." }));
+        return;
+      }
+      const handle = path.slice("/execution-feedback/".length);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(handle)) {
+        lctx.status = 404;
+        lctx.outcome = "not_found";
+        sendError(res, makeError("not_found"));
+        return;
+      }
+      let body: unknown;
+      try {
+        if (!hasJsonContentType(req)) throw new Error("invalid content type");
+        body = JSON.parse(await readBody(req, 1024));
+      } catch (err) {
+        const tooLarge = err instanceof BodyTooLargeError;
+        lctx.status = tooLarge ? 413 : 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error", { message: "Invalid execution feedback request." }));
+        return;
+      }
+      const parsed = parseExecutionFeedback(body);
+      if (!parsed.ok) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", { message: "Invalid execution feedback request." }));
+        return;
+      }
+      const result = recordExecutionFeedback({ handle, owner, usefulness: parsed.value });
+      lctx.status = result.kind === "recorded" ? 201 : result.kind === "unchanged" ? 200
+        : result.kind === "not_found" ? 404 : result.kind === "invalid" ? 400 : 409;
+      lctx.outcome = result.kind;
+      sendJson(res, lctx.status, result);
       return;
     }
     if (method === "PUT" && path.startsWith("/ledger/") && path.endsWith(REVIEWER_USEFULNESS_ROUTE_SUFFIX)) {
@@ -4974,10 +5959,11 @@ export async function handleRequest(
     // ─── Admin surface ───
     if (path === "/admin/models/load" && method === "POST") {
       if (!requireAdmin()) return;
-      await handleAdminLoad(req, res);
-      lctx.status = res.statusCode;
-      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
-      lctx.admission = "n/a";
+      await handleAdminLoad(req, res, controller, principal, lctx, gatewayModelStartAdmission(cfg, hostMemoryDeps));
+      if (lctx.outcome !== "memory_refused" && lctx.outcome !== "busy") {
+        lctx.status = res.statusCode;
+        lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      }
       return;
     }
     if (path === "/admin/models/unload" && method === "POST") {
@@ -4999,6 +5985,30 @@ export async function handleRequest(
     if (path === "/admin/keys" && method === "POST") {
       if (!requireAdmin()) return;
       await handleKeysMint(req, res, cfg);
+      lctx.status = res.statusCode;
+      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/systemone-grants" && method === "POST") {
+      if (!requireAdmin()) return;
+      await handleSystemOneKeyGrant(req, res);
+      lctx.status = res.statusCode;
+      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/embedding-grants" && method === "POST") {
+      if (!requireAdmin()) return;
+      await handleEmbeddingKeyGrant(req, res);
+      lctx.status = res.statusCode;
+      lctx.outcome = res.statusCode < 300 ? "ok" : "error";
+      lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/chat-grants" && method === "POST") {
+      if (!requireAdmin()) return;
+      await handleExistingChatKeyGrant(req, res);
       lctx.status = res.statusCode;
       lctx.outcome = res.statusCode < 300 ? "ok" : "error";
       lctx.admission = "n/a";

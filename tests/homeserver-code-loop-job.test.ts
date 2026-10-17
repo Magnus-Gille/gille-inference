@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, beforeAll, vi } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync } from "node:fs";
+import { PassThrough } from "node:stream";
+import { makePiEngine } from "../src/homeserver/pi-engine.js";
+import { appendFileSync, chmodSync, mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, unlinkSync, rmSync, utimesSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -34,12 +36,14 @@ import {
   sweepCodeLoopSandboxes,
   isCodeLoopUnitName,
   _resetCodeLoopStateForTests,
+  seedSandbox,
   type CodeLoopStartConfig,
   CODE_LOOP_HARNESS_VERSION,
 } from "../src/homeserver/code-loop.js";
 import { execCageCommand } from "../src/homeserver/code-loop-cage.js";
 import { isAdvisoryOnlyTaskType } from "../src/homeserver/delegate-policy.js";
 import type { CodeLoopDeps, EngineRunResult } from "../src/homeserver/code-loop-types.js";
+import { createModelStartAdmission, HostMemoryAdmissionError } from "../src/homeserver/host-memory-admission.js";
 import {
   acquireDurableCodeLoopLease,
   claimDurableCodeLoopRun,
@@ -47,6 +51,7 @@ import {
   isDurableCodeLoopWorkLive,
   readDurableCodeLoopRunByWork,
 } from "../src/homeserver/code-loop-store.js";
+import * as codeLoopStore from "../src/homeserver/code-loop-store.js";
 import {
   TASK_FINGERPRINT_VERSION,
   lookupTaskExposures,
@@ -59,6 +64,13 @@ import {
   type HuginRequestStamp,
 } from "../src/homeserver/learning-task-contract.js";
 import { claimLearningTaskAdmission } from "../src/homeserver/learning-task-admission-store.js";
+import {
+  CODE_LOOP_SCHEMA_TASK_INSTRUCTION,
+  GROUNDED_GENERATED_PYTHON_SUITE,
+  MUTANT_IMPLEMENTATIONS,
+  REFERENCE_PYTHON_IMPLEMENTATION,
+  WRONG_GENERATED_PYTHON_SUITE,
+} from "./fixtures/code-loop-schema-grounding.js";
 
 /**
  * Job lifecycle over a REAL tmp sandbox (design §11 tests 3–6): real git diff harvest, the
@@ -106,7 +118,9 @@ function fakeDeps(over: {
   now?: () => number;
   learningTaskAdmission?: CodeLoopDeps["learningTaskAdmission"];
   keyAlias?: string;
+  feedbackOwner?: CodeLoopDeps["feedbackOwner"];
   cleanupUnit?: (unit: string) => Promise<void>;
+  runCommand?: CodeLoopDeps["runCommand"];
 } = {}): CodeLoopDeps {
   const okRun = async (): Promise<EngineRunResult> => ({
     outcome: "completed",
@@ -123,16 +137,82 @@ function fakeDeps(over: {
       ? {}
       : { learningTaskAdmission: over.learningTaskAdmission }),
     keyAlias: over.keyAlias ?? null,
+    ...(over.feedbackOwner === undefined ? {} : { feedbackOwner: over.feedbackOwner }),
     readinessProbe: async () => true,
     maintenanceMode: () => over.maintenance === true,
     growthCapBytes: 50 * 1024 * 1024,
     pollMs: 10_000,
     retentionTtlMs: 24 * 60 * 60 * 1000,
-    runCommand: (argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env }),
+    runCommand: over.runCommand ?? ((argv, opts) => execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env, signal: opts.signal })),
     acquireLease: async () => (over.lease === "unavailable" ? null : { release: async () => {} }),
     cageSelfTest: async () => ({ ok: over.cageOk !== false, failures: over.cageOk === false ? ["forced fail"] : [] }),
     cleanupUnit: over.cleanupUnit ?? (async () => {}),
   };
+}
+
+function scriptedPiEngine(lines: string[]) {
+  return makePiEngine(
+    { piBin: "/x/pi", provider: "inference-local", piAgentDir: "/agent", apiKey: "test-only-key-0123456789", degeneracyRunThreshold: 400 },
+    {
+      spawnPi: () => {
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        let resolveExit!: (code: number | null) => void;
+        const exited = new Promise<number | null>((resolve) => (resolveExit = resolve));
+        queueMicrotask(() => {
+          for (const line of lines) stdout.write(`${line}\n`);
+          stdout.end();
+          stderr.end();
+          resolveExit(0);
+        });
+        return {
+          stdout,
+          stderr,
+          pid: 4321,
+          kill() {
+            if (!stdout.destroyed) stdout.end();
+            if (!stderr.destroyed) stderr.end();
+            resolveExit(null);
+          },
+          exited,
+        };
+      },
+      readinessProbe: async () => true,
+      pollMs: 10_000,
+    },
+  );
+}
+
+function mutationAccountingLines(kind: "bash" | "write"): string[] {
+  const mutation = kind === "bash"
+    ? [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: "bash-1", toolName: "bash", args: { command: "printf 'after\\n' > solution.txt" } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: "bash-1", toolName: "bash", isError: false }),
+      ]
+    : [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: "write-1", toolName: "write", args: { path: "solution.txt", content: "after\n" } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: "write-1", toolName: "write", isError: false }),
+      ];
+  return [
+    JSON.stringify({ type: "turn_start" }),
+    ...mutation,
+    JSON.stringify({ type: "turn_end", message: { role: "assistant", usage: { input: 1, output: 1 }, stopReason: "stop" } }),
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "wrote solution" }] } }),
+  ];
+}
+
+/** These tests target engine/job accounting; bypass the host process-identity probe so restricted
+ * CI does not need a real sysctl while the dedicated lease tests cover admission itself. */
+async function withHermeticDurableAdmission<T>(run: () => Promise<T>): Promise<T> {
+  const leaseSpy = vi.spyOn(codeLoopStore, "acquireDurableCodeLoopLease").mockReturnValue({
+    kind: "acquired",
+    lease: { work_id: "test-hermetic-admission", release: () => {} },
+  });
+  try {
+    return await run();
+  } finally {
+    leaseSpy.mockRestore();
+  }
 }
 
 async function waitForTerminal(workId: string, timeoutMs = 5000): Promise<void> {
@@ -145,7 +225,278 @@ async function waitForTerminal(workId: string, timeoutMs = 5000): Promise<void> 
   }
 }
 
+const ORGANIC_MUTANT_GROUPS: Array<[string, string[]]> = [
+  ["mutants.nesting", ["topLevelEventInfo", "wrongSessionNesting"]],
+  ["mutants.call-nesting", ["wrongCallNesting"]],
+  ["mutants.cardinality", ["oneOutputPerSession"]],
+  ["mutants.token-fields", ["legacyInputTokens", "freshEqualsInput"]],
+  ["mutants.filtering", ["ignoresTimestampFilter"]],
+  ["mutants.ordering", ["reverseOrder"]],
+];
+
+/**
+ * Build an owner-held behavioral oracle for the grounded suite. The reference and candidate
+ * implementations are decoded into isolated Python modules; unittest results, rather than any
+ * process failure, decide whether a mutant was rejected. Keeping the command inline means the
+ * model can change only suite.py, while the trusted implementation and mutants remain protected
+ * owner inputs.
+ */
+function organicMutantOracleCommand(mutants: Array<[string, string]>): string {
+  const encoded = (source: string): string => Buffer.from(source, "utf8").toString("base64");
+  const candidatePayload = mutants
+    .map(([name, source]) => `    (${JSON.stringify(name)}, ${JSON.stringify(encoded(source))}),`)
+    .join("\n");
+  return `python3 -I - <<'PY'
+import base64
+import importlib.util
+import sys
+import types
+import unittest
+
+CANDIDATES = [
+${candidatePayload}
+]
+
+def load_extractor(encoded_source, module_name):
+    source = base64.b64decode(encoded_source).decode("utf-8")
+    module = types.ModuleType(module_name)
+    exec(compile(source, module_name, "exec"), module.__dict__)
+    if not callable(getattr(module, "extract_usage", None)):
+        raise SystemExit(1)
+    return module
+
+def run_suite(extractor, module_name):
+    sys.modules["extractor"] = extractor
+    spec = importlib.util.spec_from_file_location(module_name, "suite.py")
+    if spec is None or spec.loader is None:
+        raise SystemExit(1)
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    tests = unittest.defaultTestLoader.loadTestsFromModule(suite)
+    result = unittest.TestResult()
+    tests.run(result)
+    return result
+
+for mutant_name, mutant_source in CANDIDATES:
+    mutant_result = run_suite(load_extractor(mutant_source, "mutant_" + mutant_name), "suite_" + mutant_name)
+    # A valid rejection is exactly a clean unittest assertion failure: tests ran, no errors,
+    # and the candidate process status would be 1. Empty/erroring suites are not rejections.
+    mutant_exit_status = 1 if mutant_result.failures and not mutant_result.errors and mutant_result.testsRun > 0 else 0
+    if mutant_exit_status != 1:
+        raise SystemExit(1)
+print("mutants rejected: " + ",".join(name for name, _ in CANDIDATES))
+PY`;
+}
+
+/** Separate positive reference oracle: unittest must execute at least one test and be clean. */
+function organicReferenceOracleCommand(): string {
+  return `python3 -I - <<'PY'
+import importlib.util
+import sys
+import types
+import unittest
+
+def load_extractor(source, module_name):
+    module = types.ModuleType(module_name)
+    exec(compile(source, module_name, "exec"), module.__dict__)
+    if not callable(getattr(module, "extract_usage", None)):
+        raise SystemExit(1)
+    return module
+
+def run_suite(extractor, module_name):
+    sys.modules["extractor"] = extractor
+    spec = importlib.util.spec_from_file_location(module_name, "suite.py")
+    if spec is None or spec.loader is None:
+        raise SystemExit(1)
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    tests = unittest.defaultTestLoader.loadTestsFromModule(suite)
+    result = unittest.TestResult()
+    tests.run(result)
+    return result
+
+with open("extractor.py", encoding="utf-8") as reference_file:
+    reference_source = reference_file.read()
+reference_result = run_suite(load_extractor(reference_source, "trusted_reference"), "trusted_suite")
+if reference_result.testsRun <= 0 or reference_result.errors or reference_result.failures:
+    raise SystemExit(1)
+print("reference passed with testsRun=" + str(reference_result.testsRun))
+PY`;
+}
+
+function organicMutantSchemaChecks(): Array<{ name: string; command: string }> {
+  const mutantMap = MUTANT_IMPLEMENTATIONS as Record<string, string>;
+  const covered = new Set<string>();
+  const checks = [
+    { name: "reference.behavior", command: organicReferenceOracleCommand() },
+    ...ORGANIC_MUTANT_GROUPS.map(([name, keys]) => {
+      const entries = keys.map((key) => {
+        const source = mutantMap[key];
+        if (source === undefined) throw new Error(`missing named organic mutant ${key}`);
+        covered.add(key);
+        return [key, source] as [string, string];
+      });
+      return { name, command: organicMutantOracleCommand(entries) };
+    }),
+  ];
+  if (covered.size !== Object.keys(mutantMap).length) throw new Error("organic mutant oracle does not cover every named mutant");
+  if (checks.some((check) => Buffer.byteLength(check.command, "utf8") > 8192)) throw new Error("organic mutant oracle exceeds per-check command bound");
+  if (checks.reduce((bytes, check) => bytes + Buffer.byteLength(check.command, "utf8"), 0) > 32768) throw new Error("organic mutant oracle exceeds aggregate command bound");
+  return checks;
+}
+
 // ─── glob matcher ───────────────────────────────────────────────────────────────────────
+
+describe("organic schema grounding (#260)", () => {
+  it("refuses unit-test-gen without owner schema checks before engine admission", async () => {
+    const engineRun = vi.fn();
+    const result = await startCodeLoop({
+      instruction: "Generate a bounded regression test.",
+      task_type: "unit-test-gen",
+      files: [{ path: "test.py", content: "" }],
+      check_cmd: "python3 -m py_compile test.py",
+    }, startCfg(), fakeDeps({ engineRun }));
+    expect(result).toMatchObject({ ok: false, refusal: "invalid-request" });
+    expect(engineRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "cap-exceeded"] as const)("withholds failed schema output after %s while retaining the syntax check", async (outcome) => {
+    const req = {
+      instruction: "Generate a bounded regression test.",
+      task_type: "unit-test-gen",
+      files: [{ path: "test.py", content: "" }],
+      check_cmd: "python3 -m py_compile test.py",
+      schema_checks: [{ name: "payload.info.last_token_usage", command: "exit 1" }],
+    };
+    const started = await startCodeLoop(req, startCfg(), fakeDeps({
+      engineRun: async (dir) => {
+        writeFileSync(join(dir, "test.py"), "assert True\n");
+        return { outcome, usage: { turns: 3, wall_ms: 1000, prompt_tokens: 10, completion_tokens: 10 }, finalMessage: "usable tests", unparseableLines: 0, detail: "" };
+      },
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+    const fetched = getJobResult(started.work_id);
+    expect(fetched?.kind).toBe("result");
+    if (fetched?.kind !== "result") return;
+    expect(fetched.result.check).toMatchObject({ ran: true, exit_code: 0 });
+    expect(fetched.result).toMatchObject({
+      status: outcome, diff: "", summary: "",
+      schema_grounding: { schema_version: 1, state: "failed", checks: [{ name: "payload.info.last_token_usage", ran: true, exit_code: 1 }] },
+    });
+  });
+
+  it.each(["completed", "cap-exceeded"] as const)("runs the wrong reconstructed suite through both checks and withholds output after %s", async (outcome) => {
+    const checkName = "payload.info.last_token_usage";
+    const started = await startCodeLoop({
+      instruction: CODE_LOOP_SCHEMA_TASK_INSTRUCTION,
+      task_type: "unit-test-gen",
+      files: [
+        { path: "extractor.py", content: REFERENCE_PYTHON_IMPLEMENTATION },
+        { path: "suite.py", content: "" },
+      ],
+      writable: ["suite.py"],
+      protected: ["extractor.py"],
+      check_cmd: "python3 -m py_compile suite.py",
+      schema_checks: [{ name: checkName, command: "python3 -m unittest suite.py" }],
+    }, startCfg(), fakeDeps({
+      engineRun: async (sandboxDir) => {
+        writeFileSync(join(sandboxDir, "suite.py"), WRONG_GENERATED_PYTHON_SUITE);
+        return {
+          outcome,
+          usage: { turns: 3, wall_ms: 1000, prompt_tokens: 10, completion_tokens: 10 },
+          finalMessage: "wrong reconstructed suite generated",
+          unparseableLines: 0,
+          detail: "",
+        };
+      },
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const fetched = getJobResult(started.work_id);
+    expect(fetched.kind).toBe("result");
+    if (fetched.kind !== "result") return;
+    expect(fetched.result.status).toBe(outcome);
+    expect(fetched.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(fetched.result.schema_grounding).toMatchObject({
+      schema_version: 1,
+      state: "failed",
+      checks: [{ name: checkName, ran: true, exit_code: 1 }],
+    });
+    expect(fetched.result.diff).toBe("");
+    expect(fetched.result.summary).toBe("");
+    expect(fetched.result.changed_files).toEqual(["suite.py"]);
+    expect(fetched.result.diff).not.toContain("__pycache__");
+    expect(fetched.result.changed_files.some((path) => path.includes("__pycache__"))).toBe(false);
+    expect(fetched.result.protected_violations).toEqual([]);
+    const row = getDb().prepare("SELECT source, outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC, id DESC LIMIT 1").get() as { source: string; outcome: string; verifier: string };
+    expect(row).toEqual({ source: "code-loop", outcome: outcome === "completed" ? "fail" : "error", verifier: "owner-schema-checks-v1" });
+  });
+
+  it("passes the grounded reconstructed suite after syntax and behavioral checks, retaining only suite.py", async () => {
+    const checkName = "payload.info.last_token_usage";
+    const mutantChecks = organicMutantSchemaChecks();
+    const schemaChecks = [
+      { name: checkName, command: "python3 -m unittest suite.py" },
+      ...mutantChecks,
+    ];
+    expect(schemaChecks).toHaveLength(8);
+    expect(schemaChecks.every((check) => Buffer.byteLength(check.command, "utf8") <= 8192)).toBe(true);
+    expect(schemaChecks.reduce((bytes, check) => bytes + Buffer.byteLength(check.command, "utf8"), 0)).toBeLessThanOrEqual(32768);
+    const started = await startCodeLoop({
+      instruction: CODE_LOOP_SCHEMA_TASK_INSTRUCTION,
+      task_type: "unit-test-gen",
+      files: [
+        { path: "extractor.py", content: REFERENCE_PYTHON_IMPLEMENTATION },
+        { path: "suite.py", content: "" },
+      ],
+      writable: ["suite.py"],
+      protected: ["extractor.py"],
+      check_cmd: "python3 -m py_compile suite.py",
+      schema_checks: schemaChecks,
+    }, startCfg(), fakeDeps({
+      engineRun: async (sandboxDir) => {
+        writeFileSync(join(sandboxDir, "suite.py"), GROUNDED_GENERATED_PYTHON_SUITE);
+        return {
+          outcome: "completed",
+          usage: { turns: 3, wall_ms: 1000, prompt_tokens: 10, completion_tokens: 10 },
+          finalMessage: "grounded reconstructed suite generated",
+          unparseableLines: 0,
+          detail: "",
+        };
+      },
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitForTerminal(started.work_id);
+
+    const fetched = getJobResult(started.work_id);
+    expect(fetched.kind).toBe("result");
+    if (fetched.kind !== "result") return;
+    expect(fetched.result.status).toBe("completed");
+    expect(fetched.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(fetched.result.schema_grounding).toMatchObject({ schema_version: 1, state: "passed" });
+    expect(fetched.result.schema_grounding.checks).toHaveLength(8);
+    expect(fetched.result.schema_grounding.checks.map((check) => check.name)).toEqual([
+      checkName,
+      "reference.behavior",
+      ...ORGANIC_MUTANT_GROUPS.map(([name]) => name),
+    ]);
+    expect(fetched.result.schema_grounding.checks.every((check) => check.ran && check.exit_code === 0)).toBe(true);
+    expect(fetched.result.diff).not.toBe("");
+    expect(fetched.result.diff).toContain("GroundedGeneratedSuite");
+    expect(fetched.result.summary).toBe("grounded reconstructed suite generated");
+    expect(fetched.result.changed_files).toEqual(["suite.py"]);
+    expect(fetched.result.diff).not.toContain("__pycache__");
+    expect(fetched.result.changed_files.some((path) => path.includes("__pycache__"))).toBe(false);
+    expect(fetched.result.protected_violations).toEqual([]);
+    const row = getDb().prepare("SELECT source, outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC, id DESC LIMIT 1").get() as { source: string; outcome: string; verifier: string };
+    expect(row).toEqual({ source: "code-loop", outcome: "pass", verifier: "owner-schema-checks-v1" });
+  });
+});
 
 describe("globToRegExp / matchesAnyGlob", () => {
   it("** matches across directories", () => {
@@ -201,6 +552,19 @@ describe("startCodeLoop — refusals", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal).toBe("maintenance");
   });
+  it("names an absent user-bus transport before model admission or cage work", async () => {
+    const beforeModelStart = vi.fn(async () => {});
+    const cageSelfTest = vi.fn(async () => ({ ok: true, failures: [] }));
+    const r = await startCodeLoop(req, startCfg(), {
+      ...fakeDeps(),
+      codeLoopTransportProbe: async () => false,
+      beforeModelStart,
+      cageSelfTest,
+    });
+    expect(r).toMatchObject({ ok: false, refusal: "cage-transport-unavailable" });
+    expect(beforeModelStart).not.toHaveBeenCalled();
+    expect(cageSelfTest).not.toHaveBeenCalled();
+  });
   it("cage self-test failure refuses with cage-unavailable (confinement required)", async () => {
     const r = await startCodeLoop(req, startCfg({ confinement: "required", cage: { buildArgv: () => [] } }), fakeDeps({ cageOk: false }));
     expect(r.ok).toBe(false);
@@ -221,11 +585,120 @@ describe("startCodeLoop — refusals", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal).toBe("invalid-request");
   });
+
+  it("host-memory refusal rolls back the start claim before cage, seed, lease, or engine work", async () => {
+    const engineRun = vi.fn(async (): Promise<EngineRunResult> => ({
+      outcome: "completed",
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      finalMessage: "done",
+      unparseableLines: 0,
+      detail: "",
+    }));
+    const cageSelfTest = vi.fn(async () => ({ ok: true, failures: [] }));
+    const acquireLease = vi.fn(async () => ({ release: async () => {} }));
+    const spawnPi = vi.fn(() => { throw new Error("spawn must not run"); });
+    const deps = fakeDeps({ engineRun });
+    deps.cageSelfTest = cageSelfTest;
+    deps.acquireLease = acquireLease;
+    deps.spawnPi = spawnPi;
+    deps.beforeModelStart = async () => {
+      throw new HostMemoryAdmissionError({
+        code: "insufficient_memory",
+        message: "not enough memory",
+        retryAfterSeconds: 7,
+        reason: "insufficient_memory",
+      });
+    };
+
+    const workrootBefore = readdirSync(workroot).filter((entry) => entry !== ".code-loop-state-v1");
+    const refused = await startCodeLoop(req, startCfg(), deps);
+    expect(refused).toMatchObject({ ok: false, refusal: "insufficient_memory", message: "not enough memory" });
+    expect(cageSelfTest).not.toHaveBeenCalled();
+    expect(acquireLease).not.toHaveBeenCalled();
+    expect(spawnPi).not.toHaveBeenCalled();
+    expect(engineRun).not.toHaveBeenCalled();
+    expect(readdirSync(workroot).filter((entry) => entry !== ".code-loop-state-v1")).toEqual(workrootBefore);
+
+    const healthy = await startCodeLoop(req, startCfg(), { ...deps, beforeModelStart: async () => {} });
+    expect(healthy).toMatchObject({ ok: true, status: "running" });
+    if (healthy.ok) await waitForTerminal(healthy.work_id);
+  });
+
+  it("shadow model-start admission records the refusal and still allows the engine", async () => {
+    const logs: Record<string, unknown>[] = [];
+    const engineRun = vi.fn(async (): Promise<EngineRunResult> => ({
+      outcome: "completed",
+      usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+      finalMessage: "done",
+      unparseableLines: 0,
+      detail: "",
+    }));
+    const deps = fakeDeps({ engineRun });
+    deps.beforeModelStart = createModelStartAdmission(
+      {
+        mode: "shadow",
+        modelBudgetBytes: new Map([["qwen3-coder-next-80b", 60 * 1024 ** 3]]),
+        modelReclaimBytes: new Map(),
+        reserveBytes: 12 * 1024 ** 3,
+        retryAfterSeconds: 7,
+      },
+      {
+        getRunning: async () => [],
+        readMemory: async () => ({
+          ok: true,
+          memory: {
+            memTotalBytes: 100 * 1024 ** 3,
+            memAvailableBytes: 1 * 1024 ** 3,
+            cmaFreeBytes: null,
+            gttUsedBytes: null,
+            gttTotalBytes: null,
+          },
+        }),
+        log: (record) => logs.push(record),
+      },
+      (model) => model,
+    );
+
+    const started = await startCodeLoop(req, startCfg(), deps);
+    expect(started).toMatchObject({ ok: true, status: "running" });
+    if (started.ok) await waitForTerminal(started.work_id);
+    expect(engineRun).toHaveBeenCalledTimes(1);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      event: "host_memory_admission",
+      mode: "shadow",
+      model: "qwen3-coder-next-80b",
+      outcome: "refuse",
+      reason: "insufficient_memory",
+      enforced: false,
+    });
+  });
 });
 
 // ─── full lifecycle + real diff harvest ─────────────────────────────────────────────────
 
 describe("startCodeLoop — lifecycle + git diff harvest", () => {
+  it("refuses pre-existing agent Git config and hooks before host seed commands", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "cl-preseed-git-"));
+    const marker = join(sandbox, "hook-ran");
+    const hooks = join(sandbox, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(
+      join(sandbox, ".git", "config"),
+      "[core]\n\thooksPath = " + hooks +
+      "\n[filter \"host-pwn\"]\n\tclean = /bin/sh -c 'touch " + marker + "; cat'\n\trequired = true\n",
+    );
+    writeFileSync(join(hooks, "post-commit"), "#!/bin/sh\ntouch \"" + marker + "\"\n");
+    chmodSync(join(hooks, "post-commit"), 0o755);
+
+    expect(() => seedSandbox(sandbox, [
+      { path: "a.ts", content: "export {};\n" },
+      { path: ".git/config", content: "[filter \"host-pwn\"]\n" },
+      { path: ".git/hooks/post-commit", content: "#!/bin/sh\n" },
+    ])).toThrow(/pre-existing agent Git metadata|\.git/);
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it("persists a failed transient cleanup and the sweep retries it after terminal arm-error", async () => {
     const start = await startCodeLoop(
       { instruction: "no-op", files: [{ path: "a.ts", content: "export {};\n" }] },
@@ -269,7 +742,7 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
       return { outcome: "completed", usage: { turns: 3, wall_ms: 900, prompt_tokens: 100, completion_tokens: 50 }, finalMessage: "changed x", unparseableLines: 0, detail: "" };
     };
     const start = await startCodeLoop(
-      { instruction: "bump x", files: [{ path: "a.ts", content: "export const x = 1;\n" }] },
+      { instruction: "bump x", files: [{ path: "a.ts", content: "export const x = 1;\n" }], writable: ["a.ts", "new.ts"] },
       startCfg(),
       fakeDeps({ engineRun })
     );
@@ -288,11 +761,13 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
       schema_version: 1,
       model: "qwen3-coder-next-80b",
       engine: "pi",
-      harness_version: "code-loop-pi-2026-07-14-v6",
+      harness_version: "code-loop-pi-2026-09-05-v9",
       effective_caps: { wall_s: 480, turns: 24, completion_tokens: 60_000 },
       capabilities: {
         start_idempotency: "client-run-id-v1",
         agent_checks: "pi-bash-events-v3",
+        result_scope: "writable-v1",
+        completion_accounting: "bounded-turns-v1",
       },
     });
     expect(res.result.telemetry).toEqual({
@@ -318,6 +793,455 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     expect(row.outcome).toBe("unverified"); // no check_cmd
   });
 
+  it("preserves deleted and added paths when harvesting through trusted Git metadata", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "replace old with new",
+        files: [
+          { path: "keep.ts", content: "export const keep = true;\n" },
+          { path: "old.ts", content: "export const old = true;\n" },
+        ],
+        writable: ["old.ts", "new.ts"],
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          unlinkSync(join(sandboxDir, "old.ts"));
+          writeFileSync(join(sandboxDir, "new.ts"), "export const replacement = true;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 2, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+            finalMessage: "replaced file",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files.sort()).toEqual(["new.ts", "old.ts"]);
+    expect(result.result.diff).toContain("deleted file mode");
+    expect(result.result.diff).toContain("new file mode");
+    expect(existsSync(join(workroot, ".code-loop-host-git", start.work_id))).toBe(false);
+  });
+
+  it("never executes an agent-planted case-variant Git clean filter during host harvest", async () => {
+    const markerDir = mkdtempSync(join(tmpdir(), "cl-host-filter-marker-"));
+    const marker = join(markerDir, "executed");
+    const helper = join(markerDir, "filter.sh");
+    writeFileSync(helper, `#!/bin/sh\n/bin/cat\n/usr/bin/touch "${marker}"\n`);
+    chmodSync(helper, 0o755);
+    let caseVariantWritten = false;
+    let caseVariantHiddenDuringHostAdd = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (caseVariantWritten && argv[0] === "/usr/bin/git" && argv.includes("add") && opts.env["GIT_DIR"]?.includes(".code-loop-host-git")) {
+        caseVariantHiddenDuringHostAdd = !existsSync(join(opts.cwd, ".GITATTRIBUTES"));
+      }
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+
+    const engineRun = async (sandboxDir: string): Promise<EngineRunResult> => {
+      appendFileSync(join(sandboxDir, ".git", "config"), `\n[filter "host-pwn"]\n\tclean = ${helper}\n\trequired = true\n`);
+      writeFileSync(join(sandboxDir, ".git", "index.lock"), "agent-controlled lock\n");
+      // APFS is case-insensitive: this aliases the attributes file Git resolves as
+      // `.gitattributes` while remaining a distinct path on this Linux test host.
+      writeFileSync(join(sandboxDir, ".GITATTRIBUTES"), "*.ts filter=host-pwn\n");
+      caseVariantWritten = true;
+      writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+      return {
+        outcome: "completed",
+        usage: { turns: 2, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+        finalMessage: "done",
+        unparseableLines: 0,
+        detail: "",
+      };
+    };
+    const start = await startCodeLoop(
+      { instruction: "edit a", files: [{ path: "a.ts", content: "export const x = 1;\n" }] },
+      startCfg(),
+      fakeDeps({ engineRun, runCommand }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files).toContain("a.ts");
+    expect(existsSync(marker)).toBe(false);
+    expect(caseVariantHiddenDuringHostAdd).toBe(true);
+  });
+
+  it("fails closed when an agent creates a nested Git repository that could hide protected files", async () => {
+    let checkAttempted = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "write the protected file in a nested repository",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        protected: ["nested/protected.ts"],
+        check_cmd: "true",
+      },
+      startCfg(),
+      fakeDeps({
+        runCommand,
+        engineRun: async (sandboxDir) => {
+          mkdirSync(join(sandboxDir, "nested", ".GIT"), { recursive: true });
+          writeFileSync(join(sandboxDir, "nested", ".GIT", "config"), "[core]\n\trepositoryformatversion = 0\n");
+          writeFileSync(join(sandboxDir, "nested", "protected.ts"), "must not be hidden\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("arm-error");
+    expect(result.result.detail).toContain("agent Git metadata");
+    expect(result.result.diff).toBe("");
+    expect(result.result.changed_files).toEqual([]);
+    expect(result.result.protected_violations).toEqual([]);
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+  });
+
+  it("harvests textual changes despite agent-controlled .gitattributes diff attributes", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "edit a TypeScript file",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        writable: ["a.ts", ".gitattributes"],
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, ".gitattributes"), "*.ts -diff\n");
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files.sort()).toEqual([".gitattributes", "a.ts"]);
+    expect(result.result.diff).not.toContain("Binary files");
+    expect(result.result.diff).toContain("-export const x = 1;");
+    expect(result.result.diff).toContain("+export const x = 2;");
+  });
+
+  it("force-adds ignored files so protected additions are detected and check_cmd is suppressed", async () => {
+    let checkAttempted = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "write the protected file",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        writable: [".gitignore", "protected.ts"],
+        protected: ["protected.ts"],
+        check_cmd: "false",
+      },
+      startCfg(),
+      fakeDeps({
+        runCommand,
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, ".gitignore"), ".gitignore\nprotected.ts\n");
+          writeFileSync(join(sandboxDir, "protected.ts"), "must not be hidden\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.changed_files.sort()).toEqual([".gitignore", "protected.ts"]);
+    expect(result.result.protected_violations).toEqual(["protected.ts"]);
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+  });
+
+  it("fails closed with no harvest when transient cleanup is still pending", async () => {
+    let checkAttempted = false;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "edit a",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        check_cmd: "true",
+      },
+      startCfg(),
+      fakeDeps({
+        runCommand,
+        cleanupUnit: async () => { throw new Error("user bus unavailable"); },
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("arm-error");
+    expect(result.result.detail).toContain("transient cleanup pending");
+    expect(result.result.diff).toBe("");
+    expect(result.result.changed_files).toEqual([]);
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+  });
+
+  it("fails closed and skips check_cmd when any trusted Git harvest command fails", async () => {
+    let checkAttempted = false;
+    let trustedGitDir: string | undefined;
+    const runCommand: CodeLoopDeps["runCommand"] = async (argv, opts) => {
+      if (argv[0] === "/usr/bin/git" && argv.includes("diff") && argv.includes("--cached")) {
+        trustedGitDir = opts.env["GIT_DIR"];
+        return { code: 1, stdout: "", stderr: "forced harvest failure" };
+      }
+      if (argv.includes("bash") && argv.includes("-c")) checkAttempted = true;
+      return execCageCommand(argv, opts.timeoutMs, { cwd: opts.cwd, env: opts.env });
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "edit a",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        check_cmd: "test -f a.ts",
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 2, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+        runCommand,
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("arm-error");
+    expect(result.result.detail).toContain("trusted Git harvest failed");
+    expect(result.result.check.ran).toBe(false);
+    expect(checkAttempted).toBe(false);
+    expect(trustedGitDir).toMatch(/^\//);
+    expect(trustedGitDir).not.toBe(join(workroot, ".git"));
+  });
+
+  it("defaults to seeded-only writes and returns only permitted changes", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "edit only a.ts",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        check_cmd: "true",
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, "a.ts"), "export const x = 2;\n");
+          writeFileSync(join(sandboxDir, "out-of-seed.ts"), "must not be returned\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 100, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.changed_files).toEqual(["a.ts"]);
+    expect(result.result.diff).toContain("+export const x = 2;");
+    expect(result.result.diff).not.toContain("out-of-seed.ts");
+    expect(result.result.scope_violations).toEqual(["out-of-seed.ts"]);
+    expect(result.result.check.ran).toBe(false);
+  });
+
+  it("excludes generated bytecode without suppressing owner verification", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "edit the module",
+        files: [{ path: "mod.py", content: "VALUE = 1\n" }],
+        writable: ["**/*"],
+        check_cmd: "true",
+      } as Parameters<typeof startCodeLoop>[0],
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, "mod.py"), "VALUE = 2\n");
+          mkdirSync(join(sandboxDir, "__pycache__"));
+          writeFileSync(join(sandboxDir, "__pycache__", "mod.cpython-312.pyc"), "bytecode\0\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 100, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.changed_files).toEqual(["mod.py"]);
+    expect(result.result.diff).not.toContain("__pycache__");
+    expect(result.result.scope_violations).toEqual([]);
+    expect(result.result.check).toMatchObject({ ran: true, exit_code: 0 });
+  });
+
+  it("keeps harness metadata out of the diff while preserving protected-glob reporting", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "tamper with harness metadata",
+        files: [{ path: "a.ts", content: "export const x = 1;\n" }],
+        protected: [".meta.json"],
+        check_cmd: "true",
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          writeFileSync(join(sandboxDir, ".meta.json"), "{}\n");
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 100, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.changed_files).toEqual([]);
+    expect(result.result.diff).toBe("");
+    expect(result.result.scope_violations).toEqual([]);
+    expect(result.result.protected_violations).toEqual([".meta.json"]);
+    expect(result.result.check.ran).toBe(false);
+  });
+
+  it("rejects both endpoints of an out-of-scope rename without leaking source content", async () => {
+    const start = await startCodeLoop(
+      {
+        instruction: "rename the secret into the allowed destination",
+        files: [{ path: "secret.ts", content: "OUT_OF_SCOPE_CONTENT=fixture-only\nline2\n" }],
+        writable: ["allowed.ts"],
+        check_cmd: "true",
+      } as Parameters<typeof startCodeLoop>[0],
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir) => {
+          renameSync(join(sandboxDir, "secret.ts"), join(sandboxDir, "allowed.ts"));
+          return {
+            outcome: "completed",
+            usage: { turns: 1, wall_ms: 100, prompt_tokens: 1, completion_tokens: 1 },
+            finalMessage: "done",
+            unparseableLines: 0,
+            detail: "",
+          };
+        },
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.changed_files).toEqual([]);
+    expect(result.result.diff).toBe("");
+    expect(result.result.diff).not.toContain("OUT_OF_SCOPE_CONTENT");
+    expect(result.result.scope_violations.sort()).toEqual(["allowed.ts", "secret.ts"]);
+    expect(result.result.check).toMatchObject({ ran: false, skip_reason: "scope-violation" });
+  });
+
   it("check_cmd pass → ledger pass; protected violation disqualifies the check", async () => {
     // engine writes solution.txt; check_cmd asserts it exists.
     const engineRun = async (sandboxDir: string): Promise<EngineRunResult> => {
@@ -326,7 +1250,7 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     };
     let clock = 0;
     const start = await startCodeLoop(
-      { instruction: "write solution", files: [{ path: "seed.txt", content: "todo\n" }], check_cmd: "test -f solution.txt" },
+      { instruction: "write solution", files: [{ path: "seed.txt", content: "todo\n" }], writable: ["solution.txt"], check_cmd: "test -f solution.txt" },
       startCfg(),
       fakeDeps({ engineRun, now: () => (clock += 100) })
     );
@@ -341,6 +1265,268 @@ describe("startCodeLoop — lifecycle + git diff harvest", () => {
     const row = getDb().prepare("SELECT outcome, verifier FROM delegations WHERE source='code-loop' ORDER BY ts DESC LIMIT 1").get() as { outcome: string; verifier: string };
     expect(row.outcome).toBe("pass");
     expect(row.verifier).toBe("check-cmd");
+  });
+
+  it("runs the owner check on a scope-clean turn-cap result and marks it unfinished", async () => {
+    const engineRun = async (sandboxDir: string): Promise<EngineRunResult> => {
+      writeFileSync(join(sandboxDir, "solution.txt"), "partial but valid\n");
+      return {
+        outcome: "cap-exceeded",
+        usage: { turns: 3, wall_ms: 500, prompt_tokens: 10, completion_tokens: 5 },
+        finalMessage: "Implemented the core change; polish remains.",
+        unparseableLines: 0,
+        detail: "cap breached: turns",
+        telemetry: {
+          phase_ms: {},
+          mutation_evidence: "tool-call",
+          observability_coverage: 1,
+          failure_kind: "turn-cap",
+        },
+      };
+    };
+    const start = await startCodeLoop(
+      {
+        instruction: "write solution",
+        files: [{ path: "seed.txt", content: "todo\n" }],
+        writable: ["solution.txt"],
+        check_cmd: "test -f solution.txt",
+        caps: { turns: 3 },
+      },
+      startCfg(),
+      fakeDeps({ engineRun }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+    const res = getJobResult(start.work_id);
+    if (res.kind !== "result") throw new Error("no result");
+    expect(res.result.status).toBe("cap-exceeded");
+    expect(res.result.completion_state).toBe("unfinished");
+    expect(res.result.telemetry.failure_kind).toBe("turn-cap");
+    expect(res.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+  });
+
+  // #240: the small closed five-file release-metadata repro. The worker only reads the
+  // supplied seed set and looks for more workspace files instead of editing, then exits
+  // cleanly. The conductor must get an empty-diff terminal result with an explicit
+  // machine-readable no-edit reason — never a silent "completed" with no artifact.
+  // The wander is replayed through the REAL pi engine (canned NDJSON), so this covers
+  // engine classification plus job assembly, harvest, and the conductor-visible result.
+  it("reports a wandering five-file metadata edit as an explicit no-edit terminal result (#240)", async () => {
+    const seedFiles = [
+      { path: "package.json", content: `${JSON.stringify({ name: "acme-widget", version: "1.1.2", dependencies: { "left-pad": "1.1.2", "stable-dep": "9.9.9" } }, null, 2)}\n` },
+      { path: "package-lock.json", content: `${JSON.stringify({ name: "acme-widget", version: "1.1.2", packages: { "": { version: "1.1.2" }, "node_modules/left-pad": { version: "1.1.2" } } }, null, 2)}\n` },
+      { path: "CHANGELOG.md", content: "# Changelog\n\n## 1.1.2\n\n- Previous release.\n" },
+      { path: "src/version.ts", content: "export const VERSION = \"1.1.2\";\n" },
+      { path: "README.md", content: "# acme-widget\n\n![version](https://img.shields.io/badge/version-1.1.2-blue)\n" },
+    ];
+    const wanderSummary = "still looking for additional workspace files";
+    const wanderLines = [
+      JSON.stringify({ type: "turn_start" }),
+      ...seedFiles.slice(0, 3).flatMap((f, i) => [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: `read-1-${i}`, toolName: "read", args: { path: f.path } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: `read-1-${i}`, toolName: "read", isError: false, result: { content: [{ type: "text", text: "ok" }] } }),
+      ]),
+      JSON.stringify({ type: "turn_start" }),
+      ...seedFiles.slice(3).flatMap((f, i) => [
+        JSON.stringify({ type: "tool_execution_start", toolCallId: `read-2-${i}`, toolName: "read", args: { path: f.path } }),
+        JSON.stringify({ type: "tool_execution_end", toolCallId: `read-2-${i}`, toolName: "read", isError: false, result: { content: [{ type: "text", text: "ok" }] } }),
+      ]),
+      JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: wanderSummary }] } }),
+    ];
+    const engine = makePiEngine(
+      { piBin: "/x/pi", provider: "inference-local", piAgentDir: "/agent", apiKey: "test-only-key-0123456789", degeneracyRunThreshold: 400 },
+      {
+        spawnPi: () => {
+          const stdout = new PassThrough();
+          const stderr = new PassThrough();
+          let resolveExit!: (code: number | null) => void;
+          const exited = new Promise<number | null>((r) => (resolveExit = r));
+          queueMicrotask(() => {
+            for (const l of wanderLines) stdout.write(`${l}\n`);
+            stdout.end();
+            stderr.end();
+            resolveExit(0);
+          });
+          return {
+            stdout,
+            stderr,
+            pid: 4321,
+            kill() {
+              try { stdout.end(); } catch { /* already ended */ }
+              try { stderr.end(); } catch { /* already ended */ }
+              resolveExit(null);
+            },
+            exited,
+          };
+        },
+        readinessProbe: async () => true,
+        pollMs: 10_000,
+      },
+    );
+    const start = await startCodeLoop(
+      {
+        instruction: "Bump the acme-widget project version from 1.1.2 to 1.1.3 in the five supplied seed files. Leave unrelated dependency versions untouched.",
+        files: seedFiles,
+        caps: { turns: 12, edit_deadline_turn: 5 },
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: (sandboxDir: string, instruction: string) => engine.run({
+          sandboxDir,
+          instruction,
+          model: "qwen3-coder-next-80b",
+          caps: { wall_s: 480, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 5 },
+          cageArgv: [],
+          growthCapBytes: 50 * 1024 * 1024,
+        }),
+      }),
+    );
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+    const res = getJobResult(start.work_id);
+    if (res.kind !== "result") throw new Error("no result");
+    // Machine-readable no-edit reason: distinct from a patch that failed verification
+    // (which would be completed + mutation evidence + a ran check with nonzero exit).
+    expect(res.result.status).toBe("cap-exceeded");
+    expect(res.result.completion_state).toBe("unfinished");
+    expect(res.result.diff).toBe("");
+    expect(res.result.changed_files).toEqual([]);
+    expect(res.result.telemetry).toMatchObject({ mutation_evidence: "none", failure_kind: "edit-deadline" });
+    expect(res.result.detail).toMatch(/^no relevant edit attempted/);
+    expect(res.result.detail).toContain("edit-deadline");
+    // Content-blind diagnostic: counts only — no seed content, paths, or versions leak.
+    expect(res.result.detail).not.toContain("1.1.2");
+    expect(res.result.detail).not.toContain("package.json");
+    expect(res.result.detail).not.toContain("acme-widget");
+    // The useful bounded summary is preserved for the conductor.
+    expect(res.result.summary).toBe(wanderSummary);
+    expect(res.result.summary.length).toBeLessThanOrEqual(2048);
+  });
+
+  it("keeps a bash-only diff unobserved and still verifies it on a clean early exit", async () => {
+    const engine = scriptedPiEngine(mutationAccountingLines("bash"));
+    const start = await withHermeticDurableAdmission(() => startCodeLoop(
+      {
+        instruction: "write solution",
+        files: [{ path: "solution.txt", content: "before\n" }],
+        writable: ["solution.txt"],
+        check_cmd: "test -f solution.txt",
+        schema_checks: [{ name: "solution.exists", command: "test -f solution.txt" }],
+        caps: { turns: 12, edit_deadline_turn: 3 },
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir, instruction) => {
+          // Synthetic reproduction: the bash event claims the mutation, while the fixture writes
+          // the same file so host-owned Git harvest sees the exact resulting diff.
+          writeFileSync(join(sandboxDir, "solution.txt"), "after\n");
+          return engine.run({
+            sandboxDir,
+            instruction,
+            model: "qwen3-coder-next-80b",
+            caps: { wall_s: 480, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 3 },
+            cageArgv: [],
+            growthCapBytes: 50 * 1024 * 1024,
+          });
+        },
+      }),
+    ));
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("cap-exceeded");
+    expect(result.result.completion_state).toBe("unfinished");
+    expect(result.result.usage.turns).toBe(1);
+    expect(result.result.changed_files).toEqual(["solution.txt"]);
+    expect(result.result.diff).toContain("-before");
+    expect(result.result.diff).toContain("+after");
+    expect(result.result.telemetry).toMatchObject({
+      mutation_evidence: "diff-only",
+      observability_coverage: 0.5,
+      failure_kind: "edit-deadline",
+    });
+    expect(result.result.telemetry.first_edit_turn).toBeUndefined();
+    expect(result.result.telemetry.edit_start_ms).toBeUndefined();
+    expect(result.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(result.result.schema_grounding).toMatchObject({
+      schema_version: 1,
+      state: "passed",
+      checks: [{ name: "solution.exists", ran: true, exit_code: 0 }],
+    });
+    expect(result.result.agent_checks).toMatchObject({
+      state: "none",
+      unparseable_lines: 0,
+      coverage_loss_events: 0,
+      attempts: [],
+    });
+  });
+
+  it("records the same diff as tool-call evidence after a matching write event", async () => {
+    const engine = scriptedPiEngine(mutationAccountingLines("write"));
+    const start = await withHermeticDurableAdmission(() => startCodeLoop(
+      {
+        instruction: "write solution",
+        files: [{ path: "solution.txt", content: "before\n" }],
+        writable: ["solution.txt"],
+        check_cmd: "test -f solution.txt",
+        schema_checks: [{ name: "solution.exists", command: "test -f solution.txt" }],
+        caps: { turns: 12, edit_deadline_turn: 3 },
+      },
+      startCfg(),
+      fakeDeps({
+        engineRun: async (sandboxDir, instruction) => {
+          // The filesystem mutation is identical to the bash-only fixture above; only the
+          // successful matching write start/end events change the evidence classification.
+          writeFileSync(join(sandboxDir, "solution.txt"), "after\n");
+          return engine.run({
+            sandboxDir,
+            instruction,
+            model: "qwen3-coder-next-80b",
+            caps: { wall_s: 480, turns: 12, completion_tokens: 60_000, edit_deadline_turn: 3 },
+            cageArgv: [],
+            growthCapBytes: 50 * 1024 * 1024,
+          });
+        },
+      }),
+    ));
+    expect(start.ok).toBe(true);
+    if (!start.ok) return;
+    await waitForTerminal(start.work_id);
+
+    const result = getJobResult(start.work_id);
+    expect(result.kind).toBe("result");
+    if (result.kind !== "result") return;
+    expect(result.result.status).toBe("completed");
+    expect(result.result.completion_state).toBe("complete");
+    expect(result.result.usage.turns).toBe(1);
+    expect(result.result.changed_files).toEqual(["solution.txt"]);
+    expect(result.result.diff).toContain("-before");
+    expect(result.result.diff).toContain("+after");
+    expect(result.result.telemetry).toMatchObject({
+      mutation_evidence: "tool-call",
+      observability_coverage: 1,
+    });
+    expect(result.result.telemetry.first_edit_turn).toBe(1);
+    expect(result.result.telemetry.edit_start_ms).toEqual(expect.any(Number));
+    expect(result.result.telemetry.failure_kind).toBeUndefined();
+    expect(result.result.check).toMatchObject({ ran: true, exit_code: 0, skip_reason: null });
+    expect(result.result.schema_grounding).toMatchObject({
+      schema_version: 1,
+      state: "passed",
+      checks: [{ name: "solution.exists", ran: true, exit_code: 0 }],
+    });
+    expect(result.result.agent_checks).toMatchObject({
+      state: "none",
+      unparseable_lines: 0,
+      coverage_loss_events: 0,
+      attempts: [],
+    });
   });
 
   // #80: a caller-supplied `task_type` used to enter the pipeline UNTRIMMED (the old guard trimmed
@@ -733,6 +1919,15 @@ describe("code_loop_start caller idempotency (#251)", () => {
     });
   });
 
+  it("binds an explicit writable scope without changing the omitted-scope legacy fingerprint", () => {
+    const legacy = codeLoopRequestFingerprint(baseRequest);
+    expect(codeLoopRequestFingerprint({ ...baseRequest, writable: undefined })).toBe(legacy);
+    expect(codeLoopRequestFingerprint({ ...baseRequest, writable: ["a.ts"] })).not.toBe(legacy);
+    expect(codeLoopRequestFingerprint({ ...baseRequest, writable: ["a.ts"] })).not.toBe(
+      codeLoopRequestFingerprint({ ...baseRequest, writable: ["**/*"] }),
+    );
+  });
+
   it("records one content-blind code-loop exposure across recovered retries", async () => {
     const marker = "CODE_LOOP_EXPOSURE_RAW_MARKER_257";
     const request = {
@@ -790,7 +1985,9 @@ describe("code_loop_start caller idempotency (#251)", () => {
     expect(duplicate.recovered).toBe(true);
     expect(duplicate.status).toBe("running");
     expect(duplicate.request_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
-    for (let i = 0; i < 50 && executions === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    // The seed consists of several real Git subprocesses; under the full code-loop suite it can
+    // exceed the old 250 ms timing assumption even though admission already recovered correctly.
+    for (let i = 0; i < 1_000 && executions === 0; i++) await new Promise((r) => setTimeout(r, 5));
     expect(executions).toBe(1);
 
     release();
@@ -839,6 +2036,136 @@ describe("code_loop_start caller idempotency (#251)", () => {
     expect(getJobResult(retry.work_id, workroot).kind).toBe("result");
   });
 
+  it("retains one exact feedback handle across terminal recovery and rejects purpose relabelling", async () => {
+    const request = { ...baseRequest, client_run_id: "exact-feedback-recovery", traffic_purpose: "organic" as const };
+    const deps = { ...fakeDeps({ keyAlias: "feedback-owner" }), feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" } };
+    const started = await startCodeLoop(request, startCfg(), deps);
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+    const initial = getJobResult(started.work_id, workroot);
+    if (initial.kind !== "result") throw new Error("result missing");
+    const handle = (initial.result as unknown as { feedback_handle?: string }).feedback_handle;
+    expect(handle).toMatch(/^[a-f0-9-]{36}$/);
+    expect(initial.result.summary).toBe("done");
+    const binding = getDb().prepare(`SELECT e.handle, e.traffic_purpose, d.model_id, d.source
+      FROM execution_feedback e JOIN delegations d ON d.id = e.ledger_id WHERE e.handle = ?`).get(handle!) as {
+        handle: string; traffic_purpose: string; model_id: string; source: string;
+      };
+    expect(binding).toMatchObject({ handle, traffic_purpose: "organic", model_id: "qwen3-coder-next-80b", source: "code-loop" });
+    expect(getDb().prepare("SELECT available FROM execution_feedback WHERE handle = ?").get(handle!)).toEqual({ available: 1 });
+    // Model output is durably retained separately from the exact feedback row. This simulates a
+    // crash after the terminal result was committed but before the availability publication.
+    getDb().prepare("UPDATE execution_feedback SET available = 0 WHERE handle = ?").run(handle!);
+    _resetCodeLoopStateForTests();
+    const recovered = await startCodeLoop(request, startCfg(), deps);
+    expect(recovered).toMatchObject({ ok: true, recovered: true, result: { feedback_handle: handle } });
+    if (recovered.ok) expect(recovered.result?.summary).toBe("done");
+    expect(getDb().prepare("SELECT COUNT(*) AS n, MIN(available) AS available FROM execution_feedback WHERE handle = ?").get(handle!)).toEqual({ n: 1, available: 1 });
+    const relabelled = await startCodeLoop({ ...request, traffic_purpose: "synthetic" as const }, startCfg(), deps);
+    expect(relabelled).toMatchObject({ ok: false, refusal: "conflict" });
+  });
+
+  it("withholds an exact feedback handle when the terminal durable result write fails", async () => {
+    const request = { ...baseRequest, client_run_id: "exact-feedback-persist-failure", traffic_purpose: "organic" as const };
+    const deps = fakeDeps({
+      keyAlias: "feedback-owner",
+      feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" },
+    });
+    const persistSpy = vi.spyOn(codeLoopStore, "persistDurableCodeLoopRun").mockImplementation(() => {
+      throw new Error("forced terminal persistence failure");
+    });
+    try {
+      const started = await startCodeLoop(request, startCfg(), deps);
+      if (!started.ok) throw new Error("start failed");
+      await waitForTerminal(started.work_id);
+      const result = getJobResult(started.work_id, workroot);
+      if (result.kind !== "result") throw new Error("result missing");
+      expect(result.result.feedback_handle).toBeUndefined();
+      const durable = readDurableCodeLoopRunByWork(workroot, started.work_id);
+      expect(durable).toMatchObject({ status: "running", result: null });
+      const pending = getDb().prepare(`SELECT e.available, e.traffic_purpose, d.source
+        FROM execution_feedback e JOIN delegations d ON d.id = e.ledger_id
+        WHERE d.source = 'code-loop' AND e.traffic_purpose = 'organic'
+        ORDER BY e.rowid DESC LIMIT 1`).get() as { available: number; traffic_purpose: string; source: string } | undefined;
+      expect(pending).toEqual({ available: 0, traffic_purpose: "organic", source: "code-loop" });
+    } finally {
+      persistSpy.mockRestore();
+    }
+  });
+
+  it("keeps omitted traffic purpose as unknown for a durable owner-bound result", async () => {
+    const request = { ...baseRequest, client_run_id: "exact-feedback-unknown-purpose" };
+    const deps = fakeDeps({
+      keyAlias: "feedback-owner",
+      feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" },
+    });
+    const started = await startCodeLoop(request, startCfg(), deps);
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+    const result = getJobResult(started.work_id, workroot);
+    if (result.kind !== "result") throw new Error("result missing");
+    const handle = result.result.feedback_handle;
+    expect(handle).toMatch(/^[a-f0-9-]{36}$/);
+    expect(getDb().prepare("SELECT traffic_purpose, available FROM execution_feedback WHERE handle = ?").get(handle!)).toEqual({ traffic_purpose: "unknown", available: 1 });
+  });
+
+  it.each([
+    {
+      name: "failed",
+      clientRunId: "exact-feedback-failed",
+      engineRun: async (): Promise<EngineRunResult> => ({
+        outcome: "arm-error",
+        usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+        finalMessage: "",
+        unparseableLines: 0,
+        detail: "forced failure",
+      }),
+    },
+    {
+      name: "truncated",
+      clientRunId: "exact-feedback-truncated",
+      engineRun: async (sandboxDir: string): Promise<EngineRunResult> => {
+        writeFileSync(join(sandboxDir, "a.ts"), `${"x".repeat(220 * 1024)}\n`);
+        return {
+          outcome: "completed",
+          usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+          finalMessage: "large diff",
+          unparseableLines: 0,
+          detail: "",
+        };
+      },
+    },
+    {
+      name: "withheld",
+      clientRunId: "exact-feedback-withheld",
+      engineRun: async (): Promise<EngineRunResult> => ({
+        outcome: "completed",
+        usage: { turns: 1, wall_ms: 1, prompt_tokens: 1, completion_tokens: 1 },
+        finalMessage: "",
+        unparseableLines: 0,
+        detail: "",
+      }),
+    },
+  ])("does not mint an exact feedback handle for $name output", async ({ clientRunId, engineRun }) => {
+    const before = getDb().prepare("SELECT COUNT(*) AS n FROM execution_feedback").get() as { n: number };
+    const request = { ...baseRequest, client_run_id: clientRunId, traffic_purpose: "organic" as const };
+    const deps = fakeDeps({
+      keyAlias: "feedback-owner",
+      feedbackOwner: { alias: "feedback-owner", keyHash: "owner-hash" },
+      engineRun,
+    });
+    const started = await startCodeLoop(request, startCfg(), deps);
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+    const result = getJobResult(started.work_id, workroot);
+    if (result.kind !== "result") throw new Error("result missing");
+    expect(result.result.feedback_handle).toBeUndefined();
+    if (clientRunId === "exact-feedback-truncated") expect(result.result.diff_truncated).toBe(true);
+    if (clientRunId === "exact-feedback-withheld") expect(result.result.summary).toBe("");
+    const after = getDb().prepare("SELECT COUNT(*) AS n FROM execution_feedback").get() as { n: number };
+    expect(after.n).toBe(before.n);
+  });
+
   it("fails closed when a cached terminal result predates the current harness evidence contract", async () => {
     const request = { ...baseRequest, client_run_id: "legacy-terminal-result" };
     const started = await startCodeLoop(request, startCfg(), fakeDeps());
@@ -856,6 +2183,34 @@ describe("code_loop_start caller idempotency (#251)", () => {
     cached.result.execution.harness_version = "code-loop-pi-2026-07-14-v4";
     cached.result.execution.capabilities.agent_checks = "pi-bash-events-v1";
     cached.result.agent_checks.schema_version = 1;
+    writeFileSync(clientPath, JSON.stringify(cached));
+
+    _resetCodeLoopStateForTests();
+    const recovered = await startCodeLoop(request, startCfg(), fakeDeps());
+    expect(recovered).toMatchObject({ ok: true, recovered: true, status: "completed" });
+    if (!recovered.ok) return;
+    expect(recovered.result).toBeUndefined();
+    expect(getJobResult(recovered.work_id, workroot)).toEqual({
+      kind: "terminal-unavailable",
+      status: "completed",
+    });
+  });
+
+  it("fails closed when a cached v8 result reports turns beyond its effective cap", async () => {
+    const request = { ...baseRequest, client_run_id: "over-cap-terminal-result" };
+    const started = await startCodeLoop(request, startCfg(), fakeDeps());
+    if (!started.ok) throw new Error("start failed");
+    await waitForTerminal(started.work_id);
+
+    const clientPath = join(
+      workroot,
+      ".code-loop-state-v1",
+      `client-${createHash("sha256").update(request.client_run_id).digest("hex")}.json`,
+    );
+    const cached = JSON.parse(readFileSync(clientPath, "utf8")) as {
+      result: { usage: { turns: number }; execution: { effective_caps: { turns: number } } };
+    };
+    cached.result.usage.turns = cached.result.execution.effective_caps.turns + 1;
     writeFileSync(clientPath, JSON.stringify(cached));
 
     _resetCodeLoopStateForTests();
@@ -1730,6 +3085,26 @@ describe("isCodeLoopUnitName", () => {
 });
 
 describe("sweepCodeLoopSandboxes", () => {
+  it("reclaims stale trusted Git metadata but preserves a live peer's directory", async () => {
+    const staleWorkId = "cl-20260714-deadbeef";
+    const liveWorkId = "cl-20260714-cafebabe";
+    const trustedRoot = join(workroot, ".code-loop-host-git");
+    mkdirSync(join(trustedRoot, staleWorkId), { recursive: true, mode: 0o700 });
+    mkdirSync(join(trustedRoot, liveWorkId), { recursive: true, mode: 0o700 });
+    const lease = acquireDurableCodeLoopLease(workroot, liveWorkId, () => true);
+    expect(lease.kind).toBe("acquired");
+    if (lease.kind !== "acquired") return;
+
+    await sweepCodeLoopSandboxes(
+      { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+      { now: () => Date.now(), stopUnit: async () => {} },
+    );
+
+    expect(existsSync(join(trustedRoot, staleWorkId))).toBe(false);
+    expect(existsSync(join(trustedRoot, liveWorkId))).toBe(true);
+    lease.lease.release();
+  });
+
   it("does not orphan a running sandbox owned by an overlapping live gateway process", async () => {
     const workId = "cl-20260714-cafebabe";
     const lease = acquireDurableCodeLoopLease(workroot, workId, () => true);
@@ -2003,5 +3378,156 @@ describe("sweepCodeLoopSandboxes", () => {
     );
     expect(result.reclaimed).toBe(0);
     expect(getJobResult(started.work_id, workroot)).toEqual({ kind: "terminal-unavailable", status: "completed" });
+  });
+});
+
+
+describe("optional whole-job deadline", () => {
+  it("stops an admission probe and never acquires a GPU lease after the shared deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const deps = fakeDeps();
+    deps.acquireLease = vi.fn(deps.acquireLease);
+    deps.engine.run = vi.fn(deps.engine.run);
+    let probeResolve!: () => void;
+    const probeStarted = { promise: new Promise<void>(resolve => { probeResolve = resolve; }), resolve: () => probeResolve() };
+    deps.cageSelfTest = async (signal?: AbortSignal) => {
+      probeStarted.resolve();
+      return new Promise(resolve => signal?.addEventListener("abort", () => resolve({ ok: false, failures: ["deadline"] }), { once: true }));
+    };
+    try {
+      const started = startCodeLoop({ instruction: "fix x", files: [{ path: "a.ts", content: "x" }], caps: { total_wall_s: 180 } }, startCfg({ confinement: "required" }), deps);
+      await Promise.race([probeStarted.promise, started.then(result => { throw new Error(`Admission finished before the probe: ${JSON.stringify(result)}`); })]);
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(await started).toMatchObject({ ok: false, refusal: "deadline-exceeded" });
+      expect(deps.acquireLease).not.toHaveBeenCalled();
+      expect(deps.engine.run).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  for (const [cleanupFails, peerClearsPending] of [[false, false], [true, false], [true, true]] as const) {
+    it(`retains resources until exact cleanup, including peer-cleared durable state (failure=${cleanupFails}, peer=${peerClearsPending})`, async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const deps = fakeDeps();
+      const release = vi.fn(async () => {});
+      deps.acquireLease = async () => ({ release });
+      let engineEntered!: () => void;
+      const entered = new Promise<void>(resolve => { engineEntered = resolve; });
+      let observedSignal: AbortSignal | undefined;
+      deps.engine.run = async options => {
+        observedSignal = options.signal;
+        engineEntered();
+        return await new Promise(resolve => options.signal?.addEventListener("abort", () => resolve({
+          outcome: "cap-exceeded", usage: { turns: 0, wall_ms: 105_000, prompt_tokens: 0, completion_tokens: 0 },
+          finalMessage: "withhold this", unparseableLines: 0, detail: "aborted",
+        }), { once: true }));
+      };
+      const ownerCheck = vi.fn();
+      const runCommand = deps.runCommand;
+      deps.runCommand = async (argv, options) => {
+        if (argv.includes("OWNER_CHECK")) ownerCheck();
+        return runCommand(argv, options);
+      };
+      deps.cleanupUnit = async () => { if (cleanupFails) throw new Error("manager unavailable"); };
+      try {
+        const started = await startCodeLoop({ instruction: "fix x", files: [{ path: "a.ts", content: "x" }], check_cmd: "OWNER_CHECK", caps: { wall_s: 120, total_wall_s: 180 } }, startCfg(), deps);
+        if (!started.ok) throw new Error(JSON.stringify(started));
+        await entered;
+        expect(getJobStatus(started.work_id)?.status).toBe("running");
+        await vi.advanceTimersByTimeAsync(105_000);
+        expect(observedSignal?.aborted).toBe(true);
+        const terminal = getJobResult(started.work_id);
+        expect(terminal).toMatchObject({ kind: "result", result: { status: cleanupFails ? "arm-error" : "cap-exceeded", diff: "", summary: "", check: { ran: false }, execution: { effective_caps: { total_wall_s: 180 }, whole_job: { budget_s: 180, cleanup_complete: !cleanupFails } } } });
+        expect(release).toHaveBeenCalledTimes(cleanupFails ? 0 : 1);
+        expect(ownerCheck).not.toHaveBeenCalled();
+        expect(readDurableCodeLoopRunByWork(workroot, started.work_id)?.cleanup_pending).toBe(cleanupFails);
+        if (cleanupFails) {
+          const next = { instruction: "next", files: [{ path: "next.ts", content: "next" }] };
+          expect(await startCodeLoop(next, startCfg(), fakeDeps())).toMatchObject({ ok: false, refusal: "busy" });
+          await expect(sweepCodeLoopSandboxes(
+            { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+            { now: Date.now, stopUnit: async () => { throw new Error("still unavailable"); } },
+          )).rejects.toThrow("still unavailable");
+          expect(release).not.toHaveBeenCalled();
+          if (peerClearsPending) {
+            // A new gateway process has its own memory table: it can prove absence and clear
+            // the durable bit without owning this process's lease-release closures.
+            const record = readDurableCodeLoopRunByWork(workroot, started.work_id)!;
+            codeLoopStore.persistDurableCodeLoopRun(workroot, { ...record, cleanup_pending: false });
+          }
+          const stopUnit = vi.fn(async () => {});
+          await sweepCodeLoopSandboxes(
+            { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+            { now: Date.now, stopUnit },
+          );
+          expect(stopUnit).toHaveBeenCalledWith(`code-loop-${started.work_id}`);
+          expect(release).toHaveBeenCalledTimes(1);
+          expect(await startCodeLoop(next, startCfg(), fakeDeps({ lease: "unavailable" }))).toMatchObject({ ok: false, refusal: "lease-unavailable" });
+        }
+      } finally { vi.useRealTimers(); }
+    });
+  }
+
+  it("refuses fresh admission while a prior process left a durable cleanup obligation", async () => {
+    claimDurableCodeLoopRun(workroot, {
+      schema_version: 1, client_run_id: "prior-process", request_fingerprint: "sha256:" + "a".repeat(64),
+      work_id: "cl-20261017-1234abcd", status: "arm-error", usage: { turns: 0, wall_ms: 1, prompt_tokens: 0, completion_tokens: 0 },
+      result: null, started_at_ms: Date.now(), cleanup_pending: true,
+    });
+    const deps = fakeDeps();
+    deps.acquireLease = vi.fn(deps.acquireLease);
+    expect(await startCodeLoop({ instruction: "next", files: [{ path: "next.ts", content: "next" }] }, startCfg(), deps)).toMatchObject({ ok: false, refusal: "cage-unavailable" });
+    expect(deps.acquireLease).not.toHaveBeenCalled();
+  });
+
+  it("releases a lease granted after admission expiry without starting the engine", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const deps = fakeDeps();
+    const release = vi.fn(async () => {});
+    let enteredLease!: () => void;
+    const entered = new Promise<void>(resolve => { enteredLease = resolve; });
+    let grant!: (lease: { release: () => Promise<void> }) => void;
+    deps.acquireLease = async () => { enteredLease(); return await new Promise(resolve => { grant = resolve; }); };
+    deps.engine.run = vi.fn(deps.engine.run);
+    try {
+      const started = startCodeLoop({ instruction: "x", files: [{ path: "a.ts", content: "x" }], caps: { total_wall_s: 180 } }, startCfg(), deps);
+      await entered;
+      await vi.advanceTimersByTimeAsync(120_000);
+      grant({ release });
+      expect(await started).toMatchObject({ ok: false, refusal: "deadline-exceeded" });
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(deps.engine.run).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("aborts an active owner verifier and forbids subsequent schema checks", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const deps = fakeDeps();
+    let enteredCheck!: () => void;
+    const entered = new Promise<void>(resolve => { enteredCheck = resolve; });
+    const runCommand = deps.runCommand;
+    const laterCheck = vi.fn();
+    deps.runCommand = async (argv, options) => {
+      if (argv.includes("OWNER_CHECK")) {
+        enteredCheck();
+        return await new Promise(resolve => options.signal?.addEventListener("abort", () => resolve({ code: null, stdout: "", stderr: "aborted" }), { once: true }));
+      }
+      if (argv.includes("SCHEMA_CHECK")) laterCheck();
+      return runCommand(argv, options);
+    };
+    try {
+      const started = await startCodeLoop({ instruction: "x", files: [{ path: "a.ts", content: "x" }], check_cmd: "OWNER_CHECK", schema_checks: [{ name: "later", command: "SCHEMA_CHECK" }], caps: { total_wall_s: 180 } }, startCfg(), deps);
+      if (!started.ok) throw new Error(JSON.stringify(started));
+      await entered;
+      await vi.advanceTimersByTimeAsync(105_000);
+      expect(getJobResult(started.work_id)).toMatchObject({ kind: "result", result: { status: "cap-exceeded", diff: "", summary: "", check: { ran: true, exit_code: null }, schema_grounding: { state: "skipped" } } });
+      expect(laterCheck).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("binds an explicit whole-job deadline without changing deployed legacy fingerprints", () => {
+    const request = { instruction: "x", files: [{ path: "a.ts", content: "x" }], caps: { wall_s: 30 } };
+    expect(codeLoopRequestFingerprint({ ...request, caps: { ...request.caps, total_wall_s: 180 } })).not.toBe(codeLoopRequestFingerprint(request));
   });
 });

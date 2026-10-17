@@ -11,14 +11,14 @@ import {
   DEFAULT_SCOUT_GATE_CONFIG,
 } from "../src/homeserver/scout-gate.js";
 
-// The actual model the Scout auto-promoted (issue #176).
+// The actual model an earlier autonomous path promoted (issue #176).
 const INCIDENT_ID = "yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF";
 const INCIDENT_SCORES = { sql: 1.0, "code-review": 1.0, "reason-hard": 0.5, "code-implement": 0.9 };
 
-describe("evaluateScoutGate — the #176 incident must not be auto-servable", () => {
+describe("evaluateScoutGate — the #176 incident must require evidence review", () => {
   it("flags the benchmark-gamed model on BOTH plausibility and name", () => {
     const r = evaluateScoutGate({ id: INCIDENT_ID, scoresByTaskType: INCIDENT_SCORES });
-    expect(r.autoServable).toBe(false);
+    expect(r.passesSafetyChecks).toBe(false);
     expect(r.flags.some((f) => f.includes("implausible-capability"))).toBe(true);
     expect(r.flags.some((f) => f.includes("name-gaming-tell"))).toBe(true);
   });
@@ -28,7 +28,7 @@ describe("evaluateScoutGate — the #176 incident must not be auto-servable", ()
       id: "Qwen/Qwen3-Coder-Next-80B-Instruct",
       scoresByTaskType: { sql: 1.0, "code-review": 0.0, "reason-hard": 0.5, "code-implement": 0.8 },
     });
-    expect(r.autoServable).toBe(true);
+    expect(r.passesSafetyChecks).toBe(true);
     expect(r.flags).toEqual([]);
   });
 
@@ -37,7 +37,7 @@ describe("evaluateScoutGate — the #176 incident must not be auto-servable", ()
       id: "mistralai/Mixtral-8x7B-Instruct-v0.1",
       scoresByTaskType: { sql: 0.5, "code-review": 0.0 },
     });
-    expect(r.autoServable).toBe(true);
+    expect(r.passesSafetyChecks).toBe(true);
   });
 });
 

@@ -107,6 +107,48 @@ describe("validateCodeLoopRequest — bounds", () => {
     expect(r.ok).toBe(false);
   });
 
+  it("rejects alternate path spellings and globs before admission", () => {
+    for (const path of ["C:\\temp\\a.ts", "src\\a.ts", "*.ts", "sub/.git/config"]) {
+      const r = validateCodeLoopRequest({ instruction: "do it", files: [{ path, content: "x" }] }, CAPS);
+      expect(r.ok).toBe(false);
+    }
+    const duplicate = validateCodeLoopRequest({
+      instruction: "do it",
+      files: [{ path: "src/a.ts", content: "x" }, { path: "src/./a.ts", content: "y" }],
+    }, CAPS);
+    expect(duplicate.ok).toBe(false);
+  });
+
+  it("validates writable and protected scopes as bounded relative POSIX globs", () => {
+    expect(validateCodeLoopRequest({
+      instruction: "do it",
+      files: okFiles,
+      writable: ["src/**", "new-?.ts"],
+      protected: ["**/*.lock"],
+    }, CAPS).ok).toBe(true);
+
+    for (const writable of [["../escape"], ["C:\\escape"], [".git/config"], ["a".repeat(513)]]) {
+      expect(validateCodeLoopRequest({ instruction: "do it", files: okFiles, writable }, CAPS).ok).toBe(false);
+    }
+    expect(validateCodeLoopRequest({
+      instruction: "do it",
+      files: okFiles,
+      writable: Array.from({ length: 65 }, (_, index) => `file-${index}.ts`),
+    }, CAPS).ok).toBe(false);
+  });
+
+  it("rejects an implicitly writable generated seed but allows broad scope with hygiene filtering", () => {
+    expect(validateCodeLoopRequest({
+      instruction: "do it",
+      files: [{ path: "__pycache__/mod.pyc", content: "x" }],
+    }, CAPS).ok).toBe(false);
+    expect(validateCodeLoopRequest({
+      instruction: "do it",
+      files: okFiles,
+      writable: ["**/*"],
+    }, CAPS).ok).toBe(true);
+  });
+
   it("accepts a valid request and returns clamped caps", () => {
     const r = validateCodeLoopRequest({ instruction: "do it", files: okFiles }, CAPS);
     expect(r.ok).toBe(true);

@@ -15,8 +15,9 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   await rename(temporary, path);
 }
 
-async function runChild(command: string[]): Promise<number> {
+async function runChild(command: string[], _opened: unknown, signal: AbortSignal): Promise<number> {
   return new Promise((resolve, reject) => {
+    let abortKillTimer: NodeJS.Timeout | undefined;
     const child = spawn(command[0]!, command.slice(1), {
       stdio: "inherit",
       env: childEnvironmentWithoutMaintenanceKey(process.env),
@@ -24,11 +25,21 @@ async function runChild(command: string[]): Promise<number> {
     const forward = (signal: NodeJS.Signals): void => {
       if (!child.killed) child.kill(signal);
     };
+    const abortForExpiry = (): void => {
+      if (!child.killed) {
+        child.kill("SIGTERM");
+        abortKillTimer = setTimeout(() => child.kill("SIGKILL"), 3_000);
+        abortKillTimer.unref();
+      }
+    };
+    signal.addEventListener("abort", abortForExpiry, { once: true });
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, forward);
     const cleanup = (): void => {
       for (const forwarded of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
         process.removeListener(forwarded, forward);
       }
+      signal.removeEventListener("abort", abortForExpiry);
+      if (abortKillTimer) clearTimeout(abortKillTimer);
     };
     child.once("error", (error) => {
       cleanup();

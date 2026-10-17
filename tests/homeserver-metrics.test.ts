@@ -23,6 +23,7 @@ let recordRateLimited: typeof import("../src/homeserver/metrics.js").recordRateL
 let recordTtft: typeof import("../src/homeserver/metrics.js").recordTtft;
 let inflightInc: typeof import("../src/homeserver/metrics.js").inflightInc;
 let inflightDec: typeof import("../src/homeserver/metrics.js").inflightDec;
+let currentM5InflightRequests: typeof import("../src/homeserver/metrics.js").currentM5InflightRequests;
 let renderMetrics: typeof import("../src/homeserver/metrics.js").renderMetrics;
 
 let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
@@ -85,6 +86,7 @@ beforeAll(async () => {
   recordTtft = metricsMod.recordTtft;
   inflightInc = metricsMod.inflightInc;
   inflightDec = metricsMod.inflightDec;
+  currentM5InflightRequests = metricsMod.currentM5InflightRequests;
   renderMetrics = metricsMod.renderMetrics;
 
   const ks = await import("../src/homeserver/keystore.js");
@@ -367,6 +369,16 @@ describe("metrics unit — in-flight concurrency gauge", () => {
     inflightDec("guest");
     const output = renderMetrics();
     expect(output).toMatch(/homeserver_inflight_requests\s+0/);
+  });
+
+  it("reports current M5 activity without counting Orin work", () => {
+    inflightInc("owner", "m5");
+    inflightInc("owner", "orin");
+    expect(currentM5InflightRequests()).toBe(1);
+    inflightDec("owner", "orin");
+    expect(currentM5InflightRequests()).toBe(1);
+    inflightDec("owner", "m5");
+    expect(currentM5InflightRequests()).toBe(0);
   });
 });
 

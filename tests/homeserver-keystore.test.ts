@@ -5,11 +5,15 @@ import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import {
   mintKey,
+  grantSystemOneModel,
+  grantEmbeddingModelToCustomerKeys,
+  grantExistingChatModelToCustomerKeys,
   lookupKey,
   revokeKey,
   listKeys,
   hashKey,
   rotateKey,
+  stageKeyRotation,
   nextFreeAlias,
   KeyAliasExistsError,
   createInvite,
@@ -33,6 +37,92 @@ function alias(): string {
 }
 
 describe("keystore mint / lookup", () => {
+  it("grants EmbeddingGemma to exact active customer aliases and leaves all other key state intact", () => {
+    const open = mintKey({ alias: alias(), tier: "guest", scope: "inference", creditLimit: 100 }, DEFAULTS);
+    const scoped = mintKey({ alias: alias(), tier: "guest", scope: "inference",
+      modelAllowList: ["mellum"] }, DEFAULTS);
+    const monitor = mintKey({ alias: alias(), tier: "guest", scope: "monitor" }, DEFAULTS);
+    const before = lookupKey(open.plaintextKey)!;
+    expect(() => grantEmbeddingModelToCustomerKeys([open.record.alias, monitor.record.alias], "embeddinggemma-2"))
+      .toThrow();
+    expect(lookupKey(open.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+    expect(grantEmbeddingModelToCustomerKeys([open.record.alias, scoped.record.alias], "embeddinggemma-2"))
+      .toEqual({ changed: [open.record.alias, scoped.record.alias], unchanged: [] });
+    expect(grantEmbeddingModelToCustomerKeys([open.record.alias], "embeddinggemma-2"))
+      .toEqual({ changed: [], unchanged: [open.record.alias] });
+    const after = lookupKey(open.plaintextKey)!;
+    expect(after.embeddingModelAllowList).toEqual(["embeddinggemma-2"]);
+    expect(after.modelAllowList).toEqual(before.modelAllowList);
+    expect(after.systemOneModelAllowList).toEqual(before.systemOneModelAllowList);
+    expect(after.keyHash).toBe(before.keyHash);
+    expect(after.creditLimit).toBe(before.creditLimit);
+    expect(after.creditsUsed).toBe(before.creditsUsed);
+    expect(() => grantEmbeddingModelToCustomerKeys([open.record.alias], "clef-flash")).toThrow();
+    expect(() => grantEmbeddingModelToCustomerKeys([open.record.alias, open.record.alias], "embeddinggemma-2"))
+      .toThrow();
+  });
+
+  it("rejects an embedding grant during a staged rotation so the successor cannot silently lose it", () => {
+    const current = mintKey({ alias: alias(), tier: "guest", scope: "inference" }, DEFAULTS);
+    const staged = stageKeyRotation(current.record.alias, {}, DEFAULTS);
+    expect(() => grantEmbeddingModelToCustomerKeys([current.record.alias], "embeddinggemma-2"))
+      .toThrow();
+    expect(lookupKey(current.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+    expect(lookupKey(staged.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+  });
+
+  it("atomically adds the existing Qwen chat model only to restricted customer keys", () => {
+    const restricted = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: ["mellum"], creditLimit: 100 }, DEFAULTS);
+    const open = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: [], creditLimit: 200 }, DEFAULTS);
+    const internal = mintKey({ alias: alias(), tier: "owner", scope: "agent", modelAllowList: ["mellum"] }, DEFAULTS);
+    const before = lookupKey(restricted.plaintextKey)!;
+
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, "missing"], "qwen3-30b-instruct"))
+      .toThrow();
+    expect(lookupKey(restricted.plaintextKey)!.modelAllowList).toEqual(["mellum"]);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, internal.record.alias], "qwen3-30b-instruct"))
+      .toThrow();
+    expect(lookupKey(restricted.plaintextKey)!.modelAllowList).toEqual(["mellum"]);
+
+    expect(grantExistingChatModelToCustomerKeys([restricted.record.alias, open.record.alias], "qwen3-30b-instruct"))
+      .toEqual({ changed: [restricted.record.alias], unchanged: [open.record.alias] });
+    expect(grantExistingChatModelToCustomerKeys([restricted.record.alias], "qwen3-30b-instruct"))
+      .toEqual({ changed: [], unchanged: [restricted.record.alias] });
+    const after = lookupKey(restricted.plaintextKey)!;
+    expect(after.modelAllowList).toEqual(["mellum", "qwen3-30b-instruct"]);
+    expect(after.keyHash).toBe(before.keyHash);
+    expect(after.creditLimit).toBe(before.creditLimit);
+    expect(after.creditsUsed).toBe(before.creditsUsed);
+    expect(after.useCount).toBe(before.useCount);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias], "clef-flash")).toThrow();
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, restricted.record.alias], "qwen3-30b-instruct"))
+      .toThrow();
+    const revoked = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: ["mellum"] }, DEFAULTS);
+    revokeKey(revoked.record.alias);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, revoked.record.alias], "qwen3-30b-instruct"))
+      .toThrow();
+    const expiring = mintKey({ alias: alias(), tier: "guest", scope: "inference", modelAllowList: ["mellum"],
+      ttlSeconds: 3600 }, DEFAULTS);
+    expect(() => grantExistingChatModelToCustomerKeys([restricted.record.alias, expiring.record.alias],
+      "qwen3-30b-instruct", new Date(Date.now() + 7200 * 1000))).toThrow();
+    expect(lookupKey(expiring.plaintextKey)!.modelAllowList).toEqual(["mellum"]);
+  });
+
+  it("grants a decision model without changing an existing credential or ordinary model access", () => {
+    const key = mintKey({ alias: alias(), tier: "guest", modelAllowList: [], creditLimit: 100 }, DEFAULTS);
+    const before = lookupKey(key.plaintextKey)!;
+    expect(before.systemOneModelAllowList).toEqual([]);
+    expect(grantSystemOneModel(before.alias, "clef-flash")).toBe(true);
+    expect(grantSystemOneModel(before.alias, "clef-flash")).toBe(false);
+    const after = lookupKey(key.plaintextKey)!;
+    expect(after.modelAllowList).toEqual([]);
+    expect(after.systemOneModelAllowList).toEqual(["clef-flash"]);
+    expect(after.keyHash).toBe(before.keyHash);
+    expect(after.creditLimit).toBe(before.creditLimit);
+    expect(after.creditsUsed).toBe(before.creditsUsed);
+    expect(after.useCount).toBe(before.useCount);
+  });
+
   it("defaults new owner keys to agent, guest keys to inference, and preserves explicit scope", () => {
     const owner = mintKey({ alias: alias(), tier: "owner" }, DEFAULTS);
     expect(owner.record.scope).toBe("agent");
@@ -346,6 +436,8 @@ describe("rotateKey (#99)", () => {
       { alias: base, tier: "guest", modelAllowList: ["m1"], rpm: 7, tpm: 700, dailyTokenBudget: 70, maxParallel: 3, creditLimit: 5000 },
       DEFAULTS
     );
+    grantSystemOneModel(base, "clef-flash");
+    grantEmbeddingModelToCustomerKeys([base], "embeddinggemma-2");
     // Rotate WITHOUT re-specifying tier/limits — they must be inherited.
     const rot = rotateKey(base, {}, DEFAULTS);
     expect(rot.newAlias).toBe(`${base}-r2`);
@@ -356,6 +448,8 @@ describe("rotateKey (#99)", () => {
     expect(live.alias).toBe(`${base}-r2`);
     expect(live.tier).toBe("guest");
     expect(live.modelAllowList).toEqual(["m1"]);
+    expect(live.systemOneModelAllowList).toEqual(["clef-flash"]);
+    expect(live.embeddingModelAllowList).toEqual(["embeddinggemma-2"]);
     expect(live.rpm).toBe(7);
     expect(live.creditLimit).toBe(5000);
     expect(live.creditsUsed).toBe(0); // fresh balance

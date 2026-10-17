@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createNetServer, type Server as NetServer } from "node:net";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.js";
+import { closeDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { runChatCompletion } from "../src/homeserver/mcp.js";
 import { AdmissionController } from "../src/homeserver/admission.js";
@@ -169,10 +169,12 @@ let bodyResetServer: NetServer;
 let bodyResetPort = 0;
 let bodyResetGatewayPort = 0;
 let stopBodyResetGateway: (() => Promise<void>) | null = null;
+let runtimeDir = "";
+const ORIGINAL_FEEDBACK_FILE = process.env["HOMESERVER_FEEDBACK_FILE"];
 
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), "hs-degrade-test-"));
-  initDb(join(dir, "test.db"));
+  runtimeDir = mkdtempSync(join(tmpdir(), "hs-degrade-test-"));
+  initDb(join(runtimeDir, "test.db"));
   await startUpstream();
 
   // Find a dead port (bind then immediately close) for the connection-refused gateway.
@@ -189,6 +191,9 @@ beforeAll(async () => {
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
+  // Keep the public feedback route's append-only store outside the repository. The oversized
+  // body test below is rejected before writing, but the suite's route setup remains hermetic.
+  process.env["HOMESERVER_FEEDBACK_FILE"] = join(runtimeDir, "feedback.jsonl");
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   // SHORT timeout so the "hang" case trips the upstream_timeout path quickly.
@@ -255,6 +260,10 @@ afterAll(async () => {
   if (stopBodyResetGateway) await stopBodyResetGateway();
   await new Promise<void>((r) => upstream.close(() => r()));
   await new Promise<void>((r) => bodyResetServer.close(() => r()));
+  closeDb();
+  rmSync(runtimeDir, { recursive: true, force: true });
+  if (ORIGINAL_FEEDBACK_FILE === undefined) delete process.env["HOMESERVER_FEEDBACK_FILE"];
+  else process.env["HOMESERVER_FEEDBACK_FILE"] = ORIGINAL_FEEDBACK_FILE;
 });
 
 beforeEach(() => {
@@ -683,7 +692,14 @@ describe("R6 graceful degradation — MCP runChatCompletion upstream failures", 
       maxTokens: 16,
     });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.code).toBe("upstream_error");
+    if (!r.ok) {
+      expect(r.code).toBe("upstream_error");
+      expect(r.reason).toBe("upstream_connection_failed");
+      expect(r.layer).toBe("model_backend");
+      expect(r.retryable).toBe(true);
+      expect(r.retryAfterSeconds).toBe(cfg.busyRetryAfterSeconds);
+      expect(r.message).not.toContain("127.0.0.1");
+    }
     // C2: a failed upstream call is never billed.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
   });
@@ -746,4 +762,56 @@ describe("R6 graceful degradation — MCP runChatCompletion upstream failures", 
     // C2: a failed call is never billed.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
   });
+
+  it.each(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"])(
+    "M2: %s from fetch → MCP request_log records upstream_timeout / status=504 / 0 credits",
+    async (code) => {
+      // Undici emits these as a TypeError with a cause code. Stub fetch so the MCP path sees the
+      // exact runtime shape without depending on timing or a live upstream.
+      const originalFetch = globalThis.fetch;
+      const timeoutError = () => Object.assign(new TypeError("fetch failed"), { cause: { code } });
+      globalThis.fetch = (async () => {
+        if (code === "UND_ERR_HEADERS_TIMEOUT") throw timeoutError();
+        return {
+          status: 200,
+          text: async () => {
+            throw timeoutError();
+          },
+        } as Response;
+      }) as typeof fetch;
+
+      const alias = `mcp-deg-${code.toLowerCase()}`;
+      const k = mintKey({ alias, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+      const rec = lookupKey(k.plaintextKey)!;
+      const cfg = { ...loadConfig(), requestLog: "on" as const };
+      const controller = new AdmissionController({ maxInflight: 2, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
+      const principal = makePrincipal(rec);
+
+      try {
+        const r = await runChatCompletion(principal, cfg, controller, noopInflight, {
+          model: "m1",
+          messages: [{ role: "user", content: "hi" }],
+          maxTokens: 16,
+        });
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.code).toBe("upstream_error");
+          expect(r.traceOutcome).toBe("upstream_timeout");
+          expect(r.traceErrorClass).toBe("upstream_timeout");
+          expect(r.reason).toBe("upstream_timeout");
+          expect(r.layer).toBe("model_backend");
+          expect(r.retryable).toBe(true);
+          expect(r.retryAfterSeconds).toBe(cfg.busyRetryAfterSeconds);
+        }
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+
+      const log = getRequestLog(200).find((r) => r.alias === alias);
+      expect(log).toBeDefined();
+      expect(log?.outcome).toBe("upstream_timeout");
+      expect(log?.status).toBe(504);
+      expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    },
+  );
 });

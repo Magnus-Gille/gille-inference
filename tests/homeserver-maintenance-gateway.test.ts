@@ -280,7 +280,7 @@ describe("repository-owned exclusive window API couples the fence to the GPU lea
   });
 });
 
-// #105 follow-up: an unattended batch job (weekly Model Scout) engages maintenance mode around
+// #105 follow-up: an unattended evaluation job may engage maintenance mode around
 // an ephemeral GPU test window via this exact HTTP route. ttlSeconds is the crash-safety net —
 // if the job dies before it can POST {on:false}, guests must not stay locked out forever.
 describe("/admin/maintenance ttlSeconds — auto-expiry safety net (#105)", () => {

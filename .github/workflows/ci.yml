@@ -88,3 +88,6 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Native System One adapter contract
+        run: python3 tests/test_systemone_native_server.py -v

@@ -118,7 +118,7 @@ async function listedTools(key: string): Promise<Array<{ name: string; descripti
 }
 
 const CODE_LOOP_TOOLS = ["code_loop_start", "code_loop_status", "code_loop_result"];
-const TOOLS_WITH_OUTPUT_SCHEMAS = ["list_models", "ask", ...CODE_LOOP_TOOLS];
+const TOOLS_WITH_OUTPUT_SCHEMAS = ["tokenize", "list_models", "ask", ...CODE_LOOP_TOOLS];
 
 describe("LearningTaskContract authenticated preflight", () => {
   it("does not advertise the learning seam without authentication", async () => {
@@ -190,8 +190,9 @@ describe("code_loop_* visibility in tools/list", () => {
   it("advertises the exact harness and evidence contract before a paid start", async () => {
     const start = (await listedTools(ownerKey)).find((tool) => tool.name === "code_loop_start");
     expect(start?.description).toContain(
-      "contract[harness=code-loop-pi-2026-07-14-v6;agent_checks=pi-bash-events-v3;schema=3;max_attempts=1000]"
+      "contract[harness=code-loop-pi-2026-09-05-v9;agent_checks=pi-bash-events-v3;result_scope=writable-v1;completion_accounting=bounded-turns-v1;schema=3;max_attempts=1000]"
     );
+    expect(start?.inputSchema?.properties).toHaveProperty("writable");
   });
 
   it("makes the delegate-or-not contract discoverable without starting a job", async () => {
@@ -222,7 +223,7 @@ describe("code_loop_* visibility in tools/list", () => {
     for (const value of ["running", "completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]) {
       expect(schemaText).toContain(value);
     }
-    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
+    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
       expect(schemaText).toContain(refusal);
     }
   });
