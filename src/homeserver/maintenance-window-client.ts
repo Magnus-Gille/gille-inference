@@ -39,6 +39,8 @@ export interface MaintenanceWindowClientDependencies {
     command: string[],
     opened: MaintenanceWindowOpeningEvidence,
     signal: AbortSignal,
+    /** Absolute deadline already clamped to both server expiry and requested TTL. */
+    childDeadlineAt: number,
   ): Promise<number>;
   now?: () => number;
   /** A runtime supervisor may retain exclusion when shutdown/restoration cannot be proved.
@@ -133,6 +135,7 @@ export async function runMaintenanceWindowCommand(
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
       throw new Error("exclusive maintenance window has insufficient TTL remaining for safe child execution");
     }
+    const childDeadlineAt = (deps.now ?? Date.now)() + remainingMs;
     const childAbort = new AbortController();
     const expiryTimer = setTimeout(
       () => childAbort.abort(new Error("exclusive maintenance window is nearing expiry")),
@@ -140,7 +143,7 @@ export async function runMaintenanceWindowCommand(
     );
     expiryTimer.unref();
     try {
-      childExitCode = await deps.runChild(plan.command, openedBody.evidence, childAbort.signal);
+      childExitCode = await deps.runChild(plan.command, openedBody.evidence, childAbort.signal, childDeadlineAt);
     } finally {
       clearTimeout(expiryTimer);
     }

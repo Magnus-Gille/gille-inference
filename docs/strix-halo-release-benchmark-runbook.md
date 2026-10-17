@@ -288,6 +288,68 @@ uses direct decoding everywhere else. Policy output paths are canonicalized so t
 input report. If either JSON/Markdown publication step fails, the writer restores and verifies the
 previous pair; an incomplete rollback is surfaced as a separate hard failure:
 
+The preferred hardware capture is the repository-owned exact-artifact runner. Its gitignored JSON
+config pins the full runtime revision and SHA-256 of `llama-server`, the Vulkan library, model,
+optional mmproj, and fixture file; it also declares every serving flag, candidate depth, and
+concurrency cell. The runtime must expose the full configured commit and the configured Vulkan
+device through `--version` and `--list-devices`. The runner hashes all artifacts before unloading
+anything and rehashes them after restoration before it can publish complete evidence,
+then Latin-rotates direct and every MTP depth so each arm occupies every execution position once.
+For direct plus depths 1 and 2 this is nine cold process/model launches, with one benchmark
+repetition per arm per cycle. Run it only as the child of the authoritative maintenance fence:
+
+```bash
+npm run maintenance:run -- \
+  --base-url http://127.0.0.1:8080 \
+  --ttl-seconds 14400 \
+  --drain-timeout-seconds 60 \
+  --evidence data/strix-benchmarks/qwen38-mtp-window.json \
+  -- npm run benchmark:strix-spec-experiment -- \
+    --config data/strix-benchmarks/qwen38-mtp-experiment.json \
+    --out-dir data/strix-benchmarks/qwen38-mtp-latin \
+    --expected-resident-model qwen38-27b \
+    --max-runtime-seconds 12000 \
+    --ack-exclusive-window
+```
+
+The wrapper supplies its TTL-clamped absolute child deadline without the maintenance credential.
+The runner refuses a missing deadline and ends work at the earlier of `--max-runtime-seconds`
+(measured from entry, including artifact preflight) and 1,800 seconds before that outer deadline.
+This reserves the complete bounded child stop and residency restoration path (about 1,578 seconds including an already in-flight unload,
+plus 222 seconds headroom). The example leaves further margin for wrapper startup. Artifact hashing
+is abortable; synchronous probes use a hard kill and the remaining work budget, with an absolute
+deadline check after each probe before any unload.
+Cleanup can continue after the work deadline; an externally killed or suspended process still
+requires operator verification and cannot promise restoration.
+
+The config must keep `status=hardware-validation-pending` and
+`promotionGate.deploymentStatus=not-authorized-by-evidence`; the validator rejects any promotion
+claim. `server.cacheIdleSlots` records the explicit cache policy, while context checkpoints,
+minimum step, cache RAM, explicit Vulkan device, GPU layers, KV types, Flash Attention,
+batch/ubatch, and parallelism are controlled fields. `cacheIdleSlots` must agree with the
+controlled `--cache-ram` value. The command refuses a changed resident model, unstable or multiple
+residency, occupied
+ephemeral port, artifact/version mismatch, malformed fixture/report, failed request, or
+signal/deadline interruption. Its external abort signal cancels in-flight benchmark requests and
+an independent SIGTERM-to-SIGKILL watchdog bounds a stuck child before restoration. Missing
+speculation counters reject that arm in the synthesized policy. The runner restores and verifies
+the pre-run ready model identity on catchable failures only after confirming that the ephemeral
+child has exited. If TERM and KILL cannot confirm termination, restoration is blocked to avoid
+starting a competing GPU resident; the incomplete receipt records
+`restoration.blockedByUnverifiedChild=true`. Cancellation is checked after the port probe and
+through readiness requests and delays, so an expired arm cannot start a new model process.
+llama-swap TTL preservation is not claimed. Simultaneous experiment and restore failures are both
+reported.
+
+Each arm's cycle reports are merged with the Latin cycle number as the paired repetition index,
+then the lossless speculation policy below is synthesized automatically. Raw reports, provenance,
+server-log hashes, merged reports, policy, and a restoration receipt are mode 0600 under a fresh,
+empty gitignored output directory. A failed run writes an explicit incomplete receipt, and policy
+JSON/Markdown publication uses the rollback-verified pair writer. The incomplete receipt records a
+bounded diagnostic plus restoration attempt/completion and ready-model verification state. The
+receipt and policy explicitly remain evidence only: this command does not edit llama-swap,
+services, routes, or deployment state.
+
 ```bash
 npm run benchmark:strix-spec-policy -- \
   --direct data/strix-benchmarks/qwen38-direct-server.json \
