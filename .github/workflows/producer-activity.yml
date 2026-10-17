@@ -1,0 +1,50 @@
+name: Native producer activity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: producer-activity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpp-activity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile and verify bounded concurrent accounting
+        run: |
+          c++ --version | head -n 1
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/producer/activity.cpp native/producer/test_activity.cpp -o "$RUNNER_TEMP/producer-test"
+          timeout 30 "$RUNNER_TEMP/producer-test"
+      - name: Prove stale and foreign handle tests reject a broken owner check
+        run: |
+          ulimit -c 0
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          source = Path('native/producer/activity.cpp').read_text()
+          before = 'if (token.owner_ != this || token.value_ == 0) return nullptr;'
+          assert source.count(before) == 1
+          mutant = Path(os.environ['RUNNER_TEMP']) / 'producer-mutant.cpp'
+          binary = Path(os.environ['RUNNER_TEMP']) / 'producer-mutant'
+          mutant.write_text(source.replace(before, 'if (token.owner_ == nullptr || token.value_ == 0) return nullptr;'))
+          subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-pthread',
+              '-I', str(Path('native/producer').resolve()), str(mutant),
+              'native/producer/test_activity.cpp', '-o', str(binary)], check=True, timeout=30)
+          result = subprocess.run([str(binary)], capture_output=True, timeout=30, check=False)
+          if result.returncode != -signal.SIGABRT:
+              raise SystemExit('owner-check mutant was not rejected by an assertion')
+          print('red: foreign handle regression rejects broken owner binding')
+          PY

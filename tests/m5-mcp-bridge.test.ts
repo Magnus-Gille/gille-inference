@@ -118,6 +118,54 @@ describe("m5 stdio MCP conformance", () => {
     expect(JSON.stringify([initialize, list, call])).not.toContain(SECRET);
   });
 
+  it("forwards include_reasoning and keeps reasoning outside the answer text", async () => {
+    let upstreamRequest: Record<string, unknown> | undefined;
+    const reasoning = "The model's private trace is carried separately.";
+    const bridge = await makeBridge(async (_input, init) => {
+      upstreamRequest = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const id = upstreamRequest.id as number;
+      return rpcResponse(id, {
+        content: [{ type: "text", text: "answer" }],
+        isError: false,
+        structuredContent: {
+          model: "mellum",
+          text: "answer",
+          finish_reason: "stop",
+          truncated: false,
+          metered: true,
+          reasoning_content: reasoning,
+          reasoning_truncated: false,
+          usage: null,
+        },
+      });
+    });
+
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "ask",
+        arguments: { model: "mellum", prompt: "bounded", include_reasoning: true },
+      },
+    }));
+    const parsed = JSON.parse(response!);
+    const result = parsed.result;
+
+    expect((upstreamRequest?.params as { arguments?: unknown }).arguments).toEqual({
+      model: "mellum",
+      prompt: "bounded",
+      include_reasoning: true,
+    });
+    expect(result.structuredContent).toMatchObject({
+      text: "answer",
+      reasoning_content: reasoning,
+      reasoning_truncated: false,
+    });
+    expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+    expect(result.content[0].text).not.toContain(reasoning);
+  });
+
   it("handles 202/no-body notifications and rejects no-body request responses", async () => {
     const bridge = await makeBridge(async () => new Response(null, { status: 202 }));
 
@@ -866,6 +914,49 @@ describe("m5 stdio MCP conformance", () => {
       expect(response).not.toContain("unsafe.invalid");
     },
   );
+
+  it("projects only validated model backoff metadata from M5 client errors", async () => {
+    const bridge = createMcpStdioBridge({
+      client: {
+        rpc: async () => {
+          throw new M5ClientError("model_temporarily_unavailable", "ignored peer text", {
+            retryable: true,
+            retryAfterSeconds: 5,
+            requestId: "77777777-7777-4777-8777-777777777777",
+            backoff: {
+              scope: "key_model",
+              retry_after_seconds: 5,
+              unavailable_until: "2026-10-15T14:30:00.000Z",
+            },
+          });
+        },
+      },
+      profile: "codex",
+    });
+
+    const response = await bridge.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"tools/list"}',
+    );
+    const parsed = JSON.parse(response!);
+    expect(parsed).toMatchObject({
+      id: 15,
+      error: {
+        message: "This model is temporarily unavailable for your API key. Retry after the indicated delay.",
+        data: {
+          m5_code: "model_temporarily_unavailable",
+          request_id: "77777777-7777-4777-8777-777777777777",
+          retry_after_seconds: 5,
+          backoff: {
+            scope: "key_model",
+            retry_after_seconds: 5,
+            unavailable_until: "2026-10-15T14:30:00.000Z",
+          },
+        },
+      },
+    });
+    expect(response).not.toContain("ignored peer text");
+    expect(parsed.error.data).not.toHaveProperty("quota");
+  });
 
   it("rejects a mismatched upstream response id as malformed JSON-RPC", async () => {
     const bridge = await makeBridge(async () => rpcResponse(999, { tools: [] }));

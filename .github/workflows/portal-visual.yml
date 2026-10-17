@@ -1,0 +1,62 @@
+name: Portal visual verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  portal-visual:
+    name: Portal desktop and mobile states
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+      - name: Locked dependency setup and inspected native SQLite build
+        run: |
+          mkdir -p "$RUNNER_TEMP/portal-deps-home"
+          TASK_PATH="$(dirname "$(command -v node)"):/usr/sbin:/usr/bin:/sbin:/bin"
+          env -i PATH="$TASK_PATH" HOME="$RUNNER_TEMP/portal-deps-home" \
+            npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          node -e 'const p=require("./node_modules/better-sqlite3/package.json");if(p.scripts.install!=="prebuild-install || node-gyp rebuild --release")throw Error("SQLite build contract changed");'
+          NPM_ROOT="$(npm root -g)"
+          NODE_ROOT="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$NODE_ROOT/include/node/node.h"
+          env -i PATH="$TASK_PATH" HOME="$RUNNER_TEMP/portal-deps-home" \
+            node "$NPM_ROOT/npm/node_modules/node-gyp/bin/node-gyp.js" \
+            rebuild --release --directory=node_modules/better-sqlite3 --nodedir="$NODE_ROOT"
+      - name: Capture real portal states with sandboxed Chrome and loopback-only network
+        run: |
+          CHROME_BIN="$(command -v google-chrome)"
+          test -x "$CHROME_BIN"
+          "$CHROME_BIN" --version
+          TASK_USER="$(id -un)"
+          TASK_PATH="$(dirname "$(command -v node)"):/usr/sbin:/usr/bin:/sbin:/bin"
+          TASK_HOME="$RUNNER_TEMP/portal-browser-home"
+          ARTIFACT_DIR="$RUNNER_TEMP/portal-visual-evidence"
+          mkdir -p "$TASK_HOME" "$ARTIFACT_DIR"
+          # Both the actual gateway fixture and fresh browser run in the same new network
+          # namespace. Only loopback exists; Chrome's own sandbox remains enabled.
+          sudo -n unshare --net -- /bin/bash -c '
+            set -euo pipefail
+            /usr/sbin/ip link set lo up
+            exec /usr/sbin/runuser -u "$1" -- /usr/bin/env -i \
+              PATH="$2" HOME="$3" TMPDIR="$4" \
+              timeout --signal=TERM --kill-after=10s 300 node \
+              diagnostics/portal-browser-check.mjs --browser "$5" --output-dir "$6"
+          ' portal-visual "$TASK_USER" "$TASK_PATH" "$TASK_HOME" "$RUNNER_TEMP" "$CHROME_BIN" "$ARTIFACT_DIR"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: portal-visual-evidence
+          path: ${{ runner.temp }}/portal-visual-evidence/
+          retention-days: 14

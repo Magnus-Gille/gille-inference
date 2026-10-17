@@ -389,7 +389,13 @@ export interface CageSelfTestOptions {
   /** Outer gateway control socket that MUST remain absent from the model-driven inner cage. */
   userManagerSocketPath: string;
   /** Command executor (DI; the real one is execCageCommand below). */
-  exec: (argv: string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+  exec: (
+    argv: string[],
+    timeoutMs: number,
+    opts?: { signal?: AbortSignal },
+  ) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+  /** Optional whole-self-test cancellation signal. */
+  signal?: AbortSignal;
   timeoutMs?: number;
   /** Optional job-runnability arm: assert pi + its agent dir are visible in-cage. */
   runnability?: CageRunnabilityProbe;
@@ -403,6 +409,9 @@ export function buildCageProbeScript(
   // missing marker. The gateway probe does a real HTTP GET /healthz and requires a 200 — a bare
   // TCP connect could succeed at the pasta layer even if the relay/gateway were down.
   return [
+    // `timeout` is required by the bounded network probes. Exit before any marker when it is
+    // absent or unusable so the parser's missing-marker policy fails closed.
+    "if ! command -v timeout >/dev/null 2>&1 || ! timeout 1 true >/dev/null 2>&1; then exit 127; fi",
     `if cat ${shq(o.secretPath)} >/dev/null 2>&1; then echo "cage-probe:secret=READABLE"; else echo "cage-probe:secret=denied"; fi`,
     `if echo x > ${shq(o.readonlyProbePath)} 2>/dev/null; then echo "cage-probe:outside-write=WROTE"; rm -f ${shq(o.readonlyProbePath)} 2>/dev/null; else echo "cage-probe:outside-write=denied"; fi`,
     `if timeout 5 bash -c ${shq(`echo > /dev/tcp/${o.externalProbe.host}/${o.externalProbe.port}`)} 2>/dev/null; then echo "cage-probe:egress=OPEN"; else echo "cage-probe:egress=blocked"; fi`,
@@ -427,12 +436,20 @@ function shq(s: string): string {
  * bwrap missing, unit collision, timeout) is a FAILING result, never a pass.
  */
 export async function runCageSelfTest(o: CageSelfTestOptions): Promise<CageSelfTestResult> {
+  if (o.signal?.aborted) {
+    return { ok: false, failures: ["cage probe aborted before spawn"], raw: "" };
+  }
   const script = buildCageProbeScript(o);
   const argv = [...o.cageArgv, "bash", "-c", script];
   try {
-    const r = await o.exec(argv, o.timeoutMs ?? 60_000);
+    const r = await o.exec(argv, o.timeoutMs ?? 60_000, { signal: o.signal });
     const parsed = parseCageProbeOutput(r.stdout, o.runnability);
-    if (!parsed.ok && r.code !== 0) {
+    if (o.signal?.aborted) {
+      parsed.ok = false;
+      parsed.failures.push("cage probe aborted");
+    }
+    if (r.code !== 0) {
+      parsed.ok = false;
       parsed.failures.push(`probe exited ${r.code === null ? "by timeout/signal" : r.code}: ${r.stderr.slice(0, 400)}`);
     }
     return parsed;
@@ -546,36 +563,114 @@ export function requestTransientCodeLoopUnitStop(
 export function execCageCommand(
   argv: string[],
   timeoutMs: number,
-  opts: { cwd?: string; env?: Record<string, string> } = {}
+  opts: {
+    cwd?: string;
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+    /** Test seam; production callers use the imported child_process implementation. */
+    execFile?: typeof execFile;
+  } = {}
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  if (opts.signal?.aborted) {
+    return Promise.resolve({ code: null, stdout: "", stderr: "ABORT_ERR: execution aborted before spawn" });
+  }
   return new Promise((resolve) => {
     const env = withUserBusEnv(opts.env ?? process.env);
-    const unit = transientCodeLoopUnitFromArgv(argv);
-    execFile(
-      argv[0]!,
-      argv.slice(1),
-      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, killSignal: "SIGKILL", cwd: opts.cwd, env },
-      async (err, stdout, stderr) => {
-        let cleanupError = "";
-        if (unit !== null) {
-          try {
-            await stopTransientCodeLoopUnit(unit, env);
-          } catch (stopErr) {
+    let child: ReturnType<typeof execFile> | null = null;
+    let callbackResult: {
+      err: Error | null;
+      stdout: string;
+      stderr: string;
+    } | null = null;
+    let childClosed = false;
+    let cleanupPromise: Promise<void> | null = null;
+    let cleanupError = "";
+    let finalized = false;
+    let forceReason: "abort" | "timeout" | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const requestCleanup = (): Promise<void> => {
+      if (cleanupPromise !== null) return cleanupPromise;
+      try {
+        const requested = requestTransientCodeLoopUnitStop(argv, env);
+        cleanupPromise = requested === null
+          ? Promise.resolve()
+          : requested.catch((stopErr) => {
             cleanupError = `\ntransient cleanup failed: ${(stopErr as Error).message}`;
-          }
-        }
+          });
+      } catch (stopErr) {
+        cleanupError = `\ntransient cleanup failed: ${(stopErr as Error).message}`;
+        cleanupPromise = Promise.resolve();
+      }
+      return cleanupPromise;
+    };
+
+    const forceTerminate = (reason: "abort" | "timeout"): void => {
+      if (forceReason !== null) return;
+      forceReason = reason;
+      // AbortSignal's default handling can invoke execFile's callback before the child has
+      // emitted `close`; explicitly kill the direct process and retain the unit-stop promise.
+      if (child !== null && !child.killed) child.kill("SIGKILL");
+      void requestCleanup();
+    };
+
+    const maybeFinalize = (): void => {
+      if (finalized || callbackResult === null || !childClosed) return;
+      const cleanup = requestCleanup();
+      finalized = true;
+      void cleanup.then(() => {
+        if (timer !== null) clearTimeout(timer);
+        if (opts.signal !== undefined) opts.signal.removeEventListener("abort", onAbort);
+        const { err, stdout, stderr } = callbackResult!;
         if (err && typeof (err as NodeJS.ErrnoException).code === "string") {
-          // ENOENT etc. — the tool itself is missing; surface as a rejected exec.
+          // ENOENT/ABORT_ERR etc. — the tool itself or this invocation was interrupted; surface
+          // it as a null-code result while preserving the established stderr shape.
           resolve({ code: null, stdout: String(stdout), stderr: `${(err as NodeJS.ErrnoException).code}: ${err.message}${cleanupError}` });
           return;
         }
         const code = err ? ((err as { code?: number }).code ?? null) : 0;
         resolve({
-          code: cleanupError === "" && typeof code === "number" ? code : null,
+          code: forceReason === null && cleanupError === "" && typeof code === "number" ? code : null,
           stdout: String(stdout),
           stderr: `${String(stderr)}${cleanupError}`,
         });
+      });
+    };
+
+    const onAbort = (): void => forceTerminate("abort");
+    if (opts.signal !== undefined) opts.signal.addEventListener("abort", onAbort, { once: true });
+    // The caller may abort between the initial check and listener registration only through
+    // synchronous code; check once more before spawning to keep the no-spawn guarantee exact.
+    if (opts.signal?.aborted) {
+      if (opts.signal !== undefined) opts.signal.removeEventListener("abort", onAbort);
+      resolve({ code: null, stdout: "", stderr: "ABORT_ERR: execution aborted before spawn" });
+      return;
+    }
+    timer = setTimeout(() => forceTerminate("timeout"), timeoutMs);
+    child = (opts.execFile ?? execFile)(
+      argv[0]!,
+      argv.slice(1),
+      {
+        // Keep Node's timeout as a secondary backstop; the own timer above initiates cleanup at
+        // the same deadline and settlement still waits for the callback plus child `close`.
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        killSignal: "SIGKILL",
+        signal: opts.signal,
+        cwd: opts.cwd,
+        env,
+      },
+      (err, stdout, stderr) => {
+        callbackResult = { err, stdout: String(stdout), stderr: String(stderr) };
+        // Preserve the old behavior of stopping naturally completed transient units too, while
+        // ensuring an abort/timeout has already requested the same cleanup immediately.
+        void requestCleanup();
+        maybeFinalize();
       }
     );
+    child.once("close", () => {
+      childClosed = true;
+      maybeFinalize();
+    });
   });
 }

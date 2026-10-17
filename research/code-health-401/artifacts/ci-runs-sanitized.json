@@ -1,0 +1,229 @@
+{
+  "repository": "Magnus-Gille/gille-inference",
+  "fetched_at": "2026-10-09T08:21:12.828324+00:00",
+  "endpoint": "repos/Magnus-Gille/gille-inference/actions/workflows/ci.yml/runs?branch=main&per_page=20",
+  "total_count": 215,
+  "scope": "latest20 main CI runs; latest attempt state, not first-attempt claim",
+  "runs": [
+    {
+      "id": 37898795769,
+      "head_sha": "7a169653afb67cc55284126f7602c257bd04591f",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-09T07:24:05Z",
+      "updated_at": "2026-10-09T07:30:43Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37898795769"
+    },
+    {
+      "id": 37897781818,
+      "head_sha": "0f17d81878d72756a90749b631950619f03ef9fd",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-09T07:13:20Z",
+      "updated_at": "2026-10-09T07:20:03Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37897781818"
+    },
+    {
+      "id": 37895558087,
+      "head_sha": "87d669be2bfbf998ccdd5f9d6960d69c2f1e4da4",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-09T06:49:26Z",
+      "updated_at": "2026-10-09T06:55:28Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37895558087"
+    },
+    {
+      "id": 37891363926,
+      "head_sha": "e413dba608f80f06a0b29c884ad5c7d2e8687050",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-09T06:01:07Z",
+      "updated_at": "2026-10-09T06:05:36Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37891363926"
+    },
+    {
+      "id": 37886527320,
+      "head_sha": "175c543d591b48461274504e1b15114204a37550",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-09T05:00:32Z",
+      "updated_at": "2026-10-09T05:07:04Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37886527320"
+    },
+    {
+      "id": 37797379121,
+      "head_sha": "ec7c1e7c027667cb928798a0922a0cda92cf3139",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-08T15:02:02Z",
+      "updated_at": "2026-10-08T15:08:22Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37797379121"
+    },
+    {
+      "id": 37769635650,
+      "head_sha": "3285e2fa3ac4dca310bd8f2c700e20fcf7fb0375",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-08T11:22:42Z",
+      "updated_at": "2026-10-08T11:29:12Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37769635650"
+    },
+    {
+      "id": 37751274496,
+      "head_sha": "a7f029ca5dc8de3ec026d440d676e20e3d54624b",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-08T08:39:22Z",
+      "updated_at": "2026-10-08T08:45:25Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37751274496"
+    },
+    {
+      "id": 37743645091,
+      "head_sha": "05229559ae26db8ec1d5f5f60cc6d961106f1e59",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-08T07:28:30Z",
+      "updated_at": "2026-10-08T07:32:33Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37743645091"
+    },
+    {
+      "id": 37735993739,
+      "head_sha": "82d9446a4a7f0d32689f66219b673022e6406e30",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-10-08T06:08:26Z",
+      "updated_at": "2026-10-08T06:13:52Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37735993739"
+    },
+    {
+      "id": 37689339738,
+      "head_sha": "ef40cf0708b87affd28c8c3e37c8ec5765ae601e",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-07T21:25:52Z",
+      "updated_at": "2026-10-07T21:32:27Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37689339738"
+    },
+    {
+      "id": 37663599831,
+      "head_sha": "538b219ff3cab23b8f3e45783e102f573f226853",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-07T18:01:23Z",
+      "updated_at": "2026-10-07T18:08:06Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37663599831"
+    },
+    {
+      "id": 37615055043,
+      "head_sha": "26cdcb690decd38a26789571fe4ee74641723ccc",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-07T11:35:02Z",
+      "updated_at": "2026-10-07T11:41:45Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37615055043"
+    },
+    {
+      "id": 37611826582,
+      "head_sha": "7e01a4e8b078eea2aa0fc3452eb01c8ba9475f36",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-07T11:06:18Z",
+      "updated_at": "2026-10-07T11:12:48Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37611826582"
+    },
+    {
+      "id": 37603813113,
+      "head_sha": "21bbb4b86bb4f0931136fb3941f5b2a541224bc8",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-07T09:54:32Z",
+      "updated_at": "2026-10-07T10:01:17Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37603813113"
+    },
+    {
+      "id": 37216102663,
+      "head_sha": "239e0196bb605b1de758869d143750259b648977",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-04T16:15:35Z",
+      "updated_at": "2026-10-04T16:21:59Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37216102663"
+    },
+    {
+      "id": 37190223412,
+      "head_sha": "df898714d2dc376f48d15a5ae4f1cd45914ca057",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-04T08:50:33Z",
+      "updated_at": "2026-10-04T08:55:57Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37190223412"
+    },
+    {
+      "id": 37190073929,
+      "head_sha": "950194fdca44f201f238135dd18c13186c382b7f",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "created_at": "2026-10-04T08:47:44Z",
+      "updated_at": "2026-10-04T08:50:50Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37190073929"
+    },
+    {
+      "id": 37189722501,
+      "head_sha": "c45c1f295758dc013e8f81b763ee9ec471be4d9a",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "created_at": "2026-10-04T08:41:13Z",
+      "updated_at": "2026-10-04T08:47:55Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37189722501"
+    },
+    {
+      "id": 37151666236,
+      "head_sha": "a052d6b45843748e65cc385686ce026c1148be74",
+      "run_attempt": 1,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-03T20:28:32Z",
+      "updated_at": "2026-10-03T20:35:01Z",
+      "html_url": "https://github.com/Magnus-Gille/gille-inference/actions/runs/37151666236"
+    }
+  ]
+}

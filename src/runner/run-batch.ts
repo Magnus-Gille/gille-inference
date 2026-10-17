@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { getDb } from '../db.js';
 import { ALL_TASKS } from '../tasks/index.js';
-import { MODELS, getModelById } from './models.js';
+import { MODELS } from './models.js';
 import { runInference } from './openrouter-client.js';
 import { runLocalInference, warmModel, unloadModel } from './local-client.js';
 import { runLmStudioInference } from './lmstudio-client.js';
@@ -42,7 +42,6 @@ export interface BatchResult {
 interface WorkItem {
   task: TaskDefinition;
   model: ModelSpec;
-  existingRunId?: string;
 }
 
 function formatDuration(ms: number): string {
@@ -57,10 +56,8 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
     modelIds,
     taskIds,
     concurrency: requestedConcurrency = 3,
-    resume = false,
     provider = 'openrouter',
     localModelMap = {},
-    skipPreflight = false,
   } = options;
 
   // Local inference must be sequential — one request at a time per model
@@ -130,7 +127,7 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
       if (existing?.status === 'failed') {
         resetFailedRun.run({ batchId, taskId: task.id, modelId: model.id });
       }
-      workItems.push({ task, model, existingRunId: runId });
+      workItems.push({ task, model });
     }
   }
 
@@ -141,7 +138,6 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
   const total = workItems.length;
   let completed = 0;
   let failed = 0;
-  let skipped = 0;
   let dispatchCount = 0;
   let finishedCount = 0;
   const batchStartTime = performance.now();
@@ -302,15 +298,9 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
       }
 
       // Run all tasks for this model sequentially
-      let taskIndex = 0;
-      async function localWorker(): Promise<void> {
-        while (taskIndex < items.length) {
-          const item = items[taskIndex++]!;
-          await processItem(item);
-        }
+      for (const item of items) {
+        await processItem(item);
       }
-      // concurrency is already forced to 1 for local, but be explicit
-      await Promise.all([localWorker()]);
 
       // Unload: evict from GPU memory before next model
       console.log(`[unload] Evicting ${model.shortName} from memory...`);
@@ -332,5 +322,5 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
     await Promise.all(workers);
   }
 
-  return { completed, failed, skipped: skipped + alreadyCompleted };
+  return { completed, failed, skipped: alreadyCompleted };
 }

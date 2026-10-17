@@ -72,10 +72,10 @@ const windows = new Map<string, UsageEvent[]>();
 
 // ─── Daily table (persisted) ───────────────────────────────────────────────────────
 
-let _quotaInit = false;
+const initializedDatabases = new WeakSet<Database.Database>();
 
 function ensureSchema(db: Database.Database): void {
-  if (_quotaInit) return;
+  if (initializedDatabases.has(db)) return;
   db.exec(`
     CREATE TABLE IF NOT EXISTS key_usage_daily (
       alias  TEXT NOT NULL,
@@ -84,7 +84,7 @@ function ensureSchema(db: Database.Database): void {
       PRIMARY KEY (alias, day)
     );
   `);
-  _quotaInit = true;
+  initializedDatabases.add(db);
 }
 
 function quotaDb(): Database.Database {

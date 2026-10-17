@@ -60,11 +60,14 @@ function parseGlobalArgs(argv) {
   let profile;
   let endpoint = "public";
   let privateRequested = false;
+  let publicRequested = false;
+  let routeFlagCount = 0;
   let publicGatewayUrl;
   let sshTarget;
   let authHelper;
   let timeoutMsRaw;
   let checkLatest = false;
+  let probeInferenceModel;
   const positional = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -78,8 +81,21 @@ function parseGlobalArgs(argv) {
     } else if (arg === "--private") {
       endpoint = "private";
       privateRequested = true;
+      routeFlagCount += 1;
     } else if (arg === "--public") {
       endpoint = "public";
+      publicRequested = true;
+      routeFlagCount += 1;
+    } else if (arg === "--probe-inference") {
+      if (probeInferenceModel !== undefined) {
+        throw new M5ClientError("invalid_args", "--probe-inference may be specified only once.");
+      }
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new M5ClientError("invalid_args", "--probe-inference requires a model identifier.");
+      }
+      probeInferenceModel = value;
+      index += 1;
     } else if (arg === "--public-gateway-url") {
       const value = argv[index + 1];
       if (!value || value.startsWith("-")) {
@@ -143,12 +159,15 @@ function parseGlobalArgs(argv) {
     profile,
     endpoint,
     privateRequested,
+    publicRequested,
+    routeFlagCount,
     positional,
     publicGatewayUrl,
     sshTarget,
     authHelper,
     timeoutMsRaw,
     checkLatest,
+    probeInferenceModel,
   };
 }
 
@@ -237,6 +256,7 @@ function help() {
       "m5 build status",
       "m5 build [--pull relative/file] [--toolchain version] -- command args",
       "m5 --profile <claude|codex> doctor [--check-latest]",
+      "m5 --profile <claude|codex> [--public|--private] doctor --probe-inference <model>",
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
@@ -303,12 +323,15 @@ export async function main(
       profile,
       endpoint,
       privateRequested,
+      publicRequested,
+      routeFlagCount,
       positional,
       publicGatewayUrl,
       sshTarget,
       authHelper,
       timeoutMsRaw,
       checkLatest,
+      probeInferenceModel,
     } = parseGlobalArgs(argv);
     selectedProfileName = profile;
     const command = positional[0];
@@ -322,6 +345,22 @@ export async function main(
     }
     if (checkLatest && command !== "doctor") {
       throw new M5ClientError("invalid_args", "--check-latest is only valid with doctor.");
+    }
+    let inferenceProbe;
+    if (probeInferenceModel !== undefined) {
+      if (command !== "doctor") {
+        throw new M5ClientError("invalid_args", "--probe-inference is only valid with doctor.");
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(probeInferenceModel)) {
+        throw new M5ClientError("invalid_args", "--probe-inference requires a valid model identifier.");
+      }
+      if (routeFlagCount !== 1 || publicRequested === privateRequested) {
+        throw new M5ClientError("invalid_args", "--probe-inference requires exactly one of --public or --private.");
+      }
+      inferenceProbe = {
+        route: privateRequested ? "private" : "public",
+        model: probeInferenceModel,
+      };
     }
     const askTimeoutMs =
       timeoutMsRaw === undefined ? M5_ASK_TIMEOUT_MS_DEFAULT : parseAskTimeoutMs(timeoutMsRaw);
@@ -402,6 +441,7 @@ export async function main(
         credentialStore,
         fetch: fetchImpl,
         checkLatest,
+        inferenceProbe,
       });
       writeJson(output, result);
       return result.status === "mcp_reachable" ? 0 : 1;

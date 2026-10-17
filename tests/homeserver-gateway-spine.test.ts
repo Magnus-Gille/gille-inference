@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
+import { createServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import {
   type ExposureReceiptEnvelope,
 } from "../src/homeserver/exposure-receipt-schema.js";
 import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admission.js";
+import { SYSTEMONE_MAX_BODY_BYTES } from "../src/homeserver/systemone-request.js";
 
 // The gateway reads config from env at startGateway() time. We must set env BEFORE
 // importing config/gateway, and isolate the DB before any keystore call. Tests drive a
@@ -19,9 +20,10 @@ import type { HostMemoryReadResult } from "../src/homeserver/host-memory-admissi
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "notfound" | "sse" | "error500" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-list" | "clef-running" | "qwen-list" | "validrunning" = "ok";
+let mockMode: "ok" | "stall" | "queued-disconnect" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
+let upstreamModelRequestCount = 0;
 let releaseStall: (() => void) | null = null;
 let hostMemoryAvailableGib = 90;
 // Keep this below HOMESERVER_OWNER_QUEUE_MAX_MS (3000ms in this file): a wrongly queued owner
@@ -54,19 +56,21 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", async () => {
-      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone")) upstreamInferenceRequestCount += 1;
+      if (req.url?.endsWith("/chat/completions") || req.url?.endsWith("/systemone") || req.url?.endsWith("/embeddings") || req.url?.endsWith("/api/chat")) upstreamInferenceRequestCount += 1;
       lastUpstreamBody = Buffer.concat(chunks).toString("utf-8");
-      if ((mockMode === "validrunning" || mockMode === "systemone-list" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
+      if (req.url === "/v1/models") upstreamModelRequestCount += 1;
+      if ((mockMode === "validrunning" || mockMode === "queued-disconnect" || mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/running") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ running: mockMode === "systemone-list" ? [] : [
+        res.end(JSON.stringify({ running: mockMode === "systemone-list" || mockMode === "embedding-list" ? [] : [
           { model: mockMode === "clef-running" ? "clef-flash" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "m1",
             state: "ready", cmd: "-c 8192", proxy: "", ttl: 1800 },
         ] }));
         return;
       }
-      if ((mockMode === "systemone-list" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
+      if ((mockMode === "systemone-list" || mockMode === "embedding-list" || mockMode === "embedding-list-absent" || mockMode === "embedding-error500" || mockMode === "embedding-error413" || mockMode === "embedding-stall" || mockMode === "embedding-malformed" || mockMode === "clef-running" || mockMode === "qwen-list") && req.url === "/v1/models") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash" }] }));
+        res.end(JSON.stringify({ data: [{ id: "m1" }, { id: mockMode === "embedding-list-absent" ? "other" : mockMode.startsWith("embedding-") ? "embeddinggemma-2" : mockMode === "qwen-list" ? "qwen3-30b-instruct" : "clef-flash",
+          ...(mockMode === "embedding-list" ? { architecture: { input_modalities: ["text", "image", "audio", "video"] } } : {}) }] }));
         return;
       }
       if (mockMode === "notfound") {
@@ -74,11 +78,16 @@ function startUpstream(): Promise<void> {
         res.end(JSON.stringify({ error: { message: "model not found" } }));
         return;
       }
-      if (mockMode === "error500") {
+      if (mockMode === "error500" || (mockMode === "embedding-error500" && req.url?.endsWith("/embeddings"))) {
         // An upstream failure AFTER a successful 200-route lookup (i.e. not a 404). Carries a
         // usage frame in the body to prove the gateway does NOT read it on a non-2xx (Fix #1).
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "boom" }, usage: { total_tokens: 9999 } }));
+        return;
+      }
+      if (mockMode === "embedding-error413" && req.url?.endsWith("/embeddings")) {
+        res.writeHead(413, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "do not relay this upstream message" } }));
         return;
       }
       if (mockMode === "format500" && req.url?.endsWith("/chat/completions")) {
@@ -112,10 +121,18 @@ function startUpstream(): Promise<void> {
         res.end();
         return;
       }
-      if (mockMode === "stall") {
+      if (mockMode === "stall" || (mockMode === "queued-disconnect" && upstreamInferenceRequestCount === 1)) {
         await new Promise<void>((resolve) => {
           releaseStall = resolve;
         });
+      }
+      if (req.url?.endsWith("/api/chat")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: { content: "synthetic" }, prompt_eval_count: 3, eval_count: 4 }));
+        return;
+      }
+      if (mockMode === "embedding-stall" && req.url?.endsWith("/embeddings")) {
+        await new Promise<void>((resolve) => { releaseStall = resolve; });
       }
       if (mockMode === "length") {
         res.writeHead(200, { "content-type": "application/json" });
@@ -129,21 +146,51 @@ function startUpstream(): Promise<void> {
         return;
       }
       if (req.url?.endsWith("/systemone")) {
+        const choice = mockMode === "systemone-choice" || mockMode === "systemone-choice-malformed";
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
-          answers: { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
-          usage: { input_tokens: 18, output_tokens: 0 },
+          answers: choice
+            ? {
+                route: {
+                  type: "choice",
+                  choice: "billing",
+                  probabilities: mockMode === "systemone-choice-malformed"
+                    ? ["billing", "support"]
+                    : { billing: 0.9, support: 0.1 },
+                  confidence: 0.8,
+                },
+              }
+            : { urgent: { type: "noul", noul: mockMode === "systemone-malformed" ? 2 : 0.92 } },
+          usage: { input_tokens: choice ? 24 : 18, output_tokens: 0 },
+        }));
+        return;
+      }
+      if (req.url?.endsWith("/embeddings")) {
+        const body = JSON.parse(lastUpstreamBody) as { input: string | string[] };
+        const count = Array.isArray(body.input) ? body.input.length : 1;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          object: "list", model: "embeddinggemma-2",
+          data: Array.from({ length: count }, (_, index) => ({
+            object: "embedding", index,
+            embedding: Array.from({ length: mockMode === "embedding-malformed" ? 767 : 768 }, (_, i) => i === 0 ? 3 : i === 1 ? 4 : 0),
+          })),
+          usage: { prompt_tokens: 3, total_tokens: 3 },
         }));
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          id: "cmpl-1",
-          choices: [{ message: { role: "assistant", content: "ok" } }],
-          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
-        })
-      );
+      res.end(JSON.stringify(mockMode === "queued-disconnect"
+        ? {
+            id: "cmpl-disconnect",
+            choices: [{ message: { role: "assistant", content: "synthetic" } }],
+            usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+          }
+        : {
+            id: "cmpl-1",
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+            usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+          }));
     });
   });
   return new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => {
@@ -157,6 +204,7 @@ let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let lookupKey: typeof import("../src/homeserver/keystore.js").lookupKey;
 let recordCreditUsage: typeof import("../src/homeserver/keystore.js").recordUsage;
 let loadConfig: typeof import("../src/homeserver/config.js").loadConfig;
+let resetConfig: typeof import("../src/homeserver/config.js").resetConfig;
 let resetQuotaWindows: typeof import("../src/homeserver/quota.js").resetQuotaWindows;
 let taskTextFingerprint: typeof import("../src/homeserver/task-exposure.js").taskTextFingerprint;
 let taskFingerprintVersion: typeof import("../src/homeserver/task-exposure.js").TASK_FINGERPRINT_VERSION;
@@ -195,6 +243,11 @@ beforeAll(async () => {
   process.env["HOMESERVER_BUSY_RETRY_AFTER_S"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
   process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
+  process.env["HOMESERVER_ORIN_URL"] = `http://127.0.0.1:${upstreamPort}`;
+  process.env["HOMESERVER_ORIN_MODEL"] = "qwen2.5-coder:3b";
+  process.env["HOMESERVER_EMBEDDING_MODELS"] = "embeddinggemma-2";
+  process.env["HOMESERVER_EMBEDDING_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
+  process.env["HOMESERVER_EMBEDDING_MEDIA_ENABLED"] = "true";
   process.env["HOMESERVER_KEY_DEFAULT_RPM"] = "1000";
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
@@ -220,6 +273,7 @@ beforeAll(async () => {
   recordCreditUsage = ks.recordUsage;
   loadConfig = cfgMod.loadConfig;
   resetQuotaWindows = q.resetQuotaWindows;
+  resetConfig = cfgMod.resetConfig;
   taskTextFingerprint = exposure.taskTextFingerprint;
   taskFingerprintVersion = exposure.TASK_FINGERPRINT_VERSION;
 
@@ -235,12 +289,15 @@ afterAll(async () => {
   delete process.env["HOMESERVER_HOST_MEMORY_ADMISSION"];
   delete process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"];
   delete process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"];
+  delete process.env["HOMESERVER_ORIN_URL"];
+  delete process.env["HOMESERVER_ORIN_MODEL"];
 });
 
 beforeEach(() => {
   mockMode = "ok";
   releaseStall = null;
   upstreamInferenceRequestCount = 0;
+  upstreamModelRequestCount = 0;
   hostMemoryAvailableGib = 90;
   resetQuotaWindows();
 });
@@ -265,6 +322,70 @@ function tableCount(table: string): number {
 
 const ADMIN = "admin-static-key";
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
+
+async function restartGatewayWithHostMemory(mode: "off" | "enforce"): Promise<void> {
+  if (stopGateway !== null) {
+    const stop = stopGateway;
+    stopGateway = null;
+    await stop();
+  }
+  process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = mode;
+  resetConfig();
+  const handle = await startGateway(memoryComposition());
+  gatewayPort = handle.port;
+  stopGateway = handle.stop;
+}
+
+async function gatewayAdmissionSnapshot(): Promise<{ inflight: number; ownerQueued: number }> {
+  const response = await fetch(url("/admin/maintenance"), {
+    headers: { authorization: `Bearer ${ADMIN}` },
+  });
+  expect(response.status).toBe(200);
+  return await response.json() as { inflight: number; ownerQueued: number };
+}
+
+async function waitForGatewayAdmission(
+  predicate: (snapshot: { inflight: number; ownerQueued: number }) => boolean,
+  timeoutMs = 1_500,
+): Promise<{ inflight: number; ownerQueued: number }> {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = await gatewayAdmissionSnapshot();
+  while (!predicate(snapshot) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    snapshot = await gatewayAdmissionSnapshot();
+  }
+  expect(predicate(snapshot), `admission snapshot did not reach the expected state: ${JSON.stringify(snapshot)}`).toBe(true);
+  return snapshot;
+}
+
+function systemOneBodyAtBytes(targetBytes: number): { value: Record<string, unknown>; raw: string } {
+  const value: Record<string, unknown> = {
+    model: "clef-flash",
+    state: "x",
+    questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+  };
+  const baseBytes = Buffer.byteLength(JSON.stringify(value));
+  value.state = "x".repeat(targetBytes - baseBytes + 1);
+  const raw = JSON.stringify(value);
+  expect(Buffer.byteLength(raw)).toBe(targetBytes);
+  return { value, raw };
+}
+
+function postChunkedSystemOne(raw: string, token: string): Promise<{ status: number }> {
+  const target = new URL(url("/v1/systemone"));
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(target, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    }, (res) => {
+      res.resume();
+      res.once("end", () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.once("error", reject);
+    req.write(raw.slice(0, 4096));
+    req.end(raw.slice(4096));
+  });
+}
 
 async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Promise<{
   principalId: string;
@@ -315,6 +436,258 @@ async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Prom
 }
 
 describe("gateway spine — HTTP integration", () => {
+  it("serves EmbeddingGemma through explicit guest grants, validates vectors, and meters actual usage", async () => {
+    mockMode = "embedding-list";
+    const scoped = mintKey({ alias: `embedding-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const unscoped = mintKey({ alias: `embedding-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const body = { model: "embeddinggemma-2", input: ["hello", "world"], dimensions: 128 };
+    const call = (token: string | null, payload: unknown) => fetch(url("/v1/embeddings"), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+    });
+
+    expect((await call(null, body)).status).toBe(401);
+    expect((await call(unscoped.plaintextKey, body)).status).toBe(403);
+    expect((await call(scoped.plaintextKey, { ...body, input: [] })).status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+
+    const success = await call(scoped.plaintextKey, body);
+    expect(success.status).toBe(200);
+    const payload = await success.json() as { data: Array<{ index: number; embedding: number[] }>; usage: { total_tokens: number } };
+    expect(payload.data.map((item) => item.index)).toEqual([0, 1]);
+    expect(payload.data[0]!.embedding).toHaveLength(128);
+    expect(payload.data[0]!.embedding.slice(0, 2)).toEqual([0.6, 0.8]);
+    expect(payload.usage.total_tokens).toBe(3);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2", input: body.input, encoding_format: "float" });
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+
+    expect((await chat(scoped.plaintextKey, { model: "embeddinggemma-2" })).status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(1);
+
+    mockMode = "embedding-error500";
+    expect((await call(scoped.plaintextKey, body)).status).toBe(502);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    mockMode = "embedding-malformed";
+    expect((await call(scoped.plaintextKey, body)).status).toBe(502);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    mockMode = "embedding-error413";
+    const oversized = await call(scoped.plaintextKey, body);
+    expect(oversized.status).toBe(413);
+    expect(JSON.stringify(await oversized.json())).not.toContain("do not relay");
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("accepts bounded typed media for an existing embedding grant and charges actual successful usage", async () => {
+    mockMode = "embedding-list";
+    const portal = await (await fetch(url("/portal"))).text();
+    expect(portal).toContain("PNG/JPEG images");
+    expect(portal).toContain("remote and local URLs are rejected");
+    expect(portal).not.toContain("EMBEDDING_MEDIA_EXAMPLE");
+    const sidecarReads = upstreamModelRequestCount;
+    expect((await fetch(url("/portal"))).status).toBe(200);
+    expect(upstreamModelRequestCount).toBe(sidecarReads);
+    const scoped = mintKey({ alias: `embedding-media-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 10_000 }, DEFAULTS);
+    const discovery = await fetch(url("/v1/models"), {
+      headers: { authorization: `Bearer ${scoped.plaintextKey}` },
+    });
+    expect(discovery.status).toBe(200);
+    const listed = await discovery.json() as { data: Array<{ id: string; architecture?: { input_modalities: string[] } }> };
+    expect(listed.data.find((item) => item.id === "embeddinggemma-2")?.architecture?.input_modalities)
+      .toEqual(["text", "image", "audio", "video"]);
+    const wav = Buffer.alloc(46);
+    wav.write("RIFF", 0); wav.writeUInt32LE(38, 4); wav.write("WAVEfmt ", 8);
+    wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(8_000, 24); wav.writeUInt32LE(16_000, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+    wav.write("data", 36); wav.writeUInt32LE(2, 40);
+    const call = (input: unknown) => fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${scoped.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input, dimensions: 256 }) });
+    const priorCalls = upstreamInferenceRequestCount;
+    const invalid = await call([{ content: [{ type: "image_url", image_url: { url: "http://example.invalid/a.png" } }] }]);
+    expect(invalid.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(priorCalls);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(0);
+    const success = await call([{ content: [{ type: "input_audio", input_audio: {
+      data: wav.toString("base64"), format: "wav",
+    } }] }]);
+    expect(success.status).toBe(200);
+    expect((await success.json() as { data: Array<{ embedding: number[] }> }).data[0]?.embedding).toHaveLength(256);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2",
+      input: [{ content: [{ type: "input_audio", input_audio: { data: wav.toString("base64") } }] }],
+      encoding_format: "float" });
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+    const beforeWrapped = upstreamInferenceRequestCount;
+    mockMode = "embedding-error500"; // Model metadata omits the media projector.
+    const wrappedText = await call([{ content: [{ type: "text", text: "A short document" }] }]);
+    expect(wrappedText.status).toBe(502);
+    expect(upstreamInferenceRequestCount).toBe(beforeWrapped);
+    expect(lookupKey(scoped.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("caps CPU embedding work at one request before consuming another gateway slot", async () => {
+    mockMode = "embedding-stall";
+    releaseStall = null;
+    const guest = mintKey({ alias: `embedding-cap-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const ungranted = mintKey({ alias: `embedding-cap-ungranted-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const call = () => fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+    const first = call();
+    try {
+      for (let attempt = 0; attempt < 100 && releaseStall === null; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(releaseStall).not.toBeNull();
+      const reservedCredits = lookupKey(guest.plaintextKey)!.creditsUsed;
+      const ungrantedResponse = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ungranted.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document" }) });
+      expect(ungrantedResponse.status).toBe(403);
+      const second = await call();
+      expect(second.status).toBe(503);
+      const malformedConcurrent = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: [{ unsupported: "value" }] }) });
+      expect(malformedConcurrent.status).toBe(503);
+      expect(upstreamInferenceRequestCount).toBe(1);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(reservedCredits);
+    } finally {
+      releaseStall?.();
+      releaseStall = null;
+    }
+    expect((await first).status).toBe(200);
+    expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("does not let an unfinished authorized upload hold the embedding slot", async () => {
+    mockMode = "embedding-list";
+    const guest = mintKey({ alias: `embedding-upload-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const unfinished = httpRequest(url("/v1/embeddings"), { method: "POST", headers: {
+      authorization: `Bearer ${guest.plaintextKey}`, "content-type": "application/json",
+    } });
+    unfinished.on("error", () => undefined);
+    try {
+      await new Promise<void>((resolve) => unfinished.write('{"model":"embeddinggemma-2","input":"', resolve));
+      const response = await fetch(url("/v1/embeddings"), { method: "POST", headers: {
+        authorization: `Bearer ${guest.plaintextKey}`, "content-type": "application/json",
+      }, body: JSON.stringify({ model: "embeddinggemma-2", input: "another request" }) });
+      expect(response.status).toBe(200);
+      expect(upstreamInferenceRequestCount).toBe(1);
+    } finally {
+      unfinished.destroy();
+    }
+  });
+
+  it("accepts the OpenAI SDK base64 format and user field without forwarding user", async () => {
+    mockMode = "embedding-list";
+    const guest = mintKey({ alias: `embedding-sdk-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 1_000 }, DEFAULTS);
+    const response = await fetch(url("/v1/embeddings"), { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${guest.plaintextKey}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", input: "A short document",
+        dimensions: 128, encoding_format: "base64", user: "sdk-user" }) });
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { data: Array<{ embedding: string }> };
+    expect(Buffer.from(payload.data[0]!.embedding, "base64")).toHaveLength(128 * 4);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({ model: "embeddinggemma-2",
+      input: "A short document", encoding_format: "float" });
+    expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(3);
+  });
+
+  it("hides embedding models from open guest discovery and when disabled", async () => {
+    mockMode = "embedding-list";
+    const open = mintKey({ alias: `embedding-list-open-${randomUUID()}`, tier: "guest" }, DEFAULTS);
+    const scoped = mintKey({ alias: `embedding-list-scoped-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["embeddinggemma-2"] }, DEFAULTS);
+    const owner = mintKey({ alias: `embedding-list-owner-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const models = async (token: string, path: "/models" | "/v1/models") => {
+      const response = await fetch(url(path), { headers: { authorization: `Bearer ${token}` } });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+      const payload = await response.json() as { data?: Array<{ id: string }>; models?: Array<{ key: string; type: string }> };
+      return path === "/models" ? payload.models!.map((item) => item.key) : payload.data!.map((item) => item.id);
+    };
+    for (const path of ["/models", "/v1/models"] as const) {
+      expect(await models(open.plaintextKey, path)).not.toContain("embeddinggemma-2");
+      expect(await models(scoped.plaintextKey, path)).toContain("embeddinggemma-2");
+      expect(await models(owner.plaintextKey, path)).toContain("embeddinggemma-2");
+    }
+    const cfg = loadConfig();
+    const enabled = cfg.embeddingModels;
+    cfg.embeddingModels = [];
+    try {
+      expect(await models(scoped.plaintextKey, "/v1/models")).not.toContain("embeddinggemma-2");
+      expect((await chat(scoped.plaintextKey, { model: "embeddinggemma-2" })).status).toBe(400);
+      const disabled = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${scoped.plaintextKey}` },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "hello" }) });
+      expect(disabled.status).toBe(400);
+      expect(upstreamInferenceRequestCount).toBe(0);
+    } finally {
+      cfg.embeddingModels = enabled;
+    }
+  });
+
+  it("omits an unavailable embedding sidecar from discovery and refuses inference without billing", async () => {
+    const guest = mintKey({ alias: `embedding-unready-${randomUUID()}`, tier: "guest",
+      embeddingModelAllowList: ["embeddinggemma-2"], creditLimit: 100 }, DEFAULTS);
+    const headers = { authorization: `Bearer ${guest.plaintextKey}` };
+    for (const mode of ["embedding-list-absent"]) {
+      mockMode = mode;
+      for (const path of ["/models", "/v1/models"]) {
+        const response = await fetch(url(path), { headers });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("private, no-store");
+        expect(JSON.stringify(await response.json())).not.toContain("embeddinggemma-2");
+      }
+      const call = await fetch(url("/v1/embeddings"), { method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ model: "embeddinggemma-2", input: "hello" }) });
+      expect(call.status).toBe(502);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(0);
+    }
+  });
+
+  it("atomically grants the embedding model to existing open customer keys without changing credits", async () => {
+    mockMode = "embedding-list";
+    const first = mintKey({ alias: `embedding-grant-a-${randomUUID()}`, tier: "guest",
+      creditLimit: 1_000 }, DEFAULTS);
+    const second = mintKey({ alias: `embedding-grant-b-${randomUUID()}`, tier: "guest",
+      modelAllowList: ["m1"], creditLimit: 1_000 }, DEFAULTS);
+    const owner = mintKey({ alias: `embedding-grant-owner-${randomUUID()}`, tier: "owner",
+      scope: "admin" }, DEFAULTS);
+    const grant = (aliases: string[], token = "admin-static-key") => fetch(url("/admin/keys/embedding-grants"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ model: "embeddinggemma-2", aliases }),
+    });
+    const before = lookupKey(first.plaintextKey)!.creditsUsed;
+    expect((await grant([first.record.alias, second.record.alias], first.plaintextKey)).status).toBe(403);
+    expect((await grant([first.record.alias, "missing-customer"])).status).toBe(400);
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+    expect((await grant([first.record.alias, owner.record.alias])).status).toBe(400);
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual([]);
+
+    const response = await grant([first.record.alias, second.record.alias]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ model: "embeddinggemma-2",
+      changed: [first.record.alias, second.record.alias], unchanged: [] });
+    expect(lookupKey(first.plaintextKey)!.embeddingModelAllowList).toEqual(["embeddinggemma-2"]);
+    expect(lookupKey(first.plaintextKey)!.modelAllowList).toEqual([]);
+    expect(lookupKey(first.plaintextKey)!.creditsUsed).toBe(before);
+    expect((await grant([first.record.alias])).status).toBe(200);
+
+    const list = await fetch(url("/v1/models"), { headers: { authorization: `Bearer ${first.plaintextKey}` } });
+    const models = await list.json() as { data: Array<{ id: string }> };
+    expect(models.data.map((entry) => entry.id)).toContain("embeddinggemma-2");
+  });
+
   it("serves a configured System One model through guest auth, admission, and exact usage billing", async () => {
     const minted = mintKey({
       alias: `systemone-${randomUUID()}`,
@@ -372,6 +745,111 @@ describe("gateway spine — HTTP integration", () => {
     const malformedUpstream = await call(body);
     expect(malformedUpstream.status).toBe(502);
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+  });
+
+  it("serves a configured System One choice question with exact forwarding and usage billing", async () => {
+    mockMode = "systemone-choice";
+    const minted = mintKey({
+      alias: `systemone-choice-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const body = {
+      model: "clef-flash",
+      state: "The customer was charged twice for the same order.",
+      questions: {
+        route: {
+          type: "choice",
+          instructions: "Which team should handle this request?",
+          criteria: {
+            billing: "Payments, charges and refunds",
+            support: "Technical product problems",
+          },
+        },
+      },
+    };
+    const call = (payload: unknown, token = minted.plaintextKey) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    const malformedRequest = { ...body, questions: { route: {
+      ...body.questions.route, criteria: ["Payments, charges and refunds", "Technical product problems"],
+    } } };
+    const malformed = await call(malformedRequest);
+    expect(malformed.status).toBe(400);
+    expect(upstreamInferenceRequestCount).toBe(0);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(0);
+
+    const success = await call(body);
+    expect(success.status).toBe(200);
+    expect(await success.json()).toEqual({
+      answers: {
+        route: {
+          type: "choice",
+          choice: "billing",
+          probabilities: { billing: 0.9, support: 0.1 },
+          confidence: 0.8,
+        },
+      },
+      usage: { input_tokens: 24, output_tokens: 0 },
+    });
+    expect(JSON.parse(lastUpstreamBody)).toEqual(body);
+    expect(upstreamInferenceRequestCount).toBe(1);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
+
+    mockMode = "systemone-choice-malformed";
+    const malformedUpstream = await call(body);
+    expect(malformedUpstream.status).toBe(502);
+    expect(upstreamInferenceRequestCount).toBe(2);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
+  });
+
+  it("accepts System One bodies up to the raw-byte cap and rejects oversize bodies before billing", async () => {
+    expect(SYSTEMONE_MAX_BODY_BYTES).toBe(256 * 1024);
+    const minted = mintKey({
+      alias: `systemone-large-${randomUUID()}`,
+      tier: "guest",
+      modelAllowList: ["clef-flash"],
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const callRaw = (raw: string) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${minted.plaintextKey}` },
+      body: raw,
+    });
+
+    const unicode = {
+      model: "clef-flash",
+      state: "Ångström 🙂 är tillgänglig för kunder. ".repeat(400),
+      questions: { urgent: { type: "noul", instructions: "Är detta brådskande?" } },
+    };
+    const unicodeRaw = JSON.stringify(unicode);
+    expect(Buffer.byteLength(unicodeRaw)).toBeGreaterThan(8 * 1024);
+    const unicodeResponse = await callRaw(unicodeRaw);
+    expect(unicodeResponse.status).toBe(200);
+    expect(lastUpstreamBody).toBe(unicodeRaw);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(18);
+
+    const exact = systemOneBodyAtBytes(SYSTEMONE_MAX_BODY_BYTES);
+    const exactResponse = await callRaw(exact.raw);
+    expect(exactResponse.status).toBe(200);
+    expect(lastUpstreamBody).toBe(exact.raw);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+
+    const oversized = systemOneBodyAtBytes(SYSTEMONE_MAX_BODY_BYTES + 1);
+    const beforeOversized = upstreamInferenceRequestCount;
+    const oversizedResponse = await callRaw(oversized.raw);
+    expect(oversizedResponse.status).toBe(413);
+    expect(upstreamInferenceRequestCount).toBe(beforeOversized);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
+
+    const chunked = await postChunkedSystemOne(oversized.raw, minted.plaintextKey);
+    expect(chunked.status).toBe(413);
+    expect(upstreamInferenceRequestCount).toBe(beforeOversized);
+    expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(36);
   });
 
   it("keeps Clef out of chat when the System One setting is absent", async () => {
@@ -851,6 +1329,90 @@ describe("gateway spine — HTTP integration", () => {
     expect(j.error.code).toBe("rate_limit_exceeded");
   });
 
+  it.each([
+    { reason: "rpm", limits: { rpm: 0, tpm: 1_000, dailyTokenBudget: 0, maxParallel: 1 }, limit: 0, phrase: "requests per minute" },
+    { reason: "tpm", limits: { rpm: 100, tpm: 2, dailyTokenBudget: 0, maxParallel: 1 }, limit: 2, phrase: "tokens per minute" },
+    { reason: "daily", limits: { rpm: 100, tpm: 1_000, dailyTokenBudget: 1, maxParallel: 1 }, limit: 1, phrase: "per UTC day" },
+  ])("quota 429 explains the caller's $reason limit and returns matching metadata", async ({ reason, limits, limit, phrase }) => {
+    const minted = mintKey({ alias: `quota-${reason}-${randomUUID()}`, tier: "guest" }, limits);
+    if (reason === "daily") {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-14T12:00:00.000Z"));
+    }
+    try {
+      const response = await chat(minted.plaintextKey, { max_tokens: 10 });
+      expect(response.status).toBe(429);
+      const retryAfter = Number(response.headers.get("retry-after"));
+      expect(retryAfter).toBeGreaterThan(0);
+      const body = await response.json() as { error: { code: string; message: string; quota?: Record<string, unknown> } };
+      expect(body.error.code).toBe("rate_limit_exceeded");
+      expect(body.error.message).toContain(`Per-key ${reason} limit reached`);
+      expect(body.error.message).toContain("your own API key");
+      expect(body.error.message).toContain(phrase);
+      if (reason === "rpm" && limit === 0) {
+        expect(body.error.message).toContain("contact the gateway operator");
+        expect(body.error.message).toContain("will not restore request capacity");
+        expect(body.error.message).not.toMatch(/expiry|reset/i);
+        expect(body.error.message).not.toContain("retry after");
+      } else if (reason === "daily") {
+        expect(body.error.message).toContain(`The UTC-day budget resets in ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).toContain(`retry after ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+      } else {
+        expect(body.error.message).toContain(`The next quota-window expiry is in ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).toContain(`retry after ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}`);
+        expect(body.error.message).not.toContain("The quota window resets");
+      }
+      if (reason === "daily") expect(body.error.message).toContain("1 token per UTC day");
+      expect(body.error.quota).toMatchObject({
+        reason,
+        scope: "key",
+        window: reason === "daily" ? "utc_day" : "60s",
+        limit,
+        requested: reason === "rpm" ? 1 : expect.any(Number),
+        counted: false,
+        retry_after_seconds: retryAfter,
+      });
+      expect(Object.keys(body.error.quota ?? {}).sort()).toEqual([
+        "counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "used_before", "window",
+      ]);
+      expect(body.error.message).not.toContain(minted.record.alias);
+      expect(body.error.message).not.toContain(minted.record.keyHash);
+      expect(body.error.message).not.toContain("model");
+      expect(body.error.message).not.toContain("ip");
+      expect(response.headers.get("x-ratelimit-limit")).toBe(String(limit));
+      expect(response.headers.get("x-ratelimit-remaining")).toBe(
+        String(Math.max(0, limit - Number(body.error.quota?.used_before))),
+      );
+      expect(response.headers.get("x-ratelimit-reset")).toBe(String(retryAfter));
+      expect(upstreamInferenceRequestCount).toBe(0);
+      if (reason === "daily") {
+        expect(retryAfter).toBe(43_200);
+        expect(body.error.quota?.window).toBe("utc_day");
+        const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ? AND day = ?").get(minted.record.alias, "2026-10-14") as { tokens: number } | undefined;
+        expect(daily?.tokens ?? 0).toBe(0);
+      }
+    } finally {
+      if (reason === "daily") vi.useRealTimers();
+    }
+  });
+
+  it("quota 429 for a minted static-alias collision hides shared usage", async () => {
+    const minted = mintKey({ alias: "static:user", tier: "guest", rpm: 1 }, DEFAULTS);
+    expect((await chat(minted.plaintextKey, {})).status).toBe(200);
+    const response = await chat(minted.plaintextKey, {});
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(response.headers.get("x-ratelimit-remaining")).toBeNull();
+    const body = await response.json() as { error: { message: string; quota?: Record<string, unknown> } };
+    expect(body.error.message).toContain("Shared static-tier rpm limit reached");
+    expect(body.error.message).toContain("shared static-tier bucket");
+    expect(JSON.stringify(body.error)).not.toContain("static:user");
+    expect(Object.keys(body.error.quota ?? {}).sort()).toEqual([
+      "counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "window",
+    ]);
+    expect(body.error.quota).toMatchObject({ scope: "shared_static_tier", counted: false });
+  });
+
   it("admission 503: guest is rejected while a slot is held; a queued owner succeeds on release", async () => {
     mockMode = "stall";
     // Owner needs maxParallel >= 2 so a second owner request can queue while the first holds the slot.
@@ -881,6 +1443,85 @@ describe("gateway spine — HTTP integration", () => {
     if (releaseStall) releaseStall();
     const queued = await queuedP;
     expect(queued.status).toBe(200);
+  });
+
+  it.each(["m5", "orin"] as const)("cancels a disconnected queued owner before %s reaches upstream", async (node) => {
+    await restartGatewayWithHostMemory("off");
+    let heldP: Promise<Response> | null = null;
+    let queuedReq: ReturnType<typeof httpRequest> | null = null;
+    try {
+      mockMode = "queued-disconnect";
+      upstreamInferenceRequestCount = 0;
+      lastUpstreamBody = "";
+      const model = node === "orin" ? "qwen2.5-coder:3b" : "m1";
+      const owner = mintKey({
+        alias: `queued-disconnect-${node}-${randomUUID()}`,
+        tier: "owner",
+        scope: "admin",
+        modelAllowList: [model],
+        maxParallel: 2,
+        dailyTokenBudget: 100_000,
+        creditLimit: 100_000,
+      }, DEFAULTS);
+      const requestBody = JSON.stringify({
+        model,
+        node,
+        messages: [{ role: "user", content: `synthetic ${node} request` }],
+        max_tokens: 8,
+      });
+
+      heldP = chat(owner.plaintextKey, { model, node, messages: [{ role: "user", content: `synthetic ${node} request` }], max_tokens: 8 });
+      await waitForGatewayAdmission((snapshot) => snapshot.inflight === 1 && snapshot.ownerQueued === 0);
+      const firstCallDeadline = Date.now() + 1_500;
+      while (upstreamInferenceRequestCount !== 1 && Date.now() < firstCallDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(upstreamInferenceRequestCount).toBe(1);
+
+      const target = new URL(url("/v1/chat/completions"));
+      queuedReq = httpRequest(target, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${owner.plaintextKey}`,
+        },
+      });
+      queuedReq.on("error", () => {}); // The test intentionally destroys this waiting client.
+      const queuedClosed = new Promise<void>((resolve) => queuedReq!.once("close", resolve));
+      queuedReq.end(requestBody);
+      await waitForGatewayAdmission((snapshot) => snapshot.ownerQueued === 1);
+
+      queuedReq.destroy();
+      expect(await settlesWithin(queuedClosed, 1_000)).toBe(true);
+      const disconnected = await waitForGatewayAdmission((snapshot) => snapshot.inflight === 1 && snapshot.ownerQueued === 0);
+      expect(disconnected).toMatchObject({ inflight: 1, ownerQueued: 0 });
+      expect(upstreamInferenceRequestCount).toBe(1);
+
+      const releaseFirst = releaseStall;
+      releaseStall = null;
+      releaseFirst?.();
+      expect((await heldP).status).toBe(200);
+      heldP = null;
+      const idle = await waitForGatewayAdmission((snapshot) => snapshot.inflight === 0 && snapshot.ownerQueued === 0);
+      expect(idle).toMatchObject({ inflight: 0, ownerQueued: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(upstreamInferenceRequestCount).toBe(1);
+      expect(lookupKey(owner.plaintextKey)!.creditsUsed).toBe(7);
+      const daily = getDb().prepare("SELECT tokens FROM key_usage_daily WHERE alias = ?")
+        .get(owner.record.alias) as { tokens: number } | undefined;
+      expect(daily?.tokens ?? 0).toBe(7);
+      queuedReq = null;
+    } finally {
+      queuedReq?.destroy();
+      for (let i = 0; i < 4; i++) {
+        const release = releaseStall;
+        releaseStall = null;
+        release?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await heldP?.catch(() => undefined);
+      await restartGatewayWithHostMemory("enforce");
+    }
   });
 
   it("max_tokens cap: a request above the per-request cap is clamped before proxying", async () => {
@@ -1057,14 +1698,15 @@ describe("gateway spine — HTTP integration", () => {
       model_ids: ["m1"],
       harness_ids: ["openai-chat"],
     });
-    expect(body.results.find((row) => row.fingerprint_sha256 === legacyOwnerChatHash)).toMatchObject({
+    const legacyExposure = body.results.find((row) => row.fingerprint_sha256 === legacyOwnerChatHash)!;
+    expect(legacyExposure).toMatchObject({
       seen: true,
       lanes: ["chat"],
-      // The static principal has no trusted per-key catalogue identity, so exposure is retained
-      // without inventing model metadata.
-      model_ids: [],
       harness_ids: ["openai-chat"],
     });
+    // The implicit model may be resolved from a prior discovery cache. The static principal's
+    // exposure must never invent any ID beyond the mock backend's actual m1 model.
+    expect([[], ["m1"]]).toContainEqual(legacyExposure.model_ids);
     expect(body.results.find((row) => row.fingerprint_sha256 === delegateHash)).toMatchObject({
       seen: true,
       lanes: ["delegate"],

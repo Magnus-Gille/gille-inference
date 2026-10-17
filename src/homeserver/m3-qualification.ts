@@ -363,7 +363,6 @@ const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const CURRENT_HARVEST_POLICY = "ctx-tools-parts-v1";
 const POLICY_STAMP_RE = new RegExp(`^${CURRENT_HARVEST_POLICY}\\|ctx=(0|[1-9]\\d{0,15})$`);
 const TEXT_RE = /^[^\u0000-\u001f\u007f]{1,1024}$/u;
-const PURPOSES: QualificationTrafficPurpose[] = ["organic", "evaluation", "synthetic", "unknown"];
 const FIRST_CANARY_THRESHOLD_KEYS = [
   "version",
   "rationale",
@@ -1037,51 +1036,6 @@ function invalidSnapshotValue(raw: unknown): { sha256: string; observedAt: strin
   return {
     sha256: digest(record.sha256) ? record.sha256 : "",
     observedAt: typeof record.observedAt === "string" && parseCanonicalIso(record.observedAt) !== null ? record.observedAt : "",
-  };
-}
-
-function emptyReport(): QualificationCandidateReport {
-  const empty: QualificationSignalSummary = { status: "unknown", value: null, sampleSize: null };
-  const purpose: QualificationPurposeSummary = {
-    candidateBound: null,
-    opportunities: empty,
-    attempts: empty,
-    useful: empty,
-    assessed: empty,
-    pass: empty,
-    partial: empty,
-    redo: empty,
-    wrong: empty,
-  };
-  return {
-    key: { taskType: "", nodeId: "", modelId: "", lane: "", verifier: "" },
-    identity: { evidenceIdentitySha256: "", artifactSha256: "", runtimeSha256: "", verifierSha256: "" },
-    diagnostic: "HOLD",
-    reasons: ["invalid_input"],
-    policyStatus: "invalid",
-    eligibility: { nonJudgmentLane: null, dataClass: null, destinationClass: null },
-    verifier: { kind: null, trusted: null, trustPolicyId: "" },
-    safety: {
-      boundedTaskType: empty,
-      lowBlastRadius: empty,
-      rollbackPathTested: empty,
-      watchdogPathTested: empty,
-    },
-    costProvenance: { local: "", baseline: "" },
-    evidence: {
-      organic: purpose,
-      evaluation: purpose,
-      synthetic: purpose,
-      unknown: purpose,
-      qualityRate: empty,
-      errorRate: empty,
-      p90LatencyMs: empty,
-      busyRate: empty,
-      localCostPerAcceptedUsd: empty,
-      baselineCostPerAcceptedUsd: empty,
-      calibrated: empty,
-      exactOneCostCoverage: empty,
-    },
   };
 }
 

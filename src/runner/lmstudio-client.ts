@@ -97,7 +97,6 @@ export async function runLmStudioInference(
 
     let promptTokens = 0;
     let completionTokens = 0;
-    let reasoningChars = 0;
     let finishReason: string | null = null;
 
     for await (const chunk of stream) {
@@ -113,7 +112,6 @@ export async function runLmStudioInference(
       const reasoningDelta = choiceDelta?.reasoning_content ?? choiceDelta?.reasoning;
       if (reasoningDelta) {
         if (firstTokenAt === null) firstTokenAt = performance.now();
-        reasoningChars += reasoningDelta.length;
       }
       const delta = choiceDelta?.content;
       if (delta) {
@@ -128,8 +126,6 @@ export async function runLmStudioInference(
         finishReason = choice.finish_reason;
       }
     }
-    void reasoningChars; // (available for diagnostics; not persisted)
-
     const end = performance.now();
     const durationMs = Math.round(end - start);
     const ttftMs = firstTokenAt !== null ? Math.round(firstTokenAt - start) : durationMs;

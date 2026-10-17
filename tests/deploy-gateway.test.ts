@@ -978,6 +978,60 @@ describe("scripts/deploy-gateway.sh", () => {
     expect(r2.stdout).toMatch(/Skipping restart -- rsync reported no changes/);
   });
 
+  it("restarts after a content change even when rsync emits a large itemized receipt", async () => {
+    const src = initSourceRepo();
+    const committedReadme = readFileSync(join(src, "README.md"), "utf8");
+    const remote = tmpDir("dg-remote-");
+    writeFileSync(join(remote, "README.md"), "stale live bytes\n");
+
+    const fakeBin = tmpDir("dg-large-rsync-bin-");
+    const fakeRsync = join(fakeBin, "rsync");
+    const realRsync = execFileSync("sh", ["-c", "command -v rsync"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(
+      fakeRsync,
+      "#!/bin/sh\n" +
+        "set -eu\n" +
+        "append_receipt=1\n" +
+        "for arg in \"$@\"; do\n" +
+        "  if [ \"$arg\" = \"--server\" ]; then append_receipt=0; fi\n" +
+        "done\n" +
+        "\"$REAL_RSYNC\" \"$@\"\n" +
+        "status=$?\n" +
+        // Keep this receipt sanitized and below exec-style output limits while making it much
+        // larger than a pipe buffer. The first itemized line lets grep exit early, reproducing
+        // the pipefail/SIGPIPE failure in the deploy script's payload_changed check.
+        "if [ \"$append_receipt\" -eq 1 ]; then\n" +
+        "  awk 'BEGIN { for (i = 0; i < 50000; i++) print \">f+++++++++ synthetic-item\" }'\n" +
+        "fi\n" +
+        "exit \"$status\"\n"
+    );
+    chmodSync(fakeRsync, 0o755);
+
+    const restartSentinel = join(remote, "RESTARTED_SENTINEL");
+    const local = await startOkServer();
+    const tailnet = await startOkServer();
+    const cap = await startCapabilityServer(OWNER_KEY);
+    const r = await runScript(
+      "deploy",
+      src,
+      baseEnv(remote, {
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        REAL_RSYNC: realRsync,
+        DEPLOY_RESTART_CMD: `touch '${restartSentinel}'`,
+        DEPLOY_HEALTH_LOCAL_URL: local.url,
+        DEPLOY_HEALTH_TAILNET_URL: tailnet.url,
+        DEPLOY_CAPABILITY_URL: cap.url,
+      })
+    );
+
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(readFileSync(join(remote, "README.md"), "utf8")).toBe(committedReadme);
+    expect(existsSync(restartSentinel)).toBe(true);
+    expect(readFileSync(join(remote, ".deployed-commit"), "utf8").trim()).toBe(headSha(src));
+  });
+
   it("dry-run prints a plan and never mutates anything, even against a matching remote", async () => {
     const src = initSourceRepo();
     const remote = tmpDir("dg-remote-");

@@ -1,0 +1,20 @@
+
+In scripts/overnight-mellum-instruct.sh line 89:
+     WHERE r.batch_id='$BATCH' AND j.judge_model='anthropic/claude-opus-4-5';" 2>>"$LOG" | tee -a "$LOG"
+                                                                                  ^----^ SC2094 (info): Make sure not to read and write the same file in the same pipeline.
+                                                                                                  ^----^ SC2094 (info): Make sure not to read and write the same file in the same pipeline.
+
+
+In scripts/prepare-model-evaluation-registry.sh line 47:
+  node -e '
+          ^-- SC2016 (info): Expressions don't expand in single quotes, use double quotes for that.
+
+
+In scripts/service-isolation.sh line 21:
+readonly LLAMA_ROCM_TEMPLATE="$(dirname "${BASH_SOURCE[0]}")/../deploy/systemd/llama-swap-rocm-device.conf"
+         ^-----------------^ SC2155 (warning): Declare and assign separately to avoid masking return values.
+
+For more information:
+  https://www.shellcheck.net/wiki/SC2155 -- Declare and assign separately to ...
+  https://www.shellcheck.net/wiki/SC2016 -- Expressions don't expand in singl...
+  https://www.shellcheck.net/wiki/SC2094 -- Make sure not to read and write t...
