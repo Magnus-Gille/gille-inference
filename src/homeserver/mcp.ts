@@ -1,10 +1,11 @@
 import type { ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { clampMaxTokensForModel, type HomeserverConfig } from "./config.js";
-import { listModels } from "./model-admin.js";
+import { getRunningSnapshot, listModels } from "./model-admin.js";
 import { admitHostMemory, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
 import { AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
 import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
+import { quotaScopeForPrincipal, describeQuotaFailure, type QuotaFailureDetail } from "./quota-error.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
 import { recordOwnerRequest } from "./owner-log.js";
 import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
@@ -15,7 +16,9 @@ import { parseExecutionTrafficPurpose, type ExecutionTrafficPurpose } from "./ex
 import { buildDelegationCostTrace, tryRecordDelegationCost } from "./delegation-cost.js";
 import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
-import { canonicalizeModelTrusted } from "./catalogue.js";
+import { canonicalizeModelTrusted, getTrustedCatalogue } from "./catalogue.js";
+import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
+import type { ModelFailureBackoff } from "./model-failure-backoff.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
 import {
   describeBlindContextAvailability,
@@ -41,6 +44,7 @@ import { deriveEvidenceIdentity } from "./orchestrator.js";
 import { currentTraceHeaders } from "./tracing.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { isEmbeddingModel } from "./embedding-request.js";
+import { TOKENIZE_TOOL, runTokenize } from "./tokenize.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -273,6 +277,37 @@ const ASK_OUTPUT_SCHEMA = {
   required: ["model", "text", "finish_reason", "truncated", "metered", "usage"],
 } as const;
 
+/** Only the separately requested reasoning field is capped; generation/usage is unchanged. */
+export const ASK_REASONING_MAX_BYTES = 16_384;
+class InvalidAskResponse extends Error {}
+interface AskReasoning {
+  content: string | null;
+  truncated: boolean | null;
+}
+function boundedAskReasoning(raw: unknown): AskReasoning {
+  if (typeof raw !== "string") return { content: null, truncated: null };
+  let bytes = 0;
+  let end = 0;
+  // Stop at a complete Unicode code point. Never decode a sliced UTF-8 byte sequence.
+  for (const character of raw) {
+    const next = Buffer.byteLength(character, "utf8");
+    if (bytes + next > ASK_REASONING_MAX_BYTES) return { content: raw.slice(0, end), truncated: true };
+    bytes += next;
+    end += character.length;
+  }
+  return { content: raw, truncated: false };
+}
+const ASK_OWNER_OUTPUT_SCHEMA = {
+  ...ASK_OUTPUT_SCHEMA,
+  properties: {
+    ...ASK_OUTPUT_SCHEMA.properties,
+    reasoning_content: { type: ["string", "null"], maxLength: ASK_REASONING_MAX_BYTES,
+      description: "Only with include_reasoning:true: upstream reasoning text, limited to 16384 UTF-8 bytes, or null when unavailable." },
+    reasoning_truncated: { type: ["boolean", "null"],
+      description: "Whether the reasoning field was clipped by the response byte cap; null when unavailable. Independent of generation finish_reason." },
+  },
+} as const;
+
 const CODE_LOOP_OWNER_INSTRUCTIONS =
   "code_loop is OWNER-AGENT ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
 
@@ -465,13 +500,19 @@ export function isAdoptionEvidenceToolCall(rawBody: string): boolean {
 function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] {
   const filesCapability = askFilesCapability(principal, cfg);
   const base: McpToolDef[] = [
+    TOKENIZE_TOOL,
     {
       name: "list_models",
       description:
         "List the local models THIS key is permitted to use, each with a one-line strength hint, " +
-        "plus the live call-time ask.files capability state for this request.",
+        "plus the live call-time ask.files capability state for this request. Use model_status for a non-inference residency and limit observation.",
       inputSchema: { type: "object", properties: {}, required: [] },
       outputSchema: LIST_MODELS_OUTPUT_SCHEMA,
+    },
+    {
+      name: "model_status",
+      description: "Observe one granted model's residency and this caller's configured limits without loading a model or running inference. Loadability, swap cost and protection remain unknown when not proven.",
+      inputSchema: { type: "object", properties: { model: { type: "string" } }, required: ["model"], additionalProperties: false },
     },
     {
       name: "ask",
@@ -500,6 +541,10 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
             description:
               "optional actual known cloud delegator model id for savings accounting; omit when unknown, never guess",
           },
+          ...(principal.tier === "owner" ? {
+            include_reasoning: { type: "boolean", default: false,
+              description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
+          } : {}),
           files: {
             type: "array",
             items: { type: "string" },
@@ -511,7 +556,7 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
         },
         required: ["model", "prompt"],
       },
-      outputSchema: ASK_OUTPUT_SCHEMA,
+      outputSchema: principal.tier === "owner" ? ASK_OWNER_OUTPUT_SCHEMA : ASK_OUTPUT_SCHEMA,
     },
   ];
   if (isAdoptionReporter(principal)) {
@@ -584,6 +629,8 @@ export interface RunChatArgs {
   topK?: number;
   minP?: number;
   reasoningEffort?: "low";
+  /** Expose native reasoning only when true AND the authenticated caller is owner-tier. */
+  includeReasoning?: boolean;
   /**
    * #33: an already-ADMITTED LearningTaskContract Hugin request stamp, when the caller has one —
    * threaded straight through to the ledger write's evidence-identity derivation (lane "mcp-ask"),
@@ -612,19 +659,24 @@ interface AskUsageMetadata {
 export type RunChatResult =
   | {
       ok: true;
+      requestId?: string;
       text: string;
       totalTokens: number;
       finishReason: string | null;
       truncated: boolean | null;
       usage: AskUsageMetadata;
       feedbackHandle?: string;
+      reasoning?: AskReasoning;
     }
   | {
       ok: false;
+      requestId?: string;
+      backoff?: { scope: "key_model"; retry_after_seconds: number; unavailable_until: string };
       code:
         | "credits_exhausted"
         | "rate_limited"
         | "server_busy"
+        | "model_temporarily_unavailable"
         | "insufficient_memory"
         | "memory_admission_unavailable"
         | "model_not_allowed"
@@ -644,19 +696,7 @@ export type RunChatResult =
       traceErrorClass: string;
     };
 
-interface AskQuotaFailureCommon {
-  reason: "rpm" | "tpm" | "daily";
-  window: "60s" | "utc_day";
-  limit: number;
-  requested: number;
-  counted: false;
-  retry_after_seconds: number;
-}
-
-export type AskQuotaFailureDetail = AskQuotaFailureCommon & (
-  | { scope: "key"; used_before: number }
-  | { scope: "shared_static_tier"; used_before?: never }
-);
+export type AskQuotaFailureDetail = QuotaFailureDetail;
 
 /**
  * Machine-readable cause for a failed `ask`, sent in the MCP result's `_meta` (#349, #357). The
@@ -667,6 +707,7 @@ export type AskQuotaFailureDetail = AskQuotaFailureCommon & (
  */
 const ASK_FAILURE_RETRYABLE: Partial<Record<Extract<RunChatResult, { ok: false }>["code"], boolean>> = {
   server_busy: true,
+  model_temporarily_unavailable: true,
   rate_limited: true,
   insufficient_memory: true,
   memory_admission_unavailable: false,
@@ -678,6 +719,8 @@ export function askFailureMeta(failure: Extract<RunChatResult, { ok: false }>): 
   const retryable = failure.retryable ?? (failure.reason !== undefined ? true : ASK_FAILURE_RETRYABLE[failure.code]);
   return {
     m5_code: failure.code,
+    ...(failure.requestId === undefined ? {} : { request_id: failure.requestId }),
+    ...(failure.backoff === undefined ? {} : { backoff: failure.backoff }),
     ...(failure.reason === undefined ? {} : { reason: failure.reason }),
     ...(failure.layer === undefined ? {} : { layer: failure.layer }),
     ...(retryable === undefined ? {} : { retryable }),
@@ -779,6 +822,8 @@ function toAskStructuredContent(
   truncated: boolean | null;
   metered: true;
   feedback_handle?: string;
+  reasoning_content?: string | null;
+  reasoning_truncated?: boolean | null;
   usage: {
     prompt_tokens: number | null;
     completion_tokens: number | null;
@@ -791,6 +836,9 @@ function toAskStructuredContent(
   return {
     model,
     text: result.text,
+    ...(result.reasoning === undefined ? {} : {
+      reasoning_content: result.reasoning.content, reasoning_truncated: result.reasoning.truncated,
+    }),
     finish_reason: result.finishReason,
     truncated: result.truncated,
     metered: true,
@@ -832,10 +880,12 @@ export async function runChatCompletion(
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number },
   args: RunChatArgs,
   hostMemoryAdmission?: HostMemoryAdmissionDeps,
+  failureBackoff?: ModelFailureBackoff,
 ): Promise<RunChatResult> {
   // Wall clock for the whole metered attempt — covers pre-admission rejections too, so every
   // request_log row (success OR failure) carries a real total_ms.
   const attemptStart = Date.now();
+  const inferenceRequestId = randomUUID();
 
   // C3 / M1: canonicalize the user-supplied model into a label SAFE for /metrics + request_log
   // BEFORE any exit path, EXACTLY as the HTTP route does (canonicalizeModelTrusted). A known
@@ -852,7 +902,7 @@ export async function runChatCompletion(
   const logInferenceFailure = (status: number, outcome: string, errorClass: string, admission: string): void => {
     if (cfg.requestLog !== "on") return;
     recordRequestLog({
-      requestId: randomUUID(),
+      requestId: inferenceRequestId,
       alias: principal.alias,
       tier: principal.tier,
       keyHash: principal.keyHash,
@@ -887,6 +937,7 @@ export async function runChatCompletion(
     logInferenceFailure(403, "forbidden", "model_not_allowed", "n/a");
     return {
       ok: false,
+      requestId: inferenceRequestId,
       code: "model_not_allowed",
       message: `Your API key is not permitted to use model '${args.model}'. Allowed: ${principal.modelAllowList.join(", ")}.`,
       traceOutcome: "forbidden",
@@ -897,6 +948,7 @@ export async function runChatCompletion(
     logInferenceFailure(400, "bad_request", "model_not_allowed", "n/a");
     return {
       ok: false,
+      requestId: inferenceRequestId,
       code: "model_not_allowed",
       message: "Decision models use POST /v1/systemone instead of MCP ask.",
       traceOutcome: "bad_request",
@@ -907,11 +959,24 @@ export async function runChatCompletion(
     logInferenceFailure(400, "bad_request", "model_not_allowed", "n/a");
     return {
       ok: false,
+      requestId: inferenceRequestId,
       code: "model_not_allowed",
       message: "Embedding models use POST /v1/embeddings instead of MCP ask.",
       traceOutcome: "bad_request",
       traceErrorClass: "model_not_allowed",
     };
+  }
+
+  const backoff = failureBackoff?.observe(args.model);
+  if (backoff !== null && backoff !== undefined) {
+    recordRequest({ model: canonModel, outcome: "model_temporarily_unavailable", tier: principal.tier,
+      promptTokens: null, completionTokens: null, durationMs: Date.now() - attemptStart, creditsCharged: 0 });
+    logInferenceFailure(503, "model_temporarily_unavailable", "model_temporarily_unavailable", "n/a");
+    return { ok: false, requestId: inferenceRequestId, code: "model_temporarily_unavailable",
+      message: "Repeated backend failures paused this key/model briefly; wait until the retry time. The underlying cause is not established.",
+      retryable: true, retryAfterSeconds: backoff.retry_after_seconds,
+      backoff: { scope: "key_model", retry_after_seconds: backoff.retry_after_seconds, unavailable_until: backoff.unavailable_until },
+      traceOutcome: "model_temporarily_unavailable", traceErrorClass: "model_temporarily_unavailable" };
   }
 
   // Estimate cost: prompt chars/4 + the (capped) completion reservation.
@@ -938,6 +1003,7 @@ export async function runChatCompletion(
       logInferenceFailure(402, "credits_exhausted", "credits_exhausted", "n/a");
       return {
         ok: false,
+        requestId: inferenceRequestId,
         code: "credits_exhausted",
         message: "Your credit budget is exhausted. Contact the operator for more credits.",
         traceOutcome: "credits_exhausted",
@@ -960,38 +1026,14 @@ export async function runChatCompletion(
     releaseReserve();
     recordRateLimited("quota");
     logInferenceFailure(429, "rate_limited", "rate_limit_exceeded", "n/a");
-    const quotaBase: AskQuotaFailureCommon = {
-      reason: q.reason,
-      window: q.reason === "daily" ? "utc_day" : "60s",
-      limit: q.reason === "rpm" ? q.snapshot.rpmLimit : q.reason === "tpm" ? q.snapshot.tpmLimit : q.snapshot.dailyLimit,
-      requested: q.reason === "rpm" ? 1 : estTokens,
-      counted: false,
-      retry_after_seconds: q.retryAfterSeconds,
-    };
-    // Legacy static tokens share one tier-wide alias. A minted key may also collide with that
-    // reserved alias, so decide from the actual quota bucket name as well as credential type.
-    // Such usage can include another consumer; never expose its exact count as per-key usage.
-    const sharedStaticBucket = principal.keyHash === null
-      || principal.alias === "static:user"
-      || principal.alias === "static:admin"
-      || principal.alias === "static:monitor";
-    const quota: AskQuotaFailureDetail = sharedStaticBucket
-      ? { ...quotaBase, scope: "shared_static_tier" }
-      : {
-          ...quotaBase,
-          scope: "key",
-          used_before: q.reason === "rpm"
-            ? q.snapshot.rpmUsed - 1
-            : q.reason === "tpm"
-              ? q.snapshot.tpmUsed - estTokens
-              : q.snapshot.dailyUsed,
-        };
+    const failure = describeQuotaFailure(q, estTokens, principal);
     return {
       ok: false,
+      requestId: inferenceRequestId,
       code: "rate_limited",
-      message: `${quota.scope === "key" ? "Per-key" : "Shared static-tier"} ${q.reason} limit reached (${quota.limit} ${q.reason === "rpm" ? "requests" : "estimated tokens"} per ${quota.window === "60s" ? "60s" : "UTC day"}). This rejected request was not counted. Retry after ${q.retryAfterSeconds}s.`,
+      message: failure.message,
       retryAfterSeconds: q.retryAfterSeconds,
-      quota,
+      quota: failure.quota,
       traceOutcome: "rate_limited",
       traceErrorClass: "rate_limit_exceeded",
     };
@@ -1020,6 +1062,7 @@ export async function runChatCompletion(
       logInferenceFailure(503, "busy", "server_busy", "busy");
       return {
         ok: false,
+        requestId: inferenceRequestId,
         code: "server_busy",
         message: `The server is busy. Retry after ${err.retryAfterSeconds}s.`,
         retryAfterSeconds: err.retryAfterSeconds,
@@ -1057,6 +1100,7 @@ export async function runChatCompletion(
       logInferenceFailure(503, "memory_refused", memoryRejection.code, "admitted");
       return {
         ok: false,
+        requestId: inferenceRequestId,
         code: memoryRejection.code,
         message: memoryRejection.message,
         ...(memoryRejection.retryAfterSeconds === null ? {} : { retryAfterSeconds: memoryRejection.retryAfterSeconds }),
@@ -1123,11 +1167,13 @@ export async function runChatCompletion(
     });
     const text = await upstream.text();
 
+    if (upstream.status >= 500) failureBackoff?.recordFailure(args.model, "upstream_http_error");
     if (upstream.status >= 400) {
       // No successful completion ⇒ no credit charge (actualTokens stays 0).
       if (upstream.status === 404 || /model.*not.*found/i.test(text)) {
         return {
           ok: false,
+          requestId: inferenceRequestId,
           code: "upstream_error",
           message: `The model '${args.model}' does not exist or is not loaded.`,
           traceOutcome: "bad_request",
@@ -1136,6 +1182,7 @@ export async function runChatCompletion(
       }
       return {
         ok: false,
+        requestId: inferenceRequestId,
         code: "upstream_error",
         message: `Upstream model error (HTTP ${upstream.status}).`,
         traceOutcome: "error",
@@ -1144,6 +1191,9 @@ export async function runChatCompletion(
     }
 
     let content = "";
+    // Recheck tier at the shared helper boundary; never mix reasoning into final text or logs.
+    const includeReasoning = args.includeReasoning === true && principal.tier === "owner";
+    let reasoning = includeReasoning ? boundedAskReasoning(undefined) : undefined;
     let promptTokens: number | null = null;
     let completionTokens: number | null = null;
     let usageMetadata = emptyAskUsageMetadata();
@@ -1151,10 +1201,16 @@ export async function runChatCompletion(
     let truncated: boolean | null = null;
     try {
       const json = JSON.parse(text) as {
-        choices?: Array<{ message?: { content?: string }; finish_reason?: string | null }>;
+        choices?: Array<{ message?: { content?: string; reasoning_content?: unknown }; finish_reason?: string | null }>;
         usage?: unknown;
       };
-      content = json.choices?.[0]?.message?.content ?? "";
+      if (json === null || typeof json !== "object" || Array.isArray(json) ||
+          (json.choices != null && !Array.isArray(json.choices))) throw new InvalidAskResponse();
+      const message = json.choices?.[0]?.message;
+      if (message != null && (typeof message !== "object" || Array.isArray(message) ||
+          (message.content != null && typeof message.content !== "string"))) throw new InvalidAskResponse();
+      content = message?.content ?? "";
+      if (includeReasoning) reasoning = boundedAskReasoning(message?.reasoning_content);
       usageMetadata = parseAskUsageMetadata(json.usage);
       promptTokens = usageMetadata.promptTokens;
       completionTokens = usageMetadata.completionTokens;
@@ -1165,10 +1221,13 @@ export async function runChatCompletion(
         (promptTokens !== null && completionTokens !== null
           ? promptTokens + completionTokens
           : Math.ceil(promptChars / 4));
-    } catch {
-      // 2xx non-JSON: surface the raw body, charge only the prompt estimate.
-      content = text;
-      actualTokens = Math.ceil(promptChars / 4);
+    } catch (error) {
+      if (!(error instanceof SyntaxError) && !(error instanceof InvalidAskResponse)) throw error;
+      // A malformed envelope may contain reasoning bytes. Never reflect it as a final answer
+      // or persist it in owner logs; this failed call is reconciled to zero as other failures are.
+      actualTokens = 0;
+      return { ok: false, requestId: inferenceRequestId, code: "upstream_error", message: "The model backend returned an invalid chat response.",
+        traceOutcome: "error", traceErrorClass: "upstream_error" };
     }
     metricPrompt = promptTokens;
     metricCompletion = completionTokens;
@@ -1192,13 +1251,16 @@ export async function runChatCompletion(
         outcome: "ok",
       });
     }
+    failureBackoff?.recordSuccess(args.model);
     completedResult = {
       ok: true,
+      requestId: inferenceRequestId,
       text: content,
       totalTokens: actualTokens,
       finishReason,
       truncated,
       usage: usageMetadata,
+      ...(reasoning === undefined ? {} : { reasoning }),
     };
     return completedResult;
   } catch (err) {
@@ -1211,9 +1273,11 @@ export async function runChatCompletion(
     const kind = classifyUpstreamError(err);
     if (kind === "upstream_timeout") {
       // M2: set the failure kind so the finally / request_log row records the distinct 504 label.
+      failureBackoff?.recordFailure(args.model, "upstream_timeout");
       upstreamFailureKind = "upstream_timeout";
       return {
         ok: false,
+        requestId: inferenceRequestId,
         code: "upstream_error",
         message: "The model backend timed out (it may be loading a model) — please retry in a few seconds.",
         reason: "upstream_timeout",
@@ -1226,9 +1290,11 @@ export async function runChatCompletion(
     }
     if (kind === "upstream_unavailable") {
       // M2: set the failure kind so the finally / request_log row records the distinct 502 label.
+      failureBackoff?.recordFailure(args.model, "upstream_unavailable");
       upstreamFailureKind = "upstream_unavailable";
       return {
         ok: false,
+        requestId: inferenceRequestId,
         code: "upstream_error",
         message: "The model backend is unavailable — please retry shortly.",
         reason: "upstream_connection_failed",
@@ -1277,7 +1343,7 @@ export async function runChatCompletion(
     // content is ever written here.
     if (cfg.requestLog === "on") {
       recordRequestLog({
-        requestId: randomUUID(),
+        requestId: inferenceRequestId,
         alias: principal.alias,
         tier: principal.tier,
         keyHash: principal.keyHash,
@@ -1422,6 +1488,7 @@ async function callTool(
   args: Record<string, unknown>,
   ctx: ToolCallContext
 ): Promise<{ text: string; isError: boolean; structuredContent?: unknown; meta?: Record<string, unknown>; trace?: McpTraceOverride }> {
+  if (name === "tokenize") return runTokenize(args, ctx);
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal, ctx.cfg);
     const structuredContent = buildListModelsStructuredContent(
@@ -1433,6 +1500,56 @@ async function callTool(
       isError: false,
       ...(supportsStructuredListModelsContent(ctx.userAgent) ? { structuredContent } : {}),
     };
+  }
+
+  if (name === "model_status") {
+    if (Object.keys(args).length !== 1 || typeof args["model"] !== "string") {
+      return { text: "model_status requires one model identifier.", isError: true, trace: badRequestTrace() };
+    }
+    const model = args["model"];
+    const excluded = isSystemOneDecisionModel(model, ctx.cfg.systemOneModels) || isEmbeddingModel(model);
+    const granted = ctx.principal.modelAllowList.length > 0;
+    const denied = () => ({ text: "This model is not available to this key.", isError: true,
+      meta: { m5_code: "model_not_allowed", retryable: false },
+      trace: { traceOutcome: "forbidden", traceErrorClass: "model_not_allowed" } });
+    if (excluded || (granted && !ctx.principal.modelAllowList.includes(model))) return denied();
+    let residency: "resident" | "not_resident" | "unknown" | "unavailable";
+    let diagnosticCode: "backend_observation_unavailable" | undefined;
+    try {
+      const observed = (await listModels()).find((candidate) => candidate.key === model);
+      if (!granted && observed === undefined) return denied();
+      const running = (await getRunningSnapshot()).find((candidate) => candidate.model === model);
+      // Not-ready is not evidence of free memory: loading/unloading may still
+      // hold resources. Only a ready entry or an absent running entry is decisive.
+      residency = observed === undefined ? "unknown"
+        : running === undefined ? "not_resident" : running.state === "ready" ? "resident" : "unknown";
+    } catch (error) {
+      // Preserve the failed source, never backend messages, locators or commands.
+      if (!(error instanceof Error)) throw error;
+      diagnosticCode = "backend_observation_unavailable";
+      console.warn("Model status observation unavailable", { reason: diagnosticCode });
+      if (!granted && !getTrustedCatalogue().has(model)) {
+        return { text: "Model observation is unavailable; no residency or loadability is established.",
+          isError: true, meta: { m5_code: "upstream_error" }, trace: genericToolErrorTrace() };
+      }
+      residency = "unavailable";
+    }
+    const backoff = modelFailureBackoffFor(ctx.controller, ctx.principal).observe(model);
+    const structuredContent = {
+      model, checked_at: new Date().toISOString(), source: "backend_catalogue_running_snapshot",
+      residency, inference: "not_checked", loadable_now: "unknown", swap_cost_ms: null, protected: "unknown",
+      limits: {
+        scope: quotaScopeForPrincipal(ctx.principal),
+        rpm: { limit: ctx.principal.limits.rpm, window: "60s", zero_means: "blocked" },
+        tpm: { limit: ctx.principal.limits.tpm, window: "60s", zero_means: "unlimited" },
+        daily_tokens: { limit: ctx.principal.limits.dailyTokenBudget, window: "utc_day", zero_means: "unlimited" },
+        max_parallel: ctx.principal.maxParallel,
+        rpm_counts_failed_upstream: true, token_usage_reconciled: true, quota_rejections_counted: false,
+      },
+      backoff: backoff === null ? null : { scope: "key_model", retry_after_seconds: backoff.retry_after_seconds, unavailable_until: backoff.unavailable_until },
+      ...(diagnosticCode === undefined ? {} : { diagnostic_code: diagnosticCode }),
+    };
+    return { text: JSON.stringify(structuredContent), isError: false, structuredContent };
   }
 
   if (name === "record_adoption_evidence" && isAdoptionReporter(ctx.principal)) {
@@ -1454,6 +1571,15 @@ async function callTool(
   }
 
   if (name === "ask") {
+    const includeReasoning = args["include_reasoning"];
+    if (includeReasoning !== undefined && typeof includeReasoning !== "boolean") {
+      return { text: "'include_reasoning' must be a boolean.", isError: true, trace: badRequestTrace() };
+    }
+    if (includeReasoning === true && ctx.principal.tier !== "owner") {
+      return { text: "'include_reasoning' requires an owner-tier API key.", isError: true,
+        meta: { m5_code: "route_not_allowed", retryable: false },
+        trace: { traceOutcome: "forbidden", traceErrorClass: "route_not_allowed" } };
+    }
     const model = typeof args["model"] === "string" ? (args["model"] as string) : "";
     const prompt = typeof args["prompt"] === "string" ? (args["prompt"] as string) : "";
     const system = typeof args["system"] === "string" ? (args["system"] as string) : undefined;
@@ -1575,6 +1701,7 @@ async function callTool(
       model,
       messages,
       exposureTaskText: prompt,
+      ...(includeReasoning === true ? { includeReasoning: true } : {}),
       trafficPurpose: trafficPurpose.value,
       maxTokens,
       delegatorModelId,
@@ -1586,7 +1713,7 @@ async function callTool(
         outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE && supportsReasoningEffort(model)
           ? "low"
           : undefined,
-    }, ctx.hostMemoryAdmission);
+    }, ctx.hostMemoryAdmission, modelFailureBackoffFor(ctx.controller, ctx.principal));
     if (r.ok) {
       const structuredContent = toAskStructuredContent(model, r);
       if (isAskTokenLimitTruncation(r)) {
@@ -1596,7 +1723,8 @@ async function callTool(
           structuredContent,
         };
       }
-      return { text: r.text, isError: false, structuredContent };
+      return { text: r.text, isError: false, structuredContent,
+        ...(r.requestId === undefined ? {} : { meta: { request_id: r.requestId } }) };
     }
     return {
       text: r.message,

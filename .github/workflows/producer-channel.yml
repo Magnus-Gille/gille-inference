@@ -1,0 +1,75 @@
+name: Native producer channel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: producer-channel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  producer-channel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'off'
+      GO111MODULE: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Compile native decoder and client
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/observer/producer_receipt.c native/observer/test_producer_receipt.c -o "$RUNNER_TEMP/receipt-tests"
+          timeout 15 "$RUNNER_TEMP/receipt-tests"
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -D_FORTIFY_SOURCE=2 -O2 -fstack-protector-strong \
+            native/observer/producer_client.c native/observer/producer_receipt.c native/observer/proc_stat.c \
+            native/tests/producer_client_probe.c -o "$RUNNER_TEMP/native-producer-probe"
+      - name: Build fixture with the exact owned Go endpoint
+        run: |
+          mkdir "$RUNNER_TEMP/producer-channel-source"
+          cp runtime-patches/llama-swap/overlay/internal/installactivity/*.go "$RUNNER_TEMP/producer-channel-source/"
+          cp native/tests/producer_channel_test.go "$RUNNER_TEMP/producer-channel-source/"
+          cd "$RUNNER_TEMP/producer-channel-source"
+          go test -c -o "$RUNNER_TEMP/producer-channel-tests"
+      - name: Verify cross-UID identity, freshness, bounds and unknown results
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GI_NATIVE_PROBE="$RUNNER_TEMP/native-producer-probe" "$RUNNER_TEMP/producer-channel-tests" \
+            -test.run '^TestNativeProducerChannel$' -test.v -test.timeout=20s
+      - name: Prove replay regression rejects a client with nonce validation removed
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          source = Path('native/observer/producer_client.c').read_text()
+          before = '        strcmp(receipt.request_nonce_sha256, nonce) != 0 ||\n'
+          assert source.count(before) == 1
+          mutant = Path(os.environ['RUNNER_TEMP']) / 'producer-client-mutant.c'
+          binary = Path(os.environ['RUNNER_TEMP']) / 'producer-client-mutant'
+          mutant.write_text(source.replace(before, ''))
+          subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-pedantic',
+              '-I', str(Path('native/observer').resolve()), str(mutant),
+              'native/observer/producer_receipt.c', 'native/observer/proc_stat.c',
+              'native/tests/producer_client_probe.c', '-o', str(binary)], check=True, timeout=30)
+          result = subprocess.run(['sudo', '-n', 'env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+              'GITHUB_ACTIONS=true', 'RUNNER_ENVIRONMENT=github-hosted', 'GI_NATIVE_PROBE=' + str(binary),
+              str(Path(os.environ['RUNNER_TEMP']) / 'producer-channel-tests'),
+              '-test.run', '^TestNativeProducerChannel/replay$', '-test.v', '-test.timeout=10s'],
+              capture_output=True, text=True, timeout=15, check=False)
+          if result.returncode != 1 or 'native producer case failed: replay' not in result.stdout:
+              raise SystemExit('replay mutant did not fail its behavioral assertion')
+          print('red: replay regression rejects missing nonce validation')
+          PY

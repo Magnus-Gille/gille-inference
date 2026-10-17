@@ -57,6 +57,7 @@ const CANONICAL_GRIMNIR_SCHEMA_IDS = new Map<string, string>([
   ["contracts/grimnir-autonomy-v2/schemas/owner-authorization.schema.json", "https://grimnir.gille.ai/contracts/autonomy-owner-authorization/v1/schema.json"],
   ["contracts/grimnir-autonomy-v2/schemas/journal.schema.json", "https://grimnir.gille.ai/contracts/autonomous-mutation-journal/v2/schema.json"],
   ["contracts/grimnir-autonomy-v2/schemas/recovery-workers.schema.json", "https://grimnir.gille.ai/contracts/autonomy-recovery-worker-registry/v1/schema.json"],
+  ["contracts/grimnir-code-health-v1/docs/code-health-objective-v1.schema.json", "https://grimnir.gille.ai/contracts/code-health-objective/v1/schema.json"],
 ]);
 
 function contentWithoutCanonicalSchemaId(path: string, content: string): string {
@@ -116,6 +117,17 @@ describe("public repository host identifiers", () => {
     expect(contentWithoutCanonicalSchemaId(v2Path, `{\n  "$id": ${JSON.stringify(allowedV2)},\n}`)).not.toMatch(PRIVATE_DOMAIN);
     PRIVATE_DOMAIN.lastIndex = 0;
     expect(contentWithoutCanonicalSchemaId(v2Path, `{\n  "$id": "https://grimnir.gille.ai/other",\n}`)).toMatch(PRIVATE_DOMAIN);
+    PRIVATE_DOMAIN.lastIndex = 0;
+
+    const codeHealthPath = "contracts/grimnir-code-health-v1/docs/code-health-objective-v1.schema.json";
+    const allowedCodeHealth = CANONICAL_GRIMNIR_SCHEMA_IDS.get(codeHealthPath)!;
+    expect(contentWithoutCanonicalSchemaId(codeHealthPath, `{\n  "$id": ${JSON.stringify(allowedCodeHealth)},\n}`)).not.toMatch(PRIVATE_DOMAIN);
+    PRIVATE_DOMAIN.lastIndex = 0;
+    expect(contentWithoutCanonicalSchemaId(codeHealthPath, `{\n  "$id": "https://grimnir.gille.ai/other",\n}`)).toMatch(PRIVATE_DOMAIN);
+    PRIVATE_DOMAIN.lastIndex = 0;
+    expect(contentWithoutCanonicalSchemaId("docs/example.md", `{\n  "$id": ${JSON.stringify(allowedCodeHealth)},\n}`)).toMatch(PRIVATE_DOMAIN);
+    PRIVATE_DOMAIN.lastIndex = 0;
+    expect(contentWithoutCanonicalSchemaId(codeHealthPath, `{\n  "$id": ${JSON.stringify(allowedCodeHealth)},\n  "description": "uses grimnir.gille.ai only as additional content",\n}`)).toMatch(PRIVATE_DOMAIN);
     PRIVATE_DOMAIN.lastIndex = 0;
   });
 

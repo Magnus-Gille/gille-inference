@@ -8,6 +8,7 @@
  * Written BEFORE the implementation (red→green).
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { performance } from "node:perf_hooks";
 
 /** A minimal OpenAI-streaming async-iterable: one content chunk + a terminal usage chunk. */
 function makeStream(text: string, finishReason: string | null = "stop", completionTokens = 3) {
@@ -99,5 +100,43 @@ describe("runLmStudioInference — response_format forwarding (#166)", () => {
       truncated: false,
       completionTokens: 7,
     });
+  });
+
+  it("uses a reasoning delta to start TTFT without exposing it in the answer", async () => {
+    let stage = "start";
+    const stream = (async function* () {
+      stage = "reasoning";
+      yield { choices: [{ delta: { reasoning_content: "private reasoning" } }] };
+      stage = "content";
+      yield {
+        choices: [{ delta: { content: "answer" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      };
+      stage = "after-content";
+    })();
+
+    const now = vi.spyOn(performance, "now").mockImplementation(() => {
+      if (stage === "start") {
+        stage = "waiting-for-reasoning";
+        return 100;
+      }
+      if (stage === "reasoning") return 123;
+      if (stage === "content") return 140;
+      if (stage === "after-content") return 150;
+      throw new Error(`unexpected performance stage: ${stage}`);
+    });
+    try {
+      const { res } = await runWith({}, stream);
+
+      expect(res).toMatchObject({
+        ok: true,
+        response: "answer",
+        finishReason: "stop",
+        truncated: false,
+        ttftMs: 23,
+      });
+    } finally {
+      now.mockRestore();
+    }
   });
 });

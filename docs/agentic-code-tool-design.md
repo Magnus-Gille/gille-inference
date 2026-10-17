@@ -2,6 +2,8 @@
 
 **Issue:** #116 · **Acceptance (§11): ✅ PASSED 2026-07-02** — Gate D through code_loop: rounds 8/9/10 of 10, median 9 ≥ bar 9, same-day direct baseline 10/10 (`docs/gate-d-code-loop-acceptance-2026-07-02.md`) · **Status:** FINAL (synthesized from three candidate designs + three adversarial judge lenses) · **Date:** 2026-07-02
 
+> **Historical design and acceptance record.** The July 2 FINAL and Gate D acceptance above remain the dated record; they are not fresh verification of today's cage. Some design and review dispositions below were superseded as the implementation evolved. In particular, the `IPAddressDeny`/gateway-host allow disposition (S5) and tailnet `baseUrl` (O2) describe the historical design, not the current cage: systemd supplies resource limits, while `pasta` forwards an in-cage loopback port through the gateway relay. See the [current cage operations](../src/homeserver/README.md#code_loop--owner-agent-sandboxed-agentic-coding-116) and [cage implementation](../src/homeserver/code-loop-cage.ts).
+
 ---
 
 ## 1. Chosen architecture and why
@@ -124,6 +126,16 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   overlong/unbounded scope lists, and ambiguous seed spellings before a durable claim.
 - `protected`: optional globs; violations detected at exit (§6), never silently passed.
 - `caps` are clamped to hard maxima `wall_s ≤ 900`, `turns ≤ 40`, `completion_tokens ≤ 120000`. Default wall-clock is 480 s (delivery-lens must-fix), sized to tolerate 1–2 mid-loop model swaps (§8). The turn budget is global across a serving-degeneracy retry and reported usage never includes the over-cap `turn_start` enforcement signal. A stable completion-pressure wrapper asks the agent to begin wrapping up two turns early. `edit_deadline_turn` is optional, strictly positive, and must be ≤ effective `turns`; omission preserves the edit-deadline behavior. When present, a stable policy wrapper asks for the first edit/write by that overall turn and the monitor deterministically returns `cap-exceeded` + `failure_kind:edit-deadline` if no successful mutation event arrives. A clean exit with no successful mutation is the same non-converging outcome (never a silent `completed` with an empty diff); the detail carries a stable `no relevant edit attempted` prefix plus content-blind discovery/turn counts, while `failure_kind:edit-deadline` + `mutation_evidence:none` stays the machine-readable reason distinguishing it from a patch that failed verification (#240). Enforcement fires when the deadline turn ends (a stalled run cannot consume the wall cap), and a successful first-attempt mutation satisfies the deadline globally, exempting the degeneracy retry.
+- Optional `caps.total_wall_s` is a strict integer 90–900 seconds, measured from the gateway's
+  start invocation before asynchronous admission. Its shared work cutoff reserves the final
+  75 seconds for TERM/KILL, exact-unit stop/absence, lease release and bounded provenance lookup.
+  Each subsequent engine/check invocation receives a newly tightened cgroup lifetime and the
+  same stop signal. No new verifier or retry starts after cutoff; an acquired late lease is
+  released. Timeout output is withheld, cleanup uncertainty is durable and never a successful
+  completion. `execution.whole_job` reports a monotonic pre-persistence observation and cleanup status; acceptance
+  also measures dispatch-to-terminal/cleanup externally, including transport and polling time.
+  Verify the live input schema supports this optional field before dispatch. A client timeout
+  alone neither cancels an accepted job nor proves cleanup.
 
 Returns immediately with `work_id`, `status`, `client_run_id`, `request_fingerprint`, `recovered`,
 and versioned capabilities. A terminal idempotent retry also carries the original `result`. A new
