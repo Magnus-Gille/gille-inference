@@ -140,6 +140,13 @@ function gen(p: number, token: string | null, body: unknown): Promise<Response> 
   if (token !== null) headers["authorization"] = `Bearer ${token}`;
   return fetch(`http://127.0.0.1:${p}/v1/images/generations`, { method: "POST", headers, body: JSON.stringify(body) });
 }
+function setMaintenance(on: boolean): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/admin/maintenance`, {
+    method: "POST",
+    headers: { authorization: "Bearer admin-static-key", "content-type": "application/json" },
+    body: JSON.stringify({ on, mode: on ? "exclusive" : undefined, ttlSeconds: on ? 60 : undefined }),
+  });
+}
 function jobReq(method: string, token: string, id: string): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/v1/images/generations/jobs/${id}`, {
     method,
@@ -263,6 +270,28 @@ describe("POST /v1/images/generations — sync fast tier", () => {
 });
 
 describe("async balanced/high tiers + jobs", () => {
+  it("exclusive maintenance rejects an owner async image before credits, queue, or sidecar work", async () => {
+    const owner = mintKey({ alias: "img-owner-exclusive", tier: "owner", scope: "admin", creditLimit: 1_000_000 }, DEFAULTS);
+    const engaged = await setMaintenance(true);
+    expect(engaged.status).toBe(200);
+
+    try {
+      const response = await gen(port, owner.plaintextKey, { prompt: "x", model: "image-balanced" });
+      const body = await response.json() as { error?: { code?: string } };
+      const queued = getDb().prepare("SELECT COUNT(*) AS count FROM image_jobs WHERE alias = ?")
+        .get("img-owner-exclusive") as { count: number };
+
+      expect(response.status).toBe(503);
+      expect(body.error?.code).toBe("server_busy");
+      expect(credits(owner.plaintextKey)).toBe(0);
+      expect(queued.count).toBe(0);
+      expect(sidecarHits).toBe(0);
+    } finally {
+      const restored = await setMaintenance(false);
+      expect(restored.status).toBe(200);
+    }
+  });
+
   it("202 → poll → succeeded with bytes; debits after completion", async () => {
     const k = mintKey({ alias: "img-async", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
     const r = await gen(port, k.plaintextKey, { prompt: "x", model: "image-balanced", n: 2 });

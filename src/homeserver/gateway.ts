@@ -3421,10 +3421,12 @@ async function handleImageGeneration(
 
   // Bench/maintenance mode (#108): refuse GUEST image work outright. This covers the ASYNC
   // (balanced/high) path — which otherwise returns 202 and runs later on the shared GPU slot,
-  // bypassing the admission gate — as well as the sync path. Owners are unaffected. Placed
-  // BEFORE any credit/quota reservation so there is nothing to refund. Same server_busy
-  // envelope + maintenance Retry-After as the chat/audio admission rejection.
-  if (controller.isMaintenanceMode() && principal.tier !== "owner") {
+  // bypassing the admission gate — as well as the sync path. Exclusive windows (including
+  // the startup fence) refuse owner submissions too, before credit/quota reservation or queueing.
+  // Guest-only maintenance keeps the existing owner behavior. Same server_busy envelope and
+  // maintenance Retry-After as chat/audio admission rejection.
+  const maintenance = controller.snapshot();
+  if (maintenance.maintenanceMode && (principal.tier !== "owner" || maintenance.maintenanceScope === "exclusive")) {
     const retryAfterSeconds = cfg.maintenanceRetryAfterSeconds;
     lctx.status = 503;
     lctx.outcome = "busy";

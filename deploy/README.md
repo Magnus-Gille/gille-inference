@@ -578,13 +578,17 @@ GPU lease, so it supplements the canonical window rather than replacing the init
 
 Read back `/admin/maintenance` as `maintenance:true,mode:"exclusive"` after each gateway restart
 and before any manager mutation or recovery. Confirm sufficient remaining window time and bound
-the complete refresh command, including restoration, to finish before that deadline. An expired
+the complete refresh command, including restoration, to finish before that deadline. A timed-out
+`systemctl` client does not cancel an accepted manager job: reconcile the operation's exact
+systemd jobs and prove they have settled before releasing the fence. An expired
 fence or lease-loss/restore anomaly stops further mutation; do not silently extend the window.
 Refresh verifies the loaded soft dependency graph, restarts the manager with its new OOM score,
 checks that the current gateway PID stayed unchanged, then restarts the gateway last. Its
 post-restart verification and any automatic unit restoration must still run under the startup
 fence. On failure, restore units/manager while that accepted gateway is fenced; restore an older
-gateway without startup-fence support only **after** all manager changes are complete.
+gateway without startup-fence support only **after** all manager changes are complete. In that
+recovery branch, remove the temporary override and reload systemd while the current process is
+still fenced, then redeploy the older code as the actual final gateway restart.
 
 When the release and any recovery are verified, remove only the temporary runtime override,
 reload systemd and restart the gateway as the last mutation to restore normal admission. Read
