@@ -539,11 +539,12 @@ sudo scripts/service-isolation.sh verify --service gateway
 ```
 
 The refresh requires the dedicated lingered user manager to be healthy before mutation, backs up
-the exact prior drop-in, orders `home-gateway.service` after and requires the resolved
-`user@<gille-gateway-uid>.service`, restarts once, and verifies that a user-manager transport is
-visible inside the gateway's mount namespace. It binds only the private manager directory and the
-ordinary session-bus socket read-only; `systemd-run --pipe` needs the latter to pass stdio file
-descriptors. The dedicated user manager spawns each transient code-loop service, so `pasta` can
+the exact prior drop-in, orders `home-gateway.service` after the resolved
+`user@<gille-gateway-uid>.service`, then restarts both units and verifies that a user-manager
+transport is visible inside the gateway's mount namespace. It binds the dedicated manager's
+runtime directory read-only, so replacement socket paths resolve after the manager restarts;
+`systemd-run --pipe` needs the ordinary session bus to pass stdio file descriptors. The
+dedicated user manager spawns each transient code-loop service, so `pasta` can
 construct its namespace without granting `AF_NETLINK`, TUN, or weaker
 `NoNewPrivileges`/device policy to `home-gateway.service`; the model-driven bwrap cage still
 receives no host `/run` mounts or session-bus access. Isolation-only runtime variables also take
@@ -564,6 +565,44 @@ namespace can reach it. Complete recovery with one harmless owner-agent `ask` an
 seed-file `code_loop` smoke from a supported client; the latter must still prove every cage marker
 before inference begins.
 
+The initial gateway migration and recovery refresh install a reviewed drop-in for that exact
+dedicated `user@UID.service`: `Restart=on-failure` and `OOMScoreAdjust=-500`.
+A release that restarts the gateway and then changes its manager requires an exclusive fence
+that survives gateway restarts. Open the canonical exclusive maintenance window and let work
+drain first. Before the first gateway restart, install a temporary root-owned systemd runtime
+override setting `HOMESERVER_STARTUP_EXCLUSIVE_UNTIL` to the approved window's **same fixed**
+canonical UTC ISO timestamp (at most 30 minutes ahead). The accepted gateway must support this
+setting before any manager refresh. It overrides both inference lanes across process restarts;
+closing a process-local window or posting `{on:false}` does not clear it. It does not acquire a
+GPU lease, so it supplements the canonical window rather than replacing the initial drain.
+
+Read back `/admin/maintenance` as `maintenance:true,mode:"exclusive"` after each gateway restart
+and before any manager mutation or recovery. Confirm sufficient remaining window time and bound
+the complete refresh command, including restoration, to finish before that deadline. A timed-out
+`systemctl` client does not cancel an accepted manager job: reconcile the operation's exact
+systemd jobs and prove they have settled before releasing the fence. An expired
+fence or lease-loss/restore anomaly stops further mutation; do not silently extend the window.
+Refresh verifies the loaded soft dependency graph, restarts the manager with its new OOM score,
+checks that the current gateway PID stayed unchanged, then restarts the gateway last. Its
+post-restart verification and any automatic unit restoration must still run under the startup
+fence. On failure, restore units/manager while that accepted gateway is fenced; restore an older
+gateway without startup-fence support only **after** all manager changes are complete. In that
+recovery branch, remove the temporary override and reload systemd while the current process is
+still fenced, then redeploy the older code as the actual final gateway restart.
+
+When the release and any recovery are verified, remove only the temporary runtime override,
+reload systemd and restart the gateway as the last mutation to restore normal admission. Read
+back normal admission and the absent startup override. The fixed fence also expires automatically
+at its original deadline; a stale override never extends it after restart. A later manager recovery should
+leave the gateway process running while its directory mount sees replacement bus sockets.
+An intentional gateway stop does not trigger a restart. The refresh backs up and restores both
+unit drop-ins together on failure; it rejects an existing manager drop-in whose contents differ
+from the reviewed template. Gateway migration rollback removes the owned manager drop-in.
+Before owner-attended rollout, verify the resolved systemd dependencies, exercise an unexpected
+manager failure on a non-production unit, and check ordinary inference plus a caged code-loop
+smoke. `/healthz.codeLoopTransport` and `m5 doctor` report only the content-free socket-listener
+observation, not end-to-end code-loop readiness.
+
 Rollback is likewise one service at a time and explicit:
 
 ```bash
@@ -571,7 +610,8 @@ sudo scripts/service-isolation.sh rollback --service gateway --ack-rollback
 ```
 
 It stops the selected service, restores only its moved source paths, removes the isolation
-drop-in (leaving other pre-existing drop-ins intact), reloads systemd, and demands a recovered
+drop-in and its exact owned manager recovery drop-in (leaving other pre-existing drop-ins intact),
+reloads systemd, and demands a recovered
 legacy `magnus` unit. It refuses any merge with a non-empty original state directory. The
 dedicated inactive account/runtime is retained, mode-restricted, for forensic recovery; delete it
 only in a separate owner-approved cleanup.
@@ -586,6 +626,12 @@ Read-only — never syncs, restarts, or writes anything. Reports the `.deployed-
 content spot-check (sha256 of `src/homeserver/learning-task-contract.ts` and
 `src/homeserver/gateway.ts` against that commit in your local checkout), so a stale marker or a
 hand-edited file on the box shows up as an explicit `MISMATCH` instead of a false green.
+
+File identity does not prove which code the running process has loaded. When a release changes
+gateway behavior, also confirm that the gateway restarted after the payload update and verify
+the changed behavior through its client surface. For MCP tool changes, reconnect and inspect
+`tools/list` before making bounded functional calls. Missing new tools or fields fails acceptance
+even when the marker and file hashes match.
 
 ### Rollback
 

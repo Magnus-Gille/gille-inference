@@ -10,7 +10,8 @@ The optional `m5 build` command is a separate SSH-based, offline-first remote bu
 gateway inference route; see the [remote build guide](../docs/m5-remote-build.md). All
 `example.com` URLs below are reserved documentation examples; replace them with your deployment URL.
 
-Requires Node 18+ (uses built-in `fetch`). No external dependencies.
+Requires Node 18+ (uses built-in `fetch`). The dependency-free package gate and runtime fixtures
+run on Linux with Node 18 and 22 in CI. Windows support is not asserted here; see #266.
 
 ### Owner-client 1.5.x compatibility
 
@@ -18,6 +19,11 @@ The 1.5.x `m5` client requires the gateway's v9 schema-grounding contract for `c
 Its doctor reports MCP catalogue reachability without calling metered inference and checks the
 installed client against the gateway's advertised result contract; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
+For minted owner agent/admin keys, `inference_observation` reports the last successful admitted
+M5 inference recorded in the gateway's content-blind request log. It is global historical evidence,
+not a public/private route probe: `inference` stays `not_checked` even when a timestamp exists.
+Older gateways report `not_supported`; an unavailable or disabled log cannot establish that no
+inference succeeded.
 Coordinate the client and gateway upgrade: v8/v9 terminal results are deliberately not
 interchangeable. Restart/reconnect long-lived MCP bridge processes after installing the
 accepted package. The `hs` friend-facing API is unchanged. Publication, installation, and
@@ -25,11 +31,35 @@ gateway deployment are separate operations; source documentation does not prove 
 
 `m5 doctor` keeps older gateways with missing compatibility metadata in the existing reachability
 status, while a known contract or version mismatch reports `status: "degraded"` and exits nonzero.
+It also checks the public, content-free `/healthz` code-loop transport field without a bearer.
+`unavailable` reports degraded; a missing or invalid field reports `unknown`. This socket check
+does not prove that the caged code loop or inference can complete.
 It includes only validated gateway revision, client version, and result contract fields. Use
 `m5 --profile <name> doctor --check-latest` only when an explicit registry check is needed; this
 uses the fixed public npm endpoint and does not send credentials. An upgrade recommendation names
 the exact gateway client pin and the installed rollback pin, but has no executable install command
 until the registry check confirms that the gateway pin is published.
+
+### Reliability diagnostics (1.5.5)
+
+Version 1.5.5 lets the content-free code-loop transport check wait up to 3.5 seconds
+(within the caller's timeout), accommodating `/healthz`'s bounded peer check. It remains separate
+from inference readiness. `code run` accepts optional `caps.total_wall_s` (90–900 seconds) only
+when the live gateway schema advertises that budget; otherwise it refuses before sending the
+seed files. The shared budget reserves 75 seconds for cleanup. A 180-second request therefore
+allows up to 105 seconds of admission, coding and verification. Its terminal result reports
+`execution.whole_job`; its `observed_before_persistence_ms` excludes final synchronous
+persistence. External dispatch-to-terminal timing and proved cleanup are required for acceptance.
+Omitting the field preserves the separate engine/check limits.
+
+The default `m5 --profile <name> doctor` remains catalogue and transport discovery only. Its
+historical inference timestamp is global past activity, not current route readiness. To request
+one real synthetic check, explicitly choose `--public` or `--private` and pass
+`--probe-inference MODEL`; this makes one fixed 16-token `ask` on that route with a 30-second
+bound. Normal admission, quotas, and credits apply, and answer text is not returned. The client
+is distributed as a local tarball, not an npm release. See the
+[reliability diagnostics guide](../docs/reliability-diagnostics.md) for probe semantics,
+`model_status`, temporary backoff, incident-window access, and evaluation guidance.
 
 ## Install
 
@@ -102,6 +132,14 @@ printf '%s' '{"model":"mellum","prompt":"Summarize this."}' \
 ```
 
 A longer client bound does not raise server caps or guarantee completion.
+
+With a gateway and client containing #441, owner callers may add `"include_reasoning":true` to
+an `ask` input. The JSON result then preserves separate `reasoning_content` and
+`reasoning_truncated` fields; missing native data is `null`, and the gateway caps the text at
+16 KiB of UTF-8. Defaults omit both fields. The generic MCP bridge passes the same input and
+structured output without changing the final-answer text. See the
+[synthetic MCP example](../docs/m5-agent-client.md#native-reasoning-through-mcp); no credential
+export is needed and reasoning-token usage must never be inferred from the text.
 
 For a real owner execution, set `traffic_purpose` to `organic` in the `ask` or code request.
 The structured `ask` or `code_loop_result` output may then include a `feedback_handle`. After

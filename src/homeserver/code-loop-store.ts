@@ -238,6 +238,7 @@ export function codeLoopRequestFingerprint(
           turns: req.caps.turns ?? null,
           completion_tokens: req.caps.completion_tokens ?? null,
           edit_deadline_turn: req.caps.edit_deadline_turn ?? null,
+          ...(req.caps.total_wall_s === undefined ? {} : { total_wall_s: req.caps.total_wall_s }),
         },
     // Preserve the exact pre-LearningTaskContract serialization for unstamped callers. Adding a
     // trailing null here would invalidate every durable client_run_id created before the rollout.

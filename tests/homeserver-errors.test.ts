@@ -25,6 +25,37 @@ describe("error envelope", () => {
     expect(env.headers["X-RateLimit-Reset"]).toBe("12");
   });
 
+  it("rate_limit_exceeded: carries shared quota details without a shared remaining count", () => {
+    const env = makeError("rate_limit_exceeded", {
+      retryAfterSeconds: 43_200,
+      message: "Shared static-tier daily limit reached.",
+      quota: {
+        reason: "daily",
+        scope: "shared_static_tier",
+        window: "utc_day",
+        limit: 1,
+        requested: 12,
+        counted: false,
+        retry_after_seconds: 43_200,
+      },
+      rateLimit: { limit: 1, resetSeconds: 43_200 },
+    });
+
+    expect(env.body.error.quota).toEqual({
+      reason: "daily",
+      scope: "shared_static_tier",
+      window: "utc_day",
+      limit: 1,
+      requested: 12,
+      counted: false,
+      retry_after_seconds: 43_200,
+    });
+    expect(env.headers["Retry-After"]).toBe("43200");
+    expect(env.headers["X-RateLimit-Limit"]).toBe("1");
+    expect(env.headers["X-RateLimit-Reset"]).toBe("43200");
+    expect(env.headers["X-RateLimit-Remaining"]).toBeUndefined();
+  });
+
   it("upstream_unavailable: 502 server_error, generic retry-shortly message", () => {
     const env = makeError("upstream_unavailable");
     expect(env.status).toBe(502);

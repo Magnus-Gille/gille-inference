@@ -111,11 +111,6 @@ function ensureSchema(db: Database.Database): void {
   initialized.add(db);
 }
 
-/** Eagerly create the schema (idempotent) — mirrors ledger.ts's ensureLedgerSchema. */
-export function ensureExperimentImportSchema(): void {
-  ensureSchema(getDb());
-}
-
 export function subjectKeyOf(s: ExperimentImportSubject): string {
   return `${s.experimentId}|${s.armId}|${s.sampleId}`;
 }

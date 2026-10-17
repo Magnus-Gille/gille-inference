@@ -327,6 +327,118 @@ describe("secret-safe M5 client", () => {
     ).resolves.toMatchObject({ id: 2, result: { tools: [] } });
   });
 
+  it("classifies an aborted Cloudflare 530 body read as post-header timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 1_000,
+        fetch: async (_input, init) => {
+          attempts += 1;
+          return {
+            status: 530,
+            headers: new Headers({ server: "cloudflare" }),
+            body: {
+              getReader: () => ({
+                read: () => new Promise((_resolve, reject) => {
+                  init?.signal?.addEventListener("abort", () => reject(new DOMException("body aborted", "AbortError")), { once: true });
+                }),
+                cancel: async () => {},
+              }),
+            },
+          } as Response;
+        },
+      });
+      const pending = client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const assertion = expect(pending).rejects.toMatchObject({
+        code: "timeout",
+        message: expect.stringContaining("timed out while reading the gateway response after HTTP headers"),
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+      expect(attempts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a transport timeout before fetch headers classified as pre-header", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const client = await createM5Client({
+        gatewayUrl: "http://gateway.invalid",
+        profile: "codex",
+        endpoint: "private",
+        credentialStore: { resolve: async () => SECRET },
+        localProbes: { tailnet: async () => "down" },
+        timeoutMs: 1_000,
+        fetch: async (_input, init) => {
+          attempts += 1;
+          return new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("connect aborted", "AbortError")), { once: true });
+          });
+        },
+      });
+      const pending = client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const assertion = expect(pending).rejects.toMatchObject({
+        code: "timeout",
+        diagnosticCode: "connect_timeout",
+        failureLayer: "local_tailnet_unavailable",
+        message: expect.stringContaining("local tailnet is unavailable"),
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+      expect(attempts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([404, 410])("tears down a stale MCP session on HTTP %s and retries once with a fresh deadline", async (status) => {
+    vi.useFakeTimers();
+    try {
+      const calls: RequestInit[] = [];
+      const client = await createM5Client({
+        gatewayUrl: "https://gateway.invalid",
+        profile: "codex",
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 1_000,
+        fetch: async (_input, init) => {
+          calls.push(init ?? {});
+          const request = JSON.parse(String(init?.body)) as { id: number };
+          if (calls.length === 1) {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: [] } }), {
+              status: 200,
+              headers: { "mcp-session-id": "session-1" },
+            });
+          }
+          if (calls.length === 2) {
+            await new Promise((resolve) => setTimeout(resolve, 600));
+            return new Response("stale session", { status });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 600));
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: [] } }), { status: 200 });
+        },
+      });
+
+      await expect(client.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" })).resolves.toMatchObject({ id: 1 });
+      const pending = client.rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+      const assertion = expect(pending).resolves.toMatchObject({ id: 2, result: { tools: [] } });
+      await vi.advanceTimersByTimeAsync(1_200);
+      await assertion;
+
+      expect(calls).toHaveLength(3);
+      expect((calls[1]?.headers as Record<string, string>)?.["mcp-session-id"]).toBe("session-1");
+      expect((calls[2]?.headers as Record<string, string>)?.["mcp-session-id"]).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // #154: bounded ask timeouts. Omission keeps the exact 30,000 ms default; an explicit
   // 1,000–600,000 ms bound reaches the single-request AbortSignal; anything else fails at
   // the library boundary before credential resolution or network access.
@@ -524,6 +636,452 @@ describe("secret-safe M5 client", () => {
     });
     expect(JSON.stringify(seen)).toContain('"name":"list_models"');
     expect(JSON.stringify(seen)).toContain('"name":"ask"');
+  });
+
+  it.each(["rpm", "tpm", "daily"] as const)("preserves validated %s quota details from MCP ask refusals", async (reason) => {
+    const retryAfter = reason === "daily" ? 43_200 : 60;
+    const requestId = "44444444-4444-4444-8444-444444444444";
+    const quota = {
+      reason,
+      scope: "key",
+      window: reason === "daily" ? "utc_day" : "60s",
+      limit: reason === "rpm" ? 10 : 1_000,
+      used_before: reason === "rpm" ? 10 : 0,
+      requested: reason === "rpm" ? 1 : 29,
+      counted: false,
+      retry_after_seconds: retryAfter,
+    };
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: "peer supplied alias=private-alias keyHash=private-hash" }],
+          _meta: { m5_code: "rate_limited", request_id: requestId, retryable: true, retry_after_seconds: retryAfter, quota },
+        });
+      },
+    });
+
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected quota refusal"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    const serialized = failure.toJSON().error;
+    expect(failure).toMatchObject({ code: "rate_limited", retryable: true, retryAfterSeconds: retryAfter, quota });
+    expect(serialized).toMatchObject({ code: "rate_limited", retryable: true, retry_after_seconds: retryAfter, request_id: requestId, quota });
+    expect(serialized.message).toContain(`Per-key ${reason} limit reached`);
+    if (reason === "daily") {
+      expect(serialized.message).toContain("The UTC-day budget resets in");
+      expect(serialized.message).toContain("tokens per UTC day");
+    } else {
+      expect(serialized.message).toContain("The next quota-window expiry is in");
+      expect(serialized.message).not.toContain("The quota window resets");
+    }
+    expect(serialized.message).not.toContain("private-alias");
+    expect(serialized.message).not.toContain("private-hash");
+    expect(JSON.stringify(serialized)).not.toContain(SECRET);
+    expect(JSON.stringify(serialized)).not.toContain("private-alias");
+    expect(JSON.stringify(serialized)).not.toContain("private-hash");
+  });
+
+  it("normalizes a strict per-key/model temporary-unavailability backoff", async () => {
+    const requestId = "11111111-1111-4111-8111-111111111111";
+    const backoff = {
+      scope: "key_model",
+      retry_after_seconds: 7,
+      unavailable_until: "2026-10-15T14:30:00.000Z",
+    };
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `raw peer text ${SECRET} private-alias keyHash=abc123` }],
+          _meta: {
+            m5_code: "model_temporarily_unavailable",
+            request_id: requestId,
+            retryable: true,
+            retry_after_seconds: 7,
+            backoff,
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected temporary model unavailability"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure).toMatchObject({
+      code: "model_temporarily_unavailable",
+      retryable: true,
+      retryAfterSeconds: 7,
+      requestId,
+      backoff,
+    });
+    expect(failure.message).toBe("This model is temporarily unavailable for your API key. Retry after the indicated delay.");
+    expect(failure.toJSON().error).toMatchObject({
+      code: "model_temporarily_unavailable",
+      retryable: true,
+      retry_after_seconds: 7,
+      request_id: requestId,
+      backoff,
+    });
+    expect(JSON.stringify(failure.toJSON())).not.toContain(SECRET);
+    expect(JSON.stringify(failure.toJSON())).not.toContain("private-alias");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("abc123");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("raw peer text");
+  });
+
+  it.each([
+    ["mismatched retry", {
+      scope: "key_model", retry_after_seconds: 8, unavailable_until: "2026-10-15T14:30:00.000Z",
+    }, {}],
+    ["extra alias", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z", alias: "private-alias",
+    }, {}],
+    ["extra key hash", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z", key_hash: "private-hash",
+    }, {}],
+    ["unsafe timestamp", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-02-30T14:30:00.000Z",
+    }, {}],
+    ["top-level alias", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z",
+    }, { alias: "private-alias" }],
+    ["top-level key hash", {
+      scope: "key_model", retry_after_seconds: 7, unavailable_until: "2026-10-15T14:30:00.000Z",
+    }, { key_hash: "private-hash" }],
+  ] as const)("drops malformed temporary-unavailability metadata: %s", async (_caseName, backoff, extraMeta) => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `raw peer text ${SECRET} private-alias private-hash` }],
+          _meta: {
+            m5_code: "model_temporarily_unavailable",
+            request_id: "11111111-1111-4111-8111-111111111111",
+            retryable: true,
+            retry_after_seconds: 7,
+            backoff,
+            ...extraMeta,
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected generic fallback"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.code).toBe("tool_error");
+    expect(failure.toJSON().error.message).toBe("The model backend reported an error.");
+    expect(failure.toJSON().error).not.toHaveProperty("backoff");
+    expect(failure.toJSON().error).not.toHaveProperty("retry_after_seconds");
+    expect(failure.toJSON().error).not.toHaveProperty("request_id");
+    expect(JSON.stringify(failure.toJSON())).not.toContain(SECRET);
+    expect(JSON.stringify(failure.toJSON())).not.toContain("private-alias");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("private-hash");
+    expect(JSON.stringify(failure.toJSON())).not.toContain("raw peer text");
+  });
+
+  it("passes only a valid request UUID through generic upstream errors", async () => {
+    const requestId = "22222222-2222-4222-8222-222222222222";
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `peer correlator ${SECRET}` }],
+          _meta: {
+            m5_code: "upstream_error", reason: "unknown_reason", layer: "unknown",
+            request_id: requestId,
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected generic upstream fallback"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.code).toBe("tool_error");
+    expect(failure.toJSON().error).toMatchObject({
+      message: "The model backend reported an error.", request_id: requestId,
+    });
+    expect(JSON.stringify(failure.toJSON())).not.toContain("peer correlator");
+    expect(JSON.stringify(failure.toJSON())).not.toContain(SECRET);
+  });
+
+  it("drops an invalid UUID without discarding otherwise valid backoff metadata", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: "ignored peer text" }],
+          _meta: {
+            m5_code: "model_temporarily_unavailable",
+            request_id: "not-a-uuid",
+            retryable: true,
+            retry_after_seconds: 2,
+            backoff: {
+              scope: "key_model", retry_after_seconds: 2,
+              unavailable_until: "2026-10-15T14:30:00.000Z",
+            },
+          },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected temporary model unavailability"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    expect(failure.code).toBe("model_temporarily_unavailable");
+    expect(failure.toJSON().error).toHaveProperty("backoff");
+    expect(failure.toJSON().error).not.toHaveProperty("request_id");
+  });
+
+  it("only serializes validated backoff and UUID values from M5ClientError options", () => {
+    const valid = new M5ClientError("model_temporarily_unavailable", "safe", {
+      retryable: true,
+      retryAfterSeconds: 3,
+      requestId: "33333333-3333-4333-8333-333333333333",
+      backoff: {
+        scope: "key_model", retry_after_seconds: 3,
+        unavailable_until: "2026-10-15T14:30:00.000Z",
+      },
+    });
+    expect(valid.toJSON().error).toMatchObject({
+      retryable: true,
+      retry_after_seconds: 3,
+      request_id: "33333333-3333-4333-8333-333333333333",
+      backoff: {
+        scope: "key_model", retry_after_seconds: 3,
+        unavailable_until: "2026-10-15T14:30:00.000Z",
+      },
+    });
+    const invalid = new M5ClientError("model_temporarily_unavailable", "safe", {
+      retryable: true,
+      retryAfterSeconds: 3,
+      requestId: "not-a-uuid",
+      backoff: {
+        scope: "key_model", retry_after_seconds: 4,
+        unavailable_until: "2026-10-15T14:30:00.000Z",
+      },
+    });
+    expect(invalid.toJSON().error).not.toHaveProperty("request_id");
+    expect(invalid.toJSON().error).not.toHaveProperty("backoff");
+    expect(invalid.toJSON().error).not.toHaveProperty("retry_after_seconds");
+    expect(invalid.toJSON().error).not.toHaveProperty("retryable");
+    const invalidGenericId = new M5ClientError("tool_error", "safe", { requestId: "invalid" });
+    expect(invalidGenericId.toJSON().error).not.toHaveProperty("request_id");
+  });
+
+  it("advises the operator for a zero-RPM quota without promising a useful retry", async () => {
+    const quota = {
+      reason: "rpm", scope: "key", window: "60s", limit: 0, used_before: 0,
+      requested: 1, counted: false, retry_after_seconds: 1,
+    };
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: "ignored peer text" }],
+          _meta: { m5_code: "rate_limited", retryable: true, retry_after_seconds: 1, quota },
+        });
+      },
+    });
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error("expected zero-RPM refusal"); },
+      (error: unknown) => error as M5ClientError,
+    );
+    const message = failure.toJSON().error.message;
+    expect(message).toContain("The configured request allowance is zero");
+    expect(message).toContain("contact the gateway operator");
+    expect(message).toContain("will not restore request capacity");
+    expect(message).not.toMatch(/expiry|reset/i);
+    expect(message).not.toContain("retry after");
+    expect(failure.retryAfterSeconds).toBe(1);
+  });
+
+  it.each([
+    ["shared descriptor contains usage and identity", {
+      reason: "rpm", scope: "shared_static_tier", window: "60s", limit: 5,
+      requested: 1, counted: false, retry_after_seconds: 60, used_before: 4,
+      alias: "private-shared-alias", key_hash: "private-shared-hash",
+    }],
+    ["quota retry conflicts with MCP retry", {
+      reason: "daily", scope: "key", window: "utc_day", limit: 100,
+      requested: 200, counted: false, retry_after_seconds: 43_200, used_before: 0,
+    }],
+  ] as const)("drops malformed quota metadata: %s", async (caseName, quota) => {
+    const retryAfter = 60;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: "There is not enough host memory to start the requested model right now. Retry after 20s." }],
+          _meta: { m5_code: "rate_limited", retryable: true, retry_after_seconds: retryAfter, quota },
+        });
+      },
+    });
+
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task" }).then(
+      () => { throw new Error(`expected generic fallback: ${caseName}`); },
+      (error: unknown) => error as M5ClientError,
+    );
+    const serialized = failure.toJSON().error;
+    expect(failure.code).toBe("tool_error");
+    expect(serialized.message).toContain("host memory");
+    expect(serialized).not.toHaveProperty("quota");
+    expect(serialized).not.toHaveProperty("retry_after_seconds");
+    expect(JSON.stringify(serialized)).not.toContain("private-shared-alias");
+    expect(JSON.stringify(serialized)).not.toContain("private-shared-hash");
+  });
+
+  it("preserves optional reasoning metadata without changing answer text or usage", async () => {
+    const reasoning = "The bounded answer follows from the supplied evidence.";
+    let seenArguments: unknown;
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          id: number;
+          params?: { arguments?: unknown };
+        };
+        seenArguments = request.params?.arguments;
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            metered: true,
+            reasoning_content: reasoning,
+            reasoning_truncated: false,
+            usage: {
+              prompt_tokens: 11,
+              completion_tokens: 4,
+              total_tokens: 15,
+              reasoning_tokens: 2,
+              cache_creation_input_tokens: null,
+              cache_read_input_tokens: 3,
+            },
+          },
+        });
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task", include_reasoning: true })).resolves.toEqual({
+      model: "mellum",
+      text: "answer",
+      finish_reason: "stop",
+      truncated: false,
+      metered: true,
+      reasoning_content: reasoning,
+      reasoning_truncated: false,
+      usage: {
+        prompt_tokens: 11,
+        completion_tokens: 4,
+        total_tokens: 15,
+        reasoning_tokens: 2,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 3,
+      },
+    });
+    expect(seenArguments).toEqual({
+      model: "mellum",
+      prompt: "bounded task",
+      include_reasoning: true,
+    });
+  });
+
+  it("normalizes an unavailable reasoning pair to explicit nulls when the pair is present", async () => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            usage: null,
+            reasoning_content: null,
+            reasoning_truncated: null,
+          },
+        });
+      },
+    });
+
+    await expect(client.ask({ model: "mellum", prompt: "bounded task", include_reasoning: true })).resolves.toMatchObject({
+      model: "mellum",
+      text: "answer",
+      reasoning_content: null,
+      reasoning_truncated: null,
+    });
+  });
+
+  it.each([
+    ["invalid types", { reasoning_content: 42, reasoning_truncated: "malformed reasoning carrier" }],
+    ["string with null", { reasoning_content: "trace", reasoning_truncated: null }],
+    ["null with true", { reasoning_content: null, reasoning_truncated: true }],
+    ["only reasoning content", { reasoning_content: "trace" }],
+    ["only reasoning truncation", { reasoning_truncated: false }],
+  ])("rejects malformed optional reasoning metadata without inventing a trace: %s", async (_name, reasoning) => {
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid",
+      profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { id: number };
+        return rpcResult(request.id, {
+          content: [{ type: "text", text: "answer" }],
+          isError: false,
+          structuredContent: {
+            model: "mellum",
+            text: "answer",
+            finish_reason: "stop",
+            truncated: false,
+            metered: true,
+            ...reasoning,
+            usage: null,
+          },
+        });
+      },
+    });
+
+    const failure = await client.ask({ model: "mellum", prompt: "bounded task", include_reasoning: true }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "malformed_mcp" });
   });
 
   it("preserves a valid ask feedback handle while keeping absent handles omitted", async () => {
@@ -1889,6 +2447,57 @@ describe("m5 doctor diagnostic distinctions", () => {
     expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
+  it("allows delayed healthz responses while preserving abort handling", async () => {
+    vi.useFakeTimers();
+    try {
+      let healthzCalls = 0;
+      let healthzAborts = 0;
+      const resultPromise = diagnoseProfile({
+        profile: "codex",
+        profileConfig: PROFILE,
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 5_000,
+        fetch: async (input, init) => {
+          const url = String(input);
+          if (url.endsWith("/portal/me")) {
+            return jsonResponse({ alias: "codex-agent", tier: "owner", scope: "agent" });
+          }
+          if (url.endsWith("/healthz")) {
+            healthzCalls += 1;
+            return new Promise<Response>((resolve, reject) => {
+              const timer = setTimeout(() => resolve(jsonResponse({ codeLoopTransport: "available" })), 2_000);
+              init?.signal?.addEventListener("abort", () => {
+                healthzAborts += 1;
+                clearTimeout(timer);
+                reject(new DOMException("healthz aborted", "AbortError"));
+              }, { once: true });
+            });
+          }
+          const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+          if (request.params?.name === "list_models") {
+            return rpcResult(request.id, {
+              content: [{ type: "text", text: "Models available to you:\n- mellum — test" }],
+              isError: false,
+            });
+          }
+          return rpcResult(request.id, tools(REQUIRED_TOOLS));
+        },
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await resultPromise;
+      expect(healthzCalls).toBe(2);
+      expect(healthzAborts).toBe(0);
+      expect(result).toMatchObject({
+        status: "mcp_reachable",
+        endpoints: { public: "healthy", private: "healthy" },
+        code_loop_transport: { public: "available", private: "available" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["credential_timeout", "credential_timeout"],
     ["credential_unavailable", "credential_unavailable"],
@@ -2004,12 +2613,25 @@ describe("m5 doctor diagnostic distinctions", () => {
     expect(JSON.stringify(result)).not.toContain(PROFILE.privateGatewayUrl);
   });
 
-  it("distinguishes wrong credential scope", async () => {
-    await expect(
-      diagnose({
-        publicIdentity: { alias: "wrong", tier: "owner", scope: "inference" },
-      }),
-    ).resolves.toMatchObject({ status: "wrong_scope" });
+  it.each([
+    [
+      "public",
+      { publicIdentity: { alias: "wrong", tier: "owner", scope: "inference" } },
+      { public: "healthy", private: "not_checked" },
+    ],
+    [
+      "private",
+      { privateIdentity: { alias: "wrong", tier: "owner", scope: "inference" } },
+      { public: "healthy", private: "wrong_scope" },
+    ],
+  ] as const)("distinguishes wrong credential scope on the %s endpoint", async (_endpoint, options, endpoints) => {
+    const result = await diagnose(options);
+    expect(result).toMatchObject({
+      status: "wrong_scope",
+      identity: { tier: "owner", scope: "inference" },
+      endpoints,
+    });
+    expect(result).not.toHaveProperty("discovery_failure");
   });
 
   it("reports wrong scope even when model discovery fails", async () => {
@@ -2025,11 +2647,26 @@ describe("m5 doctor diagnostic distinctions", () => {
     });
   });
 
-  it("distinguishes missing MCP tools", async () => {
-    await expect(diagnose({ publicTools: ["list_models", "ask"] })).resolves.toMatchObject({
+  it.each([
+    [
+      "public",
+      { publicTools: ["list_models", "ask"] },
+      { public: "missing_tools", private: "not_checked" },
+    ],
+    [
+      "private",
+      { privateTools: ["list_models", "ask"] },
+      { public: "healthy", private: "missing_tools" },
+    ],
+  ] as const)("distinguishes missing MCP tools on the %s endpoint", async (_endpoint, options, endpoints) => {
+    const result = await diagnose(options);
+    expect(result).toMatchObject({
       status: "missing_tools",
+      identity: { tier: "owner", scope: "agent" },
       missing_tools: ["code_loop_start", "code_loop_status", "code_loop_result", "record_adoption_evidence"],
+      endpoints,
     });
+    expect(result).not.toHaveProperty("discovery_failure");
   });
 
   it("reports missing tools even when list_models fails", async () => {
@@ -2269,6 +2906,33 @@ describe("adoption-report spool and unconfigured-path diagnostics (#242)", () =>
       expect(readdirSync(dir)).toHaveLength(100);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("whole-job budget dispatch", () => {
+  it.each([false, true])("requires an advertised deadline before dispatch (supported=%s)", async supported => {
+    const calls: string[] = [];
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid", profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_url, init) => {
+        const request = JSON.parse(String(init?.body));
+        calls.push(request.method === "tools/call" ? request.params.name : request.method);
+        if (request.method === "tools/list") return rpcResult(request.id, { tools: [{
+          name: "code_loop_start", inputSchema: { properties: { caps: { properties: supported
+            ? { total_wall_s: { type: "integer", minimum: 90, maximum: 900 } } : {} } } },
+        }] });
+        return rpcResult(request.id, { isError: false, structuredContent: { ok: true, work_id: "cl-1", status: "running" }, content: [] });
+      },
+    });
+    const result = client.codeRun({ instruction: "x", files: [{ path: "x", content: "x" }], caps: { total_wall_s: 180 }, wait: false });
+    if (supported) {
+      await expect(result).resolves.toMatchObject({ ok: true, work_id: "cl-1" });
+      expect(calls).toEqual(["tools/list", "code_loop_start"]);
+    } else {
+      await expect(result).rejects.toMatchObject({ code: "whole_job_deadline_unsupported" });
+      expect(calls).toEqual(["tools/list"]);
     }
   });
 });

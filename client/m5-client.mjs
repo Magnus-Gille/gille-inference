@@ -4,10 +4,12 @@ import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const M5_CLIENT_VERSION = "1.5.3";
+export const M5_CLIENT_VERSION = "1.5.5";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
 // the word of a remote peer.
 const MAX_RETRY_AFTER_SECONDS = 86_400;
+const QUOTA_REASONS = new Set(["rpm", "tpm", "daily"]);
+const QUOTA_WINDOWS = new Map([["rpm", "60s"], ["tpm", "60s"], ["daily", "utc_day"]]);
 // Bounded direct ask timeout (#154): the stock 30 s default is preserved byte-for-byte for
 // callers that omit timeoutMs. An explicit bound must stay within 1–600 s so a cold model
 // switch or long implementation response can complete without an unbounded client wait.
@@ -75,6 +77,14 @@ const FAILURE_LAYERS = new Set([
   "private_route_unconfigured",
   "model_backend",
 ]);
+
+const DOCTOR_INFERENCE_PROBE_ERROR_CODES = new Set([
+  "invalid_input", "malformed_mcp", "tool_error", "timeout", "network_failure",
+  "upstream_error", "upstream_connection_failed", "upstream_timeout", "rate_limited",
+  "quota_exhausted", "model_not_allowed", "model_unavailable", "model_temporarily_unavailable",
+  "budget_exceeded", "token_limit_reached", "completion_unconfirmed",
+]);
+const DOCTOR_INFERENCE_PROBE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
 /** The standalone client cannot inspect an interactive host connector session. */
 const UNSUPPORTED_CONNECTOR_DIAGNOSTIC = Object.freeze({
@@ -151,6 +161,8 @@ function isValidEvidenceRecovery(value) {
 }
 const EXECUTION_FEEDBACK_VALUES = new Set(["pass", "partial", "redo", "wrong"]);
 const FEEDBACK_HANDLE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MODEL_TEMPORARILY_UNAVAILABLE_MESSAGE = "This model is temporarily unavailable for your API key. Retry after the indicated delay.";
 const MAX_BLIND_CONTEXT_ROOTS = 128;
 
 const TOKEN_PATTERNS = [
@@ -158,12 +170,40 @@ const TOKEN_PATTERNS = [
   /\bhs_[A-Za-z0-9._~-]+/g,
 ];
 
+function isValidRequestId(value) {
+  return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
+function normalizeModelUnavailableBackoff(value, expectedSeconds) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 3 || keys[0] !== "retry_after_seconds" ||
+      keys[1] !== "scope" || keys[2] !== "unavailable_until") return null;
+  if (
+    value.scope !== "key_model" ||
+    !Number.isSafeInteger(value.retry_after_seconds) ||
+    value.retry_after_seconds < 1 || value.retry_after_seconds > 30 ||
+    value.retry_after_seconds !== expectedSeconds ||
+    typeof value.unavailable_until !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.unavailable_until)
+  ) return null;
+  const parsed = Date.parse(value.unavailable_until);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value.unavailable_until) return null;
+  return {
+    scope: "key_model",
+    retry_after_seconds: value.retry_after_seconds,
+    unavailable_until: value.unavailable_until,
+  };
+}
+
 /**
  * Error safe to serialize or print. Details are deliberately content-free.
  */
 export class M5ClientError extends Error {
   constructor(code, message, options = {}) {
-    super(redactText(message));
+    super(code === "model_temporarily_unavailable"
+      ? MODEL_TEMPORARILY_UNAVAILABLE_MESSAGE
+      : redactText(message));
     this.name = "M5ClientError";
     this.code = code;
     // JSON.stringify invokes toJSON with the containing property key, not the profile that
@@ -181,10 +221,29 @@ export class M5ClientError extends Error {
       this.diagnosticCode = options.diagnosticCode;
     }
     if (FAILURE_LAYERS.has(options.failureLayer)) this.failureLayer = options.failureLayer;
-    if (typeof options.retryable === "boolean") this.retryable = options.retryable;
-    if (Number.isInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 0 &&
-        options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
-      this.retryAfterSeconds = options.retryAfterSeconds;
+    if (isValidRequestId(options.requestId)) this.requestId = options.requestId;
+    if (code === "model_temporarily_unavailable") {
+      const backoff = options.retryable === true
+        ? normalizeModelUnavailableBackoff(options.backoff, options.retryAfterSeconds)
+        : null;
+      if (backoff !== null) {
+        this.retryable = true;
+        this.retryAfterSeconds = backoff.retry_after_seconds;
+        this.backoff = backoff;
+      }
+    } else {
+      if (typeof options.retryable === "boolean") this.retryable = options.retryable;
+      if (Number.isInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 0 &&
+          options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
+        this.retryAfterSeconds = options.retryAfterSeconds;
+      }
+    }
+    if (code === "rate_limited" && options.retryable === true &&
+        Number.isInteger(options.retryAfterSeconds) && options.retryAfterSeconds >= 1 &&
+        options.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS &&
+        options.quota?.retry_after_seconds === options.retryAfterSeconds) {
+      const quota = normalizeQuotaFailure(options.quota);
+      if (quota !== null) this.quota = quota;
     }
     if (isValidEvidenceRecovery(options.evidenceRecovery)) {
       this.evidenceRecovery = { ...options.evidenceRecovery };
@@ -208,6 +267,10 @@ export class M5ClientError extends Error {
     const remediation = CREDENTIAL_FAILURE_CODES.has(this.code)
       ? credentialRemediation(profile)
       : this.remediation;
+    const quota = this.code === "rate_limited" ? normalizeQuotaFailure(this.quota) : null;
+    const backoff = this.code === "model_temporarily_unavailable"
+      ? normalizeModelUnavailableBackoff(this.backoff, this.retryAfterSeconds)
+      : null;
     return {
       error: {
         code: this.code,
@@ -216,8 +279,13 @@ export class M5ClientError extends Error {
         ...(this.workId === undefined ? {} : { work_id: this.workId }),
         ...(this.diagnosticCode === undefined ? {} : { diagnostic_code: this.diagnosticCode }),
         ...(this.failureLayer === undefined ? {} : { failure_layer: this.failureLayer }),
-        ...(this.retryable === undefined ? {} : { retryable: this.retryable }),
-        ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
+        ...(this.retryable === undefined || (this.code === "model_temporarily_unavailable" && backoff === null)
+          ? {} : { retryable: this.retryable }),
+        ...(this.retryAfterSeconds === undefined || (this.code === "model_temporarily_unavailable" && backoff === null)
+          ? {} : { retry_after_seconds: this.retryAfterSeconds }),
+        ...(backoff === null ? {} : { backoff }),
+        ...(isValidRequestId(this.requestId) ? { request_id: this.requestId } : {}),
+        ...(quota === null ? {} : { quota }),
         ...(this.evidenceRecovery === undefined ? {} : { evidence_recovery: { ...this.evidenceRecovery } }),
         ...(remediation === undefined ? {} : { remediation }),
       },
@@ -481,6 +549,7 @@ function safeError(error, secrets, profile) {
       failureLayer: error.failureLayer,
       retryable: error.retryable,
       retryAfterSeconds: error.retryAfterSeconds,
+      quota: error.quota,
       remediation: error.remediation,
       evidenceRecovery: error.evidenceRecovery,
     }));
@@ -820,6 +889,36 @@ function normalizeOptionalFeedbackHandle(value) {
   throw new M5ClientError("malformed_mcp", "The gateway returned malformed feedback metadata.");
 }
 
+function normalizeOptionalReasoning(payload) {
+  const hasReasoningContent = Object.prototype.hasOwnProperty.call(payload, "reasoning_content");
+  const hasReasoningTruncated = Object.prototype.hasOwnProperty.call(payload, "reasoning_truncated");
+  if (!hasReasoningContent && !hasReasoningTruncated) return undefined;
+  if (!hasReasoningContent || !hasReasoningTruncated) {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+  }
+
+  const reasoningContent =
+    payload.reasoning_content === null
+      ? null
+      : typeof payload.reasoning_content === "string"
+        ? payload.reasoning_content
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+          })();
+  const reasoningTruncated =
+    payload.reasoning_truncated === null
+      ? null
+      : typeof payload.reasoning_truncated === "boolean"
+        ? payload.reasoning_truncated
+        : (() => {
+            throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+          })();
+  if ((reasoningContent === null) !== (reasoningTruncated === null)) {
+    throw new M5ClientError("malformed_mcp", "The ask tool returned malformed reasoning metadata.");
+  }
+  return { reasoning_content: reasoningContent, reasoning_truncated: reasoningTruncated };
+}
+
 function normalizeAskPayload(payload, fallbackModel) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
@@ -872,6 +971,7 @@ function normalizeAskPayload(payload, fallbackModel) {
             throw new M5ClientError("malformed_mcp", "The ask tool returned malformed metering metadata.");
           })();
   const feedbackHandle = normalizeOptionalFeedbackHandle(payload.feedback_handle);
+  const reasoning = normalizeOptionalReasoning(payload);
   return {
     model,
     text: payload.text,
@@ -879,6 +979,7 @@ function normalizeAskPayload(payload, fallbackModel) {
     truncated,
     metered,
     usage: normalizeAskUsage(payload.usage),
+    ...(reasoning === undefined ? {} : reasoning),
     ...(feedbackHandle === undefined ? {} : { feedback_handle: feedbackHandle }),
   };
 }
@@ -930,18 +1031,71 @@ const ASK_BACKEND_MESSAGES = new Map([
 export function askRefusalFromMeta(result, text) {
   const meta = result?._meta;
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+  const requestId = isValidRequestId(meta.request_id) ? meta.request_id : undefined;
+  const requestIdField = requestId === undefined ? {} : { requestId };
+  if (meta.m5_code === "rate_limited") {
+    const retryAfterSeconds = meta.retry_after_seconds;
+    const quota = normalizeQuotaFailure(meta.quota);
+    if (
+      quota === null ||
+      meta.retryable !== true ||
+      !Number.isSafeInteger(retryAfterSeconds) ||
+      retryAfterSeconds < 1 ||
+      retryAfterSeconds > MAX_RETRY_AFTER_SECONDS ||
+      retryAfterSeconds !== quota.retry_after_seconds
+    ) {
+      return {
+        code: "tool_error",
+        message: typeof text === "string" ? text.trim() : "The MCP tool reported an error.",
+      };
+    }
+    return {
+      code: "rate_limited",
+      retryable: true,
+      retryAfterSeconds,
+      quota,
+      ...requestIdField,
+      message: quotaFailureMessage(quota),
+    };
+  }
+  if (meta.m5_code === "model_temporarily_unavailable") {
+    const allowedKeys = new Set([
+      "m5_code", "request_id", "retryable", "retry_after_seconds", "backoff",
+    ]);
+    const keys = Object.keys(meta);
+    const retryAfterSeconds = meta.retry_after_seconds;
+    const backoff = normalizeModelUnavailableBackoff(meta.backoff, retryAfterSeconds);
+    if (
+      keys.some((key) => !allowedKeys.has(key)) ||
+      meta.retryable !== true ||
+      !Number.isSafeInteger(retryAfterSeconds) || retryAfterSeconds < 1 || retryAfterSeconds > 30 ||
+      backoff === null
+    ) {
+      return { code: "tool_error", message: "The model backend reported an error." };
+    }
+    return {
+      code: "model_temporarily_unavailable",
+      retryable: true,
+      retryAfterSeconds,
+      backoff,
+      ...requestIdField,
+      failureLayer: "model_backend",
+      message: MODEL_TEMPORARILY_UNAVAILABLE_MESSAGE,
+    };
+  }
   if (meta.m5_code === "upstream_error") {
     const generic = { code: "tool_error", message: "The model backend reported an error." };
     const message = ASK_BACKEND_MESSAGES.get(meta.reason);
-    if (meta.layer !== "model_backend" || message === undefined) return generic;
+    if (meta.layer !== "model_backend" || message === undefined) return { ...generic, ...requestIdField };
     if (Object.prototype.hasOwnProperty.call(meta, "retry_after_seconds") &&
-        !Number.isInteger(meta.retry_after_seconds)) return generic;
+        !Number.isInteger(meta.retry_after_seconds)) return { ...generic, ...requestIdField };
     const seconds = meta.retry_after_seconds;
     return {
       code: "upstream_error",
       retryable: true,
       failureLayer: "model_backend",
       ...(Number.isInteger(seconds) && seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS ? { retryAfterSeconds: seconds } : {}),
+      ...requestIdField,
       // Do not trust the tool text for a classified backend failure: the gateway's fixed
       // reason-specific message is the safe client contract.
       message,
@@ -954,8 +1108,59 @@ export function askRefusalFromMeta(result, text) {
     code: meta.m5_code,
     retryable,
     ...(retryable && Number.isInteger(seconds) && seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS ? { retryAfterSeconds: seconds } : {}),
+    ...requestIdField,
     message: typeof text === "string" ? text.trim() : "",
   };
+}
+
+function normalizeQuotaFailure(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const { reason, scope, window, limit, requested, counted, retry_after_seconds } = value;
+  if (
+    !QUOTA_REASONS.has(reason) ||
+    QUOTA_WINDOWS.get(reason) !== window ||
+    !["key", "shared_static_tier"].includes(scope) ||
+    !Number.isSafeInteger(limit) || limit < 0 ||
+    !Number.isSafeInteger(requested) || requested < 0 ||
+    counted !== false ||
+    !Number.isSafeInteger(retry_after_seconds) || retry_after_seconds < 1 || retry_after_seconds > MAX_RETRY_AFTER_SECONDS
+  ) return null;
+  const expectedKeys = scope === "key"
+    ? ["counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "used_before", "window"]
+    : ["counted", "limit", "reason", "requested", "retry_after_seconds", "scope", "window"];
+  expectedKeys.sort();
+  const actualKeys = Object.keys(value).sort();
+  if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) return null;
+  if (scope === "key" && (!Number.isSafeInteger(value.used_before) || value.used_before < 0)) return null;
+  return {
+    reason,
+    scope,
+    window,
+    limit,
+    ...(scope === "key" ? { used_before: value.used_before } : {}),
+    requested,
+    counted: false,
+    retry_after_seconds,
+  };
+}
+
+function quotaFailureMessage(quota) {
+  const shared = quota.scope === "shared_static_tier";
+  const prefix = shared ? "Shared static-tier" : "Per-key";
+  const subject = shared ? "the shared static-tier bucket" : "your own API key";
+  const basis = quota.reason === "rpm"
+    ? `${quota.limit} ${quota.limit === 1 ? "request" : "requests"} per minute`
+    : quota.reason === "tpm"
+      ? `${quota.limit} ${quota.limit === 1 ? "token" : "tokens"} per minute`
+      : `${quota.limit} ${quota.limit === 1 ? "token" : "tokens"} per UTC day`;
+  const estimate = quota.reason === "rpm" ? "" : ` The request was estimated at ${quota.requested} tokens.`;
+  const retryUnit = quota.retry_after_seconds === 1 ? "second" : "seconds";
+  const retryGuidance = quota.reason === "rpm" && quota.limit === 0
+    ? "The configured request allowance is zero; contact the gateway operator. A retry delay will not restore request capacity."
+    : quota.reason === "daily"
+      ? `The UTC-day budget resets in ${quota.retry_after_seconds} ${retryUnit}; retry after ${quota.retry_after_seconds} ${retryUnit}.`
+      : `The next quota-window expiry is in ${quota.retry_after_seconds} ${retryUnit}; retry after ${quota.retry_after_seconds} ${retryUnit}.`;
+  return `${prefix} ${quota.reason} limit reached. This applies to ${subject}, which permits ${basis}.${estimate} This rejected request was not counted. ${retryGuidance}`;
 }
 
 function toolResultText(result) {
@@ -1350,6 +1555,9 @@ export async function createM5Client({
         body: JSON.stringify(message),
         signal: controller.signal,
       });
+      // Fetch resolving means response headers have arrived, even when an error-status body
+      // still needs inspection. Keep timeout diagnostics tied to the real response stage.
+      headersReceived = true;
 
       if ((response.status === 404 || response.status === 410) && sessionId !== null && retrySession) {
         sessionId = null;
@@ -1374,7 +1582,6 @@ export async function createM5Client({
       if (returnedSession) sessionId = returnedSession;
       // Keep the same abort deadline active through body consumption. Fetch resolving headers
       // is not completion: a peer can otherwise hold this sequential stdio bridge forever.
-      headersReceived = true;
       const text = await response.text();
       if (text.trim() === "") {
         if (message.id === undefined || message.id === null) return null;
@@ -1649,6 +1856,22 @@ export async function createM5Client({
     );
   }
 
+  async function callToolResponse(name, args) {
+    const response = await client.rpc({
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: { name, arguments: args },
+    });
+    if (response?.error) {
+      throw new M5ClientError(
+        "mcp_error",
+        redactText(rpcErrorMessage(response), secrets),
+      );
+    }
+    return response;
+  }
+
   const client = {
     async rpc(message) {
       try {
@@ -1659,19 +1882,7 @@ export async function createM5Client({
     },
 
     async tool(name, args) {
-      const id = nextId++;
-      const response = await client.rpc({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name, arguments: args },
-      });
-      if (response?.error) {
-        throw new M5ClientError(
-          "mcp_error",
-          redactText(rpcErrorMessage(response), secrets),
-        );
-      }
+      const response = await callToolResponse(name, args);
       try {
         return redactValue(toolPayload(response?.result), secrets);
       } catch (error) {
@@ -1681,19 +1892,7 @@ export async function createM5Client({
 
     async models() {
       try {
-        const id = nextId++;
-        const response = await client.rpc({
-          jsonrpc: "2.0",
-          id,
-          method: "tools/call",
-          params: { name: "list_models", arguments: {} },
-        });
-        if (response?.error) {
-          throw new M5ClientError(
-            "mcp_error",
-            redactText(rpcErrorMessage(response), secrets),
-          );
-        }
+        const response = await callToolResponse("list_models", {});
         const result = response?.result;
         if (!result || typeof result !== "object") {
           throw new M5ClientError(
@@ -1742,19 +1941,7 @@ export async function createM5Client({
           "ask requires JSON with non-empty model and prompt strings.",
         );
       }
-      const id = nextId++;
-      const response = await client.rpc({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name: "ask", arguments: input },
-      });
-      if (response?.error) {
-        throw new M5ClientError(
-          "mcp_error",
-          redactText(rpcErrorMessage(response), secrets),
-        );
-      }
+      const response = await callToolResponse("ask", input);
       const result = redactValue(response?.result, secrets);
       if (!result || typeof result !== "object") {
         throw new M5ClientError("malformed_mcp", "The ask tool returned malformed content.");
@@ -1768,12 +1955,20 @@ export async function createM5Client({
             // A broken structured error payload must not mask the real tool_error content.
           }
         }
-        const refusal = askRefusalFromMeta(result, toolResultText(result)) ?? classifyAskRefusal(toolResultText(result));
+        const metaRefusal = askRefusalFromMeta(result, toolResultText(result));
+        const refusal = metaRefusal ?? classifyAskRefusal(toolResultText(result));
         if (refusal !== null) {
           throw new M5ClientError(refusal.code, refusal.message, {
             retryable: refusal.retryable,
             failureLayer: refusal.failureLayer,
             retryAfterSeconds: refusal.retryAfterSeconds,
+            quota: refusal.quota,
+            backoff: refusal.backoff,
+            requestId: refusal.requestId ?? (
+              refusal.code !== "tool_error" && isValidRequestId(result?._meta?.request_id)
+                ? result._meta.request_id
+                : undefined
+            ),
           });
         }
         throw new M5ClientError(
@@ -1811,19 +2006,7 @@ export async function createM5Client({
         // Adoption refusals are still useful acknowledgements. Read the structured result even
         // when an older gateway marks a telemetry-only refusal as an MCP tool error; ask and
         // code-loop tool errors retain their existing strict client.tool() semantics.
-        const id = nextId++;
-        const response = await client.rpc({
-          jsonrpc: "2.0",
-          id,
-          method: "tools/call",
-          params: { name: "record_adoption_evidence", arguments: input },
-        });
-        if (response?.error) {
-          throw new M5ClientError(
-            "mcp_error",
-            redactText(rpcErrorMessage(response), secrets),
-          );
-        }
+        const response = await callToolResponse("record_adoption_evidence", input);
         const result = response?.result;
         if (result?.structuredContent !== undefined) {
           return normalizeAdoptionAcknowledgement(result.structuredContent);
@@ -1898,6 +2081,24 @@ export async function createM5Client({
         );
       }
       const { wait, ...requestInput } = input;
+      if (requestInput.caps?.total_wall_s !== undefined) {
+        const budget = requestInput.caps.total_wall_s;
+        if (!Number.isInteger(budget) || budget < 90 || budget > 900) {
+          throw new M5ClientError("invalid_input", "caps.total_wall_s must be an integer between 90 and 900 seconds.");
+        }
+        // An older gateway may silently ignore a new optional cap. Require its live schema
+        // before sending task content; a client polling timeout cannot enforce a server budget.
+        const catalogue = await client.rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
+        const tools = catalogue?.result?.tools;
+        const schema = Array.isArray(tools)
+          ? tools.find(tool => tool?.name === "code_loop_start")?.inputSchema?.properties?.caps?.properties?.total_wall_s
+          : null;
+        if (catalogue?.error || schema?.type !== "integer" ||
+            !Number.isFinite(schema.minimum) || schema.minimum > budget ||
+            !Number.isFinite(schema.maximum) || schema.maximum < budget) {
+          throw new M5ClientError("whole_job_deadline_unsupported", "The gateway does not advertise the requested whole-job deadline; no job was dispatched.");
+        }
+      }
       const started = await client.tool("code_loop_start", requestInput);
       if (!started || typeof started !== "object") {
         throw new M5ClientError(
@@ -1941,7 +2142,7 @@ function safeDoctorResult(result) {
   return redactValue({
     connector: { ...UNSUPPORTED_CONNECTOR_DIAGNOSTIC },
     client_version: M5_CLIENT_VERSION,
-    // The probe reaches /mcp tools/list and list_models. It never submits metered inference.
+    // Default doctor reaches only content-free MCP catalogue endpoints.
     health_scope: "mcp_catalogue_only",
     ...result,
   }, []);
@@ -2093,7 +2294,7 @@ async function endpointDoctor({
     .filter((name) => typeof name === "string")
     .sort();
   // list_models is a content-free catalogue/discovery check. It does not exercise the model
-  // backend: ask is metered and doctor deliberately never issues an inference probe.
+  // backend: default doctor never submits inference; explicit probes are added after all gates.
   let modelDiscovery = { status: "not_advertised", model_count: null };
   if (tools.includes("list_models")) {
     try {
@@ -2126,10 +2327,35 @@ async function endpointDoctor({
       tier: identity?.tier,
       scope: identity?.scope,
     },
+    inference_observation: sanitizeInferenceObservation(identity),
     gateway_compatibility: classifyGatewayCompatibility(identity),
     tools,
     model_discovery: modelDiscovery,
+    code_loop_transport: await doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs),
+    client,
   };
+}
+
+// /healthz is public and content-free. Treat missing/older/invalid responses as
+// unknown, never as proof of code-loop health. No credential or model prompt is sent.
+async function doctorCodeLoopTransport(baseUrl, fetchImpl, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 3500));
+  try {
+    const response = await fetchImpl(`${baseUrl}/healthz`, {
+      redirect: "error",
+      headers: { accept: "application/json", "user-agent": `m5-cli/${M5_CLIENT_VERSION}` },
+      signal: controller.signal,
+    });
+    if (!response.ok) return "unknown";
+    const payload = JSON.parse(await readBoundedRegistryBody(response));
+    return ["available", "unavailable", "disabled"].includes(payload?.codeLoopTransport)
+      ? payload.codeLoopTransport : "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function modelCatalogueDigest(models) {
@@ -2176,6 +2402,28 @@ function sanitizeGatewayMetadata(identity) {
     contract_state: gatewayPresent && (!identity.gateway || typeof identity.gateway !== "object" || Array.isArray(identity.gateway)) ? "invalid"
       : !gatewayPresent || !contractPresent ? "absent" : resultContractValid ? "valid" : "invalid",
   };
+}
+
+/** A global request-log observation, never a live inference readiness claim. */
+function sanitizeInferenceObservation(identity) {
+  const unsupported = { status: "not_supported", last_successful_at: null };
+  if (!identity || typeof identity !== "object" || Array.isArray(identity) ||
+    !Object.prototype.hasOwnProperty.call(identity, "inferenceObservation")) return unsupported;
+  const value = identity.inferenceObservation;
+  const invalid = { status: "invalid", last_successful_at: null };
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    value.source !== "request_log" || value.scope !== "m5_global") return invalid;
+  if (value.status === "observed") {
+    const at = value.lastSuccessfulAt;
+    if (typeof at !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(at)) return invalid;
+    const parsed = Date.parse(at);
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== at) return invalid;
+    return { status: "observed", last_successful_at: at };
+  }
+  if (["none", "disabled", "unavailable"].includes(value.status) && value.lastSuccessfulAt === null) {
+    return { status: value.status, last_successful_at: null };
+  }
+  return invalid;
 }
 
 function classifyGatewayCompatibility(metadata) {
@@ -2341,14 +2589,11 @@ function doctorEndpointFailure(error, profile, secrets) {
     else if (safe.diagnosticCode === "cloudflare_origin_unresolved") status = "public_origin_unresolved";
     else if (safe.httpStatus === 503) status = "busy";
     else if (safe.httpStatus === 504 || safe.httpStatus === 408) status = "timeout";
-    else if (safe.httpStatus >= 500) status = "backend_failure";
     else status = "backend_failure";
   } else if (safe.code === "tool_error" || safe.code === "mcp_error") {
     if (/\b(?:server\s+)?busy\b/i.test(safe.message)) status = "busy";
     else if (/\b(?:timed?\s*out|timeout)\b/i.test(safe.message)) status = "timeout";
     else status = "backend_failure";
-  } else if (safe.failureLayer === "local_tailnet_unavailable") {
-    status = "tailnet_unavailable";
   } else if (safe.code === "network_failure") {
     // `network_failure` was the original public doctor status. Keep it stable for callers while
     // retaining the richer diagnostic code for newer consumers.
@@ -2376,6 +2621,11 @@ function doctorCredentialResult({ profile, status, credential, endpoints }) {
       : {}),
     model_discovery: { public: "not_checked", private: "not_checked" },
     inference: { public: "not_checked", private: "not_checked" },
+    inference_observation: {
+      source: "request_log", scope: "m5_global",
+      public: { status: "not_checked", last_successful_at: null },
+      private: { status: "not_checked", last_successful_at: null },
+    },
     gateway: { public: null, private: null },
     compatibility: { public: "unknown", private: "unknown" },
     endpoints,
@@ -2395,14 +2645,305 @@ function doctorCapabilityFields(
       public: publicProbe?.model_discovery?.status ?? publicStatus,
       private: privateProbe?.model_discovery?.status ?? privateStatus,
     },
-    // Doctor never calls `ask`: that path is metered, so readiness remains explicitly unknown.
+    // Inference readiness is unknown unless the caller explicitly requests a probe.
     inference: { public: "not_checked", private: "not_checked" },
+    code_loop_transport: {
+      public: publicProbe?.code_loop_transport ?? "unknown",
+      private: privateProbe?.code_loop_transport ?? "unknown",
+    },
+    inference_observation: {
+      source: "request_log", scope: "m5_global",
+      public: publicProbe?.inference_observation ?? { status: "not_checked", last_successful_at: null },
+      private: privateProbe?.inference_observation ?? { status: "not_checked", last_successful_at: null },
+    },
   };
 }
 
+function doctorProbeNotChecked(request) {
+  return request === undefined
+    ? undefined
+    : { status: "not_checked", route: request.route, model: request.model };
+}
+
+function validateDoctorInferenceProbe(value) {
+  if (value === undefined) return undefined;
+  if (
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    Object.keys(value).length !== 2 ||
+    Object.keys(value).some((key) => key !== "route" && key !== "model") ||
+    !["public", "private"].includes(value.route) ||
+    typeof value.model !== "string" || !DOCTOR_INFERENCE_PROBE_MODEL.test(value.model)
+  ) {
+    throw new M5ClientError(
+      "invalid_args",
+      "inferenceProbe must contain one supported route and a valid model identifier.",
+    );
+  }
+  return { route: value.route, model: value.model };
+}
+
+function finalizeDoctorInferenceProbe(result, request, outcome) {
+  if (request === undefined) return result;
+  const inferenceProbe = outcome ?? doctorProbeNotChecked(request);
+  if (inferenceProbe.status === "not_checked") {
+    return safeDoctorResult({
+      ...result,
+      inference_probe: inferenceProbe,
+    });
+  }
+  return safeDoctorResult({
+    ...result,
+    status: inferenceProbe.status === "failed" ? "degraded" : result.status,
+    health_scope: "mcp_catalogue_and_inference_probe",
+    inference: { ...result.inference, [request.route]: inferenceProbe.status },
+    inference_probe: inferenceProbe,
+  });
+}
+
+function doctorExplicitProbeGateFailure(profile, probe, request) {
+  let status;
+  let details = {};
+  let diagnosticCode;
+  if (probe.identity.tier !== "owner" || !["agent", "admin"].includes(probe.identity.scope)) {
+    status = "wrong_scope";
+  } else {
+    const missing = REQUIRED_AGENT_TOOLS.filter((tool) => !probe.tools.includes(tool));
+    if (missing.length > 0) {
+      status = "missing_tools";
+      details = { missing_tools: missing };
+      if (!probe.tools.includes("ask")) diagnosticCode = "ask_not_advertised";
+    } else if (probe.model_discovery.status === "unavailable") {
+      status = "model_discovery_unavailable";
+      details = {
+        diagnostic_code: probe.model_discovery.failure_code,
+        discovery_failure: probe.model_discovery.failure_details,
+        ...(probe.model_discovery.http_status === undefined
+          ? {} : { http_status: probe.model_discovery.http_status }),
+      };
+    } else {
+      return null;
+    }
+  }
+
+  const isPublic = request.route === "public";
+  return safeDoctorResult({
+    status,
+    profile,
+    credential: "present",
+    identity: {
+      tier: probe.identity.tier ?? "unknown",
+      scope: probe.identity.scope ?? "unknown",
+    },
+    ...details,
+    ...doctorCapabilityFields(isPublic ? probe : null, isPublic ? null : probe),
+    endpoints: isPublic
+      ? { public: status, private: "not_checked" }
+      : { public: "not_checked", private: status },
+    inference_probe: {
+      ...doctorProbeNotChecked(request),
+      ...(diagnosticCode === undefined ? {} : { diagnostic_code: diagnosticCode }),
+    },
+  });
+}
+
+function doctorExplicitProbeEndpointFailure(profile, request, error, token) {
+  const failure = doctorEndpointFailure(error, profile, [token]);
+  const isPublic = request.route === "public";
+  return safeDoctorResult({
+    status: failure.status,
+    profile,
+    credential: "present",
+    ...(failure.safe.code === "rejected_credential"
+      ? { auth_layer: "gateway_credential", remediation: credentialRemediation(profile) }
+      : {}),
+    ...(failure.safe.code === "upstream_http_error"
+      ? { remediation: gatewayHttpRemediation(profile, failure.safe.diagnosticCode) }
+      : {}),
+    ...(failure.status === "tailnet_unavailable"
+      ? { remediation: failure.safe.remediation ?? localTailnetRemediation(profile) }
+      : {}),
+    ...(failure.safe.code === "rejected_credential"
+      ? {} : { diagnostic_code: failure.safe.diagnosticCode ?? failure.safe.code }),
+    ...(failure.http_status === undefined ? {} : { http_status: failure.http_status }),
+    ...doctorCapabilityFields(null, null, isPublic
+      ? { publicStatus: failure.status }
+      : { privateStatus: failure.status }),
+    endpoints: isPublic
+      ? { public: failure.status, private: "not_checked" }
+      : { public: "not_checked", private: failure.status },
+    inference_probe: doctorProbeNotChecked(request),
+  });
+}
+
+async function diagnoseExplicitInferenceProbe({
+  profile,
+  config,
+  token,
+  credentialStore,
+  fetchImpl,
+  timeoutMs,
+  localProbes,
+  request,
+}) {
+  const route = request.route;
+  const otherRoute = route === "public" ? "private" : "public";
+  const baseUrl = route === "public" ? config.publicGatewayUrl : config.privateGatewayUrl;
+  if (!baseUrl) {
+    return safeDoctorResult({
+      status: "endpoint_not_configured",
+      diagnostic_code: `${route}_route_unconfigured`,
+      profile,
+      credential: "present",
+      ...doctorCapabilityFields(null, null, route === "public"
+        ? { publicStatus: "not_configured", privateStatus: "not_checked" }
+        : { publicStatus: "not_checked", privateStatus: "not_configured" }),
+      endpoints: { [route]: "not_configured", [otherRoute]: "not_checked" },
+      inference_probe: doctorProbeNotChecked(request),
+    });
+  }
+
+  let selectedProbe;
+  try {
+    selectedProbe = await endpointDoctor({
+      baseUrl,
+      endpoint: route,
+      profile,
+      token,
+      credentialStore: { resolve: async () => token },
+      fetchImpl,
+      timeoutMs: Math.min(timeoutMs, 30_000),
+      localProbes,
+    });
+  } catch (error) {
+    return doctorExplicitProbeEndpointFailure(profile, request, error, token);
+  }
+
+  const gateFailure = doctorExplicitProbeGateFailure(profile, selectedProbe, request);
+  if (gateFailure) return gateFailure;
+
+  const isPublic = route === "public";
+  const compatibility = doctorCompatibilityFields(
+    isPublic ? selectedProbe : null,
+    isPublic ? null : selectedProbe,
+  );
+  const recommendation = compatibilityRecommendation(
+    isPublic ? selectedProbe : null,
+    isPublic ? null : selectedProbe,
+    compatibility.compatibility,
+  );
+  const status =
+    Object.values(compatibility.compatibility).some((value) =>
+      value === "client_outdated" || value === "gateway_outdated" || value === "incompatible") ||
+    selectedProbe.code_loop_transport === "unavailable"
+      ? "degraded" : "mcp_reachable";
+  const result = safeDoctorResult({
+    status,
+    profile,
+    credential: "present",
+    identity: {
+      tier: selectedProbe.identity.tier,
+      scope: selectedProbe.identity.scope,
+    },
+    tools: REQUIRED_AGENT_TOOLS,
+    ...doctorCapabilityFields(isPublic ? selectedProbe : null, isPublic ? null : selectedProbe),
+    ...(recommendation === undefined ? {} : { recommendation }),
+    endpoints: { [route]: "healthy", [otherRoute]: "not_checked" },
+  });
+
+  try {
+    const outcome = await runDoctorInferenceProbe(selectedProbe.client, request);
+    return finalizeDoctorInferenceProbe(result, request, outcome);
+  } catch (error) {
+    return doctorExplicitProbeEndpointFailure(profile, request, error, token);
+  }
+}
+
+async function runDoctorInferenceProbe(client, request) {
+  const startedAt = Date.now();
+  const checkedAt = new Date(startedAt).toISOString();
+  try {
+    // The client returns only sanitized probe metadata. The gateway's existing
+    // authenticated-owner logging policy still applies to this synthetic ask.
+    const result = await client.ask({
+      model: request.model,
+      prompt: "Reply with the single word OK.",
+      max_tokens: 16,
+      temperature: 0,
+      traffic_purpose: "synthetic",
+    });
+    if (result?.truncated === true) {
+      throw new M5ClientError("token_limit_reached", "The inference probe reached its token limit.");
+    }
+    if (result?.truncated !== false) {
+      throw new M5ClientError("completion_unconfirmed", "The inference probe completion was not confirmed.");
+    }
+    return {
+      status: "succeeded",
+      route: request.route,
+      checked_at: checkedAt,
+      model: request.model,
+      elapsed_ms: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Date.now() - startedAt)),
+    };
+  } catch (error) {
+    if (!(error instanceof M5ClientError)) throw error;
+    return {
+      status: "failed",
+      route: request.route,
+      checked_at: checkedAt,
+      model: request.model,
+      elapsed_ms: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Date.now() - startedAt)),
+      ...(error instanceof M5ClientError && DOCTOR_INFERENCE_PROBE_ERROR_CODES.has(error.code)
+        ? { diagnostic_code: error.code }
+        : {}),
+    };
+  }
+}
+
+/** Share the endpoint capability gates while preserving public/private diagnostic labels. */
+function doctorProbeFailure(profile, publicProbe, privateProbe = null) {
+  const probe = privateProbe ?? publicProbe;
+  let status;
+  let details = {};
+  if (probe.identity.tier !== "owner" || !["agent", "admin"].includes(probe.identity.scope)) {
+    status = "wrong_scope";
+  } else {
+    const missing = REQUIRED_AGENT_TOOLS.filter((tool) => !probe.tools.includes(tool));
+    if (missing.length > 0) {
+      status = "missing_tools";
+      details = { missing_tools: missing };
+    } else if (probe.model_discovery.status === "unavailable") {
+      status = "model_discovery_unavailable";
+      details = {
+        diagnostic_code: probe.model_discovery.failure_code,
+        discovery_failure: probe.model_discovery.failure_details,
+        ...(probe.model_discovery.http_status === undefined
+          ? {}
+          : { http_status: probe.model_discovery.http_status }),
+      };
+    } else {
+      return null;
+    }
+  }
+  return safeDoctorResult({
+    status,
+    profile,
+    credential: "present",
+    identity: {
+      tier: probe.identity.tier ?? "unknown",
+      scope: probe.identity.scope ?? "unknown",
+    },
+    ...details,
+    ...doctorCapabilityFields(publicProbe, privateProbe),
+    endpoints: privateProbe
+      ? { public: "healthy", private: status }
+      : { public: status === "wrong_scope" ? "healthy" : status, private: "not_checked" },
+  });
+}
+
 export async function diagnoseProfile(options) {
+  const inferenceProbe = validateDoctorInferenceProbe(options.inferenceProbe);
   const fetchImpl = options.fetch ?? globalThis.fetch;
-  const result = await diagnoseProfileCore(options);
+  const result = await diagnoseProfileCore({ ...options, inferenceProbe });
   return appendLatestCheck(result, fetchImpl, options.checkLatest === true);
 }
 
@@ -2413,6 +2954,7 @@ async function diagnoseProfileCore({
   fetch: fetchImpl = globalThis.fetch,
   timeoutMs = 10_000,
   localProbes,
+  inferenceProbe,
 }) {
   const config = validateProfileConfig(profileConfig);
   let token;
@@ -2420,31 +2962,44 @@ async function diagnoseProfileCore({
     token = await credentialStore.resolve(profile);
   } catch (error) {
     if (error instanceof M5ClientError && error.code === "missing_credential") {
-      return doctorCredentialResult({
+      return finalizeDoctorInferenceProbe(doctorCredentialResult({
         status: "missing_credential",
         profile,
         credential: "missing",
         endpoints: { public: "not_checked", private: "not_checked" },
-      });
+      }), inferenceProbe);
     }
     const status =
       error instanceof M5ClientError &&
       ["credential_timeout", "credential_unavailable"].includes(error.code)
         ? error.code
         : "credential_unavailable";
-    return doctorCredentialResult({
+    return finalizeDoctorInferenceProbe(doctorCredentialResult({
       status,
       profile,
       credential: "unavailable",
       endpoints: { public: "not_checked", private: "not_checked" },
-    });
+    }), inferenceProbe);
   }
   if (typeof token !== "string" || token.length === 0) {
-    return doctorCredentialResult({
+    return finalizeDoctorInferenceProbe(doctorCredentialResult({
       profile,
       status: "missing_credential",
       credential: "missing",
       endpoints: { public: "not_checked", private: "not_checked" },
+    }), inferenceProbe);
+  }
+
+  if (inferenceProbe !== undefined) {
+    return diagnoseExplicitInferenceProbe({
+      profile,
+      config,
+      token,
+      credentialStore,
+      fetchImpl,
+      timeoutMs,
+      localProbes,
+      request: inferenceProbe,
     });
   }
 
@@ -2490,56 +3045,8 @@ async function diagnoseProfileCore({
     });
   }
 
-  if (publicProbe.identity.tier !== "owner" || !["agent", "admin"].includes(publicProbe.identity.scope)) {
-    return safeDoctorResult({
-      status: "wrong_scope",
-      profile,
-      credential: "present",
-      identity: {
-        tier: publicProbe.identity.tier ?? "unknown",
-        scope: publicProbe.identity.scope ?? "unknown",
-      },
-      ...doctorCapabilityFields(publicProbe, null),
-      endpoints: { public: "healthy", private: "not_checked" },
-    });
-  }
-
-  const publicMissing = REQUIRED_AGENT_TOOLS.filter(
-    (tool) => !publicProbe.tools.includes(tool),
-  );
-  if (publicMissing.length > 0) {
-    return safeDoctorResult({
-      status: "missing_tools",
-      profile,
-      credential: "present",
-      identity: {
-        tier: publicProbe.identity.tier ?? "unknown",
-        scope: publicProbe.identity.scope ?? "unknown",
-      },
-      missing_tools: publicMissing,
-      ...doctorCapabilityFields(publicProbe, null),
-      endpoints: { public: "missing_tools", private: "not_checked" },
-    });
-  }
-
-  if (publicProbe.model_discovery.status === "unavailable") {
-    return safeDoctorResult({
-      status: "model_discovery_unavailable",
-      profile,
-      credential: "present",
-      identity: {
-        tier: publicProbe.identity.tier,
-        scope: publicProbe.identity.scope,
-      },
-      diagnostic_code: publicProbe.model_discovery.failure_code,
-      discovery_failure: publicProbe.model_discovery.failure_details,
-      ...(publicProbe.model_discovery.http_status === undefined
-        ? {}
-        : { http_status: publicProbe.model_discovery.http_status }),
-      ...doctorCapabilityFields(publicProbe, null),
-      endpoints: { public: "model_discovery_unavailable", private: "not_checked" },
-    });
-  }
+  const publicFailure = doctorProbeFailure(profile, publicProbe);
+  if (publicFailure) return publicFailure;
 
   if (!config.privateGatewayUrl) {
     const compatibilityFields = doctorCompatibilityFields(publicProbe, null);
@@ -2551,7 +3058,7 @@ async function diagnoseProfileCore({
     const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
       .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
     const result = safeDoctorResult({
-      status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
+      status: knownCompatibilityMismatch || publicProbe.code_loop_transport === "unavailable" ? "degraded" : "mcp_reachable",
       profile,
       credential: "present",
       ...doctorCapabilityFields(publicProbe, null),
@@ -2600,56 +3107,8 @@ async function diagnoseProfileCore({
     });
   }
 
-  if (privateProbe.identity.tier !== "owner" || !["agent", "admin"].includes(privateProbe.identity.scope)) {
-    return safeDoctorResult({
-      status: "wrong_scope",
-      profile,
-      credential: "present",
-      identity: {
-        tier: privateProbe.identity.tier ?? "unknown",
-        scope: privateProbe.identity.scope ?? "unknown",
-      },
-      ...doctorCapabilityFields(publicProbe, privateProbe),
-      endpoints: { public: "healthy", private: "wrong_scope" },
-    });
-  }
-
-  const privateMissing = REQUIRED_AGENT_TOOLS.filter(
-    (tool) => !privateProbe.tools.includes(tool),
-  );
-  if (privateMissing.length > 0) {
-    return safeDoctorResult({
-      status: "missing_tools",
-      profile,
-      credential: "present",
-      identity: {
-        tier: privateProbe.identity.tier ?? "unknown",
-        scope: privateProbe.identity.scope ?? "unknown",
-      },
-      missing_tools: privateMissing,
-      ...doctorCapabilityFields(publicProbe, privateProbe),
-      endpoints: { public: "healthy", private: "missing_tools" },
-    });
-  }
-
-  if (privateProbe.model_discovery.status === "unavailable") {
-    return safeDoctorResult({
-      status: "model_discovery_unavailable",
-      profile,
-      credential: "present",
-      identity: {
-        tier: privateProbe.identity.tier,
-        scope: privateProbe.identity.scope,
-      },
-      diagnostic_code: privateProbe.model_discovery.failure_code,
-      discovery_failure: privateProbe.model_discovery.failure_details,
-      ...(privateProbe.model_discovery.http_status === undefined
-        ? {}
-        : { http_status: privateProbe.model_discovery.http_status }),
-      ...doctorCapabilityFields(publicProbe, privateProbe),
-      endpoints: { public: "healthy", private: "model_discovery_unavailable" },
-    });
-  }
+  const privateFailure = doctorProbeFailure(profile, publicProbe, privateProbe);
+  if (privateFailure) return privateFailure;
 
   if (
     JSON.stringify(publicProbe.identity) !== JSON.stringify(privateProbe.identity) ||
@@ -2674,7 +3133,8 @@ async function diagnoseProfileCore({
   const knownCompatibilityMismatch = Object.values(compatibilityFields.compatibility)
     .some((value) => value === "client_outdated" || value === "gateway_outdated" || value === "incompatible");
   const result = safeDoctorResult({
-    status: knownCompatibilityMismatch ? "degraded" : "mcp_reachable",
+    status: knownCompatibilityMismatch || [publicProbe, privateProbe].some((probe) => probe.code_loop_transport === "unavailable")
+      ? "degraded" : "mcp_reachable",
     profile,
     credential: "present",
     identity: {

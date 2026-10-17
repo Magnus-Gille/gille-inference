@@ -27,6 +27,8 @@ export interface CodeLoopSeedFile {
 /** Caller-supplied caps; every field optional, clamped to the configured hard maxima. */
 export interface CodeLoopCapsRequest {
   wall_s?: number;
+  /** Optional whole invocation budget, including admission and reserved cleanup (90–900s). */
+  total_wall_s?: number;
   turns?: number;
   completion_tokens?: number;
   /** Optional first-mutation deadline. Strictly validated; never silently clamped. */
@@ -36,6 +38,7 @@ export interface CodeLoopCapsRequest {
 /** Effective caps after clamping — always fully populated. */
 export interface CodeLoopCaps {
   wall_s: number;
+  total_wall_s?: number;
   turns: number;
   completion_tokens: number;
   /** Omitted preserves the pre-#247 harness behavior byte-for-byte. */
@@ -82,11 +85,13 @@ export interface CodeLoopRequest {
 
 /** Immediate structured refusals from code_loop_start (design §4). */
 export type CodeLoopRefusal =
+  | "deadline-exceeded"
   | "disabled"
   | "busy"
   | "maintenance"
   | "lease-unavailable"
   | "cage-unavailable"
+  | "cage-transport-unavailable"
   | "insufficient_memory"
   | "memory_admission_unavailable"
   | "invalid-request"
@@ -122,6 +127,7 @@ export interface CodeLoopExecution {
   /** Immutable harness contract identifier, not a mutable deployment label. */
   harness_version: string;
   effective_caps: CodeLoopCaps;
+  whole_job?: { budget_s: number; observed_before_persistence_ms: number; cleanup_complete: boolean };
   capabilities: {
     start_idempotency: "client-run-id-v1";
     agent_checks: "pi-bash-events-v3";
@@ -245,6 +251,8 @@ export type CodeLoopStartResult =
 export type EngineOutcome = "completed" | "cap-exceeded" | "degenerate" | "arm-error";
 
 export interface EngineRunOptions {
+  /** Shared whole-job stop signal; an aborted signal forbids any new subprocess/retry. */
+  signal?: AbortSignal;
   sandboxDir: string;
   instruction: string;
   model: string;
@@ -324,10 +332,12 @@ export interface CodeLoopDeps {
   feedbackOwner?: import("./execution-feedback.js").ExecutionFeedbackOwner | null;
   /** Optional pre-start resource admission; invoked before cage, seed, GPU lease, or engine work. */
   beforeModelStart?: ModelStartAdmission;
+  /** Content-free reachability of the dedicated user-bus listener before new work. */
+  codeLoopTransportProbe?: () => Promise<boolean>;
   /** Poll gateway/model readiness after a suspected degeneracy abort; resolves ready?. */
   readinessProbe: (timeoutMs: number) => Promise<boolean>;
   /** The cage self-test (design §6); consulted at every job start when confinement=required. */
-  cageSelfTest: () => Promise<{ ok: boolean; failures: string[] }>;
+  cageSelfTest: (signal?: AbortSignal, remainingMs?: number) => Promise<{ ok: boolean; failures: string[] }>;
   /** Verify the deterministic transient service is stopped before publishing a terminal result. */
   cleanupUnit?: (unit: string) => Promise<void>;
   /** Live maintenance-mode flag (an explicit evaluation window). */
@@ -337,11 +347,12 @@ export interface CodeLoopDeps {
     model: string;
     timeoutMs: number;
     onLeaseLost: () => void;
+    signal?: AbortSignal;
   }) => Promise<{ release: () => Promise<void> } | null>;
   /** Run a host-side command (git harvest, caged check_cmd). Never throws; returns code null on timeout. */
   runCommand: (
     argv: string[],
-    opts: { cwd: string; env: Record<string, string>; timeoutMs: number }
+    opts: { cwd: string; env: Record<string, string>; timeoutMs: number; signal?: AbortSignal }
   ) => Promise<{ code: number | null; stdout: string; stderr: string }>;
   /** Sandbox growth cap (bytes). Default 50 MB; overridable for tests. */
   growthCapBytes: number;

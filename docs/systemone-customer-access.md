@@ -72,7 +72,15 @@ spec, enabled setting, or source checkout alone does not grant access or establi
   `type` (`noul`, `choice`, or `score`) and `instructions`; `choice` needs a criteria object with
   2–26 named options. Each option key must match `^[A-Za-z0-9_-]{1,64}$`, and each option
   description must be a string or `null`. `score` needs 2–10 ordered labels. The gateway accepts
-  at most 8 KiB of request JSON. Images, streaming, `keep_alive`, and arbitrary runtime parameters
+  at most 256 KiB (262,144 bytes) of UTF-8 request JSON, including state, questions and formatting.
+  This is a transport-size bound, not a token allowance. It replaces the initial 8 KiB gateway cap
+  so ordinary text can use more of the existing context. The served input bound remains 8,192
+  tokenizer-specific tokens per question/prompt, including instructions and runtime formatting;
+  Clef shares one context across all questions. JSON bytes cannot be converted to tokens with a
+  fixed ratio. Exceeding the byte cap returns `413 payload_too_large` before inference; a body
+  within that cap can still exceed the backend context and be rejected upstream. This change
+  does not increase runtime context or establish a publisher maximum.
+  Images, streaming, `keep_alive`, and arbitrary runtime parameters
   are not enabled in this release.
 - Response: compatible typed `answers` and `usage` from the selected decision adapter. Credits charge the upstream
   `usage.input_tokens` on successful calls; rejected or failed calls charge zero. A decision
@@ -146,6 +154,16 @@ return a valid upstream decision; the status alone does not prove that the reque
 failure.
 
 ## Release gate
+
+Clef processes all questions and the state in one physical batch. Its serving template therefore
+pins both `batch: 8192` (`-b`) and `ubatch: 8192` (`-ub`), alongside `ctx: 8192`.
+In [llama.cpp's context initialization](https://github.com/ggml-org/llama.cpp/blob/d81235049384534c167caea52b85a694f6103d14/src/llama-context.cpp#L248-L250),
+the physical batch is capped by the logical batch. Setting only `-ub 8192` can leave the
+effective limit at the runtime's default logical batch size (2048 in this pinned version).
+The JSON body cap does not override this runtime limit. Verify the effective batch values and
+a prompt above 2048 tokens before claiming the full configured context is usable. Include
+memory/OOM and service-health checks; changing either batch setting requires a separately
+approved roster update and rollback. A merged template does not change an existing live entry.
 
 The public [`deploy/specs/clef-flash.yaml`](../deploy/specs/clef-flash.yaml) is a reviewable
 template. Resolve its artifact and runtime paths in the private operations ticket; do not copy
