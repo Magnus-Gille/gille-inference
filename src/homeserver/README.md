@@ -500,6 +500,20 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   cap; a successful first-attempt mutation satisfies the deadline globally and exempts the
   degeneracy retry. Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  An optional integer `caps.total_wall_s` (90–900 seconds) adds a shared deadline starting
+  before asynchronous admission. It reserves 75 seconds for process/unit cleanup, lease release
+  and bounded evidence finalization; a 180-second budget therefore permits at most 105 seconds
+  of admission, Git, engine and verifier work combined. It aborts active commands/engine work,
+  forbids later phases and tightens each transient unit's `RuntimeMaxSec` to the remaining work
+  time. Admission expiry returns `deadline-exceeded`; admitted expiry withholds diff/summary and
+  returns `cap-exceeded`, or `arm-error` when cleanup/release cannot be proved. Unresolved unit
+  cleanup remains durable for recovery. Opted-in results include `execution.whole_job` with the
+  budget, monotonic `observed_before_persistence_ms` and cleanup status. This observation precedes
+  synchronous terminal persistence; it is not dispatch-to-terminal timing proof. A cleanup failure or elapsed time
+  beyond the budget fails operational acceptance. Omission preserves the separate legacy caps.
+  Reconnect and verify that the live `code_loop_start` input schema advertises `total_wall_s`
+  before using it; older gateways do not enforce this optional field. Engine `usage.wall_ms`
+  and a client wait timeout are not whole-job timing evidence.
   Harness v9 additionally requires `schema_checks` for the resolved `unit-test-gen` task type;
   compile-only requests are refused before admission. Supply 1–8 owner-authored
   `{name, command}` behavioral oracles, each expecting exit zero. Names are unique lowercase
@@ -948,6 +962,9 @@ HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[
 HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
 HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108
+# HOMESERVER_STARTUP_EXCLUSIVE_UNTIL=<canonical UTC ISO timestamp, at most 30 minutes ahead>
+# Optional operator restart fence: refuses BOTH lanes until that fixed absolute deadline.
+# Reapplied at every startup; cannot be cleared through the process-local maintenance API.
 HOMESERVER_MAINTENANCE_RETRY_AFTER_S=30       # Retry-After on a guest 503 caused by maintenance mode
 HOMESERVER_PER_REQUEST_MAX_TOKENS=12288       # fleet default and ordinary-model cap
 HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768 # exact-model explicit-request ceilings; empty disables

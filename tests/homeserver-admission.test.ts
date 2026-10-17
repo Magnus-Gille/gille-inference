@@ -526,4 +526,47 @@ describe("bench/maintenance mode (#108)", () => {
       expect(ctrl.isMaintenanceMode()).toBe(false);
     });
   });
+
+  describe("startup exclusive fence", () => {
+    const baseCfg = { maxInflight: 4, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 };
+    type ControllerConfig = ConstructorParameters<typeof AdmissionController>[0];
+
+    function startupController(deadlineMs: number, now: () => number): AdmissionController {
+      return new AdmissionController({
+        ...baseCfg,
+        now,
+        startupExclusiveUntilMs: deadlineMs,
+      } as ControllerConfig);
+    }
+
+    it("rejects both owner and guest before the absolute deadline", async () => {
+      const ctrl = startupController(2_000, () => 1_000);
+      await expect(ctrl.acquire(reqFor("owner"))).rejects.toBeInstanceOf(AdmissionRejected);
+      await expect(ctrl.acquire(reqFor("guest"))).rejects.toBeInstanceOf(AdmissionRejected);
+    });
+
+    it("cannot be cleared by maintenance shutdown", async () => {
+      const ctrl = startupController(2_000, () => 1_000);
+      ctrl.setMaintenanceMode(true, 60_000, "exclusive");
+      ctrl.setMaintenanceMode(false);
+      await expect(ctrl.acquire(reqFor("owner"))).rejects.toBeInstanceOf(AdmissionRejected);
+      await expect(ctrl.acquire(reqFor("guest"))).rejects.toBeInstanceOf(AdmissionRejected);
+    });
+
+    it("survives controller reconstruction, then expires without extending across reconstruction", async () => {
+      let now = 1_000;
+      const deadline = 2_000;
+      const first = startupController(deadline, () => now);
+      await expect(first.acquire(reqFor("guest"))).rejects.toBeInstanceOf(AdmissionRejected);
+
+      const reconstructed = startupController(deadline, () => now);
+      await expect(reconstructed.acquire(reqFor("owner"))).rejects.toBeInstanceOf(AdmissionRejected);
+
+      now = deadline + 1;
+      const guestRelease = await reconstructed.acquire(reqFor("guest"));
+      guestRelease();
+      const ownerRelease = await reconstructed.acquire(reqFor("owner"));
+      ownerRelease();
+    });
+  });
 });

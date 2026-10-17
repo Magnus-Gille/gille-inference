@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, unlinkSync, existsSync, statSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
 const root = "/run/gi-code-loop-recovery-fixture";
@@ -126,8 +126,48 @@ assert.equal(statSync("/run/user/" + uid).ino, dirIdentity, "runtime directory r
 const recovered = await smoke("recovered");
 assert.deepEqual(pidIdentity(Number(prop("gi-recovery-gateway.service", "MainPID"))), gatewayIdentity);
 assert.deepEqual(pidIdentity(Number(prop("gi-recovery-canary.service", "MainPID"))), canaryIdentity);
+// Exercise the optional whole-job deadline in the real gateway and real user-manager cage.
+// The synthetic Pi exits normally; this deliberately stalled owner check must be killed without
+// publishing its already-harvested patch, and the next job must acquire the released resources.
+const boundedArgs = args("whole-job-deadline");
+boundedArgs.caps = { wall_s: 30, total_wall_s: 90 };
+boundedArgs.check_cmd = "trap '' TERM; sleep 120";
+const deadlineStartedAt = performance.now();
+const boundedStart = await call("code_loop_start", boundedArgs);
+assert(!boundedStart.isError && boundedStart.payload.work_id, "bounded real-cage admission failed");
+const boundedWorkId = boundedStart.payload.work_id;
+assert.match(boundedWorkId, /^cl-[a-zA-Z0-9-]+$/);
+let boundedResult;
+await wait(async () => {
+  const status = await call("code_loop_status", { work_id: boundedWorkId });
+  if (status.payload.status === "running") return false;
+  boundedResult = (await call("code_loop_result", { work_id: boundedWorkId })).payload;
+  return true;
+}, "whole-job deadline and cleanup", 90000);
+const boundedElapsedMs = Math.ceil(performance.now() - deadlineStartedAt);
+assert(boundedElapsedMs <= 90000, "whole-job dispatch-to-cleanup exceeded its 90s budget");
+assert.equal(boundedResult.status, "cap-exceeded");
+assert.equal(boundedResult.check.ran, true, "deadline must interrupt the real caged owner check");
+assert.equal(boundedResult.check.exit_code, null);
+assert.equal(boundedResult.diff, "");
+assert.equal(boundedResult.summary, "");
+assert.equal(boundedResult.execution.whole_job.budget_s, 90);
+assert(boundedResult.execution.whole_job.observed_before_persistence_ms <= 90000);
+assert.equal(boundedResult.execution.whole_job.cleanup_complete, true);
+const absent = spawnSync("runuser", ["-u", "gi-code-loop-ci", "--", "env", "-i",
+  "PATH=/usr/bin:/bin", "XDG_RUNTIME_DIR=/run/user/" + uid,
+  "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/systemd/private",
+  "systemctl", "--user", "show", "code-loop-" + boundedWorkId, "--property=LoadState", "--value"],
+  { encoding: "utf8", timeout: 10000 });
+assert.equal(absent.status, 0, "manager must answer the exact unit absence query");
+assert.equal(absent.stdout.trim(), "not-found", "deadline left a cgroup unit behind");
+const afterDeadline = await smoke("after-deadline");
+assert.deepEqual(pidIdentity(Number(prop("gi-recovery-gateway.service", "MainPID"))), gatewayIdentity);
+assert.deepEqual(pidIdentity(Number(prop("gi-recovery-canary.service", "MainPID"))), canaryIdentity);
 writeFileSync(root + "/acceptance.json", JSON.stringify({
   baseline, outage: "cage-transport-unavailable", recovered,
+  deadline: { status: boundedResult.status, elapsedMs: boundedElapsedMs, cleanupComplete: true, outputWithheld: true },
+  afterDeadline,
   managerRestartedAutomatically: true, gatewayIdentityUnchanged: true,
   runtimeDirectoryUnchanged: true, fixtureCanaryUnchanged: true,
   resourceCeiling: { memoryBytes: 2147483648, swapBytes: 0, cpus: 2, tasks: 128 },

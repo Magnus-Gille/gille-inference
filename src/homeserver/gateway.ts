@@ -3421,10 +3421,12 @@ async function handleImageGeneration(
 
   // Bench/maintenance mode (#108): refuse GUEST image work outright. This covers the ASYNC
   // (balanced/high) path — which otherwise returns 202 and runs later on the shared GPU slot,
-  // bypassing the admission gate — as well as the sync path. Owners are unaffected. Placed
-  // BEFORE any credit/quota reservation so there is nothing to refund. Same server_busy
-  // envelope + maintenance Retry-After as the chat/audio admission rejection.
-  if (controller.isMaintenanceMode() && principal.tier !== "owner") {
+  // bypassing the admission gate — as well as the sync path. Exclusive windows (including
+  // the startup fence) refuse owner submissions too, before credit/quota reservation or queueing.
+  // Guest-only maintenance keeps the existing owner behavior. Same server_busy envelope and
+  // maintenance Retry-After as chat/audio admission rejection.
+  const maintenance = controller.snapshot();
+  if (maintenance.maintenanceMode && (principal.tier !== "owner" || maintenance.maintenanceScope === "exclusive")) {
     const retryAfterSeconds = cfg.maintenanceRetryAfterSeconds;
     lctx.status = 503;
     lctx.outcome = "busy";
@@ -4038,6 +4040,7 @@ export function startGateway(
     retryAfterAtCapSeconds: cfg.busyRetryAfterSeconds,
     maintenanceRetryAfterSeconds: cfg.maintenanceRetryAfterSeconds,
     maintenanceMode: cfg.maintenanceModeAtStart,
+    startupExclusiveUntilMs: cfg.startupExclusiveUntilMs,
   });
   const maintenanceWindow = new ExclusiveMaintenanceWindow(
     controller,
@@ -4053,7 +4056,9 @@ export function startGateway(
       observeRunning: getRunningSnapshot,
     },
   );
-  if (cfg.maintenanceModeAtStart) {
+  if (cfg.startupExclusiveUntilMs !== undefined && Date.now() < cfg.startupExclusiveUntilMs) {
+    console.warn("Startup exclusive maintenance fence engaged; all inference admission refused until operator deadline.");
+  } else if (cfg.maintenanceModeAtStart) {
     console.warn("⚠  bench/maintenance mode ENGAGED at startup — guest admission is refused (#108).");
   }
 

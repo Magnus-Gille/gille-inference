@@ -139,7 +139,7 @@ test("packaged hs and m5 CLIs honor their dependency-free contracts", async () =
 
   const versionOutput = outputCollector();
   assert.equal(await m5.main(["--version"], { output: versionOutput.stream }), 0);
-  assert.deepEqual(JSON.parse(versionOutput.text()), { name: "m5", version: "1.5.4" });
+  assert.deepEqual(JSON.parse(versionOutput.text()), { name: "m5", version: "1.5.5" });
 
   const invalidM5Output = outputCollector();
   const invalidM5Error = outputCollector();
@@ -170,7 +170,7 @@ test("packaged hs and m5 CLIs honor their dependency-free contracts", async () =
     assert.equal(request.headers["content-type"], "application/json");
     assert.equal(request.headers.accept, "application/json");
     assert.equal(request.headers.authorization, "Bearer synthetic-m5-token");
-    assert.equal(request.headers["user-agent"], "m5-cli/1.5.4");
+    assert.equal(request.headers["user-agent"], "m5-cli/1.5.5");
     assert.ok(request.signal instanceof AbortSignal);
     assert.deepEqual(message, {
       jsonrpc: "2.0",
