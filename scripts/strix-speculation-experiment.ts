@@ -55,8 +55,20 @@ interface ArmExecution {
   logBytes: number;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return; }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function atomicWrite(path: string, content: string): void {
@@ -177,34 +189,51 @@ async function portIsFree(port: number): Promise<boolean> {
   });
 }
 
-async function waitHealthy(child: ChildProcess, port: number): Promise<void> {
+export async function waitHealthy(child: ChildProcess, port: number, signal?: AbortSignal): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
+  let lastError: unknown;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     if (child.exitCode !== null || child.signalCode !== null) throw new Error("ephemeral llama-server exited before ready");
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2_000) });
-      if (response.ok) { await response.body?.cancel(); return; }
-    } catch { /* still loading */ }
-    await sleep(250);
+      const timeout = AbortSignal.timeout(2_000);
+      const response = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
+      });
+      await response.body?.cancel();
+      signal?.throwIfAborted();
+      if (response.ok) return;
+      lastError = new Error(`ephemeral health returned ${response.status}`);
+    } catch (error) {
+      signal?.throwIfAborted();
+      lastError = error;
+    }
+    await sleep(250, signal);
   }
-  throw new Error("ephemeral llama-server did not become ready before timeout");
+  throw new Error("ephemeral llama-server did not become ready before timeout", { cause: lastError });
 }
 
-async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.pid === undefined) return;
-  if (child.exitCode !== null || child.signalCode !== null) return;
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    const finish = (exited: boolean): void => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolveExit(exited);
+    };
+    const onExit = (): void => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+export async function stopChild(child: ChildProcess): Promise<void> {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
-  const exited = await Promise.race([
-    new Promise<boolean>((resolveExit) => child.once("exit", () => resolveExit(true))),
-    sleep(30_000).then(() => false),
-  ]);
-  if (!exited && child.exitCode === null && child.signalCode === null) {
-    child.kill("SIGKILL");
-    await new Promise<void>((resolveExit, rejectExit) => {
-      if (child.exitCode !== null || child.signalCode !== null) { resolveExit(); return; }
-      const timeout = setTimeout(() => rejectExit(new Error("ephemeral llama-server did not exit after SIGKILL")), 5_000);
-      child.once("exit", () => { clearTimeout(timeout); resolveExit(); });
-    });
+  if (await waitForChildExit(child, 30_000)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForChildExit(child, 5_000))) {
+    throw new Error("ephemeral llama-server did not exit after SIGKILL");
   }
 }
 
@@ -259,18 +288,22 @@ function provenance(config: StrixSpeculationExperimentConfig, plan: StrixSpecula
   };
 }
 
-async function runArm(
+export async function runArm(
   config: StrixSpeculationExperimentConfig,
   plan: StrixSpeculationRunPlan,
   host: ArtifactPreflight,
   signal: AbortSignal,
+  dependencies: { portIsFree?: typeof portIsFree; spawn?: typeof spawn } = {},
 ): Promise<ArmExecution> {
-  if (!(await portIsFree(config.server.port))) throw new Error(`ephemeral port ${config.server.port} is occupied`);
+  signal.throwIfAborted();
+  const free = await (dependencies.portIsFree ?? portIsFree)(config.server.port);
+  signal.throwIfAborted();
+  if (!free) throw new Error(`ephemeral port ${config.server.port} is occupied`);
   const provenancePath = `${plan.outPrefix}.provenance.json`;
   atomicWrite(provenancePath, `${JSON.stringify(provenance(config, plan, host), null, 2)}\n`);
   const logHash = createHash("sha256");
   let logBytes = 0;
-  const child = spawn(plan.serverArgv[0]!, plan.serverArgv.slice(1), {
+  const child = (dependencies.spawn ?? spawn)(plan.serverArgv[0]!, plan.serverArgv.slice(1), {
     shell: false,
     stdio: ["ignore", "ignore", "pipe"],
     env: buildStrixChildEnvironment(process.env, {
@@ -290,7 +323,7 @@ async function runArm(
       child.once("spawn", resolveSpawn);
       child.once("error", rejectSpawn);
     });
-    await waitHealthy(child, config.server.port);
+    await waitHealthy(child, config.server.port, signal);
     const exitCode = await runStrixServerBenchmark([
       "--base-url", `http://127.0.0.1:${config.server.port}/v1`,
       "--metrics-url", `http://127.0.0.1:${config.server.port}/metrics`,
@@ -314,6 +347,7 @@ async function runArm(
 }
 
 export async function runStrixSpeculationExperiment(argv: string[]): Promise<number> {
+  if (activeChild !== null) throw new Error("previous ephemeral child termination is unverified");
   const args = parseStrixSpeculationExperimentArgs(argv);
   if (process.platform !== "linux") throw new Error("Strix speculation experiment requires Linux");
   const configText = readFileSync(args.configPath, "utf8");
@@ -323,6 +357,7 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
   const host = await preflightStrixSpeculationArtifacts(config); // Hash everything before unloading.
   let interruptedBy: NodeJS.Signals | "deadline" | null = null;
   let forcedStopError: unknown;
+  let restorationBlockedByUnverifiedChild = false;
   let restorationAttempted = false;
   let restorationCompleted = false;
   let finalReadyIdentityVerified = false;
@@ -353,6 +388,12 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
         const result = await runArm(config, plan, host, interruption.signal);
         executions.push(result);
         return { cycle: plan.cycle, position: plan.position, sequence: plan.sequence, armId: plan.arm.id, reportPath: result.reportPath };
+      },
+      confirmStopped: async () => {
+        try { await stopActiveChild(); } catch (error) {
+          restorationBlockedByUnverifiedChild = true;
+          throw error;
+        }
       },
       restore: async (initial) => {
         restorationAttempted = true;
@@ -401,6 +442,7 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
       initialResidency: execution.initialResidency,
       finalResidency: execution.finalResidency,
       restoration: {
+        blockedByUnverifiedChild: restorationBlockedByUnverifiedChild,
         attempted: restorationAttempted,
         completed: restorationCompleted,
         readyModelIdentityVerified: finalReadyIdentityVerified,
@@ -429,6 +471,7 @@ export async function runStrixSpeculationExperiment(argv: string[]): Promise<num
       failure: failureDiagnostic(error),
       forcedStopFailure: forcedStopError === undefined ? null : failureDiagnostic(forcedStopError),
       restoration: {
+        blockedByUnverifiedChild: restorationBlockedByUnverifiedChild,
         attempted: restorationAttempted,
         completed: restorationCompleted,
         readyModelIdentityVerified: finalReadyIdentityVerified,

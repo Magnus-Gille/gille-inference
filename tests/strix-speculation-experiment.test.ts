@@ -1,13 +1,18 @@
+import { EventEmitter } from "node:events";
+import type { ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   preflightStrixSpeculationArtifacts,
   prepareFreshStrixOutputDirectory,
+  runArm,
+  stopChild,
+  waitHealthy,
 } from "../scripts/strix-speculation-experiment.js";
 
 import {
@@ -252,6 +257,7 @@ describe("Strix speculation experiment contract", () => {
         events.push(plan.arm.id);
         return { cycle: plan.cycle, position: plan.position, sequence: plan.sequence, armId: plan.arm.id, reportPath: `${plan.outPrefix}.json` };
       },
+      confirmStopped: async () => { events.push("stopped"); },
       restore: async () => { restored = true; events.push("restore"); },
       interruptedBy: () => null,
     });
@@ -261,7 +267,7 @@ describe("Strix speculation experiment contract", () => {
       "direct", "draft-mtp-1", "draft-mtp-2",
       "draft-mtp-1", "draft-mtp-2", "direct",
       "draft-mtp-2", "direct", "draft-mtp-1",
-      "restore",
+      "stopped", "restore",
     ]);
     expect(restored).toBe(true);
     expect(result).toMatchObject({ restored: true, deploymentStatus: "not-authorized-by-evidence" });
@@ -314,6 +320,7 @@ describe("Strix speculation experiment contract", () => {
     const dependencies = {
       snapshot: async () => [{ model: "qwen38-27b", state: "ready" }],
       unload: async () => {},
+      confirmStopped: async () => {},
       runArm: async () => { throw new Error("arm failed"); },
       restore: async () => { restored = true; },
       interruptedBy: () => null,
@@ -336,6 +343,7 @@ describe("Strix speculation experiment contract", () => {
     await expect(executeStrixSpeculationExperiment(config, args, {
       snapshot: async () => [{ model: "qwen38-27b", state: "loading", ttl: 1800 }],
       unload: async () => {},
+      confirmStopped: async () => {},
       runArm: async () => { throw new Error("must not run"); },
       restore: async () => {},
       interruptedBy: () => null,
@@ -358,6 +366,7 @@ describe("Strix speculation experiment contract", () => {
         return [{ model: "qwen38-27b", state: "ready", ttl: 1800 }];
       },
       unload: async () => {},
+      confirmStopped: async () => {},
       runArm: async (plan) => ({
         cycle: plan.cycle, position: plan.position, sequence: plan.sequence,
         armId: plan.arm.id, reportPath: `${plan.outPrefix}.json`,
@@ -365,5 +374,185 @@ describe("Strix speculation experiment contract", () => {
       restore: async () => {},
       interruptedBy: () => interrupted,
     })).rejects.toThrow(/interrupted by deadline/i);
+  });
+});
+
+describe("speculation child lifecycle", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function childFixture(): ChildProcess {
+    return Object.assign(new EventEmitter(), {
+      pid: 12345,
+      exitCode: null,
+      signalCode: null,
+      kill: vi.fn(() => true),
+    }) as unknown as ChildProcess;
+  }
+
+  it("does not spawn if cancellation arrives during the port probe", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "strix-abort-probe-"));
+    const controller = new AbortController();
+    const reason = new Error("deadline during port probe");
+    const spawnChild = vi.fn(() => { throw new Error("spawned after cancellation"); });
+    const config = validateStrixSpeculationExperimentConfig(fixture());
+    const plan = buildStrixSpeculationRunPlans(config, dir)[0]!;
+    try {
+      await expect(runArm(config, plan, {
+        hashes: {}, runtimeVersion: "fixture", runtimeDevicesSha256: "0".repeat(64),
+        kernel: "fixture", mesaVersion: null, rocmVersion: null,
+      }, controller.signal, {
+        portIsFree: async () => { controller.abort(reason); return true; },
+        spawn: spawnChild as unknown as typeof spawn,
+      })).rejects.toBe(reason);
+      expect(spawnChild).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not poll health with an already aborted signal", async () => {
+    const controller = new AbortController();
+    const reason = new Error("deadline before health polling");
+    controller.abort(reason);
+    const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(waitHealthy(childFixture(), 5919, controller.signal)).rejects.toBe(reason);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not accept ready health after cancellation during fetch", async () => {
+    const controller = new AbortController();
+    const reason = new Error("deadline during health fetch");
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      controller.abort(reason);
+      return new Response(null, { status: 200 });
+    }));
+    await expect(waitHealthy(childFixture(), 5919, controller.signal)).rejects.toBe(reason);
+  });
+
+  it("passes cancellation to an in-flight health request", async () => {
+    const controller = new AbortController();
+    const reason = new Error("deadline with health request pending");
+    const fetchMock = vi.fn((_url: unknown, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const pending = waitHealthy(childFixture(), 5919, controller.signal);
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the delay between health polls without another request", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("not ready"))
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const outcome = waitHealthy(childFixture(), 5919, controller.signal).then(
+      () => ({ error: null }), (error: unknown) => ({ error }),
+    );
+    setTimeout(() => controller.abort(new Error("deadline between polls")), 25);
+    await vi.advanceTimersByTimeAsync(250);
+    expect((await outcome).error).toBeInstanceOf(Error);
+    expect(String((await outcome).error)).toMatch(/abort|deadline/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans the TERM wait timer and listener when exit is confirmed", async () => {
+    vi.useFakeTimers();
+    const child = childFixture();
+    vi.mocked(child.kill).mockImplementation(() => {
+      setTimeout(() => { child.exitCode = 0; child.emit("exit", 0, null); }, 10);
+      return true;
+    });
+    const stopped = stopChild(child);
+    await vi.advanceTimersByTimeAsync(10);
+    await stopped;
+    expect(child.listenerCount("exit")).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fails with no dangling listeners when TERM and KILL cannot confirm exit", async () => {
+    vi.useFakeTimers();
+    const child = childFixture();
+    const checked = expect(stopChild(child)).rejects.toThrow("did not exit after SIGKILL");
+    await vi.advanceTimersByTimeAsync(35_000);
+    await checked;
+    expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+    expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.listenerCount("exit")).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("blocks restoration if child termination cannot be confirmed after an arm failure", async () => {
+    const config = validateStrixSpeculationExperimentConfig(fixture());
+    const args = parseStrixSpeculationExperimentArgs([
+      "--config", "config.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "qwen38-27b", "--max-runtime-seconds", "7200",
+      "--ack-exclusive-window",
+    ]);
+    const restore = vi.fn(async () => {});
+    await expect(executeStrixSpeculationExperiment(config, args, {
+      snapshot: async () => [{ model: "qwen38-27b", state: "ready" }],
+      unload: async () => {},
+      runArm: async () => { throw new Error("arm failed"); },
+      confirmStopped: async () => { throw new Error("child still alive after SIGKILL"); },
+      restore,
+      interruptedBy: () => null,
+    })).rejects.toThrow(/termination unverified|restoration blocked/i);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("also requires confirmed termination when every arm succeeded", async () => {
+    const config = validateStrixSpeculationExperimentConfig(fixture());
+    const args = parseStrixSpeculationExperimentArgs([
+      "--config", "config.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "qwen38-27b", "--max-runtime-seconds", "7200",
+      "--ack-exclusive-window",
+    ]);
+    const restore = vi.fn(async () => {});
+    await expect(executeStrixSpeculationExperiment(config, args, {
+      snapshot: async () => [{ model: "qwen38-27b", state: "ready" }],
+      unload: async () => {},
+      runArm: async (plan) => ({
+        cycle: plan.cycle, position: plan.position, sequence: plan.sequence,
+        armId: plan.arm.id, reportPath: `${plan.outPrefix}.json`,
+      }),
+      confirmStopped: async () => { throw new Error("unverified child exit"); },
+      restore,
+      interruptedBy: () => null,
+    })).rejects.toThrow(/restoration blocked/i);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("does not unload or restore if cancellation arrives during the initial snapshot", async () => {
+    const config = validateStrixSpeculationExperimentConfig(fixture());
+    const args = parseStrixSpeculationExperimentArgs([
+      "--config", "config.json", "--out-dir", "/evidence",
+      "--expected-resident-model", "qwen38-27b", "--max-runtime-seconds", "7200",
+      "--ack-exclusive-window",
+    ]);
+    let interrupted: string | null = null;
+    const unload = vi.fn(async () => {});
+    const restore = vi.fn(async () => {});
+    await expect(executeStrixSpeculationExperiment(config, args, {
+      snapshot: async () => {
+        interrupted = "deadline";
+        return [{ model: "qwen38-27b", state: "ready" }];
+      },
+      unload,
+      runArm: async () => { throw new Error("must not run"); },
+      confirmStopped: async () => {},
+      restore,
+      interruptedBy: () => interrupted,
+    })).rejects.toThrow(/interrupted by deadline/i);
+    expect(unload).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
   });
 });

@@ -123,6 +123,8 @@ export interface StrixSpeculationExecutionDependencies {
   snapshot(): Promise<StrixResidentEntry[]>;
   unload(): Promise<void>;
   runArm(plan: StrixSpeculationRunPlan): Promise<StrixSpeculationRunEvidence>;
+  /** Must confirm termination before restoration can start another GPU resident. */
+  confirmStopped(): Promise<void>;
   restore(initial: StrixResidentEntry[]): Promise<void>;
   interruptedBy(): string | null;
 }
@@ -530,6 +532,8 @@ export async function executeStrixSpeculationExperiment(
 ): Promise<StrixSpeculationExecutionResult> {
   const initialResidency = await dependencies.snapshot();
   assertExpectedResidency(initialResidency, args.expectedResidentModel);
+  const initialSignal = dependencies.interruptedBy();
+  if (initialSignal !== null) throw new Error(`speculation experiment interrupted by ${initialSignal}`);
   const plans = buildStrixSpeculationRunPlans(config, args.outDir);
   const runs: StrixSpeculationRunEvidence[] = [];
   let operationError: unknown;
@@ -544,6 +548,15 @@ export async function executeStrixSpeculationExperiment(
     }
   } catch (error) {
     operationError = error;
+  }
+
+  try {
+    await dependencies.confirmStopped();
+  } catch (stopError) {
+    throw new AggregateError(
+      operationError === undefined ? [stopError] : [operationError, stopError],
+      "ephemeral child termination unverified; residency restoration blocked",
+    );
   }
 
   let restoreError: unknown;

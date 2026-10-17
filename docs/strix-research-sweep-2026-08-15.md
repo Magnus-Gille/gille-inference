@@ -123,8 +123,9 @@ maintenance child validates the exact runtime/Vulkan/model/mmproj/fixture hashes
 again after restoration before complete evidence can be published,
 requires the configured binary's `--version` to prove the pinned commit, and Latin-rotates direct
 plus every declared MTP depth across all execution positions. It records one raw report per
-arm/cycle, restores and verifies the prior ready model identity even on failure (without claiming
-TTL preservation), merges cycles into paired repetitions, and synthesizes the lossless policy
+arm/cycle, restores and verifies the prior ready model identity after confirmed ephemeral-child
+termination, and blocks restoration when termination is unverified (without claiming TTL
+preservation). It merges cycles into paired repetitions and synthesizes the lossless policy
 automatically. Signals and the bounded runtime abort in-flight requests and escalate a stuck server
 from SIGTERM to SIGKILL without bypassing restoration. A fresh output directory and explicit
 incomplete receipt prevent stale partial runs from masquerading as complete evidence. The output

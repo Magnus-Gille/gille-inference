@@ -323,8 +323,13 @@ ephemeral port, artifact/version mismatch, malformed fixture/report, failed requ
 signal/deadline interruption. Its external abort signal cancels in-flight benchmark requests and
 an independent SIGTERM-to-SIGKILL watchdog bounds a stuck child before restoration. Missing
 speculation counters reject that arm in the synthesized policy. The runner restores and verifies
-the pre-run ready model identity on every catchable failure; llama-swap TTL preservation is not
-claimed. Simultaneous experiment and restore failures are both reported.
+the pre-run ready model identity on catchable failures only after confirming that the ephemeral
+child has exited. If TERM and KILL cannot confirm termination, restoration is blocked to avoid
+starting a competing GPU resident; the incomplete receipt records
+`restoration.blockedByUnverifiedChild=true`. Cancellation is checked after the port probe and
+through readiness requests and delays, so an expired arm cannot start a new model process.
+llama-swap TTL preservation is not claimed. Simultaneous experiment and restore failures are both
+reported.
 
 Each arm's cycle reports are merged with the Latin cycle number as the paired repetition index,
 then the lossless speculation policy below is synthesized automatically. Raw reports, provenance,
