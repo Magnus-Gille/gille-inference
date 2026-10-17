@@ -44,6 +44,8 @@ migrated through the staged lifecycle in `docs/credential-lifecycle-runbook.md`.
 
 Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Error messages name the request units already metered by each route: chat/MCP use tokens, transcription uses worst-case audio-seconds, and image generation uses image units. Shared static-tier buckets retain their existing shared accounting across callers and routes. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
 
+Audio transcription has a separate non-queuing upload-memory bound before multipart buffering: at most two active audio handlers process-wide, at most one guest handler process-wide (leaving one slot available to owner traffic), and at most `min(2, key.maxParallel)` per authenticated alias. Saturated uploads receive `503 server_busy` with `Retry-After`; no body is buffered and no credit, quota, or GPU admission is reserved. Restricted keys without canonical `whisper-1` access are rejected before reading the multipart body because all accepted Whisper aliases route to that one backend model.
+
 ## Error envelope (OpenAI-shaped)
 
 **Every inference and auth error path** uses an `errors.ts` envelope so OpenAI-SDK clients parse them natively:

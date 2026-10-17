@@ -91,6 +91,7 @@ import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
 import { IncidentWindowOptionsError, queryIncidentWindow } from "./incident-window.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
+import { AudioUploadAdmission } from "./audio-upload-admission.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image-request.js";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
   SYSTEMONE_MAX_BODY_BYTES,
@@ -328,6 +329,9 @@ function keyLimits(cfg: HomeserverConfig): QuotaLimits {
 // ─── Per-key in-flight tracking ──────────────────────────────────────────────────────
 
 const keyInflight = new Map<string, number>();
+// Audio multipart bodies are buffered before GPU admission, so they need a separate bounded
+// process-wide gate. This is deliberately independent of the GPU slot budget.
+const audioUploadAdmission = new AudioUploadAdmission();
 // One CPU embedding call per gateway instance matches the sidecar's single server slot and
 // prevents queued sidecar calls from occupying every shared GPU admission slot.
 const embeddingInFlight = new WeakSet<AdmissionController>();
@@ -871,46 +875,70 @@ async function readBuffer(
         idle = null;
       }
     };
-    const armIdle = (): void => {
+    const cleanup = (): void => {
       clearIdle();
-      idle = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        // A slow-loris that never finishes: there is no clean response to send, so drop the socket.
-        req.destroy();
-        reject(new Error("request body read timed out"));
-      }, idleMs);
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("aborted", onAborted);
+      req.removeListener("close", onClose);
+      // IncomingMessage can emit `error` after `aborted`. Keep the handler until the request's
+      // close event so that this late transport error cannot become an unhandled exception.
+      if (req.closed) req.removeListener("error", onError);
+      else req.once("close", removeLateErrorListener);
+    };
+    const removeLateErrorListener = (): void => {
+      req.removeListener("error", onError);
     };
     const fail = (err: Error): void => {
       if (settled) return;
       settled = true;
-      clearIdle();
+      cleanup();
+      chunks.length = 0;
       reject(err);
     };
-    armIdle();
-    req.on("data", (c: Buffer) => {
+    const armIdle = (): void => {
+      clearIdle();
+      idle = setTimeout(() => {
+        // A slow-loris that never finishes: there is no clean response to send, so drop the socket.
+        fail(new Error("request body read timed out"));
+        req.destroy();
+      }, idleMs);
+    };
+    const onData = (c: Buffer): void => {
       if (settled) return;
       armIdle(); // reset the idle clock on every chunk
       size += c.length;
       if (size > maxBytes) {
         settled = true;
-        clearIdle();
+        cleanup();
         // Stop buffering and reject, but keep the connection writable so the caller can send a 413.
-        // Drop our reference to the buffered chunks and drain the rest of the upload.
         chunks.length = 0;
         req.resume();
         reject(new BodyTooLargeError());
         return;
       }
       chunks.push(c);
-    });
-    req.on("end", () => {
+    };
+    const onEnd = (): void => {
       if (settled) return;
       settled = true;
-      clearIdle();
-      resolve(Buffer.concat(chunks));
-    });
-    req.on("error", fail);
+      cleanup();
+      const body = Buffer.concat(chunks);
+      chunks.length = 0;
+      resolve(body);
+    };
+    const onError = (err: Error): void => fail(err);
+    const onAborted = (): void => fail(new Error("request body aborted"));
+    const onClose = (): void => {
+      if (!req.complete) fail(new Error("request body closed before completion"));
+      removeLateErrorListener();
+    };
+    armIdle();
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("aborted", onAborted);
+    req.on("close", onClose);
   });
 }
 
@@ -2936,6 +2964,52 @@ interface WhisperVerbose {
  * carries the audio SECONDS (a numeric, content-blind field) and creditsCharged the real cost.
  */
 async function handleAudioTranscription(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cfg: HomeserverConfig,
+  controller: AdmissionController,
+  principal: PrincipalContext,
+  lctx: LogCtx
+): Promise<void> {
+  // The backend always runs the canonical Whisper model. Enforce that authorization before
+  // accepting even a single multipart body byte; a caller-supplied model field cannot change it.
+  if (principal.modelAllowList.length > 0 && !principal.modelAllowList.includes(WHISPER_MODEL)) {
+    res.setHeader("Connection", "close");
+    req.resume();
+    lctx.status = 403;
+    lctx.outcome = "forbidden";
+    lctx.errorClass = "model_not_allowed";
+    lctx.admission = "n/a";
+    sendError(res, makeError("model_not_allowed", {
+      param: "model",
+      message: `Your API key is not permitted to use model '${WHISPER_MODEL}'.`,
+    }));
+    return;
+  }
+
+  const releaseUpload = audioUploadAdmission.acquire(principal.alias, principal.tier, principal.maxParallel);
+  if (releaseUpload === null) {
+    // Do not drain an unbounded request indefinitely; tell the client this connection is closing
+    // after the bounded, content-blind busy response. No body bytes are retained by the gateway.
+    res.setHeader("Connection", "close");
+    req.resume();
+    lctx.status = 503;
+    lctx.outcome = "busy";
+    lctx.errorClass = "server_busy";
+    lctx.retryAfterS = cfg.busyRetryAfterSeconds;
+    lctx.admission = "busy";
+    recordAdmissionRejection(principal.tier);
+    sendError(res, makeError("server_busy", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
+    return;
+  }
+  try {
+    await handleAudioTranscriptionAdmitted(req, res, cfg, controller, principal, lctx);
+  } finally {
+    releaseUpload();
+  }
+}
+
+async function handleAudioTranscriptionAdmitted(
   req: IncomingMessage,
   res: ServerResponse,
   cfg: HomeserverConfig,

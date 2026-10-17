@@ -60,4 +60,14 @@ describe("readBody idle-read bound", () => {
     expect(req.destroyed).toBe(false);
     expect(req.resumed).toBe(true);
   });
+
+  it("absorbs a transport error emitted after an abort and removes it when the request closes", async () => {
+    const req = new FakeRequest({ "content-length": "100" });
+    const pending = readBody(asRequest(req), 1024, 60);
+    req.emit("aborted");
+    expect(() => req.emit("error", new Error("ECONNRESET"))).not.toThrow();
+    await expect(pending).rejects.toThrow("request body aborted");
+    req.emit("close");
+    expect(req.listenerCount("error")).toBe(0);
+  });
 });
