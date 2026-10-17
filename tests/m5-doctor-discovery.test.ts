@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   M5ClientError,
   diagnoseProfile,
@@ -72,6 +72,13 @@ type DiagnoseOptions = {
   privateTransport?: string;
   publicObservation?: unknown;
   privateObservation?: unknown;
+  inferenceProbe?: { route: "public" | "private"; model: string };
+  askFailure?: boolean;
+  askSuccess?: boolean;
+  askTemporaryFailure?: boolean;
+  profileConfig?: { publicGatewayUrl: string; privateGatewayUrl?: string };
+  visitedEndpoints?: string[];
+  timeoutMs?: number;
 };
 
 function discoveryFailureForEndpoint(
@@ -93,11 +100,19 @@ async function diagnose({
   privateTransport = publicTransport,
   publicObservation,
   privateObservation,
+  inferenceProbe,
+  askFailure = false,
+  askSuccess = false,
+  askTemporaryFailure = false,
+  profileConfig = PROFILE,
+  visitedEndpoints,
+  timeoutMs = failure === "public_timeout" ? 1_000 : 10_000,
 }: DiagnoseOptions = {}) {
   let askCalls = 0;
+  const askEndpoints: string[] = [];
   const result = await diagnoseProfile({
     profile: "codex",
-    profileConfig: PROFILE,
+    profileConfig,
     // Make private-route failure classification deterministic across hosts with and without
     // a configured Tailscale CLI. These tests exercise the gateway transport, not host state.
     localProbes: { tailnet: async () => "up" },
@@ -109,11 +124,13 @@ async function diagnose({
         return credential;
       },
     },
-    timeoutMs: failure === "public_timeout" ? 1_000 : 10_000,
+    timeoutMs,
+    inferenceProbe,
     fetch: async (input, init) => {
       const url = String(input);
-      const isPrivate = url.startsWith(PROFILE.privateGatewayUrl);
+      const isPrivate = Boolean(profileConfig.privateGatewayUrl) && url.startsWith(profileConfig.privateGatewayUrl);
       const endpoint = isPrivate ? "private" : "public";
+      visitedEndpoints?.push(endpoint);
       if (url.endsWith("/portal/me")) {
         if (!isPrivate && rejectPublic !== undefined) {
           return rejectPublic === 530
@@ -151,7 +168,34 @@ async function diagnose({
       const name = request.params?.name;
       if (name === "ask") {
         askCalls += 1;
-        throw new Error(`ask must not be called: ${SECRET} ${LOCATOR}`);
+        askEndpoints.push(endpoint);
+        if (askSuccess) {
+          return rpcResult(request.id, {
+            isError: false,
+            structuredContent: { model: inferenceProbe?.model ?? "safe-model", text: "OK" },
+          });
+        }
+        if (askTemporaryFailure) {
+          return rpcResult(request.id, {
+            isError: true,
+            content: [{ type: "text", text: `${SECRET} unsafe peer response` }],
+            _meta: {
+              m5_code: "model_temporarily_unavailable",
+              request_id: "66666666-6666-4666-8666-666666666666",
+              retryable: true,
+              retry_after_seconds: 4,
+              backoff: {
+                scope: "key_model", retry_after_seconds: 4,
+                unavailable_until: "2026-10-15T14:30:00.000Z",
+              },
+            },
+          });
+        }
+        if (!askFailure) throw new Error(`unexpected ask call: ${SECRET} ${LOCATOR}`);
+        return rpcResult(request.id, {
+          isError: true,
+          content: [{ type: "text", text: `${ERROR_TEXT} ${SECRET} ${LOCATOR}` }],
+        });
       }
       if (name !== "list_models") {
         throw new Error(`unexpected tool call ${String(name)} ${SECRET}`);
@@ -210,7 +254,8 @@ async function diagnose({
       });
     },
   });
-  expect(askCalls).toBe(0);
+  expect(askCalls).toBe(askFailure || askSuccess || askTemporaryFailure ? 1 : 0);
+  if (askFailure || askSuccess || askTemporaryFailure) expect(askEndpoints).toEqual([inferenceProbe?.route]);
   return result;
 }
 
@@ -267,6 +312,158 @@ function expectSafeDiscoveryFailure(
 }
 
 describe("m5 doctor model-discovery diagnostics", () => {
+  it("probes a healthy selected private route without touching an unavailable public route", async () => {
+    const visited: string[] = [];
+    const result = await diagnose({
+      failure: "public_refused",
+      inferenceProbe: { route: "private", model: "safe-model" },
+      askSuccess: true,
+      visitedEndpoints: visited,
+    });
+    expect(visited.length).toBeGreaterThan(0);
+    expect(new Set(visited)).toEqual(new Set(["private"]));
+    expect(result).toMatchObject({
+      status: "mcp_reachable",
+      inference: { public: "not_checked", private: "succeeded" },
+      inference_probe: { status: "succeeded", route: "private", model: "safe-model" },
+      endpoints: { public: "not_checked", private: "healthy" },
+    });
+    expectNoTaintedContent(result);
+  });
+
+  it("never touches the unselected private route for a selected public probe", async () => {
+    const visited: string[] = [];
+    const result = await diagnose({
+      inferenceProbe: { route: "public", model: "safe-model" },
+      askSuccess: true,
+      visitedEndpoints: visited,
+    });
+    expect(visited.length).toBeGreaterThan(0);
+    expect(new Set(visited)).toEqual(new Set(["public"]));
+    expect(result).toMatchObject({
+      inference: { public: "succeeded", private: "not_checked" },
+      inference_probe: { status: "succeeded", route: "public", model: "safe-model" },
+      endpoints: { public: "healthy", private: "not_checked" },
+    });
+  });
+
+  it("validates the exported inferenceProbe contract before credential or network access", async () => {
+    for (const inferenceProbe of [
+      null,
+      {},
+      { route: "sideways", model: "safe-model" },
+      { route: "public", model: "bad model" },
+      { route: "public", model: "safe-model", extra: true },
+    ]) {
+      let credentialCalls = 0;
+      let fetchCalls = 0;
+      await expect(diagnoseProfile({
+        profile: "codex",
+        profileConfig: PROFILE,
+        inferenceProbe: inferenceProbe as never,
+        credentialStore: { resolve: async () => { credentialCalls += 1; return SECRET; } },
+        fetch: async () => { fetchCalls += 1; throw new Error("unexpected fetch"); },
+      })).rejects.toMatchObject({ code: "invalid_args" });
+      expect(credentialCalls).toBe(0);
+      expect(fetchCalls).toBe(0);
+    }
+  });
+
+  it("does not ask when the selected catalogue does not advertise ask", async () => {
+    const result = await diagnose({
+      publicTools: REQUIRED_TOOLS.filter((tool) => tool !== "ask"),
+      inferenceProbe: { route: "public", model: "safe-model" },
+    });
+    expect(result).toMatchObject({
+      status: "missing_tools",
+      inference_probe: {
+        status: "not_checked", route: "public", model: "safe-model",
+        diagnostic_code: "ask_not_advertised",
+      },
+    });
+    expect(result.inference).toEqual({ public: "not_checked", private: "not_checked" });
+  });
+
+  it("keeps an explicit probe not_checked when catalogue gates fail", async () => {
+    const result = await diagnose({
+      failure: "public_refused",
+      inferenceProbe: { route: "public", model: "safe-model" },
+    });
+    expect(result).toMatchObject({
+      status: "model_discovery_unavailable",
+      inference: { public: "not_checked", private: "not_checked" },
+      inference_probe: { status: "not_checked", route: "public", model: "safe-model" },
+      health_scope: "mcp_catalogue_only",
+    });
+    expect(result.inference_probe).not.toHaveProperty("checked_at");
+  });
+
+  it("reports a sanitized explicit inference failure and preserves historical observation", async () => {
+    const result = await diagnose({
+      inferenceProbe: { route: "private", model: "safe-model" },
+      askFailure: true,
+      publicObservation: {
+        source: "request_log", scope: "m5_global", status: "observed",
+        lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+      },
+      privateObservation: {
+        source: "request_log", scope: "m5_global", status: "observed",
+        lastSuccessfulAt: "2026-10-08T12:34:56.000Z",
+      },
+    });
+    expect(result).toMatchObject({
+      status: "degraded",
+      health_scope: "mcp_catalogue_and_inference_probe",
+      inference: { public: "not_checked", private: "failed" },
+      inference_probe: {
+        status: "failed", route: "private", model: "safe-model", diagnostic_code: "tool_error",
+      },
+      inference_observation: {
+        scope: "m5_global",
+        public: { status: "not_checked", last_successful_at: null },
+        private: { status: "observed", last_successful_at: "2026-10-08T12:34:56.000Z" },
+      },
+    });
+    expect(Number.isSafeInteger(result.inference_probe.elapsed_ms)).toBe(true);
+    expectNoTaintedContent(result);
+  });
+
+  it("projects temporary model failure into doctor without exposing backoff or request id", async () => {
+    const result = await diagnose({
+      inferenceProbe: { route: "private", model: "safe-model" },
+      askTemporaryFailure: true,
+    });
+    expect(result).toMatchObject({
+      status: "degraded",
+      inference: { public: "not_checked", private: "failed" },
+      inference_probe: {
+        status: "failed", route: "private", model: "safe-model",
+        diagnostic_code: "model_temporarily_unavailable",
+      },
+    });
+    expect(result.inference_probe).not.toHaveProperty("backoff");
+    expect(result.inference_probe).not.toHaveProperty("request_id");
+    expect(JSON.stringify(result)).not.toContain("66666666-6666-4666-8666-666666666666");
+    expect(JSON.stringify(result)).not.toContain("unavailable_until");
+    expectNoTaintedContent(result);
+  });
+
+  it("caps the explicit selected-route request timeout at 30 seconds", async () => {
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await diagnose({
+        inferenceProbe: { route: "public", model: "safe-model" },
+        askSuccess: true,
+        timeoutMs: 120_000,
+      });
+      const delays = timeoutSpy.mock.calls.map(([, delay]) => Number(delay));
+      expect(delays).toContain(30_000);
+      expect(delays.every((delay) => delay <= 30_000)).toBe(true);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
   it("labels historical successful inference without claiming current readiness", async () => {
     const observation = {
       source: "request_log", scope: "m5_global", status: "observed",
