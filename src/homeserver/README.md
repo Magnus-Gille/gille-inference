@@ -161,7 +161,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks), plus content-free `codeLoopTransport: "available" \| "unavailable" \| "disabled"`. This checks the dedicated user-bus socket listener only when code loops are enabled. Overall `ok` remains independent of this field because ordinary inference can work while code loops cannot. It does not prove that a caged job can run. |
 | `GET /` · `GET /portal` | none | Serves the self-service portal page (HTML; `nosniff` + restrictive CSP + `no-store`). Per-IP throttled. |
 | `POST /portal/redeem` | none (the **code** is the credential) | `{code}` → `200 {key, alias, model, models, creditLimit}` (`Cache-Control: no-store`). Trades a one-time invite code for a freshly minted key. Uniform `409 invite_invalid` for an unknown **or** already-used code (identical body — no enumeration oracle); `400` for a missing code. Per-IP throttled (`HOMESERVER_REDEEM_RPM`, default 10 / 10 min) → `429`. |
-| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` plus `gateway` release metadata and `inferenceObservation` only for minted owner agent/admin keys (`Cache-Control: no-store`). The latter is a global, content-blind request-log timestamp for the last observed successful admitted M5 inference, or `none`/`disabled`/`unavailable`; it does not establish current inference health or the health of either ingress route. |
+| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` plus `gateway` release metadata for minted owner agent/admin keys and keys with an explicit `embeddinggemma-2` grant, and `inferenceObservation` only for minted owner agent/admin keys (`Cache-Control: no-store`). The latter is a global, content-blind request-log timestamp for the last observed successful admitted M5 inference, or `none`/`disabled`/`unavailable`; it does not establish current inference health or the health of either ingress route. |
 | `GET /portal/stats` | none | **PUBLIC, content-blind grand aggregate** powering the portal's "Served so far" card → `200 {total_tokens, total_requests, since}` (`Cache-Control: public, max-age=30`). Summed from the **durable** `request_log` (survives restarts — the honest "served so far"), NOT the in-memory Prometheus counters. Exposes ONLY fleet-wide totals — never any per-user / per-key / per-alias / per-model / content dimension. Per-IP throttled (shares the redeem window). Deliberately distinct from authed `/metrics`. |
 | `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the historical manual model-evaluation registry (`model-registry.ts`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. Prompt caching is server-owned and forced on for the ordinary exact-common-prefix path; client-supplied `id_slot` and `n_cache_reuse` are stripped so one principal cannot select a shared slot or alter the reviewed cache policy. A changed message/file prefix naturally diverges and its suffix is re-evaluated; the gateway stores no repository path or prompt cache. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
@@ -500,6 +500,20 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   cap; a successful first-attempt mutation satisfies the deadline globally and exempts the
   degeneracy retry. Omitting it preserves the edit-deadline behavior. `check_cmd` is owner-authored,
   run in the sandbox **inside the same cage** post-loop (120 s cap).
+  An optional integer `caps.total_wall_s` (90–900 seconds) adds a shared deadline starting
+  before asynchronous admission. It reserves 75 seconds for process/unit cleanup, lease release
+  and bounded evidence finalization; a 180-second budget therefore permits at most 105 seconds
+  of admission, Git, engine and verifier work combined. It aborts active commands/engine work,
+  forbids later phases and tightens each transient unit's `RuntimeMaxSec` to the remaining work
+  time. Admission expiry returns `deadline-exceeded`; admitted expiry withholds diff/summary and
+  returns `cap-exceeded`, or `arm-error` when cleanup/release cannot be proved. Unresolved unit
+  cleanup remains durable for recovery. Opted-in results include `execution.whole_job` with the
+  budget, monotonic `observed_before_persistence_ms` and cleanup status. This observation precedes
+  synchronous terminal persistence; it is not dispatch-to-terminal timing proof. A cleanup failure or elapsed time
+  beyond the budget fails operational acceptance. Omission preserves the separate legacy caps.
+  Reconnect and verify that the live `code_loop_start` input schema advertises `total_wall_s`
+  before using it; older gateways do not enforce this optional field. Engine `usage.wall_ms`
+  and a client wait timeout are not whole-job timing evidence.
   Harness v9 additionally requires `schema_checks` for the resolved `unit-test-gen` task type;
   compile-only requests are refused before admission. Supply 1–8 owner-authored
   `{name, command}` behavioral oracles, each expecting exit zero. Names are unique lowercase
@@ -948,6 +962,9 @@ HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[
 HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
 HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108
+# HOMESERVER_STARTUP_EXCLUSIVE_UNTIL=<canonical UTC ISO timestamp, at most 30 minutes ahead>
+# Optional operator restart fence: refuses BOTH lanes until that fixed absolute deadline.
+# Reapplied at every startup; cannot be cleared through the process-local maintenance API.
 HOMESERVER_MAINTENANCE_RETRY_AFTER_S=30       # Retry-After on a guest 503 caused by maintenance mode
 HOMESERVER_PER_REQUEST_MAX_TOKENS=12288       # fleet default and ordinary-model cap
 HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768 # exact-model explicit-request ceilings; empty disables

@@ -2447,6 +2447,57 @@ describe("m5 doctor diagnostic distinctions", () => {
     expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
+  it("allows delayed healthz responses while preserving abort handling", async () => {
+    vi.useFakeTimers();
+    try {
+      let healthzCalls = 0;
+      let healthzAborts = 0;
+      const resultPromise = diagnoseProfile({
+        profile: "codex",
+        profileConfig: PROFILE,
+        credentialStore: { resolve: async () => SECRET },
+        timeoutMs: 5_000,
+        fetch: async (input, init) => {
+          const url = String(input);
+          if (url.endsWith("/portal/me")) {
+            return jsonResponse({ alias: "codex-agent", tier: "owner", scope: "agent" });
+          }
+          if (url.endsWith("/healthz")) {
+            healthzCalls += 1;
+            return new Promise<Response>((resolve, reject) => {
+              const timer = setTimeout(() => resolve(jsonResponse({ codeLoopTransport: "available" })), 2_000);
+              init?.signal?.addEventListener("abort", () => {
+                healthzAborts += 1;
+                clearTimeout(timer);
+                reject(new DOMException("healthz aborted", "AbortError"));
+              }, { once: true });
+            });
+          }
+          const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+          if (request.params?.name === "list_models") {
+            return rpcResult(request.id, {
+              content: [{ type: "text", text: "Models available to you:\n- mellum — test" }],
+              isError: false,
+            });
+          }
+          return rpcResult(request.id, tools(REQUIRED_TOOLS));
+        },
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await resultPromise;
+      expect(healthzCalls).toBe(2);
+      expect(healthzAborts).toBe(0);
+      expect(result).toMatchObject({
+        status: "mcp_reachable",
+        endpoints: { public: "healthy", private: "healthy" },
+        code_loop_transport: { public: "available", private: "available" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["credential_timeout", "credential_timeout"],
     ["credential_unavailable", "credential_unavailable"],
@@ -2855,6 +2906,33 @@ describe("adoption-report spool and unconfigured-path diagnostics (#242)", () =>
       expect(readdirSync(dir)).toHaveLength(100);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("whole-job budget dispatch", () => {
+  it.each([false, true])("requires an advertised deadline before dispatch (supported=%s)", async supported => {
+    const calls: string[] = [];
+    const client = await createM5Client({
+      gatewayUrl: "https://gateway.invalid", profile: "codex",
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_url, init) => {
+        const request = JSON.parse(String(init?.body));
+        calls.push(request.method === "tools/call" ? request.params.name : request.method);
+        if (request.method === "tools/list") return rpcResult(request.id, { tools: [{
+          name: "code_loop_start", inputSchema: { properties: { caps: { properties: supported
+            ? { total_wall_s: { type: "integer", minimum: 90, maximum: 900 } } : {} } } },
+        }] });
+        return rpcResult(request.id, { isError: false, structuredContent: { ok: true, work_id: "cl-1", status: "running" }, content: [] });
+      },
+    });
+    const result = client.codeRun({ instruction: "x", files: [{ path: "x", content: "x" }], caps: { total_wall_s: 180 }, wait: false });
+    if (supported) {
+      await expect(result).resolves.toMatchObject({ ok: true, work_id: "cl-1" });
+      expect(calls).toEqual(["tools/list", "code_loop_start"]);
+    } else {
+      await expect(result).rejects.toMatchObject({ code: "whole_job_deadline_unsupported" });
+      expect(calls).toEqual(["tools/list"]);
     }
   });
 });

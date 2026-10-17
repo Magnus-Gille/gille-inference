@@ -160,6 +160,8 @@ export class AdmissionController {
   private activeModel: string | null = null;
   private maintenanceMode: boolean;
   private maintenanceScope: MaintenanceScope = "guest";
+  /** Separate from process-local window ownership: shutdown/close cannot clear this fence. */
+  private readonly startupExclusiveUntilMs: number | null;
   /**
    * Auto-expiry safety net (#105 follow-up): if a batch job that engaged maintenance mode dies
    * uncleanly (crash, OOM, SIGKILL) before turning it back off, a plain boolean would stay stuck
@@ -181,6 +183,7 @@ export class AdmissionController {
     retryAfterAtCapSeconds: number;
     maintenanceRetryAfterSeconds?: number;
     maintenanceMode?: boolean;
+    startupExclusiveUntilMs?: number;
     /** Injectable clock (tests). Defaults to Date.now. */
     now?: () => number;
   }) {
@@ -191,10 +194,19 @@ export class AdmissionController {
       cfg.maintenanceRetryAfterSeconds ?? MAINTENANCE_RETRY_AFTER_DEFAULT;
     this.maintenanceMode = cfg.maintenanceMode ?? false;
     this.now = cfg.now ?? Date.now;
+    if (cfg.startupExclusiveUntilMs !== undefined && !Number.isSafeInteger(cfg.startupExclusiveUntilMs)) {
+      throw new Error("startupExclusiveUntilMs must be an integer epoch timestamp");
+    }
+    this.startupExclusiveUntilMs = cfg.startupExclusiveUntilMs ?? null;
   }
 
-  /** Effective maintenance state: engaged AND (no TTL set OR TTL not yet elapsed). */
+  /** The operator deadline survives process reconstruction without extending its duration. */
+  private startupExclusiveActive(): boolean {
+    return this.startupExclusiveUntilMs !== null && this.now() < this.startupExclusiveUntilMs;
+  }
+
   private effectiveMaintenanceMode(): boolean {
+    if (this.startupExclusiveActive()) return true;
     if (!this.maintenanceMode) return false;
     if (this.maintenanceExpiresAtMs !== null && this.now() > this.maintenanceExpiresAtMs) {
       return false;
@@ -203,6 +215,7 @@ export class AdmissionController {
   }
 
   private effectiveMaintenanceScope(): MaintenanceScope | "off" {
+    if (this.startupExclusiveActive()) return "exclusive";
     return this.effectiveMaintenanceMode() ? this.maintenanceScope : "off";
   }
 
@@ -351,13 +364,14 @@ export class AdmissionController {
   }
 
   private state(): AdmissionState {
+    const scope = this.effectiveMaintenanceScope();
     return {
       maxInflight: this.maxInflight,
       inflight: this.inflight,
       ownerQueued: this.ownerWaiters.length,
       activeModel: this.activeModel,
-      maintenanceMode: this.effectiveMaintenanceMode(),
-      maintenanceScope: this.effectiveMaintenanceScope() === "off" ? undefined : this.maintenanceScope,
+      maintenanceMode: scope !== "off",
+      maintenanceScope: scope === "off" ? undefined : scope,
     };
   }
 

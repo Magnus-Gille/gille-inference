@@ -445,6 +445,144 @@ verify_gateway_manager_recovery 4242 "$2"`;
     expect(refresh.indexOf("REFRESH_ACTIVE=1")).toBeLessThan(refresh.indexOf("provision_gateway_codeloop_toolchain"));
   });
 
+  it("keeps the original gateway alive through manager restart, then restarts the gateway last", () => {
+    const work = mkdtempSync(join(tmpdir(), "gille-refresh-order-"));
+    const fakeRoot = join(work, "root");
+    const fakeEtc = join(work, "etc");
+    const fakeTree = join(work, "tree");
+    const fakeSystemd = join(work, "systemd");
+    const backup = join(work, "backup");
+    const marker = join(fakeRoot, "gateway", "isolation-marker");
+    const dropin = join(fakeSystemd, "home-gateway.service.d", "50-service-isolation.conf");
+    mkdirSync(join(fakeRoot, "gateway"), { recursive: true });
+    mkdirSync(join(fakeTree, "deploy"), { recursive: true });
+    mkdirSync(join(fakeSystemd, "home-gateway.service.d"), { recursive: true });
+    writeFileSync(marker, "isolated\n");
+    writeFileSync(dropin, "[Unit]\nWants=user@4242.service\nAfter=user@4242.service\n");
+
+    const harness = join(work, "service-isolation-refresh-harness.sh");
+    writeFileSync(
+      harness,
+      readFileSync(script, "utf8")
+        .replace('readonly ROOT="/var/lib/gille-inference"', `readonly ROOT="${fakeRoot}"`)
+        .replace('readonly ETC="/etc/gille-inference"', `readonly ETC="${fakeEtc}"`)
+        .replace('readonly GATEWAY_TREE="/home/magnus/home-server-eval"', `readonly GATEWAY_TREE="${fakeTree}"`)
+        .replaceAll("/etc/systemd/system", fakeSystemd) + `
+LOG="$2"
+live_gateway_pid=1000
+record() { printf '%s\\n' "$1" >> "$LOG"; }
+root_only() { :; }
+need() { :; }
+id() { printf '4242\\n'; }
+prepare_gateway_user_manager() { :; }
+gateway_codeloop_enabled() { return 1; }
+provision_gateway_codeloop_config() { :; }
+provision_gateway_codeloop_toolchain() { :; }
+verify_manager_live_oom_policy() { :; }
+gateway_user_bus_ready() { :; }
+gateway_user_default_target_active() { :; }
+sleep() { :; }
+install() {
+  if [[ " $* " == *" -d "* ]]; then mkdir -p "\${@: -1}"; else cp "\${@: -2:1}" "\${@: -1}"; fi
+}
+chown() { :; }
+chmod() { :; }
+atomic_install_file() { cp "$1" "$2"; }
+atomic_render_dropin() { render_dropin "$1" >/dev/null; record reload; }
+show_value() {
+  case "$2" in
+    Wants) record soft-graph-observed; printf 'user@4242.service\\n' ;;
+    User) printf 'gille-gateway\\n' ;;
+    MainPID) printf '%s\\n' "$live_gateway_pid" ;;
+  esac
+}
+systemctl() {
+  case "$*" in
+    'show home-gateway.service '*) : ;;
+    'restart user@4242.service') record "manager-restart:$live_gateway_pid" ;;
+    'is-active --quiet user@4242.service') : ;;
+    'restart home-gateway.service') record "gateway-restart:$live_gateway_pid"; live_gateway_pid=2000 ;;
+    'is-active --quiet home-gateway.service') : ;;
+  esac
+}
+verify() { record verified; }
+refresh_isolation gateway "$3"
+`,
+      { mode: 0o755 },
+    );
+    const log = join(work, "order.log");
+    let output = "";
+    try {
+      output = execFileSync("bash", ["-c", "source \"$1\"", "--", harness, log, backup], { cwd: root, encoding: "utf8", stderr: "pipe" });
+    } catch (error: any) {
+      output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+    }
+    expect(output).toContain("REFRESHED: gateway isolation");
+    expect(readFileSync(log, "utf8")).toBe(
+      "reload\nsoft-graph-observed\nmanager-restart:1000\ngateway-restart:1000\nverified\n",
+    );
+  });
+
+  it("accepts the soft gateway-to-manager graph before a manager restart", () => {
+    expect(() => execFileSync("bash", ["-c", `
+source "$1"
+show_value() {
+  case "$1:$2" in
+    home-gateway.service:Wants) printf 'user@4242.service\\n' ;;
+    home-gateway.service:Requires|home-gateway.service:BindsTo|home-gateway.service:PartOf) ;;
+    user@4242.service:PropagatesStopTo) ;;
+  esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script], { cwd: root, encoding: "utf8", stderr: "pipe" })).not.toThrow();
+  });
+
+  it.each(["Requires", "BindsTo", "PartOf"])(
+    "rejects a direct gateway %s edge to the dedicated manager before restart",
+    (property) => {
+      expect(() => execFileSync("bash", ["-c", `
+source "$1"
+show_value() {
+  case "$1:$2" in
+    home-gateway.service:Wants) printf 'user@4242.service\\n' ;;
+    home-gateway.service:${property}) printf 'user@4242.service\\n' ;;
+    user@4242.service:PropagatesStopTo) ;;
+  esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script], { cwd: root, encoding: "utf8", stderr: "pipe" })).toThrow();
+    },
+  );
+
+  it.each(["Wants", "Requires", "BindsTo", "PartOf", "PropagatesStopTo"])(
+    "refuses manager restart when the %s observation fails",
+    (property) => {
+      expect(() => execFileSync("bash", ["-c", `
+source "$1"
+failed_property="$2"
+show_value() {
+  [ "$2" != "$failed_property" ] || return 1
+  case "$1:$2" in home-gateway.service:Wants) printf 'user@4242.service\\n' ;; esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script, property], { cwd: root, encoding: "utf8", stderr: "pipe" })).toThrow();
+    },
+  );
+
+  it("rejects manager stop propagation to the gateway before restart", () => {
+    expect(() => execFileSync("bash", ["-c", `
+source "$1"
+show_value() {
+  case "$1:$2" in
+    home-gateway.service:Wants) printf 'user@4242.service\\n' ;;
+    home-gateway.service:Requires|home-gateway.service:BindsTo|home-gateway.service:PartOf) ;;
+    user@4242.service:PropagatesStopTo) printf 'home-gateway.service\\n' ;;
+  esac
+}
+require_gateway_manager_restart_safe home-gateway.service 4242
+`, "--", script], { cwd: root, encoding: "utf8", stderr: "pipe" })).toThrow();
+  });
+
   it("accepts only the reviewed Pi provider config in the dedicated runtime", () => {
     const canonical = readFileSync(join(root, "deploy", "pi-models.json.example"), "utf8");
     const legacy = canonical

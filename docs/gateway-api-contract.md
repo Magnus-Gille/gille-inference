@@ -93,7 +93,7 @@ A temporary refusal adds `m5_code:model_temporarily_unavailable`, `retryable:tru
 The UUID identifies the distinct `/mcp/ask` request-log row, not the outer `/mcp` transport row.
 Disabled/missing logging leaves correlation unresolvable; a UUID alone does not prove retention.
 
-Client 1.5.4's default doctor never submits inference. An explicitly selected public/private
+Client 1.5.5's default doctor never submits inference. An explicitly selected public/private
 `doctor --probe-inference MODEL` makes one synthetic ask for at most 16 output tokens with a
 30s inference bound. Only a completed, nontruncated ask is a successful probe. Its sanitized
 result describes that route and attempt only; the other route remains unchecked. Existing owner
@@ -759,13 +759,15 @@ durable, macro-routed tasks, not a mandatory inference proxy.
 
 ### Gateway release advertisement
 
-For a minted owner key with `agent` or `admin` scope, authenticated `GET /portal/me`
-includes `gateway.revision`, `gateway.client_version`
+For a minted owner key with `agent` or `admin` scope, or any key with an explicit
+`embeddinggemma-2` grant (embedding grant or exact chat allow-list entry), authenticated
+`GET /portal/me` includes `gateway.revision`, `gateway.client_version`
 and `gateway.result_contract`. These contain only a full source SHA (or `null`), the
 bundled client version (or `null`), and the code-loop result contract identifier.
 The SHA is substituted by `git archive` at the accepted immutable release, then
 held by the running process; an ordinary checkout reports `null`. It is source
 identity, not proof that deployment probes passed. The mutable `.deployed-commit`
-remains the deployment acceptance marker. Guests, inference-scoped keys, implicit admins,
-and legacy static admins receive no `gateway` field, matching the code-loop tool visibility
-predicate. `Cache-Control: no-store` applies; no inference or administrative log access is needed.
+remains the deployment acceptance marker. Embedding clients pin this revision before each
+call. Other guests and inference-scoped keys (including owner inference keys whose access is only
+the implicit empty-allow-list grant), implicit admins and legacy static admins receive no
+`gateway` field. `inferenceObservation` stays limited to owner agent/admin keys. `Cache-Control: no-store` applies; no inference or administrative log access is needed.

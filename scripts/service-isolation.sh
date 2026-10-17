@@ -393,6 +393,20 @@ require_gateway_backend_dependency() {
   fi
 }
 
+# A manager restart must leave the current, admission-fenced gateway process alive.
+require_gateway_manager_restart_safe() {
+  local unit="$1" manager="user@$2.service" property observed
+  observed="$(show_value "$unit" Wants)" || die "could not observe gateway manager start dependency"
+  [[ " $observed " == *" $manager "* ]] || die "gateway manager start dependency is absent"
+  for property in Requires BindsTo PartOf; do
+    observed="$(show_value "$unit" "$property")" || die "could not observe gateway $property"
+    [[ " $observed " != *" $manager "* ]] \
+      || die "gateway $property would propagate a manager stop before admission is reopened safely"
+  done
+  observed="$(show_value "$manager" PropagatesStopTo)" || die "could not observe manager stop propagation"
+  [[ " $observed " != *" $unit "* ]] || die "dedicated manager propagates its stop to the gateway"
+}
+
 effective_oom_score_adj() { cat "/proc/$1/oom_score_adj"; }
 verify_manager_live_oom_policy() {
   local manager="$1" expected pid
@@ -1301,11 +1315,15 @@ refresh_isolation() {
   REFRESH_MANAGER_POLICY_MUTATION_ATTEMPTED=1
   atomic_install_file "$backup/manager.new.conf" "$manager_dropin" || die "could not install dedicated manager recovery drop-in"
   atomic_render_dropin "$service" "$dropin" || die "could not atomically install refreshed gateway isolation drop-in"
-  systemctl restart "$unit" || die "refreshed gateway unit did not restart"
+  # The caller's drained maintenance fence belongs to the current gateway process. Keep that
+  # process alive until the last manager mutation; restarting it first would reopen admission
+  # and allow a new code job to be killed by the subsequent manager restart.
+  require_gateway_manager_restart_safe "$unit" "$uid"
   gateway_pid="$(show_value "$unit" MainPID)"
-  [[ "$gateway_pid" =~ ^[1-9][0-9]*$ ]] || die "refreshed gateway has no running main process"
+  [[ "$gateway_pid" =~ ^[1-9][0-9]*$ ]] || die "gateway has no running main process before manager refresh"
   restart_gateway_user_manager_with_loaded_policy "$uid" || die "dedicated manager did not restart with its recovery policy and transport"
   [ "$(show_value "$unit" MainPID)" = "$gateway_pid" ] || die "gateway restarted when its dedicated manager restarted"
+  systemctl restart "$unit" || die "refreshed gateway unit did not restart"
   ( verify "$service" ) || die "refreshed gateway unit did not verify"
   printf 'service=%s\nunit=%s\nbackup=%s\nverified_at=%s\n' "$service" "$unit" "$backup" "$(date -u +%FT%TZ)" >"$backup/refresh-receipt" \
     || die "could not write gateway isolation refresh receipt"
