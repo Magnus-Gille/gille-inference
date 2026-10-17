@@ -4038,6 +4038,7 @@ export function startGateway(
     retryAfterAtCapSeconds: cfg.busyRetryAfterSeconds,
     maintenanceRetryAfterSeconds: cfg.maintenanceRetryAfterSeconds,
     maintenanceMode: cfg.maintenanceModeAtStart,
+    startupExclusiveUntilMs: cfg.startupExclusiveUntilMs,
   });
   const maintenanceWindow = new ExclusiveMaintenanceWindow(
     controller,
@@ -4053,7 +4054,9 @@ export function startGateway(
       observeRunning: getRunningSnapshot,
     },
   );
-  if (cfg.maintenanceModeAtStart) {
+  if (cfg.startupExclusiveUntilMs !== undefined && Date.now() < cfg.startupExclusiveUntilMs) {
+    console.warn("Startup exclusive maintenance fence engaged; all inference admission refused until operator deadline.");
+  } else if (cfg.maintenanceModeAtStart) {
     console.warn("⚠  bench/maintenance mode ENGAGED at startup — guest admission is refused (#108).");
   }
 

@@ -567,14 +567,29 @@ before inference begins.
 
 The initial gateway migration and recovery refresh install a reviewed drop-in for that exact
 dedicated `user@UID.service`: `Restart=on-failure` and `OOMScoreAdjust=-500`.
-Open the canonical exclusive maintenance window and let admitted work drain before refresh.
-Refresh verifies the loaded soft dependency graph, then restarts the manager once to activate
-its new OOM score while the original gateway process still owns that admission fence. It
-checks that the gateway process did not restart as a result, and restarts the gateway last.
-That final restart ends the process-local maintenance window; confirm the new instance has
-no active window and normal admission is restored. Reopen and drain a fresh window before
-any later restart. Restarting the gateway before the manager could admit a job that the
-subsequent manager restart would terminate. A later manager recovery should
+A release that restarts the gateway and then changes its manager requires an exclusive fence
+that survives gateway restarts. Open the canonical exclusive maintenance window and let work
+drain first. Before the first gateway restart, install a temporary root-owned systemd runtime
+override setting `HOMESERVER_STARTUP_EXCLUSIVE_UNTIL` to the approved window's **same fixed**
+canonical UTC ISO timestamp (at most 30 minutes ahead). The accepted gateway must support this
+setting before any manager refresh. It overrides both inference lanes across process restarts;
+closing a process-local window or posting `{on:false}` does not clear it. It does not acquire a
+GPU lease, so it supplements the canonical window rather than replacing the initial drain.
+
+Read back `/admin/maintenance` as `maintenance:true,mode:"exclusive"` after each gateway restart
+and before any manager mutation or recovery. Confirm sufficient remaining window time and bound
+the complete refresh command, including restoration, to finish before that deadline. An expired
+fence or lease-loss/restore anomaly stops further mutation; do not silently extend the window.
+Refresh verifies the loaded soft dependency graph, restarts the manager with its new OOM score,
+checks that the current gateway PID stayed unchanged, then restarts the gateway last. Its
+post-restart verification and any automatic unit restoration must still run under the startup
+fence. On failure, restore units/manager while that accepted gateway is fenced; restore an older
+gateway without startup-fence support only **after** all manager changes are complete.
+
+When the release and any recovery are verified, remove only the temporary runtime override,
+reload systemd and restart the gateway as the last mutation to restore normal admission. Read
+back normal admission and the absent startup override. The fixed fence also expires automatically
+at its original deadline; a stale override never extends it after restart. A later manager recovery should
 leave the gateway process running while its directory mount sees replacement bus sockets.
 An intentional gateway stop does not trigger a restart. The refresh backs up and restores both
 unit drop-ins together on failure; it rejects an existing manager drop-in whose contents differ

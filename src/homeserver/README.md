@@ -962,6 +962,9 @@ HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[
 HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
 HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108
+# HOMESERVER_STARTUP_EXCLUSIVE_UNTIL=<canonical UTC ISO timestamp, at most 30 minutes ahead>
+# Optional operator restart fence: refuses BOTH lanes until that fixed absolute deadline.
+# Reapplied at every startup; cannot be cleared through the process-local maintenance API.
 HOMESERVER_MAINTENANCE_RETRY_AFTER_S=30       # Retry-After on a guest 503 caused by maintenance mode
 HOMESERVER_PER_REQUEST_MAX_TOKENS=12288       # fleet default and ordinary-model cap
 HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768 # exact-model explicit-request ceilings; empty disables
