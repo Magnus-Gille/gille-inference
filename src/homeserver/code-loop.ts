@@ -1,4 +1,7 @@
-import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, readFileSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
+import {
+  CodeLoopDeadline, withCodeLoopDeadline, CODE_LOOP_TOTAL_WALL_MIN_S, CODE_LOOP_TOTAL_WALL_MAX_S,
+} from "./code-loop-deadline.js";
+import { constants as fsConstants, mkdtempSync, mkdirSync, writeFileSync, openSync, closeSync, fstatSync, readSync, writeSync, realpathSync, existsSync, readdirSync, rmSync, lstatSync, renameSync, type Dirent, type Stats } from "node:fs";
 import { dirname, join, sep, resolve, isAbsolute, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
@@ -98,7 +101,7 @@ const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
   "engine-failure",
 ]);
 const CODE_LOOP_REFUSAL_ENUM = [
-  "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
+  "deadline-exceeded", "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
 ] as const;
 
 const CODE_LOOP_START_OUTPUT_SCHEMA = {
@@ -226,6 +229,7 @@ export function codeLoopToolDefs(): unknown[] {
               wall_s: { type: "number" },
               turns: { type: "number" },
               completion_tokens: { type: "number" },
+              total_wall_s: { type: "integer", minimum: CODE_LOOP_TOTAL_WALL_MIN_S, maximum: CODE_LOOP_TOTAL_WALL_MAX_S, description: "optional whole-job budget from start admission through terminal cleanup; reserves 75s for cleanup and forbids later phases after the work cutoff" },
               edit_deadline_turn: {
                 type: "integer",
                 minimum: 1,
@@ -274,6 +278,7 @@ export function clampCaps(req: CodeLoopCapsRequest | undefined, c: CodeLoopCapsC
   const deadline = req?.edit_deadline_turn;
   return {
     wall_s: clampInt(req?.wall_s, c.wallSDefault, c.wallSMax),
+    ...(req?.total_wall_s === undefined ? {} : { total_wall_s: req.total_wall_s }),
     turns,
     completion_tokens: clampInt(req?.completion_tokens, c.tokensDefault, c.tokensMax),
     ...(typeof deadline === "number" && Number.isInteger(deadline) && deadline >= 1 && deadline <= turns
@@ -440,6 +445,10 @@ export function validateCodeLoopRequestStructure(req: CodeLoopRequest): Structur
         return { ok: false, message: `Seed path '${path}' is a generated cache/bytecode artifact and cannot be writable.` };
       }
     }
+  }
+  const totalWall = req.caps?.total_wall_s;
+  if (totalWall !== undefined && (typeof totalWall !== "number" || !Number.isInteger(totalWall) || totalWall < CODE_LOOP_TOTAL_WALL_MIN_S || totalWall > CODE_LOOP_TOTAL_WALL_MAX_S)) {
+    return { ok: false, message: `\`caps.total_wall_s\` must be an integer between ${CODE_LOOP_TOTAL_WALL_MIN_S} and ${CODE_LOOP_TOTAL_WALL_MAX_S}.` };
   }
   const rawDeadline = req.caps?.edit_deadline_turn;
   if (rawDeadline !== undefined) {
@@ -829,9 +838,31 @@ interface Job {
 
 const jobs = new Map<string, Job>();
 let runningWorkId: string | null = null; // single-flight mutex
+// Keep live leases/heartbeat ownership while an exact manager stop is unproved. Durable
+// cleanup_pending blocks fresh admission after a process restart; this map retains this
+// process's release closures until the sweep proves the physical unit is absent.
+const cleanupResourceHolds = new Map<string, {
+  workroot: string;
+  absenceVerified: boolean;
+  release: () => Promise<void>;
+}>();
+
+async function releaseVerifiedCleanupResources(workroot: string, workId: string): Promise<void> {
+  const hold = cleanupResourceHolds.get(workId);
+  if (!hold || hold.workroot !== resolve(workroot) || !hold.absenceVerified) return;
+  await hold.release();
+  cleanupResourceHolds.delete(workId);
+  const job = jobs.get(workId);
+  if (job) job.cleanupPending = false;
+  if (runningWorkId === workId) {
+    runningWorkId = null;
+    setCodeLoopActive(false);
+  }
+}
 
 export function _resetCodeLoopStateForTests(): void {
   jobs.clear();
+  cleanupResourceHolds.clear();
   runningWorkId = null;
   setCodeLoopActive(false);
 }
@@ -939,6 +970,27 @@ export async function startCodeLoop(
   req: CodeLoopRequest,
   cfg: CodeLoopStartConfig,
   deps: CodeLoopDeps
+): Promise<CodeLoopStartResult> {
+  const structural = validateCodeLoopRequestStructure(req);
+  if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
+  if (req.caps?.total_wall_s === undefined) return startCodeLoopInner(req, cfg, deps);
+  const deadline = new CodeLoopDeadline(req.caps.total_wall_s);
+  try {
+    const result = await startCodeLoopInner(req, cfg, withCodeLoopDeadline(deps, deadline), deadline);
+    if (!result.ok && deadline.expired) {
+      return { ok: false, refusal: "deadline-exceeded", message: "Whole-job deadline reached during admission; no model job started." };
+    }
+    return result;
+  } finally {
+    if (!deadline.transferred) deadline.dispose();
+  }
+}
+
+async function startCodeLoopInner(
+  req: CodeLoopRequest,
+  cfg: CodeLoopStartConfig,
+  deps: CodeLoopDeps,
+  deadline?: CodeLoopDeadline,
 ): Promise<CodeLoopStartResult> {
   const structural = validateCodeLoopRequestStructure(req);
   if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
@@ -1126,8 +1178,17 @@ export async function startCodeLoop(
   if (deps.maintenanceMode()) {
     return { ok: false, refusal: "maintenance", message: "The box is in maintenance mode for an explicit evaluation window. Try again shortly." };
   }
+  if (deps.codeLoopTransportProbe !== undefined) {
+    const transportReady = await deps.codeLoopTransportProbe().catch(() => false);
+    if (!transportReady) {
+      return { ok: false, refusal: "cage-transport-unavailable", message: "The dedicated code_loop user bus is unavailable. Retry after the service recovers." };
+    }
+  }
   if (runningWorkId !== null) {
     return { ok: false, refusal: "busy", message: "A code_loop run is already in progress (single-flight). Retry when it finishes." };
+  }
+  if (listDurableCodeLoopRunsPendingCleanup(cfg.workroot).length > 0) {
+    return { ok: false, refusal: "cage-unavailable", message: "A previous code_loop unit still awaits verified cleanup; refusing new work until its absence is proved." };
   }
 
   // Claim the single-flight mutex SYNCHRONOUSLY — before the cage self-test await below. The
@@ -1185,6 +1246,7 @@ export async function startCodeLoop(
           message: err.rejection.message,
         };
       }
+      if (deadline?.expired) return { ok: false, refusal: "deadline-exceeded", message: "Whole-job deadline reached during admission." };
       throw err;
     }
   }
@@ -1410,18 +1472,34 @@ export async function startCodeLoop(
 
   // Fire-and-forget the run; start returns immediately.
   setCodeLoopActive(true);
-  void runJob(job, req, deps, cageArgv, growthCapBytes, unitName, () => leaseLost)
+  let resourcesReleased = false;
+  const releaseResources = async (): Promise<void> => {
+    if (resourcesReleased) return;
+    await lease!.release();
+    processLease.release();
+    resourcesReleased = true;
+  };
+  if (deadline) deadline.transferred = true;
+  void runJob(job, req, deps, cageArgv, growthCapBytes, unitName, () => leaseLost, deadline, releaseResources)
     .finally(async () => {
+      if (job.cleanupPending) {
+        deadline?.dispose();
+        cleanupResourceHolds.set(workId, {
+          workroot: resolve(job.workroot), absenceVerified: false, release: releaseResources,
+        });
+        return;
+      }
       try {
-        await lease!.release();
+        if (!resourcesReleased) await lease!.release();
       } catch {
         /* lease already gone */
       }
       try {
-        processLease.release();
+        if (!resourcesReleased) processLease.release();
       } catch (err) {
         console.error(`code_loop durable process lease release failed for ${workId}: ${(err as Error).message}`);
       } finally {
+        deadline?.dispose();
         setCodeLoopActive(false);
         if (runningWorkId === workId) runningWorkId = null;
       }
@@ -1467,7 +1545,9 @@ async function runJob(
   cageArgv: string[],
   growthCapBytes: number,
   unitName: string,
-  leaseLost: () => boolean
+  leaseLost: () => boolean,
+  deadline?: CodeLoopDeadline,
+  releaseResources?: () => Promise<void>,
 ): Promise<void> {
   const caps = job.effectiveCaps;
   let outcome: CodeLoopTerminalStatus = "arm-error";
@@ -1544,7 +1624,7 @@ async function runJob(
   // Validate immediately after cleanup proves the manager-spawned process tree is absent. A
   // pre-cleanup scan would leave a race in which a residual process mutates the sandbox after the
   // proof but before trusted harvest.
-  if (!job.cleanupPending && seedSha !== null && trustedGitDir !== null && knownAgentGit !== null) {
+  if (!deadline?.expired && !job.cleanupPending && seedSha !== null && trustedGitDir !== null && knownAgentGit !== null) {
     try {
       assertNoAgentGitMetadata(job.sandboxDir, knownAgentGit);
       agentGitValid = true;
@@ -1576,6 +1656,12 @@ async function runJob(
       }
     }
   }
+  if (deadline?.expired) {
+    outcome = job.cleanupPending ? "arm-error" : "cap-exceeded";
+    detail = "whole-job deadline reached; further verification and output withheld";
+    job.summary = "";
+    harvestTrusted = false;
+  }
   const protectedViolations = harvest.allChangedFiles.filter((f) => matchesAnyGlob(f, job.protectedGlobs));
 
   // The owner check has its own bounded runtime outside the agent's turn budget. A cleanly
@@ -1601,7 +1687,12 @@ async function runJob(
   let checkDurationMs: number | undefined;
   if (checkSkipReason === null && job.checkCmd !== null) {
     const checkStartedAt = deps.now();
-    check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
+    try {
+      check = await runCheck(job.checkCmd, job.sandboxDir, cageArgv, deps);
+    } catch (err) {
+      if (!deadline?.expired) throw err;
+      check = { ran: true, exit_code: null, output_tail: "whole-job deadline reached", skip_reason: null };
+    }
     checkDurationMs = Math.max(0, deps.now() - checkStartedAt);
     try {
       if (deps.cleanupUnit !== undefined) await deps.cleanupUnit(unitName);
@@ -1617,13 +1708,13 @@ async function runJob(
   // Separate from the syntax/owner check and the exhausted agent budget. Commands are snapshotted
   // owner input, run only inside the same cage after the relay has closed, never model assertions.
   const schemaGrounding = skippedSchemaGrounding(job.schemaChecks);
-  if (job.schemaChecks.length && harvestTrusted && !harvest.scopeViolations.length &&
+  if (!deadline?.expired && job.schemaChecks.length && harvestTrusted && !harvest.scopeViolations.length &&
       !protectedViolations.length && !job.cleanupPending && (outcome === "completed" || outcome === "cap-exceeded")) {
-    const deadline = performance.now() + CHECK_TIMEOUT_MS;
+    const schemaDeadline = performance.now() + CHECK_TIMEOUT_MS;
     schemaGrounding.state = "failed";
     for (let index = 0; index < job.schemaChecks.length; index++) {
-      const remaining = Math.floor(deadline - performance.now());
-      if (remaining <= 0) break;
+      const remaining = Math.floor(schemaDeadline - performance.now());
+      if (remaining <= 0 || deadline?.expired) break;
       const entry = job.schemaChecks[index]!;
       try {
         const verified = await runCheck(entry.command, job.sandboxDir, cageArgv, deps, remaining);
@@ -1643,8 +1734,15 @@ async function runJob(
     }
     if (!job.cleanupPending && schemaGrounding.checks.every(c => c.ran && c.exit_code === 0)) schemaGrounding.state = "passed";
   }
-  const withhold = schemaGrounding.state === "failed" || schemaGrounding.state === "skipped";
-  if (withhold) detail = `${detail ? `${detail}; ` : ""}schema grounding ${schemaGrounding.state}: ${schemaGrounding.checks.filter(c => !c.ran || c.exit_code !== 0).map(c => c.name).join(", ")}`;
+  const withhold = deadline?.expired || schemaGrounding.state === "failed" || schemaGrounding.state === "skipped";
+  if (deadline?.expired) {
+    outcome = job.cleanupPending ? "arm-error" : "cap-exceeded";
+    detail = job.cleanupPending
+      ? "whole-job deadline reached; transient cleanup pending; output withheld"
+      : "whole-job deadline reached; further verification and output withheld";
+    job.summary = "";
+  }
+  if (schemaGrounding.state === "failed" || schemaGrounding.state === "skipped") detail = `${detail ? `${detail}; ` : ""}schema grounding ${schemaGrounding.state}: ${schemaGrounding.checks.filter(c => !c.ran || c.exit_code !== 0).map(c => c.name).join(", ")}`;
   const telemetry = buildResultTelemetry(job, harvest.changedFiles.length > 0, checkDurationMs);
 
   const result: CodeLoopResult = {
@@ -1667,7 +1765,7 @@ async function runJob(
     // an arm-error with empty everything cost a manual sandbox dig (live smoke, 2026-07-02).
     detail: detail.slice(0, 400),
   };
-  await finalizeJobWithResult(job, result, req, deps, unitName);
+  await finalizeJobWithResult(job, result, req, deps, unitName, deadline, releaseResources);
 }
 
 function codeLoopExecution(job: Job): CodeLoopResult["execution"] {
@@ -2043,14 +2141,53 @@ async function finalizeJobWithResult(
   result: CodeLoopResult,
   req: CodeLoopRequest,
   deps: CodeLoopDeps,
-  unitName: string
+  unitName: string,
+  deadline?: CodeLoopDeadline,
+  releaseResources?: () => Promise<void>,
 ): Promise<void> {
   // #33: derive evidence identity BEFORE flipping job.status/result to terminal — a caller polling
   // code_loop_status/code_loop_result must never observe "terminal" while the ledger write (now
   // async, since it joins a live served-model observation) is still in flight. This preserves the
   // pre-#33 atomicity: everything from the status flip onward stays synchronous, exactly like
   // before this change, with the one new async step ordered strictly earlier.
-  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
+  // A stamped identity lookup may wait on the serving backend. Bound this read-only lookup
+  // inside the cleanup reserve; missing provenance must remain unknown, never fabricated.
+  const evidenceIdentity = deadline
+    ? await boundedCodeLoopIdentity(job, 5_000)
+    : await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
+  // Keep the process lease through asynchronous evidence collection. For the opt-in whole-job
+  // contract, release both leases immediately before the synchronous terminal publication.
+  let resourcesReleased = false;
+  if (deadline && releaseResources && !job.cleanupPending) {
+    try {
+      await releaseResources();
+      resourcesReleased = true;
+    } catch (err) {
+      result.status = "arm-error";
+      result.completion_state = "unfinished";
+      result.diff = "";
+      result.summary = "";
+      result.diff_truncated = false;
+      result.detail = `resource release failed: ${(err as Error).message}`.slice(0, 400);
+    }
+  }
+  if (deadline?.expired) {
+    result.status = job.cleanupPending || !resourcesReleased ? "arm-error" : "cap-exceeded";
+    result.completion_state = "unfinished";
+    result.diff = "";
+    result.summary = "";
+    result.diff_truncated = false;
+    result.detail = job.cleanupPending
+      ? "whole-job deadline reached; transient cleanup pending; output withheld"
+      : "whole-job deadline reached; output withheld";
+  }
+  if (deadline) {
+    result.execution.whole_job = {
+      budget_s: deadline.totalWallS,
+      observed_before_persistence_ms: Math.max(0, Math.ceil(performance.now() - deadline.startedAt)),
+      cleanup_complete: !job.cleanupPending && resourcesReleased,
+    };
+  }
   job.status = result.status;
   job.result = result;
   job.usage = result.usage;
@@ -2073,41 +2210,6 @@ async function finalizeJobWithResult(
     delete result.feedback_handle;
   }
   recordCodeLoopRun(result.status);
-}
-
-/** Used only for the pre-run lease/spawn refusal (no engine result yet). */
-async function finalizeJob(
-  job: Job,
-  status: CodeLoopTerminalStatus,
-  detail: string,
-  check: CodeLoopResult["check"],
-  req: CodeLoopRequest,
-  deps: CodeLoopDeps
-): Promise<void> {
-  // #33: same ordering discipline as finalizeJobWithResult above.
-  const evidenceIdentity = await deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop");
-  job.status = status;
-  job.result = {
-    status,
-    completion_state: "unfinished",
-    diff: "",
-    diff_truncated: false,
-    changed_files: [],
-    scope_violations: [],
-    protected_violations: [],
-    summary: "",
-    check,
-    schema_grounding: skippedSchemaGrounding(job.schemaChecks),
-    usage: job.usage,
-    execution: codeLoopExecution(job),
-    telemetry: buildResultTelemetry(job, false),
-    agent_checks: codeLoopAgentChecks(job),
-    work_id: job.id,
-    detail: detail.slice(0, 400),
-  };
-  persistJobDurable(job);
-  recordCodeLoopRun(status);
-  writeLedger(job, status, req, deps, check, evidenceIdentity);
 }
 
 function persistJobDurable(job: Job): boolean {
@@ -2135,7 +2237,7 @@ function persistJobDurable(job: Job): boolean {
 
 /**
  * `evidenceIdentity` is derived by the caller (deriveEvidenceIdentity, #33) BEFORE the job's
- * status/result are flipped to terminal — see finalizeJobWithResult/finalizeJob — so this stays a
+ * status/result are flipped to terminal — see finalizeJobWithResult — so this stays a
  * plain synchronous write, exactly like it was before #33. Reuses PR #32's exact derivation (the
  * same stamp-field join + live served-model observation as the delegate lane), tagged with THIS
  * lane's own identity ("code-loop") so a code_loop row can never be mistaken for (or copy) a
@@ -2230,17 +2332,37 @@ export async function sweepCodeLoopSandboxes(
   let reclaimed = 0;
   const now = deps.now();
   const cleanupVerifiedWorkIds = new Set<string>();
+  // Another gateway process may have cleared the durable pending bit after proving absence,
+  // but it cannot release this process's closures. Revisit every local hold independently of
+  // that bit and obtain our own exact-unit proof before releasing ownership. A prior release
+  // failure can retry without stopping again once this process has already proved absence.
+  for (const [workId, hold] of cleanupResourceHolds) {
+    if (hold.workroot !== resolve(cfg.workroot)) continue;
+    if (!hold.absenceVerified) {
+      await deps.stopUnit(`code-loop-${workId}`);
+      const record = readDurableCodeLoopRunByWork(cfg.workroot, workId);
+      if (record?.cleanup_pending) {
+        persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+      }
+      hold.absenceVerified = true;
+    }
+    await releaseVerifiedCleanupResources(cfg.workroot, workId);
+    cleanupVerifiedWorkIds.add(workId);
+  }
   // Reap trusted cleanup obligations from the durable index first. A caged process owns and may
   // delete its sandbox, so directory enumeration must never be the only path to a residual unit.
   for (const record of listDurableCodeLoopRunsPendingCleanup(cfg.workroot)) {
     if (
-      record.status === "running" &&
+      record.status === "running" && !cleanupResourceHolds.has(record.work_id) &&
       (jobs.has(record.work_id) || isDurableCodeLoopWorkLive(cfg.workroot, record.work_id))
     ) continue;
     const unitName = `code-loop-${record.work_id}`;
     if (!isCodeLoopUnitName(unitName)) continue;
     await deps.stopUnit(unitName);
     persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+    const hold = cleanupResourceHolds.get(record.work_id);
+    if (hold) hold.absenceVerified = true;
+    await releaseVerifiedCleanupResources(cfg.workroot, record.work_id);
     cleanupVerifiedWorkIds.add(record.work_id);
   }
   // Enforce source retention from the trusted caller record even when the sandbox or its
@@ -2373,4 +2495,15 @@ export async function sweepCodeLoopSandboxes(
   for (let i = 0; i < durableOrphans; i++) recordCodeLoopRun("orphaned");
   orphaned += durableOrphans;
   return { orphaned, reclaimed };
+}
+
+
+async function boundedCodeLoopIdentity(job: Job, timeoutMs: number): Promise<Awaited<ReturnType<typeof deriveEvidenceIdentity>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      deriveEvidenceIdentity(job.learningTaskStamp ?? undefined, job.model, "code-loop"),
+      new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), timeoutMs); }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
 }

@@ -41,6 +41,20 @@ function makeFetch(port: number): typeof globalThis.fetch {
   };
 }
 
+const encodeSse = (chunk: string) => new TextEncoder().encode(chunk);
+const streamConfigDir = mkdtempSync(join(tmpdir(), "hs-stream-test-"));
+saveConfig({ baseUrl: "http://stream.test", key: "hs_stream_test" }, streamConfigDir);
+
+/** Build an injected fetch whose response body stays open until the test closes it. */
+function makeStreamingFetch(
+  onController: (controller: ReadableStreamDefaultController<Uint8Array>) => void
+): typeof globalThis.fetch {
+  return (async () => {
+    const body = new ReadableStream<Uint8Array>({ start: onController });
+    return new Response(body, { headers: { "content-type": "text/event-stream" } });
+  }) as typeof globalThis.fetch;
+}
+
 /**
  * Start a mock HTTP server handling the main API surface:
  *  POST /portal/redeem  → 200 with key/models/tier
@@ -180,6 +194,133 @@ function startMockServer(
 }
 
 // ── Test groups ───────────────────────────────────────────────────────────────
+
+describe("hs stream parser", () => {
+  it("keeps LF-framed streams successful when [DONE] is present", async () => {
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((controller) => {
+        controller.enqueue(encodeSse('data: {"choices":[{"delta":{"content":"complete"}}]}\n\n'));
+        controller.enqueue(encodeSse("data: [DONE]\n\n"));
+        controller.close();
+      }),
+      out: { write: (_value: string) => {} } as any,
+    });
+
+    await expect(pending).resolves.toBe("complete");
+  });
+
+  it("streams CRLF events before EOF when delimiters and [DONE] cross chunks", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let resolveController!: () => void;
+    const controllerReady = new Promise<void>((resolve) => { resolveController = resolve; });
+    const written: string[] = [];
+    let resolveWritten!: () => void;
+    const firstWrite = new Promise<void>((resolve) => { resolveWritten = resolve; });
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((value) => { controller = value; resolveController(); }),
+      out: { write: (value: string) => { written.push(value); resolveWritten(); } } as any,
+    });
+    await controllerReady;
+
+    controller.enqueue(encodeSse('data: {"choices":[{"delta":{"content":"early"}}]}\r'));
+    controller.enqueue(encodeSse("\n\r"));
+    controller.enqueue(encodeSse("\n"));
+    const streamedBeforeEof = await Promise.race([
+      firstWrite.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+
+    controller.enqueue(encodeSse("data: [DO"));
+    controller.enqueue(encodeSse("NE]\r"));
+    controller.enqueue(encodeSse("\n\r\n"));
+    controller.close();
+    await expect(pending).resolves.toBe("early");
+    expect(streamedBeforeEof).toBe(true);
+    expect(written.join("")).toContain("early");
+  });
+
+  it("accepts [DONE] split across chunks at EOF without a trailing blank line", async () => {
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((controller) => {
+        controller.enqueue(encodeSse("data: [DO"));
+        controller.enqueue(encodeSse("NE]"));
+        controller.close();
+      }),
+      out: { write: (_value: string) => {} } as any,
+    });
+
+    await expect(pending).resolves.toBe("");
+  });
+
+  it("rejects EOF without [DONE] after preserving streamed partial text", async () => {
+    const written: string[] = [];
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((controller) => {
+        controller.enqueue(encodeSse('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+        controller.close();
+      }),
+      out: { write: (value: string) => { written.push(value); } } as any,
+    });
+
+    await expect(pending).rejects.toThrow(/incomplete.*\[DONE\]/i);
+    expect(written.join("")).toContain("partial");
+  });
+
+  it("rejects an empty EOF without [DONE]", async () => {
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((controller) => controller.close()),
+      out: { write: (_value: string) => {} } as any,
+    });
+
+    await expect(pending).rejects.toThrow(/incomplete.*\[DONE\]/i);
+  });
+
+  it("keeps a terminal error frame authoritative when EOF omits [DONE]", async () => {
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((controller) => {
+        controller.enqueue(encodeSse('data: {"error":{"message":"upstream failed","code":"upstream_error"}}\n\n'));
+        controller.close();
+      }),
+      out: { write: (_value: string) => {} } as any,
+    });
+
+    await expect(pending).rejects.toMatchObject({ message: "upstream failed", code: "upstream_error", midStream: true });
+  });
+
+  it("keeps a terminal error frame authoritative when followed by [DONE]", async () => {
+    const pending = ask({
+      prompt: "test",
+      model: "test-model",
+      configDir: streamConfigDir,
+      fetch: makeStreamingFetch((controller) => {
+        controller.enqueue(encodeSse('data: {"error":{"message":"upstream failed","code":"upstream_error"}}\n\n'));
+        controller.enqueue(encodeSse("data: [DONE]\n\n"));
+        controller.close();
+      }),
+      out: { write: (_value: string) => {} } as any,
+    });
+
+    await expect(pending).rejects.toMatchObject({ message: "upstream failed", code: "upstream_error", midStream: true });
+  });
+});
 
 describe("hs-cli — redeem", () => {
   let port = 0;

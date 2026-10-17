@@ -867,9 +867,11 @@ cmd_deploy() (
   # attribute/timestamp-only line) even when nothing inside changed, so a naive "output
   # non-empty" check would restart on every single deploy. An itemize line's first column is
   # "." when only attributes changed and the file itself was not transferred; a real content
-  # transfer, creation, hardlink, or deletion uses '>' / 'c' / 'h' / '*' instead. Only THOSE
+  # transfer, creation, hardlink, or deletion uses '<' / '>' / 'c' / 'h' / '*' instead. Only THOSE
   # lines mean the payload actually changed.
-  if printf '%s\n' "$rsync_out" | grep -qE '^[^.]'; then payload_changed=1; fi
+  # Consume the entire receipt: grep -q can close the pipe early and give printf
+  # SIGPIPE for large deployments. Under pipefail that would hide real changes.
+  if printf '%s\n' "$rsync_out" | grep -E '^[^.]' >/dev/null; then payload_changed=1; fi
 
   # Close the TOCTOU window between the initial check and rsync reading the tree (mirrors
   # hugin/scripts/deploy-pi.sh's post-sync re-check): if source changed mid-sync, the payload no

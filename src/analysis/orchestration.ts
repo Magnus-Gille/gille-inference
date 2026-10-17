@@ -15,10 +15,10 @@ loadEnv();
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { initDb } from "../db.js";
-import { averageScores, scoreToNumeric } from "./stats.js";
+import { averageScores } from "./stats.js";
 import { COMPOUND_TASKS } from "../tasks/compound.js";
 import { ALL_STRATEGIES } from "../orchestrator/strategies.js";
-import type { JudgeScores, ScoreLevel } from "../types.js";
+import type { JudgeScores } from "../types.js";
 
 // ─── DB row types ─────────────────────────────────────────────────────────────
 

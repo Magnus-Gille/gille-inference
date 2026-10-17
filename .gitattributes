@@ -1,1 +1,3 @@
 src/homeserver/gateway-release.ts export-subst
+# Unified patch context contains a leading space before source indentation.
+runtime-patches/llama-swap/instrumentation.patch -whitespace

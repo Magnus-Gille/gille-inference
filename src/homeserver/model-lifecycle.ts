@@ -62,10 +62,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function hasOwn(value: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function assertExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();

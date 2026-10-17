@@ -118,7 +118,7 @@ async function listedTools(key: string): Promise<Array<{ name: string; descripti
 }
 
 const CODE_LOOP_TOOLS = ["code_loop_start", "code_loop_status", "code_loop_result"];
-const TOOLS_WITH_OUTPUT_SCHEMAS = ["list_models", "ask", ...CODE_LOOP_TOOLS];
+const TOOLS_WITH_OUTPUT_SCHEMAS = ["tokenize", "list_models", "ask", ...CODE_LOOP_TOOLS];
 
 describe("LearningTaskContract authenticated preflight", () => {
   it("does not advertise the learning seam without authentication", async () => {
@@ -223,7 +223,7 @@ describe("code_loop_* visibility in tools/list", () => {
     for (const value of ["running", "completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"]) {
       expect(schemaText).toContain(value);
     }
-    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
+    for (const refusal of ["disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "invalid-request", "conflict", "admission-recovery"]) {
       expect(schemaText).toContain(refusal);
     }
   });
