@@ -195,7 +195,8 @@ See [`SECURITY.md`](./SECURITY.md),
 
 ### Requirements
 
-- Node.js 20+
+- Node.js 20+ for runtime-only serving
+- Node.js 22.12+ on the 22.x line or Node.js 24.x for development and tests (Vitest 5 and SQLite)
 - npm
 - Runtime/provider configuration for the command being used
 - `OPENROUTER_API_KEY` only for experiments that deliberately call OpenRouter
