@@ -132,7 +132,7 @@ All three tools: owner-gated, invisible to guests, each individual call returns 
   Each subsequent engine/check invocation receives a newly tightened cgroup lifetime and the
   same stop signal. No new verifier or retry starts after cutoff; an acquired late lease is
   released. Timeout output is withheld, cleanup uncertainty is durable and never a successful
-  completion. `execution.whole_job` reports observed elapsed time and cleanup status; acceptance
+  completion. `execution.whole_job` reports a monotonic pre-persistence observation and cleanup status; acceptance
   also measures dispatch-to-terminal/cleanup externally, including transport and polling time.
   Verify the live input schema supports this optional field before dispatch. A client timeout
   alone neither cancels an accepted job nor proves cleanup.

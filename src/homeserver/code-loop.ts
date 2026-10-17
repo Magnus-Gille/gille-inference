@@ -838,9 +838,31 @@ interface Job {
 
 const jobs = new Map<string, Job>();
 let runningWorkId: string | null = null; // single-flight mutex
+// Keep live leases/heartbeat ownership while an exact manager stop is unproved. Durable
+// cleanup_pending blocks fresh admission after a process restart; this map retains this
+// process's release closures until the sweep proves the physical unit is absent.
+const cleanupResourceHolds = new Map<string, {
+  workroot: string;
+  absenceVerified: boolean;
+  release: () => Promise<void>;
+}>();
+
+async function releaseVerifiedCleanupResources(workroot: string, workId: string): Promise<void> {
+  const hold = cleanupResourceHolds.get(workId);
+  if (!hold || hold.workroot !== resolve(workroot) || !hold.absenceVerified) return;
+  await hold.release();
+  cleanupResourceHolds.delete(workId);
+  const job = jobs.get(workId);
+  if (job) job.cleanupPending = false;
+  if (runningWorkId === workId) {
+    runningWorkId = null;
+    setCodeLoopActive(false);
+  }
+}
 
 export function _resetCodeLoopStateForTests(): void {
   jobs.clear();
+  cleanupResourceHolds.clear();
   runningWorkId = null;
   setCodeLoopActive(false);
 }
@@ -1165,6 +1187,9 @@ async function startCodeLoopInner(
   if (runningWorkId !== null) {
     return { ok: false, refusal: "busy", message: "A code_loop run is already in progress (single-flight). Retry when it finishes." };
   }
+  if (listDurableCodeLoopRunsPendingCleanup(cfg.workroot).length > 0) {
+    return { ok: false, refusal: "cage-unavailable", message: "A previous code_loop unit still awaits verified cleanup; refusing new work until its absence is proved." };
+  }
 
   // Claim the single-flight mutex SYNCHRONOUSLY — before the cage self-test await below. The
   // busy-check and this claim must not straddle an await, or two concurrent starts both pass the
@@ -1457,6 +1482,13 @@ async function startCodeLoopInner(
   if (deadline) deadline.transferred = true;
   void runJob(job, req, deps, cageArgv, growthCapBytes, unitName, () => leaseLost, deadline, releaseResources)
     .finally(async () => {
+      if (job.cleanupPending) {
+        deadline?.dispose();
+        cleanupResourceHolds.set(workId, {
+          workroot: resolve(job.workroot), absenceVerified: false, release: releaseResources,
+        });
+        return;
+      }
       try {
         if (!resourcesReleased) await lease!.release();
       } catch {
@@ -2126,7 +2158,7 @@ async function finalizeJobWithResult(
   // Keep the process lease through asynchronous evidence collection. For the opt-in whole-job
   // contract, release both leases immediately before the synchronous terminal publication.
   let resourcesReleased = false;
-  if (deadline && releaseResources) {
+  if (deadline && releaseResources && !job.cleanupPending) {
     try {
       await releaseResources();
       resourcesReleased = true;
@@ -2152,7 +2184,7 @@ async function finalizeJobWithResult(
   if (deadline) {
     result.execution.whole_job = {
       budget_s: deadline.totalWallS,
-      elapsed_ms: Math.max(0, Math.ceil(performance.now() - deadline.startedAt)),
+      observed_before_persistence_ms: Math.max(0, Math.ceil(performance.now() - deadline.startedAt)),
       cleanup_complete: !job.cleanupPending && resourcesReleased,
     };
   }
@@ -2300,17 +2332,27 @@ export async function sweepCodeLoopSandboxes(
   let reclaimed = 0;
   const now = deps.now();
   const cleanupVerifiedWorkIds = new Set<string>();
+  // A lease-release filesystem failure can occur after absence was already proved and the
+  // durable cleanup bit cleared. Retain and retry that local release without stopping peers.
+  for (const [workId, hold] of cleanupResourceHolds) {
+    if (hold.workroot === resolve(cfg.workroot) && hold.absenceVerified) {
+      await releaseVerifiedCleanupResources(cfg.workroot, workId);
+    }
+  }
   // Reap trusted cleanup obligations from the durable index first. A caged process owns and may
   // delete its sandbox, so directory enumeration must never be the only path to a residual unit.
   for (const record of listDurableCodeLoopRunsPendingCleanup(cfg.workroot)) {
     if (
-      record.status === "running" &&
+      record.status === "running" && !cleanupResourceHolds.has(record.work_id) &&
       (jobs.has(record.work_id) || isDurableCodeLoopWorkLive(cfg.workroot, record.work_id))
     ) continue;
     const unitName = `code-loop-${record.work_id}`;
     if (!isCodeLoopUnitName(unitName)) continue;
     await deps.stopUnit(unitName);
     persistDurableCodeLoopRun(cfg.workroot, { ...record, cleanup_pending: false });
+    const hold = cleanupResourceHolds.get(record.work_id);
+    if (hold) hold.absenceVerified = true;
+    await releaseVerifiedCleanupResources(cfg.workroot, record.work_id);
     cleanupVerifiedWorkIds.add(record.work_id);
   }
   // Enforce source retention from the trusted caller record even when the sandbox or its

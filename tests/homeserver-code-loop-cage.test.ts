@@ -457,6 +457,15 @@ describe("runCageSelfTest — drives the probe INSIDE the exact cage argv (fail-
     expect(r.failures.join(" ")).toContain("secret");
   });
 
+  it.each([
+    [null, "probe exited by timeout/signal"],
+    [1, "probe exited 1"],
+  ] as const)("complete markers with exit code %s fail closed", async (code, diagnostic) => {
+    const r = await runCageSelfTest(opts(async () => ({ code, stdout: PASS_OUT, stderr: "probe failed" })));
+    expect(r.ok).toBe(false);
+    expect(r.failures.join(" ")).toContain(diagnostic);
+  });
+
   it("an exec failure (cage tooling missing) is ok=false, never a pass (fail-closed)", async () => {
     const r = await runCageSelfTest(
       opts(async () => {

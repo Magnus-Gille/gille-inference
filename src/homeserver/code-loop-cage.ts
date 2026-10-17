@@ -448,7 +448,8 @@ export async function runCageSelfTest(o: CageSelfTestOptions): Promise<CageSelfT
       parsed.ok = false;
       parsed.failures.push("cage probe aborted");
     }
-    if (!parsed.ok && r.code !== 0) {
+    if (r.code !== 0) {
+      parsed.ok = false;
       parsed.failures.push(`probe exited ${r.code === null ? "by timeout/signal" : r.code}: ${r.stderr.slice(0, 400)}`);
     }
     return parsed;

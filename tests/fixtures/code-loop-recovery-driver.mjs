@@ -152,7 +152,7 @@ assert.equal(boundedResult.check.exit_code, null);
 assert.equal(boundedResult.diff, "");
 assert.equal(boundedResult.summary, "");
 assert.equal(boundedResult.execution.whole_job.budget_s, 90);
-assert(boundedResult.execution.whole_job.elapsed_ms <= 90000);
+assert(boundedResult.execution.whole_job.observed_before_persistence_ms <= 90000);
 assert.equal(boundedResult.execution.whole_job.cleanup_complete, true);
 const absent = spawnSync("runuser", ["-u", "gi-code-loop-ci", "--", "env", "-i",
   "PATH=/usr/bin:/bin", "XDG_RUNTIME_DIR=/run/user/" + uid,

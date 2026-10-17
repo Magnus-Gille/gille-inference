@@ -3407,7 +3407,7 @@ describe("optional whole-job deadline", () => {
   });
 
   for (const cleanupFails of [false, true]) {
-    it(`aborts the admitted engine, skips owner checks, releases leases and retains cleanup failure=${cleanupFails}`, async () => {
+    it(`aborts the engine and retains resources until cleanup is proved (failure=${cleanupFails})`, async () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
       const deps = fakeDeps();
       const release = vi.fn(async () => {});
@@ -3439,12 +3439,39 @@ describe("optional whole-job deadline", () => {
         expect(observedSignal?.aborted).toBe(true);
         const terminal = getJobResult(started.work_id);
         expect(terminal).toMatchObject({ kind: "result", result: { status: cleanupFails ? "arm-error" : "cap-exceeded", diff: "", summary: "", check: { ran: false }, execution: { effective_caps: { total_wall_s: 180 }, whole_job: { budget_s: 180, cleanup_complete: !cleanupFails } } } });
-        expect(release).toHaveBeenCalledTimes(1);
+        expect(release).toHaveBeenCalledTimes(cleanupFails ? 0 : 1);
         expect(ownerCheck).not.toHaveBeenCalled();
         expect(readDurableCodeLoopRunByWork(workroot, started.work_id)?.cleanup_pending).toBe(cleanupFails);
+        if (cleanupFails) {
+          const next = { instruction: "next", files: [{ path: "next.ts", content: "next" }] };
+          expect(await startCodeLoop(next, startCfg(), fakeDeps())).toMatchObject({ ok: false, refusal: "busy" });
+          await expect(sweepCodeLoopSandboxes(
+            { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+            { now: Date.now, stopUnit: async () => { throw new Error("still unavailable"); } },
+          )).rejects.toThrow("still unavailable");
+          expect(release).not.toHaveBeenCalled();
+          await sweepCodeLoopSandboxes(
+            { workroot, retentionTtlMs: 24 * 60 * 60 * 1000 },
+            { now: Date.now, stopUnit: async () => {} },
+          );
+          expect(release).toHaveBeenCalledTimes(1);
+          expect(await startCodeLoop(next, startCfg(), fakeDeps({ lease: "unavailable" }))).toMatchObject({ ok: false, refusal: "lease-unavailable" });
+        }
       } finally { vi.useRealTimers(); }
     });
   }
+
+  it("refuses fresh admission while a prior process left a durable cleanup obligation", async () => {
+    claimDurableCodeLoopRun(workroot, {
+      schema_version: 1, client_run_id: "prior-process", request_fingerprint: "sha256:" + "a".repeat(64),
+      work_id: "cl-20261017-1234abcd", status: "arm-error", usage: { turns: 0, wall_ms: 1, prompt_tokens: 0, completion_tokens: 0 },
+      result: null, started_at_ms: Date.now(), cleanup_pending: true,
+    });
+    const deps = fakeDeps();
+    deps.acquireLease = vi.fn(deps.acquireLease);
+    expect(await startCodeLoop({ instruction: "next", files: [{ path: "next.ts", content: "next" }] }, startCfg(), deps)).toMatchObject({ ok: false, refusal: "cage-unavailable" });
+    expect(deps.acquireLease).not.toHaveBeenCalled();
+  });
 
   it("releases a lease granted after admission expiry without starting the engine", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });

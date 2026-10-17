@@ -127,7 +127,7 @@ export interface CodeLoopExecution {
   /** Immutable harness contract identifier, not a mutable deployment label. */
   harness_version: string;
   effective_caps: CodeLoopCaps;
-  whole_job?: { budget_s: number; elapsed_ms: number; cleanup_complete: boolean };
+  whole_job?: { budget_s: number; observed_before_persistence_ms: number; cleanup_complete: boolean };
   capabilities: {
     start_idempotency: "client-run-id-v1";
     agent_checks: "pi-bash-events-v3";

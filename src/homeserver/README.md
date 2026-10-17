@@ -508,7 +508,8 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   time. Admission expiry returns `deadline-exceeded`; admitted expiry withholds diff/summary and
   returns `cap-exceeded`, or `arm-error` when cleanup/release cannot be proved. Unresolved unit
   cleanup remains durable for recovery. Opted-in results include `execution.whole_job` with the
-  budget, observed monotonic elapsed time and cleanup status. A cleanup failure or elapsed time
+  budget, monotonic `observed_before_persistence_ms` and cleanup status. This observation precedes
+  synchronous terminal persistence; it is not dispatch-to-terminal timing proof. A cleanup failure or elapsed time
   beyond the budget fails operational acceptance. Omission preserves the separate legacy caps.
   Reconnect and verify that the live `code_loop_start` input schema advertises `total_wall_s`
   before using it; older gateways do not enforce this optional field. Engine `usage.wall_ms`

@@ -97,7 +97,8 @@ including admission, coding, verification and reserved cleanup time. Engine `cap
 client wait timeout are separate bounds. The server reserves 75 seconds for process/unit stop,
 lease release and evidence finalization; expired runs withhold output, and unproved cleanup is
 an error retained for recovery. Record external dispatch, terminal and cleanup times alongside
-`execution.whole_job`; cleanup failure or a whole-job overrun fails acceptance.
+`execution.whole_job`; its `observed_before_persistence_ms` is a pre-persistence observation,
+not proof of terminal publication time. Cleanup failure or a measured whole-job overrun fails acceptance.
 
 The content-free doctor health probe allows up to 3.5 seconds within the caller's timeout.
 `/healthz` also waits for its bounded peer observation, so its response can legitimately take
