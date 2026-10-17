@@ -26,7 +26,6 @@ import {
 import { diagnoseTraceSet } from "../scripts/gate-e-rescore.js";
 import { buildVerdicts, e5Pivotal } from "../scripts/gate-e-apply-verdict.js";
 import { aggregateJudgeScores } from "../scripts/gate-e-judge.js";
-import type { ArmId, TaskScore } from "../scripts/gate-e-types.js";
 import { ORCH_TASKS, getTask } from "../scripts/gate-e-tasks.js";
 import type {
   OrchTask,

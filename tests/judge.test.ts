@@ -276,9 +276,9 @@ describe("judgeWithOpus (mocked)", () => {
 
     vi.doMock("openai", () => {
       return {
-        default: vi.fn().mockImplementation(() => ({
-          chat: { completions: { create: mockCreate } },
-        })),
+        default: vi.fn().mockImplementation(function () {
+          return { chat: { completions: { create: mockCreate } } };
+        }),
       };
     });
 
@@ -301,9 +301,9 @@ describe("judgeWithOpus (mocked)", () => {
 
     vi.doMock("openai", () => {
       return {
-        default: vi.fn().mockImplementation(() => ({
-          chat: { completions: { create: mockCreate } },
-        })),
+        default: vi.fn().mockImplementation(function () {
+          return { chat: { completions: { create: mockCreate } } };
+        }),
       };
     });
 
@@ -341,9 +341,9 @@ describe("judgeWithO4Mini (mocked)", () => {
 
     vi.doMock("openai", () => {
       return {
-        default: vi.fn().mockImplementation(() => ({
-          chat: { completions: { create: mockCreate } },
-        })),
+        default: vi.fn().mockImplementation(function () {
+          return { chat: { completions: { create: mockCreate } } };
+        }),
       };
     });
 
@@ -375,9 +375,9 @@ describe("judgeWithO4Mini (mocked)", () => {
 
     vi.doMock("openai", () => {
       return {
-        default: vi.fn().mockImplementation(() => ({
-          chat: { completions: { create: mockCreate } },
-        })),
+        default: vi.fn().mockImplementation(function () {
+          return { chat: { completions: { create: mockCreate } } };
+        }),
       };
     });
 

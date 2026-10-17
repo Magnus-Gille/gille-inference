@@ -6,7 +6,7 @@ import { buildManifest, parseWorkflowJobs, runChecks, validateReceipt } from '..
 
 function workflowFixtureRoot(root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-fixture-'))) {
   fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
-  for (const file of ['ci.yml','cgroup-stop-proof.yml','code-health.yml','code-loop-recovery.yml','host-arbiter.yml','observer-test-host.yml','producer-activity.yml','producer-channel.yml','proxy-activity.yml','portal-visual.yml','runtime-producer-channel.yml'])
+  for (const file of ['ci.yml','cgroup-stop-proof.yml','code-health.yml','code-loop-recovery.yml','dependency-compatibility.yml','host-arbiter.yml','observer-test-host.yml','producer-activity.yml','producer-channel.yml','proxy-activity.yml','portal-visual.yml','runtime-producer-channel.yml'])
     fs.copyFileSync(path.join(process.cwd(), `.github/workflows/${file}`), path.join(root, `.github/workflows/${file}`));
   return root;
 }
@@ -87,8 +87,54 @@ describe('local verification manifest', () => {
       expect(manifest.checks.find(({ workflowName }) => workflowName === 'Informational code health')?.status).toBe('conformance-only');
       expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('Native code-loop recovery / Real manager and cage recovery');
       expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('Portal visual verification / Portal desktop and mobile states');
-      expect(manifest.checks).toHaveLength(13);
+      expect(manifest.checks).toHaveLength(14);
       expect(manifest.clientCompatibility).toEqual({ present: false, reason: 'workflow-absent-at-invoked-revision' });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('covers the Vitest coverage compatibility workflow and its event conditions', () => {
+    const root = workflowFixtureRoot();
+    try {
+      const manifest = buildManifest({ root, event: 'pull_request' });
+      const coverage = manifest.checks.find((check: any) => check.workflowFile === 'dependency-compatibility.yml');
+      expect(coverage).toMatchObject({
+        workflowName: 'Dependency compatibility',
+        jobId: 'vitest-coverage',
+        rawName: 'Vitest coverage compatibility',
+        eventConditions: { push: ['main'], pull_request: ['all branches'] },
+        appliesToInvocation: true,
+        status: 'unavailable',
+      });
+      expect(manifest.workflowSourcesValidated).toContainEqual({
+        file: 'dependency-compatibility.yml',
+        workflowName: 'Dependency compatibility',
+      });
+
+      const source = fs.readFileSync(path.join(root, '.github/workflows/dependency-compatibility.yml'), 'utf8');
+      expect(source).toContain("node-version: '22'");
+      expect(source).toContain('run: npm ci\n');
+      expect(source).toContain('run: npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts');
+      expect(source).toContain('name: Verify Vitest and coverage provider versions');
+      expect(source).toContain('run: ./node_modules/.bin/vitest run --config research/code-health-401/vitest.coverage.config.mjs');
+
+      const push = buildManifest({ root, event: 'push', branch: 'main' });
+      const dispatch = buildManifest({ root, event: 'workflow_dispatch', branch: 'main' });
+      expect(push.checks.find((check: any) => check.workflowFile === 'dependency-compatibility.yml')?.appliesToInvocation).toBe(true);
+      expect(dispatch.checks.find((check: any) => check.workflowFile === 'dependency-compatibility.yml')?.appliesToInvocation).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('fails closed for unknown dependency commands and workflow files', () => {
+    const root = workflowFixtureRoot();
+    try {
+      const workflowPath = path.join(root, '.github/workflows/dependency-compatibility.yml');
+      const source = fs.readFileSync(workflowPath, 'utf8');
+      fs.writeFileSync(workflowPath, source.replace('run: npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts', 'run: npm install --prefix research/code-health-401/coverage-tooling'));
+      expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(/command coverage changed/i);
+
+      fs.writeFileSync(workflowPath, source);
+      fs.writeFileSync(path.join(root, '.github/workflows/unmapped.yml'), 'name: Unmapped\njobs:\n  check:\n    name: Unmapped\n');
+      expect(() => buildManifest({ root, event: 'pull_request' })).toThrow(/workflow source has no manifest coverage/i);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -119,7 +165,7 @@ describe('local verification manifest', () => {
       const manifest = buildManifest({ root, event: 'pull_request' });
       expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
         .toEqual(['Client Node 18', 'Client Node 22']);
-      expect(manifest.checks).toHaveLength(15);
+      expect(manifest.checks).toHaveLength(16);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -131,7 +177,7 @@ describe('local verification manifest', () => {
       const manifest = buildManifest({ root, event: 'pull_request' });
       expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
         .toEqual(['Client Node 18', 'Client Node 22']);
-      expect(manifest.checks).toHaveLength(15);
+      expect(manifest.checks).toHaveLength(16);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 

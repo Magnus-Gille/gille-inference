@@ -10,6 +10,7 @@ const REQUIRED_WORKFLOWS = [
   ['ci.yml', 'CI', ['secret-scan', 'test']],
   ['code-health.yml', 'Informational code health', ['collect']],
   ['code-loop-recovery.yml', 'Native code-loop recovery', ['code-loop-recovery']],
+  ['dependency-compatibility.yml', 'Dependency compatibility', ['vitest-coverage']],
   ['host-arbiter.yml', 'Fixed host arbitration', ['host-arbiter']],
   ['observer-test-host.yml', 'Observer test-host prerequisites', ['native-boundary', 'preflight']],
   ['producer-activity.yml', 'Native producer activity', ['cpp-activity']],
@@ -25,6 +26,7 @@ const EXPECTED_CHECKS = [
   ['CI', 'secret-scan', 'Gitleaks'], ['CI', 'test', 'test'],
   ['Informational code health', 'collect', 'Collect report-only code health'],
   ['Native code-loop recovery', 'code-loop-recovery', 'Real manager and cage recovery'],
+  ['Dependency compatibility', 'vitest-coverage', 'Vitest coverage compatibility'],
   ['Fixed host arbitration', 'host-arbiter', 'host-arbiter'],
   ['Observer test-host prerequisites', 'native-boundary', 'native-boundary'],
   ['Observer test-host prerequisites', 'preflight', 'preflight'],
@@ -84,6 +86,7 @@ function workflowInfo(root, definition) {
   if (declaredName !== expectedName) throw new Error(`${file} workflow name changed: expected ${expectedName}, got ${declaredName ?? 'missing'}`);
   const jobs = parseWorkflowJobs(source);
   if (file === CLIENT_WORKFLOW[0]) validateClientCompatibilityMatrix(source, jobs);
+  if (file === 'dependency-compatibility.yml') validateDependencyCompatibilityWorkflow(source);
   const expectedTriggers = file === 'code-health.yml' ? ['pull_request', 'schedule', 'workflow_dispatch'] : ['push', 'pull_request'];
   for (const trigger of expectedTriggers) {
     if (!new RegExp(`^  ${trigger}:\\s*$`, 'm').test(source)) throw new Error(`${file} is missing expected ${trigger} trigger`);
@@ -100,6 +103,45 @@ function workflowInfo(root, definition) {
     throw new Error(`${file} job coverage changed: expected ${expectedJobs.join(', ')}, found ${ids.join(', ')}`);
   }
   return { file, name: expectedName, jobs, source };
+}
+
+function validateDependencyCompatibilityWorkflow(source) {
+  const stepNames = [...source.matchAll(/^\s+- name:\s*(.*?)\s*$/gm)].map(match => match[1]);
+  const expectedStepNames = [
+    'Install root dependencies',
+    'Install isolated coverage provider',
+    'Verify Vitest and coverage provider versions',
+    'Link isolated coverage provider',
+    'Run scoped Vitest coverage',
+    'Verify unimported image sidecar coverage',
+  ];
+  if (stepNames.join('\0') !== expectedStepNames.join('\0')) {
+    throw new Error('dependency-compatibility.yml step coverage changed');
+  }
+
+  const directRuns = [...source.matchAll(/^[ \t]+run:[ \t]+(?![ \t]*\|)(.+?)[ \t]*$/gm)].map(match => match[1]);
+  const expectedDirectRuns = [
+    'npm ci',
+    'npm ci --prefix research/code-health-401/coverage-tooling --ignore-scripts',
+    './node_modules/.bin/vitest run --config research/code-health-401/vitest.coverage.config.mjs',
+  ];
+  if (directRuns.join('\0') !== expectedDirectRuns.join('\0')) {
+    throw new Error('dependency-compatibility.yml command coverage changed');
+  }
+
+  const requiredFragments = [
+    /node-version:\s*['"]?22['"]?/,
+    /root_version="\$\(node -p "require\('\.\/node_modules\/vitest\/package\.json'\)\.version"\)"/,
+    /provider_version="\$\(node -p "require\('\.\/research\/code-health-401\/coverage-tooling\/node_modules\/@vitest\/coverage-v8\/package\.json'\)\.version"\)"/,
+    /if \[\[ "\$root_version" != "\$provider_version" \]\]; then/,
+    /provider_link='\.\.\/\.\.\/research\/code-health-401\/coverage-tooling\/node_modules\/@vitest\/coverage-v8'/,
+    /provider_target='node_modules\/@vitest\/coverage-v8'/,
+    /summaryPath = 'research\/code-health-401\/artifacts\/correction\/ts-coverage-scoped\/coverage-summary\.json'/,
+    /expectedSourcePath = path\.resolve\('src\/homeserver\/image-sidecar\.ts'\)/,
+  ];
+  for (const fragment of requiredFragments) {
+    if (!fragment.test(source)) throw new Error(`dependency-compatibility.yml expected check missing: ${fragment}`);
+  }
 }
 
 function validateClientCompatibilityMatrix(source, jobs) {
