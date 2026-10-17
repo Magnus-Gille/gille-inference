@@ -86,6 +86,64 @@ describe("captureServedProcess", () => {
     expect(result).not.toHaveProperty("argv");
   });
 
+  it.each([
+    {
+      name: "does not consume a following flag for a missing projector value",
+      argv: [
+        "llama-server", "--mmproj", "--temp", "-0.5", "--model", "/models/model.gguf",
+      ],
+      launchFlags: {
+        contextSize: null,
+        parallelism: null,
+        temperature: -0.5,
+        topP: null,
+        topK: null,
+        minP: null,
+        predictLimit: null,
+      },
+      reasons: ["artifact-path-unavailable", "projector-flag-ambiguous"],
+    },
+    {
+      name: "does not consume a following flag for an invalid numeric value",
+      argv: ["llama-server", "--ctx-size", "--model", "/models/model.gguf"],
+      launchFlags: {
+        contextSize: null,
+        parallelism: null,
+        temperature: null,
+        topP: null,
+        topK: null,
+        minP: null,
+        predictLimit: null,
+      },
+      reasons: ["launch-flag-invalid"],
+    },
+    {
+      name: "accepts negative values for every numeric launch alias",
+      argv: [
+        "llama-server", "--model", "/models/model.gguf", "--ctx-size", "-1", "--parallel=-2",
+        "--temp", "-0.5", "--top-p", "-0.1", "--top-k", "-3", "--min-p", "-0.2",
+        "--n-predict", "-4",
+      ],
+      launchFlags: {
+        contextSize: -1,
+        parallelism: -2,
+        temperature: -0.5,
+        topP: -0.1,
+        topK: -3,
+        minP: -0.2,
+        predictLimit: -4,
+      },
+      reasons: [],
+    },
+  ])("characterizes parseArgs value consumption: $name", ({ argv, launchFlags, reasons }) => {
+    const { deps } = fixture({ readProcCmdline: () => argv });
+    const result = captureServedProcess(42, deps);
+
+    expect(result.launchFlags).toEqual(launchFlags);
+    expect(result.reasons).toEqual(reasons);
+    expect(result.weights).toEqual([{ sha256: expect.any(String), binding: "unproven" }]);
+  });
+
   it("does not treat model values or unrelated value text as unsupported flags", () => {
     const { root, deps } = fixture({
       readProcCmdline: () => [
