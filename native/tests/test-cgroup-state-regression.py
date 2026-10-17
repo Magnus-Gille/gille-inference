@@ -18,7 +18,8 @@ mutant.write_text(source.replace(before, ""))
 subprocess.run([
     "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic",
     "-I", str(Path("native/launcher").resolve()), str(mutant),
-    "native/observer/cgroup_events.c", "native/tests/cgroup_state_fixture.c", "-o", str(binary)
+    "native/observer/cgroup_events.c", "native/tests/cgroup_state_fixture.c",
+    "native/observer/cgroup_limits.c", "native/launcher/resource_limits.c", "-o", str(binary)
 ], check=True, timeout=30)
 result = subprocess.run([
     "sudo", "-n", "env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
