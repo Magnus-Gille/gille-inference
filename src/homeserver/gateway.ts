@@ -855,8 +855,12 @@ export function clientIp(req: IncomingMessage, trustedProxies: string[]): string
   return normalizeIp(remote);
 }
 
-async function readBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024): Promise<string> {
-  return (await readBuffer(req, maxBytes, null)).toString("utf-8");
+/**
+ * Read a JSON/text body. Shares readBuffer's reader and its idle-read bound, so a text route
+ * cannot be held open by a client that stalls mid-body until Node's requestTimeout.
+ */
+export async function readBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024, idleMs = 30_000): Promise<string> {
+  return (await readBuffer(req, maxBytes, idleMs)).toString("utf-8");
 }
 
 /** Thrown when a request body exceeds the size cap — caller maps it to HTTP 413. */
@@ -885,7 +889,7 @@ class BodyTooLargeError extends Error {
 async function readBuffer(
   req: IncomingMessage,
   maxBytes = 32 * 1024 * 1024,
-  idleMs: number | null = 30_000
+  idleMs = 30_000
 ): Promise<Buffer> {
   // Early rejection on a declared Content-Length over the cap — before buffering anything. We do
   // NOT destroy the socket here: the caller still has to write a 413 response, which requires the
@@ -907,7 +911,6 @@ async function readBuffer(
       }
     };
     const armIdle = (): void => {
-      if (idleMs === null) return; // Text routes retain their existing no-idle-timeout policy.
       clearIdle();
       idle = setTimeout(() => {
         if (settled) return;
