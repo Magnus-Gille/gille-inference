@@ -5528,8 +5528,14 @@ export async function handleRequest(
           }
         }
       }
+      // Embedding clients pin the gateway revision before each call, so an explicit embedding
+      // grant also sees release metadata. Owner telemetry stays owner-agent only, and the
+      // implicit owner grant (empty allow-list) does not count as explicit.
+      const explicitEmbeddingGrant = principal.embeddingModelAllowList.includes(EMBEDDING_MODEL_ID) ||
+        principal.modelAllowList.includes(EMBEDDING_MODEL_ID);
       sendJson(res, 200, {
-        ...(ownerAgent ? { gateway: gatewayRelease, inferenceObservation } : {}),
+        ...(ownerAgent || explicitEmbeddingGrant ? { gateway: gatewayRelease } : {}),
+        ...(ownerAgent ? { inferenceObservation } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,
