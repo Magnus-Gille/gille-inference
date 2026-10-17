@@ -567,8 +567,14 @@ before inference begins.
 
 The initial gateway migration and recovery refresh install a reviewed drop-in for that exact
 dedicated `user@UID.service`: `Restart=on-failure` and `OOMScoreAdjust=-500`.
-Refresh restarts the manager once to activate its new OOM score and
-checks that the gateway process did not restart as a result. A later manager recovery should
+Open the canonical exclusive maintenance window and let admitted work drain before refresh.
+Refresh verifies the loaded soft dependency graph, then restarts the manager once to activate
+its new OOM score while the original gateway process still owns that admission fence. It
+checks that the gateway process did not restart as a result, and restarts the gateway last.
+That final restart ends the process-local maintenance window; confirm the new instance has
+no active window and normal admission is restored. Reopen and drain a fresh window before
+any later restart. Restarting the gateway before the manager could admit a job that the
+subsequent manager restart would terminate. A later manager recovery should
 leave the gateway process running while its directory mount sees replacement bus sockets.
 An intentional gateway stop does not trigger a restart. The refresh backs up and restores both
 unit drop-ins together on failure; it rejects an existing manager drop-in whose contents differ
