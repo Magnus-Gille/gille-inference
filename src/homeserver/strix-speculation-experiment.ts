@@ -221,7 +221,8 @@ function commonArgs(record: Record<string, unknown>): string[] {
     if (typeof value !== "string" || value.length === 0 || value.length > 1_024 || /[\r\n\0]/.test(value)) {
       throw new Error(`server.commonArgs[${index}] must be a bounded single-line string`);
     }
-    const controlled = [...CONTROLLED_FLAGS].find((flag) => value === flag || value.startsWith(`${flag}=`));
+    const controlled = value.startsWith("--spec-") ? value.split("=")[0] :
+      [...CONTROLLED_FLAGS].find((flag) => value === flag || value.startsWith(`${flag}=`));
     if (controlled !== undefined) throw new Error(`server.commonArgs contains controlled flag ${controlled}`);
     return value;
   });

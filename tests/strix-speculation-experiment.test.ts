@@ -234,6 +234,14 @@ describe("Strix speculation experiment contract", () => {
     expect(depthOne.outPrefix).toBe("/evidence/cycle-00-position-01-draft-mtp-1");
   });
 
+  it("rejects every speculation flag in shared arguments so the invariant excludes only generated arm flags", () => {
+    for (const flag of ["--spec-draft-n", "--spec-draft-n-min=1", "--spec-draft-p-min", "--spec-draft-p-split=0.5", "--spec-unknown"]) {
+      const raw = fixture() as any;
+      raw.server.commonArgs.push(flag, "1");
+      expect(() => validateStrixSpeculationExperimentConfig(raw)).toThrow(/controlled flag/);
+    }
+  });
+
   it("rejects uncontrolled flags, malformed arms, unsafe paths, and false deployment authority", () => {
     const mutate = (change: (copy: any) => void): unknown => {
       const copy = structuredClone(fixture());
