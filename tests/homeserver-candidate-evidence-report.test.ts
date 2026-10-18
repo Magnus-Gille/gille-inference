@@ -142,6 +142,36 @@ describe("candidate evidence report", () => {
     expect(report.diagnostics).toMatchObject({ failedOutcomes: 1, unavailableOutcomes: 2, unknownPurpose: 3 });
   });
 
+  it("keeps cost counts exact across duplicate delegations, boundaries, and malformed cost ids", () => {
+    const db = schema();
+    try {
+      insertDelegation(db, "duplicate-delegation", null);
+      insertDelegation(db, "duplicate-delegation", null);
+      insertDelegation(db, "missing-cost", null);
+      insertDelegation(db, "duplicate-cost", null);
+      insertDelegation(db, "outside-boundary", null);
+      db.prepare("UPDATE delegations SET ts = ? WHERE id = ?").run(THROUGH, "outside-boundary");
+
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-linked", "duplicate-delegation", "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-duplicate-a", "duplicate-cost", "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-duplicate-b", "duplicate-cost", "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-outside", "outside-boundary", "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-null", null, "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-empty", "", "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-whitespace", "   ", "2026-09-01T12:00:00.000Z", "verified");
+      db.prepare("INSERT INTO delegation_costs VALUES (?, ?, ?, ?)").run("cost-blob", Buffer.from("duplicate-delegation"), "2026-09-01T12:00:00.000Z", "verified");
+
+      const report = buildCandidateEvidenceReport(db, { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED });
+      expect(report.cost).toEqual({ availability: "available", rows: 3, linked: 2, missing: 1, duplicate: 1, costAssessment: "unassessed" });
+      expect(report.diagnostics).toEqual({ failedOutcomes: 0, unavailableOutcomes: 0, unassessedFeedback: 0, unknownPurpose: 4, duplicateFeedback: 0, duplicateCost: 1 });
+      expect(report.qualification).toEqual({ status: "hold", reason: "diagnostic_only", selectedCandidate: null, enablingDecision: null });
+      const text = JSON.stringify(report);
+      for (const identifier of ["duplicate-delegation", "missing-cost", "duplicate-cost", "outside-boundary", "cost-linked", "cost-blob"]) expect(text).not.toContain(identifier);
+    } finally {
+      db.close();
+    }
+  });
+
   it("does not treat the served model path digest as immutable artifact binding", () => {
     const db = schema();
     const modelPath = "/private/models/served-Q4_K_M.gguf";
@@ -267,6 +297,21 @@ describe("candidate evidence report", () => {
     incomplete.prepare("INSERT INTO delegations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("d", "2026-09-01T12:00:00.000Z", "m5", "mellum", "code-edit", "pass", 0, null, null);
     const partial = buildCandidateEvidenceReport(incomplete, { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED });
     expect(partial).toMatchObject({ availability: "available", rows: { inWindow: 1, unknownPurpose: 1 }, feedback: { availability: "unavailable", unavailableReason: "missing_column", missing: 1 }, cost: { availability: "unavailable", unavailableReason: "missing_column", missing: 1 } });
+  });
+
+  it("keeps cost unavailable and qualification on hold when the cost schema is missing", () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec("CREATE TABLE delegations (id TEXT, ts TEXT, node_id TEXT, model_id TEXT, task_type TEXT, outcome TEXT, shadow INTEGER, superseded_at TEXT, evidence_identity_hash TEXT)");
+      db.prepare("INSERT INTO delegations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("missing-cost-schema", "2026-09-01T12:00:00.000Z", "m5", "mellum", "code-edit", "pass", 0, null, null);
+      const report = buildCandidateEvidenceReport(db, { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED });
+      expect(report.cost).toEqual({ availability: "unavailable", unavailableReason: "missing_table", rows: 0, linked: 0, missing: 1, duplicate: 0, costAssessment: "unassessed" });
+      expect(report.diagnostics).toEqual({ failedOutcomes: 0, unavailableOutcomes: 0, unassessedFeedback: 0, unknownPurpose: 1, duplicateFeedback: 0, duplicateCost: 0 });
+      expect(report.qualification).toEqual({ status: "hold", reason: "diagnostic_only", selectedCandidate: null, enablingDecision: null });
+      expect(JSON.stringify(report)).not.toContain("missing-cost-schema");
+    } finally {
+      db.close();
+    }
   });
 
   it("returns fixed unavailable diagnostics for missing schema and rejects noncanonical bounds", () => {
