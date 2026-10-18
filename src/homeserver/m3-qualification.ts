@@ -806,6 +806,89 @@ function validatePurpose(
 
 type CandidateThresholds = QualificationThresholds | M3FirstCanaryThresholds;
 
+function validateCandidateCost(
+  candidate: AnyRecord,
+  thresholds: CandidateThresholds | null,
+  costMode: "strict" | "unassessed",
+  reasons: string[],
+): AnyRecord {
+  const cost = isRecord(candidate.cost) ? candidate.cost : {};
+  let localCost: number | null = null;
+  let baselineCost: number | null = null;
+  if (costMode === "unassessed") {
+    validateFirstCanaryCost(candidate.cost, reasons);
+  } else {
+    if (!isToken(cost.localProvenance) || !isToken(cost.baselineProvenance)) reasons.push("invalid_cost");
+    localCost = readNumber(cost.localCostPerAcceptedUsd, "cost", "cost", reasons, true);
+    baselineCost = readNumber(cost.baselineCostPerAcceptedUsd, "baseline_cost", "cost", reasons, true);
+    const calibrated = readBoolean(cost.calibrated, "cost_calibration", reasons, true);
+    const exactCoverage = readBoolean(cost.exactOneCostCoverage, "cost_coverage", reasons, true);
+    if (calibrated === false) reasons.push("uncalibrated_cost");
+    if (exactCoverage === false) reasons.push("invalid_cost_coverage");
+    if (localCost !== null && thresholds !== null && "maxCostPerAcceptedUsd" in thresholds && localCost > thresholds.maxCostPerAcceptedUsd) reasons.push("cost_exceeded");
+    if (thresholds !== null && "maxLocalToBaselineRatio" in thresholds && thresholds.maxLocalToBaselineRatio !== null && thresholds.maxLocalToBaselineRatio !== undefined) {
+      if (baselineCost === null || baselineCost <= 0 || localCost === null) {
+        reasons.push("invalid_cost");
+      } else if (localCost / baselineCost > thresholds.maxLocalToBaselineRatio) {
+        reasons.push("cost_ratio_exceeded");
+      }
+    }
+  }
+  return cost;
+}
+
+function validateCandidateOrganicCoverage(
+  candidate: AnyRecord,
+  organic: ReturnType<typeof validatePurpose>["values"],
+  cost: AnyRecord,
+  thresholds: CandidateThresholds | null,
+  costMode: "strict" | "unassessed",
+  reasons: string[],
+): void {
+  if (
+    thresholds !== null &&
+    (organic.opportunities === undefined || organic.attempts === undefined ||
+      organic.opportunities < thresholds.minOrganicOpportunities ||
+      organic.attempts < thresholds.minOrganicAttempts)
+  ) {
+    reasons.push("insufficient_organic_sample");
+  }
+  if (organic.attempts !== undefined && organic.attempts > 0 && organic.assessed !== undefined) {
+    if (organic.assessed / organic.attempts < (thresholds?.minFeedbackCoverage ?? 1)) reasons.push("insufficient_feedback");
+  } else {
+    reasons.push("missing_feedback");
+  }
+
+  const qualitySampleSize = signalSampleSize(candidate.qualityRate);
+  if (qualitySampleSize !== null && organic.attempts !== undefined && qualitySampleSize !== organic.attempts) {
+    reasons.push("quality_denominator_mismatch");
+  }
+  const errorSampleSize = signalSampleSize(candidate.errorRate);
+  if (errorSampleSize !== null && organic.attempts !== undefined && errorSampleSize !== organic.attempts) {
+    reasons.push("error_denominator_mismatch");
+  }
+  const latencySampleSize = signalSampleSize(candidate.p90LatencyMs);
+  if (latencySampleSize !== null && organic.attempts !== undefined && latencySampleSize !== organic.attempts) {
+    reasons.push("latency_denominator_mismatch");
+  }
+  const busySampleSize = signalSampleSize(candidate.busyRate);
+  if (busySampleSize !== null && organic.opportunities !== undefined && busySampleSize !== organic.opportunities) {
+    reasons.push("busy_denominator_mismatch");
+  }
+  const organicPass = organic.pass;
+  if (costMode === "strict") {
+    const localCostSampleSize = signalSampleSize(cost.localCostPerAcceptedUsd);
+    const baselineCostSampleSize = signalSampleSize(cost.baselineCostPerAcceptedUsd);
+    if (organicPass !== undefined) {
+      if (localCostSampleSize !== null && localCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
+      if (baselineCostSampleSize !== null && baselineCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
+    }
+    if (localCostSampleSize !== null && baselineCostSampleSize !== null && localCostSampleSize !== baselineCostSampleSize) {
+      reasons.push("cost_denominator_mismatch");
+    }
+  }
+}
+
 function validateCandidate(
   raw: unknown,
   thresholds: CandidateThresholds | null,
@@ -904,72 +987,9 @@ function validateCandidate(
   const busy = readNumber(candidate.busyRate, "busy_signal", "rate", reasons, true);
   if (busy !== null && thresholds !== null && busy > thresholds.maxBusyRate) reasons.push("busy_rate_exceeded");
 
-  const cost = isRecord(candidate.cost) ? candidate.cost : {};
-  let localCost: number | null = null;
-  let baselineCost: number | null = null;
-  if (costMode === "unassessed") {
-    validateFirstCanaryCost(candidate.cost, reasons);
-  } else {
-    if (!isToken(cost.localProvenance) || !isToken(cost.baselineProvenance)) reasons.push("invalid_cost");
-    localCost = readNumber(cost.localCostPerAcceptedUsd, "cost", "cost", reasons, true);
-    baselineCost = readNumber(cost.baselineCostPerAcceptedUsd, "baseline_cost", "cost", reasons, true);
-    const calibrated = readBoolean(cost.calibrated, "cost_calibration", reasons, true);
-    const exactCoverage = readBoolean(cost.exactOneCostCoverage, "cost_coverage", reasons, true);
-    if (calibrated === false) reasons.push("uncalibrated_cost");
-    if (exactCoverage === false) reasons.push("invalid_cost_coverage");
-    if (localCost !== null && thresholds !== null && "maxCostPerAcceptedUsd" in thresholds && localCost > thresholds.maxCostPerAcceptedUsd) reasons.push("cost_exceeded");
-    if (thresholds !== null && "maxLocalToBaselineRatio" in thresholds && thresholds.maxLocalToBaselineRatio !== null && thresholds.maxLocalToBaselineRatio !== undefined) {
-      if (baselineCost === null || baselineCost <= 0 || localCost === null) {
-        reasons.push("invalid_cost");
-      } else if (localCost / baselineCost > thresholds.maxLocalToBaselineRatio) {
-        reasons.push("cost_ratio_exceeded");
-      }
-    }
-  }
-
+  const cost = validateCandidateCost(candidate, thresholds, costMode, reasons);
   const organic = validatedPurposes.organic.values;
-  if (
-    thresholds !== null &&
-    (organic.opportunities === undefined || organic.attempts === undefined ||
-      organic.opportunities < thresholds.minOrganicOpportunities ||
-      organic.attempts < thresholds.minOrganicAttempts)
-  ) {
-    reasons.push("insufficient_organic_sample");
-  }
-  if (organic.attempts !== undefined && organic.attempts > 0 && organic.assessed !== undefined) {
-    if (organic.assessed / organic.attempts < (thresholds?.minFeedbackCoverage ?? 1)) reasons.push("insufficient_feedback");
-  } else {
-    reasons.push("missing_feedback");
-  }
-
-  const qualitySampleSize = signalSampleSize(candidate.qualityRate);
-  if (qualitySampleSize !== null && organic.attempts !== undefined && qualitySampleSize !== organic.attempts) {
-    reasons.push("quality_denominator_mismatch");
-  }
-  const errorSampleSize = signalSampleSize(candidate.errorRate);
-  if (errorSampleSize !== null && organic.attempts !== undefined && errorSampleSize !== organic.attempts) {
-    reasons.push("error_denominator_mismatch");
-  }
-  const latencySampleSize = signalSampleSize(candidate.p90LatencyMs);
-  if (latencySampleSize !== null && organic.attempts !== undefined && latencySampleSize !== organic.attempts) {
-    reasons.push("latency_denominator_mismatch");
-  }
-  const busySampleSize = signalSampleSize(candidate.busyRate);
-  if (busySampleSize !== null && organic.opportunities !== undefined && busySampleSize !== organic.opportunities) {
-    reasons.push("busy_denominator_mismatch");
-  }
-  const organicPass = organic.pass;
-  if (costMode === "strict") {
-    const localCostSampleSize = signalSampleSize(cost.localCostPerAcceptedUsd);
-    const baselineCostSampleSize = signalSampleSize(cost.baselineCostPerAcceptedUsd);
-    if (organicPass !== undefined) {
-      if (localCostSampleSize !== null && localCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
-      if (baselineCostSampleSize !== null && baselineCostSampleSize !== organicPass) reasons.push("cost_denominator_mismatch");
-    }
-    if (localCostSampleSize !== null && baselineCostSampleSize !== null && localCostSampleSize !== baselineCostSampleSize) {
-      reasons.push("cost_denominator_mismatch");
-    }
-  }
+  validateCandidateOrganicCoverage(candidate, organic, cost, thresholds, costMode, reasons);
 
   const eligibilityReport = {
     nonJudgmentLane: typeof eligibility.nonJudgmentLane === "boolean" ? eligibility.nonJudgmentLane : null,

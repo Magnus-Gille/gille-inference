@@ -39,6 +39,10 @@ function insertDelegation(db: Database.Database, id: string, hash: string | null
   db.prepare("INSERT INTO delegations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(id, "2026-09-01T12:00:00.000Z", "m5", "mellum", "code-edit", outcome, 0, null, hash, "policy-v1", "mcp");
 }
 
+function insertFeedback(db: Database.Database, id: string, purpose: string, epoch: string, usefulness: string | null, available = 1) {
+  db.prepare("INSERT INTO execution_feedback VALUES (?, ?, ?, ?, ?, ?)").run(`handle-${id}`, id, purpose, epoch, usefulness, available);
+}
+
 describe("candidate evidence report", () => {
   it("joins a resolved snapshot, exact organic feedback and cost without emitting identifiers", () => {
     const db = schema();
@@ -68,6 +72,51 @@ describe("candidate evidence report", () => {
     expect(readFileSync(path).equals(before)).toBe(true);
     expect(report).toMatchObject({ rows: { inWindow: 1, unknownPurpose: 1 }, feedback: { missing: 1, byPurpose: { unknown: 1 } } });
     rmSync(directory, { recursive: true, force: true });
+  });
+
+  it.each([
+    {
+      name: "counts eligible current organic feedback as assessed",
+      delegations: [["eligible", "pass"]],
+      feedback: [["eligible", "organic", EXECUTION_FEEDBACK_EPOCH, "pass"]],
+      expected: {
+        rows: { inWindow: 1, organic: 1, unknownPurpose: 0 },
+        feedback: { missing: 0, duplicate: 0, conflicting: 0, legacyEpoch: 0, byPurpose: { organic: 1, unknown: 0 }, organic: { completed: 1, assessed: 1, pass: 1 } },
+      },
+    },
+    {
+      name: "keeps missing and unrecognized purposes unknown",
+      delegations: [["missing", "pass"], ["unknown", "pass"]],
+      feedback: [["unknown", "future-purpose", EXECUTION_FEEDBACK_EPOCH, "pass"]],
+      expected: {
+        rows: { inWindow: 2, organic: 0, unknownPurpose: 2 },
+        feedback: { missing: 1, duplicate: 0, conflicting: 0, legacyEpoch: 0, byPurpose: { organic: 0, unknown: 2 }, organic: { completed: 0, assessed: 0 } },
+      },
+    },
+    {
+      name: "separates duplicate, conflicting, and legacy feedback",
+      delegations: [["duplicate", "pass"], ["conflict", "pass"], ["legacy", "pass"]],
+      feedback: [
+        ["duplicate", "organic", EXECUTION_FEEDBACK_EPOCH, "pass"],
+        ["duplicate", "organic", EXECUTION_FEEDBACK_EPOCH, "pass"],
+        ["conflict", "organic", EXECUTION_FEEDBACK_EPOCH, "pass"],
+        ["conflict", "evaluation", EXECUTION_FEEDBACK_EPOCH, "wrong"],
+        ["legacy", "organic", "old-epoch", "pass"],
+      ],
+      expected: {
+        rows: { inWindow: 3, organic: 2, unknownPurpose: 1 },
+        feedback: { missing: 0, duplicate: 2, conflicting: 1, legacyEpoch: 1, byPurpose: { organic: 2, evaluation: 0, unknown: 1 }, organic: { completed: 0, assessed: 0 } },
+        diagnostics: { duplicateFeedback: 2, unknownPurpose: 1, unassessedFeedback: 0 },
+      },
+    },
+  ])("characterizes feedback aggregation: $name", ({ delegations, feedback, expected }) => {
+    const db = schema();
+    for (const [id, outcome] of delegations) insertDelegation(db, id, null, outcome);
+    for (const [id, purpose, epoch, usefulness] of feedback) insertFeedback(db, id, purpose, epoch, usefulness);
+
+    const report = buildCandidateEvidenceReport(db, { from: FROM, throughExclusive: THROUGH, generatedAt: GENERATED });
+
+    expect(report).toMatchObject(expected);
   });
 
   it("keeps unresolved, mismatched, duplicate, failed and non-organic rows explicit", () => {

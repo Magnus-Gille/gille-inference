@@ -127,6 +127,63 @@ function unavailableReport(options: CandidateEvidenceOptions, reason: "missing_t
   return { ...report, generatedAt: options.generatedAt, window: { from: options.from, throughExclusive: options.throughExclusive }, unavailableReason: reason };
 }
 
+function aggregateCandidateFeedback(
+  base: CandidateEvidenceReport,
+  rows: Array<Record<string, unknown>>,
+  feedbackRows: Array<Record<string, unknown>>,
+): void {
+  const feedbackById = new Map<string, Array<Record<string, unknown>>>();
+  for (const feedback of feedbackRows) {
+    const id = typeof feedback.ledger_id === "string" && feedback.ledger_id.trim() !== "" ? feedback.ledger_id : null;
+    if (id === null) continue;
+    const list = feedbackById.get(id) ?? [];
+    list.push(feedback);
+    feedbackById.set(id, list);
+  }
+  for (const row of rows) {
+    const id = typeof row.id === "string" && row.id.trim() !== "" ? row.id : null;
+    const matches = id === null ? [] : feedbackById.get(id) ?? [];
+    if (matches.length === 0) {
+      base.feedback.missing += 1;
+      base.feedback.byPurpose.unknown += 1;
+      base.rows.unknownPurpose += 1;
+      continue;
+    }
+    const purposes = new Set(matches.map((m) => {
+      const purpose = m.traffic_purpose;
+      return purpose === "organic" || purpose === "evaluation" || purpose === "synthetic" ? purpose : "unknown";
+    }));
+    const purpose = purposes.size === 1 ? [...purposes][0] : "unknown";
+    const rowPurpose = purpose === "organic" || purpose === "evaluation" || purpose === "synthetic" ? purpose : "unknownPurpose";
+    base.rows[rowPurpose] += 1;
+    base.feedback.byPurpose[purpose] += 1;
+    if (matches.length !== 1) {
+      base.feedback.duplicate += 1; base.diagnostics.duplicateFeedback += 1;
+      const signatures = new Set(matches.map((m) => JSON.stringify([m.traffic_purpose, m.epoch, m.usefulness, m.available])));
+      if (signatures.size > 1) base.feedback.conflicting += 1;
+      continue;
+    }
+    const feedback = matches[0];
+    if (feedback.epoch !== EXECUTION_FEEDBACK_EPOCH) { base.feedback.legacyEpoch += 1; continue; }
+    if (feedback.available !== 1) { base.feedback.unavailable += 1; continue; }
+    if (purpose !== "organic") continue;
+    const knownOutcome = row.outcome === "pass" || row.outcome === "partial"
+      || row.outcome === "fail" || row.outcome === "unverified";
+    const eligible = row.node_id === "m5" && row.shadow === 0 && row.superseded_at === null && knownOutcome;
+    if (!eligible) continue;
+    base.feedback.organic.completed += 1;
+    const usefulness = feedback.usefulness;
+    if (typeof usefulness === "string" && ["pass", "partial", "redo", "wrong"].includes(usefulness)) {
+      base.feedback.organic.assessed += 1;
+      base.feedback.organic[usefulness as "pass" | "partial" | "redo" | "wrong"] += 1;
+    } else {
+      base.feedback.organic.missing += 1;
+      base.diagnostics.unassessedFeedback += 1;
+    }
+  }
+  base.diagnostics.unknownPurpose = base.rows.unknownPurpose;
+}
+
 /** Build the content-blind candidate evidence diagnostic. This function never creates schema or writes. */
 export function buildCandidateEvidenceReport(db: Database.Database, options: CandidateEvidenceOptions): CandidateEvidenceReport {
   const fromMs = parseIso("from", options.from);
@@ -220,56 +277,7 @@ export function buildCandidateEvidenceReport(db: Database.Database, options: Can
   const feedbackRows = feedbackStatus === "available"
     ? db.prepare("SELECT ledger_id, traffic_purpose, epoch, usefulness, available FROM execution_feedback ORDER BY rowid ASC").all() as Array<Record<string, unknown>>
     : [];
-  const feedbackById = new Map<string, Array<Record<string, unknown>>>();
-  for (const feedback of feedbackRows) {
-    const id = typeof feedback.ledger_id === "string" && feedback.ledger_id.trim() !== "" ? feedback.ledger_id : null;
-    if (id === null) continue;
-    const list = feedbackById.get(id) ?? [];
-    list.push(feedback);
-    feedbackById.set(id, list);
-  }
-  for (const row of rows) {
-    const id = typeof row.id === "string" && row.id.trim() !== "" ? row.id : null;
-    const matches = id === null ? [] : feedbackById.get(id) ?? [];
-    if (matches.length === 0) {
-      base.feedback.missing += 1;
-      base.feedback.byPurpose.unknown += 1;
-      base.rows.unknownPurpose += 1;
-      continue;
-    }
-    const purposes = new Set(matches.map((m) => {
-      const purpose = m.traffic_purpose;
-      return purpose === "organic" || purpose === "evaluation" || purpose === "synthetic" ? purpose : "unknown";
-    }));
-    const purpose = purposes.size === 1 ? [...purposes][0] : "unknown";
-    const rowPurpose = purpose === "organic" || purpose === "evaluation" || purpose === "synthetic" ? purpose : "unknownPurpose";
-    base.rows[rowPurpose] += 1;
-    base.feedback.byPurpose[purpose] += 1;
-    if (matches.length !== 1) {
-      base.feedback.duplicate += 1; base.diagnostics.duplicateFeedback += 1;
-      const signatures = new Set(matches.map((m) => JSON.stringify([m.traffic_purpose, m.epoch, m.usefulness, m.available])));
-      if (signatures.size > 1) base.feedback.conflicting += 1;
-      continue;
-    }
-    const feedback = matches[0];
-    if (feedback.epoch !== EXECUTION_FEEDBACK_EPOCH) { base.feedback.legacyEpoch += 1; continue; }
-    if (feedback.available !== 1) { base.feedback.unavailable += 1; continue; }
-    if (purpose !== "organic") continue;
-    const knownOutcome = row.outcome === "pass" || row.outcome === "partial"
-      || row.outcome === "fail" || row.outcome === "unverified";
-    const eligible = row.node_id === "m5" && row.shadow === 0 && row.superseded_at === null && knownOutcome;
-    if (!eligible) continue;
-    base.feedback.organic.completed += 1;
-    const usefulness = feedback.usefulness;
-    if (typeof usefulness === "string" && ["pass", "partial", "redo", "wrong"].includes(usefulness)) {
-      base.feedback.organic.assessed += 1;
-      base.feedback.organic[usefulness as "pass" | "partial" | "redo" | "wrong"] += 1;
-    } else {
-      base.feedback.organic.missing += 1;
-      base.diagnostics.unassessedFeedback += 1;
-    }
-  }
-  base.diagnostics.unknownPurpose = base.rows.unknownPurpose;
+  aggregateCandidateFeedback(base, rows, feedbackRows);
 
   const selectedIds = new Set(rows.flatMap((row) => typeof row.id === "string" && row.id.trim() !== "" ? [row.id] : []));
   const costs = costStatus === "available"

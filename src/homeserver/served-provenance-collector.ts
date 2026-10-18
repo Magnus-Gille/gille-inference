@@ -392,6 +392,42 @@ function finiteNumber(raw: string): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
+function canonicalFlag(flag: string): string {
+  if (MODEL_FLAGS.has(flag)) return "model";
+  if (PROJECTOR_FLAGS.has(flag)) return "projector";
+  if (CONTEXT_FLAGS.has(flag)) return "contextSize";
+  if (PARALLEL_FLAGS.has(flag)) return "parallelism";
+  if (TEMPERATURE_FLAGS.has(flag)) return "temperature";
+  if (TOP_P_FLAGS.has(flag)) return "topP";
+  if (TOP_K_FLAGS.has(flag)) return "topK";
+  if (MIN_P_FLAGS.has(flag)) return "minP";
+  if (PREDICT_FLAGS.has(flag)) return "predictLimit";
+  return flag;
+}
+
+type FlagValueRead =
+  | { invalid: true; nextIndex: number; value: undefined }
+  | { invalid: false; nextIndex: number; value: string };
+
+function readFlagValue(
+  argv: string[],
+  index: number,
+  rawFlag: string,
+  inlineValue: string | undefined,
+): FlagValueRead {
+  if (inlineValue !== undefined) return { invalid: false, nextIndex: index, value: inlineValue };
+
+  const value = argv[index + 1];
+  const numericValue = value !== undefined && finiteNumber(value) !== null;
+  if (value === undefined || (value.startsWith("-") && !isRemoteArtifact(value) &&
+    !((CONTEXT_FLAGS.has(rawFlag) || PARALLEL_FLAGS.has(rawFlag) || TEMPERATURE_FLAGS.has(rawFlag) ||
+      TOP_P_FLAGS.has(rawFlag) || TOP_K_FLAGS.has(rawFlag) || MIN_P_FLAGS.has(rawFlag) ||
+      PREDICT_FLAGS.has(rawFlag)) && numericValue))) {
+    return { invalid: true, nextIndex: index, value: undefined };
+  }
+  return { invalid: false, nextIndex: index + 1, value };
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const flags = emptyLaunchFlags();
   const counts = new Map<string, number>();
@@ -402,19 +438,6 @@ function parseArgs(argv: string[]): ParsedArgs {
   let artifactInvalid = false;
   let launchAmbiguous = false;
   let launchInvalid = false;
-
-  const canonical = (flag: string): string => {
-    if (MODEL_FLAGS.has(flag)) return "model";
-    if (PROJECTOR_FLAGS.has(flag)) return "projector";
-    if (CONTEXT_FLAGS.has(flag)) return "contextSize";
-    if (PARALLEL_FLAGS.has(flag)) return "parallelism";
-    if (TEMPERATURE_FLAGS.has(flag)) return "temperature";
-    if (TOP_P_FLAGS.has(flag)) return "topP";
-    if (TOP_K_FLAGS.has(flag)) return "topK";
-    if (MIN_P_FLAGS.has(flag)) return "minP";
-    if (PREDICT_FLAGS.has(flag)) return "predictLimit";
-    return flag;
-  };
 
   for (let index = 1; index < argv.length; index++) {
     const token = argv[index]!;
@@ -433,24 +456,18 @@ function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
 
-    const key = canonical(rawFlag);
-    let value = inline?.value;
-    if (value === undefined) {
-      value = argv[index + 1];
-      const numericValue = value !== undefined && finiteNumber(value) !== null;
-      if (value === undefined || (value.startsWith("-") && !isRemoteArtifact(value) &&
-        !((CONTEXT_FLAGS.has(rawFlag) || PARALLEL_FLAGS.has(rawFlag) || TEMPERATURE_FLAGS.has(rawFlag) ||
-          TOP_P_FLAGS.has(rawFlag) || TOP_K_FLAGS.has(rawFlag) || MIN_P_FLAGS.has(rawFlag) ||
-          PREDICT_FLAGS.has(rawFlag)) && numericValue))) {
-        if (key === "model" || key === "projector") {
-          artifactInvalid = true;
-          counts.set(key, (counts.get(key) ?? 0) + 1);
-        }
-        if (key !== "model" && key !== "projector") launchInvalid = true;
-        continue;
+    const key = canonicalFlag(rawFlag);
+    const valueRead = readFlagValue(argv, index, rawFlag, inline?.value);
+    if (valueRead.invalid) {
+      if (key === "model" || key === "projector") {
+        artifactInvalid = true;
+        counts.set(key, (counts.get(key) ?? 0) + 1);
       }
-      index++;
+      if (key !== "model" && key !== "projector") launchInvalid = true;
+      continue;
     }
+    const value = valueRead.value;
+    index = valueRead.nextIndex;
     if (value === "") {
       if (key === "model" || key === "projector") {
         artifactInvalid = true;

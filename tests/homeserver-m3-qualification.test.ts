@@ -300,6 +300,28 @@ describe("evaluateM3Qualification", () => {
     expect(result.candidates[0]?.reasons).toContain("uncalibrated_cost");
   });
 
+  it("reports the exact sorted and deduplicated strict cost failures", () => {
+    const value = input();
+    value.thresholds!.maxLocalToBaselineRatio = 1;
+    value.candidates[0]!.cost.localProvenance = "bad provenance";
+    value.candidates[0]!.cost.localCostPerAcceptedUsd = measured(0.3, 7);
+    value.candidates[0]!.cost.baselineCostPerAcceptedUsd = measured(0.2, 6);
+    value.candidates[0]!.cost.calibrated = measured(false);
+    value.candidates[0]!.cost.exactOneCostCoverage = measured(false);
+
+    const result = evaluateM3Qualification(value);
+
+    expect(result.analysisVerdict).toBe("HOLD");
+    expect(result.candidates[0]?.reasons).toEqual([
+      "cost_denominator_mismatch",
+      "cost_exceeded",
+      "cost_ratio_exceeded",
+      "invalid_cost",
+      "invalid_cost_coverage",
+      "uncalibrated_cost",
+    ]);
+  });
+
   it("holds when lane busy evidence is unavailable", () => {
     const value = input();
     value.candidates[0]!.busyRate = unknown();
@@ -523,6 +545,36 @@ describe("evaluateM3FirstCanaryQualification", () => {
       expect(result.candidates[0]?.reasons).toContain("invalid_cost_evidence");
       expect(JSON.stringify(result)).not.toContain("secret");
     }
+  });
+
+  it("reports the exact sorted and deduplicated multi-error non-cost gate set", () => {
+    const value = firstCanaryInput();
+    value.candidates[0]!.eligibility.nonJudgmentLane = false;
+    value.candidates[0]!.policy.fullStamps = ["ctx-tools-parts-v1|ctx=23000"];
+    value.candidates[0]!.verifier.trusted = false;
+    value.candidates[0]!.safety.boundedTaskType = measured(false);
+    value.candidates[0]!.samples.organic.opportunities = measured(1, 1);
+    value.candidates[0]!.qualityRate = measured(0.1);
+    value.candidates[0]!.errorRate = measured(0.5);
+    value.candidates[0]!.p90LatencyMs = measured(1000);
+    value.candidates[0]!.busyRate = measured(0.5);
+
+    const result = evaluateM3FirstCanaryQualification(value);
+
+    expect(result.canaryEligibility).toBe("HOLD");
+    expect(result.candidates[0]?.reasons).toEqual([
+      "busy_denominator_mismatch",
+      "busy_rate_exceeded",
+      "error_rate_exceeded",
+      "inconsistent_counts",
+      "ineligible_candidate",
+      "insufficient_organic_sample",
+      "insufficient_quality",
+      "latency_exceeded",
+      "stale_policy",
+      "unsafe_task_type",
+      "untrusted_verifier",
+    ]);
   });
 
   it("retains every reviewed non-cost gate in the scoped diagnostic", () => {

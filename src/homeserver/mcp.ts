@@ -1,3 +1,11 @@
+import {
+  ASK_REASONING_MAX_BYTES,
+  ASK_TRUNCATION_FINISH_REASON,
+  InvalidAskResponse,
+  parseAskChatResponse,
+  type AskReasoning,
+  type AskUsageMetadata,
+} from "./mcp-chat-response.js";
 import type { ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { clampMaxTokensForModel, type HomeserverConfig } from "./config.js";
@@ -12,7 +20,8 @@ import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmis
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
 import { bindExecutionFeedback, executionFeedbackOwner } from "./execution-feedback.js";
-import { parseExecutionTrafficPurpose, type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
+import { type ExecutionTrafficPurpose } from "./execution-feedback-contract.js";
+import { normalizeAskArgs } from "./mcp-ask-arguments.js";
 import { buildDelegationCostTrace, tryRecordDelegationCost } from "./delegation-cost.js";
 import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
@@ -45,6 +54,7 @@ import { currentTraceHeaders } from "./tracing.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { isEmbeddingModel } from "./embedding-request.js";
 import { TOKENIZE_TOOL, runTokenize } from "./tokenize.js";
+import { parseMcpEnvelope, type JsonRpcRequest } from "./mcp-envelope.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -87,13 +97,6 @@ interface McpPostResult {
 }
 
 // ─── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────────────
-
-interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id?: string | number | null;
-  method?: unknown;
-  params?: unknown;
-}
 
 const PROTOCOL_VERSION = "2025-06-18";
 
@@ -277,26 +280,7 @@ const ASK_OUTPUT_SCHEMA = {
   required: ["model", "text", "finish_reason", "truncated", "metered", "usage"],
 } as const;
 
-/** Only the separately requested reasoning field is capped; generation/usage is unchanged. */
-export const ASK_REASONING_MAX_BYTES = 16_384;
-class InvalidAskResponse extends Error {}
-interface AskReasoning {
-  content: string | null;
-  truncated: boolean | null;
-}
-function boundedAskReasoning(raw: unknown): AskReasoning {
-  if (typeof raw !== "string") return { content: null, truncated: null };
-  let bytes = 0;
-  let end = 0;
-  // Stop at a complete Unicode code point. Never decode a sliced UTF-8 byte sequence.
-  for (const character of raw) {
-    const next = Buffer.byteLength(character, "utf8");
-    if (bytes + next > ASK_REASONING_MAX_BYTES) return { content: raw.slice(0, end), truncated: true };
-    bytes += next;
-    end += character.length;
-  }
-  return { content: raw, truncated: false };
-}
+export { ASK_REASONING_MAX_BYTES } from "./mcp-chat-response.js";
 const ASK_OWNER_OUTPUT_SCHEMA = {
   ...ASK_OUTPUT_SCHEMA,
   properties: {
@@ -647,15 +631,6 @@ export interface RunChatArgs {
   trafficPurpose?: ExecutionTrafficPurpose;
 }
 
-interface AskUsageMetadata {
-  promptTokens: number | null;
-  completionTokens: number | null;
-  totalTokens: number | null;
-  reasoningTokens: number | null;
-  cacheCreationInputTokens: number | null;
-  cacheReadInputTokens: number | null;
-}
-
 export type RunChatResult =
   | {
       ok: true;
@@ -729,27 +704,6 @@ export function askFailureMeta(failure: Extract<RunChatResult, { ok: false }>): 
   };
 }
 
-const ASK_TRUNCATION_FINISH_REASON = "length";
-
-function emptyAskUsageMetadata(): AskUsageMetadata {
-  return {
-    promptTokens: null,
-    completionTokens: null,
-    totalTokens: null,
-    reasoningTokens: null,
-    cacheCreationInputTokens: null,
-    cacheReadInputTokens: null,
-  };
-}
-
-function nonNegativeIntegerOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
-}
-
-function askTruncatedOfFinishReason(finishReason: string | null): boolean | null {
-  return finishReason === null ? null : finishReason === ASK_TRUNCATION_FINISH_REASON;
-}
-
 function isAskTokenLimitTruncation(result: Extract<RunChatResult, { ok: true }>): boolean {
   return result.truncated === true && result.finishReason === ASK_TRUNCATION_FINISH_REASON;
 }
@@ -762,54 +716,6 @@ function askTruncationWarningText(partialText: string): string {
     "Partial response follows:",
   ].join("\n");
   return partialText.length > 0 ? `${prefix}\n\n${partialText}` : prefix;
-}
-
-function parseAskUsageMetadata(rawUsage: unknown): AskUsageMetadata {
-  if (rawUsage === null || rawUsage === undefined) {
-    return emptyAskUsageMetadata();
-  }
-  if (typeof rawUsage !== "object" || Array.isArray(rawUsage)) {
-    return emptyAskUsageMetadata();
-  }
-  const usage = rawUsage as {
-    prompt_tokens?: unknown;
-    input_tokens?: unknown;
-    completion_tokens?: unknown;
-    output_tokens?: unknown;
-    total_tokens?: unknown;
-    reasoning_tokens?: unknown;
-    cache_creation_input_tokens?: unknown;
-    cache_read_input_tokens?: unknown;
-    prompt_tokens_details?: {
-      cached_tokens?: unknown;
-      cache_read_input_tokens?: unknown;
-      cache_creation_input_tokens?: unknown;
-    };
-    completion_tokens_details?: {
-      reasoning_tokens?: unknown;
-    };
-  };
-  const promptTokens =
-    nonNegativeIntegerOrNull(usage.prompt_tokens) ?? nonNegativeIntegerOrNull(usage.input_tokens);
-  const completionTokens =
-    nonNegativeIntegerOrNull(usage.completion_tokens) ?? nonNegativeIntegerOrNull(usage.output_tokens);
-  return {
-    promptTokens,
-    completionTokens,
-    totalTokens:
-      nonNegativeIntegerOrNull(usage.total_tokens) ??
-      (promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null),
-    reasoningTokens:
-      nonNegativeIntegerOrNull(usage.reasoning_tokens) ??
-      nonNegativeIntegerOrNull(usage.completion_tokens_details?.reasoning_tokens),
-    cacheCreationInputTokens:
-      nonNegativeIntegerOrNull(usage.cache_creation_input_tokens) ??
-      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cache_creation_input_tokens),
-    cacheReadInputTokens:
-      nonNegativeIntegerOrNull(usage.cache_read_input_tokens) ??
-      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cache_read_input_tokens) ??
-      nonNegativeIntegerOrNull(usage.prompt_tokens_details?.cached_tokens),
-  };
 }
 
 function toAskStructuredContent(
@@ -1190,37 +1096,12 @@ export async function runChatCompletion(
       };
     }
 
-    let content = "";
     // Recheck tier at the shared helper boundary; never mix reasoning into final text or logs.
     const includeReasoning = args.includeReasoning === true && principal.tier === "owner";
-    let reasoning = includeReasoning ? boundedAskReasoning(undefined) : undefined;
-    let promptTokens: number | null = null;
-    let completionTokens: number | null = null;
-    let usageMetadata = emptyAskUsageMetadata();
-    let finishReason: string | null = null;
-    let truncated: boolean | null = null;
+    let parsed: ReturnType<typeof parseAskChatResponse>;
     try {
-      const json = JSON.parse(text) as {
-        choices?: Array<{ message?: { content?: string; reasoning_content?: unknown }; finish_reason?: string | null }>;
-        usage?: unknown;
-      };
-      if (json === null || typeof json !== "object" || Array.isArray(json) ||
-          (json.choices != null && !Array.isArray(json.choices))) throw new InvalidAskResponse();
-      const message = json.choices?.[0]?.message;
-      if (message != null && (typeof message !== "object" || Array.isArray(message) ||
-          (message.content != null && typeof message.content !== "string"))) throw new InvalidAskResponse();
-      content = message?.content ?? "";
-      if (includeReasoning) reasoning = boundedAskReasoning(message?.reasoning_content);
-      usageMetadata = parseAskUsageMetadata(json.usage);
-      promptTokens = usageMetadata.promptTokens;
-      completionTokens = usageMetadata.completionTokens;
-      finishReason = typeof json.choices?.[0]?.finish_reason === "string" ? json.choices[0].finish_reason : null;
-      truncated = askTruncatedOfFinishReason(finishReason);
-      actualTokens =
-        usageMetadata.totalTokens ??
-        (promptTokens !== null && completionTokens !== null
-          ? promptTokens + completionTokens
-          : Math.ceil(promptChars / 4));
+      parsed = parseAskChatResponse(text, { includeReasoning, promptChars });
+      actualTokens = parsed.actualTokens;
     } catch (error) {
       if (!(error instanceof SyntaxError) && !(error instanceof InvalidAskResponse)) throw error;
       // A malformed envelope may contain reasoning bytes. Never reflect it as a final answer
@@ -1229,6 +1110,8 @@ export async function runChatCompletion(
       return { ok: false, requestId: inferenceRequestId, code: "upstream_error", message: "The model backend returned an invalid chat response.",
         traceOutcome: "error", traceErrorClass: "upstream_error" };
     }
+    const { content, reasoning, usage: usageMetadata, finishReason, truncated } = parsed;
+    const { promptTokens, completionTokens } = usageMetadata;
     metricPrompt = promptTokens;
     metricCompletion = completionTokens;
     // C3 / M1: the model label is canonModel (computed once at the top via canonicalizeModelTrusted,
@@ -1580,62 +1463,23 @@ async function callTool(
         meta: { m5_code: "route_not_allowed", retryable: false },
         trace: { traceOutcome: "forbidden", traceErrorClass: "route_not_allowed" } };
     }
-    const model = typeof args["model"] === "string" ? (args["model"] as string) : "";
-    const prompt = typeof args["prompt"] === "string" ? (args["prompt"] as string) : "";
-    const system = typeof args["system"] === "string" ? (args["system"] as string) : undefined;
-    const rawOutputProfile = args["output_profile"];
-    if (rawOutputProfile !== undefined && rawOutputProfile !== COMPLETE_WITHIN_BUDGET_PROFILE) {
-      return {
-        text: `'output_profile' must be '${COMPLETE_WITHIN_BUDGET_PROFILE}' when supplied.`,
-        isError: true,
-        trace: badRequestTrace(),
-      };
+    const normalized = normalizeAskArgs(args, COMPLETE_WITHIN_BUDGET_PROFILE);
+    if (!normalized.ok) {
+      return { text: normalized.message, isError: true, trace: badRequestTrace() };
     }
-    const outputProfile = rawOutputProfile === COMPLETE_WITHIN_BUDGET_PROFILE
-      ? COMPLETE_WITHIN_BUDGET_PROFILE
-      : undefined;
-    const rawDelegatorModelId = args["delegator_model_id"] ?? args["delegatorModelId"];
-    if (
-      rawDelegatorModelId !== undefined &&
-      (typeof rawDelegatorModelId !== "string" || rawDelegatorModelId.trim() === "")
-    ) {
-      return {
-        text: "'delegator_model_id' must be a non-empty string when supplied.",
-        isError: true,
-        trace: badRequestTrace(),
-      };
-    }
-    const delegatorModelId = typeof rawDelegatorModelId === "string" ? rawDelegatorModelId : undefined;
-    const trafficPurpose = parseExecutionTrafficPurpose(args["traffic_purpose"]);
-    if (!trafficPurpose.ok) {
-      return { text: "Invalid traffic_purpose.", isError: true, trace: badRequestTrace() };
-    }
-    if (model === "" || prompt === "") {
-      return { text: "Both 'model' and 'prompt' are required.", isError: true, trace: badRequestTrace() };
-    }
-    const samplerSpecs = [
-      ["temperature", 0, 2, false],
-      ["top_p", 0, 1, false],
-      ["top_k", 0, Number.MAX_SAFE_INTEGER, true],
-      ["min_p", 0, 1, false],
-    ] as const;
-    for (const [field, min, max, integer] of samplerSpecs) {
-      const value = args[field];
-      if (value === undefined) continue;
-      if (
-        typeof value !== "number" ||
-        !Number.isFinite(value) ||
-        value < min ||
-        value > max ||
-        (integer && !Number.isInteger(value))
-      ) {
-        return {
-          text: `'${field}' must be ${integer ? "an integer" : "a number"} in [${min}, ${max}].`,
-          isError: true,
-          trace: badRequestTrace(),
-        };
-      }
-    }
+    const {
+      model,
+      prompt,
+      system,
+      outputProfile,
+      delegatorModelId,
+      trafficPurpose,
+      files,
+      temperature,
+      topP,
+      topK,
+      minP,
+    } = normalized.value;
 
     // #128 (blind-context delegation): `files` is OWNER-TIER ONLY, enforced HERE — the earliest
     // point in the request that has BOTH the resolved principal tier (ctx.principal, set by the
@@ -1644,21 +1488,6 @@ async function callTool(
     // never inspects per-tool params). A guest key carrying `files` is NEVER silently ignored: it
     // is rejected before any credit reservation / quota / admission work runs, using the same
     // OpenAI-shaped error vocabulary (errors.ts) as the rest of the gateway.
-    let files: string[] | undefined;
-    if (args["files"] !== undefined) {
-      const raw = args["files"];
-      // `raw.length > 0` matters: `[].every(...)` is vacuously true, so without it an empty
-      // array would slip through as a SILENT no-op — for a guest that would contradict the
-      // "supplying `files` is never silently ignored" contract this error message states.
-      if (!Array.isArray(raw) || raw.length === 0 || !raw.every((f) => typeof f === "string" && f.length > 0)) {
-        return {
-          text: "'files' must be a non-empty array of absolute path strings.",
-          isError: true,
-          trace: badRequestTrace(),
-        };
-      }
-      files = raw as string[];
-    }
     if (files !== undefined && files.length > 0 && !isAskFilesOwner(ctx.principal)) {
       const env = makeError("route_not_allowed", {
         message: "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
@@ -1702,13 +1531,13 @@ async function callTool(
       messages,
       exposureTaskText: prompt,
       ...(includeReasoning === true ? { includeReasoning: true } : {}),
-      trafficPurpose: trafficPurpose.value,
+      trafficPurpose,
       maxTokens,
       delegatorModelId,
-      temperature: args["temperature"] as number | undefined,
-      topP: args["top_p"] as number | undefined,
-      topK: args["top_k"] as number | undefined,
-      minP: args["min_p"] as number | undefined,
+      temperature,
+      topP,
+      topK,
+      minP,
       reasoningEffort:
         outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE && supportsReasoningEffort(model)
           ? "low"
@@ -1772,19 +1601,17 @@ async function callTool(
  * Always resolves; never throws to the gateway's top-level handler.
  */
 export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: ToolCallContext): Promise<McpPostResult> {
-  let msg: JsonRpcRequest;
-  try {
-    msg = JSON.parse(rawBody) as JsonRpcRequest;
-  } catch {
+  const parsed = parseMcpEnvelope(rawBody);
+  if (!parsed.ok) {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcError(null, PARSE_ERROR, "Parse error"));
+    if (parsed.kind === "parse") {
+      res.end(rpcError(null, PARSE_ERROR, "Parse error"));
+    } else {
+      res.end(rpcError(null, INVALID_REQUEST, "Invalid Request"));
+    }
     return { trace: badRequestTrace() };
   }
-  if (typeof msg !== "object" || msg === null || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(rpcError(null, INVALID_REQUEST, "Invalid Request"));
-    return { trace: badRequestTrace() };
-  }
+  const msg = parsed.message;
 
   const method = msg.method;
   const isNotification = msg.id === undefined || msg.id === null;
