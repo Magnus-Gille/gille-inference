@@ -11,11 +11,11 @@ import { getDb } from "../db.js";
  *
  * GUESTS ARE NEVER CONTENT-LOGGED. The single guard lives at each capture site:
  *   principal.tier === "owner" && principal.keyHash !== null
- * — which captures only real minted owner keys and deliberately EXCLUDES implicit-admin and
- * legacy static-key admins (both have keyHash === null). The rationale: a content log is a
- * privacy-sensitive surface, so we log only the operator's own deliberately-minted owner keys,
- * never an ambient bootstrap/legacy posture that may not represent a real human operator. A
- * guest tier, a legacy static key, or implicit-admin therefore NEVER produces a row.
+ * — which captures only real minted owner keys and deliberately EXCLUDES legacy static-key
+ * admins (keyHash === null). The rationale: a content log is a privacy-sensitive surface, so we
+ * log only the operator's own deliberately-minted owner keys, never a legacy posture that may not
+ * represent a real human operator. A guest tier or legacy static key therefore NEVER produces a
+ * row.
  *
  * Writes are strictly best-effort: every insert is wrapped in try/catch so a log failure can
  * NEVER affect (fail, slow, or alter) the request itself. The schema is additive and created

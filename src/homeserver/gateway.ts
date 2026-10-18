@@ -91,6 +91,7 @@ import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
 import { IncidentWindowOptionsError, queryIncidentWindow } from "./incident-window.js";
 import { configuredDelegateModelIds, isComputeNodeId, orinEnabled, probeOrin, runOrinChat } from "./nodes.js";
 import { parseMultipart } from "./multipart.js";
+import { AudioUploadAdmission } from "./audio-upload-admission.js";
 import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image-request.js";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
   SYSTEMONE_MAX_BODY_BYTES,
@@ -202,7 +203,7 @@ interface PrincipalContext {
   maxParallel: number;
   /**
    * sha256(token) for a minted store key — the handle credit accounting keys on. null for
-   * legacy static keys / implicit-admin (which have no per-key credit row).
+   * legacy static keys (which have no per-key credit row).
    */
   keyHash: string | null;
   /** Lifetime credit cap snapshot (0 = unlimited). null when there is no credit row. */
@@ -226,51 +227,12 @@ function bearerToken(req: IncomingMessage): string | null {
  * Resolve a request to a principal. The keystore is the primary path; the legacy static
  * keys are a fallback so existing deployments keep working. Returns null on no/invalid key.
  */
-/**
- * Whether a no-token request may be granted implicit owner/admin. SAFE ONLY on a
- * loopback bind with truly zero credentials of any kind (no legacy env keys AND no
- * minted store keys). Computed ONCE at startup and frozen by startGateway() — never on
- * a LAN/internet bind, and not re-derived per request — so it cannot fail open if keys
- * are later revoked or expire while a 0.0.0.0/Tunnel-bound server is running.
- */
-export function isImplicitAdminAllowed(cfg: HomeserverConfig, loopback: boolean): boolean {
-  return (
-    loopback &&
-    cfg.apiKeys.length === 0 &&
-    cfg.adminApiKeys.length === 0 &&
-    cfg.monitorApiKeys.length === 0 &&
-    listKeys().length === 0
-  );
-}
-
 function resolvePrincipal(
   req: IncomingMessage,
-  cfg: HomeserverConfig,
-  implicitAdminAllowed: boolean
+  cfg: HomeserverConfig
 ): PrincipalContext | null {
   const token = bearerToken(req);
-  if (!token) {
-    // Implicit-admin (no-token) is granted only when the startup-frozen posture permits
-    // it (loopback + zero credentials). See isImplicitAdminAllowed().
-    if (implicitAdminAllowed) {
-      return {
-        alias: "static:admin",
-        logicalAlias: "static:admin",
-        tier: "owner",
-        scope: "admin",
-        isAdmin: true,
-        modelAllowList: [],
-        systemOneModelAllowList: [],
-        embeddingModelAllowList: [],
-        limits: keyLimits(cfg),
-        maxParallel: cfg.keyDefaults.maxParallel,
-        keyHash: null,
-        creditLimit: 0,
-        creditsUsed: 0,
-      };
-    }
-    return null;
-  }
+  if (!token) return null;
 
   // (1) keystore
   const rec = lookupKey(token);
@@ -367,6 +329,9 @@ function keyLimits(cfg: HomeserverConfig): QuotaLimits {
 // ─── Per-key in-flight tracking ──────────────────────────────────────────────────────
 
 const keyInflight = new Map<string, number>();
+// Audio multipart bodies are buffered before GPU admission, so they need a separate bounded
+// process-wide gate. This is deliberately independent of the GPU slot budget.
+const audioUploadAdmission = new AudioUploadAdmission();
 // One CPU embedding call per gateway instance matches the sidecar's single server slot and
 // prevents queued sidecar calls from occupying every shared GPU admission slot.
 const embeddingInFlight = new WeakSet<AdmissionController>();
@@ -910,46 +875,70 @@ async function readBuffer(
         idle = null;
       }
     };
-    const armIdle = (): void => {
+    const cleanup = (): void => {
       clearIdle();
-      idle = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        // A slow-loris that never finishes: there is no clean response to send, so drop the socket.
-        req.destroy();
-        reject(new Error("request body read timed out"));
-      }, idleMs);
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("aborted", onAborted);
+      req.removeListener("close", onClose);
+      // IncomingMessage can emit `error` after `aborted`. Keep the handler until the request's
+      // close event so that this late transport error cannot become an unhandled exception.
+      if (req.closed) req.removeListener("error", onError);
+      else req.once("close", removeLateErrorListener);
+    };
+    const removeLateErrorListener = (): void => {
+      req.removeListener("error", onError);
     };
     const fail = (err: Error): void => {
       if (settled) return;
       settled = true;
-      clearIdle();
+      cleanup();
+      chunks.length = 0;
       reject(err);
     };
-    armIdle();
-    req.on("data", (c: Buffer) => {
+    const armIdle = (): void => {
+      clearIdle();
+      idle = setTimeout(() => {
+        // A slow-loris that never finishes: there is no clean response to send, so drop the socket.
+        fail(new Error("request body read timed out"));
+        req.destroy();
+      }, idleMs);
+    };
+    const onData = (c: Buffer): void => {
       if (settled) return;
       armIdle(); // reset the idle clock on every chunk
       size += c.length;
       if (size > maxBytes) {
         settled = true;
-        clearIdle();
+        cleanup();
         // Stop buffering and reject, but keep the connection writable so the caller can send a 413.
-        // Drop our reference to the buffered chunks and drain the rest of the upload.
         chunks.length = 0;
         req.resume();
         reject(new BodyTooLargeError());
         return;
       }
       chunks.push(c);
-    });
-    req.on("end", () => {
+    };
+    const onEnd = (): void => {
       if (settled) return;
       settled = true;
-      clearIdle();
-      resolve(Buffer.concat(chunks));
-    });
-    req.on("error", fail);
+      cleanup();
+      const body = Buffer.concat(chunks);
+      chunks.length = 0;
+      resolve(body);
+    };
+    const onError = (err: Error): void => fail(err);
+    const onAborted = (): void => fail(new Error("request body aborted"));
+    const onClose = (): void => {
+      if (!req.complete) fail(new Error("request body closed before completion"));
+      removeLateErrorListener();
+    };
+    armIdle();
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("aborted", onAborted);
+    req.on("close", onClose);
   });
 }
 
@@ -1004,7 +993,7 @@ async function admitAndMeterLogged(
   // reserveCredits() debits `reserve` in a single conditional UPDATE that only succeeds while
   // the key is still under its limit; SQLite serializes the writes, so the cap holds under
   // concurrency. We reconcile reserve→real after the call. keyHash null = no credit row
-  // (legacy static / implicit-admin) → skip; those are uncapped by design.
+  // (legacy static keys) → skip; those are uncapped by design.
   const creditReserve = estTokens;
   let creditReserved = false;
   if (principal.keyHash !== null && principal.creditLimit > 0) {
@@ -1245,7 +1234,7 @@ async function admitAndMeterLogged(
     // M1: reconcile the EXACT admitted quota event + daily delta via the reservation handle.
     recordUsage(principal.alias, actualTokens, Date.now(), reservation);
     // Settle the lifetime credit ledger for minted store keys (keyHash present). Legacy
-    // static keys and implicit-admin have no credit row and are skipped.
+    // static keys have no credit row and are skipped.
     if (principal.keyHash !== null) {
       if (creditReserved) {
         // Reconcile the atomic reservation to real usage: adjust by (real − reserve). An
@@ -1626,10 +1615,10 @@ async function handleChatProxy(
   // already-canonicalized lctx.model (set at the route) through as the canonicalModel.
   const servedModel = lctx.model;
   // OWNER-ONLY full request log. The guard is strictly owner-tier AND a real minted key
-  // (keyHash !== null), which EXCLUDES implicit-admin and legacy static admins (both keyHash
-  // null). Guests are never content-logged. See owner-log.ts for the full rationale.
-  // The exposure digest is content-blind and must cover every owner-tier ingress, including the
-  // legacy/implicit admin posture, or the lookup could report a false-fresh holdout. The full raw
+  // (keyHash !== null), which excludes legacy static admins (keyHash null). Guests are never
+  // content-logged. See owner-log.ts for the full rationale. The exposure digest is content-blind
+  // and must cover every owner-tier ingress, including the legacy admin posture, or the lookup
+  // could report a false-fresh holdout. The full raw
   // owner log remains deliberately narrower: only a real minted owner key may write content.
   const ownerExposure = principal.tier === "owner";
   const ownerLog = cfg.ownerRequestLog === "on" && ownerExposure && principal.keyHash !== null;
@@ -2982,6 +2971,52 @@ async function handleAudioTranscription(
   principal: PrincipalContext,
   lctx: LogCtx
 ): Promise<void> {
+  // The backend always runs the canonical Whisper model. Enforce that authorization before
+  // accepting even a single multipart body byte; a caller-supplied model field cannot change it.
+  if (principal.modelAllowList.length > 0 && !principal.modelAllowList.includes(WHISPER_MODEL)) {
+    res.setHeader("Connection", "close");
+    req.resume();
+    lctx.status = 403;
+    lctx.outcome = "forbidden";
+    lctx.errorClass = "model_not_allowed";
+    lctx.admission = "n/a";
+    sendError(res, makeError("model_not_allowed", {
+      param: "model",
+      message: `Your API key is not permitted to use model '${WHISPER_MODEL}'.`,
+    }));
+    return;
+  }
+
+  const releaseUpload = audioUploadAdmission.acquire(principal.alias, principal.tier, principal.maxParallel);
+  if (releaseUpload === null) {
+    // Do not drain an unbounded request indefinitely; tell the client this connection is closing
+    // after the bounded, content-blind busy response. No body bytes are retained by the gateway.
+    res.setHeader("Connection", "close");
+    req.resume();
+    lctx.status = 503;
+    lctx.outcome = "busy";
+    lctx.errorClass = "server_busy";
+    lctx.retryAfterS = cfg.busyRetryAfterSeconds;
+    lctx.admission = "busy";
+    recordAdmissionRejection(principal.tier);
+    sendError(res, makeError("server_busy", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
+    return;
+  }
+  try {
+    await handleAudioTranscriptionAdmitted(req, res, cfg, controller, principal, lctx);
+  } finally {
+    releaseUpload();
+  }
+}
+
+async function handleAudioTranscriptionAdmitted(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cfg: HomeserverConfig,
+  controller: AdmissionController,
+  principal: PrincipalContext,
+  lctx: LogCtx
+): Promise<void> {
   // Parse the incoming OpenAI multipart body (binary-safe). Hardened (DoS): an oversized upload is
   // rejected EARLY (413, on the declared Content-Length when present — before buffering) and the
   // read carries an idle/socket timeout so a slow-loris client cannot hold the connection open.
@@ -3306,7 +3341,7 @@ async function handleAudioTranscription(
     recordAudioSeconds(WHISPER_MODEL, audioSeconds);
 
     // OWNER-ONLY transcript capture — identical guard to the chat path (tier owner AND a real
-    // minted key). Guests / legacy static / implicit-admin NEVER get a content row.
+    // minted key). Guests and legacy static keys NEVER get a content row.
     if (cfg.ownerRequestLog === "on" && principal.tier === "owner" && principal.keyHash !== null) {
       recordOwnerRequest({
         alias: principal.alias,
@@ -3343,7 +3378,7 @@ async function handleAudioTranscription(
     recordUsage(principal.alias, actualSeconds, Date.now(), q.reservation);
     // Settle the lifetime credit ledger for minted store keys. We reserved worstCaseCost up-front;
     // reconcile it DOWN to the real cost (a valid duration refunds the difference; a fault keeps the
-    // full reservation; a failed call → actualCost 0 → full refund). Legacy static / implicit-admin
+    // full reservation; a failed call → actualCost 0 → full refund). Legacy static keys
     // (keyHash null) reserved nothing and are uncapped by design.
     if (principal.keyHash !== null) {
       if (creditReserved) {
@@ -3834,6 +3869,8 @@ async function handleKeysMint(
     }
     throw err;
   }
+  // The only HTTP response carrying a newly minted bearer must never be cached.
+  res.setHeader("cache-control", "no-store");
   sendJson(res, 201, result);
 }
 
@@ -4069,9 +4106,6 @@ export function startGateway(
   // whole image surface is inert, so there is nothing to schedule. Runs restart-recovery on start.
   const imageWorker = cfg.imageUrl !== "" ? startImageWorker(cfg, controller) : null;
 
-  // Freeze the implicit-admin posture once, here, from the actual bind host. Never
-  // re-derived per request, so it cannot drift open as keys are revoked/expire.
-  const implicitAdminAllowed = isImplicitAdminAllowed(cfg, loopback);
   // Process/configuration epoch for LearningTaskContract advertisements. Its secret rotates on
   // every gateway start, so cached preflight evidence from an earlier deployment fails closed.
   const learningTaskCapabilityEpoch = createLearningTaskCapabilityEpoch();
@@ -4123,7 +4157,6 @@ export function startGateway(
       res,
       cfg,
       controller,
-      implicitAdminAllowed,
       learningTaskCapabilityEpoch,
       composition.rosterAdmissionDependencies,
       maintenanceWindow,
@@ -4145,7 +4178,7 @@ export function startGateway(
       console.log(`home-server gateway on http://${cfg.gatewayHost}:${port}`);
       if (noKeys)
         console.warn(
-          "⚠  AUTH DISABLED (no API keys, loopback only). Set HOMESERVER_API_KEYS for LAN use."
+          "⚠  No API keys configured (loopback only). Protected routes still require a bearer; mint the first key with the local CLI."
         );
       console.log(`   proxying LM Studio at ${cfg.lmStudioBaseUrl}`);
       resolve({
@@ -4230,7 +4263,6 @@ export async function handleRequest(
   res: ServerResponse,
   cfg: HomeserverConfig,
   controller: AdmissionController,
-  implicitAdminAllowed: boolean,
   learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch,
   rosterAdmissionDependencies?: RosterAdmissionDependencies,
   maintenanceWindow?: ExclusiveMaintenanceWindow,
@@ -4286,7 +4318,7 @@ export async function handleRequest(
     // before ANY route dispatch — including the public /portal*, /portal/feedback and /hs routes
     // below. principal may be null (no/invalid token): public routes tolerate that; protected
     // routes reject at the canonical 401 gate further down.
-    const principal = resolvePrincipal(req, cfg, implicitAdminAllowed);
+    const principal = resolvePrincipal(req, cfg);
     if (principal) {
       lctx.principal = principal.alias;
       lctx.tier = principal.tier;
@@ -4900,7 +4932,7 @@ export async function handleRequest(
     // Authenticated, content-blind producer-receipt path for Codex App/Codex CLI/Pi exposure
     // observations — gille's half of the pair with Magnus-Gille/hugin#237. Same boundary as
     // /admin/task-exposures/lookup: a real minted owner-admin key is required (every external producer/
-    // subscription is provisioned its own minted key); legacy static/implicit admins have no
+    // subscription is provisioned its own minted key); legacy static admins have no
     // per-principal identity to bind a subscription alias to and are denied. The authenticated
     // principal's OWN alias — never a body-supplied claim — becomes the receipt's subscription
     // alias, so a receipt can never impersonate a different subscription.

@@ -209,6 +209,64 @@ function rawPost(port: number, request: string): Promise<{ statusCode: number; b
   });
 }
 
+function openPartialPost(port: number, token: string, contentLength = 65_536): {
+  status: Promise<number>;
+  close: () => void;
+} {
+  const socket = netConnect({ host: "127.0.0.1", port });
+  let received = "";
+  let resolveStatus!: (status: number) => void;
+  const status = new Promise<number>((resolve) => { resolveStatus = resolve; });
+  socket.setEncoding("utf-8");
+  socket.on("data", (chunk: string) => {
+    received += chunk;
+    const match = /^HTTP\/1\.1 (\d{3})/m.exec(received);
+    if (match) resolveStatus(Number(match[1]));
+  });
+  socket.on("connect", () => {
+    socket.write([
+      "POST /v1/audio/transcriptions HTTP/1.1",
+      "Host: 127.0.0.1",
+      `Authorization: Bearer ${token}`,
+      "Content-Type: multipart/form-data; boundary=----x",
+      `Content-Length: ${contentLength}`,
+      "Connection: keep-alive",
+      "",
+      "------x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\n\r\npartial",
+    ].join("\r\n"));
+  });
+  return { status, close: () => socket.destroy() };
+}
+
+async function expectNoResponse(status: Promise<number>): Promise<void> {
+  const result = await Promise.race([
+    status.then((value) => `status:${value}`),
+    new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 30)),
+  ]);
+  expect(result).toBe("pending");
+}
+
+async function statusWithin(status: Promise<number>, timeoutMs = 1_500): Promise<number | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      status,
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function expectRejectedBeforeBody(port: number, token: string, expectedStatus: number): Promise<void> {
+  const rejected = openPartialPost(port, token);
+  try {
+    expect(await statusWithin(rejected.status)).toBe(expectedStatus);
+  } finally {
+    rejected.close();
+  }
+}
+
 function lastLog(alias: string): ReturnType<typeof getRequestLog>[number] | undefined {
   return getRequestLog(500).find((r) => r.alias === alias);
 }
@@ -283,6 +341,7 @@ describe("POST /v1/audio/transcriptions", () => {
     expect(j.error.param).toBe("file");
     // No charge for a rejected request.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect((await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
   });
 
   it("rejects a near-cap key with 402 from the UP-FRONT reservation and never transcribes / overdrafts", async () => {
@@ -379,6 +438,7 @@ describe("POST /v1/audio/transcriptions", () => {
     const row = lastLog("aud-down");
     expect(row!.outcome).toBe("upstream_unavailable");
     expect(row!.status).toBe(502);
+    expect((await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
   });
 
   it("accepts kb-whisper-large as a model alias and respects an empty allow-list", async () => {
@@ -401,6 +461,79 @@ describe("POST /v1/audio/transcriptions", () => {
     });
     expect(res.status).toBe(403);
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+  });
+
+  it("rejects a disallowed canonical Whisper model before the multipart body arrives", async () => {
+    const k = mintKey({ alias: "aud-allow-early", tier: "guest", creditLimit: 1_000_000,
+      modelAllowList: ["some-other-model"] }, DEFAULTS);
+    const held = openPartialPost(gatewayPort, k.plaintextKey);
+    try {
+      expect(await statusWithin(held.status)).toBe(403);
+      expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    } finally {
+      held.close();
+    }
+  });
+
+  it("releases its upload permit after post-parse model rejection", async () => {
+    const k = mintKey({ alias: "aud-allow-postparse", tier: "guest", creditLimit: 1_000_000,
+      modelAllowList: ["whisper-1"] }, DEFAULTS);
+    expect((await transcribe(gatewayPort, k.plaintextKey, {
+      file: fakeAudio(), fields: { model: "unknown-model" },
+    })).status).toBe(403);
+    expect((await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
+  });
+
+  it("bounds pre-buffer uploads per alias and reserves process capacity for owner traffic", async () => {
+    const guest = mintKey({ alias: "aud-held-guest", tier: "guest", maxParallel: 2 }, DEFAULTS);
+    const owner = mintKey({ alias: "aud-owner-slot", tier: "owner", maxParallel: 2,
+      creditLimit: 1_000_000 }, DEFAULTS);
+    const held = openPartialPost(gatewayPort, guest.plaintextKey);
+    try {
+      await expectNoResponse(held.status);
+      await expectRejectedBeforeBody(gatewayPort, guest.plaintextKey, 503);
+      const otherGuest = mintKey({ alias: "aud-other-guest", tier: "guest", maxParallel: 2 }, DEFAULTS);
+      await expectRejectedBeforeBody(gatewayPort, otherGuest.plaintextKey, 503);
+      // Guest traffic consumes only one of the two process-wide upload permits.
+      expect((await transcribe(gatewayPort, owner.plaintextKey, { file: fakeAudio() })).status).toBe(200);
+      expect(lookupKey(guest.plaintextKey)!.creditsUsed).toBe(0);
+    } finally {
+      held.close();
+    }
+  });
+
+  it("caps two distinct owner uploads globally and enforces a key's lower maxParallel", async () => {
+    const first = mintKey({ alias: "aud-owner-held-1", tier: "owner", maxParallel: 2 }, DEFAULTS);
+    const second = mintKey({ alias: "aud-owner-held-2", tier: "owner", maxParallel: 2 }, DEFAULTS);
+    const third = mintKey({ alias: "aud-owner-held-3", tier: "owner", maxParallel: 2 }, DEFAULTS);
+    const heldOne = openPartialPost(gatewayPort, first.plaintextKey);
+    const heldTwo = openPartialPost(gatewayPort, second.plaintextKey);
+    try {
+      await expectNoResponse(heldOne.status);
+      await expectNoResponse(heldTwo.status);
+      await expectRejectedBeforeBody(gatewayPort, third.plaintextKey, 503);
+    } finally {
+      heldOne.close();
+      heldTwo.close();
+    }
+
+    const single = mintKey({ alias: "aud-owner-single", tier: "owner", maxParallel: 1 }, DEFAULTS);
+    const heldSingle = openPartialPost(gatewayPort, single.plaintextKey);
+    try {
+      await expectNoResponse(heldSingle.status);
+      await expectRejectedBeforeBody(gatewayPort, single.plaintextKey, 503);
+    } finally {
+      heldSingle.close();
+    }
+  });
+
+  it("releases upload permits after an aborted partial body", async () => {
+    const k = mintKey({ alias: "aud-disconnect-release", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const held = openPartialPost(gatewayPort, k.plaintextKey);
+    await expectNoResponse(held.status);
+    held.close();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect((await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
   });
 
   // ── Reserve→reconcile billing fidelity ──────────────────────────────────────────────
@@ -531,6 +664,7 @@ describe("POST /v1/audio/transcriptions", () => {
     expect(raw.statusCode).toBe(413);
     expect(raw.body).toContain("payload_too_large");
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect((await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
   });
 
   it("maps an oversized streamed body (no Content-Length) to 413, not 400", async () => {
@@ -549,6 +683,7 @@ describe("POST /v1/audio/transcriptions", () => {
     expect(res.statusCode).toBe(413);
     expect(res.body).toContain("payload_too_large");
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect((await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
   });
 
   it("closes an idle audio upload without charging the caller", async () => {
@@ -566,6 +701,7 @@ describe("POST /v1/audio/transcriptions", () => {
       ].join("\r\n"));
       expect(res.statusCode).toBe(0); // The read timeout drops the incomplete request's socket.
       expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+      expect((await transcribe(idleGateway.port, k.plaintextKey, { file: fakeAudio() })).status).toBe(200);
     } finally {
       setConfig({ audioReadIdleMs: originalIdleMs });
       await idleGateway.stop();

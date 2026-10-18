@@ -156,7 +156,7 @@ describe("PUT /ledger/:id/reviewer-usefulness — real socket smoke", () => {
     );
   });
 
-  itIfLoopback("denies loopback implicit-admin on the live socket path", async () => {
+  itIfLoopback("requires a bearer for protected writes on a keyless loopback listener", async () => {
     await withGateway(
       async () => {
         delete process.env["HOMESERVER_ADMIN_API_KEYS"];
@@ -178,7 +178,7 @@ describe("PUT /ledger/:id/reviewer-usefulness — real socket smoke", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ usefulness: "pass" }),
         });
-        expect(res.status).toBe(403);
+        expect(res.status).toBe(401);
       },
     );
   });

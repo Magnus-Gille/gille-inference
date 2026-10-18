@@ -10,7 +10,6 @@ import {
 import {
   handleRequest,
   initializeGatewayRegistries,
-  isImplicitAdminAllowed,
 } from "../../src/homeserver/gateway.js";
 
 export interface DirectGatewayInvokeArgs {
@@ -81,10 +80,6 @@ class MockServerResponse extends EventEmitter {
   }
 }
 
-function isLoopbackHost(host: string): boolean {
-  return host === "127.0.0.1" || host === "localhost" || host === "::1";
-}
-
 function makeRequest(args: DirectGatewayInvokeArgs): IncomingMessage {
   const payload =
     typeof args.body === "string"
@@ -124,7 +119,6 @@ export function createDirectGatewayHarness(codeLoopTransportProbe?: () => Promis
     maintenanceMode: cfg.maintenanceModeAtStart,
   });
   const learningTaskCapabilityEpoch: LearningTaskCapabilityEpoch = createLearningTaskCapabilityEpoch();
-  const implicitAdminAllowed = isImplicitAdminAllowed(cfg, isLoopbackHost(cfg.gatewayHost));
 
   return {
     async invoke(args: DirectGatewayInvokeArgs): Promise<DirectGatewayResult> {
@@ -135,7 +129,6 @@ export function createDirectGatewayHarness(codeLoopTransportProbe?: () => Promis
         res as unknown as ServerResponse,
         cfg,
         controller,
-        implicitAdminAllowed,
         learningTaskCapabilityEpoch,
         undefined,
         undefined,
