@@ -184,6 +184,28 @@ function aggregateCandidateFeedback(
   base.diagnostics.unknownPurpose = base.rows.unknownPurpose;
 }
 
+type CandidateCostCounts = Pick<CandidateEvidenceReport["cost"], "rows" | "linked" | "missing" | "duplicate">;
+
+function aggregateCandidateCostCounts(
+  rows: readonly Record<string, unknown>[],
+  costs: readonly Record<string, unknown>[],
+): CandidateCostCounts {
+  const costById = new Map<string, number>();
+  for (const cost of costs) {
+    const id = typeof cost.delegation_id === "string" ? cost.delegation_id : "";
+    costById.set(id, (costById.get(id) ?? 0) + 1);
+  }
+  const counts: CandidateCostCounts = { rows: costs.length, linked: 0, missing: 0, duplicate: 0 };
+  for (const row of rows) {
+    const id = typeof row.id === "string" ? row.id : "";
+    const count = costById.get(id) ?? 0;
+    if (count === 1) counts.linked += 1;
+    else if (count === 0) counts.missing += 1;
+    else counts.duplicate += 1;
+  }
+  return counts;
+}
+
 /** Build the content-blind candidate evidence diagnostic. This function never creates schema or writes. */
 export function buildCandidateEvidenceReport(db: Database.Database, options: CandidateEvidenceOptions): CandidateEvidenceReport {
   const fromMs = parseIso("from", options.from);
@@ -284,21 +306,11 @@ export function buildCandidateEvidenceReport(db: Database.Database, options: Can
     ? (db.prepare("SELECT id, delegation_id FROM delegation_costs ORDER BY rowid ASC").all() as Array<Record<string, unknown>>)
       .filter((cost) => typeof cost.delegation_id === "string" && selectedIds.has(cost.delegation_id))
     : [];
-  const costById = new Map<string, number>();
-  for (const cost of costs) {
-    const id = typeof cost.delegation_id === "string" ? cost.delegation_id : "";
-    costById.set(id, (costById.get(id) ?? 0) + 1);
-  }
-  base.cost.rows = costs.length;
-  for (const row of rows) {
-    const id = typeof row.id === "string" ? row.id : "";
-    const count = costById.get(id) ?? 0;
-    if (count === 1) base.cost.linked += 1;
-    else if (count === 0) base.cost.missing += 1;
-    else {
-      base.cost.duplicate += 1;
-      base.diagnostics.duplicateCost += 1;
-    }
-  }
+  const costCounts = aggregateCandidateCostCounts(rows, costs);
+  base.cost.rows = costCounts.rows;
+  base.cost.linked = costCounts.linked;
+  base.cost.missing = costCounts.missing;
+  base.cost.duplicate = costCounts.duplicate;
+  base.diagnostics.duplicateCost += costCounts.duplicate;
   return base;
 }
