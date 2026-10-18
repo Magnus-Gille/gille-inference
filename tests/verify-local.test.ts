@@ -258,8 +258,8 @@ describe('local verification manifest', () => {
         { id: 'green', command: [process.execPath, '-e', "process.stdout.write('exit-zero-marker'); process.exit(0)"] },
       ],
       cwd: process.cwd(),
-      tempRoot: '/tmp',
-      homeRoot: '/tmp',
+      tempRoot: os.tmpdir(),
+      homeRoot: os.tmpdir(),
       pathValue: '/usr/bin:/bin',
     });
     if (results.every((item: any) => item.error?.includes('EPERM'))) skip('sandbox denied child process creation');
@@ -271,6 +271,8 @@ describe('local verification manifest', () => {
   it('reports a missing executable as unavailable while keeping PATH explicit', async () => {
     const { results, environment } = await runChecks({
       commands: [{ id: 'missing-tool', command: ['missing-local-binary'] }],
+      tempRoot: os.tmpdir(),
+      homeRoot: os.tmpdir(),
       spawn: () => ({ status: null, signal: null, stdout: '', stderr: '', error: Object.assign(new Error('not found'), { code: 'ENOENT' }) }),
     });
     expect(results[0].status).toBe('unavailable');

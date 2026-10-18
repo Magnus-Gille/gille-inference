@@ -67,7 +67,7 @@ function runScript(
       cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: 120_000,
-      env: { ...process.env, TMPDIR: "/tmp", EVAL_DB_PATH: selectedDbPath },
+      env: { ...process.env, TMPDIR: tmpdir(), EVAL_DB_PATH: selectedDbPath },
     }
   );
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
