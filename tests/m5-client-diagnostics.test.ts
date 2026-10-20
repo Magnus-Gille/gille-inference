@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { createM5Client, M5ClientError } from "../client/m5-client.mjs";
+import { askRefusalFromMeta, createM5Client, M5ClientError } from "../client/m5-client.mjs";
 import { runBuild } from "../client/m5-build.mjs";
 import { createMcpStdioBridge } from "../client/m5-stdio-bridge.mjs";
 
@@ -117,6 +117,37 @@ describe("gateway-supplied cause in _meta is preferred over the sentence (#357)"
     });
     expect(error.message).not.toContain(raw);
     expect(error.toJSON().error).not.toHaveProperty("diagnostic_code");
+  });
+
+  it("keeps backend reason lookup closed and preserves exact safe messages", () => {
+    const hostile = "backend https://model.internal/v1 leaked detail";
+    const known = [
+      ["upstream_connection_failed", "The model backend is unavailable — please retry shortly."],
+      ["upstream_timeout", "The model backend timed out (it may be loading a model) — please retry in a few seconds."],
+    ] as const;
+    for (const [reason, message] of known) {
+      expect(askRefusalFromMeta({
+        _meta: { m5_code: "upstream_error", reason, layer: "model_backend" },
+      }, hostile)).toEqual({
+        code: "upstream_error",
+        retryable: true,
+        failureLayer: "model_backend",
+        message,
+      });
+    }
+
+    const nonStringReason = {
+      [Symbol.toPrimitive]: () => { throw new Error("reason must not be coerced"); },
+      toString: () => { throw new Error("reason must not be stringified"); },
+      valueOf: () => { throw new Error("reason must not be unboxed"); },
+    };
+    for (const reason of ["__proto__", "constructor", new String("upstream_timeout"), nonStringReason, Symbol("upstream_timeout")]) {
+      const result = askRefusalFromMeta({
+        _meta: { m5_code: "upstream_error", reason, layer: "model_backend" },
+      }, hostile);
+      expect(result).toEqual({ code: "tool_error", message: "The model backend reported an error." });
+      expect(JSON.stringify(result)).not.toContain(hostile);
+    }
   });
 
   it.each([

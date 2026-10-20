@@ -55,6 +55,8 @@ import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { isEmbeddingModel } from "./embedding-request.js";
 import { TOKENIZE_TOOL, runTokenize } from "./tokenize.js";
 import { parseMcpEnvelope, type JsonRpcRequest } from "./mcp-envelope.js";
+import { BACKEND_FAILURE_DESCRIPTORS } from "../../client/backend-failure-contract.mjs";
+import type { BackendFailureReason } from "../../client/backend-failure-contract.mjs";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -660,7 +662,7 @@ export type RunChatResult =
       /** Present when the gateway knows how long the caller should wait before retrying. */
       retryAfterSeconds?: number;
       /** Sanitized backend failure detail; never contains the backend error or URL. */
-      reason?: "upstream_connection_failed" | "upstream_timeout";
+      reason?: BackendFailureReason;
       /** Trust boundary that produced a sanitized reason. */
       layer?: "model_backend";
       /** Explicit retry guidance for classified transient backend failures. */
@@ -1155,6 +1157,7 @@ export async function runChatCompletion(
     // upstream_error). A non-upstream error is NOT masked: re-throw so a real logic bug surfaces.
     const kind = classifyUpstreamError(err);
     if (kind === "upstream_timeout") {
+      const backendFailure = BACKEND_FAILURE_DESCRIPTORS.upstream_timeout;
       // M2: set the failure kind so the finally / request_log row records the distinct 504 label.
       failureBackoff?.recordFailure(args.model, "upstream_timeout");
       upstreamFailureKind = "upstream_timeout";
@@ -1162,8 +1165,8 @@ export async function runChatCompletion(
         ok: false,
         requestId: inferenceRequestId,
         code: "upstream_error",
-        message: "The model backend timed out (it may be loading a model) — please retry in a few seconds.",
-        reason: "upstream_timeout",
+        message: backendFailure.message,
+        reason: backendFailure.reason,
         layer: "model_backend",
         retryable: true,
         retryAfterSeconds: cfg.busyRetryAfterSeconds,
@@ -1172,6 +1175,7 @@ export async function runChatCompletion(
       };
     }
     if (kind === "upstream_unavailable") {
+      const backendFailure = BACKEND_FAILURE_DESCRIPTORS.upstream_connection_failed;
       // M2: set the failure kind so the finally / request_log row records the distinct 502 label.
       failureBackoff?.recordFailure(args.model, "upstream_unavailable");
       upstreamFailureKind = "upstream_unavailable";
@@ -1179,8 +1183,8 @@ export async function runChatCompletion(
         ok: false,
         requestId: inferenceRequestId,
         code: "upstream_error",
-        message: "The model backend is unavailable — please retry shortly.",
-        reason: "upstream_connection_failed",
+        message: backendFailure.message,
+        reason: backendFailure.reason,
         layer: "model_backend",
         retryable: true,
         retryAfterSeconds: cfg.busyRetryAfterSeconds,

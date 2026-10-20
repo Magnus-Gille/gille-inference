@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { makeError, classifyUpstreamError, type ErrorCode } from "../src/homeserver/errors.js";
+import { makeError, classifyUpstreamError, projectUpstreamError, type ErrorCode } from "../src/homeserver/errors.js";
 
 describe("error envelope", () => {
   it("server_busy: mandated message, type server_error, Retry-After header", () => {
@@ -76,6 +76,19 @@ describe("error envelope", () => {
     expect(env.body.error.message).toMatch(/timed out/i);
     expect(env.body.error.message).toMatch(/loading/i);
     expect(env.headers["Retry-After"]).toBe("5");
+  });
+
+  it("projectUpstreamError: preserves the classified status and only retries timeouts", () => {
+    const cases = [
+      { kind: "upstream_unavailable" as const, status: 502, retry: undefined },
+      { kind: "upstream_timeout" as const, status: 504, retry: "11" },
+    ];
+    for (const expected of cases) {
+      const env = projectUpstreamError(expected.kind, 11);
+      expect(env.status).toBe(expected.status);
+      expect(env.body.error.code).toBe(expected.kind);
+      expect(env.headers["Retry-After"]).toBe(expected.retry);
+    }
   });
 
   it("each code maps to the right status and a complete 4-field error body", () => {

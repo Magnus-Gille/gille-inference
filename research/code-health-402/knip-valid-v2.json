@@ -47,6 +47,7 @@
     "scripts/**/*.ts",
     "scripts/**/*.mjs",
     "client/**/*.mjs",
+    "client/**/*.d.mts",
     "tests/**/*.ts",
     "benchmarks/**/*.ts",
     "benchmarks/**/*.mjs",

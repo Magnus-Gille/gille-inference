@@ -312,6 +312,8 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
     expect(j.error.code).toBe("upstream_unavailable");
     expect(j.error.type).toBe("server_error");
     expect(j.error.message).toMatch(/backend.*unavailable/i);
+    expect(j.error.message).not.toContain(String(deadPort));
+    expect(res.headers.get("retry-after")).toBeNull();
 
     // C2: a failed call is never billed.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
@@ -329,7 +331,7 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
 
     const res = await chat(gatewayPort, k.plaintextKey, {});
     expect(res.status).toBe(504);
-    expect(res.headers.get("retry-after")).toBeTruthy();
+    expect(res.headers.get("retry-after")).toBe("2");
     const j = (await res.json()) as { error: { code: string; type: string; message: string } };
     expect(j.error.code).toBe("upstream_timeout");
     expect(j.error.type).toBe("server_error");
@@ -341,6 +343,34 @@ describe("R6 graceful degradation — upstream + streaming failures", () => {
     expect(log?.outcome).toBe("upstream_timeout");
     expect(log?.status).toBe(504);
     expect(log?.errorClass).toBe("upstream_timeout");
+  });
+
+  it("unexpected upstream fetch errors remain a generic 500 and do not leak the thrown message", async () => {
+    const originalFetch = globalThis.fetch;
+    const k = mintKey({ alias: "deg-unexpected", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const thrownMessage = "unexpected backend detail /etc/private-model-path";
+    globalThis.fetch = (async (input, init) => {
+      const target = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const targetUrl = new URL(target);
+      if (targetUrl.port === String(upstreamPort) && targetUrl.pathname.endsWith("/chat/completions")) {
+        throw new Error(thrownMessage);
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    let res: Response;
+    try {
+      res = await chat(gatewayPort, k.plaintextKey, {});
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(res.status).toBe(500);
+    const body = await res.text();
+    expect(body).not.toContain(thrownMessage);
+    expect(JSON.parse(body)).toMatchObject({ error: { code: "internal_error" } });
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect(lastLog("deg-unexpected")?.status).toBe(500);
   });
 
   it("L2: streaming request with no upstream body charges 0 credits (billing invariant C2)", async () => {

@@ -57,7 +57,7 @@ import {
   MaintenanceWindowTokenError,
   type MaintenanceWindowDependencies,
 } from "./maintenance-window.js";
-import { makeError, sendError, classifyUpstreamError } from "./errors.js";
+import { makeError, sendError, classifyUpstreamError, projectUpstreamError } from "./errors.js";
 import { createAccessLogger, setDefaultLogger, defaultLogger } from "./access-log.js";
 import { admitHostMemory, createModelStartAdmission, HostMemoryAdmissionError, readHostMemory, readOomKillCount, type HostMemoryAdmissionDeps, type HostMemoryAdmissionMode, type HostMemoryReadResult, type ModelStartAdmission } from "./host-memory-admission.js";
 import { handleMcpPost, isAdoptionEvidenceToolCall, isCodeLoopOwner } from "./mcp.js";
@@ -1480,14 +1480,13 @@ async function handleEmbeddingProxy(
       return ZERO_RESULT;
     }
     const kind = classifyUpstreamError(err);
-    if (kind !== "upstream_timeout" && kind !== "upstream_unavailable" &&
-      !(err instanceof SyntaxError) && !(err instanceof EmbeddingResponseError)) throw err;
-    lctx.status = kind === "upstream_timeout" ? 504 : 502;
-    lctx.outcome = kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable";
-    lctx.errorClass = lctx.outcome;
-    sendError(res, makeError(kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable", {
-      ...(kind === "upstream_timeout" ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {}),
-    }));
+    if (kind === null && !(err instanceof SyntaxError) && !(err instanceof EmbeddingResponseError)) throw err;
+    const projectedKind = kind ?? "upstream_unavailable";
+    const envelope = projectUpstreamError(projectedKind, cfg.busyRetryAfterSeconds);
+    lctx.status = envelope.status;
+    lctx.outcome = projectedKind;
+    lctx.errorClass = projectedKind;
+    sendError(res, envelope);
     return ZERO_RESULT;
   }
 }
@@ -1558,14 +1557,13 @@ async function handleSystemOneProxy(
       return ZERO_RESULT;
     }
     const kind = classifyUpstreamError(err);
-    if (kind !== "upstream_timeout" && kind !== "upstream_unavailable" &&
-      !(err instanceof SyntaxError) && !(err instanceof SystemOneResponseError)) throw err;
-    lctx.status = kind === "upstream_timeout" ? 504 : 502;
-    lctx.outcome = kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable";
-    lctx.errorClass = lctx.outcome;
-    sendError(res, makeError(kind === "upstream_timeout" ? "upstream_timeout" : "upstream_unavailable", {
-      ...(kind === "upstream_timeout" ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {}),
-    }));
+    if (kind === null && !(err instanceof SyntaxError) && !(err instanceof SystemOneResponseError)) throw err;
+    const projectedKind = kind ?? "upstream_unavailable";
+    const envelope = projectUpstreamError(projectedKind, cfg.busyRetryAfterSeconds);
+    lctx.status = envelope.status;
+    lctx.outcome = projectedKind;
+    lctx.errorClass = projectedKind;
+    sendError(res, envelope);
     return ZERO_RESULT;
   }
 }
@@ -1871,27 +1869,15 @@ async function handleChatProxy(
         return ZERO_RESULT;
       }
       const kind = classifyUpstreamError(err);
-      if (kind === "upstream_timeout") {
-        lctx.status = 504;
-        lctx.outcome = "upstream_timeout";
-        lctx.errorClass = "upstream_timeout";
-        emitInferenceTrace("upstream_timeout");
-        emitResponseTrace("upstream_timeout");
-        sendError(res, makeError("upstream_timeout", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
-        return ZERO_RESULT;
-      }
-      if (kind === "upstream_unavailable") {
-        lctx.status = 502;
-        lctx.outcome = "upstream_unavailable";
-        lctx.errorClass = "upstream_unavailable";
-        emitInferenceTrace("upstream_unavailable");
-        emitResponseTrace("upstream_unavailable");
-        sendError(res, makeError("upstream_unavailable"));
-        return ZERO_RESULT;
-      }
-      // Not a recognised upstream connection/timeout failure — re-throw so it surfaces as a generic
-      // 500 (detail logged server-side). We do NOT mask an unexpected logic bug as a friendly 502.
-      throw err;
+      if (kind === null) throw err;
+      const envelope = projectUpstreamError(kind, cfg.busyRetryAfterSeconds);
+      lctx.status = envelope.status;
+      lctx.outcome = kind;
+      lctx.errorClass = kind;
+      emitInferenceTrace(kind);
+      emitResponseTrace(kind);
+      sendError(res, envelope);
+      return ZERO_RESULT;
     }
 
     // ── Streaming path: pipe bytes straight through, never buffer. ──
@@ -2201,26 +2187,15 @@ async function handleChatProxy(
       return ZERO_RESULT;
     }
     const kind = classifyUpstreamError(err);
-    if (kind === "upstream_timeout") {
-      lctx.status = 504;
-      lctx.outcome = "upstream_timeout";
-      lctx.errorClass = "upstream_timeout";
-      emitInferenceTrace("upstream_timeout");
-      emitResponseTrace("upstream_timeout");
-      sendError(res, makeError("upstream_timeout", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
-      return ZERO_RESULT;
-    }
-    if (kind === "upstream_unavailable") {
-      lctx.status = 502;
-      lctx.outcome = "upstream_unavailable";
-      lctx.errorClass = "upstream_unavailable";
-      emitInferenceTrace("upstream_unavailable");
-      emitResponseTrace("upstream_unavailable");
-      sendError(res, makeError("upstream_unavailable"));
-      return ZERO_RESULT;
-    }
-    // Not a recognised upstream failure — re-throw so it surfaces as a generic 500.
-    throw err;
+    if (kind === null) throw err;
+    const envelope = projectUpstreamError(kind, cfg.busyRetryAfterSeconds);
+    lctx.status = envelope.status;
+    lctx.outcome = kind;
+    lctx.errorClass = kind;
+    emitInferenceTrace(kind);
+    emitResponseTrace(kind);
+    sendError(res, envelope);
+    return ZERO_RESULT;
     }
 
   // An upstream ERROR response (Codex finding 1: this whole block is gated on `status >= 400`, so
@@ -3248,21 +3223,13 @@ async function handleAudioTranscriptionAdmitted(
     } catch (err) {
       // Graceful degradation: reuse the same envelopes/outcomes as the chat path. Charge 0.
       const kind = classifyUpstreamError(err);
-      if (kind === "upstream_timeout") {
-        lctx.status = 504;
-        lctx.outcome = "upstream_timeout";
-        lctx.errorClass = "upstream_timeout";
-        sendError(res, makeError("upstream_timeout", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
-        return;
-      }
-      if (kind === "upstream_unavailable") {
-        lctx.status = 502;
-        lctx.outcome = "upstream_unavailable";
-        lctx.errorClass = "upstream_unavailable";
-        sendError(res, makeError("upstream_unavailable"));
-        return;
-      }
-      throw err;
+      if (kind === null) throw err;
+      const envelope = projectUpstreamError(kind, cfg.busyRetryAfterSeconds);
+      lctx.status = envelope.status;
+      lctx.outcome = kind;
+      lctx.errorClass = kind;
+      sendError(res, envelope);
+      return;
     }
 
     let text: string;
@@ -3270,21 +3237,13 @@ async function handleAudioTranscriptionAdmitted(
       text = await upstream.text();
     } catch (err) {
       const kind = classifyUpstreamError(err);
-      if (kind === "upstream_timeout") {
-        lctx.status = 504;
-        lctx.outcome = "upstream_timeout";
-        lctx.errorClass = "upstream_timeout";
-        sendError(res, makeError("upstream_timeout", { retryAfterSeconds: cfg.busyRetryAfterSeconds }));
-        return;
-      }
-      if (kind === "upstream_unavailable") {
-        lctx.status = 502;
-        lctx.outcome = "upstream_unavailable";
-        lctx.errorClass = "upstream_unavailable";
-        sendError(res, makeError("upstream_unavailable"));
-        return;
-      }
-      throw err;
+      if (kind === null) throw err;
+      const envelope = projectUpstreamError(kind, cfg.busyRetryAfterSeconds);
+      lctx.status = envelope.status;
+      lctx.outcome = kind;
+      lctx.errorClass = kind;
+      sendError(res, envelope);
+      return;
     }
 
     // Any non-2xx from the backend is an errored response — forward a uniform 502 and charge 0.

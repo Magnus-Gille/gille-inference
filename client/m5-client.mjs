@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getBackendFailureDescriptor } from "./backend-failure-contract.mjs";
 
 export const M5_CLIENT_VERSION = "1.5.5";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
@@ -1018,11 +1019,6 @@ export function classifyAskRefusal(text) {
 
 // Retryability is part of each code's contract, so it is fixed here, not taken from the peer.
 const ASK_REFUSAL_RETRYABLE = new Map([["insufficient_memory", true], ["memory_admission_unavailable", false]]);
-const ASK_BACKEND_MESSAGES = new Map([
-  ["upstream_connection_failed", "The model backend is unavailable — please retry shortly."],
-  ["upstream_timeout", "The model backend timed out (it may be loading a model) — please retry in a few seconds."],
-]);
-
 /**
  * The gateway's own machine-readable cause, when it sends one in the result's `_meta` (newer
  * gateways). Preferred over reading the sentence. Returns null for anything else, so an older
@@ -1085,7 +1081,7 @@ export function askRefusalFromMeta(result, text) {
   }
   if (meta.m5_code === "upstream_error") {
     const generic = { code: "tool_error", message: "The model backend reported an error." };
-    const message = ASK_BACKEND_MESSAGES.get(meta.reason);
+    const message = getBackendFailureDescriptor(meta.reason)?.message;
     if (meta.layer !== "model_backend" || message === undefined) return { ...generic, ...requestIdField };
     if (Object.prototype.hasOwnProperty.call(meta, "retry_after_seconds") &&
         !Number.isInteger(meta.retry_after_seconds)) return { ...generic, ...requestIdField };

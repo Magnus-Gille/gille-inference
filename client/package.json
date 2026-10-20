@@ -11,6 +11,8 @@
     "hs.mjs",
     "m5.mjs",
     "m5-client.mjs",
+    "backend-failure-contract.mjs",
+    "backend-failure-contract.d.mts",
     "m5-provision.mjs",
     "m5-stdio-bridge.mjs",
     "m5-build.mjs",
