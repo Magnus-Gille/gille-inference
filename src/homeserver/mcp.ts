@@ -15,7 +15,7 @@ import { AdmissionController, AdmissionRejected, type Lane } from "./admission.j
 import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
 import { quotaScopeForPrincipal, describeQuotaFailure, type QuotaFailureDetail } from "./quota-error.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
-import { recordOwnerRequest } from "./owner-log.js";
+import { recordOwnerRequest, shouldCaptureOwnerContent } from "./owner-log.js";
 import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
@@ -1021,12 +1021,13 @@ export async function runChatCompletion(
   // OWNER-ONLY full request log. Strictly owner-tier AND a real minted key (keyHash !== null) —
   // EXCLUDES legacy static admins, and NEVER logs guests. See owner-log.ts.
   // Owner-own content gate: the owner's minted-key traffic only (NOT guests, NOT legacy/implicit
-  // admin). Reused for the owner-log AND the usage-telemetry delegation write below.
+  // admin). This independently gates the usage-telemetry delegation write below; full logging
+  // also requires the global switch through shouldCaptureOwnerContent.
   const isOwnerContent = principal.tier === "owner" && principal.keyHash !== null;
   // Unlike the raw owner log, the content-blind exposure digest covers every owner-tier MCP
   // ingress. Otherwise a legacy/implicit owner call could later be misclassified as a fresh exam.
   const isOwnerExposure = principal.tier === "owner";
-  const ownerLog = cfg.ownerRequestLog === "on" && isOwnerContent;
+  const ownerLog = shouldCaptureOwnerContent(cfg.ownerRequestLog, principal);
   const callStart = Date.now();
 
   if (isOwnerExposure) {

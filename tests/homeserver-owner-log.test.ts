@@ -4,6 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
+import { ensureLedgerSchema } from "../src/homeserver/ledger.js";
 
 /**
  * OWNER-ONLY full request log suite. Mirrors the portal/mcp-test harness: a controllable stub
@@ -272,6 +273,33 @@ describe("HOMESERVER_OWNER_REQUEST_LOG=off disables logging", () => {
     });
     expect(res.status).toBe(200);
     expect(rowsWithMarker(marker)).toBe(0);
+  });
+
+  it("keeps admitted MCP delegation telemetry when owner content logging is off", async () => {
+    const marker = "TOGGLE_OFF_MCP_TELEMETRY_MARKER";
+    ensureLedgerSchema();
+    const before = (getDb().prepare("SELECT COUNT(*) AS n FROM delegations WHERE source = 'mcp-ask'").get() as { n: number }).n;
+    const res = await fetch(`http://127.0.0.1:${offPort}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${offOwnerKey}` },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "ask", arguments: { model: "m1", prompt: marker } },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+    expect(body.result?.isError).toBe(false);
+    expect(body.result?.content?.[0]?.text).toContain(NONSTREAM_COMPLETION);
+    expect(rowsWithMarker(marker)).toBe(0);
+    const after = (getDb().prepare("SELECT COUNT(*) AS n FROM delegations WHERE source = 'mcp-ask'").get() as { n: number }).n;
+    expect(after).toBe(before + 1);
+    const row = getDb()
+      .prepare("SELECT outcome FROM delegations WHERE source = 'mcp-ask' ORDER BY rowid DESC LIMIT 1")
+      .get() as { outcome: string };
+    expect(row.outcome).toBe("unverified");
   });
 });
 

@@ -70,7 +70,7 @@ import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
 import { DegeneracyWatchdog } from "./degeneracy-watchdog.js";
-import { recordOwnerRequest } from "./owner-log.js";
+import { recordOwnerRequest, shouldCaptureOwnerContent } from "./owner-log.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import {
@@ -1619,7 +1619,7 @@ async function handleChatProxy(
   // could report a false-fresh holdout. The full raw
   // owner log remains deliberately narrower: only a real minted owner key may write content.
   const ownerExposure = principal.tier === "owner";
-  const ownerLog = cfg.ownerRequestLog === "on" && ownerExposure && principal.keyHash !== null;
+  const ownerLog = shouldCaptureOwnerContent(cfg.ownerRequestLog, principal);
   const reqMessages: unknown = ownerExposure && Array.isArray(parsed.obj["messages"])
     ? parsed.obj["messages"]
     : [];
@@ -3301,7 +3301,7 @@ async function handleAudioTranscriptionAdmitted(
 
     // OWNER-ONLY transcript capture — identical guard to the chat path (tier owner AND a real
     // minted key). Guests and legacy static keys NEVER get a content row.
-    if (cfg.ownerRequestLog === "on" && principal.tier === "owner" && principal.keyHash !== null) {
+    if (shouldCaptureOwnerContent(cfg.ownerRequestLog, principal)) {
       recordOwnerRequest({
         alias: principal.alias,
         model: WHISPER_MODEL,
@@ -3483,7 +3483,7 @@ async function handleImageGeneration(
   }
 
   const ownerCapture =
-    cfg.ownerRequestLog === "on" && principal.tier === "owner" && principal.keyHash !== null;
+    shouldCaptureOwnerContent(cfg.ownerRequestLog, principal);
   const backendModel = cfg.imageBackendModels[parsed.tier];
 
   // ── Async (balanced/high): hand to the worker; it owns the reconcile/refund from here. ──
