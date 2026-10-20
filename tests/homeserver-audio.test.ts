@@ -429,8 +429,10 @@ describe("POST /v1/audio/transcriptions", () => {
 
     const res = await transcribe(downGatewayPort, k.plaintextKey, { file: fakeAudio() });
     expect(res.status).toBe(502);
-    const j = (await res.json()) as { error: { code: string } };
+    const j = (await res.json()) as { error: { code: string; message: string } };
     expect(j.error.code).toBe("upstream_unavailable");
+    expect(j.error.message).not.toContain(String(deadPort));
+    expect(res.headers.get("retry-after")).toBeNull();
 
     // Billing invariant: a failed call is never charged.
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);

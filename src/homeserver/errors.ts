@@ -43,6 +43,8 @@ export interface ErrorEnvelope {
   body: OpenAIError;
 }
 
+export type UpstreamErrorKind = "upstream_unavailable" | "upstream_timeout";
+
 interface CodeSpec {
   status: number;
   type: string;
@@ -232,6 +234,14 @@ export function makeError(code: ErrorCode, opts: MakeErrorOptions = {}): ErrorEn
 }
 
 /**
+ * Project a classified upstream failure into its HTTP envelope. Only a timeout has a
+ * configured retry interval; an unavailable backend must not imply a precise wait time.
+ */
+export function projectUpstreamError(kind: UpstreamErrorKind, retryAfterSeconds: number): ErrorEnvelope {
+  return makeError(kind, kind === "upstream_timeout" ? { retryAfterSeconds } : {});
+}
+
+/**
  * Classify a thrown error from an upstream `fetch()` to the model backend into the matching
  * graceful-degradation error code, or null if it is NOT a recognised upstream connection /
  * timeout failure (caller then falls through to a generic 500 / internal_error).
@@ -252,7 +262,7 @@ export function makeError(code: ErrorCode, opts: MakeErrorOptions = {}): ErrorEn
  * returns null so a genuine logic bug is not masked as a friendly 502/504 (it stays a 500 with
  * the detail logged server-side).
  */
-export function classifyUpstreamError(err: unknown): "upstream_unavailable" | "upstream_timeout" | null {
+export function classifyUpstreamError(err: unknown): UpstreamErrorKind | null {
   if (typeof err !== "object" || err === null) return null;
 
   const name = (err as { name?: unknown }).name;

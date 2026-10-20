@@ -9,6 +9,8 @@ const clientDir = join(repoRoot, "client");
 const expectedFiles = [
   "LICENSE",
   "README.md",
+  "backend-failure-contract.d.mts",
+  "backend-failure-contract.mjs",
   "hs.mjs",
   "m5-client.mjs",
   "m5-build.mjs",
