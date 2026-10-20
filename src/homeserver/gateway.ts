@@ -71,6 +71,13 @@ import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
 import { DegeneracyWatchdog } from "./degeneracy-watchdog.js";
 import { recordOwnerRequest } from "./owner-log.js";
+import {
+  CONTENT_CAPTURE_HEADER,
+  CONTENT_CAPTURE_OPT_OUT_CONTRACT,
+  CONTENT_CAPTURE_SUPPRESSED,
+  parseContentCaptureHeader,
+  type ContentCapture,
+} from "./content-capture.js";
 import { scheduleReviewCascadeShadow } from "./review-cascade-shadow.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
 import {
@@ -1608,6 +1615,7 @@ async function handleChatProxy(
   lctx: LogCtx,
   principal: PrincipalContext,
   memoryDeps: HostMemoryAdmissionDeps,
+  contentCapture: ContentCapture = "default",
 ): Promise<MeteredResult> {
   // C3: the model is safe to label only after upstream returns 2xx for it. We thread the
   // already-canonicalized lctx.model (set at the route) through as the canonicalModel.
@@ -1752,7 +1760,7 @@ async function handleChatProxy(
       lctx.outcome = "ok";
       emitInferenceTrace("ok");
       emitResponseTrace("ok");
-      if (ownerLog) recordOwnerChat(principal, parsed.model, reqMessages, v.response, v.promptTokens, v.completionTokens, Date.now() - chatStart, "ok");
+      if (ownerLog) recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, v.response, v.promptTokens, v.completionTokens, Date.now() - chatStart, "ok");
       return {
         totalTokens: v.promptTokens + v.completionTokens,
         promptTokens: v.promptTokens,
@@ -2046,7 +2054,7 @@ async function handleChatProxy(
         // Terminal frame is best-effort; never let it crash the request.
       }
       if (assembled !== null) {
-        recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "degenerate");
+        recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "degenerate");
       }
       // A degenerate (garbage) completion is not a valid response → charge 0.
       emitInferenceTrace("degenerate");
@@ -2066,7 +2074,7 @@ async function handleChatProxy(
       // requests. Unload it (allow-listed + cooldown) so the box self-heals without a restart.
       poisonClearOnDisconnect(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs);
       if (assembled !== null) {
-        recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "client_closed");
+        recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "client_closed");
       }
       emitInferenceTrace("client_closed");
       emitResponseTrace("client_closed");
@@ -2094,7 +2102,7 @@ async function handleChatProxy(
         // Writing the terminal frame is best-effort; never let it crash the request.
       }
       if (assembled !== null) {
-        recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "stream_failed");
+        recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "stream_failed");
       }
       // Billing invariant: a truncated/failed stream is not a successful completion → charge 0.
       emitInferenceTrace("stream_failed");
@@ -2128,7 +2136,7 @@ async function handleChatProxy(
       requestPoisonClear(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs, "degeneracy watchdog (trailing frame)");
       recordDegeneracyDetected(parsed.model);
       if (assembled !== null) {
-        recordOwnerChat(principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "degenerate");
+        recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, assembled, null, null, Date.now() - chatStart, "degenerate");
       }
       emitInferenceTrace("degenerate");
       emitResponseTrace("degenerate");
@@ -2145,7 +2153,7 @@ async function handleChatProxy(
     emitInferenceTrace("ok");
     emitResponseTrace("ok");
     if (assembled !== null) {
-      recordOwnerChat(principal, parsed.model, reqMessages, assembled, prompt, completion, Date.now() - chatStart, "ok");
+      recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, assembled, prompt, completion, Date.now() - chatStart, "ok");
     }
     if (usage !== null) {
       return { totalTokens: usage, promptTokens: prompt, completionTokens: completion, canonicalModel: servedModel, ttftMs };
@@ -2255,7 +2263,7 @@ async function handleChatProxy(
       requestPoisonClear(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs, "degeneracy watchdog (non-streaming)");
       recordDegeneracyDetected(parsed.model);
       if (ownerLog) {
-        recordOwnerChat(principal, parsed.model, reqMessages, nsContent, null, null, Date.now() - chatStart, "degenerate");
+        recordOwnerChat(contentCapture, principal, parsed.model, reqMessages, nsContent, null, null, Date.now() - chatStart, "degenerate");
       }
       emitInferenceTrace("degenerate");
       emitResponseTrace("degenerate");
@@ -2263,6 +2271,7 @@ async function handleChatProxy(
     }
     if (ownerLog) {
       recordOwnerChat(
+        contentCapture,
         principal,
         parsed.model,
         reqMessages,
@@ -2399,6 +2408,7 @@ function parseTrailingUsageBreakdown(tail: string): { prompt: number | null; com
  * swallows errors). tok/s is completion_tokens / (latency seconds) when both are known.
  */
 function recordOwnerChat(
+  contentCapture: ContentCapture,
   principal: PrincipalContext,
   model: string | null,
   messages: unknown,
@@ -2421,6 +2431,8 @@ function recordOwnerChat(
     latencyMs,
     tokPerSec,
     outcome,
+    // #487: owner-log.ts discards messages/completion for a suppressed row on every outcome.
+    ...(contentCapture === "suppressed" ? { contentCapture } : {}),
   });
 }
 
@@ -4326,6 +4338,37 @@ export async function handleRequest(
       }
     }
 
+    // #487: per-call "do not log content" opt-out. Validate before any route work so an invalid
+    // value is never treated as the default, honour it only where every content sink implements
+    // suppression, and refuse it on any other request that may carry content. Content-free reads
+    // are unaffected. Neither the bad value nor any body is echoed.
+    const captureHeader = parseContentCaptureHeader(req.headers[CONTENT_CAPTURE_HEADER]);
+    if (!captureHeader.ok) {
+      lctx.status = 400;
+      lctx.outcome = "bad_request";
+      lctx.errorClass = "invalid_request_error";
+      sendError(res, makeError("invalid_request_error", { param: CONTENT_CAPTURE_HEADER, message: captureHeader.message }));
+      return;
+    }
+    const requestContentCapture: ContentCapture = captureHeader.capture;
+    if (requestContentCapture === "suppressed") {
+      const honoured = method === "POST" && (path === "/v1/chat/completions" || path === "/mcp");
+      const contentFreeRead = method === "GET" || method === "HEAD" || method === "OPTIONS";
+      if (!honoured && !contentFreeRead) {
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", {
+          param: CONTENT_CAPTURE_HEADER,
+          message:
+            "X-Content-Capture: none is not supported on this route; the request was not processed. " +
+            "Use POST /v1/chat/completions or the MCP ask/code_loop_start tools.",
+        }));
+        return;
+      }
+      if (honoured) res.setHeader(CONTENT_CAPTURE_HEADER, CONTENT_CAPTURE_SUPPRESSED);
+    }
+
     // Health is unauthenticated (for router/uptime checks) — minimal liveness only.
     // Gate healthz logging behind the config toggle (default: off, to avoid noise).
     if (path === "/healthz" && method === "GET") {
@@ -5106,6 +5149,7 @@ export async function handleRequest(
         userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
         learningTaskCapabilityEpoch,
         hostMemoryAdmission: hostMemoryDeps,
+        ...(requestContentCapture === "suppressed" ? { contentCapture: requestContentCapture } : {}),
         inflight: {
           inc: incInflight,
           dec: decInflight,
@@ -5309,7 +5353,7 @@ export async function handleRequest(
         return;
       }
       await admitAndMeterLogged(res, controller, principal, parsed.model, est, lctx, async () => {
-        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps);
+        const result = await handleChatProxy(raw, parsed, res, cfg, effectiveMax, lctx, principal, hostMemoryDeps, requestContentCapture);
         traceOutcomeOverride = result.traceOutcome ?? null;
         traceErrorClassOverride = result.traceErrorClass ?? null;
         return result;
@@ -5535,6 +5579,9 @@ export async function handleRequest(
       sendJson(res, 200, {
         ...(ownerAgent || explicitEmbeddingGrant ? { gateway: gatewayRelease } : {}),
         ...(ownerAgent ? { inferenceObservation } : {}),
+        // #487 preflight: this gateway honours `X-Content-Capture: none` / `content_capture:"none"`
+        // on /v1/chat/completions and the MCP ask/code_loop_start tools, and refuses it elsewhere.
+        contentCaptureOptOut: CONTENT_CAPTURE_OPT_OUT_CONTRACT,
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,

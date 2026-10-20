@@ -16,6 +16,14 @@ import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
 import { quotaScopeForPrincipal, describeQuotaFailure, type QuotaFailureDetail } from "./quota-error.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
 import { recordOwnerRequest } from "./owner-log.js";
+import {
+  CONTENT_CAPTURE_NONE,
+  CONTENT_CAPTURE_OPT_OUT_CONTRACT,
+  CONTENT_CAPTURE_SUPPRESSED,
+  combineContentCapture,
+  parseContentCaptureArgument,
+  type ContentCapture,
+} from "./content-capture.js";
 import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
@@ -527,6 +535,13 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
             description:
               "optional actual known cloud delegator model id for savings accounting; omit when unknown, never guess",
           },
+          content_capture: {
+            type: "string",
+            enum: [CONTENT_CAPTURE_NONE],
+            description:
+              `optional per-call opt-out (${CONTENT_CAPTURE_OPT_OUT_CONTRACT}): 'none' stores metadata only — no prompt or ` +
+              "completion text in owner logs, ledger excerpts or harvest datasets; echoed as _meta.content_capture='suppressed'",
+          },
           ...(principal.tier === "owner" ? {
             include_reasoning: { type: "boolean", default: false,
               description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
@@ -631,6 +646,8 @@ export interface RunChatArgs {
    */
   learningTaskStamp?: HuginRequestStamp;
   trafficPurpose?: ExecutionTrafficPurpose;
+  /** #487: "suppressed" records metadata only in the owner log and capability ledger. */
+  contentCapture?: ContentCapture;
 }
 
 export type RunChatResult =
@@ -1134,6 +1151,7 @@ export async function runChatCompletion(
         latencyMs,
         tokPerSec,
         outcome: "ok",
+        ...(args.contentCapture === "suppressed" ? { contentCapture: "suppressed" as const } : {}),
       });
     }
     failureBackoff?.recordSuccess(args.model);
@@ -1302,6 +1320,7 @@ export async function runChatCompletion(
           source: "mcp-ask",
           keyAlias: principal.alias,
           evidenceIdentity,
+          ...(args.contentCapture === "suppressed" ? { contentCapture: "suppressed" as const } : {}),
         });
         const feedbackOwner = executionFeedbackOwner(principal);
         if (feedbackOwner && completedResult) {
@@ -1367,6 +1386,8 @@ interface ToolCallContext {
   /** #350 whole-host memory admission readers; absent in tests that predate it (feature then inert). */
   hostMemoryAdmission?: HostMemoryAdmissionDeps;
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
+  /** #487: transport-level `X-Content-Capture: none` on this /mcp POST (validated by the gateway). */
+  contentCapture?: ContentCapture;
 }
 
 /** A tools/call result: a text content block + isError flag. Never throws for a tool error. */
@@ -1458,6 +1479,15 @@ async function callTool(
   }
 
   if (name === "ask") {
+    const captureArgument = parseContentCaptureArgument(args["content_capture"]);
+    if (!captureArgument.ok) {
+      return { text: captureArgument.message, isError: true, trace: badRequestTrace() };
+    }
+    const contentCapture = combineContentCapture(ctx.contentCapture ?? "default", captureArgument.capture);
+    // Echo the honoured opt-out on every ask outcome so a caller can verify it was applied.
+    const captureMeta: Record<string, unknown> = contentCapture === "suppressed"
+      ? { content_capture: CONTENT_CAPTURE_SUPPRESSED }
+      : {};
     const includeReasoning = args["include_reasoning"];
     if (includeReasoning !== undefined && typeof includeReasoning !== "boolean") {
       return { text: "'include_reasoning' must be a boolean.", isError: true, trace: badRequestTrace() };
@@ -1542,6 +1572,7 @@ async function callTool(
       topP,
       topK,
       minP,
+      ...(contentCapture === "suppressed" ? { contentCapture } : {}),
       reasoningEffort:
         outputProfile === COMPLETE_WITHIN_BUDGET_PROFILE && supportsReasoningEffort(model)
           ? "low"
@@ -1554,15 +1585,17 @@ async function callTool(
           text: askTruncationWarningText(r.text),
           isError: true,
           structuredContent,
+          ...(contentCapture === "suppressed" ? { meta: captureMeta } : {}),
         };
       }
+      const successMeta = { ...(r.requestId === undefined ? {} : { request_id: r.requestId }), ...captureMeta };
       return { text: r.text, isError: false, structuredContent,
-        ...(r.requestId === undefined ? {} : { meta: { request_id: r.requestId } }) };
+        ...(Object.keys(successMeta).length === 0 ? {} : { meta: successMeta }) };
     }
     return {
       text: r.message,
       isError: true,
-      meta: askFailureMeta(r),
+      meta: { ...askFailureMeta(r), ...captureMeta },
       trace: { traceOutcome: r.traceOutcome, traceErrorClass: r.traceErrorClass },
     };
   }
@@ -1584,6 +1617,7 @@ async function callTool(
         gatewayRequestId: ctx.gatewayRequestId,
         capabilityEpoch: ctx.learningTaskCapabilityEpoch,
         hostMemoryAdmissionDependencies: ctx.hostMemoryAdmission,
+        ...(ctx.contentCapture === "suppressed" ? { transportContentCapture: ctx.contentCapture } : {}),
       },
     );
     return { ...out, structuredContent: JSON.parse(out.text) };

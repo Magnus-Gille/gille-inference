@@ -124,6 +124,8 @@ export interface CodeLoopGatewayContext {
   gatewayRequestId: string;
   capabilityEpoch: LearningTaskCapabilityEpoch;
   hostMemoryAdmissionDependencies?: Partial<HostMemoryAdmissionDeps>;
+  /** #487: `X-Content-Capture: none` on the /mcp POST; equivalent to `content_capture:"none"`. */
+  transportContentCapture?: "suppressed";
 }
 
 export function buildCodeLoopRuntime(
@@ -192,13 +194,27 @@ export function buildCodeLoopRuntime(
   // whole pi run — the ONE egress hole the cage forwards. Closed on completion regardless of
   // outcome. check_cmd runs AFTER this (in code-loop.ts) and needs no gateway, so it is unaffected.
   const engine: AgentEngine = {
+    // #487: only the relay can stamp every per-turn request with X-Content-Capture: none. The
+    // offline confinement=off path talks to the gateway directly, so suppressed starts are refused.
+    supportsContentCaptureSuppression: confinement === "required",
     run: async (opts) => {
       let relay: GatewayRelay | null = null;
       try {
-        if (confinement === "off") return await piEngine(cfg.codeLoopApiKey).run(opts);
+        if (confinement === "off") {
+          if (opts.contentCapture === "suppressed") {
+            throw new Error("content_capture suppression requires the confined gateway relay");
+          }
+          return await piEngine(cfg.codeLoopApiKey).run(opts);
+        }
         // A fresh high-entropy client capability prevents this loopback listener from becoming
         // an unauthenticated local proxy for the real gateway key.
-        relay = await startGatewayRelay(forwardPort, gatewayHost, gatewayPort, cfg.codeLoopApiKey);
+        relay = await startGatewayRelay(
+          forwardPort,
+          gatewayHost,
+          gatewayPort,
+          cfg.codeLoopApiKey,
+          opts.contentCapture === "suppressed" ? { contentCapture: "suppressed" } : {},
+        );
         return await piEngine(relay.clientApiKey).run(opts);
       } finally {
         if (relay !== null) await relay.close();
@@ -428,6 +444,13 @@ export async function handleCodeLoopTool(
       protected: Array.isArray(args["protected"]) ? (args["protected"] as string[]) : undefined,
       task_type: typeof args["task_type"] === "string" ? (args["task_type"] as string) : undefined,
       caps: typeof args["caps"] === "object" && args["caps"] !== null ? (args["caps"] as CodeLoopRequest["caps"]) : undefined,
+      // #487: preserve a malformed value for fail-closed structural validation; the /mcp header
+      // is equivalent to the argument ("none" is the only valid value, so they cannot conflict).
+      ...(Object.hasOwn(args, "content_capture")
+        ? { content_capture: args["content_capture"] as CodeLoopRequest["content_capture"] }
+        : gatewayContext.transportContentCapture === "suppressed"
+          ? { content_capture: "none" as const }
+          : {}),
     };
     const r = await startCodeLoop(req, startConfig, deps);
     if (r.ok) {
@@ -442,6 +465,7 @@ export async function handleCodeLoopTool(
             ? { learning_task_gateway_echo: r.learning_task_gateway_echo }
             : {}),
           ...(r.result !== undefined ? { result: callerResult(r.result) } : {}),
+          ...(r.content_capture !== undefined ? { content_capture: r.content_capture } : {}),
           capabilities: r.capabilities,
         }),
         isError: false,

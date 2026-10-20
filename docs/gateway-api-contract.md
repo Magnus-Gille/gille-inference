@@ -30,7 +30,7 @@ privacy/admission tier, route scope, and model allow-list:
 
 | Dimension | Value | Meaning |
 |---|---|---|
-| Tier | `owner` | Deliberate owner-content logging and owner-priority admission. |
+| Tier | `owner` | Deliberate owner-content logging (per-call opt-out: see below) and owner-priority admission. |
 | Tier | `guest` | Content-blind guest admission; cannot carry privileged scopes. |
 | Scope | `admin` | Operator routes plus agent/inference surfaces. Explicit for new keys; legacy null-scope owner rows retain it compatibly. |
 | Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
@@ -45,6 +45,64 @@ migrated through the staged lifecycle in `docs/credential-lifecycle-runbook.md`.
 Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Error messages name the request units already metered by each route: chat/MCP use tokens, transcription uses worst-case audio-seconds, and image generation uses image units. Shared static-tier buckets retain their existing shared accounting across callers and routes. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
 
 Audio transcription has a separate non-queuing upload-memory bound before multipart buffering: at most two active audio handlers process-wide, at most one guest handler process-wide (leaving one slot available to owner traffic), and at most `min(2, key.maxParallel)` per authenticated alias. Saturated uploads receive `503 server_busy` with `Retry-After`; no body is buffered and no credit, quota, or GPU admission is reserved. Restricted keys without canonical `whisper-1` access are rejected before reading the multipart body because all accepted Whisper aliases route to that one backend model.
+
+## Per-call content-capture opt-out (#487)
+
+Owner traffic is content-logged by default (`owner_request_log`, the capability-ledger prompt
+excerpt, code_loop durable results). A caller handling Restricted material can opt out **per call**:
+
+| Surface | How to opt out | Echo when honoured |
+|---|---|---|
+| `POST /v1/chat/completions` | header `X-Content-Capture: none` (case-insensitive) | response header `X-Content-Capture: suppressed` |
+| `POST /mcp` → `ask` | argument `content_capture: "none"`, or the header on the `/mcp` POST | `_meta.content_capture: "suppressed"` on success, truncation and failure |
+| `POST /mcp` → `code_loop_start` | argument `content_capture: "none"`, or the header on the `/mcp` POST | top-level `content_capture: "suppressed"` on the start (and recovered start) response |
+
+`"none"` is the only accepted value. Any other value, a duplicated header, or a malformed argument
+is rejected (`400 invalid_request_error`, `param: "x-content-capture"`, or an MCP tool error /
+`invalid-request` refusal) before any inference; the bad value and the request body are never
+echoed. Omitting the field keeps today's behaviour byte-for-byte.
+
+When honoured, the gateway persists **metadata only**:
+
+- `owner_request_log` still gets a row per call (alias, model, route, timings, token counts,
+  outcome) with `messages_json = ""`, `completion = ""` and `content_capture = 'suppressed'`. This
+  holds on every outcome, including streaming `stream_failed` / `client_closed` / `degenerate`.
+  `owner-log.ts` discards content for a suppressed row itself, whichever call site writes it.
+- The capability ledger (`delegations`) keeps its task-type/model/outcome/token row with
+  `prompt_excerpt = NULL`, `prompt_hash = 'suppressed'` and `content_capture = 'suppressed'`.
+- Harvest and replay readers (`scripts/gate-chat-replay.ts` → `harvest-verdicts`,
+  `replay-gate-experiment`, `gate-shadow-measure`) and the task-exposure startup backfill exclude
+  suppressed rows explicitly.
+- `code_loop`: every per-turn `/v1/chat/completions` call is stamped `X-Content-Capture: none` by
+  the confined relay (an agent-supplied value is always stripped, so the caged agent cannot choose
+  capture either way); the ledger row is metadata-only; the durable run record never stores
+  `result` (the store forces `null` on every write); the result is held **in memory only** until
+  the 24 h TTL or a gateway restart, after which `code_loop_result` reports
+  `terminal result unavailable after restart`; the sandbox and host-side Git index are deleted as
+  soon as cleanup of the transient unit is proved (the sweep reclaims a suppressed sandbox without
+  waiting for the TTL if cleanup was pending). Seed files exist on disk only while the job runs.
+  `content_capture` is part of the `client_run_id` request fingerprint, so a suppressed retry never
+  recovers a content-capturing run or vice versa. A runtime that cannot stamp per-turn calls
+  (confinement `off`) refuses with `content-capture-unsupported` before any admission or write.
+
+Still recorded (no prompt or completion text): the content-blind `request_log`, metrics, and the
+task-exposure registry's SHA-256 fingerprint of the task text (`docs/task-exposure-contract.md`).
+The fingerprint keeps exam-contamination coverage complete; it is not text, but like any unkeyed
+digest it can confirm a guessed exact prompt to someone with database access.
+
+Surfaces that cannot honour the opt-out **refuse** it rather than capture content: any other
+non-read request carrying `X-Content-Capture: none` (`/delegate`, `/v1/embeddings`,
+`/v1/systemone`, `/v1/audio/transcriptions`, `/v1/images/generations`, admin routes, …) gets
+`400 invalid_request_error` (`param: "x-content-capture"`) and is not processed. `GET`/`HEAD`
+requests ignore the header. Guest keys are content-blind already; the header is accepted and
+echoed for them.
+
+**Preflight.** `GET /portal/me` returns `contentCaptureOptOut: "content-capture-none-v1"` for every
+authenticated key, and `tools/list` advertises `content_capture` (`enum: ["none"]`) on `ask` and
+`code_loop_start`. An older gateway silently ignores the unknown argument or header, so a caller must
+check one of these before sending Restricted content; the m5 client and stdio bridge do this
+automatically. This is a per-call capability advertisement, not the full effective-capture
+discovery requested in #344 (retention horizon, per-route/scope policy), which remains open.
 
 ## Error envelope (OpenAI-shaped)
 
@@ -634,7 +692,9 @@ Sampling controls (`temperature`, `top_p`, plus llama.cpp extensions `top_k` and
 
 **Response 200 (non-streaming):** standard OpenAI chat-completion body (`id`, `object`, `created`, `model`, `choices[].message`, `usage{prompt_tokens, completion_tokens, total_tokens}`).
 
-**Errors:** unknown model → `400 model_not_found` (`param: "model"`); `max_tokens <= 0` → `400 invalid_request_error` (`param: "max_tokens"`).
+**Errors:** unknown model → `400 model_not_found` (`param: "model"`); `max_tokens <= 0` → `400 invalid_request_error` (`param: "max_tokens"`); an invalid `X-Content-Capture` value → `400 invalid_request_error` (`param: "x-content-capture"`).
+
+`X-Content-Capture: none` stores metadata only for this call and is echoed as `X-Content-Capture: suppressed`; see *Per-call content-capture opt-out*.
 
 ### POST `/v1/images/generations`
 

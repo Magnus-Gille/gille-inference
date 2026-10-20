@@ -79,6 +79,11 @@ export interface CodeLoopRequest {
   /** Ledger task type; defaults to the classifier's verdict on the instruction. */
   task_type?: string;
   caps?: CodeLoopCapsRequest;
+  /**
+   * #487: per-call "do not log content" opt-out. "none" suppresses per-turn owner-log content (via
+   * the relay), ledger excerpts, durable result persistence and post-run sandbox retention.
+   */
+  content_capture?: "none";
 }
 
 // ─── Statuses ───────────────────────────────────────────────────────────────────────────
@@ -96,7 +101,9 @@ export type CodeLoopRefusal =
   | "memory_admission_unavailable"
   | "invalid-request"
   | "conflict"
-  | "admission-recovery";
+  | "admission-recovery"
+  /** #487: content_capture:"none" was requested but this engine cannot suppress per-turn capture. */
+  | "content-capture-unsupported";
 
 /** Terminal run statuses. `status` describes the RUN; verification lives in `check` —
  *  there is deliberately no "pass" status (design §4). */
@@ -230,6 +237,8 @@ export type CodeLoopStartResult =
       /** Exact immutable echo for stamped starts; absent on the declared legacy path. */
       learning_task_gateway_echo?: LearningTaskGatewayEcho;
       result?: CodeLoopResult;
+      /** #487: present only when the per-call content opt-out is in effect for this run. */
+      content_capture?: "suppressed";
       capabilities: {
         start_idempotency: "client-run-id-v1";
         agent_checks: "pi-bash-events-v3";
@@ -261,6 +270,8 @@ export interface EngineRunOptions {
   cageArgv: string[];
   /** Sandbox growth cap (bytes); breach aborts the run as cap-exceeded. */
   growthCapBytes: number;
+  /** #487: "suppressed" requires every per-turn gateway call to carry X-Content-Capture: none. */
+  contentCapture?: "suppressed";
 }
 
 export interface EngineRunResult {
@@ -298,6 +309,11 @@ export interface EngineRunResult {
 
 export interface AgentEngine {
   run(opts: EngineRunOptions): Promise<EngineRunResult>;
+  /**
+   * #487: true only when `run` guarantees every per-turn gateway request of a suppressed run carries
+   * X-Content-Capture: none (the confined relay injects it). Absent ⇒ suppressed starts are refused.
+   */
+  supportsContentCaptureSuppression?: boolean;
 }
 
 // ─── DI seams (fake spawn + scripted probes in offline tests) ───────────────────────────

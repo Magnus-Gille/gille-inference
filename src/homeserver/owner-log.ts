@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { getDb } from "../db.js";
+import { CONTENT_CAPTURE_SUPPRESSED, type ContentCapture } from "./content-capture.js";
 
 /**
  * OWNER-ONLY full request log.
@@ -16,6 +17,12 @@ import { getDb } from "../db.js";
  * log only the operator's own deliberately-minted owner keys, never a legacy posture that may not
  * represent a real human operator. A guest tier or legacy static key therefore NEVER produces a
  * row.
+ *
+ * PER-CALL OPT-OUT (#487): a row recorded with `contentCapture: "suppressed"` keeps only metadata.
+ * recordOwnerRequest itself discards `messagesJson` / `completion` for such a row (empty strings,
+ * matching the retention redaction value) and marks `content_capture = 'suppressed'`, so no caller
+ * path — success, error, or retry — can persist content once the caller opted out. Readers that
+ * mine content (harvest, replay, exposure backfill) also exclude marked rows explicitly.
  *
  * Writes are strictly best-effort: every insert is wrapped in try/catch so a log failure can
  * NEVER affect (fail, slow, or alter) the request itself. The schema is additive and created
@@ -41,6 +48,8 @@ export interface OwnerLogRow {
   tokPerSec: number | null;
   /** Free-form outcome label (e.g. "ok", "upstream_error"). */
   outcome: string;
+  /** #487: "suppressed" stores metadata only. Omitted/"default" keeps the full-content row. */
+  contentCapture?: ContentCapture;
 }
 
 let _olInit = false;
@@ -64,6 +73,11 @@ function ensureSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_owner_request_log_ts ON owner_request_log(ts);
   `);
+  // #487: additive, idempotent migration. NULL is the legacy/full-content state.
+  const cols = db.prepare(`PRAGMA table_info(owner_request_log)`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "content_capture")) {
+    db.exec(`ALTER TABLE owner_request_log ADD COLUMN content_capture TEXT`);
+  }
   _olInit = true;
 }
 
@@ -79,32 +93,39 @@ function olDb(): Database.Database {
  * owner-only guard (tier === "owner" && keyHash !== null) before calling this.
  */
 export function recordOwnerRequest(row: OwnerLogRow): void {
+  const suppressed = row.contentCapture === "suppressed";
   try {
     olDb()
       .prepare(
         `INSERT INTO owner_request_log
            (ts, alias, model, route, messages_json, completion,
-            prompt_tokens, completion_tokens, latency_ms, tok_per_sec, outcome)
+            prompt_tokens, completion_tokens, latency_ms, tok_per_sec, outcome, content_capture)
          VALUES
            (@ts, @alias, @model, @route, @messagesJson, @completion,
-            @promptTokens, @completionTokens, @latencyMs, @tokPerSec, @outcome)`
+            @promptTokens, @completionTokens, @latencyMs, @tokPerSec, @outcome, @contentCapture)`
       )
       .run({
         ts: new Date().toISOString(),
         alias: row.alias,
         model: row.model,
         route: row.route,
-        messagesJson: row.messagesJson,
-        completion: row.completion,
+        messagesJson: suppressed ? "" : row.messagesJson,
+        completion: suppressed ? "" : row.completion,
         promptTokens: row.promptTokens,
         completionTokens: row.completionTokens,
         latencyMs: row.latencyMs,
         tokPerSec: row.tokPerSec,
         outcome: row.outcome,
+        contentCapture: suppressed ? CONTENT_CAPTURE_SUPPRESSED : null,
       });
   } catch (err) {
-    // Never let a log write break a request. Surface the detail server-side only.
-    console.error("[owner-log] failed to record owner request (ignored):", err);
+    // Never let a log write break a request. Surface the detail server-side only. A suppressed
+    // row's driver error could quote bound values, so report only the error class for it.
+    if (suppressed) {
+      console.error("[owner-log] failed to record metadata-only owner request (ignored):", err instanceof Error ? err.name : "unknown");
+    } else {
+      console.error("[owner-log] failed to record owner request (ignored):", err);
+    }
   }
 }
 
@@ -128,6 +149,19 @@ interface OwnerLogDbRow {
   latency_ms: number | null;
   tok_per_sec: number | null;
   outcome: string;
+  content_capture: string | null;
+}
+
+/**
+ * #487: SQL predicate (with leading AND) excluding metadata-only rows from content readers. Returns
+ * "" for a database whose owner_request_log predates the column (no row there can be suppressed).
+ * Readers that open the DB directly (scripts) use this instead of assuming the migration ran.
+ */
+export function ownerLogContentRowsPredicate(db: Database.Database): string {
+  const cols = db.prepare(`PRAGMA table_info(owner_request_log)`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === "content_capture")
+    ? `AND (content_capture IS NULL OR content_capture <> '${CONTENT_CAPTURE_SUPPRESSED}')`
+    : "";
 }
 
 /** Read the most recent owner-log entries (newest first). For operator analysis. */
@@ -148,5 +182,6 @@ export function getOwnerLog(limit = 100): OwnerLogEntry[] {
     latencyMs: r.latency_ms,
     tokPerSec: r.tok_per_sec,
     outcome: r.outcome,
+    contentCapture: r.content_capture === CONTENT_CAPTURE_SUPPRESSED ? "suppressed" : "default",
   }));
 }

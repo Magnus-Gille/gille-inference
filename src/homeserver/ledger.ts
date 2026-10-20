@@ -31,6 +31,7 @@ import {
 import { REVIEWER_USEFULNESS_VALUES, REVIEW_BOUNDED_TASK_TYPE } from "./review-bounded.js";
 import { isKnownTaskType } from "./taxonomy.js";
 import { policyTaskTypeIdentity } from "./task-type-identity.js";
+import { CONTENT_CAPTURE_SUPPRESSED, type ContentCapture } from "./content-capture.js";
 
 export type {
   EvidenceIdentityBundle,
@@ -133,6 +134,11 @@ export interface DelegationRecord {
   learningTaskAdmissionId?: string;
   /** The exact validated stamp paired with learningTaskAdmissionId; validated but never stored here. */
   learningTaskStamp?: HuginRequestStamp;
+  /**
+   * #487: "suppressed" keeps the metadata row (task type, model, outcome, tokens, timings) but
+   * writes no prompt excerpt and no prompt hash, and marks `content_capture = 'suppressed'`.
+   */
+  contentCapture?: ContentCapture;
 }
 
 // ─── Verdict ───────────────────────────────────────────────────────────────────
@@ -258,6 +264,8 @@ function ensureSchema(db: Database.Database): void {
     if (!names.has("reviewer_usefulness_legacy_quarantined_at")) {
       db.exec(`ALTER TABLE delegations ADD COLUMN reviewer_usefulness_legacy_quarantined_at TEXT`);
     }
+    // #487: per-call content opt-out marker. NULL is the legacy/full-excerpt state.
+    if (!names.has("content_capture")) db.exec(`ALTER TABLE delegations ADD COLUMN content_capture TEXT`);
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -292,7 +300,8 @@ export function recordDelegation(rec: DelegationRecord): string {
   const db = ledgerDb();
   const id = randomUUID();
   const ts = new Date().toISOString();
-  const excerpt = rec.prompt.slice(0, 280);
+  const suppressed = rec.contentCapture === "suppressed";
+  const excerpt = suppressed ? null : rec.prompt.slice(0, 280);
   // #95: policy reads a known taxonomy spelling from its canonical identity. Write the same
   // identity so failures supplied as e.g. "Summarize" degrade the "summarize" lane rather than
   // accumulating in an orphaned bucket. Unknown caller-domain buckets retain #155's verbatim
@@ -319,14 +328,14 @@ export function recordDelegation(rec: DelegationRecord): string {
         error_class, escalated, source, notes,
         gate_mode, gate_score, gate_would_escalate, gate_error, key_alias, shadow,
         evidence_identity_hash, evidence_lane, learning_task_admission_id,
-        learning_task_instance_id, learning_task_attempt_id)
+        learning_task_instance_id, learning_task_attempt_id, content_capture)
      VALUES
        (@id, @ts, @taskType, @nodeId, @modelId, @promptHash, @promptExcerpt, @outcome, @score,
         @latencyMs, @ttftMs, @promptTokens, @completionTokens, @tokPerSec, @verifier,
         @errorClass, @escalated, @source, @notes,
         @gateMode, @gateScore, @gateWouldEscalate, @gateError, @keyAlias, @shadow,
         @evidenceIdentityHash, @evidenceLane, @learningTaskAdmissionId,
-        @learningTaskInstanceId, @learningTaskAttemptId)`
+        @learningTaskInstanceId, @learningTaskAttemptId, @contentCapture)`
   );
 
   // #5 (M5 dogfood review): the snapshot upsert and the row insert are two separate statements —
@@ -371,7 +380,8 @@ export function recordDelegation(rec: DelegationRecord): string {
       taskType: ledgerTaskType,
       nodeId: rec.nodeId ?? "m5",
       modelId: rec.modelId,
-      promptHash: hashPrompt(rec.prompt),
+      // prompt_hash is NOT NULL; an unkeyed digest of a suppressed prompt could confirm a guess.
+      promptHash: suppressed ? CONTENT_CAPTURE_SUPPRESSED : hashPrompt(rec.prompt),
       promptExcerpt: excerpt,
       outcome: rec.outcome,
       score: rec.score ?? null,
@@ -396,6 +406,7 @@ export function recordDelegation(rec: DelegationRecord): string {
       learningTaskAdmissionId: admission?.admissionRecordId ?? null,
       learningTaskInstanceId: admission?.taskInstanceId ?? null,
       learningTaskAttemptId: admission?.attemptId ?? null,
+      contentCapture: suppressed ? CONTENT_CAPTURE_SUPPRESSED : null,
     });
   });
   // Acquire the writer lock before resolving the admission so another process cannot remove or

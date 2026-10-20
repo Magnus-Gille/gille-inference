@@ -43,6 +43,17 @@ function sanitizeMessages(msgs: unknown): ChatMsg[] {
   return ok;
 }
 
+/**
+ * #487: exclude metadata-only owner-log rows. Inlined (rather than importing owner-log.ts) to keep
+ * this script's lazy-import discipline; mirrors ownerLogContentRowsPredicate.
+ */
+function suppressedRowsPredicate(db: import("better-sqlite3").Database): string {
+  const cols = db.prepare(`PRAGMA table_info(owner_request_log)`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === "content_capture")
+    ? `AND (content_capture IS NULL OR content_capture <> 'suppressed')`
+    : "";
+}
+
 /** Deduped, stride-sampled real single-turn-ish owner sub-tasks with usable inputs. */
 function loadTasks(
   DatabaseCtor: typeof import("better-sqlite3"),
@@ -56,6 +67,7 @@ function loadTasks(
         `SELECT id, messages_json
          FROM owner_request_log
          WHERE messages_json IS NOT NULL AND length(messages_json) BETWEEN 40 AND 8000
+           ${suppressedRowsPredicate(db)}
          ORDER BY id DESC`
       )
       .all() as { id: number; messages_json: string }[];

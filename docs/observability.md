@@ -244,7 +244,10 @@ tier === "owner" && keyHash !== null
 
 which excludes legacy static admins (`keyHash === null`) and **never** logs
 guests. Gate: `HOMESERVER_OWNER_REQUEST_LOG` (`on` | `off`, default `on`). The observability layer
-does not change this guard or widen content capture. MCP `ask` owner opt-in native reasoning
+does not change this guard or widen content capture. A caller may also opt out per call
+(`X-Content-Capture: none` / `content_capture: "none"`, #487): the row is then metadata-only
+(`messages_json` and `completion` empty, `content_capture = 'suppressed'`) on every outcome, and
+content readers skip it; see `docs/gateway-api-contract.md`. MCP `ask` owner opt-in native reasoning
 (`#441`) is returned separately and is not added to any content log, metrics, request log or
 delegation evidence; the existing prompt and final-answer logging contract is unchanged.
 

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { getDb } from "../db.js";
+import { ownerLogContentRowsPredicate } from "./owner-log.js";
 
 /**
  * Content-blind task-exposure registry (#257).
@@ -765,10 +766,11 @@ function backfillOwnerRequests(db: Database.Database): {
   through: string | null;
 } {
   if (!tableExists(db, "owner_request_log")) return { scanned: 0, imported: 0, from: null, through: null };
+  // #487: metadata-only rows carry no task text to fingerprint.
   const rows = db.prepare(
     `SELECT id, ts, route, messages_json
      FROM owner_request_log
-     WHERE route IN ('chat', 'mcp')
+     WHERE route IN ('chat', 'mcp') ${ownerLogContentRowsPredicate(db)}
      ORDER BY id`
   ).all() as OwnerRequestDbRow[];
   let imported = 0;

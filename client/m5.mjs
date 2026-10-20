@@ -66,6 +66,7 @@ function parseGlobalArgs(argv) {
   let sshTarget;
   let authHelper;
   let timeoutMsRaw;
+  let contentCapture;
   let checkLatest = false;
   let probeInferenceModel;
   const positional = [];
@@ -142,6 +143,16 @@ function parseGlobalArgs(argv) {
       }
       timeoutMsRaw = value;
       index += 1;
+    } else if (arg === "--content-capture") {
+      const value = argv[index + 1];
+      if (contentCapture !== undefined) {
+        throw new M5ClientError("invalid_args", "--content-capture may be specified only once.");
+      }
+      if (value !== "none") {
+        throw new M5ClientError("invalid_args", "--content-capture accepts only: none.");
+      }
+      contentCapture = value;
+      index += 1;
     } else if (arg === "--check-latest") {
       if (checkLatest) {
         throw new M5ClientError("invalid_args", "--check-latest may be specified only once.");
@@ -166,6 +177,7 @@ function parseGlobalArgs(argv) {
     sshTarget,
     authHelper,
     timeoutMsRaw,
+    contentCapture,
     checkLatest,
     probeInferenceModel,
   };
@@ -260,10 +272,10 @@ function help() {
       "eval \"$(m5 --profile <name> deploy-env --auth-helper <absolute-path>)\"",
       "m5 --profile <claude|codex> [--public|--private] mcp",
       "m5 --profile <claude|codex> [--public|--private] models",
-      "printf '%s' '<json>' | m5 --profile <claude|codex> [--timeout-ms <1000-600000>] ask",
+      "printf '%s' '<json>' | m5 --profile <claude|codex> [--timeout-ms <1000-600000>] [--content-capture none] ask",
       "printf '%s' '<content-free-json>' | m5 --profile <claude|codex> adoption report",
       "printf '%s' '{\"feedback_handle\":\"<uuid>\",\"usefulness\":\"pass\"}' | m5 --profile <claude|codex> feedback submit",
-      "printf '%s' '<json>' | m5 --profile <claude|codex> code run",
+      "printf '%s' '<json>' | m5 --profile <claude|codex> [--content-capture none] code run",
       "m5 --profile <claude|codex> code status <work_id>",
       "m5 --profile <claude|codex> code result <work_id>",
       "m5 --profile <name> --public-gateway-url <https-url> --m5-host <user@host> provision",
@@ -330,11 +342,25 @@ export async function main(
       sshTarget,
       authHelper,
       timeoutMsRaw,
+      contentCapture,
       checkLatest,
       probeInferenceModel,
     } = parseGlobalArgs(argv);
     selectedProfileName = profile;
     const command = positional[0];
+    // #487: the opt-out applies only to the two content-bearing commands; reject it elsewhere
+    // before config, credential or network access rather than implying it did something.
+    if (contentCapture !== undefined && command !== "ask" && !(command === "code" && positional[1] === "run")) {
+      throw new M5ClientError("invalid_args", "--content-capture is only valid with ask and code run.");
+    }
+    const withContentCapture = (value) => {
+      if (contentCapture === undefined) return value;
+      if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+      if (Object.prototype.hasOwnProperty.call(value, "content_capture") && value.content_capture !== contentCapture) {
+        throw new M5ClientError("invalid_args", "--content-capture conflicts with the input's content_capture.");
+      }
+      return { ...value, content_capture: contentCapture };
+    };
     // Scope before value: the flag is meaningless outside a direct ask, and both
     // rejections must land before config loading, credential lookup, or any I/O.
     if (timeoutMsRaw !== undefined && command !== "ask") {
@@ -483,7 +509,7 @@ export async function main(
       return 0;
     }
     if (command === "ask") {
-      writeJson(output, await client.ask(await readBoundedInput(input)));
+      writeJson(output, await client.ask(withContentCapture(await readBoundedInput(input))));
       return 0;
     }
     if (command === "adoption") {
@@ -503,7 +529,7 @@ export async function main(
     if (command === "code") {
       const operation = positional[1];
       if (operation === "run") {
-        writeJson(output, await client.codeRun(await readBoundedInput(input)));
+        writeJson(output, await client.codeRun(withContentCapture(await readBoundedInput(input))));
         return 0;
       }
       if (operation === "status") {

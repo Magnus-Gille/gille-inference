@@ -459,6 +459,11 @@ sees only the model's answer text.
   They DO reach the owner-only full-content log (`owner-log.ts`) and the capability-ledger prompt
   excerpt (`ledger.ts`), exactly like the rest of an owner's own `ask` content already does — this
   is not a new exposure, since `files` is itself owner-tier-only.
+- **Per-call opt-out (#487):** `content_capture: "none"` on `ask` (or `X-Content-Capture: none` on
+  the `/mcp` POST or on `POST /v1/chat/completions`) keeps the owner-log and ledger rows
+  metadata-only — no prompt, attached file, or completion text — and is echoed as
+  `_meta.content_capture: "suppressed"`. Other content-bearing routes refuse the header. Full
+  contract: `docs/gateway-api-contract.md` → *Per-call content-capture opt-out*.
 **Owner-agent tools** (`code_loop_start` / `code_loop_status` / `code_loop_result`, issue #116)
 appear in `tools/list` **only** for a real minted owner-tier key with `scope=agent|admin`
 (`tier === "owner" && keyHash !== null` preserves the owner-content boundary, while the
@@ -478,12 +483,15 @@ checkout. Every loop turn transits the gateway spine (admission, `owner_request_
 poison-clear, the degeneracy watchdog), so it is the Claude→local **agentic-delegation
 dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE_LOOP=off`).
 
-- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?}`
-  → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, capabilities}`
+- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?, content_capture?}`
+  → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, content_capture?, capabilities}`
   immediately, or a structured refusal (`disabled` / `busy` / `maintenance` /
   `lease-unavailable` / `cage-unavailable` / `cage-transport-unavailable` /
   `invalid-request` / `conflict` /
-  `admission-recovery`). Optional
+  `admission-recovery` / `content-capture-unsupported`). `content_capture: "none"` (#487) makes the
+  run metadata-only: the relay stamps every turn `X-Content-Capture: none`, the durable record never
+  holds the result (memory only until TTL/restart), and the sandbox is deleted once cleanup is
+  proved; without the confined relay it is refused as `content-capture-unsupported`. Optional
   `client_run_id` activates `client-run-id-v1`: an exclusive durable binding to the canonical
   request digest is committed before execution; same id+request recovers the original
   state/result across response loss/restart, and same id+different request conflicts. Recovery is

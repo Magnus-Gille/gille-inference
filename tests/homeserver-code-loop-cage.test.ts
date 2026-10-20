@@ -614,7 +614,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
   // at the relay WITHOUT any upstream connection.
   interface Stub {
     port: number;
-    hits: Array<{ method: string; url: string; body: string; authorization: string | undefined }>;
+    hits: Array<{ method: string; url: string; body: string; authorization: string | undefined; contentCapture: string | string[] | undefined }>;
     close: () => Promise<void>;
   }
   async function startStub(): Promise<Stub> {
@@ -623,7 +623,7 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c as Buffer));
       req.on("end", () => {
-        hits.push({ method: req.method ?? "", url: req.url ?? "", body: Buffer.concat(chunks).toString(), authorization: req.headers.authorization });
+        hits.push({ method: req.method ?? "", url: req.url ?? "", body: Buffer.concat(chunks).toString(), authorization: req.headers.authorization, contentCapture: req.headers["x-content-capture"] });
         if ((req.url ?? "").startsWith("/v1/chat/completions")) {
           // Stream two SSE-ish frames to exercise streaming passthrough.
           res.writeHead(200, { "content-type": "text/event-stream", "x-stub": "chat" });
@@ -649,9 +649,10 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
     path: string,
     body?: string,
     authorization?: string,
+    extraHeaders: Record<string, string> = {},
   ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
     return new Promise((resolve, reject) => {
-      const req = http.request({ host: "127.0.0.1", port, method, path, headers: authorization === undefined ? {} : { authorization } }, (res) => {
+      const req = http.request({ host: "127.0.0.1", port, method, path, headers: { ...(authorization === undefined ? {} : { authorization }), ...extraHeaders } }, (res) => {
         let buf = "";
         res.on("data", (d) => (buf += d.toString()));
         res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: buf }));
@@ -674,6 +675,29 @@ describe("startGatewayRelay — HTTP-aware path-allowlisted forwarder (admin-exp
     expect(stub.hits[0]!.method).toBe("POST");
     expect(stub.hits[0]!.body).toContain('"model":"m"'); // request body streamed through
     expect(stub.hits[0]!.authorization).toBe("Bearer upstream-test-key");
+    await relay.close();
+    await stub.close();
+  });
+
+  it("#487: a suppressed run stamps X-Content-Capture: none on every upstream request, overriding the agent", async () => {
+    const stub = await startStub();
+    const fwd = await freePort();
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key", { contentCapture: "suppressed" });
+    await request(fwd, "POST", "/v1/chat/completions", JSON.stringify({ model: "m", messages: [] }), `Bearer ${relay.clientApiKey}`);
+    await request(fwd, "POST", "/v1/chat/completions", "{}", `Bearer ${relay.clientApiKey}`, { "x-content-capture": "bogus" });
+    await request(fwd, "GET", "/v1/models", undefined, `Bearer ${relay.clientApiKey}`);
+    expect(stub.hits.map((h) => h.contentCapture)).toEqual(["none", "none", "none"]);
+    await relay.close();
+    await stub.close();
+  });
+
+  it("#487: an ordinary run strips any agent-supplied X-Content-Capture (capture is not the agent's choice)", async () => {
+    const stub = await startStub();
+    const fwd = await freePort();
+    const relay = await startGatewayRelay(fwd, "127.0.0.1", stub.port, "upstream-test-key");
+    await request(fwd, "POST", "/v1/chat/completions", "{}", `Bearer ${relay.clientApiKey}`, { "x-content-capture": "none" });
+    expect(stub.hits).toHaveLength(1);
+    expect(stub.hits[0]!.contentCapture).toBeUndefined();
     await relay.close();
     await stub.close();
   });
