@@ -828,6 +828,19 @@ llama-swap serves one model at a time. The latest verified production roster has
 `qwen3-30b-instruct`, `gemma4`, `qwen36-a3b`, `vibethinker-3b`,
 `qwen3-coder-next-80b`, `gpt-oss-120b`, `qwen35-122b-a10b`, `muse-glimmer-30b`,
 `nemotron-3.5-lightning-30b-a3b`, `qwen38-27b`, and `ornith-1.5-35b`.
+The additional ordinary chat entry `flint` uses the official
+Recursive Flint 40B-A2.5B INT4/Q4_1 model at revision
+`9c47151036bc2c34331142dda04488bceab2bc9f` with GGUF SHA-256
+`43c07baccdba42eb7528a9630ee15699b1942c297291dc1b39a061f508ee1a4b`. Its configured context is
+262,144 tokens for text, tool use and reasoning; speed is unmeasured. The separately pinned
+launcher forwards the reviewed runtime arguments and then enforces `--cache-ram 0 --temp 1
+--top-p 0.95 --top-k 20 --min-p 0`; the spec's `cache_ram_mib: 64` is promoter compatibility.
+The serving contract uses batch 256, physical batch 128, one slot, Jinja and flash attention,
+F16 KV, and a 1,800-second idle TTL. Activation remains conditional on live model discovery:
+do not claim availability until the authenticated `GET /v1/models` response includes `flint`
+after its runtime and roster are live.
+No model-quality evaluation or performance measurement is claimed.
+
 The `clef-flash`, `bespoke-nimble-9b`, and `pplx-decider-v1-27b` System One decision models
 are separate, gated roster additions. Customer availability is conditional: the runtime, roster,
 and `HOMESERVER_SYSTEMONE_MODELS` setting must be verified, and the customer's key must receive
