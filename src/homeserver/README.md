@@ -354,7 +354,7 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   bytes; decoding each separately can introduce replacement characters. The generic `m5` bridge
   forwards this tool without a client upgrade. After gateway rollout, refresh/reconnect the MCP
   session if the agent cached an older `tools/list` response.
-- `ask` — `{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?, include_reasoning?}` → runs a completion on the chosen
+- `ask` — `{model, prompt, system?, max_tokens?, response_format?, output_profile?, temperature?, top_p?, top_k?, min_p?, delegator_model_id?, files?, include_reasoning?}` → runs a completion on the chosen
   local model. Successful calls keep the text in the content block and also attach
   `structuredContent {model,text,finish_reason,truncated,metered,usage}`. `metered` is always
   content-blind `true` for this tool; `usage` is content-blind prompt/input, completion/output,
@@ -366,6 +366,13 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   (`finish_reason="length"`) also returns `isError:true`, keeps the paid partial answer in the
   content block behind a loud warning, preserves the same structured payload, and means any retry
   is a new billable call. `max_tokens` uses the same fleet/per-model ceiling as raw chat.
+  `response_format` optionally requests backend grammar-constrained output using the same shapes
+  as `/delegate`'s `responseFormat`: `{type:"text"}`, `{type:"json_object"}`, or
+  `{type:"json_schema",json_schema:{name,schema,strict?}}`. The gateway validates the format
+  before credits, quota, admission, or inference and forwards only its recognized fields. Omission
+  preserves the default backend request. Use a JSON format explicitly for JSON-shaped tasks;
+  it does not mix native reasoning into the final answer or change truncation and metering.
+  The existing `m5 ask` JSON-stdin client and generic MCP bridge forward it without an upgrade.
   `output_profile: "complete-within-budget"` is an opt-in profile for bounded multi-section work:
   it adds a hard structural-completion instruction and requests low reasoning effort from
   `gpt-oss` so required sections retain output budget. Other models receive only the completion
