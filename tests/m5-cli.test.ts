@@ -748,6 +748,35 @@ describe("m5 command surface", () => {
     expect(error.text()).toBe("");
   });
 
+  it("forwards response_format from JSON stdin through the existing ask client", async () => {
+    const output = sink();
+    const error = sink();
+    const args = {
+      model: "mellum", prompt: "Return JSON.",
+      response_format: { type: "json_schema", json_schema: { name: "answer", schema: { type: "object" }, strict: true } },
+    };
+    let forwarded: unknown;
+    const exitCode = await main(["--profile", "codex", "ask"], {
+      input: Readable.from([JSON.stringify(args)]),
+      output: output.stream,
+      error: error.stream,
+      configLoader,
+      credentialStore: { resolve: async () => SECRET },
+      fetch: async (_input, init) => {
+        const request = JSON.parse(String(init?.body));
+        forwarded = request.params.arguments;
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0", id: request.id,
+          result: { content: [{ type: "text", text: '{"answer":"final"}' }], isError: false },
+        }), { status: 200 });
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(forwarded).toEqual(args);
+    expect(JSON.parse(output.text()).text).toBe('{"answer":"final"}');
+    expect(error.text()).toBe("");
+  });
+
   it("serializes only validated temporary model backoff metadata for direct ask", async () => {
     const output = sink();
     const error = sink();

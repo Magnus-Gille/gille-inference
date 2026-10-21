@@ -33,6 +33,12 @@ function backendResponse(model: string): Record<string, unknown> {
   if (model === "reasoning-nonstring-answer") {
     return { choices: [{ message: { content: { reasoning_content: MALFORMED_REASONING_SENTINEL } } }] };
   }
+  if (model === "reasoning-json" || model === "reasoning-json-length") {
+    return {
+      choices: [{ message: { role: "assistant", content: '{"answer":"final"}', reasoning_content: REASONING_SENTINEL }, finish_reason: model.endsWith("-length") ? "length" : "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12, reasoning_tokens: 7 },
+    };
+  }
   if (model === "reasoning-populated") {
     return {
       id: "reasoning-populated",
@@ -186,6 +192,26 @@ function askTool(tools: Array<Record<string, any>>): Record<string, any> {
 }
 
 describe("MCP ask reasoning opt-in (#441)", () => {
+  it.each(["reasoning-json", "reasoning-json-length"])("keeps %s structured-output final text separate from native reasoning and preserves truncation", async (model) => {
+    const beforeHits = upstreamHits;
+    const body = await ask(model, `structured-${model}`, { response_format: { type: "json_object" }, include_reasoning: true });
+    const truncated = model.endsWith("-length");
+    expect(body.result.isError).toBe(truncated);
+    expect(body.result.content[0].text).toContain('{"answer":"final"}');
+    expect(body.result.content[0].text).not.toContain(REASONING_SENTINEL);
+    expect(body.result.structuredContent).toMatchObject({
+      text: '{"answer":"final"}',
+      finish_reason: truncated ? "length" : "stop",
+      truncated,
+      metered: true,
+      reasoning_content: REASONING_SENTINEL,
+      reasoning_truncated: false,
+      usage: { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12, reasoning_tokens: 7 },
+    });
+    expect(JSON.parse(upstreamBodies.at(-1)!)).toHaveProperty("response_format", { type: "json_object" });
+    expect(upstreamHits).toBe(beforeHits + 1);
+  });
+
   it("advertises include_reasoning and owner-only output fields while hiding them from guests", async () => {
     const owner = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" }, ownerKey);
     const guest = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, guestKey);

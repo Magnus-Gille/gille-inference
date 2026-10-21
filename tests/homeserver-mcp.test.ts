@@ -8,6 +8,7 @@ import { classifyTask } from "../src/homeserver/taxonomy.js";
 import { ensureLedgerSchema, getVerdict } from "../src/homeserver/ledger.js";
 import { ensureDelegationCostSchema } from "../src/homeserver/delegation-cost.js";
 import { DEFAULT_POLICY } from "../src/homeserver/config.js";
+import { AdmissionController } from "../src/homeserver/admission.js";
 import {
   TASK_FINGERPRINT_VERSION,
   lookupTaskExposures,
@@ -486,6 +487,96 @@ describe("MCP tools/call list_models", () => {
 // ─── tools/call ask (valid model) ────────────────────────────────────────────────────
 
 describe("MCP tools/call ask", () => {
+  it("advertises optional structured-output formats to owner and guest callers", async () => {
+    for (const key of [openKey, scopedKey]) {
+      const body = await (await rpc({ jsonrpc: "2.0", id: 390, method: "tools/list" }, key)).json();
+      const ask = body.result.tools.find((tool: { name: string }) => tool.name === "ask");
+      expect(ask.inputSchema.properties.response_format).toMatchObject({
+        type: "object",
+        oneOf: [
+          { properties: { type: { enum: ["text", "json_object"] } }, required: ["type"] },
+          { properties: { type: { const: "json_schema" }, json_schema: { required: ["name", "schema"] } }, required: ["type", "json_schema"] },
+        ],
+      });
+      expect(ask.inputSchema.required).not.toContain("response_format");
+    }
+  });
+
+  it.each([
+    [{ type: "text", ignored: "drop" }, { type: "text" }],
+    [{ type: "json_object", ignored: "drop" }, { type: "json_object" }],
+    [{
+      type: "json_schema",
+      ignored: "drop",
+      json_schema: {
+        name: "answer-v1",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false },
+        strict: true,
+        ignored: "drop",
+      },
+    }, {
+      type: "json_schema",
+      json_schema: {
+        name: "answer-v1",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false },
+        strict: true,
+      },
+    }],
+  ])("forwards sanitized response_format %j unchanged to the backend", async (responseFormat, expected) => {
+    const beforeHits = upstreamHits;
+    const beforeCredits = lookupKey(creditKey)!.creditsUsed;
+    const body = await (await rpc({
+      jsonrpc: "2.0", id: 391, method: "tools/call",
+      params: { name: "ask", arguments: { model: "any-model", prompt: "Return JSON.", response_format: responseFormat } },
+    }, creditKey)).json();
+    expect(body.result.isError).toBe(false);
+    expect(JSON.parse(lastUpstreamBody)).toEqual({
+      model: "any-model", messages: [{ role: "user", content: "Return JSON." }], max_tokens: 256,
+      response_format: expected,
+    });
+    expect(upstreamHits).toBe(beforeHits + 1);
+    expect(lookupKey(creditKey)!.creditsUsed - beforeCredits).toBe(10);
+  });
+
+  it("preserves the exact default backend body when response_format is omitted", async () => {
+    const body = await (await rpc({
+      jsonrpc: "2.0", id: 392, method: "tools/call",
+      params: { name: "ask", arguments: { model: "any-model", prompt: "Default text." } },
+    })).json();
+    expect(body.result.isError).toBe(false);
+    expect(lastUpstreamBody).toBe(JSON.stringify({
+      model: "any-model", messages: [{ role: "user", content: "Default text." }], max_tokens: 256,
+    }));
+  });
+
+  it.each([
+    null, "json", [], {}, { type: "yaml" },
+    { type: "json_schema" },
+    { type: "json_schema", json_schema: null },
+    { type: "json_schema", json_schema: { schema: {} } },
+    { type: "json_schema", json_schema: { name: "has space", schema: {} } },
+    { type: "json_schema", json_schema: { name: "a".repeat(65), schema: {} } },
+    { type: "json_schema", json_schema: { name: "answer" } },
+    { type: "json_schema", json_schema: { name: "answer", schema: [] } },
+  ].map((responseFormat) => ({ responseFormat })))("rejects invalid response_format $responseFormat before admission, credits, or inference", async ({ responseFormat }) => {
+    const beforeHits = upstreamHits;
+    const beforeCredits = lookupKey(creditKey)!.creditsUsed;
+    const acquire = vi.spyOn(AdmissionController.prototype, "acquire");
+    try {
+      const body = await (await rpc({
+        jsonrpc: "2.0", id: 393, method: "tools/call",
+        params: { name: "ask", arguments: { model: "any-model", prompt: "Return JSON.", response_format: responseFormat } },
+      }, creditKey)).json();
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text).toMatch(/response_format/);
+      expect(acquire).not.toHaveBeenCalled();
+      expect(upstreamHits).toBe(beforeHits);
+      expect(lookupKey(creditKey)!.creditsUsed).toBe(beforeCredits);
+    } finally {
+      acquire.mockRestore();
+    }
+  });
+
   it("advertises and applies the complete-within-budget profile for gpt-oss", async () => {
     const listed = await rpc({ jsonrpc: "2.0", id: 39, method: "tools/list" });
     const listedJson = (await listed.json()) as {
