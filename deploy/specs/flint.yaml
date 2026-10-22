@@ -1,0 +1,22 @@
+# Planned ordinary chat roster entry; activation remains conditional on live model discovery.
+# Official Recursive Flint40B-A2.5B INT4/Q4_1 model at immutable revision
+# 9c47151036bc2c34331142dda04488bceab2bc9f.
+# GGUF SHA256: 43c07baccdba42eb7528a9630ee15699b1942c297291dc1b39a061f508ee1a4b.
+# The manually reviewed schema requires cache_ram_mib >= 64, so this compatibility
+# value is rendered by the promoter; the installed sibling launcher overrides it to
+# --cache-ram 0 and enforces the reviewed Flint sampler defaults.
+key: flint
+api: chat
+gguf: /operator-resolve/models/flint-int4-q4_1.gguf
+runtime_bin: /operator-resolve/flint-runtime/bin/flint-server.sh
+ctx: 262144
+batch: 256
+ngl: 999
+ubatch: 128
+np: 1
+jinja: true
+fa: on
+cache_ram_mib: 64
+ctk: f16
+ctv: f16
+ttl: 1800
