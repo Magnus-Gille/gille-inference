@@ -15,7 +15,7 @@ import { AdmissionController, AdmissionRejected, type Lane } from "./admission.j
 import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
 import { quotaScopeForPrincipal, describeQuotaFailure, type QuotaFailureDetail } from "./quota-error.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
-import { recordOwnerRequest } from "./owner-log.js";
+import { recordOwnerRequest, shouldCaptureOwnerContent } from "./owner-log.js";
 import { isKeyedExposureFingerprintAvailable } from "./task-exposure.js";
 import {
   CONTENT_CAPTURE_NONE,
@@ -66,6 +66,8 @@ import { TOKENIZE_TOOL, runTokenize } from "./tokenize.js";
 import { parseMcpEnvelope, type JsonRpcRequest } from "./mcp-envelope.js";
 import { BACKEND_FAILURE_DESCRIPTORS } from "../../client/backend-failure-contract.mjs";
 import type { BackendFailureReason } from "../../client/backend-failure-contract.mjs";
+import { parseResponseFormat } from "./response-format.js";
+import type { ResponseFormat } from "../runner/openrouter-client.js";
 
 /**
  * MCP (Model Context Protocol) Streamable-HTTP transport for the gateway.
@@ -139,6 +141,7 @@ const ASK_DESCRIPTION =
   "no data leaves the box). Ideal for code generation/refactoring, drafting, classification, " +
   "summarization, extraction, and short reasoning where you would otherwise spend frontier tokens. " +
   "Pick a model from list_models; pass the full prompt (and an optional system instruction). " +
+  "For grammar-constrained JSON output, explicitly pass response_format {type:'json_object'} or {type:'json_schema',json_schema:{name,schema,strict?}}; omission preserves the model's default output. " +
   "Successful calls return the model text plus structuredContent {model,text,finish_reason,truncated,metered,usage}. " +
   "A token-limit finish (finish_reason=length) returns isError:true while preserving the partial text in content and the same structuredContent; the truncated call is already metered and any retry is a new billable call. " +
   "Any other failure returns isError:true with the reason as text and the cause in _meta {m5_code, retryable, retry_after_seconds}; rate limits also include quota details {reason, scope, window, limit, requested, counted, retry_after_seconds}. Isolated keys also receive used_before; shared static tiers do not. Retry only when retryable is true, after retry_after_seconds when given. " +
@@ -521,6 +524,28 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
           traffic_purpose: { type: "string", enum: ["organic", "evaluation", "synthetic"], description: "Purpose fixed before execution; omission remains unknown." },
           system: { type: "string", description: "optional system instruction" },
           max_tokens: { type: "number", description: "optional cap on the completion length" },
+          response_format: {
+            type: "object",
+            description: "optional OpenAI output format; JSON formats request grammar-constrained decoding from the backend",
+            oneOf: [
+              { properties: { type: { enum: ["text", "json_object"] } }, required: ["type"] },
+              {
+                properties: {
+                  type: { const: "json_schema" },
+                  json_schema: {
+                    type: "object",
+                    properties: {
+                      name: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+                      schema: { type: "object" },
+                      strict: { type: "boolean" },
+                    },
+                    required: ["name", "schema"],
+                  },
+                },
+                required: ["type", "json_schema"],
+              },
+            ],
+          },
           output_profile: {
             type: "string",
             enum: [COMPLETE_WITHIN_BUDGET_PROFILE],
@@ -634,6 +659,8 @@ export interface RunChatArgs {
   topK?: number;
   minP?: number;
   reasoningEffort?: "low";
+  /** Explicit caller format, validated before the shared metered path. Omitted by default. */
+  responseFormat?: ResponseFormat;
   /** Expose native reasoning only when true AND the authenticated caller is owner-tier. */
   includeReasoning?: boolean;
   /**
@@ -1042,12 +1069,13 @@ export async function runChatCompletion(
   // OWNER-ONLY full request log. Strictly owner-tier AND a real minted key (keyHash !== null) —
   // EXCLUDES legacy static admins, and NEVER logs guests. See owner-log.ts.
   // Owner-own content gate: the owner's minted-key traffic only (NOT guests, NOT legacy/implicit
-  // admin). Reused for the owner-log AND the usage-telemetry delegation write below.
+  // admin). This independently gates the usage-telemetry delegation write below; full logging
+  // also requires the global switch through shouldCaptureOwnerContent.
   const isOwnerContent = principal.tier === "owner" && principal.keyHash !== null;
   // Unlike the raw owner log, the content-blind exposure digest covers every owner-tier MCP
   // ingress. Otherwise a legacy/implicit owner call could later be misclassified as a fresh exam.
   const isOwnerExposure = principal.tier === "owner";
-  const ownerLog = cfg.ownerRequestLog === "on" && isOwnerContent;
+  const ownerLog = shouldCaptureOwnerContent(cfg.ownerRequestLog, principal);
   const callStart = Date.now();
 
   if (isOwnerExposure) {
@@ -1093,6 +1121,7 @@ export async function runChatCompletion(
         ...(args.topK !== undefined ? { top_k: args.topK } : {}),
         ...(args.minP !== undefined ? { min_p: args.minP } : {}),
         ...(args.reasoningEffort !== undefined ? { reasoning_effort: args.reasoningEffort } : {}),
+        ...(args.responseFormat !== undefined ? { response_format: args.responseFormat } : {}),
       }),
       signal: AbortSignal.timeout(cfg.callTimeoutMs),
     });
@@ -1502,6 +1531,14 @@ async function callTool(
     const captureMeta: Record<string, unknown> = contentCapture === "suppressed"
       ? { content_capture: CONTENT_CAPTURE_SUPPRESSED }
       : {};
+    let responseFormat: ResponseFormat = undefined;
+    if (args["response_format"] !== undefined) {
+      const parsed = parseResponseFormat(args["response_format"], "response_format");
+      if (!parsed.ok) {
+        return { text: parsed.message, isError: true, trace: badRequestTrace() };
+      }
+      responseFormat = parsed.value;
+    }
     const includeReasoning = args["include_reasoning"];
     if (includeReasoning !== undefined && typeof includeReasoning !== "boolean") {
       return { text: "'include_reasoning' must be a boolean.", isError: true, trace: badRequestTrace() };
@@ -1579,6 +1616,7 @@ async function callTool(
       messages,
       exposureTaskText: prompt,
       ...(includeReasoning === true ? { includeReasoning: true } : {}),
+      ...(responseFormat !== undefined ? { responseFormat } : {}),
       trafficPurpose,
       maxTokens,
       delegatorModelId,

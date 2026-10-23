@@ -118,7 +118,7 @@ describe("m5 stdio MCP conformance", () => {
     expect(JSON.stringify([initialize, list, call])).not.toContain(SECRET);
   });
 
-  it("forwards include_reasoning and keeps reasoning outside the answer text", async () => {
+  it("forwards response_format and include_reasoning while keeping reasoning outside the answer text", async () => {
     let upstreamRequest: Record<string, unknown> | undefined;
     const reasoning = "The model's private trace is carried separately.";
     const bridge = await makeBridge(async (_input, init) => {
@@ -146,7 +146,7 @@ describe("m5 stdio MCP conformance", () => {
       method: "tools/call",
       params: {
         name: "ask",
-        arguments: { model: "mellum", prompt: "bounded", include_reasoning: true },
+        arguments: { model: "mellum", prompt: "bounded", include_reasoning: true, response_format: { type: "json_object" } },
       },
     }));
     const parsed = JSON.parse(response!);
@@ -156,6 +156,7 @@ describe("m5 stdio MCP conformance", () => {
       model: "mellum",
       prompt: "bounded",
       include_reasoning: true,
+      response_format: { type: "json_object" },
     });
     expect(result.structuredContent).toMatchObject({
       text: "answer",

@@ -22,7 +22,7 @@ let sidecar: Server;
 let sidecarPort = 0;
 let gateEnabled = false;
 let releaseGate: (() => void) | null = null;
-let mode: "ok" | "fault" = "ok";
+let mode: "ok" | "fault" | "empty" = "ok";
 let sidecarHits = 0;
 
 function startSidecar(): Promise<void> {
@@ -51,7 +51,9 @@ function startSidecar(): Promise<void> {
         return;
       }
       const n = body.n ?? 1;
-      const data = Array.from({ length: n }, (_, i) => ({ b64_json: Buffer.from(`png-${i}`).toString("base64") }));
+      const data = mode === "empty"
+        ? []
+        : Array.from({ length: n }, (_, i) => ({ b64_json: Buffer.from(`png-${i}`).toString("base64") }));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ created: 0, data }));
     });
@@ -74,6 +76,8 @@ let port = 0;
 let inertPort = 0;
 let stop: (() => Promise<void>) | null = null;
 let stopInert: (() => Promise<void>) | null = null;
+let offPort = 0;
+let stopOff: (() => Promise<void>) | null = null;
 
 const DEFAULTS = { rpm: 1000, tpm: 0, dailyTokenBudget: 0, maxParallel: 2 };
 
@@ -119,11 +123,19 @@ beforeAll(async () => {
   stopInert = inert.stop;
   // Restore the singleton for tidiness (the primary gateway captured its own cfg object).
   setConfig({ imageUrl: `http://127.0.0.1:${sidecarPort}` });
+
+  // A separate gateway captures the config snapshot with owner logging disabled.
+  setConfig({ ownerRequestLog: "off" });
+  const off = await startGateway();
+  offPort = off.port;
+  stopOff = off.stop;
+  setConfig({ ownerRequestLog: "on" });
 });
 
 afterAll(async () => {
   if (stop) await stop();
   if (stopInert) await stopInert();
+  if (stopOff) await stopOff();
   await new Promise<void>((r) => sidecar.close(() => r()));
 });
 
@@ -147,18 +159,18 @@ function setMaintenance(on: boolean): Promise<Response> {
     body: JSON.stringify({ on, mode: on ? "exclusive" : undefined, ttlSeconds: on ? 60 : undefined }),
   });
 }
-function jobReq(method: string, token: string, id: string): Promise<Response> {
-  return fetch(`http://127.0.0.1:${port}/v1/images/generations/jobs/${id}`, {
+function jobReq(method: string, token: string, id: string, targetPort = port): Promise<Response> {
+  return fetch(`http://127.0.0.1:${targetPort}/v1/images/generations/jobs/${id}`, {
     method,
     headers: { authorization: `Bearer ${token}` },
   });
 }
 const credits = (k: string): number => lookupKey(k)!.creditsUsed;
 
-async function poll(token: string, id: string, want: string, timeoutMs = 4000): Promise<Record<string, unknown>> {
+async function poll(token: string, id: string, want: string, timeoutMs = 4000, targetPort = port): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const r = await jobReq("GET", token, id);
+    const r = await jobReq("GET", token, id, targetPort);
     const j = (await r.json()) as Record<string, unknown>;
     if (j["status"] === want || Date.now() > deadline) return j;
     await new Promise((res) => setTimeout(res, 25));
@@ -188,6 +200,54 @@ describe("POST /v1/images/generations — sync fast tier", () => {
     expect(renderMetrics()).toMatch(/homeserver_images_total\{model="image-fast"\}/);
     // A guest is NEVER content-logged.
     expect(JSON.stringify(getOwnerLog(500))).not.toContain(SECRET_PROMPT_MARKER);
+  });
+
+  it("owner-logs a minted OWNER sync image request with its prompt marker", async () => {
+    const marker = "OWNER_IMAGE_SYNC_CAPTURE_MARKER";
+    const k = mintKey({ alias: "img-owner-sync", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    const r = await gen(port, k.plaintextKey, { prompt: marker, model: "image-fast" });
+    expect(r.status).toBe(200);
+    expect((await r.json() as { data: unknown[] }).data).toHaveLength(1);
+    const row = getOwnerLog(500).find((entry) => entry.alias === "img-owner-sync");
+    expect(row).toBeDefined();
+    expect(row!.route).toBe("image");
+    expect(row!.messagesJson).toContain(marker);
+    expect(row!.completion).toBe("1 image(s) generated");
+  });
+
+  it("does not owner-log the legacy static admin key for a successful image", async () => {
+    const marker = "STATIC_ADMIN_IMAGE_PROMPT";
+    const before = getOwnerLog(500).filter((entry) => entry.alias === "static:admin").length;
+    const r = await gen(port, "admin-static-key", { prompt: marker, model: "image-fast" });
+    expect(r.status).toBe(200);
+    const after = getOwnerLog(500);
+    expect(after.filter((entry) => entry.alias === "static:admin")).toHaveLength(before);
+    expect(JSON.stringify(after)).not.toContain(marker);
+  });
+
+  it("does not owner-log a minted OWNER when owner logging is disabled", async () => {
+    const marker = "OWNER_IMAGE_OFF_MARKER";
+    const k = mintKey({ alias: "img-owner-off", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    const r = await gen(offPort, k.plaintextKey, { prompt: marker, model: "image-fast" });
+    expect(r.status).toBe(200);
+    expect(getOwnerLog(500).some((entry) => entry.alias === "img-owner-off")).toBe(false);
+    expect(JSON.stringify(getOwnerLog(500))).not.toContain(marker);
+  });
+
+  it("does not owner-log a minted OWNER on a sync sidecar failure or empty response", async () => {
+    mode = "fault";
+    const failed = mintKey({ alias: "img-owner-sync-failure", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    const failureResponse = await gen(port, failed.plaintextKey, { prompt: "OWNER_IMAGE_FAILURE_MARKER", model: "image-fast" });
+    expect(failureResponse.status).toBe(502);
+    expect(getOwnerLog(500).some((entry) => entry.alias === "img-owner-sync-failure")).toBe(false);
+    expect(JSON.stringify(getOwnerLog(500))).not.toContain("OWNER_IMAGE_FAILURE_MARKER");
+
+    mode = "empty";
+    const empty = mintKey({ alias: "img-owner-sync-empty", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    const emptyResponse = await gen(port, empty.plaintextKey, { prompt: "OWNER_IMAGE_EMPTY_MARKER", model: "image-fast" });
+    expect(emptyResponse.status).toBe(502);
+    expect(getOwnerLog(500).some((entry) => entry.alias === "img-owner-sync-empty")).toBe(false);
+    expect(JSON.stringify(getOwnerLog(500))).not.toContain("OWNER_IMAGE_EMPTY_MARKER");
   });
 
   it("403 when the key's allow-list excludes the model (no charge)", async () => {
@@ -311,6 +371,55 @@ describe("async balanced/high tiers + jobs", () => {
     expect(submissions[0]).toMatchObject({ admission: "n/a", status: 202 });
     expect(completions).toHaveLength(1);
     expect(completions[0]).toMatchObject({ node: "m5", admission: "admitted", status: 200, model: "image-balanced" });
+  });
+
+  it("owner-logs a minted OWNER async image only after the job succeeds", async () => {
+    const marker = "OWNER_IMAGE_ASYNC_CAPTURE_MARKER";
+    const k = mintKey({ alias: "img-owner-async", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    gateEnabled = true;
+    try {
+      const r = await gen(port, k.plaintextKey, { prompt: marker, model: "image-balanced" });
+      expect(r.status).toBe(202);
+      const sub = (await r.json()) as { id: string };
+      const deadline = Date.now() + 2000;
+      while (sidecarHits === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sidecarHits).toBeGreaterThan(0);
+      expect(getOwnerLog(500).some((entry) => entry.alias === "img-owner-async")).toBe(false);
+      openGateForCleanup();
+      const done = await poll(k.plaintextKey, sub.id, "succeeded");
+      expect(done.status).toBe("succeeded");
+    } finally {
+      openGateForCleanup();
+    }
+    const row = getOwnerLog(500).find((entry) => entry.alias === "img-owner-async");
+    expect(row).toBeDefined();
+    expect(row!.route).toBe("image");
+    expect(row!.messagesJson).toContain(marker);
+    expect(row!.completion).toBe("1 image(s) generated");
+  });
+
+  it("does not owner-log a successful async image when owner logging is disabled", async () => {
+    const marker = "OWNER_IMAGE_ASYNC_OFF_MARKER";
+    const k = mintKey({ alias: "img-owner-async-off", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    const r = await gen(offPort, k.plaintextKey, { prompt: marker, model: "image-balanced" });
+    expect(r.status).toBe(202);
+    const sub = (await r.json()) as { id: string };
+    const done = await poll(k.plaintextKey, sub.id, "succeeded", 4000, offPort);
+    expect(done.status).toBe("succeeded");
+    expect(getOwnerLog(500).some((entry) => entry.alias === "img-owner-async-off")).toBe(false);
+    expect(JSON.stringify(getOwnerLog(500))).not.toContain(marker);
+  });
+
+  it("does not owner-log an async OWNER when the sidecar returns no images", async () => {
+    mode = "empty";
+    const k = mintKey({ alias: "img-owner-async-empty", tier: "owner", scope: "agent", creditLimit: 1_000_000 }, DEFAULTS);
+    const r = await gen(port, k.plaintextKey, { prompt: "OWNER_IMAGE_ASYNC_EMPTY_MARKER", model: "image-balanced" });
+    expect(r.status).toBe(202);
+    const sub = (await r.json()) as { id: string };
+    const failed = await poll(k.plaintextKey, sub.id, "failed");
+    expect(failed.status).toBe("failed");
+    expect(getOwnerLog(500).some((entry) => entry.alias === "img-owner-async-empty")).toBe(false);
+    expect(JSON.stringify(getOwnerLog(500))).not.toContain("OWNER_IMAGE_ASYNC_EMPTY_MARKER");
   });
 
   it("#229: GET jobs/% (malformed percent-encoding) → 400 invalid_request_error, not 500", async () => {

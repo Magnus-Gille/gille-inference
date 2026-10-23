@@ -309,6 +309,12 @@
         <td>~21&#8211;25 MTP<br><span style="font-size:11px;color:var(--muted)">~13 direct</span></td>
       </tr>
       <tr>
+        <td><span class="badge mono">flint</span></td>
+        <td>Recursive Flint 40B-A2.5B — official INT4/Q4_1</td>
+        <td>Text, coding, tool use and reasoning</td>
+        <td>Not measured</td>
+      </tr>
+      <tr>
         <td><span class="badge mono">ornith-1.5-35b</span></td>
         <td>Ornith-1.5-35B — multimodal Q4_K_M MoE, thinking-capable, native MTP</td>
         <td>Fast explicit coding, reasoning and image work; still evaluation-only for routing</td>
@@ -390,8 +396,9 @@
       <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>,
       <span class="badge mono">gpt-oss-120b</span>, <span class="badge mono">qwen38-27b</span>, and
       <span class="badge mono">ornith-1.5-35b</span> provide 65,536 per request;
-      <span class="badge mono">qwen35-122b-a10b</span> provides 32,768. Prompt and completion
-      tokens share that window; the output limits documented below still apply. VibeThinker works best on
+      <span class="badge mono">qwen35-122b-a10b</span> provides 32,768. The
+      <span class="badge mono">flint</span> configuration uses 262,144 tokens. Prompt and completion tokens share that window; the output limits documented below
+      still apply. VibeThinker works best on
       answer-verifiable reasoning with sampling enabled: <span class="badge mono">temperature: 1.0</span>,
       <span class="badge mono">top_p: 0.95</span>, <span class="badge mono">top_k: 0</span>, and
       <span class="badge mono">min_p: 0</span>. Explicit VibeThinker requests may ask for up to
@@ -690,6 +697,17 @@ EOF</pre>
           <strong>Always use <span class="badge mono">stream: true</span></strong> for longer
           completions — non-streaming requests are cut off after ~100 seconds by the network
           layer. Streaming keeps the connection alive and tokens arrive as they are generated.
+        </p>
+
+        <p>
+          <strong>Flint:</strong> <span class="badge mono">flint</span> is the
+          official Recursive Flint 40B-A2.5B INT4/Q4_1 model, intended for text, tool use and reasoning.
+          Its configured context is 262,144 tokens and speed is currently unmeasured. Check availability with your key: when an authenticated <span class="badge mono">/v1/models</span>
+          response lists <span class="badge mono">flint</span>, call it through
+          <span class="badge mono">POST /v1/chat/completions</span> with your normal key and limits. Use <span class="badge mono">temperature: 1.0</span>,
+          <span class="badge mono">top_p: 0.95</span>, <span class="badge mono">top_k: 20</span>,
+          and <span class="badge mono">min_p: 0</span>; preserve returned
+          <span class="badge mono">reasoning_content</span> when replaying conversation history.
         </p>
 
         <p><strong>OpenAI Python SDK:</strong></p>

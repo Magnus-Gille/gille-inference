@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-21
+
+- MCP `ask` accepts optional validated `response_format` (`text`, `json_object`, or `json_schema`) and forwards the sanitized format to the local backend for explicit grammar-constrained output. Omission, final-answer/reasoning separation, truncation, and metering retain their existing behavior; malformed formats fail before admission or inference.
+
 ## 2026-08-02
 
 - Tightened staged credential-rotation proof so only successful authenticated protected routes advance replacement-key preflight. Public `200` routes (`/healthz`, `/hs`, `/portal*`) plus anonymous `401` and forbidden `403` requests no longer satisfy the proof gate.

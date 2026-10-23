@@ -10,8 +10,9 @@ import { CONTENT_CAPTURE_SUPPRESSED, type ContentCapture } from "./content-captu
  * metrics — to a private table for the operator's own analysis (e.g. "what did I actually
  * delegate to the box, and how well did it answer?").
  *
- * GUESTS ARE NEVER CONTENT-LOGGED. The single guard lives at each capture site:
- *   principal.tier === "owner" && principal.keyHash !== null
+ * GUESTS ARE NEVER CONTENT-LOGGED. Chat, MCP ask, audio and image capture use
+ * shouldCaptureOwnerContent below:
+ *   logging enabled AND owner tier AND a real minted key
  * — which captures only real minted owner keys and deliberately EXCLUDES legacy static-key
  * admins (keyHash === null). The rationale: a content log is a privacy-sensitive surface, so we
  * log only the operator's own deliberately-minted owner keys, never a legacy posture that may not
@@ -28,6 +29,18 @@ import { CONTENT_CAPTURE_SUPPRESSED, type ContentCapture } from "./content-captu
  * NEVER affect (fail, slow, or alter) the request itself. The schema is additive and created
  * idempotently in the shared eval DB, coexisting with runs / api_keys / etc.
  */
+
+/**
+ * Shared eligibility for full owner-content logging. This is deliberately narrower than
+ * owner-tier content-blind exposure and independent of tool scope or delegation telemetry.
+ * Call at the route's existing decision point; async work keeps that captured decision.
+ */
+export function shouldCaptureOwnerContent(
+  mode: "on" | "off",
+  principal: Readonly<{ tier: "owner" | "guest"; keyHash: string | null }>,
+): boolean {
+  return mode === "on" && principal.tier === "owner" && principal.keyHash !== null;
+}
 
 export type OwnerLogRoute = "chat" | "mcp" | "audio" | "image" | "review-cascade";
 

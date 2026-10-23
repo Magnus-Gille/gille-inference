@@ -27,6 +27,7 @@ let whisperPort = 0;
 // reconcile path (a valid duration) vs. the FAULT path (a bogus / zero / missing / over-cap value).
 // `undefined` here means the backend OMITS the top-level `duration` field entirely.
 let whisperDuration: number | undefined = KNOWN_DURATION;
+let whisperText = SECRET_TRANSCRIPT_MARKER;
 let whisperHits = 0;
 // Records what the gateway forwarded so we can assert response_format=verbose_json is always sent.
 let lastForwardedContentType = "";
@@ -49,9 +50,9 @@ function startWhisper(): Promise<void> {
       const payload: Record<string, unknown> = {
         task: "transcribe",
         language: "sv",
-        text: SECRET_TRANSCRIPT_MARKER,
+        text: whisperText,
         segments: [
-          { id: 0, start: 0.0, end: KNOWN_DURATION, text: SECRET_TRANSCRIPT_MARKER },
+          { id: 0, start: 0.0, end: KNOWN_DURATION, text: whisperText },
         ],
       };
       // Only include the top-level `duration` when set — `undefined` simulates a backend that
@@ -82,6 +83,8 @@ let stopGateway: (() => Promise<void>) | null = null;
 let deadPort = 0;
 let downGatewayPort = 0;
 let stopDownGateway: (() => Promise<void>) | null = null;
+let offGatewayPort = 0;
+let stopOffGateway: (() => Promise<void>) | null = null;
 
 const RATE = 50; // HOMESERVER_AUDIO_CREDITS_PER_SECOND
 // Small cap so the worst-case reservation (AUDIO_MAX_SECONDS * RATE) is easy to reason about in the
@@ -138,16 +141,25 @@ beforeAll(async () => {
 
   // Restore the live whisper URL for the primary gateway.
   cfgMod.setConfig({ whisperUrl: `http://127.0.0.1:${whisperPort}` });
+
+  // Capture a separate gateway config snapshot with owner logging disabled.
+  cfgMod.setConfig({ ownerRequestLog: "off" });
+  const off = await startGateway();
+  offGatewayPort = off.port;
+  stopOffGateway = off.stop;
+  cfgMod.setConfig({ ownerRequestLog: "on" });
 });
 
 afterAll(async () => {
   if (stopGateway) await stopGateway();
   if (stopDownGateway) await stopDownGateway();
+  if (stopOffGateway) await stopOffGateway();
   await new Promise<void>((r) => whisper.close(() => r()));
 });
 
 beforeEach(() => {
   whisperDuration = KNOWN_DURATION;
+  whisperText = SECRET_TRANSCRIPT_MARKER;
   whisperHits = 0;
   lastForwardedContentType = "";
   lastForwardedBody = Buffer.alloc(0);
@@ -421,6 +433,51 @@ describe("POST /v1/audio/transcriptions", () => {
     expect(row).toBeDefined();
     expect(row!.completion).toContain(SECRET_TRANSCRIPT_MARKER);
     expect(row!.route).toBe("audio");
+  });
+
+  it("keeps an OWNER owner-log row when the successful transcript has no content", async () => {
+    whisperText = "";
+    const k = mintKey({ alias: "aud-owner-empty", tier: "owner", creditLimit: 1_000_000 }, DEFAULTS);
+    const res = await transcribe(gatewayPort, k.plaintextKey, { file: fakeAudio() });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { text: string };
+    expect(body.text).toBe("");
+    const row = getOwnerLog(1000).find((r) => r.alias === "aud-owner-empty");
+    expect(row).toBeDefined();
+    expect(row!.route).toBe("audio");
+    expect(row!.completion).toBe("");
+  });
+
+  it("does not owner-log the legacy static admin key", async () => {
+    const marker = "AUD_STATIC_ADMIN_TRANSCRIPT_MARKER";
+    whisperText = marker;
+    const before = getOwnerLog(1000).filter((r) => r.alias === "static:admin").length;
+    const res = await transcribe(gatewayPort, "admin-static-key", { file: fakeAudio() });
+    expect(res.status).toBe(200);
+    const after = getOwnerLog(1000);
+    expect(after.filter((r) => r.alias === "static:admin")).toHaveLength(before);
+    expect(JSON.stringify(after)).not.toContain(marker);
+  });
+
+  it("does not owner-log an OWNER transcription failure", async () => {
+    const marker = "AUD_OWNER_FAILURE_TRANSCRIPT_MARKER";
+    whisperText = marker;
+    const k = mintKey({ alias: "aud-owner-failure", tier: "owner", creditLimit: 1_000_000 }, DEFAULTS);
+    const before = getOwnerLog(1000).filter((r) => r.alias === "aud-owner-failure").length;
+    const res = await transcribe(downGatewayPort, k.plaintextKey, { file: fakeAudio() });
+    expect(res.status).toBe(502);
+    expect(getOwnerLog(1000).filter((r) => r.alias === "aud-owner-failure")).toHaveLength(before);
+    expect(JSON.stringify(getOwnerLog(1000))).not.toContain(marker);
+  });
+
+  it("does not owner-log an OWNER when owner logging is disabled", async () => {
+    const marker = "AUD_OWNER_OFF_TRANSCRIPT_MARKER";
+    whisperText = marker;
+    const k = mintKey({ alias: "aud-owner-off", tier: "owner", creditLimit: 1_000_000 }, DEFAULTS);
+    const res = await transcribe(offGatewayPort, k.plaintextKey, { file: fakeAudio() });
+    expect(res.status).toBe(200);
+    expect(getOwnerLog(1000).some((r) => r.alias === "aud-owner-off")).toBe(false);
+    expect(JSON.stringify(getOwnerLog(1000))).not.toContain(marker);
   });
 
   it("upstream whisper down → 502 upstream_unavailable and 0 credits charged", async () => {
