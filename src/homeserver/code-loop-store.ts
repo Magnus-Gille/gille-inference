@@ -16,6 +16,7 @@ import { platform } from "node:os";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import { keyedSuppressedContentDigest } from "./task-exposure.js";
 import type {
   CodeLoopJobStatus,
   CodeLoopRequest,
@@ -260,7 +261,16 @@ export function codeLoopRequestFingerprint(
     // so a suppressed retry can never recover (or be recovered by) a content-capturing run.
     ...(req.content_capture === undefined ? {} : { content_capture: req.content_capture }),
   };
-  return `sha256:${createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex")}`;
+  const serialized = JSON.stringify(canonical);
+  if (req.content_capture === "none") {
+    // #487: the canonical request embeds the instruction and every seed file. A suppressed run must
+    // not persist an unkeyed (guess-confirmable) digest of it, so its identity is a keyed HMAC.
+    // A rotated key yields a different fingerprint: a retry then conflicts instead of recovering.
+    const keyed = keyedSuppressedContentDigest("code-loop-request-v1", serialized);
+    if (keyed === null) throw new Error("keyed request fingerprint key is not configured");
+    return `hmac-sha256:${keyed.keyId}:${keyed.hex}`;
+  }
+  return `sha256:${createHash("sha256").update(serialized, "utf8").digest("hex")}`;
 }
 
 /** Synchronous exclusive create is the concurrency linearization point. */

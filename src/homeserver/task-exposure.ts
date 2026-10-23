@@ -52,6 +52,20 @@ export function isKeyedExposureFingerprintAvailable(): boolean {
   return keyedFingerprint !== null;
 }
 
+/**
+ * #487: keyed digest of other content-derived identities of a suppressed call (for example the
+ * code_loop request fingerprint), under the same gateway key with a caller-chosen domain that must
+ * differ from the exposure domain. Returns null when no key is configured; callers fail closed.
+ */
+export function keyedSuppressedContentDigest(domain: string, data: string): { keyId: string; hex: string } | null {
+  if (keyedFingerprint === null) return null;
+  if (domain.includes("\0") || domain === "task-exposure-v1") throw new Error("invalid keyed digest domain");
+  return {
+    keyId: keyedFingerprint.version.slice(KEYED_FINGERPRINT_SCHEME.length + 1),
+    hex: createHmac("sha256", keyedFingerprint.key).update(`${domain}\0${data}`, "utf8").digest("hex"),
+  };
+}
+
 function keyedDigest(key: Buffer, sha256Hex: string): string {
   return createHmac("sha256", key).update(`${KEYED_FINGERPRINT_DOMAIN}${sha256Hex}`, "utf8").digest("hex");
 }

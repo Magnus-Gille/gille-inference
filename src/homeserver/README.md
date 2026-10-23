@@ -498,7 +498,9 @@ dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE
   `admission-recovery` / `content-capture-unsupported`). `content_capture: "none"` (#487) makes the
   run metadata-only: the relay stamps every turn `X-Content-Capture: none`, the durable record never
   holds the result (memory only until TTL/restart), and the sandbox is deleted once cleanup is
-  proved; without the confined relay it is refused as `content-capture-unsupported`. Optional
+  proved; its `request_fingerprint` is a keyed `hmac-sha256:` value; it cannot be combined with
+  `learning_task_stamp`; without the confined relay or the exposure fingerprint key it is refused as
+  `content-capture-unsupported`. Optional
   `client_run_id` activates `client-run-id-v1`: an exclusive durable binding to the canonical
   request digest is committed before execution; same id+request recovers the original
   state/result across response loss/restart, and same id+different request conflicts. Recovery is

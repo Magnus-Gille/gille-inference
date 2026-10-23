@@ -398,3 +398,45 @@ describe("code_loop opt-out review regressions", () => {
     expect(argv.slice(0, separator)).toContain("--description=gille code_loop caged run");
   });
 });
+
+describe("code_loop opt-out leaves no unkeyed request digest (review pass 2)", () => {
+  it("a suppressed request fingerprint is a keyed HMAC, stable under one key and different across keys", () => {
+    const base = request("same-content");
+    const suppressed = { ...base, content_capture: "none" as const };
+    const first = codeLoopRequestFingerprint(suppressed);
+    expect(first.startsWith("hmac-sha256:")).toBe(true);
+    expect(codeLoopRequestFingerprint(suppressed)).toBe(first);
+    expect(codeLoopRequestFingerprint(base).startsWith("sha256:")).toBe(true);
+    configureTaskExposureFingerprintKey("z".repeat(40) + "-other-test-key");
+    try {
+      expect(codeLoopRequestFingerprint(suppressed)).not.toBe(first);
+    } finally {
+      configureTaskExposureFingerprintKey(TEST_EXPOSURE_KEY);
+    }
+  });
+
+  it("a suppressed run persists only the keyed request fingerprint", async () => {
+    const marker = canary("REQ_FP");
+    const r = await startCodeLoop(request(marker, { client_run_id: `fp-${seq}`, content_capture: "none" }), startCfg(), deps({ suppressionCapable: true, marker }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.request_fingerprint?.startsWith("hmac-sha256:")).toBe(true);
+    await waitTerminal(r.work_id);
+    expect(workrootText()).not.toMatch(/"request_fingerprint":"sha256:/);
+    expect(readDurableCodeLoopRunByWork(workroot, r.work_id)!.request_fingerprint.startsWith("hmac-sha256:")).toBe(true);
+  });
+
+  it("refuses a suppressed LearningTaskContract-stamped start before any admission (its echo would carry a plain digest)", async () => {
+    const marker = canary("STAMPED");
+    const seen: EngineRunOptions[] = [];
+    const r = await startCodeLoop(
+      request(marker, { content_capture: "none", learning_task_stamp: { raw_fingerprint: { digest: "0".repeat(64) } } as never }),
+      startCfg(),
+      deps({ suppressionCapable: true, seen, marker }),
+    );
+    expect(r).toMatchObject({ ok: false, refusal: "content-capture-unsupported" });
+    expect(seen).toHaveLength(0);
+    expect(workrootText()).not.toContain(marker);
+    expect(dbText()).not.toContain(marker);
+  });
+});

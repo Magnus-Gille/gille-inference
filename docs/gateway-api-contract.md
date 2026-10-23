@@ -82,8 +82,13 @@ When honoured, the gateway persists **metadata only**:
   soon as cleanup of the transient unit is proved (the sweep reclaims a suppressed sandbox without
   waiting for the TTL if cleanup was pending). Seed files exist on disk only while the job runs.
   `content_capture` is part of the `client_run_id` request fingerprint, so a suppressed retry never
-  recovers a content-capturing run or vice versa. A runtime that cannot stamp per-turn calls
-  (confinement `off`) refuses with `content-capture-unsupported` before any admission or write.
+  recovers a content-capturing run or vice versa. A suppressed run's `request_fingerprint` is a
+  keyed `hmac-sha256:<key id>:<hex>` (the plain `sha256:` form would be a guess-confirmable digest
+  of the instruction and seed files); after a key rotation a suppressed retry conflicts rather than
+  recovers. `content_capture: "none"` cannot be combined with `learning_task_stamp` (its durable
+  echo must reproduce the stamp's plain digest) and is refused. A runtime that cannot stamp
+  per-turn calls (confinement `off`) refuses with `content-capture-unsupported` before any
+  admission or write.
 
 Still recorded (no prompt or completion text): the content-blind `request_log`, metrics, and a
 **keyed** task-exposure fingerprint (`docs/task-exposure-contract.md`). A suppressed call never

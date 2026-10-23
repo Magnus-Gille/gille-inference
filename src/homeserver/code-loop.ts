@@ -1028,6 +1028,15 @@ async function startCodeLoopInner(
       message: "content_capture 'none' requires the confined gateway relay, which is unavailable here; no job was started.",
     };
   }
+  if (contentSuppressed && req.learning_task_stamp !== undefined) {
+    // The durable LearningTaskContract echo (and its admission row) must reproduce the exact stamp,
+    // including its unkeyed raw_fingerprint digest. Refuse rather than persist that digest.
+    return {
+      ok: false,
+      refusal: "content-capture-unsupported",
+      message: "content_capture 'none' cannot be combined with learning_task_stamp; no job was started.",
+    };
+  }
   if (contentSuppressed && !isKeyedExposureFingerprintAvailable()) {
     return {
       ok: false,
