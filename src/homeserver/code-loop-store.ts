@@ -16,6 +16,7 @@ import { platform } from "node:os";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import { keyedSuppressedContentDigest } from "./task-exposure.js";
 import type {
   CodeLoopJobStatus,
   CodeLoopRequest,
@@ -45,6 +46,16 @@ export interface DurableCodeLoopRun {
   owner_pid?: number;
   /** True until the deterministic transient service has been verified stopped. */
   cleanup_pending?: boolean;
+  /**
+   * #487: the run opted out of content capture. Such a record never stores `result` (the store
+   * forces null on every write), and its terminal sandbox is reclaimed without waiting for the TTL.
+   */
+  content_capture?: "suppressed";
+}
+
+/** #487: a suppressed record keeps metadata only, whichever caller path writes it. */
+function withoutSuppressedContent(record: DurableCodeLoopRun): DurableCodeLoopRun {
+  return record.content_capture === "suppressed" && record.result !== null ? { ...record, result: null } : record;
 }
 
 export type ClaimCodeLoopRun =
@@ -154,6 +165,7 @@ function readRecord(path: string): DurableCodeLoopRun | null {
       !["running", "completed", "cap-exceeded", "degenerate", "arm-error", "orphaned"].includes(parsed.status) ||
       typeof parsed.started_at_ms !== "number" ||
       (parsed.cleanup_pending !== undefined && typeof parsed.cleanup_pending !== "boolean") ||
+      (parsed.content_capture !== undefined && parsed.content_capture !== "suppressed") ||
       parsed.usage === null ||
       typeof parsed.usage !== "object" ||
       typeof parsed.usage.turns !== "number" ||
@@ -181,7 +193,7 @@ function durableCreate(path: string, value: DurableCodeLoopRun): boolean {
   }
   let complete = false;
   try {
-    writeSync(fd, JSON.stringify(value));
+    writeSync(fd, JSON.stringify(withoutSuppressedContent(value)));
     fsyncSync(fd);
     complete = true;
   } finally {
@@ -197,7 +209,7 @@ function durableCreate(path: string, value: DurableCodeLoopRun): boolean {
 function atomicReplace(path: string, value: DurableCodeLoopRun): void {
   const temp = `${path}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
+    writeFileSync(temp, JSON.stringify(withoutSuppressedContent(value)), { mode: 0o600 });
     const fd = openSync(temp, "r");
     try {
       fsyncSync(fd);
@@ -245,8 +257,20 @@ export function codeLoopRequestFingerprint(
     ...(req.learning_task_stamp === undefined
       ? {}
       : { learning_task_stamp: req.learning_task_stamp }),
+    // #487: omission preserves every pre-opt-out fingerprint; the opt-out is new request identity
+    // so a suppressed retry can never recover (or be recovered by) a content-capturing run.
+    ...(req.content_capture === undefined ? {} : { content_capture: req.content_capture }),
   };
-  return `sha256:${createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex")}`;
+  const serialized = JSON.stringify(canonical);
+  if (req.content_capture === "none") {
+    // #487: the canonical request embeds the instruction and every seed file. A suppressed run must
+    // not persist an unkeyed (guess-confirmable) digest of it, so its identity is a keyed HMAC.
+    // A rotated key yields a different fingerprint: a retry then conflicts instead of recovering.
+    const keyed = keyedSuppressedContentDigest("code-loop-request-v1", serialized);
+    if (keyed === null) throw new Error("keyed request fingerprint key is not configured");
+    return `hmac-sha256:${keyed.keyId}:${keyed.hex}`;
+  }
+  return `sha256:${createHash("sha256").update(serialized, "utf8").digest("hex")}`;
 }
 
 /** Synchronous exclusive create is the concurrency linearization point. */

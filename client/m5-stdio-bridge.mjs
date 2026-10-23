@@ -269,6 +269,7 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           }
           response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
         } else {
+          // #487: client.rpc() validates, preflights and confirms any content_capture call.
           try {
             response = await client.rpc(message);
         } catch (error) {

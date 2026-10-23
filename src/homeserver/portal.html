@@ -232,6 +232,11 @@
       verification and cleanup; this is separate from the model's own time limit.
       Minted owner-agent/admin keys can also report exact-run usefulness through a separate,
       key-bound feedback endpoint; this does not change routing or guest telemetry.
+      Where the operator has enabled it, owner calls may opt out of content logging one call at a time with
+      <span class="badge mono">X-Content-Capture: none</span> (or
+      <span class="badge mono">content_capture: "none"</span> on the MCP ask and code-loop tools);
+      the gateway then keeps only metadata such as model, timing and token counts plus a keyed
+      fingerprint for exam-contamination checks, and refuses the option on routes that cannot honour it.
     </p>
     <h3>Chat and general models</h3>
     <p style="margin-bottom:8px">Mostly Q4_K_M; VibeThinker uses Q8_0; gpt-oss uses MXFP4.</p>

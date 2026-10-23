@@ -5,6 +5,7 @@ import net from "node:net";
 import http from "node:http";
 import { join, sep } from "node:path";
 import { recordCodeLoopRelayDenied } from "./metrics.js";
+import { CONTENT_CAPTURE_HEADER, CONTENT_CAPTURE_NONE } from "./content-capture.js";
 
 /**
  * The Phase-1 OS cage for code_loop (docs/agentic-code-tool-design.md §6).
@@ -125,6 +126,9 @@ export function buildCageArgv(o: CageArgvOptions): string[] {
     "--quiet",
     "--service-type=exec",
     "--expand-environment=no",
+    // #487: without an explicit description systemd describes the unit by its full command line
+    // (which carries pi's instruction) in journal lifecycle messages. Keep it content-free.
+    "--description=gille code_loop caged run",
     // NAME without '=VALUE' copies from the client environment without putting the per-run
     // capability in argv (other local users may be able to read process command lines).
     "--setenv=HS_API_KEY",
@@ -229,6 +233,7 @@ export function startGatewayRelay(
   gatewayHost: string,
   gatewayPort: number,
   gatewayApiKey: string,
+  options: { contentCapture?: "suppressed" } = {},
 ): Promise<GatewayRelay> {
   return new Promise((resolve, reject) => {
     if (gatewayApiKey === "") {
@@ -265,6 +270,10 @@ export function startGatewayRelay(
       const headers = { ...req.headers };
       delete headers.authorization;
       if (pathname !== "/healthz") headers.authorization = `Bearer ${gatewayApiKey}`;
+      // #487: content capture is the run's decision, never the caged agent's. Drop any
+      // agent-supplied value and stamp every upstream request of a suppressed run.
+      delete headers[CONTENT_CAPTURE_HEADER];
+      if (options.contentCapture === "suppressed") headers[CONTENT_CAPTURE_HEADER] = CONTENT_CAPTURE_NONE;
       const upstream = http.request(
         { host: gatewayHost, port: gatewayPort, method: req.method, path: req.url, headers },
         (upRes) => {

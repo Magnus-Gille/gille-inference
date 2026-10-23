@@ -541,6 +541,12 @@ export interface HomeserverConfig {
   /** The dedicated owner-tier, agent-scope service key pi calls the gateway back with (real
    *  keystore key — owner_request_log fires per turn without admin authority). Never logged. */
   codeLoopApiKey: string;
+  /**
+   * #487: gateway-held HMAC key for keyed task-exposure fingerprints of content-suppressed calls
+   * (HOMESERVER_EXPOSURE_FINGERPRINT_KEY, ≥32 bytes). Private environment only; never logged or
+   * persisted. Empty ⇒ the per-call content-capture opt-out is unavailable (refused, not advertised).
+   */
+  exposureFingerprintKey: string;
   /** Sandbox work root. Under ./data so rsync deploys never touch it and `npx --no-install`
    *  resolves node_modules by walk-up. */
   codeLoopWorkroot: string;
@@ -947,6 +953,7 @@ export function loadConfig(): HomeserverConfig {
       ?? "",
     codeLoopNodeModulesDir: process.env["HOMESERVER_CODE_LOOP_RUNTIME_NODE_MODULES_DIR"] ?? "",
     codeLoopApiKey: process.env["HOMESERVER_CODE_LOOP_API_KEY"] ?? "",
+    exposureFingerprintKey: process.env["HOMESERVER_EXPOSURE_FINGERPRINT_KEY"] ?? "",
     codeLoopWorkroot: process.env["HOMESERVER_CODE_LOOP_RUNTIME_WORKROOT"]
       ?? process.env["HOMESERVER_CODE_LOOP_WORKROOT"]
       ?? "./data/code-loop-work",

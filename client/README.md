@@ -13,9 +13,9 @@ gateway inference route; see the [remote build guide](../docs/m5-remote-build.md
 Requires Node 18+ (uses built-in `fetch`). The dependency-free package gate and runtime fixtures
 run on Linux with Node 18 and 22 in CI. Windows support is not asserted here; see #266.
 
-### Owner-client 1.5.x compatibility
+### Owner-client 1.5.x / 1.6.x compatibility
 
-The 1.5.x `m5` client requires the gateway's v9 schema-grounding contract for `code_loop`.
+The 1.5.x and 1.6.x `m5` clients requires the gateway's v9 schema-grounding contract for `code_loop`.
 Its doctor reports MCP catalogue reachability without calling metered inference and checks the
 installed client against the gateway's advertised result contract; bridge errors
 also repeat safe diagnostic codes in the visible message for MCP hosts that hide error data.
@@ -39,6 +39,34 @@ It includes only validated gateway revision, client version, and result contract
 uses the fixed public npm endpoint and does not send credentials. An upgrade recommendation names
 the exact gateway client pin and the installed rollback pin, but has no executable install command
 until the registry check confirms that the gateway pin is published.
+
+### Content-capture opt-out (1.6.0)
+
+Version 1.6.0 adds the per-call "do not log content" opt-out (#487) for Restricted material.
+Pass `--content-capture none` to `ask` or `code run`, or put `"content_capture": "none"` in the
+input JSON (a conflicting value is rejected):
+
+```bash
+printf '%s' '{"model":"<model>","prompt":"<restricted task>"}' | m5 --profile codex --content-capture none ask
+```
+
+Before any content is sent, the client reads the live `tools/list` schema and refuses with
+`content_capture_unsupported` unless the gateway advertises `content_capture` for that tool. An
+older gateway would silently ignore the field and log the content. After the call, the client
+requires the gateway's confirmation (`_meta.content_capture` for `ask`, `content_capture` on the
+`code_loop_start` response). If the confirmation is missing, the client fails with
+`content_capture_unconfirmed` instead of returning the result as suppressed. A confirmed `ask`
+result carries `"content_capture": "suppressed"`. The stdio MCP bridge applies the same preflight
+and confirmation to `ask` and `code_loop_start` calls that carry the argument. Calls without the
+option are unchanged.
+
+When honoured, the gateway keeps metadata only (model, timings, token counts, outcome). A
+suppressed `code run` result is held only in gateway memory: after a gateway restart,
+`code result` reports it as unavailable. Gateway routes that cannot honour the option refuse
+it. See the gateway contract's *Per-call content-capture opt-out* section for exactly what is
+and is not recorded. Use 1.6.0 against a gateway that advertises `content-capture-none-v1` in
+`GET /portal/me`. A gateway advertises it only when its exposure fingerprint key is provisioned.
+Against an older or unprovisioned gateway, only calls that request the opt-out are refused.
 
 ### Reliability diagnostics (1.5.5)
 

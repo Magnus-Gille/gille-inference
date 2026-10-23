@@ -466,6 +466,11 @@ sees only the model's answer text.
   They DO reach the owner-only full-content log (`owner-log.ts`) and the capability-ledger prompt
   excerpt (`ledger.ts`), exactly like the rest of an owner's own `ask` content already does — this
   is not a new exposure, since `files` is itself owner-tier-only.
+- **Per-call opt-out (#487):** `content_capture: "none"` on `ask` (or `X-Content-Capture: none` on
+  the `/mcp` POST or on `POST /v1/chat/completions`) keeps the owner-log and ledger rows
+  metadata-only — no prompt, attached file, or completion text — and is echoed as
+  `_meta.content_capture: "suppressed"`. Other content-bearing routes refuse the header. Full
+  contract: `docs/gateway-api-contract.md` → *Per-call content-capture opt-out*.
 **Owner-agent tools** (`code_loop_start` / `code_loop_status` / `code_loop_result`, issue #116)
 appear in `tools/list` **only** for a real minted owner-tier key with `scope=agent|admin`
 (`tier === "owner" && keyHash !== null` preserves the owner-content boundary, while the
@@ -485,12 +490,17 @@ checkout. Every loop turn transits the gateway spine (admission, `owner_request_
 poison-clear, the degeneracy watchdog), so it is the Claude→local **agentic-delegation
 dataset** (RQ6/RQ7) with zero new logging code. Off by default (`HOMESERVER_CODE_LOOP=off`).
 
-- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?}`
-  → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, capabilities}`
+- `code_loop_start` — `{client_run_id?, learning_task_stamp?, instruction, files:[{path,content}], check_cmd?, schema_checks?, writable?, protected?, task_type?, caps?, content_capture?}`
+  → returns `{work_id, status, client_run_id, request_fingerprint, recovered, learning_task_gateway_echo?, content_capture?, capabilities}`
   immediately, or a structured refusal (`disabled` / `busy` / `maintenance` /
   `lease-unavailable` / `cage-unavailable` / `cage-transport-unavailable` /
   `invalid-request` / `conflict` /
-  `admission-recovery`). Optional
+  `admission-recovery` / `content-capture-unsupported`). `content_capture: "none"` (#487) makes the
+  run metadata-only: the relay stamps every turn `X-Content-Capture: none`, the durable record never
+  holds the result (memory only until TTL/restart), and the sandbox is deleted once cleanup is
+  proved; its `request_fingerprint` is a keyed `hmac-sha256:` value; it cannot be combined with
+  `learning_task_stamp`; without the confined relay or the exposure fingerprint key it is refused as
+  `content-capture-unsupported`. Optional
   `client_run_id` activates `client-run-id-v1`: an exclusive durable binding to the canonical
   request digest is committed before execution; same id+request recovers the original
   state/result across response loss/restart, and same id+different request conflicts. Recovery is
@@ -1033,6 +1043,7 @@ HOMESERVER_FORMAT_DISCOUNT_WEIGHT=0.5          # weight in [0,1] applied to a fo
 # ── code_loop — owner-only sandboxed agentic coding tool (#116) ──
 HOMESERVER_CODE_LOOP=off                       # master switch. off (default) → the MCP tools are visible to owners but code_loop_start returns `disabled`. on → runs.
 HOMESERVER_CODE_LOOP_PI_BIN=                   # abs path to the pinned pi binary (vendor install OUTSIDE the rsync root, e.g. ~/.local/bin/pi)
+HOMESERVER_EXPOSURE_FINGERPRINT_KEY=           # #487: ≥32-byte private HMAC key for keyed exposure fingerprints of content-suppressed calls. Unset → the content-capture opt-out is refused and not advertised. Private env only; never logged.
 HOMESERVER_CODE_LOOP_API_KEY=                  # minted owner-tier, agent-scope service key pi calls back with (allow-listed to the 80b). Real key → owner_request_log fires; agent scope denies admin. Never in models.json.
 HOMESERVER_CODE_LOOP_PI_AGENT_DIR=             # PI_CODING_AGENT_DIR — holds models.json (see deploy/pi-models.json.example; baseUrl = the loopback forward, NOT the tailnet IP) AND pi's own auth.json credential store; the cage binds ONLY <dir>/models.json (auth.json stays hidden in-cage)
 HOMESERVER_CODE_LOOP_WORKROOT=./data/code-loop-work  # throwaway sandbox root (under ./data so rsync never touches it; under the deploy dir so check_cmd's `npx --no-install` walk-up resolves node_modules)

@@ -44,6 +44,7 @@ import Database from "better-sqlite3";
 import { writeFileSync, appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { gateDecision } from "../src/homeserver/disagreement-gate.js";
+import { ownerLogContentRowsPredicate } from "../src/homeserver/owner-log.js";
 import { classifyTask, isKnownTaskType, TASK_TYPES } from "../src/homeserver/taxonomy.js";
 import { loadConfig } from "../src/homeserver/config.js";
 
@@ -379,6 +380,7 @@ export function loadChatRequests(
          WHERE messages_json IS NOT NULL AND completion IS NOT NULL AND length(completion) >= 1
            AND outcome = 'ok' AND route IN ('chat', 'mcp')
            AND (@since IS NULL OR ts >= @since)
+           ${ownerLogContentRowsPredicate(db)}
          ORDER BY id DESC`
       )
       .all({ since: sinceIso }) as { id: number; ts: string; model: string | null; messages_json: string; completion: string; completion_tokens: number | null }[];

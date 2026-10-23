@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getBackendFailureDescriptor } from "./backend-failure-contract.mjs";
 
-export const M5_CLIENT_VERSION = "1.5.5";
+export const M5_CLIENT_VERSION = "1.6.0";
 // A retry delay above one day is treated as not given: no caller should park itself that long on
 // the word of a remote peer.
 const MAX_RETRY_AFTER_SECONDS = 86_400;
@@ -993,6 +993,59 @@ function normalizeAskPayload(payload, fallbackModel) {
  *   insufficient_memory: retry later (retryAfterSeconds parsed from the gateway's own sentence).
  *   memory_admission_unavailable: the operator must fix it; retrying will not help.
  */
+export const CONTENT_CAPTURE_NONE = "none";
+export const CONTENT_CAPTURE_SUPPRESSED = "suppressed";
+
+/**
+ * #487: validate an optional `content_capture` request field before any network access. Only
+ * "none" is accepted; anything else is refused instead of being treated as the default.
+ */
+function requestsContentSuppression(input) {
+  if (!Object.prototype.hasOwnProperty.call(input, "content_capture")) return false;
+  if (input.content_capture !== CONTENT_CAPTURE_NONE) {
+    throw new M5ClientError("invalid_input", "content_capture must be 'none' when supplied.");
+  }
+  return true;
+}
+
+const CONTENT_CAPTURE_TOOLS = new Set(["ask", "code_loop_start"]);
+
+/** Returns the tool name for a tools/call that carries `content_capture`, after validating it. */
+function contentCaptureToolCall(message) {
+  if (message?.method !== "tools/call" || !CONTENT_CAPTURE_TOOLS.has(message?.params?.name)) return null;
+  const args = message.params.arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  return requestsContentSuppression(args) ? message.params.name : null;
+}
+
+/**
+ * A gateway that advertises the opt-out confirms it on every accepted call. An accepted call
+ * without the marker must not be presented as suppressed: its content may have been captured.
+ */
+function assertContentSuppressionConfirmed(toolName, response) {
+  const result = response?.result;
+  if (!result || typeof result !== "object") return;
+  if (toolName === "ask") {
+    if (result.isError === true && result.structuredContent === undefined) return;
+    if (result._meta?.content_capture === CONTENT_CAPTURE_SUPPRESSED) return;
+  } else {
+    let started = result.structuredContent;
+    if (started === undefined) {
+      try { started = JSON.parse(toolResultText(result) ?? ""); } catch { started = undefined; }
+    }
+    if (result.isError === true || started?.refusal !== undefined) return;
+    if (started?.content_capture === CONTENT_CAPTURE_SUPPRESSED) return;
+  }
+  throw new M5ClientError("content_capture_unconfirmed", "The gateway did not confirm content_capture suppression.");
+}
+
+function confirmContentSuppression(payload, marker) {
+  if (marker !== CONTENT_CAPTURE_SUPPRESSED) {
+    throw new M5ClientError("content_capture_unconfirmed", "The gateway did not confirm content_capture suppression.");
+  }
+  return { ...payload, content_capture: CONTENT_CAPTURE_SUPPRESSED };
+}
+
 export function classifyAskRefusal(text) {
   if (typeof text !== "string") return null;
   const short = /^There is not enough host memory to start the (?:requested )?model(?: '[^\n]*')? right now\.(?: (?:Retry after (\d{1,6})s\.|Please retry later\.))?$/s.exec(text.trim());
@@ -1852,13 +1905,30 @@ export async function createM5Client({
     );
   }
 
-  async function callToolResponse(name, args) {
-    const response = await client.rpc({
-      jsonrpc: "2.0",
-      id: nextId++,
-      method: "tools/call",
-      params: { name, arguments: args },
-    });
+  // #487: every tools/call that carries `content_capture` passes this one boundary, whichever
+  // public entry point (ask, codeRun, tool, rpc, the stdio bridge) sent it: validate the value,
+  // require the live schema to advertise the opt-out before any content leaves, and require the
+  // gateway's confirmation before the result is returned.
+  async function guardedRequest(message, { preflighted = false } = {}) {
+    const captureTool = contentCaptureToolCall(message);
+    if (captureTool !== null && !preflighted) await requireContentCaptureSupport(captureTool);
+    const response = await request(message);
+    if (captureTool !== null) assertContentSuppressionConfirmed(captureTool, response);
+    return response;
+  }
+
+  async function callToolResponse(name, args, options = {}) {
+    let response;
+    try {
+      response = await guardedRequest({
+        jsonrpc: "2.0",
+        id: nextId++,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }, options);
+    } catch (error) {
+      throw safeError(error, secrets, profile);
+    }
     if (response?.error) {
       throw new M5ClientError(
         "mcp_error",
@@ -1868,22 +1938,44 @@ export async function createM5Client({
     return response;
   }
 
+  // #487: an older gateway silently ignores an unknown `content_capture` argument and would then
+  // capture the content, so the live tool schema must advertise the opt-out before any content
+  // is sent. Returns the catalogue so a caller can reuse it for other schema checks.
+  async function requireContentCaptureSupport(toolName) {
+    const catalogue = await client.rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
+    const tools = catalogue?.result?.tools;
+    const schema = Array.isArray(tools)
+      ? tools.find((tool) => tool?.name === toolName)?.inputSchema?.properties?.content_capture
+      : undefined;
+    if (catalogue?.error || !Array.isArray(schema?.enum) || !schema.enum.includes(CONTENT_CAPTURE_NONE)) {
+      throw new M5ClientError(
+        "content_capture_unsupported",
+        "The gateway does not advertise content_capture 'none' for this tool; no content was sent.",
+      );
+    }
+    return catalogue;
+  }
+
+  async function toolPayloadCall(name, args, options = {}) {
+    const response = await callToolResponse(name, args, options);
+    try {
+      return redactValue(toolPayload(response?.result), secrets);
+    } catch (error) {
+      throw safeError(error, secrets, profile);
+    }
+  }
+
   const client = {
     async rpc(message) {
       try {
-        return await request(message);
+        return await guardedRequest(message);
       } catch (error) {
         throw safeError(error, secrets, profile);
       }
     },
 
     async tool(name, args) {
-      const response = await callToolResponse(name, args);
-      try {
-        return redactValue(toolPayload(response?.result), secrets);
-      } catch (error) {
-        throw safeError(error, secrets, profile);
-      }
+      return toolPayloadCall(name, args);
     },
 
     async models() {
@@ -1937,6 +2029,7 @@ export async function createM5Client({
           "ask requires JSON with non-empty model and prompt strings.",
         );
       }
+      const suppressContent = requestsContentSuppression(input);
       const response = await callToolResponse("ask", input);
       const result = redactValue(response?.result, secrets);
       if (!result || typeof result !== "object") {
@@ -1946,8 +2039,11 @@ export async function createM5Client({
         if (result.structuredContent !== undefined) {
           try {
             const structured = normalizeAskPayload(result.structuredContent, input.model);
-            if (isSupportedAskTruncation(structured)) return structured;
-          } catch {
+            if (isSupportedAskTruncation(structured)) {
+              return suppressContent ? confirmContentSuppression(structured, result?._meta?.content_capture) : structured;
+            }
+          } catch (error) {
+            if (error instanceof M5ClientError && error.code === "content_capture_unconfirmed") throw error;
             // A broken structured error payload must not mask the real tool_error content.
           }
         }
@@ -1971,6 +2067,16 @@ export async function createM5Client({
           "tool_error",
           toolResultText(result),
         );
+      }
+      if (suppressContent) {
+        // A gateway that advertised the opt-out confirms it on every successful ask.
+        const payload = result.structuredContent !== undefined
+          ? normalizeAskPayload(result.structuredContent, input.model)
+          : null;
+        if (payload === null) {
+          throw new M5ClientError("content_capture_unconfirmed", "The gateway did not confirm content_capture suppression.");
+        }
+        return confirmContentSuppression(payload, result?._meta?.content_capture);
       }
       if (result.structuredContent !== undefined) {
         return normalizeAskPayload(result.structuredContent, input.model);
@@ -2077,6 +2183,8 @@ export async function createM5Client({
         );
       }
       const { wait, ...requestInput } = input;
+      const suppressContent = requestsContentSuppression(requestInput);
+      const captureCatalogue = suppressContent ? await requireContentCaptureSupport("code_loop_start") : null;
       if (requestInput.caps?.total_wall_s !== undefined) {
         const budget = requestInput.caps.total_wall_s;
         if (!Number.isInteger(budget) || budget < 90 || budget > 900) {
@@ -2084,7 +2192,8 @@ export async function createM5Client({
         }
         // An older gateway may silently ignore a new optional cap. Require its live schema
         // before sending task content; a client polling timeout cannot enforce a server budget.
-        const catalogue = await client.rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
+        const catalogue = captureCatalogue ??
+          await client.rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
         const tools = catalogue?.result?.tools;
         const schema = Array.isArray(tools)
           ? tools.find(tool => tool?.name === "code_loop_start")?.inputSchema?.properties?.caps?.properties?.total_wall_s
@@ -2095,7 +2204,7 @@ export async function createM5Client({
           throw new M5ClientError("whole_job_deadline_unsupported", "The gateway does not advertise the requested whole-job deadline; no job was dispatched.");
         }
       }
-      const started = await client.tool("code_loop_start", requestInput);
+      const started = await toolPayloadCall("code_loop_start", requestInput, { preflighted: captureCatalogue !== null });
       if (!started || typeof started !== "object") {
         throw new M5ClientError(
           "invalid_code_start",

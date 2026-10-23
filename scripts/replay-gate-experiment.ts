@@ -18,6 +18,7 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync, appendFileSync } fr
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
+import { ownerLogContentRowsPredicate } from "../src/homeserver/owner-log.js";
 import {
   disagreementScore,
   auroc,
@@ -81,6 +82,7 @@ function loadTasks(limit: number): { id: number; messages: ChatMsg[]; servedMode
       `SELECT id, messages_json, model, completion_tokens
        FROM owner_request_log
        WHERE messages_json IS NOT NULL AND length(messages_json) BETWEEN 40 AND 8000
+         ${ownerLogContentRowsPredicate(db)}
        ORDER BY id DESC`,
     )
     .all() as { id: number; messages_json: string; model: string }[];

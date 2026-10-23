@@ -7,6 +7,12 @@ import { randomUUID } from "node:crypto";
 import { CODE_LOOP_AGENT_CHECK_ATTEMPT_MAX } from "./code-loop-types.js";
 import { bindExecutionFeedback, publishDurableExecutionFeedback } from "./execution-feedback.js";
 import { parseExecutionTrafficPurpose } from "./execution-feedback-contract.js";
+import {
+  CONTENT_CAPTURE_NONE,
+  CONTENT_CAPTURE_OPT_OUT_CONTRACT,
+  CONTENT_CAPTURE_SUPPRESSED,
+  parseContentCaptureArgument,
+} from "./content-capture.js";
 import type {
   CodeLoopRequest,
   CodeLoopCaps,
@@ -41,6 +47,7 @@ import { recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import { recordCodeLoopRun, setCodeLoopActive } from "./metrics.js";
 import {
   TASK_FINGERPRINT_VERSION,
+  isKeyedExposureFingerprintAvailable,
   recordTaskExposureBestEffort,
 } from "./task-exposure.js";
 import {
@@ -101,7 +108,7 @@ const CODE_LOOP_CHECK_SKIP_REASONS = new Set([
   "engine-failure",
 ]);
 const CODE_LOOP_REFUSAL_ENUM = [
-  "deadline-exceeded", "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery",
+  "deadline-exceeded", "disabled", "busy", "maintenance", "lease-unavailable", "cage-unavailable", "cage-transport-unavailable", "insufficient_memory", "memory_admission_unavailable", "invalid-request", "conflict", "admission-recovery", "content-capture-unsupported",
 ] as const;
 
 const CODE_LOOP_START_OUTPUT_SCHEMA = {
@@ -222,6 +229,14 @@ export function codeLoopToolDefs(): unknown[] {
           },
           protected: { type: "array", items: { type: "string" }, description: "globs whose modification is reported at exit" },
           task_type: { type: "string", enum: TASK_TYPES.map((task) => task.id), description: "optional canonical task vocabulary; omit to classify from instruction" },
+          ...(isKeyedExposureFingerprintAvailable() ? { content_capture: {
+            type: "string",
+            enum: [CONTENT_CAPTURE_NONE],
+            description:
+              `optional per-call opt-out (${CONTENT_CAPTURE_OPT_OUT_CONTRACT}): 'none' keeps per-turn owner-log rows, the ledger ` +
+              "row and the durable run record metadata-only, holds the result in memory only, and deletes the sandbox once " +
+              "cleanup is proved; refused as content-capture-unsupported where per-turn suppression is unavailable",
+          } } : {}),
           caps: {
             type: "object",
             additionalProperties: false,
@@ -382,6 +397,8 @@ export type StructuralValidateResult =
 /** Immutable shape/size checks required before safely deriving the durable request identity. */
 export function validateCodeLoopRequestStructure(req: CodeLoopRequest): StructuralValidateResult {
   if (!parseExecutionTrafficPurpose(req.traffic_purpose).ok) return { ok: false, message: "Invalid traffic_purpose." };
+  const capture = parseContentCaptureArgument(req.content_capture);
+  if (!capture.ok) return { ok: false, message: capture.message };
   const schemaError = validateSchemaChecks(req.schema_checks);
   if (schemaError !== null) return { ok: false, message: schemaError };
   try {
@@ -700,7 +717,10 @@ async function withWorktreeAttributesHidden<T>(
 ): Promise<{ value: T; attributes: WorktreeAttribute[] }> {
   const attributes = listWorktreeAttributes(sandboxDir);
   if (attributes.length === 0) return { value: await fn(), attributes };
-  const temporaryRoot = mkdtempSync(join(dirname(trustedGitDir), ".code-loop-attrs-"));
+  // Keep the relocated attribute files INSIDE this run's trusted Git directory: a crash between the
+  // move and the restore then leaves them under a work-id directory that removeTrustedGitDir and the
+  // startup sweep reclaim, never in an unswept sibling (#487 review: suppressed content residue).
+  const temporaryRoot = mkdtempSync(join(trustedGitDir, "code-loop-attrs-"));
   const moved: Array<{ attribute: WorktreeAttribute; temporaryPath: string }> = [];
   try {
     for (const attribute of attributes) {
@@ -834,6 +854,8 @@ interface Job {
    * echo). `null` for every unstamped/legacy run — never synthesized.
    */
   learningTaskStamp: HuginRequestStamp | null;
+  /** #487: content_capture "none" — metadata-only persistence and eager sandbox removal. */
+  contentSuppressed: boolean;
 }
 
 const jobs = new Map<string, Job>();
@@ -959,6 +981,8 @@ function recordCodeLoopTaskExposure(
     harnessId,
     eventKey: `code-loop:${workId}:${TASK_FINGERPRINT_VERSION}`,
     canonicalFingerprintSha256,
+    // #487: a suppressed run records only keyed fingerprints of its instruction and stamp digest.
+    ...(req.content_capture === CONTENT_CAPTURE_NONE ? { contentCapture: "suppressed" as const } : {}),
   });
 }
 
@@ -994,6 +1018,32 @@ async function startCodeLoopInner(
 ): Promise<CodeLoopStartResult> {
   const structural = validateCodeLoopRequestStructure(req);
   if (!structural.ok) return { ok: false, refusal: "invalid-request", message: structural.message };
+  // #487: refuse an opt-out the engine cannot honour before recovery, admission, seeding or any
+  // durable write — a suppressed task's content must never reach a path that would capture it.
+  const contentSuppressed = req.content_capture === CONTENT_CAPTURE_NONE;
+  if (contentSuppressed && deps.engine.supportsContentCaptureSuppression !== true) {
+    return {
+      ok: false,
+      refusal: "content-capture-unsupported",
+      message: "content_capture 'none' requires the confined gateway relay, which is unavailable here; no job was started.",
+    };
+  }
+  if (contentSuppressed && req.learning_task_stamp !== undefined) {
+    // The durable LearningTaskContract echo (and its admission row) must reproduce the exact stamp,
+    // including its unkeyed raw_fingerprint digest. Refuse rather than persist that digest.
+    return {
+      ok: false,
+      refusal: "content-capture-unsupported",
+      message: "content_capture 'none' cannot be combined with learning_task_stamp; no job was started.",
+    };
+  }
+  if (contentSuppressed && !isKeyedExposureFingerprintAvailable()) {
+    return {
+      ok: false,
+      refusal: "content-capture-unsupported",
+      message: "content_capture 'none' is not available on this gateway (exposure fingerprint key not provisioned); no job was started.",
+    };
+  }
   // Scope is admission identity. Snapshot canonical values before the first await so an in-process
   // caller cannot mutate request arrays after validation but before execution/harvest.
   const writableGlobs = effectiveWritableGlobs(req);
@@ -1388,6 +1438,7 @@ async function startCodeLoopInner(
       started_at_ms: acceptedAt,
       cleanup_pending: true,
       ...(learningTaskGatewayEcho !== null ? { learning_task_gateway_echo: learningTaskGatewayEcho } : {}),
+      ...(contentSuppressed ? { content_capture: CONTENT_CAPTURE_SUPPRESSED } : {}),
     };
     try {
       const claim = claimDurableCodeLoopRun(cfg.workroot, candidate);
@@ -1448,6 +1499,7 @@ async function startCodeLoopInner(
     learningTaskGatewayEcho,
     cleanupPending: true,
     learningTaskStamp: validatedLearningStamp,
+    contentSuppressed,
   };
   jobs.set(workId, job);
   // The run is durably accepted and about to reach the model. A recovered retry uses the same
@@ -1513,6 +1565,7 @@ async function startCodeLoopInner(
     request_fingerprint: requestFingerprint,
     recovered: false,
     ...(learningTaskGatewayEcho !== null ? { learning_task_gateway_echo: learningTaskGatewayEcho } : {}),
+    ...(contentSuppressed ? { content_capture: CONTENT_CAPTURE_SUPPRESSED } : {}),
     capabilities: CODE_LOOP_CAPABILITIES,
   };
 }
@@ -1532,6 +1585,7 @@ function startResultFromRecord(record: DurableCodeLoopRun, recovered: boolean): 
       ? { learning_task_gateway_echo: record.learning_task_gateway_echo }
       : {}),
     ...(record.result !== null && isCurrentCodeLoopResult(record.result) ? { result: record.result } : {}),
+    ...(record.content_capture === CONTENT_CAPTURE_SUPPRESSED ? { content_capture: CONTENT_CAPTURE_SUPPRESSED } : {}),
     capabilities: CODE_LOOP_CAPABILITIES,
   };
 }
@@ -1578,6 +1632,7 @@ async function runJob(
         caps,
         cageArgv,
         growthCapBytes,
+        ...(job.contentSuppressed ? { contentCapture: CONTENT_CAPTURE_SUPPRESSED } : {}),
       });
       job.usage = run.usage;
       job.engineTelemetry = run.telemetry ?? null;
@@ -1844,6 +1899,9 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: "code-loop@local",
 };
 const CODE_LOOP_WORK_ID_RE = /^cl-\d{8}-[0-9a-f]{8}$/;
+const LEGACY_ATTRIBUTE_STASH_RE = /^\.code-loop-attrs-[A-Za-z0-9]{6}$/;
+// Longer than any run's whole lifetime (wall cap + cleanup), so a live peer's stash is never taken.
+const LEGACY_ATTRIBUTE_STASH_MIN_AGE_MS = 6 * 60 * 60 * 1000;
 
 function trustedGitRootPath(workroot: string): string {
   return join(realpathSync(resolve(workroot)), TRUSTED_GIT_ROOT_NAME);
@@ -1886,6 +1944,20 @@ function sweepTrustedGitDirs(workroot: string): void {
   if (!existsSync(root)) return;
   assertPrivateOwnedDirectory(root, root);
   for (const workId of readdirSync(root)) {
+    if (LEGACY_ATTRIBUTE_STASH_RE.test(workId)) {
+      // Pre-#487 releases stashed .gitattributes beside the work-id directories, where a crash left
+      // them unswept. No current run writes there; reclaim residue once it outlives any run.
+      const legacy = join(root, workId);
+      try {
+        const stat = lstatSync(legacy);
+        if (stat.isDirectory() && !stat.isSymbolicLink() && Date.now() - stat.mtimeMs > LEGACY_ATTRIBUTE_STASH_MIN_AGE_MS) {
+          rmSync(legacy, { recursive: true, force: true });
+        }
+      } catch {
+        /* next sweep retries */
+      }
+      continue;
+    }
     if (!CODE_LOOP_WORK_ID_RE.test(workId)) continue;
     if (jobs.has(workId) || isDurableCodeLoopWorkLive(workroot, workId)) continue;
     removeTrustedGitDir(workroot, workId);
@@ -2209,6 +2281,16 @@ async function finalizeJobWithResult(
     // only if the authoritative terminal file actually committed before the write failure.
     delete result.feedback_handle;
   }
+  // #487: a suppressed run's sandbox holds the seed files and agent edits. Its result now lives
+  // only in memory, so remove the sandbox as soon as the transient unit is proved absent; while
+  // cleanup is pending the (cage-owned) tree is left for the verified-cleanup sweep instead.
+  if (job.contentSuppressed && !job.cleanupPending) {
+    try {
+      rmSync(job.sandboxDir, { recursive: true, force: true });
+    } catch (err) {
+      console.error(`[code-loop] suppressed sandbox removal failed for ${job.id} (sweep retries):`, err instanceof Error ? err.name : "unknown");
+    }
+  }
   recordCodeLoopRun(result.status);
 }
 
@@ -2227,6 +2309,8 @@ function persistJobDurable(job: Job): boolean {
       ...(job.learningTaskGatewayEcho !== null
         ? { learning_task_gateway_echo: job.learningTaskGatewayEcho }
         : {}),
+      // The store also forces `result: null` for a suppressed record on every write.
+      ...(job.contentSuppressed ? { content_capture: CONTENT_CAPTURE_SUPPRESSED } : {}),
     });
     return true;
   } catch (err) {
@@ -2268,6 +2352,7 @@ function writeLedger(
       source: "code-loop",
       keyAlias: deps.keyAlias ?? null,
       evidenceIdentity,
+      ...(job.contentSuppressed ? { contentCapture: "suppressed" as const } : {}),
     });
     if (deps.feedbackOwner && job.result) {
       const handle = bindExecutionFeedback({
@@ -2477,8 +2562,12 @@ export async function sweepCodeLoopSandboxes(
     }
 
     // Reclaim only non-running sandboxes. The trusted durable start time wins over any forged
-    // `.meta.json`; deleted/garbled metadata therefore cannot extend source retention.
-    if (status !== "running" && startedAtMs !== null && now - startedAtMs > cfg.retentionTtlMs) {
+    // `.meta.json`; deleted/garbled metadata therefore cannot extend source retention. #487: a
+    // trusted suppressed record is reclaimed as soon as it is terminal with cleanup proved.
+    const suppressedTerminal = durable?.content_capture === CONTENT_CAPTURE_SUPPRESSED &&
+      durable.cleanup_pending !== true && status !== "running";
+    if (suppressedTerminal ||
+        (status !== "running" && startedAtMs !== null && now - startedAtMs > cfg.retentionTtlMs)) {
       try {
         compactDurableCodeLoopRunResult(cfg.workroot, workId);
         rmSync(dir, { recursive: true, force: true });

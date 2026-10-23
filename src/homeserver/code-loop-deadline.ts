@@ -93,6 +93,8 @@ export function withCodeLoopDeadline(deps: CodeLoopDeps, deadline: CodeLoopDeadl
       return lease;
     },
     engine: {
+      // #487: the deadline wraps transport, not capture semantics; keep the engine's capability.
+      ...(deps.engine?.supportsContentCaptureSuppression === true ? { supportsContentCaptureSuppression: true } : {}),
       run: async options => {
         deadline.assertActive();
         return deps.engine.run({
