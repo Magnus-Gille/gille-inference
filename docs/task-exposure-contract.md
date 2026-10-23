@@ -141,6 +141,18 @@ anyone who needs more than the two rollup counters.
 
 ## Captured metadata and privacy
 
+**Content-suppressed calls (#487).** A call made with `X-Content-Capture: none` /
+`content_capture: "none"` is still captured (coverage stays complete), but only as a keyed
+fingerprint: `HMAC-SHA256(gateway key, "task-exposure-v1\0" + <trim-utf8-sha256-v1 hex>)`, stored
+with `fingerprint_version = "trim-utf8-sha256-hmac-v1:<key id>"` (the key id is an HMAC of a fixed
+label, not the key). This applies to the rendered-prompt row and to a stamp-supplied canonical
+digest. Lookups are unchanged on the wire: the gateway derives the keyed value from each queried
+digest in memory, so bare labels, canonical digests and `exact_bytes` all match suppressed rows.
+If any keyed row was written under a key other than the current one (rotation) or the key is now
+missing, the response reports `coverage.keyed_fingerprints.unmatchable_rows_present: true`,
+`coverage_complete: false` and `unseen_claim_supported: false` on every result. Without a key the
+gateway refuses the opt-out up front, so no suppressed call is ever recorded with an unkeyed digest.
+
 The registry stores only event key, timestamp, fingerprint version/digest, identity kind, coverage
 epoch id, lane, canonical model id, and harness id. It has no task, prompt, answer, diff, file, or
 completion column — including for the canonical-raw identity, which only ever stores the digest

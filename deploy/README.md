@@ -285,6 +285,18 @@ artifact identities, and limitations are in
 This candidate supersedes the stale public roster claim for `qwen35-122b-a10b`; it does not erase
 the historical Qwen3.5 comparison or create an automatic Qwen route.
 
+### Content-capture opt-out key (#487)
+
+The per-call "do not log content" opt-out (`X-Content-Capture: none`) is **unavailable until the
+operator provisions `HOMESERVER_EXPOSURE_FINGERPRINT_KEY`** in the gateway's private environment
+file (≥ 32 bytes of random secret, e.g. 32 random bytes base64-encoded; never in Git, the release
+payload, the database or logs). Without it the gateway starts normally, logs only that the key is
+unset, does not advertise `content-capture-none-v1`, and refuses every opt-out request. Provision
+it before (or with) the restart that ships #487, then verify with an owner key that
+`GET /portal/me` contains `contentCaptureOptOut`. Rotating the key makes previously keyed exposure
+rows incomparable; the exposure lookup reports that as incomplete coverage rather than "fresh".
+Removing the key disables the opt-out again (rollback-safe: no schema or data change depends on it).
+
 ### Deploying
 
 ```bash

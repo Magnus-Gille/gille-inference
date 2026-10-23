@@ -65,7 +65,8 @@ suppressed `code run` result is held only in gateway memory: after a gateway res
 `code result` reports it as unavailable. Gateway routes that cannot honour the option refuse
 it. See the gateway contract's *Per-call content-capture opt-out* section for exactly what is
 and is not recorded. Use 1.6.0 against a gateway that advertises `content-capture-none-v1` in
-`GET /portal/me`. Against an older gateway, only calls that request the opt-out are refused.
+`GET /portal/me`. A gateway advertises it only when its exposure fingerprint key is provisioned.
+Against an older or unprovisioned gateway, only calls that request the opt-out are refused.
 
 ### Reliability diagnostics (1.5.5)
 

@@ -85,10 +85,23 @@ When honoured, the gateway persists **metadata only**:
   recovers a content-capturing run or vice versa. A runtime that cannot stamp per-turn calls
   (confinement `off`) refuses with `content-capture-unsupported` before any admission or write.
 
-Still recorded (no prompt or completion text): the content-blind `request_log`, metrics, and the
-task-exposure registry's SHA-256 fingerprint of the task text (`docs/task-exposure-contract.md`).
-The fingerprint keeps exam-contamination coverage complete; it is not text, but like any unkeyed
-digest it can confirm a guessed exact prompt to someone with database access.
+Still recorded (no prompt or completion text): the content-blind `request_log`, metrics, and a
+**keyed** task-exposure fingerprint (`docs/task-exposure-contract.md`). A suppressed call never
+stores an unkeyed digest of its prompt — a short Restricted prompt (an identity number) would be
+brute-forceable from a plain SHA-256. The registry stores
+`HMAC-SHA256(key, "task-exposure-v1\0" + <trim-utf8-sha256-v1 hex digest>)` under
+`fingerprint_version = "trim-utf8-sha256-hmac-v1:<key id>"`, for the rendered prompt and for any
+stamp-supplied canonical digest. The key is gateway-held (`HOMESERVER_EXPOSURE_FINGERPRINT_KEY`,
+≥ 32 bytes, private environment only, never in Git, the database or logs). Lookups derive the
+same value in memory, so exam-contamination checks still match suppressed calls.
+
+**Missing key ⇒ fail closed (refuse).** Without a valid key the gateway does not advertise the
+opt-out and refuses every request for it (`400 invalid_request_error` on HTTP, `_meta.m5_code:
+"content_capture_unavailable"` on `ask`, `content-capture-unsupported` on `code_loop_start`)
+before any inference; it never falls back to an unkeyed digest. Key provisioning is a deploy step
+(`deploy/README.md`). After a key rotation, rows written under the old key cannot be compared:
+lookups then report `coverage.keyed_fingerprints.unmatchable_rows_present: true`,
+`coverage_complete: false` and `unseen_claim_supported: false`, never a silent "fresh".
 
 Surfaces that cannot honour the opt-out **refuse** it rather than capture content: any other
 non-read request carrying `X-Content-Capture: none` (`/delegate`, `/v1/embeddings`,
@@ -97,8 +110,8 @@ non-read request carrying `X-Content-Capture: none` (`/delegate`, `/v1/embedding
 requests ignore the header. Guest keys are content-blind already; the header is accepted and
 echoed for them.
 
-**Preflight.** `GET /portal/me` returns `contentCaptureOptOut: "content-capture-none-v1"` for every
-authenticated key, and `tools/list` advertises `content_capture` (`enum: ["none"]`) on `ask` and
+**Preflight.** When the key is provisioned, `GET /portal/me` returns
+`contentCaptureOptOut: "content-capture-none-v1"` for every authenticated key, and `tools/list` advertises `content_capture` (`enum: ["none"]`) on `ask` and
 `code_loop_start`. An older gateway silently ignores the unknown argument or header, so a caller must
 check one of these before sending Restricted content; the m5 client and stdio bridge do this
 automatically. This is a per-call capability advertisement, not the full effective-capture

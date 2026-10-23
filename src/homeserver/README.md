@@ -1041,6 +1041,7 @@ HOMESERVER_FORMAT_DISCOUNT_WEIGHT=0.5          # weight in [0,1] applied to a fo
 # ── code_loop — owner-only sandboxed agentic coding tool (#116) ──
 HOMESERVER_CODE_LOOP=off                       # master switch. off (default) → the MCP tools are visible to owners but code_loop_start returns `disabled`. on → runs.
 HOMESERVER_CODE_LOOP_PI_BIN=                   # abs path to the pinned pi binary (vendor install OUTSIDE the rsync root, e.g. ~/.local/bin/pi)
+HOMESERVER_EXPOSURE_FINGERPRINT_KEY=           # #487: ≥32-byte private HMAC key for keyed exposure fingerprints of content-suppressed calls. Unset → the content-capture opt-out is refused and not advertised. Private env only; never logged.
 HOMESERVER_CODE_LOOP_API_KEY=                  # minted owner-tier, agent-scope service key pi calls back with (allow-listed to the 80b). Real key → owner_request_log fires; agent scope denies admin. Never in models.json.
 HOMESERVER_CODE_LOOP_PI_AGENT_DIR=             # PI_CODING_AGENT_DIR — holds models.json (see deploy/pi-models.json.example; baseUrl = the loopback forward, NOT the tailnet IP) AND pi's own auth.json credential store; the cage binds ONLY <dir>/models.json (auth.json stays hidden in-cage)
 HOMESERVER_CODE_LOOP_WORKROOT=./data/code-loop-work  # throwaway sandbox root (under ./data so rsync never touches it; under the deploy dir so check_cmd's `npx --no-install` walk-up resolves node_modules)
