@@ -16,6 +16,7 @@ import { checkQuota, recordUsage, type QuotaReservation } from "./quota.js";
 import { quotaScopeForPrincipal, describeQuotaFailure, type QuotaFailureDetail } from "./quota-error.js";
 import { reserveCredits, reconcileCredits, recordUsage as recordCreditUsage } from "./keystore.js";
 import { recordOwnerRequest } from "./owner-log.js";
+import { isKeyedExposureFingerprintAvailable } from "./task-exposure.js";
 import {
   CONTENT_CAPTURE_NONE,
   CONTENT_CAPTURE_OPT_OUT_CONTRACT,
@@ -535,13 +536,16 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
             description:
               "optional actual known cloud delegator model id for savings accounting; omit when unknown, never guess",
           },
-          content_capture: {
-            type: "string",
-            enum: [CONTENT_CAPTURE_NONE],
-            description:
-              `optional per-call opt-out (${CONTENT_CAPTURE_OPT_OUT_CONTRACT}): 'none' stores metadata only — no prompt or ` +
-              "completion text in owner logs, ledger excerpts or harvest datasets; echoed as _meta.content_capture='suppressed'",
-          },
+          // #487: advertised only when the gateway can honour it (keyed exposure fingerprint key).
+          ...(isKeyedExposureFingerprintAvailable() ? {
+            content_capture: {
+              type: "string",
+              enum: [CONTENT_CAPTURE_NONE],
+              description:
+                `optional per-call opt-out (${CONTENT_CAPTURE_OPT_OUT_CONTRACT}): 'none' stores metadata only — no prompt or ` +
+                "completion text in owner logs, ledger excerpts or harvest datasets; echoed as _meta.content_capture='suppressed'",
+            },
+          } : {}),
           ...(principal.tier === "owner" ? {
             include_reasoning: { type: "boolean", default: false,
               description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
@@ -1054,6 +1058,8 @@ export async function runChatCompletion(
       lane: "mcp-ask",
       modelId: canonModel,
       harnessId: "mcp-ask",
+      // #487: a suppressed call records only a keyed fingerprint (never an unkeyed digest).
+      ...(args.contentCapture === "suppressed" ? { contentCapture: "suppressed" as const } : {}),
     });
   }
 
@@ -1484,6 +1490,14 @@ async function callTool(
       return { text: captureArgument.message, isError: true, trace: badRequestTrace() };
     }
     const contentCapture = combineContentCapture(ctx.contentCapture ?? "default", captureArgument.capture);
+    if (contentCapture === "suppressed" && !isKeyedExposureFingerprintAvailable()) {
+      return {
+        text: "content_capture 'none' is not available on this gateway (exposure fingerprint key not provisioned); nothing was run.",
+        isError: true,
+        meta: { m5_code: "content_capture_unavailable", retryable: false },
+        trace: badRequestTrace(),
+      };
+    }
     // Echo the honoured opt-out on every ask outcome so a caller can verify it was applied.
     const captureMeta: Record<string, unknown> = contentCapture === "suppressed"
       ? { content_capture: CONTENT_CAPTURE_SUPPRESSED }

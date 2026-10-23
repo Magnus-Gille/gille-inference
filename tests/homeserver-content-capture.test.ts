@@ -3,7 +3,12 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { initDb, getDb } from "../src/db.js";
+import { configureTaskExposureFingerprintKey } from "../src/homeserver/task-exposure.js";
+
+const TEST_EXPOSURE_KEY = "test-only-exposure-fingerprint-key-0123456789abcdef";
+const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
 
 /**
  * #487 — per-call "do not log content" opt-out for owner routes.
@@ -119,6 +124,7 @@ beforeAll(async () => {
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_REDEEM_RPM"] = "10000";
   process.env["HOMESERVER_OWNER_REQUEST_LOG"] = "on";
+  process.env["HOMESERVER_EXPOSURE_FINGERPRINT_KEY"] = TEST_EXPOSURE_KEY;
   delete process.env["HOMESERVER_API_KEYS"];
   delete process.env["HOMESERVER_ADMIN_API_KEYS"];
 
@@ -176,7 +182,10 @@ async function settle(): Promise<void> {
 }
 
 function expectAbsent(marker: string): void {
-  expect(persistedText()).not.toContain(marker);
+  const text = persistedText();
+  expect(text).not.toContain(marker);
+  // No unkeyed digest of the prompt either (a short Restricted prompt is brute-forceable from it).
+  expect(text).not.toContain(sha256(marker));
   expect(captured.join("\n")).not.toContain(marker);
 }
 
@@ -478,5 +487,37 @@ describe("preflight advertisement", () => {
       const body = await res.json() as Record<string, unknown>;
       expect(body["contentCaptureOptOut"]).toBe("content-capture-none-v1");
     }
+  });
+});
+
+describe("without a provisioned exposure fingerprint key the opt-out fails closed", () => {
+  beforeAll(() => { configureTaskExposureFingerprintKey(""); });
+  afterAll(() => { configureTaskExposureFingerprintKey(TEST_EXPOSURE_KEY); });
+
+  it("refuses X-Content-Capture: none on chat before any upstream work", async () => {
+    const marker = canary("NO_KEY_CHAT");
+    const posts = upstreamPosts;
+    const res = await chat(ownerKey, marker, { header: "none" });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toMatch(/not available on this gateway/);
+    expect(upstreamPosts).toBe(posts);
+    await settle();
+    expectAbsent(marker);
+  });
+
+  it("refuses content_capture:'none' on ask and stops advertising it", async () => {
+    const marker = canary("NO_KEY_ASK");
+    const posts = upstreamPosts;
+    const out = await mcp(ownerKey, "tools/call", { name: "ask", arguments: { model: "m1", prompt: marker, content_capture: "none" } });
+    expect(out.body.result.isError).toBe(true);
+    expect(out.body.result._meta.m5_code).toBe("content_capture_unavailable");
+    expect(upstreamPosts).toBe(posts);
+    const list = await mcp(ownerKey, "tools/list", {});
+    const ask = (list.body.result.tools as Array<{ name: string; inputSchema: any }>).find((t) => t.name === "ask")!;
+    expect(ask.inputSchema.properties.content_capture).toBeUndefined();
+    const me = await (await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${ownerKey}` } })).json() as Record<string, unknown>;
+    expect(me["contentCaptureOptOut"]).toBeUndefined();
+    await settle();
+    expectAbsent(marker);
   });
 });

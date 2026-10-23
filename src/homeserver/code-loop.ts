@@ -47,6 +47,7 @@ import { recordDelegation, type Outcome, type ErrorClass } from "./ledger.js";
 import { recordCodeLoopRun, setCodeLoopActive } from "./metrics.js";
 import {
   TASK_FINGERPRINT_VERSION,
+  isKeyedExposureFingerprintAvailable,
   recordTaskExposureBestEffort,
 } from "./task-exposure.js";
 import {
@@ -228,14 +229,14 @@ export function codeLoopToolDefs(): unknown[] {
           },
           protected: { type: "array", items: { type: "string" }, description: "globs whose modification is reported at exit" },
           task_type: { type: "string", enum: TASK_TYPES.map((task) => task.id), description: "optional canonical task vocabulary; omit to classify from instruction" },
-          content_capture: {
+          ...(isKeyedExposureFingerprintAvailable() ? { content_capture: {
             type: "string",
             enum: [CONTENT_CAPTURE_NONE],
             description:
               `optional per-call opt-out (${CONTENT_CAPTURE_OPT_OUT_CONTRACT}): 'none' keeps per-turn owner-log rows, the ledger ` +
               "row and the durable run record metadata-only, holds the result in memory only, and deletes the sandbox once " +
               "cleanup is proved; refused as content-capture-unsupported where per-turn suppression is unavailable",
-          },
+          } } : {}),
           caps: {
             type: "object",
             additionalProperties: false,
@@ -716,7 +717,10 @@ async function withWorktreeAttributesHidden<T>(
 ): Promise<{ value: T; attributes: WorktreeAttribute[] }> {
   const attributes = listWorktreeAttributes(sandboxDir);
   if (attributes.length === 0) return { value: await fn(), attributes };
-  const temporaryRoot = mkdtempSync(join(dirname(trustedGitDir), ".code-loop-attrs-"));
+  // Keep the relocated attribute files INSIDE this run's trusted Git directory: a crash between the
+  // move and the restore then leaves them under a work-id directory that removeTrustedGitDir and the
+  // startup sweep reclaim, never in an unswept sibling (#487 review: suppressed content residue).
+  const temporaryRoot = mkdtempSync(join(trustedGitDir, "code-loop-attrs-"));
   const moved: Array<{ attribute: WorktreeAttribute; temporaryPath: string }> = [];
   try {
     for (const attribute of attributes) {
@@ -977,6 +981,8 @@ function recordCodeLoopTaskExposure(
     harnessId,
     eventKey: `code-loop:${workId}:${TASK_FINGERPRINT_VERSION}`,
     canonicalFingerprintSha256,
+    // #487: a suppressed run records only keyed fingerprints of its instruction and stamp digest.
+    ...(req.content_capture === CONTENT_CAPTURE_NONE ? { contentCapture: "suppressed" as const } : {}),
   });
 }
 
@@ -1020,6 +1026,13 @@ async function startCodeLoopInner(
       ok: false,
       refusal: "content-capture-unsupported",
       message: "content_capture 'none' requires the confined gateway relay, which is unavailable here; no job was started.",
+    };
+  }
+  if (contentSuppressed && !isKeyedExposureFingerprintAvailable()) {
+    return {
+      ok: false,
+      refusal: "content-capture-unsupported",
+      message: "content_capture 'none' is not available on this gateway (exposure fingerprint key not provisioned); no job was started.",
     };
   }
   // Scope is admission identity. Snapshot canonical values before the first await so an in-process
@@ -1877,6 +1890,9 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: "code-loop@local",
 };
 const CODE_LOOP_WORK_ID_RE = /^cl-\d{8}-[0-9a-f]{8}$/;
+const LEGACY_ATTRIBUTE_STASH_RE = /^\.code-loop-attrs-[A-Za-z0-9]{6}$/;
+// Longer than any run's whole lifetime (wall cap + cleanup), so a live peer's stash is never taken.
+const LEGACY_ATTRIBUTE_STASH_MIN_AGE_MS = 6 * 60 * 60 * 1000;
 
 function trustedGitRootPath(workroot: string): string {
   return join(realpathSync(resolve(workroot)), TRUSTED_GIT_ROOT_NAME);
@@ -1919,6 +1935,20 @@ function sweepTrustedGitDirs(workroot: string): void {
   if (!existsSync(root)) return;
   assertPrivateOwnedDirectory(root, root);
   for (const workId of readdirSync(root)) {
+    if (LEGACY_ATTRIBUTE_STASH_RE.test(workId)) {
+      // Pre-#487 releases stashed .gitattributes beside the work-id directories, where a crash left
+      // them unswept. No current run writes there; reclaim residue once it outlives any run.
+      const legacy = join(root, workId);
+      try {
+        const stat = lstatSync(legacy);
+        if (stat.isDirectory() && !stat.isSymbolicLink() && Date.now() - stat.mtimeMs > LEGACY_ATTRIBUTE_STASH_MIN_AGE_MS) {
+          rmSync(legacy, { recursive: true, force: true });
+        }
+      } catch {
+        /* next sweep retries */
+      }
+      continue;
+    }
     if (!CODE_LOOP_WORK_ID_RE.test(workId)) continue;
     if (jobs.has(workId) || isDurableCodeLoopWorkLive(workroot, workId)) continue;
     removeTrustedGitDir(workroot, workId);

@@ -1,8 +1,6 @@
 import { isAbsolute } from "node:path";
 import { getBuildStatus, runBuild } from "./m5-build.mjs";
 import {
-  CONTENT_CAPTURE_NONE,
-  CONTENT_CAPTURE_SUPPRESSED,
   M5ClientError,
   classifyAskRefusal,
   createFileAdoptionSpool,
@@ -70,36 +68,6 @@ function annotateAskRefusal(message, response) {
       },
     },
   };
-}
-
-// #487: the two content-bearing tools that accept `content_capture:"none"`.
-const CONTENT_CAPTURE_TOOLS = new Set(["ask", "code_loop_start"]);
-
-function contentCaptureRequest(message) {
-  if (message?.method !== "tools/call" || !CONTENT_CAPTURE_TOOLS.has(message?.params?.name)) return null;
-  const args = message.params.arguments;
-  if (!args || typeof args !== "object" || Array.isArray(args) ||
-      !Object.prototype.hasOwnProperty.call(args, "content_capture")) return null;
-  if (args.content_capture !== CONTENT_CAPTURE_NONE) {
-    throw new M5ClientError("invalid_input", "content_capture must be 'none' when supplied.");
-  }
-  return message.params.name;
-}
-
-// A gateway that advertises the opt-out confirms it on every accepted call. An accepted call
-// without the marker must not be presented as suppressed (its content may have been captured).
-function assertContentSuppressionConfirmed(toolName, response) {
-  const result = response?.result;
-  if (!result || typeof result !== "object") return;
-  if (toolName === "ask") {
-    if (result.isError === true && result.structuredContent === undefined) return;
-    if (result._meta?.content_capture === CONTENT_CAPTURE_SUPPRESSED) return;
-  } else {
-    const started = result.structuredContent;
-    if (result.isError === true || started?.refusal !== undefined) return;
-    if (started?.content_capture === CONTENT_CAPTURE_SUPPRESSED) return;
-  }
-  throw new M5ClientError("content_capture_unconfirmed", "The gateway did not confirm content_capture suppression.");
 }
 
 function isCodeLoopResult(message) {
@@ -301,8 +269,7 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           }
           response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], isError: result.exit_code !== 0 } };
         } else {
-          const captureTool = contentCaptureRequest(message);
-          if (captureTool !== null) await client.requireContentCaptureSupport(captureTool);
+          // #487: client.rpc() validates, preflights and confirms any content_capture call.
           try {
             response = await client.rpc(message);
         } catch (error) {
@@ -315,8 +282,6 @@ export function createMcpStdioBridge({ client, profile, adoptionSpool = createFi
           }
         }
         if (notification) return null;
-        const confirmedTool = contentCaptureRequest(message);
-        if (confirmedTool !== null) assertContentSuppressionConfirmed(confirmedTool, response);
         response = annotateAskRefusal(message, response);
         if (response === null) {
           return rpcError(

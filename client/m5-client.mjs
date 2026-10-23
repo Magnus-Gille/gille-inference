@@ -1008,6 +1008,37 @@ function requestsContentSuppression(input) {
   return true;
 }
 
+const CONTENT_CAPTURE_TOOLS = new Set(["ask", "code_loop_start"]);
+
+/** Returns the tool name for a tools/call that carries `content_capture`, after validating it. */
+function contentCaptureToolCall(message) {
+  if (message?.method !== "tools/call" || !CONTENT_CAPTURE_TOOLS.has(message?.params?.name)) return null;
+  const args = message.params.arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  return requestsContentSuppression(args) ? message.params.name : null;
+}
+
+/**
+ * A gateway that advertises the opt-out confirms it on every accepted call. An accepted call
+ * without the marker must not be presented as suppressed: its content may have been captured.
+ */
+function assertContentSuppressionConfirmed(toolName, response) {
+  const result = response?.result;
+  if (!result || typeof result !== "object") return;
+  if (toolName === "ask") {
+    if (result.isError === true && result.structuredContent === undefined) return;
+    if (result._meta?.content_capture === CONTENT_CAPTURE_SUPPRESSED) return;
+  } else {
+    let started = result.structuredContent;
+    if (started === undefined) {
+      try { started = JSON.parse(toolResultText(result) ?? ""); } catch { started = undefined; }
+    }
+    if (result.isError === true || started?.refusal !== undefined) return;
+    if (started?.content_capture === CONTENT_CAPTURE_SUPPRESSED) return;
+  }
+  throw new M5ClientError("content_capture_unconfirmed", "The gateway did not confirm content_capture suppression.");
+}
+
 function confirmContentSuppression(payload, marker) {
   if (marker !== CONTENT_CAPTURE_SUPPRESSED) {
     throw new M5ClientError("content_capture_unconfirmed", "The gateway did not confirm content_capture suppression.");
@@ -1874,13 +1905,30 @@ export async function createM5Client({
     );
   }
 
-  async function callToolResponse(name, args) {
-    const response = await client.rpc({
-      jsonrpc: "2.0",
-      id: nextId++,
-      method: "tools/call",
-      params: { name, arguments: args },
-    });
+  // #487: every tools/call that carries `content_capture` passes this one boundary, whichever
+  // public entry point (ask, codeRun, tool, rpc, the stdio bridge) sent it: validate the value,
+  // require the live schema to advertise the opt-out before any content leaves, and require the
+  // gateway's confirmation before the result is returned.
+  async function guardedRequest(message, { preflighted = false } = {}) {
+    const captureTool = contentCaptureToolCall(message);
+    if (captureTool !== null && !preflighted) await requireContentCaptureSupport(captureTool);
+    const response = await request(message);
+    if (captureTool !== null) assertContentSuppressionConfirmed(captureTool, response);
+    return response;
+  }
+
+  async function callToolResponse(name, args, options = {}) {
+    let response;
+    try {
+      response = await guardedRequest({
+        jsonrpc: "2.0",
+        id: nextId++,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }, options);
+    } catch (error) {
+      throw safeError(error, secrets, profile);
+    }
     if (response?.error) {
       throw new M5ClientError(
         "mcp_error",
@@ -1908,27 +1956,26 @@ export async function createM5Client({
     return catalogue;
   }
 
-  const client = {
-    /** #487: throws content_capture_unsupported unless the live schema advertises the opt-out. */
-    async requireContentCaptureSupport(toolName) {
-      await requireContentCaptureSupport(toolName);
-    },
+  async function toolPayloadCall(name, args, options = {}) {
+    const response = await callToolResponse(name, args, options);
+    try {
+      return redactValue(toolPayload(response?.result), secrets);
+    } catch (error) {
+      throw safeError(error, secrets, profile);
+    }
+  }
 
+  const client = {
     async rpc(message) {
       try {
-        return await request(message);
+        return await guardedRequest(message);
       } catch (error) {
         throw safeError(error, secrets, profile);
       }
     },
 
     async tool(name, args) {
-      const response = await callToolResponse(name, args);
-      try {
-        return redactValue(toolPayload(response?.result), secrets);
-      } catch (error) {
-        throw safeError(error, secrets, profile);
-      }
+      return toolPayloadCall(name, args);
     },
 
     async models() {
@@ -1983,7 +2030,6 @@ export async function createM5Client({
         );
       }
       const suppressContent = requestsContentSuppression(input);
-      if (suppressContent) await requireContentCaptureSupport("ask");
       const response = await callToolResponse("ask", input);
       const result = redactValue(response?.result, secrets);
       if (!result || typeof result !== "object") {
@@ -2158,7 +2204,7 @@ export async function createM5Client({
           throw new M5ClientError("whole_job_deadline_unsupported", "The gateway does not advertise the requested whole-job deadline; no job was dispatched.");
         }
       }
-      const started = await client.tool("code_loop_start", requestInput);
+      const started = await toolPayloadCall("code_loop_start", requestInput, { preflighted: captureCatalogue !== null });
       if (!started || typeof started !== "object") {
         throw new M5ClientError(
           "invalid_code_start",
@@ -2166,13 +2212,6 @@ export async function createM5Client({
         );
       }
       if (started.ok === false || started.refusal) return started;
-      if (suppressContent && started.content_capture !== CONTENT_CAPTURE_SUPPRESSED) {
-        throw new M5ClientError(
-          "content_capture_unconfirmed",
-          "The gateway accepted the code-loop start without confirming content_capture suppression.",
-          typeof started.work_id === "string" ? { workId: started.work_id } : {},
-        );
-      }
       const workId = started.work_id;
       validateWorkId(workId);
       if (started.result !== undefined) return validateCodeResult(started.result);

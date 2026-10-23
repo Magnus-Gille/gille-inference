@@ -126,6 +126,9 @@ export function buildCageArgv(o: CageArgvOptions): string[] {
     "--quiet",
     "--service-type=exec",
     "--expand-environment=no",
+    // #487: without an explicit description systemd describes the unit by its full command line
+    // (which carries pi's instruction) in journal lifecycle messages. Keep it content-free.
+    "--description=gille code_loop caged run",
     // NAME without '=VALUE' copies from the client environment without putting the per-run
     // capability in argv (other local users may be able to read process command lines).
     "--setenv=HS_API_KEY",

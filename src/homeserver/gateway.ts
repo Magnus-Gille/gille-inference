@@ -115,7 +115,9 @@ import {
   type ImageJobSubmission,
 } from "./image-jobs.js";
 import {
+  configureTaskExposureFingerprintKey,
   initializeTaskExposureRegistry,
+  isKeyedExposureFingerprintAvailable,
   lookupTaskExposures,
   parseTaskExposureLookupRequest,
   recordMessageTaskExposuresBestEffort,
@@ -1715,6 +1717,8 @@ async function handleChatProxy(
           lane: "chat",
           modelId: servedModel,
           harnessId: "openai-chat",
+          // #487: a suppressed call records only a keyed fingerprint.
+          ...(contentCapture === "suppressed" ? { contentCapture } : {}),
         });
       }
       const messages = Array.isArray(body["messages"])
@@ -1852,6 +1856,8 @@ async function handleChatProxy(
           lane: "chat",
           modelId: servedModel,
           harnessId: "openai-chat",
+          // #487: a suppressed call records only a keyed fingerprint.
+          ...(contentCapture === "suppressed" ? { contentCapture } : {}),
         });
       }
       upstream = await fetch(`${cfg.lmStudioBaseUrl}/chat/completions`, {
@@ -3999,6 +4005,16 @@ export function startGateway(
   composition: GatewayComposition = {},
 ): Promise<GatewayHandle> {
   const cfg = loadConfig();
+  // #487: install the keyed exposure fingerprint key before traffic. Without a valid key the
+  // per-call content-capture opt-out is neither advertised nor accepted (fail closed). Only the
+  // status is logged, never the value.
+  const exposureKeyStatus = configureTaskExposureFingerprintKey(cfg.exposureFingerprintKey);
+  if (exposureKeyStatus !== "configured") {
+    console.warn(
+      `[content-capture] HOMESERVER_EXPOSURE_FINGERPRINT_KEY ${exposureKeyStatus === "invalid" ? "is shorter than 32 bytes" : "is not set"}; ` +
+      "the per-call content-capture opt-out is unavailable.",
+    );
+  }
   try {
     // Install independent task-exposure and roster-proposal registries before
     // the port accepts traffic; each preserves its own diagnostic cause.
@@ -4354,6 +4370,20 @@ export async function handleRequest(
     if (requestContentCapture === "suppressed") {
       const honoured = method === "POST" && (path === "/v1/chat/completions" || path === "/mcp");
       const contentFreeRead = method === "GET" || method === "HEAD" || method === "OPTIONS";
+      if (honoured && !isKeyedExposureFingerprintAvailable()) {
+        // Fail closed: without the keyed exposure fingerprint the call could only be recorded with
+        // an unkeyed (brute-forceable) digest of its prompt.
+        lctx.status = 400;
+        lctx.outcome = "bad_request";
+        lctx.errorClass = "invalid_request_error";
+        sendError(res, makeError("invalid_request_error", {
+          param: CONTENT_CAPTURE_HEADER,
+          message:
+            "X-Content-Capture: none is not available on this gateway (exposure fingerprint key not provisioned); " +
+            "the request was not processed.",
+        }));
+        return;
+      }
       if (!honoured && !contentFreeRead) {
         lctx.status = 400;
         lctx.outcome = "bad_request";
@@ -5579,9 +5609,9 @@ export async function handleRequest(
       sendJson(res, 200, {
         ...(ownerAgent || explicitEmbeddingGrant ? { gateway: gatewayRelease } : {}),
         ...(ownerAgent ? { inferenceObservation } : {}),
-        // #487 preflight: this gateway honours `X-Content-Capture: none` / `content_capture:"none"`
+        // #487 preflight (only when the keyed exposure fingerprint key is provisioned): this gateway honours `X-Content-Capture: none` / `content_capture:"none"`
         // on /v1/chat/completions and the MCP ask/code_loop_start tools, and refuses it elsewhere.
-        contentCaptureOptOut: CONTENT_CAPTURE_OPT_OUT_CONTRACT,
+        ...(isKeyedExposureFingerprintAvailable() ? { contentCaptureOptOut: CONTENT_CAPTURE_OPT_OUT_CONTRACT } : {}),
         alias: principal.alias,
         tier: principal.tier,
         scope: principal.scope,

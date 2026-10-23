@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { getDb } from "../db.js";
 import { ownerLogContentRowsPredicate } from "./owner-log.js";
@@ -12,6 +12,49 @@ import { ownerLogContentRowsPredicate } from "./owner-log.js";
  */
 
 export const TASK_FINGERPRINT_VERSION = "trim-utf8-sha256-v1" as const;
+/**
+ * #487: keyed fingerprint scheme for content-suppressed calls. A suppressed call must not leave an
+ * unkeyed digest of its task text: a short Restricted prompt (an identity number, an account
+ * number) is brute-forceable from a plain SHA-256. Suppressed rows store
+ *   HMAC-SHA256(gateway key, "task-exposure-v1\0" + <trim-utf8-sha256-v1 hex digest>)
+ * under fingerprint_version `trim-utf8-sha256-hmac-v1:<key id>`. Keying the HMAC over the plain
+ * digest (computed in memory only, never stored) lets every existing lookup form — bare
+ * fingerprint labels, canonical digests and exact bytes — match a suppressed exposure, so
+ * exam-contamination coverage stays complete. The key id is itself an HMAC of a fixed label, so it
+ * identifies the key for rotation without revealing it.
+ */
+export const KEYED_FINGERPRINT_SCHEME = "trim-utf8-sha256-hmac-v1" as const;
+const KEYED_FINGERPRINT_DOMAIN = "task-exposure-v1\0";
+const KEYED_FINGERPRINT_KEY_ID_LABEL = "task-exposure-key-id-v1";
+/** Minimum key length in UTF-8 bytes (a 256-bit secret). */
+export const KEYED_FINGERPRINT_MIN_KEY_BYTES = 32;
+
+let keyedFingerprint: { key: Buffer; version: string } | null = null;
+
+export type ExposureFingerprintKeyStatus = "configured" | "missing" | "invalid";
+
+/**
+ * Install (or clear) the gateway-held exposure fingerprint key. Called once at gateway start from
+ * the private environment; never logged, never persisted. Returns only a status.
+ */
+export function configureTaskExposureFingerprintKey(secret: string | undefined): ExposureFingerprintKeyStatus {
+  keyedFingerprint = null;
+  if (secret === undefined || secret === "") return "missing";
+  const key = Buffer.from(secret, "utf8");
+  if (key.length < KEYED_FINGERPRINT_MIN_KEY_BYTES) return "invalid";
+  const keyId = createHmac("sha256", key).update(KEYED_FINGERPRINT_KEY_ID_LABEL, "utf8").digest("hex").slice(0, 16);
+  keyedFingerprint = { key, version: `${KEYED_FINGERPRINT_SCHEME}:${keyId}` };
+  return "configured";
+}
+
+/** True when content-suppressed calls can record their exposure without an unkeyed digest. */
+export function isKeyedExposureFingerprintAvailable(): boolean {
+  return keyedFingerprint !== null;
+}
+
+function keyedDigest(key: Buffer, sha256Hex: string): string {
+  return createHmac("sha256", key).update(`${KEYED_FINGERPRINT_DOMAIN}${sha256Hex}`, "utf8").digest("hex");
+}
 export const TASK_EXPOSURE_LOOKUP_MAX = 100;
 
 export const TASK_EXPOSURE_LANES = [
@@ -101,6 +144,11 @@ export interface TaskExposureRecord {
    * from Codex CLI from Pi for cross-surface lineage.
    */
   externalSurface?: string | null;
+  /**
+   * #487: the call opted out of content capture. Both identities are then stored only as keyed
+   * fingerprints; with no key configured the write fails (never a plain-digest fallback).
+   */
+  contentCapture?: "suppressed";
 }
 
 /** One query item for the legacy `fingerprints` array — always "rendered-prompt", label-only. */
@@ -239,6 +287,16 @@ export interface TaskExposureLookupResponse {
     /** False whenever any REGISTERED external surface's heartbeat is missing/stale (gille#10 AC2)
      *  — see `unseen_claim_supported` below, which is fail-closed gated on this too. */
     external_producer_heartbeats_healthy: boolean;
+    /**
+     * #487: content-suppressed exposures are stored as keyed fingerprints. Lookups match them with
+     * the gateway's current key; rows written under another (rotated) or a now-missing key cannot
+     * be compared, which makes coverage incomplete and every negative claim unsupported.
+     */
+    keyed_fingerprints: {
+      scheme: typeof KEYED_FINGERPRINT_SCHEME;
+      key_configured: boolean;
+      unmatchable_rows_present: boolean;
+    };
   };
   results: TaskExposureLookupResult[];
 }
@@ -613,6 +671,13 @@ function insertExposure(
   if (input.taskText === undefined && !input.canonicalFingerprintSha256) {
     throw new Error("recordTaskExposure requires taskText and/or canonicalFingerprintSha256");
   }
+  const keyed = input.contentCapture === "suppressed" ? keyedFingerprint : null;
+  if (input.contentCapture === "suppressed" && keyed === null) {
+    // Fail closed: a suppressed call never falls back to an unkeyed digest.
+    throw new Error("keyed exposure fingerprint key is not configured; refusing an unkeyed digest for a suppressed call");
+  }
+  const storedVersion = keyed === null ? TASK_FINGERPRINT_VERSION : keyed.version;
+  const storedDigest = (sha256Hex: string): string => keyed === null ? sha256Hex : keyedDigest(keyed.key, sha256Hex);
   const epochId = identityKindOverride === "legacy-inexact" ? "legacy-pre-epoch" : currentCoverageEpochId(db);
   const modelId = cleanMetadataId(input.modelId);
   const harnessId = cleanMetadataId(input.harnessId);
@@ -647,7 +712,7 @@ function insertExposure(
     if (canonical === "" && !input.canonicalFingerprintSha256) return false;
     if (canonical !== "") {
       const fingerprint = taskTextFingerprint(canonical);
-      inserted = insertRow(`${eventKey}#${identityKindOverride}`, fingerprint.version, fingerprint.sha256, identityKindOverride);
+      inserted = insertRow(`${eventKey}#${identityKindOverride}`, storedVersion, storedDigest(fingerprint.sha256), identityKindOverride);
     }
   }
 
@@ -663,8 +728,8 @@ function insertExposure(
     // parseTaskExposureLookupRequest's exact_bytes recomputation below.
     const canonicalInserted = insertRow(
       `${eventKey}#canonical-raw`,
-      TASK_FINGERPRINT_VERSION,
-      input.canonicalFingerprintSha256,
+      storedVersion,
+      storedDigest(input.canonicalFingerprintSha256),
       "canonical-raw"
     );
     inserted = inserted || canonicalInserted;
@@ -746,6 +811,7 @@ export function recordMessageTaskExposuresBestEffort(input: {
   lane: "chat" | "mcp-ask";
   modelId?: string | null;
   harnessId: string;
+  contentCapture?: "suppressed";
 }): number {
   let recorded = 0;
   for (const text of taskTextsFromMessages(input.messages)) {
@@ -754,6 +820,7 @@ export function recordMessageTaskExposuresBestEffort(input: {
       lane: input.lane,
       modelId: input.modelId,
       harnessId: input.harnessId,
+      ...(input.contentCapture === "suppressed" ? { contentCapture: "suppressed" as const } : {}),
     })) recorded++;
   }
   return recorded;
@@ -1067,7 +1134,35 @@ function findExposureRows(
     list.push(row);
     map.set(row.fingerprint_sha256, list);
   }
+  // #487: also match content-suppressed rows, keyed under the current gateway key. The keyed
+  // value is derived in memory from the queried plain digest and mapped back to it.
+  if (keyedFingerprint !== null && version === TASK_FINGERPRINT_VERSION) {
+    const byKeyed = new Map(fingerprints.map((fp) => [keyedDigest(keyedFingerprint!.key, fp), fp]));
+    const keyedRows = db.prepare(
+      `SELECT fingerprint_sha256, ts, lane, model_id, harness_id, identity_kind, external_surface
+         FROM task_exposure_events
+        WHERE fingerprint_version = ? AND identity_kind IN (${kindPlaceholders}) AND fingerprint_sha256 IN (${fpPlaceholders})
+        ORDER BY ts, event_key`
+    ).all(keyedFingerprint.version, ...identityKinds, ...byKeyed.keys()) as ExposureDbRow[];
+    for (const row of keyedRows) {
+      const original = byKeyed.get(row.fingerprint_sha256)!;
+      const list = map.get(original) ?? [];
+      list.push({ ...row, fingerprint_sha256: original });
+      map.set(original, list);
+    }
+    for (const list of map.values()) list.sort((a, b) => a.ts.localeCompare(b.ts));
+  }
   return map;
+}
+
+/** #487: keyed rows this process cannot compare (rotated key, or the key is now missing). */
+function unmatchableKeyedRowsPresent(db: Database.Database): boolean {
+  const row = db.prepare(
+    `SELECT 1 FROM task_exposure_events
+      WHERE fingerprint_version >= ? AND fingerprint_version < ? AND fingerprint_version <> ?
+      LIMIT 1`
+  ).get(`${KEYED_FINGERPRINT_SCHEME}:`, `${KEYED_FINGERPRINT_SCHEME};`, keyedFingerprint?.version ?? "");
+  return row !== undefined;
 }
 
 function buildLookupResult(
@@ -1123,7 +1218,11 @@ export function lookupTaskExposures(
   if (!externalHeartbeatsHealthy) {
     reasons.push("one or more registered external exposure producers have a missing or stale heartbeat");
   }
-  const unseenClaimHealthy = captureHealthy && externalHeartbeatsHealthy;
+  const keyedUnmatchable = unmatchableKeyedRowsPresent(db);
+  if (keyedUnmatchable) {
+    reasons.push("keyed fingerprints recorded under a different or unavailable key cannot be compared");
+  }
+  const unseenClaimHealthy = captureHealthy && externalHeartbeatsHealthy && !keyedUnmatchable;
 
   const canonicalIdentityCaptureStartedAt = metaGet(db, "canonical_identity_capture_started_at");
 
@@ -1164,7 +1263,7 @@ export function lookupTaskExposures(
     schema_version: 1,
     fingerprint_version: TASK_FINGERPRINT_VERSION,
     coverage: {
-      coverage_complete: captureHealthy,
+      coverage_complete: captureHealthy && !keyedUnmatchable,
       from: liveCaptureStartedAt,
       through: nowIso,
       lanes: TASK_EXPOSURE_LANES,
@@ -1183,6 +1282,11 @@ export function lookupTaskExposures(
       exact_match_semantics: EXACT_MATCH_SEMANTICS_DISCLOSURE,
       external_producer_heartbeats: externalSurfaceHeartbeats,
       external_producer_heartbeats_healthy: externalHeartbeatsHealthy,
+      keyed_fingerprints: {
+        scheme: KEYED_FINGERPRINT_SCHEME,
+        key_configured: keyedFingerprint !== null,
+        unmatchable_rows_present: keyedUnmatchable,
+      },
     },
     results: [...renderedResults, ...canonicalResults],
   };

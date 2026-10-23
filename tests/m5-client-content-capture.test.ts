@@ -215,3 +215,24 @@ describe("stdio MCP bridge content_capture:'none'", () => {
     expect(s.calls).toEqual(["ask"]);
   });
 });
+
+describe("generic client entry points cannot bypass the guard", () => {
+  it("client.tool('ask', …) preflights and refuses an unadvertised gateway", async () => {
+    const s = stub({ advertised: false, echo: false });
+    await expect((await client(s)).tool("ask", { model: "m1", prompt: CANARY, content_capture: "none" }))
+      .rejects.toMatchObject({ code: "content_capture_unsupported" });
+    expect(s.calls).toEqual(["tools/list"]);
+    expect(s.bodies.join("\n")).not.toContain(CANARY);
+  });
+
+  it("client.rpc(tools/call code_loop_start) preflights and requires confirmation", async () => {
+    const message = { jsonrpc: "2.0", id: 99, method: "tools/call", params: { name: "code_loop_start", arguments: { instruction: CANARY, files: [], content_capture: "none" } } };
+    const unsupported = stub({ advertised: false, echo: false });
+    await expect((await client(unsupported)).rpc(message)).rejects.toMatchObject({ code: "content_capture_unsupported" });
+    expect(unsupported.bodies.join("\n")).not.toContain(CANARY);
+    const unconfirmed = stub({ advertised: true, echo: false });
+    await expect((await client(unconfirmed)).rpc(message)).rejects.toMatchObject({ code: "content_capture_unconfirmed" });
+    const confirmed = stub({ advertised: true, echo: true });
+    await expect((await client(confirmed)).rpc(message)).resolves.toMatchObject({ result: { structuredContent: { content_capture: "suppressed" } } });
+  });
+});

@@ -1,9 +1,13 @@
 import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, utimesSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb, getDb } from "../src/db.js";
 import { ensureLedgerSchema } from "../src/homeserver/ledger.js";
+import { configureTaskExposureFingerprintKey } from "../src/homeserver/task-exposure.js";
+import { createHash } from "node:crypto";
+
+const TEST_EXPOSURE_KEY = "test-only-exposure-fingerprint-key-0123456789abcdef";
 
 vi.mock("../src/homeserver/model-admin.js", () => ({
   getLoaded: async () => [{ key: "qwen3-coder-next-80b" }],
@@ -18,7 +22,7 @@ import {
   _resetCodeLoopStateForTests,
   type CodeLoopStartConfig,
 } from "../src/homeserver/code-loop.js";
-import { execCageCommand } from "../src/homeserver/code-loop-cage.js";
+import { buildCageArgv, execCageCommand } from "../src/homeserver/code-loop-cage.js";
 import { readDurableCodeLoopRunByWork, persistDurableCodeLoopRun, codeLoopRequestFingerprint } from "../src/homeserver/code-loop-store.js";
 import type { CodeLoopDeps, CodeLoopRequest, EngineRunOptions } from "../src/homeserver/code-loop-types.js";
 import { buildCodeLoopRuntime, handleCodeLoopTool, type CodeLoopGatewayContext } from "../src/homeserver/code-loop-runtime.js";
@@ -37,6 +41,7 @@ let workroot = "";
 beforeAll(() => {
   initDb(join(mkdtempSync(join(tmpdir(), "cl-cc-db-")), "test.db"));
   ensureLedgerSchema();
+  configureTaskExposureFingerprintKey(TEST_EXPOSURE_KEY);
 });
 
 beforeEach(() => {
@@ -178,6 +183,24 @@ describe("code_loop content_capture:'none'", () => {
 
     expect(workrootText()).not.toContain(marker);
     expect(dbText()).not.toContain(marker);
+    // The exposure registry keeps only a keyed fingerprint of the instruction.
+    expect(dbText()).not.toContain(createHash("sha256").update(`Rewrite a.txt. ${marker}`, "utf8").digest("hex"));
+    const exposure = getDb().prepare(`SELECT fingerprint_version FROM task_exposure_events WHERE lane = 'code-loop' ORDER BY ts DESC LIMIT 1`).get() as { fingerprint_version: string };
+    expect(exposure.fingerprint_version.startsWith("trim-utf8-sha256-hmac-v1:")).toBe(true);
+  });
+
+  it("is refused before admission when no exposure fingerprint key is provisioned", async () => {
+    configureTaskExposureFingerprintKey("");
+    try {
+      const marker = canary("NO_KEY");
+      const r = await startCodeLoop(request(marker, { content_capture: "none" }), startCfg(), deps({ suppressionCapable: true, marker }));
+      expect(r).toMatchObject({ ok: false, refusal: "content-capture-unsupported" });
+      expect((codeLoopToolDefs() as Array<{ name: string; inputSchema: any }>).find((t) => t.name === "code_loop_start")!.inputSchema.properties.content_capture).toBeUndefined();
+      expect(workrootText()).not.toContain(marker);
+      expect(dbText()).not.toContain(marker);
+    } finally {
+      configureTaskExposureFingerprintKey(TEST_EXPOSURE_KEY);
+    }
   });
 
   it("after a restart a suppressed result is unavailable rather than recovered from disk", async () => {
@@ -314,5 +337,64 @@ describe("code_loop runtime wiring of the opt-out", () => {
   it("a malformed argument is still rejected when the header is present", async () => {
     const out = await handleCodeLoopTool("code_loop_start", { ...startArgs("y"), content_capture: "full" }, runtimeConfig("off"), () => false, context({ transportContentCapture: "suppressed" }));
     expect(JSON.parse(out.text)).toMatchObject({ refusal: "invalid-request" });
+  });
+});
+
+describe("code_loop opt-out review regressions", () => {
+  it("survives the whole-job deadline wrapper (capability is preserved)", async () => {
+    const marker = canary("DEADLINE");
+    const r = await startCodeLoop(
+      request(marker, { content_capture: "none", caps: { total_wall_s: 120 } }),
+      startCfg(),
+      deps({ suppressionCapable: true, marker }),
+    );
+    expect(r).toMatchObject({ ok: true, content_capture: "suppressed" });
+    if (r.ok) await waitTerminal(r.work_id);
+    expect(workrootText()).not.toContain(marker);
+  });
+
+  it("stashes .gitattributes inside the run's own trusted Git dir, never in an unswept sibling", async () => {
+    const marker = canary("ATTRS");
+    const siblingsSeen: string[] = [];
+    const base = deps({ suppressionCapable: true, marker });
+    const trustedRoot = () => join(realpathSync(workroot), ".code-loop-host-git");
+    const d: CodeLoopDeps = {
+      ...base,
+      runCommand: async (argv, o) => {
+        if (existsSync(trustedRoot())) {
+          siblingsSeen.push(...readdirSync(trustedRoot()).filter((n) => n.startsWith(".code-loop-attrs-")));
+        }
+        return base.runCommand(argv, o);
+      },
+    };
+    const r = await startCodeLoop(
+      { instruction: `edit ${marker}`, files: [{ path: "a.txt", content: "seed\n" }, { path: ".gitattributes", content: `# ${marker}\n*.txt text\n` }], content_capture: "none" },
+      startCfg(),
+      d,
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) await waitTerminal(r.work_id);
+    expect(siblingsSeen).toEqual([]);
+    expect(existsSync(trustedRoot()) ? readdirSync(trustedRoot()) : []).toEqual([]);
+    expect(workrootText()).not.toContain(marker);
+  });
+
+  it("the sweep reclaims a stale legacy attribute stash beside the work-id dirs", async () => {
+    const marker = canary("LEGACY_STASH");
+    const root = join(realpathSync(workroot), ".code-loop-host-git");
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const stash = join(root, ".code-loop-attrs-AbC123");
+    mkdirSync(stash, { mode: 0o700 });
+    writeFileSync(join(stash, "0"), marker);
+    const old = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    utimesSync(stash, old, old);
+    await sweepCodeLoopSandboxes({ workroot, retentionTtlMs: 24 * 60 * 60 * 1000 }, { now: () => Date.now(), stopUnit: async () => {} });
+    expect(existsSync(stash)).toBe(false);
+  });
+
+  it("the transient unit has a fixed, content-free description (journal lines never carry argv)", () => {
+    const argv = buildCageArgv({ sandboxDir: "/w/s", homeDir: "/h", forwardPort: 1, nodeModulesDir: null, unitName: "code-loop-cl-20261020-00000001", piAgentDir: "/a" });
+    const separator = argv.indexOf("--");
+    expect(argv.slice(0, separator)).toContain("--description=gille code_loop caged run");
   });
 });
