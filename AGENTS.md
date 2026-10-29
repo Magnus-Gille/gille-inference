@@ -3,7 +3,7 @@
 ## Resume and persistence
 
 Keep the initial handshake read-only. Current proof obligations live in `docs/ROADMAP.md` and Plane
-`INFER` tickets (https://tickets.gille.ai); load `docs/architecture.md` only when architectural
+`INFER` tickets; load `docs/architecture.md` only when architectural
 context is needed. GitHub Issues on this public repo are only an intake for outside reports; an
 agent moves an actionable report into a Plane ticket and closes the GitHub issue with a link to it.
 Operators may keep a gitignored `STATUS.md` as a private local handoff, but it must never be
