@@ -2,18 +2,20 @@
 
 ## Resume and persistence
 
-Keep the initial handshake read-only. Current proof obligations live in `docs/ROADMAP.md` and
-GitHub issues; load `docs/architecture.md` only when architectural context is needed. Operators may
-keep a gitignored `STATUS.md` as a private local handoff, but it must never be committed. These
-files replace the generic `STATUS.md`/`PROGRESS.md`/`TODO.md` handoff defaults in the global
-instructions.
+Keep the initial handshake read-only. Current proof obligations live in `docs/ROADMAP.md` and Plane
+`INFER` tickets (https://tickets.gille.ai); load `docs/architecture.md` only when architectural
+context is needed. GitHub Issues on this public repo are only an intake for outside reports; an
+agent moves an actionable report into a Plane ticket and closes the GitHub issue with a link to it.
+Operators may keep a gitignored `STATUS.md` as a private local handoff, but it must never be
+committed. These files replace the generic `STATUS.md`/`PROGRESS.md`/`TODO.md` handoff defaults in
+the global instructions.
 
-After a substantive session, record public work in the relevant issue or pull request, containing
-only the reusable engineering contract and sanitized evidence. Exact transient operator handoffs
-may use the gitignored local `STATUS.md`; durable or multi-session deployment state, incidents, and
-maintenance belong in the private repository `Magnus-Gille/grimnir-ops`, never in this public
-repository. That repository is an execution tracker and does not own this service's code or
-architecture. Log durable decisions before replacing mutable project status.
+After a substantive session, record public work in the relevant `INFER` ticket or pull request,
+containing only the reusable engineering contract and sanitized evidence. Exact transient operator
+handoffs may use the gitignored local `STATUS.md`; durable or multi-session deployment state,
+incidents, and maintenance belong in the private repository `Magnus-Gille/grimnir-ops`, never in
+this public repository. That repository is an execution tracker and does not own this service's
+code or architecture. Log durable decisions before replacing mutable project status.
 
 ## Mission and architecture
 
@@ -96,14 +98,14 @@ Start with `README.md`, then load only the references needed for the task:
 - `docs/gateway-api-contract.md` and `src/homeserver/README.md` — concrete API/operator surface.
 - `docs/observability.md` — content and telemetry boundaries.
 - `docs/adr-005-hybrid-steady-state.md` — why frontier L1 plus local leaves is current policy.
-- `docs/ROADMAP.md` and GitHub issues — current proof obligations and resumption detail.
+- `docs/ROADMAP.md` and Plane `INFER` tickets — current proof obligations and resumption detail.
 - `RESULTS.md`, `docs/eval-spec-hardware-gate.md`, and `docs/migration-go-no-go-verdict.md` —
   benchmark interpretation and hardware/migration decisions.
 - `deploy/README.md` — production configuration and deployment runbook.
 
 Source ownership is discoverable from `src/homeserver/` with `rg`; it is intentionally not
-duplicated here. Issue-specific internals, dated measurements, and historical phases belong in
-issues and focused documents under `docs/`.
+duplicated here. Ticket-specific internals, dated measurements, and historical phases belong in
+Plane tickets and focused documents under `docs/`.
 
 ## Development and validation
 
