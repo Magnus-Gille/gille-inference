@@ -1,8 +1,9 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdir, open, readdir, realpath, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { getBackendFailureDescriptor } from "./backend-failure-contract.mjs";
 
 export const M5_CLIENT_VERSION = "1.6.0";
@@ -304,7 +305,7 @@ function safeProfileForDiagnostic(profile) {
 export function credentialRemediation(profile) {
   const selected = safeProfileForDiagnostic(profile);
   const command = selected === "selected" ? "m5 doctor" : `m5 --profile ${selected} doctor`;
-  return `Restore the selected profile credential through the owner-attended Keychain recovery/rotation procedure, then rerun: ${command}.`;
+  return `Restore the selected profile credential through the owner-attended Keychain recovery/rotation procedure on macOS, or protected profile-file recovery on Linux, then rerun: ${command}.`;
 }
 
 /** Locator-free recovery for a down local tailnet (#242). */
@@ -422,7 +423,7 @@ function networkDiagnosticCode(error) {
 
 function credentialFailureMessage(code, profile) {
   const reason = code === "missing_credential"
-    ? "The selected profile has no usable Keychain credential."
+    ? "The selected profile has no usable credential."
     : "The gateway rejected the selected profile credential.";
   return `${reason} ${credentialRemediation(profile)}`;
 }
@@ -562,7 +563,7 @@ function safeError(error, secrets, profile) {
 }
 
 function profileAccount(profile) {
-  if (!/^[a-z][a-z0-9_-]{0,31}$/i.test(profile)) {
+  if (typeof profile !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/i.test(profile)) {
     throw new M5ClientError(
       "invalid_profile",
       "Profile names must contain only letters, digits, underscores, and hyphens.",
@@ -639,6 +640,89 @@ export function createKeychainCredentialStore({
           },
         );
       });
+    },
+  };
+}
+
+/**
+ * Read an operator-provisioned Linux profile credential. Never creates, repairs, or chmods
+ * anything. The OS-provided home is the trust root; this does not isolate processes sharing
+ * the same UID. No fallback to another profile, an environment bearer, or macOS Keychain.
+ */
+export function createLinuxCredentialStore({ home = homedir(), uid = process.getuid?.() } = {}) {
+  return {
+    authLayer: "profile_file",
+    async resolve(profile) {
+      const account = profileAccount(profile);
+      const unavailable = () => new M5ClientError(
+        "credential_unavailable", "The protected Linux profile credential is unavailable.",
+        { profile },
+      );
+      const missing = () => new M5ClientError(
+        "missing_credential", "The selected profile has no usable credential.", { profile },
+      );
+      try {
+        if (typeof home !== "string" || !isAbsolute(home) || !Number.isInteger(uid) || uid < 0) {
+          throw unavailable();
+        }
+        const base = resolvePath(home);
+        // Reject redirected homes as well as symlinks inside the credential hierarchy.
+        if (await realpath(base) !== base) throw unavailable();
+        const directories = [base, join(base, ".config"), join(base, ".config", "m5"),
+          join(base, ".config", "m5", "credentials")];
+        for (const [index, directory] of directories.entries()) {
+          const stat = await lstat(directory);
+          if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid ||
+              (stat.mode & 0o022) !== 0 ||
+              (index === directories.length - 1 && (stat.mode & 0o7777) !== 0o700)) {
+            throw unavailable();
+          }
+        }
+        const path = join(directories.at(-1), account);
+        // NONBLOCK makes an attacker-controlled FIFO fail the regular-file check without hanging.
+        const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+        const buffer = Buffer.alloc(4097);
+        try {
+          const validFile = stat => stat.isFile() && stat.uid === uid && stat.nlink === 1 &&
+            (stat.mode & 0o7777) === 0o600 && stat.size <= 4096;
+          const before = await handle.stat();
+          if (!validFile(before)) throw unavailable();
+          if (before.size === 0) throw missing();
+          let length = 0;
+          while (length < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+            if (bytesRead === 0) break;
+            length += bytesRead;
+          }
+          const after = await handle.stat();
+          if (!validFile(after) || length > 4096 || length !== before.size ||
+              after.size !== before.size || after.mtimeMs !== before.mtimeMs ||
+              after.ctimeMs !== before.ctimeMs) throw unavailable();
+          const token = buffer.subarray(0, length).toString("utf8").replace(/\r?\n$/, "");
+          if (token.length === 0) throw missing();
+          if (!/^hs_[A-Za-z0-9_-]+$/.test(token)) throw unavailable();
+          return token;
+        } finally {
+          buffer.fill(0);
+          await handle.close();
+        }
+      } catch (error) {
+        if (error instanceof M5ClientError) throw error;
+        if (error?.code === "ENOENT") throw missing();
+        // Filesystem errors can include the private path. Never serialize the original error.
+        throw unavailable();
+      }
+    },
+  };
+}
+
+export function createPlatformCredentialStore({ platform = process.platform, ...options } = {}) {
+  if (platform === "linux") return createLinuxCredentialStore(options);
+  if (platform === "darwin") return createKeychainCredentialStore(options);
+  return {
+    authLayer: "profile_credential",
+    async resolve() {
+      throw new M5ClientError("credential_unavailable", "No supported profile credential store is available on this platform.");
     },
   };
 }
@@ -1513,7 +1597,7 @@ export async function createM5Client({
   gatewayUrl,
   profile,
   endpoint = "public",
-  credentialStore = createKeychainCredentialStore(),
+  credentialStore = createPlatformCredentialStore(),
   fetch: fetchImpl = globalThis.fetch,
   timeoutMs = 30_000,
   sleep = delay,
@@ -1564,7 +1648,7 @@ export async function createM5Client({
         if (error instanceof M5ClientError) throw error;
         throw new M5ClientError(
           "credential_unavailable",
-          "The selected Keychain credential could not be resolved.",
+          "The selected profile credential could not be resolved.",
         );
       }
       if (typeof resolved !== "string" || resolved.length === 0) {
@@ -2715,12 +2799,15 @@ function doctorEndpointFailure(error, profile, secrets) {
   };
 }
 
-function doctorCredentialResult({ profile, status, credential, endpoints }) {
+function doctorCredentialResult({ profile, status, credential, endpoints, authLayer }) {
   return safeDoctorResult({
     status,
     profile,
     credential,
-    auth_layer: "profile_keychain",
+    // Keep the existing contract for Keychain and legacy injected stores. New built-in
+    // stores opt into fixed diagnostic values; arbitrary adapter strings are never echoed.
+    auth_layer: ["profile_file", "profile_credential"].includes(authLayer)
+      ? authLayer : "profile_keychain",
     ...(status === "missing_credential" || status === "rejected_credential"
       ? { remediation: credentialRemediation(profile) }
       : {}),
@@ -3055,7 +3142,7 @@ export async function diagnoseProfile(options) {
 async function diagnoseProfileCore({
   profile,
   profileConfig,
-  credentialStore = createKeychainCredentialStore(),
+  credentialStore = createPlatformCredentialStore(),
   fetch: fetchImpl = globalThis.fetch,
   timeoutMs = 10_000,
   localProbes,
@@ -3070,6 +3157,7 @@ async function diagnoseProfileCore({
       return finalizeDoctorInferenceProbe(doctorCredentialResult({
         status: "missing_credential",
         profile,
+        authLayer: credentialStore.authLayer,
         credential: "missing",
         endpoints: { public: "not_checked", private: "not_checked" },
       }), inferenceProbe);
@@ -3082,6 +3170,7 @@ async function diagnoseProfileCore({
     return finalizeDoctorInferenceProbe(doctorCredentialResult({
       status,
       profile,
+      authLayer: credentialStore.authLayer,
       credential: "unavailable",
       endpoints: { public: "not_checked", private: "not_checked" },
     }), inferenceProbe);
@@ -3089,6 +3178,7 @@ async function diagnoseProfileCore({
   if (typeof token !== "string" || token.length === 0) {
     return finalizeDoctorInferenceProbe(doctorCredentialResult({
       profile,
+      authLayer: credentialStore.authLayer,
       status: "missing_credential",
       credential: "missing",
       endpoints: { public: "not_checked", private: "not_checked" },

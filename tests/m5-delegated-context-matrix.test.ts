@@ -10,6 +10,6 @@ describe("M5 delegated-context matrix", () => {
     );
 
     expect(output).toContain("M5 delegated-context matrix check passed");
-    expect(output).toContain("4 contexts");
+    expect(output).toContain("5 contexts");
   });
 });

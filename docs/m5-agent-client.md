@@ -123,7 +123,7 @@ explicit `privateGatewayUrl` path selected with `--private`; HTTPS also works th
 only two allowed profile fields: credential-like and unknown fields are rejected rather than
 ignored. Keep private locator files local and out of Git.
 
-The credential itself lives in macOS Keychain under service `gille-inference`. Accounts are
+On macOS, the credential lives in Keychain under service `gille-inference`. Accounts are
 derived mechanically from the selected profile:
 
 | Profile | Keychain account |
@@ -135,6 +135,19 @@ This makes the two least-privilege credentials independently revocable. Provisio
 remain owner-attended operator actions. This client's guided provisioning command mints a fresh
 `owner` / `agent` credential only through the fixed live gateway path described below; the
 repository and client configuration never contain bearer values.
+
+On Linux, the same profile resolves a protected file at
+`~/.config/m5/credentials/gateway-agent-<lowercase-profile>`. The operator provisions a dedicated
+agent-scoped credential through an approved channel; no token input or provisioning command is
+added here. The [Linux credential contract](../client/README.md#managed-linux-agent-credentials)
+defines ownership, modes, size, symlink and hardlink checks. Missing and unsafe files fail closed
+before gateway access, with locator-free diagnostics and no fallback to another profile or store.
+The explicit `doctor --check-latest` option can still query the public package registry without credentials.
+`doctor`, direct commands and the stdio MCP bridge use the same platform-selected store.
+Local credential failures report `auth_layer: "profile_file"` on Linux; macOS keeps
+`profile_keychain`. Unsupported platforms report `profile_credential` and fail closed.
+File rotation requires reconnecting long-lived clients, which cache a successfully resolved
+credential in memory. The macOS guided `provision` flow below is not a Linux installer.
 
 ### Guided provisioning
 
@@ -313,7 +326,7 @@ profile that ran the execution.
 
 `m5 doctor` checks, in order:
 
-1. profile-specific Keychain presence;
+1. profile-specific credential availability (Keychain on macOS; protected file on Linux);
 2. gateway reachability and authenticated identity;
 3. `owner` plus `agent|admin` route scope;
 4. visibility of `list_models`, `ask`, all three `code_loop_*` tools, and `record_adoption_evidence`;
@@ -484,7 +497,7 @@ echo or silently spool the report payload; the caller retains its already conten
 can replay that exact tool call after recovery. This makes the lost observation explicit and
 recoverable without creating a new local identity/timestamp store.
 
-The Keychain value is captured inside the client process and used only to construct the outbound
+The profile credential is captured inside the client process and used only to construct the outbound
 HTTP `Authorization` header. It is never exported, passed to a subprocess, accepted from client
 config/argv, printed, logged, or persisted as an artifact. Error paths discard upstream bodies and
 redact bearer/token-shaped values, including Keychain subprocess failures and malformed upstream

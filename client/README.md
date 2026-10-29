@@ -3,7 +3,8 @@
 This package contains two deliberately separate zero-dependency clients:
 
 - `hs` is the friend-facing invite, streaming chat, and usage client described below.
-- `m5` is the profile-based, Keychain-backed owner-agent client and stdio MCP bridge.
+- `m5` is the profile-based owner-agent client and stdio MCP bridge, using macOS Keychain or
+  protected Linux profile credentials.
 
 The box-local operator CLI remains `src/homeserver/cli.ts`; neither packaged client replaces it.
 The optional `m5 build` command is a separate SSH-based, offline-first remote build bridge, not a
@@ -12,6 +13,30 @@ gateway inference route; see the [remote build guide](../docs/m5-remote-build.md
 
 Requires Node 18+ (uses built-in `fetch`). The dependency-free package gate and runtime fixtures
 run on Linux with Node 18 and 22 in CI. Windows support is not asserted here; see #266.
+
+### Managed Linux agent credentials
+
+On Linux, `m5` reads the selected profile from
+`~/.config/m5/credentials/gateway-agent-<profile>` (lowercase profile name, no extension).
+An operator must provision a dedicated minted `owner` / `agent` credential there through an
+approved secret-safe channel. The client only reads the file; it does not mint, copy, repair,
+chmod or rotate credentials. Do not use `hs login --key`, a bearer environment variable, or a
+bearer in the profile configuration for this setup.
+
+The file must be a regular, single-link, non-symlink file owned by the agent UID with mode
+`0600`, at most 4096 bytes, containing one credential with an optional final newline. The
+`credentials` directory must be owned by that UID with mode `0700`. The home, `.config` and
+`m5` directories must also be owned by that UID and not writable by group or others; symlinked
+homes or credential paths are refused. This protects against other UIDs, not other processes
+running as the same agent UID. Protect the operating system's home-directory ancestry as usual.
+
+The existing URL-only profile selects the authenticated gateway. Brokkr #165 supplies the
+separate exact-destination network allowance; neither the file reader nor an allowance grants
+admin/residency access. `m5 --profile codex doctor` checks credentials and gateway capabilities
+without inference; `m5 --profile codex mcp` uses the same reader for the stdio bridge. Do not add
+`--probe-inference` without a valid evaluation mandate. The `provision` command remains macOS-only.
+Host provisioning, network application and a real bounded MCP classification are still required
+for operational acceptance under gille-inference #450; source tests are not that evidence.
 
 ### Owner-client 1.5.x / 1.6.x compatibility
 

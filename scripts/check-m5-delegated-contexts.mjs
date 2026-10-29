@@ -9,6 +9,7 @@ const requiredContexts = new Map([
   ["codex-repo-subagent", "supported"],
   ["claude-real-session", "supported"],
   ["pi-delegated-leaf", "unsupported"],
+  ["linux-managed-agent", "unsupported"],
 ]);
 const secretPattern = /(?:\bbearer\s+(?:hs_[A-Za-z0-9._~-]+|[A-Za-z0-9._~-]{32,})|\bhs_[A-Za-z0-9._~-]+|authorization\s*[:=]|\btoken\s*[:=]\s*\S+)/i;
 

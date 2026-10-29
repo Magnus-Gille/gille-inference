@@ -2,8 +2,8 @@
 /**
  * m5 — secret-safe owner-agent client for the Gille Inference gateway.
  *
- * Credentials are resolved internally from macOS Keychain profile accounts. This command
- * deliberately has no key/token/environment/config/argv credential input.
+ * Credentials are resolved internally from macOS Keychain or protected Linux profile files.
+ * This command has no key/token/environment/argv or profile-config credential input.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -14,7 +14,7 @@ import {
   M5_ASK_TIMEOUT_MS_MIN,
   M5_CLIENT_VERSION,
   M5ClientError,
-  createKeychainCredentialStore,
+  createPlatformCredentialStore,
   createM5Client,
   diagnoseProfile,
   provisionRemediation,
@@ -280,7 +280,7 @@ function help() {
       "m5 --profile <claude|codex> code result <work_id>",
       "m5 --profile <name> --public-gateway-url <https-url> --m5-host <user@host> provision",
     ],
-    credential_source: "macOS Keychain profile account (internal only)",
+    credential_source: "macOS Keychain or protected Linux profile file (internal only)",
     security_boundary:
       "The gateway sandbox and diff-only server result are authoritative; CLI defaults are not enforcement.",
   };
@@ -311,7 +311,7 @@ export async function main(
     output = process.stdout,
     error = process.stderr,
     configLoader = loadM5Config,
-    credentialStore = createKeychainCredentialStore(),
+    credentialStore = createPlatformCredentialStore(),
     fetch: fetchImpl = globalThis.fetch,
     bridgeRunner = runMcpStdioBridge,
     provisioner = provisionProfile,

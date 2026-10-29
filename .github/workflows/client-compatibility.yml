@@ -30,4 +30,4 @@ jobs:
         run: node scripts/verify-client-package.mjs
 
       - name: Run dependency-free runtime fixtures
-        run: node --test client/tests/runtime-compatibility.mjs
+        run: node --test client/tests/*.mjs

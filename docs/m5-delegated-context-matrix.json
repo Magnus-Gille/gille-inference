@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "as_of": "2026-07-31",
+  "as_of": "2026-10-29",
   "purpose": "Operational support declaration for bounded M5 delegation. It is evidence inventory, not credential provisioning or a routing policy.",
   "contexts": [
     {
@@ -52,6 +52,15 @@
       "surface": "none accepted",
       "reason": "No completed Pi owner-agent credential smoke test or bounded M5 delegation receipt is recorded. The client can mechanically name a pi profile, but that does not establish provisioned credentials, safe harness wiring, or support.",
       "next_probe": "Run the bounded classification procedure in docs/m5-delegated-contexts.md with a minted owner-agent Pi credential; publish only the ledger ID and deterministic result."
+    },
+    {
+      "id": "linux-managed-agent",
+      "harness": "Codex / Claude Code",
+      "context": "managed Linux agent account",
+      "status": "unsupported",
+      "surface": "authenticated MCP ask (acceptance pending)",
+      "reason": "The owner requires inference access under #450. The Linux profile credential reader and Brokkr #165 network allowance are source implementations; no accepted live managed-agent credential and classification receipt exists yet.",
+      "next_probe": "After separately authorized credential provisioning and gateway-only network application, run doctor without inference, then the bounded MCP classification procedure under a valid evaluation mandate. Record only sanitized acceptance evidence."
     }
   ]
 }
