@@ -25,12 +25,35 @@ MAX_QUESTIONS = 16
 MAX_TOKENS_PER_QUESTION = 8192
 
 
+class ContextLengthExceeded(Exception):
+    """The backend rejected a request because its input context is too long."""
+
+
 class DecisionBackend(Protocol):
-    def decide(self, state: str | dict[str, Any], questions: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], int]: ...
+    def decide(self, state: str | dict[str, Any], questions: dict[str, dict[str, Any]],
+               input_token_limit: int = MAX_TOKENS_PER_QUESTION) -> (
+                   tuple[dict[str, Any], int] | tuple[dict[str, Any], int, int]
+               ): ...
 
 
 def _state_text(state: str | dict[str, Any]) -> str:
     return state if isinstance(state, str) else json.dumps(state, ensure_ascii=False, allow_nan=False)
+
+
+def shared_prefix_length(full_ids: list[list[int]]) -> int:
+    """Return the common leading token-ID count across all prepared prompts."""
+    if not full_ids:
+        return 0
+    first = full_ids[0]
+    prefix_length = len(first)
+    for ids in full_ids[1:]:
+        index = 0
+        while index < prefix_length and index < len(ids) and first[index] == ids[index]:
+            index += 1
+        prefix_length = index
+        if not prefix_length:
+            break
+    return prefix_length
 
 
 def _schema_for_nimble(questions: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -96,16 +119,22 @@ class NimbleBackend:
         if self.max_length != MAX_TOKENS_PER_QUESTION or self.model.temperature != 1.0:
             raise RuntimeError("Nimble serving contract changed")
 
-    def decide(self, state: str | dict[str, Any], questions: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], int]:
+    def decide(self, state: str | dict[str, Any], questions: dict[str, dict[str, Any]],
+               input_token_limit: int = MAX_TOKENS_PER_QUESTION) -> tuple[dict[str, Any], int, int]:
         context = _state_text(state)
         schema, score_fields = _schema_for_nimble(questions)
-        prepared = self.prepare_prompts(self.model.tokenizer, context, schema, self.max_length)
+        # The pinned preparation helper checks its bound without truncating. Use a
+        # finite bound derived from the request byte ceiling so its full_ids are
+        # available for the effective per-question limit below.
+        prepared = self.prepare_prompts(self.model.tokenizer, context, schema, MAX_BODY_BYTES * 8)
         tokens = sum(map(len, prepared.full_ids))
+        if max(map(len, prepared.full_ids)) > input_token_limit:
+            raise ContextLengthExceeded
         result = self.model.score(context, schema, score_fields=score_fields)
         fields = result["fields"]
         answers = {name: _answer_from_probabilities(question, fields[name]["probabilities"])
                    for name, question in questions.items()}
-        return answers, tokens
+        return answers, tokens, shared_prefix_length(prepared.full_ids)
 
 
 class DeciderBackend:
@@ -119,7 +148,8 @@ class DeciderBackend:
         import torch
         self.torch = torch
 
-    def decide(self, state: str | dict[str, Any], questions: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], int]:
+    def decide(self, state: str | dict[str, Any], questions: dict[str, dict[str, Any]],
+               input_token_limit: int = MAX_TOKENS_PER_QUESTION) -> tuple[dict[str, Any], int]:
         answers: dict[str, Any] = {}
         input_tokens = 0
         with self.torch.inference_mode():
@@ -132,8 +162,16 @@ class DeciderBackend:
 
 
 def _valid_request(value: Any, model_id: str) -> bool:
-    if not isinstance(value, dict) or set(value) != {"model", "state", "questions"} or value["model"] != model_id:
+    required = {"model", "state", "questions"}
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"input_token_limit"}:
         return False
+    if value["model"] != model_id:
+        return False
+    if "input_token_limit" in value:
+        limit = value["input_token_limit"]
+        if (model_id != NIMBLE_ID or type(limit) is not int
+                or not 0 < limit <= MAX_TOKENS_PER_QUESTION):
+            return False
     state = value["state"]
     if not isinstance(state, (str, dict)) or (isinstance(state, str) and not state):
         return False
@@ -188,12 +226,33 @@ def make_handler(model_id: str, backend: DecisionBackend) -> type[BaseHTTPReques
                 self._json(400, {"error": "invalid_request"})
                 return
             try:
-                answers, input_tokens = backend.decide(value["state"], value["questions"])
+                result = backend.decide(
+                    value["state"], value["questions"],
+                    value.get("input_token_limit", MAX_TOKENS_PER_QUESTION),
+                )
+                if not isinstance(result, tuple) or len(result) not in (2, 3):
+                    raise RuntimeError("invalid backend response")
+                answers, input_tokens = result[:2]
                 if (set(answers) != set(value["questions"]) or not isinstance(input_tokens, int)
                         or not 0 < input_tokens <= len(answers) * MAX_TOKENS_PER_QUESTION):
                     raise RuntimeError("invalid backend response")
+                usage: dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": 0}
+                if len(result) == 3:
+                    if model_id != NIMBLE_ID:
+                        raise RuntimeError("invalid backend response")
+                    shared_tokens = result[2]
+                    question_count = len(value["questions"])
+                    if (type(shared_tokens) is not int
+                            or not 0 <= shared_tokens <= input_tokens // question_count):
+                        raise RuntimeError("invalid backend response")
+                    usage.update({
+                        "shared_prefix_tokens": shared_tokens,
+                        "billable_input_tokens": input_tokens - (question_count - 1) * shared_tokens,
+                    })
                 self._json(200, {"model": model_id, "answers": answers,
-                                 "usage": {"input_tokens": input_tokens, "output_tokens": 0}})
+                                 "usage": usage})
+            except ContextLengthExceeded:
+                self._json(400, {"error": {"code": "context_length_exceeded"}})
             except Exception as exc:
                 # Only the error class is logged; upstream exception messages can contain prompts.
                 print(f"systemone backend failure: {type(exc).__name__}", file=sys.stderr)

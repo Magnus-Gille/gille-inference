@@ -240,6 +240,7 @@
     </p>
     <h3>Chat and general models</h3>
     <p style="margin-bottom:8px">Mostly Q4_K_M; VibeThinker uses Q8_0; gpt-oss uses MXFP4.</p>
+    <div class="model-table-scroll" role="region" aria-label="Chat and general models" tabindex="0">
     <table>
       <tr><th>Model</th><th>What it is</th><th>Best for</th><th>~tok/s</th></tr>
       <tr>
@@ -321,11 +322,18 @@
         <td>~75<br><span style="font-size:11px;color:var(--muted)">served canary</span></td>
       </tr>
     </table>
+    </div>
     <h3 id="systemone-models-heading" style="margin-top:16px">System One decision models</h3>
     <p style="margin-bottom:8px;font-size:12.5px">
       Availability requires an activated runtime and roster entry plus an explicit key grant.
-      Requests accept up to 256&nbsp;KiB of UTF-8 JSON. The separate input context is
-      8,192 tokens per question/prompt, shared across questions for Clef.
+      Requests accept up to 256&nbsp;KiB of UTF-8 JSON and at most 16 schema-valid questions.
+      Nimble checks every complete prompt against its input bound before scoring. The default is
+      8,192 tokens: Clef reserves one shared 8,192-token prompt, while Nimble and Decider
+      reserve one bound per question. Nimble alone accepts optional
+      <span class="badge mono">input_token_limit</span>, a positive safe integer from 1 to
+      8,192 (default 8,192); a smaller bound such as 2,048 can make a batch fit a key's
+      per-key TPM quota when eight default reservations would not. These configured limits are
+      source-code contracts, not proof that a runtime is enabled or measured in production.
     </p>
     <div class="model-table-scroll" role="region" aria-labelledby="systemone-models-heading" tabindex="0">
       <table class="decision-table" aria-label="Model use, API and access">
@@ -360,6 +368,15 @@
       <span class="badge mono">1</span> means yes and near <span class="badge mono">0</span> means no.
       They share your ordinary credits and rate limits. Published benchmark scores do not establish
       accuracy on your own task.
+    </p>
+    <p style="margin-top:10px;font-size:12.5px">
+      Nimble reports exact <span class="badge mono">usage.input_tokens</span> as the sum of its
+      question prompts. Its native shared-prefix metadata may also report the longest common token
+      prefix across those prompts: <span class="badge mono">billable_input_tokens =
+      input_tokens - (question_count - 1) * shared_prefix_tokens</span>. TPM/daily resource
+      quotas use the conservative reservation; this is lifetime-credit billing accounting, not a
+      claim of compute savings. Legacy adapters without the metadata bill the raw
+      input count; Decider remains raw-input billing. Failed calls cost zero credits.
     </p>
     <h3 id="embedding-models-heading" style="margin-top:16px">Embedding models</h3>
     <p style="margin-bottom:8px;font-size:12.5px">EmbeddingGemma 2 serves customer keys that see it in their authenticated model list. Check your access before calling the API.</p>
@@ -442,10 +459,12 @@
       owner-reviewed operation. Latest results (<span class="badge mono">pass%</span> = share of
       probe tasks passed; higher is better):
     </p>
+    <div class="model-table-scroll" role="region" aria-label="New model evaluations" tabindex="0">
     <table>
       <tr><th>Model</th><th>Quant</th><th>Size</th><th>pass%</th><th>~tok/s</th><th>Verdict</th></tr>
       <tbody id="evals-rows"></tbody>
     </table>
+    </div>
     <p style="margin-top:10px;font-size:12.5px">
       Each candidate is tested on a throwaway server under the GPU lease and maintenance guard,
       isolated from the live model line-up. A &#8220;winner&#8221; is a measured result for operator review,
@@ -502,6 +521,7 @@
       <div class="label">Credits</div>
       <div class="bartext"><span id="credits-used">—</span><span id="credits-limit">—</span></div>
       <div id="credits-bar" class="bar"><span style="width:0%"></span></div>
+      <div id="credits-status" class="sub" style="margin:4px 0 0">—</div>
     </div>
     <div class="row">
       <div class="label">Base URL</div>
@@ -556,12 +576,52 @@
           <span class="badge mono">choice</span> and <span class="badge mono">score</span> questions.
           Decision models return typed decisions, not chat text. Up to 16 questions and 256&nbsp;KiB
           (262,144 bytes) of UTF-8 JSON per call, including state, questions and formatting.
-          This byte limit is separate from the 8,192-token input context per question/prompt,
-          which includes instructions and runtime formatting; Clef shares one context across
-          all questions. Text that fits the byte limit can still exceed the token context.
-          Images and streaming are not enabled here. Successful
-          calls use input-token credits. This is a separate endpoint from chat completions.
+          This byte limit is separate from the input-token bound. Nimble checks every complete prompt
+          before scoring. The default bound is 8,192: Clef shares one reservation across all
+          questions, while Nimble and Decider reserve <span class="badge mono">question_count ×
+          bound</span>. Nimble alone accepts optional <span class="badge mono">input_token_limit</span>
+          from 1 to 8,192; omit it for 8,192, or use a smaller value such as 2,048 when the full
+          prompts fit it. Eight default Nimble reservations are 65,536 tokens, so a key with the
+          default 60,000-token TPM limit receives <span class="badge mono">400
+          request_exceeds_quota</span>; a smaller bound can fit if the complete prompts fit too.
+          Text that fits the byte limit can still exceed the token context. Images and streaming
+          are not enabled here. Successful calls use input-token credits. This is a separate endpoint from chat completions.
         </p>
+
+        <p><strong>Context recipe:</strong> the following three probes are required before claiming
+          that a configured context works. They are a release check, not a live-availability or
+          context-increase claim.</p>
+        <pre>{
+  "model": "clef-flash",
+  "state": "A formatted prompt whose tokenizer count is below, at, and above 8,192 in separate runs.",
+  "questions": {"check": {"type": "noul", "instructions": "Does the state meet the stated condition?"}}
+}
+# Clef release settings: batch=8192, ubatch=8192, ctx=8192.
+# Exercise a prompt above 2,048 tokens; verify runtime, memory, OOM and rollback separately.</pre>
+        <p>Use the authenticated <span class="badge mono">/v1/models</span> response as the
+          customer availability check. A configured model contract or source checkout alone is
+          not a production qualification.</p>
+
+        <p><strong>Limits, errors and retries:</strong> a reserved maximum can produce
+          <span class="badge mono">402 credits_exhausted</span> even when the displayed balance is
+          positive. Backend context rejection is sanitized as
+          <span class="badge mono">400 context_length_exceeded</span>; temporary backend busy is
+          <span class="badge mono">503 server_busy</span> with <span class="badge mono">Retry-After</span>;
+          timeout is <span class="badge mono">504 upstream_timeout</span> with retry guidance.
+          A pre-admission maximum-reservation refusal is <span class="badge mono">400
+          request_exceeds_quota</span>; an actual temporary TPM/daily quota hit is
+          <span class="badge mono">429 rate_limit_exceeded</span> with retry/reset guidance.
+          A reserved maximum can produce <span class="badge mono">402 credits_exhausted</span>
+          even when the displayed balance is positive. Failed calls charge zero credits. Clients
+          may use bounded jitter after a retryable response, but must not retry a 402 and must not
+          automatically replay a request whose response outcome is unknown.
+        </p>
+
+        <p><strong>Credits and quota:</strong> the dashboard's lifetime credit balance includes
+          reservations and never resets. Its quota snapshot is advisory; the endpoint snapshot may
+          change before admission. Shared static-tier snapshots are intentionally <span class="badge mono">null</span>
+          to avoid disclosing other consumers. A top-up is a manual operator action only; there is
+          no automatic reset or payment flow.</p>
 
         <p><strong>Choice question example:</strong></p>
         <pre id="systemone-choice-request">{
@@ -963,6 +1023,7 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
 
     var limit = me.creditLimit || 0;
     var used = me.creditsUsed || 0;
+    var balance = me.credits || {};
     var bar = $("credits-bar");
     var fill = bar.firstElementChild;
     bar.classList.remove("warn", "bad");
@@ -977,6 +1038,19 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
       fill.style.width = pct + "%";
       if (pct >= 100) bar.classList.add("bad");
       else if (pct >= 80) bar.classList.add("warn");
+    }
+    var remaining = balance.remaining;
+    var status = balance.status;
+    if (status === "unlimited") {
+      $("credits-status").textContent = "Credits remaining: unlimited (lifetime cap disabled)";
+    } else if (status === "exhausted") {
+      $("credits-status").textContent = "Credits exhausted — ask the operator for a manual top-up";
+    } else if (status === "low") {
+      $("credits-status").textContent = "Credits low — " + (typeof remaining === "number" ? remaining.toLocaleString() : "—") + " remaining";
+    } else if (typeof remaining === "number") {
+      $("credits-status").textContent = "Credits remaining: " + remaining.toLocaleString();
+    } else {
+      $("credits-status").textContent = "Credit status unavailable";
     }
     show("dash");
   }

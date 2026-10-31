@@ -51,7 +51,7 @@ production roster transaction succeed.
 
 | Customer model ID | Immutable upstream identity | License and serving note |
 |---|---|---|
-| `bespoke-nimble-9b` | [`bespokelabs/Bespoke-Nimble-9B`](https://huggingface.co/bespokelabs/Bespoke-Nimble-9B), revision `bd792f44ec8e265be861bfcdf4e05967ffe0e858` (release `v3-12026`); adapter SHA256 `29ef39b072dee97287947455337879c1e916705c2f727287922a2d81f5e2f20a` | Apache-2.0. Native Python/ROCm adapter; the public spec is a placeholder and does not prove M5 readiness. |
+| `bespoke-nimble-9b` | [`bespokelabs/Bespoke-Nimble-9B`](https://huggingface.co/bespokelabs/Bespoke-Nimble-9B), revision `bd792f44ec8e265be861bfcdf4e05967ffe0e858` (release `v3-12026`); adapter SHA256 `1d902afdc030428487aeb0b51cf4bb3ba67d5ea54c3226c0c4a435ff90242747` | Apache-2.0. Native Python/ROCm adapter; the public spec is a placeholder and does not prove M5 readiness. |
 | `pplx-decider-v1-27b` | [`perplexity-ai/pplx-decider-v1-27b`](https://huggingface.co/perplexity-ai/pplx-decider-v1-27b), revision `5117a6c7fe73b19308dc1a6b0fb529a40c2ecad4` | Apache-2.0. Preserve the model's readout and decision temperature in the native adapter; its approximately 49 GiB BF16 weights plus working memory require a measured M5 check. |
 
 Both IDs use the typed `/v1/systemone` contract. After a successful promotion, an existing
@@ -73,27 +73,92 @@ spec, enabled setting, or source checkout alone does not grant access or establi
   2–26 named options. Each option key must match `^[A-Za-z0-9_-]{1,64}$`, and each option
   description must be a string or `null`. `score` needs 2–10 ordered labels. The gateway accepts
   at most 256 KiB (262,144 bytes) of UTF-8 request JSON, including state, questions and formatting.
-  This is a transport-size bound, not a token allowance. It replaces the initial 8 KiB gateway cap
-  so ordinary text can use more of the existing context. The served input bound remains 8,192
-  tokenizer-specific tokens per question/prompt, including instructions and runtime formatting;
-  Clef shares one context across all questions. JSON bytes cannot be converted to tokens with a
-  fixed ratio. Exceeding the byte cap returns `413 payload_too_large` before inference; a body
-  within that cap can still exceed the backend context and be rejected upstream. This change
-  does not increase runtime context or establish a publisher maximum.
+  This is a transport-size bound, not a token allowance. Nimble checks every complete prompt against
+  its tokenizer-specific input bound before scoring. The default bound is 8,192 tokens:
+  Clef reserves one shared 8,192-token prompt, while Nimble and Decider reserve one bound per
+  question. Nimble alone accepts optional `input_token_limit`, a positive safe integer from
+  1 through 8,192 (default 8,192). JSON bytes cannot be converted to tokens with a fixed ratio.
+  Exceeding the byte cap returns `413 payload_too_large` before inference; a body within that cap
+  can still exceed the backend context and be rejected upstream. This change does not increase
+  runtime context or establish a publisher maximum.
   Images, streaming, `keep_alive`, and arbitrary runtime parameters
   are not enabled in this release.
-- Response: compatible typed `answers` and `usage` from the selected decision adapter. Credits charge the upstream
-  `usage.input_tokens` on successful calls; rejected or failed calls charge zero. A decision
-  model is not a chat model: `/v1/chat/completions` and MCP `ask` reject it.
-- Admission reserves Clef's full 8,192-token shared context, then reconciles to exact successful
-  usage. The native Nimble and Decider adapters must publish and enforce their own measured input
-  bounds before customer activation; an upstream response above the reviewed bound is rejected.
+- Response: compatible typed `answers` and `usage` from the selected decision adapter. Credits
+  charge successful billable input usage; rejected or failed calls charge zero. A decision model
+  is not a chat model: `/v1/chat/completions` and MCP `ask` reject it.
+- Admission reserves the model's maximum input allowance before inference and reconciles only a
+  successful response. Clef reserves one shared 8,192-token prompt; Nimble and Decider reserve
+  `question_count × input_token_limit` (or `question_count × 8,192` when omitted). The separate
+  16-question schema cap does not change these reservations. Thus eight default Nimble questions
+  reserve 65,536 tokens and can fail with `400 request_exceeds_quota` under a 60,000-token TPM
+  limit; a bound such as 2,048 can fit if every complete prompt fits it. The native Nimble and
+  Decider adapters must publish and enforce their own measured input bounds before customer
+  activation; an upstream response above the reviewed bound is rejected.
 - `/v1/models` and `/models` list a decision model only after it is in the llama-swap roster and the key can
   use it. A known decision model stays out of chat, MCP `ask`, delegation and model discovery
   even if its enablement setting is removed while it remains in the roster. MCP `list_models`
   remains a list of chat models for the MCP `ask` tool.
 - The gateway never records guest state/questions/answers in the owner content log. Existing
   request telemetry is content-blind and uses only the configured model ID.
+
+## Billing, failure and retry contract
+
+Nimble native responses report exact `usage.input_tokens` as the sum of the question-prompt token
+counts. When present, `shared_prefix_tokens` is the longest common token prefix across those
+question prompts and `billable_input_tokens` must equal:
+
+```text
+input_tokens - (question_count - 1) * shared_prefix_tokens
+```
+
+Per-key TPM/daily resource-quota admission reserves the conservative maximum, then reconciles to exact compute usage; the
+shared-prefix value changes lifetime credit billing only. It is not a compute-savings claim.
+Legacy adapters that omit the metadata bill the raw input count, and Decider remains raw-input
+billing. A malformed or inconsistent usage response is rejected and charged zero.
+
+An upstream native context rejection is sanitized to `400 context_length_exceeded`; temporary
+backend unavailability is `503 server_busy` with `Retry-After`; a timeout is `504
+upstream_timeout` with retry guidance. Clients may retry retryable failures with bounded jitter,
+but must not retry `402 credits_exhausted` and must not automatically replay a request whose
+response outcome is unknown. The pre-admission maximum-reservation refusal is
+`400 request_exceeds_quota`; a later temporary TPM/daily quota hit is the ordinary
+`429 rate_limit_exceeded` response with its retry/reset guidance. All failed requests
+charge zero credits.
+
+The reservation is intentionally conservative: a maximum reservation can produce `402
+credits_exhausted` even while a dashboard displays a positive remaining balance. The dashboard's
+credit balance includes reservations and never resets; its quota snapshot is advisory and may
+change before admission.
+
+### Context qualification recipe
+
+Before claiming a configured context works, run one small, one near-limit, and one above-limit
+prompt through the full typed endpoint. For Clef the reviewed release template pins `ctx=8192`,
+`batch=8192`, and `ubatch=8192`; include a prompt above 2,048 tokens in the check.
+This recipe proves neither live availability nor an increased context by itself: verify the
+authenticated `/v1/models` response, runtime, memory/OOM state, and rollback separately.
+
+## Manual credit top-ups
+
+Credit renewal is a manual operator action. There is no automatic reset or payment flow. An
+admin-only `POST /admin/keys/credits/topup` accepts exactly:
+
+```json
+{"alias":"customer-alias","amount":10000,"requestId":"topup-2026-10-31-01"}
+```
+
+`amount` is a positive safe integer and `requestId` is the idempotency key. The operation applies
+only to an active, capped key outside staged rotation; it changes only the lifetime cap and
+preserves the key, used counter, quotas, expiry and scope. A durable receipt is returned without
+the plaintext key. Repeating the same request ID with the same terms returns the original receipt;
+different terms return `409 credit_topup_conflict`. Live changes remain a separate operator
+approval and are not implied by this documentation.
+
+The source contract exposes configured model entries with `qualification:
+configured_not_measured`, and `/portal/me` exposes only models that are both enabled and allowed
+for the authenticated key. Neither a source checkout, an enabled setting, nor a public model
+spec is proof of actual production availability; require the authenticated model-list check and
+release evidence.
 
 For a yes/no probability, use a `noul` question such as
 `"questions":{"urgent":{"type":"noul","instructions":"Does this need immediate attention?"}}`.

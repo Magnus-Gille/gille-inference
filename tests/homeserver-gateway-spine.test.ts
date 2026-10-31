@@ -20,7 +20,7 @@ import { SYSTEMONE_MAX_BODY_BYTES } from "../src/homeserver/systemone-request.js
 
 let upstream: Server;
 let upstreamPort = 0;
-let mockMode: "ok" | "stall" | "queued-disconnect" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
+let mockMode: "systemone-llama-context" | "systemone-batch" | "systemone-context" | "systemone-busy" | "systemone-timeout" | "systemone-unsafe400" | "systemone-bad-billing" | "ok" | "stall" | "queued-disconnect" | "notfound" | "sse" | "error500" | "embedding-error500" | "embedding-error413" | "embedding-stall" | "format500" | "nonjson" | "reset" | "length" | "systemone-malformed" | "systemone-choice" | "systemone-choice-malformed" | "systemone-list" | "embedding-malformed" | "embedding-list" | "embedding-list-absent" | "clef-running" | "qwen-list" | "validrunning" = "ok";
 let lastUpstreamBody = "";
 let upstreamInferenceRequestCount = 0;
 let upstreamModelRequestCount = 0;
@@ -146,6 +146,20 @@ function startUpstream(): Promise<void> {
         return;
       }
       if (req.url?.endsWith("/systemone")) {
+        if (["systemone-context", "systemone-llama-context", "systemone-busy", "systemone-timeout", "systemone-unsafe400"].includes(mockMode)) {
+          res.writeHead(mockMode === "systemone-busy" ? 503 : mockMode === "systemone-timeout" ? 504 : 400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { code: mockMode === "systemone-context" ? "context_length_exceeded" : "secret-backend-detail", type: mockMode === "systemone-llama-context" ? "exceed_context_size_error" : "server_error", message: "/private/model/prompt" } }));
+          return;
+        }
+        if (mockMode === "systemone-batch" || mockMode === "systemone-bad-billing") {
+          const body = JSON.parse(lastUpstreamBody) as { questions: Record<string, unknown> };
+          const n = Object.keys(body.questions).length;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ answers: Object.fromEntries(Object.keys(body.questions).map(key => [key, { type: "noul", noul: 0.8 }])),
+            usage: { input_tokens: n * 100, output_tokens: 0, shared_prefix_tokens: 60,
+              billable_input_tokens: mockMode === "systemone-bad-billing" ? 1 : n * 100 - (n - 1) * 60 } }));
+          return;
+        }
         const choice = mockMode === "systemone-choice" || mockMode === "systemone-choice-malformed";
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
@@ -242,7 +256,7 @@ beforeAll(async () => {
   process.env["HOMESERVER_OWNER_QUEUE_MAX_MS"] = "3000";
   process.env["HOMESERVER_BUSY_RETRY_AFTER_S"] = "2";
   process.env["HOMESERVER_PER_REQUEST_MAX_TOKENS"] = "256";
-  process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
+  process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash,bespoke-nimble-9b";
   process.env["HOMESERVER_ORIN_URL"] = `http://127.0.0.1:${upstreamPort}`;
   process.env["HOMESERVER_ORIN_MODEL"] = "qwen2.5-coder:3b";
   process.env["HOMESERVER_EMBEDDING_MODELS"] = "embeddinggemma-2";
@@ -252,7 +266,7 @@ beforeAll(async () => {
   process.env["HOMESERVER_KEY_DEFAULT_TPM"] = "1000000";
   process.env["HOMESERVER_HOST_MEMORY_ADMISSION"] = "enforce";
   process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"] =
-    "m1=60,m2=60,clef-flash=20,qwen3-30b-instruct=60,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
+    "m1=60,m2=60,clef-flash=20,bespoke-nimble-9b=20,qwen3-30b-instruct=60,vibethinker-3b=60,gpt-oss-120b=60,qwen35-122b-a10b=60,qwen3-coder-next-80b=60";
   process.env["HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS"] = "7";
   process.env["HOMESERVER_REVIEW_CASCADE"] = "shadow";
   process.env["HOMESERVER_REVIEW_CASCADE_GPT_MODEL"] = "gpt-oss-120b";
@@ -436,6 +450,99 @@ async function makeStampedDelegateRequest(owner: { plaintextKey: string }): Prom
 }
 
 describe("gateway spine — HTTP integration", () => {
+  const decisionCall = (token: string, body: unknown) => fetch(url("/v1/systemone"), {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body),
+  });
+  const decisionBody = (count = 1, model = "bespoke-nimble-9b") => ({ model, state: "shared state",
+    questions: Object.fromEntries(Array.from({ length: count }, (_, i) => [`q${i}`, { type: "noul", instructions: "Urgent?" }])) });
+
+  it.each([7, 8, 16])("admits %i bounded Nimble questions and separates credits from compute quota", async count => {
+    mockMode = "systemone-batch";
+    const key = mintKey({ alias: `bounded-${randomUUID()}`, tier: "guest", modelAllowList: ["bespoke-nimble-9b"],
+      creditLimit: 1000000, tpm: 60000 }, DEFAULTS);
+    const body = { ...decisionBody(count), input_token_limit: 2048 };
+    const result = await decisionCall(key.plaintextKey, body);
+    expect(result.status).toBe(200);
+    const billable = count * 100 - (count - 1) * 60;
+    expect(await result.json()).toMatchObject({ usage: { input_tokens: count * 100, billable_input_tokens: billable } });
+    expect(JSON.parse(lastUpstreamBody)).toEqual(body);
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBe(billable);
+    const me = await (await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${key.plaintextKey}` } })).json() as any;
+    expect(me.quota.snapshot.tpmUsed).toBe(count * 100);
+    expect(me.credits.remaining).toBe(1000000 - billable);
+    expect(me.systemOne.models.map((m: any) => m.model)).toEqual(["bespoke-nimble-9b"]);
+  });
+
+  it("rejects a request larger than the whole quota allowance before reservation or inference", async () => {
+    const key = mintKey({ alias: `impossible-${randomUUID()}`, tier: "guest", modelAllowList: ["bespoke-nimble-9b"],
+      creditLimit: 1000000, tpm: 60000 }, DEFAULTS);
+    const result = await decisionCall(key.plaintextKey, decisionBody(8));
+    expect(result.status).toBe(400);
+    expect((await result.json() as any).error.code).toBe("request_exceeds_quota");
+    expect(result.headers.get("retry-after")).toBeNull();
+    expect(upstreamInferenceRequestCount).toBe(0);
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBe(0);
+  });
+
+  it.each([
+    ["systemone-context", 400, "context_length_exceeded"], ["systemone-llama-context", 400, "context_length_exceeded"], ["systemone-busy", 503, "server_busy"],
+    ["systemone-timeout", 504, "upstream_timeout"], ["systemone-unsafe400", 502, "upstream_unavailable"],
+    ["systemone-bad-billing", 502, "upstream_unavailable"],
+  ] as const)("sanitizes %s with no credit or token charge", async (mode, status, code) => {
+    mockMode = mode;
+    const key = mintKey({ alias: `failure-${randomUUID()}`, tier: "guest", modelAllowList: ["bespoke-nimble-9b"], creditLimit: 100000 }, DEFAULTS);
+    const result = await decisionCall(key.plaintextKey, { ...decisionBody(3), input_token_limit: 2048 });
+    expect(result.status).toBe(status);
+    const text = await result.text();
+    expect(JSON.parse(text).error.code).toBe(code);
+    expect(text).not.toContain("/private/model/prompt");
+    if (status === 400) {
+      const row = getDb().prepare("SELECT outcome FROM request_log WHERE alias = ? AND route = '/v1/systemone' ORDER BY rowid DESC LIMIT 1")
+        .get(key.record.alias) as { outcome: string };
+      expect(row.outcome).toBe("bad_request");
+    }
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBe(0);
+    const me = await (await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${key.plaintextKey}` } })).json() as any;
+    expect(me.quota.snapshot.tpmUsed).toBe(0);
+    if (status === 503 || status === 504) expect(result.headers.get("retry-after")).toBe("2");
+  });
+
+  it("pauses repeated System One failures only for the affected key/model", async () => {
+    mockMode = "systemone-busy";
+    const a = mintKey({ alias: `backoff-a-${randomUUID()}`, tier: "guest", modelAllowList: ["bespoke-nimble-9b"], creditLimit: 100000 }, DEFAULTS);
+    const b = mintKey({ alias: `backoff-b-${randomUUID()}`, tier: "guest", modelAllowList: ["bespoke-nimble-9b"], creditLimit: 100000 }, DEFAULTS);
+    for (let i = 0; i < 3; i++) expect((await decisionCall(a.plaintextKey, decisionBody())).status).toBe(503);
+    const calls = upstreamInferenceRequestCount;
+    const blocked = await decisionCall(a.plaintextKey, decisionBody());
+    expect((await blocked.json() as any).error.code).toBe("model_temporarily_unavailable");
+    expect(upstreamInferenceRequestCount).toBe(calls);
+    expect((await decisionCall(b.plaintextKey, decisionBody())).status).toBe(503);
+    expect(upstreamInferenceRequestCount).toBe(calls + 1);
+  });
+
+  it("authorizes audited top-ups only for admin and replays receipts without double credit", async () => {
+    const key = mintKey({ alias: `topup-http-${randomUUID()}`, tier: "guest", creditLimit: 100 }, DEFAULTS);
+    const requestId = `topup-${randomUUID()}`;
+    const topup = (token: string, amount = 50) => fetch(url("/admin/keys/credits/topup"), { method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ alias: key.record.alias, amount, requestId }) });
+    expect((await topup(key.plaintextKey)).status).toBe(403);
+    const agent = mintKey({ alias: `topup-agent-${randomUUID()}`, tier: "owner", scope: "agent" }, DEFAULTS);
+    expect((await topup(agent.plaintextKey)).status).toBe(403);
+    expect((await topup("not-a-key")).status).toBe(401);
+    const result = await topup("admin-static-key");
+    expect(result.status).toBe(200); expect(result.headers.get("cache-control")).toBe("no-store");
+    const receipt = await result.json();
+    expect(await (await topup("admin-static-key")).json()).toEqual(receipt);
+    expect((await topup("admin-static-key", 60)).status).toBe(409);
+    expect(lookupKey(key.plaintextKey)!.creditLimit).toBe(150);
+    expect(JSON.stringify(receipt)).not.toContain(key.plaintextKey);
+  });
+  it("returns only an advisory quota shape for shared static keys", async () => {
+    const result = await fetch(url("/portal/me"), { headers: { authorization: "Bearer legacy-user-key" } });
+    expect(result.status).toBe(200);
+    expect((await result.json() as any).quota).toEqual({ scope: "shared_static_tier", snapshot: null,
+      advisory: true, includesReservations: true });
+  });
   it("serves EmbeddingGemma through explicit guest grants, validates vectors, and meters actual usage", async () => {
     mockMode = "embedding-list";
     const scoped = mintKey({ alias: `embedding-${randomUUID()}`, tier: "guest",

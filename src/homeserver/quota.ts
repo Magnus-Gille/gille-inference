@@ -171,6 +171,30 @@ function windowRetry(live: UsageEvent[], nowMs: number): number {
   return Math.max(1, Math.ceil((freesAt - nowMs) / 1000));
 }
 
+/**
+ * Read the current quota counters for an alias without admitting a request.
+ *
+ * Pruning the in-memory window is the only state change this performs. Daily usage is read from
+ * the persisted reservation counter, so an admitted request remains visible until it is
+ * reconciled (and aliases never share counters).
+ */
+export function snapshotQuota(
+  alias: string,
+  limits: QuotaLimits,
+  now: number = Date.now()
+): QuotaSnapshot {
+  const live = pruned(alias, now);
+  return {
+    rpmUsed: live.length,
+    rpmLimit: limits.rpm,
+    tpmUsed: live.reduce((sum, event) => sum + event.tokens, 0),
+    tpmLimit: limits.tpm,
+    dailyUsed: dailyUsed(alias, now),
+    dailyLimit: limits.dailyTokenBudget,
+    resetSeconds: windowRetry(live, now),
+  };
+}
+
 // ─── Pre-admission check ─────────────────────────────────────────────────────────────
 
 export function checkQuota(

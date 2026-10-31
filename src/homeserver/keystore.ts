@@ -252,6 +252,15 @@ function ensureSchema(db: Database.Database): void {
       redeemed_key_alias TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_invites_code ON invites(code_hash);
+    CREATE TABLE IF NOT EXISTS credit_topups (
+      request_id TEXT PRIMARY KEY,
+      alias TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      previous_limit INTEGER NOT NULL,
+      credit_limit INTEGER NOT NULL,
+      operator_alias TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
 
   // Additive, idempotent migrations. SQLite has transactional DDL, so wrap them in one
@@ -1271,6 +1280,49 @@ export function credentialInventoryReadOnly(
  */
 export function isCreditExhausted(rec: Pick<ApiKeyRecord, "creditLimit" | "creditsUsed">): boolean {
   return rec.creditLimit > 0 && rec.creditsUsed >= rec.creditLimit;
+}
+
+export class CreditTopUpError extends Error {
+  constructor(readonly conflict = false) { super(conflict ? "Top-up request ID already has different terms." :
+    "Top-up requires an active capped key outside staged rotation, a positive safe integer amount, and a request ID."); }
+}
+
+export interface CreditTopUpReceipt {
+  requestId: string; alias: string; amount: number; previousLimit: number;
+  creditLimit: number; operatorAlias: string; createdAt: string;
+}
+
+/** Additive only: no key rotation, usage reset, expiry change, or implicit unlimited budget. */
+export function topUpCredits(alias: string, amount: number, requestId: string, operatorAlias: string,
+  now: Date = new Date()): CreditTopUpReceipt {
+  if (typeof alias !== "string" || !alias || alias.length > 200 ||
+      !Number.isSafeInteger(amount) || amount <= 0 || typeof requestId !== "string" ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) || typeof operatorAlias !== "string" || !operatorAlias) {
+    throw new CreditTopUpError();
+  }
+  const db = ksDb();
+  return db.transaction(() => {
+    const prior = db.prepare(`SELECT request_id AS requestId, alias, amount, previous_limit AS previousLimit,
+      credit_limit AS creditLimit, operator_alias AS operatorAlias, created_at AS createdAt
+      FROM credit_topups WHERE request_id = ?`).get(requestId) as CreditTopUpReceipt | undefined;
+    if (prior) {
+      if (prior.alias !== alias || prior.amount !== amount || prior.operatorAlias !== operatorAlias) throw new CreditTopUpError(true);
+      return prior;
+    }
+    const row = db.prepare(`SELECT * FROM api_keys WHERE alias = ?`).get(alias) as KeyRow | undefined;
+    if (!row || row.revoked_at !== null || (row.expires_at !== null && row.expires_at <= now.toISOString()) ||
+        row.credit_limit <= 0 || !Number.isSafeInteger(row.credit_limit + amount)) throw new CreditTopUpError();
+    const staged = db.prepare(`SELECT 1 FROM key_rotation_plans WHERE logical_alias = ? AND status = 'staged'`)
+      .get(row.logical_alias ?? row.alias);
+    if (staged) throw new CreditTopUpError();
+    const receipt: CreditTopUpReceipt = { requestId, alias, amount, previousLimit: row.credit_limit,
+      creditLimit: row.credit_limit + amount, operatorAlias, createdAt: now.toISOString() };
+    db.prepare(`UPDATE api_keys SET credit_limit = ? WHERE alias = ?`).run(receipt.creditLimit, alias);
+    db.prepare(`INSERT INTO credit_topups
+      (request_id, alias, amount, previous_limit, credit_limit, operator_alias, created_at)
+      VALUES (@requestId, @alias, @amount, @previousLimit, @creditLimit, @operatorAlias, @createdAt)`).run(receipt);
+    return receipt;
+  })();
 }
 
 /**

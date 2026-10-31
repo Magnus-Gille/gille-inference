@@ -196,13 +196,59 @@ logging, authorization, quota, admission and billing apply. See [reliability dia
 | PUT | `/ledger/{id}/reviewer-usefulness` | minted owner-admin | Record reviewer usefulness for one validated `review-bounded` ledger row by exact `ledgerId`; requires a non-empty authenticated logical alias, exact retries are idempotent, differing overwrites 409 |
 | PUT | `/execution-feedback/{handle}` | same minted owner-agent/admin key that ran the task | Exact organic execution usefulness (`pass`, `partial`, `redo`, `wrong`); 201 first write, 200 identical retry, 409 conflicting/ineligible write, 404 unknown/other-key handle. Separate from the reviewer overlay and routing; see [contract](execution-feedback.md). |
 | POST | `/v1/chat/completions` | any | Raw OpenAI-compatible inference (micro-routed to LM Studio/llama.cpp). The gateway forces ordinary exact-prefix prompt caching and strips client-directed `id_slot`/`n_cache_reuse`; slot/cache lifecycle remains server-owned. |
-| POST | `/v1/systemone` | owner key or guest key explicitly granted the model | Typed decision API for explicitly enabled llama-swap models. Credits, quota, GPU queue, and host-memory admission match chat; an empty guest model allow-list does not grant decision models. 256 KiB UTF-8 JSON body limit (262,144 bytes including state, questions and formatting), text/JSON-object state, 1–16 `noul`/`choice`/`score` questions, no images or streaming. The separate served input context remains 8,192 tokens per question/prompt (one shared context for Clef), including instructions and runtime formatting. Successful upstream `usage.input_tokens` is billed; failures bill zero. See [customer contract](systemone-customer-access.md). |
+| POST | `/v1/systemone` | owner key or guest key explicitly granted the model | Typed decision API for explicitly enabled llama-swap models. Credits, quota, GPU queue, and host-memory admission match chat; an empty guest model allow-list does not grant decision models. 256 KiB UTF-8 JSON body limit (262,144 bytes including state, questions and formatting), text/JSON-object state, 1–16 schema-valid `noul`/`choice`/`score` questions, no images or streaming. Nimble checks every complete prompt against its input bound before scoring. The default bound is 8,192 tokens: one shared reservation for Clef and one per question for Nimble/Decider; Nimble alone accepts optional `input_token_limit` from 1–8,192. Successful native usage is billed according to the adapter contract; failures bill zero. See [customer contract](systemone-customer-access.md). |
 | POST | `/v1/embeddings` | owner or guest key with exact model access | OpenAI-shaped vectors for enabled `embeddinggemma-2`. Text: one string or 1–16 strings, 32 KiB body cap. With `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` and verified projector: bounded wrapped text/image/audio/video inputs, 8 MiB body cap (details below). Optional `dimensions` 128/256/512/768, `encoding_format:"float"` or `"base64"`, and `user`. Uses ordinary admission, quota and credits; bills successful upstream `usage.prompt_tokens`, failures zero. An owner with an empty ordinary allow-list has access by default; an owner with a restricted list needs the exact model ID or explicit embedding grant. An empty ordinary guest model list does not grant embedding access. No streaming, chat or MCP `ask`. |
 | POST | `/delegate` | owner-admin | Ledger-gated one-shot delegation (record; verify only if a verifier is configured) |
 | POST | `/admin/models/load` | admin scope | Load a model (modelKey **syntax** validated) |
 | POST | `/admin/models/unload` | admin scope | Unload one/all models |
 | POST | `/admin/models/download` | admin scope | Download a model (fire-and-forget; modelKey **syntax** validated) |
+| POST | `/admin/keys/credits/topup` | admin scope | Manual additive credit renewal with `{alias,amount,requestId}`; positive safe-integer amount, durable idempotent receipt, active capped target outside staged rotation, and `409 credit_topup_conflict` for conflicting request IDs. |
 | POST | `/admin/keys/embedding-grants` | admin scope | Atomically grant `embeddinggemma-2` to exact active guest/inference aliases without rotating keys or changing chat access, credits or quotas. |
+
+### System One and portal account contract
+
+`POST /v1/systemone` accepts a 256 KiB UTF-8 JSON body with 1–16 schema-valid questions.
+The 16-question schema cap is separate from each key's RPM/TPM/daily quota and lifetime credit
+cap. Nimble checks every complete prompt against its bound before scoring. The default bound is
+8,192 tokens: Clef reserves one shared prompt, while Nimble and Decider reserve one bound per
+question. Nimble alone accepts optional `input_token_limit`, a positive safe integer from 1
+through 8,192 (default 8,192). Thus eight default Nimble questions reserve 65,536 tokens and
+may receive `400 request_exceeds_quota` under a 60,000-token TPM limit; a smaller bound
+such as 2,048 can fit when every complete prompt fits it.
+
+The native Nimble adapter reports exact `usage.input_tokens` as the sum of question prompts.
+Its optional `shared_prefix_tokens` is the longest common token prefix across those prompts,
+and `billable_input_tokens` must equal `input_tokens - (question_count - 1) *
+shared_prefix_tokens`. TPM/daily resource-quota admission reserves the conservative maximum, then reconciles to exact compute usage;
+the shared-prefix value changes lifetime credit accounting only. It is not a compute-savings claim.
+Legacy adapters omitting the metadata bill raw input, and Decider remains raw-input billing.
+Rejected or failed calls charge zero credits. Native context rejection is normalized to
+`400 context_length_exceeded`; temporary backend busy is `503 server_busy` with
+`Retry-After`; timeout is `504 upstream_timeout`. Bounded-jitter retries are
+permitted for retryable failures, but clients must not retry `402 credits_exhausted` or
+automatically replay a request with an unknown response outcome.
+The pre-admission maximum-reservation refusal is `400 request_exceeds_quota`; a later
+temporary TPM/daily quota hit is `429 rate_limit_exceeded` with the normal retry/reset
+guidance.
+
+`GET /portal/me` returns top-level alias, tier and scope plus the content-blind balance projection
+`credits:{remaining,status,percentUsed,resets:false,includesReservations:true}`. Its quota
+projection is advisory: isolated keys return `scope:"key"` with
+`snapshot`, `dailyResetsAt`, `advisory:true` and
+`includesReservations:true`; shared static-tier callers return
+`scope:"shared_static_tier",snapshot:null,advisory:true,includesReservations:true` to
+preserve other consumers' privacy. `systemOne.models` includes the models both enabled
+and allowed for the key and their configured contracts (including `contextScope`,
+`inputTokenLimitSupported` and `billingPolicy`); source qualification is explicitly
+`configured_not_measured`. Source code, an enabled setting, or a public spec does not
+prove actual production availability; use authenticated `/v1/models` and release evidence.
+
+Credit renewal is manual and admin-only through `POST /admin/keys/credits/topup`:
+`{alias,amount,requestId}`. `amount` must be a positive safe integer; the target
+must be active, capped, and outside staged rotation. The durable receipt contains no plaintext
+key. Exact idempotent reuse returns the same receipt; conflicting terms return `409
+credit_topup_conflict`. The operation only increases the lifetime cap and preserves used
+counters, quotas, expiry and scope; there is no automatic reset or payment flow.
 
 ### POST `/v1/embeddings`
 
