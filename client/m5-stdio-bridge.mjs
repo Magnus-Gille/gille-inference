@@ -163,7 +163,7 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
       };
   }
   const visibleMessage = credentialFailure
-    ? `${error.code === "missing_credential" ? "The selected profile has no usable Keychain credential." : "The gateway rejected the selected profile credential."} ${remediation}`
+    ? `${error.code === "missing_credential" ? "The selected profile has no usable credential." : "The gateway rejected the selected profile credential."} ${remediation}`
     : error.message;
   return {
     message: `${visibleMessage}${visibleFailureSuffix(error, failureLayer)}`,
