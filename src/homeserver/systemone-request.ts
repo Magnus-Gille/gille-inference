@@ -20,7 +20,7 @@ function record(value: unknown): value is Record<string, unknown> {
 
 export interface SystemOneRequest {
   model: string;
-  body: { model: string; state: unknown; questions: Record<string, unknown> };
+  body: { model: string; state: unknown; questions: Record<string, unknown>; input_token_limit?: number };
 }
 
 export class SystemOneResponseError extends Error {}
@@ -38,7 +38,32 @@ export const SYSTEMONE_MAX_BODY_BYTES = 256 * 1024;
 export function systemOneTokenReservation(request: SystemOneRequest): number {
   // Clef reads all questions in one prompt. Other System One models may evaluate them separately.
   if (request.model === "clef-flash") return SYSTEMONE_MAX_TOKENS_PER_QUESTION;
-  return Object.keys(request.body.questions).length * SYSTEMONE_MAX_TOKENS_PER_QUESTION;
+  return Object.keys(request.body.questions).length * (request.body.input_token_limit ?? SYSTEMONE_MAX_TOKENS_PER_QUESTION);
+}
+
+/** Configured bounds, not a claim of measured usable context or current residency. */
+export function systemOneModelContract(model: string) {
+  return { model, maxQuestions: 16, maxBodyBytes: SYSTEMONE_MAX_BODY_BYTES,
+    contextTokens: SYSTEMONE_MAX_TOKENS_PER_QUESTION,
+    contextScope: model === "clef-flash" ? "shared_request" : "per_question",
+    inputTokenLimitSupported: model === "bespoke-nimble-9b",
+    billingPolicy: model === "bespoke-nimble-9b" ? "shared_prefix_once_when_reported" : "input_tokens",
+    qualification: "configured_not_measured" };
+}
+
+/** Explicit native accounting metadata is optional for backwards compatibility. */
+export function systemOneBillableTokens(payload: unknown, request: SystemOneRequest, inputTokens: number): number {
+  if (!record(payload) || !record(payload["usage"])) throw new SystemOneResponseError("invalid usage");
+  const usage = payload["usage"];
+  if (usage["billable_input_tokens"] === undefined && usage["shared_prefix_tokens"] === undefined) return inputTokens;
+  const billable = usage["billable_input_tokens"], shared = usage["shared_prefix_tokens"];
+  const count = Object.keys(request.body.questions).length;
+  if (request.model !== "bespoke-nimble-9b" || typeof billable !== "number" || !Number.isSafeInteger(billable) ||
+      typeof shared !== "number" || !Number.isSafeInteger(shared) || shared < 0 || shared > Math.floor(inputTokens / count) ||
+      billable <= 0 || billable !== inputTokens - (count - 1) * shared) {
+    throw new SystemOneResponseError("invalid billable usage");
+  }
+  return billable;
 }
 
 function probability(value: unknown): value is number {
@@ -102,12 +127,17 @@ export function parseSystemOneBody(raw: string): SystemOneRequest {
     throw new SystemOneRequestError("body", "Body must be valid JSON.");
   }
   if (!record(value)) throw new SystemOneRequestError("body", "Body must be a JSON object.");
-  if (Object.keys(value).some((key) => !["model", "state", "questions"].includes(key))) {
-    throw new SystemOneRequestError("body", "Only model, state, and questions are supported.");
+  if (Object.keys(value).some((key) => !["model", "state", "questions", "input_token_limit"].includes(key))) {
+    throw new SystemOneRequestError("body", "Only model, state, questions, and Nimble input_token_limit are supported.");
   }
   const model = value["model"];
   if (typeof model !== "string" || model.length === 0) {
     throw new SystemOneRequestError("model", "A model ID is required.");
+  }
+  const inputLimit = value["input_token_limit"];
+  if (inputLimit !== undefined && (model !== "bespoke-nimble-9b" || typeof inputLimit !== "number" ||
+      !Number.isSafeInteger(inputLimit) || inputLimit < 1 || inputLimit > SYSTEMONE_MAX_TOKENS_PER_QUESTION)) {
+    throw new SystemOneRequestError("input_token_limit", "Only Nimble accepts input_token_limit: an integer from 1 to 8192, enforced on every complete prompt before inference.");
   }
   const state = value["state"];
   if (state === null || state === undefined || typeof state === "number" || typeof state === "boolean") {
@@ -162,5 +192,5 @@ export function parseSystemOneBody(raw: string): SystemOneRequest {
       throw new SystemOneRequestError("questions", "Question type must be choice, score, or noul.");
     }
   }
-  return { model, body: { model, state, questions } };
+  return { model, body: { model, state, questions, ...(typeof inputLimit === "number" ? { input_token_limit: inputLimit } : {}) } };
 }

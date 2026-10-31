@@ -7,6 +7,7 @@ import {
   checkQuota,
   recordUsage,
   resetQuotaWindows,
+  snapshotQuota,
   type QuotaLimits,
 } from "../src/homeserver/quota.js";
 
@@ -145,6 +146,42 @@ describe("quota sliding windows", () => {
     expect(rej.ok).toBe(false);
     expect(rej.snapshot.rpmUsed).toBeGreaterThanOrEqual(2);
     expect(rej.snapshot.rpmLimit).toBe(2);
+  });
+
+  it("snapshotQuota is read-only and includes an admitted reservation", () => {
+    const a = alias();
+    const limits: QuotaLimits = { rpm: 2, tpm: 1000, dailyTokenBudget: 5000 };
+    const admitted = checkQuota(a, limits, 120, T0);
+    expect(admitted.ok).toBe(true);
+
+    const before = snapshotQuota(a, limits, T0 + 100);
+    const after = snapshotQuota(a, limits, T0 + 100);
+    expect(before).toEqual(after);
+    expect(before).toMatchObject({
+      rpmUsed: 1,
+      tpmUsed: 120,
+      dailyUsed: 120,
+      rpmLimit: 2,
+      tpmLimit: 1000,
+      dailyLimit: 5000,
+    });
+    expect(checkQuota(a, limits, 880, T0 + 200).ok).toBe(true);
+  });
+
+  it("snapshotQuota keeps aliases isolated and rolls windows and daily usage over", () => {
+    const a = alias();
+    const b = alias();
+    const limits: QuotaLimits = { rpm: 10, tpm: 1000, dailyTokenBudget: 5000 };
+    expect(checkQuota(a, limits, 200, T0).ok).toBe(true);
+    expect(snapshotQuota(b, limits, T0)).toMatchObject({ rpmUsed: 0, tpmUsed: 0, dailyUsed: 0 });
+
+    const nextDay = Date.UTC(2023, 11, 15, 0, 0, 1);
+    expect(snapshotQuota(a, limits, nextDay)).toMatchObject({
+      rpmUsed: 0,
+      tpmUsed: 0,
+      dailyUsed: 0,
+      resetSeconds: 1,
+    });
   });
 
   // ─── M1: reservation-safe daily budget under concurrency ───────────────────────────

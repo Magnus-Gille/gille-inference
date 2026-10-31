@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError,
   systemOneTokenReservation, validateSystemOneResponse } from "../src/homeserver/systemone-request.js";
+import { systemOneBillableTokens, systemOneModelContract } from "../src/homeserver/systemone-request.js";
 
 const base = {
   model: "clef-flash",
@@ -15,6 +16,18 @@ const base = {
 };
 
 describe("System One customer request", () => {
+  it.each([7, 8, 16])("accepts %i Nimble questions with an explicit enforced input bound", count => {
+    const req = parseSystemOneBody(JSON.stringify({ ...base, model: "bespoke-nimble-9b", input_token_limit: 2048,
+      questions: Object.fromEntries(Array.from({ length: count }, (_, i) => [`q${i}`, base.questions.urgent])) }));
+    expect(systemOneTokenReservation(req)).toBe(count * 2048);
+  });
+  it.each([0, -1, 1.5, 8193, "2048"])("rejects an unsafe Nimble input bound %s", input_token_limit => {
+    expect(() => parseSystemOneBody(JSON.stringify({ ...base, model: "bespoke-nimble-9b", input_token_limit })))
+      .toThrow(SystemOneRequestError);
+  });
+  it("refuses a reduced reservation on a runtime that does not enforce it", () => {
+    expect(() => parseSystemOneBody(JSON.stringify({ ...base, input_token_limit: 2048 }))).toThrow(SystemOneRequestError);
+  });
   it.each(["clef-flash", "bespoke-nimble-9b", "pplx-decider-v1-27b"])(
     "keeps known decision model %s out of chat when enablement is missing",
     (model) => expect(isSystemOneDecisionModel(model, [])).toBe(true),
@@ -79,6 +92,22 @@ describe("System One upstream response", () => {
   it("reserves separate contexts for a future per-question decision model", () => {
     const other = parseSystemOneBody(JSON.stringify({ ...base, model: "another-decision-model" }));
     expect(systemOneTokenReservation(other)).toBe(3 * 8192);
+  });
+  it("keeps exact compute usage while charging a proven native shared prefix once", () => {
+    const native = parseSystemOneBody(JSON.stringify({ ...base, model: "bespoke-nimble-9b" }));
+    expect(systemOneBillableTokens({ usage: { billable_input_tokens: 12, shared_prefix_tokens: 6 } }, native, 24)).toBe(12);
+    expect(systemOneBillableTokens(response, native, 24)).toBe(24);
+    for (const usage of [{ billable_input_tokens: 0, shared_prefix_tokens: 12 },
+      { billable_input_tokens: 12 }, { billable_input_tokens: 12, shared_prefix_tokens: 99 }]) {
+      expect(() => systemOneBillableTokens({ usage }, native, 24)).toThrow(SystemOneResponseError);
+    }
+    expect(() => systemOneBillableTokens({ usage: { billable_input_tokens: 12, shared_prefix_tokens: 6 } }, request, 24))
+      .toThrow(SystemOneResponseError);
+  });
+  it("publishes configured context scopes without claiming measured context", () => {
+    expect(systemOneModelContract("clef-flash")).toMatchObject({ contextScope: "shared_request", maxQuestions: 16, inputTokenLimitSupported: false });
+    expect(systemOneModelContract("bespoke-nimble-9b")).toMatchObject({ contextScope: "per_question", inputTokenLimitSupported: true,
+      qualification: "configured_not_measured" });
   });
 
   it.each([

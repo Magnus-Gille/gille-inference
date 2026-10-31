@@ -162,11 +162,11 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /healthz` | none | Liveness + loaded models (for the router/uptime checks), plus content-free `codeLoopTransport: "available" \| "unavailable" \| "disabled"`. This checks the dedicated user-bus socket listener only when code loops are enabled. Overall `ok` remains independent of this field because ordinary inference can work while code loops cannot. It does not prove that a caged job can run. |
 | `GET /` · `GET /portal` | none | Serves the self-service portal page (HTML; `nosniff` + restrictive CSP + `no-store`). Per-IP throttled. |
 | `POST /portal/redeem` | none (the **code** is the credential) | `{code}` → `200 {key, alias, model, models, creditLimit}` (`Cache-Control: no-store`). Trades a one-time invite code for a freshly minted key. Uniform `409 invite_invalid` for an unknown **or** already-used code (identical body — no enumeration oracle); `400` for a missing code. Per-IP throttled (`HOMESERVER_REDEEM_RPM`, default 10 / 10 min) → `429`. |
-| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}` plus `gateway` release metadata for minted owner agent/admin keys and keys with an explicit `embeddinggemma-2` grant, and `inferenceObservation` only for minted owner agent/admin keys (`Cache-Control: no-store`). The latter is a global, content-blind request-log timestamp for the last observed successful admitted M5 inference, or `none`/`disabled`/`unavailable`; it does not establish current inference health or the health of either ingress route. |
+| `GET /portal/me` | user | The dashboard's data source → `{alias, tier, scope, models, creditLimit, creditsUsed, rpm, tpm}`, plus `credits: {remaining, status, percentUsed, resets:false, includesReservations:true}`. Its `quota` is advisory: key callers receive `{scope:"key", snapshot, dailyResetsAt, advisory:true, includesReservations:true}`; shared static-tier callers receive `{scope:"shared_static_tier", snapshot:null, advisory:true, includesReservations:true}` to preserve privacy. It also returns `gateway` release metadata for minted owner agent/admin keys and keys with an explicit `embeddinggemma-2` grant, and `inferenceObservation` only for minted owner agent/admin keys (`Cache-Control: no-store`). The latter is a global, content-blind request-log timestamp for the last observed successful admitted M5 inference, or `none`/`disabled`/`unavailable`; it does not establish current inference health or the health of either ingress route. |
 | `GET /portal/stats` | none | **PUBLIC, content-blind grand aggregate** powering the portal's "Served so far" card → `200 {total_tokens, total_requests, since}` (`Cache-Control: public, max-age=30`). Summed from the **durable** `request_log` (survives restarts — the honest "served so far"), NOT the in-memory Prometheus counters. Exposes ONLY fleet-wide totals — never any per-user / per-key / per-alias / per-model / content dimension. Per-IP throttled (shares the redeem window). Deliberately distinct from authed `/metrics`. |
 | `GET /portal/model-evals.json` | none | **PUBLIC, content-blind** feed powering the portal's "New model evaluations" card → `200 {generatedAt, count, models: [{id, quant, sizeGB, passRate, tokPerSec, verdict, served, evaluatedAt}]}` (`Cache-Control: public, max-age=300`). Reads the historical manual model-evaluation registry (`model-registry.ts`) — no prompts, no request content, just per-model benchmark verdicts. A read failure degrades to an empty `{count:0, models:[]}` rather than an error. Per-IP throttled (shares the redeem window). |
 | `POST /v1/chat/completions` | user | OpenAI-compatible proxy to LM Studio/llama.cpp. `temperature`, `top_p`, and llama.cpp extensions `top_k`/`min_p` pass through. Prompt caching is server-owned and forced on for the ordinary exact-common-prefix path; client-supplied `id_slot` and `n_cache_reuse` are stripped so one principal cannot select a shared slot or alter the reviewed cache policy. A changed message/file prefix naturally diverges and its suffix is re-evaluated; the gateway stores no repository path or prompt cache. `max_tokens` uses the fleet cap unless an exact model has a higher configured ceiling. Refused with `402 credits_exhausted` when the key's lifetime credit budget is spent. |
-| `POST /v1/systemone` | user | Typed `noul`/`choice`/`score` decisions for explicitly configured llama-swap models (`HOMESERVER_SYSTEMONE_MODELS`); text or JSON-object state, 1–16 questions, 256 KiB UTF-8 JSON body cap (262,144 bytes, including state, questions and formatting), no images/streaming/keep-alive. The separate served input context remains 8,192 tokens per question/prompt including instructions and runtime formatting; Clef shares one context across all questions. Guest keys need an explicit model grant, even when their ordinary chat allow-list is empty. Shares lifetime credits, quotas, GPU and host-memory admission with chat. Charges successful `usage.input_tokens`; failures charge zero. Decision models cannot be called through chat or MCP `ask`. See [customer contract](../../docs/systemone-customer-access.md). |
+| `POST /v1/systemone` | user | Typed `noul`/`choice`/`score` decisions for explicitly configured llama-swap models (`HOMESERVER_SYSTEMONE_MODELS`); text or JSON-object state, 1–16 schema-valid questions, 256 KiB UTF-8 JSON body cap (262,144 bytes, including state, questions and formatting), no images/streaming/keep-alive. Nimble checks every complete prompt against its input bound before scoring. The default input bound is 8,192 tokens: Clef reserves one shared prompt, while Nimble and Decider reserve one bound per question. Nimble alone accepts optional `input_token_limit` from 1–8,192 (default 8,192). Eight default Nimble questions reserve 65,536 tokens and may receive `400 request_exceeds_quota` under a 60,000-token TPM limit; a smaller bound such as 2,048 can fit if prompts fit. Actual temporary TPM/daily quota hits return `429 rate_limit_exceeded`. Native context rejection is sanitized as `400 context_length_exceeded`; temporary backend busy is `503 server_busy` with `Retry-After`, and timeout is `504 upstream_timeout`. Native Nimble shared-prefix metadata changes billed input accounting only; legacy metadata omission and Decider use raw input billing. Failed calls charge zero. Do not automatically replay unknown outcomes or retry `402`. Decision models cannot be called through chat or MCP `ask`. See [customer contract](../../docs/systemone-customer-access.md). |
 | `POST /v1/embeddings` | user | OpenAI-shaped EmbeddingGemma 2 vectors for explicitly enabled `embeddinggemma-2` (`HOMESERVER_EMBEDDING_MODELS`). Text accepts one string or 1–16 strings and at most 32 KiB JSON. When `HOMESERVER_EMBEDDING_MEDIA_ENABLED=true` is activated with a verified projector, bounded wrapped text/image/audio/video inputs are also accepted (8 MiB JSON cap; contract below). `encoding_format` is `float` or `base64`; optional `user` and `dimensions` 128/256/512/768. Vectors are validated and L2-normalized after truncation. Guest keys require an explicit embedding grant or exact ID in their restricted ordinary allow-list. Shares admission, quotas and ordinary credits with chat; successful `usage.prompt_tokens` is charged, failures zero. Embedding models are excluded from chat, MCP `ask`, and automatic delegation. |
 | `GET /v1/capabilities/learning-task` | user | **LearningTaskContract v1 preflight.** Returns the closed four-feature capability advertisement, `service:gille-inference` identity, exact observation/expiry clocks, and an opaque advertisement ID bound to the current process/configuration epoch (`Cache-Control: private, max-age=900`). Hugin must carry this exact fresh response for every new stamped `/delegate` or `code_loop_start` claim; stale, downgraded, cross-principal, or cross-epoch new claims fail closed. Exact authenticated durable admission recovery remains available after expiry/restart without executing new work. |
 | `POST /v1/roster-proposals` | minted logical `service:hugin` owner | Content-blind roster-proposal validation and durable admission only. This rotation-family credential is route-scoped before generic owner dispatch and receives `403` everywhere except proposal submit and exact own-read. No apply/re-arm/widen/model-admin operation. Production rejects until the atomic five-state roster observer, common provider fence/mutator lock, and all restore/template/canary registries are configured; see `docs/roster-proposal-contract.md`. |
@@ -284,6 +284,48 @@ Legacy static keys appear as `static:*`; probe, CLI, and imported evidence rows 
 and coarse labels (`model`, `outcome`, `tier`, `direction`, `lane`, `surface`). It never
 records request/response content, key aliases or hashes, IP addresses, or any other PII.
 Any key (owner or guest) may read the metrics; they reveal operational health, not per-user data.
+
+### System One account, quota and operator contract
+
+The typed `POST /v1/systemone` surface accepts at most 16 schema-valid questions and a
+256 KiB UTF-8 JSON body. Nimble checks every complete prompt against its input bound before scoring. The default input
+bound is 8,192 tokens: Clef reserves one shared prompt, while Nimble and Decider reserve one
+bound per question. Nimble alone accepts optional `input_token_limit`, a positive safe integer
+from 1 through 8,192 (default 8,192). Eight default Nimble questions reserve 65,536 tokens and
+can receive `400 request_exceeds_quota` under a 60,000-token TPM limit; a smaller bound such as
+2,048 can fit when every complete prompt fits it. The 16-question schema cap is separate from
+per-key TPM, daily and lifetime-credit limits.
+
+Nimble native billing reports exact `usage.input_tokens` as the sum of question prompts. When
+provided, `shared_prefix_tokens` is the longest common token prefix and
+`billable_input_tokens = input_tokens - (question_count - 1) * shared_prefix_tokens`. TPM/daily
+resource-quota admission uses the conservative reservation; this changes lifetime credit billing
+only and is not a compute-savings claim. Legacy adapters without
+the metadata bill raw input; Decider remains raw-input billing. Failed calls charge zero credits.
+Native context rejection is sanitized to `400 context_length_exceeded`; temporary backend busy
+is `503 server_busy` with `Retry-After`; timeout is `504 upstream_timeout`.
+Use bounded jitter for retryable failures, never retry `402 credits_exhausted`, and never
+automatically replay an unknown response outcome. A pre-admission maximum-reservation refusal is
+`400 request_exceeds_quota` before inference; an actual temporary TPM/daily quota hit
+returns `429 rate_limit_exceeded` with its retry/reset guidance. A conservative credit
+reservation may still return `402 credits_exhausted` even while the displayed balance is positive.
+
+`GET /portal/me` returns top-level alias, tier and scope plus `credits: {remaining, status, percentUsed, resets:false,
+includesReservations:true}`. Its `quota` is advisory: isolated keys return
+`{scope:"key", snapshot, dailyResetsAt, advisory:true, includesReservations:true}`;
+shared static-tier callers return `{scope:"shared_static_tier", snapshot:null, advisory:true,
+includesReservations:true}` to preserve privacy. `systemOne.models` contains only models
+both enabled and allowed for this key, with configured contracts marked
+`qualification:"configured_not_measured"`. Source configuration and a public model spec
+are not proof of production availability; require the authenticated `/v1/models` check and
+release evidence.
+
+Credit renewal is manual only. Admins use `POST /admin/keys/credits/topup` with
+`{alias,amount,requestId}`, where `amount` is a positive safe integer. Only active,
+capped keys outside staged rotation qualify. The durable receipt is idempotent for the same terms;
+conflicting reuse returns `409 credit_topup_conflict`. The operation preserves the key,
+used counter, quotas, expiry and scope; it does not reset credits or process payments. Live
+changes require separate operator approval.
 
 ### MCP transport (offload sub-tasks from Claude Code)
 

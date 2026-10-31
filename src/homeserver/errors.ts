@@ -15,6 +15,9 @@ export type ErrorCode =
   | "model_not_allowed" // 403
   | "model_not_found" // 400
   | "invalid_request_error" // 400 (generic bad request — bad params)
+  | "context_length_exceeded" // 400, explicit safe native decision error
+  | "request_exceeds_quota" // 400, cannot fit even an empty quota window
+  | "credit_topup_conflict" // 409, idempotency identifier has different terms
   | "payload_too_large" // 413 (upload body exceeds the size cap)
   | "route_not_allowed" // 403 (principal not permitted on this route)
   | "not_found" // 404 (no such route / resource)
@@ -76,6 +79,18 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
     type: "invalid_request_error",
     param: null,
     message: "The request is invalid. Check your parameters.",
+  },
+  context_length_exceeded: {
+    status: 400, type: "invalid_request_error", param: "state",
+    message: "The complete decision prompt exceeds the input token limit. Reduce state, instructions or options; nothing was truncated and no credits were charged.",
+  },
+  request_exceeds_quota: {
+    status: 400, type: "invalid_request_error", param: "questions",
+    message: "This request's conservative token reservation exceeds the key's full quota allowance. Use fewer questions or an enforced smaller input_token_limit on Nimble, or ask the operator to change the allowance. Waiting will not make this request fit. No credits were charged.",
+  },
+  credit_topup_conflict: {
+    status: 409, type: "invalid_request_error", param: "requestId",
+    message: "This top-up request ID has already been used with different terms.",
   },
   payload_too_large: {
     status: 413,

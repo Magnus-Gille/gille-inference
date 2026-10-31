@@ -32,6 +32,11 @@ const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? "";
+    if (req.method === "POST" && url.endsWith("/systemone")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "context_length_exceeded" } }));
+      return;
+    }
     if (req.method === "GET" && (url.includes("/models") || url.includes("/running"))) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(url.includes("/running")
@@ -66,6 +71,7 @@ beforeAll(async () => {
 
   process.env["LMSTUDIO_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
   process.env["HOMESERVER_BACKEND"] = "llamaswap";
+  process.env["HOMESERVER_SYSTEMONE_MODELS"] = "clef-flash";
   process.env["HOMESERVER_HOST"] = "127.0.0.1";
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "1";
@@ -107,6 +113,18 @@ afterEach(() => {
 });
 
 describe("gateway tracing unexpected errors", () => {
+  it("records a customer context rejection as unknown readiness rather than a failed gateway", async () => {
+    setTracingTestHooks({ captureExports: true });
+    const key = mintKey({ alias: "trace-context-rejection", tier: "guest", modelAllowList: ["clef-flash"] }, DEFAULTS);
+    const res = await fetch(`http://127.0.0.1:${gatewayPort}/v1/systemone`, { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key.plaintextKey}` },
+      body: JSON.stringify({ model: "clef-flash", state: "synthetic overflow", questions: { urgent: { type: "noul", instructions: "Urgent?" } } }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: { code: "context_length_exceeded" } });
+    const records = await flushTracingForTests();
+    expect(records).toContainEqual(expect.objectContaining({ kind: "service-observation", slot_id: "gateway-ready", outcome: "unknown" }));
+  });
   it("finishes response and inference spans on an unexpected throw without leaking the thrown detail", async () => {
     setTracingTestHooks({ captureExports: true });
     recordMessageTaskExposuresBestEffortMock.mockImplementation(() => {

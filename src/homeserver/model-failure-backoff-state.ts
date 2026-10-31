@@ -9,6 +9,7 @@ const MAX_CALLERS = 256;
 export function modelFailureBackoffFor(
   gateway: object,
   principal: { alias: string; keyHash: string | null },
+  configuredModels: readonly string[] = [],
 ): ModelFailureBackoff {
   // Legacy/static identities share aliases and quota buckets. They cannot safely
   // identify an individual key for this guard, so retain their existing policy.
@@ -18,9 +19,10 @@ export function modelFailureBackoffFor(
     callers = new Map();
     gateways.set(gateway, callers);
   }
-  const ids = [...getTrustedCatalogue()].filter((id) => id !== "unknown" && id !== "none").sort();
+  const ids = [...new Set([...getTrustedCatalogue(), ...configuredModels])].filter((id) => id !== "unknown" && id !== "none").sort();
   const roster = JSON.stringify(ids);
-  const key = principal.keyHash;
+  // Dedicated configured decision-model state cannot be cleared by switching to chat/MCP.
+  const key = `${principal.keyHash}${configuredModels.length ? ":configured" : ""}`;
   const existing = callers.get(key);
   if (existing?.roster === roster) {
     callers.delete(key);

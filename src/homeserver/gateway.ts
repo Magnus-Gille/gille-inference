@@ -23,6 +23,8 @@ import { resetRoutingTable, loadRoutingTable } from "./routing-table.js";
 import { parseHuginExperimentOutcomeBundle, importHuginExperimentOutcome } from "./experiment-import.js";
 import {
   lookupKey,
+  topUpCredits,
+  CreditTopUpError,
   mintKey,
   revokeKey,
   listKeys,
@@ -45,8 +47,9 @@ import {
   type KeyScope,
   type Tier,
 } from "./keystore.js";
-import { checkQuota, recordUsage, checkRateWindow, type QuotaLimits, type QuotaReservation } from "./quota.js";
-import { describeQuotaFailure } from "./quota-error.js";
+import { checkQuota, recordUsage, checkRateWindow, snapshotQuota, type QuotaLimits, type QuotaReservation } from "./quota.js";
+import { describeQuotaFailure, quotaScopeForPrincipal } from "./quota-error.js";
+import { describeCreditBalance } from "./account-balance.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -105,6 +108,7 @@ import { parseImageRequest, isImageRequestError, IMAGE_MODEL_IDS } from "./image
 import { isSystemOneDecisionModel, parseSystemOneBody, SystemOneRequestError, SystemOneResponseError, systemOneTokenReservation,
   SYSTEMONE_MAX_BODY_BYTES,
   validateSystemOneResponse, type SystemOneRequest } from "./systemone-request.js";
+import { systemOneBillableTokens, systemOneModelContract } from "./systemone-request.js";
 import { EMBEDDING_MODEL_ID, isEmbeddingModel, parseEmbeddingBody, EmbeddingRequestError, EmbeddingResponseError,
   embeddingTokenReservation, validateAndShapeEmbeddingResponse, type EmbeddingRequest } from "./embedding-request.js";
 import { EmbeddingVideoProbeError, validateEmbeddingVideoBitstream } from "./embedding-video-probe.js";
@@ -1205,6 +1209,7 @@ async function admitAndMeterLogged(
   // actualTokens stays 0, so the finally block reconciles the credit reservation and the quota
   // estimate to ZERO — a failed request is never billed at the full estimate.
   let actualTokens = 0;
+  let actualCreditTokens = 0;
   let creditsCharged = 0;
   // A background measurement must not observe the foreground request as active. Defer it
   // until this wrapper has released the admission lease and completed accounting.
@@ -1212,12 +1217,14 @@ async function admitAndMeterLogged(
   try {
     const result = await handler();
     actualTokens = result.totalTokens;
+    actualCreditTokens = result.billableTokens ?? result.totalTokens;
     afterRelease = result.afterRelease;
     // R6: the handler may already have classified a DISTINCT failure outcome (an upstream
     // connection/timeout failure, or a mid-stream abort that cannot change the already-sent 200
     // status). Preserve that — do NOT clobber it with the generic ok/error derivation below.
     // HANDLER_OWNED_OUTCOMES is the small allow-list of outcomes the handler sets itself.
-    const handlerOwned = HANDLER_OWNED_OUTCOMES.has(lctx.outcome);
+    const handlerOwned = HANDLER_OWNED_OUTCOMES.has(lctx.outcome) ||
+      (surface === "systemone" && lctx.outcome === "bad_request");
     // handler() (handleChatProxy or handleDelegate) writes its own status before returning.
     // Best-effort: read res.statusCode if it was set.
     if (!handlerOwned) {
@@ -1251,12 +1258,12 @@ async function admitAndMeterLogged(
         // Reconcile the atomic reservation to real usage: adjust by (real − reserve). An
         // errored/non-completed call has actualTokens 0 (C2/HIGH-2), so the reserve is fully
         // released — no charge for a failed completion.
-        reconcileCredits(principal.keyHash, creditReserve, actualTokens);
+        reconcileCredits(principal.keyHash, creditReserve, actualCreditTokens);
       } else {
         // Uncapped key (creditLimit 0): nothing was reserved, so accrue real usage directly.
-        recordCreditUsage(principal.keyHash, actualTokens);
+        recordCreditUsage(principal.keyHash, actualCreditTokens);
       }
-      creditsCharged = actualTokens;
+      creditsCharged = actualCreditTokens;
     }
     // M3: feed the credits charged for this request into the metrics record site.
     lctx.creditsCharged = creditsCharged;
@@ -1277,6 +1284,8 @@ async function admitAndMeterLogged(
  */
 export interface MeteredResult {
   totalTokens: number;
+  /** Validated native decision billing; resource quotas always use totalTokens. */
+  billableTokens?: number;
   promptTokens: number | null;
   completionTokens: number | null;
   canonicalModel: string | null;
@@ -1545,20 +1554,28 @@ async function handleSystemOneProxy(
       body: JSON.stringify(req.body),
       signal: AbortSignal.any([AbortSignal.timeout(cfg.callTimeoutMs), clientGone.signal]),
     });
-    // Never forward an upstream error body: it may contain local model paths or runtime details.
+    // Project a closed code only; never forward upstream messages or HTML.
     if (!upstream.ok) {
-      lctx.status = upstream.status === 404 ? 400 : 502;
-      lctx.outcome = upstream.status === 404 ? "bad_request" : "upstream_unavailable";
-      lctx.errorClass = upstream.status === 404 ? "model_not_found" : "upstream_unavailable";
-      sendError(res, makeError(upstream.status === 404 ? "model_not_found" : "upstream_unavailable"));
+      const contextError = upstream.status === 400 && await isSystemOneContextError(upstream);
+      if (upstream.status !== 400) await upstream.body?.cancel();
+      const code = contextError ? "context_length_exceeded" : upstream.status === 404 ? "model_not_found" :
+        upstream.status === 503 ? "server_busy" : upstream.status === 504 ? "upstream_timeout" : "upstream_unavailable";
+      const envelope = makeError(code, code === "server_busy" || code === "upstream_timeout"
+        ? { retryAfterSeconds: cfg.busyRetryAfterSeconds } : {});
+      lctx.status = envelope.status;
+      lctx.outcome = contextError || upstream.status === 404 ? "bad_request" :
+        code === "server_busy" ? "upstream_unavailable" : code;
+      lctx.errorClass = code;
+      sendError(res, envelope);
       return ZERO_RESULT;
     }
     const payload = await upstream.json() as unknown;
     const inputTokens = validateSystemOneResponse(payload, req);
+    const billableTokens = systemOneBillableTokens(payload, req, inputTokens);
     sendJson(res, 200, payload);
     lctx.status = 200;
     lctx.outcome = "ok";
-    return { totalTokens: inputTokens, promptTokens: inputTokens, completionTokens: 0,
+    return { totalTokens: inputTokens, billableTokens, promptTokens: inputTokens, completionTokens: 0,
       canonicalModel: req.model, ttftMs: null };
   } catch (err) {
     if (clientAborted) {
@@ -1577,6 +1594,29 @@ async function handleSystemOneProxy(
     sendError(res, envelope);
     return ZERO_RESULT;
   }
+}
+
+async function isSystemOneContextError(response: Response): Promise<boolean> {
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    await response.body?.cancel(); return false;
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return false;
+  const chunks: Uint8Array[] = []; let bytes = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 4096) { await reader.cancel(); return false; }
+      chunks.push(value);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { error?: { code?: unknown; type?: unknown } };
+    // Pinned llama.cpp exposes the closed type for context overflows; native adapters use code.
+    return body?.error?.code === "context_length_exceeded" || body?.error?.type === "exceed_context_size_error";
+  } catch (error) {
+    if (error instanceof SyntaxError) return false;
+    throw error;
+  } finally { reader.releaseLock(); }
 }
 
 function modelNotFoundResult(): MeteredResult {
@@ -5168,11 +5208,32 @@ export async function handleRequest(
         return;
       }
       lctx.model = cfg.systemOneModels.includes(parsed.model) ? parsed.model : "unknown";
+      if (!cfg.systemOneModels.includes(parsed.model)) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "model_not_found";
+        sendError(res, makeError("model_not_found")); return;
+      }
       // Clef uses one shared prompt; other decision models may use one prompt per question.
       // Reserve full context(s); reconcile exact successful usage after the call.
       const estimatedTokens = systemOneTokenReservation(parsed);
+      if ((principal.limits.tpm > 0 && estimatedTokens > principal.limits.tpm) ||
+          (principal.limits.dailyTokenBudget > 0 && estimatedTokens > principal.limits.dailyTokenBudget)) {
+        lctx.status = 400; lctx.outcome = "bad_request"; lctx.errorClass = "request_exceeds_quota";
+        lctx.admission = "n/a"; sendError(res, makeError("request_exceeds_quota")); return;
+      }
+      const failureBackoff = modelFailureBackoffFor(controller, principal, cfg.systemOneModels);
+      const backoff = failureBackoff?.observe(parsed.model);
+      if (backoff) {
+        lctx.status = 503; lctx.outcome = "model_temporarily_unavailable";
+        lctx.errorClass = "model_temporarily_unavailable"; lctx.admission = "n/a";
+        sendError(res, makeError("model_temporarily_unavailable", { retryAfterSeconds: backoff.retry_after_seconds,
+          backoff: { scope: "key_model", retry_after_seconds: backoff.retry_after_seconds, unavailable_until: backoff.unavailable_until } }));
+        return;
+      }
       await admitAndMeterLogged(res, controller, principal, parsed.model, estimatedTokens, lctx,
         () => handleSystemOneProxy(parsed, res, cfg, lctx, hostMemoryDeps), "systemone");
+      if (lctx.outcome === "upstream_unavailable") failureBackoff?.recordFailure(parsed.model, "upstream_unavailable");
+      else if (lctx.outcome === "upstream_timeout") failureBackoff?.recordFailure(parsed.model, "upstream_timeout");
+      else if (lctx.outcome === "ok") failureBackoff?.recordSuccess(parsed.model);
       return;
     }
     if (path === "/v1/embeddings" && method === "POST") {
@@ -5566,6 +5627,15 @@ export async function handleRequest(
         models: principal.modelAllowList,
         creditLimit: principal.creditLimit,
         creditsUsed: principal.creditsUsed,
+        credits: describeCreditBalance(principal),
+        quota: quotaScopeForPrincipal(principal) === "key" ? {
+          scope: "key", snapshot: snapshotQuota(principal.alias, principal.limits),
+          dailyResetsAt: new Date(new Date().setUTCHours(24, 0, 0, 0)).toISOString(),
+          advisory: true, includesReservations: true,
+        } : { scope: "shared_static_tier", snapshot: null, advisory: true, includesReservations: true },
+        systemOne: { models: cfg.systemOneModels.filter(model => systemOneGranted(principal, model)).map(systemOneModelContract),
+          reservation: "full_context_per_prompt_unless_enforced_input_token_limit",
+          renewal: "manual_operator_topup", automaticReset: false },
         rpm: principal.limits.rpm,
         tpm: principal.limits.tpm,
       });
@@ -6007,6 +6077,27 @@ export async function handleRequest(
       lctx.status = res.statusCode;
       lctx.outcome = res.statusCode < 300 ? "ok" : "error";
       lctx.admission = "n/a";
+      return;
+    }
+    if (path === "/admin/keys/credits/topup" && method === "POST") {
+      if (!requireAdmin()) return;
+      res.setHeader("Cache-Control", "no-store");
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        if (!body || Array.isArray(body) || typeof body !== "object" ||
+          Object.keys(body).some(key => !["alias", "amount", "requestId"].includes(key)) ||
+          typeof body["alias"] !== "string" || typeof body["amount"] !== "number" || typeof body["requestId"] !== "string") {
+          throw new CreditTopUpError();
+        }
+        sendJson(res, 200, topUpCredits(body["alias"], body["amount"], body["requestId"], principal.alias));
+      } catch (error) {
+        if (error instanceof SyntaxError || error instanceof CreditTopUpError) {
+          sendError(res, makeError(error instanceof CreditTopUpError && error.conflict ? "credit_topup_conflict" : "invalid_request_error",
+            { message: error instanceof CreditTopUpError ? error.message : "Body must be valid JSON." }));
+        } else throw error;
+      }
+      lctx.status = res.statusCode; lctx.outcome = res.statusCode < 300 ? "ok" : "error"; lctx.admission = "n/a";
       return;
     }
     if (path === "/admin/keys/systemone-grants" && method === "POST") {
