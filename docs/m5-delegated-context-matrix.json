@@ -59,7 +59,7 @@
       "context": "managed Linux agent account",
       "status": "unsupported",
       "surface": "authenticated MCP ask (acceptance pending)",
-      "reason": "The owner requires inference access under #450. The Linux profile credential reader and Brokkr #165 network allowance are source implementations; no accepted live managed-agent credential and classification receipt exists yet.",
+      "reason": "The owner requires inference access under INFER-450. The Linux profile credential reader and BROKKR-165 network allowance are source implementations; no accepted live managed-agent credential and classification receipt exists yet.",
       "next_probe": "After separately authorized credential provisioning and gateway-only network application, run doctor without inference, then the bounded MCP classification procedure under a valid evaluation mandate. Record only sanitized acceptance evidence."
     }
   ]

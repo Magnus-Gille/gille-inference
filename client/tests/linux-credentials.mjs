@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  realpathSync,
   symlinkSync,
   writeFileSync,
   chmodSync,
@@ -29,7 +30,7 @@ function requireFactories() {
 }
 
 function newHome() {
-  const root = mkdtempSync(join(tmpdir(), "m5-linux-credentials-"));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "m5-linux-credentials-"));
   fixtureRoots.add(root);
   const home = join(root, "home");
   mkdirSync(home, { mode: 0o700 });

@@ -30,13 +30,13 @@ The file must be a regular, single-link, non-symlink file owned by the agent UID
 homes or credential paths are refused. This protects against other UIDs, not other processes
 running as the same agent UID. Protect the operating system's home-directory ancestry as usual.
 
-The existing URL-only profile selects the authenticated gateway. Brokkr #165 supplies the
+The existing URL-only profile selects the authenticated gateway. BROKKR-165 supplies the
 separate exact-destination network allowance; neither the file reader nor an allowance grants
 admin/residency access. `m5 --profile codex doctor` checks credentials and gateway capabilities
 without inference; `m5 --profile codex mcp` uses the same reader for the stdio bridge. Do not add
 `--probe-inference` without a valid evaluation mandate. The `provision` command remains macOS-only.
 Host provisioning, network application and a real bounded MCP classification are still required
-for operational acceptance under gille-inference #450; source tests are not that evidence.
+for operational acceptance under INFER-450; source tests are not that evidence.
 
 ### Owner-client 1.5.x / 1.6.x compatibility
 
