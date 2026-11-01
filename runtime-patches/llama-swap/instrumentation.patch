@@ -346,3 +346,134 @@
  	}
  
  	// Add the consumer to the list of active consumers
+--- a/internal/server/metrics_test.go
++++ b/internal/server/metrics_test.go
+@@ -6,6 +6,7 @@
+ 	"math"
+ 	"net/http"
+ 	"net/http/httptest"
++	"regexp"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -411,11 +412,49 @@
+ 	if entries[0].RespStatusCode == swaputil.StatusClientClosedRequest {
+ 		t.Error("a server-side cancel must not be recorded as a client disconnect")
+ 	}
+-	if line := string(proxylog.GetHistory()); strings.Contains(line, "499") {
++	if line := string(proxylog.GetHistory()); clientClosedAccessLogStatus.MatchString(line) {
+ 		t.Errorf("access log %q should not report 499 for a connected client", line)
+ 	}
+ }
++
++var clientClosedAccessLogStatus = regexp.MustCompile(`"POST /v1/chat/completions HTTP/1\.1" 499([[:space:]]|$)`)
+ 
++func TestClientClosedAccessLogStatus_MatchesOnlyStatusField(t *testing.T) {
++	tests := []struct {
++		name string
++		line string
++		want bool
++	}{
++		{
++			name: "connected client 502 with observed duration",
++			line: `INFO "POST /v1/chat/completions HTTP/1.1" 502 0 1.324992`,
++			want: false,
++		},
++		{
++			name: "actual client-closed status",
++			line: `INFO "POST /v1/chat/completions HTTP/1.1" 499 0 0.002143`,
++			want: true,
++		},
++		{
++			name: "499 appears in URI but response is 502",
++			line: `INFO "POST /v1/chat/completions?trace=499 HTTP/1.1" 502 0 1.324992`,
++			want: false,
++		},
++		{
++			name: "499 appears in duration but response is 502",
++			line: `INFO "POST /v1/chat/completions HTTP/1.1" 502 0 1.499s`,
++			want: false,
++		},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := clientClosedAccessLogStatus.MatchString(test.line); got != test.want {
++				t.Errorf("client-closed status match = %t, want %t; line=%q", got, test.want, test.line)
++			}
++		})
++	}
++}
++
+ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
+ 	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 5)
+ 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+--- a/internal/server/apigroup_test.go
++++ b/internal/server/apigroup_test.go
+@@ -633,9 +633,8 @@
+ 	}
+ }
+ 
+-// serveLogEvents runs GET target against s for a short time. during is called
+-// once the handler has subscribed, so it can write live log lines. It returns
+-// the recorded response after the handler exits.
++// serveLogEvents runs GET target against s for a short time. during writes live
++// log lines after handler startup. It returns the response after the handler exits.
+ func serveLogEvents(t *testing.T, s *Server, target string, during func()) *httptest.ResponseRecorder {
+ 	t.Helper()
+ 	ctx, cancel := context.WithCancel(context.Background())
+@@ -660,6 +659,37 @@
+ 		t.Fatal("handler did not return after context cancel")
+ 	}
+ 	return w
++}
++
++type logDataSource interface {
++	Info(string)
++	OnLogData(func([]byte)) context.CancelFunc
++}
++
++// drainLogBroadcast waits for a callback acknowledgment from the monitor's
++// ordered event stream. Because log writes enter the broadcast channel FIFO,
++// observing the marker proves earlier writes were published before the SSE
++// handler subscribes, while leaving their history buffer intact for replay.
++func drainLogBroadcast(t *testing.T, log logDataSource) {
++	t.Helper()
++	const marker = "APILOG-BROADCAST-BARRIER"
++	delivered := make(chan struct{}, 1)
++	unsubscribe := log.OnLogData(func(data []byte) {
++		if strings.Contains(string(data), marker) {
++			select {
++			case delivered <- struct{}{}:
++			default:
++			}
++		}
++	})
++	defer unsubscribe()
++
++	log.Info(marker)
++	select {
++	case <-delivered:
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for log broadcast barrier")
++	}
+ }
+ 
+ func TestServer_APILogEvents_SelectedStreams(t *testing.T) {
+@@ -667,6 +697,9 @@
+ 	s.logs.ProxyLogs.Info("PROXYHIST")
+ 	s.logs.UpstreamLogs.Info("UPSTREAMHIST")
+ 	s.logs.HttpLogs.Info("HTTPHIST")
++	drainLogBroadcast(t, s.logs.ProxyLogs)
++	drainLogBroadcast(t, s.logs.UpstreamLogs)
++	drainLogBroadcast(t, s.logs.HttpLogs)
+ 
+ 	w := serveLogEvents(t, s, "/api/events/logs?stream=proxy&stream=http", func() {
+ 		s.logs.ProxyLogs.Info("PROXYLIVE")
+@@ -693,6 +726,7 @@
+ func TestServer_APILogEvents_NoHistory(t *testing.T) {
+ 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+ 	s.logs.UpstreamLogs.Info("UPSTREAMHIST")
++	drainLogBroadcast(t, s.logs.UpstreamLogs)
+ 
+ 	w := serveLogEvents(t, s, "/api/events/logs?stream=upstream&no-history", func() {
+ 		s.logs.UpstreamLogs.Info("UPSTREAMLIVE")
