@@ -25,9 +25,22 @@ export interface SystemOneRequest {
 
 export class SystemOneResponseError extends Error {}
 
-const CHOICE_CRITERIA_HELP = 'Choice needs a criteria object with 2 to 26 named options, e.g. '
+const CHOICE_CRITERIA_EXAMPLE = 'Choice needs a criteria object with 2 to {max} named options, e.g. '
   + '{"billing":"Payment issue","support":"Technical issue"}. '
   + 'Option names use letters A-Z/a-z, digits, underscores or hyphens (1 to 64 characters); descriptions are strings or null.';
+
+/** Upstream source-enforced ceiling for the three explicitly supported decision models. */
+export const SYSTEMONE_MAX_CHOICE_OPTIONS = 255;
+const SYSTEMONE_LEGACY_MAX_CHOICES = 26;
+const WIDE_CHOICE_MODELS = new Set(["bespoke-nimble-9b", "clef-flash", "pplx-decider-v1-27b"]);
+
+function maxChoiceOptions(model: string): number {
+  return WIDE_CHOICE_MODELS.has(model) ? SYSTEMONE_MAX_CHOICE_OPTIONS : SYSTEMONE_LEGACY_MAX_CHOICES;
+}
+
+function choiceCriteriaHelp(model: string): string {
+  return CHOICE_CRITERIA_EXAMPLE.replace("{max}", String(maxChoiceOptions(model)));
+}
 
 /** The first serving contract fixes ctx=8192. */
 export const SYSTEMONE_MAX_TOKENS_PER_QUESTION = 8192;
@@ -44,6 +57,7 @@ export function systemOneTokenReservation(request: SystemOneRequest): number {
 /** Configured bounds, not a claim of measured usable context or current residency. */
 export function systemOneModelContract(model: string) {
   return { model, maxQuestions: 16, maxBodyBytes: SYSTEMONE_MAX_BODY_BYTES,
+    maxChoiceOptions: maxChoiceOptions(model),
     contextTokens: SYSTEMONE_MAX_TOKENS_PER_QUESTION,
     contextScope: model === "clef-flash" ? "shared_request" : "per_question",
     inputTokenLimitSupported: model === "bespoke-nimble-9b",
@@ -162,7 +176,7 @@ export function parseSystemOneBody(raw: string): SystemOneRequest {
     if (Object.keys(question).some((key) => !["type", "instructions", "criteria"].includes(key))) {
       if (question["type"] === "choice" &&
           (Object.hasOwn(question, "choices") || Object.hasOwn(question, "options"))) {
-        throw new SystemOneRequestError(`questions.${id}.criteria`, CHOICE_CRITERIA_HELP);
+        throw new SystemOneRequestError(`questions.${id}.criteria`, choiceCriteriaHelp(model));
       }
       throw new SystemOneRequestError("questions", "Unsupported question field.");
     }
@@ -172,10 +186,10 @@ export function parseSystemOneBody(raw: string): SystemOneRequest {
     const type = question["type"];
     const criteria = question["criteria"];
     if (type === "choice") {
-      if (!record(criteria) || Object.keys(criteria).length < 2 || Object.keys(criteria).length > 26 ||
+      if (!record(criteria) || Object.keys(criteria).length < 2 || Object.keys(criteria).length > maxChoiceOptions(model) ||
         Object.keys(criteria).some((key) => !/^[A-Za-z0-9_-]{1,64}$/.test(key)) ||
         Object.values(criteria).some((item) => item !== null && typeof item !== "string")) {
-        throw new SystemOneRequestError(`questions.${id}.criteria`, CHOICE_CRITERIA_HELP);
+        throw new SystemOneRequestError(`questions.${id}.criteria`, choiceCriteriaHelp(model));
       }
     } else if (type === "score") {
       if (!Array.isArray(criteria) || criteria.length < 2 || criteria.length > 10 ||

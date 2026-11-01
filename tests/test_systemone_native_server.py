@@ -5,6 +5,7 @@ import importlib.util
 import json
 import threading
 import unittest
+from contextlib import nullcontext
 from http.server import HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -115,6 +116,64 @@ class NativeBridgeTests(unittest.TestCase):
         self.assertEqual(schema["team"]["choice_descriptions"]["support"], "Technical help")
         self.assertEqual(schema["impact"]["choices"], ["0", "1", "2"])
         self.assertEqual(score_fields, ["impact"])
+
+    def test_nimble_schema_translation_preserves_all_255_choices(self):
+        criteria = {f"option-{index}": f"Option {index}" for index in range(255)}
+        schema, _ = bridge._schema_for_nimble({"route": {
+            "type": "choice", "instructions": "Select a route.", "criteria": criteria,
+        }})
+        self.assertEqual(schema["route"]["choices"], list(criteria))
+        self.assertEqual(schema["route"]["choice_descriptions"], criteria)
+
+    def test_decider_bridge_passes_all_255_criteria_to_native_prepare_and_answer(self):
+        criteria = {f"option-{index}": f"Option {index}" for index in range(255)}
+        question = {"type": "choice", "instructions": "Select a route.", "criteria": criteria}
+        prepared_questions = []
+        answered_questions = []
+
+        class Probabilities:
+            def __truediv__(self, _temperature):
+                return self
+
+            def softmax(self, _dimension):
+                return self
+
+            def __getitem__(self, _index):
+                return self
+
+            def cpu(self):
+                return self
+
+            def tolist(self):
+                return [1 / 255] * 255
+
+        class FakeModel:
+            temperature = 1.0
+
+            def prepare(self, prompts, max_length):
+                self.asserted_max_length = max_length
+                prepared_questions.extend(prompts[0]["question"]["criteria"].items())
+                return SimpleNamespace(counts=[255], input_tokens=42)
+
+            def forward(self, _batch):
+                return Probabilities()
+
+        backend = bridge.DeciderBackend.__new__(bridge.DeciderBackend)
+        backend.model = FakeModel()
+        backend.torch = SimpleNamespace(inference_mode=nullcontext)
+
+        def answer(received_question, probabilities):
+            answered_questions.extend(received_question["criteria"].items())
+            self.assertEqual(len(probabilities), 255)
+            return {"type": "choice", "choice": "option-0"}
+
+        backend.answer = answer
+        answers, input_tokens = backend.decide("state", {"route": question})
+        self.assertEqual(backend.model.asserted_max_length, bridge.MAX_TOKENS_PER_QUESTION)
+        self.assertEqual(prepared_questions, list(criteria.items()))
+        self.assertEqual(answered_questions, list(criteria.items()))
+        self.assertEqual(answers["route"]["choice"], "option-0")
+        self.assertEqual(input_tokens, 42)
 
     def test_probability_mapping_matches_typed_gateway_contract(self):
         self.assertEqual(bridge._answer_from_probabilities(QUESTIONS["urgent"], {

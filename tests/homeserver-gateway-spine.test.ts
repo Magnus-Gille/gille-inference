@@ -914,6 +914,59 @@ describe("gateway spine — HTTP integration", () => {
     expect(lookupKey(minted.plaintextKey)!.creditsUsed).toBe(24);
   });
 
+  it("rejects malformed 255/256-choice boundary probes before any upstream request", async () => {
+    const minted = mintKey({
+      alias: `systemone-choice-boundary-${randomUUID()}`,
+      tier: "guest",
+      creditLimit: 1_000_000,
+    }, DEFAULTS);
+    const models = ["clef-flash", "bespoke-nimble-9b", "pplx-decider-v1-27b"];
+    const criteria255 = Object.fromEntries(Array.from({ length: 255 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    const criteria256 = Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    const inferenceCount = upstreamInferenceRequestCount;
+    const modelCount = upstreamModelRequestCount;
+    const call = (body: unknown) => fetch(url("/v1/systemone"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${minted.plaintextKey}` },
+      body: JSON.stringify(body),
+    });
+
+    for (const model of models) {
+      const shared = {
+        model,
+        state: "Local boundary validation probe.",
+        questions: {
+          wide: { type: "choice", instructions: "Choose one.", criteria: criteria255 },
+          invalid: { type: "score", instructions: "Score this.", criteria: [] },
+        },
+      };
+      const invalidSecond = await call(shared);
+      expect(invalidSecond.status).toBe(400);
+      expect(await invalidSecond.json()).toMatchObject({ error: {
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "questions",
+        message: "Score needs 2 to 10 level descriptions.",
+      } });
+      expect(upstreamInferenceRequestCount).toBe(inferenceCount);
+      expect(upstreamModelRequestCount).toBe(modelCount);
+
+      const oversizedFirst = await call({ ...shared, questions: {
+        ...shared.questions,
+        wide: { ...shared.questions.wide, criteria: criteria256 },
+      } });
+      expect(oversizedFirst.status).toBe(400);
+      expect(await oversizedFirst.json()).toMatchObject({ error: {
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "questions.wide.criteria",
+        message: expect.stringContaining("2 to 255"),
+      } });
+      expect(upstreamInferenceRequestCount).toBe(inferenceCount);
+      expect(upstreamModelRequestCount).toBe(modelCount);
+    }
+  });
+
   it("accepts System One bodies up to the raw-byte cap and rejects oversize bodies before billing", async () => {
     expect(SYSTEMONE_MAX_BODY_BYTES).toBe(256 * 1024);
     const minted = mintKey({

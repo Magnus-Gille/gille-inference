@@ -327,6 +327,9 @@
     <p style="margin-bottom:8px;font-size:12.5px">
       Availability requires an activated runtime and roster entry plus an explicit key grant.
       Requests accept up to 256&nbsp;KiB of UTF-8 JSON and at most 16 schema-valid questions.
+      Choice questions accept 2–255 options for Clef, Nimble and Decider. These are the configured
+      API ceilings backed by each model's pinned source contract, not evidence of decision quality
+      or runtime qualification. Unknown model IDs retain the legacy 26-option maximum.
       Nimble checks every complete prompt against its input bound before scoring. The default is
       8,192 tokens: Clef reserves one shared 8,192-token prompt, while Nimble and Decider
       reserve one bound per question. Nimble alone accepts optional
@@ -651,7 +654,10 @@ Content-Type: application/json
 EOF</pre>
         <p>
           A <span class="badge mono">choice</span> question needs a criteria <strong>object</strong>
-          with 2–26 named option keys. Each key must be 1–64 ASCII letters, numbers, hyphens or
+          with 2–255 named option keys for Clef, Nimble and Decider. These source-enforced ceilings
+          appear in the configured per-model API contract; they do not establish live qualification
+          or decision quality. Unknown model IDs retain the legacy 26-option maximum. Each key must
+          be 1–64 ASCII letters, numbers, hyphens or
           underscores (<span class="badge mono">^[A-Za-z0-9_-]{1,64}$</span>); each description must
           be a string or <span class="badge mono">null</span>. The question also needs non-empty
           <span class="badge mono">instructions</span>. The answer contains the selected
@@ -673,7 +679,8 @@ EOF</pre>
         <p>
           Example response; probabilities and token counts vary. A <span class="badge mono">400 invalid_request_error</span> means
           local JSON/schema validation failed (common mistakes are an array instead of a criteria
-          object, fewer than 2 or more than 26 options, invalid option keys, empty instructions, or
+          object, fewer than 2 or more than that model's maximum (255 for the three named decision
+          models, 26 for unknown models), invalid option keys, empty instructions, or
           unsupported fields). Other <span class="badge mono">400</span> envelopes, such as
           <span class="badge mono">model_not_found</span>, have a different cause. A
           <span class="badge mono">502</span> means the gateway could not return a valid upstream
