@@ -67,6 +67,8 @@ jobs:
         working-directory: upstream
         run: |
           git apply ../runtime-patches/llama-swap/instrumentation.patch
+          # Exercise status-field detection before the complete server contracts.
+          go test -mod=readonly -race -run '^TestClientClosedAccessLogStatus_MatchesOnlyStatusField$' ./internal/server
           go test -mod=readonly -race -run '^TestInstall' ./internal/server ./internal/process ./internal/event
           go test -mod=readonly -race -skip '^TestInstall' ./internal/installactivity ./internal/event ./internal/router/... ./internal/process ./internal/server
       - name: Build complete candidate including pinned UI dependencies

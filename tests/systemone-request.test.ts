@@ -36,6 +36,74 @@ describe("System One customer request", () => {
     expect(parseSystemOneBody(JSON.stringify(base)).body).toEqual(base);
   });
 
+  const wideChoiceModels = ["bespoke-nimble-9b", "clef-flash", "pplx-decider-v1-27b"];
+  it.each(wideChoiceModels.flatMap(model => [26, 27, 31, 255].map(count => [model, count] as const)))
+    ("accepts %s with %i choice options", (model, count) => {
+      const criteria = Object.fromEntries(Array.from({ length: count }, (_, i) => [`option-${i}`, `Option ${i}`]));
+      const req = parseSystemOneBody(JSON.stringify({ ...base, model, questions: {
+        route: { type: "choice", instructions: "Select the best route.", criteria },
+      } }));
+      expect(Object.keys((req.body.questions.route as { criteria: object }).criteria)).toHaveLength(count);
+      expect(systemOneModelContract(req.model).maxChoiceOptions).toBe(255);
+    });
+
+  it.each(wideChoiceModels)("rejects 256 choice options for %s with model-specific guidance", model => {
+    const criteria = Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    try {
+      parseSystemOneBody(JSON.stringify({ ...base, model, questions: {
+        route: { type: "choice", instructions: "Select the best route.", criteria },
+      } }));
+      expect.fail("256 choices were accepted");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SystemOneRequestError);
+      expect((error as Error).message).toContain("2 to 255");
+    }
+  });
+
+  it.each(["future-decision-model"])("keeps the legacy 26-choice cap for %s", model => {
+    const criteria = Object.fromEntries(Array.from({ length: 27 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    expect(systemOneModelContract(model).maxChoiceOptions).toBe(26);
+    try {
+      parseSystemOneBody(JSON.stringify({ ...base, model, questions: {
+        route: { type: "choice", instructions: "Select the best route.", criteria },
+      } }));
+      expect.fail(`27 choices were accepted for ${model}`);
+    } catch (error) {
+      expect(error).toBeInstanceOf(SystemOneRequestError);
+      expect((error as Error).message).toContain("2 to 26");
+    }
+  });
+
+  it.each(wideChoiceModels)("rejects a later malformed score after 255 valid choices for %s", model => {
+    const criteria = Object.fromEntries(Array.from({ length: 255 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    try {
+      parseSystemOneBody(JSON.stringify({ ...base, model, questions: {
+        wide: { type: "choice", instructions: "Select a route.", criteria },
+        invalid: { type: "score", instructions: "Score this.", criteria: [] },
+      } }));
+      expect.fail("malformed second question was accepted");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SystemOneRequestError);
+      expect((error as SystemOneRequestError).param).toBe("questions");
+      expect((error as Error).message).toContain("Score needs 2 to 10");
+    }
+  });
+
+  it.each(wideChoiceModels)("rejects an oversized first choice before later validation for %s", model => {
+    const criteria = Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    try {
+      parseSystemOneBody(JSON.stringify({ ...base, model, questions: {
+        wide: { type: "choice", instructions: "Select a route.", criteria },
+        invalid: { type: "score", instructions: "Score this.", criteria: [] },
+      } }));
+      expect.fail("256 choice options were accepted");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SystemOneRequestError);
+      expect((error as SystemOneRequestError).param).toBe("questions.wide.criteria");
+      expect((error as Error).message).toContain("2 to 255");
+    }
+  });
+
   it.each([
     { criteria: ["billing", "support"] },
     { choices: ["billing", "support"] },
@@ -108,6 +176,19 @@ describe("System One upstream response", () => {
     expect(systemOneModelContract("clef-flash")).toMatchObject({ contextScope: "shared_request", maxQuestions: 16, inputTokenLimitSupported: false });
     expect(systemOneModelContract("bespoke-nimble-9b")).toMatchObject({ contextScope: "per_question", inputTokenLimitSupported: true,
       qualification: "configured_not_measured" });
+  });
+
+  it.each(["bespoke-nimble-9b", "clef-flash", "pplx-decider-v1-27b"])("validates a complete 31-option distribution for %s", model => {
+    const criteria = Object.fromEntries(Array.from({ length: 31 }, (_, i) => [`option-${i}`, `Option ${i}`]));
+    const nimble = parseSystemOneBody(JSON.stringify({ ...base, model,
+      ...(model === "bespoke-nimble-9b" ? { input_token_limit: 8192 } : {}),
+      questions: { route: { type: "choice", instructions: "Select the best route.", criteria } } }));
+    expect(systemOneTokenReservation(nimble)).toBe(8192);
+    const probabilities = Object.fromEntries(Object.keys(criteria).map((key, i) => [key, i === 0 ? 1 : 0]));
+    expect(validateSystemOneResponse({ answers: { route: { type: "choice", choice: "option-0", probabilities,
+      confidence: 1 } }, usage: { input_tokens: 8192, output_tokens: 0 } }, nimble)).toBe(8192);
+    expect(() => validateSystemOneResponse({ answers: { route: { type: "choice", choice: "option-0", probabilities,
+      confidence: 1 } }, usage: { input_tokens: 8193, output_tokens: 0 } }, nimble)).toThrow(SystemOneResponseError);
   });
 
   it.each([

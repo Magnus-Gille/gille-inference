@@ -202,11 +202,15 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /admin/maintenance/window` | **admin** | Content-blind status for the server-owned exclusive window. Returns `{active,evidence}` and never returns its opaque release token. |
 | `POST /admin/maintenance/window` | **admin** | `{action:"open",ttlSeconds,drainTimeoutSeconds?}` makes the isolated gateway identity acquire the canonical GPU lease, fences both lanes, drains admitted/queued work, and verifies a stable non-starting llama-swap snapshot before returning `{token,evidence}`. `{action:"close",token}` releases the lease and restores admission. TTL and disconnect cleanup are independent recovery paths (#196). |
 
-For `choice`, supply `criteria` as an object with 2–26 named options, for example
+For `choice`, supply `criteria` as an object with 2–255 named options for Clef, Nimble, and Decider,
+for example
 `{"billing":"Payment issue","support":"Technical issue"}`. Read the selected key from
 `answers.<question-id>.choice`; `probabilities` uses the same keys. The portal and
 [customer contract](../../docs/systemone-customer-access.md) include a complete request,
 illustrative response and troubleshooting for invalid criteria and upstream failures.
+The 255-option ceiling is source-enforced upstream for these three pinned decision models and
+exposed through the configured per-model API contract. This does not qualify runtime availability,
+context, or decision quality; unknown model IDs retain the legacy 26-option API maximum.
 
 
 `GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...}}` when the backend snapshot is

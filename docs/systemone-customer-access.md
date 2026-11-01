@@ -70,7 +70,11 @@ spec, enabled setting, or source checkout alone does not grant access or establi
   Owner keys with an empty ordinary allow-list can run release checks before guest access is granted.
 - Request: `model`, a text or JSON-object `state`, and 1–16 named `questions`. Each question has
   `type` (`noul`, `choice`, or `score`) and `instructions`; `choice` needs a criteria object with
-  2–26 named options. Each option key must match `^[A-Za-z0-9_-]{1,64}$`, and each option
+  2–255 named options for Clef, Nimble, and Decider. The three source-enforced 255 ceilings are
+  exposed as the configured per-model API contract; they do not establish live qualification or
+  decision quality. Unknown model IDs retain the legacy 26-option API maximum. See
+  [decision choice limits](decision-choice-limits.md) for pinned-source evidence and scope. Each option key must match
+  `^[A-Za-z0-9_-]{1,64}$`, and each option
   description must be a string or `null`. `score` needs 2–10 ordered labels. The gateway accepts
   at most 256 KiB (262,144 bytes) of UTF-8 request JSON, including state, questions and formatting.
   This is a transport-size bound, not a token allowance. Nimble checks every complete prompt against
@@ -211,8 +215,9 @@ set `HS_KEY` in the shell first. A choice response has the selected option in
 }
 ```
 
-Common `400` errors are a criteria array instead of an object, fewer than 2 or more than 26
-options, invalid ASCII option keys, non-string/non-null descriptions, empty instructions, or
+Common `400` errors are a criteria array instead of an object, fewer than 2 or more than the
+selected model's configured choice-option maximum (255 for the three named decision models, 26
+for unknown models), invalid ASCII option keys, non-string/non-null descriptions, empty instructions, or
 unsupported fields. A `400 invalid_request_error` is request syntax/schema validation; another
 `400` code such as `model_not_found` has a different cause. A `502` means the gateway could not
 return a valid upstream decision; the status alone does not prove that the request JSON caused the
