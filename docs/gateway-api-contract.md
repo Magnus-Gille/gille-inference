@@ -222,7 +222,8 @@ and `billable_input_tokens` must equal `input_tokens - (question_count - 1) *
 shared_prefix_tokens`. TPM/daily resource-quota admission reserves the conservative maximum, then reconciles to exact compute usage;
 the shared-prefix value changes lifetime credit accounting only. It is not a compute-savings claim.
 Legacy adapters omitting the metadata bill raw input, and Decider remains raw-input billing.
-Rejected or failed calls charge zero credits. Native context rejection is normalized to
+Rejected or failed calls charge zero credits. Native context rejection, and Clef's llama.cpp
+rejection of a prompt above its 8,192-token batch, are normalized to
 `400 context_length_exceeded`; temporary backend busy is `503 server_busy` with
 `Retry-After`; timeout is `504 upstream_timeout`. Bounded-jitter retries are
 permitted for retryable failures, but clients must not retry `402 credits_exhausted` or
