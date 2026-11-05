@@ -553,7 +553,9 @@ describe("gateway spine — HTTP integration", () => {
     const [model, scenario] = mode.startsWith("nimble:") ? ["bespoke-nimble-9b", mode.slice(7)] : ["clef-flash", mode];
     mockMode = scenario;
     const key = mintKey({ alias: `clef-overflow-${randomUUID()}`, tier: "guest", modelAllowList: [model], creditLimit: 100000 }, DEFAULTS);
+    const before = upstreamInferenceRequestCount;
     const result = await decisionCall(key.plaintextKey, model === "clef-flash" ? decisionBody(1, model) : { ...decisionBody(1, model), input_token_limit: 2048 });
+    expect(upstreamInferenceRequestCount).toBe(before + 1); // the mocked upstream response was actually exercised
     expect(result.status).toBe(status);
     const text = await result.text();
     const error = JSON.parse(text).error;

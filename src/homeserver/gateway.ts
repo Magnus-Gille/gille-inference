@@ -1598,11 +1598,14 @@ async function handleSystemOneProxy(
   }
 }
 
-// Pinned llama.cpp (d81235049384534c167caea52b85a694f6103d14, tools/server/server-context.cpp) checks a
-// non-splittable decision prompt against n_ubatch before n_ctx and answers HTTP 500 server_error. Clef
-// is served with ubatch = ctx = the 8,192-token contract, so only that exact message, reporting more input
-// tokens than the contract and a batch at least as large as the contract, is a caller-side overflow.
-// Any other 500 stays a sanitized upstream failure (INFER-509).
+// Pinned llama.cpp (d81235049384534c167caea52b85a694f6103d14, tools/server/server-context.cpp): when a task
+// needs embeddings and the context has no memory module (can_split() is false: need_embd() &&
+// !llama_get_memory), the prompt is checked against n_ubatch before n_ctx and rejected with HTTP 500
+// server_error. Clef's reviewed template sets ubatch = ctx = the 8,192-token contract, so only that exact
+// message, reporting more input tokens than the contract and a batch at least as large as the contract, is
+// a caller-side overflow. Any other 500 stays a sanitized upstream failure; a runtime or template change
+// that moves Clef to the split path falls back to the existing 400 exceed_context_size_error mapping or
+// to 502, never to a false 400 (INFER-509).
 const LLAMA_UBATCH_OVERFLOW = /^input \((\d{1,9}) tokens\) is too large to process\. increase the physical batch size \(current batch size: (\d{1,9})\)$/;
 
 function isLlamaUbatchContextOverflow(error: { type?: unknown; message?: unknown } | undefined, contractTokens: number): boolean {
