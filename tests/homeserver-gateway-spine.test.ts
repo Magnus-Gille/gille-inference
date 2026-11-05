@@ -151,6 +151,36 @@ function startUpstream(): Promise<void> {
           res.end(JSON.stringify({ error: { code: mockMode === "systemone-context" ? "context_length_exceeded" : "secret-backend-detail", type: mockMode === "systemone-llama-context" ? "exceed_context_size_error" : "server_error", message: "/private/model/prompt" } }));
           return;
         }
+        // Pinned llama.cpp d8123504 rejects a non-splittable decision prompt above n_ubatch with HTTP 500
+        // server_error before its context check (INFER-509). Bodies mirror format_error_response.
+        const ubatch: Record<string, [number, string, string]> = {
+          "systemone-clef-ubatch": [500, "application/json; charset=utf-8",
+            JSON.stringify({ error: { code: 500, message: "input (8590 tokens) is too large to process. increase the physical batch size (current batch size: 8192)", type: "server_error" } })],
+          "systemone-ubatch-within-contract": [500, "application/json; charset=utf-8",
+            JSON.stringify({ error: { code: 500, message: "input (5000 tokens) is too large to process. increase the physical batch size (current batch size: 4096)", type: "server_error" } })],
+          "systemone-server500": [500, "application/json; charset=utf-8",
+            JSON.stringify({ error: { code: 500, message: "/private/model/prompt failed", type: "server_error" } })],
+          "systemone-ubatch-html": [500, "text/html",
+            "<html>input (8590 tokens) is too large to process. increase the physical batch size (current batch size: 8192) /private/model/prompt</html>"],
+          "systemone-ubatch-batch-below-contract": [500, "application/json",
+            JSON.stringify({ error: { code: 500, message: "input (9000 tokens) is too large to process. increase the physical batch size (current batch size: 8191)", type: "server_error" } })],
+          "systemone-ubatch-at-contract": [500, "application/json",
+            JSON.stringify({ error: { code: 500, message: "input (8192 tokens) is too large to process. increase the physical batch size (current batch size: 8192)", type: "server_error" } })],
+          "systemone-ubatch-just-over": [500, "application/json",
+            JSON.stringify({ error: { code: 500, message: "input (8193 tokens) is too large to process. increase the physical batch size (current batch size: 8192)", type: "server_error" } })],
+          "systemone-ubatch-trailing": [500, "application/json",
+            JSON.stringify({ error: { code: 500, message: "input (8590 tokens) is too large to process. increase the physical batch size (current batch size: 8192) /private/model/prompt", type: "server_error" } })],
+          "systemone-ubatch-oversized": [500, "application/json",
+            JSON.stringify({ error: { code: 500, message: "input (8590 tokens) is too large to process. increase the physical batch size (current batch size: 8192)", type: "server_error", detail: "x".repeat(5000) } })],
+          "systemone-ubatch-wrongtype": [500, "application/json",
+            JSON.stringify({ error: { code: 500, message: "input (8590 tokens) is too large to process. increase the physical batch size (current batch size: 8192)", type: "invalid_request_error" } })],
+        };
+        if (ubatch[mockMode]) {
+          const [status, type, body] = ubatch[mockMode]!;
+          res.writeHead(status, { "content-type": type });
+          res.end(body);
+          return;
+        }
         if (mockMode === "systemone-batch" || mockMode === "systemone-bad-billing") {
           const body = JSON.parse(lastUpstreamBody) as { questions: Record<string, unknown> };
           const n = Object.keys(body.questions).length;
@@ -505,6 +535,53 @@ describe("gateway spine — HTTP integration", () => {
     const me = await (await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${key.plaintextKey}` } })).json() as any;
     expect(me.quota.snapshot.tpmUsed).toBe(0);
     if (status === 503 || status === 504) expect(result.headers.get("retry-after")).toBe("2");
+  });
+
+  it.each([
+    ["systemone-clef-ubatch", 400, "context_length_exceeded"],
+    ["systemone-ubatch-within-contract", 502, "upstream_unavailable"],
+    ["systemone-server500", 502, "upstream_unavailable"],
+    ["systemone-ubatch-html", 502, "upstream_unavailable"],
+    ["systemone-ubatch-wrongtype", 502, "upstream_unavailable"],
+    ["systemone-ubatch-batch-below-contract", 502, "upstream_unavailable"],
+    ["systemone-ubatch-at-contract", 502, "upstream_unavailable"],
+    ["systemone-ubatch-just-over", 400, "context_length_exceeded"],
+    ["systemone-ubatch-trailing", 502, "upstream_unavailable"],
+    ["systemone-ubatch-oversized", 502, "upstream_unavailable"],
+    ["nimble:systemone-clef-ubatch", 502, "upstream_unavailable"],
+  ] as const)("maps upstream %s to a closed %i without leaking upstream text or charging", async (mode, status, code) => {
+    const [model, scenario] = mode.startsWith("nimble:") ? ["bespoke-nimble-9b", mode.slice(7)] : ["clef-flash", mode];
+    mockMode = scenario;
+    const key = mintKey({ alias: `clef-overflow-${randomUUID()}`, tier: "guest", modelAllowList: [model], creditLimit: 100000 }, DEFAULTS);
+    const result = await decisionCall(key.plaintextKey, model === "clef-flash" ? decisionBody(1, model) : { ...decisionBody(1, model), input_token_limit: 2048 });
+    expect(result.status).toBe(status);
+    const text = await result.text();
+    const error = JSON.parse(text).error;
+    expect(error.code).toBe(code);
+    expect(text).not.toContain("/private/model/prompt");
+    expect(text).not.toContain("physical batch size");
+    expect(result.headers.get("retry-after")).toBeNull();
+    if (status === 400) {
+      expect(error.type).toBe("invalid_request_error");
+      const row = getDb().prepare("SELECT outcome FROM request_log WHERE alias = ? AND route = '/v1/systemone' ORDER BY rowid DESC LIMIT 1")
+        .get(key.record.alias) as { outcome: string };
+      expect(row.outcome).toBe("bad_request");
+    }
+    expect(lookupKey(key.plaintextKey)!.creditsUsed).toBe(0);
+    const me = await (await fetch(url("/portal/me"), { headers: { authorization: `Bearer ${key.plaintextKey}` } })).json() as any;
+    expect(me.quota.snapshot.tpmUsed).toBe(0);
+  });
+
+  it("does not count a Clef context overflow toward the per-model failure pause", async () => {
+    mockMode = "systemone-clef-ubatch";
+    const key = mintKey({ alias: `clef-overflow-pause-${randomUUID()}`, tier: "guest", modelAllowList: ["clef-flash"], creditLimit: 100000 }, DEFAULTS);
+    // The pause opens after three counted failures; four overflows must all still reach upstream.
+    const before = upstreamInferenceRequestCount;
+    for (let i = 0; i < 4; i++) {
+      const r = await decisionCall(key.plaintextKey, decisionBody(1, "clef-flash"));
+      expect((await r.json() as any).error.code).toBe("context_length_exceeded");
+    }
+    expect(upstreamInferenceRequestCount).toBe(before + 4);
   });
 
   it("pauses repeated System One failures only for the affected key/model", async () => {

@@ -120,7 +120,8 @@ shared-prefix value changes lifetime credit billing only. It is not a compute-sa
 Legacy adapters that omit the metadata bill the raw input count, and Decider remains raw-input
 billing. A malformed or inconsistent usage response is rejected and charged zero.
 
-An upstream native context rejection is sanitized to `400 context_length_exceeded`; temporary
+An upstream context rejection, including Clef's rejection of a prompt above 8,192 tokens, is
+sanitized to `400 context_length_exceeded` and charges zero; temporary
 backend unavailability is `503 server_busy` with `Retry-After`; a timeout is `504
 upstream_timeout` with retry guidance. Clients may retry retryable failures with bounded jitter,
 but must not retry `402 credits_exhausted` and must not automatically replay a request whose

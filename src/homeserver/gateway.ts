@@ -1556,8 +1556,10 @@ async function handleSystemOneProxy(
     });
     // Project a closed code only; never forward upstream messages or HTML.
     if (!upstream.ok) {
-      const contextError = upstream.status === 400 && await isSystemOneContextError(upstream);
-      if (upstream.status !== 400) await upstream.body?.cancel();
+      // Only Clef's reviewed template (ubatch = ctx = contract) gives a 500 that can mean "input too large".
+      const inspectable = upstream.status === 400 || (upstream.status === 500 && req.model === "clef-flash");
+      const contextError = inspectable && await isSystemOneContextError(upstream, systemOneModelContract(req.model).contextTokens);
+      if (!inspectable) await upstream.body?.cancel();
       const code = contextError ? "context_length_exceeded" : upstream.status === 404 ? "model_not_found" :
         upstream.status === 503 ? "server_busy" : upstream.status === 504 ? "upstream_timeout" : "upstream_unavailable";
       const envelope = makeError(code, code === "server_busy" || code === "upstream_timeout"
@@ -1596,7 +1598,23 @@ async function handleSystemOneProxy(
   }
 }
 
-async function isSystemOneContextError(response: Response): Promise<boolean> {
+// Pinned llama.cpp (d81235049384534c167caea52b85a694f6103d14, tools/server/server-context.cpp) checks a
+// non-splittable decision prompt against n_ubatch before n_ctx and answers HTTP 500 server_error. Clef
+// is served with ubatch = ctx = the 8,192-token contract, so only that exact message, reporting more input
+// tokens than the contract and a batch at least as large as the contract, is a caller-side overflow.
+// Any other 500 stays a sanitized upstream failure (INFER-509).
+const LLAMA_UBATCH_OVERFLOW = /^input \((\d{1,9}) tokens\) is too large to process\. increase the physical batch size \(current batch size: (\d{1,9})\)$/;
+
+function isLlamaUbatchContextOverflow(error: { type?: unknown; message?: unknown } | undefined, contractTokens: number): boolean {
+  if (error?.type !== "server_error" || typeof error.message !== "string") return false;
+  const match = LLAMA_UBATCH_OVERFLOW.exec(error.message);
+  if (!match) return false;
+  // llama.cpp reports the whole task's tokens; Clef evaluates all questions in one shared prompt.
+  const inputTokens = Number(match[1]), batchTokens = Number(match[2]);
+  return inputTokens > contractTokens && batchTokens >= contractTokens;
+}
+
+async function isSystemOneContextError(response: Response, contractTokens: number): Promise<boolean> {
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     await response.body?.cancel(); return false;
   }
@@ -1610,7 +1628,8 @@ async function isSystemOneContextError(response: Response): Promise<boolean> {
       if (bytes > 4096) { await reader.cancel(); return false; }
       chunks.push(value);
     }
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { error?: { code?: unknown; type?: unknown } };
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { error?: { code?: unknown; type?: unknown; message?: unknown } };
+    if (response.status === 500) return isLlamaUbatchContextOverflow(body?.error, contractTokens);
     // Pinned llama.cpp exposes the closed type for context overflows; native adapters use code.
     return body?.error?.code === "context_length_exceeded" || body?.error?.type === "exceed_context_size_error";
   } catch (error) {

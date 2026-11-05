@@ -306,7 +306,8 @@ provided, `shared_prefix_tokens` is the longest common token prefix and
 resource-quota admission uses the conservative reservation; this changes lifetime credit billing
 only and is not a compute-savings claim. Legacy adapters without
 the metadata bill raw input; Decider remains raw-input billing. Failed calls charge zero credits.
-Native context rejection is sanitized to `400 context_length_exceeded`; temporary backend busy
+Native context rejection, and Clef's llama.cpp rejection of a prompt above its 8,192-token batch,
+are sanitized to `400 context_length_exceeded`; temporary backend busy
 is `503 server_busy` with `Retry-After`; timeout is `504 upstream_timeout`.
 Use bounded jitter for retryable failures, never retry `402 credits_exhausted`, and never
 automatically replay an unknown response outcome. A pre-admission maximum-reservation refusal is
