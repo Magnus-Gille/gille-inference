@@ -142,7 +142,7 @@ credential through an approved channel; no token input or provisioning command i
 added here. An on-box agent account that should only delegate small leaves gets an `owner` /
 `ask` credential (`keys mint --tier owner --scope ask`, INFER-450): MCP `ask`, `list_models`,
 `model_status` and `tokenize` only, with no `code_loop`, `/delegate`, `ask.files`, ordinary `/v1`
-inference, or admin/residency route; use an `agent` credential only where `code_loop` is intended. The [Linux credential contract](../client/README.md#managed-linux-agent-credentials)
+inference, or admin/residency route; use an `agent` credential only where `code_loop` is intended. Always mint `ask` keys with `--models` and `--credits`/quota limits: they are owner tier, so their prompts enter owner content logs and get owner-priority admission. Before rolling the gateway back below this version, run `keys revoke --scope ask --confirm` (older builds would read the row as owner `inference`). The [Linux credential contract](../client/README.md#managed-linux-agent-credentials)
 defines ownership, modes, size, symlink and hardlink checks. Missing and unsafe files fail closed
 before gateway access, with locator-free diagnostics and no fallback to another profile or store.
 The explicit `doctor --check-latest` option can still query the public package registry without credentials.

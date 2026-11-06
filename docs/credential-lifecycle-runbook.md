@@ -41,6 +41,20 @@ active admin keys. Static fallback credentials cannot carry lifecycle metadata a
 reported as `not_inspected`; migrate them to minted scoped keys through the normal backed-up
 deployment procedure without copying their values into an inventory command.
 
+## Rolling the gateway back below the `ask` scope
+
+**Mandatory before rolling back below the `ask`-scope version (INFER-450).** A gateway build
+without the `ask` scope reads a stored owner `ask` row as owner `inference`, silently re-enabling
+`ask.files` and ordinary `/v1` inference for that key. Revoke every `ask` key first and verify:
+
+```bash
+npx tsx src/homeserver/cli.ts keys revoke --scope ask             # dry-run: lists aliases and count
+npx tsx src/homeserver/cli.ts keys revoke --scope ask --confirm   # one transaction, soft-revoke
+npx tsx src/homeserver/cli.ts keys inventory --scope ask          # must show no active keys
+```
+
+Re-mint `ask` keys only after rolling forward again.
+
 ## Staged consumer migration
 
 Work through one logical consumer at a time. Do not revoke first and do not place a credential in

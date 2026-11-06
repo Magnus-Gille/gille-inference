@@ -567,6 +567,30 @@ export function revokeKey(alias: string, now: Date = new Date()): boolean {
   return info.changes > 0;
 }
 
+/**
+ * Soft-revoke EVERY active key whose resolved scope is `scope`, in one transaction (INFER-450
+ * rollback guard: a pre-`ask` build reads a stored `ask` row as owner `inference`, so `ask` keys
+ * must be revoked before rolling back below that version). With `dryRun` nothing is written.
+ * Returns aliases only — never hashes or plaintext.
+ */
+export function revokeKeysByScope(
+  scope: KeyScope,
+  opts: { dryRun?: boolean; now?: Date } = {}
+): { aliases: string[]; revoked: boolean } {
+  const db = ksDb();
+  const ts = (opts.now ?? new Date()).toISOString();
+  const run = db.transaction(() => {
+    const rows = (db.prepare(`SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`).all() as KeyRow[])
+      .map(rowToRecord)
+      .filter((key) => key.scope === scope);
+    if (opts.dryRun !== false) return { aliases: rows.map((r) => r.alias), revoked: false };
+    const stmt = db.prepare(`UPDATE api_keys SET revoked_at = @ts WHERE alias = @alias AND revoked_at IS NULL`);
+    for (const row of rows) stmt.run({ alias: row.alias, ts });
+    return { aliases: rows.map((r) => r.alias), revoked: true };
+  });
+  return run();
+}
+
 // ─── Rotate (#99) ───────────────────────────────────────────────────────────────────
 
 export interface RotateResult extends MintResult {
@@ -1199,6 +1223,8 @@ export interface CredentialInventoryOptions {
   now?: Date;
   staleAfterDays?: number;
   includeRevoked?: boolean;
+  /** Only report keys whose resolved scope matches (summary counts reflect the filter). */
+  scope?: KeyScope;
 }
 
 function credentialInventoryFromDb(
@@ -1212,7 +1238,8 @@ function credentialInventoryFromDb(
   const sql = opts.includeRevoked
     ? `SELECT * FROM api_keys ORDER BY created_at`
     : `SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`;
-  const source = (db.prepare(sql).all() as KeyRow[]).map(rowToRecord);
+  const source = (db.prepare(sql).all() as KeyRow[]).map(rowToRecord)
+    .filter((key) => opts.scope === undefined || key.scope === opts.scope);
 
   const all = source.map((key): CredentialInventoryEntry => {
     const expired = key.expiresAt !== null && Date.parse(key.expiresAt) <= now.getTime();

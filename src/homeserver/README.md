@@ -96,6 +96,8 @@ tsx src/homeserver/cli.ts keys mint --alias claude-agent --tier owner --scope ag
 tsx src/homeserver/cli.ts keys mint --alias guest1 --tier guest --models qwen3-coder --rpm 30 --daily 200000
 tsx src/homeserver/cli.ts keys list
 tsx src/homeserver/cli.ts keys revoke --alias guest1
+tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # bulk; dry-run unless --confirm. Mandatory before rolling back below the ask-scope version
+tsx src/homeserver/cli.ts keys inventory --scope ask
 
 # Rotate a leaked/refreshed key in ONE step (#99): revokes the active key for the name and mints a
 # fresh one, inheriting its tier + scope + limits. Do NOT `revoke A` then `mint A` — `alias` is the PRIMARY

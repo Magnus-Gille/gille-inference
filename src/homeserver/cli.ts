@@ -24,6 +24,7 @@ import {
   credentialInventoryReadOnly,
   listKeys,
   revokeKey,
+  revokeKeysByScope,
   KeyAliasExistsError,
   createInvite,
   listInvites,
@@ -445,13 +446,14 @@ export function cmdKeys(args: ParsedArgs): void {
   // Inventory is deliberately separate from every mutating command: it must remain usable when
   // the production database is mounted read-only, and it must not load static fallback values.
   if (sub === "inventory") {
-    const allowed = new Set(["all", "stale-days", "json"]);
+    const allowed = new Set(["all", "stale-days", "json", "scope"]);
     for (const name of Object.keys(args.flags)) {
       if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
     }
     const report = credentialInventoryReadOnly({
       includeRevoked: args.flags["all"] === true,
       staleAfterDays: strictNumFlag(args.flags, "stale-days"),
+      scope: strictScopeFlag(args.flags),
     });
     if (args.flags["json"] === true) {
       console.log(JSON.stringify({ ...report, legacyStaticCredentialCounts: "not_inspected" }, null, 2));
@@ -684,8 +686,25 @@ export function cmdKeys(args: ParsedArgs): void {
   }
 
   if (sub === "revoke") {
+    if ("scope" in args.flags) {
+      // Bulk revoke by scope (INFER-450 rollback guard). Dry-run unless --confirm is exactly set.
+      for (const name of Object.keys(args.flags)) {
+        if (!["scope", "confirm", "dry-run"].includes(name)) throw new Error(`keys revoke --scope: unknown flag --${name}`);
+      }
+      if (args.positional.length > 1) throw new Error("keys revoke --scope takes no alias");
+      const scope = strictScopeFlag(args.flags)!;
+      const confirm = args.flags["confirm"] === true;
+      if (confirm && "dry-run" in args.flags) throw new Error("keys revoke --scope: --confirm and --dry-run are mutually exclusive");
+      const result = revokeKeysByScope(scope, { dryRun: !confirm });
+      console.log(
+        `${confirm ? "revoked" : "dry-run: would revoke"} ${result.aliases.length} active '${scope}' key(s)` +
+        (result.aliases.length > 0 ? `: ${result.aliases.join(", ")}` : "")
+      );
+      if (!confirm) console.log("re-run with --confirm to apply; verify with `keys inventory --scope " + scope + "`");
+      return;
+    }
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : args.positional[1];
-    if (!alias) throw new Error("usage: keys revoke --alias A");
+    if (!alias) throw new Error("usage: keys revoke --alias A | keys revoke --scope S [--confirm]");
     const ok = revokeKey(alias);
     console.log(ok ? `✓ revoked '${alias}'` : `✗ no such active key '${alias}'`);
     return;
@@ -1061,7 +1080,8 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias box-agent --tier owner --scope ask --models mellum --credits 200000   # MCP ask only (INFER-450)\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
-          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30\n" +
+          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30 [--scope ask]\n" +
+          "  tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # dry-run unless --confirm; REQUIRED before rolling the gateway back below the ask-scope version\n" +
           "  tsx src/homeserver/cli.ts keys stage --alias harness --scope agent --overlap 3600\n" +
           "  tsx src/homeserver/cli.ts keys preflight --plan rot_...\n" +
           "  tsx src/homeserver/cli.ts keys commit --plan rot_...\n" +
