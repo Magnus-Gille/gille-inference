@@ -5,6 +5,7 @@ import {
   reconcileCompletionIdentity,
   ServedIdentityGuard,
   identitySubject,
+  rosterIdentityOf,
   ServedIdentityMismatchError,
   unknownAliasRosterIds,
 } from "./served-model-identity.js";
@@ -1699,7 +1700,13 @@ async function handleChatProxy(
   // INFER-343: identity checks, alias lookup and the shadow metric all use this ONE canonical
   // roster ID (null when the request did not name a roster ID we can vouch for -> not checked).
   // enforce falls back to the requested string when unresolved (never forwards an unverified identity).
-  const rosterId = identitySubject(cfg.servedModelIdentity, lctx.model, parsed.model);
+  const idSubject = identitySubject(cfg.servedModelIdentity, lctx.model, parsed.model);
+  // Only the RESOLVED roster ID may label the shadow metric; the client-supplied request string
+  // (used as the enforce fallback subject) never becomes a label or a log field.
+  const metricRosterId = rosterIdentityOf(lctx.model);
+  const countShadowMismatch = (): void => {
+    if (metricRosterId !== null) recordServedModelMismatchShadow(metricRosterId);
+  };
   // OWNER-ONLY full request log. The guard is strictly owner-tier AND a real minted key
   // (keyHash !== null), which excludes legacy static admins (keyHash null). Guests are never
   // content-logged. See owner-log.ts for the full rationale. The exposure digest is content-blind
@@ -2110,12 +2117,12 @@ async function handleChatProxy(
         else degenerateGone.signal.addEventListener("abort", onDegenerate, { once: true });
         // INFER-343: verify/canonicalize every frame's `model` before it reaches the client.
         let relay: NodeJS.ReadableStream = nodeStream;
-        if (rosterId !== null && cfg.servedModelIdentity !== "off") {
+        if (idSubject.kind !== "skip" && cfg.servedModelIdentity !== "off") {
           const guard = new ServedIdentityGuard(
-            rosterId,
+            idSubject,
             cfg.servedModelAliases,
             cfg.servedModelIdentity,
-            () => recordServedModelMismatchShadow(rosterId),
+            countShadowMismatch,
           );
           guard.on("error", (guardErr) => {
             nodeStream.destroy();
@@ -2366,8 +2373,8 @@ async function handleChatProxy(
 
   // INFER-343: the body's `model` must be the requested roster ID, a declared alias of it
   // (rewritten to the roster ID), or absent. Anything else is withheld and billed zero.
-    const identity = reconcileCompletionIdentity(text, rosterId, cfg.servedModelAliases, cfg.servedModelIdentity);
-    if (identity.kind === "mismatch_shadow") recordServedModelMismatchShadow(rosterId);
+    const identity = reconcileCompletionIdentity(text, idSubject, cfg.servedModelAliases, cfg.servedModelIdentity);
+    if (identity.kind === "mismatch_shadow") countShadowMismatch();
     if (identity.kind === "mismatch") {
       lctx.status = 502;
       lctx.outcome = "upstream_model_mismatch";

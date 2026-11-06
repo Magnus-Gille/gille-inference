@@ -85,23 +85,45 @@ export function rosterIdentityOf(canonical: string | null | undefined): string |
 }
 
 /**
- * The identity an enforce/shadow check is made against.
- *  - A resolved roster ID is always the subject (all modes).
+ * What a response's `model` is checked against.
+ *  - `check`: a concrete identity (the resolved roster ID, or in enforce the requested string).
+ *  - `unverifiable` (enforce only): nothing usable was requested and no roster ID resolved, so no
+ *    reported `model` can be verified; any present value fails closed, absent/null passes.
+ *  - `skip`: no check (off; shadow with an unresolved roster ID so it adds no false positives).
+ */
+export type IdentitySubject =
+  | { kind: "check"; id: string }
+  | { kind: "unverifiable" }
+  | { kind: "skip" };
+
+/** Accepts a plain string / null for convenience (string -> check, null -> skip). */
+export function asIdentitySubject(subject: IdentitySubject | string | null): IdentitySubject {
+  if (subject === null) return { kind: "skip" };
+  return typeof subject === "string" ? { kind: "check", id: subject } : subject;
+}
+
+/**
+ * The subject an enforce/shadow check is made against.
+ *  - A resolved roster ID is always the subject (all checking modes).
  *  - Unresolved (cold/stale catalogue, unrecognised spelling): `enforce` NEVER forwards an
- *    unverified identity, so it falls back to the requested string exactly as sent (exact match, or
- *    an alias declared for that exact string; anything else is a mismatch). `shadow` skips the check
- *    (null) so false positives stay out of the rollout signal; `off` never checks.
+ *    unverified identity, so it checks the requested string exactly as sent (exact match, or an alias
+ *    declared for that exact string; anything else is a mismatch). With no usable requested string it
+ *    is `unverifiable`. `shadow` skips; `off` never checks.
  */
 export function identitySubject(
   mode: ServedModelIdentityMode,
   canonical: string | null | undefined,
   requested: string | null | undefined,
-): string | null {
-  if (mode === "off") return null;
+): IdentitySubject {
+  if (mode === "off") return { kind: "skip" };
   const roster = rosterIdentityOf(canonical);
-  if (roster !== null) return roster;
-  if (mode === "enforce" && typeof requested === "string" && requested !== "") return requested;
-  return null;
+  if (roster !== null) return { kind: "check", id: roster };
+  if (mode === "enforce") {
+    return typeof requested === "string" && requested !== ""
+      ? { kind: "check", id: requested }
+      : { kind: "unverifiable" };
+  }
+  return { kind: "skip" };
 }
 
 /** Judge one reported `model` value against the requested roster ID. */
@@ -114,6 +136,15 @@ export function judgeServedIdentity(
   if (typeof reported !== "string") return "mismatch";
   if (reported === requested) return "canonical";
   return aliases.get(requested)?.has(reported) === true ? "aliased" : "mismatch";
+}
+
+function judgeSubject(
+  subject: { kind: "check"; id: string } | { kind: "unverifiable" },
+  reported: unknown,
+  aliases: ServedModelAliasMap,
+): ServedIdentityVerdict {
+  if (subject.kind === "check") return judgeServedIdentity(subject.id, reported, aliases);
+  return reported === undefined || reported === null ? "absent" : "mismatch";
 }
 
 export type CompletionIdentityResult =
@@ -129,11 +160,12 @@ export type CompletionIdentityResult =
  */
 export function reconcileCompletionIdentity(
   text: string,
-  requested: string | null,
+  requested: IdentitySubject | string | null,
   aliases: ServedModelAliasMap,
   mode: ServedModelIdentityMode,
 ): CompletionIdentityResult {
-  if (requested === null || mode === "off") return { kind: "unchanged", text };
+  const subject = asIdentitySubject(requested);
+  if (subject.kind === "skip" || mode === "off") return { kind: "unchanged", text };
   let json: unknown;
   try {
     json = JSON.parse(text);
@@ -142,12 +174,12 @@ export function reconcileCompletionIdentity(
   }
   if (json === null || typeof json !== "object" || Array.isArray(json)) return { kind: "unchanged", text };
   const obj = json as Record<string, unknown>;
-  const verdict = judgeServedIdentity(requested, obj["model"], aliases);
+  const verdict = judgeSubject(subject, obj["model"], aliases);
   if (verdict === "mismatch") {
     return mode === "shadow" ? { kind: "mismatch_shadow", text } : { kind: "mismatch" };
   }
-  if (verdict !== "aliased") return { kind: "unchanged", text };
-  return { kind: "rewritten", text: JSON.stringify({ ...obj, model: requested }) };
+  if (verdict !== "aliased" || subject.kind !== "check") return { kind: "unchanged", text };
+  return { kind: "rewritten", text: JSON.stringify({ ...obj, model: subject.id }) };
 }
 
 /** Raised by {@link ServedIdentityGuard}; carries no identity text by design. */
@@ -180,13 +212,16 @@ export class ServedIdentityGuard extends Transform {
   private shadowCounted = false;
   private readonly decoder = new StringDecoder("utf8");
 
+  private readonly subject: { kind: "check"; id: string } | { kind: "unverifiable" };
+
   constructor(
-    private readonly requested: string,
+    requested: { kind: "check"; id: string } | { kind: "unverifiable" } | string,
     private readonly aliases: ServedModelAliasMap,
     private readonly mode: "shadow" | "enforce",
     private readonly onShadowMismatch: () => void = () => {},
   ) {
     super();
+    this.subject = typeof requested === "string" ? { kind: "check", id: requested } : requested;
   }
 
   private flaw(reason: "mismatch" | "unverifiable" | "overflow"): void {
@@ -223,14 +258,14 @@ export class ServedIdentityGuard extends Transform {
     if (json === null || typeof json !== "object" || Array.isArray(json)) return raw;
     const obj = json as Record<string, unknown>;
     if (!("model" in obj)) return raw;
-    const verdict = judgeServedIdentity(this.requested, obj["model"], this.aliases);
+    const verdict = judgeSubject(this.subject, obj["model"], this.aliases);
     if (verdict === "mismatch") {
       this.flaw("mismatch");
       return raw;
     }
-    if (verdict !== "aliased") return raw;
+    if (verdict !== "aliased" || this.subject.kind !== "check") return raw;
     const eol = /\r\n$/.test(lines[0] ?? "") ? "\r\n" : "\n";
-    return `${otherLines.join("")}data: ${JSON.stringify({ ...obj, model: this.requested })}${eol}${eol}`;
+    return `${otherLines.join("")}data: ${JSON.stringify({ ...obj, model: this.subject.id })}${eol}${eol}`;
   }
 
   private consume(text: string, final: boolean): string {

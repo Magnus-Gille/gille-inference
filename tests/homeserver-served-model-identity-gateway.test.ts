@@ -20,7 +20,7 @@ import { closeDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { runChatCompletion } from "../src/homeserver/mcp.js";
 import { AdmissionController } from "../src/homeserver/admission.js";
-import { ModelFailureBackoff } from "../src/homeserver/model-failure-backoff.js";
+import { FAILURE_THRESHOLD, ModelFailureBackoff } from "../src/homeserver/model-failure-backoff.js";
 import { loadConfig } from "../src/homeserver/config.js";
 
 const ROSTER = "qwen3-30b-instruct";
@@ -32,6 +32,8 @@ const UNKNOWN_PATH = "/home/operator/private/models/never-declared.gguf";
 const unloadedIds: string[] = [];
 // When set, the SSE branch writes exactly these raw strings (spaced by 10 ms) instead of the default.
 let ssePlan: ((model: unknown) => string[]) | null = null;
+// When true the upstream drops the connection (a real, breaker-eligible upstream_unavailable).
+let dropConnection = false;
 let reportedModel: unknown = SERVED_PATH;
 let omitModel = false;
 let upstream: Server;
@@ -67,6 +69,10 @@ function startUpstream(): Promise<void> {
       if (req.method !== "POST") {
         res.writeHead(404);
         res.end();
+        return;
+      }
+      if (dropConnection) {
+        req.socket.destroy();
         return;
       }
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
@@ -184,6 +190,7 @@ beforeEach(() => {
   reportedModel = SERVED_PATH;
   omitModel = false;
   ssePlan = null;
+  dropConnection = false;
   resetQuotaWindows();
 });
 
@@ -620,19 +627,37 @@ describe("INFER-343 enforce never forwards an unverified identity (unresolved ro
 });
 
 describe("INFER-343 identity mismatches never feed the failure breaker (NB1)", () => {
-  it("HTTP: repeated enforce mismatches never open model_temporarily_unavailable for that key/model", async () => {
-    const k = mintKey({ alias: "breaker-http", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
-    reportedModel = UNKNOWN_PATH;
-    for (let i = 0; i < 6; i++) expect((await chat(k.plaintextKey)).status).toBe(502);
-    reportedModel = ROSTER;
+  it("HTTP: the breaker is live in this harness (control): eligible failures open it", async () => {
+    const k = mintKey({ alias: "breaker-control", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    dropConnection = true;
+    for (let i = 0; i < FAILURE_THRESHOLD; i++) expect((await chat(k.plaintextKey)).status).toBe(502);
+    dropConnection = false;
     const res = await chat(k.plaintextKey);
-    expect(res.status).toBe(200); // a tripped breaker would be 503 model_temporarily_unavailable
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("model_temporarily_unavailable");
   });
 
-  it("MCP: repeated mismatches (code upstream_error) leave the breaker closed", async () => {
+  it("HTTP: more than the breaker threshold of enforce mismatches never opens it", async () => {
+    const k = mintKey({ alias: "breaker-http", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    reportedModel = UNKNOWN_PATH;
+    for (let i = 0; i < FAILURE_THRESHOLD * 2; i++) expect((await chat(k.plaintextKey)).status).toBe(502);
+    reportedModel = ROSTER;
+    expect((await chat(k.plaintextKey)).status).toBe(200);
+  });
+
+  it("MCP: the backoff parameter is wired (control): a tripped backoff short-circuits ask", async () => {
+    const tripped = new ModelFailureBackoff([ROSTER]);
+    for (let i = 0; i < FAILURE_THRESHOLD; i++) tripped.recordFailure(ROSTER, "upstream_unavailable");
+    expect(tripped.observe(ROSTER)).not.toBeNull();
+    const { r } = await mcpRun("breaker-mcp-control", "enforce", ROSTER, tripped);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("model_temporarily_unavailable");
+  });
+
+  it("MCP: more than the threshold of mismatches (code upstream_error) leave the breaker closed", async () => {
     const backoff = new ModelFailureBackoff([ROSTER]);
     reportedModel = UNKNOWN_PATH;
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < FAILURE_THRESHOLD * 2; i++) {
       const { r } = await mcpRun(`breaker-mcp-${i}`, "enforce", ROSTER, backoff);
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.code).toBe("upstream_error");
@@ -640,5 +665,89 @@ describe("INFER-343 identity mismatches never feed the failure breaker (NB1)", (
     expect(backoff.observe(ROSTER)).toBeNull();
     reportedModel = ROSTER;
     expect((await mcpRun("breaker-mcp-ok", "enforce", ROSTER, backoff)).r.ok).toBe(true);
+  });
+});
+
+describe("INFER-343 enforce with no usable requested model (unverifiable)", () => {
+  const raw = (token: string, body: Record<string, unknown>, port = gatewayPort): Promise<Response> =>
+    fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }], ...body }),
+    });
+
+  it('model "" reaches the upstream: any reported model fails closed, absent passes (non-stream and stream)', async () => {
+    const k = mintKey({ alias: "empty-model", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    reportedModel = SERVED_PATH;
+    const bad = await raw(k.plaintextKey, { model: "" });
+    expect(bad.status).toBe(502);
+    expect(((await bad.json()) as { error: { code: string } }).error.code).toBe("upstream_model_mismatch");
+    const st = await (await raw(k.plaintextKey, { model: "", stream: true })).text();
+    expect(st).toContain('"code":"upstream_model_mismatch"');
+    expect(st).not.toContain('"content":"hel"');
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    omitModel = true;
+    expect((await raw(k.plaintextKey, { model: "" })).status).toBe(200);
+  });
+
+  it("a missing or non-string model never reaches the upstream unresolved: the gateway substitutes the default roster model first", async () => {
+    // parseChatBody maps non-strings to null; for an empty allow-list the gateway then picks a
+    // server-chosen roster model and rewrites the body BEFORE the upstream call, so the identity
+    // subject is that resolved roster ID (verified, alias rewritten), not an unverifiable one.
+    const k = mintKey({ alias: "missing-model", tier: "guest" }, DEFAULTS);
+    for (const body of [{}, { model: 42 }, { model: null }]) {
+      reportedModel = SERVED_PATH;
+      const ok = await raw(k.plaintextKey, body);
+      expect(ok.status).toBe(200);
+      expect(((await ok.json()) as { model: string }).model).toBe(ROSTER);
+      reportedModel = UNKNOWN_PATH;
+      expect((await raw(k.plaintextKey, body)).status).toBe(502);
+    }
+  });
+
+  it("with a non-empty allow-list a missing model is rejected (403) before any upstream call", async () => {
+    const k = mintKey({ alias: "allow-omit", tier: "guest", modelAllowList: [ROSTER] }, DEFAULTS);
+    reportedModel = SERVED_PATH;
+    const res = await raw(k.plaintextKey, {});
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("model_not_allowed");
+  });
+
+  it("MCP ask without a usable model while the catalogue is cold: any reported model fails closed", async () => {
+    const cat = await import("../src/homeserver/catalogue.js");
+    try {
+      cat.resetCatalogueCache();
+      reportedModel = SERVED_PATH;
+      const { r, k } = await mcpRun("mcp-empty-model", "enforce", "");
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.traceErrorClass).toBe("upstream_model_mismatch");
+      expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+      omitModel = true;
+      expect((await mcpRun("mcp-empty-model-absent", "enforce", "")).r.ok).toBe(true);
+    } finally {
+      await cat.warmCatalogue();
+    }
+  });
+});
+
+describe("INFER-343 client-supplied model strings never become labels or log fields (N1)", () => {
+  it("an unresolvable, hostile model string used as the enforce subject appears nowhere in metrics or the request log", async () => {
+    const HOSTILE = 'evil"} injected_metric{x="y\nFAKE_LOG_LINE';
+    const k = mintKey({ alias: "hostile-model", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    for (const [port, reported] of [[gatewayPort, HOSTILE], [gatewayPort, SERVED_PATH], [shadowPort, UNKNOWN_PATH]] as const) {
+      reportedModel = reported;
+      await chat(k.plaintextKey, { model: HOSTILE }, port);
+      await chat(k.plaintextKey, { model: HOSTILE, stream: true }, port);
+    }
+    const metrics = renderMetrics();
+    const rows = JSON.stringify(getRequestLog(500));
+    for (const needle of ["injected_metric", "FAKE_LOG_LINE", "evil"]) {
+      expect(metrics).not.toContain(needle);
+      expect(rows).not.toContain(needle);
+    }
+    // the shadow counter, if present, is only ever labelled with the resolved roster ID
+    for (const line of metrics.split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{"))) {
+      expect(line).toMatch(new RegExp(`^${SHADOW_METRIC}\\{model="[A-Za-z0-9._:-]+"\\} \\d+$`));
+    }
   });
 });

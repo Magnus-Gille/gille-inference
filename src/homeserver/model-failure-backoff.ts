@@ -11,7 +11,7 @@ export interface ModelTemporarilyUnavailable {
   unavailable_until: string;
 }
 
-const FAILURE_THRESHOLD = 3;
+export const FAILURE_THRESHOLD = 3;
 const FAILURE_WINDOW_MS = 60_000;
 const COOLDOWN_MS = 30_000;
 const CANONICAL_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;

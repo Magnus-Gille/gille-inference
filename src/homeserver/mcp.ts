@@ -35,7 +35,7 @@ import { buildDelegationCostTrace, tryRecordDelegationCost } from "./delegation-
 import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
 import { canonicalizeModelTrusted, getTrustedCatalogue } from "./catalogue.js";
-import { identitySubject, reconcileCompletionIdentity } from "./served-model-identity.js";
+import { identitySubject, reconcileCompletionIdentity, rosterIdentityOf } from "./served-model-identity.js";
 import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
 import type { ModelFailureBackoff } from "./model-failure-backoff.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
@@ -1155,7 +1155,10 @@ export async function runChatCompletion(
     // roster ID (never the backend's raw name), so a response whose `model` neither equals it
     // nor is a declared alias is rejected rather than relabelled. An absent `model` is allowed.
     const askIdentity = reconcileCompletionIdentity(text, identitySubject(cfg.servedModelIdentity, canonModel, args.model), cfg.servedModelAliases, cfg.servedModelIdentity);
-    if (askIdentity.kind === "mismatch_shadow") recordServedModelMismatchShadow(canonModel);
+    if (askIdentity.kind === "mismatch_shadow") {
+      const metricRosterId = rosterIdentityOf(canonModel);
+      if (metricRosterId !== null) recordServedModelMismatchShadow(metricRosterId);
+    }
     if (askIdentity.kind === "mismatch") {
       actualTokens = 0;
       return {

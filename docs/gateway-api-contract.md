@@ -197,7 +197,7 @@ paths alike. When it cannot be resolved the modes differ on purpose:
 
 | Mode | Roster ID unresolved (cold/stale catalogue, unrecognised spelling) |
 |---|---|
-| `enforce` | **never forwards an unverified identity.** The check runs against the requested string exactly as sent: an exact match passes; an alias declared for that exact string passes and is rewritten to it; any other reported `model` fails closed like a mismatch (502 / terminal SSE frame / MCP `ok:false`, billed `0`); an absent `model` passes. Consequence: a request spelled differently from the roster ID is rejected unless the backend echoes that exact spelling. |
+| `enforce` | **never forwards an unverified identity.** The check runs against the requested string exactly as sent: an exact match passes; an alias declared for that exact string passes and is rewritten to it; any other reported `model` fails closed like a mismatch (502 / terminal SSE frame / MCP `ok:false`, billed `0`); an absent `model` passes. With no usable requested string at all (e.g. `model:""` or an MCP call without one) nothing can be verified, so any present `model` fails closed and only an absent/null one passes (a request that omits `model` or sends a non-string never gets here: the gateway substitutes a server-chosen roster model first, or returns 403 for keys with an allow-list). Consequence: a request spelled differently from the roster ID is rejected unless the backend echoes that exact spelling. |
 | `shadow` | check skipped and **not counted**, so unresolved requests never add false positives to the rollout signal. The response is forwarded unchanged. |
 | `off` | not inspected. |
 

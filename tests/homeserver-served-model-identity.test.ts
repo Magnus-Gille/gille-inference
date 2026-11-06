@@ -239,14 +239,18 @@ describe("ServedIdentityGuard SSE framing (N1)", () => {
 
 describe("identitySubject", () => {
   it("resolved roster ID is the subject in every checking mode; unresolved differs by mode", () => {
-    expect(identitySubject("enforce", "roster-a", "roster-a")).toBe("roster-a");
-    expect(identitySubject("shadow", "roster-a", "roster-a")).toBe("roster-a");
-    expect(identitySubject("enforce", "unknown", "Roster-A")).toBe("Roster-A");
-    expect(identitySubject("enforce", null, "Roster-A")).toBe("Roster-A");
-    expect(identitySubject("enforce", "unknown", null)).toBeNull();
-    expect(identitySubject("enforce", "unknown", "")).toBeNull();
-    expect(identitySubject("shadow", "unknown", "Roster-A")).toBeNull();
-    expect(identitySubject("off", "roster-a", "roster-a")).toBeNull();
+    const check = (id: string) => ({ kind: "check", id });
+    expect(identitySubject("enforce", "roster-a", "roster-a")).toEqual(check("roster-a"));
+    expect(identitySubject("shadow", "roster-a", "roster-a")).toEqual(check("roster-a"));
+    expect(identitySubject("enforce", "unknown", "Roster-A")).toEqual(check("Roster-A"));
+    expect(identitySubject("enforce", null, "Roster-A")).toEqual(check("Roster-A"));
+    // enforce with nothing usable requested: explicitly unverifiable, never silently skipped
+    for (const requested of [null, undefined, ""]) {
+      expect(identitySubject("enforce", "unknown", requested)).toEqual({ kind: "unverifiable" });
+    }
+    expect(identitySubject("shadow", "unknown", "Roster-A")).toEqual({ kind: "skip" });
+    expect(identitySubject("shadow", "unknown", null)).toEqual({ kind: "skip" });
+    expect(identitySubject("off", "roster-a", "roster-a")).toEqual({ kind: "skip" });
   });
 });
 
@@ -258,4 +262,32 @@ describe("rosterIdentityOf / unknownAliasRosterIds", () => {
   it("lists alias keys missing from the roster (IDs only)", () => {
     expect(unknownAliasRosterIds(aliases, new Set(["roster-a"]))).toEqual(["roster-b"]);
   });
+});
+
+describe("unverifiable subject (enforce, nothing requested and no roster ID)", () => {
+  const unverifiable = { kind: "unverifiable" } as const;
+  it("non-stream: any present model fails closed; absent/null passes", () => {
+    for (const body of ['{"model":"anything"}', '{"model":"roster-a"}', '{"model":""}', '{"model":7}']) {
+      expect(reconcileCompletionIdentity(body, unverifiable, aliases, "enforce").kind).toBe("mismatch");
+    }
+    for (const body of ['{"x":1}', '{"model":null}']) {
+      expect(reconcileCompletionIdentity(body, unverifiable, aliases, "enforce").kind).toBe("unchanged");
+    }
+  });
+  it("stream: any present model errors; model-free events pass and nothing is ever rewritten", async () => {
+    await expect(pipeThroughSubject('data: {"model":"roster-a"}\n\n')).rejects.toBeInstanceOf(ServedIdentityMismatchError);
+    const raw = 'data: {"choices":[]}\n\ndata: [DONE]\n\n';
+    expect(await pipeThroughSubject(raw)).toBe(raw);
+  });
+  async function pipeThroughSubject(input: string): Promise<string> {
+    const guard = new ServedIdentityGuard({ kind: "unverifiable" }, aliases, "enforce");
+    const out: string[] = [];
+    guard.on("data", (c: Buffer) => out.push(c.toString("utf8")));
+    await new Promise<void>((resolve, reject) => {
+      guard.on("end", resolve);
+      guard.on("error", reject);
+      Readable.from([Buffer.from(input)]).pipe(guard);
+    });
+    return out.join("");
+  }
 });
