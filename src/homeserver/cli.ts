@@ -41,6 +41,7 @@ import {
   type StaticKeyCounts,
   type StaticKeyKillSwitch,
 } from "./static-keys.js";
+import { loadEnv } from "../env.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
 import { observeGpuLeaseMutex, type GpuMutexObservation } from "./gpu-lease-observation.js";
@@ -456,7 +457,7 @@ function printStaticInventory(report: {
 }): void {
   const { counts, killSwitch } = report;
   console.log(
-    `legacy static credentials (counts only): admin=${counts.admin} user=${counts.user} ` +
+    `legacy static credentials (counts only, from this process's environment and .env, not necessarily the running gateway's): admin=${counts.admin} user=${counts.user} ` +
     `monitor=${counts.monitor} total=${counts.total}`
   );
   const disabled = disabledStaticLists(killSwitch);
@@ -470,7 +471,8 @@ export function cmdKeys(args: ParsedArgs): void {
   const sub = args.positional[0];
 
   // Inventory is deliberately separate from every mutating command: it must remain usable when
-  // the production database is mounted read-only, and it must not load static fallback values.
+  // the production database is mounted read-only. Static fallback credentials are only COUNTED
+  // (never returned), using the same environment/.env path the gateway uses to read the lists.
   if (sub === "inventory") {
     const allowed = new Set(["all", "stale-days", "json", "static", "plan"]);
     for (const name of Object.keys(args.flags)) {
@@ -478,10 +480,12 @@ export function cmdKeys(args: ParsedArgs): void {
     }
     // Counts of configured static bearer values per list. Presence/count only: the values are
     // never printed, hashed or fingerprinted. Read from the process environment (no .env read).
+    loadEnv();
     const staticCounts = countStaticCredentials();
     const killSwitch = parseStaticKeyKillSwitch(process.env[STATIC_KEY_SWITCH_ENV]);
     const staticReport = {
-      source: "process_environment",
+      source: "this_process_environment_including_dotenv_in_cwd",
+      note: "counts reflect THIS process's environment (and .env in the working directory), not necessarily the running gateway's",
       counts: staticCounts,
       killSwitch: { ...killSwitch, env: STATIC_KEY_SWITCH_ENV },
       suggestedAction: staticCounts.total > 0 ? "migrate to minted keys" : "none",

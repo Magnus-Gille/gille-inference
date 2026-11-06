@@ -102,3 +102,19 @@ export function staticKeyStartupLine(counts: StaticKeyCounts, sw: StaticKeyKillS
   const ignoring = disabled.map((list) => `${list}=${ignored[list]}`).join(" ");
   return `[auth] static-key kill switch ${STATIC_KEY_SWITCH_ENV}: on (${disabled.join(",")}); ignoring ${ignoring}; configured ${configured}`;
 }
+
+/**
+ * Number of distinct configured values that appear in more than one list. Compared in memory
+ * only; neither the values nor any digest of them leaves this function. A shared value is
+ * dangerous with a per-list kill switch, so the gateway treats it as disabled when ANY list that
+ * contains it is disabled.
+ */
+export function countOverlappingStaticValues(lists: readonly (readonly string[])[]): number {
+  const seenIn = new Map<string, number>();
+  for (const list of lists) {
+    for (const value of new Set(list)) seenIn.set(value, (seenIn.get(value) ?? 0) + 1);
+  }
+  let shared = 0;
+  for (const n of seenIn.values()) if (n > 1) shared += 1;
+  return shared;
+}

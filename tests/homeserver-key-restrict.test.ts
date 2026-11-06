@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 import { chmodSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, initDb } from "../src/db.js";
 import {
   KeyRestrictError,
+  abortKeyRotation,
   MAX_KEY_LIFETIME_SECONDS,
   buildCredentialPlan,
   credentialInventory,
@@ -25,7 +27,14 @@ const NOW = new Date("2026-11-06T12:00:00.000Z");
 const DAY = 24 * 60 * 60;
 
 beforeEach(() => {
+  // Pin the wall clock (Date only) so mint/expiry arithmetic never depends on the real time.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
   initDb(join(mkdtempSync(join(tmpdir(), "hs-restrict-")), "test.db"));
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 function legacyAdmin(alias: string): string {
@@ -126,7 +135,7 @@ describe("keys restrict — narrowing only (INFER-152)", () => {
     revokeKey("gone");
     expect(codeOf(() => restrictKey("gone", { scope: "agent", now: NOW }))).toBe("revoked");
     mintKey({ alias: "old", tier: "owner", scope: "agent", ttlSeconds: 60 }, DEFAULTS);
-    expect(codeOf(() => restrictKey("old", { expiresInSeconds: 30, now: new Date(Date.now() + 3_600_000) })))
+    expect(codeOf(() => restrictKey("old", { expiresInSeconds: 30, now: new Date(NOW.getTime() + 3_600_000) })))
       .toBe("expired");
   });
 
@@ -152,6 +161,61 @@ describe("keys restrict — narrowing only (INFER-152)", () => {
     const after = getDb().prepare("SELECT * FROM api_keys WHERE alias='legacy'").get() as Record<string, unknown>;
     const diff = Object.keys(before).filter((column) => before[column] !== after[column]).sort();
     expect(diff).toEqual(["expires_at", "scope"]);
+  });
+});
+
+describe("keys restrict — locking, concurrency and audit (INFER-152 review)", () => {
+  it("a lost compare-and-swap reports concurrent_change, not no_change", () => {
+    legacyAdmin("legacy");
+    // RAISE(IGNORE) makes the guarded UPDATE affect zero rows, as if another writer had won.
+    getDb().exec(`CREATE TRIGGER ignore_restrict BEFORE UPDATE ON api_keys
+      BEGIN SELECT RAISE(IGNORE); END`);
+    expect(codeOf(() => restrictKey("legacy", { scope: "agent", now: NOW }))).toBe("concurrent_change");
+  });
+
+  it("dry-run takes no write lock: it succeeds while another connection holds one", () => {
+    const dbPath = (getDb().pragma("database_list") as Array<{ file: string }>)[0]!.file;
+    legacyAdmin("legacy");
+    const other = new Database(dbPath);
+    other.exec("BEGIN IMMEDIATE");
+    try {
+      expect(restrictKey("legacy", { scope: "agent", dryRun: true, now: NOW })).toMatchObject({ dryRun: true, changed: true });
+    } finally {
+      other.exec("ROLLBACK");
+      other.close();
+    }
+  });
+
+  it("logs one content-free audit line on a real change and none on dry-run", () => {
+    legacyAdmin("legacy");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      restrictKey("legacy", { scope: "agent", expiresInSeconds: DAY, dryRun: true, now: NOW });
+      expect(warn).not.toHaveBeenCalled();
+      restrictKey("legacy", { scope: "agent", expiresInSeconds: DAY, now: NOW });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]![0])).toBe(
+        "[audit] keys.restrict alias=legacy scope=admin->agent expires=never->2026-11-07T12:00:00.000Z"
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("scope-only narrowing keeps the existing expiry unchanged (documented behaviour)", () => {
+    legacyAdmin("legacy");
+    const result = restrictKey("legacy", { scope: "agent", now: NOW });
+    expect(result.after.expiresAt).toBeNull();
+    expect(result.before.expiresAt).toBeNull();
+  });
+
+  it("refuses a key in any non-terminal rotation plan (the guard excludes only committed/aborted)", () => {
+    mintKey({ alias: "svc", tier: "owner", scope: "admin" }, DEFAULTS);
+    const staged = stageKeyRotation("svc", { scope: "agent" }, DEFAULTS);
+    expect(codeOf(() => restrictKey("svc", { expiresInSeconds: 3_600, now: NOW }))).toBe("staged_rotation");
+    abortKeyRotation(staged.plan.planId);
+    // A terminal plan no longer blocks restriction of the surviving predecessor.
+    expect(restrictKey("svc", { expiresInSeconds: 3_600, dryRun: true, now: NOW }).changed).toBe(true);
   });
 });
 
@@ -258,8 +322,8 @@ describe("credential plan and inventory output are secret-free (INFER-152)", () 
     expectClean(planJson);
     expectClean(run(["inventory", "--plan"]));
     const plan = JSON.parse(planJson).plan as Array<{ alias: string; suggestedAction: string }>;
-    // Freshly minted and not yet used: kept, but it still needs an expiry.
-    expect(plan.find((entry) => entry.alias === "legacy-admin")?.suggestedAction).toBe("keep+expiry");
+    // Freshly minted, unused admin without expiry is never "keep" (N7).
+    expect(plan.find((entry) => entry.alias === "legacy-admin")?.suggestedAction).toBe("rotate");
   });
 
   it("--static does not need the keystore and rejects an invalid switch without echoing it", () => {
@@ -285,6 +349,7 @@ describe("credential plan and inventory output are secret-free (INFER-152)", () 
 describe("credential plan suggestions (INFER-152)", () => {
   it("maps each situation to one action", () => {
     const t0 = new Date("2026-01-01T00:00:00.000Z");
+    const inventoryNow = NOW;
     // active admin, used recently, no expiry → rotate
     legacyAdmin("admin-noexp");
     // active admin with expiry, used → narrow
@@ -298,19 +363,22 @@ describe("credential plan suggestions (INFER-152)", () => {
     mintKey({ alias: "idle", tier: "guest", scope: "inference" }, DEFAULTS);
     // never used but fresh → keep
     mintKey({ alias: "fresh", tier: "guest", scope: "inference" }, DEFAULTS);
-    getDb().prepare("UPDATE api_keys SET created_at = ? WHERE alias != 'fresh'").run(t0.toISOString());
+    // fresh, never-used admin must never be "keep" (N7): no expiry → rotate, with expiry → narrow
+    legacyAdmin("fresh-admin-noexp");
+    mintKey({ alias: "fresh-admin-exp", tier: "owner", scope: "admin" }, DEFAULTS);
+    getDb().prepare("UPDATE api_keys SET created_at = ? WHERE alias NOT LIKE 'fresh%'").run(t0.toISOString());
     for (const alias of ["admin-noexp", "admin-exp", "agent-noexp", "fine"]) {
       getDb().prepare("UPDATE api_keys SET last_used_at = ?, use_count = 3 WHERE alias = ?")
-        .run("2026-08-01T00:00:00.000Z", alias);
+        .run("2026-11-01T00:00:00.000Z", alias);
     }
 
-    getDb().prepare("UPDATE api_keys SET created_at = ? WHERE alias = 'fresh'").run("2026-08-01T00:00:00.000Z");
-    const report = credentialInventory({ now: new Date("2026-08-02T00:00:00.000Z"), staleAfterDays: 30 });
+    getDb().prepare("UPDATE api_keys SET created_at = ? WHERE alias = 'fresh'").run("2026-11-05T00:00:00.000Z");
+    const report = credentialInventory({ now: inventoryNow, staleAfterDays: 30 });
     const actions = Object.fromEntries(
       buildCredentialPlan(report)
         .map((entry) => [entry.alias, entry.suggestedAction])
     );
-    expect(report.keys).toHaveLength(6);
+    expect(report.keys).toHaveLength(8);
     expect(actions).toEqual({
       "admin-noexp": "rotate",
       "admin-exp": "narrow",
@@ -318,6 +386,8 @@ describe("credential plan suggestions (INFER-152)", () => {
       fine: "keep",
       idle: "retire",
       fresh: "keep",
+      "fresh-admin-noexp": "rotate",
+      "fresh-admin-exp": "narrow",
     });
   });
 });

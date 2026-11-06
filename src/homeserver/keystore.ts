@@ -1315,11 +1315,8 @@ export function buildCredentialPlan(report: CredentialInventoryReport): Credenti
     if (key.status !== "active") {
       return { ...base, suggestedAction: "none", reason: `already ${key.status}` };
     }
-    if (has("unused") && nowMs - Date.parse(key.createdAt) < staleMs) {
-      return { ...base, suggestedAction: key.expiresAt === null ? "keep+expiry" : "keep",
-        reason: "created recently and not yet used; confirm the consumer, then decide" };
-    }
-    if (has("unused") || has("stale")) {
+    const recentlyCreatedUnused = has("unused") && nowMs - Date.parse(key.createdAt) < staleMs;
+    if (!recentlyCreatedUnused && (has("unused") || has("stale"))) {
       return { ...base, suggestedAction: "retire",
         reason: has("unused") ? "never used by the running gateway" : `no use within ${report.staleAfterDays} days` };
     }
@@ -1330,6 +1327,10 @@ export function buildCredentialPlan(report: CredentialInventoryReport): Credenti
     if (key.scope === "admin") {
       return { ...base, suggestedAction: "narrow",
         reason: "active admin; narrow with `keys restrict` unless the consumer needs /admin routes" };
+    }
+    if (recentlyCreatedUnused) {
+      return { ...base, suggestedAction: key.expiresAt === null ? "keep+expiry" : "keep",
+        reason: "created recently and not yet used; confirm the consumer, then decide" };
     }
     if (key.expiresAt === null) {
       return { ...base, suggestedAction: "keep+expiry", reason: "active without expiry; set one with `keys restrict`" };
@@ -1358,6 +1359,7 @@ export function isScopeNarrowing(from: KeyScope, to: KeyScope): boolean {
 }
 
 export type KeyRestrictErrorCode =
+  | "concurrent_change"
   | "unknown_alias"
   | "revoked"
   | "expired"
@@ -1410,7 +1412,7 @@ export function restrictKey(alias: string, opts: RestrictKeyOptions): RestrictKe
     throw new KeyRestrictError("invalid_param", "expiry must be a positive whole number of seconds");
   }
 
-  return db.transaction((): RestrictKeyResult => {
+  const run = db.transaction((): RestrictKeyResult => {
     const row = db.prepare(`SELECT * FROM api_keys WHERE alias = @alias`).get({ alias }) as KeyRow | undefined;
     if (!row) throw new KeyRestrictError("unknown_alias", `no key with alias '${alias}'`);
     const rec = rowToRecord(row);
@@ -1422,7 +1424,7 @@ export function restrictKey(alias: string, opts: RestrictKeyOptions): RestrictKe
     const family = rec.logicalAlias ?? rec.alias;
     const staged = db.prepare(
       `SELECT logical_alias, replacement_alias, previous_aliases
-         FROM key_rotation_plans WHERE status = 'staged'`
+         FROM key_rotation_plans WHERE status NOT IN ('committed','aborted')`
     ).all() as Array<{ logical_alias: string; replacement_alias: string; previous_aliases: string }>;
     if (staged.some((plan) =>
       plan.logical_alias === family
@@ -1483,10 +1485,19 @@ export function restrictKey(alias: string, opts: RestrictKeyOptions): RestrictKe
       oldExpiry: row.expires_at,
     });
     if (info.changes !== 1) {
-      throw new KeyRestrictError("no_change", `'${alias}' changed concurrently; re-run restrict`);
+      throw new KeyRestrictError("concurrent_change", `'${alias}' changed concurrently; re-run restrict`);
     }
     return result;
-  }).immediate();
+  });
+  // A dry run only reads, so it runs in a plain (deferred) transaction and takes no write lock.
+  const result = opts.dryRun === true ? run() : run.immediate();
+  if (!result.dryRun) {
+    console.warn(
+      `[audit] keys.restrict alias=${alias} scope=${result.before.scope}->${result.after.scope} ` +
+      `expires=${result.before.expiresAt ?? "never"}->${result.after.expiresAt ?? "never"}`
+    );
+  }
+  return result;
 }
 
 // ─── Credit accounting (lifetime, non-resetting) ────────────────────────────────────

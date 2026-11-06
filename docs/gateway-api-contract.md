@@ -49,7 +49,11 @@ comma-separated subset of `admin,user,monitor` disables those. A disabled static
 no principal, so protected routes return `401 invalid_api_key`, identical to an unknown token;
 minted keys are unaffected. An invalid value aborts startup without echoing it. Startup logs one
 content-free line with the switch state and the configured counts per list. Lists that are
-disabled do not count as configured keys for the non-loopback bind check.
+disabled do not count as configured keys for the non-loopback bind check. A value configured in
+several lists is refused when any list containing it is disabled (startup logs a count-only
+warning about such overlap). The switch is read through the same environment/`.env` path as the
+lists. `resolvePrincipal` is the only consumer of the static lists, so `/mcp`, `/metrics`,
+`/portal/*` and every other route inherit the switch.
 
 Operator-only CLI (no HTTP surface): `keys inventory [--static|--plan] [--json]` reports static
 counts and a per-key migration worksheet; `keys restrict --alias A [--scope X] [--expires-in S]

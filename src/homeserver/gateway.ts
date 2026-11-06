@@ -10,7 +10,7 @@ import {
   unknownAliasRosterIds,
 } from "./served-model-identity.js";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
-import { effectiveStaticCounts, staticKeyStartupLine } from "./static-keys.js";
+import { countOverlappingStaticValues, effectiveStaticCounts, staticKeyStartupLine } from "./static-keys.js";
 import {
   listModels,
   loadModel,
@@ -279,8 +279,20 @@ function resolvePrincipal(
     };
   }
 
+  // Static keys. Evaluate every list first, then refuse if the token matches ANY list that the
+  // kill switch has disabled: a value configured in two lists must not fall through to the
+  // still-enabled one (INFER-152). Each match is computed unconditionally so timing does not
+  // depend on the switch.
+  const matchAdmin = keyMatches(token, cfg.adminApiKeys);
+  const matchUser = keyMatches(token, cfg.apiKeys);
+  const matchMonitor = keyMatches(token, cfg.monitorApiKeys);
+  const sw = cfg.disableStaticKeys;
+  if ((matchAdmin && sw.admin) || (matchUser && sw.user) || (matchMonitor && sw.monitor)) {
+    return null;
+  }
+
   // (2) legacy admin static key
-  if (!cfg.disableStaticKeys.admin && keyMatches(token, cfg.adminApiKeys)) {
+  if (matchAdmin) {
     return {
       alias: "static:admin",
       logicalAlias: "static:admin",
@@ -299,7 +311,7 @@ function resolvePrincipal(
   }
 
   // (3) legacy user static key
-  if (!cfg.disableStaticKeys.user && keyMatches(token, cfg.apiKeys)) {
+  if (matchUser) {
     return {
       alias: "static:user",
       logicalAlias: "static:user",
@@ -320,7 +332,7 @@ function resolvePrincipal(
   // (4) legacy monitor static key — a read-only monitoring scope (e.g. Heimdall's dashboard).
   // isAdmin stays false (admin gating is unaffected); the request handler restricts this
   // principal to GET /healthz, /ledger, /metrics and 403s everything else.
-  if (!cfg.disableStaticKeys.monitor && keyMatches(token, cfg.monitorApiKeys)) {
+  if (matchMonitor) {
     return {
       alias: "static:monitor",
       logicalAlias: "static:monitor",
@@ -4136,6 +4148,13 @@ export function startGateway(
     total: cfg.adminApiKeys.length + cfg.apiKeys.length + cfg.monitorApiKeys.length,
   };
   console.log(staticKeyStartupLine(staticCounts, cfg.disableStaticKeys));
+  const sharedStatic = countOverlappingStaticValues([cfg.adminApiKeys, cfg.apiKeys, cfg.monitorApiKeys]);
+  if (sharedStatic > 0) {
+    console.warn(
+      `[auth] ${sharedStatic} static credential value(s) are configured in more than one list; ` +
+      "with HOMESERVER_DISABLE_STATIC_KEYS such a value is refused if ANY list containing it is disabled."
+    );
+  }
   const noKeys = effectiveStaticCounts(staticCounts, cfg.disableStaticKeys).total === 0 && noStoreKeys;
 
   if (noKeys && !loopback) {

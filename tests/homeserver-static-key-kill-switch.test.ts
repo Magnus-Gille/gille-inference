@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDb, initDb } from "../src/db.js";
 import { resetConfig } from "../src/homeserver/config.js";
 import { mintKey, restrictKey, revokeKey, type KeyDefaults } from "../src/homeserver/keystore.js";
 import { startGateway } from "../src/homeserver/gateway.js";
+import { cmdKeys, parseArgs } from "../src/homeserver/cli.js";
 
 /**
  * INFER-152 end-to-end: the gateway answers 401 `invalid_api_key` for a revoked key, an expired
@@ -85,7 +86,7 @@ describe("gateway rejects retired minted keys (INFER-152)", () => {
     expect((await get("/admin/keys", minted.plaintextKey)).status).toBe(200);
 
     getDb().prepare("UPDATE api_keys SET expires_at = ? WHERE alias = 'short'")
-      .run(new Date(Date.now() - 1_000).toISOString());
+      .run("2000-01-01T00:00:00.000Z");
     await expect401(await get("/admin/keys", minted.plaintextKey));
   });
 
@@ -157,5 +158,122 @@ describe("HOMESERVER_DISABLE_STATIC_KEYS (INFER-152)", () => {
     process.env["HOMESERVER_DISABLE_STATIC_KEYS"] = "on";
     resetConfig();
     await expect(startGateway()).rejects.toThrow(/no API keys/i);
+  });
+});
+
+function post(path: string, token: string, body: unknown): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("a value shared by several lists (INFER-152 B1)", () => {
+  const SHARED = "planted-shared-static-8c2d17";
+
+  for (const disabled of ["admin", "user"] as const) {
+    it(`a token in admin+user is refused everywhere when '${disabled}' is disabled`, async () => {
+      process.env["HOMESERVER_ADMIN_API_KEYS"] = SHARED;
+      process.env["HOMESERVER_API_KEYS"] = SHARED;
+      delete process.env["HOMESERVER_MONITOR_API_KEYS"];
+      process.env["HOMESERVER_DISABLE_STATIC_KEYS"] = disabled;
+      await boot();
+      await expect401(await get("/admin/keys", SHARED));
+      await expect401(await get("/portal/me", SHARED));
+    });
+  }
+
+  it("with the switch off the shared token still authenticates (admin list wins, as before)", async () => {
+    process.env["HOMESERVER_ADMIN_API_KEYS"] = SHARED;
+    process.env["HOMESERVER_API_KEYS"] = SHARED;
+    await boot();
+    expect((await get("/admin/keys", SHARED)).status).toBe(200);
+  });
+
+  it("startup warns with a count only when a value is configured in several lists", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      process.env["HOMESERVER_ADMIN_API_KEYS"] = `${SHARED},unique-admin-only`;
+      process.env["HOMESERVER_API_KEYS"] = SHARED;
+      process.env["HOMESERVER_MONITOR_API_KEYS"] = SHARED;
+      await boot();
+      const out = warn.mock.calls.flat().join("\n");
+      expect(out).toMatch(/\[auth\] 1 static credential value\(s\) are configured in more than one list/);
+      expect(out).not.toContain(SHARED);
+      expect(out).not.toContain("unique-admin-only");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not warn when the lists are disjoint", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await boot();
+      expect(warn.mock.calls.flat().join("\n")).not.toMatch(/more than one list/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("every bearer-consuming surface honours the switch (INFER-152 N3)", () => {
+  it("a disabled static key gets 401 on /mcp, /metrics and /portal/me; a live one does not", async () => {
+    await boot();
+    const control = await post("/mcp", STATIC_USER, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(control.status).toBe(200);
+    await stop!();
+    stop = null;
+
+    process.env["HOMESERVER_DISABLE_STATIC_KEYS"] = "on";
+    await boot();
+    for (const token of [STATIC_ADMIN, STATIC_USER, STATIC_MONITOR]) {
+      await expect401(await post("/mcp", token, { jsonrpc: "2.0", id: 1, method: "tools/list" }));
+      await expect401(await get("/metrics", token));
+      await expect401(await get("/portal/me", token));
+    }
+  });
+});
+
+describe("the switch and lists share one configuration path (INFER-152 N1)", () => {
+  let cwdSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+  function withDotenv(contents: string): void {
+    const dir = mkdtempSync(join(tmpdir(), "hs-dotenv-"));
+    writeFileSync(join(dir, ".env"), contents);
+    cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(dir);
+  }
+
+  afterEach(() => {
+    cwdSpy?.mockRestore();
+    cwdSpy = null;
+  });
+
+  it("a switch set only in .env takes effect for the gateway", async () => {
+    for (const name of ENV_NAMES) delete process.env[name];
+    process.env["HOMESERVER_HOST"] = "127.0.0.1";
+    process.env["HOMESERVER_PORT"] = "0";
+    withDotenv("HOMESERVER_ADMIN_API_KEYS=dotenv-admin-token\nHOMESERVER_API_KEYS=dotenv-user-token\nHOMESERVER_DISABLE_STATIC_KEYS=admin\n");
+    await boot();
+    await expect401(await get("/admin/keys", "dotenv-admin-token"));
+    expect((await get("/portal/me", "dotenv-user-token")).status).toBe(200);
+  });
+
+  it("inventory counts and the switch come from the same .env", () => {
+    for (const name of ENV_NAMES) delete process.env[name];
+    withDotenv("HOMESERVER_ADMIN_API_KEYS=aaa-planted,bbb-planted\nHOMESERVER_DISABLE_STATIC_KEYS=admin\n");
+    const out = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      cmdKeys(parseArgs(["inventory", "--static", "--json"]));
+      const text = out.mock.calls.flat().join("\n");
+      const report = JSON.parse(text).legacyStaticCredentialCounts;
+      expect(report.counts).toMatchObject({ admin: 2, total: 2 });
+      expect(report.killSwitch.admin).toBe(true);
+      expect(report.note).toMatch(/THIS process/);
+      expect(text).not.toMatch(/planted/);
+    } finally {
+      out.mockRestore();
+    }
   });
 });
