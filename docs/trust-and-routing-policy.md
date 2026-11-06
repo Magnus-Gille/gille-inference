@@ -113,7 +113,8 @@ content-blind by default and must not be copied into owner logs, shadow prompts,
 **Enforced today:** gateway authentication, key allow-lists, quota, admission, owner-only content
 logging guard, content-blind guest operations data, explicit Orin eligibility constraints, and
 route scope separated from privacy/admission tier (`agent` may use bounded agent tools without
-admin or ledger authority).
+admin or ledger authority; `ask` is a closed allow-list limited to MCP `ask` and its read-only
+helpers, with no `code_loop`, `/delegate`, file context or admin/residency route).
 
 **Partly enforced:** Hugin sensitivity/provider filtering, external-provider selection, nested
 harness network/tool policy, and shadow-policy traces.

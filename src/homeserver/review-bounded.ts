@@ -437,7 +437,7 @@ export type ReviewerUsefulnessAvailabilityReason =
 
 export interface ReviewerUsefulnessPrincipal {
   tier: "owner" | "guest";
-  scope: "admin" | "agent" | "inference" | "monitor";
+  scope: "admin" | "agent" | "ask" | "inference" | "monitor";
   keyHash: string | null;
   logicalAlias: string;
 }

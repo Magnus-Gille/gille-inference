@@ -22,11 +22,13 @@ export type Tier = "owner" | "guest";
  * - admin: operator routes plus agent/inference surfaces
  * - agent: bounded agent/inference surfaces, never operator routes
  * - inference: ordinary inference surfaces only
+ * - ask: owner-tier MCP `ask` (plus its read-only helpers) and preflight reads, nothing else;
+ *   enforced as a closed route allow-list in the gateway (INFER-450)
  *
  * Existing rows predate this column. A null stored scope is interpreted as the
  * legacy-compatible default for its tier (owner→admin, guest→inference).
  */
-export type KeyScope = "admin" | "agent" | "inference" | "monitor";
+export type KeyScope = "admin" | "agent" | "ask" | "inference" | "monitor";
 
 /**
  * Maximum lifetime for newly minted credentials. Existing rows with no expiry remain readable so
@@ -35,6 +37,7 @@ export type KeyScope = "admin" | "agent" | "inference" | "monitor";
 export const MAX_KEY_LIFETIME_SECONDS: Readonly<Record<KeyScope, number>> = Object.freeze({
   admin: 30 * 24 * 60 * 60,
   agent: 90 * 24 * 60 * 60,
+  ask: 90 * 24 * 60 * 60,
   inference: 365 * 24 * 60 * 60,
   monitor: 365 * 24 * 60 * 60,
 });
@@ -189,7 +192,7 @@ function legacyScopeForTier(tier: Tier): KeyScope {
 function storedScope(tier: Tier, value: string | null): KeyScope {
   if (value === null) return legacyScopeForTier(tier);
   if (value === "inference" || value === "monitor") return value;
-  if (tier === "owner" && (value === "admin" || value === "agent")) return value;
+  if (tier === "owner" && (value === "admin" || value === "agent" || value === "ask")) return value;
   // A malformed or tier-incompatible stored value must not expand authority.
   return "inference";
 }
