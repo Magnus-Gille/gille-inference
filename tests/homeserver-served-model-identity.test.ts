@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig, resetConfig } from "../src/homeserver/config.js";
 import { Readable } from "node:stream";
 import {
+  MAX_PENDING_SSE_EVENT_CHARS,
+  rosterIdentityOf,
+  unknownAliasRosterIds,
   parseServedModelIdentityMode,
   judgeServedIdentity,
   parseServedModelAliases,
@@ -38,17 +41,17 @@ describe("judgeServedIdentity", () => {
 
 describe("reconcileCompletionIdentity", () => {
   it("rewrites only a declared alias and leaves non-JSON alone", () => {
-    const r = reconcileCompletionIdentity('{"model":"a-alt","x":1}', "roster-a", aliases);
+    const r = reconcileCompletionIdentity('{"model":"a-alt","x":1}', "roster-a", aliases, "enforce");
     expect(r.kind).toBe("rewritten");
     expect(r.kind === "rewritten" && JSON.parse(r.text)).toEqual({ model: "roster-a", x: 1 });
-    expect(reconcileCompletionIdentity("not json", "roster-a", aliases).kind).toBe("unchanged");
-    expect(reconcileCompletionIdentity('{"model":"nope"}', "roster-a", aliases).kind).toBe("mismatch");
-    expect(reconcileCompletionIdentity('{"model":"nope"}', null, aliases).kind).toBe("unchanged");
+    expect(reconcileCompletionIdentity("not json", "roster-a", aliases, "enforce").kind).toBe("unchanged");
+    expect(reconcileCompletionIdentity('{"model":"nope"}', "roster-a", aliases, "enforce").kind).toBe("mismatch");
+    expect(reconcileCompletionIdentity('{"model":"nope"}', null, aliases, "enforce").kind).toBe("unchanged");
   });
 });
 
 async function run(input: string[], requested = "roster-a"): Promise<string> {
-  const guard = new ServedIdentityGuard(requested, aliases);
+  const guard = new ServedIdentityGuard(requested, aliases, "enforce");
   const out: string[] = [];
   guard.on("data", (c: Buffer) => out.push(c.toString("utf8")));
   await new Promise<void>((resolve, reject) => {
@@ -65,7 +68,7 @@ describe("ServedIdentityGuard", () => {
     const bytes = Buffer.from(frame + ": keepalive\n\ndata: [DONE]\n\n");
     // Split inside the multi-byte character too.
     const cut = bytes.indexOf(0xc3) + 1;
-    const guard = new ServedIdentityGuard("roster-a", aliases);
+    const guard = new ServedIdentityGuard("roster-a", aliases, "enforce");
     const chunks: string[] = [];
     guard.on("data", (c: Buffer) => chunks.push(c.toString("utf8")));
     const done = new Promise<void>((r) => guard.on("end", r));
@@ -77,7 +80,7 @@ describe("ServedIdentityGuard", () => {
   });
 
   it("errors on a mismatching frame and never forwards it", async () => {
-    const guard = new ServedIdentityGuard("roster-a", aliases);
+    const guard = new ServedIdentityGuard("roster-a", aliases, "enforce");
     const seen: string[] = [];
     guard.on("data", (c: Buffer) => seen.push(c.toString("utf8")));
     const failed = new Promise<unknown>((r) => guard.on("error", r));
@@ -158,5 +161,87 @@ describe("loadConfig served-model identity", () => {
     process.env["HOMESERVER_SERVED_MODEL_ALIASES"] = "bogus-value-2";
     expect(() => loadConfig()).toThrow(/not a valid/);
     try { loadConfig(); } catch (e) { expect(String(e)).not.toContain("bogus-value-2"); }
+  });
+});
+
+async function pipeThrough(chunks: string[], mode: "shadow" | "enforce", count?: () => void): Promise<string> {
+  const guard = new ServedIdentityGuard("roster-a", aliases, mode, count);
+  const out: string[] = [];
+  guard.on("data", (c: Buffer) => out.push(c.toString("utf8")));
+  await new Promise<void>((resolve, reject) => {
+    guard.on("end", resolve);
+    guard.on("error", reject);
+    Readable.from(chunks.map((c) => Buffer.from(c))).pipe(guard);
+  });
+  return out.join("");
+}
+
+describe("ServedIdentityGuard SSE framing (N1)", () => {
+  const rewritten = (eol: string, space = " ") => `data:${space}{"model":"roster-a","n":1}${eol}${eol}`;
+  const framings: Array<[string, string, string]> = [
+    ["no space after data:", 'data:{"model":"/srv/a.gguf","n":1}\n\n', rewritten("\n")],
+    ["extra spaces after data:", 'data:    {"model":"/srv/a.gguf","n":1}\n\n', rewritten("\n")],
+    ["tab after data:", 'data:\t{"model":"/srv/a.gguf","n":1}\n\n', rewritten("\n")],
+    ["trailing whitespace after the JSON", 'data: {"model":"/srv/a.gguf","n":1}   \n\n', rewritten("\n")],
+    ["CRLF line endings", 'data: {"model":"/srv/a.gguf","n":1}\r\n\r\n', rewritten("\r\n")],
+    ["multi-line data joined per spec", 'data: {"model":"/srv/a.gguf",\ndata: "n":1}\n\n', rewritten("\n")],
+    ["event/id lines kept", 'event: message\nid: 7\ndata: {"model":"/srv/a.gguf","n":1}\n\n', 'event: message\nid: 7\ndata: {"model":"roster-a","n":1}\n\n'],
+    ["unterminated final event", 'data: {"model":"/srv/a.gguf","n":1}', 'data: {"model":"roster-a","n":1}\n\n'],
+  ];
+  for (const [name, input, expected] of framings) {
+    it(`rewrites an alias: ${name}`, async () => {
+      expect(await pipeThrough([input], "enforce")).toBe(expected);
+      // and split into 3-char chunks
+      expect(await pipeThrough(input.match(/[\s\S]{1,3}/g)!, "enforce")).toBe(expected);
+    });
+    it(`rejects a mismatch in enforce: ${name}`, async () => {
+      const bad = input.replace("/srv/a.gguf", "/srv/zzz.gguf");
+      await expect(pipeThrough([bad], "enforce")).rejects.toBeInstanceOf(ServedIdentityMismatchError);
+    });
+  }
+
+  it("passes comments, [DONE], model-free and non-JSON events through byte-for-byte", async () => {
+    const raw = ': keepalive\n\ndata: [DONE]\n\ndata: {"choices":[]}\n\ndata: plain text\n\nevent: ping\n\n';
+    expect(await pipeThrough([raw], "enforce")).toBe(raw);
+  });
+
+  it("does not misread a model-looking string inside content", async () => {
+    const raw = 'data: {"choices":[{"delta":{"content":"say \\"model\\": x"}}]}\n\n';
+    expect(await pipeThrough([raw], "enforce")).toBe(raw);
+  });
+
+  it("enforce: an unparsable JSON-looking event that mentions model is unverifiable", async () => {
+    await expect(pipeThrough(['data: {"model": broken\n\n'], "enforce")).rejects.toMatchObject({ reason: "unverifiable" });
+  });
+
+  it("enforce: a unicode-escaped key is not allowed to bypass the fast path", async () => {
+    await expect(pipeThrough(['data: {"mod\\u0065l":"nope"}\n\n'], "enforce")).rejects.toBeInstanceOf(ServedIdentityMismatchError);
+  });
+
+  it("shadow: unverifiable and mismatching events pass through unchanged and are counted once", async () => {
+    let n = 0;
+    const raw = 'data: {"model": broken\n\ndata: {"model":"zzz"}\n\n';
+    expect(await pipeThrough([raw], "shadow", () => { n++; })).toBe(raw);
+    expect(n).toBe(1);
+  });
+
+  it("bounds a pending event: enforce fails closed, shadow passes through and counts", async () => {
+    const huge = `data: {"model":"roster-a","pad":"${"x".repeat(MAX_PENDING_SSE_EVENT_CHARS)}"}`;
+    await expect(pipeThrough([huge.slice(0, 5000), huge.slice(5000)], "enforce")).rejects.toMatchObject({ reason: "overflow" });
+    let n = 0;
+    const out = await pipeThrough([huge.slice(0, 5000), huge.slice(5000), "\n\n", 'data: {"model":"/srv/a.gguf"}\n\n'], "shadow", () => { n++; });
+    expect(out.startsWith(huge)).toBe(true);
+    expect(out.endsWith('data: {"model":"roster-a"}\n\n')).toBe(true);
+    expect(n).toBe(1);
+  });
+});
+
+describe("rosterIdentityOf / unknownAliasRosterIds", () => {
+  it("maps sentinels to null and keeps roster IDs", () => {
+    expect(rosterIdentityOf("roster-a")).toBe("roster-a");
+    for (const v of [null, undefined, "", "unknown", "none"]) expect(rosterIdentityOf(v)).toBeNull();
+  });
+  it("lists alias keys missing from the roster (IDs only)", () => {
+    expect(unknownAliasRosterIds(aliases, new Set(["roster-a"]))).toEqual(["roster-b"]);
   });
 });

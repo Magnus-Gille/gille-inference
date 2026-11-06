@@ -69,6 +69,21 @@ export function parseServedModelAliases(entries: readonly string[]): ServedModel
 
 export type ServedIdentityVerdict = "canonical" | "aliased" | "absent" | "mismatch";
 
+/**
+ * The roster ID an identity check runs against: the already-canonicalized request model
+ * (`canonicalizeModelTrusted`). That function returns the requested string unchanged only when it
+ * is an exact allow-list/catalogue (roster) ID, otherwise the "unknown" sentinel (or null/"none"
+ * for non-inference routes), so canonical is always either the requested roster ID or a sentinel.
+ * A sentinel means the request did not name a roster ID we can vouch for, so there is no identity
+ * to verify and the check is skipped (null). The same value keys the alias lookup and labels the
+ * shadow metric.
+ */
+export function rosterIdentityOf(canonical: string | null | undefined): string | null {
+  if (canonical === null || canonical === undefined) return null;
+  if (canonical === "" || canonical === "unknown" || canonical === "none") return null;
+  return canonical;
+}
+
 /** Judge one reported `model` value against the requested roster ID. */
 export function judgeServedIdentity(
   requested: string,
@@ -96,7 +111,7 @@ export function reconcileCompletionIdentity(
   text: string,
   requested: string | null,
   aliases: ServedModelAliasMap,
-  mode: ServedModelIdentityMode = "enforce",
+  mode: ServedModelIdentityMode,
 ): CompletionIdentityResult {
   if (requested === null || mode === "off") return { kind: "unchanged", text };
   let json: unknown;
@@ -117,75 +132,148 @@ export function reconcileCompletionIdentity(
 
 /** Raised by {@link ServedIdentityGuard}; carries no identity text by design. */
 export class ServedIdentityMismatchError extends Error {
-  constructor() {
+  /** `mismatch`: a verified-wrong identity; `unverifiable`: a frame that should carry JSON did not parse; `overflow`: pending event too large. */
+  constructor(readonly reason: "mismatch" | "unverifiable" | "overflow" = "mismatch") {
     super("served model identity mismatch");
     this.name = "ServedIdentityMismatchError";
   }
 }
 
+/** Upper bound on one pending (not yet terminated) SSE event. */
+export const MAX_PENDING_SSE_EVENT_CHARS = 1 << 20;
+
 /**
- * SSE transform: verifies and canonicalizes the `model` field of EVERY `data:` JSON frame before
- * it is forwarded. Frames without a `model` key, comments, `[DONE]` and non-JSON payloads pass
- * through byte-for-byte. A mismatching frame is never forwarded; the stream errors instead.
+ * SSE transform: verifies and canonicalizes the `model` field of EVERY JSON `data` event before
+ * it is forwarded. Events are assembled per the SSE spec (lines up to a blank line; `\n` or
+ * `\r\n` endings; `data:` with or without a following space; multi-line `data` joined with `\n`).
+ * Events without data, `[DONE]`, comments and non-JSON payloads pass through byte-for-byte.
+ *
+ * enforce: a mismatching event, a JSON-looking event that mentions `model` but cannot be parsed
+ * (unverifiable), or an event exceeding the pending bound is never forwarded; the stream errors.
+ * shadow: all of those are passed through unchanged and reported once through `onShadowMismatch`.
  */
 export class ServedIdentityGuard extends Transform {
-  private buffer = "";
+  private partial = "";
+  private event: string[] = [];
+  private eventChars = 0;
+  private bypass = false;
   private shadowCounted = false;
   private readonly decoder = new StringDecoder("utf8");
 
   constructor(
     private readonly requested: string,
     private readonly aliases: ServedModelAliasMap,
-    private readonly mode: Exclude<ServedModelIdentityMode, "off"> = "enforce",
+    private readonly mode: "shadow" | "enforce",
     private readonly onShadowMismatch: () => void = () => {},
   ) {
     super();
   }
 
-  private reconcileLine(line: string): string {
-    const m = /^data:[ \t]?(\{.*\})([\r\n]*)$/s.exec(line);
-    if (m === null) return line;
-    let json: unknown;
-    try {
-      json = JSON.parse(m[1]!);
-    } catch {
-      return line;
+  private flaw(reason: "mismatch" | "unverifiable" | "overflow"): void {
+    if (this.mode === "enforce") throw new ServedIdentityMismatchError(reason);
+    if (!this.shadowCounted) {
+      this.shadowCounted = true;
+      this.onShadowMismatch();
     }
-    if (json === null || typeof json !== "object" || Array.isArray(json)) return line;
-    const obj = json as Record<string, unknown>;
-    if (!("model" in obj)) return line;
-    const verdict = judgeServedIdentity(this.requested, obj["model"], this.aliases);
-    if (verdict === "mismatch") {
-      if (this.mode === "enforce") throw new ServedIdentityMismatchError();
-      if (!this.shadowCounted) {
-        this.shadowCounted = true;
-        this.onShadowMismatch();
-      }
-      return line;
-    }
-    if (verdict !== "aliased") return line;
-    return `data: ${JSON.stringify({ ...obj, model: this.requested })}${m[2]!}`;
   }
 
-  private drain(final: boolean): string {
-    let out = "";
-    let nl = this.buffer.indexOf("\n");
-    while (nl !== -1) {
-      out += this.reconcileLine(this.buffer.slice(0, nl + 1));
-      this.buffer = this.buffer.slice(nl + 1);
-      nl = this.buffer.indexOf("\n");
+  /** Reconcile one complete event (raw lines incl. endings, last one blank). */
+  private reconcileEvent(lines: string[]): string {
+    const raw = lines.join("");
+    const dataParts: string[] = [];
+    const otherLines: string[] = [];
+    for (const line of lines) {
+      const body = line.replace(/\r?\n$/, "");
+      if (body.startsWith("data:")) dataParts.push(body.slice(5));
+      else if (body !== "") otherLines.push(line);
     }
-    if (final && this.buffer !== "") {
-      out += this.reconcileLine(this.buffer);
-      this.buffer = "";
+    if (dataParts.length === 0) return raw;
+    const data = dataParts.join("\n");
+    const trimmed = data.trim();
+    // Fast path: no `model` key can be present (also guard against unicode-escaped key names).
+    if (!data.includes('"model"') && !data.includes("\\u")) return raw;
+    if (trimmed === "[DONE]") return raw;
+    let json: unknown;
+    try {
+      json = JSON.parse(trimmed);
+    } catch {
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) this.flaw("unverifiable");
+      return raw;
+    }
+    if (json === null || typeof json !== "object" || Array.isArray(json)) return raw;
+    const obj = json as Record<string, unknown>;
+    if (!("model" in obj)) return raw;
+    const verdict = judgeServedIdentity(this.requested, obj["model"], this.aliases);
+    if (verdict === "mismatch") {
+      this.flaw("mismatch");
+      return raw;
+    }
+    if (verdict !== "aliased") return raw;
+    const eol = /\r\n$/.test(lines[0] ?? "") ? "\r\n" : "\n";
+    return `${otherLines.join("")}data: ${JSON.stringify({ ...obj, model: this.requested })}${eol}${eol}`;
+  }
+
+  private consume(text: string, final: boolean): string {
+    let out = "";
+    this.partial += text;
+    let pos = 0;
+    for (;;) {
+      const nl = this.partial.indexOf("\n", pos);
+      if (nl === -1) break;
+      const line = this.partial.slice(pos, nl + 1);
+      pos = nl + 1;
+      out += this.acceptLine(line);
+    }
+    this.partial = this.partial.slice(pos);
+    if (final && this.partial !== "") {
+      out += this.acceptLine(this.partial);
+      this.partial = "";
+    }
+    if (final && this.event.length > 0) {
+      const pending = this.event;
+      this.event = [];
+      this.eventChars = 0;
+      out += this.bypass ? pending.join("") : this.reconcileEvent(pending);
+    }
+    if (!final && this.partial.length > MAX_PENDING_SSE_EVENT_CHARS) {
+      // An unterminated line alone is already past the bound.
+      this.flaw("overflow");
+      out += this.event.join("") + this.partial;
+      this.event = [];
+      this.eventChars = 0;
+      this.partial = "";
+      this.bypass = true;
     }
     return out;
   }
 
+  private acceptLine(line: string): string {
+    if (this.bypass) {
+      if (/^\r?\n$/.test(line)) this.bypass = false;
+      return line;
+    }
+    this.event.push(line);
+    this.eventChars += line.length;
+    if (/^\r?\n$/.test(line)) {
+      const lines = this.event;
+      this.event = [];
+      this.eventChars = 0;
+      return this.reconcileEvent(lines);
+    }
+    if (this.eventChars > MAX_PENDING_SSE_EVENT_CHARS) {
+      this.flaw("overflow");
+      const raw = this.event.join("");
+      this.event = [];
+      this.eventChars = 0;
+      this.bypass = true;
+      return raw;
+    }
+    return "";
+  }
+
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     try {
-      this.buffer += this.decoder.write(chunk);
-      const out = this.drain(false);
+      const out = this.consume(this.decoder.write(chunk), false);
       callback(null, out === "" ? undefined : out);
     } catch (err) {
       callback(err as Error);
@@ -194,11 +282,15 @@ export class ServedIdentityGuard extends Transform {
 
   override _flush(callback: TransformCallback): void {
     try {
-      this.buffer += this.decoder.end();
-      const out = this.drain(true);
+      const out = this.consume(this.decoder.end(), true);
       callback(null, out === "" ? undefined : out);
     } catch (err) {
       callback(err as Error);
     }
   }
+}
+
+/** Roster IDs named in the alias map that are absent from the live roster (log these, never served values). */
+export function unknownAliasRosterIds(aliases: ServedModelAliasMap, roster: ReadonlySet<string>): string[] {
+  return [...aliases.keys()].filter((id) => !roster.has(id));
 }

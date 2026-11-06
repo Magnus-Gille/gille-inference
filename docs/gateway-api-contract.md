@@ -182,21 +182,51 @@ need attention; start those backends with `--alias <roster-id>` or declare the p
 `HOMESERVER_SERVED_MODEL_ALIASES`; when the counter stays flat, switch to `enforce`. Enforcing before
 that turns every unaliased roster entry's `200` into a `502`.
 
-The `enforce` behaviour, and the MCP/streaming rules below, apply only in that mode (shadow passes mismatches through and counts them on every path). The gateway neither echoes the requested ID blindly nor accepts arbitrary returned IDs; only an explicit
-`roster-id=served-identity` pair from configuration bridges the gap. Declare it with
-`HOMESERVER_SERVED_MODEL_ALIASES="qwen3-30b-instruct=<name llama-server reports>"` (comma-separated
-pairs; repeat a roster ID for several served names), or preferably start the backend with
-`--alias <roster-id>` so no mapping is needed. Malformed pairs abort startup without printing the value.
+**What "the requested roster ID" means.** The check runs against the *canonical* request model, the same
+value used for request-log and metric labels (`canonicalizeModelTrusted`): it is the requested string
+only when that string is exactly a roster ID (key allow-list entry, or an entry of the trusted catalogue
+built from `/v1/models`); anything else (different case, whitespace, a llama-swap alias spelling, or a
+catalogue that is still cold at startup) canonicalizes to `unknown`. For `unknown` the gateway cannot vouch
+for what was requested, so it performs **no** identity check, rewrite or shadow count; the backend's
+body is forwarded as before. The identity check, the alias lookup (keyed by roster ID) and the shadow
+metric label all use that one canonical value, on the HTTP and MCP paths alike.
 
-- **Streaming:** `200` and SSE headers are committed before the first frame, so a mismatching frame is
-  never forwarded and the stream ends with a terminal `data: {"error":{…,"code":"upstream_model_mismatch","param":"model"}}`
-  frame plus `data: [DONE]`. A mismatch on the first frame (the normal case) delivers no content. The
-  request log records status `200`, outcome `upstream_model_mismatch`, billed `0`.
-- **MCP `ask`:** returns the requested roster ID as `structuredContent.model`. A mismatch returns
-  `isError:true`, `_meta.m5_code:"upstream_error"`, billed `0`; an absent `model` succeeds.
-- **Discovery:** `/v1/models` lists roster IDs only; those are the values a verified response carries.
-- **Diagnostics:** the error, request log and metrics carry only the closed outcome/error-class names, never
-  the served identity, backend command, path, credentials or content.
+The gateway neither echoes the requested ID blindly nor accepts arbitrary returned IDs; only an explicit
+`roster-id=served-identity` pair from configuration bridges the gap. Declare it with
+`HOMESERVER_SERVED_MODEL_ALIASES="qwen3-30b-instruct=<name llama-server reports>"`: comma-separated pairs
+split on the first `=`; repeat a roster ID for several served names; **served names containing a comma
+cannot be declared** (start the backend with `--alias <roster-id>` instead, which is preferred and needs
+no mapping). Malformed pairs abort startup without printing the value. After the catalogue first loads, the
+gateway logs a warning naming each alias-map roster ID that is not in the roster (roster ID only; the
+served value is never logged).
+
+Behaviour by path (mismatch handling per mode above):
+
+- **Non-streaming:** enforce returns `502 upstream_model_mismatch` (billed `0`; request-log outcome
+  `upstream_model_mismatch`). A non-JSON-object 2xx body carries no identity claim and is unchanged.
+- **Streaming:** the `200` and SSE headers are committed before the first frame, so enforce **stays `200`**
+  and ends the stream with a terminal `data: {"error":{…,"code":"upstream_model_mismatch","param":"model"}}`
+  frame (the same envelope as the non-streaming error) plus `data: [DONE]`. The offending event is never
+  forwarded and the upstream is aborted (a recurrent model is poison-cleared like other gateway aborts);
+  content from earlier events may already have been delivered when the mismatch appears on a later frame.
+  The request log records status `200`, outcome `upstream_model_mismatch`, billed `0`.
+  Events are assembled per the SSE spec (`data:` with or without a following space, any whitespace, CRLF,
+  multi-line `data` joined with `\n`, event/id lines preserved). In enforce, a JSON-looking event that
+  mentions `model` but cannot be parsed, or one whose pending size exceeds 1 MiB, is **unverifiable** and fails
+  closed like a mismatch; in shadow it passes through and is counted once. Events with no `model` key,
+  comments and `[DONE]` pass through byte-for-byte.
+- **MCP `ask`:** applies the same rule to the backend response. A mismatch returns `isError:true`,
+  `_meta.m5_code:"upstream_error"`, billed `0`; an absent `model` succeeds. `structuredContent.model` is
+  the model string the caller requested, never the backend-reported value.
+- **Discovery:** `/v1/models` lists the roster IDs (llama-swap model keys); this change does not alter it.
+  Those IDs are the values a verified response carries.
+- **Breaker / readiness:** `upstream_model_mismatch` does **not** count toward the per-key/model failure
+  breaker (`model_temporarily_unavailable`, which counts only connection failures, timeouts and
+  upstream 5xx). It does count as a `failed` gateway-readiness outcome. Shadow mismatches are only counted
+  in the metric and leave readiness and the breaker untouched.
+- **Diagnostics:** the error, request log, traces and metrics carry only the closed outcome/error-class
+  names and the canonical requested roster ID, never the served identity, backend command, path,
+  credentials or content.
 - Out of scope: other relays (`/v1/systemone`, embeddings, `/delegate`, the Orin adapter, which sets its own model).
 
 ## Caller reliability observations

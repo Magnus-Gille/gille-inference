@@ -4,7 +4,9 @@ import { Readable } from "node:stream";
 import {
   reconcileCompletionIdentity,
   ServedIdentityGuard,
+  rosterIdentityOf,
   ServedIdentityMismatchError,
+  unknownAliasRosterIds,
 } from "./served-model-identity.js";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import {
@@ -1694,6 +1696,9 @@ async function handleChatProxy(
   // C3: the model is safe to label only after upstream returns 2xx for it. We thread the
   // already-canonicalized lctx.model (set at the route) through as the canonicalModel.
   const servedModel = lctx.model;
+  // INFER-343: identity checks, alias lookup and the shadow metric all use this ONE canonical
+  // roster ID (null when the request did not name a roster ID we can vouch for -> not checked).
+  const rosterId = rosterIdentityOf(lctx.model);
   // OWNER-ONLY full request log. The guard is strictly owner-tier AND a real minted key
   // (keyHash !== null), which excludes legacy static admins (keyHash null). Guests are never
   // content-logged. See owner-log.ts for the full rationale. The exposure digest is content-blind
@@ -2104,12 +2109,12 @@ async function handleChatProxy(
         else degenerateGone.signal.addEventListener("abort", onDegenerate, { once: true });
         // INFER-343: verify/canonicalize every frame's `model` before it reaches the client.
         let relay: NodeJS.ReadableStream = nodeStream;
-        if (parsed.model !== null && cfg.servedModelIdentity !== "off") {
+        if (rosterId !== null && cfg.servedModelIdentity !== "off") {
           const guard = new ServedIdentityGuard(
-            parsed.model,
+            rosterId,
             cfg.servedModelAliases,
             cfg.servedModelIdentity,
-            () => recordServedModelMismatchShadow(lctx.model),
+            () => recordServedModelMismatchShadow(rosterId),
           );
           guard.on("error", (guardErr) => {
             nodeStream.destroy();
@@ -2132,11 +2137,12 @@ async function handleChatProxy(
       lctx.status = 200;
       lctx.outcome = "upstream_model_mismatch";
       lctx.errorClass = "upstream_model_mismatch";
+      // The gateway itself aborted the upstream mid-generation (like a degenerate/disconnect abort),
+      // which can leave a recurrent model's state half-written: self-heal with the existing path.
+      requestPoisonClear(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs, "served-model identity abort");
       try {
         if (!res.writableEnded) {
-          res.write(
-            'data: {"error":{"message":"The model backend served a model identity that does not match the requested model, so the response was withheld and no credits were charged.","type":"server_error","code":"upstream_model_mismatch","param":"model"}}\n\n'
-          );
+          res.write(`data: ${JSON.stringify(makeError("upstream_model_mismatch").body)}\n\n`);
           res.write("data: [DONE]\n\n");
           res.end();
         }
@@ -2359,8 +2365,8 @@ async function handleChatProxy(
 
   // INFER-343: the body's `model` must be the requested roster ID, a declared alias of it
   // (rewritten to the roster ID), or absent. Anything else is withheld and billed zero.
-    const identity = reconcileCompletionIdentity(text, parsed.model, cfg.servedModelAliases, cfg.servedModelIdentity);
-    if (identity.kind === "mismatch_shadow") recordServedModelMismatchShadow(lctx.model);
+    const identity = reconcileCompletionIdentity(text, rosterId, cfg.servedModelAliases, cfg.servedModelIdentity);
+    if (identity.kind === "mismatch_shadow") recordServedModelMismatchShadow(rosterId);
     if (identity.kind === "mismatch") {
       lctx.status = 502;
       lctx.outcome = "upstream_model_mismatch";
@@ -4174,7 +4180,14 @@ export function startGateway(
   // Warm the trusted-catalogue cache in the background so empty-allow-list (owner/admin) requests
   // get a per-model label from the first request onward. Fire-and-forget — never blocks startup,
   // and a failure just leaves the cache empty (→ "unknown" labels) until the next refresh.
-  void warmCatalogue();
+  void warmCatalogue().then((roster) => {
+    // INFER-343: alias keys must be roster IDs. Log roster IDs only, never served values. A cold
+    // (empty) catalogue proves nothing, so stay quiet then.
+    if (roster.size === 0) return;
+    for (const id of unknownAliasRosterIds(cfg.servedModelAliases, roster)) {
+      console.warn("[served-model-identity] HOMESERVER_SERVED_MODEL_ALIASES names a roster ID that is not in the roster:", /^[A-Za-z0-9._:\/-]{1,128}$/.test(id) ? id : "<invalid-id>");
+    }
+  });
 
   // code_loop (#116): sweep at startup AND periodically. Source-bearing durable results must
   // expire without requiring a gateway restart; no-overlap keeps maintenance work bounded.

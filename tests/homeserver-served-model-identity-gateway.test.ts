@@ -11,7 +11,7 @@
  * fails closed with the named `upstream_model_mismatch`, billed zero, with no served identity
  * leaked into the response.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,6 +28,9 @@ const SERVED_PATH = "/home/operator/private/models/Qwen3-30B-A3B-Instruct-2507-Q
 const OTHER_ROSTER_PATH = "/home/operator/private/models/some-other-model.gguf";
 const UNKNOWN_PATH = "/home/operator/private/models/never-declared.gguf";
 
+const unloadedIds: string[] = [];
+// When set, the SSE branch writes exactly these raw strings (spaced by 10 ms) instead of the default.
+let ssePlan: ((model: unknown) => string[]) | null = null;
 let reportedModel: unknown = SERVED_PATH;
 let omitModel = false;
 let upstream: Server;
@@ -42,13 +45,40 @@ function startUpstream(): Promise<void> {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
+      const url = req.url ?? "";
+      if (req.method === "GET" && url === "/v1/models") {
+        // Warms the trusted catalogue: ROSTER is a real roster ID (the llama-swap model key).
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: ROSTER, object: "model" }, { id: "some-other-model", object: "model" }] }));
+        return;
+      }
+      if (req.method === "GET" && url === "/running") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ running: [] }));
+        return;
+      }
+      if (req.method === "POST" && url.startsWith("/api/models/unload/")) {
+        unloadedIds.push(decodeURIComponent(url.slice("/api/models/unload/".length)));
+        res.writeHead(200);
+        res.end("OK");
+        return;
+      }
       if (req.method !== "POST") {
-        // Catalogue/running probes from the gateway: not under test.
         res.writeHead(404);
         res.end();
         return;
       }
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
+      if (body.stream === true && ssePlan !== null) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const parts = ssePlan(reportedModel);
+        parts.forEach((part, i) => setTimeout(() => {
+          if (res.destroyed || res.writableEnded) return;
+          res.write(part);
+          if (i === parts.length - 1) res.end();
+        }, 10 * (i + 1)));
+        return;
+      }
       if (body.stream === true) {
         res.writeHead(200, { "content-type": "text/event-stream" });
         const f1 = `data: ${JSON.stringify(withModel({ id: "c1", choices: [{ delta: { role: "assistant", content: "hel" } }] }))}\n\n`;
@@ -95,7 +125,7 @@ const stops: Array<() => Promise<void>> = [];
 let runtimeDir = "";
 let aliases: Map<string, Set<string>>;
 let renderMetrics: () => string;
-let mcpRun: (alias: string, mode?: "enforce" | "shadow" | "off") => Promise<{
+let mcpRun: (alias: string, mode?: "enforce" | "shadow" | "off", model?: string) => Promise<{
   r: Awaited<ReturnType<typeof runChatCompletion>>;
   k: { plaintextKey: string };
 }>;
@@ -129,7 +159,7 @@ beforeAll(async () => {
   ]);
   // Explicit, operator-declared roster -> served-identity pairs (config.servedModelAliases).
   const start = async (mode: "enforce" | "shadow" | "off"): Promise<number> => {
-    cfgMod.setConfig({ servedModelAliases: aliases, servedModelIdentity: mode } as never);
+    cfgMod.setConfig({ servedModelAliases: aliases, servedModelIdentity: mode, recurrentModelIds: [ROSTER], poisonClearCooldownMs: 1 } as never);
     const handle = await gw.startGateway();
     stops.push(handle.stop);
     return handle.port;
@@ -138,6 +168,8 @@ beforeAll(async () => {
   shadowPort = await start("shadow");
   offPort = await start("off");
   renderMetrics = (await import("../src/homeserver/metrics.js")).renderMetrics;
+  // The roster ID must be in the trusted catalogue for identity checks to apply (canonical ID).
+  expect((await (await import("../src/homeserver/catalogue.js")).warmCatalogue()).has(ROSTER)).toBe(true);
 });
 
 afterAll(async () => {
@@ -150,6 +182,7 @@ afterAll(async () => {
 beforeEach(() => {
   reportedModel = SERVED_PATH;
   omitModel = false;
+  ssePlan = null;
   resetQuotaWindows();
 });
 
@@ -171,6 +204,14 @@ async function chat(token: string, extra: Record<string, unknown> = {}, port = g
 function lastLog(alias: string): { outcome: string; status: number; errorClass: string | null } | null {
   const row = getRequestLog(200).find((r) => r.alias === alias);
   return row ? { outcome: row.outcome, status: row.status, errorClass: row.errorClass } : null;
+}
+
+function expectNoServedIdentityLeak(): void {
+  const rows = JSON.stringify(getRequestLog(500));
+  for (const needle of [SERVED_PATH, UNKNOWN_PATH, OTHER_ROSTER_PATH, "/home/operator"]) {
+    expect(rows).not.toContain(needle);
+    expect(renderMetrics()).not.toContain(needle);
+  }
 }
 
 function sseModels(text: string): unknown[] {
@@ -258,13 +299,17 @@ describe("INFER-343 direct streaming identity", () => {
     reportedModel = UNKNOWN_PATH;
     const k = mintKey({ alias: "sid-unknown", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
     const res = await chat(k.plaintextKey, { stream: true });
+    expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).not.toContain('"content":"hel"');
     expect(text).not.toContain("/home/operator");
     expect(text).toContain('"code":"upstream_model_mismatch"');
     expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
     expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
-    expect(lastLog("sid-unknown")?.outcome).toBe("upstream_model_mismatch");
+    expect(lastLog("sid-unknown")).toEqual({ outcome: "upstream_model_mismatch", status: 200, errorClass: "upstream_model_mismatch" });
+    expectNoServedIdentityLeak();
+    // N2: the gateway aborted the upstream itself; a recurrent model must be poison-cleared.
+    await vi.waitFor(() => expect(unloadedIds).toContain(ROSTER));
   });
 
   it("frames without a model are forwarded unchanged", async () => {
@@ -289,12 +334,12 @@ describe("INFER-343 MCP ask identity", () => {
       creditLimit: rec.creditLimit,
     };
   }
-  const run = async (alias: string, mode: "enforce" | "shadow" | "off" = "enforce") => {
+  const run = async (alias: string, mode: "enforce" | "shadow" | "off" = "enforce", model = ROSTER) => {
     const k = mintKey({ alias, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
     const cfg = { ...loadConfig(), servedModelAliases: aliases, servedModelIdentity: mode, lmStudioBaseUrl: `http://127.0.0.1:${upstreamPort}/v1` };
     const controller = new AdmissionController({ maxInflight: 2, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
     const r = await runChatCompletion(principalOf(lookupKey(k.plaintextKey)!), cfg, controller, noopInflight, {
-      model: ROSTER,
+      model,
       messages: [{ role: "user", content: "hi" }],
       maxTokens: 16,
     });
@@ -353,12 +398,15 @@ describe("INFER-343 shadow mode (default rollout)", () => {
     expect(sseModels(await (await chat(k.plaintextKey, { stream: true }, shadowPort)).text())).toEqual([ROSTER, ROSTER, ROSTER]);
     reportedModel = UNKNOWN_PATH;
     const before = metricCount();
-    const text = await (await chat(k.plaintextKey, { stream: true }, shadowPort)).text();
+    // Fresh key: the billed-amount assertion must not be satisfied by the earlier request.
+    const fresh = mintKey({ alias: "sh-sid-mismatch", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    expect(lookupKey(fresh.plaintextKey)!.creditsUsed).toBe(0);
+    const text = await (await chat(fresh.plaintextKey, { stream: true }, shadowPort)).text();
     expect(sseModels(text)).toEqual([UNKNOWN_PATH, UNKNOWN_PATH, UNKNOWN_PATH]);
     expect(text).toContain('"content":"hel"');
     expect(text).not.toContain("upstream_model_mismatch");
     expect(metricCount()).toBe(before + 1);
-    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+    expect(lookupKey(fresh.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
   });
 
   it("MCP ask: mismatch succeeds (billed) and is counted", async () => {
@@ -389,5 +437,105 @@ describe("INFER-343 off mode", () => {
   it("MCP ask: mismatch succeeds", async () => {
     reportedModel = UNKNOWN_PATH;
     expect((await mcpRun("mcp-off-unknown", "off")).r.ok).toBe(true);
+  });
+});
+
+describe("INFER-343 canonical roster ID (B1)", () => {
+  const metricCount = (): number =>
+    renderMetrics().split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{")).reduce((n, l) => n + Number(l.split(" ").pop()), 0);
+
+  it("canonicalization only ever yields the requested roster ID or the unknown sentinel", async () => {
+    const { canonicalizeModelTrusted } = await import("../src/homeserver/catalogue.js");
+    expect(canonicalizeModelTrusted(ROSTER, [])).toBe(ROSTER);
+    for (const spelling of ["Qwen3-30B-Instruct", ` ${ROSTER}`, "qwen3-30b", "qwen3-30b-instruct\u0000"]) {
+      expect(canonicalizeModelTrusted(spelling, [])).toBe("unknown");
+    }
+  });
+
+  it("a non-canonical spelling is not a roster ID: no check, no rewrite, no false shadow count", async () => {
+    const k = mintKey({ alias: "canon-spell", tier: "guest" }, DEFAULTS);
+    const before = metricCount();
+    // Backend correctly reports the roster ID for a differently-spelled request: accepted.
+    reportedModel = ROSTER;
+    for (const port of [gatewayPort, shadowPort]) {
+      const res = await chat(k.plaintextKey, { model: "Qwen3-30B-Instruct" }, port);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { model: string }).model).toBe(ROSTER);
+    }
+    // The raw spelling is never used as the identity: a declared alias is not rewritten for it,
+    // and nothing is rejected or counted (we cannot vouch for what was requested).
+    reportedModel = SERVED_PATH;
+    for (const port of [gatewayPort, shadowPort]) {
+      const res = await chat(k.plaintextKey, { model: "Qwen3-30B-Instruct" }, port);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { model: string }).model).toBe(SERVED_PATH);
+    }
+    expect(metricCount()).toBe(before);
+  });
+
+  it("MCP uses the same canonical ID: a non-roster spelling is unchecked and never counted", async () => {
+    const before = metricCount();
+    reportedModel = ROSTER;
+    expect((await mcpRun("mcp-spell-ok", "enforce", "Qwen3-30B-Instruct")).r.ok).toBe(true);
+    reportedModel = UNKNOWN_PATH;
+    expect((await mcpRun("mcp-spell-mm", "shadow", "Qwen3-30B-Instruct")).r.ok).toBe(true);
+    expect(metricCount()).toBe(before);
+  });
+
+  it("the canonical roster ID still verifies, rewrites declared aliases and labels the metric", async () => {
+    const k = mintKey({ alias: "canon-ok", tier: "guest" }, DEFAULTS);
+    reportedModel = ROSTER;
+    expect(((await (await chat(k.plaintextKey)).json()) as { model: string }).model).toBe(ROSTER);
+    reportedModel = SERVED_PATH;
+    expect(((await (await chat(k.plaintextKey)).json()) as { model: string }).model).toBe(ROSTER);
+    reportedModel = UNKNOWN_PATH;
+    await chat(k.plaintextKey, {}, shadowPort);
+    expect(renderMetrics()).toContain(`${SHADOW_METRIC}{model="${ROSTER}"}`);
+  });
+});
+
+describe("INFER-343 streaming edge cases (enforce)", () => {
+  const event = (model: unknown, content: string): string =>
+    `data: ${JSON.stringify({ id: "c", model, choices: [{ delta: { content } }] })}\n\n`;
+
+  it("mismatch on a LATER frame: partial content, then the named error frame, billed 0", async () => {
+    ssePlan = () => [event(ROSTER, "part"), event(UNKNOWN_PATH, "LEAK"), "data: [DONE]\n\n"];
+    const k = mintKey({ alias: "later-mm", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const res = await chat(k.plaintextKey, { stream: true });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"content":"part"');
+    expect(text).not.toContain("LEAK");
+    expect(text).toContain('"code":"upstream_model_mismatch"');
+    expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+    expect(lastLog("later-mm")).toEqual({ outcome: "upstream_model_mismatch", status: 200, errorClass: "upstream_model_mismatch" });
+    expectNoServedIdentityLeak();
+  });
+
+  it("an unparsable JSON-looking frame that mentions model is unverifiable and fails closed", async () => {
+    ssePlan = () => ['data: {"model": "oops", broken\n\n', "data: [DONE]\n\n"];
+    const k = mintKey({ alias: "unparsable", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const text = await (await chat(k.plaintextKey, { stream: true })).text();
+    expect(text).toContain('"code":"upstream_model_mismatch"');
+    expect(text).not.toContain("oops");
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+  });
+
+  it("CRLF / no-space framing is verified and rewritten end to end", async () => {
+    ssePlan = (m) => [`data:${JSON.stringify({ model: m, choices: [{ delta: { content: "x" } }] })}\r\n\r\n`, "data: [DONE]\r\n\r\n"];
+    const k = mintKey({ alias: "crlf", tier: "guest" }, DEFAULTS);
+    const text = await (await chat(k.plaintextKey, { stream: true })).text();
+    expect(text).toContain(`"model":"${ROSTER}"`);
+    expect(text).not.toContain("/home/operator");
+  });
+
+  it("shadow counts an unverifiable frame once and passes it through", async () => {
+    ssePlan = () => ['data: {"model": "oops", broken\n\n', "data: [DONE]\n\n"];
+    const k = mintKey({ alias: "unparsable-sh", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const metricBefore = renderMetrics().split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{")).join("");
+    const text = await (await chat(k.plaintextKey, { stream: true }, shadowPort)).text();
+    expect(text).toContain("oops");
+    expect(renderMetrics().split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{")).join("")).not.toBe(metricBefore);
   });
 });
