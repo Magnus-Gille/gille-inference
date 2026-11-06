@@ -4,7 +4,7 @@
 
 **Architecture:** [`architecture.md`](./architecture.md)
 
-**Execution detail:** Plane `INFER` tickets (`https://tickets.gille.ai/gille/browse/INFER-N/`; a migrated
+**Execution detail:** the owner's Plane `INFER` tickets (referenced by key; a migrated
 GitHub issue `#N` is `INFER-N`) and repository pull requests. Private operator handoffs are not
 tracked in this repository.
 
