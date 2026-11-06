@@ -1,0 +1,795 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "accounted-host-policy-v1.schema.json",
+  "title": "Accounted host policy v1",
+  "description": "Structural schema for the offline accounted-podman-info-v1 policy contract.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/admissionInput"
+    },
+    {
+      "$ref": "#/$defs/restorationInput"
+    },
+    {
+      "$ref": "#/$defs/result"
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^(?:[0-9]{3}[1-9]|[0-9]{2}[1-9][0-9]|[0-9][1-9][0-9]{2}|[1-9][0-9]{3})-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{6}Z$",
+      "format": "date-time"
+    },
+    "header": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "laneId"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "laneId": {
+          "const": "accounted-podman-info-v1"
+        }
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "attemptId",
+        "hostId",
+        "actorUid",
+        "requestDigest",
+        "artifactSha256",
+        "deadline",
+        "protectedManifestDigest",
+        "ownerAllocationDigest",
+        "firstChargedInstructionDigest",
+        "controlPlaneAccountingDigest"
+      ],
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "attemptId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "hostId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,62}$",
+          "minLength": 1,
+          "maxLength": 63
+        },
+        "actorUid": {
+          "const": 1000
+        },
+        "requestDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "artifactSha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "deadline": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "protectedManifestDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "ownerAllocationDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "firstChargedInstructionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "controlPlaneAccountingDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "wireCoreProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "laneId",
+        "requestId",
+        "attemptId",
+        "hostId",
+        "actorUid",
+        "requestDigest",
+        "artifactSha256",
+        "deadline",
+        "protectedManifestDigest",
+        "ownerAllocationDigest",
+        "firstChargedInstructionDigest",
+        "controlPlaneAccountingDigest"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "laneId": {
+          "const": "accounted-podman-info-v1"
+        },
+        "requestId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "attemptId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "minLength": 36,
+          "maxLength": 36
+        },
+        "hostId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,62}$",
+          "minLength": 1,
+          "maxLength": 63
+        },
+        "actorUid": {
+          "const": 1000
+        },
+        "requestDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "artifactSha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "deadline": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "protectedManifestDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "ownerAllocationDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "firstChargedInstructionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "controlPlaneAccountingDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chargedMemoryMaxBytes",
+        "swapMaxBytes",
+        "cpuQuotaMicros",
+        "cpuPeriodMicros",
+        "tasksMax",
+        "addressSpaceLimitBytes",
+        "digest"
+      ],
+      "properties": {
+        "chargedMemoryMaxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "swapMaxBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "cpuQuotaMicros": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "cpuPeriodMicros": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "tasksMax": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "addressSpaceLimitBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wholeTask",
+        "completeBeforeFirstWork"
+      ],
+      "properties": {
+        "wholeTask": {
+          "enum": [
+            "complete",
+            "incomplete",
+            "unknown"
+          ]
+        },
+        "completeBeforeFirstWork": {
+          "type": "boolean"
+        }
+      }
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "scope",
+        "digest"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "complete",
+            "incomplete",
+            "unknown"
+          ]
+        },
+        "scope": {
+          "enum": [
+            "whole-task",
+            "partial",
+            "unknown"
+          ]
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gpuAccess",
+        "payloadIpNetwork",
+        "localIpcDefined"
+      ],
+      "properties": {
+        "gpuAccess": {
+          "type": "boolean"
+        },
+        "payloadIpNetwork": {
+          "type": "boolean"
+        },
+        "localIpcDefined": {
+          "type": "boolean"
+        }
+      }
+    },
+    "residencyPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "models"
+      ],
+      "properties": {
+        "mode": {
+          "const": "preserve"
+        },
+        "models": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "residencyObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "models"
+      ],
+      "properties": {
+        "models": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "active",
+        "invocationId",
+        "restarts"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "invocationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "restarts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "oomService": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "kills"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "kills": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "oomCounters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "services"
+      ],
+      "properties": {
+        "host": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "services": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/oomService"
+          }
+        }
+      }
+    },
+    "plan": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/header"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "laneId",
+            "bindings",
+            "ownerAllocation",
+            "coverage",
+            "controlPlaneAccounting",
+            "controls",
+            "observationMaxAgeMs",
+            "residency"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "laneId": {
+              "const": "accounted-podman-info-v1"
+            },
+            "bindings": {
+              "$ref": "#/$defs/bindings"
+            },
+            "ownerAllocation": {
+              "$ref": "#/$defs/allocation"
+            },
+            "coverage": {
+              "$ref": "#/$defs/coverage"
+            },
+            "controlPlaneAccounting": {
+              "$ref": "#/$defs/accounting"
+            },
+            "controls": {
+              "$ref": "#/$defs/controls"
+            },
+            "observationMaxAgeMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "residency": {
+              "$ref": "#/$defs/residencyPlan"
+            }
+          }
+        }
+      ]
+    },
+    "protectedManifest": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/header"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "laneId",
+            "digest",
+            "services",
+            "residency",
+            "oomCounters"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "laneId": {
+              "const": "accounted-podman-info-v1"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "services": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/service"
+              }
+            },
+            "residency": {
+              "$ref": "#/$defs/residencyPlan"
+            },
+            "oomCounters": {
+              "$ref": "#/$defs/oomCounters"
+            }
+          }
+        }
+      ]
+    },
+    "activity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active",
+        "queued",
+        "leaseHeld"
+      ],
+      "properties": {
+        "active": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "queued": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "leaseHeld": {
+          "type": "boolean"
+        }
+      }
+    },
+    "backendActivity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage",
+        "active",
+        "queued"
+      ],
+      "properties": {
+        "coverage": {
+          "enum": [
+            "complete",
+            "incomplete",
+            "unknown"
+          ]
+        },
+        "active": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "queued": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "work": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gateway",
+        "backend"
+      ],
+      "properties": {
+        "gateway": {
+          "$ref": "#/$defs/activity"
+        },
+        "backend": {
+          "$ref": "#/$defs/backendActivity"
+        }
+      }
+    },
+    "maintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active"
+      ],
+      "properties": {
+        "active": {
+          "type": "boolean"
+        }
+      }
+    },
+    "observation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/header"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "laneId",
+            "bindings",
+            "observedAt",
+            "ownerAllocation",
+            "coverage",
+            "controlPlaneAccounting",
+            "controls",
+            "work",
+            "maintenance",
+            "protectedServices",
+            "residency",
+            "oomCounters"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "laneId": {
+              "const": "accounted-podman-info-v1"
+            },
+            "bindings": {
+              "$ref": "#/$defs/bindings"
+            },
+            "observedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "ownerAllocation": {
+              "$ref": "#/$defs/allocation"
+            },
+            "coverage": {
+              "$ref": "#/$defs/coverage"
+            },
+            "controlPlaneAccounting": {
+              "$ref": "#/$defs/accounting"
+            },
+            "controls": {
+              "$ref": "#/$defs/controls"
+            },
+            "work": {
+              "$ref": "#/$defs/work"
+            },
+            "maintenance": {
+              "$ref": "#/$defs/maintenance"
+            },
+            "protectedServices": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/service"
+              }
+            },
+            "residency": {
+              "$ref": "#/$defs/residencyObservation"
+            },
+            "oomCounters": {
+              "$ref": "#/$defs/oomCounters"
+            }
+          }
+        }
+      ]
+    },
+    "admissionInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan",
+        "protectedManifest",
+        "observation"
+      ],
+      "properties": {
+        "plan": {
+          "$ref": "#/$defs/plan"
+        },
+        "protectedManifest": {
+          "$ref": "#/$defs/protectedManifest"
+        },
+        "observation": {
+          "$ref": "#/$defs/observation"
+        }
+      }
+    },
+    "restorationInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan",
+        "protectedManifest",
+        "observation",
+        "baseline"
+      ],
+      "properties": {
+        "plan": {
+          "$ref": "#/$defs/plan"
+        },
+        "protectedManifest": {
+          "$ref": "#/$defs/protectedManifest"
+        },
+        "observation": {
+          "$ref": "#/$defs/observation"
+        },
+        "baseline": {
+          "$ref": "#/$defs/observation"
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "laneId",
+        "phase",
+        "offlineOnly",
+        "executionAuthorized",
+        "admit",
+        "inputDigest",
+        "reasons",
+        "decisionDigest"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "laneId": {
+          "const": "accounted-podman-info-v1"
+        },
+        "phase": {
+          "enum": [
+            "admission",
+            "restoration"
+          ]
+        },
+        "offlineOnly": {
+          "const": true
+        },
+        "executionAuthorized": {
+          "const": false
+        },
+        "admit": {
+          "type": "boolean"
+        },
+        "inputDigest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "activity_unknown",
+              "allocation_invalid",
+              "allocation_mismatch",
+              "baseline_invalid",
+              "baseline_missing",
+              "binding_mismatch",
+              "clock_invalid",
+              "conflicting_evidence",
+              "control_plane_incomplete",
+              "control_plane_unknown",
+              "controls_conflict",
+              "coverage_incomplete",
+              "digest_mismatch",
+              "expired",
+              "future_observation",
+              "gpu_access_forbidden",
+              "lane_mismatch",
+              "lease_held",
+              "local_ipc_undefined",
+              "malformed_input",
+              "maintenance_active",
+              "maintenance_unknown",
+              "manifest_invalid",
+              "missing_field",
+              "observation_stale",
+              "oom_drift",
+              "oom_unknown",
+              "payload_ip_network_forbidden",
+              "protected_identity_drift",
+              "protected_inventory_drift",
+              "protected_restart_drift",
+              "protected_service_unhealthy",
+              "residency_drift",
+              "schema_mismatch",
+              "unknown_field",
+              "work_active",
+              "work_queued"
+            ]
+          }
+        },
+        "decisionDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}
