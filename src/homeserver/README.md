@@ -332,6 +332,57 @@ conflicting reuse returns `409 credit_topup_conflict`. The operation preserves t
 used counter, quotas, expiry and scope; it does not reset credits or process payments. Live
 changes require separate operator approval.
 
+### Context-overflow contract probe (INFER-510)
+
+A reusable guard for the INFER-501 / INFER-509 defect class: a request over a model's effective
+context must return a closed `400 context_length_exceeded` with zero charge, never an opaque
+5xx. It lives in `src/homeserver/overflow-contract-probe.ts` with the CLI
+`scripts/check-overflow-contract.ts`. It is a separate script rather than a `homeserver probe`
+extension because `probe` runs the model-capability battery through the in-process orchestrator
+and ledger; this probe is an authenticated black-box client of the HTTP contract.
+
+```bash
+# Offline plan (default): no network, no credentials.
+npx tsx scripts/check-overflow-contract.ts --targets targets.json
+# Live (separately approved envelope only):
+OVERFLOW_PROBE_API_KEY=... npx tsx scripts/check-overflow-contract.ts --targets targets.json \
+  --live --envelope-ref <approved-envelope-id> --base-url https://<gateway>
+```
+
+`targets.json` is an array of `{model, endpoint: "systemone"|"chat", effectiveLimitTokens,
+tokensPerFillerUnit?, underFraction?, overFraction?}`. The probe **consumes** certified effective
+limits (INFER-125); it neither defines nor measures them, so supply the certified value (and a
+calibrated `tokensPerFillerUnit` if the tokenizer is not about one token per filler word). Per
+target it sends one request at `underFraction` (default 0.95) and one at `overFraction` (default
+1.05) of the limit, with synthetic filler only, and reads `creditsUsed` from `GET /portal/me`
+before and after each call. Bodies are never logged or reported; the output holds statuses, a
+validated error code, filler-unit counts and integer charge deltas.
+
+| Label | Meaning |
+| --- | --- |
+| `fixed_verified` | under call 200 **and charged (> 0, proving the meter is live)**, over call closed `400 context_length_exceeded`, charge exactly 0, balance continuous between the calls |
+| `fixed_unbracketed` | over call closed with charge 0, but the under call was not 200 |
+| `fix_not_effective` | over call returned 5xx, or 400/422 with a missing or unexpected code, with a healthy under call and charge 0 |
+| `inconclusive` | anything else; `reasons` says why, e.g. `charge_meter_not_live`, `balance_moved_between_calls`, `balance_decreased`, `over_call_charged`, `charge_evidence_missing`, `over_call_admission_rejected` (401/402/403/408/413/429 or codes such as `server_busy`, `rate_limit_exceeded`) |
+
+After each call the probe polls `GET /portal/me` until two consecutive reads, one settle interval
+apart, agree (bounded retries and deadline), so a charge reconciled after the response is seen. A
+concurrent same-key request or a reservation release landing inside the over call's own window
+cannot be told apart from a real charge, so run it on a quiet key. Reported balances are raw
+integers only.
+
+Exit code 0 only if every target is `fixed_verified`; 1 for any other label; 2 for usage errors
+(including a flag without a value). `--base-url` must be `https:` (loopback may use `http:`) with
+no credentials, query, fragment or path prefix; a path prefix is unsupported.
+
+**Never run by default.** Nothing in `scripts/deploy-gateway.sh` invokes it. A live run sends two
+real inference calls per target (a near-limit call occupies the serial GPU), so it needs a
+separately approved envelope, the durable GPU lease, normal admission, owner preemption and a key
+with enough credit/TPM headroom. `--envelope-ref` is only recorded in the output, not verified,
+and the probe neither checks nor takes the GPU lease: the operator must arrange it. Do not run it
+concurrently with benchmarks or other traffic on the same key, since concurrent charges would
+confound the zero-charge evidence.
+
 ### MCP transport (offload sub-tasks from Claude Code)
 
 `POST /mcp` speaks the **MCP Streamable-HTTP** transport (hand-rolled JSON-RPC 2.0, one
