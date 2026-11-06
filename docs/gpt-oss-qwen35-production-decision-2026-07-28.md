@@ -95,7 +95,9 @@ The selected serving contract is:
 
 - one slot, ubatch 512, flash attention, Jinja templates
 - F16 KV and a 2 GiB prompt cache
-- shared llama-swap cgroup at 96 GiB with no swap and kill-on-OOM
+- shared llama-swap cgroup at 96 GiB with no swap and kill-on-OOM (as of 2026-07-28; the template now
+  uses `OOMPolicy=continue` and no `MemoryMin`, and the cgroup ceiling does not bound GPU memory, see
+  the correction above)
 - GPT-OSS at 65,536 context
 - Qwen at 32,768 context with reasoning off and the complete audited runtime bundle pinned
 

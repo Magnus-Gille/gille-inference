@@ -42,6 +42,8 @@ be installed; the runtime uses `--pull=never` and cannot install it implicitly.
 - Use a transient **system** unit running as the explicit unprivileged owner. This permits a
   unit-scoped 96 GiB locked-memory ceiling without changing the user manager or global limits.
   The same unit enforces 96 GiB total memory, zero swap, 512 tasks and group OOM termination.
+  This is a cgroup ceiling only: on the unified-memory M5 GPU allocations are charged to no cgroup,
+  so it is not whole-host containment (INFER-350/354).
 - The rootless container has no network, a read-only filesystem, no capabilities, no-new-privileges,
   private IPC, bounded tmpfs mounts, and only the pinned model directory mounted read-only.
   No credential, user home or owner-data mount is passed into the container.

@@ -219,6 +219,8 @@ For a reviewed roster release:
    configuration, and verify the applied bytes without copying them into the public ticket.
 4. Install the [`systemd/llama-swap-memory.conf`](./systemd/llama-swap-memory.conf) limits, reload
    systemd, and verify the effective `MemoryMax`, `MemorySwapMax`, and `OOMPolicy`.
+   `MemoryMax` caps only the service cgroup; it does not contain GPU memory on this unified-memory
+   host. The template no longer sets `MemoryMin`; see "Memory drop-in review (INFER-354)" below.
    Native ROCm System One models also require `/dev/kfd` in the private unit's closed device
    policy. Install the additive, reviewed
    [`systemd/llama-swap-rocm-device.conf`](./systemd/llama-swap-rocm-device.conf) at
@@ -716,6 +718,36 @@ before any backend stop or file replacement; the MCP interruption may therefore 
 gateway deploy caveat above. The gateway's process-local `ActiveWindow` does not by itself authorize
 or survive this restart-spanning operation. Do not treat the public roster example as live
 configuration or copy it over the live config as part of an executable upgrade.
+
+### Memory drop-in review (INFER-354)
+
+Status: the template change below is in the public repository only; it is **not applied to the
+live host**. The live drop-in still carries `MemoryMin=20G` until an owner-attended change.
+
+Decision: remove `MemoryMin=20G`. `memory.min` is a hard reclaim exemption (unlike best-effort
+`memory.low`). The anonymous working set is about 1 GiB and needs no floor; the only large
+resident class is file-backed page cache of the model weights. Every roster entry offloads fully to
+the GPU and none uses `--mlock`, so that cache is read once at start, copied to GPU memory, and not
+used again. At the 2026-10-01 OOM about 18.5 GiB of it was pinned while the same weights were
+already in GPU memory, removing reclaimable memory the host needed. Risk if removed: a model's
+cache is evicted sooner, so a reload may re-read weights from disk (slower cold start, no
+correctness effect). `MemoryLow` is not a substitute.
+
+Owner apply (private operator change; back up the live drop-in first):
+
+1. Edit the live `memory.conf` drop-in of `llama-swap.service` (installed from
+   [`systemd/llama-swap-memory.conf`](./systemd/llama-swap-memory.conf)) and delete only the
+   `MemoryMin=20G` line. Do not touch the other settings.
+2. `systemctl daemon-reload`. This applies cgroup resource-control properties to the running unit
+   and does not restart it, so a resident model, the gateway (`Requires=llama-swap.service` unless
+   already softened) and the MCP transport are not interrupted. Do not `systemctl restart`.
+3. Verify: `systemctl show llama-swap.service -p MemoryMin -p MemoryMax -p OOMPolicy` reports
+   `MemoryMin=0`, `MemoryMax` 96 GiB and `OOMPolicy=continue`, and the unit cgroup's `memory.min`
+   file reads `0`.
+4. Observe over the next model swaps: gateway memory-admission shadow records, no new increase in
+   the host-wide OOM counter, and cold-start latency of a model swapped back in.
+5. Rollback: restore the backed-up drop-in, `systemctl daemon-reload`, and repeat step 3 expecting
+   `MemoryMin=20G`.
 
 ### Credential-safe authenticated capability smoke test
 
