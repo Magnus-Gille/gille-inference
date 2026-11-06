@@ -39,6 +39,14 @@ describe("tracked llama-swap production contract", () => {
     expect(memory).toContain("MemorySwapMax=0");
   });
 
+  // Issue #354: memory.min pinned ~18.5 GiB of already-copied weight page cache during the
+  // 2026-10-01 OOM. The template must not reintroduce a reclaim floor (MemoryMin or MemoryLow).
+  it("sets no reclaim protection floor on the model service", () => {
+    const keys = memory.split("\n").filter((line) => /^\s*(Startup)?Memory(Min|Low)\s*=/.test(line));
+    expect(keys).toEqual([]);
+    expect(memory).toContain("MemoryMin (issue #354): intentionally NOT set");
+  });
+
   it("allows only the ROCm compute device required by native System One models", () => {
     const setting = (key: string) => rocmDevice.split("\n").filter((line) => line.startsWith(`${key}=`));
     expect(rocmDevice).toContain("[Service]");
