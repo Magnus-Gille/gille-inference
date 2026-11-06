@@ -24,6 +24,7 @@ import {
   credentialInventoryReadOnly,
   listKeys,
   revokeKey,
+  revokeKeysByScope,
   KeyAliasExistsError,
   createInvite,
   listInvites,
@@ -181,10 +182,10 @@ export function strictScopeFlag(flags: Record<string, string | boolean>): KeySco
   if (!("scope" in flags)) return undefined;
   const value = flags["scope"];
   if (typeof value !== "string") {
-    throw new Error("keys: --scope requires a value (admin|agent|inference|monitor)");
+    throw new Error("keys: --scope requires a value (admin|agent|ask|inference|monitor)");
   }
-  if (value !== "admin" && value !== "agent" && value !== "inference" && value !== "monitor") {
-    throw new Error("keys: --scope must be admin|agent|inference|monitor");
+  if (value !== "admin" && value !== "agent" && value !== "ask" && value !== "inference" && value !== "monitor") {
+    throw new Error("keys: --scope must be admin|agent|ask|inference|monitor");
   }
   return value;
 }
@@ -445,13 +446,14 @@ export function cmdKeys(args: ParsedArgs): void {
   // Inventory is deliberately separate from every mutating command: it must remain usable when
   // the production database is mounted read-only, and it must not load static fallback values.
   if (sub === "inventory") {
-    const allowed = new Set(["all", "stale-days", "json"]);
+    const allowed = new Set(["all", "stale-days", "json", "scope"]);
     for (const name of Object.keys(args.flags)) {
       if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
     }
     const report = credentialInventoryReadOnly({
       includeRevoked: args.flags["all"] === true,
       staleAfterDays: strictNumFlag(args.flags, "stale-days"),
+      scope: strictScopeFlag(args.flags),
     });
     if (args.flags["json"] === true) {
       console.log(JSON.stringify({ ...report, legacyStaticCredentialCounts: "not_inspected" }, null, 2));
@@ -480,7 +482,7 @@ export function cmdKeys(args: ParsedArgs): void {
     const tier = typeof args.flags["tier"] === "string" ? (args.flags["tier"] as string) : undefined;
     const scope = strictScopeFlag(args.flags);
     if (!alias || (tier !== "owner" && tier !== "guest")) {
-      throw new Error("usage: keys mint --alias A --tier owner|guest [--scope admin|agent|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]");
+      throw new Error("usage: keys mint --alias A --tier owner|guest [--scope admin|agent|ask|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]");
     }
     const models =
       typeof args.flags["models"] === "string"
@@ -527,7 +529,7 @@ export function cmdKeys(args: ParsedArgs): void {
     const scopeRaw = strictScopeFlag(args.flags);
     if (!alias) {
       throw new Error(
-        "usage: keys rotate --alias A [--tier owner|guest] [--scope admin|agent|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]\n" +
+        "usage: keys rotate --alias A [--tier owner|guest] [--scope admin|agent|ask|inference] [--models a,b] [--rpm N] [--tpm N] [--daily N] [--parallel N] [--credits N] [--ttl S]\n" +
           "  Revokes the active key(s) for A and mints a fresh one, inheriting tier+scope+limits from\n" +
           "  the current key (override with flags). --tier is required only for a brand-new name."
       );
@@ -572,7 +574,7 @@ export function cmdKeys(args: ParsedArgs): void {
     const scope = strictScopeFlag(args.flags);
     if (!alias) {
       throw new Error(
-        "usage: keys stage --alias A [--scope admin|agent|inference|monitor] [--overlap S] " +
+        "usage: keys stage --alias A [--scope admin|agent|ask|inference|monitor] [--overlap S] " +
         "[--ttl S] [limit overrides]\n" +
         "  Mints a replacement while the current credential remains active for a bounded overlap."
       );
@@ -684,8 +686,27 @@ export function cmdKeys(args: ParsedArgs): void {
   }
 
   if (sub === "revoke") {
+    if ("scope" in args.flags) {
+      // Bulk revoke by scope (INFER-450 rollback guard). Dry-run unless --confirm is exactly set.
+      for (const name of Object.keys(args.flags)) {
+        if (!["scope", "confirm", "dry-run"].includes(name)) throw new Error(`keys revoke --scope: unknown flag --${name}`);
+      }
+      if (args.positional.length > 1) throw new Error("keys revoke --scope takes no alias");
+      const scope = strictScopeFlag(args.flags)!;
+      // Bulk revoke exists only as the INFER-450 rollback guard; everything else is by alias.
+      if (scope !== "ask") throw new Error("keys revoke --scope only supports 'ask'; revoke other keys by alias");
+      const confirm = args.flags["confirm"] === true;
+      if (confirm && "dry-run" in args.flags) throw new Error("keys revoke --scope: --confirm and --dry-run are mutually exclusive");
+      const result = revokeKeysByScope(scope, { dryRun: !confirm });
+      console.log(
+        `${confirm ? "revoked" : "dry-run: would revoke"} ${result.aliases.length} active '${scope}' key(s)` +
+        (result.aliases.length > 0 ? `: ${result.aliases.join(", ")}` : "")
+      );
+      if (!confirm) console.log("re-run with --confirm to apply; verify with `keys inventory --scope " + scope + "`");
+      return;
+    }
     const alias = typeof args.flags["alias"] === "string" ? (args.flags["alias"] as string) : args.positional[1];
-    if (!alias) throw new Error("usage: keys revoke --alias A");
+    if (!alias) throw new Error("usage: keys revoke --alias A | keys revoke --scope S [--confirm]");
     const ok = revokeKey(alias);
     console.log(ok ? `✓ revoked '${alias}'` : `✗ no such active key '${alias}'`);
     return;
@@ -1059,8 +1080,10 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts residency [--json]\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner   # defaults to agent + 90d\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
+          "  tsx src/homeserver/cli.ts keys mint --alias box-agent --tier owner --scope ask --models mellum --credits 200000   # MCP ask only (INFER-450)\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
-          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30\n" +
+          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30 [--scope ask]\n" +
+          "  tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # ask ONLY; dry-run unless --confirm; REQUIRED before rolling the gateway back below the ask-scope version\n" +
           "  tsx src/homeserver/cli.ts keys stage --alias harness --scope agent --overlap 3600\n" +
           "  tsx src/homeserver/cli.ts keys preflight --plan rot_...\n" +
           "  tsx src/homeserver/cli.ts keys commit --plan rot_...\n" +

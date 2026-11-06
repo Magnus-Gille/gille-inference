@@ -34,11 +34,12 @@ privacy/admission tier, route scope, and model allow-list:
 | Tier | `guest` | Content-blind guest admission; cannot carry privileged scopes. |
 | Scope | `admin` | Operator routes plus agent/inference surfaces. Explicit for new keys; legacy null-scope owner rows retain it compatibly. |
 | Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
+| Scope | `ask` | Owner tier only (INFER-450). MCP `ask` plus its read-only helpers `list_models`, `model_status`, `tokenize`; and the preflight reads `GET /portal/me`, `GET /v1/models`, `GET /healthz`. Enforced as a closed route allow-list (every other route, including `/v1/chat/completions`, returns `403 route_not_allowed`), and per MCP tool: `tools/list` omits, and `tools/call` answers the unknown-tool error for, `code_loop_*` and `record_adoption_evidence`; `ask.files` is rejected and not advertised; no execution-feedback handle. Intended for an unprivileged on-box agent account. `ask` keys are owner tier: prompts enter the owner content log and get owner-priority admission, so always mint them with `--models` and credit/quota limits. A gateway older than this scope reads the stored value as owner `inference`; run `keys revoke --scope ask --confirm` before any rollback below this version. |
 | Scope | `inference` | Ordinary inference only. Legacy guest-key default. |
 | Scope | `monitor` | Read-only `GET /healthz`, `/models*`, `/metrics`, `/ledger*`, and `/ops/summary`; no inference or mutation. |
 
 Tier does not imply admin authority. New owner credentials default to `agent`; admin must be
-explicit. New credentials are lifetime-bounded (admin 30 days, agent 90 days, inference/monitor
+explicit. New credentials are lifetime-bounded (admin 30 days, agent and ask 90 days, inference/monitor
 365 days). Existing owner rows without a stored scope resolve compatibly to `admin` so they can be
 migrated through the staged lifecycle in `docs/credential-lifecycle-runbook.md`.
 

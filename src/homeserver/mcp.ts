@@ -332,8 +332,13 @@ function isAdoptionReporter(principal: McpPrincipal): boolean {
   return isCodeLoopOwner(principal);
 }
 
+/**
+ * Blind-context `files` expansion is read by the gateway's own service account, so it is never
+ * available to the `ask` scope: an on-box agent account must not be able to use the gateway as a
+ * confused deputy for files it cannot read itself (INFER-450).
+ */
 function isAskFilesOwner(principal: McpPrincipal): boolean {
-  return principal.tier === "owner";
+  return principal.tier === "owner" && principal.scope !== "ask";
 }
 
 function askFilesCapability(principal: McpPrincipal, cfg: HomeserverConfig): AskFilesCapability {
@@ -576,14 +581,17 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
             include_reasoning: { type: "boolean", default: false,
               description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
           } : {}),
-          files: {
-            type: "array",
-            items: { type: "string" },
-            description:
-              "OWNER-ONLY: absolute paths on the box, expanded server-side into the prompt as " +
-              "local context (allow-listed roots only; see HOMESERVER_BLIND_CONTEXT_ROOTS). A " +
-              "guest key supplying this is rejected, never silently ignored.",
-          },
+          // The ask-only scope never reads server-side files, so the input is not advertised.
+          ...(principal.scope === "ask" ? {} : {
+            files: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "OWNER-ONLY: absolute paths on the box, expanded server-side into the prompt as " +
+                "local context (allow-listed roots only; see HOMESERVER_BLIND_CONTEXT_ROOTS). A " +
+                "guest key supplying this is rejected, never silently ignored.",
+            },
+          }),
         },
         required: ["model", "prompt"],
       },
@@ -1596,7 +1604,9 @@ async function callTool(
     // OpenAI-shaped error vocabulary (errors.ts) as the rest of the gateway.
     if (files !== undefined && files.length > 0 && !isAskFilesOwner(ctx.principal)) {
       const env = makeError("route_not_allowed", {
-        message: "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
+        message: ctx.principal.scope === "ask"
+          ? "File attachments ('files') are not available to an ask-scope key."
+          : "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
       });
       return {
         text: env.body.error.message,

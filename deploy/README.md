@@ -660,6 +660,21 @@ even when the marker and file hashes match.
 
 ### Rollback
 
+**Mandatory before rolling back below the `ask`-scope version (INFER-450).** A gateway build
+without the `ask` scope reads a stored owner `ask` row as owner `inference`, silently re-enabling
+`ask.files` and ordinary `/v1` inference for that key. Revoke every `ask` key first and verify:
+
+```bash
+npx tsx src/homeserver/cli.ts keys revoke --scope ask             # dry-run: lists aliases and count
+npx tsx src/homeserver/cli.ts keys revoke --scope ask --confirm   # one transaction, soft-revoke
+npx tsx src/homeserver/cli.ts keys inventory --scope ask          # must show no active keys
+```
+
+Rollback floor: the first release containing the `ask` scope (the merge of the INFER-450 PR).
+Rolling back to any earlier revision requires this step. Revoked aliases stay reserved (see the
+alias note in `src/homeserver/README.md`), so after rolling forward again mint the replacement
+under a NEW alias. `keys revoke --scope` accepts only `ask`; revoke other keys by alias.
+
 The unit is not a git checkout, so "rollback" means **redeploy a known-good commit**, not
 `git revert` on the box:
 
