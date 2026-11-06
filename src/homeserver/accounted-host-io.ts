@@ -203,8 +203,14 @@ export function executeAccountedHostIo(invocation: Readonly<AccountedIoInvocatio
  * a signal, a timeout or a spawn failure stays a transport failure, and the
  * child's stdout/stderr are never retained as an error cause. */
 export function recoverAccountedHelperFailureEnvelope(error: unknown, maximumBytes: number): string {
-  const failure = error !== null && typeof error === "object" ? error as {status?: unknown; signal?: unknown; stdout?: unknown} : {};
-  if (failure.status === 2 && failure.signal === null && typeof failure.stdout === "string"
-      && Buffer.byteLength(failure.stdout) <= maximumBytes) return failure.stdout;
+  const failure = error !== null && typeof error === "object" ? error as {code?: unknown; status?: unknown; signal?: unknown; stdout?: unknown} : {};
+  // An errno code (ENOBUFS, ETIMEDOUT, ...) or a buffer at its ceiling means
+  // stdout may be truncated; exit 2 must never carry a success envelope.
+  if (failure.code === undefined && failure.status === 2 && failure.signal === null && typeof failure.stdout === "string"
+      && Buffer.byteLength(failure.stdout) < maximumBytes) {
+    let status: unknown;
+    try {status = (JSON.parse(failure.stdout) as {status?: unknown} | null)?.status;} catch {status = undefined;}
+    if (status === "refused" || status === "unknown") return failure.stdout;
+  }
   throw new Error("helper_transport_failed");
 }

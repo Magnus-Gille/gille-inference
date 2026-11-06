@@ -26,7 +26,12 @@ describe("fixed IO helper bridge; synthetic executors only", () => {
     expect(() => run('process.stdout.write(\'{"reason":"root_linux_required","status":"refused"}\\n\'); process.exit(78)')).toThrow("helper_transport_failed");
     expect(() => run('process.stdout.write(\'{"status":"refused"}\'); process.exit(1)')).toThrow("helper_transport_failed");
     expect(() => run("setTimeout(() => {}, 10000)", 200)).toThrow("helper_transport_failed");
-    expect(() => recoverAccountedHelperFailureEnvelope({status:2, signal:null, stdout:"x".repeat(11)}, 10)).toThrow("helper_transport_failed");
+    expect(() => run('process.stdout.write(\'{"result":{},"status":"ok"}\\n\'); process.exit(2)')).toThrow("helper_transport_failed");
+    expect(() => run('process.stdout.write("not json"); process.exit(2)')).toThrow("helper_transport_failed");
+    const unknown = '{"reason":"helper_io_unresolved","status":"unknown"}';
+    expect(recoverAccountedHelperFailureEnvelope({status:2, signal:null, stdout:unknown}, unknown.length+1)).toBe(unknown);
+    expect(() => recoverAccountedHelperFailureEnvelope({status:2, signal:null, stdout:unknown}, unknown.length)).toThrow("helper_transport_failed");
+    expect(() => recoverAccountedHelperFailureEnvelope({code:"ENOBUFS", status:2, signal:null, stdout:unknown}, 262144)).toThrow("helper_transport_failed");
     expect(() => recoverAccountedHelperFailureEnvelope(null, 10)).toThrow("helper_transport_failed");
     const io = createAccountedHostIoBridge(binding, () => run(`process.stdout.write(${JSON.stringify(refusal)}); process.exit(2)`));
     let failure: unknown;
