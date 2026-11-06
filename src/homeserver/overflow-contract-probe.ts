@@ -379,6 +379,7 @@ export function planOverflowProbe(targets: readonly OverflowTarget[]) {
     effectiveLimitTokens: t.effectiveLimitTokens,
     fillerUnits: fillerUnitsFor(t),
     inferenceCalls: 2,
-    balanceReads: 4,
+    // Per call: one before-read, then one read plus 1..maxSettleReads settle reads (default 8).
+    balanceReads: { min: 6, max: 20 },
   }));
 }

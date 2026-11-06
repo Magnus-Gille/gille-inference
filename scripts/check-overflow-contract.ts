@@ -39,7 +39,7 @@ async function main(args: string[]): Promise<number> {
   const envelopeRef = flag(args, "--envelope-ref");
   const baseUrl = flag(args, "--base-url");
   if (!envelopeRef || !/^[A-Za-z0-9._:-]{3,64}$/.test(envelopeRef) || !baseUrl) {
-    console.error("--live requires --envelope-ref (approved envelope reference) and --base-url.");
+    console.error("--live requires --envelope-ref (recorded, not verified: name the approved envelope) and --base-url.");
     return 2;
   }
   const keyEnv = flag(args, "--key-env") ?? "OVERFLOW_PROBE_API_KEY";
