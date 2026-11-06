@@ -39,6 +39,9 @@ not a whole-host guarantee from `MemoryMax=96G`. On this unified-memory M5, GPU 
 from RAM but bypass cgroup accounting, so separate whole-host admission is required to enforce a
 host-memory reserve.
 
+Correction note, 2026-11 (#354): the template since changed to `OOMPolicy=continue` and no
+`MemoryMin` (not yet applied live); the kill-on-OOM contract below is the 2026-07-28 state.
+
 ## Quality result
 
 The primary battery was 74 deterministic probes repeated three times: 222 scored results per
@@ -95,9 +98,7 @@ The selected serving contract is:
 
 - one slot, ubatch 512, flash attention, Jinja templates
 - F16 KV and a 2 GiB prompt cache
-- shared llama-swap cgroup at 96 GiB with no swap and kill-on-OOM (as of 2026-07-28; the template now
-  uses `OOMPolicy=continue` and no `MemoryMin`, and the cgroup ceiling does not bound GPU memory, see
-  the correction above)
+- shared llama-swap cgroup at 96 GiB with no swap and kill-on-OOM (as of 2026-07-28)
 - GPT-OSS at 65,536 context
 - Qwen at 32,768 context with reasoning off and the complete audited runtime bundle pinned
 
