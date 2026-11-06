@@ -1272,6 +1272,223 @@ export function credentialInventoryReadOnly(
   }
 }
 
+// ─── Migration worksheet (INFER-152) ────────────────────────────────────────────────
+
+export type SuggestedAction = "keep" | "keep+expiry" | "narrow" | "retire" | "rotate" | "none";
+
+export interface CredentialPlanEntry {
+  alias: string;
+  tier: Tier;
+  scope: KeyScope;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  status: CredentialInventoryEntry["status"];
+  findings: CredentialFinding[];
+  suggestedAction: SuggestedAction;
+  reason: string;
+}
+
+/**
+ * Per-key decision worksheet derived from an inventory report. Pure and metadata-only: it takes
+ * the already-redacted report, so it cannot reach a hash or plaintext.
+ *
+ * Precedence: inactive → none; never used / stale → retire (a recently created, still-unused key
+ * is kept: it is probably a staged replacement awaiting its first call); admin without expiry →
+ * rotate; admin → narrow; any other key without expiry → keep+expiry; otherwise keep.
+ */
+export function buildCredentialPlan(report: CredentialInventoryReport): CredentialPlanEntry[] {
+  const nowMs = Date.parse(report.generatedAt);
+  const staleMs = report.staleAfterDays * 24 * 60 * 60 * 1000;
+  return report.keys.map((key): CredentialPlanEntry => {
+    const base = {
+      alias: key.alias,
+      tier: key.tier,
+      scope: key.scope,
+      createdAt: key.createdAt,
+      lastUsedAt: key.lastUsedAt,
+      expiresAt: key.expiresAt,
+      status: key.status,
+      findings: key.findings,
+    };
+    const has = (finding: CredentialFinding) => key.findings.includes(finding);
+    if (key.status !== "active") {
+      return { ...base, suggestedAction: "none", reason: `already ${key.status}` };
+    }
+    if (has("unused") && nowMs - Date.parse(key.createdAt) < staleMs) {
+      return { ...base, suggestedAction: key.expiresAt === null ? "keep+expiry" : "keep",
+        reason: "created recently and not yet used; confirm the consumer, then decide" };
+    }
+    if (has("unused") || has("stale")) {
+      return { ...base, suggestedAction: "retire",
+        reason: has("unused") ? "never used by the running gateway" : `no use within ${report.staleAfterDays} days` };
+    }
+    if (key.scope === "admin" && key.expiresAt === null) {
+      return { ...base, suggestedAction: "rotate",
+        reason: "active admin with no expiry; stage a bounded replacement (narrower scope if the consumer allows)" };
+    }
+    if (key.scope === "admin") {
+      return { ...base, suggestedAction: "narrow",
+        reason: "active admin; narrow with `keys restrict` unless the consumer needs /admin routes" };
+    }
+    if (key.expiresAt === null) {
+      return { ...base, suggestedAction: "keep+expiry", reason: "active without expiry; set one with `keys restrict`" };
+    }
+    return { ...base, suggestedAction: "keep", reason: "bounded and in use" };
+  });
+}
+
+// ─── In-place narrowing (INFER-152) ─────────────────────────────────────────────────
+
+/**
+ * Strict partial order on route authority. `admin` reaches every route `agent`, `inference`
+ * and `monitor` reach; `agent` reaches `inference`. `monitor` (read-only observer routes that
+ * `agent` cannot read) and `inference` are incomparable with each other, and `agent` does not
+ * cover `monitor`'s ledger/metrics reads, so `agent→monitor` is NOT a narrowing.
+ */
+export const NARROWER_SCOPES: Readonly<Record<KeyScope, readonly KeyScope[]>> = Object.freeze({
+  admin: Object.freeze(["agent", "inference", "monitor"] as KeyScope[]),
+  agent: Object.freeze(["inference"] as KeyScope[]),
+  inference: Object.freeze([] as KeyScope[]),
+  monitor: Object.freeze([] as KeyScope[]),
+});
+
+export function isScopeNarrowing(from: KeyScope, to: KeyScope): boolean {
+  return NARROWER_SCOPES[from].includes(to);
+}
+
+export type KeyRestrictErrorCode =
+  | "unknown_alias"
+  | "revoked"
+  | "expired"
+  | "staged_rotation"
+  | "widening_scope"
+  | "widening_expiry"
+  | "lifetime_exceeds_scope_max"
+  | "invalid_param"
+  | "no_change";
+
+/** A refused restriction. Carries a stable code; messages contain only aliases/scopes/numbers. */
+export class KeyRestrictError extends Error {
+  constructor(public code: KeyRestrictErrorCode, message: string) {
+    super(message);
+    this.name = "KeyRestrictError";
+  }
+}
+
+export interface RestrictKeyOptions {
+  scope?: KeyScope;
+  /** Seconds from `now`. Must be a positive integer within the resulting scope's maximum. */
+  expiresInSeconds?: number;
+  dryRun?: boolean;
+  now?: Date;
+}
+
+export interface RestrictKeyResult {
+  alias: string;
+  dryRun: boolean;
+  changed: boolean;
+  before: { scope: KeyScope; expiresAt: string | null };
+  after: { scope: KeyScope; expiresAt: string | null };
+}
+
+/**
+ * Narrow an existing minted key in place: lower its scope along {@link NARROWER_SCOPES} and/or
+ * set or shorten its expiry. It never widens either, never touches key material or any other
+ * column, and refuses revoked, expired, or staged-rotation keys. The read, every check and the
+ * single guarded UPDATE run in one IMMEDIATE transaction; the UPDATE also re-asserts the values
+ * the checks used so a concurrent writer cannot be overwritten.
+ */
+export function restrictKey(alias: string, opts: RestrictKeyOptions): RestrictKeyResult {
+  const db = ksDb();
+  const now = opts.now ?? new Date();
+  if (opts.scope === undefined && opts.expiresInSeconds === undefined) {
+    throw new KeyRestrictError("invalid_param", "restrict requires a scope and/or an expiry");
+  }
+  if (opts.expiresInSeconds !== undefined
+    && (!Number.isSafeInteger(opts.expiresInSeconds) || opts.expiresInSeconds <= 0)) {
+    throw new KeyRestrictError("invalid_param", "expiry must be a positive whole number of seconds");
+  }
+
+  return db.transaction((): RestrictKeyResult => {
+    const row = db.prepare(`SELECT * FROM api_keys WHERE alias = @alias`).get({ alias }) as KeyRow | undefined;
+    if (!row) throw new KeyRestrictError("unknown_alias", `no key with alias '${alias}'`);
+    const rec = rowToRecord(row);
+    if (rec.revokedAt !== null) throw new KeyRestrictError("revoked", `'${alias}' is revoked`);
+    if (rec.expiresAt !== null && Date.parse(rec.expiresAt) <= now.getTime()) {
+      throw new KeyRestrictError("expired", `'${alias}' is expired`);
+    }
+
+    const family = rec.logicalAlias ?? rec.alias;
+    const staged = db.prepare(
+      `SELECT logical_alias, replacement_alias, previous_aliases
+         FROM key_rotation_plans WHERE status = 'staged'`
+    ).all() as Array<{ logical_alias: string; replacement_alias: string; previous_aliases: string }>;
+    if (staged.some((plan) =>
+      plan.logical_alias === family
+      || plan.replacement_alias === alias
+      || (JSON.parse(plan.previous_aliases) as string[]).includes(alias)
+    )) {
+      throw new KeyRestrictError("staged_rotation", `'${alias}' is part of a staged rotation; commit or abort it first`);
+    }
+
+    let newScope = rec.scope;
+    if (opts.scope !== undefined && opts.scope !== rec.scope) {
+      if (!isScopeNarrowing(rec.scope, opts.scope)) {
+        throw new KeyRestrictError("widening_scope", `'${alias}': ${rec.scope} → ${opts.scope} is not a narrowing`);
+      }
+      newScope = opts.scope;
+    }
+
+    let newExpiry = rec.expiresAt;
+    if (opts.expiresInSeconds !== undefined) {
+      const max = MAX_KEY_LIFETIME_SECONDS[newScope];
+      if (opts.expiresInSeconds > max) {
+        throw new KeyRestrictError(
+          "lifetime_exceeds_scope_max",
+          `requested lifetime ${opts.expiresInSeconds}s exceeds the maximum ${max}s for '${newScope}' scope`
+        );
+      }
+      const candidate = new Date(now.getTime() + opts.expiresInSeconds * 1_000).toISOString();
+      if (rec.expiresAt !== null && Date.parse(candidate) > Date.parse(rec.expiresAt)) {
+        throw new KeyRestrictError("widening_expiry", `'${alias}': the new expiry would be later than the current one`);
+      }
+      newExpiry = candidate;
+    }
+
+    const scopeChanged = newScope !== rec.scope;
+    const expiryChanged = newExpiry !== rec.expiresAt;
+    const result: RestrictKeyResult = {
+      alias,
+      dryRun: opts.dryRun === true,
+      changed: scopeChanged || expiryChanged,
+      before: { scope: rec.scope, expiresAt: rec.expiresAt },
+      after: { scope: newScope, expiresAt: newExpiry },
+    };
+    if (!result.changed) throw new KeyRestrictError("no_change", `'${alias}' already satisfies the requested restriction`);
+    if (opts.dryRun === true) return result;
+
+    const info = db.prepare(
+      `UPDATE api_keys
+          SET scope = @newScope, expires_at = @newExpiry
+        WHERE alias = @alias
+          AND revoked_at IS NULL
+          AND scope IS @oldStoredScope
+          AND expires_at IS @oldExpiry`
+    ).run({
+      alias,
+      newScope,
+      newExpiry,
+      oldStoredScope: row.scope,
+      oldExpiry: row.expires_at,
+    });
+    if (info.changes !== 1) {
+      throw new KeyRestrictError("no_change", `'${alias}' changed concurrently; re-run restrict`);
+    }
+    return result;
+  }).immediate();
+}
+
 // ─── Credit accounting (lifetime, non-resetting) ────────────────────────────────────
 
 /**

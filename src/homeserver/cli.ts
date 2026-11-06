@@ -22,6 +22,8 @@ import {
   abortKeyRotation,
   listKeyRotations,
   credentialInventoryReadOnly,
+  buildCredentialPlan,
+  restrictKey,
   listKeys,
   revokeKey,
   KeyAliasExistsError,
@@ -31,6 +33,14 @@ import {
   type Tier,
   type InvitePublic,
 } from "./keystore.js";
+import {
+  STATIC_KEY_SWITCH_ENV,
+  countStaticCredentials,
+  disabledStaticLists,
+  parseStaticKeyKillSwitch,
+  type StaticKeyCounts,
+  type StaticKeyKillSwitch,
+} from "./static-keys.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
 import { observeGpuLeaseMutex, type GpuMutexObservation } from "./gpu-lease-observation.js";
@@ -439,22 +449,84 @@ export function cmdLedger(): void {
   if (pricingWarnings.length > 0) console.log(`\n${pricingWarnings.join("\n")}`);
 }
 
+function printStaticInventory(report: {
+  counts: StaticKeyCounts;
+  killSwitch: StaticKeyKillSwitch;
+  suggestedAction: string;
+}): void {
+  const { counts, killSwitch } = report;
+  console.log(
+    `legacy static credentials (counts only): admin=${counts.admin} user=${counts.user} ` +
+    `monitor=${counts.monitor} total=${counts.total}`
+  );
+  const disabled = disabledStaticLists(killSwitch);
+  console.log(
+    `${STATIC_KEY_SWITCH_ENV}: ${disabled.length === 0 ? "off" : disabled.join(",")}; ` +
+    `suggested action: ${report.suggestedAction}`
+  );
+}
+
 export function cmdKeys(args: ParsedArgs): void {
   const sub = args.positional[0];
 
   // Inventory is deliberately separate from every mutating command: it must remain usable when
   // the production database is mounted read-only, and it must not load static fallback values.
   if (sub === "inventory") {
-    const allowed = new Set(["all", "stale-days", "json"]);
+    const allowed = new Set(["all", "stale-days", "json", "static", "plan"]);
     for (const name of Object.keys(args.flags)) {
       if (!allowed.has(name)) throw new Error(`keys inventory: unknown flag --${name}`);
+    }
+    // Counts of configured static bearer values per list. Presence/count only: the values are
+    // never printed, hashed or fingerprinted. Read from the process environment (no .env read).
+    const staticCounts = countStaticCredentials();
+    const killSwitch = parseStaticKeyKillSwitch(process.env[STATIC_KEY_SWITCH_ENV]);
+    const staticReport = {
+      source: "process_environment",
+      counts: staticCounts,
+      killSwitch: { ...killSwitch, env: STATIC_KEY_SWITCH_ENV },
+      suggestedAction: staticCounts.total > 0 ? "migrate to minted keys" : "none",
+    };
+    const json = args.flags["json"] === true;
+    if (args.flags["static"] === true) {
+      if (args.flags["plan"] === true) throw new Error("keys inventory: --static and --plan are mutually exclusive");
+      if (json) {
+        console.log(JSON.stringify({ legacyStaticCredentialCounts: staticReport }, null, 2));
+        return;
+      }
+      printStaticInventory(staticReport);
+      return;
     }
     const report = credentialInventoryReadOnly({
       includeRevoked: args.flags["all"] === true,
       staleAfterDays: strictNumFlag(args.flags, "stale-days"),
     });
-    if (args.flags["json"] === true) {
-      console.log(JSON.stringify({ ...report, legacyStaticCredentialCounts: "not_inspected" }, null, 2));
+    if (args.flags["plan"] === true) {
+      const plan = buildCredentialPlan(report);
+      if (json) {
+        console.log(JSON.stringify({
+          generatedAt: report.generatedAt,
+          staleAfterDays: report.staleAfterDays,
+          plan,
+          legacyStaticCredentialCounts: staticReport,
+        }, null, 2));
+        return;
+      }
+      console.log(
+        `${"ALIAS".padEnd(20)} ${"TIER".padEnd(6)} ${"SCOPE".padEnd(10)} ${"EXPIRES".padEnd(24)} ` +
+        `${"LAST USED".padEnd(24)} ${"ACTION".padEnd(12)} REASON`
+      );
+      for (const entry of plan) {
+        console.log(
+          `${entry.alias.slice(0, 19).padEnd(20)} ${entry.tier.padEnd(6)} ${entry.scope.padEnd(10)} ` +
+          `${(entry.expiresAt ?? "never").padEnd(24)} ${(entry.lastUsedAt ?? "never").padEnd(24)} ` +
+          `${entry.suggestedAction.padEnd(12)} ${entry.reason}`
+        );
+      }
+      printStaticInventory(staticReport);
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ ...report, legacyStaticCredentialCounts: staticReport }, null, 2));
       return;
     }
     console.log(
@@ -468,7 +540,34 @@ export function cmdKeys(args: ParsedArgs): void {
       );
     }
     console.log(`summary: ${JSON.stringify(report.summary)}`);
-    console.log("legacy static credential counts: not inspected by read-only inventory");
+    printStaticInventory(staticReport);
+    return;
+  }
+
+  if (sub === "restrict") {
+    const allowed = new Set(["alias", "scope", "expires-in", "dry-run"]);
+    for (const name of Object.keys(args.flags)) {
+      if (!allowed.has(name)) throw new Error(`keys restrict: unknown flag --${name}`);
+    }
+    const alias = typeof args.flags["alias"] === "string" ? args.flags["alias"] : undefined;
+    const scope = strictScopeFlag(args.flags);
+    const expiresIn = strictNumFlag(args.flags, "expires-in");
+    if (!alias || (scope === undefined && expiresIn === undefined)) {
+      throw new Error(
+        "usage: keys restrict --alias A [--scope X] [--expires-in S] [--dry-run]\n" +
+        "  Narrows an existing key in place (scope may only go down, expiry may only be set or shortened)."
+      );
+    }
+    const result = restrictKey(alias, {
+      ...(scope !== undefined ? { scope } : {}),
+      ...(expiresIn !== undefined ? { expiresInSeconds: expiresIn } : {}),
+      dryRun: args.flags["dry-run"] === true,
+    });
+    console.log(
+      `${result.dryRun ? "(dry-run) would restrict" : "✓ restricted"} '${alias}': ` +
+      `scope ${result.before.scope} → ${result.after.scope}; ` +
+      `expires ${result.before.expiresAt ?? "never"} → ${result.after.expiresAt ?? "never"}`
+    );
     return;
   }
 
@@ -1060,7 +1159,8 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts keys mint --alias laptop --tier owner   # defaults to agent + 90d\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
-          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30\n" +
+          "  tsx src/homeserver/cli.ts keys inventory --stale-days 30 [--static | --plan] [--json]\n" +
+          "  tsx src/homeserver/cli.ts keys restrict --alias harness --scope agent --expires-in 2592000 [--dry-run]\n" +
           "  tsx src/homeserver/cli.ts keys stage --alias harness --scope agent --overlap 3600\n" +
           "  tsx src/homeserver/cli.ts keys preflight --plan rot_...\n" +
           "  tsx src/homeserver/cli.ts keys commit --plan rot_...\n" +

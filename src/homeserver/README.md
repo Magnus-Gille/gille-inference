@@ -97,6 +97,12 @@ tsx src/homeserver/cli.ts keys mint --alias guest1 --tier guest --models qwen3-c
 tsx src/homeserver/cli.ts keys list
 tsx src/homeserver/cli.ts keys revoke --alias guest1
 
+# Legacy credential cleanup (INFER-152): counts-only static-key view, per-key worksheet, and
+# in-place narrowing (scope may only go down; expiry may only be set or shortened).
+tsx src/homeserver/cli.ts keys inventory --static
+tsx src/homeserver/cli.ts keys inventory --plan [--json]
+tsx src/homeserver/cli.ts keys restrict --alias harness --scope agent --expires-in 2592000 --dry-run
+
 # Rotate a leaked/refreshed key in ONE step (#99): revokes the active key for the name and mints a
 # fresh one, inheriting its tier + scope + limits. Do NOT `revoke A` then `mint A` — `alias` is the PRIMARY
 # KEY, so the revoked row keeps owning the name and the re-mint fails (a naive pipeline then clobbers
@@ -250,6 +256,11 @@ exposure-receipt producers are a distinct service role and currently still requi
 New keys expire automatically: admin at no more than 30 days, agent at 90 days, and inference or
 monitor at 365 days. Inventory and staged migration commands are documented in
 [`docs/credential-lifecycle-runbook.md`](../../docs/credential-lifecycle-runbook.md).
+
+Static env keys never expire. Set `HOMESERVER_DISABLE_STATIC_KEYS=on` (or a subset such as
+`admin`; default off) once consumers use minted keys: every static bearer then gets the same
+`401 invalid_api_key` as an unknown token. An invalid value aborts startup without being
+echoed, and startup logs one line with the switch state and per-list counts (never values).
 
 Auth is `Authorization: Bearer <key>`. **Safety default:** the gateway refuses to bind a
 non-loopback host when no API keys are configured (no legacy keys **and** no minted keys) —
@@ -1080,6 +1091,7 @@ HOMESERVER_PORT=8080
 HOMESERVER_API_KEYS=key1,key2                 # bearer tokens for normal endpoints
 HOMESERVER_ADMIN_API_KEYS=adminkey            # bearer tokens for /admin/* (model mgmt)
 HOMESERVER_MONITOR_API_KEYS=monitorkey        # read-only monitor keys — GET /healthz,/ledger*,/metrics,/models*,/ops/summary only
+HOMESERVER_DISABLE_STATIC_KEYS=off            # off (default) | on | admin,user,monitor subset: static keys then resolve to 401 (minted keys unaffected)
 HOMESERVER_MIN_CONTEXT=32768                  # context floor the orchestrator enforces
 HOMESERVER_MAX_TOKENS=12288                   # default per-call token budget
 HOMESERVER_CALL_TIMEOUT_MS=600000             # per-call wall-clock guard (spiral cap)
