@@ -693,6 +693,8 @@ export function cmdKeys(args: ParsedArgs): void {
       }
       if (args.positional.length > 1) throw new Error("keys revoke --scope takes no alias");
       const scope = strictScopeFlag(args.flags)!;
+      // Bulk revoke exists only as the INFER-450 rollback guard; everything else is by alias.
+      if (scope !== "ask") throw new Error("keys revoke --scope only supports 'ask'; revoke other keys by alias");
       const confirm = args.flags["confirm"] === true;
       if (confirm && "dry-run" in args.flags) throw new Error("keys revoke --scope: --confirm and --dry-run are mutually exclusive");
       const result = revokeKeysByScope(scope, { dryRun: !confirm });
@@ -1081,7 +1083,7 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts keys mint --alias box-agent --tier owner --scope ask --models mellum --credits 200000   # MCP ask only (INFER-450)\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
           "  tsx src/homeserver/cli.ts keys inventory --stale-days 30 [--scope ask]\n" +
-          "  tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # dry-run unless --confirm; REQUIRED before rolling the gateway back below the ask-scope version\n" +
+          "  tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # ask ONLY; dry-run unless --confirm; REQUIRED before rolling the gateway back below the ask-scope version\n" +
           "  tsx src/homeserver/cli.ts keys stage --alias harness --scope agent --overlap 3600\n" +
           "  tsx src/homeserver/cli.ts keys preflight --plan rot_...\n" +
           "  tsx src/homeserver/cli.ts keys commit --plan rot_...\n" +

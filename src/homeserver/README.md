@@ -96,7 +96,7 @@ tsx src/homeserver/cli.ts keys mint --alias claude-agent --tier owner --scope ag
 tsx src/homeserver/cli.ts keys mint --alias guest1 --tier guest --models qwen3-coder --rpm 30 --daily 200000
 tsx src/homeserver/cli.ts keys list
 tsx src/homeserver/cli.ts keys revoke --alias guest1
-tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # bulk; dry-run unless --confirm. Mandatory before rolling back below the ask-scope version
+tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # bulk, `ask` ONLY (rollback guard); dry-run unless --confirm. Mandatory before rolling back below the ask-scope version
 tsx src/homeserver/cli.ts keys inventory --scope ask
 
 # Rotate a leaked/refreshed key in ONE step (#99): revokes the active key for the name and mints a
@@ -243,7 +243,7 @@ and the redeem path uses a uniform error so it cannot be used to probe which cod
 **Tier and scope are separate.** `tier` controls privacy classification and the owner/guest
 admission lane. `scope` controls route authority: `admin` includes operator routes, `agent`
 adds `code_loop` without operator authority, `monitor` is the closed read-only observer surface,
-`ask` (owner tier only) is MCP `ask` and nothing else (closed route allow-list, no `code_loop`, no `ask.files`; INFER-450), and `inference` is ordinary inference. New owner keys default to `agent`; only pre-scope legacy
+`ask` (owner tier only) allows MCP `ask` plus `tokenize`, `list_models`, `model_status`, `GET /portal/me`, `GET /v1/models` and `GET /healthz` and nothing else (closed route allow-list, no `code_loop`, no `ask.files`; INFER-450), and `inference` is ordinary inference. New owner keys default to `agent`; only pre-scope legacy
 owner rows retain admin compatibility. Interactive Claude/Codex credentials should use `--tier
 owner --scope agent` so owner-content learning and owner-priority admission remain intact while
 `/delegate`, every `/admin/*` route, and `/ledger` stay forbidden. External

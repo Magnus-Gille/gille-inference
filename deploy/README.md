@@ -670,7 +670,10 @@ npx tsx src/homeserver/cli.ts keys revoke --scope ask --confirm   # one transact
 npx tsx src/homeserver/cli.ts keys inventory --scope ask          # must show no active keys
 ```
 
-Re-mint `ask` keys only after rolling forward again.
+Rollback floor: the first release containing the `ask` scope (the merge of the INFER-450 PR).
+Rolling back to any earlier revision requires this step. Revoked aliases stay reserved (see the
+alias note in `src/homeserver/README.md`), so after rolling forward again mint the replacement
+under a NEW alias. `keys revoke --scope` accepts only `ask`; revoke other keys by alias.
 
 The unit is not a git checkout, so "rollback" means **redeploy a known-good commit**, not
 `git revert` on the box:

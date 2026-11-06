@@ -543,6 +543,13 @@ describe("ask scope: rollback hazard guard (B1)", () => {
       expect(() => cli.cmdKeys({ positional: ["revoke"], flags: { scope: "ask", alias: "x" } })).toThrow(/unknown flag/);
       expect(activeAsk()).toEqual(before);
 
+      for (const other of ["admin", "agent", "inference", "monitor"]) {
+        const n = keystore.credentialInventory({ scope: other as never }).keys.length;
+        expect(() => cli.cmdKeys({ positional: ["revoke"], flags: { scope: other, confirm: true } }))
+          .toThrow("keys revoke --scope only supports 'ask'; revoke other keys by alias");
+        expect(keystore.credentialInventory({ scope: other as never }).keys.length).toBe(n);
+        expect(n).toBeGreaterThan(0);
+      }
       const agentBefore = keystore.credentialInventory({ scope: "agent" }).keys.length;
       cli.cmdKeys({ positional: ["revoke"], flags: { scope: "ask", confirm: true } });
       expect(activeAsk()).toEqual([]);
