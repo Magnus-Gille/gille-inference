@@ -30,6 +30,6 @@ jobs:
           node --test contracts/accounted-host-policy-v1/tests/accounted-host-policy.mjs
           shopt -s nullglob
           tests=(tests/accounted_*_test.py)
-          [ "${#tests[@]}" -gt 0 ] || { echo "no accounted Python test files found"; exit 1; }
+          [ "${#tests[@]}" -eq 10 ] || { echo "expected 10 accounted Python test files, found ${#tests[@]}"; exit 1; }
           python3 --version
           for t in "${tests[@]}"; do python3 -I "$t" -v; done
