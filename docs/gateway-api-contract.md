@@ -180,16 +180,26 @@ backend-reported `model`, against the requested roster ID:
 **Rollout:** deploy in `shadow`; watch `homeserver_served_model_mismatch_shadow_total` for the models that
 need attention; start those backends with `--alias <roster-id>` or declare the pair in
 `HOMESERVER_SERVED_MODEL_ALIASES`; when the counter stays flat, switch to `enforce`. Enforcing before
-that turns every unaliased roster entry's `200` into a `502`.
+that turns every unaliased roster entry's `200` into a `502` (non-streaming) or a terminal
+`upstream_model_mismatch` error frame (streaming).
+
+In the default `shadow` mode an unaliased backend still returns its own model name, which may be a file
+path, to every caller, guests included. That is pre-existing behaviour and persists until aliases are
+set or `enforce` is on.
 
 **What "the requested roster ID" means.** The check runs against the *canonical* request model, the same
 value used for request-log and metric labels (`canonicalizeModelTrusted`): it is the requested string
 only when that string is exactly a roster ID (key allow-list entry, or an entry of the trusted catalogue
 built from `/v1/models`); anything else (different case, whitespace, a llama-swap alias spelling, or a
-catalogue that is still cold at startup) canonicalizes to `unknown`. For `unknown` the gateway cannot vouch
-for what was requested, so it performs **no** identity check, rewrite or shadow count; the backend's
-body is forwarded as before. The identity check, the alias lookup (keyed by roster ID) and the shadow
-metric label all use that one canonical value, on the HTTP and MCP paths alike.
+catalogue that is still cold or stale) canonicalizes to `unknown`. The identity check, the alias lookup
+(keyed by roster ID) and the shadow metric label use that one canonical value, on the HTTP and MCP
+paths alike. When it cannot be resolved the modes differ on purpose:
+
+| Mode | Roster ID unresolved (cold/stale catalogue, unrecognised spelling) |
+|---|---|
+| `enforce` | **never forwards an unverified identity.** The check runs against the requested string exactly as sent: an exact match passes; an alias declared for that exact string passes and is rewritten to it; any other reported `model` fails closed like a mismatch (502 / terminal SSE frame / MCP `ok:false`, billed `0`); an absent `model` passes. Consequence: a request spelled differently from the roster ID is rejected unless the backend echoes that exact spelling. |
+| `shadow` | check skipped and **not counted**, so unresolved requests never add false positives to the rollout signal. The response is forwarded unchanged. |
+| `off` | not inspected. |
 
 The gateway neither echoes the requested ID blindly nor accepts arbitrary returned IDs; only an explicit
 `roster-id=served-identity` pair from configuration bridges the gap. Declare it with

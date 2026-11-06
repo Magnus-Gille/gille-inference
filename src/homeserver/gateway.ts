@@ -4,7 +4,7 @@ import { Readable } from "node:stream";
 import {
   reconcileCompletionIdentity,
   ServedIdentityGuard,
-  rosterIdentityOf,
+  identitySubject,
   ServedIdentityMismatchError,
   unknownAliasRosterIds,
 } from "./served-model-identity.js";
@@ -1698,7 +1698,8 @@ async function handleChatProxy(
   const servedModel = lctx.model;
   // INFER-343: identity checks, alias lookup and the shadow metric all use this ONE canonical
   // roster ID (null when the request did not name a roster ID we can vouch for -> not checked).
-  const rosterId = rosterIdentityOf(lctx.model);
+  // enforce falls back to the requested string when unresolved (never forwards an unverified identity).
+  const rosterId = identitySubject(cfg.servedModelIdentity, lctx.model, parsed.model);
   // OWNER-ONLY full request log. The guard is strictly owner-tier AND a real minted key
   // (keyHash !== null), which excludes legacy static admins (keyHash null). Guests are never
   // content-logged. See owner-log.ts for the full rationale. The exposure digest is content-blind
@@ -4181,12 +4182,25 @@ export function startGateway(
   // get a per-model label from the first request onward. Fire-and-forget — never blocks startup,
   // and a failure just leaves the cache empty (→ "unknown" labels) until the next refresh.
   void warmCatalogue().then((roster) => {
-    // INFER-343: alias keys must be roster IDs. Log roster IDs only, never served values. A cold
-    // (empty) catalogue proves nothing, so stay quiet then.
+    // INFER-343: alias keys must be roster IDs. A cold (empty) catalogue proves nothing, so stay
+    // quiet then. Only keys matching a strict roster-ID pattern (no "/") are named, so a swapped
+    // pair can never log a private path; anything else is reported as a count only. Served values
+    // are never logged.
     if (roster.size === 0) return;
+    const safe = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+    let unnamed = 0;
     for (const id of unknownAliasRosterIds(cfg.servedModelAliases, roster)) {
-      console.warn("[served-model-identity] HOMESERVER_SERVED_MODEL_ALIASES names a roster ID that is not in the roster:", /^[A-Za-z0-9._:\/-]{1,128}$/.test(id) ? id : "<invalid-id>");
+      if (safe.test(id)) {
+        console.warn("[served-model-identity] HOMESERVER_SERVED_MODEL_ALIASES names a roster ID that is not in the roster:", id);
+      } else {
+        unnamed++;
+      }
     }
+    if (unnamed > 0) {
+      console.warn(`[served-model-identity] HOMESERVER_SERVED_MODEL_ALIASES has ${unnamed} key(s) that are not roster IDs (not shown)`);
+    }
+  }).catch(() => {
+    // Advisory only; never affects startup.
   });
 
   // code_loop (#116): sweep at startup AND periodically. Source-bearing durable results must

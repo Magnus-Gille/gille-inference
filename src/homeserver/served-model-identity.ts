@@ -84,6 +84,26 @@ export function rosterIdentityOf(canonical: string | null | undefined): string |
   return canonical;
 }
 
+/**
+ * The identity an enforce/shadow check is made against.
+ *  - A resolved roster ID is always the subject (all modes).
+ *  - Unresolved (cold/stale catalogue, unrecognised spelling): `enforce` NEVER forwards an
+ *    unverified identity, so it falls back to the requested string exactly as sent (exact match, or
+ *    an alias declared for that exact string; anything else is a mismatch). `shadow` skips the check
+ *    (null) so false positives stay out of the rollout signal; `off` never checks.
+ */
+export function identitySubject(
+  mode: ServedModelIdentityMode,
+  canonical: string | null | undefined,
+  requested: string | null | undefined,
+): string | null {
+  if (mode === "off") return null;
+  const roster = rosterIdentityOf(canonical);
+  if (roster !== null) return roster;
+  if (mode === "enforce" && typeof requested === "string" && requested !== "") return requested;
+  return null;
+}
+
 /** Judge one reported `model` value against the requested roster ID. */
 export function judgeServedIdentity(
   requested: string,

@@ -20,6 +20,7 @@ import { closeDb, initDb } from "../src/db.js";
 import { getRequestLog } from "../src/homeserver/request-log.js";
 import { runChatCompletion } from "../src/homeserver/mcp.js";
 import { AdmissionController } from "../src/homeserver/admission.js";
+import { ModelFailureBackoff } from "../src/homeserver/model-failure-backoff.js";
 import { loadConfig } from "../src/homeserver/config.js";
 
 const ROSTER = "qwen3-30b-instruct";
@@ -125,7 +126,7 @@ const stops: Array<() => Promise<void>> = [];
 let runtimeDir = "";
 let aliases: Map<string, Set<string>>;
 let renderMetrics: () => string;
-let mcpRun: (alias: string, mode?: "enforce" | "shadow" | "off", model?: string) => Promise<{
+let mcpRun: (alias: string, mode?: "enforce" | "shadow" | "off", model?: string, backoff?: ModelFailureBackoff) => Promise<{
   r: Awaited<ReturnType<typeof runChatCompletion>>;
   k: { plaintextKey: string };
 }>;
@@ -334,7 +335,7 @@ describe("INFER-343 MCP ask identity", () => {
       creditLimit: rec.creditLimit,
     };
   }
-  const run = async (alias: string, mode: "enforce" | "shadow" | "off" = "enforce", model = ROSTER) => {
+  const run = async (alias: string, mode: "enforce" | "shadow" | "off" = "enforce", model = ROSTER, backoff?: ModelFailureBackoff) => {
     const k = mintKey({ alias, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
     const cfg = { ...loadConfig(), servedModelAliases: aliases, servedModelIdentity: mode, lmStudioBaseUrl: `http://127.0.0.1:${upstreamPort}/v1` };
     const controller = new AdmissionController({ maxInflight: 2, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
@@ -342,7 +343,7 @@ describe("INFER-343 MCP ask identity", () => {
       model,
       messages: [{ role: "user", content: "hi" }],
       maxTokens: 16,
-    });
+    }, undefined, backoff);
     return { r, k };
   };
   mcpRun = run;
@@ -452,31 +453,20 @@ describe("INFER-343 canonical roster ID (B1)", () => {
     }
   });
 
-  it("a non-canonical spelling is not a roster ID: no check, no rewrite, no false shadow count", async () => {
-    const k = mintKey({ alias: "canon-spell", tier: "guest" }, DEFAULTS);
+  it("shadow: an unresolved spelling is skipped and never counted (no false positives in the rollout signal)", async () => {
+    const k = mintKey({ alias: "canon-spell-sh", tier: "guest" }, DEFAULTS);
     const before = metricCount();
-    // Backend correctly reports the roster ID for a differently-spelled request: accepted.
-    reportedModel = ROSTER;
-    for (const port of [gatewayPort, shadowPort]) {
-      const res = await chat(k.plaintextKey, { model: "Qwen3-30B-Instruct" }, port);
+    for (const reported of [ROSTER, SERVED_PATH, UNKNOWN_PATH]) {
+      reportedModel = reported;
+      const res = await chat(k.plaintextKey, { model: "Qwen3-30B-Instruct" }, shadowPort);
       expect(res.status).toBe(200);
-      expect(((await res.json()) as { model: string }).model).toBe(ROSTER);
-    }
-    // The raw spelling is never used as the identity: a declared alias is not rewritten for it,
-    // and nothing is rejected or counted (we cannot vouch for what was requested).
-    reportedModel = SERVED_PATH;
-    for (const port of [gatewayPort, shadowPort]) {
-      const res = await chat(k.plaintextKey, { model: "Qwen3-30B-Instruct" }, port);
-      expect(res.status).toBe(200);
-      expect(((await res.json()) as { model: string }).model).toBe(SERVED_PATH);
+      expect(((await res.json()) as { model: string }).model).toBe(reported);
     }
     expect(metricCount()).toBe(before);
   });
 
-  it("MCP uses the same canonical ID: a non-roster spelling is unchecked and never counted", async () => {
+  it("MCP shadow: a non-roster spelling is unchecked and never counted", async () => {
     const before = metricCount();
-    reportedModel = ROSTER;
-    expect((await mcpRun("mcp-spell-ok", "enforce", "Qwen3-30B-Instruct")).r.ok).toBe(true);
     reportedModel = UNKNOWN_PATH;
     expect((await mcpRun("mcp-spell-mm", "shadow", "Qwen3-30B-Instruct")).r.ok).toBe(true);
     expect(metricCount()).toBe(before);
@@ -537,5 +527,118 @@ describe("INFER-343 streaming edge cases (enforce)", () => {
     const text = await (await chat(k.plaintextKey, { stream: true }, shadowPort)).text();
     expect(text).toContain("oops");
     expect(renderMetrics().split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{")).join("")).not.toBe(metricBefore);
+  });
+});
+
+describe("INFER-343 enforce never forwards an unverified identity (unresolved roster ID)", () => {
+  const SPELLING = "Qwen3-30B-Instruct"; // not an exact roster ID -> canonical "unknown"
+  const body = (model: string) => ({ model });
+
+  it("non-stream: the requested string as reported passes; anything else fails closed, billed 0", async () => {
+    const k = mintKey({ alias: "unres-ns", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    reportedModel = SPELLING;
+    const ok = await chat(k.plaintextKey, body(SPELLING));
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { model: string }).model).toBe(SPELLING);
+    const paid = lookupKey(k.plaintextKey)!.creditsUsed;
+    for (const other of [ROSTER, SERVED_PATH, UNKNOWN_PATH]) {
+      reportedModel = other;
+      const res = await chat(k.plaintextKey, body(SPELLING));
+      expect(res.status).toBe(502);
+      const text = await res.text();
+      expect((JSON.parse(text) as { error: { code: string } }).error.code).toBe("upstream_model_mismatch");
+      expect(text).not.toContain("/home/operator");
+    }
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(paid);
+    expect(lastLog("unres-ns")?.outcome).toBe("upstream_model_mismatch");
+  });
+
+  it("an alias declared for the exact requested string passes and is rewritten to it", async () => {
+    aliases.set(SPELLING, new Set([SERVED_PATH]));
+    try {
+      const k = mintKey({ alias: "unres-alias", tier: "guest" }, DEFAULTS);
+      reportedModel = SERVED_PATH;
+      expect(((await (await chat(k.plaintextKey, body(SPELLING))).json()) as { model: string }).model).toBe(SPELLING);
+      expect(sseModels(await (await chat(k.plaintextKey, { ...body(SPELLING), stream: true })).text())).toEqual([SPELLING, SPELLING, SPELLING]);
+    } finally {
+      aliases.delete(SPELLING);
+    }
+  });
+
+  it("an absent model still passes", async () => {
+    omitModel = true;
+    const k = mintKey({ alias: "unres-absent", tier: "guest" }, DEFAULTS);
+    expect((await chat(k.plaintextKey, body(SPELLING))).status).toBe(200);
+  });
+
+  it("stream: the requested string passes; anything else ends with the named terminal frame, billed 0", async () => {
+    const k = mintKey({ alias: "unres-st", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    reportedModel = SPELLING;
+    expect(sseModels(await (await chat(k.plaintextKey, { ...body(SPELLING), stream: true })).text())).toEqual([SPELLING, SPELLING, SPELLING]);
+    const paid = lookupKey(k.plaintextKey)!.creditsUsed;
+    reportedModel = UNKNOWN_PATH;
+    const text = await (await chat(k.plaintextKey, { ...body(SPELLING), stream: true })).text();
+    expect(text).toContain('"code":"upstream_model_mismatch"');
+    expect(text).not.toContain('"content":"hel"');
+    expect(text).not.toContain("/home/operator");
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(paid);
+  });
+
+  it("MCP: the requested string passes; anything else is ok:false, billed 0", async () => {
+    reportedModel = SPELLING;
+    expect((await mcpRun("unres-mcp-ok", "enforce", SPELLING)).r.ok).toBe(true);
+    reportedModel = ROSTER;
+    const { r, k } = await mcpRun("unres-mcp-bad", "enforce", SPELLING);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.traceErrorClass).toBe("upstream_model_mismatch");
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+  });
+
+  it("cold catalogue (roster ID requested, canonical unknown): same behaviour", async () => {
+    const cat = await import("../src/homeserver/catalogue.js");
+    const k = mintKey({ alias: "cold-cat", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    try {
+      cat.resetCatalogueCache();
+      reportedModel = UNKNOWN_PATH;
+      const res = await chat(k.plaintextKey); // requests ROSTER while the catalogue is cold
+      expect(res.status).toBe(502);
+      expect(lookupKey(k.plaintextKey)!.creditsUsed).toBe(0);
+      await cat.warmCatalogue();
+      cat.resetCatalogueCache();
+      reportedModel = ROSTER;
+      expect((await chat(k.plaintextKey)).status).toBe(200);
+    } finally {
+      await cat.warmCatalogue();
+    }
+  });
+
+  it("off: unresolved requests are not inspected", async () => {
+    reportedModel = UNKNOWN_PATH;
+    const k = mintKey({ alias: "unres-off", tier: "guest" }, DEFAULTS);
+    expect((await chat(k.plaintextKey, body(SPELLING), offPort)).status).toBe(200);
+  });
+});
+
+describe("INFER-343 identity mismatches never feed the failure breaker (NB1)", () => {
+  it("HTTP: repeated enforce mismatches never open model_temporarily_unavailable for that key/model", async () => {
+    const k = mintKey({ alias: "breaker-http", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    reportedModel = UNKNOWN_PATH;
+    for (let i = 0; i < 6; i++) expect((await chat(k.plaintextKey)).status).toBe(502);
+    reportedModel = ROSTER;
+    const res = await chat(k.plaintextKey);
+    expect(res.status).toBe(200); // a tripped breaker would be 503 model_temporarily_unavailable
+  });
+
+  it("MCP: repeated mismatches (code upstream_error) leave the breaker closed", async () => {
+    const backoff = new ModelFailureBackoff([ROSTER]);
+    reportedModel = UNKNOWN_PATH;
+    for (let i = 0; i < 6; i++) {
+      const { r } = await mcpRun(`breaker-mcp-${i}`, "enforce", ROSTER, backoff);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe("upstream_error");
+    }
+    expect(backoff.observe(ROSTER)).toBeNull();
+    reportedModel = ROSTER;
+    expect((await mcpRun("breaker-mcp-ok", "enforce", ROSTER, backoff)).r.ok).toBe(true);
   });
 });

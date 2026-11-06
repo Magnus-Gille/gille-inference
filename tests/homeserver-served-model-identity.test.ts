@@ -3,6 +3,7 @@ import { loadConfig, resetConfig } from "../src/homeserver/config.js";
 import { Readable } from "node:stream";
 import {
   MAX_PENDING_SSE_EVENT_CHARS,
+  identitySubject,
   rosterIdentityOf,
   unknownAliasRosterIds,
   parseServedModelIdentityMode,
@@ -233,6 +234,19 @@ describe("ServedIdentityGuard SSE framing (N1)", () => {
     expect(out.startsWith(huge)).toBe(true);
     expect(out.endsWith('data: {"model":"roster-a"}\n\n')).toBe(true);
     expect(n).toBe(1);
+  });
+});
+
+describe("identitySubject", () => {
+  it("resolved roster ID is the subject in every checking mode; unresolved differs by mode", () => {
+    expect(identitySubject("enforce", "roster-a", "roster-a")).toBe("roster-a");
+    expect(identitySubject("shadow", "roster-a", "roster-a")).toBe("roster-a");
+    expect(identitySubject("enforce", "unknown", "Roster-A")).toBe("Roster-A");
+    expect(identitySubject("enforce", null, "Roster-A")).toBe("Roster-A");
+    expect(identitySubject("enforce", "unknown", null)).toBeNull();
+    expect(identitySubject("enforce", "unknown", "")).toBeNull();
+    expect(identitySubject("shadow", "unknown", "Roster-A")).toBeNull();
+    expect(identitySubject("off", "roster-a", "roster-a")).toBeNull();
   });
 });
 
