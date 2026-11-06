@@ -726,8 +726,8 @@ live host**. The live drop-in still carries `MemoryMin=20G` until an owner-atten
 
 Decision: remove `MemoryMin=20G`. `memory.min` is a hard reclaim exemption (unlike best-effort
 `memory.low`). The anonymous working set is about 1 GiB and needs no floor; the only large
-resident class is file-backed page cache of the model weights. Every roster entry offloads fully to
-the GPU and none uses `--mlock`, so that cache is read once at start, copied to GPU memory, and not
+resident class is file-backed page cache of the model weights. Every tracked llama-server roster
+entry offloads fully to the GPU and none uses `--mlock`, so that cache is read once at start, copied to GPU memory, and not
 used again. At the 2026-10-01 OOM about 18.5 GiB of it was pinned while the same weights were
 already in GPU memory, removing reclaimable memory the host needed. Risk if removed: a model's
 cache is evicted sooner, so a reload may re-read weights from disk (slower cold start, no
@@ -743,7 +743,10 @@ Owner apply (private operator change; back up the live drop-in first):
    already softened) and the MCP transport are not interrupted. Do not `systemctl restart`.
 3. Verify: `systemctl show llama-swap.service -p MemoryMin -p MemoryMax -p OOMPolicy` reports
    `MemoryMin=0`, `MemoryMax` 96 GiB and `OOMPolicy=continue`, and the unit cgroup's `memory.min`
-   file reads `0`.
+   file reads `0`. If the cgroup still reads the old value, apply it to the running unit with
+   `systemctl set-property --runtime llama-swap.service MemoryMin=0` (no restart) and re-verify.
+   Before applying, confirm the live roster (larger than the tracked example, including native
+   System One runtimes) has no entry that relies on weight page cache after load.
 4. Observe over the next model swaps: gateway memory-admission shadow records, no new increase in
    the host-wide OOM counter, and cold-start latency of a model swapped back in.
 5. Rollback: restore the backed-up drop-in, `systemctl daemon-reload`, and repeat step 3 expecting
