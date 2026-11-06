@@ -360,17 +360,26 @@ validated error code, filler-unit counts and integer charge deltas.
 
 | Label | Meaning |
 | --- | --- |
-| `fixed_verified` | under call 200, over call closed `400 context_length_exceeded`, charge 0 |
+| `fixed_verified` | under call 200 **and charged (> 0, proving the meter is live)**, over call closed `400 context_length_exceeded`, charge exactly 0, balance continuous between the calls |
 | `fixed_unbracketed` | over call closed with charge 0, but the under call was not 200 |
-| `fix_not_effective` | over call returned 5xx or an opaque error, with a healthy under call and charge 0 |
-| `inconclusive` | anything else, including unknown outcomes, a charged over call or missing balance evidence |
+| `fix_not_effective` | over call returned 5xx, or 400/422 with a missing or unexpected code, with a healthy under call and charge 0 |
+| `inconclusive` | anything else; `reasons` says why, e.g. `charge_meter_not_live`, `balance_moved_between_calls`, `balance_decreased`, `over_call_charged`, `charge_evidence_missing`, `over_call_admission_rejected` (401/402/403/408/413/429 or codes such as `server_busy`, `rate_limit_exceeded`) |
 
-Exit code 0 only if every target is `fixed_verified`; 1 for any other label; 2 for usage errors.
+After each call the probe polls `GET /portal/me` until two consecutive reads, one settle interval
+apart, agree (bounded retries and deadline), so a charge reconciled after the response is seen. A
+concurrent same-key request or a reservation release landing inside the over call's own window
+cannot be told apart from a real charge, so run it on a quiet key. Reported balances are raw
+integers only.
+
+Exit code 0 only if every target is `fixed_verified`; 1 for any other label; 2 for usage errors
+(including a flag without a value). `--base-url` must be `https:` (loopback may use `http:`) with
+no credentials, query, fragment or path prefix; a path prefix is unsupported.
 
 **Never run by default.** Nothing in `scripts/deploy-gateway.sh` invokes it. A live run sends two
 real inference calls per target (a near-limit call occupies the serial GPU), so it needs a
 separately approved envelope, the durable GPU lease, normal admission, owner preemption and a key
-with enough credit/TPM headroom; the probe does not take the lease itself. Do not run it
+with enough credit/TPM headroom. `--envelope-ref` is only recorded in the output, not verified,
+and the probe neither checks nor takes the GPU lease: the operator must arrange it. Do not run it
 concurrently with benchmarks or other traffic on the same key, since concurrent charges would
 confound the zero-charge evidence.
 

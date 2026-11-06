@@ -42,7 +42,11 @@ export interface CallObservation {
   /** Machine error code, only when it matches a safe snake_case shape. */
   errorCode: string | null;
   fillerUnits: number;
-  /** Integer credit delta across the call, or null when either balance read failed. */
+  /** Raw `creditsUsed` read before the call (integer), or null when the read failed. */
+  beforeBalance: number | null;
+  /** Settled `creditsUsed` after the call (two equal consecutive reads), or null. */
+  afterBalance: number | null;
+  /** after - before, or null when either is missing. Negative means the balance fell. */
   chargeDelta: number | null;
 }
 
@@ -69,6 +73,14 @@ export interface OverflowProbeOptions {
   apiKey: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Injectable delay and clock (tests). */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  /** Interval between balance reads while settling (default 500 ms). */
+  settleMs?: number;
+  /** Maximum extra reads while settling (default 8) and overall settle deadline (default 15 s). */
+  maxSettleReads?: number;
+  maxSettleMs?: number;
 }
 
 interface Resolved {
@@ -76,6 +88,11 @@ interface Resolved {
   apiKey: string;
   timeoutMs: number;
   fetchImpl: typeof fetch;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  settleMs: number;
+  maxSettleReads: number;
+  maxSettleMs: number;
 }
 
 const MAX_BODY_BYTES = 262_144;
@@ -177,9 +194,29 @@ async function readCreditsUsed(opts: Resolved): Promise<number | null> {
   }
 }
 
+/**
+ * Read the balance until two consecutive reads, one settle interval apart, agree (a charge may
+ * be reconciled after the response). Bounded by read count and an overall deadline; returns null
+ * when a read fails or the balance never stabilises.
+ */
+async function readSettledCredits(opts: Resolved): Promise<number | null> {
+  const deadline = opts.now() + opts.maxSettleMs;
+  let previous = await readCreditsUsed(opts);
+  if (previous === null) return null;
+  for (let attempt = 0; attempt < opts.maxSettleReads; attempt++) {
+    if (opts.now() >= deadline) return null;
+    await opts.sleep(opts.settleMs);
+    const current = await readCreditsUsed(opts);
+    if (current === null) return null;
+    if (current === previous) return current;
+    previous = current;
+  }
+  return null;
+}
+
 async function observe(target: OverflowTarget, units: number, opts: Resolved): Promise<CallObservation> {
   const body = buildProbeBody(target, units);
-  const before = await readCreditsUsed(opts);
+  const beforeBalance = await readCreditsUsed(opts);
   let httpStatus: number | null = null;
   let errorCode: string | null = null;
   try {
@@ -196,10 +233,18 @@ async function observe(target: OverflowTarget, units: number, opts: Resolved): P
   } catch {
     httpStatus = null;
   }
-  const after = await readCreditsUsed(opts);
-  const chargeDelta = before === null || after === null ? null : after - before;
-  return { httpStatus, errorCode, fillerUnits: units, chargeDelta };
+  const afterBalance = await readSettledCredits(opts);
+  const chargeDelta = beforeBalance === null || afterBalance === null ? null : afterBalance - beforeBalance;
+  return { httpStatus, errorCode, fillerUnits: units, beforeBalance, afterBalance, chargeDelta };
 }
+
+/** Over-call statuses/codes that are admission or transport refusals, not evidence about the fix. */
+const ADMISSION_STATUSES = new Set([401, 402, 403, 408, 413, 429]);
+const ADMISSION_CODES = new Set([
+  "server_busy", "rate_limit_exceeded", "credits_exhausted", "request_exceeds_quota",
+  "model_not_found", "invalid_api_key", "insufficient_quota", "payload_too_large",
+]);
+const CLOSED_CODE = "context_length_exceeded";
 
 /** Pure verdict over the two observations. Labels follow the INFER-509 c2 contract. */
 export function classifyOverflow(
@@ -213,25 +258,52 @@ export function classifyOverflow(
   if (!over || over.httpStatus === null) {
     return { label: "inconclusive", reasons: [...reasons, "over_call_outcome_unknown"] };
   }
+  const inconclusive = (...extra: string[]) => ({ label: "inconclusive" as const, reasons: [...reasons, ...extra] });
 
-  const closed = over.httpStatus === 400 && over.errorCode === "context_length_exceeded";
-  if (closed && over.chargeDelta === 0) {
-    return { label: bracketed ? "fixed_verified" : "fixed_unbracketed", reasons };
+  if (ADMISSION_STATUSES.has(over.httpStatus) || (over.errorCode !== null && ADMISSION_CODES.has(over.errorCode))) {
+    return inconclusive("over_call_admission_rejected");
   }
+  // Charge evidence for the over call must be present and exactly zero.
+  if (over.chargeDelta === null) return inconclusive("charge_evidence_missing");
+  if (over.chargeDelta < 0) return inconclusive("balance_decreased");
+  if (over.chargeDelta > 0) return inconclusive("over_call_charged");
+  // Continuity: nothing else may have moved the balance between the two calls.
+  if (under?.afterBalance != null && over.beforeBalance != null && under.afterBalance !== over.beforeBalance) {
+    return inconclusive("balance_moved_between_calls");
+  }
+
+  const closed = over.httpStatus === 400 && over.errorCode === CLOSED_CODE;
   if (closed) {
-    reasons.push(over.chargeDelta === null ? "charge_evidence_missing" : "over_call_charged");
-    return { label: "inconclusive", reasons };
+    if (!bracketed) return { label: "fixed_unbracketed", reasons };
+    // A live meter is a precondition: a 200 under call must have been charged.
+    if (!(under!.chargeDelta !== null && under!.chargeDelta > 0)) return inconclusive("charge_meter_not_live");
+    return { label: "fixed_verified", reasons };
   }
-  // Not the closed shape: a 5xx, or an opaque / mismatched client error. Blame the fix only
-  // with a healthy under call and proven zero charge, so a sick backend is not misread.
-  const opaque = over.httpStatus >= 400;
-  if (opaque && bracketed && over.chargeDelta === 0) {
-    reasons.push(over.httpStatus >= 500 ? "over_call_5xx" : "over_call_opaque_4xx");
-    return { label: "fix_not_effective", reasons };
+  const notEffective = over.httpStatus >= 500 ||
+    ((over.httpStatus === 400 || over.httpStatus === 422) && over.errorCode !== CLOSED_CODE);
+  if (notEffective && bracketed) {
+    return { label: "fix_not_effective", reasons: [...reasons, over.httpStatus >= 500 ? "over_call_5xx" : "over_call_opaque_4xx"] };
   }
-  reasons.push(opaque ? "over_call_unclassified" : "over_call_accepted");
-  if (over.chargeDelta !== 0) reasons.push(over.chargeDelta === null ? "charge_evidence_missing" : "over_call_charged");
-  return { label: "inconclusive", reasons };
+  return inconclusive(over.httpStatus === 200 ? "over_call_accepted" : "over_call_unclassified");
+}
+
+/**
+ * Parse and validate the gateway base URL. https only (loopback may use http); no credentials,
+ * query, fragment or path prefix (requests are built from absolute paths, so a prefix would be
+ * silently dropped).
+ */
+export function parseBaseUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("base-url-invalid");
+  }
+  const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) throw new Error("base-url-scheme-invalid");
+  if (url.username || url.password || url.search || url.hash) throw new Error("base-url-components-invalid");
+  if (url.pathname !== "/") throw new Error("base-url-path-prefix-unsupported");
+  return url.origin;
 }
 
 /** Run the probe for each target sequentially (the serial GPU is a shared resource). */
@@ -240,10 +312,15 @@ export async function runOverflowProbe(
   options: OverflowProbeOptions,
 ): Promise<OverflowProbeReport> {
   const opts: Resolved = {
-    baseUrl: options.baseUrl,
+    baseUrl: parseBaseUrl(options.baseUrl),
     apiKey: options.apiKey,
     timeoutMs: options.timeoutMs ?? 60_000,
     fetchImpl: options.fetchImpl ?? fetch,
+    sleep: options.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms))),
+    now: options.now ?? Date.now,
+    settleMs: options.settleMs ?? 500,
+    maxSettleReads: options.maxSettleReads ?? 8,
+    maxSettleMs: options.maxSettleMs ?? 15_000,
   };
   const results: OverflowTargetResult[] = [];
   for (const target of targets) {
