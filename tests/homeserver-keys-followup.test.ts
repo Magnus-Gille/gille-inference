@@ -121,7 +121,7 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     expect(getDb().prepare("SELECT alias FROM api_keys WHERE alias = ?").get(`${alias}-r2`)).toBeUndefined();
   });
 
-  it("runs inventory through the read-only path and leaves static fallback values uninspected", () => {
+  it("runs inventory through the read-only path and reports static fallback counts, never values", () => {
     const dbPath = join(mkdtempSync(join(tmpdir(), "hs-inventory-cli-")), "inventory.db");
     initDb(dbPath);
     mintKey({ alias: "inventory-cli", tier: "owner", scope: "agent" }, DEFAULTS);
@@ -135,7 +135,7 @@ describe("keys CLI — valueless scope fails closed (#139 review)", () => {
     try {
       cmdKeys(parseArgs(["inventory", "--json"]));
       const output = log.mock.calls.flat().join("\n");
-      expect(output).toContain('"legacyStaticCredentialCounts": "not_inspected"');
+      expect(JSON.parse(output).legacyStaticCredentialCounts.counts).toMatchObject({ admin: 1, total: 1 });
       expect(output).not.toContain("must-not-be-reported");
     } finally {
       log.mockRestore();

@@ -1,4 +1,5 @@
 import { loadEnv } from "../env.js";
+import { parseStaticKeyKillSwitch, type StaticKeyKillSwitch } from "./static-keys.js";
 import { isEmbeddingModel } from "./embedding-request.js";
 import { MAX_BLIND_CONTEXT_ROOTS } from "./blind-context.js";
 import type { ShadowLaneConfig } from "./shadow-lane.js";
@@ -323,6 +324,12 @@ export interface HomeserverConfig {
   adminApiKeys: string[];
   /** Bearer tokens for a read-only MONITOR scope — may ONLY GET /healthz, /ledger, /metrics, /models. */
   monitorApiKeys: string[];
+  /**
+   * INFER-152 kill switch (`HOMESERVER_DISABLE_STATIC_KEYS`, default off). A `true` list's static
+   * bearer tokens resolve to unauthenticated, exactly like an unknown key. Minted keys are
+   * unaffected.
+   */
+  disableStaticKeys: StaticKeyKillSwitch;
   /** Minimum context length the orchestrator requires of a loaded model. */
   minContextLength: number;
   /** Default per-call token budget for local delegations (reasoning needs headroom). */
@@ -773,6 +780,8 @@ export function loadConfig(): HomeserverConfig {
     apiKeys: envList("HOMESERVER_API_KEYS"),
     adminApiKeys: envList("HOMESERVER_ADMIN_API_KEYS"),
     monitorApiKeys: envList("HOMESERVER_MONITOR_API_KEYS"),
+    // Throws InvalidStaticKeySwitchError (without echoing the value) so startup aborts.
+    disableStaticKeys: parseStaticKeyKillSwitch(process.env["HOMESERVER_DISABLE_STATIC_KEYS"]),
     minContextLength: envNum("HOMESERVER_MIN_CONTEXT", 32768),
     defaultMaxTokens: envNum("HOMESERVER_MAX_TOKENS", 12288),
     callTimeoutMs: envNum("HOMESERVER_CALL_TIMEOUT_MS", 600_000),

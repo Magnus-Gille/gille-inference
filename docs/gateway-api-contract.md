@@ -43,6 +43,25 @@ explicit. New credentials are lifetime-bounded (admin 30 days, agent and ask 90 
 365 days). Existing owner rows without a stored scope resolve compatibly to `admin` so they can be
 migrated through the staged lifecycle in `docs/credential-lifecycle-runbook.md`.
 
+Legacy static environment keys (`HOMESERVER_ADMIN_API_KEYS`, `HOMESERVER_API_KEYS`,
+`HOMESERVER_MONITOR_API_KEYS`) have no expiry or revocation. `HOMESERVER_DISABLE_STATIC_KEYS`
+(default off, so behaviour is unchanged) switches them off: `on` disables all three lists, or a
+comma-separated subset of `admin,user,monitor` disables those. A disabled static key resolves to
+no principal, so protected routes return `401 invalid_api_key`, identical to an unknown token;
+minted keys are unaffected. An invalid value aborts startup without echoing it. Startup logs one
+content-free line with the switch state and the configured counts per list. Lists that are
+disabled do not count as configured keys for the non-loopback bind check. A value configured in
+several lists is refused when any list containing it is disabled (startup logs a count-only
+warning about such overlap). The switch is read through the same environment/`.env` path as the
+lists. `resolvePrincipal` is the only consumer of the static lists, so `/mcp`, `/metrics`,
+`/portal/*` and every other route inherit the switch.
+
+Operator-only CLI (no HTTP surface): `keys inventory [--static|--plan] [--json]` reports static
+counts and a per-key migration worksheet; `keys restrict --alias A [--scope X] [--expires-in S]
+[--dry-run]` narrows a minted key in place. Narrowing order: `admin` to `agent`/`ask`/`inference`/
+`monitor`, `agent` to `ask`/`inference`, and `inference` to `ask` (owner-tier only); nothing else, and expiry may only be set or shortened
+within the resulting scope's maximum lifetime.
+
 Quotas (sliding-window RPM/TPM + daily budget) are enforced per key → `429`. Error messages name the request units already metered by each route: chat/MCP use tokens, transcription uses worst-case audio-seconds, and image generation uses image units. Shared static-tier buckets retain their existing shared accounting across callers and routes. Owner-preempts-guest admission for the serial GPU → `503` + `Retry-After`.
 
 Audio transcription has a separate non-queuing upload-memory bound before multipart buffering: at most two active audio handlers process-wide, at most one guest handler process-wide (leaving one slot available to owner traffic), and at most `min(2, key.maxParallel)` per authenticated alias. Saturated uploads receive `503 server_busy` with `Retry-After`; no body is buffered and no credit, quota, or GPU admission is reserved. Restricted keys without canonical `whisper-1` access are rejected before reading the multipart body because all accepted Whisper aliases route to that one backend model.

@@ -33,13 +33,65 @@ npx tsx src/homeserver/cli.ts keys inventory --stale-days 30 --all --json
 ```
 
 The command opens the existing SQLite store read-only: it does not create directories, initialise
-schema, run migrations, or inspect `.env`/static fallback values. The report contains aliases,
+schema, run migrations, or return static fallback values (it only counts them; see below). The report contains aliases,
 lifecycle timestamps, use counts, and findings, but no plaintext or hash. `unused` means the
 running gateway has never completed an allowed request for that minted key; `stale` means its last
 successful request is older than the threshold. `over_scoped` is a conservative review flag on
-active admin keys. Static fallback credentials cannot carry lifecycle metadata and are deliberately
-reported as `not_inspected`; migrate them to minted scoped keys through the normal backed-up
-deployment procedure without copying their values into an inventory command.
+active admin keys. Static fallback credentials cannot carry lifecycle metadata, so the report gives
+only the **count** configured in each list (`legacyStaticCredentialCounts`: admin, user, monitor,
+read from THIS process's environment plus any `.env` in the working directory, the same path the
+gateway uses, so they match the running gateway only if you run the command with the gateway's
+environment; the output says so). Values are never printed, hashed or fingerprinted.
+
+```bash
+npx tsx src/homeserver/cli.ts keys inventory --static [--json]   # counts + kill-switch state only; needs no database
+npx tsx src/homeserver/cli.ts keys inventory --plan [--json]     # per-key worksheet + static counts
+```
+
+`--plan` lists alias, tier, scope, created/last-used/expiry, findings and one suggested action:
+`retire` (never used, or stale), `rotate` (active admin without expiry: stage a bounded
+replacement), `narrow` (active admin with expiry), `keep+expiry` (no expiry), `keep`, or
+`none` (already inactive). A recently created, still-unused key is kept rather than retired. The
+static lists always read "migrate to minted keys".
+
+## Narrowing a key in place
+
+`keys restrict` lowers the scope and/or sets or shortens the expiry of an existing minted key
+without touching its key material or rotating it:
+
+```bash
+npx tsx src/homeserver/cli.ts keys restrict --alias <alias> --scope agent --expires-in 2592000 --dry-run
+npx tsx src/homeserver/cli.ts keys restrict --alias <alias> --scope agent --expires-in 2592000
+```
+
+The allowed order is `admin` to `agent`, `ask`, `inference` or `monitor`; `agent` to `ask` or `inference`; and `inference` to `ask` (`ask` only for owner-tier keys; it reaches a strict subset of each source scope, pinned by the reach test)
+(`monitor` and `inference` are incomparable, and `agent` does not cover `monitor`'s reads). A
+widening scope, a later expiry, a lifetime above the resulting scope's maximum, a revoked or
+expired key, or a key in a staged rotation is refused. One guarded transactional update changes
+only `scope` and `expires_at`, and logs one content-free `[audit] keys.restrict` line (alias, old
+and new scope, old and new expiry) to stderr. **Narrowing only the scope leaves the existing
+expiry exactly as it was** (including none, or one beyond the new scope's cap); pass
+`--expires-in` as well to bound it. A `--dry-run` reads only and takes no write lock; a lost
+race reports `concurrent_change`. Any rotation plan that is not committed or aborted blocks the
+key. Use it for consumers that already have the right credential but
+too much authority; use staged rotation when the consumer must receive a new secret.
+
+## Retiring static env keys
+
+1. Run `keys inventory --static` and note the counts per list.
+2. Migrate each static consumer to a minted key through the staged workflow below
+   (admin consumers: re-check whether they need admin at all; prefer `agent`, `monitor` or `inference`).
+3. If a value is configured in more than one list, startup logs a count-only warning; such a value
+   is refused when ANY list that contains it is disabled. Set `HOMESERVER_DISABLE_STATIC_KEYS` to the list(s) that are fully migrated (for example
+   `user,monitor`), restart the gateway, and read the single startup line: it states the switch
+   state and the counts being ignored. An invalid value aborts startup without being echoed.
+4. From each former static consumer, send the content-free probe with the old static value and
+   expect `401 invalid_api_key`; confirm the minted replacement still succeeds.
+5. Rollback is removing the variable (or setting `off`) and restarting; the static values remain
+   in the environment until you delete them.
+
+Deploying the code is a separate owner step; the switch defaults to off, so deploy alone changes
+no authentication behaviour.
 
 ## Rolling the gateway back below the `ask` scope
 
