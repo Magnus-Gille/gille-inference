@@ -59,7 +59,7 @@ def body_fixture():
 
 class CgroupBindingTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = Path(tempfile.mkdtemp(prefix="accounted-binding-", dir="/private/tmp"))
+        self.scratch = Path(tempfile.mkdtemp(prefix="accounted-binding-", dir=os.path.realpath("/tmp")))
         self.release_root = self.scratch / "releases"
         self.release_root.mkdir(mode=0o700)
         self.body, self.manifest, self.release_id = body_fixture()

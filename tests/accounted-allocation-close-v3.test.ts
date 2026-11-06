@@ -65,7 +65,7 @@ function accepted(overrides: Record<string, unknown> = {}): any {
 
 for(const action of ["read","reserve-read","reserve-sync"] as const)it("closes both real directory FDs after concurrent "+action,async()=>{
  const ownerUid=process.geteuid!();if(ownerUid===0)throw Error("nonroot only");
- const directory=await fs.mkdtemp("/private/tmp/allocation-close-");
+ const directory=await fs.mkdtemp(join(await fs.realpath("/tmp"), "allocation-close-"));
  await fs.chmod(directory,0o700);hooks.directory=directory;hooks.pauseAt=action==="reserve-sync"?"sync":"read";
  const initial=planAccountedAllocationLedgerV3Bootstrap(hostBootId);
  await fs.writeFile(join(directory,"journal.json"),initial.bytes,{mode:0o600,flag:"wx"});

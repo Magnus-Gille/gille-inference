@@ -186,9 +186,25 @@ export function executeAccountedHostIo(invocation: Readonly<AccountedIoInvocatio
       throw new AccountedHostIoError("public_invocation_unavailable", "refused", operation);
     environment.INVOCATION_ID=publicInvocationId;
   }
-  return execFileSync(invocation.program, [...invocation.arguments], {
-    shell:false, encoding:"utf8", env:environment, cwd:invocation.workingDirectory,
-    timeout:invocation.timeoutMs, killSignal:"SIGKILL", maxBuffer:invocation.maximumBytes,
-    input:invocation.input, stdio:["pipe","pipe","pipe"],
-  });
+  try {
+    return execFileSync(invocation.program, [...invocation.arguments], {
+      shell:false, encoding:"utf8", env:environment, cwd:invocation.workingDirectory,
+      timeout:invocation.timeoutMs, killSignal:"SIGKILL", maxBuffer:invocation.maximumBytes,
+      input:invocation.input, stdio:["pipe","pipe","pipe"],
+    });
+  } catch (error) {
+    return recoverAccountedHelperFailureEnvelope(error, invocation.maximumBytes);
+  }
+}
+
+/** execFileSync throws for every non-zero exit. The helper reports its own
+ * refused/unknown outcomes as a bounded stdout envelope with exit status 2, so
+ * only that envelope is recovered for the bridge to validate. Any other status,
+ * a signal, a timeout or a spawn failure stays a transport failure, and the
+ * child's stdout/stderr are never retained as an error cause. */
+export function recoverAccountedHelperFailureEnvelope(error: unknown, maximumBytes: number): string {
+  const failure = error !== null && typeof error === "object" ? error as {status?: unknown; signal?: unknown; stdout?: unknown} : {};
+  if (failure.status === 2 && failure.signal === null && typeof failure.stdout === "string"
+      && Buffer.byteLength(failure.stdout) <= maximumBytes) return failure.stdout;
+  throw new Error("helper_transport_failed");
 }

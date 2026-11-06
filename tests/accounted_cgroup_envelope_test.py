@@ -40,7 +40,7 @@ ROLES = {
 
 class CgroupEnvelopeTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = Path(tempfile.mkdtemp(prefix="accounted-cgroup-", dir="/private/tmp"))
+        self.scratch = Path(tempfile.mkdtemp(prefix="accounted-cgroup-", dir=os.path.realpath("/tmp")))
         self.root = self.scratch / "root"
         self.root.mkdir(mode=0o700)
         self.parent = self.root / PARENT

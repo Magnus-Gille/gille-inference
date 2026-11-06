@@ -55,7 +55,7 @@ function accepted(overrides: Record<string, unknown> = {}): any {
 
 async function freshDirectory(): Promise<string> {
   if (ownerUid === 0) throw new Error("unprivileged filesystem test required");
-  const path = await fs.mkdtemp("/private/tmp/accounted-allocation-intent-");
+  const path = await fs.mkdtemp(join(await fs.realpath("/tmp"), "accounted-allocation-intent-"));
   await fs.chmod(path, 0o700); roots.push(path); return path;
 }
 

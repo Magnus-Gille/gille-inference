@@ -30,7 +30,7 @@ const owned: {path:string;dev:number;ino:number}[] = [];
 const handles: {close():Promise<void>}[] = [];
 async function root() {
   if (!ownerUid) throw Error("unprivileged tests only");
-  const path = await fs.mkdtemp("/private/tmp/accounted-cas-test-"); await fs.chmod(path,0o700);
+  const path = await fs.mkdtemp(join(await fs.realpath("/tmp"), "accounted-cas-test-")); await fs.chmod(path,0o700);
   const s = await fs.lstat(path); owned.push({path,dev:s.dev,ino:s.ino}); return path;
 }
 async function seeded(state: unknown = {value:0}) {
