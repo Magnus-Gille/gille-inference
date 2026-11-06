@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "laneId": "accounted-podman-info-v1",
+  "phase": "admission",
+  "offlineOnly": true,
+  "executionAuthorized": false,
+  "admit": true,
+  "inputDigest": "4e4af283555e4dcb310eb1eaad7d32afe8f7da25f041a6f2cd703dfe2727d7e0",
+  "reasons": [],
+  "decisionDigest": "a43d8c35bc3321992ffdd5f89ee8e02b6177c519116483200a62ff0ae6749dce"
+}

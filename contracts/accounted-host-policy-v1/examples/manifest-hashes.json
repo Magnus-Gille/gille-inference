@@ -1,0 +1,7 @@
+{
+  "fixture": "accounted-host-policy-v1",
+  "protectedManifestDigest": "b8386a2accab3e670726403fd9e55b4ae7b729689a10997f5915591fabf0b820",
+  "ownerAllocationDigest": "b08d14bdb80fcd813f1dd9431c02d0468218a468a941c18d44c0a420556ccf7c",
+  "controlPlaneAccountingDigest": "c33ee0d90380c6693c8ee9ddffd28ba59a465db001e7b0a5dabb53262f1cdd8e",
+  "note": "Synthetic fixture hashes only; no live manifest or host state is represented."
+}

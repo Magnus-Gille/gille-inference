@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "laneId": "accounted-podman-info-v1",
+  "phase": "admission",
+  "offlineOnly": true,
+  "executionAuthorized": false,
+  "admit": false,
+  "inputDigest": "376f8dd5cba586928ecbc27540be2ee50b83a164220d42b2a3cf67a9a99957fe",
+  "reasons": [
+    "controls_conflict",
+    "payload_ip_network_forbidden",
+    "work_active"
+  ],
+  "decisionDigest": "05777f4a95e7efd405e2870c77133a95c6f2470a711d57b76d1359b212e37176"
+}
