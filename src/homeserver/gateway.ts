@@ -235,6 +235,14 @@ interface PrincipalContext {
   creditsUsed: number;
 }
 
+/** Closed route allow-list for scope `ask` (INFER-450). Keys are `${METHOD} ${pathname}`. */
+const ASK_SCOPE_ROUTES: ReadonlySet<string> = new Set([
+  "POST /mcp",
+  "GET /portal/me",
+  "GET /v1/models",
+  "GET /healthz",
+]);
+
 function keyMatches(provided: string, keys: string[]): boolean {
   if (keys.length === 0) return false;
   const ph = createHash("sha256").update(provided).digest();
@@ -3888,11 +3896,12 @@ async function handleKeysMint(
     || (body.scope !== undefined
       && body.scope !== "admin"
       && body.scope !== "agent"
+      && body.scope !== "ask"
       && body.scope !== "inference"
       && body.scope !== "monitor")
   ) {
     sendError(res, makeError("invalid_request_error", {
-      message: "Require 'alias' and 'tier' (owner|guest); optional 'scope' is admin|agent|inference|monitor.",
+      message: "Require 'alias' and 'tier' (owner|guest); optional 'scope' is admin|agent|ask|inference|monitor.",
     }));
     return;
   }
@@ -4462,6 +4471,24 @@ export async function handleRequest(
         );
         return;
       }
+    }
+
+    // INFER-450: the `ask` scope is a CLOSED route allow-list, enforced before any other dispatch
+    // (public, inference, admin, residency, delegate, code_loop). It carries MCP `ask` (tool-level
+    // gating lives in mcp.ts) plus the read-only preflight GETs the m5 client doctor uses.
+    // Anything not listed — including ordinary /v1 inference — is refused here, never per-route.
+    if (principal?.scope === "ask" && !ASK_SCOPE_ROUTES.has(`${method} ${path}`)) {
+      lctx.status = 403;
+      lctx.outcome = "forbidden";
+      lctx.errorClass = "route_not_allowed";
+      sendError(
+        res,
+        makeError("route_not_allowed", {
+          param: null,
+          message: "This is an ask-only key (allowed: POST /mcp, GET /portal/me, GET /v1/models and GET /healthz).",
+        })
+      );
+      return;
     }
 
     // The Hugin roster credential is a route-scoped service principal, not a

@@ -43,6 +43,10 @@ function legacyAdmin(alias: string): string {
   return plaintextKey;
 }
 
+function lookupKeyByAlias(alias: string): string {
+  return (getDb().prepare("SELECT scope FROM api_keys WHERE alias = ?").get(alias) as { scope: string }).scope;
+}
+
 function codeOf(fn: () => unknown): string {
   try {
     fn();
@@ -54,8 +58,11 @@ function codeOf(fn: () => unknown): string {
 }
 
 describe("scope partial order (INFER-152)", () => {
-  const scopes: KeyScope[] = ["admin", "agent", "inference", "monitor"];
-  const allowed = new Set(["admin>agent", "admin>inference", "admin>monitor", "agent>inference"]);
+  const scopes: KeyScope[] = ["admin", "agent", "ask", "inference", "monitor"];
+  const allowed = new Set([
+    "admin>agent", "admin>ask", "admin>inference", "admin>monitor",
+    "agent>ask", "agent>inference", "inference>ask",
+  ]);
 
   it("allows exactly admin→{agent,inference,monitor} and agent→inference", () => {
     for (const from of scopes) {
@@ -82,6 +89,19 @@ describe("keys restrict — narrowing only (INFER-152)", () => {
     expect(rec?.keyHash).toBe(hashKey(secret));
   });
 
+  it("narrows to ask only for owner-tier keys; a guest key is refused, not silently reinterpreted", () => {
+    mintKey({ alias: "owner-inf", tier: "owner", scope: "inference" }, DEFAULTS);
+    mintKey({ alias: "guest-inf", tier: "guest", scope: "inference" }, DEFAULTS);
+    expect(restrictKey("owner-inf", { scope: "ask", now: NOW }).after.scope).toBe("ask");
+    expect(lookupKeyByAlias("owner-inf")).toBe("ask");
+    expect(codeOf(() => restrictKey("guest-inf", { scope: "ask", now: NOW }))).toBe("tier_incompatible");
+    expect(lookupKeyByAlias("guest-inf")).toBe("inference");
+    // ask itself can narrow to nothing, and cannot move sideways or up.
+    for (const to of ["admin", "agent", "inference", "monitor"] as const) {
+      expect(codeOf(() => restrictKey("owner-inf", { scope: to, now: NOW }))).toBe("widening_scope");
+    }
+  });
+
   it("refuses every widening of scope and leaves the row unchanged", () => {
     mintKey({ alias: "a", tier: "owner", scope: "agent" }, DEFAULTS);
     mintKey({ alias: "i", tier: "guest", scope: "inference" }, DEFAULTS);
@@ -90,6 +110,7 @@ describe("keys restrict — narrowing only (INFER-152)", () => {
 
     expect(codeOf(() => restrictKey("a", { scope: "admin", now: NOW }))).toBe("widening_scope");
     expect(codeOf(() => restrictKey("a", { scope: "monitor", now: NOW }))).toBe("widening_scope");
+    expect(codeOf(() => restrictKey("m", { scope: "ask", now: NOW }))).toBe("widening_scope");
     expect(codeOf(() => restrictKey("i", { scope: "agent", now: NOW }))).toBe("widening_scope");
     expect(codeOf(() => restrictKey("i", { scope: "monitor", now: NOW }))).toBe("widening_scope");
     expect(codeOf(() => restrictKey("m", { scope: "inference", now: NOW }))).toBe("widening_scope");
@@ -343,6 +364,70 @@ describe("credential plan and inventory output are secret-free (INFER-152)", () 
 
   it("rejects combining --static with --plan", () => {
     expect(() => run(["inventory", "--static", "--plan"])).toThrow(/mutually exclusive/);
+  });
+});
+
+describe("flag combinations on inventory (INFER-152 + INFER-450)", () => {
+  function runInv(argv: string[]): string {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      cmdKeys(parseArgs(argv));
+      return log.mock.calls.flat().join("\n");
+    } finally {
+      log.mockRestore();
+    }
+  }
+
+  function seed(): void {
+    const dbPath = join(mkdtempSync(join(tmpdir(), "hs-inv-combo-")), "inv.db");
+    initDb(dbPath);
+    mintKey({ alias: "ask-key", tier: "owner", scope: "ask" }, DEFAULTS);
+    mintKey({ alias: "agent-key", tier: "owner", scope: "agent" }, DEFAULTS);
+    getDb().prepare("UPDATE api_keys SET expires_at = NULL, use_count = 4, last_used_at = '2026-11-05T00:00:00.000Z' WHERE alias = 'ask-key'").run();
+    getDb().close();
+    chmodSync(dbPath, 0o444);
+    process.env["EVAL_DB_PATH"] = dbPath;
+  }
+
+  it("--plan --scope ask lists only ask keys and respects the 90-day cap", () => {
+    seed();
+    const out = JSON.parse(runInv(["inventory", "--plan", "--scope", "ask", "--json"]));
+    expect(out.plan.map((e: { alias: string }) => e.alias)).toEqual(["ask-key"]);
+    expect(out.plan[0]).toMatchObject({
+      scope: "ask", suggestedAction: "keep+expiry", maxExpiresInSeconds: MAX_KEY_LIFETIME_SECONDS.ask,
+    });
+    expect(out.plan[0].reason).toMatch(/at most 90 days \(ask cap\)/);
+  });
+
+  it("an ask key whose expiry is beyond the cap is told to shorten it", () => {
+    seed();
+    const far = new Date(NOW.getTime() + 200 * DAY * 1000).toISOString();
+    // Rebuild a plan from a report with a far expiry (pure function; no write to the read-only DB).
+    const entry = buildCredentialPlan({
+      generatedAt: NOW.toISOString(), staleAfterDays: 30,
+      summary: { total: 1, active: 1, expired: 0, revoked: 0, findings: {} as never },
+      keys: [{
+        alias: "ask-far", tier: "owner", scope: "ask", expiresAt: far, createdAt: NOW.toISOString(),
+        lastUsedAt: NOW.toISOString(), useCount: 5, status: "active", findings: [],
+      } as never],
+    })[0]!;
+    expect(entry.suggestedAction).toBe("keep+expiry");
+    expect(entry.reason).toMatch(/beyond the 90-day ask cap/);
+  });
+
+  it("--static with --scope or --plan, and --plan with --static, are rejected", () => {
+    seed();
+    expect(() => runInv(["inventory", "--static", "--scope", "ask"])).toThrow(/cannot be combined with --static/);
+    expect(() => runInv(["inventory", "--static", "--plan"])).toThrow(/mutually exclusive/);
+    expect(() => runInv(["inventory", "--scope"])).toThrow(/--scope/);
+    expect(() => runInv(["inventory", "--scope", "bogus"])).toThrow(/--scope/);
+  });
+
+  it("--scope alone still filters the table and JSON and carries static counts", () => {
+    seed();
+    const out = JSON.parse(runInv(["inventory", "--scope", "ask", "--json"]));
+    expect(out.keys.map((k: { alias: string }) => k.alias)).toEqual(["ask-key"]);
+    expect(out.legacyStaticCredentialCounts.counts).toBeDefined();
   });
 });
 

@@ -64,7 +64,7 @@ npx tsx src/homeserver/cli.ts keys restrict --alias <alias> --scope agent --expi
 npx tsx src/homeserver/cli.ts keys restrict --alias <alias> --scope agent --expires-in 2592000
 ```
 
-The allowed order is `admin` to `agent`, `inference` or `monitor`, and `agent` to `inference`
+The allowed order is `admin` to `agent`, `ask`, `inference` or `monitor`; `agent` to `ask` or `inference`; and `inference` to `ask` (`ask` only for owner-tier keys; it reaches a strict subset of each source scope, pinned by the reach test)
 (`monitor` and `inference` are incomparable, and `agent` does not cover `monitor`'s reads). A
 widening scope, a later expiry, a lifetime above the resulting scope's maximum, a revoked or
 expired key, or a key in a staged rotation is refused. One guarded transactional update changes
@@ -92,6 +92,23 @@ too much authority; use staged rotation when the consumer must receive a new sec
 
 Deploying the code is a separate owner step; the switch defaults to off, so deploy alone changes
 no authentication behaviour.
+
+## Rolling the gateway back below the `ask` scope
+
+**Mandatory before rolling back below the `ask`-scope version (INFER-450).** A gateway build
+without the `ask` scope reads a stored owner `ask` row as owner `inference`, silently re-enabling
+`ask.files` and ordinary `/v1` inference for that key. Revoke every `ask` key first and verify:
+
+```bash
+npx tsx src/homeserver/cli.ts keys revoke --scope ask             # dry-run: lists aliases and count
+npx tsx src/homeserver/cli.ts keys revoke --scope ask --confirm   # one transaction, soft-revoke
+npx tsx src/homeserver/cli.ts keys inventory --scope ask          # must show no active keys
+```
+
+Rollback floor: the first release containing the `ask` scope (the merge of the INFER-450 PR).
+Rolling back to any earlier revision requires this step. Revoked aliases stay reserved (see the
+alias note in `src/homeserver/README.md`), so after rolling forward again mint the replacement
+under a NEW alias. `keys revoke --scope` accepts only `ask`; revoke other keys by alias.
 
 ## Staged consumer migration
 

@@ -22,11 +22,13 @@ export type Tier = "owner" | "guest";
  * - admin: operator routes plus agent/inference surfaces
  * - agent: bounded agent/inference surfaces, never operator routes
  * - inference: ordinary inference surfaces only
+ * - ask: owner-tier MCP `ask` (plus its read-only helpers) and preflight reads, nothing else;
+ *   enforced as a closed route allow-list in the gateway (INFER-450)
  *
  * Existing rows predate this column. A null stored scope is interpreted as the
  * legacy-compatible default for its tier (owner→admin, guest→inference).
  */
-export type KeyScope = "admin" | "agent" | "inference" | "monitor";
+export type KeyScope = "admin" | "agent" | "ask" | "inference" | "monitor";
 
 /**
  * Maximum lifetime for newly minted credentials. Existing rows with no expiry remain readable so
@@ -35,6 +37,7 @@ export type KeyScope = "admin" | "agent" | "inference" | "monitor";
 export const MAX_KEY_LIFETIME_SECONDS: Readonly<Record<KeyScope, number>> = Object.freeze({
   admin: 30 * 24 * 60 * 60,
   agent: 90 * 24 * 60 * 60,
+  ask: 90 * 24 * 60 * 60,
   inference: 365 * 24 * 60 * 60,
   monitor: 365 * 24 * 60 * 60,
 });
@@ -189,7 +192,7 @@ function legacyScopeForTier(tier: Tier): KeyScope {
 function storedScope(tier: Tier, value: string | null): KeyScope {
   if (value === null) return legacyScopeForTier(tier);
   if (value === "inference" || value === "monitor") return value;
-  if (tier === "owner" && (value === "admin" || value === "agent")) return value;
+  if (tier === "owner" && (value === "admin" || value === "agent" || value === "ask")) return value;
   // A malformed or tier-incompatible stored value must not expand authority.
   return "inference";
 }
@@ -562,6 +565,30 @@ export function revokeKey(alias: string, now: Date = new Date()): boolean {
     .prepare(`UPDATE api_keys SET revoked_at = @ts WHERE alias = @alias AND revoked_at IS NULL`)
     .run({ alias, ts: now.toISOString() });
   return info.changes > 0;
+}
+
+/**
+ * Soft-revoke EVERY active key whose resolved scope is `scope`, in one transaction (INFER-450
+ * rollback guard: a pre-`ask` build reads a stored `ask` row as owner `inference`, so `ask` keys
+ * must be revoked before rolling back below that version). With `dryRun` nothing is written.
+ * Returns aliases only — never hashes or plaintext.
+ */
+export function revokeKeysByScope(
+  scope: KeyScope,
+  opts: { dryRun?: boolean; now?: Date } = {}
+): { aliases: string[]; revoked: boolean } {
+  const db = ksDb();
+  const ts = (opts.now ?? new Date()).toISOString();
+  const run = db.transaction(() => {
+    const rows = (db.prepare(`SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`).all() as KeyRow[])
+      .map(rowToRecord)
+      .filter((key) => key.scope === scope);
+    if (opts.dryRun !== false) return { aliases: rows.map((r) => r.alias), revoked: false };
+    const stmt = db.prepare(`UPDATE api_keys SET revoked_at = @ts WHERE alias = @alias AND revoked_at IS NULL`);
+    for (const row of rows) stmt.run({ alias: row.alias, ts });
+    return { aliases: rows.map((r) => r.alias), revoked: true };
+  });
+  return run();
 }
 
 // ─── Rotate (#99) ───────────────────────────────────────────────────────────────────
@@ -1196,6 +1223,8 @@ export interface CredentialInventoryOptions {
   now?: Date;
   staleAfterDays?: number;
   includeRevoked?: boolean;
+  /** Only report keys whose resolved scope matches (summary counts reflect the filter). */
+  scope?: KeyScope;
 }
 
 function credentialInventoryFromDb(
@@ -1209,7 +1238,8 @@ function credentialInventoryFromDb(
   const sql = opts.includeRevoked
     ? `SELECT * FROM api_keys ORDER BY created_at`
     : `SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at`;
-  const source = (db.prepare(sql).all() as KeyRow[]).map(rowToRecord);
+  const source = (db.prepare(sql).all() as KeyRow[]).map(rowToRecord)
+    .filter((key) => opts.scope === undefined || key.scope === opts.scope);
 
   const all = source.map((key): CredentialInventoryEntry => {
     const expired = key.expiresAt !== null && Date.parse(key.expiresAt) <= now.getTime();
@@ -1287,6 +1317,8 @@ export interface CredentialPlanEntry {
   findings: CredentialFinding[];
   suggestedAction: SuggestedAction;
   reason: string;
+  /** Longest expiry `keys restrict --expires-in` accepts for the key's current scope. */
+  maxExpiresInSeconds: number;
 }
 
 /**
@@ -1301,7 +1333,10 @@ export function buildCredentialPlan(report: CredentialInventoryReport): Credenti
   const nowMs = Date.parse(report.generatedAt);
   const staleMs = report.staleAfterDays * 24 * 60 * 60 * 1000;
   return report.keys.map((key): CredentialPlanEntry => {
+    const cap = MAX_KEY_LIFETIME_SECONDS[key.scope];
+    const capDays = Math.round(cap / 86_400);
     const base = {
+      maxExpiresInSeconds: cap,
       alias: key.alias,
       tier: key.tier,
       scope: key.scope,
@@ -1333,7 +1368,12 @@ export function buildCredentialPlan(report: CredentialInventoryReport): Credenti
         reason: "created recently and not yet used; confirm the consumer, then decide" };
     }
     if (key.expiresAt === null) {
-      return { ...base, suggestedAction: "keep+expiry", reason: "active without expiry; set one with `keys restrict`" };
+      return { ...base, suggestedAction: "keep+expiry",
+        reason: `active without expiry; set one of at most ${capDays} days (${key.scope} cap) with \`keys restrict\`` };
+    }
+    if (Date.parse(key.expiresAt) - nowMs > cap * 1_000) {
+      return { ...base, suggestedAction: "keep+expiry",
+        reason: `expiry is beyond the ${capDays}-day ${key.scope} cap; shorten it with \`keys restrict\`` };
     }
     return { ...base, suggestedAction: "keep", reason: "bounded and in use" };
   });
@@ -1342,15 +1382,20 @@ export function buildCredentialPlan(report: CredentialInventoryReport): Credenti
 // ─── In-place narrowing (INFER-152) ─────────────────────────────────────────────────
 
 /**
- * Strict partial order on route authority. `admin` reaches every route `agent`, `inference`
- * and `monitor` reach; `agent` reaches `inference`. `monitor` (read-only observer routes that
- * `agent` cannot read) and `inference` are incomparable with each other, and `agent` does not
- * cover `monitor`'s ledger/metrics reads, so `agent→monitor` is NOT a narrowing.
+ * Strict partial order on route authority, pinned to the live gateway by
+ * tests/homeserver-scope-narrowing-reach.test.ts. `admin` reaches every route `agent`, `inference`,
+ * `ask` and `monitor` reach; `agent` reaches `inference` and `ask`; `inference` reaches `ask`.
+ * `ask` (INFER-450: MCP ask without files, tokenize, list_models, model_status, /portal/me,
+ * /v1/models, /healthz) is a strict subset of each of those three, so they may narrow to it, but
+ * only for OWNER-tier keys (see {@link restrictKey}). `monitor` (read-only observer routes that
+ * `agent`, `inference` and `ask` cannot read) is incomparable with them, and `monitor` reaches
+ * none of `ask`'s routes, so `→monitor` is only a narrowing from `admin`, and `monitor→ask` is not.
  */
 export const NARROWER_SCOPES: Readonly<Record<KeyScope, readonly KeyScope[]>> = Object.freeze({
-  admin: Object.freeze(["agent", "inference", "monitor"] as KeyScope[]),
-  agent: Object.freeze(["inference"] as KeyScope[]),
-  inference: Object.freeze([] as KeyScope[]),
+  admin: Object.freeze(["agent", "ask", "inference", "monitor"] as KeyScope[]),
+  agent: Object.freeze(["ask", "inference"] as KeyScope[]),
+  ask: Object.freeze([] as KeyScope[]),
+  inference: Object.freeze(["ask"] as KeyScope[]),
   monitor: Object.freeze([] as KeyScope[]),
 });
 
@@ -1365,6 +1410,7 @@ export type KeyRestrictErrorCode =
   | "expired"
   | "staged_rotation"
   | "widening_scope"
+  | "tier_incompatible"
   | "widening_expiry"
   | "lifetime_exceeds_scope_max"
   | "invalid_param"
@@ -1438,6 +1484,11 @@ export function restrictKey(alias: string, opts: RestrictKeyOptions): RestrictKe
     if (opts.scope !== undefined && opts.scope !== rec.scope) {
       if (!isScopeNarrowing(rec.scope, opts.scope)) {
         throw new KeyRestrictError("widening_scope", `'${alias}': ${rec.scope} → ${opts.scope} is not a narrowing`);
+      }
+      // `ask` is owner-only: a tier-incompatible stored scope silently reads back as
+      // `inference`, so narrowing a guest key to it would widen it. Refuse instead.
+      if (opts.scope === "ask" && rec.tier !== "owner") {
+        throw new KeyRestrictError("tier_incompatible", `'${alias}': scope 'ask' is owner-only; this key is ${rec.tier}-tier`);
       }
       newScope = opts.scope;
     }

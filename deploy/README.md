@@ -660,6 +660,21 @@ even when the marker and file hashes match.
 
 ### Rollback
 
+**Mandatory before rolling back below the `ask`-scope version (INFER-450).** A gateway build
+without the `ask` scope reads a stored owner `ask` row as owner `inference`, silently re-enabling
+`ask.files` and ordinary `/v1` inference for that key. Revoke every `ask` key first and verify:
+
+```bash
+npx tsx src/homeserver/cli.ts keys revoke --scope ask             # dry-run: lists aliases and count
+npx tsx src/homeserver/cli.ts keys revoke --scope ask --confirm   # one transaction, soft-revoke
+npx tsx src/homeserver/cli.ts keys inventory --scope ask          # must show no active keys
+```
+
+Rollback floor: the first release containing the `ask` scope (the merge of the INFER-450 PR).
+Rolling back to any earlier revision requires this step. Revoked aliases stay reserved (see the
+alias note in `src/homeserver/README.md`), so after rolling forward again mint the replacement
+under a NEW alias. `keys revoke --scope` accepts only `ask`; revoke other keys by alias.
+
 The unit is not a git checkout, so "rollback" means **redeploy a known-good commit**, not
 `git revert` on the box:
 
@@ -751,8 +766,14 @@ Owner apply (private operator change; back up the live drop-in first):
 3. Verify. `systemctl show` prints bytes: expect `MemoryMin=0`, `MemoryMax=103079215104` (96 GiB)
    and `OOMPolicy=continue` from `systemctl show llama-swap.service -p MemoryMin -p MemoryMax -p OOMPolicy`.
    Also read the unit cgroup's `memory.min` (expect `0`) and `memory.max` (expect `103079215104`),
-   and `memory.min` of the parent slice (normally `system.slice`), which must be `0` or unchanged
-   from before so that no ancestor protection remains in effect.
+   and `memory.min` of the parent slice (normally `system.slice`), which must be `0`. "Unchanged" is
+   not enough: with cgroup2 mounted `memory_recursiveprot` (check the cgroup2 mount options), a
+   slice's `memory.min` is shared among children without their own floor in proportion to usage,
+   so the model service would still inherit most of it. On the M5 this protection came from a
+   persistent control drop-in, `/etc/systemd/system.control/system.slice.d/50-MemoryMin.conf`.
+   Removing it is a separate owner decision: back it up, run
+   `systemctl set-property system.slice MemoryMin=0` (no restart) and verify that the slice's
+   `memory.min` reads `0`. Roll back by restoring the backup and running `systemctl daemon-reload`.
    If the cgroup still reads the old value, apply it to the running unit with
    `systemctl set-property --runtime llama-swap.service MemoryMin=0` (no restart) and re-verify.
    Record whether this fallback was used by listing
