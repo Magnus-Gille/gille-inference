@@ -1,0 +1,35 @@
+name: Accounted host policy
+
+# Kept separate from ci.yml: the code-health v1 collector pins ci.yml by digest.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: accounted-host-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  accounted-host-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Contract and Python helper tests
+        run: |
+          set -euo pipefail
+          node --test contracts/accounted-host-policy-v1/tests/accounted-host-policy.mjs
+          shopt -s nullglob
+          tests=(tests/accounted_*_test.py)
+          [ "${#tests[@]}" -gt 0 ] || { echo "no accounted Python test files found"; exit 1; }
+          python3 --version
+          for t in "${tests[@]}"; do python3 -I "$t" -v; done

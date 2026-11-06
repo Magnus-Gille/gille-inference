@@ -173,8 +173,11 @@ class KernelChargesTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 2:
-                path.unlink()
-                self._write(path, "usage_usec 101\n")
+                # Create the replacement before the old file is gone so the
+                # inode number cannot be reused (Linux reuses freed inodes).
+                replacement = path.with_name("cpu.stat.replacement")
+                self._write(replacement, "usage_usec 101\n")
+                os.replace(replacement, path)
             return (100, 200, 300)[calls - 1]
 
         self._assert_code(

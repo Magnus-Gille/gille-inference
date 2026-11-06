@@ -91,13 +91,3 @@ jobs:
 
       - name: Native System One adapter contract
         run: python3 tests/test_systemone_native_server.py -v
-
-      - name: Accounted host-policy contract and helper tests
-        run: |
-          set -euo pipefail
-          node --test contracts/accounted-host-policy-v1/tests/accounted-host-policy.mjs
-          shopt -s nullglob
-          tests=(tests/accounted_*_test.py)
-          [ "${#tests[@]}" -eq 10 ] || { echo "expected 10 accounted Python test files, found ${#tests[@]}"; exit 1; }
-          python3 --version
-          for t in "${tests[@]}"; do python3 -I "$t" -v; done

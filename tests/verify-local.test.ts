@@ -6,7 +6,7 @@ import { buildManifest, parseWorkflowJobs, runChecks, validateReceipt } from '..
 
 function workflowFixtureRoot(root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-local-fixture-'))) {
   fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
-  for (const file of ['ci.yml','cgroup-stop-proof.yml','code-health.yml','code-loop-recovery.yml','dependency-compatibility.yml','host-arbiter.yml','observer-test-host.yml','producer-activity.yml','producer-channel.yml','proxy-activity.yml','portal-visual.yml','runtime-producer-channel.yml'])
+  for (const file of ['accounted-host-policy.yml','ci.yml','cgroup-stop-proof.yml','code-health.yml','code-loop-recovery.yml','dependency-compatibility.yml','host-arbiter.yml','observer-test-host.yml','producer-activity.yml','producer-channel.yml','proxy-activity.yml','portal-visual.yml','runtime-producer-channel.yml'])
     fs.copyFileSync(path.join(process.cwd(), `.github/workflows/${file}`), path.join(root, `.github/workflows/${file}`));
   return root;
 }
@@ -87,7 +87,7 @@ describe('local verification manifest', () => {
       expect(manifest.checks.find(({ workflowName }) => workflowName === 'Informational code health')?.status).toBe('conformance-only');
       expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('Native code-loop recovery / Real manager and cage recovery');
       expect(manifest.checks.map(({ workflowName, rawName }) => `${workflowName} / ${rawName}`)).toContain('Portal visual verification / Portal desktop and mobile states');
-      expect(manifest.checks).toHaveLength(14);
+      expect(manifest.checks).toHaveLength(15);
       expect(manifest.clientCompatibility).toEqual({ present: false, reason: 'workflow-absent-at-invoked-revision' });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -165,7 +165,7 @@ describe('local verification manifest', () => {
       const manifest = buildManifest({ root, event: 'pull_request' });
       expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
         .toEqual(['Client Node 18', 'Client Node 22']);
-      expect(manifest.checks).toHaveLength(16);
+      expect(manifest.checks).toHaveLength(17);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -177,7 +177,7 @@ describe('local verification manifest', () => {
       const manifest = buildManifest({ root, event: 'pull_request' });
       expect(manifest.checks.filter((check: any) => check.workflowFile === 'client-compatibility.yml').map((check: any) => check.rawName))
         .toEqual(['Client Node 18', 'Client Node 22']);
-      expect(manifest.checks).toHaveLength(16);
+      expect(manifest.checks).toHaveLength(17);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 

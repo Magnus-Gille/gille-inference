@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 const REQUIRED_WORKFLOWS = [
+  ['accounted-host-policy.yml', 'Accounted host policy', ['accounted-host-policy']],
   ['cgroup-stop-proof.yml', 'Bound cgroup stop proof', ['cgroup-stop-proof']],
   ['ci.yml', 'CI', ['secret-scan', 'test']],
   ['code-health.yml', 'Informational code health', ['collect']],
@@ -22,6 +23,7 @@ const REQUIRED_WORKFLOWS = [
 const CLIENT_WORKFLOW = ['client-compatibility.yml', 'Client compatibility', ['client']];
 const CODE_HEALTH_SCHEDULES = ['17 4 * * *', '47 4 * * 1'];
 const EXPECTED_CHECKS = [
+  ['Accounted host policy', 'accounted-host-policy', 'accounted-host-policy'],
   ['Bound cgroup stop proof', 'cgroup-stop-proof', 'cgroup-stop-proof'],
   ['CI', 'secret-scan', 'Gitleaks'], ['CI', 'test', 'test'],
   ['Informational code health', 'collect', 'Collect report-only code health'],
