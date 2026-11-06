@@ -75,7 +75,7 @@ import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
 import { probeCodeLoopTransport } from "./code-loop-transport.js";
-import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
+import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordServedModelMismatchShadow, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
@@ -2104,8 +2104,13 @@ async function handleChatProxy(
         else degenerateGone.signal.addEventListener("abort", onDegenerate, { once: true });
         // INFER-343: verify/canonicalize every frame's `model` before it reaches the client.
         let relay: NodeJS.ReadableStream = nodeStream;
-        if (parsed.model !== null) {
-          const guard = new ServedIdentityGuard(parsed.model, cfg.servedModelAliases);
+        if (parsed.model !== null && cfg.servedModelIdentity !== "off") {
+          const guard = new ServedIdentityGuard(
+            parsed.model,
+            cfg.servedModelAliases,
+            cfg.servedModelIdentity,
+            () => recordServedModelMismatchShadow(lctx.model),
+          );
           guard.on("error", (guardErr) => {
             nodeStream.destroy();
             reject(guardErr);
@@ -2354,7 +2359,8 @@ async function handleChatProxy(
 
   // INFER-343: the body's `model` must be the requested roster ID, a declared alias of it
   // (rewritten to the roster ID), or absent. Anything else is withheld and billed zero.
-    const identity = reconcileCompletionIdentity(text, parsed.model, cfg.servedModelAliases);
+    const identity = reconcileCompletionIdentity(text, parsed.model, cfg.servedModelAliases, cfg.servedModelIdentity);
+    if (identity.kind === "mismatch_shadow") recordServedModelMismatchShadow(lctx.model);
     if (identity.kind === "mismatch") {
       lctx.status = 502;
       lctx.outcome = "upstream_model_mismatch";

@@ -78,6 +78,12 @@ const poisonClearTotal: LabelMap = new Map();
 // canonical model id — never any request content.
 const degeneracyDetectedTotal: LabelMap = new Map();
 
+// homeserver_served_model_mismatch_shadow_total{model} — INFER-343 shadow mode: responses whose
+// backend-reported `model` neither equalled the requested roster ID nor a declared alias, and were
+// passed through unchanged and billed normally. Content-blind: canonical requested model only,
+// never the served identity (it may be a private path).
+const servedModelMismatchShadowTotal: LabelMap = new Map();
+
 // homeserver_code_loop_runs_total{status} — terminal code_loop runs by status (#116). Content-blind:
 // the only label is the terminal run status (completed | cap-exceeded | degenerate | arm-error |
 // orphaned) — never the instruction, diff, or any content.
@@ -297,6 +303,11 @@ export function recordDegeneracyDetected(model: string | null | undefined): void
   incCounter(degeneracyDetectedTotal, labelKey({ model: modelLabel(model) }));
 }
 
+/** Count a shadow-mode served-model identity mismatch (INFER-343) for the canonical requested model. */
+export function recordServedModelMismatchShadow(model: string | null | undefined): void {
+  incCounter(servedModelMismatchShadowTotal, labelKey({ model: modelLabel(model) }));
+}
+
 /** Record a terminal code_loop run by status (#116). Content-blind: status label only. */
 export function recordCodeLoopRun(status: string): void {
   codeLoopTouched = true;
@@ -481,6 +492,11 @@ export function renderMetrics(): string {
       degeneracyDetectedTotal
     ),
     renderCounter(
+      "homeserver_served_model_mismatch_shadow_total",
+      "Shadow-mode responses whose backend-reported model did not match the requested roster ID or a declared alias (passed through, billed), by requested model",
+      servedModelMismatchShadowTotal
+    ),
+    renderCounter(
       "homeserver_code_loop_runs_total",
       "Terminal code_loop (agentic coding) runs by status",
       codeLoopRunsTotal
@@ -541,6 +557,7 @@ export function resetMetrics(): void {
   imagesTotal.clear();
   poisonClearTotal.clear();
   degeneracyDetectedTotal.clear();
+  servedModelMismatchShadowTotal.clear();
   codeLoopRunsTotal.clear();
   codeLoopInterleavedTotal.clear();
   codeLoopRelayDeniedTotal.clear();

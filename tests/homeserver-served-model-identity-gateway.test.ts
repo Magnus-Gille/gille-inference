@@ -88,10 +88,18 @@ function startUpstream(): Promise<void> {
 let mintKey: typeof import("../src/homeserver/keystore.js").mintKey;
 let lookupKey: typeof import("../src/homeserver/keystore.js").lookupKey;
 let resetQuotaWindows: typeof import("../src/homeserver/quota.js").resetQuotaWindows;
-let gatewayPort = 0;
-let stopGateway: (() => Promise<void>) | null = null;
+let gatewayPort = 0; // enforce
+let shadowPort = 0;
+let offPort = 0;
+const stops: Array<() => Promise<void>> = [];
 let runtimeDir = "";
 let aliases: Map<string, Set<string>>;
+let renderMetrics: () => string;
+let mcpRun: (alias: string, mode?: "enforce" | "shadow" | "off") => Promise<{
+  r: Awaited<ReturnType<typeof runChatCompletion>>;
+  k: { plaintextKey: string };
+}>;
+const SHADOW_METRIC = "homeserver_served_model_mismatch_shadow_total";
 
 beforeAll(async () => {
   runtimeDir = mkdtempSync(join(tmpdir(), "hs-identity-test-"));
@@ -120,14 +128,20 @@ beforeAll(async () => {
     ["some-other-model", new Set([OTHER_ROSTER_PATH])],
   ]);
   // Explicit, operator-declared roster -> served-identity pairs (config.servedModelAliases).
-  cfgMod.setConfig({ servedModelAliases: aliases } as never);
-  const handle = await gw.startGateway();
-  gatewayPort = handle.port;
-  stopGateway = handle.stop;
+  const start = async (mode: "enforce" | "shadow" | "off"): Promise<number> => {
+    cfgMod.setConfig({ servedModelAliases: aliases, servedModelIdentity: mode } as never);
+    const handle = await gw.startGateway();
+    stops.push(handle.stop);
+    return handle.port;
+  };
+  gatewayPort = await start("enforce");
+  shadowPort = await start("shadow");
+  offPort = await start("off");
+  renderMetrics = (await import("../src/homeserver/metrics.js")).renderMetrics;
 });
 
 afterAll(async () => {
-  if (stopGateway) await stopGateway();
+  for (const stop of stops) await stop();
   await new Promise<void>((r) => upstream.close(() => r()));
   closeDb();
   rmSync(runtimeDir, { recursive: true, force: true });
@@ -141,8 +155,8 @@ beforeEach(() => {
 
 const DEFAULTS = { rpm: 1000, tpm: 1_000_000, dailyTokenBudget: 0, maxParallel: 1 };
 
-async function chat(token: string, extra: Record<string, unknown> = {}): Promise<Response> {
-  return fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+async function chat(token: string, extra: Record<string, unknown> = {}, port = gatewayPort): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify({
@@ -275,9 +289,9 @@ describe("INFER-343 MCP ask identity", () => {
       creditLimit: rec.creditLimit,
     };
   }
-  const run = async (alias: string) => {
+  const run = async (alias: string, mode: "enforce" | "shadow" | "off" = "enforce") => {
     const k = mintKey({ alias, tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
-    const cfg = { ...loadConfig(), servedModelAliases: aliases, lmStudioBaseUrl: `http://127.0.0.1:${upstreamPort}/v1` };
+    const cfg = { ...loadConfig(), servedModelAliases: aliases, servedModelIdentity: mode, lmStudioBaseUrl: `http://127.0.0.1:${upstreamPort}/v1` };
     const controller = new AdmissionController({ maxInflight: 2, ownerQueueMaxMs: 1000, retryAfterAtCapSeconds: 2 });
     const r = await runChatCompletion(principalOf(lookupKey(k.plaintextKey)!), cfg, controller, noopInflight, {
       model: ROSTER,
@@ -286,6 +300,7 @@ describe("INFER-343 MCP ask identity", () => {
     });
     return { r, k };
   };
+  mcpRun = run;
 
   it("accepts a declared alias", async () => {
     const { r } = await run("mcp-id-alias");
@@ -307,5 +322,72 @@ describe("INFER-343 MCP ask identity", () => {
   it("accepts an absent model", async () => {
     omitModel = true;
     expect((await run("mcp-id-absent")).r.ok).toBe(true);
+  });
+});
+
+describe("INFER-343 shadow mode (default rollout)", () => {
+  const metricCount = (): number =>
+    renderMetrics().split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{")).reduce((n, l) => n + Number(l.split(" ").pop()), 0);
+
+  it("non-streaming: a declared alias is still rewritten", async () => {
+    const k = mintKey({ alias: "sh-alias", tier: "guest" }, DEFAULTS);
+    const j = (await (await chat(k.plaintextKey, {}, shadowPort)).json()) as { model: string };
+    expect(j.model).toBe(ROSTER);
+  });
+
+  it("non-streaming: a mismatch passes through UNCHANGED, is billed, and is counted content-free", async () => {
+    reportedModel = UNKNOWN_PATH;
+    const k = mintKey({ alias: "sh-unknown", tier: "guest", creditLimit: 1_000_000 }, DEFAULTS);
+    const before = metricCount();
+    const res = await chat(k.plaintextKey, {}, shadowPort);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { model: string }).model).toBe(UNKNOWN_PATH);
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+    expect(lastLog("sh-unknown")?.outcome).toBe("ok");
+    expect(metricCount()).toBe(before + 1);
+    expect(renderMetrics()).not.toContain("/home/operator");
+  });
+
+  it("streaming: alias rewritten in every frame; a mismatch streams through unchanged and is counted once", async () => {
+    const k = mintKey({ alias: "sh-sid", tier: "guest" }, DEFAULTS);
+    expect(sseModels(await (await chat(k.plaintextKey, { stream: true }, shadowPort)).text())).toEqual([ROSTER, ROSTER, ROSTER]);
+    reportedModel = UNKNOWN_PATH;
+    const before = metricCount();
+    const text = await (await chat(k.plaintextKey, { stream: true }, shadowPort)).text();
+    expect(sseModels(text)).toEqual([UNKNOWN_PATH, UNKNOWN_PATH, UNKNOWN_PATH]);
+    expect(text).toContain('"content":"hel"');
+    expect(text).not.toContain("upstream_model_mismatch");
+    expect(metricCount()).toBe(before + 1);
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+  });
+
+  it("MCP ask: mismatch succeeds (billed) and is counted", async () => {
+    reportedModel = UNKNOWN_PATH;
+    const before = metricCount();
+    const { r, k } = await mcpRun("mcp-sh-unknown", "shadow");
+    expect(r.ok).toBe(true);
+    expect(lookupKey(k.plaintextKey)!.creditsUsed).toBeGreaterThan(0);
+    expect(metricCount()).toBe(before + 1);
+  });
+});
+
+describe("INFER-343 off mode", () => {
+  it("does no inspection or rewrite on any path", async () => {
+    const k = mintKey({ alias: "off-k", tier: "guest" }, DEFAULTS);
+    const before = renderMetrics();
+    expect(((await (await chat(k.plaintextKey, {}, offPort)).json()) as { model: string }).model).toBe(SERVED_PATH);
+    expect(sseModels(await (await chat(k.plaintextKey, { stream: true }, offPort)).text())).toEqual([SERVED_PATH, SERVED_PATH, SERVED_PATH]);
+    reportedModel = UNKNOWN_PATH;
+    const res = await chat(k.plaintextKey, {}, offPort);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { model: string }).model).toBe(UNKNOWN_PATH);
+    expect(renderMetrics().split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{"))).toEqual(
+      before.split("\n").filter((l) => l.startsWith(SHADOW_METRIC + "{")),
+    );
+  });
+
+  it("MCP ask: mismatch succeeds", async () => {
+    reportedModel = UNKNOWN_PATH;
+    expect((await mcpRun("mcp-off-unknown", "off")).r.ok).toBe(true);
   });
 });

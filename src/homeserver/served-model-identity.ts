@@ -27,6 +27,17 @@ import { StringDecoder } from "node:string_decoder";
 export type ServedModelAliasMap = ReadonlyMap<string, ReadonlySet<string>>;
 
 export const SERVED_MODEL_ALIASES_ENV = "HOMESERVER_SERVED_MODEL_ALIASES";
+export const SERVED_MODEL_IDENTITY_MODE_ENV = "HOMESERVER_SERVED_MODEL_IDENTITY";
+
+/** shadow (default): verify + rewrite declared aliases, pass mismatches through and count them. */
+export type ServedModelIdentityMode = "off" | "shadow" | "enforce";
+
+/** Unset/empty -> shadow. Any other unknown value throws WITHOUT echoing it. */
+export function parseServedModelIdentityMode(raw: string | undefined): ServedModelIdentityMode {
+  if (raw === undefined || raw === "") return "shadow";
+  if (raw === "off" || raw === "shadow" || raw === "enforce") return raw;
+  throw new Error(`${SERVED_MODEL_IDENTITY_MODE_ENV} must be one of: off, shadow, enforce`);
+}
 const MAX_IDENTITY_CHARS = 512;
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u001f\u007f]/;
@@ -73,7 +84,9 @@ export function judgeServedIdentity(
 export type CompletionIdentityResult =
   | { kind: "unchanged"; text: string }
   | { kind: "rewritten"; text: string }
-  | { kind: "mismatch" };
+  | { kind: "mismatch" }
+  /** Shadow mode only: a mismatch that is passed through unchanged (caller counts it). */
+  | { kind: "mismatch_shadow"; text: string };
 
 /**
  * Reconcile a buffered (non-streaming) chat completion body. A body that is not a JSON object
@@ -83,8 +96,9 @@ export function reconcileCompletionIdentity(
   text: string,
   requested: string | null,
   aliases: ServedModelAliasMap,
+  mode: ServedModelIdentityMode = "enforce",
 ): CompletionIdentityResult {
-  if (requested === null) return { kind: "unchanged", text };
+  if (requested === null || mode === "off") return { kind: "unchanged", text };
   let json: unknown;
   try {
     json = JSON.parse(text);
@@ -94,7 +108,9 @@ export function reconcileCompletionIdentity(
   if (json === null || typeof json !== "object" || Array.isArray(json)) return { kind: "unchanged", text };
   const obj = json as Record<string, unknown>;
   const verdict = judgeServedIdentity(requested, obj["model"], aliases);
-  if (verdict === "mismatch") return { kind: "mismatch" };
+  if (verdict === "mismatch") {
+    return mode === "shadow" ? { kind: "mismatch_shadow", text } : { kind: "mismatch" };
+  }
   if (verdict !== "aliased") return { kind: "unchanged", text };
   return { kind: "rewritten", text: JSON.stringify({ ...obj, model: requested }) };
 }
@@ -114,11 +130,14 @@ export class ServedIdentityMismatchError extends Error {
  */
 export class ServedIdentityGuard extends Transform {
   private buffer = "";
+  private shadowCounted = false;
   private readonly decoder = new StringDecoder("utf8");
 
   constructor(
     private readonly requested: string,
     private readonly aliases: ServedModelAliasMap,
+    private readonly mode: Exclude<ServedModelIdentityMode, "off"> = "enforce",
+    private readonly onShadowMismatch: () => void = () => {},
   ) {
     super();
   }
@@ -136,7 +155,14 @@ export class ServedIdentityGuard extends Transform {
     const obj = json as Record<string, unknown>;
     if (!("model" in obj)) return line;
     const verdict = judgeServedIdentity(this.requested, obj["model"], this.aliases);
-    if (verdict === "mismatch") throw new ServedIdentityMismatchError();
+    if (verdict === "mismatch") {
+      if (this.mode === "enforce") throw new ServedIdentityMismatchError();
+      if (!this.shadowCounted) {
+        this.shadowCounted = true;
+        this.onShadowMismatch();
+      }
+      return line;
+    }
     if (verdict !== "aliased") return line;
     return `data: ${JSON.stringify({ ...obj, model: this.requested })}${m[2]!}`;
   }

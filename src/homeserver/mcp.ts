@@ -25,7 +25,7 @@ import {
   parseContentCaptureArgument,
   type ContentCapture,
 } from "./content-capture.js";
-import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
+import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection, recordServedModelMismatchShadow } from "./metrics.js";
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
 import { bindExecutionFeedback, executionFeedbackOwner } from "./execution-feedback.js";
@@ -1154,7 +1154,9 @@ export async function runChatCompletion(
     // INFER-343: same served-identity contract as the HTTP relay. `ask` reports the requested
     // roster ID (never the backend's raw name), so a response whose `model` neither equals it
     // nor is a declared alias is rejected rather than relabelled. An absent `model` is allowed.
-    if (reconcileCompletionIdentity(text, args.model, cfg.servedModelAliases).kind === "mismatch") {
+    const askIdentity = reconcileCompletionIdentity(text, args.model, cfg.servedModelAliases, cfg.servedModelIdentity);
+    if (askIdentity.kind === "mismatch_shadow") recordServedModelMismatchShadow(canonModel);
+    if (askIdentity.kind === "mismatch") {
       actualTokens = 0;
       return {
         ok: false,
