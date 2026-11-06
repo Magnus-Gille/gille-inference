@@ -32,6 +32,7 @@ export type ErrorCode =
   | "insufficient_memory" // 503 (host cannot afford starting the requested model now; Retry-After)
   | "memory_admission_unavailable" // 503 (memory admission cannot decide; operator action needed)
   | "upstream_unavailable" // 502 (model backend refused / reset the connection)
+  | "upstream_model_mismatch" // 502 (backend served a model identity that does not satisfy the request)
   | "upstream_timeout" // 504 (model backend timed out — may be loading a model)
   | "internal_error"; // 500 (generic, detail logged server-side only)
 
@@ -184,6 +185,16 @@ const SPECS: Record<ErrorCode, CodeSpec> = {
     type: "server_error",
     param: null,
     message: "The model backend is unavailable — please retry shortly.",
+  },
+  upstream_model_mismatch: {
+    // The backend answered, but its reported `model` is neither the requested roster ID nor an
+    // explicitly configured alias of it (INFER-343). The completion is withheld and not billed.
+    // The message never names the served identity: it may be a private file path.
+    status: 502,
+    type: "server_error",
+    param: "model",
+    message:
+      "The model backend served a model identity that does not match the requested model, so the response was withheld and no credits were charged. Retrying will not help until the operator fixes the model's served identity.",
   },
   upstream_timeout: {
     // The upstream call exceeded the gateway's call timeout. The most common cause is a cold

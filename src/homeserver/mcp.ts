@@ -25,7 +25,7 @@ import {
   parseContentCaptureArgument,
   type ContentCapture,
 } from "./content-capture.js";
-import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection } from "./metrics.js";
+import { recordRequest, inflightInc, inflightDec, recordRateLimited, recordAdmissionRejection, recordServedModelMismatchShadow } from "./metrics.js";
 import { recordRequestLog } from "./request-log.js";
 import { recordDelegation } from "./ledger.js";
 import { bindExecutionFeedback, executionFeedbackOwner } from "./execution-feedback.js";
@@ -35,6 +35,7 @@ import { buildDelegationCostTrace, tryRecordDelegationCost } from "./delegation-
 import { evaluateDelegatePolicy } from "./delegate-policy.js";
 import { classifyTask } from "./taxonomy.js";
 import { canonicalizeModelTrusted, getTrustedCatalogue } from "./catalogue.js";
+import { identitySubject, reconcileCompletionIdentity, rosterIdentityOf } from "./served-model-identity.js";
 import { modelFailureBackoffFor } from "./model-failure-backoff-state.js";
 import type { ModelFailureBackoff } from "./model-failure-backoff.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
@@ -1147,6 +1148,26 @@ export async function runChatCompletion(
         message: `Upstream model error (HTTP ${upstream.status}).`,
         traceOutcome: "error",
         traceErrorClass: "upstream_error",
+      };
+    }
+
+    // INFER-343: same served-identity contract as the HTTP relay. `ask` reports the requested
+    // roster ID (never the backend's raw name), so a response whose `model` neither equals it
+    // nor is a declared alias is rejected rather than relabelled. An absent `model` is allowed.
+    const askIdentity = reconcileCompletionIdentity(text, identitySubject(cfg.servedModelIdentity, canonModel, args.model), cfg.servedModelAliases, cfg.servedModelIdentity);
+    if (askIdentity.kind === "mismatch_shadow") {
+      const metricRosterId = rosterIdentityOf(canonModel);
+      if (metricRosterId !== null) recordServedModelMismatchShadow(metricRosterId);
+    }
+    if (askIdentity.kind === "mismatch") {
+      actualTokens = 0;
+      return {
+        ok: false,
+        requestId: inferenceRequestId,
+        code: "upstream_error",
+        message: "The model backend served a model identity that does not match the requested model; the response was withheld and no credits were charged.",
+        traceOutcome: "error",
+        traceErrorClass: "upstream_model_mismatch",
       };
     }
 

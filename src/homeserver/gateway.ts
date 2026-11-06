@@ -1,6 +1,14 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
+import {
+  reconcileCompletionIdentity,
+  ServedIdentityGuard,
+  identitySubject,
+  rosterIdentityOf,
+  ServedIdentityMismatchError,
+  unknownAliasRosterIds,
+} from "./served-model-identity.js";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import {
   listModels,
@@ -70,7 +78,7 @@ import { sweepCodeLoopSandboxes } from "./code-loop.js";
 import { gatewayRelease } from "./gateway-release.js";
 import { stopTransientCodeLoopUnit } from "./code-loop-cage.js";
 import { probeCodeLoopTransport } from "./code-loop-transport.js";
-import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
+import { recordRequest, recordAdmissionRejection, recordRateLimited, recordTtft, recordAudioSeconds, recordImagesGenerated, recordDegeneracyDetected, recordServedModelMismatchShadow, recordReviewCascade, inflightInc, inflightDec, currentM5InflightRequests, renderMetrics } from "./metrics.js";
 import { recordFeedback } from "./feedback.js";
 import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
@@ -1314,6 +1322,7 @@ function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" |
     || outcome === "degenerate"
     || outcome === "upstream_timeout"
     || outcome === "upstream_unavailable"
+    || outcome === "upstream_model_mismatch"
     || outcome === "error"
   ) {
     return "failed";
@@ -1659,6 +1668,8 @@ const HANDLER_OWNED_OUTCOMES = new Set([
   "upstream_unavailable",
   "upstream_timeout",
   "stream_failed",
+  // INFER-343: the backend's reported model identity did not satisfy the request; billed 0.
+  "upstream_model_mismatch",
   // #22: a client disconnect mid-call — the handler aborted the upstream + billed 0; the spine
   // must not reclassify it from the (already-sent or moot) status.
   "client_closed",
@@ -1686,6 +1697,16 @@ async function handleChatProxy(
   // C3: the model is safe to label only after upstream returns 2xx for it. We thread the
   // already-canonicalized lctx.model (set at the route) through as the canonicalModel.
   const servedModel = lctx.model;
+  // INFER-343: identity checks, alias lookup and the shadow metric all use this ONE canonical
+  // roster ID (null when the request did not name a roster ID we can vouch for -> not checked).
+  // enforce falls back to the requested string when unresolved (never forwards an unverified identity).
+  const idSubject = identitySubject(cfg.servedModelIdentity, lctx.model, parsed.model);
+  // Only the RESOLVED roster ID may label the shadow metric; the client-supplied request string
+  // (used as the enforce fallback subject) never becomes a label or a log field.
+  const metricRosterId = rosterIdentityOf(lctx.model);
+  const countShadowMismatch = (): void => {
+    if (metricRosterId !== null) recordServedModelMismatchShadow(metricRosterId);
+  };
   // OWNER-ONLY full request log. The guard is strictly owner-tier AND a real minted key
   // (keyHash !== null), which excludes legacy static admins (keyHash null). Guests are never
   // content-logged. See owner-log.ts for the full rationale. The exposure digest is content-blind
@@ -2066,6 +2087,7 @@ async function handleChatProxy(
     // here is swallowed (never throws past the handler / crashes the gateway), and the call is
     // billed NOTHING (ZERO_RESULT) since no clean completion was produced.
     let streamFailed = false;
+    let identityMismatch = false;
     try {
       await new Promise<void>((resolve, reject) => {
         nodeStream.on("error", reject);
@@ -2093,12 +2115,53 @@ async function handleChatProxy(
         };
         if (degenerateGone.signal.aborted) onDegenerate();
         else degenerateGone.signal.addEventListener("abort", onDegenerate, { once: true });
-        nodeStream.on("end", resolve);
-        nodeStream.pipe(res, { end: false });
+        // INFER-343: verify/canonicalize every frame's `model` before it reaches the client.
+        let relay: NodeJS.ReadableStream = nodeStream;
+        if (idSubject.kind !== "skip" && cfg.servedModelIdentity !== "off") {
+          const guard = new ServedIdentityGuard(
+            idSubject,
+            cfg.servedModelAliases,
+            cfg.servedModelIdentity,
+            countShadowMismatch,
+          );
+          guard.on("error", (guardErr) => {
+            nodeStream.destroy();
+            reject(guardErr);
+          });
+          relay = nodeStream.pipe(guard);
+        }
+        relay.on("end", resolve);
+        relay.pipe(res, { end: false });
       });
-    } catch {
-      streamFailed = true;
+    } catch (relayErr) {
+      if (relayErr instanceof ServedIdentityMismatchError) identityMismatch = true;
+      else streamFailed = true;
     }
+
+    if (identityMismatch && !clientAborted) {
+      // INFER-343: the mismatching frame was NOT forwarded. If it was the first frame (the normal
+      // case) the client received no content. 200 + SSE headers are already committed, so, as for
+      // a truncated stream, a terminal error frame carries the named failure. Billed zero.
+      lctx.status = 200;
+      lctx.outcome = "upstream_model_mismatch";
+      lctx.errorClass = "upstream_model_mismatch";
+      // The gateway itself aborted the upstream mid-generation (like a degenerate/disconnect abort),
+      // which can leave a recurrent model's state half-written: self-heal with the existing path.
+      requestPoisonClear(parsed.model, cfg.recurrentModelIds, cfg.poisonClearCooldownMs, "served-model identity abort");
+      try {
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(makeError("upstream_model_mismatch").body)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+      } catch {
+        // Terminal frame is best-effort; never let it crash the request.
+      }
+      emitInferenceTrace("upstream_model_mismatch");
+      emitResponseTrace("upstream_model_mismatch");
+      return ZERO_RESULT;
+    }
+    if (identityMismatch) streamFailed = true;
 
     if (degenerate) {
       // Fix #2 (silent backstop): the upstream returned a degenerate single-token "?????" run — a
@@ -2308,7 +2371,22 @@ async function handleChatProxy(
     return ZERO_RESULT;
     }
 
-  // 2xx success: forward the upstream body as-is.
+  // INFER-343: the body's `model` must be the requested roster ID, a declared alias of it
+  // (rewritten to the roster ID), or absent. Anything else is withheld and billed zero.
+    const identity = reconcileCompletionIdentity(text, idSubject, cfg.servedModelAliases, cfg.servedModelIdentity);
+    if (identity.kind === "mismatch_shadow") countShadowMismatch();
+    if (identity.kind === "mismatch") {
+      lctx.status = 502;
+      lctx.outcome = "upstream_model_mismatch";
+      lctx.errorClass = "upstream_model_mismatch";
+      emitInferenceTrace("upstream_model_mismatch");
+      emitResponseTrace("upstream_model_mismatch");
+      sendError(res, makeError("upstream_model_mismatch"));
+      return ZERO_RESULT;
+    }
+    text = identity.text;
+
+  // 2xx success: forward the (identity-verified) upstream body.
     res.writeHead(upstream.status, {
       "content-type": upstream.headers.get("content-type") ?? "application/json",
     });
@@ -4110,7 +4188,27 @@ export function startGateway(
   // Warm the trusted-catalogue cache in the background so empty-allow-list (owner/admin) requests
   // get a per-model label from the first request onward. Fire-and-forget — never blocks startup,
   // and a failure just leaves the cache empty (→ "unknown" labels) until the next refresh.
-  void warmCatalogue();
+  void warmCatalogue().then((roster) => {
+    // INFER-343: alias keys must be roster IDs. A cold (empty) catalogue proves nothing, so stay
+    // quiet then. Only keys matching a strict roster-ID pattern (no "/") are named, so a swapped
+    // pair can never log a private path; anything else is reported as a count only. Served values
+    // are never logged.
+    if (roster.size === 0) return;
+    const safe = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+    let unnamed = 0;
+    for (const id of unknownAliasRosterIds(cfg.servedModelAliases, roster)) {
+      if (safe.test(id)) {
+        console.warn("[served-model-identity] HOMESERVER_SERVED_MODEL_ALIASES names a roster ID that is not in the roster:", id);
+      } else {
+        unnamed++;
+      }
+    }
+    if (unnamed > 0) {
+      console.warn(`[served-model-identity] HOMESERVER_SERVED_MODEL_ALIASES has ${unnamed} key(s) that are not roster IDs (not shown)`);
+    }
+  }).catch(() => {
+    // Advisory only; never affects startup.
+  });
 
   // code_loop (#116): sweep at startup AND periodically. Source-bearing durable results must
   // expire without requiring a gateway restart; no-overlap keeps maintenance work bounded.

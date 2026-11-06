@@ -142,6 +142,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 413 | `payload_too_large` | Request body exceeds the size cap |
 | 429 | `rate_limit_exceeded` | RPM/TPM/daily budget exceeded. The message names whether the limit is per-key or shared static-tier and gives a plain-language rate/window plus retry or UTC-day reset delay. TPM/daily messages use the route's metered units: tokens for chat/MCP, worst-case audio-seconds for transcription, and requested image units for image generation. `error.quota.requested` is the corresponding pre-admission estimate/count; machine quota values, header limits, resets, and accounting retain the existing quota behavior. Shared static-tier buckets keep their existing shared accounting. A zero-RPM allowance requires the gateway operator to restore capacity; waiting does not restore it. `error.quota` carries `{reason,scope,window,limit,requested,counted:false,retry_after_seconds}`; isolated keys also carry `used_before`, while shared buckets omit it. `X-RateLimit-Limit` is the rejected dimension's limit (including the daily limit for daily failures). `Retry-After` and `X-RateLimit-Reset` retain the quota engine's relative retry delay: next rolling-window event expiry for RPM/TPM, UTC midnight for daily, or the existing one-second delay for an empty zero-RPM bucket. `X-RateLimit-Remaining` is emitted only for isolated key buckets; it is omitted for shared static-tier buckets to avoid exposing other consumers' usage. |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
+| 502 | `upstream_model_mismatch` | (`HOMESERVER_SERVED_MODEL_IDENTITY=enforce` only) The backend answered, but its reported `model` is neither the requested roster ID nor an operator-declared alias of it (INFER-343). Response withheld, billed `0`; `param:"model"`; the served identity is never echoed (it can be a private path). Retrying will not help until the operator fixes the served identity. See "Served model identity". |
 | 503 | `server_busy` (admission) | Owner preempted the serial GPU; client should retry after `Retry-After` seconds |
 | 503 | `model_temporarily_unavailable` | Three eligible backend failures for one minted key/known model within 60s opened a fixed 30s cooldown. `Retry-After` and `error.backoff {scope:"key_model", retry_after_seconds, unavailable_until}` identify the refusal; no new quota/credit reservation or backend call. Other keys/models and legacy static policy are unaffected; underlying cause remains unknown. |
 | 503 | `insufficient_memory` | Whole-host memory admission (opt-in, `enforce` mode only): the host cannot afford starting the requested non-resident model now; carries `Retry-After`; nothing reached the backend and nothing was billed |
@@ -152,6 +153,91 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the gateway emits a terminal `data: {"error":{…,"code":"upstream_error"}}` frame then `data: [DONE]` so clients detect truncation. A **client disconnect** mid-call aborts the upstream generation (the GPU is freed) and is billed `0` — recorded as the content-blind `client_closed` outcome. See `docs/errors.md` for the full user-facing table.
 
 ---
+
+## Served model identity (INFER-343)
+
+The canonical model identity is the roster ID: the `id` advertised by authenticated `GET /v1/models`
+(the llama-swap model key). llama-server fills a response's `model` with its own `--alias`, or with
+the model file path/name when no alias is set, so the two can differ. The direct relay
+(`POST /v1/chat/completions`, streaming and non-streaming) and MCP `ask` apply one rule to the
+backend-reported `model`, against the requested roster ID:
+
+| Backend `model` | Result |
+|---|---|
+| equals the requested roster ID | forwarded unchanged |
+| listed as an alias **of that same roster ID** in `HOMESERVER_SERVED_MODEL_ALIASES` | rewritten to the roster ID in the non-streaming body and in **every** SSE frame that carries `model` |
+| absent / `null` (provenance unavailable) | forwarded unchanged; the gateway never injects a model it did not observe |
+| anything else (other string, empty, non-string, an alias declared for a different roster ID) | **mismatch**: handled per mode below |
+
+`HOMESERVER_SERVED_MODEL_IDENTITY` selects the mismatch handling (invalid value aborts startup without echoing it):
+
+| Mode | Match / declared alias | Mismatch |
+|---|---|---|
+| `shadow` (default) | verified; a declared alias is rewritten to the roster ID | passed through **unchanged** (never relabelled), not rejected, billed as normal; counted in `homeserver_served_model_mismatch_shadow_total{model}` (canonical requested model only, no served identity) |
+| `enforce` | as above | fail closed: `502 upstream_model_mismatch`, billed `0`, request-log outcome `upstream_model_mismatch` |
+| `off` | no inspection or rewrite at all | forwarded as before |
+
+**Rollout:** deploy in `shadow`; watch `homeserver_served_model_mismatch_shadow_total` for the models that
+need attention; start those backends with `--alias <roster-id>` or declare the pair in
+`HOMESERVER_SERVED_MODEL_ALIASES`; when the counter stays flat, switch to `enforce`. Enforcing before
+that turns every unaliased roster entry's `200` into a `502` (non-streaming) or a terminal
+`upstream_model_mismatch` error frame (streaming).
+
+In the default `shadow` mode an unaliased backend still returns its own model name, which may be a file
+path, to every caller, guests included. That is pre-existing behaviour and persists until aliases are
+set or `enforce` is on.
+
+**What "the requested roster ID" means.** The check runs against the *canonical* request model, the same
+value used for request-log and metric labels (`canonicalizeModelTrusted`): it is the requested string
+only when that string is exactly a roster ID (key allow-list entry, or an entry of the trusted catalogue
+built from `/v1/models`); anything else (different case, whitespace, a llama-swap alias spelling, or a
+catalogue that is still cold or stale) canonicalizes to `unknown`. The identity check, the alias lookup
+(keyed by roster ID) and the shadow metric label use that one canonical value, on the HTTP and MCP
+paths alike. When it cannot be resolved the modes differ on purpose:
+
+| Mode | Roster ID unresolved (cold/stale catalogue, unrecognised spelling) |
+|---|---|
+| `enforce` | **never forwards an unverified identity.** The check runs against the requested string exactly as sent: an exact match passes; an alias declared for that exact string passes and is rewritten to it; any other reported `model` fails closed like a mismatch (502 / terminal SSE frame / MCP `ok:false`, billed `0`); an absent `model` passes. With no usable requested string at all (e.g. `model:""` or an MCP call without one) nothing can be verified, so any present `model` fails closed and only an absent/null one passes (a request that omits `model` or sends a non-string never gets here: the gateway substitutes a server-chosen roster model first, or returns 403 for keys with an allow-list). Consequence: a request spelled differently from the roster ID is rejected unless the backend echoes that exact spelling. |
+| `shadow` | check skipped and **not counted**, so unresolved requests never add false positives to the rollout signal. The response is forwarded unchanged. |
+| `off` | not inspected. |
+
+The gateway neither echoes the requested ID blindly nor accepts arbitrary returned IDs; only an explicit
+`roster-id=served-identity` pair from configuration bridges the gap. Declare it with
+`HOMESERVER_SERVED_MODEL_ALIASES="qwen3-30b-instruct=<name llama-server reports>"`: comma-separated pairs
+split on the first `=`; repeat a roster ID for several served names; **served names containing a comma
+cannot be declared** (start the backend with `--alias <roster-id>` instead, which is preferred and needs
+no mapping). Malformed pairs abort startup without printing the value. After the catalogue first loads, the
+gateway logs a warning naming each alias-map roster ID that is not in the roster (roster ID only; the
+served value is never logged).
+
+Behaviour by path (mismatch handling per mode above):
+
+- **Non-streaming:** enforce returns `502 upstream_model_mismatch` (billed `0`; request-log outcome
+  `upstream_model_mismatch`). A non-JSON-object 2xx body carries no identity claim and is unchanged.
+- **Streaming:** the `200` and SSE headers are committed before the first frame, so enforce **stays `200`**
+  and ends the stream with a terminal `data: {"error":{…,"code":"upstream_model_mismatch","param":"model"}}`
+  frame (the same envelope as the non-streaming error) plus `data: [DONE]`. The offending event is never
+  forwarded and the upstream is aborted (a recurrent model is poison-cleared like other gateway aborts);
+  content from earlier events may already have been delivered when the mismatch appears on a later frame.
+  The request log records status `200`, outcome `upstream_model_mismatch`, billed `0`.
+  Events are assembled per the SSE spec (`data:` with or without a following space, any whitespace, CRLF,
+  multi-line `data` joined with `\n`, event/id lines preserved). In enforce, a JSON-looking event that
+  mentions `model` but cannot be parsed, or one whose pending size exceeds 1 MiB, is **unverifiable** and fails
+  closed like a mismatch; in shadow it passes through and is counted once. Events with no `model` key,
+  comments and `[DONE]` pass through byte-for-byte.
+- **MCP `ask`:** applies the same rule to the backend response. A mismatch returns `isError:true`,
+  `_meta.m5_code:"upstream_error"`, billed `0`; an absent `model` succeeds. `structuredContent.model` is
+  the model string the caller requested, never the backend-reported value.
+- **Discovery:** `/v1/models` lists the roster IDs (llama-swap model keys); this change does not alter it.
+  Those IDs are the values a verified response carries.
+- **Breaker / readiness:** `upstream_model_mismatch` does **not** count toward the per-key/model failure
+  breaker (`model_temporarily_unavailable`, which counts only connection failures, timeouts and
+  upstream 5xx). It does count as a `failed` gateway-readiness outcome. Shadow mismatches are only counted
+  in the metric and leave readiness and the breaker untouched.
+- **Diagnostics:** the error, request log, traces and metrics carry only the closed outcome/error-class
+  names and the canonical requested roster ID, never the served identity, backend command, path,
+  credentials or content.
+- Out of scope: other relays (`/v1/systemone`, embeddings, `/delegate`, the Orin adapter, which sets its own model).
 
 ## Caller reliability observations
 
