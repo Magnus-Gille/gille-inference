@@ -1,6 +1,11 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
+import {
+  reconcileCompletionIdentity,
+  ServedIdentityGuard,
+  ServedIdentityMismatchError,
+} from "./served-model-identity.js";
 import { clampMaxTokensForModel, loadConfig, type HomeserverConfig } from "./config.js";
 import {
   listModels,
@@ -1314,6 +1319,7 @@ function gatewayReadinessOutcome(status: number | null, outcome: string): "ok" |
     || outcome === "degenerate"
     || outcome === "upstream_timeout"
     || outcome === "upstream_unavailable"
+    || outcome === "upstream_model_mismatch"
     || outcome === "error"
   ) {
     return "failed";
@@ -1659,6 +1665,8 @@ const HANDLER_OWNED_OUTCOMES = new Set([
   "upstream_unavailable",
   "upstream_timeout",
   "stream_failed",
+  // INFER-343: the backend's reported model identity did not satisfy the request; billed 0.
+  "upstream_model_mismatch",
   // #22: a client disconnect mid-call — the handler aborted the upstream + billed 0; the spine
   // must not reclassify it from the (already-sent or moot) status.
   "client_closed",
@@ -2066,6 +2074,7 @@ async function handleChatProxy(
     // here is swallowed (never throws past the handler / crashes the gateway), and the call is
     // billed NOTHING (ZERO_RESULT) since no clean completion was produced.
     let streamFailed = false;
+    let identityMismatch = false;
     try {
       await new Promise<void>((resolve, reject) => {
         nodeStream.on("error", reject);
@@ -2093,12 +2102,47 @@ async function handleChatProxy(
         };
         if (degenerateGone.signal.aborted) onDegenerate();
         else degenerateGone.signal.addEventListener("abort", onDegenerate, { once: true });
-        nodeStream.on("end", resolve);
-        nodeStream.pipe(res, { end: false });
+        // INFER-343: verify/canonicalize every frame's `model` before it reaches the client.
+        let relay: NodeJS.ReadableStream = nodeStream;
+        if (parsed.model !== null) {
+          const guard = new ServedIdentityGuard(parsed.model, cfg.servedModelAliases);
+          guard.on("error", (guardErr) => {
+            nodeStream.destroy();
+            reject(guardErr);
+          });
+          relay = nodeStream.pipe(guard);
+        }
+        relay.on("end", resolve);
+        relay.pipe(res, { end: false });
       });
-    } catch {
-      streamFailed = true;
+    } catch (relayErr) {
+      if (relayErr instanceof ServedIdentityMismatchError) identityMismatch = true;
+      else streamFailed = true;
     }
+
+    if (identityMismatch && !clientAborted) {
+      // INFER-343: the mismatching frame was NOT forwarded. If it was the first frame (the normal
+      // case) the client received no content. 200 + SSE headers are already committed, so, as for
+      // a truncated stream, a terminal error frame carries the named failure. Billed zero.
+      lctx.status = 200;
+      lctx.outcome = "upstream_model_mismatch";
+      lctx.errorClass = "upstream_model_mismatch";
+      try {
+        if (!res.writableEnded) {
+          res.write(
+            'data: {"error":{"message":"The model backend served a model identity that does not match the requested model, so the response was withheld and no credits were charged.","type":"server_error","code":"upstream_model_mismatch","param":"model"}}\n\n'
+          );
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+      } catch {
+        // Terminal frame is best-effort; never let it crash the request.
+      }
+      emitInferenceTrace("upstream_model_mismatch");
+      emitResponseTrace("upstream_model_mismatch");
+      return ZERO_RESULT;
+    }
+    if (identityMismatch) streamFailed = true;
 
     if (degenerate) {
       // Fix #2 (silent backstop): the upstream returned a degenerate single-token "?????" run — a
@@ -2308,7 +2352,21 @@ async function handleChatProxy(
     return ZERO_RESULT;
     }
 
-  // 2xx success: forward the upstream body as-is.
+  // INFER-343: the body's `model` must be the requested roster ID, a declared alias of it
+  // (rewritten to the roster ID), or absent. Anything else is withheld and billed zero.
+    const identity = reconcileCompletionIdentity(text, parsed.model, cfg.servedModelAliases);
+    if (identity.kind === "mismatch") {
+      lctx.status = 502;
+      lctx.outcome = "upstream_model_mismatch";
+      lctx.errorClass = "upstream_model_mismatch";
+      emitInferenceTrace("upstream_model_mismatch");
+      emitResponseTrace("upstream_model_mismatch");
+      sendError(res, makeError("upstream_model_mismatch"));
+      return ZERO_RESULT;
+    }
+    text = identity.text;
+
+  // 2xx success: forward the (identity-verified) upstream body.
     res.writeHead(upstream.status, {
       "content-type": upstream.headers.get("content-type") ?? "application/json",
     });

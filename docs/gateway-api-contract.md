@@ -142,6 +142,7 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 | 413 | `payload_too_large` | Request body exceeds the size cap |
 | 429 | `rate_limit_exceeded` | RPM/TPM/daily budget exceeded. The message names whether the limit is per-key or shared static-tier and gives a plain-language rate/window plus retry or UTC-day reset delay. TPM/daily messages use the route's metered units: tokens for chat/MCP, worst-case audio-seconds for transcription, and requested image units for image generation. `error.quota.requested` is the corresponding pre-admission estimate/count; machine quota values, header limits, resets, and accounting retain the existing quota behavior. Shared static-tier buckets keep their existing shared accounting. A zero-RPM allowance requires the gateway operator to restore capacity; waiting does not restore it. `error.quota` carries `{reason,scope,window,limit,requested,counted:false,retry_after_seconds}`; isolated keys also carry `used_before`, while shared buckets omit it. `X-RateLimit-Limit` is the rejected dimension's limit (including the daily limit for daily failures). `Retry-After` and `X-RateLimit-Reset` retain the quota engine's relative retry delay: next rolling-window event expiry for RPM/TPM, UTC midnight for daily, or the existing one-second delay for an empty zero-RPM bucket. `X-RateLimit-Remaining` is emitted only for isolated key buckets; it is omitted for shared static-tier buckets to avoid exposing other consumers' usage. |
 | 502 | `upstream_unavailable` | Model backend refused/reset the connection, OR returned a **non-404 error** (its status + body are normalized, never echoed — they can carry internal detail) |
+| 502 | `upstream_model_mismatch` | The backend answered, but its reported `model` is neither the requested roster ID nor an operator-declared alias of it (INFER-343). Response withheld, billed `0`; `param:"model"`; the served identity is never echoed (it can be a private path). Retrying will not help until the operator fixes the served identity. See "Served model identity". |
 | 503 | `server_busy` (admission) | Owner preempted the serial GPU; client should retry after `Retry-After` seconds |
 | 503 | `model_temporarily_unavailable` | Three eligible backend failures for one minted key/known model within 60s opened a fixed 30s cooldown. `Retry-After` and `error.backoff {scope:"key_model", retry_after_seconds, unavailable_until}` identify the refusal; no new quota/credit reservation or backend call. Other keys/models and legacy static policy are unaffected; underlying cause remains unknown. |
 | 503 | `insufficient_memory` | Whole-host memory admission (opt-in, `enforce` mode only): the host cannot afford starting the requested non-resident model now; carries `Retry-After`; nothing reached the backend and nothing was billed |
@@ -152,6 +153,38 @@ A few **protocol/admin** endpoints intentionally keep their own structured shape
 Mid-stream failures (`stream:true`) cannot change the already-sent `200`; the gateway emits a terminal `data: {"error":{…,"code":"upstream_error"}}` frame then `data: [DONE]` so clients detect truncation. A **client disconnect** mid-call aborts the upstream generation (the GPU is freed) and is billed `0` — recorded as the content-blind `client_closed` outcome. See `docs/errors.md` for the full user-facing table.
 
 ---
+
+## Served model identity (INFER-343)
+
+The canonical model identity is the roster ID: the `id` advertised by authenticated `GET /v1/models`
+(the llama-swap model key). llama-server fills a response's `model` with its own `--alias`, or with
+the model file path/name when no alias is set, so the two can differ. The direct relay
+(`POST /v1/chat/completions`, streaming and non-streaming) and MCP `ask` apply one rule to the
+backend-reported `model`, against the requested roster ID:
+
+| Backend `model` | Result |
+|---|---|
+| equals the requested roster ID | forwarded unchanged |
+| listed as an alias **of that same roster ID** in `HOMESERVER_SERVED_MODEL_ALIASES` | rewritten to the roster ID in the non-streaming body and in **every** SSE frame that carries `model` |
+| absent / `null` (provenance unavailable) | forwarded unchanged; the gateway never injects a model it did not observe |
+| anything else (other string, empty, non-string, an alias declared for a different roster ID) | fail closed: `502 upstream_model_mismatch`, billed `0`, outcome `upstream_model_mismatch` |
+
+The gateway neither echoes the requested ID blindly nor accepts arbitrary returned IDs; only an explicit
+`roster-id=served-identity` pair from configuration bridges the gap. Declare it with
+`HOMESERVER_SERVED_MODEL_ALIASES="qwen3-30b-instruct=<name llama-server reports>"` (comma-separated
+pairs; repeat a roster ID for several served names), or preferably start the backend with
+`--alias <roster-id>` so no mapping is needed. Malformed pairs abort startup without printing the value.
+
+- **Streaming:** `200` and SSE headers are committed before the first frame, so a mismatching frame is
+  never forwarded and the stream ends with a terminal `data: {"error":{…,"code":"upstream_model_mismatch","param":"model"}}`
+  frame plus `data: [DONE]`. A mismatch on the first frame (the normal case) delivers no content. The
+  request log records status `200`, outcome `upstream_model_mismatch`, billed `0`.
+- **MCP `ask`:** returns the requested roster ID as `structuredContent.model`. A mismatch returns
+  `isError:true`, `_meta.m5_code:"upstream_error"`, billed `0`; an absent `model` succeeds.
+- **Discovery:** `/v1/models` lists roster IDs only; those are the values a verified response carries.
+- **Diagnostics:** the error, request log and metrics carry only the closed outcome/error-class names, never
+  the served identity, backend command, path, credentials or content.
+- Out of scope: other relays (`/v1/systemone`, embeddings, `/delegate`, the Orin adapter, which sets its own model).
 
 ## Caller reliability observations
 

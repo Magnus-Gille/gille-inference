@@ -1054,6 +1054,7 @@ HOMESERVER_MAINTENANCE_RETRY_AFTER_S=30       # Retry-After on a guest 503 cause
 HOMESERVER_PER_REQUEST_MAX_TOKENS=12288       # fleet default and ordinary-model cap
 HOMESERVER_MODEL_MAX_TOKENS=vibethinker-3b=32768 # exact-model explicit-request ceilings; empty disables
 HOMESERVER_RECURRENT_MODEL_IDS=qwen3-coder-next-80b  # recurrent models that poison-clear (unload) on abrupt disconnect; "" disables. Default qwen3-coder-next-80b.
+HOMESERVER_SERVED_MODEL_ALIASES=             # comma-separated roster-id=served-name pairs (INFER-343). A backend `model` that is neither the requested roster ID nor a declared alias of it fails closed (502 upstream_model_mismatch). Prefer `--alias <roster-id>` on the backend; empty = no aliases. See docs/gateway-api-contract.md "Served model identity".
 HOMESERVER_SYSTEMONE_MODELS=                  # comma-separated enabled decision-model IDs; empty disables /v1/systemone, but known Clef remains excluded from chat/delegation. Stage before roster entry; issue explicit guest grants only after live checks.
 HOMESERVER_EMBEDDING_MODELS=                  # comma-separated enabled embedding IDs; empty disables /v1/embeddings. Known embedding IDs stay excluded from chat/delegation even while disabled.
 HOMESERVER_EMBEDDING_BASE_URL=                # required when embedding models are enabled; exact loopback http://127.0.0.1:<port>/v1 of the dedicated CPU sidecar

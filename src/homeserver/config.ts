@@ -8,6 +8,11 @@ import {
 } from "./review-cascade-shadow.js";
 import { sanitizeTraceIdentity } from "./tracing.js";
 import {
+  parseServedModelAliases,
+  SERVED_MODEL_ALIASES_ENV,
+  type ServedModelAliasMap,
+} from "./served-model-identity.js";
+import {
   parseHostMemoryBudgets,
   parseHostMemoryMode,
   type HostMemoryAdmissionConfig,
@@ -244,6 +249,13 @@ export interface HomeserverConfig {
    * silently reactivate the deprecated adapter.
    */
   backend: "lmstudio" | "llamaswap";
+  /**
+   * Explicit roster-ID -> served-identity declarations for the direct chat relay (INFER-343).
+   * Env `HOMESERVER_SERVED_MODEL_ALIASES="roster-id=served-name,..."`. A backend response whose
+   * `model` is neither the requested roster ID nor a declared alias of it fails closed. Empty by
+   * default: every roster entry must then be served with `--alias <roster-id>`.
+   */
+  servedModelAliases: ServedModelAliasMap;
   /** Explicitly enabled decision-model IDs served through POST /v1/systemone. Empty disables it. */
   systemOneModels: string[];
   /** Explicitly enabled embedding-model IDs served through POST /v1/embeddings. */
@@ -724,6 +736,7 @@ export function loadConfig(): HomeserverConfig {
     lmStudioBaseUrl: lmBase,
     lmStudioRestUrl: `${origin}/api/v1`,
     backend: (process.env["HOMESERVER_BACKEND"] === "lmstudio" ? "lmstudio" : "llamaswap"),
+    servedModelAliases: parseServedModelAliases(envList(SERVED_MODEL_ALIASES_ENV)),
     systemOneModels: envList("HOMESERVER_SYSTEMONE_MODELS"),
     embeddingModels,
     embeddingBaseUrl,
