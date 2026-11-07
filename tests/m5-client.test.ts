@@ -2643,7 +2643,28 @@ describe("m5 doctor diagnostic distinctions", () => {
       expect(result).toMatchObject({
         status: "mcp_reachable",
         identity: { tier: "owner", scope: "ask" },
+        tools: ["list_models", "ask", "model_status", "tokenize"],
       });
+    });
+
+    it.each([
+      ["public", { publicIdentity: askIdentity, publicTools: [...ASK_TOOLS, "code_loop_start"] }],
+      ["private", { privateIdentity: askIdentity, privateTools: [...ASK_TOOLS, "code_loop_start"] }],
+    ] as const)("rejects an over-privileged ask key on the %s path", async (_route, options) => {
+      const result = await diagnose({ publicTools: ASK_TOOLS, ...options, publicIdentity: askIdentity });
+      expect(result).toMatchObject({
+        status: "unexpected_tools",
+        unexpected_tools: ["code_loop_start"],
+      });
+    });
+
+    it("accepts an owner/ask identity on the private path", async () => {
+      const result = await diagnose({
+        publicIdentity: askIdentity,
+        privateIdentity: askIdentity,
+        publicTools: ASK_TOOLS,
+      });
+      expect(result).toMatchObject({ status: "mcp_reachable", tools: ["list_models", "ask", "model_status", "tokenize"] });
     });
 
     it("rejects an owner/ask identity that does not advertise ask", async () => {
@@ -2656,6 +2677,7 @@ describe("m5 doctor diagnostic distinctions", () => {
 
     it.each([
       ["guest ask", { alias: "g", tier: "guest", scope: "ask" }],
+      ["owner inference", { alias: "i", tier: "owner", scope: "inference" }],
       ["owner monitor", { alias: "m", tier: "owner", scope: "monitor" }],
       ["owner unknown", { alias: "u", tier: "owner", scope: "bogus" }],
     ])("keeps %s wrong_scope", async (_name, identity) => {

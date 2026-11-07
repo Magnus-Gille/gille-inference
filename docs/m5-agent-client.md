@@ -434,6 +434,7 @@ Its top-level `status` also distinguishes:
 - `model_discovery_unavailable`
 - `wrong_scope`
 - `missing_tools`
+- `unexpected_tools` (an owner `ask` key whose catalogue advertises any tool outside the ask set)
 - `path_parity_failed`
 - `mcp_reachable`
 
