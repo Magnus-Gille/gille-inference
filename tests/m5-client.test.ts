@@ -2634,6 +2634,36 @@ describe("m5 doctor diagnostic distinctions", () => {
     expect(result).not.toHaveProperty("discovery_failure");
   });
 
+  describe("owner ask scope (INFER-450)", () => {
+    const ASK_TOOLS = ["ask", "list_models", "model_status", "tokenize"];
+    const askIdentity = { alias: "agent-account", tier: "owner", scope: "ask" };
+
+    it("accepts an owner/ask identity exposing exactly the ask tool set", async () => {
+      const result = await diagnose({ publicIdentity: askIdentity, publicTools: ASK_TOOLS });
+      expect(result).toMatchObject({
+        status: "mcp_reachable",
+        identity: { tier: "owner", scope: "ask" },
+      });
+    });
+
+    it("rejects an owner/ask identity that does not advertise ask", async () => {
+      const result = await diagnose({
+        publicIdentity: askIdentity,
+        publicTools: ASK_TOOLS.filter((tool) => tool !== "ask"),
+      });
+      expect(result).toMatchObject({ status: "missing_tools" });
+    });
+
+    it.each([
+      ["guest ask", { alias: "g", tier: "guest", scope: "ask" }],
+      ["owner monitor", { alias: "m", tier: "owner", scope: "monitor" }],
+      ["owner unknown", { alias: "u", tier: "owner", scope: "bogus" }],
+    ])("keeps %s wrong_scope", async (_name, identity) => {
+      const result = await diagnose({ publicIdentity: identity, publicTools: ASK_TOOLS });
+      expect(result).toMatchObject({ status: "wrong_scope" });
+    });
+  });
+
   it("reports wrong scope even when model discovery fails", async () => {
     await expect(
       diagnose({

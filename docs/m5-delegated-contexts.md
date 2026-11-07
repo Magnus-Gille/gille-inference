@@ -16,7 +16,7 @@ call.
 | Codex repository implementation subagent | Supported | The [#72 owner evidence](https://github.com/Magnus-Gille/gille-inference/issues/72#issuecomment-5065936227) records three bounded `/delegate` receipts: `83084d86-c22b-44c6-906d-0a2b62323523`, `fc5f5c01-670b-43fd-9705-5d8fbf3089d2`, and `0e6f665e-e304-4fba-b79b-5b38e335aea0`. |
 | Claude Code real interactive session | Supported operationally | [Redacted acceptance evidence](https://github.com/Magnus-Gille/gille-inference/issues/72#issuecomment-5143969558) records a fresh session discovering its least-privilege M5 MCP tools, completing a bounded isolated code-loop task, and passing its deterministic local test. It is not a capability-promotion or route-promotion receipt. |
 | Pi delegated harness leaf | Unsupported | No accepted credential smoke test or bounded delegation receipt exists. Profile-name parsing alone is not evidence that Pi credentials, wiring, and authority are safely supported. |
-| Managed Linux agent account | Not yet operationally verified | The owner requires inference access in INFER-450. A protected profile-file reader and BROKKR-165 network allowance are source work; credential provisioning and a bounded authenticated MCP classification receipt remain pending. |
+| Managed Linux agent account | Supported (ask only) | INFER-450 live acceptance (2026-11-07): with the BROKKR-165 exact gateway allowance and a minted owner/`ask` key in the protected Linux profile file, the agent account completed one bounded classification through MCP `ask` with content capture suppressed. Admin, residency, `/delegate`, `/v1/systemone` and ordinary `/v1` chat inference are refused (403). No `code_loop` or `/delegate` authority. |
 
 ## Surface and authority boundary
 

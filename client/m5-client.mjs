@@ -52,6 +52,17 @@ export const REQUIRED_AGENT_TOOLS = Object.freeze([
   "record_adoption_evidence",
 ]);
 
+/** Tools the gateway advertises to an owner `ask` key (src/homeserver/mcp.ts base catalogue). */
+export const REQUIRED_ASK_TOOLS = Object.freeze(["list_models", "ask", "model_status", "tokenize"]);
+
+/** Required tool set for an owner identity, or null when the tier/scope is not acceptable. */
+function requiredToolsForIdentity(identity) {
+  if (identity.tier !== "owner") return null;
+  if (identity.scope === "agent" || identity.scope === "admin") return REQUIRED_AGENT_TOOLS;
+  if (identity.scope === "ask") return REQUIRED_ASK_TOOLS;
+  return null;
+}
+
 const CREDENTIAL_FAILURE_CODES = new Set(["missing_credential", "rejected_credential"]);
 const NETWORK_DIAGNOSTIC_CODES = new Set([
   "dns_failure",
@@ -2896,10 +2907,11 @@ function doctorExplicitProbeGateFailure(profile, probe, request) {
   let status;
   let details = {};
   let diagnosticCode;
-  if (probe.identity.tier !== "owner" || !["agent", "admin"].includes(probe.identity.scope)) {
+  const requiredTools = requiredToolsForIdentity(probe.identity);
+  if (requiredTools === null) {
     status = "wrong_scope";
   } else {
-    const missing = REQUIRED_AGENT_TOOLS.filter((tool) => !probe.tools.includes(tool));
+    const missing = requiredTools.filter((tool) => !probe.tools.includes(tool));
     if (missing.length > 0) {
       status = "missing_tools";
       details = { missing_tools: missing };
@@ -3036,7 +3048,7 @@ async function diagnoseExplicitInferenceProbe({
       tier: selectedProbe.identity.tier,
       scope: selectedProbe.identity.scope,
     },
-    tools: REQUIRED_AGENT_TOOLS,
+    tools: requiredToolsForIdentity(selectedProbe.identity) ?? REQUIRED_AGENT_TOOLS,
     ...doctorCapabilityFields(isPublic ? selectedProbe : null, isPublic ? null : selectedProbe),
     ...(recommendation === undefined ? {} : { recommendation }),
     endpoints: { [route]: "healthy", [otherRoute]: "not_checked" },
@@ -3096,10 +3108,11 @@ function doctorProbeFailure(profile, publicProbe, privateProbe = null) {
   const probe = privateProbe ?? publicProbe;
   let status;
   let details = {};
-  if (probe.identity.tier !== "owner" || !["agent", "admin"].includes(probe.identity.scope)) {
+  const requiredTools = requiredToolsForIdentity(probe.identity);
+  if (requiredTools === null) {
     status = "wrong_scope";
   } else {
-    const missing = REQUIRED_AGENT_TOOLS.filter((tool) => !probe.tools.includes(tool));
+    const missing = requiredTools.filter((tool) => !probe.tools.includes(tool));
     if (missing.length > 0) {
       status = "missing_tools";
       details = { missing_tools: missing };
@@ -3336,7 +3349,7 @@ async function diagnoseProfileCore({
       tier: publicProbe.identity.tier,
       scope: publicProbe.identity.scope,
     },
-    tools: REQUIRED_AGENT_TOOLS,
+    tools: requiredToolsForIdentity(publicProbe.identity) ?? REQUIRED_AGENT_TOOLS,
     ...doctorCapabilityFields(publicProbe, privateProbe),
     ...(recommendation === undefined ? {} : { recommendation }),
     endpoints: { public: "healthy", private: "healthy" },
