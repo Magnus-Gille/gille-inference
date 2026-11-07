@@ -67,6 +67,7 @@ type DiagnoseOptions = {
   credential?: string | null;
   publicTools?: string[];
   privateTools?: string[];
+  identityScope?: string;
   rejectPublic?: number;
   publicTransport?: string;
   privateTransport?: string;
@@ -97,6 +98,7 @@ async function diagnose({
   credential = SECRET,
   publicTools = REQUIRED_TOOLS,
   privateTools = publicTools,
+  identityScope = "agent",
   rejectPublic,
   publicTransport = "available",
   privateTransport = publicTransport,
@@ -144,7 +146,7 @@ async function diagnose({
             : new Response("", { status: rejectPublic });
         }
         return jsonResponse({
-          alias: "doctor-agent", tier: "owner", scope: "agent",
+          alias: "doctor-agent", tier: "owner", scope: identityScope,
           ...((isPrivate ? privateObservation : publicObservation) === undefined ? {} : {
             inferenceObservation: isPrivate ? privateObservation : publicObservation,
           }),
@@ -407,6 +409,59 @@ describe("m5 doctor model-discovery diagnostics", () => {
       expect(credentialCalls).toBe(0);
       expect(fetchCalls).toBe(0);
     }
+  });
+
+  describe("owner ask scope explicit probe (INFER-450)", () => {
+    const ASK_TOOLS = ["ask", "list_models", "model_status", "tokenize"];
+
+    it.each(["public", "private"] as const)("runs the MCP ask probe for an ask key on the %s route", async (route) => {
+      const visited: string[] = [];
+      const result = await diagnose({
+        identityScope: "ask",
+        publicTools: ASK_TOOLS,
+        inferenceProbe: { route, model: "safe-model" },
+        askSuccess: true,
+        visitedEndpoints: visited,
+      });
+      expect(result).toMatchObject({
+        status: "mcp_reachable",
+        identity: { tier: "owner", scope: "ask" },
+        tools: ["list_models", "ask", "model_status", "tokenize"],
+        inference_probe: { status: "succeeded", route },
+      });
+      expect(new Set(visited)).toEqual(new Set([route]));
+    });
+
+    it("does not ask and reports unexpected_tools for an over-privileged ask key", async () => {
+      const result = await diagnose({
+        identityScope: "ask",
+        publicTools: [...ASK_TOOLS, "code_loop_start"],
+        inferenceProbe: { route: "public", model: "safe-model" },
+      });
+      expect(result).toMatchObject({
+        status: "unexpected_tools",
+        unexpected_tools: ["code_loop_start"],
+        inference_probe: { status: "not_checked" },
+      });
+    });
+
+    it("rejects an ask key without ask on the explicit probe path", async () => {
+      const result = await diagnose({
+        identityScope: "ask",
+        publicTools: ASK_TOOLS.filter((tool) => tool !== "ask"),
+        inferenceProbe: { route: "public", model: "safe-model" },
+      });
+      expect(result).toMatchObject({ status: "missing_tools" });
+    });
+
+    it("keeps an inference-scope key wrong_scope on the explicit probe path", async () => {
+      const result = await diagnose({
+        identityScope: "inference",
+        publicTools: ASK_TOOLS,
+        inferenceProbe: { route: "public", model: "safe-model" },
+      });
+      expect(result).toMatchObject({ status: "wrong_scope" });
+    });
   });
 
   it("does not ask when the selected catalogue does not advertise ask", async () => {

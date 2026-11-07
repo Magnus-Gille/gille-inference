@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "as_of": "2026-10-29",
+  "as_of": "2026-11-07",
   "purpose": "Operational support declaration for bounded M5 delegation. It is evidence inventory, not credential provisioning or a routing policy.",
   "contexts": [
     {
@@ -57,10 +57,13 @@
       "id": "linux-managed-agent",
       "harness": "Codex / Claude Code",
       "context": "managed Linux agent account",
-      "status": "unsupported",
-      "surface": "authenticated MCP ask (acceptance pending)",
-      "reason": "The owner requires inference access under INFER-450. The Linux profile credential reader and BROKKR-165 network allowance are source implementations; no accepted live managed-agent credential and classification receipt exists yet.",
-      "next_probe": "After separately authorized credential provisioning and gateway-only network application, run doctor without inference, then the bounded MCP classification procedure under a valid evaluation mandate. Record only sanitized acceptance evidence."
+      "status": "supported",
+      "surface": "owner ask-scope key / MCP ask only",
+      "evidence": {
+        "kind": "redacted-acceptance-evidence",
+        "source": "Plane INFER-450 live acceptance comment (2026-11-07) and BROKKR-165",
+        "claim": "On the inference host, the managed agent account (exact-destination gateway allowance from BROKKR-165) used a protected 0600 Linux profile credential holding a minted owner/ask key and completed one bounded flint classification through the m5 client ask with content capture suppressed. Admin, residency, /delegate, /v1/systemone and ordinary /v1 chat inference returned 403. This is ask-only support: no code_loop, /delegate or admin authority."
+      }
     }
   ]
 }

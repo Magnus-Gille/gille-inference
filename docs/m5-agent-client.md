@@ -331,8 +331,9 @@ profile that ran the execution.
 
 1. profile-specific credential availability (Keychain on macOS; protected file on Linux);
 2. gateway reachability and authenticated identity;
-3. `owner` plus `agent|admin` route scope;
-4. visibility of `list_models`, `ask`, all three `code_loop_*` tools, and `record_adoption_evidence`;
+3. `owner` plus `agent|admin|ask` route scope;
+4. visibility of `list_models`, `ask`, all three `code_loop_*` tools, and `record_adoption_evidence`
+   (for an `ask`-scope key: only `list_models`, `ask`, `model_status`, and `tokenize`);
 5. a content-free `list_models` call for **model discovery only**; and
 6. identity, tool, and discovery parity between configured public and private paths.
 
@@ -433,6 +434,7 @@ Its top-level `status` also distinguishes:
 - `model_discovery_unavailable`
 - `wrong_scope`
 - `missing_tools`
+- `unexpected_tools` (an owner `ask` key whose catalogue advertises any tool outside the ask set)
 - `path_parity_failed`
 - `mcp_reachable`
 
