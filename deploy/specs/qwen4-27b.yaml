@@ -1,0 +1,28 @@
+# PRE-RELEASE PLACEHOLDER for an expected official Qwen 4 27B release; not reviewed, not live.
+# Copied from the reviewed qwen38-27b serving contract (docs/qwen38-27b-release-decision-2026-08-14.md).
+# Before any promotion, replace on release day from measured evidence:
+#   - official model id, immutable revision, and the exact GGUF/mmproj SHA-256 values here;
+#   - key, if the official name differs; ctx, KV types, MTP, reasoning, and image settings
+#     after the release canary (drop mm*/spec_* lines if the release has no projector or MTP);
+#   - /operator-resolve/ paths with stable non-scratch operator paths in the private ticket.
+# Checklist: docs/qwen4-27b-release-prep.md
+key: qwen4-27b
+api: chat
+gguf: /operator-resolve/models/qwen4-27b/Qwen4-27B-Q4_K_M.gguf
+mmproj: /operator-resolve/models/qwen4-27b/mmproj-Qwen4-27B-BF16.gguf
+image_min_tokens: 1024
+runtime_bin: /operator-resolve/llama-runtime/releases/<llama-cpp-short-sha>/bin/llama-server
+ctx: 65536
+ngl: 999
+ubatch: 512
+np: 1
+jinja: true
+fa: on
+spec_type: draft-mtp
+spec_draft_n_max: 2
+reasoning_format: auto
+reasoning: auto
+cache_ram_mib: 2048
+ctk: q8_0
+ctv: q8_0
+ttl: 1800

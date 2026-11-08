@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildSupport,
+  FAMILIES,
   inspectModelRuntimeCompatibility,
+  runtimeCompatibilitySourcePaths,
   renderModelRuntimeCompatibilityMarkdown,
   type RuntimeCompatibilityInput,
 } from "../src/homeserver/model-runtime-compatibility.js";
@@ -164,5 +167,50 @@ describe("inspectModelRuntimeCompatibility", () => {
     expect(markdown).toContain("Runtime compatibility: PASS");
     expect(markdown).toContain("Qwen3_5ForCausalLM");
     expect(markdown).toContain("Source SHA-256");
+  });
+});
+
+describe("architecture family table", () => {
+  it("keeps the reviewed Qwen3.5 source surface unchanged", () => {
+    expect(runtimeCompatibilitySourcePaths()).toEqual([
+      "common/speculative.cpp",
+      "conversion/__init__.py",
+      "conversion/qwen.py",
+      "gguf-py/gguf/constants.py",
+      "src/llama-arch.cpp",
+      "src/llama-model.cpp",
+      "src/models/qwen35.cpp",
+      "src/models/qwen35moe.cpp",
+    ]);
+    expect(FAMILIES.flatMap((family) => family.architectures)).toEqual([
+      "Qwen3_5ForConditionalGeneration",
+      "Qwen3_5ForCausalLM",
+      "Qwen3_5MoeForConditionalGeneration",
+      "Qwen3_5MoeForCausalLM",
+    ]);
+  });
+
+  it("derives every check from one family entry, including its converter module", () => {
+    const support = buildSupport([
+      {
+        architectures: ["NewForCausalLM"],
+        ggufArch: "NEWARCH",
+        runtimeName: "newarch",
+        converterClass: "NewTextModel",
+        converterFile: "conversion/newfam.py",
+        runtimeClass: "llama_model_newarch",
+        modelFile: "src/models/newarch.cpp",
+      },
+    ]);
+    const entry = support.get("NewForCausalLM")!;
+    const paths = entry.requirements.map((requirement) => requirement.path);
+    expect(paths).toContain("conversion/newfam.py");
+    expect(paths).toContain("src/models/newarch.cpp");
+    expect(entry.requirements[0]!.tokenGroups).toEqual([['"NewForCausalLM"', '"newfam"']]);
+  });
+
+  it("rejects an architecture claimed by two families", () => {
+    const family = FAMILIES[0]!;
+    expect(() => buildSupport([family, family])).toThrow(/duplicate architecture family/);
   });
 });
