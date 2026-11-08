@@ -5,7 +5,7 @@
  * Usage:
  *   tsx scripts/convert-model-release.ts --staged-dir <abs revision dir> --llama-dir <abs pinned
  *     llama.cpp checkout> --out-dir <abs dir> --name Qwen4-27B [--quant Q4_K_M,Q8_0] [--mmproj]
- *     [--quantize-bin <abs>] [--python <abs>] [--dry-run]
+ *     [--quantize-bin <abs>] [--python <abs>] [--verify-hashes] [--dry-run]
  *
  * Runs on the M5 host after scripts/stage-model-release.ts. `--dry-run` prints the JSON plan only.
  * Conversion and quantization are CPU-only, so no GPU lease is needed; this command never loads a
@@ -77,9 +77,10 @@ export async function runModelReleaseConversion(
       dependencies.stdout(JSON.stringify({ dryRun: true, steps }, null, 2));
       return 0;
     }
-    const { manifestPath, manifest } = await executeConversion(args, steps, dependencies);
+    const { manifestPath, manifest, warnings } = await executeConversion(args, steps, dependencies);
+    for (const warning of warnings) dependencies.stderr(`warning: ${warning}`);
     dependencies.stdout(
-      JSON.stringify({ status: "converted", manifestPath, outputs: manifest.outputs.length })
+      JSON.stringify({ status: "converted", manifestPath, outputs: manifest.outputs.length, warnings })
     );
     return 0;
   } catch (error) {

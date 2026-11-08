@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -75,6 +75,7 @@ function setup(extra: string[] = [], stageManifest: string | null = defaultStage
   mkdirSync(join(llama, "build", "bin"), { recursive: true });
   writeFileSync(join(llama, "convert_hf_to_gguf.py"), "# converter");
   writeFileSync(join(llama, "build", "bin", "llama-quantize"), "quantizer");
+  writeFileSync(join(staged, "config.json"), STAGED_CONFIG);
   if (stageManifest !== null) writeFileSync(join(staged, "stage-manifest.json"), stageManifest);
   const args = parseConversionArgs([
     "--staged-dir", staged, "--llama-dir", llama,
@@ -83,8 +84,14 @@ function setup(extra: string[] = [], stageManifest: string | null = defaultStage
   return { out, staged, llama, args, steps: planConversion(args) };
 }
 
-function defaultStageManifest(): string {
-  return `${JSON.stringify({ schemaVersion: 1, model: "Qwen/Qwen4-27B", revision: MODEL_REVISION, totalBytes: 1, files: [] }, null, 2)}\n`;
+const STAGED_CONFIG = '{"architectures":["X"]}';
+
+function defaultStageManifest(files: unknown[] = [stagedFile()]): string {
+  return `${JSON.stringify({ schemaVersion: 1, model: "Qwen/Qwen4-27B", revision: MODEL_REVISION, totalBytes: STAGED_CONFIG.length, files }, null, 2)}\n`;
+}
+
+function stagedFile(overrides: Record<string, unknown> = {}) {
+  return { path: "config.json", size: STAGED_CONFIG.length, sha256: sha(STAGED_CONFIG), kind: "control", ...overrides };
 }
 
 function fakeDeps(opts: { failId?: string; calls?: string[][]; onRun?: (target: string, bin: string) => void } = {}): ConversionDependencies {
@@ -227,5 +234,77 @@ describe("executeConversion", () => {
     await expect(executeConversion(args, steps, deps)).rejects.toThrow(/clean|dirty|modif/i);
     expect(calls).toEqual([]);
     expect(readdirSync(out)).toEqual([]);
+  });
+});
+
+describe("executeConversion review round 2", () => {
+  it("rejects a stage manifest without files, with unsafe paths or bad hashes", async () => {
+    for (const files of [[], [stagedFile({ path: "../x" })], [stagedFile({ path: "/abs" })], [stagedFile({ sha256: "x" })]]) {
+      const { args, steps } = setup([], defaultStageManifest(files));
+      const calls: string[][] = [];
+      await expect(executeConversion(args, steps, fakeDeps({ calls }))).rejects.toThrow(/stage-manifest/);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it("rejects staged files that are missing, resized or unlisted before any step", async () => {
+    const cases: Array<(staged: string) => void> = [
+      (staged) => writeFileSync(join(staged, "config.json"), "changed size"),
+      (staged) => writeFileSync(join(staged, "extra.safetensors"), "x"),
+      (staged) => rmSync(join(staged, "config.json")),
+    ];
+    for (const mutate of cases) {
+      const { staged, args, steps } = setup();
+      mutate(staged);
+      const calls: string[][] = [];
+      await expect(executeConversion(args, steps, fakeDeps({ calls }))).rejects.toThrow(/staged/);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it("verifies hashes only with --verify-hashes and records which check ran", async () => {
+    const tampered = (verify: string[]) => {
+      const ctx = setup(verify);
+      writeFileSync(join(ctx.staged, "config.json"), STAGED_CONFIG.replace("X", "Y")); // same size
+      return ctx;
+    };
+    const sizeOnly = tampered([]);
+    const { manifest } = await executeConversion(sizeOnly.args, sizeOnly.steps, fakeDeps());
+    expect(manifest.stagedFilesVerified).toBe("size");
+    const full = tampered(["--verify-hashes"]);
+    await expect(executeConversion(full.args, full.steps, fakeDeps())).rejects.toThrow(/sha256/);
+  });
+
+  it("refuses to publish when the converter changes during the run", async () => {
+    const { out, llama, args, steps } = setup();
+    const deps = fakeDeps({ onRun: () => writeFileSync(join(llama, "convert_hf_to_gguf.py"), "# swapped") });
+    await expect(executeConversion(args, steps, deps)).rejects.toThrow(/converterSha256 changed/);
+    expect(readdirSync(out)).toEqual([]);
+  });
+
+  it("refuses to publish when the llama.cpp commit changes during the run", async () => {
+    const { out, args, steps } = setup();
+    let n = 0;
+    const deps = { ...fakeDeps(), llamaCommit: async () => (n++ === 0 ? COMMIT : "c".repeat(40)) };
+    await expect(executeConversion(args, steps, deps)).rejects.toThrow(/llamaCppCommit changed/);
+    expect(readdirSync(out)).toEqual([]);
+  });
+
+  it("reports a successful publish with a warning when run-dir cleanup fails", async () => {
+    const { out, args, steps } = setup();
+    const deps = { ...fakeDeps(), removeRunDir: () => { throw new Error("EBUSY"); } };
+    const { manifestPath, warnings } = await executeConversion(args, steps, deps);
+    expect(existsSync(manifestPath)).toBe(true);
+    expect(warnings.join(" ")).toMatch(/remove run directory .*EBUSY/);
+    expect(existsSync(join(out, ".conversion.lock"))).toBe(false);
+  });
+
+  it("keeps the step error type and appends cleanup failures to it", async () => {
+    const { out, args, steps } = setup(["--mmproj"]);
+    const deps = { ...fakeDeps({ failId: "convert-mmproj" }), removeRunDir: () => { throw new Error("EBUSY"); } };
+    const error = await executeConversion(args, steps, deps).catch((e) => e);
+    expect(error).toBeInstanceOf(ConversionStepError);
+    expect(error.message).toMatch(/convert-mmproj.*cleanup also failed: remove run directory .*EBUSY/s);
+    expect(existsSync(join(out, ".conversion.lock"))).toBe(false);
   });
 });

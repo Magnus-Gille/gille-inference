@@ -56,7 +56,12 @@ the deterministic parity check from the Qwen3.8 record (reference vs BF16 vs Q4_
 The run takes an output-folder lock, publishes only after every step succeeds (so a failed run can
 simply be rerun), and requires a clean pinned llama.cpp checkout plus the staging manifest. A run
 killed by a signal or host loss leaves `.conversion.lock` and a large `.conversion-run-*` directory
-behind: confirm the PID recorded in the lock is gone, then remove both before rerunning.
+behind: confirm the PID recorded in the lock is gone, then remove both before rerunning. The
+manifest is published last, so if the run died while publishing, any final `.gguf` without a
+`conversion-manifest.json` beside it is from that incomplete run; remove those files too.
+Staged files are checked against `stage-manifest.json` by size; add `--verify-hashes` for a full
+SHA-256 re-check. Tool identity is re-checked before publishing, so a llama.cpp checkout or binary
+changed mid-run fails the run instead of being recorded.
 
 ## 5. Smoke test (maintenance window, no roster change)
 
