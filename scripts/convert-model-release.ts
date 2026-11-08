@@ -9,8 +9,9 @@
  *
  * Runs on the M5 host after scripts/stage-model-release.ts. `--dry-run` prints the JSON plan only.
  * Conversion and quantization are CPU-only, so no GPU lease is needed; this command never loads a
- * model into llama-swap and never changes the live roster. Outputs are written as `.partial` files,
- * renamed atomically, hashed, and recorded in conversion-manifest.json. Nothing secret is passed
+ * model into llama-swap and never changes the live roster. Outputs are built in a run-owned directory
+ * under an output-folder lock, hashed, and hard-linked into place (no replace) only after every step
+ * succeeds; provenance is recorded in conversion-manifest.json. Nothing secret is passed
  * on any command line.
  */
 import { execFile, spawn } from "node:child_process";
@@ -50,6 +51,15 @@ const DEFAULT_DEPS: CliDependencies = {
     new Promise((resolve) => {
       execFile("git", ["-C", llamaDir, "rev-parse", "HEAD"], { timeout: 10_000 }, (error, stdout) =>
         resolve(error ? null : stdout.trim())
+      );
+    }),
+  llamaSourceClean: (llamaDir) =>
+    new Promise((resolve) => {
+      execFile(
+        "git",
+        ["-C", llamaDir, "status", "--porcelain", "--untracked-files=no"],
+        { timeout: 10_000 },
+        (error, stdout) => resolve(!error && stdout.trim() === "")
       );
     }),
   stdout: (line) => console.log(line),

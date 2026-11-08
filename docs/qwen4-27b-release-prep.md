@@ -53,6 +53,10 @@ npx tsx scripts/convert-model-release.ts --staged-dir <staged revision dir> \
 Drop `--dry-run` to execute. Omit `--mmproj` for a text-only release. Keep the resulting
 `conversion-manifest.json` hashes for the spec and decision record. Before relying on Q4_K_M, repeat
 the deterministic parity check from the Qwen3.8 record (reference vs BF16 vs Q4_K_M final text).
+The run takes an output-folder lock, publishes only after every step succeeds (so a failed run can
+simply be rerun), and requires a clean pinned llama.cpp checkout plus the staging manifest. A run
+killed by a signal or host loss leaves `.conversion.lock` and a large `.conversion-run-*` directory
+behind: confirm the PID recorded in the lock is gone, then remove both before rerunning.
 
 ## 5. Smoke test (maintenance window, no roster change)
 

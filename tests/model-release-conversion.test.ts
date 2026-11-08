@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -62,23 +62,43 @@ describe("planConversion", () => {
   });
 });
 
-function setup(extra: string[] = []) {
-  const out = mkdtempSync(join(tmpdir(), "conv-"));
+const MODEL_REVISION = "b".repeat(40);
+const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+
+function setup(extra: string[] = [], stageManifest: string | null = defaultStageManifest()) {
+  const root = mkdtempSync(join(tmpdir(), "conv-"));
+  const out = join(root, "out");
+  const staged = join(root, "staged");
+  const llama = join(root, "llama");
+  mkdirSync(out);
+  mkdirSync(staged);
+  mkdirSync(join(llama, "build", "bin"), { recursive: true });
+  writeFileSync(join(llama, "convert_hf_to_gguf.py"), "# converter");
+  writeFileSync(join(llama, "build", "bin", "llama-quantize"), "quantizer");
+  if (stageManifest !== null) writeFileSync(join(staged, "stage-manifest.json"), stageManifest);
   const args = parseConversionArgs([
-    "--staged-dir", "/models/q/rev", "--llama-dir", "/opt/llama.cpp",
+    "--staged-dir", staged, "--llama-dir", llama,
     "--out-dir", out, "--name", "M", ...extra,
   ]);
-  return { out, args, steps: planConversion(args) };
+  return { out, staged, llama, args, steps: planConversion(args) };
 }
 
-function fakeDeps(failId?: string): ConversionDependencies {
+function defaultStageManifest(): string {
+  return `${JSON.stringify({ schemaVersion: 1, model: "Qwen/Qwen4-27B", revision: MODEL_REVISION, totalBytes: 1, files: [] }, null, 2)}\n`;
+}
+
+function fakeDeps(opts: { failId?: string; calls?: string[][]; onRun?: (target: string, bin: string) => void } = {}): ConversionDependencies {
   return {
     llamaCommit: async () => COMMIT,
+    llamaSourceClean: async () => true,
     run: async (bin, argv) => {
+      opts.calls?.push([bin, ...argv]);
       const isConvert = bin === "python3";
       const target = isConvert ? argv[argv.indexOf("--outfile") + 1]! : argv[1]!;
-      expect(target.endsWith(".partial")).toBe(true);
+      expect(target).toContain(".conversion-run-");
+      opts.onRun?.(target, bin);
       writeFileSync(target, `data:${target.split("/").pop()}`);
+      const failId = opts.failId;
       if (failId && ((failId === "convert-mmproj" && argv.includes("--mmproj")) || (failId.startsWith("quantize") && !isConvert))) {
         return { status: 3, stderr: "boom" };
       }
@@ -87,35 +107,125 @@ function fakeDeps(failId?: string): ConversionDependencies {
   };
 }
 
+const leftovers = (out: string) => readdirSync(out).filter((f) => f.startsWith(".conversion-run-") || f.endsWith(".partial") || f.endsWith(".tmp"));
+
 describe("executeConversion", () => {
-  it("writes outputs and a manifest with hashes", async () => {
-    const { out, args, steps } = setup(["--mmproj"]);
+  it("writes outputs and a manifest with hashes and provenance", async () => {
+    const { out, staged, llama, args, steps } = setup(["--mmproj"]);
     const { manifestPath, manifest } = await executeConversion(args, steps, fakeDeps());
-    const onDisk = JSON.parse(readFileSync(manifestPath, "utf8"));
-    expect(onDisk).toEqual(manifest);
+    const raw = readFileSync(manifestPath, "utf8");
+    expect(raw.endsWith("}\n")).toBe(true);
+    expect(JSON.parse(raw)).toEqual(manifest);
     expect(manifest.llamaCppCommit).toBe(COMMIT);
+    expect(manifest.model).toBe("Qwen/Qwen4-27B");
+    expect(manifest.revision).toBe(MODEL_REVISION);
+    expect(manifest.stageManifestSha256).toBe(sha(readFileSync(join(staged, "stage-manifest.json"), "utf8")));
+    expect(manifest.converterSha256).toBe(sha("# converter"));
+    expect(manifest.quantizerSha256).toBe(sha("quantizer"));
+    expect(llama).toBeTruthy();
     expect(manifest.outputs).toHaveLength(3);
     for (const o of manifest.outputs) {
       const bytes = readFileSync(o.path);
+      expect(o.path.startsWith(out)).toBe(true);
+      expect(o.path).not.toContain(".conversion-run-");
       expect(o.bytes).toBe(bytes.length);
       expect(o.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
     }
-    expect(readdirSync(out).some((f) => f.endsWith(".partial") || f.endsWith(".tmp"))).toBe(false);
+    expect(leftovers(out)).toEqual([]);
+    expect(existsSync(join(out, ".conversion.lock"))).toBe(false);
   });
-  it("reports the failing step and leaves no partial", async () => {
+  it("reports the failing step and leaves nothing behind", async () => {
     const { out, args, steps } = setup(["--mmproj"]);
-    const error = await executeConversion(args, steps, fakeDeps("convert-mmproj")).catch((e) => e);
+    const error = await executeConversion(args, steps, fakeDeps({ failId: "convert-mmproj" })).catch((e) => e);
     expect(error).toBeInstanceOf(ConversionStepError);
     expect(error.stepId).toBe("convert-mmproj");
     expect(error.exitStatus).toBe(3);
     expect(error.message).toContain("boom");
-    expect(readdirSync(out).filter((f) => f.endsWith(".partial"))).toEqual([]);
-    expect(existsSync(join(out, "conversion-manifest.json"))).toBe(false);
+    expect(readdirSync(out)).toEqual([]);
+  });
+  it("can be retried after a failure at step 2", async () => {
+    const { out, args, steps } = setup(["--mmproj"]);
+    await expect(executeConversion(args, steps, fakeDeps({ failId: "convert-mmproj" }))).rejects.toBeInstanceOf(ConversionStepError);
+    expect(readdirSync(out)).toEqual([]);
+    const { manifest } = await executeConversion(args, steps, fakeDeps());
+    expect(manifest.outputs).toHaveLength(3);
+    expect(leftovers(out)).toEqual([]);
   });
   it("refuses to overwrite existing outputs", async () => {
     const { out, args, steps } = setup();
     writeFileSync(join(out, "M-Q4_K_M.gguf"), "x");
     await expect(executeConversion(args, steps, fakeDeps())).rejects.toThrow(/refusing to overwrite/);
     expect(readdirSync(out)).toEqual(["M-Q4_K_M.gguf"]);
+  });
+  it("fails naming the lock path when locked, runs nothing, and keeps the lock", async () => {
+    const { out, args, steps } = setup();
+    const lock = join(out, ".conversion.lock");
+    writeFileSync(lock, "{}");
+    const calls: string[][] = [];
+    const error = await executeConversion(args, steps, fakeDeps({ calls })).catch((e) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain(lock);
+    expect(error.message).toMatch(/PID/);
+    expect(calls).toEqual([]);
+    expect(existsSync(lock)).toBe(true);
+  });
+  it("writes pid and createdAt in the lock while running and releases it after success and failure", async () => {
+    const { out, args, steps } = setup();
+    let seen: { pid?: number; createdAt?: string } = {};
+    await executeConversion(args, steps, fakeDeps({ onRun: () => { seen = JSON.parse(readFileSync(join(out, ".conversion.lock"), "utf8")); } }));
+    expect(seen.pid).toBe(process.pid);
+    expect(typeof seen.createdAt).toBe("string");
+    expect(existsSync(join(out, ".conversion.lock"))).toBe(false);
+    const second = setup();
+    await expect(executeConversion(second.args, second.steps, fakeDeps({ failId: "quantize-Q4_K_M" }))).rejects.toBeInstanceOf(ConversionStepError);
+    expect(existsSync(join(second.out, ".conversion.lock"))).toBe(false);
+  });
+  it("points quantize input into the run dir", async () => {
+    const { args, steps } = setup();
+    const calls: string[][] = [];
+    await executeConversion(args, steps, fakeDeps({ calls }));
+    const quant = calls.find((c) => c[0] !== "python3")!;
+    expect(quant[1]).toContain(".conversion-run-");
+    expect(quant[1]!.endsWith("M-BF16.gguf")).toBe(true);
+    expect(quant[2]).toContain(".conversion-run-");
+  });
+  it("does not replace a final created mid-run and unlinks its own finals", async () => {
+    const { out, args, steps } = setup(["--mmproj"]);
+    const rival = join(out, "M-Q4_K_M.gguf");
+    const deps = fakeDeps({ onRun: (_t, bin) => { if (bin !== "python3") writeFileSync(rival, "rival"); } });
+    await expect(executeConversion(args, steps, deps)).rejects.toThrow();
+    expect(readFileSync(rival, "utf8")).toBe("rival");
+    expect(readdirSync(out)).toEqual(["M-Q4_K_M.gguf"]);
+  });
+  it.each([
+    ["missing stage manifest", null],
+    ["malformed json", "{nope"],
+    ["wrong schema", JSON.stringify({ schemaVersion: 2, model: "Qwen/Q", revision: MODEL_REVISION })],
+    ["bad model", JSON.stringify({ schemaVersion: 1, model: "../x", revision: MODEL_REVISION })],
+    ["bad revision", JSON.stringify({ schemaVersion: 1, model: "Qwen/Q", revision: "main" })],
+  ])("fails closed before any step: %s", async (_label, content) => {
+    const { out, args, steps } = setup([], content);
+    const calls: string[][] = [];
+    await expect(executeConversion(args, steps, fakeDeps({ calls }))).rejects.toThrow(/stage-manifest/);
+    expect(calls).toEqual([]);
+    expect(readdirSync(out)).toEqual([]);
+  });
+  it("fails closed on null or malformed llama commit", async () => {
+    for (const commit of [null, "abc"]) {
+      const { out, args, steps } = setup();
+      const calls: string[][] = [];
+      const deps = { ...fakeDeps({ calls }), llamaCommit: async () => commit };
+      await expect(executeConversion(args, steps, deps)).rejects.toThrow(/commit/);
+      expect(calls).toEqual([]);
+      expect(readdirSync(out)).toEqual([]);
+    }
+  });
+  it("fails closed on a dirty llama.cpp checkout", async () => {
+    const { out, args, steps } = setup();
+    const calls: string[][] = [];
+    const deps = { ...fakeDeps({ calls }), llamaSourceClean: async () => false };
+    await expect(executeConversion(args, steps, deps)).rejects.toThrow(/clean|dirty|modif/i);
+    expect(calls).toEqual([]);
+    expect(readdirSync(out)).toEqual([]);
   });
 });

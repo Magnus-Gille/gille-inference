@@ -1,19 +1,25 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
+  closeSync,
   createReadStream,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
-  renameSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, normalize } from "node:path";
+import { basename, isAbsolute, join, normalize } from "node:path";
 
 export const CONVERSION_QUANT_ALLOWLIST = ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M"] as const;
 const SAFE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const COMMIT_RE = /^[a-f0-9]{40}$/;
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export interface ConversionArgs {
   stagedDir: string;
@@ -44,7 +50,12 @@ export interface ConversionOutputRecord {
 export interface ConversionManifest {
   schemaVersion: 1;
   stagedDir: string;
-  llamaCppCommit: string | null;
+  model: string;
+  revision: string;
+  stageManifestSha256: string;
+  llamaCppCommit: string;
+  converterSha256: string;
+  quantizerSha256: string;
   steps: ConversionStep[];
   outputs: ConversionOutputRecord[];
 }
@@ -59,6 +70,8 @@ export interface ConversionDependencies {
   run: (bin: string, argv: string[]) => Promise<StepRunResult>;
   /** Returns the llama.cpp HEAD commit, or null when unavailable. */
   llamaCommit: (llamaDir: string) => Promise<string | null>;
+  /** True only when the llama.cpp checkout has no tracked modifications. */
+  llamaSourceClean: (llamaDir: string) => Promise<boolean>;
 }
 
 export class ConversionStepError extends Error {
@@ -197,15 +210,65 @@ function removeQuietly(path: string): void {
   }
 }
 
-function atomicWrite(path: string, content: string): void {
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+function acquireLock(lockPath: string): () => void {
+  let fd: number;
   try {
-    writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    renameSync(temporary, path);
+    fd = openSync(lockPath, "wx", 0o600);
   } catch (error) {
-    removeQuietly(temporary);
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(
+        `conversion lock exists: ${lockPath}; another conversion may be running. ` +
+          `Verify the owning PID recorded in it is gone before removing the lock manually`
+      );
+    }
     throw error;
   }
+  try {
+    writeFileSync(fd, `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+  } catch (error) {
+    closeSync(fd);
+    removeQuietly(lockPath);
+    throw error;
+  }
+  closeSync(fd);
+  return () => removeQuietly(lockPath);
+}
+
+interface StageProvenance {
+  model: string;
+  revision: string;
+  stageManifestSha256: string;
+}
+
+function readStageManifest(stagedDir: string): StageProvenance {
+  const path = join(stagedDir, "stage-manifest.json");
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    throw new Error(`stage-manifest.json is required at ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`stage-manifest.json at ${path} is not valid JSON`);
+  }
+  const m = parsed as { schemaVersion?: unknown; model?: unknown; revision?: unknown } | null;
+  if (!m || typeof m !== "object" || m.schemaVersion !== 1) {
+    throw new Error(`stage-manifest.json at ${path} must have schemaVersion 1`);
+  }
+  if (typeof m.model !== "string" || !MODEL_RE.test(m.model)) {
+    throw new Error(`stage-manifest.json at ${path} has an invalid model`);
+  }
+  if (typeof m.revision !== "string" || !COMMIT_RE.test(m.revision)) {
+    throw new Error(`stage-manifest.json at ${path} has an invalid revision (need 40 lowercase hex)`);
+  }
+  return {
+    model: m.model,
+    revision: m.revision,
+    stageManifestSha256: createHash("sha256").update(raw).digest("hex"),
+  };
 }
 
 export async function executeConversion(
@@ -215,47 +278,85 @@ export async function executeConversion(
 ): Promise<{ manifestPath: string; manifest: ConversionManifest }> {
   mkdirSync(args.outDir, { recursive: true });
   if (lstatSync(args.outDir).isSymbolicLink()) throw new Error("--out-dir must not be a symbolic link");
-  const manifestPath = join(args.outDir, "conversion-manifest.json");
-  for (const path of [manifestPath, ...steps.map((s) => s.output)]) {
-    if (existsSync(path)) throw new Error(`refusing to overwrite existing output: ${path}`);
-  }
-  const rawCommit = await deps.llamaCommit(args.llamaDir);
-  const llamaCppCommit = rawCommit && COMMIT_RE.test(rawCommit) ? rawCommit : null;
+  const release = acquireLock(join(args.outDir, ".conversion.lock"));
+  let runDir: string | undefined;
+  const linked: string[] = [];
+  let failed = false;
+  try {
+    const manifestPath = join(args.outDir, "conversion-manifest.json");
+    for (const path of [manifestPath, ...steps.map((s) => s.output)]) {
+      if (existsSync(path)) throw new Error(`refusing to overwrite existing output: ${path}`);
+    }
+    const stage = readStageManifest(args.stagedDir);
+    const llamaCppCommit = await deps.llamaCommit(args.llamaDir);
+    if (!llamaCppCommit || !COMMIT_RE.test(llamaCppCommit)) {
+      throw new Error("llama.cpp commit is unavailable or not a 40-hex SHA; refusing to convert");
+    }
+    if (!(await deps.llamaSourceClean(args.llamaDir))) {
+      throw new Error(`llama.cpp checkout ${args.llamaDir} is not clean (tracked modifications); refusing to convert`);
+    }
+    const converterSha256 = await sha256File(join(args.llamaDir, "convert_hf_to_gguf.py"));
+    const quantizerSha256 = await sha256File(args.quantizeBin);
 
-  const outputs: ConversionOutputRecord[] = [];
-  for (const step of steps) {
-    const partial = `${step.output}.partial`;
-    removeQuietly(partial);
-    const argv = step.argv.map((arg) => (arg === step.output ? partial : arg));
-    let result: StepRunResult;
+    runDir = mkdtempSync(join(args.outDir, ".conversion-run-"));
+    const inRun = (path: string) => join(runDir!, basename(path));
+    const finals = new Map<string, string>(); // final path -> run path, for earlier steps
+    const outputs: ConversionOutputRecord[] = [];
+    for (const step of steps) {
+      const runOutput = inRun(step.output);
+      const argv = step.argv.map((arg) =>
+        arg === step.output ? runOutput : (finals.get(arg) ?? arg)
+      );
+      let result: StepRunResult;
+      try {
+        result = await deps.run(step.bin, argv);
+      } catch (error) {
+        throw new ConversionStepError(step.id, null, error instanceof Error ? error.message : String(error));
+      }
+      if (result.status !== 0) throw new ConversionStepError(step.id, result.status, result.stderr ?? "");
+      if (!existsSync(runOutput)) {
+        throw new ConversionStepError(step.id, 0, `step produced no output file ${runOutput}`);
+      }
+      finals.set(step.output, runOutput);
+      outputs.push({
+        stepId: step.id,
+        path: step.output,
+        bytes: statSync(runOutput).size,
+        sha256: await sha256File(runOutput),
+      });
+    }
+    const manifest: ConversionManifest = {
+      schemaVersion: 1,
+      stagedDir: args.stagedDir,
+      model: stage.model,
+      revision: stage.revision,
+      stageManifestSha256: stage.stageManifestSha256,
+      llamaCppCommit,
+      converterSha256,
+      quantizerSha256,
+      steps,
+      outputs,
+    };
+    const runManifest = inRun(manifestPath);
+    writeFileSync(runManifest, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    // No-replace publish: linkSync fails with EEXIST rather than overwriting a rival file.
+    for (const [final, source] of [...finals, [manifestPath, runManifest] as [string, string]]) {
+      linkSync(source, final);
+      linked.push(final);
+    }
+    return { manifestPath, manifest };
+  } catch (error) {
+    failed = true;
+    for (const path of linked) removeQuietly(path);
+    throw error;
+  } finally {
     try {
-      result = await deps.run(step.bin, argv);
-    } catch (error) {
-      removeQuietly(partial);
-      throw new ConversionStepError(step.id, null, error instanceof Error ? error.message : String(error));
+      if (runDir) rmSync(runDir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      // Never let run-dir cleanup mask the conversion's own failure; surface it only on success.
+      if (!failed) throw cleanupError;
+    } finally {
+      release();
     }
-    if (result.status !== 0) {
-      removeQuietly(partial);
-      throw new ConversionStepError(step.id, result.status, result.stderr ?? "");
-    }
-    if (!existsSync(partial)) {
-      throw new ConversionStepError(step.id, 0, `step produced no output file ${partial}`);
-    }
-    renameSync(partial, step.output);
-    outputs.push({
-      stepId: step.id,
-      path: step.output,
-      bytes: statSync(step.output).size,
-      sha256: await sha256File(step.output),
-    });
   }
-  const manifest: ConversionManifest = {
-    schemaVersion: 1,
-    stagedDir: args.stagedDir,
-    llamaCppCommit,
-    steps,
-    outputs,
-  };
-  atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  return { manifestPath, manifest };
 }
