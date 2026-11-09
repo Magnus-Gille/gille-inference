@@ -56,9 +56,11 @@ the deterministic parity check from the Qwen3.8 record (reference vs BF16 vs Q4_
 The run takes an output-folder lock, publishes only after every step succeeds (so a failed run can
 simply be rerun), and requires a clean pinned llama.cpp checkout plus the staging manifest. A run
 killed by a signal or host loss leaves `.conversion.lock` and a large `.conversion-run-*` directory
-behind: confirm the PID recorded in the lock is gone, then remove both before rerunning. The
-manifest is published last, so if the run died while publishing, any final `.gguf` without a
-`conversion-manifest.json` beside it is from that incomplete run; remove those files too.
+behind. To recover: confirm the PID recorded in the lock is gone and that no converter or quantizer
+from that run is still running (`pgrep -f convert_hf_to_gguf.py`, `pgrep -x llama-quantize`; a
+killed parent does not stop its children). Then remove only the files listed under
+`plannedOutputs` in the lock (never other `.gguf` files in the folder), the run directory, and the
+lock, and rerun.
 Staged files are checked against `stage-manifest.json` by size; add `--verify-hashes` for a full
 SHA-256 re-check. Tool identity is re-checked before publishing, so a llama.cpp checkout or binary
 changed mid-run fails the run instead of being recorded.

@@ -308,3 +308,33 @@ describe("executeConversion review round 2", () => {
     expect(existsSync(join(out, ".conversion.lock"))).toBe(false);
   });
 });
+
+describe("executeConversion review round 3", () => {
+  it("rejects '.' and a listed directory as staged files", async () => {
+    const dot = setup([], defaultStageManifest([stagedFile(), stagedFile({ path: "." })]));
+    await expect(executeConversion(dot.args, dot.steps, fakeDeps())).rejects.toThrow(/unsafe file path/);
+
+    const dir = setup([], defaultStageManifest([stagedFile(), stagedFile({ path: "sub", size: 0 })]));
+    mkdirSync(join(dir.staged, "sub"));
+    const calls: string[][] = [];
+    await expect(executeConversion(dir.args, dir.steps, fakeDeps({ calls }))).rejects.toThrow(/missing or not regular/);
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses to publish when the stage manifest changes during the run", async () => {
+    const { out, staged, args, steps } = setup();
+    const deps = fakeDeps({
+      onRun: () => writeFileSync(join(staged, "stage-manifest.json"), defaultStageManifest().replace("Qwen4-27B", "Qwen4-27C")),
+    });
+    await expect(executeConversion(args, steps, deps)).rejects.toThrow(/stage-manifest.json changed/);
+    expect(readdirSync(out)).toEqual([]);
+  });
+
+  it("records the planned outputs in the lock for recovery", async () => {
+    const { out, args, steps } = setup(["--mmproj"]);
+    let lock: { plannedOutputs?: string[] } = {};
+    const deps = fakeDeps({ onRun: () => { lock = JSON.parse(readFileSync(join(out, ".conversion.lock"), "utf8")); } });
+    await executeConversion(args, steps, deps);
+    expect(lock.plannedOutputs).toEqual([...steps.map((s) => s.output), join(out, "conversion-manifest.json")]);
+  });
+});

@@ -240,7 +240,7 @@ function withCleanupFailures(primary: unknown, cleanup: string[]): unknown {
   return new Error(`${String(primary)}${note}`);
 }
 
-function acquireLock(lockPath: string): () => void {
+function acquireLock(lockPath: string, plannedOutputs: string[]): () => void {
   let fd: number;
   try {
     fd = openSync(lockPath, "wx", 0o600);
@@ -254,7 +254,8 @@ function acquireLock(lockPath: string): () => void {
     throw error;
   }
   try {
-    writeFileSync(fd, `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`);
+    // plannedOutputs lets an operator recovering from a killed run remove exactly this run's files.
+    writeFileSync(fd, `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), plannedOutputs })}\n`);
   } catch (error) {
     closeSync(fd);
     try {
@@ -320,6 +321,7 @@ function readStageManifest(stagedDir: string): StageProvenance {
     if (
       typeof filePath !== "string" ||
       filePath === "" ||
+      filePath === "." ||
       isAbsolute(filePath) ||
       filePath.includes("\0") ||
       normalize(filePath) !== filePath ||
@@ -368,10 +370,15 @@ async function verifyStagedFiles(
   hashes: boolean
 ): Promise<void> {
   const expected = new Map(stage.files.map((file) => [file.path, file]));
-  const present = listRegularFiles(stagedDir).filter((path) => path !== STAGE_MANIFEST);
-  const unexpected = present.filter((path) => !expected.has(path));
+  const present = new Set(listRegularFiles(stagedDir).filter((path) => path !== STAGE_MANIFEST));
+  const unexpected = [...present].filter((path) => !expected.has(path));
   if (unexpected.length > 0) {
     throw new Error(`staged directory has files not in ${STAGE_MANIFEST}: ${unexpected.sort().join(", ")}`);
+  }
+  // Every listed entry must be one of the enumerated regular files (a directory never is).
+  const absent = [...expected.keys()].filter((path) => !present.has(path));
+  if (absent.length > 0) {
+    throw new Error(`staged file(s) missing or not regular files: ${absent.sort().join(", ")}`);
   }
   for (const file of stage.files) {
     const full = join(stagedDir, file.path);
@@ -419,7 +426,8 @@ export async function executeConversion(
   mkdirSync(args.outDir, { recursive: true });
   if (lstatSync(args.outDir).isSymbolicLink()) throw new Error("--out-dir must not be a symbolic link");
   const lockPath = join(args.outDir, ".conversion.lock");
-  const release = acquireLock(lockPath);
+  const manifestPath = join(args.outDir, "conversion-manifest.json");
+  const release = acquireLock(lockPath, [...steps.map((s) => s.output), manifestPath]);
   const removeRunDir = deps.removeRunDir ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
   let runDir: string | undefined;
   const linked: string[] = [];
@@ -428,7 +436,6 @@ export async function executeConversion(
   const warnings: string[] = [];
   let result: ConversionResult | undefined;
   try {
-    const manifestPath = join(args.outDir, "conversion-manifest.json");
     for (const path of [manifestPath, ...steps.map((s) => s.output)]) {
       if (existsSync(path)) throw new Error(`refusing to overwrite existing output: ${path}`);
     }
@@ -472,6 +479,9 @@ export async function executeConversion(
       if (after[key] !== tools[key]) {
         throw new Error(`${key} changed during conversion; refusing to publish`);
       }
+    }
+    if (readStageManifest(args.stagedDir).stageManifestSha256 !== stage.stageManifestSha256) {
+      throw new Error(`${STAGE_MANIFEST} changed during conversion; refusing to publish`);
     }
     await verifyStagedFiles(args.stagedDir, stage, false);
 
